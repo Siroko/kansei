@@ -67,7 +67,6 @@ class UniformGroup {
             }
 
             if (uniform.value?.needsUpdate) {
-                console.log('updating uniform', uniform.value);
                 await uniform.value?.update(gpuDevice);
             }
 

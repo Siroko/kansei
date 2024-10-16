@@ -49,7 +49,6 @@ class Object3D {
 
     public async getBindGroup(gpuDevice: GPUDevice, pipeline: GPURenderPipeline, bindingGroupLayoutPosition: number = 0): Promise<GPUBindGroup> {
         await this.uniformGroup!.getBindGroup(gpuDevice, pipeline!, bindingGroupLayoutPosition);
-        console.log('uniform group', this.uniformGroup!.bindGroup);
         return new Promise((resolve) => {
             resolve(this.uniformGroup!.bindGroup!);
         });
