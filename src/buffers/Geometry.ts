@@ -6,7 +6,7 @@ class Geometry {
 
     public vertexCount: number = 0;
 
-    // Indexed vertices, normals, uvs
+    // Interleaved vertices, normals, uvs
     protected vertices?: Float32Array;
     protected indices?: Uint16Array;
 
