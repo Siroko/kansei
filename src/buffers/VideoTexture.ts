@@ -22,7 +22,7 @@ class VideoTexture implements IBindable {
         res.label = 'VideoTexture ' + this.uuid;
         return res;
     }
-    async initialize(gpuDevice: GPUDevice): Promise<void> {
+    initialize(gpuDevice: GPUDevice) {
         this.gpuDevice = gpuDevice;
         this.initialized = true;
     }

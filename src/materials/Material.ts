@@ -36,10 +36,6 @@ class Material {
             this.createShaderModule(gpuDevice);
         }
 
-        if (!this.uniformGroup.bindGroupLayout) {
-            this.uniformGroup.createBindGroupLayout(gpuDevice);
-        }
-
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
             layout: "auto",
             vertex: {
@@ -72,12 +68,9 @@ class Material {
         this.initialized = true;
     }
 
-    public async getBindGroup(gpuDevice: GPUDevice): Promise<GPUBindGroup> {
-
-        await this.uniformGroup.getBindGroup(gpuDevice, this.pipeline!);
-        return new Promise((resolve) => {
-            resolve(this.uniformGroup.bindGroup!);
-        });
+    public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
+        this.uniformGroup.getBindGroup(gpuDevice, this.pipeline!);
+        return this.uniformGroup.bindGroup!;
     }
 }
 

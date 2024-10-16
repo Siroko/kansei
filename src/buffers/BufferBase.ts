@@ -27,13 +27,11 @@ class BufferBase implements IBindable {
         this._resource.unmap();
     }
 
-    public async update(gpuDevice: GPUDevice): Promise<void> {
+    public update(gpuDevice: GPUDevice) {
         if (this._resource) {
             gpuDevice!.queue.writeBuffer(this._resource, 0, this.buffer!);
         }
         this.needsUpdate = false;
-
-        return Promise.resolve();
     }
 }
 

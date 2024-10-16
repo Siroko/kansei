@@ -4,70 +4,29 @@ class UniformGroup {
     public bindGroupLayout?: GPUBindGroupLayout;
     public bindGroup?: GPUBindGroup;
     public initialized: boolean = false;
+    private pipelineBindGroupLayout?: GPUBindGroupLayout;
 
     constructor(
         public uniforms: BindGroupDescriptor[]
     ) {
     }
 
-    public createBindGroupLayout(gpuDevice: GPUDevice) {
-        const entries = [];
-        for (const uniform of this.uniforms) {
-            const entry: GPUBindGroupLayoutEntry = {
-                binding: uniform.binding!,
-                visibility: uniform.visibility!
-            };
-            switch (uniform.value!.type) {
-                case 'storage':
-                case 'read-only-storage':
-                case 'uniform':
-                    entry.buffer = {
-                        type: uniform.value!.type as GPUBufferBindingType
-                    };
-                    break;
-                case 'sampler':
-                    entry.sampler = { type: 'filtering' };
-                    break;
-                case 'texture':
-                    entry.texture = { sampleType: 'float' };
-                    break;
-                case 'storage-texture':
-                    entry.storageTexture = {
-                        access: 'write-only',
-                        format: 'rgba8unorm'
-                    };
-                    break;
-                case 'external-texture':
-                    entry.externalTexture = {
-                        sampleType: 'float'
-                    };
-                    break;
-                default:
-                    console.error(`Unknown binding type: ${uniform.value!.type}`);
-                    continue;
-            }
-            entries.push(entry);
-        }
-
-        this.bindGroupLayout = gpuDevice.createBindGroupLayout({
-            entries
-        });
-    }
-
-    public async getBindGroup(gpuDevice: GPUDevice, pipeline: GPURenderPipeline, bindingGroupLayoutPosition: number = 0): Promise<GPUBindGroup> {
+    public getBindGroup(gpuDevice: GPUDevice, pipeline: GPURenderPipeline, bindingGroupLayoutPosition: number = 0): GPUBindGroup {
         const entries: GPUBindGroupEntry[] = [];
+        // let needsRebind = false;
 
         if (!this.bindGroupLayout) {
-            this.createBindGroupLayout(gpuDevice);
+            this.bindGroupLayout = pipeline.getBindGroupLayout(bindingGroupLayoutPosition);
         }
 
         for (const uniform of this.uniforms) {
             if (!uniform.value?.initialized) {
-                await uniform.value?.initialize(gpuDevice);
+                uniform.value?.initialize(gpuDevice);
             }
 
             if (uniform.value?.needsUpdate) {
-                await uniform.value?.update(gpuDevice);
+                uniform.value?.update(gpuDevice);
+                // needsRebind = true;
             }
 
             entries.push({
@@ -76,15 +35,15 @@ class UniformGroup {
             });
         }
 
+        // if (this.bindGroup) return this.bindGroup!;
+
         this.bindGroup = gpuDevice.createBindGroup({
             label: 'UniformGroup ' + bindingGroupLayoutPosition,
-            layout: pipeline.getBindGroupLayout(bindingGroupLayoutPosition),
+            layout: this.pipelineBindGroupLayout!,
             entries: entries
         });
 
-        return new Promise((resolve) => {
-            resolve(this.bindGroup!);
-        });
+        return this.bindGroup!;
     }
 }
 

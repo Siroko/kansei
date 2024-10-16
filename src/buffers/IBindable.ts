@@ -5,5 +5,5 @@ export interface IBindable {
 
     get resource(): GPUBindingResource;
     initialize(gpuDevice: GPUDevice): void;
-    update(gpuDevice: GPUDevice): Promise<void>;
+    update(gpuDevice: GPUDevice): void;
 }
