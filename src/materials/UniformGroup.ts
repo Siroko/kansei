@@ -13,11 +13,7 @@ class UniformGroup {
 
     public getBindGroup(gpuDevice: GPUDevice, pipeline: GPURenderPipeline, bindingGroupLayoutPosition: number = 0): GPUBindGroup {
         const entries: GPUBindGroupEntry[] = [];
-        // let needsRebind = false;
-
-        if (!this.bindGroupLayout) {
-            this.bindGroupLayout = pipeline.getBindGroupLayout(bindingGroupLayoutPosition);
-        }
+        let needsRebind = false;
 
         for (const uniform of this.uniforms) {
             if (!uniform.value?.initialized) {
@@ -26,7 +22,11 @@ class UniformGroup {
 
             if (uniform.value?.needsUpdate) {
                 uniform.value?.update(gpuDevice);
-                // needsRebind = true;
+                needsRebind = true;
+            }
+
+            if (!this.pipelineBindGroupLayout) {
+                this.pipelineBindGroupLayout = pipeline.getBindGroupLayout(bindingGroupLayoutPosition);
             }
 
             entries.push({
@@ -35,7 +35,7 @@ class UniformGroup {
             });
         }
 
-        // if (this.bindGroup) return this.bindGroup!;
+        if (this.bindGroup && !needsRebind) return this.bindGroup!;
 
         this.bindGroup = gpuDevice.createBindGroup({
             label: 'UniformGroup ' + bindingGroupLayoutPosition,
