@@ -27,9 +27,7 @@
       import { Vector4 } from '../src/math/Vector4'
       import { TextureLoader } from '../src/loaders/TextureLoader'
 
-      const renderer = new Renderer({
-        alphaMode: "premultiplied"
-      });
+      const renderer = new Renderer();
       await renderer.initialize();
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement)
@@ -55,7 +53,7 @@
       ]);
       const geometry = new BoxGeometry(1, 1, 1);
       const meshes = [];
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < 50; i++) {
         const mesh = new Mesh(geometry, material);
         mesh.position.x = (Math.random() - 0.5) * 10;
         mesh.position.y = (Math.random() - 0.5) * 10;
