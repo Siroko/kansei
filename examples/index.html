@@ -34,8 +34,9 @@
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement)
 
+      const scene = new Scene();
       const camera = new Camera(75, 0.1, 100, window.innerWidth / window.innerHeight);
-      camera.position.z = 5;
+      camera.position.z = 10;
       const tl = new TextureLoader();
       const imageBitmap = await tl.load("./assets/textures/character_sheet_without_black.jpg");
       const texture = new Texture(imageBitmap);
@@ -52,28 +53,27 @@
           value: sampler
         }
       ]);
-      
       const geometry = new BoxGeometry(1, 1, 1);
-      const mesh = new Mesh(geometry, material);
-      const scene = new Scene();
-
-      const mesh2 = new Mesh(geometry, material);
-      scene.add(mesh);
-      scene.add(mesh2);
-
-      mesh2.position.x = 2;
+      const meshes = [];
+      for (let i = 0; i < 100; i++) {
+        const mesh = new Mesh(geometry, material);
+        mesh.position.x = (Math.random() - 0.5) * 10;
+        mesh.position.y = (Math.random() - 0.5) * 10;
+        scene.add(mesh);
+        meshes.push(mesh);
+      }
 
       function animate() {
-        mesh.rotation.x += 0.01;
-        mesh.rotation.y += 0.01;
-        mesh.rotation.z += 0.01;
+        let i = 0;
+        meshes.forEach(mesh => {
+          const iNorm = (i / meshes.length - 0.5);
+          mesh.rotation.x += 0.01 * (iNorm + 1) * 0.1;
+          mesh.rotation.y += 0.01 * (iNorm + 1);
+          mesh.rotation.z += 0.01 * (iNorm + 1);
+          mesh.position.x = (iNorm * 10) + Math.sin(Date.now() / 1000);
+          i++;
+        });
 
-        mesh2.rotation.x += 0.01;
-        mesh2.rotation.y += 0.01;
-        mesh2.rotation.z += 0.01;
-
-        mesh.position.x = Math.sin(Date.now() / 1000) * 2;
-        mesh2.position.x = Math.cos(Date.now() / 1000) * 2;
         renderer.render(scene, camera);
         
         requestAnimationFrame(animate);

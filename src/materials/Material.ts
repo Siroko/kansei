@@ -13,6 +13,8 @@ class Material {
     public pipeline?: GPURenderPipeline;
     public initialized: boolean = false;
 
+    public uuid: string;
+
     private uniformGroup: UniformGroup;
 
     constructor(
@@ -20,6 +22,7 @@ class Material {
         public uniforms: BindGroupDescriptor[]
     ) {
         this.uniformGroup = new UniformGroup(uniforms);
+        this.uuid = crypto.randomUUID();
     }
 
     private createShaderModule(gpuDevice: GPUDevice) {
