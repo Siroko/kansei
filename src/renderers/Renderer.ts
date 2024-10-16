@@ -98,13 +98,13 @@ class Renderer {
         const passRenderEncoder = commandRenderEncoder!.beginRenderPass(renderPassDescriptor);
 
         for (const child of scene.children) {
-            await this.renderObject(child, camera, passRenderEncoder);
+            this.renderObject(child, camera, passRenderEncoder);
         }
         passRenderEncoder!.end();
         this.device!.queue.submit([commandRenderEncoder!.finish()]);
     }
 
-    private async renderObject(object: Object3D, camera: Camera, passRenderEncoder: GPURenderPassEncoder): Promise<void> {
+    private renderObject(object: Object3D, camera: Camera, passRenderEncoder: GPURenderPassEncoder) {
 
         if (object.isMesh) {
             const mesh = object as Mesh;
@@ -112,7 +112,7 @@ class Renderer {
                 mesh.geometry.initialize(this.device!);
             }
             if (!mesh.material.initialized) {
-                await mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors, this.presentationFormat!);
+                mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors, this.presentationFormat!);
             }
 
             passRenderEncoder.setPipeline(mesh.material.pipeline!);
@@ -121,11 +121,11 @@ class Renderer {
 
             mesh.updateModelMatrix();
             // The bind group will always be 0 because the material is the first thing to be initialized
-            const materialBindGroup = await mesh.material.getBindGroup(this.device!);
+            const materialBindGroup = mesh.material.getBindGroup(this.device!);
             // The bind group will always be 1 because the mesh is the second thing to be initialized
-            const meshBindGroup = await mesh.getBindGroup(this.device!, mesh.material.pipeline!, 1);
+            const meshBindGroup = mesh.getBindGroup(this.device!, mesh.material.pipeline!, 1);
             // The bind group will always be 2 because the camera is the third thing to be initialized
-            const cameraBindGroup = await camera.getBindGroup(this.device!, mesh.material.pipeline!, 2);
+            const cameraBindGroup = camera.getBindGroup(this.device!, mesh.material.pipeline!, 2);
 
             passRenderEncoder!.setBindGroup(0, materialBindGroup);
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
@@ -137,11 +137,11 @@ class Renderer {
         // Render children
         if (object.children.length > 0) {
             for (const child of object.children) {
-                await this.renderObject(child, camera, passRenderEncoder);
+                this.renderObject(child, camera, passRenderEncoder);
             }
         }
 
-        return Promise.resolve();
+        // return Promise.resolve();
     }
 
     public async compute(compute: Compute, workgroupsX: number = 64, workgroupsY: number = 1, workgroupsZ: number = 1): Promise<void> {
