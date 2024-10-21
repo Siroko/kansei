@@ -28,7 +28,7 @@ fn noise(p: vec3<f32>) -> f32 {
 }
 
 fn curl(p: vec3<f32>) -> vec3<f32> {
-    let e = vec3<f32>(0.0001, 0.0, 0.0);
+    let e = vec3<f32>(0.01, 0.0, 0.0);
     let dx = vec3<f32>(
         noise(p + e.xyy) - noise(p - e.xyy),
         noise(p + e.yxy) - noise(p - e.yxy),
@@ -48,8 +48,8 @@ fn main(
     let speed = 0.5;
 
     var value = output[global_id.x];
-    let curlNoise = curl(value.xyz * 0.003);
-    value += vec4<f32>(curlNoise * 0.3, 0.0);
+    let curlNoise = curl(vec3<f32>(sin(time) * 0.2, cos(time) * 0.2, 0.0) + value.xyz * 0.003);
+    // value += vec4<f32>(curlNoise * 0.3, 0.0);
 
     output[global_id.x] = value;
 }

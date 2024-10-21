@@ -1,6 +1,8 @@
 import { Object3D } from "../objects/Object3D";
 import { UniformGroup } from "../materials/UniformGroup";
 import { Matrix4 } from "../math/Matrix4";
+import { mat4, vec3 } from "gl-matrix";
+import { Vector3 } from "../math/Vector3";
 
 class Camera extends Object3D {
     public viewMatrix: Matrix4;
@@ -25,6 +27,27 @@ class Camera extends Object3D {
     public updateViewMatrix() {
         this.updateModelMatrix();
         this.viewMatrix.invert(this.worldMatrix);
+    }
+
+    /**
+     * Method to calculate the lookAt rotation matrix
+     * @param target
+     */
+    lookAt(target: Vector3) {
+
+        this.worldMatrix.lookAt(this.position, target, this.up);
+        // const eye = vec3.create();
+        // vec3.subtract(eye, this.position.toVec(), target.toVec());
+
+        // mat4.identity(this.modelMatrix.internalMat4);
+        // mat4.lookAt(this.modelMatrix.internalMat4, this.position.toVec(), target.toVec(), this.up.toVec());
+
+        // mat4.identity(this.viewMatrix.internalMat4);
+        // mat4.copy(this.viewMatrix.internalMat4, this.modelMatrix.internalMat4);
+
+        // this.updateWorldMatrix();
+        this.updateViewMatrix();
+
     }
 
     protected setUniforms() {

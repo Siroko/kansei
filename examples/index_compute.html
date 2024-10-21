@@ -25,6 +25,8 @@
       import { Mesh } from '../src/objects/Mesh'
       import { BoxGeometry } from '../src/geometries/BoxGeometry'
       import { Vector4 } from '../src/math/Vector4'
+      import { Vector3 } from '../src/math/Vector3'
+      import { CameraControls } from '../src/controls/CameraControls'
 
       let time = new Vector4();
 
@@ -44,6 +46,7 @@
       const computeBuffer = new ComputeBuffer({
         usage: 
           GPUBufferUsage.STORAGE |
+          GPUBufferUsage.COPY_SRC |
           GPUBufferUsage.VERTEX,
         type: ComputeBuffer.BUFFER_TYPE_STORAGE,
         buffer: myBuffer
@@ -63,8 +66,11 @@
       ]);
       
       const scene = new Scene();
-      const camera = new Camera(75, 0.1, 100000, window.innerWidth / window.innerHeight);
+      const camera = new Camera(50, 0.1, 100000, window.innerWidth / window.innerHeight);
       camera.position.z = 1000;
+
+      const target = new Vector3(0, 0, 0);
+      const controls = new CameraControls(camera, target);
 
       const geo = new BoxGeometry();
       const material = new Material(renderCode, []);
@@ -79,6 +85,7 @@
         time.z = time.x;
         time.needsUpdate = true;
         
+        controls.update(time.y);
         await renderer.compute(compute, Math.ceil(myBuffer.length / 64));
         renderer.render(scene, camera);
 
@@ -87,11 +94,11 @@
       animate();
 
       // Read back the buffer when the user clicks the stage
-      const onClickHandler = async () => {
-        const data = await renderer.readBackBuffer(computeBuffer, Float32Array);
-        console.log(data);
-      }
-      document.body.addEventListener('click', onClickHandler);
+      // const onClickHandler = async () => {
+      //   const data = await renderer.readBackBuffer(computeBuffer, Float32Array);
+      //   console.log(data);
+      // }
+      // document.body.addEventListener('click', onClickHandler);
     </script>
   </body>
 </html>

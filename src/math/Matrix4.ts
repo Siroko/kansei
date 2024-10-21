@@ -70,6 +70,12 @@ class Matrix4 extends BufferBase {
         this.updateBuffer();
         return this;
     }
+
+    lookAt(position: Vector3, target: Vector3, up: Vector3) {
+        mat4.lookAt(this.internalMat4, position.toVec(), target.toVec(), up.toVec());
+        this.updateBuffer();
+        return this;
+    }
 }
 
 export { Matrix4 }

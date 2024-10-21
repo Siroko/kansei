@@ -33,6 +33,6 @@ fn rand(n: vec2<f32>) -> f32 {
 @fragment
 fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
 {
-    return vec4<f32>(fragData.uv, 0.0, 1.0);
+    return vec4<f32>(fragData.normal, 1.0);
 } 
 `;
