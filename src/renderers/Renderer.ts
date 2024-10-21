@@ -123,9 +123,9 @@ class Renderer {
             // The bind group will always be 0 because the material is the first thing to be initialized
             const materialBindGroup = mesh.material.getBindGroup(this.device!);
             // The bind group will always be 1 because the mesh is the second thing to be initialized
-            const meshBindGroup = mesh.getBindGroup(this.device!, mesh.material.pipeline!, 1);
+            const meshBindGroup = mesh.getBindGroup(this.device!);
             // The bind group will always be 2 because the camera is the third thing to be initialized
-            const cameraBindGroup = camera.getBindGroup(this.device!, mesh.material.pipeline!, 2);
+            const cameraBindGroup = camera.getBindGroup(this.device!);
 
             passRenderEncoder!.setBindGroup(0, materialBindGroup);
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
@@ -140,23 +140,25 @@ class Renderer {
                 this.renderObject(child, camera, passRenderEncoder);
             }
         }
-
-        // return Promise.resolve();
     }
 
     public async compute(compute: Compute, workgroupsX: number = 64, workgroupsY: number = 1, workgroupsZ: number = 1): Promise<void> {
         const commandEncoder = this.device!.createCommandEncoder();
         const passEncoder = commandEncoder.beginComputePass();
-        if (!compute.initialized) await compute.initialize(this.device!);
-        const bindGroup = await compute.getBindGroup(this.device!, 0);
+        if (!compute.initialized) {
+            compute.initialize(this.device!);
+        }
+        const bindGroup = compute.getBindGroup(this.device!);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setPipeline(compute.pipeline!);
         passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
         passEncoder.end();
         const commands = commandEncoder.finish();
+
         this.device!.queue.submit([commands]);
 
-        return Promise.resolve();
+        // Wait for the compute work to complete
+        return this.device!.queue.onSubmittedWorkDone();
     }
 
     public async readBackBuffer<T extends Float32Array | Uint32Array | Int32Array>(

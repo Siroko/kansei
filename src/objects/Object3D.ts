@@ -47,8 +47,8 @@ class Object3D {
         }
     }
 
-    public getBindGroup(gpuDevice: GPUDevice, pipeline: GPURenderPipeline, bindingGroupLayoutPosition: number = 0): GPUBindGroup {
-        this.uniformGroup!.getBindGroup(gpuDevice, pipeline!, bindingGroupLayoutPosition);
+    public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
+        this.uniformGroup!.getBindGroup(gpuDevice);
         return this.uniformGroup!.bindGroup!;
     }
 }

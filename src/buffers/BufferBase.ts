@@ -11,7 +11,9 @@ class BufferBase implements IBindable {
     public needsUpdate: boolean = false;
 
     get resource(): GPUBufferBinding {
-        return { buffer: this._resource! };
+        return {
+            buffer: this._resource!
+        };
     }
     protected _resource?: GPUBuffer;
     protected buffer?: Float32Array;

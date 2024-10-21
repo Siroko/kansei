@@ -1,11 +1,4 @@
-import { IBindable } from "../buffers/IBindable";
-import { UniformGroup } from "./UniformGroup";
-
-export class BindGroupDescriptor {
-    binding?: number;
-    visibility?: GPUFlagsConstant;
-    value?: IBindable;
-}
+import { BindGroupDescriptor, UniformGroup } from "./UniformGroup";
 
 class Material {
 
@@ -36,8 +29,21 @@ class Material {
             this.createShaderModule(gpuDevice);
         }
 
+        this.uniformGroup.createRenderingMaterialUniformsBindGroupLayout(gpuDevice);
+        this.uniformGroup.createBindGroupLayout(gpuDevice);
+
+        this.uniformGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
+            label: "Render Pipeline Layout",
+            bindGroupLayouts: [
+                this.uniformGroup.bindGroupLayout!,
+                this.uniformGroup.cameraUniformsGroupLayout!,
+                this.uniformGroup.meshUniformsGroupLayout!
+            ]
+        });
+
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
-            layout: "auto",
+            layout: this.uniformGroup.pipelineBindGroupLayout,
+            label: "Render Pipeline",
             vertex: {
                 module: this.shaderRenderModule,
                 entryPoint: 'vertex_main',
@@ -69,7 +75,7 @@ class Material {
     }
 
     public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
-        this.uniformGroup.getBindGroup(gpuDevice, this.pipeline!);
+        this.uniformGroup.getBindGroup(gpuDevice);
         return this.uniformGroup.bindGroup!;
     }
 }

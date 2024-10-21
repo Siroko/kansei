@@ -18,18 +18,26 @@
       import { shaderCode } from './assets/shaders/ComputeShaderTest'
       import { Compute } from '../src/materials/Compute'
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { Scene } from '../src/objects/Scene'
+      import { Camera } from '../src/cameras/Camera'
+      import { Mesh } from '../src/objects/Mesh'
+      import { BoxGeometry } from '../src/geometries/BoxGeometry'
 
       const renderer = new Renderer();
       await renderer.initialize();
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement);
 
-      const myBuffer = new Float32Array([1, 2, 3, 4]);
+      const myBuffer = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
       const computeBuffer = new ComputeBuffer({
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        usage: 
+          GPUBufferUsage.STORAGE | 
+          GPUBufferUsage.COPY_SRC | 
+          GPUBufferUsage.COPY_DST,
         type: ComputeBuffer.BUFFER_TYPE_STORAGE,
         buffer: myBuffer
       });
+
       const compute = new Compute(shaderCode, [
         {
           binding: 0,
@@ -37,11 +45,23 @@
           value: computeBuffer
         }
       ]);
+      
+      const scene = new Scene();
+      const camera = new Camera(75, 0.1, 100, window.innerWidth / window.innerHeight);
+      camera.position.z = 10;
+      let computeCounter = 0;
+      async function animate() {
+        await renderer.compute(compute, Math.ceil(myBuffer.length / 64));
+        requestAnimationFrame(animate);
+      }
+      animate();
 
-      await renderer.compute(compute, Math.ceil(myBuffer.length / 64));
-      console.log(myBuffer);
-      const data = await renderer.readBackBuffer(computeBuffer, Float32Array);
-      console.log(data);
+      // Read back the buffer when the user clicks the stage
+      const onClickHandler = async () => {
+        const data = await renderer.readBackBuffer(computeBuffer, Float32Array);
+        console.log(data);
+      }
+      document.body.addEventListener('click', onClickHandler);
     </script>
   </body>
 </html>
