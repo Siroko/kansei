@@ -27,6 +27,8 @@ class BufferBase implements IBindable {
         new Float32Array(this._resource.getMappedRange()).set(this.buffer!);
 
         this._resource.unmap();
+
+        this.initialized = true;
     }
 
     public update(gpuDevice: GPUDevice) {
