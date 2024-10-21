@@ -16,24 +16,35 @@
     <script type="module">
       import { Renderer } from '../src/renderers/Renderer'
       import { shaderCode } from './assets/shaders/ComputeShaderTest'
+      import { renderCode } from './assets/shaders/RenderShaderTest'
+      import { Material } from '../src/materials/Material'
       import { Compute } from '../src/materials/Compute'
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
       import { Mesh } from '../src/objects/Mesh'
       import { BoxGeometry } from '../src/geometries/BoxGeometry'
+      import { Vector4 } from '../src/math/Vector4'
+
+      let time = new Vector4();
 
       const renderer = new Renderer();
       await renderer.initialize();
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement);
 
-      const myBuffer = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const numParticles = 1000000;  
+      const myBuffer = new Float32Array(numParticles * 4);
+      for (let i = 0; i < numParticles; i++) {
+        myBuffer[i * 4] = (Math.random() - 0.5)  * 1000;
+        myBuffer[i * 4 + 1] = (Math.random() - 0.5)  * 1000;
+        myBuffer[i * 4 + 2] = (Math.random() - 0.5)  * 1000;
+        myBuffer[i * 4 + 3] = 1;
+      }
       const computeBuffer = new ComputeBuffer({
         usage: 
-          GPUBufferUsage.STORAGE | 
-          GPUBufferUsage.COPY_SRC | 
-          GPUBufferUsage.COPY_DST,
+          GPUBufferUsage.STORAGE |
+          GPUBufferUsage.VERTEX,
         type: ComputeBuffer.BUFFER_TYPE_STORAGE,
         buffer: myBuffer
       });
@@ -43,15 +54,34 @@
           binding: 0,
           visibility: GPUShaderStage.COMPUTE,
           value: computeBuffer
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          value: time
         }
       ]);
       
       const scene = new Scene();
-      const camera = new Camera(75, 0.1, 100, window.innerWidth / window.innerHeight);
-      camera.position.z = 10;
-      let computeCounter = 0;
+      const camera = new Camera(75, 0.1, 100000, window.innerWidth / window.innerHeight);
+      camera.position.z = 1000;
+
+      const geo = new BoxGeometry();
+      const material = new Material(renderCode, []);
+      const mesh = new Mesh(geo, material);
+      mesh.instanceCount = numParticles;
+      mesh.setComputeBuffer(computeBuffer);
+      scene.add(mesh);
+
       async function animate() {
+        time.x = performance.now() / 1000;
+        time.y = time.x - time.z;
+        time.z = time.x;
+        time.needsUpdate = true;
+        
         await renderer.compute(compute, Math.ceil(myBuffer.length / 64));
+        renderer.render(scene, camera);
+
         requestAnimationFrame(animate);
       }
       animate();

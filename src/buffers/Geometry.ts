@@ -52,7 +52,19 @@ class Geometry {
             ] as Iterable<GPUVertexAttribute>,
             arrayStride: 4 * 4 + 4 * 3 + 4 * 2 as GPUSize32,
             stepMode: "vertex" as GPUVertexStepMode
-        }] as Iterable<GPUVertexBufferLayout | null>;
+        },
+        {
+            attributes: [
+                {
+                    shaderLocation: 3 as GPUIndex32,
+                    offset: 0 as GPUSize64,
+                    format: "float32x4" as GPUVertexFormat
+                }
+            ] as Iterable<GPUVertexAttribute>,
+            arrayStride: 4 * 4 as GPUSize32,
+            stepMode: "instance" as GPUVertexStepMode
+        }
+        ] as Iterable<GPUVertexBufferLayout | null>;
 
         this.initialized = true;
     }

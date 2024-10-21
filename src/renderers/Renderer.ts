@@ -73,7 +73,7 @@ class Renderer {
         });
     }
 
-    public async render(scene: Scene, camera: Camera) {
+    public render(scene: Scene, camera: Camera) {
         camera.updateViewMatrix();
 
         const commandRenderEncoder = this.device!.createCommandEncoder();
@@ -115,9 +115,11 @@ class Renderer {
                 mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors, this.presentationFormat!);
             }
 
+            passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, 'uint16');
             passRenderEncoder.setPipeline(mesh.material.pipeline!);
             passRenderEncoder.setVertexBuffer(0, mesh.geometry.vertexBuffer!);
-            passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, 'uint16');
+            if (mesh.computeBuffer) passRenderEncoder.setVertexBuffer(1, mesh.computeBuffer.resource.buffer);
+
 
             mesh.updateModelMatrix();
             // The bind group will always be 0 because the material is the first thing to be initialized
@@ -131,7 +133,8 @@ class Renderer {
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
             passRenderEncoder!.setBindGroup(2, cameraBindGroup);
 
-            passRenderEncoder!.drawIndexed(mesh.geometry.vertexCount);
+
+            passRenderEncoder!.drawIndexed(mesh.geometry.vertexCount, mesh.instanceCount);
         }
 
         // Render children
