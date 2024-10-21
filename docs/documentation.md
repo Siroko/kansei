@@ -1,6 +1,6 @@
-# Supernova Engine Documentation
+# Marti Engine Documentation
 
-Supernova is an open-source 3D engine for WebGPU, providing a modular architecture for creating 3D graphics applications in the browser.
+Marti is an open-source 3D engine for WebGPU, providing a modular architecture for creating 3D graphics applications in the browser.
 
 ## Table of Contents
 
@@ -144,4 +144,4 @@ The `ComputeBuffer` class represents a buffer for use in compute shaders.
 - `constructor()`: Creates a new ComputeBuffer instance.
 - `setBuffer(buffer: Float32Array, usage: GPUFlagsConstant): void`: Sets the buffer data and usage flags.
 
-These classes form the core of the Supernova engine, providing a comprehensive set of tools for WebGPU-based 3D rendering and computation.
+These classes form the core of the Marti engine, providing a comprehensive set of tools for WebGPU-based 3D rendering and computation.

@@ -1,4 +1,4 @@
-# Supernova
+# Marti
 
 An open-source 3D engine for WebGPU.
 
@@ -15,7 +15,7 @@ An open-source 3D engine for WebGPU.
 ## Installation
 
 ```bash
-npm install @siroko/supernova
+npm install marti
 ```
 
 ## Basic Usage
@@ -28,7 +28,7 @@ import {
   Mesh,
   BoxGeometry,
   Material,
-} from '@siroko/supernova';
+} from 'marti';
 
 const renderer = new Renderer();
 await renderer.initialize();
