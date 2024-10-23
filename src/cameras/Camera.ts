@@ -1,7 +1,6 @@
 import { Object3D } from "../objects/Object3D";
 import { UniformGroup } from "../materials/UniformGroup";
 import { Matrix4 } from "../math/Matrix4";
-import { mat4, vec3 } from "gl-matrix";
 import { Vector3 } from "../math/Vector3";
 
 class Camera extends Object3D {

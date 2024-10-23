@@ -27,9 +27,6 @@ fn vertex_main(
     return output;
 } 
 
-fn rand(n: vec2<f32>) -> f32 { 
-    return fract(sin(dot(n, vec2<f32>(12.9898, 4.1414))) * 43758.5453);
-}
 @fragment
 fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
 {

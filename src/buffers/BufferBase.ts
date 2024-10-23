@@ -9,6 +9,10 @@ class BufferBase implements IBindable {
     public type?: string | undefined;
     public initialized: boolean = false;
     public needsUpdate: boolean = false;
+    public shaderLocation?: number;
+    public offset?: number;
+    public stride?: number;
+    public format?: GPUVertexFormat;
 
     get resource(): GPUBufferBinding {
         return {

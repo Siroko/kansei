@@ -1,5 +1,6 @@
 import { ComputeBuffer } from "../buffers/ComputeBuffer";
 import { Camera } from "../cameras/Camera";
+import { InstancedGeometry } from "../geometries/InstancedGeometry";
 import { Compute } from "../materials/Compute";
 import { Mesh } from "../objects/Mesh";
 import { Object3D } from "../objects/Object3D";
@@ -112,14 +113,21 @@ class Renderer {
                 mesh.geometry.initialize(this.device!);
             }
             if (!mesh.material.initialized) {
-                mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors, this.presentationFormat!);
+                console.log(mesh.geometry.vertexBuffersDescriptors!);
+                mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors!, this.presentationFormat!);
             }
 
-            passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, 'uint16');
+            passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, mesh.geometry.indexFormat!);
             passRenderEncoder.setPipeline(mesh.material.pipeline!);
             passRenderEncoder.setVertexBuffer(0, mesh.geometry.vertexBuffer!);
-            if (mesh.computeBuffer) passRenderEncoder.setVertexBuffer(1, mesh.computeBuffer.resource.buffer);
-
+            let vertexBufferIndex = 1;
+            if (mesh.geometry.isInstancedGeometry) {
+                const geo = mesh.geometry as InstancedGeometry;
+                for (const extraBuffer of geo.extraBuffers) {
+                    passRenderEncoder.setVertexBuffer(vertexBufferIndex, extraBuffer.resource.buffer);
+                    vertexBufferIndex++;
+                }
+            }
 
             mesh.updateModelMatrix();
             // The bind group will always be 0 because the material is the first thing to be initialized
@@ -133,8 +141,12 @@ class Renderer {
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
             passRenderEncoder!.setBindGroup(2, cameraBindGroup);
 
-
-            passRenderEncoder!.drawIndexed(mesh.geometry.vertexCount, mesh.instanceCount);
+            if (mesh.geometry.isInstancedGeometry) {
+                const geo = mesh.geometry as InstancedGeometry;
+                passRenderEncoder!.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
+            } else {
+                passRenderEncoder!.drawIndexed(mesh.geometry.vertexCount);
+            }
         }
 
         // Render children

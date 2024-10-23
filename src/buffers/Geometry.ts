@@ -1,14 +1,16 @@
 class Geometry {
+    public isInstancedGeometry: boolean = false;
     public vertexBuffer?: GPUBuffer;
     public indexBuffer?: GPUBuffer;
+    public indexFormat: GPUIndexFormat = "uint16";
     public vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null> = [];
     public initialized: boolean = false;
 
     public vertexCount: number = 0;
 
     // Interleaved vertices, normals, uvs
-    protected vertices?: Float32Array;
-    protected indices?: Uint16Array;
+    public vertices?: Float32Array;
+    public indices?: Uint16Array;
 
     constructor() {
     }
@@ -32,7 +34,7 @@ class Geometry {
         new Uint16Array(this.indexBuffer.getMappedRange()).set(this.indices!);
         this.indexBuffer.unmap();
 
-        this.vertexBuffersDescriptors = [{
+        (this.vertexBuffersDescriptors as Array<GPUVertexBufferLayout>).push({
             attributes: [
                 {
                     shaderLocation: 0 as GPUIndex32,
@@ -52,19 +54,7 @@ class Geometry {
             ] as Iterable<GPUVertexAttribute>,
             arrayStride: 4 * 4 + 4 * 3 + 4 * 2 as GPUSize32,
             stepMode: "vertex" as GPUVertexStepMode
-        },
-        {
-            attributes: [
-                {
-                    shaderLocation: 3 as GPUIndex32,
-                    offset: 0 as GPUSize64,
-                    format: "float32x4" as GPUVertexFormat
-                }
-            ] as Iterable<GPUVertexAttribute>,
-            arrayStride: 4 * 4 as GPUSize32,
-            stepMode: "instance" as GPUVertexStepMode
-        }
-        ] as Iterable<GPUVertexBufferLayout | null>;
+        });
 
         this.initialized = true;
     }
