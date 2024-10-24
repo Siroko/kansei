@@ -54,11 +54,11 @@
       ]);
       const geometry = new BoxGeometry(1, 1, 1);
       const meshes = [];
-      for (let i = 0; i < 1; i++) {
+      for (let i = 0; i < 5000; i++) {
         const mesh = new Mesh(geometry, material);
-        mesh.position.x = 0;
-        mesh.position.y = 0;
-        mesh.position.z = 0;
+        mesh.position.x = Math.random() * 10 - 5;
+        mesh.position.y = Math.random() * 10 - 5;
+        mesh.position.z = Math.random() * 10 - 5;
         scene.add(mesh);
         meshes.push(mesh);
       }
@@ -68,26 +68,14 @@
         let i = 0;
         meshes.forEach(mesh => {
           const iNorm = (i / meshes.length - 0.5);
-          const sc =  Math.sin(Date.now() / 1000);
-          // mesh.scale.x = sc;
-          // mesh.scale.y = sc;
-          // mesh.scale.z = sc;
-          // mesh.rotation.y += 0.01 * (iNorm + 1);
-          // mesh.rotation.z += 0.01 * (iNorm + 1);
-          // mesh.rotation.x += 0.01;
-          // mesh.rotation.y += 0.01;
-          // mesh.rotation.z += 0.01;
-          // mesh.position.x = 0;
+          const sc =  Math.abs(Math.sin(Date.now() / 1000)) + 0.3;
+          mesh.scale.x = sc;
+          mesh.scale.y = sc;
+          mesh.scale.z = sc;
+        
           i++;
         });
-        // camera.position.x = Math.cos(Date.now() / 1000) * 10;
         
-        // camera.rotation.x += 0.01;
-        // camera.rotation.y += 0.01;
-        // camera.rotation.z += 0.01;
-        // camera.position.z = 10;
-        // camera.position.y = 1;
-        // camera.lookAt(scene.position);
         renderer.render(scene, camera);
         
         requestAnimationFrame(animate);

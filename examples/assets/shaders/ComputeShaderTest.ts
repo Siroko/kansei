@@ -48,8 +48,12 @@ fn main(
     let speed = 0.5;
 
     var value = output[global_id.x];
-    let curlNoise = curl(vec3<f32>(sin(time) * 0.2, cos(time) * 0.2, 0.0) + value.xyz * 0.003);
-    // value += vec4<f32>(curlNoise * 0.3, 0.0);
+    let toCenter = normalize(vec3<f32>(0.0) - value.xyz);
+    let up = normalize(cross(toCenter, vec3<f32>(1.0, 0.0, 0.0)));
+    let right = normalize(cross(toCenter, up));
+
+    // let curlNoise = curl(vec3<f32>(value.xyz * 0.01));
+    value += vec4<f32>(up * 0.1, 0.0);
 
     output[global_id.x] = value;
 }

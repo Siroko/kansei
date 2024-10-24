@@ -70,10 +70,11 @@ class Matrix4 extends BufferBase {
     }
 
     rotate(v: Vector3): Matrix4 {
+
+
+        mat4.rotate(this.internalMat4, this.internalMat4, v.z, this.forward);
         mat4.rotate(this.internalMat4, this.internalMat4, v.y, this.up);
         mat4.rotate(this.internalMat4, this.internalMat4, v.x, this.right);
-        mat4.rotate(this.internalMat4, this.internalMat4, v.z, this.forward);
-
         this.updateBuffer();
         return this;
     }
@@ -95,19 +96,16 @@ class Matrix4 extends BufferBase {
 
         if (m[2] < 1) {
             if (m[2] > -1) {
-                console.log('else 0');
                 rotationY = Math.asin(-m[2]);
                 rotationX = Math.atan2(m[6], m[10]);
                 rotationZ = Math.atan2(m[1], m[0]);
             } else {
-                console.log('else 1');
                 // m[2] = -1
                 rotationY = Math.PI / 2;
                 rotationX = -Math.atan2(-m[9], m[5]);
                 rotationZ = 0;
             }
         } else {
-            console.log('else');
             // m[2] = 1
             rotationY = -Math.PI / 2;
             rotationX = Math.atan2(-m[9], m[5]);

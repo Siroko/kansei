@@ -36,12 +36,12 @@
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement);
 
-      const numParticles = 1;
+      const numParticles = 100000;
       const myBuffer = new Float32Array(numParticles * 4);
       for (let i = 0; i < numParticles; i++) {
-        myBuffer[i * 4] = 0; // X coordinate
-        myBuffer[i * 4 + 1] = 0; // Y coordinate
-        myBuffer[i * 4 + 2] = 0; // Z coordinate
+        myBuffer[i * 4] = Math.random() * 10 - 5; // X coordinate
+        myBuffer[i * 4 + 1] = Math.random() * 10 - 5; // Y coordinate
+        myBuffer[i * 4 + 2] = Math.random() * 10 - 5; // Z coordinate
         myBuffer[i * 4 + 3] = 1; // W coordinate
       }
       const computeBuffer = new ComputeBuffer({
@@ -71,7 +71,7 @@
       ]);
       
       const scene = new Scene();
-      const camera = new Camera(50, 0.1, 100000, window.innerWidth / window.innerHeight);
+      const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
       camera.position.z = 100;
 
       const target = new Vector3(0, 0, 0);
