@@ -6,6 +6,10 @@ class Matrix4 extends BufferBase {
     public type: string = BufferBase.BUFFER_TYPE_UNIFORM;
     public readonly internalMat4: mat4;
 
+    private right = vec3.fromValues(1, 0, 0);
+    private up = vec3.fromValues(0, 1, 0);
+    private forward = vec3.fromValues(0, 0, 1);
+
     constructor() {
         super();
         this.internalMat4 = mat4.create();
@@ -35,12 +39,6 @@ class Matrix4 extends BufferBase {
         return this;
     }
 
-    fromTranslation(v: vec3): Matrix4 {
-        mat4.fromTranslation(this.internalMat4, v);
-        this.updateBuffer();
-        return this;
-    }
-
     rotateX(angle: number): Matrix4 {
         mat4.rotateX(this.internalMat4, this.internalMat4, angle);
         this.updateBuffer();
@@ -65,16 +63,58 @@ class Matrix4 extends BufferBase {
         return this;
     }
 
+    translate(v: Vector3): Matrix4 {
+        mat4.translate(this.internalMat4, this.internalMat4, v.internalVec3);
+        this.updateBuffer();
+        return this;
+    }
+
+    rotate(v: Vector3): Matrix4 {
+        mat4.rotate(this.internalMat4, this.internalMat4, v.y, this.up);
+        mat4.rotate(this.internalMat4, this.internalMat4, v.x, this.right);
+        mat4.rotate(this.internalMat4, this.internalMat4, v.z, this.forward);
+
+        this.updateBuffer();
+        return this;
+    }
+
+    identity(): Matrix4 {
+        mat4.identity(this.internalMat4);
+        this.updateBuffer();
+        return this;
+    }
     copy(a: Matrix4): Matrix4 {
         mat4.copy(this.internalMat4, a.internalMat4);
         this.updateBuffer();
         return this;
     }
 
-    lookAt(position: Vector3, target: Vector3, up: Vector3) {
-        mat4.lookAt(this.internalMat4, position.toVec(), target.toVec(), up.toVec());
-        this.updateBuffer();
-        return this;
+    extractEulerAngles(): [number, number, number] {
+        const m = this.internalMat4;
+        let rotationX, rotationY, rotationZ;
+
+        if (m[2] < 1) {
+            if (m[2] > -1) {
+                console.log('else 0');
+                rotationY = Math.asin(-m[2]);
+                rotationX = Math.atan2(m[6], m[10]);
+                rotationZ = Math.atan2(m[1], m[0]);
+            } else {
+                console.log('else 1');
+                // m[2] = -1
+                rotationY = Math.PI / 2;
+                rotationX = -Math.atan2(-m[9], m[5]);
+                rotationZ = 0;
+            }
+        } else {
+            console.log('else');
+            // m[2] = 1
+            rotationY = -Math.PI / 2;
+            rotationX = Math.atan2(-m[9], m[5]);
+            rotationZ = 0;
+        }
+
+        return [rotationX, rotationY, rotationZ];
     }
 }
 

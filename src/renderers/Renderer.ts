@@ -75,7 +75,6 @@ class Renderer {
     }
 
     public render(scene: Scene, camera: Camera) {
-        camera.updateViewMatrix();
 
         const commandRenderEncoder = this.device!.createCommandEncoder();
         const textureView = this.context!.getCurrentTexture().createView();
@@ -98,14 +97,17 @@ class Renderer {
         } as GPURenderPassDescriptor;
         const passRenderEncoder = commandRenderEncoder!.beginRenderPass(renderPassDescriptor);
 
+        camera.updateViewMatrix();
+        const cameraBindGroup = camera.getBindGroup(this.device!);
+
         for (const child of scene.children) {
-            this.renderObject(child, camera, passRenderEncoder);
+            this.renderObject(child, cameraBindGroup, passRenderEncoder);
         }
         passRenderEncoder!.end();
         this.device!.queue.submit([commandRenderEncoder!.finish()]);
     }
 
-    private renderObject(object: Object3D, camera: Camera, passRenderEncoder: GPURenderPassEncoder) {
+    private renderObject(object: Object3D, cameraBindGroup: GPUBindGroup, passRenderEncoder: GPURenderPassEncoder) {
 
         if (object.isMesh) {
             const mesh = object as Mesh;
@@ -134,8 +136,7 @@ class Renderer {
             const materialBindGroup = mesh.material.getBindGroup(this.device!);
             // The bind group will always be 1 because the mesh is the second thing to be initialized
             const meshBindGroup = mesh.getBindGroup(this.device!);
-            // The bind group will always be 2 because the camera is the third thing to be initialized
-            const cameraBindGroup = camera.getBindGroup(this.device!);
+
 
             passRenderEncoder!.setBindGroup(0, materialBindGroup);
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
@@ -152,7 +153,7 @@ class Renderer {
         // Render children
         if (object.children.length > 0) {
             for (const child of object.children) {
-                this.renderObject(child, camera, passRenderEncoder);
+                this.renderObject(child, cameraBindGroup, passRenderEncoder);
             }
         }
     }

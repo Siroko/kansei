@@ -21,7 +21,7 @@ fn vertex_main(
 {
     var output : VertexOut;
     var offsetVertex: vec4<f32> = vec4<f32>(position.xyz + a_particlePos.xyz, 1.0);
-    output.position = projectionMatrix * viewMatrix * modelMatrix * offsetVertex;
+    output.position = projectionMatrix * viewMatrix * worldMatrix * offsetVertex;
     output.normal = (worldMatrix * vec4<f32>(normal, 1.0)).xyz;
     output.uv = uv;
     return output;

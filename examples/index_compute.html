@@ -36,12 +36,12 @@
       renderer.setSize(window.innerWidth, window.innerHeight);
       document.body.appendChild(renderer.domElement);
 
-      const numParticles = 1000000;
+      const numParticles = 1;
       const myBuffer = new Float32Array(numParticles * 4);
       for (let i = 0; i < numParticles; i++) {
-        myBuffer[i * 4] = (Math.random() - 0.5)  * 1000; // X coordinate
-        myBuffer[i * 4 + 1] = (Math.random() - 0.5)  * 1000; // Y coordinate
-        myBuffer[i * 4 + 2] = (Math.random() - 0.5)  * 1000; // Z coordinate
+        myBuffer[i * 4] = 0; // X coordinate
+        myBuffer[i * 4 + 1] = 0; // Y coordinate
+        myBuffer[i * 4 + 2] = 0; // Z coordinate
         myBuffer[i * 4 + 3] = 1; // W coordinate
       }
       const computeBuffer = new ComputeBuffer({
@@ -82,7 +82,6 @@
       ]);
       const material = new Material(renderCode, []);
       const mesh = new Mesh(instancedGeometry, material);
-      mesh.setComputeBuffer(computeBuffer);
       scene.add(mesh);
 
       async function animate() {
@@ -90,9 +89,9 @@
         time.y = time.x - time.z;
         time.z = time.x;
         time.needsUpdate = true;
-        mesh.rotation.y += 0.001;
-        mesh.rotation.x += 0.001;
-        mesh.rotation.z += 0.001;
+        // mesh.rotation.y += 0.001;
+        // mesh.rotation.x += 0.001;
+        // mesh.rotation.z += 0.001;
         
         controls.update(time.y);
         await renderer.compute(compute, Math.ceil(myBuffer.length / 64));

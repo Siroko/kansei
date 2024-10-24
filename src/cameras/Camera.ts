@@ -26,27 +26,12 @@ class Camera extends Object3D {
     public updateViewMatrix() {
         this.updateModelMatrix();
         this.viewMatrix.invert(this.worldMatrix);
+        this.viewMatrix.needsUpdate = true;
     }
 
-    /**
-     * Method to calculate the lookAt rotation matrix
-     * @param target
-     */
     lookAt(target: Vector3) {
-
-        this.worldMatrix.lookAt(this.position, target, this.up);
-        // const eye = vec3.create();
-        // vec3.subtract(eye, this.position.toVec(), target.toVec());
-
-        // mat4.identity(this.modelMatrix.internalMat4);
-        // mat4.lookAt(this.modelMatrix.internalMat4, this.position.toVec(), target.toVec(), this.up.toVec());
-
-        // mat4.identity(this.viewMatrix.internalMat4);
-        // mat4.copy(this.viewMatrix.internalMat4, this.modelMatrix.internalMat4);
-
-        // this.updateWorldMatrix();
+        super.lookAt(target);
         this.updateViewMatrix();
-
     }
 
     protected setUniforms() {
