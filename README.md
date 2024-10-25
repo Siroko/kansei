@@ -1,4 +1,4 @@
-# Marti
+# kansei
 
 An open-source 3D engine for WebGPU.
 
@@ -15,7 +15,7 @@ An open-source 3D engine for WebGPU.
 ## Installation
 
 ```bash
-npm install marti
+npm install kansei
 ```
 
 ## Basic Usage
@@ -28,7 +28,7 @@ import {
   Mesh,
   BoxGeometry,
   Material,
-} from 'marti';
+} from 'kansei';
 
 const renderer = new Renderer();
 await renderer.initialize();

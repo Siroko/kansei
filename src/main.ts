@@ -2,6 +2,8 @@ export { Renderer } from "./renderers/Renderer";
 export { Geometry } from "./buffers/Geometry";
 export { BoxGeometry } from "./geometries/BoxGeometry";
 export { BufferBase } from "./buffers/BufferBase";
+export { InstancedGeometry } from "./geometries/InstancedGeometry";
+export { CameraControls } from "./controls/CameraControls";
 export { Material } from "./materials/Material";
 export { Mesh } from "./objects/Mesh";
 export { Object3D } from "./objects/Object3D";

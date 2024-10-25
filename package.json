@@ -1,11 +1,11 @@
 {
-  "name": "marti",
+  "name": "kansei",
   "private": false,
-  "version": "0.0.2",
+  "version": "0.0.1",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Siroko/marti"
+    "url": "https://github.com/Siroko/kansei"
   },
   "scripts": {
     "dev": "vite --host 0.0.0.0",
