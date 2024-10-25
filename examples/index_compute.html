@@ -9,6 +9,7 @@
       body {
         margin: 0;
         padding: 0;
+        overflow: hidden;
       }
     </style>
   </head>
@@ -28,6 +29,7 @@
       import { Vector4 } from '../src/math/Vector4'
       import { Vector3 } from '../src/math/Vector3'
       import { CameraControls } from '../src/controls/CameraControls'
+      import { BufferBase } from '../src/buffers/BufferBase'
 
       let time = new Vector4();
 
@@ -39,16 +41,16 @@
       const numParticles = 100000;
       const myBuffer = new Float32Array(numParticles * 4);
       for (let i = 0; i < numParticles; i++) {
-        myBuffer[i * 4] = Math.random() * 10 - 5; // X coordinate
-        myBuffer[i * 4 + 1] = Math.random() * 10 - 5; // Y coordinate
-        myBuffer[i * 4 + 2] = Math.random() * 10 - 5; // Z coordinate
+        myBuffer[i * 4] = Math.random() * 100 - 50; // X coordinate
+        myBuffer[i * 4 + 1] = Math.random() * 100 - 50; // Y coordinate
+        myBuffer[i * 4 + 2] = Math.random() * 100 - 50; // Z coordinate
         myBuffer[i * 4 + 3] = 1; // W coordinate
       }
       const computeBuffer = new ComputeBuffer({
         usage: 
-          GPUBufferUsage.STORAGE |
-          GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.VERTEX,
+          BufferBase.BUFFER_USAGE_STORAGE |
+          BufferBase.BUFFER_USAGE_COPY_SRC |
+          BufferBase.BUFFER_USAGE_VERTEX,
         type: ComputeBuffer.BUFFER_TYPE_STORAGE,
         buffer: myBuffer,
         shaderLocation: 3,
@@ -94,7 +96,7 @@
         // mesh.rotation.z += 0.001;
         
         controls.update(time.y);
-        await renderer.compute(compute, Math.ceil(myBuffer.length / 64));
+        await renderer.compute(compute, Math.ceil(numParticles / 64));
         renderer.render(scene, camera);
 
         requestAnimationFrame(animate);

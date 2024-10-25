@@ -4,11 +4,13 @@ import dts from 'vite-plugin-dts'
 import { extname, relative, resolve } from 'path'
 import { fileURLToPath } from 'node:url'
 import { glob } from 'glob'
+import mkcert from 'vite-plugin-mkcert'
 
 // https://vitejs.dev/config/
 export default defineConfig({
     plugins: [
-        dts({ include: ['src'] })
+        dts({ include: ['src'] }),
+        mkcert()
     ],
     build: {
         rollupOptions: {
