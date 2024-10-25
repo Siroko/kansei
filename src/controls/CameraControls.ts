@@ -34,9 +34,6 @@ class CameraControls {
     private time: number;
     private domElement: HTMLElement | Window;
 
-    private touch: boolean;
-    private moving: boolean;
-
     private mouseWheelHandler?: (e: WheelEvent) => void;
     private mouseDownHandler?: (e: MouseEvent) => void;
     private mouseUpHandler?: (e: MouseEvent) => void;
