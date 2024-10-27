@@ -19,6 +19,5 @@ export { VideoTexture } from "./buffers/VideoTexture";
 export { Sampler } from "./buffers/Sampler";
 export { Compute } from "./materials/Compute";
 export { ComputeBuffer } from "./buffers/ComputeBuffer";
-
-
-
+export { SphereGeometry } from "./geometries/SphereGeometry";
+export { ShaderChunks } from "./materials/shaders/ShaderChunks";

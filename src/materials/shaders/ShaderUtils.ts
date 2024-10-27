@@ -1,4 +1,4 @@
-import { ShaderChunks } from "./shaderChunks";
+import { ShaderChunks } from "./ShaderChunks";
 
 // Resolve Includes
 export const parseIncludes = (string: string) => {
