@@ -93,3 +93,5 @@ Check out our example implementations:
 ## License
 
 MIT License
+
+This project uses [gl-matrix](https://github.com/toji/gl-matrix) by Brandon Jones and Colin MacKenzie IV, which is also under the MIT License.
