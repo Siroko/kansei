@@ -66,7 +66,6 @@ class Object3D {
         this.normalMatrix.multiply(viewMatrix, this.worldMatrix);
         // Calculate inverse transpose
         this.normalMatrix.invert(this.normalMatrix).transpose();
-
         this.normalMatrix.needsUpdate = true;
     }
 
