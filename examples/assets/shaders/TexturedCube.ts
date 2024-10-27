@@ -22,7 +22,7 @@ fn vertex_main(
 ) -> VertexOut
 {
     var output : VertexOut;
-    output.position = projectionMatrix * viewMatrix * modelMatrix * position;
+    output.position = projectionMatrix * viewMatrix * worldMatrix * position;
     output.normal = (worldMatrix * vec4<f32>(normal, 1.0)).xyz;
     output.uv = uv;
     return output;

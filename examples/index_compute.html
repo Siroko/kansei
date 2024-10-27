@@ -26,12 +26,14 @@
       import { Mesh } from '../src/objects/Mesh'
       import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
       import { BoxGeometry } from '../src/geometries/BoxGeometry'
+      import { SphereGeometry } from '../src/geometries/SphereGeometry'
       import { Vector4 } from '../src/math/Vector4'
       import { Vector3 } from '../src/math/Vector3'
       import { CameraControls } from '../src/controls/CameraControls'
       import { BufferBase } from '../src/buffers/BufferBase'
 
       let time = new Vector4();
+      let computeParticles = true;
 
       const renderer = new Renderer();
       await renderer.initialize();
@@ -41,14 +43,15 @@
       renderer.domElement.style.top = '0';
       renderer.domElement.style.left = '0';
       renderer.domElement.style.height = '100%';
-      renderer.domElement.style.imageRendering = 'pixelated';
+      // renderer.domElement.style.imageRendering = 'pixelated';
 
-      const numParticles = 1000000;
+      const numParticles = 300000;
+      const numRows = Math.sqrt(numParticles);
       const myBuffer = new Float32Array(numParticles * 4);
       for (let i = 0; i < numParticles; i++) {
-        myBuffer[i * 4] = Math.random() * 100 - 50; // X coordinate
-        myBuffer[i * 4 + 1] = Math.random() * 100 - 50; // Y coordinate
-        myBuffer[i * 4 + 2] = Math.random() * 100 - 50; // Z coordinate
+        myBuffer[i * 4] = i % numRows - numRows / 2; // X coordinate
+        myBuffer[i * 4 + 1] = 0; // Y coordinate
+        myBuffer[i * 4 + 2] = Math.floor(i / numRows) - numRows / 2; // Z coordinate
         myBuffer[i * 4 + 3] = 1; // W coordinate
       }
       const computeBuffer = new ComputeBuffer({
@@ -79,11 +82,11 @@
       
       const scene = new Scene();
       const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
-
+      camera.lookAt(new Vector3(0, 0, 0));
       const target = new Vector3(0, 0, 0);
       const controls = new CameraControls(camera, target);
 
-      const instancedGeometry = new InstancedGeometry(new BoxGeometry(), numParticles, [
+      const instancedGeometry = new InstancedGeometry(new SphereGeometry(3, 4), numParticles, [
         computeBuffer
       ]);
       const material = new Material(renderCode, []);
@@ -95,17 +98,25 @@
         time.y = time.x - time.z;
         time.z = time.x;
         time.needsUpdate = true;
-        // mesh.rotation.y += 0.001;
-        // mesh.rotation.x += 0.001;
-        // mesh.rotation.z += 0.001;
+        // mesh.rotation.y += 0.01;
+        // mesh.rotation.x += 0.01;
+        // mesh.rotation.z += 0.01;
         
         controls.update(time.y);
-        await renderer.compute(compute, Math.ceil(numParticles / 64));
+        if(computeParticles) {
+          await renderer.compute(compute, Math.ceil(numParticles / 64));
+        }
         renderer.render(scene, camera);
 
         requestAnimationFrame(animate);
       }
       animate();
+
+      document.addEventListener('keydown', (event) => {
+        if(event.key === 'c') {
+          computeParticles = !computeParticles;
+        }
+      });
     </script>
   </body>
 </html>

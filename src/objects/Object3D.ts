@@ -63,7 +63,7 @@ class Object3D {
 
     public updateNormalMatrix(viewMatrix: Matrix4) {
         this.normalMatrix.identity();
-        this.normalMatrix.multiply(viewMatrix, this.modelMatrix);
+        this.normalMatrix.multiply(viewMatrix, this.worldMatrix);
         // Calculate inverse transpose
         this.normalMatrix.invert(this.normalMatrix).transpose();
 

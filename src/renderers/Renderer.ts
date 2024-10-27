@@ -105,6 +105,8 @@ class Renderer {
         }
         passRenderEncoder!.end();
         this.device!.queue.submit([commandRenderEncoder!.finish()]);
+        // Wait for the render work to complete
+        // return this.device!.queue.onSubmittedWorkDone();
     }
 
     private renderObject(object: Object3D, cameraBindGroup: GPUBindGroup, passRenderEncoder: GPURenderPassEncoder, camera: Camera) {

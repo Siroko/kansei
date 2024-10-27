@@ -115,9 +115,9 @@ fn simplexNoiseDerivatives(v: vec4<f32>) -> vec4<f32> {
 }
 
 fn getCurlVelocity(position: vec4<f32>) -> vec3<f32> {
-    let NOISE_TIME_SCALE = 0.6146594;
+    let NOISE_TIME_SCALE = 10.6146594;
     let NOISE_SCALE = 1.3043478;
-    let NOISE_POSITION_SCALE = 0.0042283;
+    let NOISE_POSITION_SCALE = 0.0022283;
 
     let oldPosition = position.xyz;
     let noisePosition = oldPosition * NOISE_POSITION_SCALE;
@@ -128,7 +128,7 @@ fn getCurlVelocity(position: vec4<f32>) -> vec3<f32> {
     var yNoisePotentialDerivatives = vec4<f32>(0.0);
     var zNoisePotentialDerivatives = vec4<f32>(0.0);
 
-    let persistence = 0.0277174;
+    let persistence = 0.277174;
 
     for (var i = 0; i < OCTAVES; i++) {
         let scale = (1.0 / 2.0) * pow(2.0, f32(i));

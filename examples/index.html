@@ -55,7 +55,7 @@
       ]);
       const geometry = new BoxGeometry(1, 1, 1);
       const meshes = [];
-      for (let i = 0; i < 5000; i++) {
+      for (let i = 0; i < 2000; i++) {
         const mesh = new Mesh(geometry, material);
         mesh.position.x = Math.random() * 10 - 5;
         mesh.position.y = Math.random() * 10 - 5;
@@ -64,7 +64,7 @@
         meshes.push(mesh);
       }
 
-      function animate() {
+      async function animate() {
         cameraControls.update();
         let i = 0;
         meshes.forEach(mesh => {
@@ -77,7 +77,7 @@
           i++;
         });
         
-        renderer.render(scene, camera);
+        await renderer.render(scene, camera);
         
         requestAnimationFrame(animate);
       }
