@@ -3,6 +3,7 @@ import { BufferBase } from "../buffers/BufferBase";
 import { Vector3 } from "./Vector3";
 
 class Matrix4 extends BufferBase {
+
     public type: string = BufferBase.BUFFER_TYPE_UNIFORM;
     public readonly internalMat4: mat4;
 
@@ -23,6 +24,12 @@ class Matrix4 extends BufferBase {
 
     invert(worldMatrix: Matrix4) {
         mat4.invert(this.internalMat4, worldMatrix.internalMat4);
+        this.updateBuffer();
+        return this;
+    }
+
+    transpose() {
+        mat4.transpose(this.internalMat4, this.internalMat4);
         this.updateBuffer();
         return this;
     }

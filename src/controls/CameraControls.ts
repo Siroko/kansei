@@ -56,7 +56,7 @@ class CameraControls {
         this.downPoint = { x: 0, y: 0 };
         this.down = false;
 
-        this.radius = window.innerWidth < 768 ? 50 : 100;
+        this.radius = window.innerWidth < 768 ? 50 : 700;
         this.wheelDelta = this.radius;
         this.wheelDeltaEase = this.radius;
         this.limits = { up: 0.15, down: -0.15 };
@@ -71,8 +71,6 @@ class CameraControls {
         this.offsetEase = { x: 0, y: 0, z: 0 };
 
         this.time = 0;
-        this.touch = false;
-        this.moving = false;
 
         this.events();
     }
@@ -116,14 +114,12 @@ class CameraControls {
     private onTouchStart(e: TouchEvent) {
         const ev = { pageX: e.changedTouches[0].pageX, pageY: e.changedTouches[0].pageY, preventDefault: () => { } };
         this.onMouseDown(ev as unknown as MouseEvent);
-        this.touch = true;
 
     }
 
     private onTouchEnd(e: TouchEvent) {
         const ev = { pageX: e.changedTouches[0].pageX, pageY: e.changedTouches[0].pageY, preventDefault: () => { } };
         this.onMouseUp(ev as unknown as MouseEvent);
-        this.touch = false;
 
     }
 
@@ -137,7 +133,7 @@ class CameraControls {
             e.preventDefault();
         }
         const delta = e.deltaY;
-        this.wheelDelta -= delta * 0.001;
+        this.wheelDelta -= delta * 0.1;
 
         this._mouseX = e.pageX;
         this._mouseY = e.pageY;
@@ -187,8 +183,6 @@ class CameraControls {
 
             this.currentAngles.x = (this.prevAngles.x + this.displacement.x);
             this.currentAngles.y = (this.prevAngles.y - this.displacement.y);
-
-            if (Math.abs(this.displacement.x) > 0.001 || Math.abs(this.displacement.x) > 0.001) this.moving = true;
 
             //Check if outside limits
             if (this.currentAngles.y > this.limits.up) {

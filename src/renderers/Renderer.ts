@@ -101,13 +101,13 @@ class Renderer {
         const cameraBindGroup = camera.getBindGroup(this.device!);
 
         for (const child of scene.children) {
-            this.renderObject(child, cameraBindGroup, passRenderEncoder);
+            this.renderObject(child, cameraBindGroup, passRenderEncoder, camera);
         }
         passRenderEncoder!.end();
         this.device!.queue.submit([commandRenderEncoder!.finish()]);
     }
 
-    private renderObject(object: Object3D, cameraBindGroup: GPUBindGroup, passRenderEncoder: GPURenderPassEncoder) {
+    private renderObject(object: Object3D, cameraBindGroup: GPUBindGroup, passRenderEncoder: GPURenderPassEncoder, camera: Camera) {
 
         if (object.isMesh) {
             const mesh = object as Mesh;
@@ -115,7 +115,6 @@ class Renderer {
                 mesh.geometry.initialize(this.device!);
             }
             if (!mesh.material.initialized) {
-                console.log(mesh.geometry.vertexBuffersDescriptors!);
                 mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors!, this.presentationFormat!);
             }
 
@@ -132,6 +131,7 @@ class Renderer {
             }
 
             mesh.updateModelMatrix();
+            mesh.updateNormalMatrix(camera.viewMatrix);
             // The bind group will always be 0 because the material is the first thing to be initialized
             const materialBindGroup = mesh.material.getBindGroup(this.device!);
             // The bind group will always be 1 because the mesh is the second thing to be initialized
@@ -153,7 +153,7 @@ class Renderer {
         // Render children
         if (object.children.length > 0) {
             for (const child of object.children) {
-                this.renderObject(child, cameraBindGroup, passRenderEncoder);
+                this.renderObject(child, cameraBindGroup, passRenderEncoder, camera);
             }
         }
     }

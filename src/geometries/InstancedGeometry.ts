@@ -32,7 +32,6 @@ class InstancedGeometry extends Geometry {
                 });
         }
 
-        console.log(this.vertexBuffersDescriptors);
         this.initialized = true;
     }
 }

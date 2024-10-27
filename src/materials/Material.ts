@@ -1,5 +1,5 @@
 import { BindGroupDescriptor, UniformGroup } from "./UniformGroup";
-
+import { parseIncludes } from "./shaders/ShaderUtils";
 class Material {
 
     public shaderRenderModule?: GPUShaderModule;
@@ -20,7 +20,7 @@ class Material {
 
     private createShaderModule(gpuDevice: GPUDevice) {
         this.shaderRenderModule = gpuDevice.createShaderModule({
-            code: this.shaderCode
+            code: parseIncludes(this.shaderCode)
         });
     }
 

@@ -1,3 +1,4 @@
+import { parseIncludes } from "./shaders/ShaderUtils";
 import { BindGroupDescriptor, UniformGroup } from "./UniformGroup";
 class Compute {
 
@@ -21,7 +22,7 @@ class Compute {
 
     private createShaderModule(gpuDevice: GPUDevice) {
         this.shaderComputeModule = gpuDevice.createShaderModule({
-            code: this.shaderCode
+            code: parseIncludes(this.shaderCode)
         });
     }
 

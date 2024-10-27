@@ -23,7 +23,7 @@ class Mesh extends Object3D {
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX,
-                value: this.modelMatrix
+                value: this.normalMatrix
             },
             {
                 binding: 1,

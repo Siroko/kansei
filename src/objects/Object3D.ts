@@ -6,6 +6,7 @@ import { mat4 } from "gl-matrix";
 class Object3D {
     public modelMatrix: Matrix4;
     public worldMatrix: Matrix4;
+    public normalMatrix: Matrix4;
 
     protected rotationMatrix: Matrix4 = new Matrix4();
     protected translationMatrix: Matrix4 = new Matrix4();
@@ -26,6 +27,7 @@ class Object3D {
     constructor() {
         this.modelMatrix = new Matrix4();
         this.worldMatrix = new Matrix4();
+        this.normalMatrix = new Matrix4();
         this.setUniforms();
     }
 
@@ -57,6 +59,15 @@ class Object3D {
         this.updateWorldMatrix();
         this.modelMatrix.needsUpdate = true;
         this.worldMatrix.needsUpdate = true;
+    }
+
+    public updateNormalMatrix(viewMatrix: Matrix4) {
+        this.normalMatrix.identity();
+        this.normalMatrix.multiply(viewMatrix, this.modelMatrix);
+        // Calculate inverse transpose
+        this.normalMatrix.invert(this.normalMatrix).transpose();
+
+        this.normalMatrix.needsUpdate = true;
     }
 
     public updateWorldMatrix() {
