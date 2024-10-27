@@ -1,5 +1,9 @@
 import { BindGroupDescriptor, UniformGroup } from "./UniformGroup";
 import { parseIncludes } from "./shaders/ShaderUtils";
+
+/**
+ * Represents a material used in rendering, encapsulating shader modules and pipeline configurations.
+ */
 class Material {
 
     public shaderRenderModule?: GPUShaderModule;
@@ -10,6 +14,12 @@ class Material {
 
     private uniformGroup: UniformGroup;
 
+    /**
+     * Constructs a new Material instance.
+     * 
+     * @param shaderCode - The shader code to be used for this material.
+     * @param uniforms - The descriptor for the bind group uniforms.
+     */
     constructor(
         private shaderCode: string,
         public uniforms: BindGroupDescriptor[]
@@ -18,12 +28,24 @@ class Material {
         this.uuid = crypto.randomUUID();
     }
 
+    /**
+     * Creates a shader module from the provided shader code.
+     * 
+     * @param gpuDevice - The GPU device used to create the shader module.
+     */
     private createShaderModule(gpuDevice: GPUDevice) {
         this.shaderRenderModule = gpuDevice.createShaderModule({
             code: parseIncludes(this.shaderCode)
         });
     }
 
+    /**
+     * Initializes the material by creating the shader module, bind group layouts, and render pipeline.
+     * 
+     * @param gpuDevice - The GPU device used for initialization.
+     * @param vertexBuffersDescriptors - Descriptors for the vertex buffers.
+     * @param presentationFormat - The format of the presentation surface.
+     */
     public initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat) {
         if (!this.shaderRenderModule) {
             this.createShaderModule(gpuDevice);
@@ -74,6 +96,12 @@ class Material {
         this.initialized = true;
     }
 
+    /**
+     * Retrieves the bind group for the material.
+     * 
+     * @param gpuDevice - The GPU device used to get the bind group.
+     * @returns The bind group associated with this material.
+     */
     public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
         this.uniformGroup.getBindGroup(gpuDevice);
         return this.uniformGroup.bindGroup!;

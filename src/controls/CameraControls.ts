@@ -8,6 +8,9 @@
 import { Vector3 } from '../math/Vector3';
 import { Camera } from '../cameras/Camera';
 
+/**
+ * Controls the camera movement and interaction with mouse and touch events.
+ */
 class CameraControls {
     private PI: number = 3.14159265359;
     private camera: Camera;
@@ -41,6 +44,13 @@ class CameraControls {
     private touchStartHandler?: (e: TouchEvent) => void;
     private touchEndHandler?: (e: TouchEvent) => void;
     private touchMoveHandler?: (e: TouchEvent) => void;
+
+    /**
+     * Creates an instance of CameraControls.
+     * @param camera - The camera to control.
+     * @param target - The target vector for the camera to look at.
+     * @param domElement - The DOM element to attach event listeners to.
+     */
     constructor(camera: Camera, target: Vector3, domElement: HTMLElement | Window) {
         this.camera = camera;
         this.target = target;
@@ -75,6 +85,9 @@ class CameraControls {
         this.events();
     }
 
+    /**
+     * Initializes event listeners for mouse and touch interactions.
+     */
     private events() {
         const domElement = this.domElement || window;
 
@@ -97,6 +110,9 @@ class CameraControls {
         domElement.addEventListener('touchmove', this.touchMoveHandler as EventListener);
     }
 
+    /**
+     * Removes event listeners for mouse and touch interactions.
+     */
     private removeEvents() {
         const domElement = document.getElementById('scrollHandler') || window;
 
@@ -111,23 +127,39 @@ class CameraControls {
 
     }
 
+    /**
+     * Handles touch start events and simulates mouse down.
+     * @param e - The touch event.
+     */
     private onTouchStart(e: TouchEvent) {
         const ev = { pageX: e.changedTouches[0].pageX, pageY: e.changedTouches[0].pageY, preventDefault: () => { } };
         this.onMouseDown(ev as unknown as MouseEvent);
 
     }
 
+    /**
+     * Handles touch end events and simulates mouse up.
+     * @param e - The touch event.
+     */
     private onTouchEnd(e: TouchEvent) {
         const ev = { pageX: e.changedTouches[0].pageX, pageY: e.changedTouches[0].pageY, preventDefault: () => { } };
         this.onMouseUp(ev as unknown as MouseEvent);
 
     }
 
+    /**
+     * Handles touch move events and simulates mouse move.
+     * @param e - The touch event.
+     */
     private onTouchMove(e: TouchEvent) {
         const ev = { pageX: e.changedTouches[0].pageX, pageY: e.changedTouches[0].pageY };
         this.onMouseMove(ev as unknown as MouseEvent);
     }
 
+    /**
+     * Handles mouse wheel events to zoom in and out.
+     * @param e - The wheel event.
+     */
     private onMouseWheel(e: WheelEvent): void {
         if (this.enabled) {
             e.preventDefault();
@@ -141,6 +173,10 @@ class CameraControls {
         this.mouseY = e.pageY;
     }
 
+    /**
+     * Handles mouse down events to start camera movement.
+     * @param e - The mouse event.
+     */
     private onMouseDown(e: MouseEvent): void {
         if (this.enabled) {
             e.preventDefault();
@@ -151,6 +187,10 @@ class CameraControls {
         this.downPoint.y = e.pageY;
     }
 
+    /**
+     * Handles mouse up events to stop camera movement.
+     * @param e - The mouse event.
+     */
     private onMouseUp(e: MouseEvent): void {
         if (this.enabled) {
             e.preventDefault();
@@ -166,6 +206,10 @@ class CameraControls {
         this.mouseY = e.pageY;
     }
 
+    /**
+     * Handles mouse move events to update camera angles.
+     * @param e - The mouse event.
+     */
     private onMouseMove(e: MouseEvent): void {
         if (this.enabled) {
             e.preventDefault();
@@ -204,6 +248,10 @@ class CameraControls {
 
     }
 
+    /**
+     * Updates the camera position and orientation based on time and input.
+     * @param t - The time delta for the update.
+     */
     public update(t: number): void {
         this.time += t * 0.1;
         // Interpolamos los radianes en x y en y
@@ -223,6 +271,9 @@ class CameraControls {
         this.mouseY += (this._mouseY - this.mouseY) / 10;
     }
 
+    /**
+     * Disposes of the camera controls by removing event listeners.
+     */
     public dispose(): void {
         this.removeEvents();
     }

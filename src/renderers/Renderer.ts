@@ -6,13 +6,31 @@ import { Mesh } from "../objects/Mesh";
 import { Object3D } from "../objects/Object3D";
 import { Scene } from "../objects/Scene";
 
+/**
+ * Configuration options for the WebGPU renderer.
+ * @interface RendererOptions
+ * @property {boolean} [antialias] - Enable antialiasing
+ * @property {boolean} [premultipliedAlpha] - Enable premultiplied alpha
+ * @property {GPUCanvasAlphaMode} [alphaMode] - Canvas alpha mode configuration
+ */
 export interface RendererOptions {
     antialias?: boolean;
     premultipliedAlpha?: boolean;
     alphaMode?: GPUCanvasAlphaMode;
 }
 
+/**
+ * Core WebGPU renderer class that handles initialization, rendering, and compute operations.
+ * @class Renderer
+ */
 class Renderer {
+    /**
+     * Creates a new Renderer instance.
+     * @constructor
+     * @param {RendererOptions} options - Configuration options for the renderer
+     * @throws {Error} Throws if WebGPU is not supported in the browser
+     */
+
     public domElement: HTMLCanvasElement;
     public context: GPUCanvasContext | null;
     private device?: GPUDevice;
@@ -40,6 +58,11 @@ class Renderer {
         return new Promise<GPUDevice>(resolve => resolve(device));
     }
 
+    /**
+     * Initializes the WebGPU device and context.
+     * @async
+     * @returns {Promise<void>}
+     */
     public async initialize(): Promise<void> {
         if (!this.device) {
             const device = await this.getDevice();
@@ -62,6 +85,11 @@ class Renderer {
         return Promise.resolve();
     }
 
+    /**
+     * Sets the size of the rendering canvas and updates related resources.
+     * @param {number} width - Canvas width in pixels
+     * @param {number} height - Canvas height in pixels
+     */
     public setSize(width: number, height: number) {
         this.domElement.width = width;
         this.domElement.height = height;
@@ -74,6 +102,11 @@ class Renderer {
         });
     }
 
+    /**
+     * Renders a scene using the specified camera.
+     * @param {Scene} scene - The scene to render
+     * @param {Camera} camera - The camera to use for rendering
+     */
     public render(scene: Scene, camera: Camera) {
 
         const commandRenderEncoder = this.device!.createCommandEncoder();
@@ -109,8 +142,20 @@ class Renderer {
         // return this.device!.queue.onSubmittedWorkDone();
     }
 
-    private renderObject(object: Object3D, cameraBindGroup: GPUBindGroup, passRenderEncoder: GPURenderPassEncoder, camera: Camera) {
-
+    /**
+     * Recursively renders an object and its children in the scene graph.
+     * @private
+     * @param {Object3D} object - The object to render
+     * @param {GPUBindGroup} cameraBindGroup - The camera's bind group containing view and projection matrices
+     * @param {GPURenderPassEncoder} passRenderEncoder - The current render pass encoder
+     * @param {Camera} camera - The camera used for rendering
+     */
+    private renderObject(
+        object: Object3D,
+        cameraBindGroup: GPUBindGroup,
+        passRenderEncoder: GPURenderPassEncoder,
+        camera: Camera
+    ) {
         if (object.isMesh) {
             const mesh = object as Mesh;
             if (!mesh.geometry.initialized) {
@@ -139,7 +184,6 @@ class Renderer {
             // The bind group will always be 1 because the mesh is the second thing to be initialized
             const meshBindGroup = mesh.getBindGroup(this.device!);
 
-
             passRenderEncoder!.setBindGroup(0, materialBindGroup);
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
             passRenderEncoder!.setBindGroup(2, cameraBindGroup);
@@ -160,6 +204,15 @@ class Renderer {
         }
     }
 
+    /**
+     * Executes a compute shader with the specified workgroup configuration.
+     * @async
+     * @param {Compute} compute - The compute shader to execute
+     * @param {number} [workgroupsX=64] - Number of workgroups in X dimension
+     * @param {number} [workgroupsY=1] - Number of workgroups in Y dimension
+     * @param {number} [workgroupsZ=1] - Number of workgroups in Z dimension
+     * @returns {Promise<void>}
+     */
     public async compute(compute: Compute, workgroupsX: number = 64, workgroupsY: number = 1, workgroupsZ: number = 1): Promise<void> {
         const commandEncoder = this.device!.createCommandEncoder();
         const passEncoder = commandEncoder.beginComputePass();
@@ -179,6 +232,14 @@ class Renderer {
         return this.device!.queue.onSubmittedWorkDone();
     }
 
+    /**
+     * Reads data back from a compute buffer.
+     * @async
+     * @template T
+     * @param {ComputeBuffer} buffer - The buffer to read from
+     * @param {new (buffer: ArrayBuffer) => T} ArrayType - The type of array to create
+     * @returns {Promise<T>} The buffer data
+     */
     public async readBackBuffer<T extends Float32Array | Uint32Array | Int32Array>(
         buffer: ComputeBuffer,
         ArrayType: new (buffer: ArrayBuffer) => T

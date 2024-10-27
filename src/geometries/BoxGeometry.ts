@@ -1,6 +1,10 @@
 import { Geometry } from "../buffers/Geometry";
 import { Vector4 } from "../math/Vector4";
 
+/**
+ * Class representing a box geometry.
+ * @extends Geometry
+ */
 class BoxGeometry extends Geometry {
     // buffers
 
@@ -13,6 +17,15 @@ class BoxGeometry extends Geometry {
 
     public vertexCount: number = 0;
 
+    /**
+     * Creates an instance of BoxGeometry.
+     * @param {number} [width=1] - The width of the box.
+     * @param {number} [height=1] - The height of the box.
+     * @param {number} [depth=1] - The depth of the box.
+     * @param {number} [widthSegments=1] - Number of segmented faces along the width of the box.
+     * @param {number} [heightSegments=1] - Number of segmented faces along the height of the box.
+     * @param {number} [depthSegments=1] - Number of segmented faces along the depth of the box.
+     */
     constructor(width = 1, height = 1, depth = 1, widthSegments = 1, heightSegments = 1, depthSegments = 1) {
 
         super();
@@ -38,6 +51,20 @@ class BoxGeometry extends Geometry {
         this.indices = new Uint16Array(this._indices);
     }
 
+    /**
+     * Builds a plane for the box geometry.
+     * @private
+     * @param {number} u - The u-axis.
+     * @param {number} v - The v-axis.
+     * @param {number} w - The w-axis.
+     * @param {number} udir - The direction of the u-axis.
+     * @param {number} vdir - The direction of the v-axis.
+     * @param {number} width - The width of the plane.
+     * @param {number} height - The height of the plane.
+     * @param {number} depth - The depth of the plane.
+     * @param {number} gridX - Number of grid segments along the x-axis.
+     * @param {number} gridY - Number of grid segments along the y-axis.
+     */
     private buildPlane(u: number, v: number, w: number, udir: number, vdir: number, width: number, height: number, depth: number, gridX: number, gridY: number) {
 
         const segmentWidth = width / gridX;

@@ -1,19 +1,37 @@
 import { BufferBase } from "./BufferBase";
 
+/**
+ * Configuration options for creating a compute buffer
+ */
 interface IComputeBufferOptions {
+    /** Type of buffer (e.g. storage, uniform) */
     type?: string;
+    /** GPU buffer usage flags */
     usage: GPUFlagsConstant;
+    /** Initial buffer data */
     buffer?: Float32Array;
+    /** Binding location in shader */
     shaderLocation?: number;
+    /** Byte offset within buffer */
     offset?: number;
+    /** Byte stride between elements */
     stride?: number;
+    /** Vertex format for the buffer */
     format?: GPUVertexFormat;
 }
 
+/**
+ * Represents a GPU buffer used for compute operations
+ * @extends BufferBase
+ */
 class ComputeBuffer extends BufferBase {
-
+    /** Default buffer type for compute operations */
     public type?: string = ComputeBuffer.BUFFER_TYPE_STORAGE;
 
+    /**
+     * Creates a new compute buffer
+     * @param options - Configuration options for the buffer
+     */
     constructor(options: IComputeBufferOptions) {
         super();
         this.type = options.type;

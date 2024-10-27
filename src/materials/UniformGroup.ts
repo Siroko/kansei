@@ -1,10 +1,17 @@
 import { IBindable } from "../buffers/IBindable";
 
+/**
+ * Represents a descriptor for a bind group, which includes binding, visibility, and value.
+ */
 export class BindGroupDescriptor {
     binding?: number;
     visibility?: GPUFlagsConstant;
     value?: IBindable;
 }
+
+/**
+ * Represents a group of uniforms for rendering or compute operations.
+ */
 class UniformGroup {
     public bindGroupLayout?: GPUBindGroupLayout;
     public bindGroup?: GPUBindGroup;
@@ -14,12 +21,21 @@ class UniformGroup {
     public cameraUniformsGroupLayout?: GPUBindGroupLayout;
     public meshUniformsGroupLayout?: GPUBindGroupLayout;
 
+    /**
+     * Constructs a new UniformGroup.
+     * @param uniforms - An array of BindGroupDescriptor objects.
+     * @param isCompute - A boolean indicating if the group is for compute operations.
+     */
     constructor(
         public uniforms: BindGroupDescriptor[],
         public isCompute: boolean = false
     ) {
     }
 
+    /**
+     * Creates the bind group layout for rendering material uniforms.
+     * @param gpuDevice - The GPU device used to create the bind group layout.
+     */
     public createRenderingMaterialUniformsBindGroupLayout(gpuDevice: GPUDevice) {
         this.cameraUniformsGroupLayout = gpuDevice.createBindGroupLayout({
             label: 'Camera BindGroupLayout',
@@ -61,6 +77,11 @@ class UniformGroup {
             ]
         });
     }
+
+    /**
+     * Creates the bind group layout based on the provided uniforms.
+     * @param gpuDevice - The GPU device used to create the bind group layout.
+     */
     public createBindGroupLayout(gpuDevice: GPUDevice) {
         const entries = [];
         for (const uniform of this.uniforms) {
@@ -106,6 +127,11 @@ class UniformGroup {
         });
     }
 
+    /**
+     * Retrieves or creates the bind group for the uniforms.
+     * @param gpuDevice - The GPU device used to create or update the bind group.
+     * @returns The created or existing GPUBindGroup.
+     */
     public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
         const entries: GPUBindGroupEntry[] = [];
 

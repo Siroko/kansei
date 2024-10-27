@@ -1,17 +1,41 @@
 export const shaderCode = /* wgsl */`
 // Constants
+
+/**
+ * The number of octaves used in the Fractal Brownian Motion (FBM) calculation.
+ */
 const OCTAVES: i32 = 8;
 
 // Utility functions
+
+/**
+ * Generates a pseudo-random number based on a 2D vector input.
+ * 
+ * @param co A 2D vector used as input for the random number generation.
+ * @return A pseudo-random float value between 0.0 and 1.0.
+ */
 fn rand(co: vec2<f32>) -> f32 {
     return fract(sin(dot(co.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
+/**
+ * Generates a pseudo-random number based on a 2D vector input.
+ * 
+ * @param st A 2D vector used as input for the random number generation.
+ * @return A pseudo-random float value between 0.0 and 1.0.
+ */
 fn random(st: vec2<f32>) -> f32 {
     return fract(sin(dot(st.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453123);
 }
 
 // Noise function
+
+/**
+ * Computes a 2D noise value based on a 2D vector input.
+ * 
+ * @param st A 2D vector representing the input coordinates.
+ * @return A float value representing the noise at the given coordinates.
+ */
 fn noise(st: vec2<f32>) -> f32 {
     let i = floor(st);
     let f = fract(st);
@@ -29,6 +53,13 @@ fn noise(st: vec2<f32>) -> f32 {
 }
 
 // Fractal Brownian Motion
+
+/**
+ * Computes the Fractal Brownian Motion (FBM) value for a given 2D vector input.
+ * 
+ * @param st_input A 2D vector representing the input coordinates.
+ * @return A float value representing the FBM at the given coordinates.
+ */
 fn fbm(st_input: vec2<f32>) -> f32 {
     var value = 0.0;
     var amplitude = 0.5;

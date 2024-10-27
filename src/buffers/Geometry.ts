@@ -1,20 +1,40 @@
+/**
+ * Represents a geometric mesh with vertex and index buffers for WebGPU rendering.
+ */
 class Geometry {
+    /** Indicates if this geometry is used for instanced rendering */
     public isInstancedGeometry: boolean = false;
+
+    /** WebGPU buffer containing vertex data */
     public vertexBuffer?: GPUBuffer;
+
+    /** WebGPU buffer containing index data */
     public indexBuffer?: GPUBuffer;
+
+    /** Format of the index buffer data */
     public indexFormat: GPUIndexFormat = "uint16";
+
+    /** Collection of vertex buffer layout descriptors */
     public vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null> = [];
+
+    /** Indicates if the geometry has been initialized with GPU buffers */
     public initialized: boolean = false;
 
+    /** Number of vertices in the geometry */
     public vertexCount: number = 0;
 
-    // Interleaved vertices, normals, uvs
+    /** Raw vertex data containing interleaved positions, normals, and UVs */
     public vertices?: Float32Array;
+
+    /** Raw index data for defining triangles */
     public indices?: Uint16Array;
 
-    constructor() {
-    }
+    constructor() { }
 
+    /**
+     * Initializes the geometry by creating GPU buffers and setting up vertex layouts.
+     * @param gpuDevice - The WebGPU device to create buffers on
+     */
     public initialize(gpuDevice: GPUDevice) {
         this.vertexBuffer = gpuDevice.createBuffer({
             label: 'vertex buffer',

@@ -2,33 +2,66 @@ export const shaderCode = /* wgsl */`
 
 #include <fbm>
 
-// Modulo 289 operations
+/**
+ * Modulo 289 operation for a vec4.
+ * @param x The input vector.
+ * @return The result of the modulo operation.
+ */
 fn mod289_vec4(x: vec4<f32>) -> vec4<f32> {
     return x - floor(x * (1.0 / 289.0)) * 289.0;
 }
 
+/**
+ * Modulo 289 operation for a float.
+ * @param x The input float.
+ * @return The result of the modulo operation.
+ */
 fn mod289_f32(x: f32) -> f32 {
     return x - floor(x * (1.0 / 289.0)) * 289.0;
 }
 
-// Permute operations
+/**
+ * Permute operation for a vec4.
+ * @param x The input vector.
+ * @return The permuted vector.
+ */
 fn permute_vec4(x: vec4<f32>) -> vec4<f32> {
     return mod289_vec4(((x * 34.0) + 1.0) * x);
 }
 
+/**
+ * Permute operation for a float.
+ * @param x The input float.
+ * @return The permuted float.
+ */
 fn permute_f32(x: f32) -> f32 {
     return mod289_f32(((x * 34.0) + 1.0) * x);
 }
 
-// Taylor inverse square root
+/**
+ * Taylor inverse square root approximation for a vec4.
+ * @param r The input vector.
+ * @return The approximated inverse square root.
+ */
 fn taylorInvSqrt_vec4(r: vec4<f32>) -> vec4<f32> {
     return 1.79284291400159 - 0.85373472095314 * r;
 }
 
+/**
+ * Taylor inverse square root approximation for a float.
+ * @param r The input float.
+ * @return The approximated inverse square root.
+ */
 fn taylorInvSqrt_f32(r: f32) -> f32 {
     return 1.79284291400159 - 0.85373472095314 * r;
 }
 
+/**
+ * Computes a gradient vector for 4D noise.
+ * @param j The input float.
+ * @param ip The input permutation vector.
+ * @return The gradient vector.
+ */
 fn grad4(j: f32, ip: vec4<f32>) -> vec4<f32> {
     let ones = vec4<f32>(1.0, 1.0, 1.0, -1.0);
     var p = vec4<f32>(floor(fract(vec3<f32>(j) * ip.xyz) * 7.0) * ip.z - 1.0, 0.0);
@@ -46,6 +79,11 @@ fn grad4(j: f32, ip: vec4<f32>) -> vec4<f32> {
     return p;
 }
 
+/**
+ * Computes simplex noise derivatives.
+ * @param v The input vector.
+ * @return The noise derivatives.
+ */
 fn simplexNoiseDerivatives(v: vec4<f32>) -> vec4<f32> {
     let C = vec4<f32>(0.138196601125011, 0.276393202250021, 0.414589803375032, -0.447213595499958);
 
@@ -114,6 +152,11 @@ fn simplexNoiseDerivatives(v: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(dx, dy, dz, dw) * 49.0;
 }
 
+/**
+ * Computes the curl velocity based on a position.
+ * @param position The input position vector.
+ * @return The curl velocity vector.
+ */
 fn getCurlVelocity(position: vec4<f32>) -> vec3<f32> {
     let NOISE_TIME_SCALE = 10.6146594;
     let NOISE_SCALE = 1.3043478;
