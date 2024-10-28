@@ -35,12 +35,11 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
     var pointLight = vec3<f32>(100.0, 50.0, 0.0);
     var lightVector = pointLight;
     var lightDirection = normalize(lightVector);
-    var surfaceColor = vec3<f32>(0.767, 0.4321, 0.837);
-    var surfaceColor2 = vec3<f32>(0.0, 0.0, 0.0);
-    var blendColor = mix(surfaceColor, surfaceColor2,  smoothstep(0.0, 1.0, abs(fragData.viewPosition.z / 1000.0)));
+    var surfaceColor = vec3<f32>(0.967, 0.8321, 0.837);
+    var fogColor = vec3<f32>(0.1);
     var diffuse = (dot(fragData.normal, lightDirection) + 1.0) / 2.0;
-    var halfLambertDiffuse = (diffuse * 0.5 + 0.5) * blendColor;
-    
+    var halfLambertDiffuse = (diffuse * 0.5 + 0.5) * surfaceColor;
+    halfLambertDiffuse = mix(halfLambertDiffuse, fogColor,  smoothstep(0.0, 1.0, abs(fragData.viewPosition.z / 1000.0)));
     // halfLambertDiffuse = vec3<f32>(fragData.viewPosition.x, fragData.viewPosition.y, abs(fragData.viewPosition.z / 1000.0));
     return vec4<f32>(halfLambertDiffuse, 1.0);
 } 

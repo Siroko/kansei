@@ -31,11 +31,15 @@
       import { Vector3 } from '../src/math/Vector3'
       import { CameraControls } from '../src/controls/CameraControls'
       import { BufferBase } from '../src/buffers/BufferBase'
+      import { MouseVectors } from '../src/controls/MouseVectors' 
 
       let time = new Vector4();
       let computeParticles = true;
-
-      const renderer = new Renderer();
+      let mouseVectors = new MouseVectors();
+      
+      const renderer = new Renderer({
+        clearColor: new Vector4(0.1, 0.1, 0.1, 1.0)
+      });
       await renderer.initialize();
       renderer.setSize(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
       document.body.appendChild(renderer.domElement);
@@ -86,7 +90,7 @@
       const target = new Vector3(0, 0, 0);
       const controls = new CameraControls(camera, target);
 
-      const instancedGeometry = new InstancedGeometry(new SphereGeometry(3, 4), numParticles, [
+      const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [
         computeBuffer
       ]);
       const material = new Material(renderCode, []);
@@ -98,6 +102,10 @@
         time.y = time.x - time.z;
         time.z = time.x;
         time.needsUpdate = true;
+
+        mouseVectors.update(time.y);
+
+        console.log(mouseVectors.mouseStrength);
         // mesh.rotation.y += 0.01;
         // mesh.rotation.x += 0.01;
         // mesh.rotation.z += 0.01;

@@ -1,6 +1,7 @@
 import { ComputeBuffer } from "../buffers/ComputeBuffer";
 import { Camera } from "../cameras/Camera";
 import { InstancedGeometry } from "../geometries/InstancedGeometry";
+import { Vector4 } from "../main";
 import { Compute } from "../materials/Compute";
 import { Mesh } from "../objects/Mesh";
 import { Object3D } from "../objects/Object3D";
@@ -12,11 +13,13 @@ import { Scene } from "../objects/Scene";
  * @property {boolean} [antialias] - Enable antialiasing
  * @property {boolean} [premultipliedAlpha] - Enable premultiplied alpha
  * @property {GPUCanvasAlphaMode} [alphaMode] - Canvas alpha mode configuration
+ * @property {Vector4} [clearColor] - Clear color for the renderer
  */
 export interface RendererOptions {
     antialias?: boolean;
     premultipliedAlpha?: boolean;
     alphaMode?: GPUCanvasAlphaMode;
+    clearColor?: Vector4;
 }
 
 /**
@@ -38,7 +41,7 @@ class Renderer {
     private depthTexture?: GPUTexture;
 
     constructor(
-        private options: RendererOptions
+        private options: RendererOptions = {}
     ) {
         this.domElement = document.createElement('canvas');
         this.context = this.domElement.getContext('webgpu');
@@ -116,7 +119,12 @@ class Renderer {
             colorAttachments: [
                 {
                     view: textureView,
-                    clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                    clearValue: {
+                        r: this.options.clearColor?.x || 0.0,
+                        g: this.options.clearColor?.y || 0.0,
+                        b: this.options.clearColor?.z || 0.0,
+                        a: this.options.clearColor?.w || 1.0
+                    },
                     loadOp: 'clear',
                     storeOp: 'store',
                 },

@@ -120,7 +120,7 @@ class Matrix4 extends BufferBase {
      * @returns This matrix after scaling.
      */
     scale(v: Vector3): Matrix4 {
-        mat4.scale(this.internalMat4, this.internalMat4, v.internalVec3);
+        mat4.scale(this.internalMat4, this.internalMat4, v.getVec() as Float32Array);
         this.updateBuffer();
         return this;
     }
@@ -131,7 +131,7 @@ class Matrix4 extends BufferBase {
      * @returns This matrix after translation.
      */
     translate(v: Vector3): Matrix4 {
-        mat4.translate(this.internalMat4, this.internalMat4, v.internalVec3);
+        mat4.translate(this.internalMat4, this.internalMat4, v.getVec() as Float32Array);
         this.updateBuffer();
         return this;
     }
