@@ -1,7 +1,7 @@
 import { Vector3 } from "../math/Vector3";
 import { Matrix4 } from "../math/Matrix4";
 import { UniformGroup } from "../materials/UniformGroup";
-import { mat4 } from "gl-matrix";
+import { mat4, vec3 } from "gl-matrix";
 
 /**
  * Represents a 3D object in a scene with transformation matrices and hierarchical relationships.
@@ -107,7 +107,7 @@ class Object3D {
      */
     lookAt(target: Vector3) {
         this.lookAtMatrix.identity();
-        mat4.lookAt(this.lookAtMatrix.internalMat4, this.position.toVec(), target.toVec(), this.up.toVec());
+        mat4.lookAt(this.lookAtMatrix.internalMat4, this.position.getVec() as vec3, target.toVec() as vec3, this.up.toVec() as vec3);
         this.lookAtMatrix.invert(this.lookAtMatrix);
         // Extract Euler angles from the world matrix
         const [rotationX, rotationY, rotationZ] = this.lookAtMatrix.extractEulerAngles();
