@@ -33,7 +33,7 @@ class MouseVectors {
      * @private
      */
     private addEvents() {
-        // TODO: Create a event manager so we don't duplicate addEventListeners for the same domelement
+        // TODO: Create an event manager so we don't duplicate addEventListeners for the same domElement
         this.domElement.addEventListener(this.isMobile ? 'touchmove' : 'mousemove', this.onMouseMoveHandler);
     }
 
@@ -55,7 +55,6 @@ class MouseVectors {
         const mouseY = this.isMobile ? (e as TouchEvent).touches[0].clientY : (e as MouseEvent).clientY;
 
         this.mouseEnd.set((mouseX / innerWidth - 0.5) * 2, (mouseY / innerHeight - 0.5) * 2);
-
     }
 
     /**

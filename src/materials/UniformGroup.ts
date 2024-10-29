@@ -147,7 +147,6 @@ class UniformGroup {
             if (!uniform.value?.initialized) {
                 uniform.value?.initialize(gpuDevice);
             }
-
             if (!this.uniformGroupLayout) {
                 this.createBindGroupLayout(gpuDevice)
             }

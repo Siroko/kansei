@@ -10,6 +10,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Apply curl noise
     let curl_velocity = getCurlVelocity(vec4<f32>(value, 0.0));
     value += curl_velocity * 0.1;
+    value.x += mouseDirection.x * 10.0;
+    value.y += mouseDirection.y;
 
     // Store the result back
     positions[global_id.x] = value;
@@ -17,5 +19,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 // Declare the storage buffer for positions
 @group(0) @binding(0) var<storage, read_write> positions: array<vec3<f32>>;
+@group(0) @binding(1) var<uniform> time: vec4<f32>;
+@group(0) @binding(2) var<uniform> mouseDirection: vec2<f32>;
+@group(0) @binding(3) var<uniform> mousePosition: vec2<f32>;
+// @group(0) @binding(3) var<uniform> mouseStrength: f32;
 
 `;

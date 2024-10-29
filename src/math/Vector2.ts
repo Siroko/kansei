@@ -6,7 +6,6 @@ import { Vector } from "./Vector";
  * Provides methods to manipulate and access vector components.
  */
 class Vector2 extends Vector {
-
     /**
      * Constructs a new Vector2 instance.`
      * 
