@@ -16,7 +16,8 @@
   <body>
     <script type="module">
       import { Renderer } from '../src/renderers/Renderer'
-      import { shaderCode } from './assets/shaders/ComputeShaderTest'
+      import { shaderCode as shaderVelocities } from './assets/shaders/ComputeVelocities'
+      import { shaderCode as shaderPositions } from './assets/shaders/ComputePositions'
       import { renderCode } from './assets/shaders/RenderShaderTest'
       import { Material } from '../src/materials/Material'
       import { Compute } from '../src/materials/Compute'
@@ -58,7 +59,16 @@
         myBuffer[i * 4 + 2] = Math.floor(i / numRows) - numRows / 2; // Z coordinate
         myBuffer[i * 4 + 3] = 1; // W coordinate
       }
-      const computeBuffer = new ComputeBuffer({
+
+      const computeBufferVelocities = new ComputeBuffer({
+        usage: 
+          BufferBase.BUFFER_USAGE_STORAGE |
+          BufferBase.BUFFER_USAGE_COPY_SRC,
+        type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+        buffer:  new Float32Array(numParticles * 4)
+      });
+
+      const computeBufferPositions = new ComputeBuffer({
         usage: 
           BufferBase.BUFFER_USAGE_STORAGE |
           BufferBase.BUFFER_USAGE_COPY_SRC |
@@ -78,54 +88,74 @@
       const controls = new CameraControls(camera, target);
 
       const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [
-        computeBuffer
+        computeBufferPositions
       ]);
       const material = new Material(renderCode, []);
       const mesh = new Mesh(instancedGeometry, material);
       scene.add(mesh);
 
-      const compute = new Compute(shaderCode, [
+      const computeVelocities = new Compute(shaderVelocities, [
         {
           binding: 0,
           visibility: GPUShaderStage.COMPUTE,
-          value: computeBuffer
+          value: computeBufferVelocities
         },
         {
           binding: 1,
           visibility: GPUShaderStage.COMPUTE,
-          value: time
+          value: computeBufferPositions
         },
         {
           binding: 2,
           visibility: GPUShaderStage.COMPUTE,
-          value: mouseVectors.mouseDirection
+          value: time
         },
         {
           binding: 3,
           visibility: GPUShaderStage.COMPUTE,
-          value: mouseVectors.mousePosition
+          value: mouseVectors.mouseDirection
         },
         {
           binding: 4,
           visibility: GPUShaderStage.COMPUTE,
-          value: mesh.worldMatrix
+          value: mouseVectors.mousePosition
         },
         {
           binding: 5,
           visibility: GPUShaderStage.COMPUTE,
-          value: camera.viewMatrix
+          value: mesh.worldMatrix
         },
         {
           binding: 6,
           visibility: GPUShaderStage.COMPUTE,
+          value: camera.viewMatrix
+        },
+        {
+          binding: 7,
+          visibility: GPUShaderStage.COMPUTE,
           value: camera.projectionMatrix
         }
+      ]);
+
+      const computePositions = new Compute(shaderPositions, [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            value: computeBufferPositions
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            value: computeBufferVelocities
+          }
       ]);
 
       async function animate() {
         time.x = performance.now() / 1000;
         time.y = time.x - time.z;
         time.z = time.x;
+        time.w = mouseVectors.mouseStrength;
+
         time.needsUpdate = true;
 
         mouseVectors.update(time.y);
@@ -136,7 +166,8 @@
         
         controls.update(time.y);
         if(computeParticles) {
-          await renderer.compute(compute, Math.ceil(numParticles / 64));
+          await renderer.compute(computeVelocities, Math.ceil(numParticles / 64));
+          await renderer.compute(computePositions, Math.ceil(numParticles / 64));
         }
         renderer.render(scene, camera);
 
