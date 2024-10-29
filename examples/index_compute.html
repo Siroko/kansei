@@ -70,6 +70,19 @@
         stride: 4 * 4,
         format: "float32x4"
       });
+      
+      const scene = new Scene();
+      const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
+      camera.lookAt(new Vector3(0, 0, 0));
+      const target = new Vector3(0, 0, 0);
+      const controls = new CameraControls(camera, target);
+
+      const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [
+        computeBuffer
+      ]);
+      const material = new Material(renderCode, []);
+      const mesh = new Mesh(instancedGeometry, material);
+      scene.add(mesh);
 
       const compute = new Compute(shaderCode, [
         {
@@ -91,21 +104,23 @@
           binding: 3,
           visibility: GPUShaderStage.COMPUTE,
           value: mouseVectors.mousePosition
+        },
+        {
+          binding: 4,
+          visibility: GPUShaderStage.COMPUTE,
+          value: mesh.worldMatrix
+        },
+        {
+          binding: 5,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.viewMatrix
+        },
+        {
+          binding: 6,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.projectionMatrix
         }
       ]);
-      
-      const scene = new Scene();
-      const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
-      camera.lookAt(new Vector3(0, 0, 0));
-      const target = new Vector3(0, 0, 0);
-      const controls = new CameraControls(camera, target);
-
-      const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [
-        computeBuffer
-      ]);
-      const material = new Material(renderCode, []);
-      const mesh = new Mesh(instancedGeometry, material);
-      scene.add(mesh);
 
       async function animate() {
         time.x = performance.now() / 1000;
@@ -115,7 +130,6 @@
 
         mouseVectors.update(time.y);
 
-        console.log(mouseVectors.mouseStrength);
         // mesh.rotation.y += 0.01;
         // mesh.rotation.x += 0.01;
         // mesh.rotation.z += 0.01;
