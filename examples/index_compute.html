@@ -86,8 +86,9 @@
       const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
       camera.lookAt(new Vector3(0, 0, 0));
       const target = new Vector3(0, 0, 0);
-      const controls = new CameraControls(camera, target);
-
+      const controls = new CameraControls(camera, target, null);
+      controls.radius = 5000;
+      
       const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [
         computeBufferPositions
       ]);

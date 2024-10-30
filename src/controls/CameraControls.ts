@@ -51,7 +51,8 @@ class CameraControls {
      * @param target - The target vector for the camera to look at.
      * @param domElement - The DOM element to attach event listeners to.
      */
-    constructor(camera: Camera, target: Vector3, domElement: HTMLElement | Window) {
+    constructor(camera: Camera, target: Vector3, domElement: HTMLElement | Window, radius?: number) {
+
         this.camera = camera;
         this.target = target;
         this.domElement = domElement;
@@ -66,7 +67,7 @@ class CameraControls {
         this.downPoint = { x: 0, y: 0 };
         this.down = false;
 
-        this.radius = window.innerWidth < 768 ? 100 : 300;
+        this.radius = radius || window.innerWidth < 768 ? 100 : 400;
         this.wheelDelta = this.radius;
         this.wheelDeltaEase = this.radius;
         this.limits = { up: 0.15, down: -0.15 };
