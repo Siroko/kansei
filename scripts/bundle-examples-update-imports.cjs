@@ -4,7 +4,7 @@ const path = require('path');
 const { fileURLToPath } = require('url');
 
 const examplesDir = path.join(__dirname, '../dist/examples');
-const distDir = path.join(__dirname, '../dist/examples');
+const distDir = path.join(__dirname, '../dist');
 
 // Function to update import paths in HTML files
 function updateImports(filePath) {
@@ -18,6 +18,7 @@ function updateImports(filePath) {
     // Move index.html to the root of dist
     if (path.basename(filePath) === 'index.html') {
         const newFilePath = path.join(distDir, 'index.html');
+        // Move the file to dist
         fs.renameSync(filePath, newFilePath);
     }
 
