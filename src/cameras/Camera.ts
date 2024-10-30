@@ -9,6 +9,7 @@ import { Vector3 } from "../math/Vector3";
  */
 class Camera extends Object3D {
     public viewMatrix: Matrix4;
+    public inverseViewMatrix: Matrix4;
     public projectionMatrix: Matrix4;
 
     /**
@@ -27,6 +28,7 @@ class Camera extends Object3D {
     ) {
         super();
         this.viewMatrix = new Matrix4();
+        this.inverseViewMatrix = new Matrix4();
         this.projectionMatrix = new Matrix4().perspective(this.fov, this.aspect, this.near, this.far);
         this.setUniforms();
     }
@@ -44,7 +46,9 @@ class Camera extends Object3D {
     public updateViewMatrix() {
         this.updateModelMatrix();
         this.viewMatrix.invert(this.worldMatrix);
+        this.inverseViewMatrix.invert(this.viewMatrix);
         this.viewMatrix.needsUpdate = true;
+        this.inverseViewMatrix.needsUpdate = true;
     }
 
     /**

@@ -20,8 +20,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     if(distanceToMouse < mouseStrength * 2.0 && mouseStrength > 0.01) {
         var nDistance = distanceToMouse / (mouseStrength * 2.0);
-        velocity.x += mouseDirection.x * mouseStrength * 300.0 * (1.0 - nDistance);
-        velocity.y += mouseDirection.y * mouseStrength * 300.0 * (1.0 - nDistance);
+        var displaceMentVector = vec2<f32>(
+            mouseDirection.x * mouseStrength * 300.0 * (1.0 - nDistance) * -1.0, 
+            mouseDirection.y * mouseStrength * 300.0 * (1.0 - nDistance)
+        );
+        // Assuming you have a modelMatrix defined
+        var worldDisplacementVector = (inverseViewMatrix * vec4<f32>(displaceMentVector, 0.0, 0.0)).xyz;
+        velocity += vec3<f32>(worldDisplacementVector);
     }
 
     // Apply curl noise
@@ -40,6 +45,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @group(0) @binding(4) var<uniform> mousePosition: vec2<f32>;
 @group(0) @binding(5) var<uniform> worldMatrix: mat4x4<f32>;
 @group(0) @binding(6) var<uniform> viewMatrix: mat4x4<f32>;
-@group(0) @binding(7) var<uniform> projectionMatrix: mat4x4<f32>;
+@group(0) @binding(7) var<uniform> inverseViewMatrix: mat4x4<f32>;
+@group(0) @binding(8) var<uniform> projectionMatrix: mat4x4<f32>;
 
 `;

@@ -51,14 +51,6 @@
       // renderer.domElement.style.imageRendering = 'pixelated';
 
       const numParticles = 300000;
-      const numRows = Math.sqrt(numParticles);
-      const myBuffer = new Float32Array(numParticles * 4);
-      for (let i = 0; i < numParticles; i++) {
-        myBuffer[i * 4] = i % numRows - numRows / 2; // X coordinate
-        myBuffer[i * 4 + 1] = 0; // Y coordinate
-        myBuffer[i * 4 + 2] = Math.floor(i / numRows) - numRows / 2; // Z coordinate
-        myBuffer[i * 4 + 3] = 1; // W coordinate
-      }
 
       const computeBufferVelocities = new ComputeBuffer({
         usage: 
@@ -67,6 +59,15 @@
         type: ComputeBuffer.BUFFER_TYPE_STORAGE,
         buffer:  new Float32Array(numParticles * 4)
       });
+
+      const numRows = Math.sqrt(numParticles);
+      const myBuffer = new Float32Array(numParticles * 4);
+      for (let i = 0; i < numParticles; i++) {
+        myBuffer[i * 4] = i % numRows - numRows / 2; // X coordinate
+        myBuffer[i * 4 + 1] = 0; // Y coordinate
+        myBuffer[i * 4 + 2] = Math.floor(i / numRows) - numRows / 2; // Z coordinate
+        myBuffer[i * 4 + 3] = 1; // W coordinate
+      }
 
       const computeBufferPositions = new ComputeBuffer({
         usage: 
@@ -132,6 +133,11 @@
         },
         {
           binding: 7,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.inverseViewMatrix
+        },
+        {
+          binding: 8,
           visibility: GPUShaderStage.COMPUTE,
           value: camera.projectionMatrix
         }
