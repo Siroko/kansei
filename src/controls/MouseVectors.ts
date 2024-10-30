@@ -6,6 +6,7 @@ import { Vector2 } from "../math/Vector2";
 class MouseVectors {
 
     private onMouseMoveHandler: (e: Event) => void;
+    private onMouseEnterHandler: (e: Event) => void;
     private isMobile: boolean = navigator.userAgent.match(/(iPad)|(iPhone)|(iPod)|(android)|(webOS)/i) ? true : false;
 
     private tmpVector: Vector2 = new Vector2();
@@ -24,6 +25,7 @@ class MouseVectors {
         private domElement: HTMLElement = document.body
     ) {
         this.onMouseMoveHandler = this.onMouseMove.bind(this);
+        this.onMouseEnterHandler = this.onMouseEnter.bind(this);
 
         this.addEvents();
     }
@@ -35,6 +37,7 @@ class MouseVectors {
     private addEvents() {
         // TODO: Create an event manager so we don't duplicate addEventListeners for the same domElement
         this.domElement.addEventListener(this.isMobile ? 'touchmove' : 'mousemove', this.onMouseMoveHandler);
+        this.domElement.addEventListener('mouseenter', this.onMouseEnterHandler);
     }
 
     /**
@@ -43,6 +46,16 @@ class MouseVectors {
      */
     private removeEvents() {
         this.domElement.removeEventListener(this.isMobile ? 'touchmove' : 'mousemove', this.onMouseMoveHandler);
+        this.domElement.removeEventListener('mouseenter', this.onMouseEnterHandler);
+    }
+
+    private onMouseEnter(e: Event) {
+        const mouseX = this.isMobile ? (e as TouchEvent).touches[0].clientX : (e as MouseEvent).clientX;
+        const mouseY = this.isMobile ? (e as TouchEvent).touches[0].clientY : (e as MouseEvent).clientY;
+
+        this.mouseEnd.set((mouseX / innerWidth - 0.5) * 2, (mouseY / innerHeight - 0.5) * 2);
+        this.mousePosition.copy(this.mouseEnd);
+
     }
 
     /**
