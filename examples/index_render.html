@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Example WebGPU Renderer</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      import { Renderer } from '../src/renderers/Renderer'
+      import { Texture } from '../src/buffers/Texture'
+      import { Sampler } from '../src/buffers/Sampler'
+      import { shaderCode } from './assets/shaders/TexturedCube.js'
+      import { Material } from '../src/materials/Material'
+      import { BoxGeometry } from '../src/geometries/BoxGeometry'
+      import { Mesh } from '../src/objects/Mesh'
+      import { Scene } from '../src/objects/Scene'
+      import { Camera } from '../src/cameras/Camera'
+      import { VideoTexture } from '../src/buffers/VideoTexture'
+      import { Vector4 } from '../src/math/Vector4'
+      import { Vector3 } from '../src/math/Vector3'
+      import { TextureLoader } from '../src/loaders/TextureLoader'
+      import { CameraControls } from '../src/controls/CameraControls'
+      const renderer = new Renderer();
+      await renderer.initialize();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement)
+
+      const scene = new Scene();
+      const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
+      const cameraControls = new CameraControls(camera, scene.position);
+      const tl = new TextureLoader();
+      const imageBitmap = await tl.load("./assets/textures/character_sheet_without_black.jpg");
+      const texture = new Texture(imageBitmap);
+      const sampler = new Sampler('linear', 'linear');
+      const material = new Material(shaderCode, [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          value: texture
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.FRAGMENT,
+          value: sampler
+        }
+      ]);
+      const geometry = new BoxGeometry(1, 1, 1);
+      const meshes = [];
+      for (let i = 0; i < 2000; i++) {
+        const mesh = new Mesh(geometry, material);
+        mesh.position.x = Math.random() * 10 - 5;
+        mesh.position.y = Math.random() * 10 - 5;
+        mesh.position.z = Math.random() * 10 - 5;
+        scene.add(mesh);
+        meshes.push(mesh);
+      }
+
+      async function animate() {
+        cameraControls.update();
+        let i = 0;
+        meshes.forEach(mesh => {
+          const iNorm = (i / meshes.length - 0.5);
+          const sc =  Math.abs(Math.sin(Date.now() / 1000)) + 0.3;
+          mesh.scale.x = sc;
+          mesh.scale.y = sc;
+          mesh.scale.z = sc;
+        
+          i++;
+        });
+        
+        await renderer.render(scene, camera);
+        
+        requestAnimationFrame(animate);
+      }
+      animate();
+    </script>
+  </body>
+</html>

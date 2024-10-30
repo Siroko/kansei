@@ -15,6 +15,12 @@ function updateImports(filePath) {
         return `import {${p1}} from './${path.relative(path.dirname(filePath), path.join(distDir, p2.replace(/\/src\//, '/') + '.js')).replace(/\\/g, '/')}'`;
     });
 
+    // Move index.html to the root of dist
+    if (path.basename(filePath) === 'index.html') {
+        const newFilePath = path.join(distDir, 'index.html');
+        fs.renameSync(filePath, newFilePath);
+    }
+
     // Write the updated content back to the file
     fs.writeFileSync(filePath, content, 'utf8');
 }

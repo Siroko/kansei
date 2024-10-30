@@ -186,6 +186,12 @@
           computeParticles = !computeParticles;
         }
       });
+
+      window.addEventListener('resize', () => {
+        renderer.setSize(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      });
     </script>
   </body>
 </html>
