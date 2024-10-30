@@ -19,8 +19,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var distanceToMouse = distance(ndcMouse, ndc.xy);
 
     if(distanceToMouse < mouseStrength * 2.0 && mouseStrength > 0.01) {
-        velocity.x += mouseDirection.x * mouseStrength * 100.0;
-        velocity.y += mouseDirection.y * mouseStrength * 100.0;
+        var nDistance = distanceToMouse / (mouseStrength * 2.0);
+        velocity.x += mouseDirection.x * mouseStrength * 300.0 * (1.0 - nDistance);
+        velocity.y += mouseDirection.y * mouseStrength * 300.0 * (1.0 - nDistance);
     }
 
     // Apply curl noise

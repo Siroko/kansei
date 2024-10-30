@@ -158,7 +158,7 @@ fn simplexNoiseDerivatives(v: vec4<f32>) -> vec4<f32> {
  * @return The curl velocity vector.
  */
 fn getCurlVelocity(position: vec4<f32>) -> vec3<f32> {
-    let NOISE_TIME_SCALE = 10.6146594;
+    let NOISE_TIME_SCALE = 1.6146594;
     let NOISE_SCALE = 1.3043478;
     let NOISE_POSITION_SCALE = 0.0022283;
 
