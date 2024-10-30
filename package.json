@@ -14,7 +14,10 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "prepare": "husky install",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "copy-examples": "cp -r examples dist/examples",
+    "update-imports": "node scripts/bundle-examples-update-imports.cjs",
+    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports"
   },
   "peerDependencies": {
     "@webgpu/types": "^0.1.48",
