@@ -1,8 +1,6 @@
 # kansei
 
-Kansei is a WebGPU engine built with TypeScript, designed to bring a bit more feeling into digital experiences. Inspired by kansei engineering, it’s not just about achieving visual polish or performance; it’s about building interactions that resonate on a more personal level.
-
-With Kansei, you can create immersive 3D environments, subtle interactive effects, and refined visual layers that feel purposeful and engaging. It’s a tool for those who want to design with attention to detail, where every interaction isn’t just about usability but also about creating a small moment of connection.
+Kansei is a Toy WebGPU engine built with TypeScript, designed to bring a bit more feeling into digital experiences. Inspired by kansei engineering, it’s not just about achieving visual polish or performance; it’s about building interactions that resonate on an emotional level.
 
 ## Features
 
