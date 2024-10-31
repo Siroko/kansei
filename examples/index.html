@@ -34,11 +34,29 @@
         font-family: 'TT_supermolot';
         font-feature-settings: "ss01" 1;
       }
+
+      #cursor {
+        width: 40px;
+        height: 2px;
+        background-color: white;
+        animation: blink 1s step-start infinite;
+        position: absolute;
+        top: 68px; /* Adjust as needed to position below the logo */
+        left: 265px; /* Align with the logo */
+        box-shadow: 0 0 10px white; /* Added glow effect */
+      }
+
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
     </style>
   </head>
   <body>
    <iframe id="myIframe" width="100%" height="100%" src="./examples/index_compute.html"></iframe>
    <div id="logo">KANSEI</div>
+   <div id="cursor"></div>
 
    <script>
     const iframe = document.getElementById('myIframe');
