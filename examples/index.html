@@ -37,7 +37,15 @@
     </style>
   </head>
   <body>
-   <iframe width="100%" height="100%" src="./examples/index_compute.html"></iframe>
+   <iframe id="myIframe" width="100%" height="100%" src="./examples/index_compute.html"></iframe>
    <div id="logo">KANSEI</div>
+
+   <script>
+    const iframe = document.getElementById('myIframe');
+    window.addEventListener('keydown', (event) => {
+      // Post the keydown event to the iframe
+      iframe.contentWindow.postMessage({ type: 'keydown', key: event.key }, '*');
+    });
+  </script>
   </body>
 </html>
