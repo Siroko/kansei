@@ -40,7 +40,8 @@
     "typescript-eslint": "^8.8.1",
     "vite": "^5.4.8",
     "vite-plugin-dts": "^4.2.4",
-    "vite-plugin-mkcert": "^1.17.6"
+    "vite-plugin-mkcert": "^1.17.6",
+    "vite-plugin-wasm": "^3.3.0"
   },
   "lint-staged": {
     "**/*.{js,ts,tsx}": [

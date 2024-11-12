@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import dts from 'vite-plugin-dts'
+import wasm from 'vite-plugin-wasm'
 
 import { extname, relative, resolve } from 'path'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +11,8 @@ import mkcert from 'vite-plugin-mkcert'
 export default defineConfig({
     plugins: [
         dts({ include: ['src'] }),
-        mkcert()
+        mkcert(),
+        wasm()
     ],
     build: {
         rollupOptions: {
@@ -39,7 +41,7 @@ export default defineConfig({
             entry: resolve(__dirname, 'src/main.ts'),
             formats: ['es']
         },
-        copyPublicDir: false,
+        copyPublicDir: false
     },
     resolve: { alias: { src: resolve('src/') } },
 })
