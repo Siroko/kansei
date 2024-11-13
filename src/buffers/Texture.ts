@@ -26,7 +26,7 @@ class Texture implements IBindable {
      * @param {ImageBitmap} imageBitmap - The source image bitmap to create the texture from
      */
     constructor(
-        private imageBitmap: ImageBitmap
+        private imageBitmap: ImageBitmap | HTMLCanvasElement
     ) {
         this.uuid = crypto.randomUUID();
     }

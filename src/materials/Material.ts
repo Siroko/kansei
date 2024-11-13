@@ -22,7 +22,13 @@ class Material {
      */
     constructor(
         private shaderCode: string,
-        public uniforms: BindGroupDescriptor[]
+        public uniforms: BindGroupDescriptor[],
+        public transparent: boolean = false,
+        public depthWriteEnabled: boolean = true,
+        public depthCompare: GPUCompareFunction = 'less',
+        public cullMode: GPUCullMode = 'back',
+        public topology: GPUPrimitiveTopology = 'triangle-list',
+        public depthStencilFormat: GPUTextureFormat = 'depth24plus',
     ) {
         this.uniformGroup = new UniformGroup(uniforms);
         this.uuid = crypto.randomUUID();
@@ -77,16 +83,28 @@ class Material {
                 targets: [
                     {
                         format: presentationFormat,
-                    },
-                ],
+                        blend: {
+                            color: {
+                                operation: 'add',
+                                srcFactor: 'src-alpha',
+                                dstFactor: 'one-minus-src-alpha'
+                            },
+                            alpha: {
+                                operation: 'add',
+                                srcFactor: 'one',
+                                dstFactor: 'one-minus-src-alpha'
+                            }
+                        }
+                    }
+                ]
             } as GPUFragmentState,
             primitive: {
                 topology: 'triangle-list',
-                cullMode: 'back',
+                cullMode: this.transparent ? 'none' : 'back',
             } as GPUPrimitiveState,
 
             depthStencil: {
-                depthWriteEnabled: true,
+                depthWriteEnabled: !this.transparent,
                 depthCompare: 'less',
                 format: 'depth24plus',
             },

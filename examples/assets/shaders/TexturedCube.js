@@ -8,7 +8,7 @@ struct VertexOut {
 @group(0) @binding(0) var map : texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
-@group(1) @binding(0) var<uniform> modelMatrix:mat4x4<f32>;
+@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
 @group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
 
 @group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;

@@ -77,12 +77,6 @@ class Renderer {
                     format: this.presentationFormat,
                     alphaMode: this.options?.alphaMode || "opaque",
                 });
-
-                this.depthTexture = this.device.createTexture({
-                    size: [this.domElement.width, this.domElement.height],
-                    format: 'depth24plus',
-                    usage: GPUTextureUsage.RENDER_ATTACHMENT,
-                });
             }
         }
         return Promise.resolve();
@@ -123,7 +117,7 @@ class Renderer {
                         r: this.options.clearColor?.x || 0.0,
                         g: this.options.clearColor?.y || 0.0,
                         b: this.options.clearColor?.z || 0.0,
-                        a: this.options.clearColor?.w || 1.0
+                        a: this.options.clearColor?.w || 0.0
                     },
                     loadOp: 'clear',
                     storeOp: 'store',
@@ -138,11 +132,15 @@ class Renderer {
         } as GPURenderPassDescriptor;
         const passRenderEncoder = commandRenderEncoder!.beginRenderPass(renderPassDescriptor);
 
+        // Prepare scene (sort transparent objects)
+        scene.prepare(camera);
+
         camera.updateViewMatrix();
         const cameraBindGroup = camera.getBindGroup(this.device!);
 
-        for (const child of scene.children) {
-            this.renderObject(child, cameraBindGroup, passRenderEncoder, camera);
+        // Render objects in order (opaque first, then transparent)
+        for (const object of scene.getOrderedObjects()) {
+            this.renderObject(object, cameraBindGroup, passRenderEncoder, camera);
         }
         passRenderEncoder!.end();
         this.device!.queue.submit([commandRenderEncoder!.finish()]);

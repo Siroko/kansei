@@ -97,7 +97,6 @@ class BoxGeometry extends Geometry {
                 vector.setComponent(w, depthHalf);
 
                 // now apply vector to vertex buffer
-
                 this._vertices.push(vector.x, vector.y, vector.z, 1);
 
                 // set values to correct vector component
@@ -109,12 +108,10 @@ class BoxGeometry extends Geometry {
                 this._vertices.push(vector.x, vector.y, vector.z);
 
                 // uvs
-
                 this._vertices.push(ix / gridX);
                 this._vertices.push(1 - (iy / gridY));
 
                 // counters
-
                 vertexCounter += 1;
 
             }

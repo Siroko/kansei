@@ -40,6 +40,14 @@ class Vector3 extends Vector {
         this.internalVec![2] = value;
         this.updateBuffer();
     }
+
+    public distanceTo(other: Vector3): number {
+        return Math.sqrt(
+            Math.pow(this.x - other.x, 2) +
+            Math.pow(this.y - other.y, 2) +
+            Math.pow(this.z - other.z, 2)
+        );
+    }
 }
 
 export { Vector3 }
