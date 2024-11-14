@@ -25,13 +25,10 @@ export class PlaneGeometry extends Geometry {
 
             for (let x = 0; x <= segmentsX; x++) {
                 const xPos = (x * segmentWidth) - (width / 2);
-
                 // Add vertex position (x, y, 0)
                 this._vertices.push(xPos, yPos, 0, 1);
-
                 // Add normal (0, 0, 1) for front face
                 this._vertices.push(0, 0, 1);
-
                 // Add UV coordinates
                 this._vertices.push(x / segmentsX, y / segmentsY);
 
@@ -60,7 +57,5 @@ export class PlaneGeometry extends Geometry {
 
         this.vertices = new Float32Array(this._vertices);
         this.indices = new Uint16Array(this._indices);
-
-        console.log(this.vertexCount);
     }
 }

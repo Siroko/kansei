@@ -19,11 +19,13 @@ struct VertexOut {
 fn vertex_main(
     @location(0) position: vec4<f32>,
     @location(1) normal : vec3<f32>,
-    @location(2) uv : vec2<f32>
+    @location(2) uv : vec2<f32>,
+    @location(3) a_particlePos : vec4<f32>
 ) -> VertexOut
 {
     var output : VertexOut;
-    output.position = projectionMatrix * viewMatrix * worldMatrix * position;
+    var offsetVertex: vec4<f32> = vec4<f32>(position.xyz + a_particlePos.xyz, 1.0);
+    output.position = projectionMatrix * viewMatrix * worldMatrix * offsetVertex;
     output.normal = (worldMatrix * vec4<f32>(normal, 1.0)).xyz;
     output.uv = uv;
     output.viewPosition = worldMatrix * position;
