@@ -44,12 +44,12 @@
 
       const fontLoader = new FontLoader();
       const fontInfo = await fontLoader.load('assets/fonts/TT_Supermolot_Neue_Extended_ExtraLight.arfont');
-      const geometry = new TextGeometry('Hello World', fontInfo, 100, 100, 25);
+      const geometry = new TextGeometry('HELLO KANSEI', fontInfo, 100, 100, 25);
       const sampler = new Sampler('linear', 'linear');
       const material = new Material(shaderCode, [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           value: fontInfo.sdfTexture
         },
         {
@@ -59,6 +59,7 @@
         }
       ], true);
       const mesh = new Mesh(geometry, material);
+      mesh.position.x = -6;
       scene.add(mesh);
 
       function animate() {

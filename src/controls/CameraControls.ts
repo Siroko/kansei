@@ -67,7 +67,7 @@ class CameraControls {
         this.downPoint = { x: 0, y: 0 };
         this.down = false;
 
-        this.radius = radius || window.innerWidth < 768 ? 100 : 400;
+        this.radius = radius || window.innerWidth < 768 ? 15 : 6;
         this.wheelDelta = this.radius;
         this.wheelDeltaEase = this.radius;
         this.limits = { up: 0.15, down: -0.15 };
@@ -180,7 +180,7 @@ class CameraControls {
      */
     private onMouseDown(e: MouseEvent): void {
         if (this.enabled) {
-            e.preventDefault();
+            // e.preventDefault();
         }
         this.down = true;
 
@@ -194,7 +194,7 @@ class CameraControls {
      */
     private onMouseUp(e: MouseEvent): void {
         if (this.enabled) {
-            e.preventDefault();
+            // e.preventDefault();
         }
         this.down = false;
 
@@ -213,7 +213,7 @@ class CameraControls {
      */
     private onMouseMove(e: MouseEvent): void {
         if (this.enabled) {
-            e.preventDefault();
+            // e.preventDefault();
         }
         const normalizedX = e.pageX / window.innerWidth - 0.5;
         const normalizedY = e.pageY / window.innerHeight - 0.5;
