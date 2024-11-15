@@ -178,6 +178,9 @@ class Renderer {
             if (mesh.geometry.isInstancedGeometry) {
                 const geo = mesh.geometry as InstancedGeometry;
                 for (const extraBuffer of geo.extraBuffers) {
+                    if (!extraBuffer.initialized) {
+                        extraBuffer.initialize(this.device!);
+                    }
                     passRenderEncoder.setVertexBuffer(vertexBufferIndex, extraBuffer.resource.buffer);
                     vertexBufferIndex++;
                 }

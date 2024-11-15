@@ -27,10 +27,7 @@
       import { shaderCode } from './assets/shaders/TextShader.js'
       import { Sampler } from '../src/buffers/Sampler'
       import { Vector4 } from '../src/math/Vector4'
-
-      const fontLoader = new FontLoader();
-      const fontInfo = await fontLoader.load('assets/fonts/TT_Supermolot_Neue_Extended_ExtraLight.arfont');
-      console.log(fontInfo);
+      import { TextGeometry } from '../src/geometries/TextGeometry'
 
       const renderer = new Renderer({
         alphaMode: "premultiplied",
@@ -45,12 +42,14 @@
       const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
       const cameraControls = new CameraControls(camera, scene.position);
 
-      const geometry = new PlaneGeometry(1000, 1000);
+      const fontLoader = new FontLoader();
+      const fontInfo = await fontLoader.load('assets/fonts/TT_Supermolot_Neue_Extended_ExtraLight.arfont');
+      const geometry = new TextGeometry('HELLO KANSEI', fontInfo, 100, 100, 25);
       const sampler = new Sampler('linear', 'linear');
       const material = new Material(shaderCode, [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           value: fontInfo.sdfTexture
         },
         {
@@ -60,12 +59,8 @@
         }
       ], true);
       const mesh = new Mesh(geometry, material);
+      mesh.position.x = -6;
       scene.add(mesh);
-
-      const mesh2 = new Mesh(geometry, material);
-      mesh.position.z += 10;
-      mesh.position.x =+ 0;
-      scene.add(mesh2);
 
       function animate() {
         cameraControls.update();

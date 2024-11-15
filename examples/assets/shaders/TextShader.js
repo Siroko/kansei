@@ -19,16 +19,36 @@ struct VertexOut {
 fn vertex_main(
     @location(0) position: vec4<f32>,
     @location(1) normal : vec3<f32>,
-    @location(2) uv : vec2<f32>
+    @location(2) uv : vec2<f32>,
+    @location(3) a_particlePos : vec4<f32>,
+    @location(4) a_imageBounds : vec4<f32>,
+    @location(5) a_planeBounds : vec4<f32>,
+    @location(6) a_color : vec4<f32>
 ) -> VertexOut
 {
     var output : VertexOut;
-    output.position = projectionMatrix * viewMatrix * worldMatrix * position;
+    
+    let boundedPosition = vec3<f32>(
+        mix(a_planeBounds.x, a_planeBounds.z, step(0.0, position.x)),
+        mix(a_planeBounds.y, a_planeBounds.w, step(0.0, position.y)),
+        position.z
+    );
+    var offsetVertex: vec4<f32> = vec4<f32>(boundedPosition.xyz + a_particlePos.xyz, 1.0);
+
+    output.position = projectionMatrix * viewMatrix * worldMatrix * offsetVertex;
     output.normal = (worldMatrix * vec4<f32>(normal, 1.0)).xyz;
-    output.uv = uv;
+    output.uv = vec2<f32>(
+        mapValue(uv.x, 0.0, 1.0, a_imageBounds.x, a_imageBounds.z), 
+        mapValue(uv.y, 0.0, 1.0, a_imageBounds.y, a_imageBounds.w)
+    );
     output.viewPosition = worldMatrix * position;
     return output;
 } 
+
+fn mapValue(x: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f32
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
 
 @fragment
 fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
