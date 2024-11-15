@@ -44,7 +44,7 @@
 
       const fontLoader = new FontLoader();
       const fontInfo = await fontLoader.load('assets/fonts/TT_Supermolot_Neue_Extended_ExtraLight.arfont');
-      const geometry = new TextGeometry('HELLO KANSEI', fontInfo, 100, 100, 25);
+      const geometry = new TextGeometry('HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI HELL`O KANSEI', fontInfo, 13, 100, 25);
       const sampler = new Sampler('linear', 'linear');
       const material = new Material(shaderCode, [
         {
@@ -60,6 +60,7 @@
       ], true);
       const mesh = new Mesh(geometry, material);
       mesh.position.x = -6;
+      mesh.position.y = 10;
       scene.add(mesh);
 
       function animate() {
