@@ -95,7 +95,7 @@ export class FontLoader {
         const imgData = new ImageData(dataArray, image.width, image.height);
         ctx!.putImageData(imgData, 0, 0);
 
-        this.sdfTexture = new Texture(canvas);
+        this.sdfTexture = new Texture(canvas, true);
         this.fontInfo!.sdfTexture = this.sdfTexture;
 
         return this.fontInfo!;

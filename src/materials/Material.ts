@@ -52,7 +52,7 @@ class Material {
      * @param vertexBuffersDescriptors - Descriptors for the vertex buffers.
      * @param presentationFormat - The format of the presentation surface.
      */
-    public initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat) {
+    public initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat, sampleCount: number) {
         if (!this.shaderRenderModule) {
             this.createShaderModule(gpuDevice);
         }
@@ -72,6 +72,9 @@ class Material {
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
             layout: this.uniformGroup.pipelineBindGroupLayout,
             label: "Render Pipeline",
+            multisample: {
+                count: sampleCount
+            },
             vertex: {
                 module: this.shaderRenderModule,
                 entryPoint: 'vertex_main',
