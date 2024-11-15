@@ -35,11 +35,12 @@ class TextGeometry extends InstancedGeometry {
         const imageBoundsBuffer = new Float32Array(text.length * 4);
         const colorsBuffer = new Float32Array(text.length * 4);
 
+        let posX = 0;
         for (let i = 0; i < text.length; i++) {
             const glyph = fontInfo.variants[0].glyphs.find((char) => char.codepoint === text.charCodeAt(i));
 
-            posBuffer[i * 4] = i % width + 0.5; // X coordinate
-            posBuffer[i * 4 + 1] = Math.floor(i / width); // Y coordinate
+            posBuffer[i * 4] = posX % this._width; // X coordinate
+            posBuffer[i * 4 + 1] = -Math.floor(posX / this._width); // Y coordinate
             posBuffer[i * 4 + 2] = 0; // Z coordinate
             posBuffer[i * 4 + 3] = 1; // W coordinate
 
@@ -58,6 +59,7 @@ class TextGeometry extends InstancedGeometry {
             colorsBuffer[i * 4 + 2] = this._color.z;
             colorsBuffer[i * 4 + 3] = this._color.w;
 
+            posX += glyph!.advance.horizontal;
         }
 
         const computeBufferPositions = new ComputeBuffer({
