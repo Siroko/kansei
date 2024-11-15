@@ -20,6 +20,8 @@ export interface RendererOptions {
     premultipliedAlpha?: boolean;
     alphaMode?: GPUCanvasAlphaMode;
     clearColor?: Vector4;
+    width?: number;
+    height?: number;
 }
 
 /**
@@ -38,6 +40,8 @@ class Renderer {
     public context: GPUCanvasContext | null;
     private device?: GPUDevice;
     private presentationFormat?: GPUTextureFormat;
+    private sampleCount: number = 4;
+    private colorTexture?: GPUTexture;
     private depthTexture?: GPUTexture;
 
     constructor(
@@ -77,6 +81,11 @@ class Renderer {
                     format: this.presentationFormat,
                     alphaMode: this.options?.alphaMode || "opaque",
                 });
+
+                this.setSize(
+                    this.options.width || this.domElement.width,
+                    this.options.height || this.domElement.height
+                );
             }
         }
         return Promise.resolve();
@@ -94,7 +103,17 @@ class Renderer {
         this.depthTexture?.destroy();
         this.depthTexture = this.device!.createTexture({
             size: [this.domElement.width, this.domElement.height],
+            sampleCount: this.sampleCount,
+            dimension: '2d',
             format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+
+        this.colorTexture?.destroy();
+        this.colorTexture = this.device!.createTexture({
+            size: [this.domElement.width, this.domElement.height],
+            sampleCount: this.sampleCount,
+            format: this.presentationFormat!,
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
     }
@@ -112,7 +131,8 @@ class Renderer {
         const renderPassDescriptor = {
             colorAttachments: [
                 {
-                    view: textureView,
+                    view: this.colorTexture!.createView(),
+                    resolveTarget: textureView,
                     clearValue: {
                         r: this.options.clearColor?.x || 0.0,
                         g: this.options.clearColor?.y || 0.0,
@@ -168,7 +188,12 @@ class Renderer {
                 mesh.geometry.initialize(this.device!);
             }
             if (!mesh.material.initialized) {
-                mesh.material.initialize(this.device!, mesh.geometry.vertexBuffersDescriptors!, this.presentationFormat!);
+                mesh.material.initialize(
+                    this.device!,
+                    mesh.geometry.vertexBuffersDescriptors!,
+                    this.presentationFormat!,
+                    this.sampleCount
+                );
             }
 
             passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, mesh.geometry.indexFormat!);

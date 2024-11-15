@@ -54,6 +54,7 @@ class Sampler implements IBindable {
         const sampler = gpuDevice.createSampler({
             magFilter: this.magFilter,
             minFilter: this.minFilter,
+            mipmapFilter: this.magFilter,
             addressModeU: this.repeatMode,
             addressModeV: this.repeatMode,
         });
