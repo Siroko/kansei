@@ -43,20 +43,20 @@ class TextGeometry extends InstancedGeometry {
             posBuffer[i * 4 + 2] = 0; // Z coordinate
             posBuffer[i * 4 + 3] = 1; // W coordinate
 
-            imageBoundsBuffer[i * 4] = glyph!.image_bounds.left / fontInfo.images[0].width;
-            imageBoundsBuffer[i * 4 + 1] = glyph!.image_bounds.top / fontInfo.images[0].height;
-            imageBoundsBuffer[i * 4 + 2] = glyph!.image_bounds.right / fontInfo.images[0].width;
-            imageBoundsBuffer[i * 4 + 3] = glyph!.image_bounds.bottom / fontInfo.images[0].height;
+            imageBoundsBuffer[i * 4] = glyph!.image_bounds.left / this._fontInfo.images[0].width;
+            imageBoundsBuffer[i * 4 + 1] = glyph!.image_bounds.top / this._fontInfo.images[0].height;
+            imageBoundsBuffer[i * 4 + 2] = glyph!.image_bounds.right / this._fontInfo.images[0].width;
+            imageBoundsBuffer[i * 4 + 3] = glyph!.image_bounds.bottom / this._fontInfo.images[0].height;
 
             planeBoundsBuffer[i * 4] = glyph!.plane_bounds.left;
             planeBoundsBuffer[i * 4 + 1] = glyph!.plane_bounds.top;
             planeBoundsBuffer[i * 4 + 2] = glyph!.plane_bounds.right;
             planeBoundsBuffer[i * 4 + 3] = glyph!.plane_bounds.bottom;
 
-            colorsBuffer[i * 4] = color.x;
-            colorsBuffer[i * 4 + 1] = color.y;
-            colorsBuffer[i * 4 + 2] = color.z;
-            colorsBuffer[i * 4 + 3] = color.w;
+            colorsBuffer[i * 4] = this._color.x;
+            colorsBuffer[i * 4 + 1] = this._color.y;
+            colorsBuffer[i * 4 + 2] = this._color.z;
+            colorsBuffer[i * 4 + 3] = this._color.w;
 
         }
 
@@ -118,6 +118,14 @@ class TextGeometry extends InstancedGeometry {
             computeBufferPlaneBounds,
             computeBufferColors
         );
+    }
+
+    set fontSize(fontSize: number) {
+        this._fontSize = fontSize;
+    }
+
+    get fontSize() {
+        return this._fontSize;
     }
 
     set text(text: string) {
