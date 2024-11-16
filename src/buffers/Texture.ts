@@ -135,19 +135,31 @@ class Texture implements IBindable {
         fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let outCoord = vec2<u32>(global_id.xy);
             
-            // Sample in a wider pattern for anisotropic filtering
-            // Using a 4x2 kernel for horizontal anisotropy
+            // Sample in a 6x3 pattern for enhanced anisotropic filtering
             let color = (
-                // First row
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-1, 0), 0) * 0.125 +
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(0, 0), 0) * 0.25 +
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(1, 0), 0) * 0.25 +
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(2, 0), 0) * 0.125 +
-                // Second row
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-1, 1), 0) * 0.0625 +
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(0, 1), 0) * 0.125 +
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(1, 1), 0) * 0.125 +
-                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(2, 1), 0) * 0.0625
+                // First (top) row - weight 0.1
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-2, -1), 0) * 0.01 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-1, -1), 0) * 0.02 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(0, -1), 0) * 0.03 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(1, -1), 0) * 0.02 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(2, -1), 0) * 0.01 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(3, -1), 0) * 0.01 +
+
+                // Middle row (primary sampling) - weight 0.5
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-2, 0), 0) * 0.05 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-1, 0), 0) * 0.1 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(0, 0), 0) * 0.15 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(1, 0), 0) * 0.1 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(2, 0), 0) * 0.05 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(3, 0), 0) * 0.05 +
+
+                // Bottom row - weight 0.4
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-2, 1), 0) * 0.04 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(-1, 1), 0) * 0.08 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(0, 1), 0) * 0.12 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(1, 1), 0) * 0.08 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(2, 1), 0) * 0.04 +
+                textureLoad(inputTexture, vec2<i32>(outCoord * 2u) + vec2<i32>(3, 1), 0) * 0.04
             );
 
             textureStore(outputTexture, vec2<i32>(outCoord), color);
