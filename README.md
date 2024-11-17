@@ -69,6 +69,62 @@ animate();
 - **Compute**: Manages compute shader operations
 - **ComputeBuffer**: Handles data for compute shaders
 
+## Text Rendering
+
+Kansei includes a high-quality text rendering system using Multi-channel Signed Distance Field (MSDF) technology.
+
+### Font Generation
+
+1. Visit [msdf.kansei.graphics](https://msdf.kansei.graphics/)
+2. Upload your TTF/OTF font file
+3. Download the generated `.arfont` file containing:
+   - SDF texture atlas
+   - Font metrics
+   - Glyph information
+
+### Basic Text Usage
+
+```javascript
+import { FontLoader, TextGeometry, Material, Mesh } from 'kansei';
+
+// Load the font
+const fontLoader = new FontLoader();
+const fontInfo = await fontLoader.load('path/to/your-font.arfont');
+
+// Create text geometry
+const geometry = new TextGeometry('Hello World', fontInfo, {
+  fontSize: 40,
+  lineWidth: 100,
+  lineHeight: 25
+});
+
+// Create material with SDF shader
+const material = new Material(shaderCode, [
+  {
+    binding: 0,
+    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+    value: fontInfo.sdfTexture
+  }
+]);
+
+// Create and add mesh to scene
+const textMesh = new Mesh(geometry, material);
+scene.add(textMesh);
+```
+
+### Features
+
+- High-quality text rendering at any scale
+- Support for custom fonts via MSDF generation
+- Efficient GPU-based rendering
+- Full Unicode support
+- Customizable text properties:
+  - Font size
+  - Line width
+  - Line height
+  - Color
+  - Alignment
+
 ## Development
 
 1. Clone the repository
