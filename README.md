@@ -92,11 +92,8 @@ const fontLoader = new FontLoader();
 const fontInfo = await fontLoader.load('path/to/your-font.arfont');
 
 // Create text geometry
-const geometry = new TextGeometry('Hello World', fontInfo, {
-  fontSize: 40,
-  lineWidth: 100,
-  lineHeight: 25
-});
+const geometry = new TextGeometry('Hello World', fontInfo, 100, 25, 12, new Vector4(1, 1, 1, 1));
+const sampler = new Sampler('linear', 'linear');
 
 // Create material with SDF shader
 const material = new Material(shaderCode, [
@@ -104,6 +101,11 @@ const material = new Material(shaderCode, [
     binding: 0,
     visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
     value: fontInfo.sdfTexture
+  },
+  {
+    binding: 1,
+    visibility: GPUShaderStage.FRAGMENT,
+    value: sampler
   }
 ]);
 
