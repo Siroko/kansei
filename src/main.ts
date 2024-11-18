@@ -24,3 +24,5 @@ export { ComputeBuffer } from "./buffers/ComputeBuffer";
 export { SphereGeometry } from "./geometries/SphereGeometry";
 export { ShaderChunks } from "./materials/shaders/ShaderChunks";
 export { MouseVectors } from "./controls/MouseVectors";
+export { TextGeometry } from "./geometries/TextGeometry";
+export { FontLoader } from "./sdf/text/FontLoader";

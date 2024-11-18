@@ -70,7 +70,7 @@ class CameraControls {
         this.radius = radius || window.innerWidth < 768 ? 35 : 22;
         this.wheelDelta = this.radius;
         this.wheelDeltaEase = this.radius;
-        this.limits = { up: 0.15, down: -0.15 };
+        this.limits = { up: 0.2, down: -0.2 };
         this.mouseX = -1;
         this.mouseY = -1;
         this._mouseX = -1;

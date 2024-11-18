@@ -22,7 +22,6 @@ class TextGeometry extends InstancedGeometry {
     ) {
         super(new PlaneGeometry(1, 1), text.length);
 
-        console.log(fontInfo);
         this._text = text;
         this._fontInfo = fontInfo;
         this._width = width;

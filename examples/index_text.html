@@ -29,7 +29,13 @@
       import { Vector4 } from '../src/math/Vector4'
       import { TextGeometry } from '../src/geometries/TextGeometry'
       import { poem } from './assets/copy/poem.js'
-
+      import { shaderCode as shaderTextPositions } from './assets/shaders/ComputeTextPositions.js'
+      import { shaderCode as shaderVelocities } from './assets/shaders/ComputeTextVelocities.js'
+      import { Compute } from '../src/materials/Compute'
+      import { MouseVectors } from '../src/controls/MouseVectors'
+      import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { BufferBase } from '../src/buffers/BufferBase'
+      const time = new Vector4(0, 0, 0, 0);
       const renderer = new Renderer({
         alphaMode: "premultiplied",
         clearColor: new Vector4(0, 0, 0, 0),  // Fully transparent black
@@ -39,12 +45,14 @@
       await renderer.initialize();
       document.body.appendChild(renderer.domElement);
 
+      const mouseVectors = new MouseVectors();
+
       const scene = new Scene();
       const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
       const cameraControls = new CameraControls(camera, scene.position);
 
       const fontLoader = new FontLoader();
-      const fontInfo = await fontLoader.load('assets/fonts/TT_Supermolot_Neue_Variable-atlas.arfont');
+      const fontInfo = await fontLoader.load('assets/fonts/L10-medium.arfont');
 
       const geometry = new TextGeometry(poem, fontInfo, 40, 100, 25);
       const sampler = new Sampler('linear', 'linear');
@@ -60,14 +68,98 @@
           value: sampler
         }
       ], true);
+
       const mesh = new Mesh(geometry, material);
       mesh.position.x = -20;
       mesh.position.y = 8;
       scene.add(mesh);
 
-      function animate() {
+      const computeBufferVelocities = new ComputeBuffer({
+        usage: 
+          BufferBase.BUFFER_USAGE_STORAGE |
+          BufferBase.BUFFER_USAGE_COPY_SRC,
+        type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+        buffer:  new Float32Array(poem.length * 4)
+      });
+
+      const computeVelocities = new Compute(shaderVelocities, [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          value: computeBufferVelocities
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          value: geometry.extraBuffers[0]
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          value: time
+        },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.COMPUTE,
+          value: mouseVectors.mouseDirection
+        },
+        {
+          binding: 4,
+          visibility: GPUShaderStage.COMPUTE,
+          value: mouseVectors.mousePosition
+        },
+        {
+          binding: 5,
+          visibility: GPUShaderStage.COMPUTE,
+          value: mesh.worldMatrix
+        },
+        {
+          binding: 6,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.viewMatrix
+        },
+        {
+          binding: 7,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.inverseViewMatrix
+        },
+        {
+          binding: 8,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.projectionMatrix
+        }
+      ]);
+
+      const compute = new Compute(shaderTextPositions, [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            value: geometry.extraBuffers[0]
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            value: computeBufferVelocities
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            value: time
+          }
+      ]);
+
+      async function animate() {
+        time.x = performance.now() / 1000;
+        time.y = time.x - time.z;
+        time.z = time.x;
+        time.w = mouseVectors.mouseStrength;
+
+        mouseVectors.update(time.y);
         cameraControls.update();
+        await renderer.compute(computeVelocities, Math.ceil(poem.length / 64));
+        await renderer.compute(compute, Math.ceil(poem.length / 64));
         renderer.render(scene, camera);
+        
         requestAnimationFrame(animate);
       }
       animate();
