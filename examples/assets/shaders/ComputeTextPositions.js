@@ -6,7 +6,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var position = positions[global_id.x];
     var velocity = velocities[global_id.x];
     position += velocity;
-    position.z = pow(sin(time.x + position.x*0.1), 3.0) + cos(time.x + position.y*0.1);
+    position.z = 10.0 * pow(sin(time.x + position.x*0.1), 3.0) + cos(time.x + position.y*0.1);
 
 
     // Store the result back
