@@ -10,8 +10,9 @@ class Material {
     public pipeline?: GPURenderPipeline;
     public initialized: boolean = false;
     public uuid: string;
+    public transparent: boolean = false;
+
     private uniformGroup: UniformGroup;
-    private transparent: boolean = false;
     private depthWriteEnabled: boolean = true;
     private depthCompare: GPUCompareFunction = 'less';
     private cullMode: GPUCullMode = 'back';
@@ -22,7 +23,14 @@ class Material {
      * Constructs a new Material instance.
      * 
      * @param shaderCode - The shader code to be used for this material.
-     * @param uniforms - The descriptor for the bind group uniforms.
+     * @param options - Configuration options for the material
+     * @param options.uniforms - Array of uniform descriptors for the material's bind group
+     * @param options.transparent - Whether the material is transparent. Affects depth writing and culling. Defaults to false
+     * @param options.depthWriteEnabled - Whether depth writing is enabled. Defaults to true
+     * @param options.depthCompare - Depth comparison function. Defaults to 'less'
+     * @param options.cullMode - Face culling mode. Defaults to 'back'
+     * @param options.topology - Primitive topology type. Defaults to 'triangle-list'
+     * @param options.depthStencilFormat - Format of the depth/stencil buffer. Defaults to 'depth24plus'
      */
     constructor(
         private shaderCode: string,
@@ -40,7 +48,7 @@ class Material {
         this.uuid = crypto.randomUUID();
 
         this.transparent = this.options.transparent || false;
-        this.depthWriteEnabled = this.options.depthWriteEnabled || true;
+        this.depthWriteEnabled = this.options.depthWriteEnabled ?? true;
         this.depthCompare = this.options.depthCompare || 'less';
         this.cullMode = this.options.cullMode || 'back';
         this.topology = this.options.topology || 'triangle-list';
