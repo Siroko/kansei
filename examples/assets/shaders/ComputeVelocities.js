@@ -21,8 +21,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if(distanceToMouse < mouseStrength * 2.0 && mouseStrength > 0.01) {
         var nDistance = distanceToMouse / (mouseStrength * 2.0);
         var displaceMentVector = vec2<f32>(
-            mouseDirection.x * mouseStrength * 300.0 * (1.0 - nDistance) * -1.0, 
-            mouseDirection.y * mouseStrength * 300.0 * (1.0 - nDistance)
+            mouseDirection.x * mouseStrength * 150.0 * (1.0 - nDistance) * -1.0, 
+            mouseDirection.y * mouseStrength * 150.0 * (1.0 - nDistance)
         );
         // Assuming you have a modelMatrix defined
         var worldDisplacementVector = (inverseViewMatrix * vec4<f32>(displaceMentVector, 0.0, 0.0)).xyz;

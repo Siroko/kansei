@@ -35,6 +35,8 @@
       import { MouseVectors } from '../src/controls/MouseVectors'
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
       import { BufferBase } from '../src/buffers/BufferBase'
+      import { Float } from '../src/math/Float'
+
       const time = new Vector4(0, 0, 0, 0);
       const renderer = new Renderer({
         alphaMode: "premultiplied",
@@ -54,20 +56,32 @@
       const fontLoader = new FontLoader();
       const fontInfo = await fontLoader.load('assets/fonts/L10-medium.arfont');
 
-      const geometry = new TextGeometry(poem, fontInfo, 40, 100, 25);
+      let timeFloat = new Float(0);
+
+      const geometry = new TextGeometry({
+        text: poem,
+        fontInfo: fontInfo,
+        width: 40,
+        height: 100,
+        fontSize: 25,
+        color: new Vector4(1, 1, 1, 1)
+      });
       const sampler = new Sampler('linear', 'linear');
-      const material = new Material(shaderCode, [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-          value: fontInfo.sdfTexture
-        },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.FRAGMENT,
-          value: sampler
-        }
-      ], true);
+      const material = new Material(shaderCode, {
+        uniforms: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+            value: fontInfo.sdfTexture
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.FRAGMENT,
+            value: sampler
+          }
+        ],
+        transparent: true
+      });
 
       const mesh = new Mesh(geometry, material);
       mesh.position.x = -20;
@@ -145,6 +159,11 @@
             binding: 2,
             visibility: GPUShaderStage.COMPUTE,
             value: time
+          },
+          {
+            binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            value: new Float(geometry.width)
           }
       ]);
 
@@ -154,6 +173,7 @@
         time.z = time.x;
         time.w = mouseVectors.mouseStrength;
 
+        timeFloat.value += time.y;
         mouseVectors.update(time.y);
         cameraControls.update();
         await renderer.compute(computeVelocities, Math.ceil(poem.length / 64));

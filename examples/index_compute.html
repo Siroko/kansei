@@ -92,7 +92,9 @@
       const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [
         computeBufferPositions
       ]);
-      const material = new Material(renderCode, []);
+      const material = new Material(renderCode, {
+        uniforms: []
+      });
       const mesh = new Mesh(instancedGeometry, material);
       scene.add(mesh);
 

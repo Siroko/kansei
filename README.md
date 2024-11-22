@@ -11,6 +11,8 @@ Kansei is a Toy WebGPU engine built with TypeScript, designed to bring a bit mor
 - Texture and video texture support
 - Scene graph management
 - Camera controls
+- Compute shader support
+- MSDF text rendering
 
 ## Installation
 
@@ -20,7 +22,7 @@ npm install kansei
 
 ## Basic Usage
 
-```javascript
+```typescript
 import {
   Renderer,
   Scene,
@@ -30,7 +32,10 @@ import {
   Material,
 } from 'kansei';
 
-const renderer = new Renderer();
+const renderer = new Renderer({
+  antialias: true,
+  alphaMode: 'premultiplied'
+});
 await renderer.initialize();
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
@@ -40,7 +45,18 @@ const camera = new Camera(75, 0.1, 100, window.innerWidth / window.innerHeight);
 camera.position.z = 5;
 
 const geometry = new BoxGeometry(1, 1, 1);
-const material = new Material(shaderCode);
+const material = new Material(shaderCode, {
+  uniforms: [
+    {
+      binding: 0,
+      visibility: GPUShaderStage.FRAGMENT,
+      value: texture
+    }
+  ],
+  transparent: false,
+  depthWriteEnabled: true,
+  cullMode: 'back'
+});
 const mesh = new Mesh(geometry, material);
 scene.add(mesh);
 
@@ -69,47 +85,63 @@ animate();
 - **Compute**: Manages compute shader operations
 - **ComputeBuffer**: Handles data for compute shaders
 
-## Text Rendering
+## Font generation
 
-Kansei includes a high-quality text rendering system using Multi-channel Signed Distance Field (MSDF) technology.
-
-### Font Generation
-
-1. Visit [msdf.kansei.graphics](https://msdf.kansei.graphics/)
+1. Visit [msdf.kansei.graphics](https://msdf.kansei.
+graphics/)
 2. Upload your TTF/OTF font file
 3. Download the generated `.arfont` file containing:
    - SDF texture atlas
    - Font metrics
    - Glyph information
 
-### Basic Text Usage
+## Text Rendering
 
-```javascript
-import { FontLoader, TextGeometry, Material, Mesh } from 'kansei';
+Kansei includes a text rendering system using Multi-channel Signed Distance Field (MSDF) technology.
+
+### Text Usage
+
+```typescript
+import { 
+  FontLoader, 
+  TextGeometry, 
+  Material, 
+  Mesh, 
+  Sampler,
+  Vector4 
+} from 'kansei';
 
 // Load the font
 const fontLoader = new FontLoader();
-const fontInfo = await fontLoader.load('path/to/your-font.arfont');
+const fontInfo = await fontLoader.load('path/to/font.arfont');
 
 // Create text geometry
-const geometry = new TextGeometry('Hello World', fontInfo, 100, 25, 12, new Vector4(1, 1, 1, 1));
-const sampler = new Sampler('linear', 'linear');
+const geometry = new TextGeometry({
+  text: 'Hello World',
+  fontInfo: fontInfo,
+  width: 40,
+  height: 100,
+  fontSize: 25,
+  color: new Vector4(1, 1, 1, 1)
+});
 
 // Create material with SDF shader
-const material = new Material(shaderCode, [
-  {
-    binding: 0,
-    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-    value: fontInfo.sdfTexture
-  },
-  {
-    binding: 1,
-    visibility: GPUShaderStage.FRAGMENT,
-    value: sampler
-  }
-]);
+const material = new Material(shaderCode, {
+  uniforms: [
+    {
+      binding: 0,
+      visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+      value: fontInfo.sdfTexture
+    },
+    {
+      binding: 1,
+      visibility: GPUShaderStage.FRAGMENT,
+      value: new Sampler('linear', 'linear')
+    }
+  ],
+  transparent: true
+});
 
-// Create and add mesh to scene
 const textMesh = new Mesh(geometry, material);
 scene.add(textMesh);
 ```
@@ -125,7 +157,33 @@ scene.add(textMesh);
   - Line width
   - Line height
   - Color
-  - Alignment
+
+## Compute Shader Support
+
+```typescript
+import { Compute, ComputeBuffer, BufferBase } from 'kansei';
+
+// Create compute shader with storage buffer
+const computeBuffer = new ComputeBuffer({
+  usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX,
+  type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+  buffer: data,
+  shaderLocation: 0
+});
+
+const compute = new Compute(shaderCode, {
+  uniforms: [
+    {
+      binding: 0,
+      visibility: GPUShaderStage.COMPUTE,
+      value: computeBuffer
+    }
+  ]
+});
+
+// Dispatch compute shader
+compute.dispatch(workgroupCount);
+```
 
 ## Development
 
@@ -147,6 +205,7 @@ Check out our example implementations:
 
 1. [Basic scene rendering](examples/index.html)
 2. [Compute shader usage](examples/index_compute.html)
+3. [Text rendering](examples/index_text.html)
 
 ## License
 

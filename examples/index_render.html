@@ -39,23 +39,25 @@
       const cameraControls = new CameraControls(camera, scene.position);
       const tl = new TextureLoader();
       const imageBitmap = await tl.load("./assets/textures/character_sheet_without_black.jpg");
-      const texture = new Texture(imageBitmap);
+      const texture = new Texture(imageBitmap, true);
       const sampler = new Sampler('linear', 'linear');
-      const material = new Material(shaderCode, [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
-          value: texture
-        },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.FRAGMENT,
-          value: sampler
-        }
-      ]);
+      const material = new Material(shaderCode, {
+        uniforms: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.FRAGMENT,
+            value: texture
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.FRAGMENT,
+            value: sampler
+          }
+        ]
+      });
       const geometry = new BoxGeometry(1, 1, 1);
       const meshes = [];
-      for (let i = 0; i < 2000; i++) {
+      for (let i = 0; i < 3000; i++) {
         const mesh = new Mesh(geometry, material);
         mesh.position.x = Math.random() * 10 - 5;
         mesh.position.y = Math.random() * 10 - 5;

@@ -13,30 +13,31 @@ class TextGeometry extends InstancedGeometry {
     private _fontSize: number;
     private _color: Vector4;
 
-    constructor(text: string,
+    constructor(options: {
+        text: string,
         fontInfo: FontInfo,
         width: number,
         height: number,
         fontSize: number,
-        color: Vector4 = new Vector4(1, 1, 1, 1)
-    ) {
-        super(new PlaneGeometry(1, 1), text.length);
+        color?: Vector4
+    }) {
+        super(new PlaneGeometry(1, 1), options.text.length);
 
-        this._text = text;
-        this._fontInfo = fontInfo;
-        this._width = width;
-        this._height = height;
-        this._fontSize = fontSize;
-        this._color = color;
+        this._text = options.text;
+        this._fontInfo = options.fontInfo;
+        this._width = options.width;
+        this._height = options.height;
+        this._fontSize = options.fontSize;
+        this._color = options.color || new Vector4(1, 1, 1, 1);
 
-        const posBuffer = new Float32Array(text.length * 4);
-        const planeBoundsBuffer = new Float32Array(text.length * 4);
-        const imageBoundsBuffer = new Float32Array(text.length * 4);
-        const colorsBuffer = new Float32Array(text.length * 4);
+        const posBuffer = new Float32Array(this._text.length * 4);
+        const planeBoundsBuffer = new Float32Array(this._text.length * 4);
+        const imageBoundsBuffer = new Float32Array(this._text.length * 4);
+        const colorsBuffer = new Float32Array(this._text.length * 4);
 
         let posX = 0;
-        for (let i = 0; i < text.length; i++) {
-            const glyph = fontInfo.variants[0].glyphs.find((char) => char.codepoint === text.charCodeAt(i));
+        for (let i = 0; i < this._text.length; i++) {
+            const glyph = this._fontInfo.variants[0].glyphs.find((char: any) => char.codepoint === this._text.charCodeAt(i));
 
             posBuffer[i * 4] = posX % this._width; // X coordinate
             posBuffer[i * 4 + 1] = -Math.floor(posX / this._width); // Y coordinate

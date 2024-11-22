@@ -9,10 +9,14 @@ class Material {
     public shaderRenderModule?: GPUShaderModule;
     public pipeline?: GPURenderPipeline;
     public initialized: boolean = false;
-
     public uuid: string;
-
     private uniformGroup: UniformGroup;
+    private transparent: boolean = false;
+    private depthWriteEnabled: boolean = true;
+    private depthCompare: GPUCompareFunction = 'less';
+    private cullMode: GPUCullMode = 'back';
+    private topology: GPUPrimitiveTopology = 'triangle-list';
+    private depthStencilFormat: GPUTextureFormat = 'depth24plus';
 
     /**
      * Constructs a new Material instance.
@@ -22,16 +26,25 @@ class Material {
      */
     constructor(
         private shaderCode: string,
-        public uniforms: BindGroupDescriptor[],
-        public transparent: boolean = false,
-        public depthWriteEnabled: boolean = true,
-        public depthCompare: GPUCompareFunction = 'less',
-        public cullMode: GPUCullMode = 'back',
-        public topology: GPUPrimitiveTopology = 'triangle-list',
-        public depthStencilFormat: GPUTextureFormat = 'depth24plus',
+        private options: {
+            uniforms?: BindGroupDescriptor[],
+            transparent?: boolean,
+            depthWriteEnabled?: boolean,
+            depthCompare?: GPUCompareFunction,
+            cullMode?: GPUCullMode,
+            topology?: GPUPrimitiveTopology,
+            depthStencilFormat?: GPUTextureFormat,
+        }
     ) {
-        this.uniformGroup = new UniformGroup(uniforms);
+        this.uniformGroup = new UniformGroup(this.options.uniforms || []);
         this.uuid = crypto.randomUUID();
+
+        this.transparent = this.options.transparent || false;
+        this.depthWriteEnabled = this.options.depthWriteEnabled || true;
+        this.depthCompare = this.options.depthCompare || 'less';
+        this.cullMode = this.options.cullMode || 'back';
+        this.topology = this.options.topology || 'triangle-list';
+        this.depthStencilFormat = this.options.depthStencilFormat || 'depth24plus';
     }
 
     /**
@@ -102,14 +115,14 @@ class Material {
                 ]
             } as GPUFragmentState,
             primitive: {
-                topology: 'triangle-list',
-                cullMode: this.transparent ? 'none' : 'back',
+                topology: this.topology,
+                cullMode: this.transparent ? 'none' : this.cullMode,
             } as GPUPrimitiveState,
 
             depthStencil: {
-                depthWriteEnabled: !this.transparent,
-                depthCompare: 'less',
-                format: 'depth24plus',
+                depthWriteEnabled: this.transparent ? false : this.depthWriteEnabled,
+                depthCompare: this.depthCompare,
+                format: this.depthStencilFormat,
             },
         }
         this.pipeline = gpuDevice.createRenderPipeline(renderPipelineDescriptor);
