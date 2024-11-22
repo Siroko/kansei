@@ -82,11 +82,12 @@
         format: "float32x4"
       });
       
+      const target = new Vector3(0, 0, 0);
       const scene = new Scene();
       const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
-      camera.lookAt(new Vector3(0, 0, 0));
-      const target = new Vector3(0, 0, 0);
-      const controls = new CameraControls(camera, target, null);
+      camera.lookAt(target);
+      const radius = window.innerWidth < 768 ? 300 : 200;
+      const controls = new CameraControls(camera, target, null, radius);
       controls.radius = 5000;
       
       const instancedGeometry = new InstancedGeometry(new SphereGeometry(1, 4), numParticles, [

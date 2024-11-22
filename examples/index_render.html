@@ -36,7 +36,8 @@
 
       const scene = new Scene();
       const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
-      const cameraControls = new CameraControls(camera, scene.position);
+      const radius = window.innerWidth < 768 ? 30 : 20;
+      const cameraControls = new CameraControls(camera, scene.position, null, radius);
       const tl = new TextureLoader();
       const imageBitmap = await tl.load("./assets/textures/character_sheet_without_black.jpg");
       const texture = new Texture(imageBitmap, true);
