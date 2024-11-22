@@ -87,8 +87,7 @@ animate();
 
 ## Font generation
 
-1. Visit [msdf.kansei.graphics](https://msdf.kansei.
-graphics/)
+1. Visit [msdf.kansei.graphics](https://msdf.kansei.graphics/)
 2. Upload your TTF/OTF font file
 3. Download the generated `.arfont` file containing:
    - SDF texture atlas
