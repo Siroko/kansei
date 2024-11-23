@@ -42,6 +42,22 @@ class ComputeBuffer extends BufferBase {
         this.stride = options.stride;
         this.format = options.format;
     }
+
+    /**
+     * Clones the current buffer
+     * @returns A new buffer instance with the same data
+     */
+    public clone(): ComputeBuffer {
+        return new ComputeBuffer({
+            type: this.type,
+            usage: this.usage,
+            buffer: this.buffer?.slice(),
+            shaderLocation: this.shaderLocation,
+            offset: this.offset,
+            stride: this.stride,
+            format: this.format
+        });
+    }
 }
 
 export { ComputeBuffer };

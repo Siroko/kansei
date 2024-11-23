@@ -12,6 +12,10 @@
         overflow: hidden;
         background-color: black;
       }
+      canvas {
+        width: 100%;
+        height: 100%;
+      }
     </style>
   </head>
   <body>
@@ -24,7 +28,7 @@
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
       import { CameraControls } from '../src/controls/CameraControls'
-      import { shaderCode } from './assets/shaders/TextShader.js'
+      import { shaderCode } from '../src/materials/shaders/rendering/msdf/TextRenderShader'
       import { Sampler } from '../src/buffers/Sampler'
       import { Vector4 } from '../src/math/Vector4'
       import { TextGeometry } from '../src/geometries/TextGeometry'
@@ -41,8 +45,8 @@
       const renderer = new Renderer({
         alphaMode: "premultiplied",
         clearColor: new Vector4(0, 0, 0, 0),  // Fully transparent black
-        width: window.innerWidth,
-        height: window.innerHeight
+        width: window.innerWidth * window.devicePixelRatio,
+        height: window.innerHeight * window.devicePixelRatio
       });
       await renderer.initialize();
       document.body.appendChild(renderer.domElement);
@@ -110,35 +114,40 @@
         {
           binding: 2,
           visibility: GPUShaderStage.COMPUTE,
-          value: time
+          value: geometry.extraBuffers[0].clone()
         },
         {
           binding: 3,
           visibility: GPUShaderStage.COMPUTE,
-          value: mouseVectors.mouseDirection
+          value: time
         },
         {
           binding: 4,
           visibility: GPUShaderStage.COMPUTE,
-          value: mouseVectors.mousePosition
+          value: mouseVectors.mouseDirection
         },
         {
           binding: 5,
           visibility: GPUShaderStage.COMPUTE,
-          value: mesh.worldMatrix
+          value: mouseVectors.mousePosition
         },
         {
           binding: 6,
           visibility: GPUShaderStage.COMPUTE,
-          value: camera.viewMatrix
+          value: mesh.worldMatrix
         },
         {
           binding: 7,
           visibility: GPUShaderStage.COMPUTE,
-          value: camera.inverseViewMatrix
+          value: camera.viewMatrix
         },
         {
           binding: 8,
+          visibility: GPUShaderStage.COMPUTE,
+          value: camera.inverseViewMatrix
+        },
+        {
+          binding: 9,
           visibility: GPUShaderStage.COMPUTE,
           value: camera.projectionMatrix
         }

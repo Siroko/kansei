@@ -7,9 +7,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Assuming you have a buffer for positions
     var velocity = velocities[global_id.x];
     var position = positions[global_id.x];
-    
+    var originalPosition = originalPositions[global_id.x];
+
+    let directionToOriginal = (originalPosition - position);
+
     // damping
-    velocity *= 0.99;
+    velocity *= 0.97;
 
     var projected = projectionMatrix * viewMatrix * worldMatrix * vec4<f32>(position, 1.0);
     var ndc = projected.xyz / projected.w; 
@@ -29,8 +32,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         velocity += vec3<f32>(worldDisplacementVector);
     }
 
+
     // Apply curl noise
     let curl_velocity = getCurlVelocity(vec4<f32>(position, 0.0));
+    velocity += directionToOriginal * 0.001;
     // velocity += curl_velocity * 0.001;
 
     // Store the result back
@@ -40,12 +45,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 // Declare the storage buffer for positions
 @group(0) @binding(0) var<storage, read_write> velocities: array<vec3<f32>>;
 @group(0) @binding(1) var<storage, read_write> positions: array<vec3<f32>>;
-@group(0) @binding(2) var<uniform> time: vec4<f32>;
-@group(0) @binding(3) var<uniform> mouseDirection: vec2<f32>;
-@group(0) @binding(4) var<uniform> mousePosition: vec2<f32>;
-@group(0) @binding(5) var<uniform> worldMatrix: mat4x4<f32>;
-@group(0) @binding(6) var<uniform> viewMatrix: mat4x4<f32>;
-@group(0) @binding(7) var<uniform> inverseViewMatrix: mat4x4<f32>;
-@group(0) @binding(8) var<uniform> projectionMatrix: mat4x4<f32>;
+@group(0) @binding(2) var<storage, read_write> originalPositions: array<vec3<f32>>;
+@group(0) @binding(3) var<uniform> time: vec4<f32>;
+@group(0) @binding(4) var<uniform> mouseDirection: vec2<f32>;
+@group(0) @binding(5) var<uniform> mousePosition: vec2<f32>;
+@group(0) @binding(6) var<uniform> worldMatrix: mat4x4<f32>;
+@group(0) @binding(7) var<uniform> viewMatrix: mat4x4<f32>;
+@group(0) @binding(8) var<uniform> inverseViewMatrix: mat4x4<f32>;
+@group(0) @binding(9) var<uniform> projectionMatrix: mat4x4<f32>;
 
 `;
