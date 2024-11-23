@@ -212,4 +212,8 @@ Check out our example implementations:
 
 MIT License
 
-This project uses [gl-matrix](https://github.com/toji/gl-matrix) by Brandon Jones and Colin MacKenzie IV, which is also under the MIT License.
+This project uses:
+- [gl-matrix](https://github.com/toji/gl-matrix) by Brandon Jones and Colin MacKenzie IV
+- [artery-font](https://github.com/sidit77/artery-font/) by sidit77 - A pure Rust parser for Artery Atlas font files (compiled to WebAssembly)
+
+All dependencies are under the MIT License.

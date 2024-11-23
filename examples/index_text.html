@@ -57,8 +57,11 @@
       const renderer = new Renderer({
         alphaMode: "premultiplied",
         clearColor: new Vector4(0, 0, 0, 0),  // Fully transparent black
-        width: window.innerWidth * window.devicePixelRatio,
-        height: window.innerHeight * window.devicePixelRatio
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: Math.min(window.devicePixelRatio, 2) ,
+        antialias: true,
+        sampleCount: 1
       });
       await renderer.initialize();
       document.body.appendChild(renderer.domElement);
@@ -174,15 +177,20 @@
           {
             binding: 1,
             visibility: GPUShaderStage.COMPUTE,
-            value: computeBufferVelocities
+            value: geometry.extraBuffers[0].clone()
           },
           {
             binding: 2,
             visibility: GPUShaderStage.COMPUTE,
-            value: time
+            value: computeBufferVelocities
           },
           {
             binding: 3,
+            visibility: GPUShaderStage.COMPUTE,
+            value: time
+          },
+          {
+            binding: 4,
             visibility: GPUShaderStage.COMPUTE,
             value: new Float(geometry.width)
           }
@@ -206,7 +214,7 @@
       animate();
 
       function onResize() {
-        renderer.setSize(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
       }

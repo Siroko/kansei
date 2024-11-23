@@ -22,6 +22,8 @@ export interface RendererOptions {
     clearColor?: Vector4;
     width?: number;
     height?: number;
+    sampleCount?: number;
+    devicePixelRatio?: number;
 }
 
 /**
@@ -41,14 +43,24 @@ class Renderer {
     private device?: GPUDevice;
     private presentationFormat?: GPUTextureFormat;
     private sampleCount: number = 4;
+    private devicePixelRatio: number = window.devicePixelRatio;
     private colorTexture?: GPUTexture;
     private depthTexture?: GPUTexture;
+    private width: number = 320;
+    private height: number = 240;
+    private clearColor: Vector4 = new Vector4(0, 0, 0, 0);
 
     constructor(
         private options: RendererOptions = {}
     ) {
         this.domElement = document.createElement('canvas');
         this.context = this.domElement.getContext('webgpu');
+        this.sampleCount = this.options.sampleCount || this.sampleCount;
+        this.devicePixelRatio = this.options.devicePixelRatio || this.devicePixelRatio;
+        this.width = this.options.width || this.width;
+        this.height = this.options.height || this.height;
+        this.clearColor = this.options.clearColor || this.clearColor;
+
         if (!this.context || navigator.gpu == null) {
             throw new Error('WebGPU is not supported');
         }
@@ -97,8 +109,10 @@ class Renderer {
      * @param {number} height - Canvas height in pixels
      */
     public setSize(width: number, height: number) {
-        this.domElement.width = width;
-        this.domElement.height = height;
+        this.width = width * this.devicePixelRatio;
+        this.height = height * this.devicePixelRatio;
+        this.domElement.width = this.width;
+        this.domElement.height = this.height;
 
         this.depthTexture?.destroy();
         this.depthTexture = this.device!.createTexture({
@@ -131,8 +145,8 @@ class Renderer {
         const renderPassDescriptor = {
             colorAttachments: [
                 {
-                    view: this.colorTexture!.createView(),
-                    resolveTarget: textureView,
+                    view: this.sampleCount > 1 ? this.colorTexture!.createView() : textureView,
+                    resolveTarget: this.sampleCount > 1 ? textureView : undefined,
                     clearValue: {
                         r: this.options.clearColor?.x || 0.0,
                         g: this.options.clearColor?.y || 0.0,
