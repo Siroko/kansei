@@ -1,6 +1,8 @@
 # kansei
 
-Kansei is a Toy WebGPU engine built with TypeScript, designed to bring a bit more feeling into digital experiences. Inspired by kansei engineering, it’s not just about achieving visual polish or performance; it’s about building interactions that resonate on an emotional level.
+Kansei is a Toy WebGPU engine built with TypeScript, inspired by old school 3D frameworks like Papervision3D, Pixi.js, Three.js or Unity compute pipeline, this library is not intended to cover a generalist use case but will be specifically targeting WebGPU and provide tools to render and compute simulations by using native WGSL. 
+
+Note that the library is highly experimental and WIP, so it will take some time to be production-ready 😅 
 
 ## Features
 
