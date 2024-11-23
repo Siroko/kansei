@@ -16,6 +16,18 @@
         width: 100%;
         height: 100%;
       }
+      #info {
+        position: absolute;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: white;
+        font-family: sans-serif;
+      }
+
+      #info a {
+        color: white;
+      }
     </style>
   </head>
   <body>
@@ -200,5 +212,8 @@
       }
       window.addEventListener('resize', onResize);
     </script>
+    <div id="info">
+      Made with ❤️ and <a href="https://github.com/siroko/kansei">KANSEI</a>
+    </div>
   </body>
 </html>
