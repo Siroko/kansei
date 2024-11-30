@@ -3,15 +3,15 @@ import { Mesh } from "./Mesh";
 import { Camera } from "../cameras/Camera";
 
 /**
- * Represents a 3D scene which can contain multiple objects.
+ * Represents a 3D stack which can contain multiple objects.
  * Extends the Object3D class to inherit transformation properties.
  */
-class Scene extends Object3D {
+class Stack extends Object3D {
     private opaqueObjects: Mesh[] = [];
     private transparentObjects: Mesh[] = [];
 
     /**
-     * Constructs a new Scene object.
+     * Constructs a new Stack object.
      */
     constructor() {
         super();
@@ -47,4 +47,4 @@ class Scene extends Object3D {
     }
 }
 
-export { Scene }
+export { Stack }

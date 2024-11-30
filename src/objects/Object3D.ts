@@ -45,6 +45,10 @@ class Object3D {
         // Implementation for setting uniforms
     }
 
+    public traverse(object: Object3D, callback: (object: Object3D) => void) {
+        callback(object);
+        object.children.forEach(child => this.traverse(child, callback));
+    }
     /**
      * Adds a child Object3D to this object.
      * @param object The Object3D to add as a child.
