@@ -1,6 +1,6 @@
 import { Geometry } from "../buffers/Geometry";
 import { Material } from "../materials/Material";
-import { UniformGroup } from "../materials/UniformGroup";
+import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
 
 /**
@@ -42,7 +42,7 @@ class Renderable extends Object3D {
      */
     protected setUniforms() {
         super.setUniforms();
-        this.uniformGroup = new UniformGroup([
+        this.uniformGroup = new BindableGroup([
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX,

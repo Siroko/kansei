@@ -24,7 +24,7 @@
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
-      import { Mesh } from '../src/objects/Mesh'
+      import { Renderable } from '../src/objects/Renderable'
       import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
       import { BoxGeometry } from '../src/geometries/BoxGeometry'
       import { SphereGeometry } from '../src/geometries/SphereGeometry'
@@ -39,15 +39,19 @@
       let mouseVectors = new MouseVectors();
       
       const renderer = new Renderer({
-        clearColor: new Vector4(0.1, 0.1, 0.1, 1.0)
+        clearColor: new Vector4(0.1, 0.1, 0.1, 1.0),
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: Math.min(window.devicePixelRatio, 2) ,
+        antialias: true,
+        sampleCount: 1
       });
       await renderer.initialize();
-      renderer.setSize(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
-      document.body.appendChild(renderer.domElement);
-      renderer.domElement.style.position = 'absolute';
-      renderer.domElement.style.top = '0';
-      renderer.domElement.style.left = '0';
-      renderer.domElement.style.height = '100%';
+      document.body.appendChild(renderer.canvas);
+      renderer.canvas.style.position = 'absolute';
+      renderer.canvas.style.top = '0';
+      renderer.canvas.style.left = '0';
+      renderer.canvas.style.height = '100%';
       // renderer.domElement.style.imageRendering = 'pixelated';
 
       const numParticles = 300000;
@@ -96,8 +100,8 @@
       const material = new Material(renderCode, {
         uniforms: []
       });
-      const mesh = new Mesh(instancedGeometry, material);
-      scene.add(mesh);
+      const renderable = new Renderable(instancedGeometry, material);
+      scene.add(renderable);
 
       const computeVelocities = new Compute(shaderVelocities, [
         {
@@ -128,7 +132,7 @@
         {
           binding: 5,
           visibility: GPUShaderStage.COMPUTE,
-          value: mesh.worldMatrix
+          value: renderable.worldMatrix
         },
         {
           binding: 6,

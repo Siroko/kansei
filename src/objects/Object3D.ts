@@ -1,6 +1,6 @@
 import { Vector3 } from "../math/Vector3";
 import { Matrix4 } from "../math/Matrix4";
-import { UniformGroup } from "../materials/UniformGroup";
+import { BindableGroup } from "../materials/BindableGroup";
 import { mat4, vec3 } from "gl-matrix";
 
 /**
@@ -17,7 +17,7 @@ class Object3D {
     protected lookAtMatrix: Matrix4 = new Matrix4();
 
     public children: Object3D[] = [];
-    public isMesh: boolean = false;
+    public isRenderable: boolean = false;
     public parent?: Object3D;
     public position: Vector3 = new Vector3();
     public rotation: Vector3 = new Vector3();
@@ -25,7 +25,7 @@ class Object3D {
 
     public up: Vector3 = new Vector3(0, 1, 0);
 
-    protected uniformGroup?: UniformGroup;
+    protected uniformGroup?: BindableGroup;
 
     /**
      * Constructs a new Object3D instance with default transformation matrices.

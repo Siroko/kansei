@@ -3,8 +3,8 @@ import { Camera } from "../cameras/Camera";
 import { InstancedGeometry } from "../geometries/InstancedGeometry";
 import { Vector4 } from "../main";
 import { Compute } from "../materials/Compute";
-import { Mesh } from "../objects/Mesh";
 import { Object3D } from "../objects/Object3D";
+import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
 
 /**
@@ -196,26 +196,26 @@ class Renderer {
         passRenderEncoder: GPURenderPassEncoder,
         camera: Camera
     ) {
-        if (object.isMesh) {
-            const mesh = object as Mesh;
-            if (!mesh.geometry.initialized) {
-                mesh.geometry.initialize(this.device!);
+        if (object.isRenderable) {
+            const renderable = object as Renderable;
+            if (!renderable.geometry.initialized) {
+                renderable.geometry.initialize(this.device!);
             }
-            if (!mesh.material.initialized) {
-                mesh.material.initialize(
+            if (!renderable.material.initialized) {
+                renderable.material.initialize(
                     this.device!,
-                    mesh.geometry.vertexBuffersDescriptors!,
+                    renderable.geometry.vertexBuffersDescriptors!,
                     this.presentationFormat!,
                     this.sampleCount
                 );
             }
 
-            passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, mesh.geometry.indexFormat!);
-            passRenderEncoder.setPipeline(mesh.material.pipeline!);
-            passRenderEncoder.setVertexBuffer(0, mesh.geometry.vertexBuffer!);
+            passRenderEncoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
+            passRenderEncoder.setPipeline(renderable.material.pipeline!);
+            passRenderEncoder.setVertexBuffer(0, renderable.geometry.vertexBuffer!);
             let vertexBufferIndex = 1;
-            if (mesh.geometry.isInstancedGeometry) {
-                const geo = mesh.geometry as InstancedGeometry;
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
                 for (const extraBuffer of geo.extraBuffers) {
                     if (!extraBuffer.initialized) {
                         extraBuffer.initialize(this.device!);
@@ -225,22 +225,22 @@ class Renderer {
                 }
             }
 
-            mesh.updateModelMatrix();
-            mesh.updateNormalMatrix(camera.viewMatrix);
+            renderable.updateModelMatrix();
+            renderable.updateNormalMatrix(camera.viewMatrix);
             // The bind group will always be 0 because the material is the first thing to be initialized
-            const materialBindGroup = mesh.material.getBindGroup(this.device!);
+            const materialBindGroup = renderable.material.getBindGroup(this.device!);
             // The bind group will always be 1 because the mesh is the second thing to be initialized
-            const meshBindGroup = mesh.getBindGroup(this.device!);
+            const meshBindGroup = renderable.getBindGroup(this.device!);
 
             passRenderEncoder!.setBindGroup(0, materialBindGroup);
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
             passRenderEncoder!.setBindGroup(2, cameraBindGroup);
 
-            if (mesh.geometry.isInstancedGeometry) {
-                const geo = mesh.geometry as InstancedGeometry;
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
                 passRenderEncoder!.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
             } else {
-                passRenderEncoder!.drawIndexed(mesh.geometry.vertexCount);
+                passRenderEncoder!.drawIndexed(renderable.geometry.vertexCount);
             }
         }
 

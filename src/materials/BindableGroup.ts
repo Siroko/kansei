@@ -36,7 +36,7 @@ class BindableGroup {
      * Creates the bind group layout for rendering material bindables.
      * @param gpuDevice - The GPU device used to create the bind group layout.
      */
-    public createRenderingMaterialBindablesBindGroupLayout(gpuDevice: GPUDevice) {
+    public createRenderingBindGroupLayout(gpuDevice: GPUDevice) {
         this.cameraBindablesGroupLayout = gpuDevice.createBindGroupLayout({
             label: 'Camera BindGroupLayout',
             entries: [
