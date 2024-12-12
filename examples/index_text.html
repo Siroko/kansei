@@ -36,7 +36,7 @@
       import { Renderer } from '../src/renderers/Renderer'
       import { Material } from '../src/materials/Material'
       import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
-      import { Mesh } from '../src/objects/Mesh'
+      import { Renderable } from '../src/objects/Renderable'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
       import { CameraControls } from '../src/controls/CameraControls'
@@ -64,7 +64,7 @@
         sampleCount: 1
       });
       await renderer.initialize();
-      document.body.appendChild(renderer.domElement);
+      document.body.appendChild(renderer.canvas);
 
       const mouseVectors = new MouseVectors();
 
@@ -102,7 +102,7 @@
         transparent: true
       });
 
-      const mesh = new Mesh(geometry, material);
+      const mesh = new Renderable(geometry, material);
       mesh.position.x = -20;
       mesh.position.y = 8;
       scene.add(mesh);

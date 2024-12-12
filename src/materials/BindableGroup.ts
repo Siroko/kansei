@@ -10,34 +10,34 @@ export class BindGroupDescriptor {
 }
 
 /**
- * Represents a group of uniforms for rendering or compute operations.
+ * Represents a group of bindables for rendering or compute operations.
  */
-class UniformGroup {
+class BindableGroup {
     public bindGroupLayout?: GPUBindGroupLayout;
     public bindGroup?: GPUBindGroup;
     public initialized: boolean = false;
     public pipelineBindGroupLayout?: GPUPipelineLayout;
-    private uniformGroupLayout?: GPUBindGroupLayout;
-    public cameraUniformsGroupLayout?: GPUBindGroupLayout;
-    public meshUniformsGroupLayout?: GPUBindGroupLayout;
+    private bindableGroupLayout?: GPUBindGroupLayout;
+    public cameraBindablesGroupLayout?: GPUBindGroupLayout;
+    public meshBindablesGroupLayout?: GPUBindGroupLayout;
 
     /**
-     * Constructs a new UniformGroup.
-     * @param uniforms - An array of BindGroupDescriptor objects.
+     * Constructs a new BindableGroup.
+     * @param bindables - An array of BindGroupDescriptor objects.
      * @param isCompute - A boolean indicating if the group is for compute operations.
      */
     constructor(
-        public uniforms: BindGroupDescriptor[],
+        public bindables: BindGroupDescriptor[],
         public isCompute: boolean = false
     ) {
     }
 
     /**
-     * Creates the bind group layout for rendering material uniforms.
+     * Creates the bind group layout for rendering material bindables.
      * @param gpuDevice - The GPU device used to create the bind group layout.
      */
-    public createRenderingMaterialUniformsBindGroupLayout(gpuDevice: GPUDevice) {
-        this.cameraUniformsGroupLayout = gpuDevice.createBindGroupLayout({
+    public createRenderingBindGroupLayout(gpuDevice: GPUDevice) {
+        this.cameraBindablesGroupLayout = gpuDevice.createBindGroupLayout({
             label: 'Camera BindGroupLayout',
             entries: [
                 {
@@ -57,7 +57,7 @@ class UniformGroup {
             ]
         });
 
-        this.meshUniformsGroupLayout = gpuDevice.createBindGroupLayout({
+        this.meshBindablesGroupLayout = gpuDevice.createBindGroupLayout({
             label: 'Mesh BindGroupLayout',
             entries: [
                 {
@@ -79,22 +79,22 @@ class UniformGroup {
     }
 
     /**
-     * Creates the bind group layout based on the provided uniforms.
+     * Creates the bind group layout based on the provided bindables.
      * @param gpuDevice - The GPU device used to create the bind group layout.
      */
     public createBindGroupLayout(gpuDevice: GPUDevice) {
         const entries = [];
-        for (const uniform of this.uniforms) {
+        for (const bindable of this.bindables) {
             const entry: GPUBindGroupLayoutEntry = {
-                binding: uniform.binding!,
-                visibility: uniform.visibility!
+                binding: bindable.binding!,
+                visibility: bindable.visibility!
             };
-            switch (uniform.value!.type) {
+            switch (bindable.value!.type) {
                 case 'storage':
                 case 'read-only-storage':
                 case 'uniform':
                     entry.buffer = {
-                        type: uniform.value!.type as GPUBufferBindingType
+                        type: bindable.value!.type as GPUBufferBindingType
                     };
                     break;
                 case 'sampler':
@@ -115,20 +115,20 @@ class UniformGroup {
                     };
                     break;
                 default:
-                    console.error(`Unknown binding type: ${uniform.value!.type}`);
+                    console.error(`Unknown binding type: ${bindable.value!.type}`);
                     continue;
             }
             entries.push(entry);
         }
 
         this.bindGroupLayout = gpuDevice.createBindGroupLayout({
-            label: 'UniformGroup BindGroupLayout',
+            label: 'BindableGroup BindGroupLayout',
             entries
         });
     }
 
     /**
-     * Retrieves or creates the bind group for the uniforms.
+     * Retrieves or creates the bind group for the bindables.
      * @param gpuDevice - The GPU device used to create or update the bind group.
      * @returns The created or existing GPUBindGroup.
      */
@@ -136,18 +136,18 @@ class UniformGroup {
         const entries: GPUBindGroupEntry[] = [];
 
         if (this.bindGroup) {
-            for (const uniform of this.uniforms) {
-                if (uniform.value?.needsUpdate) {
-                    uniform.value?.update(gpuDevice);
+            for (const bindable of this.bindables) {
+                if (bindable.value?.needsUpdate) {
+                    bindable.value?.update(gpuDevice);
                 }
             }
             return this.bindGroup!;
         }
-        for (const uniform of this.uniforms) {
-            if (!uniform.value?.initialized) {
-                uniform.value?.initialize(gpuDevice);
+        for (const bindable of this.bindables) {
+            if (!bindable.value?.initialized) {
+                bindable.value?.initialize(gpuDevice);
             }
-            if (!this.uniformGroupLayout) {
+            if (!this.bindableGroupLayout) {
                 this.createBindGroupLayout(gpuDevice)
             }
             if (!this.pipelineBindGroupLayout) {
@@ -157,15 +157,15 @@ class UniformGroup {
             }
 
             entries.push({
-                binding: uniform.binding!,
-                resource: uniform.value!.resource!,
+                binding: bindable.binding!,
+                resource: bindable.value!.resource!,
             });
         }
 
         if (this.bindGroup) return this.bindGroup!;
 
         this.bindGroup = gpuDevice.createBindGroup({
-            label: 'UniformGroup',
+            label: 'BindableGroup',
             layout: this.bindGroupLayout!,
             entries: entries
         });
@@ -174,4 +174,4 @@ class UniformGroup {
     }
 }
 
-export { UniformGroup };
+export { BindableGroup };

@@ -1,15 +1,15 @@
 import { Geometry } from "../buffers/Geometry";
 import { Material } from "../materials/Material";
-import { UniformGroup } from "../materials/UniformGroup";
+import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
 
 /**
- * Represents a 3D mesh object that extends Object3D.
- * A mesh is composed of geometry and material.
+ * Represents a 3D renderable object that extends Object3D.
+ * A renderable is composed of geometry and material.
  */
-class Mesh extends Object3D {
+class Renderable extends Object3D {
     /** Indicates if the object is a mesh. */
-    public isMesh: boolean = true;
+    public isRenderable: boolean = true;
 
     /** The layout of the bind group for GPU resources. */
     public bindGroupLayout?: GPUBindGroupLayout;
@@ -17,17 +17,17 @@ class Mesh extends Object3D {
     /** The bind group for GPU resources. */
     public bindGroup?: GPUBindGroup;
 
-    /** Indicates if the mesh has been initialized. */
+    /** Indicates if the renderable has been initialized. */
     public initialized: boolean = false;
 
-    /** The number of instances of the mesh. */
+    /** The number of instances of the renderable. */
     public instanceCount: number = 1;
 
     /**
-     * Constructs a new Mesh object.
+     * Constructs a new Renderable object.
      * 
-     * @param geometry - The geometry of the mesh.
-     * @param material - The material of the mesh.
+     * @param geometry - The geometry of the renderable.
+     * @param material - The material of the renderable.
      */
     constructor(
         public geometry: Geometry,
@@ -37,12 +37,12 @@ class Mesh extends Object3D {
     }
 
     /**
-     * Sets the uniforms for the mesh.
+     * Sets the uniforms for the renderable.
      * This method initializes the uniform group with the normal and world matrices.
      */
     protected setUniforms() {
         super.setUniforms();
-        this.uniformGroup = new UniformGroup([
+        this.uniformGroup = new BindableGroup([
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX,
@@ -57,4 +57,4 @@ class Mesh extends Object3D {
     }
 }
 
-export { Mesh }
+export { Renderable }

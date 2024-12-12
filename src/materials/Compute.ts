@@ -1,5 +1,5 @@
 import { parseIncludes } from "./shaders/ShaderUtils";
-import { BindGroupDescriptor, UniformGroup } from "./UniformGroup";
+import { BindGroupDescriptor, BindableGroup } from "./BindableGroup";
 
 /**
  * Represents a compute shader and its associated pipeline and resources.
@@ -25,7 +25,7 @@ class Compute {
     public uuid: string;
 
     /** The uniform group associated with the compute shader. */
-    private uniformGroup: UniformGroup;
+    private uniformGroup: BindableGroup;
 
     /**
      * Constructs a new Compute instance.
@@ -37,7 +37,7 @@ class Compute {
         private shaderCode: string,
         public uniforms: BindGroupDescriptor[]
     ) {
-        this.uniformGroup = new UniformGroup(uniforms);
+        this.uniformGroup = new BindableGroup(uniforms);
         this.uuid = crypto.randomUUID();
     }
 

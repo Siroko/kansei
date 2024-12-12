@@ -1,4 +1,4 @@
-import { BindGroupDescriptor, UniformGroup } from "./UniformGroup";
+import { BindGroupDescriptor, BindableGroup } from "./BindableGroup";
 import { parseIncludes } from "./shaders/ShaderUtils";
 
 /**
@@ -12,7 +12,7 @@ class Material {
     public uuid: string;
     public transparent: boolean = false;
 
-    private uniformGroup: UniformGroup;
+    private uniformGroup: BindableGroup;
     private depthWriteEnabled: boolean = true;
     private depthCompare: GPUCompareFunction = 'less';
     private cullMode: GPUCullMode = 'back';
@@ -44,7 +44,7 @@ class Material {
             depthStencilFormat?: GPUTextureFormat,
         }
     ) {
-        this.uniformGroup = new UniformGroup(this.options.uniforms || []);
+        this.uniformGroup = new BindableGroup(this.options.uniforms || []);
         this.uuid = crypto.randomUUID();
 
         this.transparent = this.options.transparent || false;
@@ -78,15 +78,15 @@ class Material {
             this.createShaderModule(gpuDevice);
         }
 
-        this.uniformGroup.createRenderingMaterialUniformsBindGroupLayout(gpuDevice);
+        this.uniformGroup.createRenderingBindGroupLayout(gpuDevice);
         this.uniformGroup.createBindGroupLayout(gpuDevice);
 
         this.uniformGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
             label: "Render Pipeline Layout",
             bindGroupLayouts: [
                 this.uniformGroup.bindGroupLayout!,
-                this.uniformGroup.cameraUniformsGroupLayout!,
-                this.uniformGroup.meshUniformsGroupLayout!
+                this.uniformGroup.cameraBindablesGroupLayout!,
+                this.uniformGroup.meshBindablesGroupLayout!
             ]
         });
 

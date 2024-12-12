@@ -1,5 +1,5 @@
 import { Object3D } from "../objects/Object3D";
-import { UniformGroup } from "../materials/UniformGroup";
+import { BindableGroup } from "../materials/BindableGroup";
 import { Matrix4 } from "../math/Matrix4";
 import { Vector3 } from "../math/Vector3";
 
@@ -67,7 +67,7 @@ class Camera extends Object3D {
     protected setUniforms() {
         super.setUniforms();
 
-        this.uniformGroup = new UniformGroup([
+        this.uniformGroup = new BindableGroup([
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX,

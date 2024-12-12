@@ -1,14 +1,14 @@
 import { Object3D } from "./Object3D";
-import { Mesh } from "./Mesh";
 import { Camera } from "../cameras/Camera";
+import { Renderable } from "./Renderable";
 
 /**
  * Represents a 3D scene which can contain multiple objects.
  * Extends the Object3D class to inherit transformation properties.
  */
 class Scene extends Object3D {
-    private opaqueObjects: Mesh[] = [];
-    private transparentObjects: Mesh[] = [];
+    private opaqueObjects: Renderable[] = [];
+    private transparentObjects: Renderable[] = [];
 
     /**
      * Constructs a new Scene object.
@@ -17,23 +17,18 @@ class Scene extends Object3D {
         super();
     }
 
-    private traverse(object: Object3D, callback: (object: Object3D) => void) {
-        callback(object);
-        object.children.forEach(child => this.traverse(child, callback));
-    }
-
     public prepare(camera: Camera) {
         // Clear arrays
         this.opaqueObjects = [];
         this.transparentObjects = [];
         // Sort objects into opaque and transparent
         this.traverse(this, (object: Object3D) => {
-            if (object.isMesh) {
-                const mesh = object as Mesh;
-                if (mesh.material.transparent) {
-                    this.transparentObjects.push(mesh);
+            if (object.isRenderable) {
+                const renderable = object as Renderable;
+                if (renderable.material.transparent) {
+                    this.transparentObjects.push(renderable);
                 } else {
-                    this.opaqueObjects.push(mesh);
+                    this.opaqueObjects.push(renderable);
                 }
             }
         });
@@ -47,7 +42,7 @@ class Scene extends Object3D {
         });
     }
 
-    public getOrderedObjects(): Mesh[] {
+    public getOrderedObjects(): Renderable[] {
         return [...this.opaqueObjects, ...this.transparentObjects];
     }
 }

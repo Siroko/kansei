@@ -3,8 +3,8 @@ import { Camera } from "../cameras/Camera";
 import { InstancedGeometry } from "../geometries/InstancedGeometry";
 import { Vector4 } from "../main";
 import { Compute } from "../materials/Compute";
-import { Mesh } from "../objects/Mesh";
 import { Object3D } from "../objects/Object3D";
+import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
 
 /**
@@ -38,7 +38,7 @@ class Renderer {
      * @throws {Error} Throws if WebGPU is not supported in the browser
      */
 
-    public domElement: HTMLCanvasElement;
+    public canvas: HTMLCanvasElement;
     public context: GPUCanvasContext | null;
     private device?: GPUDevice;
     private presentationFormat?: GPUTextureFormat;
@@ -53,8 +53,8 @@ class Renderer {
     constructor(
         private options: RendererOptions = {}
     ) {
-        this.domElement = document.createElement('canvas');
-        this.context = this.domElement.getContext('webgpu');
+        this.canvas = document.createElement('canvas');
+        this.context = this.canvas.getContext('webgpu');
         this.sampleCount = this.options.sampleCount || this.sampleCount;
         this.devicePixelRatio = this.options.devicePixelRatio || this.devicePixelRatio;
         this.width = this.options.width || this.width;
@@ -95,8 +95,8 @@ class Renderer {
                 });
 
                 this.setSize(
-                    this.options.width || this.domElement.width,
-                    this.options.height || this.domElement.height
+                    this.options.width || this.canvas.width,
+                    this.options.height || this.canvas.height
                 );
             }
         }
@@ -111,12 +111,12 @@ class Renderer {
     public setSize(width: number, height: number) {
         this.width = width * this.devicePixelRatio;
         this.height = height * this.devicePixelRatio;
-        this.domElement.width = this.width;
-        this.domElement.height = this.height;
+        this.canvas.width = this.width;
+        this.canvas.height = this.height;
 
         this.depthTexture?.destroy();
         this.depthTexture = this.device!.createTexture({
-            size: [this.domElement.width, this.domElement.height],
+            size: [this.canvas.width, this.canvas.height],
             sampleCount: this.sampleCount,
             dimension: '2d',
             format: 'depth24plus',
@@ -125,7 +125,7 @@ class Renderer {
 
         this.colorTexture?.destroy();
         this.colorTexture = this.device!.createTexture({
-            size: [this.domElement.width, this.domElement.height],
+            size: [this.canvas.width, this.canvas.height],
             sampleCount: this.sampleCount,
             format: this.presentationFormat!,
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
@@ -133,11 +133,11 @@ class Renderer {
     }
 
     /**
-     * Renders a scene using the specified camera.
-     * @param {Scene} scene - The scene to render
+     * Renders a stack using the specified camera.
+     * @param {Scene} stack - The stack to render
      * @param {Camera} camera - The camera to use for rendering
      */
-    public render(scene: Scene, camera: Camera) {
+    public render(stack: Scene, camera: Camera) {
 
         const commandRenderEncoder = this.device!.createCommandEncoder();
         const textureView = this.context!.getCurrentTexture().createView();
@@ -166,14 +166,14 @@ class Renderer {
         } as GPURenderPassDescriptor;
         const passRenderEncoder = commandRenderEncoder!.beginRenderPass(renderPassDescriptor);
 
-        // Prepare scene (sort transparent objects)
-        scene.prepare(camera);
+        // Prepare stack (sort transparent objects)
+        stack.prepare(camera);
 
         camera.updateViewMatrix();
         const cameraBindGroup = camera.getBindGroup(this.device!);
 
         // Render objects in order (opaque first, then transparent)
-        for (const object of scene.getOrderedObjects()) {
+        for (const object of stack.getOrderedObjects()) {
             this.renderObject(object, cameraBindGroup, passRenderEncoder, camera);
         }
         passRenderEncoder!.end();
@@ -183,7 +183,7 @@ class Renderer {
     }
 
     /**
-     * Recursively renders an object and its children in the scene graph.
+     * Recursively renders an object and its children in the stack graph.
      * @private
      * @param {Object3D} object - The object to render
      * @param {GPUBindGroup} cameraBindGroup - The camera's bind group containing view and projection matrices
@@ -196,26 +196,26 @@ class Renderer {
         passRenderEncoder: GPURenderPassEncoder,
         camera: Camera
     ) {
-        if (object.isMesh) {
-            const mesh = object as Mesh;
-            if (!mesh.geometry.initialized) {
-                mesh.geometry.initialize(this.device!);
+        if (object.isRenderable) {
+            const renderable = object as Renderable;
+            if (!renderable.geometry.initialized) {
+                renderable.geometry.initialize(this.device!);
             }
-            if (!mesh.material.initialized) {
-                mesh.material.initialize(
+            if (!renderable.material.initialized) {
+                renderable.material.initialize(
                     this.device!,
-                    mesh.geometry.vertexBuffersDescriptors!,
+                    renderable.geometry.vertexBuffersDescriptors!,
                     this.presentationFormat!,
                     this.sampleCount
                 );
             }
 
-            passRenderEncoder.setIndexBuffer(mesh.geometry.indexBuffer!, mesh.geometry.indexFormat!);
-            passRenderEncoder.setPipeline(mesh.material.pipeline!);
-            passRenderEncoder.setVertexBuffer(0, mesh.geometry.vertexBuffer!);
+            passRenderEncoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
+            passRenderEncoder.setPipeline(renderable.material.pipeline!);
+            passRenderEncoder.setVertexBuffer(0, renderable.geometry.vertexBuffer!);
             let vertexBufferIndex = 1;
-            if (mesh.geometry.isInstancedGeometry) {
-                const geo = mesh.geometry as InstancedGeometry;
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
                 for (const extraBuffer of geo.extraBuffers) {
                     if (!extraBuffer.initialized) {
                         extraBuffer.initialize(this.device!);
@@ -225,22 +225,22 @@ class Renderer {
                 }
             }
 
-            mesh.updateModelMatrix();
-            mesh.updateNormalMatrix(camera.viewMatrix);
+            renderable.updateModelMatrix();
+            renderable.updateNormalMatrix(camera.viewMatrix);
             // The bind group will always be 0 because the material is the first thing to be initialized
-            const materialBindGroup = mesh.material.getBindGroup(this.device!);
+            const materialBindGroup = renderable.material.getBindGroup(this.device!);
             // The bind group will always be 1 because the mesh is the second thing to be initialized
-            const meshBindGroup = mesh.getBindGroup(this.device!);
+            const meshBindGroup = renderable.getBindGroup(this.device!);
 
             passRenderEncoder!.setBindGroup(0, materialBindGroup);
             passRenderEncoder!.setBindGroup(1, meshBindGroup);
             passRenderEncoder!.setBindGroup(2, cameraBindGroup);
 
-            if (mesh.geometry.isInstancedGeometry) {
-                const geo = mesh.geometry as InstancedGeometry;
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
                 passRenderEncoder!.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
             } else {
-                passRenderEncoder!.drawIndexed(mesh.geometry.vertexCount);
+                passRenderEncoder!.drawIndexed(renderable.geometry.vertexCount);
             }
         }
 
