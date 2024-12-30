@@ -48,7 +48,7 @@ camera.position.z = 5;
 
 const geometry = new BoxGeometry(1, 1, 1);
 const material = new Material(shaderCode, {
-  uniforms: [
+  bindings: [
     {
       binding: 0,
       visibility: GPUShaderStage.FRAGMENT,
@@ -78,7 +78,7 @@ animate();
 - **Camera**: Defines view and projection
 - **Mesh**: Combines geometry and material
 - **Geometry**: Defines vertex data
-- **Material**: Manages shaders and uniforms
+- **Material**: Manages shaders and bindings
 - **Texture**: Handles 2D textures
 - **VideoTexture**: Supports video textures
 - **Vector3** and **Vector4**: Represent 3D and 4D vectors
@@ -128,7 +128,7 @@ const geometry = new TextGeometry({
 
 // Create material with SDF shader
 const material = new Material(shaderCode, {
-  uniforms: [
+  bindings: [
     {
       binding: 0,
       visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
@@ -173,7 +173,7 @@ const computeBuffer = new ComputeBuffer({
 });
 
 const compute = new Compute(shaderCode, {
-  uniforms: [
+  bindings: [
     {
       binding: 0,
       visibility: GPUShaderStage.COMPUTE,

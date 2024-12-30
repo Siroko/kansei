@@ -37,12 +37,12 @@ class Renderable extends Object3D {
     }
 
     /**
-     * Sets the uniforms for the renderable.
+     * Sets the bindings for the renderable.
      * This method initializes the uniform group with the normal and world matrices.
      */
     protected setUniforms() {
         super.setUniforms();
-        this.uniformGroup = new BindableGroup([
+        this.bindableGroup = new BindableGroup([
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX,

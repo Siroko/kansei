@@ -25,19 +25,19 @@ class Compute {
     public uuid: string;
 
     /** The uniform group associated with the compute shader. */
-    private uniformGroup: BindableGroup;
+    private bindableGroup: BindableGroup;
 
     /**
      * Constructs a new Compute instance.
      * 
      * @param shaderCode - The GLSL or WGSL code for the compute shader.
-     * @param uniforms - The descriptor for the bind group uniforms.
+     * @param bindings - The descriptor for the bind group bindings.
      */
     constructor(
         private shaderCode: string,
-        public uniforms: BindGroupDescriptor[]
+        public bindings: BindGroupDescriptor[]
     ) {
-        this.uniformGroup = new BindableGroup(uniforms);
+        this.bindableGroup = new BindableGroup(bindings);
         this.uuid = crypto.randomUUID();
     }
 
@@ -62,13 +62,13 @@ class Compute {
             this.createShaderModule(gpuDevice);
         }
 
-        this.uniformGroup.createBindGroupLayout(gpuDevice);
-        this.uniformGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
+        this.bindableGroup.createBindGroupLayout(gpuDevice);
+        this.bindableGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
             label: "Compute Pipeline Layout",
-            bindGroupLayouts: [this.uniformGroup.bindGroupLayout!]
+            bindGroupLayouts: [this.bindableGroup.bindGroupLayout!]
         });
         const computePipelineDescriptor: GPUComputePipelineDescriptor = {
-            layout: this.uniformGroup.pipelineBindGroupLayout,
+            layout: this.bindableGroup.pipelineBindGroupLayout,
             label: "Compute Pipeline",
             compute: {
                 module: this.shaderComputeModule!,
@@ -87,8 +87,8 @@ class Compute {
      * @returns The bind group for the compute shader.
      */
     public getBindGroup(gpuDevice: GPUDevice) {
-        this.uniformGroup.getBindGroup(gpuDevice);
-        return this.uniformGroup.bindGroup!;
+        this.bindableGroup.getBindGroup(gpuDevice);
+        return this.bindableGroup.bindGroup!;
     }
 }
 

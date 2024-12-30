@@ -52,11 +52,11 @@ The `Geometry` class defines vertex data for meshes.
 
 ## Material
 
-The `Material` class manages shaders and uniforms for rendering.
+The `Material` class manages shaders and bindings for rendering.
 
 ### Public API
 
-- `constructor(shaderCode: string, uniforms: BindGroupDescriptor[])`: Creates a new Material instance with the given shader code and uniforms.
+- `constructor(shaderCode: string, bindings: BindGroupDescriptor[])`: Creates a new Material instance with the given shader code and bindings.
 - `async initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat): Promise<void>`: Initializes the material on the GPU.
 - `async getBindGroup(gpuDevice: GPUDevice, bindingGroupLayoutPosition: number): Promise<GPUBindGroup>`: Gets the bind group for this material.
 
@@ -131,7 +131,7 @@ The `Compute` class manages compute shader pipelines and execution.
 
 ### Public API
 
-- `constructor(shaderCode: string, uniforms: BindGroupDescriptor[])`: Creates a new Compute instance with the given shader code and uniforms.
+- `constructor(shaderCode: string, bindings: BindGroupDescriptor[])`: Creates a new Compute instance with the given shader code and bindings.
 - `initialize(gpuDevice: GPUDevice): void`: Initializes the compute pipeline on the GPU.
 - `async getBindGroup(gpuDevice: GPUDevice, bindingGroupLayoutPosition: number): Promise<GPUBindGroup>`: Gets the bind group for this compute pipeline.
 

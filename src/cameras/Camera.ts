@@ -67,7 +67,7 @@ class Camera extends Object3D {
     protected setUniforms() {
         super.setUniforms();
 
-        this.uniformGroup = new BindableGroup([
+        this.bindableGroup = new BindableGroup([
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX,

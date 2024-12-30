@@ -12,7 +12,7 @@ class Material {
     public uuid: string;
     public transparent: boolean = false;
 
-    private uniformGroup: BindableGroup;
+    private bindableGroup: BindableGroup;
     private depthWriteEnabled: boolean = true;
     private depthCompare: GPUCompareFunction = 'less';
     private cullMode: GPUCullMode = 'back';
@@ -24,7 +24,7 @@ class Material {
      * 
      * @param shaderCode - The shader code to be used for this material.
      * @param options - Configuration options for the material
-     * @param options.uniforms - Array of uniform descriptors for the material's bind group
+     * @param options.bindings - Array of uniform descriptors for the material's bind group
      * @param options.transparent - Whether the material is transparent. Affects depth writing and culling. Defaults to false
      * @param options.depthWriteEnabled - Whether depth writing is enabled. Defaults to true
      * @param options.depthCompare - Depth comparison function. Defaults to 'less'
@@ -35,7 +35,7 @@ class Material {
     constructor(
         private shaderCode: string,
         private options: {
-            uniforms?: BindGroupDescriptor[],
+            bindings?: BindGroupDescriptor[],
             transparent?: boolean,
             depthWriteEnabled?: boolean,
             depthCompare?: GPUCompareFunction,
@@ -44,7 +44,7 @@ class Material {
             depthStencilFormat?: GPUTextureFormat,
         }
     ) {
-        this.uniformGroup = new BindableGroup(this.options.uniforms || []);
+        this.bindableGroup = new BindableGroup(this.options.bindings || []);
         this.uuid = crypto.randomUUID();
 
         this.transparent = this.options.transparent || false;
@@ -78,20 +78,20 @@ class Material {
             this.createShaderModule(gpuDevice);
         }
 
-        this.uniformGroup.createRenderingBindGroupLayout(gpuDevice);
-        this.uniformGroup.createBindGroupLayout(gpuDevice);
+        this.bindableGroup.createRenderingBindGroupLayout(gpuDevice);
+        this.bindableGroup.createBindGroupLayout(gpuDevice);
 
-        this.uniformGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
+        this.bindableGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
             label: "Render Pipeline Layout",
             bindGroupLayouts: [
-                this.uniformGroup.bindGroupLayout!,
-                this.uniformGroup.cameraBindablesGroupLayout!,
-                this.uniformGroup.meshBindablesGroupLayout!
+                this.bindableGroup.bindGroupLayout!,
+                this.bindableGroup.cameraBindablesGroupLayout!,
+                this.bindableGroup.meshBindablesGroupLayout!
             ]
         });
 
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
-            layout: this.uniformGroup.pipelineBindGroupLayout,
+            layout: this.bindableGroup.pipelineBindGroupLayout,
             label: "Render Pipeline",
             multisample: {
                 count: sampleCount
@@ -145,8 +145,8 @@ class Material {
      * @returns The bind group associated with this material.
      */
     public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
-        this.uniformGroup.getBindGroup(gpuDevice);
-        return this.uniformGroup.bindGroup!;
+        this.bindableGroup.getBindGroup(gpuDevice);
+        return this.bindableGroup.bindGroup!;
     }
 }
 

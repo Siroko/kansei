@@ -49,7 +49,7 @@
       const texture = new Texture(imageBitmap, true);
       const sampler = new Sampler('linear', 'linear');
       const material = new Material(shaderCode, {
-        uniforms: [
+        bindings: [
           {
             binding: 0,
             visibility: GPUShaderStage.FRAGMENT,

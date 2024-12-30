@@ -26,3 +26,4 @@ export { ShaderChunks } from "./materials/shaders/ShaderChunks";
 export { MouseVectors } from "./controls/MouseVectors";
 export { TextGeometry } from "./geometries/TextGeometry";
 export { FontLoader } from "./sdf/text/FontLoader";
+export { Float } from "./math/Float";

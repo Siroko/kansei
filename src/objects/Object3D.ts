@@ -25,7 +25,7 @@ class Object3D {
 
     public up: Vector3 = new Vector3(0, 1, 0);
 
-    protected uniformGroup?: BindableGroup;
+    protected bindableGroup?: BindableGroup;
 
     /**
      * Constructs a new Object3D instance with default transformation matrices.
@@ -42,7 +42,7 @@ class Object3D {
      * This method is intended to be overridden by subclasses.
      */
     protected setUniforms() {
-        // Implementation for setting uniforms
+        // Implementation for setting bindings
     }
 
     public traverse(object: Object3D, callback: (object: Object3D) => void) {
@@ -129,8 +129,8 @@ class Object3D {
      * @returns The GPUBindGroup associated with this object.
      */
     public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
-        this.uniformGroup!.getBindGroup(gpuDevice);
-        return this.uniformGroup!.bindGroup!;
+        this.bindableGroup!.getBindGroup(gpuDevice);
+        return this.bindableGroup!.bindGroup!;
     }
 }
 
