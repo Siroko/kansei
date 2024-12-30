@@ -1,6 +1,7 @@
 export { Renderer } from "./renderers/Renderer";
 export { Geometry } from "./buffers/Geometry";
 export { BoxGeometry } from "./geometries/BoxGeometry";
+export { PlaneGeometry } from "./geometries/PlaneGeometry";
 export { BufferBase } from "./buffers/BufferBase";
 export { InstancedGeometry } from "./geometries/InstancedGeometry";
 export { CameraControls } from "./controls/CameraControls";
