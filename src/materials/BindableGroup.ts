@@ -111,7 +111,7 @@ class BindableGroup {
                     break;
                 case 'external-texture':
                     entry.externalTexture = {
-                        sampleType: 'float'
+                        sampleType: 'float',
                     };
                     break;
                 default:
@@ -136,12 +136,18 @@ class BindableGroup {
         const entries: GPUBindGroupEntry[] = [];
 
         if (this.bindGroup) {
+            let isExternalTexture = false;
             for (const bindable of this.bindables) {
                 if (bindable.value?.needsUpdate) {
                     bindable.value?.update(gpuDevice);
                 }
+                if (bindable.value?.type === 'external-texture') {
+                    isExternalTexture = true;
+                }
             }
-            return this.bindGroup!;
+            if (!isExternalTexture) {
+                return this.bindGroup!;
+            }
         }
         for (const bindable of this.bindables) {
             if (!bindable.value?.initialized) {
@@ -161,8 +167,6 @@ class BindableGroup {
                 resource: bindable.value!.resource!,
             });
         }
-
-        if (this.bindGroup) return this.bindGroup!;
 
         this.bindGroup = gpuDevice.createBindGroup({
             label: 'BindableGroup',

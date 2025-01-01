@@ -26,7 +26,10 @@ class VideoTexture implements IBindable {
      * Updates the video texture. This method is asynchronous.
      * @returns A promise that resolves when the update is complete.
      */
-    async update(): Promise<void> {
+    update(): GPUExternalTexture {
+        const res = this.gpuDevice!.importExternalTexture({ source: this.videoElement! });
+        res.label = 'VideoTexture ' + this.uuid;
+        return res;
     }
 
     /**

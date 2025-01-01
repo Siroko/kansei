@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Example WebGPU Renderer</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: black;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+      }
+      #info {
+        position: absolute;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: white;
+        font-family: sans-serif;
+      }
+
+      #info a {
+        color: white;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+import { Renderer } from '../src/renderers/Renderer'
+import { Camera } from '../src/cameras/Camera'
+import { CameraControls } from '../src/controls/CameraControls'
+import { Float } from '../src/math/Float'
+import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+import { Material } from '../src/materials/Material'
+import { MouseVectors } from '../src/controls/MouseVectors'
+import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+import { Renderable } from '../src/objects/Renderable'
+import { Scene } from '../src/objects/Scene'
+import { Sampler } from '../src/buffers/Sampler'
+import { Vector3 } from '../src/math/Vector3'
+import { VideoTexture } from '../src/buffers/VideoTexture'
+import { BufferBase } from '../src/buffers/BufferBase'
+
+const canvasContainer = document.body;
+const camera = new Camera(45, 0.1, 10000, window.innerWidth / window.innerHeight);
+const renderer = new Renderer({
+    width: window.innerWidth,
+    height: window.innerHeight,
+    antialias: true,
+    devicePixelRatio: devicePixelRatio,
+    sampleCount: 4,
+});
+
+const layerCount = 250;
+const time = new Float(0);
+const mouseVectors = new MouseVectors(canvasContainer);
+const cameraControls = new CameraControls(camera, new Vector3(0, 0, 0), canvasContainer);
+const scene = new Scene();
+
+const sampler = new Sampler('linear', 'linear', 'repeat');
+const video = document.createElement('video');
+video.autoplay = true;
+video.muted = true;
+video.playsInline = true;
+let videoInitialized = false;
+
+const clickHandler = () => {
+    document.body.removeEventListener('click', clickHandler);
+    // Request webcam access
+    navigator.mediaDevices.getUserMedia({ 
+        video: {
+            width: 1920,
+            height: 1080,
+        },
+        audio: true
+    })
+    .then(stream => {
+        video.srcObject = stream;
+        video.oncanplay = () => {
+            videoInitialized = true;
+            video.play();
+        }    
+    })
+    .catch(err => {
+        console.error("Error accessing webcam:", err);
+    });
+}
+document.body.addEventListener("click", clickHandler);
+
+const videoTexture = new VideoTexture(video);
+
+const material = new Material(/* wgsl */`
+    #include <curl>
+    struct VertexOut {
+        @builtin(position) position : vec4<f32>,
+        @location(1) normal : vec3<f32>,
+        @location(2) uv : vec2<f32>,
+        @location(3) viewPosition : vec4<f32>,
+        @location(4) instancePosition : vec4<f32>,
+    };
+
+    @group(0) @binding(0) var<uniform> time:f32;
+    @group(0) @binding(1) var videoTexture:texture_external;
+    @group(0) @binding(2) var texSampler:sampler;
+
+    @group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+    @group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+
+    @group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+    @group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+
+    @vertex
+    fn vertex_main(
+        @location(0) position: vec4<f32>,
+        @location(1) normal : vec3<f32>,
+        @location(2) uv : vec2<f32>,
+        @builtin(instance_index) instanceID : u32,
+    ) -> VertexOut
+    {
+        var output : VertexOut;
+        var p = position;
+        p.z -= (f32(instanceID) * 0.7) - 100.0;
+        p.y += sin(time + p.z * 0.07) * (20.7 * smoothstep(-100.0, 50.0, p.z));
+        p.x += cos(time + p.z * 0.07) * (20.7 * smoothstep(-100.0, 70.0, p.z));
+        output.instancePosition = p;
+        output.position = projectionMatrix * viewMatrix * worldMatrix * p;
+        
+        output.normal = (worldMatrix * vec4<f32>(normal, 0.0)).xyz;
+        output.uv = uv;
+        output.viewPosition = viewMatrix * worldMatrix * position;
+        return output;
+    } 
+
+    @fragment
+    fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
+    {
+        let minEdge = 0.006;
+        let maxEdge = 0.008;
+        // var n = getCurlVelocity(vec4<f32>(fragData.uv, fragData.instancePosition.z, 0.0));
+        var edgeLX = smoothstep(minEdge, maxEdge, fragData.uv.x);
+        var edgeRX = smoothstep(minEdge, maxEdge, 1.0 - fragData.uv.x);
+        var edgeX = min(edgeLX, edgeRX);
+        var edgeTY = smoothstep(minEdge, maxEdge, fragData.uv.y);
+        var edgeBY = smoothstep(minEdge, maxEdge, 1.0 - fragData.uv.y);
+        var edgeY = min(edgeTY, edgeBY);
+        var edge = min(edgeX, edgeY);
+        
+        var uvFlipY = vec2<f32>(fragData.uv.x, 1.0 - fragData.uv.y);
+        var videoColor:vec4<f32> = textureSampleBaseClampToEdge(videoTexture, texSampler, uvFlipY);
+        
+        var luminance = dot(videoColor.rgb, vec3<f32>(0.2125, 0.7154, 0.0721));
+        return vec4<f32>(videoColor.r, videoColor.g, videoColor.b, 1.0 - step(0.55, luminance) /*1.1 - edge*/);
+    }`,
+    {
+        bindings: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                value: time,
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                value: videoTexture,
+            },
+            {
+                binding: 2,
+                visibility: GPUShaderStage.FRAGMENT,
+                value: sampler,
+            }
+        ],
+        cullMode: 'none',
+        transparent: true,
+    }
+);
+
+const geometry = new PlaneGeometry(16, 9, 1, 1);
+const layersInstanced = new InstancedGeometry(geometry, layerCount);
+
+const init = async () => {
+    await renderer.initialize();
+    canvasContainer?.appendChild(renderer.canvas);
+    
+    const layerRenderable = new Renderable(layersInstanced, material);
+    scene.add(layerRenderable);
+
+
+    
+    window.addEventListener('resize', resize);
+    animate();
+}
+
+let lastTime = performance.now();
+
+const animate = () => {
+    requestAnimationFrame(animate);
+    
+    const currentTime = performance.now();
+    const deltaTime = (currentTime - lastTime) * 0.001; // Convert to seconds
+    lastTime = currentTime;
+    time.value += deltaTime;
+
+    mouseVectors.update(deltaTime);
+    cameraControls.update(deltaTime);
+
+    if(videoInitialized) {
+        console.log('render');
+        renderer.render(scene, camera);
+        videoTexture.update();
+    }
+}
+
+const resize = () => {
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+}
+
+init();
+
+</script>
+<div id="info">
+  Made with ❤️ and <a href="https://github.com/siroko/kansei">KANSEI</a>
+</div>
+</body>
+</html>
