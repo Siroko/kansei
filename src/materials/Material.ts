@@ -90,6 +90,22 @@ class Material {
             ]
         });
 
+        const colorTarget: GPUColorTargetState = { format: presentationFormat };
+        if (this.transparent) {
+            colorTarget.blend = {
+                color: {
+                    operation: 'add',
+                    srcFactor: 'src-alpha',
+                    dstFactor: 'one-minus-src-alpha'
+                },
+                alpha: {
+                    operation: 'add',
+                    srcFactor: 'one',
+                    dstFactor: 'one-minus-src-alpha'
+                }
+            };
+        }
+
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
             layout: this.bindableGroup.pipelineBindGroupLayout,
             label: "Render Pipeline",
@@ -104,23 +120,7 @@ class Material {
             fragment: {
                 module: this.shaderRenderModule,
                 entryPoint: 'fragment_main',
-                targets: [
-                    {
-                        format: presentationFormat,
-                        blend: {
-                            color: {
-                                operation: 'add',
-                                srcFactor: 'src-alpha',
-                                dstFactor: 'one-minus-src-alpha'
-                            },
-                            alpha: {
-                                operation: 'add',
-                                srcFactor: 'one',
-                                dstFactor: 'one-minus-src-alpha'
-                            }
-                        }
-                    }
-                ]
+                targets: [colorTarget]
             } as GPUFragmentState,
             primitive: {
                 topology: this.topology,

@@ -13,6 +13,9 @@ class Matrix4 extends BufferBase {
     /** The internal 4x4 matrix. */
     public readonly internalMat4: mat4;
 
+    /** Incremented each time the matrix data changes. Used for dirty tracking. */
+    public version: number = 0;
+
     private right = vec3.fromValues(1, 0, 0);
     private up = vec3.fromValues(0, 1, 0);
     private forward = vec3.fromValues(0, 0, 1);
@@ -32,6 +35,7 @@ class Matrix4 extends BufferBase {
     private updateBuffer() {
         this.buffer!.set(this.internalMat4);
         this.needsUpdate = true;
+        this.version++;
     }
 
     /**

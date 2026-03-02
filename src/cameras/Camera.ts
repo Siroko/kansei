@@ -12,6 +12,8 @@ class Camera extends Object3D {
     public inverseViewMatrix: Matrix4;
     public projectionMatrix: Matrix4;
 
+    private _lastViewWorldVersion: number = -1;
+
     /**
      * Constructs a new Camera instance.
      * 
@@ -45,10 +47,12 @@ class Camera extends Object3D {
      */
     public updateViewMatrix() {
         this.updateModelMatrix();
+        if (this.worldMatrix.version === this._lastViewWorldVersion) return;
         this.viewMatrix.invert(this.worldMatrix);
         this.inverseViewMatrix.invert(this.viewMatrix);
         this.viewMatrix.needsUpdate = true;
         this.inverseViewMatrix.needsUpdate = true;
+        this._lastViewWorldVersion = this.worldMatrix.version;
     }
 
     /**
