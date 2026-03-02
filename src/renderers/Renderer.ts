@@ -66,15 +66,13 @@ class Renderer {
         }
     }
 
-    private async getDevice(): Promise<GPUDevice | void> {
-        const adapter = await navigator.gpu.requestAdapter()
+    private async getDevice(): Promise<GPUDevice> {
+        const adapter = await navigator.gpu.requestAdapter();
         if (adapter == null) {
-            console.error("No adapter found");
-            return
+            throw new Error("No WebGPU adapter found");
         }
 
-        const device = await adapter!.requestDevice();
-        return new Promise<GPUDevice>(resolve => resolve(device));
+        return adapter.requestDevice();
     }
 
     /**
@@ -86,7 +84,7 @@ class Renderer {
         if (!this.device) {
             const device = await this.getDevice();
             if (!this.device) {
-                this.device = (device as GPUDevice);
+                this.device = device;
                 this.presentationFormat = navigator.gpu.getPreferredCanvasFormat();
                 this.context?.configure({
                     device: this.device,
