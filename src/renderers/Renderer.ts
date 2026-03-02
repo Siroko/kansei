@@ -241,13 +241,6 @@ class Renderer {
                 passRenderEncoder!.drawIndexed(renderable.geometry.vertexCount);
             }
         }
-
-        // Render children
-        if (object.children.length > 0) {
-            for (const child of object.children) {
-                this.renderObject(child, cameraBindGroup, passRenderEncoder, camera);
-            }
-        }
     }
 
     /**

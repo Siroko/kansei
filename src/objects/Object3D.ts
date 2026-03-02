@@ -25,6 +25,13 @@ class Object3D {
 
     public up: Vector3 = new Vector3(0, 1, 0);
 
+    /** Set to true after changing position/rotation/scale to trigger matrix recomputation. */
+    public matrixNeedsUpdate: boolean = true;
+
+    private _lastParentWorldVersion: number = -1;
+    private _lastNormalViewVersion: number = -1;
+    private _lastNormalWorldVersion: number = -1;
+
     protected bindableGroup?: BindableGroup;
 
     /**
@@ -62,6 +69,9 @@ class Object3D {
      * Updates the model matrix based on the object's position, rotation, and scale.
      */
     public updateModelMatrix() {
+        const parentWorldVersion = this.parent ? this.parent.worldMatrix.version : -1;
+        if (!this.matrixNeedsUpdate && parentWorldVersion === this._lastParentWorldVersion) return;
+
         this.scaleMatrix.identity(); // Reset the matrix
         this.scaleMatrix.scale(this.scale);
 
@@ -80,6 +90,9 @@ class Object3D {
         this.updateWorldMatrix();
         this.modelMatrix.needsUpdate = true;
         this.worldMatrix.needsUpdate = true;
+
+        this.matrixNeedsUpdate = false;
+        this._lastParentWorldVersion = parentWorldVersion;
     }
 
     /**
@@ -87,11 +100,17 @@ class Object3D {
      * @param viewMatrix The view matrix to use for updating the normal matrix.
      */
     public updateNormalMatrix(viewMatrix: Matrix4) {
+        if (viewMatrix.version === this._lastNormalViewVersion &&
+            this.worldMatrix.version === this._lastNormalWorldVersion) return;
+
         this.normalMatrix.identity();
         this.normalMatrix.multiply(viewMatrix, this.worldMatrix);
         // Calculate inverse transpose
         this.normalMatrix.invert(this.normalMatrix).transpose();
         this.normalMatrix.needsUpdate = true;
+
+        this._lastNormalViewVersion = viewMatrix.version;
+        this._lastNormalWorldVersion = this.worldMatrix.version;
     }
 
     /**
@@ -120,6 +139,7 @@ class Object3D {
         this.rotation.y = rotationY;
         this.rotation.z = rotationZ;
 
+        this.matrixNeedsUpdate = true;
         this.updateModelMatrix();
     }
 
