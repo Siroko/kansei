@@ -50,6 +50,14 @@ class Renderer {
     private height: number = 240;
     private clearColor: Vector4 = new Vector4(0, 0, 0, 0);
 
+    // Per-pass state tracking — reset at the start of each render() call so
+    // redundant setPipeline / setBindGroup / setIndexBuffer / setVertexBuffer
+    // commands are skipped when consecutive objects share the same state.
+    private _currentPipeline: GPURenderPipeline | null = null;
+    private _currentMaterialBindGroup: GPUBindGroup | null = null;
+    private _currentIndexBuffer: GPUBuffer | null = null;
+    private _currentVertexBuffer: GPUBuffer | null = null;
+
     constructor(
         private options: RendererOptions = {}
     ) {
@@ -170,9 +178,18 @@ class Renderer {
         camera.updateViewMatrix();
         const cameraBindGroup = camera.getBindGroup(this.device!);
 
+        // Reset per-pass state so the first object always sets everything
+        this._currentPipeline = null;
+        this._currentMaterialBindGroup = null;
+        this._currentIndexBuffer = null;
+        this._currentVertexBuffer = null;
+
+        // Camera bind group (slot 2) is identical for every object — set once
+        passRenderEncoder.setBindGroup(2, cameraBindGroup);
+
         // Render objects in order (opaque first, then transparent)
         for (const object of stack.getOrderedObjects()) {
-            this.renderObject(object, cameraBindGroup, passRenderEncoder, camera);
+            this.renderObject(object, passRenderEncoder, camera);
         }
         passRenderEncoder!.end();
         this.device!.queue.submit([commandRenderEncoder!.finish()]);
@@ -181,65 +198,86 @@ class Renderer {
     }
 
     /**
-     * Recursively renders an object and its children in the stack graph.
+     * Renders a single object, skipping redundant pipeline/buffer/bind-group
+     * state changes when consecutive objects share the same state.
      * @private
      * @param {Object3D} object - The object to render
-     * @param {GPUBindGroup} cameraBindGroup - The camera's bind group containing view and projection matrices
      * @param {GPURenderPassEncoder} passRenderEncoder - The current render pass encoder
      * @param {Camera} camera - The camera used for rendering
      */
     private renderObject(
         object: Object3D,
-        cameraBindGroup: GPUBindGroup,
         passRenderEncoder: GPURenderPassEncoder,
         camera: Camera
     ) {
-        if (object.isRenderable) {
-            const renderable = object as Renderable;
-            if (!renderable.geometry.initialized) {
-                renderable.geometry.initialize(this.device!);
-            }
-            if (!renderable.material.initialized) {
-                renderable.material.initialize(
-                    this.device!,
-                    renderable.geometry.vertexBuffersDescriptors!,
-                    this.presentationFormat!,
-                    this.sampleCount
-                );
-            }
+        if (!object.isRenderable) return;
 
-            passRenderEncoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
+        const renderable = object as Renderable;
+        if (!renderable.geometry.initialized) {
+            renderable.geometry.initialize(this.device!);
+        }
+        if (!renderable.material.initialized) {
+            renderable.material.initialize(
+                this.device!,
+                renderable.geometry.vertexBuffersDescriptors!,
+                this.presentationFormat!,
+                this.sampleCount
+            );
+        }
+
+        // Pipeline — skip if unchanged; a new pipeline may have a different
+        // layout at slot 0 so force the material bind group to be re-set.
+        if (renderable.material.pipeline !== this._currentPipeline) {
             passRenderEncoder.setPipeline(renderable.material.pipeline!);
+            this._currentPipeline = renderable.material.pipeline!;
+            this._currentMaterialBindGroup = null;
+        }
+
+        // Index buffer — skip if same geometry
+        if (renderable.geometry.indexBuffer !== this._currentIndexBuffer) {
+            passRenderEncoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
+            this._currentIndexBuffer = renderable.geometry.indexBuffer!;
+        }
+
+        // Primary vertex buffer — skip if same geometry
+        if (renderable.geometry.vertexBuffer !== this._currentVertexBuffer) {
             passRenderEncoder.setVertexBuffer(0, renderable.geometry.vertexBuffer!);
+            this._currentVertexBuffer = renderable.geometry.vertexBuffer!;
+        }
+
+        // Extra per-instance vertex buffers (instanced geometry only)
+        if (renderable.geometry.isInstancedGeometry) {
+            const geo = renderable.geometry as InstancedGeometry;
             let vertexBufferIndex = 1;
-            if (renderable.geometry.isInstancedGeometry) {
-                const geo = renderable.geometry as InstancedGeometry;
-                for (const extraBuffer of geo.extraBuffers) {
-                    if (!extraBuffer.initialized) {
-                        extraBuffer.initialize(this.device!);
-                    }
-                    passRenderEncoder.setVertexBuffer(vertexBufferIndex, extraBuffer.resource.buffer);
-                    vertexBufferIndex++;
+            for (const extraBuffer of geo.extraBuffers) {
+                if (!extraBuffer.initialized) {
+                    extraBuffer.initialize(this.device!);
                 }
+                passRenderEncoder.setVertexBuffer(vertexBufferIndex, extraBuffer.resource.buffer);
+                vertexBufferIndex++;
             }
+        }
 
-            renderable.updateModelMatrix();
-            renderable.updateNormalMatrix(camera.viewMatrix);
-            // The bind group will always be 0 because the material is the first thing to be initialized
-            const materialBindGroup = renderable.material.getBindGroup(this.device!);
-            // The bind group will always be 1 because the mesh is the second thing to be initialized
-            const meshBindGroup = renderable.getBindGroup(this.device!);
+        renderable.updateModelMatrix();
+        renderable.updateNormalMatrix(camera.viewMatrix);
 
-            passRenderEncoder!.setBindGroup(0, materialBindGroup);
-            passRenderEncoder!.setBindGroup(1, meshBindGroup);
-            passRenderEncoder!.setBindGroup(2, cameraBindGroup);
+        // Material bind group (slot 0) — skip if same material
+        const materialBindGroup = renderable.material.getBindGroup(this.device!);
+        if (materialBindGroup !== this._currentMaterialBindGroup) {
+            passRenderEncoder.setBindGroup(0, materialBindGroup);
+            this._currentMaterialBindGroup = materialBindGroup;
+        }
 
-            if (renderable.geometry.isInstancedGeometry) {
-                const geo = renderable.geometry as InstancedGeometry;
-                passRenderEncoder!.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
-            } else {
-                passRenderEncoder!.drawIndexed(renderable.geometry.vertexCount);
-            }
+        // Mesh bind group (slot 1) — unique per object, always set
+        passRenderEncoder.setBindGroup(1, renderable.getBindGroup(this.device!));
+
+        // Slot 2 (camera) is set once in render() — no per-object call needed
+
+        if (renderable.geometry.isInstancedGeometry) {
+            const geo = renderable.geometry as InstancedGeometry;
+            passRenderEncoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
+        } else {
+            passRenderEncoder.drawIndexed(renderable.geometry.vertexCount);
         }
     }
 
