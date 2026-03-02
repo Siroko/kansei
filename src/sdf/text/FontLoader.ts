@@ -34,7 +34,7 @@ interface FontGlyphBounds {
     top: number;
 }
 
-interface FontGlyph {
+export interface FontGlyph {
     codepoint: number;
     advance: FontGlyphAdvance;
     image: number; // 0
