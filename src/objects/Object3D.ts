@@ -25,7 +25,6 @@ class Object3D {
 
     public up: Vector3 = new Vector3(0, 1, 0);
 
-    /** Set to true after changing position/rotation/scale to trigger matrix recomputation. */
     public matrixNeedsUpdate: boolean = true;
 
     private _lastParentWorldVersion: number = -1;
@@ -41,6 +40,12 @@ class Object3D {
         this.modelMatrix = new Matrix4();
         this.worldMatrix = new Matrix4();
         this.normalMatrix = new Matrix4();
+
+        const flagDirty = () => { this.matrixNeedsUpdate = true; };
+        this.position.onChange = flagDirty;
+        this.rotation.onChange = flagDirty;
+        this.scale.onChange = flagDirty;
+
         this.setUniforms();
     }
 
@@ -139,7 +144,6 @@ class Object3D {
         this.rotation.y = rotationY;
         this.rotation.z = rotationZ;
 
-        this.matrixNeedsUpdate = true;
         this.updateModelMatrix();
     }
 
