@@ -23,17 +23,27 @@ class Renderable extends Object3D {
     /** The number of instances of the renderable. */
     public instanceCount: number = 1;
 
+    private _material: Material;
+    public materialDirty: boolean = false;
+
+    get material(): Material { return this._material; }
+    set material(value: Material) {
+        this._material = value;
+        this.materialDirty = true;
+    }
+
     /**
      * Constructs a new Renderable object.
-     * 
+     *
      * @param geometry - The geometry of the renderable.
      * @param material - The material of the renderable.
      */
     constructor(
         public geometry: Geometry,
-        public material: Material
+        material: Material
     ) {
         super();
+        this._material = material; // bypass setter — initial assignment is not a swap
     }
 
     /**
