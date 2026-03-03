@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Example WebGPU Post-Processing</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { shaderCode } from './assets/shaders/TexturedCube.js'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { VideoTexture } from '../src/buffers/VideoTexture'
+    import { Vector4 } from '../src/math/Vector4'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector2 } from '../src/math/Vector2'
+    import { TextureLoader } from '../src/loaders/TextureLoader'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
+    import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
+    import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
+
+    // ── Scene parameters ──────────────────────────────────────────────────────
+    const GRID_SIZE      = 100;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SPACING   = 1.5;   // world-space gap between cube centres
+    const NOISE_ZOOM     = 0.08;  // noise frequency — lower = broader hills
+    const SCALE_Y_STRENGTH = 6;   // max Y scale applied to each cube
+
+    // ── Smooth value noise (2-D, 4 octaves) ───────────────────────────────────
+    function hash2(xi, yi) {
+      const n = Math.sin(xi * 127.1 + yi * 311.7) * 43758.5453;
+      return n - Math.floor(n);
+    }
+
+    function valueNoise(x, y) {
+      const ix = Math.floor(x), iy = Math.floor(y);
+      const fx = x - ix,       fy = y - iy;
+      const ux = fx * fx * (3 - 2 * fx); // smoothstep
+      const uy = fy * fy * (3 - 2 * fy);
+      const a = hash2(ix,   iy  ), b = hash2(ix+1, iy  );
+      const c = hash2(ix,   iy+1), d = hash2(ix+1, iy+1);
+      return a + (b-a)*ux + (c-a)*uy + ((d-c)-(b-a))*ux*uy;
+    }
+
+    function fbm(x, y, octaves = 4) {
+      let v = 0, amp = 0.5, freq = 1, norm = 0;
+      for (let i = 0; i < octaves; i++) {
+        v    += valueNoise(x * freq, y * freq) * amp;
+        norm += amp;
+        amp  *= 0.5;
+        freq *= 2.0;
+      }
+      return v / norm; // normalised to [0, 1]
+    }
+
+    // ── Renderer ──────────────────────────────────────────────────────────────
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: 1,
+      antialias: true,
+      sampleCount: 1
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas)
+
+    // ── Camera & controls ─────────────────────────────────────────────────────
+    const scene  = new Scene();
+    const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
+    const orbitRadius = window.innerWidth < 768 ? 120 : 90;
+    const cameraControls = new CameraControls(camera, scene.position, null, orbitRadius);
+
+    // ── Material ──────────────────────────────────────────────────────────────
+    const tl         = new TextureLoader();
+    const imageBitmap = await tl.load('./assets/textures/character_sheet_without_black.jpg');
+    const texture    = new Texture(imageBitmap, true);
+    const sampler    = new Sampler('linear', 'linear');
+    const material   = new Material(shaderCode, {
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: texture },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: sampler },
+      ]
+    });
+
+    // ── Grid of cubes — position and scaleY set once, never changed ───────────
+    const geometry = new BoxGeometry(1, 1, 1);
+    const half     = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre the grid at 0,0
+
+    for (let row = 0; row < GRID_SIZE; row++) {
+      for (let col = 0; col < GRID_SIZE; col++) {
+        const worldX = col * GRID_SPACING - half;
+        const worldZ = row * GRID_SPACING - half;
+
+        // Perlin-like FBM noise keyed to world position
+        const noiseVal = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM);
+        const scaleY   = noiseVal * SCALE_Y_STRENGTH + 0.1; // [0.1 .. SCALE_Y_STRENGTH+0.1]
+
+        const renderable = new Renderable(geometry, material);
+        renderable.position.x = worldX;
+        renderable.position.y = 0;          // always on the ground plane
+        renderable.position.z = worldZ;
+        renderable.scale.y    = scaleY;     // height driven by noise
+        scene.add(renderable);
+      }
+    }
+
+    // ── Post-processing volume ────────────────────────────────────────────────
+    const volume = new PostProcessingVolume(renderer, [
+      // SSAO — accentuates crevices between shorter columns
+      new SSAOEffect({
+        radius: 1.2,
+        bias: 0.02,
+        kernelSize: 16,
+        strength: 1.5
+      }),
+      // God Rays — radial shafts from a fixed screen-space light source
+      new GodRaysEffect({
+        lightScreenPos: new Vector2(0.5, 0.08),
+        density: 0.95,
+        weight: 0.008,
+        decay: 0.97,
+        exposure: 0.8,
+        numSamples: 80
+      }),
+      // DoF — grid edge blurs, centre stays sharp
+      new DepthOfFieldEffect({
+        focusDistance: orbitRadius,
+        focusRange: 30,
+        maxBlur: 8
+      }),
+    ]);
+
+    // ── Render loop ───────────────────────────────────────────────────────────
+    function animate() {
+      cameraControls.update();
+      volume.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    animate();
+  </script>
+</body>
+
+</html>
