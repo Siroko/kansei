@@ -53,8 +53,6 @@ export class PlaneGeometry extends Geometry {
 
         this.vertexCount = this._indices.length;
 
-        this.vertexCount = this._indices.length;
-
         this.vertices = new Float32Array(this._vertices);
         this.indices = new Uint16Array(this._indices);
     }
