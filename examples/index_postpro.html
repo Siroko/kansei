@@ -31,10 +31,10 @@
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
-    const GRID_SIZE        = 100;   // cubes per side (total = GRID_SIZE²)
-    const GRID_SPACING     = 1.5;   // world-space gap between cube centres
-    const NOISE_ZOOM       = 0.08;  // noise frequency — lower = broader hills
-    const SCALE_Y_STRENGTH = 6;     // max Y scale applied to each cube
+    const GRID_SIZE      = 100;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SPACING   = 1;   // world-space gap between cube centres
+    const NOISE_ZOOM     = 0.08;  // noise frequency — lower = broader hills
+    const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
 
     // ── Lambert shader (white base colour, single directional/point light) ───
     // Light sits top-right of the scene: high Y, positive X, slightly back.
@@ -155,10 +155,10 @@
     // ── Post-processing volume ────────────────────────────────────────────────
     const volume = new PostProcessingVolume(renderer, [
       new SSAOEffect({
-        radius: 1.2,
+        radius: 0.8,
         bias: 0.02,
         kernelSize: 16,
-        strength: 1.5
+        strength: 0.5
       }),
       new GodRaysEffect({
         lightScreenPos: new Vector2(0.5, 0.08),
@@ -169,8 +169,8 @@
         numSamples: 80
       }),
       new DepthOfFieldEffect({
-        focusDistance: orbitRadius,
-        focusRange: 30,
+        focusDistance: 25,
+        focusRange: 15,
         maxBlur: 8
       }),
     ]);

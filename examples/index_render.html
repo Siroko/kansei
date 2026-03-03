@@ -90,10 +90,10 @@
     const volume = new PostProcessingVolume(renderer, [
       // SSAO — adds contact shadows between cubes as they cluster together.
       new SSAOEffect({
-        radius: 1.2,
+        radius: 0.2,
         bias: 0.02,
         kernelSize: 16,
-        strength: 1.5
+        strength: 0.5
       }),
       // God Rays — radial light shafts from a fixed screen-space source position.
       new GodRaysEffect({
@@ -106,9 +106,9 @@
       }),
       // Depth of Field — keeps the cluster core sharp, blurs distant strays.
       new DepthOfFieldEffect({
-        focusDistance: 20,
-        focusRange: 12,
-        maxBlur: 8
+        focusDistance: 10,
+        focusRange: 5,
+        maxBlur: 16
       }),
     ]);
 
