@@ -1,7 +1,7 @@
 import { BufferBase } from "../buffers/BufferBase";
 import { ComputeBuffer } from "../buffers/ComputeBuffer";
 import { Vector4 } from "../math/Vector4";
-import { FontInfo } from "../sdf/text/FontLoader";
+import { FontGlyph, FontInfo } from "../sdf/text/FontLoader";
 import { InstancedGeometry } from "./InstancedGeometry";
 import { PlaneGeometry } from "./PlaneGeometry";
 
@@ -23,7 +23,6 @@ class TextGeometry extends InstancedGeometry {
     }) {
         super(new PlaneGeometry(1, 1), options.text.length);
 
-        console.log(options.fontInfo);
         this._text = options.text;
         this._fontInfo = options.fontInfo;
         this._width = options.width;
@@ -43,30 +42,31 @@ class TextGeometry extends InstancedGeometry {
         for (let word of words) {
             let wordWidth = 0;
             for (let _char of word) {
-                const glyph = this._fontInfo.variants[0].glyphs.find((char: any) => char.codepoint === _char.charCodeAt(0));
-                wordWidth += glyph!.advance.horizontal;
+                const glyph = this._fontInfo.variants[0].glyphs.find((char: FontGlyph) => char.codepoint === _char.charCodeAt(0));
+                if (glyph) wordWidth += glyph.advance.horizontal;
             }
             if (posX + wordWidth > this._width) {
                 posX = 0;
                 posY -= 1.1;
             }
             for (let wordIt = 0; wordIt < word.length; wordIt++) {
-                const glyph = this._fontInfo.variants[0].glyphs.find((char: any) => char.codepoint === word[wordIt].charCodeAt(0));
+                const glyph = this._fontInfo.variants[0].glyphs.find((char: FontGlyph) => char.codepoint === word[wordIt].charCodeAt(0));
+                if (!glyph) continue;
 
                 posBuffer[itText * 4] = posX; // X coordinate
                 posBuffer[itText * 4 + 1] = posY; // Y coordinate
                 posBuffer[itText * 4 + 2] = 0; // Z coordinate
                 posBuffer[itText * 4 + 3] = 1; // W coordinate
 
-                imageBoundsBuffer[itText * 4] = glyph!.image_bounds.left / this._fontInfo.images[0].width;
-                imageBoundsBuffer[itText * 4 + 1] = glyph!.image_bounds.top / this._fontInfo.images[0].height;
-                imageBoundsBuffer[itText * 4 + 2] = glyph!.image_bounds.right / this._fontInfo.images[0].width;
-                imageBoundsBuffer[itText * 4 + 3] = glyph!.image_bounds.bottom / this._fontInfo.images[0].height;
+                imageBoundsBuffer[itText * 4] = glyph.image_bounds.left / this._fontInfo.images[0].width;
+                imageBoundsBuffer[itText * 4 + 1] = glyph.image_bounds.top / this._fontInfo.images[0].height;
+                imageBoundsBuffer[itText * 4 + 2] = glyph.image_bounds.right / this._fontInfo.images[0].width;
+                imageBoundsBuffer[itText * 4 + 3] = glyph.image_bounds.bottom / this._fontInfo.images[0].height;
 
-                planeBoundsBuffer[itText * 4] = glyph!.plane_bounds.left;
-                planeBoundsBuffer[itText * 4 + 1] = glyph!.plane_bounds.top;
-                planeBoundsBuffer[itText * 4 + 2] = glyph!.plane_bounds.right;
-                planeBoundsBuffer[itText * 4 + 3] = glyph!.plane_bounds.bottom;
+                planeBoundsBuffer[itText * 4] = glyph.plane_bounds.left;
+                planeBoundsBuffer[itText * 4 + 1] = glyph.plane_bounds.top;
+                planeBoundsBuffer[itText * 4 + 2] = glyph.plane_bounds.right;
+                planeBoundsBuffer[itText * 4 + 3] = glyph.plane_bounds.bottom;
 
                 colorsBuffer[itText * 4] = this._color.x;
                 colorsBuffer[itText * 4 + 1] = this._color.y;
@@ -74,32 +74,34 @@ class TextGeometry extends InstancedGeometry {
                 colorsBuffer[itText * 4 + 3] = this._color.w;
 
                 itText++;
-                posX += glyph!.advance.horizontal;
+                posX += glyph.advance.horizontal;
                 // Add space between words
                 if (wordIt === word.length - 1) {
-                    const spaceGlyph = this._fontInfo.variants[0].glyphs.find((char: any) => char.codepoint === ' '.charCodeAt(0));
-                    posBuffer[itText * 4] = posX; // X coordinate
-                    posBuffer[itText * 4 + 1] = posY; // Y coordinate
-                    posBuffer[itText * 4 + 2] = 0; // Z coordinate
-                    posBuffer[itText * 4 + 3] = 1; // W coordinate
+                    const spaceGlyph = this._fontInfo.variants[0].glyphs.find((char: FontGlyph) => char.codepoint === ' '.charCodeAt(0));
+                    if (spaceGlyph) {
+                        posBuffer[itText * 4] = posX; // X coordinate
+                        posBuffer[itText * 4 + 1] = posY; // Y coordinate
+                        posBuffer[itText * 4 + 2] = 0; // Z coordinate
+                        posBuffer[itText * 4 + 3] = 1; // W coordinate
 
-                    imageBoundsBuffer[itText * 4] = spaceGlyph!.image_bounds.left / this._fontInfo.images[0].width;
-                    imageBoundsBuffer[itText * 4 + 1] = spaceGlyph!.image_bounds.top / this._fontInfo.images[0].height;
-                    imageBoundsBuffer[itText * 4 + 2] = spaceGlyph!.image_bounds.right / this._fontInfo.images[0].width;
-                    imageBoundsBuffer[itText * 4 + 3] = spaceGlyph!.image_bounds.bottom / this._fontInfo.images[0].height;
+                        imageBoundsBuffer[itText * 4] = spaceGlyph.image_bounds.left / this._fontInfo.images[0].width;
+                        imageBoundsBuffer[itText * 4 + 1] = spaceGlyph.image_bounds.top / this._fontInfo.images[0].height;
+                        imageBoundsBuffer[itText * 4 + 2] = spaceGlyph.image_bounds.right / this._fontInfo.images[0].width;
+                        imageBoundsBuffer[itText * 4 + 3] = spaceGlyph.image_bounds.bottom / this._fontInfo.images[0].height;
 
-                    planeBoundsBuffer[itText * 4] = spaceGlyph!.plane_bounds.left;
-                    planeBoundsBuffer[itText * 4 + 1] = spaceGlyph!.plane_bounds.top;
-                    planeBoundsBuffer[itText * 4 + 2] = spaceGlyph!.plane_bounds.right;
-                    planeBoundsBuffer[itText * 4 + 3] = spaceGlyph!.plane_bounds.bottom;
+                        planeBoundsBuffer[itText * 4] = spaceGlyph.plane_bounds.left;
+                        planeBoundsBuffer[itText * 4 + 1] = spaceGlyph.plane_bounds.top;
+                        planeBoundsBuffer[itText * 4 + 2] = spaceGlyph.plane_bounds.right;
+                        planeBoundsBuffer[itText * 4 + 3] = spaceGlyph.plane_bounds.bottom;
 
-                    colorsBuffer[itText * 4] = this._color.x;
-                    colorsBuffer[itText * 4 + 1] = this._color.y;
-                    colorsBuffer[itText * 4 + 2] = this._color.z;
-                    colorsBuffer[itText * 4 + 3] = this._color.w;
+                        colorsBuffer[itText * 4] = this._color.x;
+                        colorsBuffer[itText * 4 + 1] = this._color.y;
+                        colorsBuffer[itText * 4 + 2] = this._color.z;
+                        colorsBuffer[itText * 4 + 3] = this._color.w;
 
-                    posX += spaceGlyph!.advance.horizontal;
-                    itText++;
+                        posX += spaceGlyph.advance.horizontal;
+                        itText++;
+                    }
                 }
             }
         }

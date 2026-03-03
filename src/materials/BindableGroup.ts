@@ -37,6 +37,10 @@ class BindableGroup {
      * @param gpuDevice - The GPU device used to create the bind group layout.
      */
     public createRenderingBindGroupLayout(gpuDevice: GPUDevice) {
+        // Slot 1 in the pipeline — per-object world/normal matrices.
+        // hasDynamicOffset: true lets the renderer select each object's slice
+        // of a single large shared buffer, reducing writeBuffer calls from
+        // 2×N (one per matrix per object) down to 2 total per frame.
         this.cameraBindablesGroupLayout = gpuDevice.createBindGroupLayout({
             label: 'Camera BindGroupLayout',
             entries: [
@@ -44,14 +48,16 @@ class BindableGroup {
                     binding: 0,
                     visibility: GPUShaderStage.VERTEX,
                     buffer: {
-                        type: 'uniform'
+                        type: 'uniform',
+                        hasDynamicOffset: true,
                     }
                 },
                 {
                     binding: 1,
                     visibility: GPUShaderStage.VERTEX,
                     buffer: {
-                        type: 'uniform'
+                        type: 'uniform',
+                        hasDynamicOffset: true,
                     }
                 }
             ]

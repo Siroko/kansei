@@ -12,6 +12,9 @@ class Vector extends BufferBase {
     /** The internal representation of the vector using gl-matrix's vec-n. */
     public internalVec?: vec2 | vec3 | vec4;
 
+    /** Called whenever any component changes. Used by Object3D to auto-flag matrixNeedsUpdate. */
+    public onChange?: () => void;
+
     /**
      * Constructs a new Vector instance.`
      * 
@@ -37,8 +40,9 @@ class Vector extends BufferBase {
      * @private
      */
     protected updateBuffer() {
-        this.buffer!.set(this.internalVec!);
+        // buffer is a shared view of internalVec — no copy needed.
         this.needsUpdate = true;
+        this.onChange?.();
     }
 
     /**
