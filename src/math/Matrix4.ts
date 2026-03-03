@@ -39,6 +39,17 @@ class Matrix4 extends BufferBase {
     }
 
     /**
+     * Syncs internalMat4 to the CPU-side buffer for GPU upload.
+     * Call this after directly manipulating internalMat4 to avoid the per-operation
+     * overhead of the individual transformation methods.
+     */
+    public syncBuffer() {
+        this.buffer!.set(this.internalMat4);
+        this.needsUpdate = true;
+        this.version++;
+    }
+
+    /**
      * Inverts the given world matrix and updates this matrix with the result.
      * @param worldMatrix The matrix to invert.
      * @returns This matrix after inversion.
