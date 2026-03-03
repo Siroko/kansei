@@ -18,19 +18,12 @@
 <body>
   <script type="module">
     import { Renderer } from '../src/renderers/Renderer'
-    import { Texture } from '../src/buffers/Texture'
-    import { Sampler } from '../src/buffers/Sampler'
-    import { shaderCode } from './assets/shaders/TexturedCube.js'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { Renderable } from '../src/objects/Renderable'
     import { Scene } from '../src/objects/Scene'
     import { Camera } from '../src/cameras/Camera'
-    import { VideoTexture } from '../src/buffers/VideoTexture'
-    import { Vector4 } from '../src/math/Vector4'
-    import { Vector3 } from '../src/math/Vector3'
     import { Vector2 } from '../src/math/Vector2'
-    import { TextureLoader } from '../src/loaders/TextureLoader'
     import { CameraControls } from '../src/controls/CameraControls'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
@@ -38,10 +31,56 @@
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
-    const GRID_SIZE      = 100;   // cubes per side (total = GRID_SIZE²)
-    const GRID_SPACING   = 1.5;   // world-space gap between cube centres
-    const NOISE_ZOOM     = 0.08;  // noise frequency — lower = broader hills
-    const SCALE_Y_STRENGTH = 6;   // max Y scale applied to each cube
+    const GRID_SIZE        = 100;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SPACING     = 1.5;   // world-space gap between cube centres
+    const NOISE_ZOOM       = 0.08;  // noise frequency — lower = broader hills
+    const SCALE_Y_STRENGTH = 6;     // max Y scale applied to each cube
+
+    // ── Lambert shader (white base colour, single directional/point light) ───
+    // Light sits top-right of the scene: high Y, positive X, slightly back.
+    // Group 0 is intentionally empty — light data is baked as a WGSL constant.
+    const lambertShader = /* wgsl */`
+      // World-space light position (top-right of the scene).
+      const LIGHT_POS : vec3f = vec3f(80.0, 150.0, -60.0);
+      const AMBIENT   : f32   = 0.12;
+      const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
+
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      // Group 0 — no material bindings for this shader
+      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        let worldPos = worldMatrix * position;
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        // normalMatrix is the inverse-transpose model matrix — correct for
+        // non-uniform scales (e.g. the tall, thin noise columns).
+        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        return out;
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> @location(0) vec4f {
+        let L        = normalize(LIGHT_POS - frag.worldPos);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
+        return vec4f(BASE_COLOR * lighting, 1.0);
+      }
+    `;
 
     // ── Smooth value noise (2-D, 4 octaves) ───────────────────────────────────
     function hash2(xi, yi) {
@@ -67,7 +106,7 @@
         amp  *= 0.5;
         freq *= 2.0;
       }
-      return v / norm; // normalised to [0, 1]
+      return v / norm; // normalised [0, 1]
     }
 
     // ── Renderer ──────────────────────────────────────────────────────────────
@@ -80,7 +119,7 @@
     });
     await renderer.initialize();
     renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas)
+    document.body.appendChild(renderer.canvas);
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
@@ -88,21 +127,12 @@
     const orbitRadius = window.innerWidth < 768 ? 120 : 90;
     const cameraControls = new CameraControls(camera, scene.position, null, orbitRadius);
 
-    // ── Material ──────────────────────────────────────────────────────────────
-    const tl         = new TextureLoader();
-    const imageBitmap = await tl.load('./assets/textures/character_sheet_without_black.jpg');
-    const texture    = new Texture(imageBitmap, true);
-    const sampler    = new Sampler('linear', 'linear');
-    const material   = new Material(shaderCode, {
-      bindings: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: texture },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: sampler },
-      ]
-    });
+    // ── Material (no texture — Lambert only) ──────────────────────────────────
+    const material = new Material(lambertShader, { bindings: [] });
+    const geometry = new BoxGeometry(1, 1, 1);
 
     // ── Grid of cubes — position and scaleY set once, never changed ───────────
-    const geometry = new BoxGeometry(1, 1, 1);
-    const half     = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre the grid at 0,0
+    const half = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
 
     for (let row = 0; row < GRID_SIZE; row++) {
       for (let col = 0; col < GRID_SIZE; col++) {
@@ -111,27 +141,25 @@
 
         // Perlin-like FBM noise keyed to world position
         const noiseVal = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM);
-        const scaleY   = noiseVal * SCALE_Y_STRENGTH + 0.1; // [0.1 .. SCALE_Y_STRENGTH+0.1]
+        const scaleY   = noiseVal * SCALE_Y_STRENGTH + 0.1;
 
         const renderable = new Renderable(geometry, material);
         renderable.position.x = worldX;
-        renderable.position.y = 0;          // always on the ground plane
+        renderable.position.y = 0;
         renderable.position.z = worldZ;
-        renderable.scale.y    = scaleY;     // height driven by noise
+        renderable.scale.y    = scaleY;
         scene.add(renderable);
       }
     }
 
     // ── Post-processing volume ────────────────────────────────────────────────
     const volume = new PostProcessingVolume(renderer, [
-      // SSAO — accentuates crevices between shorter columns
       new SSAOEffect({
         radius: 1.2,
         bias: 0.02,
         kernelSize: 16,
         strength: 1.5
       }),
-      // God Rays — radial shafts from a fixed screen-space light source
       new GodRaysEffect({
         lightScreenPos: new Vector2(0.5, 0.08),
         density: 0.95,
@@ -140,7 +168,6 @@
         exposure: 0.8,
         numSamples: 80
       }),
-      // DoF — grid edge blurs, centre stays sharp
       new DepthOfFieldEffect({
         focusDistance: orbitRadius,
         focusRange: 30,
