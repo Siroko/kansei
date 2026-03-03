@@ -284,6 +284,14 @@ class Renderer {
             this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
         }
 
+        // Invalidate the bundle if any object had its material swapped this frame.
+        for (const renderable of orderedObjects) {
+            if (renderable.materialDirty) {
+                this._renderBundle = null;
+                renderable.materialDirty = false;
+            }
+        }
+
         // Phase 2 — (re-)record the render bundle when the scene composition changes.
         if (!this._renderBundle || this._lastObjectCount !== orderedObjects.length) {
             this._renderBundle = this._buildRenderBundle(orderedObjects, cameraBindGroup);
