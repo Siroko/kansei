@@ -13,6 +13,9 @@ class Matrix4 extends BufferBase {
     /** The internal 4x4 matrix. */
     public readonly internalMat4: mat4;
 
+    /** Incremented each time the matrix data changes. Used for dirty tracking. */
+    public version: number = 0;
+
     private right = vec3.fromValues(1, 0, 0);
     private up = vec3.fromValues(0, 1, 0);
     private forward = vec3.fromValues(0, 0, 1);
@@ -23,15 +26,27 @@ class Matrix4 extends BufferBase {
     constructor() {
         super();
         this.internalMat4 = mat4.create();
-        this.buffer = new Float32Array(this.internalMat4);
+        // Shared view — any gl-matrix write to internalMat4 is instantly visible
+        // in buffer without a copy, so updateBuffer/syncBuffer need no set() call.
+        this.buffer = new Float32Array((this.internalMat4 as unknown as Float32Array).buffer);
     }
 
     /**
      * Updates the buffer with the current matrix values and marks it for update.
      */
     private updateBuffer() {
-        this.buffer!.set(this.internalMat4);
+        // buffer is a shared view of internalMat4 — no copy needed.
         this.needsUpdate = true;
+        this.version++;
+    }
+
+    /**
+     * Marks the buffer ready for GPU upload after direct internalMat4 manipulation.
+     * No copy is needed because buffer is a shared view of the same memory.
+     */
+    public syncBuffer() {
+        this.needsUpdate = true;
+        this.version++;
     }
 
     /**

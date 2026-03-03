@@ -18,7 +18,7 @@ class Vector3 extends Vector {
         super();
         this.internalVec = vec3.create();
         vec3.set(this.internalVec, x, y, z);
-        this.buffer = new Float32Array(this.internalVec);
+        this.buffer = new Float32Array((this.internalVec as unknown as Float32Array).buffer);
     }
 
     public set(x: number, y: number, z: number) {
@@ -41,12 +41,15 @@ class Vector3 extends Vector {
         this.updateBuffer();
     }
 
+    public distanceToSquared(other: Vector3): number {
+        const dx = this.x - other.x;
+        const dy = this.y - other.y;
+        const dz = this.z - other.z;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
     public distanceTo(other: Vector3): number {
-        return Math.sqrt(
-            Math.pow(this.x - other.x, 2) +
-            Math.pow(this.y - other.y, 2) +
-            Math.pow(this.z - other.z, 2)
-        );
+        return Math.sqrt(this.distanceToSquared(other));
     }
 }
 

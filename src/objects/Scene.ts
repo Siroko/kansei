@@ -9,6 +9,7 @@ import { Renderable } from "./Renderable";
 class Scene extends Object3D {
     private opaqueObjects: Renderable[] = [];
     private transparentObjects: Renderable[] = [];
+    private orderedObjects: Renderable[] = [];
 
     /**
      * Constructs a new Scene object.
@@ -18,9 +19,9 @@ class Scene extends Object3D {
     }
 
     public prepare(camera: Camera) {
-        // Clear arrays
-        this.opaqueObjects = [];
-        this.transparentObjects = [];
+        // Clear arrays in-place to avoid allocation
+        this.opaqueObjects.length = 0;
+        this.transparentObjects.length = 0;
         // Sort objects into opaque and transparent
         this.traverse(this, (object: Object3D) => {
             if (object.isRenderable) {
@@ -33,17 +34,22 @@ class Scene extends Object3D {
             }
         });
 
-        // Sort transparent objects back-to-front
+        // Sort transparent objects back-to-front (squared distance avoids sqrt per comparison)
         const cameraPosition = camera.position;
         this.transparentObjects.sort((a, b) => {
-            const distA = a.position.distanceTo(cameraPosition);
-            const distB = b.position.distanceTo(cameraPosition);
+            const distA = a.position.distanceToSquared(cameraPosition);
+            const distB = b.position.distanceToSquared(cameraPosition);
             return distB - distA;
         });
+
+        // Build ordered list in-place: opaque first, then transparent
+        this.orderedObjects.length = 0;
+        for (let i = 0; i < this.opaqueObjects.length; i++) this.orderedObjects.push(this.opaqueObjects[i]);
+        for (let i = 0; i < this.transparentObjects.length; i++) this.orderedObjects.push(this.transparentObjects[i]);
     }
 
     public getOrderedObjects(): Renderable[] {
-        return [...this.opaqueObjects, ...this.transparentObjects];
+        return this.orderedObjects;
     }
 }
 
