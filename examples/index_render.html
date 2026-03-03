@@ -29,8 +29,14 @@
     import { VideoTexture } from '../src/buffers/VideoTexture'
     import { Vector4 } from '../src/math/Vector4'
     import { Vector3 } from '../src/math/Vector3'
+    import { Vector2 } from '../src/math/Vector2'
     import { TextureLoader } from '../src/loaders/TextureLoader'
     import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
+    import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
+    import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
+
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
@@ -80,6 +86,32 @@
       originalPositions.push({ x: ox, y: oy, z: oz });
     }
 
+    // Post-processing volume — all effects are compute-shader based.
+    const volume = new PostProcessingVolume(renderer, [
+      // SSAO — adds contact shadows between cubes as they cluster together.
+      new SSAOEffect({
+        radius: 1.2,
+        bias: 0.02,
+        kernelSize: 16,
+        strength: 1.5
+      }),
+      // God Rays — radial light shafts from a fixed screen-space source position.
+      new GodRaysEffect({
+        lightScreenPos: new Vector2(0.5, 0.08),
+        density: 0.95,
+        weight: 0.008,
+        decay: 0.97,
+        exposure: 0.8,
+        numSamples: 80
+      }),
+      // Depth of Field — keeps the cluster core sharp, blurs distant strays.
+      new DepthOfFieldEffect({
+        focusDistance: 20,
+        focusRange: 12,
+        maxBlur: 8
+      }),
+    ]);
+
     // Flowmap-style nested trig: sin(cos(sin(cos(...)))) seeded per-cube
     function flowOffset(t, seed1, seed2, seed3) {
       return Math.sin(
@@ -127,7 +159,9 @@
         // renderable.scale.z = sc;
       }
 
-      await renderer.render(scene, camera);
+      // volume.render() replaces renderer.render() — runs the full chain:
+      //   renderToGBuffer → SSAO → God Rays → DoF → blit to canvas
+      volume.render(scene, camera);
 
       requestAnimationFrame(animate);
     }
