@@ -3,7 +3,6 @@ import { Camera } from "../cameras/Camera";
 import { InstancedGeometry } from "../geometries/InstancedGeometry";
 import { Vector4 } from "../main";
 import { Compute } from "../materials/Compute";
-import { Object3D } from "../objects/Object3D";
 import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
 
@@ -50,13 +49,10 @@ class Renderer {
     private height: number = 240;
     private clearColor: Vector4 = new Vector4(0, 0, 0, 0);
 
-    // Per-pass state tracking — reset at the start of each render() call so
-    // redundant setPipeline / setBindGroup / setIndexBuffer / setVertexBuffer
-    // commands are skipped when consecutive objects share the same state.
-    private _currentPipeline: GPURenderPipeline | null = null;
-    private _currentMaterialBindGroup: GPUBindGroup | null = null;
-    private _currentIndexBuffer: GPUBuffer | null = null;
-    private _currentVertexBuffer: GPUBuffer | null = null;
+    // Pre-recorded bundle of all draw commands. Re-built only when the scene
+    // composition changes (objects added/removed, pipeline reassigned, etc.).
+    private _renderBundle: GPURenderBundle | null = null;
+    private _lastObjectCount: number = -1;
 
     constructor(
         private options: RendererOptions = {}
@@ -139,12 +135,73 @@ class Renderer {
     }
 
     /**
+     * Call this whenever the scene composition changes (objects added/removed,
+     * material or pipeline reassigned) to force the render bundle to be rebuilt
+     * on the next frame.
+     */
+    public invalidateBundle() {
+        this._renderBundle = null;
+    }
+
+    /**
      * Renders a stack using the specified camera.
+     *
+     * Each frame has three phases:
+     *  1. Update — compute matrices and flush GPU buffers (writeBuffer) for
+     *     every object. This is the only place driver upload work happens.
+     *  2. Bundle — pre-record all draw commands once into a GPURenderBundle
+     *     and re-use it every frame until the scene composition changes.
+     *  3. Execute — replay the bundle inside a fresh render pass with a single
+     *     executeBundles() call, eliminating per-frame command-encoding overhead.
+     *
      * @param {Scene} stack - The stack to render
      * @param {Camera} camera - The camera to use for rendering
      */
     public render(stack: Scene, camera: Camera) {
+        stack.prepare(camera);
+        camera.updateViewMatrix();
 
+        const orderedObjects = stack.getOrderedObjects();
+        const cameraBindGroup = camera.getBindGroup(this.device!);
+
+        // Phase 1 — update matrices and flush GPU buffers outside the render pass.
+        for (const renderable of orderedObjects) {
+            if (!renderable.geometry.initialized) {
+                renderable.geometry.initialize(this.device!);
+            }
+            if (!renderable.material.initialized) {
+                renderable.material.initialize(
+                    this.device!,
+                    renderable.geometry.vertexBuffersDescriptors!,
+                    this.presentationFormat!,
+                    this.sampleCount
+                );
+            }
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
+                for (const extraBuffer of geo.extraBuffers) {
+                    if (!extraBuffer.initialized) extraBuffer.initialize(this.device!);
+                }
+            }
+
+            renderable.updateModelMatrix();
+            renderable.updateNormalMatrix(camera.viewMatrix);
+
+            // Flush dirty GPU buffers (writeBuffer). getBindGroup() calls
+            // update() on each buffer when needsUpdate is true.
+            renderable.material.getBindGroup(this.device!);
+            renderable.getBindGroup(this.device!);
+        }
+
+        // Phase 2 — (re-)record the bundle when the scene composition changes.
+        // Object count is a cheap proxy for scene change; call invalidateBundle()
+        // explicitly for pipeline/material reassignments.
+        if (!this._renderBundle || this._lastObjectCount !== orderedObjects.length) {
+            this._renderBundle = this._buildRenderBundle(orderedObjects, cameraBindGroup);
+            this._lastObjectCount = orderedObjects.length;
+        }
+
+        // Phase 3 — execute the pre-recorded bundle in a fresh render pass.
         const commandRenderEncoder = this.device!.createCommandEncoder();
         const textureView = this.context!.getCurrentTexture().createView();
 
@@ -170,115 +227,83 @@ class Renderer {
                 depthStoreOp: 'store',
             },
         } as GPURenderPassDescriptor;
-        const passRenderEncoder = commandRenderEncoder!.beginRenderPass(renderPassDescriptor);
 
-        // Prepare stack (sort transparent objects)
-        stack.prepare(camera);
-
-        camera.updateViewMatrix();
-        const cameraBindGroup = camera.getBindGroup(this.device!);
-
-        // Reset per-pass state so the first object always sets everything
-        this._currentPipeline = null;
-        this._currentMaterialBindGroup = null;
-        this._currentIndexBuffer = null;
-        this._currentVertexBuffer = null;
-
-        // Camera bind group (slot 2) is identical for every object — set once
-        passRenderEncoder.setBindGroup(2, cameraBindGroup);
-
-        // Render objects in order (opaque first, then transparent)
-        for (const object of stack.getOrderedObjects()) {
-            this.renderObject(object, passRenderEncoder, camera);
-        }
-        passRenderEncoder!.end();
-        this.device!.queue.submit([commandRenderEncoder!.finish()]);
-        // Wait for the render work to complete
-        // return this.device!.queue.onSubmittedWorkDone();
+        const passRenderEncoder = commandRenderEncoder.beginRenderPass(renderPassDescriptor);
+        passRenderEncoder.executeBundles([this._renderBundle]);
+        passRenderEncoder.end();
+        this.device!.queue.submit([commandRenderEncoder.finish()]);
     }
 
     /**
-     * Renders a single object, skipping redundant pipeline/buffer/bind-group
-     * state changes when consecutive objects share the same state.
-     * @private
-     * @param {Object3D} object - The object to render
-     * @param {GPURenderPassEncoder} passRenderEncoder - The current render pass encoder
-     * @param {Camera} camera - The camera used for rendering
+     * Records all draw commands for the given objects into a GPURenderBundle.
+     * The bundle captures pipeline, bind group, vertex/index buffer, and draw
+     * state so it can be replayed cheaply each frame without re-encoding.
+     *
+     * Buffer *contents* (world/normal matrices etc.) are not baked in — those
+     * are updated via writeBuffer before the bundle executes each frame.
      */
-    private renderObject(
-        object: Object3D,
-        passRenderEncoder: GPURenderPassEncoder,
-        camera: Camera
-    ) {
-        if (!object.isRenderable) return;
+    private _buildRenderBundle(
+        orderedObjects: Renderable[],
+        cameraBindGroup: GPUBindGroup
+    ): GPURenderBundle {
+        const encoder = this.device!.createRenderBundleEncoder({
+            colorFormats: [this.presentationFormat!],
+            depthStencilFormat: 'depth24plus',
+            sampleCount: this.sampleCount,
+        });
 
-        const renderable = object as Renderable;
-        if (!renderable.geometry.initialized) {
-            renderable.geometry.initialize(this.device!);
-        }
-        if (!renderable.material.initialized) {
-            renderable.material.initialize(
-                this.device!,
-                renderable.geometry.vertexBuffersDescriptors!,
-                this.presentationFormat!,
-                this.sampleCount
-            );
-        }
+        let currentPipeline: GPURenderPipeline | null = null;
+        let currentMaterialBindGroup: GPUBindGroup | null = null;
+        let currentIndexBuffer: GPUBuffer | null = null;
+        let currentVertexBuffer: GPUBuffer | null = null;
 
-        // Pipeline — skip if unchanged; a new pipeline may have a different
-        // layout at slot 0 so force the material bind group to be re-set.
-        if (renderable.material.pipeline !== this._currentPipeline) {
-            passRenderEncoder.setPipeline(renderable.material.pipeline!);
-            this._currentPipeline = renderable.material.pipeline!;
-            this._currentMaterialBindGroup = null;
-        }
+        // Camera bind group is the same for every object — set once.
+        encoder.setBindGroup(2, cameraBindGroup);
 
-        // Index buffer — skip if same geometry
-        if (renderable.geometry.indexBuffer !== this._currentIndexBuffer) {
-            passRenderEncoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
-            this._currentIndexBuffer = renderable.geometry.indexBuffer!;
-        }
+        for (const renderable of orderedObjects) {
+            if (!renderable.material.pipeline || !renderable.geometry.initialized) continue;
 
-        // Primary vertex buffer — skip if same geometry
-        if (renderable.geometry.vertexBuffer !== this._currentVertexBuffer) {
-            passRenderEncoder.setVertexBuffer(0, renderable.geometry.vertexBuffer!);
-            this._currentVertexBuffer = renderable.geometry.vertexBuffer!;
-        }
+            if (renderable.material.pipeline !== currentPipeline) {
+                encoder.setPipeline(renderable.material.pipeline);
+                currentPipeline = renderable.material.pipeline;
+                currentMaterialBindGroup = null;
+            }
 
-        // Extra per-instance vertex buffers (instanced geometry only)
-        if (renderable.geometry.isInstancedGeometry) {
-            const geo = renderable.geometry as InstancedGeometry;
-            let vertexBufferIndex = 1;
-            for (const extraBuffer of geo.extraBuffers) {
-                if (!extraBuffer.initialized) {
-                    extraBuffer.initialize(this.device!);
+            if (renderable.geometry.indexBuffer !== currentIndexBuffer) {
+                encoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
+                currentIndexBuffer = renderable.geometry.indexBuffer!;
+            }
+
+            if (renderable.geometry.vertexBuffer !== currentVertexBuffer) {
+                encoder.setVertexBuffer(0, renderable.geometry.vertexBuffer!);
+                currentVertexBuffer = renderable.geometry.vertexBuffer!;
+            }
+
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
+                let idx = 1;
+                for (const extraBuffer of geo.extraBuffers) {
+                    encoder.setVertexBuffer(idx++, extraBuffer.resource.buffer);
                 }
-                passRenderEncoder.setVertexBuffer(vertexBufferIndex, extraBuffer.resource.buffer);
-                vertexBufferIndex++;
+            }
+
+            const materialBindGroup = renderable.material.getBindGroup(this.device!);
+            if (materialBindGroup !== currentMaterialBindGroup) {
+                encoder.setBindGroup(0, materialBindGroup);
+                currentMaterialBindGroup = materialBindGroup;
+            }
+
+            encoder.setBindGroup(1, renderable.getBindGroup(this.device!));
+
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
+                encoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
+            } else {
+                encoder.drawIndexed(renderable.geometry.vertexCount);
             }
         }
 
-        renderable.updateModelMatrix();
-        renderable.updateNormalMatrix(camera.viewMatrix);
-
-        // Material bind group (slot 0) — skip if same material
-        const materialBindGroup = renderable.material.getBindGroup(this.device!);
-        if (materialBindGroup !== this._currentMaterialBindGroup) {
-            passRenderEncoder.setBindGroup(0, materialBindGroup);
-            this._currentMaterialBindGroup = materialBindGroup;
-        }
-
-        // Mesh bind group (slot 1) — unique per object, always set
-        passRenderEncoder.setBindGroup(1, renderable.getBindGroup(this.device!));
-
-        // Slot 2 (camera) is set once in render() — no per-object call needed
-
-        if (renderable.geometry.isInstancedGeometry) {
-            const geo = renderable.geometry as InstancedGeometry;
-            passRenderEncoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
-        } else {
-            passRenderEncoder.drawIndexed(renderable.geometry.vertexCount);
-        }
+        return encoder.finish();
     }
 
     /**

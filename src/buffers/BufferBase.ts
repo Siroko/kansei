@@ -87,7 +87,7 @@ class BufferBase implements IBindable {
      */
     public update(gpuDevice: GPUDevice) {
         if (this._resource) {
-            gpuDevice!.queue.writeBuffer(this._resource, 0, this.buffer!);
+            gpuDevice!.queue.writeBuffer(this._resource, 0, this.buffer!.buffer as ArrayBuffer);
         }
         this.needsUpdate = false;
     }
