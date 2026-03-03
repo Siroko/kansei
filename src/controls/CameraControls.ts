@@ -116,7 +116,7 @@ class CameraControls {
      * Removes event listeners for mouse and touch interactions.
      */
     private removeEvents() {
-        const domElement = document.getElementById('scrollHandler') || window;
+        const domElement = this.domElement;
 
         document.removeEventListener('wheel', this.mouseWheelHandler as EventListener);
         domElement.removeEventListener('mousedown', this.mouseDownHandler as EventListener);

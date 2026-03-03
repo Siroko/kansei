@@ -11,9 +11,6 @@ class Object3D {
     public worldMatrix: Matrix4;
     public normalMatrix: Matrix4;
 
-    protected rotationMatrix: Matrix4 = new Matrix4();
-    protected translationMatrix: Matrix4 = new Matrix4();
-    protected scaleMatrix: Matrix4 = new Matrix4();
     protected lookAtMatrix: Matrix4 = new Matrix4();
 
     public children: Object3D[] = [];
@@ -25,6 +22,12 @@ class Object3D {
 
     public up: Vector3 = new Vector3(0, 1, 0);
 
+    public matrixNeedsUpdate: boolean = true;
+
+    private _lastParentWorldVersion: number = -1;
+    private _lastNormalViewVersion: number = -1;
+    private _lastNormalWorldVersion: number = -1;
+
     protected bindableGroup?: BindableGroup;
 
     /**
@@ -34,6 +37,12 @@ class Object3D {
         this.modelMatrix = new Matrix4();
         this.worldMatrix = new Matrix4();
         this.normalMatrix = new Matrix4();
+
+        const flagDirty = () => { this.matrixNeedsUpdate = true; };
+        this.position.onChange = flagDirty;
+        this.rotation.onChange = flagDirty;
+        this.scale.onChange = flagDirty;
+
         this.setUniforms();
     }
 
@@ -62,24 +71,24 @@ class Object3D {
      * Updates the model matrix based on the object's position, rotation, and scale.
      */
     public updateModelMatrix() {
-        this.scaleMatrix.identity(); // Reset the matrix
-        this.scaleMatrix.scale(this.scale);
+        const parentWorldVersion = this.parent ? this.parent.worldMatrix.version : -1;
+        if (!this.matrixNeedsUpdate && parentWorldVersion === this._lastParentWorldVersion) return;
 
-        this.rotationMatrix.identity(); // Reset the matrix
-        this.rotationMatrix.rotate(this.rotation);
-
-        this.translationMatrix.identity(); // Reset the matrix
-        this.translationMatrix.translate(this.position);
-
-        this.modelMatrix.identity(); // Reset the matrix
-
-        this.modelMatrix.multiply(this.modelMatrix, this.translationMatrix);
-        this.modelMatrix.multiply(this.modelMatrix, this.rotationMatrix);
-        this.modelMatrix.multiply(this.modelMatrix, this.scaleMatrix);
+        // Build T*R*S directly on internalMat4 — no intermediate buffer syncs.
+        // scaleMatrix/rotationMatrix/translationMatrix wrappers are bypassed entirely
+        // since those matrices are never uploaded to the GPU.
+        const mm = this.modelMatrix.internalMat4;
+        mat4.identity(mm);
+        mat4.translate(mm, mm, this.position.getVec() as vec3);
+        mat4.rotateZ(mm, mm, this.rotation.z);
+        mat4.rotateY(mm, mm, this.rotation.y);
+        mat4.rotateX(mm, mm, this.rotation.x);
+        mat4.scale(mm, mm, this.scale.getVec() as vec3);
 
         this.updateWorldMatrix();
-        this.modelMatrix.needsUpdate = true;
-        this.worldMatrix.needsUpdate = true;
+
+        this.matrixNeedsUpdate = false;
+        this._lastParentWorldVersion = parentWorldVersion;
     }
 
     /**
@@ -87,11 +96,20 @@ class Object3D {
      * @param viewMatrix The view matrix to use for updating the normal matrix.
      */
     public updateNormalMatrix(viewMatrix: Matrix4) {
-        this.normalMatrix.identity();
-        this.normalMatrix.multiply(viewMatrix, this.worldMatrix);
-        // Calculate inverse transpose
-        this.normalMatrix.invert(this.normalMatrix).transpose();
-        this.normalMatrix.needsUpdate = true;
+        if (viewMatrix.version === this._lastNormalViewVersion &&
+            this.worldMatrix.version === this._lastNormalWorldVersion) return;
+
+        // Compute inverse-transpose directly on internalMat4, then sync to
+        // buffer once at the end. mat4.multiply overwrites nm fully so no
+        // identity() call is needed.
+        const nm = this.normalMatrix.internalMat4;
+        mat4.multiply(nm, viewMatrix.internalMat4, this.worldMatrix.internalMat4);
+        mat4.invert(nm, nm);
+        mat4.transpose(nm, nm);
+        this.normalMatrix.syncBuffer();
+
+        this._lastNormalViewVersion = viewMatrix.version;
+        this._lastNormalWorldVersion = this.worldMatrix.version;
     }
 
     /**
@@ -110,9 +128,9 @@ class Object3D {
      * @param target The target position to look at.
      */
     lookAt(target: Vector3) {
-        this.lookAtMatrix.identity();
-        mat4.lookAt(this.lookAtMatrix.internalMat4, this.position.getVec() as vec3, target.toVec() as vec3, this.up.toVec() as vec3);
-        this.lookAtMatrix.invert(this.lookAtMatrix);
+        const lm = this.lookAtMatrix.internalMat4;
+        mat4.lookAt(lm, this.position.getVec() as vec3, target.toVec() as vec3, this.up.toVec() as vec3);
+        mat4.invert(lm, lm);
         // Extract Euler angles from the world matrix
         const [rotationX, rotationY, rotationZ] = this.lookAtMatrix.extractEulerAngles();
 
