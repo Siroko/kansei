@@ -54,6 +54,19 @@ class Renderer {
     private _renderBundle: GPURenderBundle | null = null;
     private _lastObjectCount: number = -1;
 
+    // Shared matrix buffers — all objects' world and normal matrices packed into
+    // two large GPU buffers (one per type) with 256-byte aligned strides.
+    // The renderer uploads all matrices in exactly 2 writeBuffer calls per frame
+    // instead of 2×N individual calls.
+    private _matrixAlignment: number = 256;  // device.limits.minUniformBufferOffsetAlignment
+    private _worldMatricesBuf: GPUBuffer | null = null;
+    private _normalMatricesBuf: GPUBuffer | null = null;
+    private _worldMatricesStaging: Float32Array | null = null;
+    private _normalMatricesStaging: Float32Array | null = null;
+    private _sharedMeshBGLayout: GPUBindGroupLayout | null = null;
+    private _sharedMeshBG: GPUBindGroup | null = null;
+    private _sharedMeshObjectCount: number = -1;
+
     constructor(
         private options: RendererOptions = {}
     ) {
@@ -144,15 +157,75 @@ class Renderer {
     }
 
     /**
+     * Creates or resizes the shared per-object matrix GPU buffers.
+     *
+     * All objects' world and normal matrices are packed into two large GPU
+     * buffers (one per type) with 256-byte aligned strides so every object's
+     * slice is accessible via a dynamic uniform buffer offset.  This lets the
+     * renderer upload ALL matrices in exactly 2 writeBuffer calls per frame.
+     */
+    private _ensureSharedMeshResources(objectCount: number) {
+        if (objectCount === this._sharedMeshObjectCount && this._sharedMeshBG !== null) return;
+
+        const alignment = this.device!.limits.minUniformBufferOffsetAlignment as number ?? 256;
+        this._matrixAlignment = alignment;
+
+        const bufferSize = Math.max(objectCount * alignment, alignment); // at least one slot
+        const floatsPerSlot = alignment / 4; // 64 floats for 256-byte alignment
+
+        this._worldMatricesBuf?.destroy();
+        this._normalMatricesBuf?.destroy();
+
+        this._worldMatricesBuf = this.device!.createBuffer({
+            label: 'WorldMatrices',
+            size: bufferSize,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this._normalMatricesBuf = this.device!.createBuffer({
+            label: 'NormalMatrices',
+            size: bufferSize,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Pre-zero the staging arrays — padding bytes stay zero every frame.
+        this._worldMatricesStaging = new Float32Array(objectCount * floatsPerSlot);
+        this._normalMatricesStaging = new Float32Array(objectCount * floatsPerSlot);
+
+        // Create the layout once; all subsequent bind groups reuse it.
+        if (!this._sharedMeshBGLayout) {
+            this._sharedMeshBGLayout = this.device!.createBindGroupLayout({
+                label: 'SharedMesh BindGroupLayout',
+                entries: [
+                    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
+                    { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
+                ],
+            });
+        }
+
+        // Bind each buffer's first 64 bytes; the dynamic offset shifts that
+        // window to the i-th object's slot at draw time.
+        this._sharedMeshBG = this.device!.createBindGroup({
+            label: 'SharedMesh BindGroup',
+            layout: this._sharedMeshBGLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this._normalMatricesBuf, size: 64 } },
+                { binding: 1, resource: { buffer: this._worldMatricesBuf,  size: 64 } },
+            ],
+        });
+
+        this._sharedMeshObjectCount = objectCount;
+        this._renderBundle = null; // force bundle rebuild with new bind group
+    }
+
+    /**
      * Renders a stack using the specified camera.
      *
      * Each frame has three phases:
-     *  1. Update — compute matrices and flush GPU buffers (writeBuffer) for
-     *     every object. This is the only place driver upload work happens.
+     *  1. Update — compute all matrices on the CPU, copy them into aligned
+     *     staging arrays, then upload via exactly 2 writeBuffer calls.
      *  2. Bundle — pre-record all draw commands once into a GPURenderBundle
-     *     and re-use it every frame until the scene composition changes.
-     *  3. Execute — replay the bundle inside a fresh render pass with a single
-     *     executeBundles() call, eliminating per-frame command-encoding overhead.
+     *     (dynamic offsets into the shared buffers are baked per object).
+     *  3. Execute — replay the bundle with a single executeBundles() call.
      *
      * @param {Scene} stack - The stack to render
      * @param {Camera} camera - The camera to use for rendering
@@ -164,8 +237,17 @@ class Renderer {
         const orderedObjects = stack.getOrderedObjects();
         const cameraBindGroup = camera.getBindGroup(this.device!);
 
-        // Phase 1 — update matrices and flush GPU buffers outside the render pass.
-        for (const renderable of orderedObjects) {
+        // Allocate / resize shared matrix buffers to match the current object count.
+        this._ensureSharedMeshResources(orderedObjects.length);
+
+        const alignment = this._matrixAlignment;
+        const floatsPerSlot = alignment / 4; // stride in the staging Float32Array
+
+        // Phase 1 — update all CPU matrices and write them into the staging arrays.
+        // No per-object writeBuffer calls happen here.
+        for (let i = 0; i < orderedObjects.length; i++) {
+            const renderable = orderedObjects[i];
+
             if (!renderable.geometry.initialized) {
                 renderable.geometry.initialize(this.device!);
             }
@@ -187,15 +269,22 @@ class Renderer {
             renderable.updateModelMatrix();
             renderable.updateNormalMatrix(camera.viewMatrix);
 
-            // Flush dirty GPU buffers (writeBuffer). getBindGroup() calls
-            // update() on each buffer when needsUpdate is true.
+            // Copy the 16-float matrices into their aligned slots in the staging arrays.
+            // internalMat4 is the live Float32Array — no intermediate copy needed.
+            this._worldMatricesStaging!.set(renderable.worldMatrix.internalMat4,  i * floatsPerSlot);
+            this._normalMatricesStaging!.set(renderable.normalMatrix.internalMat4, i * floatsPerSlot);
+
+            // Flush any dirty material-level buffers (textures, material uniforms).
             renderable.material.getBindGroup(this.device!);
-            renderable.getBindGroup(this.device!);
         }
 
-        // Phase 2 — (re-)record the bundle when the scene composition changes.
-        // Object count is a cheap proxy for scene change; call invalidateBundle()
-        // explicitly for pipeline/material reassignments.
+        // Upload ALL matrices to the GPU in exactly 2 writeBuffer calls.
+        if (orderedObjects.length > 0) {
+            this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
+            this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
+        }
+
+        // Phase 2 — (re-)record the render bundle when the scene composition changes.
         if (!this._renderBundle || this._lastObjectCount !== orderedObjects.length) {
             this._renderBundle = this._buildRenderBundle(orderedObjects, cameraBindGroup);
             this._lastObjectCount = orderedObjects.length;
@@ -229,18 +318,17 @@ class Renderer {
         } as GPURenderPassDescriptor;
 
         const passRenderEncoder = commandRenderEncoder.beginRenderPass(renderPassDescriptor);
-        passRenderEncoder.executeBundles([this._renderBundle]);
+        passRenderEncoder.executeBundles([this._renderBundle!]);
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
     }
 
     /**
-     * Records all draw commands for the given objects into a GPURenderBundle.
-     * The bundle captures pipeline, bind group, vertex/index buffer, and draw
-     * state so it can be replayed cheaply each frame without re-encoding.
+     * Records all draw commands into a GPURenderBundle.
      *
-     * Buffer *contents* (world/normal matrices etc.) are not baked in — those
-     * are updated via writeBuffer before the bundle executes each frame.
+     * Each object uses the shared mesh bind group with a baked dynamic offset
+     * that selects its 64-byte matrix slice from the large shared buffers.
+     * The bundle is recorded once and replayed cheaply every frame.
      */
     private _buildRenderBundle(
         orderedObjects: Renderable[],
@@ -257,10 +345,13 @@ class Renderer {
         let currentIndexBuffer: GPUBuffer | null = null;
         let currentVertexBuffer: GPUBuffer | null = null;
 
+        const alignment = this._matrixAlignment;
+
         // Camera bind group is the same for every object — set once.
         encoder.setBindGroup(2, cameraBindGroup);
 
-        for (const renderable of orderedObjects) {
+        for (let i = 0; i < orderedObjects.length; i++) {
+            const renderable = orderedObjects[i];
             if (!renderable.material.pipeline || !renderable.geometry.initialized) continue;
 
             if (renderable.material.pipeline !== currentPipeline) {
@@ -293,7 +384,10 @@ class Renderer {
                 currentMaterialBindGroup = materialBindGroup;
             }
 
-            encoder.setBindGroup(1, renderable.getBindGroup(this.device!));
+            // Bake the per-object dynamic offset: both bindings (normalMatrix,
+            // worldMatrix) live in separate buffers but share the same stride.
+            const offset = i * alignment;
+            encoder.setBindGroup(1, this._sharedMeshBG!, [offset, offset]);
 
             if (renderable.geometry.isInstancedGeometry) {
                 const geo = renderable.geometry as InstancedGeometry;
