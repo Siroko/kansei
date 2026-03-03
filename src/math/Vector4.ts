@@ -18,7 +18,7 @@ class Vector4 extends Vector {
         super();
         this.internalVec = vec4.create();
         vec4.set(this.internalVec, x, y, z, w);
-        this.buffer = new Float32Array(this.internalVec);
+        this.buffer = new Float32Array((this.internalVec as unknown as Float32Array).buffer);
     }
 
     public set(x: number, y: number, z: number, w: number) {
