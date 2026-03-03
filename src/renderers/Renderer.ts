@@ -5,6 +5,7 @@ import { Vector4 } from "../main";
 import { Compute } from "../materials/Compute";
 import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
+import { GBuffer } from "../postprocessing/GBuffer";
 
 /**
  * Configuration options for the WebGPU renderer.
@@ -40,7 +41,7 @@ class Renderer {
     public canvas: HTMLCanvasElement;
     public context: GPUCanvasContext | null;
     private device?: GPUDevice;
-    private presentationFormat?: GPUTextureFormat;
+    private _presentationFormat?: GPUTextureFormat;
     private sampleCount: number = 4;
     private devicePixelRatio: number = window.devicePixelRatio;
     private colorTexture?: GPUTexture;
@@ -49,10 +50,29 @@ class Renderer {
     private height: number = 240;
     private clearColor: Vector4 = new Vector4(0, 0, 0, 0);
 
-    // Pre-recorded bundle of all draw commands. Re-built only when the scene
-    // composition changes (objects added/removed, pipeline reassigned, etc.).
+    // ── Public read-only accessors ──────────────────────────────────────────
+    /** The initialised GPU device. Undefined before initialize() resolves. */
+    public get gpuDevice(): GPUDevice { return this.device!; }
+    /** Canvas colour format negotiated with the platform. */
+    public get presentationFormat(): GPUTextureFormat { return this._presentationFormat!; }
+    /** Render width in physical pixels (includes devicePixelRatio). */
+    public get renderWidth(): number { return this.width; }
+    /** Render height in physical pixels (includes devicePixelRatio). */
+    public get renderHeight(): number { return this.height; }
+    /** The shared per-object mesh bind group (normal + world matrices, dynamic offsets). */
+    public get sharedMeshBindGroup(): GPUBindGroup | null { return this._sharedMeshBG; }
+    /** Layout used for the shared mesh bind group. */
+    public get sharedMeshBindGroupLayout(): GPUBindGroupLayout | null { return this._sharedMeshBGLayout; }
+    /** Alignment stride for the shared matrix buffers (device minimum, typically 256). */
+    public get matrixAlignment(): number { return this._matrixAlignment; }
+
+    // Pre-recorded bundle for the standard canvas render pass.
     private _renderBundle: GPURenderBundle | null = null;
     private _lastObjectCount: number = -1;
+
+    // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float, no MSAA).
+    private _gbufferBundle: GPURenderBundle | null = null;
+    private _gbufferLastObjectCount: number = -1;
 
     // Shared matrix buffers — all objects' world and normal matrices packed into
     // two large GPU buffers (one per type) with 256-byte aligned strides.
@@ -102,10 +122,10 @@ class Renderer {
             const device = await this.getDevice();
             if (!this.device) {
                 this.device = device;
-                this.presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+                this._presentationFormat = navigator.gpu.getPreferredCanvasFormat();
                 this.context?.configure({
                     device: this.device,
-                    format: this.presentationFormat,
+                    format: this._presentationFormat,
                     alphaMode: this.options?.alphaMode || "opaque",
                 });
 
@@ -154,6 +174,7 @@ class Renderer {
      */
     public invalidateBundle() {
         this._renderBundle = null;
+        this._gbufferBundle = null;
     }
 
     /**
@@ -214,7 +235,8 @@ class Renderer {
         });
 
         this._sharedMeshObjectCount = objectCount;
-        this._renderBundle = null; // force bundle rebuild with new bind group
+        this._renderBundle = null;     // force bundle rebuild with new bind group
+        this._gbufferBundle = null;
     }
 
     /**
@@ -332,20 +354,137 @@ class Renderer {
     }
 
     /**
+     * Renders the scene into a GBuffer for post-processing.
+     *
+     * This is a drop-in replacement for render() when a PostProcessingVolume is in use.
+     * It performs the same three-phase matrix-upload / bundle-record / execute loop but
+     * targets the GBuffer's rgba16float colour texture and depth32float depth texture at
+     * sampleCount=1 (no MSAA — post-processing handles aliasing via FXAA etc.).
+     *
+     * @param stack   - The scene to render.
+     * @param camera  - The camera to use.
+     * @param gbuffer - The GBuffer to write colour and depth data into.
+     */
+    public renderToGBuffer(stack: Scene, camera: Camera, gbuffer: GBuffer): void {
+        stack.prepare(camera);
+        camera.updateViewMatrix();
+
+        const orderedObjects = stack.getOrderedObjects();
+        const cameraBindGroup = camera.getBindGroup(this.device!);
+
+        this._ensureSharedMeshResources(orderedObjects.length);
+
+        const alignment = this._matrixAlignment;
+        const floatsPerSlot = alignment / 4;
+
+        // Phase 1 — identical to render(): upload matrices.
+        for (let i = 0; i < orderedObjects.length; i++) {
+            const renderable = orderedObjects[i];
+
+            if (!renderable.geometry.initialized) {
+                renderable.geometry.initialize(this.device!);
+            }
+            // Ensure the material has a pipeline compiled for (rgba16float, 1, depth32float).
+            renderable.material.getPipelineForConfig(
+                this.device!,
+                renderable.geometry.vertexBuffersDescriptors,
+                'rgba16float',
+                1,
+                'depth32float'
+            );
+            if (!renderable.material.initialized) {
+                renderable.material.initialize(
+                    this.device!,
+                    renderable.geometry.vertexBuffersDescriptors,
+                    this._presentationFormat!,
+                    this.sampleCount
+                );
+            }
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
+                for (const extraBuffer of geo.extraBuffers) {
+                    if (!extraBuffer.initialized) extraBuffer.initialize(this.device!);
+                }
+            }
+
+            renderable.updateModelMatrix();
+            renderable.updateNormalMatrix(camera.viewMatrix);
+
+            this._worldMatricesStaging!.set(renderable.worldMatrix.internalMat4,  i * floatsPerSlot);
+            this._normalMatricesStaging!.set(renderable.normalMatrix.internalMat4, i * floatsPerSlot);
+
+            renderable.material.getBindGroup(this.device!);
+        }
+
+        if (orderedObjects.length > 0) {
+            this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
+            this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
+        }
+
+        for (const renderable of orderedObjects) {
+            if (renderable.materialDirty) {
+                this._gbufferBundle = null;
+                renderable.materialDirty = false;
+            }
+        }
+
+        // Phase 2 — build GBuffer bundle if stale.
+        if (!this._gbufferBundle || this._gbufferLastObjectCount !== orderedObjects.length) {
+            this._gbufferBundle = this._buildRenderBundle(
+                orderedObjects, cameraBindGroup, 'rgba16float', 1, 'depth32float'
+            );
+            this._gbufferLastObjectCount = orderedObjects.length;
+        }
+
+        // Phase 3 — execute into the GBuffer render pass.
+        const commandEncoder = this.device!.createCommandEncoder();
+
+        const passDescriptor: GPURenderPassDescriptor = {
+            colorAttachments: [
+                {
+                    view: gbuffer.colorTexture.createView(),
+                    clearValue: {
+                        r: this.options.clearColor?.x || 0.0,
+                        g: this.options.clearColor?.y || 0.0,
+                        b: this.options.clearColor?.z || 0.0,
+                        a: this.options.clearColor?.w || 0.0
+                    },
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                },
+            ],
+            depthStencilAttachment: {
+                view: gbuffer.depthTexture.createView(),
+                depthClearValue: 1.0,
+                depthLoadOp: 'clear',
+                depthStoreOp: 'store',
+            },
+        };
+
+        const pass = commandEncoder.beginRenderPass(passDescriptor);
+        pass.executeBundles([this._gbufferBundle!]);
+        pass.end();
+        this.device!.queue.submit([commandEncoder.finish()]);
+    }
+
+    /**
      * Records all draw commands into a GPURenderBundle.
      *
-     * Each object uses the shared mesh bind group with a baked dynamic offset
-     * that selects its 64-byte matrix slice from the large shared buffers.
-     * The bundle is recorded once and replayed cheaply every frame.
+     * @param colorFormat   Target colour attachment format. Defaults to the canvas presentation format.
+     * @param sampleCount   MSAA sample count of the render pass. Defaults to the renderer's sampleCount.
+     * @param depthFormat   Depth-stencil format. Defaults to 'depth24plus'.
      */
     private _buildRenderBundle(
         orderedObjects: Renderable[],
-        cameraBindGroup: GPUBindGroup
+        cameraBindGroup: GPUBindGroup,
+        colorFormat: GPUTextureFormat = this._presentationFormat!,
+        sampleCount: number = this.sampleCount,
+        depthFormat: GPUTextureFormat = 'depth24plus'
     ): GPURenderBundle {
         const encoder = this.device!.createRenderBundleEncoder({
-            colorFormats: [this.presentationFormat!],
-            depthStencilFormat: 'depth24plus',
-            sampleCount: this.sampleCount,
+            colorFormats: [colorFormat],
+            depthStencilFormat: depthFormat,
+            sampleCount,
         });
 
         let currentPipeline: GPURenderPipeline | null = null;
@@ -360,11 +499,19 @@ class Renderer {
 
         for (let i = 0; i < orderedObjects.length; i++) {
             const renderable = orderedObjects[i];
-            if (!renderable.material.pipeline || !renderable.geometry.initialized) continue;
+            // For off-screen passes request the pipeline for the specific config.
+            const pipeline = renderable.material.getPipelineForConfig(
+                this.device!,
+                renderable.geometry.vertexBuffersDescriptors,
+                colorFormat,
+                sampleCount,
+                depthFormat
+            );
+            if (!pipeline || !renderable.geometry.initialized) continue;
 
-            if (renderable.material.pipeline !== currentPipeline) {
-                encoder.setPipeline(renderable.material.pipeline);
-                currentPipeline = renderable.material.pipeline;
+            if (pipeline !== currentPipeline) {
+                encoder.setPipeline(pipeline);
+                currentPipeline = pipeline;
                 currentMaterialBindGroup = null;
             }
 

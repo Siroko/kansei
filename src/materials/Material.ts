@@ -12,6 +12,11 @@ class Material {
     public uuid: string;
     public transparent: boolean = false;
 
+    // Cache of render pipelines keyed by "colorFormat:sampleCount:depthFormat".
+    // Allows the same material to be used in multiple render passes with different
+    // target configurations (e.g. canvas MSAA pass vs. off-screen GBuffer pass).
+    private _pipelineCache: Map<string, GPURenderPipeline> = new Map();
+
     private bindableGroup: BindableGroup;
     private depthWriteEnabled: boolean = true;
     private depthCompare: GPUCompareFunction = 'less';
@@ -67,30 +72,39 @@ class Material {
     }
 
     /**
-     * Initializes the material by creating the shader module, bind group layouts, and render pipeline.
-     * 
-     * @param gpuDevice - The GPU device used for initialization.
-     * @param vertexBuffersDescriptors - Descriptors for the vertex buffers.
-     * @param presentationFormat - The format of the presentation surface.
+     * Ensures the shader module and shared bind group layouts are created exactly once.
      */
-    public initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat, sampleCount: number) {
+    private _ensureSharedResources(gpuDevice: GPUDevice): void {
         if (!this.shaderRenderModule) {
             this.createShaderModule(gpuDevice);
         }
 
-        this.bindableGroup.createRenderingBindGroupLayout(gpuDevice);
-        this.bindableGroup.createBindGroupLayout(gpuDevice);
+        if (!this.bindableGroup.bindGroupLayout) {
+            this.bindableGroup.createRenderingBindGroupLayout(gpuDevice);
+            this.bindableGroup.createBindGroupLayout(gpuDevice);
 
-        this.bindableGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
-            label: "Render Pipeline Layout",
-            bindGroupLayouts: [
-                this.bindableGroup.bindGroupLayout!,
-                this.bindableGroup.cameraBindablesGroupLayout!,
-                this.bindableGroup.meshBindablesGroupLayout!
-            ]
-        });
+            this.bindableGroup.pipelineBindGroupLayout = gpuDevice.createPipelineLayout({
+                label: "Render Pipeline Layout",
+                bindGroupLayouts: [
+                    this.bindableGroup.bindGroupLayout!,
+                    this.bindableGroup.cameraBindablesGroupLayout!,
+                    this.bindableGroup.meshBindablesGroupLayout!
+                ]
+            });
+        }
+    }
 
-        const colorTarget: GPUColorTargetState = { format: presentationFormat };
+    /**
+     * Builds a GPURenderPipeline for the given (colorFormat, sampleCount, depthFormat) combination.
+     */
+    private _buildPipeline(
+        gpuDevice: GPUDevice,
+        vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
+        colorFormat: GPUTextureFormat,
+        sampleCount: number,
+        depthFormat: GPUTextureFormat
+    ): GPURenderPipeline {
+        const colorTarget: GPUColorTargetState = { format: colorFormat };
         if (this.transparent) {
             colorTarget.blend = {
                 color: {
@@ -107,18 +121,16 @@ class Material {
         }
 
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
-            layout: this.bindableGroup.pipelineBindGroupLayout,
+            layout: this.bindableGroup.pipelineBindGroupLayout!,
             label: "Render Pipeline",
-            multisample: {
-                count: sampleCount
-            },
+            multisample: { count: sampleCount },
             vertex: {
-                module: this.shaderRenderModule,
+                module: this.shaderRenderModule!,
                 entryPoint: 'vertex_main',
                 buffers: vertexBuffersDescriptors
             } as GPUVertexState,
             fragment: {
-                module: this.shaderRenderModule,
+                module: this.shaderRenderModule!,
                 entryPoint: 'fragment_main',
                 targets: [colorTarget]
             } as GPUFragmentState,
@@ -126,15 +138,59 @@ class Material {
                 topology: this.topology,
                 cullMode: this.transparent ? 'none' : this.cullMode,
             } as GPUPrimitiveState,
-
             depthStencil: {
                 depthWriteEnabled: this.transparent ? false : this.depthWriteEnabled,
                 depthCompare: this.depthCompare,
-                format: this.depthStencilFormat,
+                format: depthFormat,
             },
-        }
-        this.pipeline = gpuDevice.createRenderPipeline(renderPipelineDescriptor);
+        };
+        return gpuDevice.createRenderPipeline(renderPipelineDescriptor);
+    }
 
+    /**
+     * Returns a cached pipeline for the given configuration, creating it if it does not exist.
+     *
+     * This allows the same material to be used in multiple render passes that differ in
+     * color format, sample count, or depth format — e.g. the canvas MSAA pass and an
+     * off-screen GBuffer pass — without re-compiling the shader.
+     *
+     * @param gpuDevice - The GPU device.
+     * @param vertexBuffersDescriptors - Vertex buffer layout descriptors (only used on first call per key).
+     * @param colorFormat - Target color attachment format.
+     * @param sampleCount - MSAA sample count of the render pass.
+     * @param depthFormat - Depth-stencil attachment format. Defaults to 'depth24plus'.
+     */
+    public getPipelineForConfig(
+        gpuDevice: GPUDevice,
+        vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
+        colorFormat: GPUTextureFormat,
+        sampleCount: number,
+        depthFormat: GPUTextureFormat = 'depth24plus'
+    ): GPURenderPipeline {
+        this._ensureSharedResources(gpuDevice);
+        const key = `${colorFormat}:${sampleCount}:${depthFormat}`;
+        if (!this._pipelineCache.has(key)) {
+            this._pipelineCache.set(
+                key,
+                this._buildPipeline(gpuDevice, vertexBuffersDescriptors, colorFormat, sampleCount, depthFormat)
+            );
+        }
+        return this._pipelineCache.get(key)!;
+    }
+
+    /**
+     * Initializes the material by creating the shader module, bind group layouts, and render pipeline.
+     *
+     * @param gpuDevice - The GPU device used for initialization.
+     * @param vertexBuffersDescriptors - Descriptors for the vertex buffers.
+     * @param presentationFormat - The format of the presentation surface.
+     * @param sampleCount - MSAA sample count for the render pass.
+     */
+    public initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat, sampleCount: number) {
+        this._ensureSharedResources(gpuDevice);
+        this.pipeline = this.getPipelineForConfig(
+            gpuDevice, vertexBuffersDescriptors, presentationFormat, sampleCount, this.depthStencilFormat
+        );
         this.initialized = true;
     }
 
