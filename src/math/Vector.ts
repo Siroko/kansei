@@ -40,7 +40,7 @@ class Vector extends BufferBase {
      * @private
      */
     protected updateBuffer() {
-        this.buffer!.set(this.internalVec!);
+        // buffer is a shared view of internalVec — no copy needed.
         this.needsUpdate = true;
         this.onChange?.();
     }

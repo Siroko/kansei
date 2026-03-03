@@ -26,25 +26,25 @@ class Matrix4 extends BufferBase {
     constructor() {
         super();
         this.internalMat4 = mat4.create();
-        this.buffer = new Float32Array(this.internalMat4);
+        // Shared view — any gl-matrix write to internalMat4 is instantly visible
+        // in buffer without a copy, so updateBuffer/syncBuffer need no set() call.
+        this.buffer = new Float32Array((this.internalMat4 as unknown as Float32Array).buffer);
     }
 
     /**
      * Updates the buffer with the current matrix values and marks it for update.
      */
     private updateBuffer() {
-        this.buffer!.set(this.internalMat4);
+        // buffer is a shared view of internalMat4 — no copy needed.
         this.needsUpdate = true;
         this.version++;
     }
 
     /**
-     * Syncs internalMat4 to the CPU-side buffer for GPU upload.
-     * Call this after directly manipulating internalMat4 to avoid the per-operation
-     * overhead of the individual transformation methods.
+     * Marks the buffer ready for GPU upload after direct internalMat4 manipulation.
+     * No copy is needed because buffer is a shared view of the same memory.
      */
     public syncBuffer() {
-        this.buffer!.set(this.internalMat4);
         this.needsUpdate = true;
         this.version++;
     }
