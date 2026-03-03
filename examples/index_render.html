@@ -1,96 +1,138 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Example WebGPU Renderer</title>
-    <style>
-      body {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-      }
-    </style>
-  </head>
-  <body>
-    <script type="module">
-      import { Renderer } from '../src/renderers/Renderer'
-      import { Texture } from '../src/buffers/Texture'
-      import { Sampler } from '../src/buffers/Sampler'
-      import { shaderCode } from './assets/shaders/TexturedCube.js'
-      import { Material } from '../src/materials/Material'
-      import { BoxGeometry } from '../src/geometries/BoxGeometry'
-      import { Renderable } from '../src/objects/Renderable'
-      import { Scene } from '../src/objects/Scene'
-      import { Camera } from '../src/cameras/Camera'
-      import { VideoTexture } from '../src/buffers/VideoTexture'
-      import { Vector4 } from '../src/math/Vector4'
-      import { Vector3 } from '../src/math/Vector3'
-      import { TextureLoader } from '../src/loaders/TextureLoader'
-      import { CameraControls } from '../src/controls/CameraControls'
-      const renderer = new Renderer({
-        width: window.innerWidth,
-        height: window.innerHeight,
-        devicePixelRatio: 1 ,
-        antialias: true,
-        sampleCount: 1
-      });
-      await renderer.initialize();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      document.body.appendChild(renderer.canvas)
 
-      const scene = new Scene();
-      const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
-      const radius = window.innerWidth < 768 ? 30 : 20;
-      const cameraControls = new CameraControls(camera, scene.position, null, radius);
-      const tl = new TextureLoader();
-      const imageBitmap = await tl.load("./assets/textures/character_sheet_without_black.jpg");
-      const texture = new Texture(imageBitmap, true);
-      const sampler = new Sampler('linear', 'linear');
-      const material = new Material(shaderCode, {
-        bindings: [
-          {
-            binding: 0,
-            visibility: GPUShaderStage.FRAGMENT,
-            value: texture
-          },
-          {
-            binding: 1,
-            visibility: GPUShaderStage.FRAGMENT,
-            value: sampler
-          }
-        ]
-      });
-      const geometry = new BoxGeometry(1, 1, 1);
-      const renderables = [];
-      for (let i = 0; i < 3000; i++) {
-        const renderable = new Renderable(geometry, material);
-        renderable.position.x = Math.random() * 10 - 5;
-        renderable.position.y = Math.random() * 10 - 5;
-        renderable.position.z = Math.random() * 10 - 5;
-        scene.add(renderable);
-        renderables.push(renderable);
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Example WebGPU Renderer</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { shaderCode } from './assets/shaders/TexturedCube.js'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { VideoTexture } from '../src/buffers/VideoTexture'
+    import { Vector4 } from '../src/math/Vector4'
+    import { Vector3 } from '../src/math/Vector3'
+    import { TextureLoader } from '../src/loaders/TextureLoader'
+    import { CameraControls } from '../src/controls/CameraControls'
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: 1,
+      antialias: true,
+      sampleCount: 1
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas)
+
+    const scene = new Scene();
+    const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
+    const radius = window.innerWidth < 768 ? 30 : 20;
+    const cameraControls = new CameraControls(camera, scene.position, null, radius);
+    const tl = new TextureLoader();
+    const imageBitmap = await tl.load("./assets/textures/character_sheet_without_black.jpg");
+    const texture = new Texture(imageBitmap, true);
+    const sampler = new Sampler('linear', 'linear');
+    const material = new Material(shaderCode, {
+      bindings: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          value: texture
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.FRAGMENT,
+          value: sampler
+        }
+      ]
+    });
+    const geometry = new BoxGeometry(1, 1, 1);
+    const renderables = [];
+    const originalPositions = [];
+    for (let i = 0; i < 10000; i++) {
+      const renderable = new Renderable(geometry, material);
+      const ox = Math.random() * 10 - 5;
+      const oy = Math.random() * 10 - 5;
+      const oz = Math.random() * 10 - 5;
+      renderable.position.x = ox;
+      renderable.position.y = oy;
+      renderable.position.z = oz;
+      scene.add(renderable);
+      renderables.push(renderable);
+      originalPositions.push({ x: ox, y: oy, z: oz });
+    }
+
+    // Flowmap-style nested trig: sin(cos(sin(cos(...)))) seeded per-cube
+    function flowOffset(t, seed1, seed2, seed3) {
+      return Math.sin(
+        Math.cos(
+          Math.sin(
+            Math.cos(t * 0.2 + seed1 * 1.3) * 2.0 + seed2 * 0.9
+          ) * 1.5 + seed3 * 1.1
+        ) * 1.8 + seed1 * 0.6
+      );
+    }
+
+    let lastTime = performance.now();
+    let elapsed = 0;
+
+    async function animate() {
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000; // seconds
+      lastTime = now;
+      elapsed += dt;
+
+      cameraControls.update();
+
+      for (let i = 0; i < renderables.length; i++) {
+        const renderable = renderables[i];
+        const op = originalPositions[i];
+
+        // Each axis uses the original xyz as unique seeds → every cube flows differently
+        const offsetX = flowOffset(elapsed * 0.1, op.x, op.y, op.z) * 30.5;
+        const offsetY = flowOffset(elapsed * 0.3, op.y, op.z, op.x) * 30.5;
+        const offsetZ = flowOffset(elapsed * 0.2, op.z, op.x, op.y) * 30.5;
+
+        renderable.position.x = op.x + offsetX;
+        renderable.position.y = op.y + offsetY;
+        renderable.position.z = op.z + offsetZ;
+
+        // Per-cube local rotation using the same flowOffset formula
+        renderable.rotation.x = flowOffset(elapsed * 0.15, op.y, op.x, op.z) * Math.PI;
+        renderable.rotation.y = flowOffset(elapsed * 0.12, op.z, op.y, op.x) * Math.PI;
+        renderable.rotation.z = flowOffset(elapsed * 0.18, op.x, op.z, op.y) * Math.PI;
+
+        // Keep the pulsing scale
+        // const sc = Math.abs(Math.sin(elapsed)) + 0.3;
+        // renderable.scale.x = sc;
+        // renderable.scale.y = sc;
+        // renderable.scale.z = sc;
       }
 
-      async function animate() {
-        cameraControls.update();
-        let i = 0;
-        renderables.forEach(renderable => {
-          const iNorm = (i / renderables.length - 0.5);
-          const sc =  Math.abs(Math.sin(Date.now() / 1000)) + 0.3;
-          renderable.scale.x = sc;
-          renderable.scale.y = sc;
-          renderable.scale.z = sc;
-        
-          i++;
-        });
-        
-        await renderer.render(scene, camera);
-        
-        requestAnimationFrame(animate);
-      }
-      animate();
-    </script>
-  </body>
+      await renderer.render(scene, camera);
+
+      requestAnimationFrame(animate);
+    }
+    animate();
+  </script>
+</body>
+
 </html>
