@@ -30,10 +30,7 @@ export interface DepthOfFieldOptions {
  *     (background) samples accumulate into separate layers that are composited
  *     with alpha blending so foreground objects scatter onto the background.
  *
- *  4. Focus ramp: the final output is smoothly blended between the sharp source
- *     and the bokeh result over a transition zone around the focus plane, so
- *     there is never a hard cut as pixels enter or leave the depth-of-field region.
- */
+*/
 class DepthOfFieldEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
     private _pipeline: GPUComputePipeline | null = null;
@@ -198,13 +195,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                 bokehResult = mix(far, near, nearAlpha);
             }
 
-            // ── 4. Focus ramp ─────────────────────────────────────────────────
-            // Smoothly blend between sharp and bokeh so there is never a hard
-            // cut at the focus-plane boundary.  The transition spans the first
-            // 25 % of maxBlur (at least 2 px), giving a gentle fade-in of blur.
-            let transitionPx = max(params.maxBlur * 0.25, 2.0);
-            let blendFactor  = smoothstep(0.0, transitionPx, absCoc);
-            textureStore(outputTex, coord, mix(sharp, bokehResult, blendFactor));
+            textureStore(outputTex, coord, bokehResult);
         }
     `;
 
