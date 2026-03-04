@@ -142,7 +142,8 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             if (coord.x >= w || coord.y >= h) { return; }
 
             let ownCoc = textureLoad(cocIn, coord, 0).r;
-            var maxR = max(0.0, -ownCoc); // own near-field radius (positive value)
+            let ownAbsR = abs(ownCoc);
+            var nearR = max(0.0, -ownCoc); // own near-field radius
 
             let radius = i32(params.maxBlur);
             let iCoord = vec2i(coord);
@@ -151,23 +152,21 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                 let sx = clamp(iCoord.x + dx, 0, i32(w) - 1);
                 let sc = vec2u(u32(sx), coord.y);
                 let sCoc = textureLoad(cocIn, sc, 0).r;
-                // Only dilate near-field (negative CoC)
                 if (sCoc < 0.0) {
-                    let sR = -sCoc; // positive radius
+                    let sR = -sCoc;
                     let dist = f32(abs(dx));
-                    // Near-field CoC is large enough to reach this pixel
                     if (sR >= dist) {
-                        maxR = max(maxR, sR);
+                        let t = dist / sR;
+                        let dilatedR = sR * (1.0 - t) * (1.0 - t);
+                        nearR = max(nearR, dilatedR);
                     }
                 }
             }
 
-            // Store as negative (near-field convention) if dilated, else keep original
-            var result = ownCoc;
-            if (maxR > max(0.0, -ownCoc)) {
-                result = -maxR;
-            }
-            textureStore(cocOut, coord, vec4f(result, 0.0, 0.0, 0.0));
+            // Store max of dilated near radius and own absolute CoC —
+            // far/in-focus pixels keep at least their own blur radius
+            let outR = max(nearR, ownAbsR);
+            textureStore(cocOut, coord, vec4f(outR, 0.0, 0.0, 0.0));
         }
     `;
 
@@ -187,7 +186,8 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             if (coord.x >= w || coord.y >= h) { return; }
 
             let ownCoc = textureLoad(cocIn, coord, 0).r;
-            var maxR = max(0.0, -ownCoc);
+            let ownAbsR = abs(ownCoc);
+            var nearR = max(0.0, -ownCoc);
 
             let radius = i32(params.maxBlur);
             let iCoord = vec2i(coord);
@@ -200,16 +200,15 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                     let sR = -sCoc;
                     let dist = f32(abs(dy));
                     if (sR >= dist) {
-                        maxR = max(maxR, sR);
+                        let t = dist / sR;
+                        let dilatedR = sR * (1.0 - t) * (1.0 - t);
+                        nearR = max(nearR, dilatedR);
                     }
                 }
             }
 
-            var result = ownCoc;
-            if (maxR > max(0.0, -ownCoc)) {
-                result = -maxR;
-            }
-            textureStore(cocOut, coord, vec4f(result, 0.0, 0.0, 0.0));
+            let outR = max(nearR, ownAbsR);
+            textureStore(cocOut, coord, vec4f(outR, 0.0, 0.0, 0.0));
         }
     `;
 
