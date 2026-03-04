@@ -70,9 +70,19 @@ class Renderer {
     private _renderBundle: GPURenderBundle | null = null;
     private _lastObjectCount: number = -1;
 
-    // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float, no MSAA).
+    // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float).
     private _gbufferBundle: GPURenderBundle | null = null;
     private _gbufferLastObjectCount: number = -1;
+    private _gbufferLastSampleCount: number = -1;
+
+    // Depth-copy pipeline: resolves MSAA depth from depthMSAATexture → depthTexture.
+    // A fullscreen render pass reads texture_depth_multisampled_2d (sample 0) and
+    // writes it via @builtin(frag_depth) into the non-MSAA depth attachment so that
+    // compute shaders can sample it as texture_depth_2d.
+    private _depthCopyPipeline: GPURenderPipeline | null = null;
+    private _depthCopyBGL: GPUBindGroupLayout | null = null;
+    private _depthCopyBG: GPUBindGroup | null = null;
+    private _depthCopyBGSource: GPUTexture | null = null;
 
     // Shared matrix buffers — all objects' world and normal matrices packed into
     // two large GPU buffers (one per type) with 256-byte aligned strides.
@@ -353,6 +363,77 @@ class Renderer {
         this.device!.queue.submit([commandRenderEncoder.finish()]);
     }
 
+    // ── Depth-copy helpers ───────────────────────────────────────────────────
+
+    /**
+     * Builds the depth-copy render pipeline on first use.
+     * The pipeline draws a fullscreen triangle, reads sample 0 from a
+     * texture_depth_multisampled_2d, and writes it as @builtin(frag_depth)
+     * into a non-MSAA depth32float attachment.
+     */
+    private _ensureDepthCopyPipeline(): void {
+        if (this._depthCopyPipeline) return;
+
+        const shader = /* wgsl */`
+            @group(0) @binding(0) var msaaDepth: texture_depth_multisampled_2d;
+
+            @vertex
+            fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+                const pos = array<vec2f, 3>(
+                    vec2f(-1.0, -1.0),
+                    vec2f( 3.0, -1.0),
+                    vec2f(-1.0,  3.0),
+                );
+                return vec4f(pos[vi], 0.0, 1.0);
+            }
+
+            struct DepthOut { @builtin(frag_depth) depth: f32 }
+
+            @fragment
+            fn fs(@builtin(position) fragPos: vec4f) -> DepthOut {
+                let coord = vec2i(i32(fragPos.x), i32(fragPos.y));
+                return DepthOut(textureLoad(msaaDepth, coord, 0));
+            }
+        `;
+
+        const module = this.device!.createShaderModule({ code: shader });
+
+        this._depthCopyBGL = this.device!.createBindGroupLayout({
+            label: 'DepthCopy/BGL',
+            entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: { sampleType: 'depth', multisampled: true },
+            }],
+        });
+
+        this._depthCopyPipeline = this.device!.createRenderPipeline({
+            label: 'DepthCopy/Pipeline',
+            layout: this.device!.createPipelineLayout({ bindGroupLayouts: [this._depthCopyBGL] }),
+            vertex: { module, entryPoint: 'vs' },
+            fragment: { module, entryPoint: 'fs', targets: [] },
+            depthStencil: {
+                format: 'depth32float',
+                depthWriteEnabled: true,
+                depthCompare: 'always',
+            },
+            primitive: { topology: 'triangle-list' },
+        });
+    }
+
+    /** Returns (and lazily creates) the depth-copy bind group for the given MSAA depth texture. */
+    private _getDepthCopyBindGroup(msaaDepth: GPUTexture): GPUBindGroup {
+        if (this._depthCopyBGSource !== msaaDepth) {
+            this._depthCopyBG = this.device!.createBindGroup({
+                label: 'DepthCopy/BindGroup',
+                layout: this._depthCopyBGL!,
+                entries: [{ binding: 0, resource: msaaDepth.createView() }],
+            });
+            this._depthCopyBGSource = msaaDepth;
+        }
+        return this._depthCopyBG!;
+    }
+
     /**
      * Renders the scene into a GBuffer for post-processing.
      *
@@ -384,12 +465,12 @@ class Renderer {
             if (!renderable.geometry.initialized) {
                 renderable.geometry.initialize(this.device!);
             }
-            // Ensure the material has a pipeline compiled for (rgba16float, 1, depth32float).
+            // Ensure the material has a pipeline compiled for the GBuffer config.
             renderable.material.getPipelineForConfig(
                 this.device!,
                 renderable.geometry.vertexBuffersDescriptors,
                 'rgba16float',
-                1,
+                gbuffer.msaaSampleCount,
                 'depth32float'
             );
             if (!renderable.material.initialized) {
@@ -429,41 +510,85 @@ class Renderer {
         }
 
         // Phase 2 — build GBuffer bundle if stale.
-        if (!this._gbufferBundle || this._gbufferLastObjectCount !== orderedObjects.length) {
+        if (!this._gbufferBundle ||
+            this._gbufferLastObjectCount !== orderedObjects.length ||
+            this._gbufferLastSampleCount !== gbuffer.msaaSampleCount) {
             this._gbufferBundle = this._buildRenderBundle(
-                orderedObjects, cameraBindGroup, 'rgba16float', 1, 'depth32float'
+                orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float'
             );
             this._gbufferLastObjectCount = orderedObjects.length;
+            this._gbufferLastSampleCount = gbuffer.msaaSampleCount;
         }
 
         // Phase 3 — execute into the GBuffer render pass.
         const commandEncoder = this.device!.createCommandEncoder();
 
-        const passDescriptor: GPURenderPassDescriptor = {
-            colorAttachments: [
-                {
+        const clearColor = {
+            r: this.options.clearColor?.x || 0.0,
+            g: this.options.clearColor?.y || 0.0,
+            b: this.options.clearColor?.z || 0.0,
+            a: this.options.clearColor?.w || 0.0,
+        };
+
+        let passDescriptor: GPURenderPassDescriptor;
+        if (gbuffer.msaaSampleCount > 1 && gbuffer.colorMSAATexture && gbuffer.depthMSAATexture) {
+            // MSAA path: render into multi-sample textures, resolve colour automatically.
+            // MSAA depth is stored so the depth-copy pass can read it next.
+            passDescriptor = {
+                colorAttachments: [{
+                    view: gbuffer.colorMSAATexture.createView(),
+                    resolveTarget: gbuffer.colorTexture.createView(),
+                    clearValue: clearColor,
+                    loadOp: 'clear',
+                    storeOp: 'discard', // MSAA samples discarded after resolve
+                }],
+                depthStencilAttachment: {
+                    view: gbuffer.depthMSAATexture.createView(),
+                    depthClearValue: 1.0,
+                    depthLoadOp: 'clear',
+                    depthStoreOp: 'store', // keep MSAA depth for the depth-copy pass
+                },
+            };
+        } else {
+            // Non-MSAA path (original behaviour).
+            passDescriptor = {
+                colorAttachments: [{
                     view: gbuffer.colorTexture.createView(),
-                    clearValue: {
-                        r: this.options.clearColor?.x || 0.0,
-                        g: this.options.clearColor?.y || 0.0,
-                        b: this.options.clearColor?.z || 0.0,
-                        a: this.options.clearColor?.w || 0.0
-                    },
+                    clearValue: clearColor,
                     loadOp: 'clear',
                     storeOp: 'store',
+                }],
+                depthStencilAttachment: {
+                    view: gbuffer.depthTexture.createView(),
+                    depthClearValue: 1.0,
+                    depthLoadOp: 'clear',
+                    depthStoreOp: 'store',
                 },
-            ],
-            depthStencilAttachment: {
-                view: gbuffer.depthTexture.createView(),
-                depthClearValue: 1.0,
-                depthLoadOp: 'clear',
-                depthStoreOp: 'store',
-            },
-        };
+            };
+        }
 
         const pass = commandEncoder.beginRenderPass(passDescriptor);
         pass.executeBundles([this._gbufferBundle!]);
         pass.end();
+
+        // Depth-copy pass: resolve MSAA depth → non-MSAA depthTexture for compute shaders.
+        if (gbuffer.msaaSampleCount > 1 && gbuffer.depthMSAATexture) {
+            this._ensureDepthCopyPipeline();
+            const depthCopyPass = commandEncoder.beginRenderPass({
+                colorAttachments: [],
+                depthStencilAttachment: {
+                    view: gbuffer.depthTexture.createView(),
+                    depthClearValue: 1.0,
+                    depthLoadOp: 'clear',
+                    depthStoreOp: 'store',
+                },
+            });
+            depthCopyPass.setPipeline(this._depthCopyPipeline!);
+            depthCopyPass.setBindGroup(0, this._getDepthCopyBindGroup(gbuffer.depthMSAATexture));
+            depthCopyPass.draw(3);
+            depthCopyPass.end();
+        }
+
         this.device!.queue.submit([commandEncoder.finish()]);
     }
 
