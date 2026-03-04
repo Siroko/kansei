@@ -110,7 +110,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         ${DepthOfFieldEffect._COMMON}
 
         @group(0) @binding(0) var depthTex : texture_depth_2d;
-        @group(0) @binding(1) var cocOut   : texture_storage_2d<r16float, write>;
+        @group(0) @binding(1) var cocOut   : texture_storage_2d<r32float, write>;
         @group(0) @binding(2) var<uniform> params : DoFParams;
 
         @compute @workgroup_size(8, 8)
@@ -131,7 +131,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         ${DepthOfFieldEffect._COMMON}
 
         @group(0) @binding(0) var cocIn  : texture_2d<f32>;
-        @group(0) @binding(1) var cocOut : texture_storage_2d<r16float, write>;
+        @group(0) @binding(1) var cocOut : texture_storage_2d<r32float, write>;
         @group(0) @binding(2) var<uniform> params : DoFParams;
 
         @compute @workgroup_size(8, 8)
@@ -178,7 +178,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         ${DepthOfFieldEffect._COMMON}
 
         @group(0) @binding(0) var cocIn  : texture_2d<f32>;
-        @group(0) @binding(1) var cocOut : texture_storage_2d<r16float, write>;
+        @group(0) @binding(1) var cocOut : texture_storage_2d<r32float, write>;
         @group(0) @binding(2) var<uniform> params : DoFParams;
 
         @compute @workgroup_size(8, 8)
@@ -376,22 +376,23 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         @group(0) @binding(4) var outputTex  : texture_storage_2d<rgba16float, write>;
         @group(0) @binding(5) var<uniform> params : DoFParams;
 
-        // Manual bilinear interpolation for half-res storage textures
-        fn sampleBilinear(tex: texture_2d<f32>, fullCoord: vec2f, halfW: f32, halfH: f32) -> vec4f {
-            // Map full-res pixel center to half-res coordinates
-            let hc = fullCoord * 0.5 - 0.25;
+        // Manual bilinear interpolation for half-res textures
+        fn sampleBilinear(tex: texture_2d<f32>, fullCoord: vec2u, halfW: u32, halfH: u32) -> vec4f {
+            // Map full-res pixel to half-res continuous coordinate
+            // fullPixel 0 → 0.0, fullPixel 1 → 0.5, fullPixel 2 → 1.0, etc.
+            let hc = vec2f(f32(fullCoord.x), f32(fullCoord.y)) * 0.5;
             let fl = floor(hc);
             let fr = hc - fl;
 
-            let c00 = vec2u(clamp(u32(fl.x), 0u, u32(halfW) - 1u), clamp(u32(fl.y), 0u, u32(halfH) - 1u));
-            let c10 = vec2u(clamp(u32(fl.x) + 1u, 0u, u32(halfW) - 1u), clamp(u32(fl.y), 0u, u32(halfH) - 1u));
-            let c01 = vec2u(clamp(u32(fl.x), 0u, u32(halfW) - 1u), clamp(u32(fl.y) + 1u, 0u, u32(halfH) - 1u));
-            let c11 = vec2u(clamp(u32(fl.x) + 1u, 0u, u32(halfW) - 1u), clamp(u32(fl.y) + 1u, 0u, u32(halfH) - 1u));
+            let ix0 = u32(max(i32(fl.x), 0));
+            let iy0 = u32(max(i32(fl.y), 0));
+            let ix1 = min(ix0 + 1u, halfW - 1u);
+            let iy1 = min(iy0 + 1u, halfH - 1u);
 
-            let s00 = textureLoad(tex, c00, 0);
-            let s10 = textureLoad(tex, c10, 0);
-            let s01 = textureLoad(tex, c01, 0);
-            let s11 = textureLoad(tex, c11, 0);
+            let s00 = textureLoad(tex, vec2u(ix0, iy0), 0);
+            let s10 = textureLoad(tex, vec2u(ix1, iy0), 0);
+            let s01 = textureLoad(tex, vec2u(ix0, iy1), 0);
+            let s11 = textureLoad(tex, vec2u(ix1, iy1), 0);
 
             let top = mix(s00, s10, fr.x);
             let bot = mix(s01, s11, fr.x);
@@ -410,29 +411,30 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             let coc = computeCoC(depth, params);
             let absCoc = abs(coc);
 
-            // Early out for in-focus pixels
-            if (absCoc < 0.5) {
+            let halfW = u32(ceil(params.screenWidth * 0.5));
+            let halfH = u32(ceil(params.screenHeight * 0.5));
+
+            // Always sample near blur (needed for foreground bleed onto in-focus pixels)
+            let nearBlur = sampleBilinear(nearBlurTex, coord, halfW, halfH);
+            let nearAlpha = clamp(nearBlur.a * 3.0, 0.0, 1.0);
+
+            // Early out: truly in-focus pixel with no near-field bleed
+            if (absCoc < 0.5 && nearAlpha < 0.001) {
                 textureStore(outputTex, coord, sharp);
                 return;
             }
 
-            let halfW = ceil(params.screenWidth * 0.5);
-            let halfH = ceil(params.screenHeight * 0.5);
-            let fc = vec2f(f32(coord.x), f32(coord.y));
-
-            let nearBlur = sampleBilinear(nearBlurTex, fc, halfW, halfH);
-            let farBlur = sampleBilinear(farBlurTex, fc, halfW, halfH);
+            let farBlur = sampleBilinear(farBlurTex, coord, halfW, halfH);
 
             var result = sharp;
 
-            // Far field blend
+            // Far field: blend from sharp to blurred based on CoC magnitude
             if (coc > 0.0) {
                 let farMix = saturate(absCoc / 2.0);
                 result = mix(sharp, vec4f(farBlur.rgb, sharp.a), farMix);
             }
 
-            // Near field alpha composite on top
-            let nearAlpha = clamp(nearBlur.a * 3.0, 0.0, 1.0);
+            // Near field: alpha-composite blurred foreground on top of everything
             if (nearAlpha > 0.001) {
                 let nearRgb = nearBlur.rgb / max(nearBlur.a, 0.001);
                 result = vec4f(mix(result.rgb, nearRgb, nearAlpha), result.a);
@@ -459,21 +461,21 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         // --- Pass 1: CoC ---
         this._cocPipeline = this._createPipeline(device, 'DoF/CoC', DepthOfFieldEffect._COC_SHADER, [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r16float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float' } },
             { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         ]);
 
         // --- Pass 2a: Dilate H ---
         this._dilateHPipeline = this._createPipeline(device, 'DoF/DilateH', DepthOfFieldEffect._DILATE_H_SHADER, [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r16float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float' } },
             { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         ]);
 
         // --- Pass 2b: Dilate V ---
         this._dilateVPipeline = this._createPipeline(device, 'DoF/DilateV', DepthOfFieldEffect._DILATE_V_SHADER, [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r16float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float' } },
             { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         ]);
 
@@ -661,14 +663,14 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         this._cocTex = device.createTexture({
             label: 'DoF/CoCTex',
             size: [width, height],
-            format: 'r16float',
+            format: 'r32float',
             usage: fullR16Usage,
         });
 
         this._cocDilTempTex = device.createTexture({
             label: 'DoF/CoCDilTempTex',
             size: [width, height],
-            format: 'r16float',
+            format: 'r32float',
             usage: fullR16Usage,
         });
 
