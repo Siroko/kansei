@@ -392,7 +392,14 @@ class Renderer {
             @fragment
             fn fs(@builtin(position) fragPos: vec4f) -> DepthOut {
                 let coord = vec2i(i32(fragPos.x), i32(fragPos.y));
-                return DepthOut(textureLoad(msaaDepth, coord, 0));
+                // Resolve MSAA depth by taking the closest (min) sample.
+                // Using only sample 0 would create wrong depth at silhouette edges,
+                // causing DoF to alternate between sharp and max-blur on edge pixels.
+                let d0 = textureLoad(msaaDepth, coord, 0);
+                let d1 = textureLoad(msaaDepth, coord, 1);
+                let d2 = textureLoad(msaaDepth, coord, 2);
+                let d3 = textureLoad(msaaDepth, coord, 3);
+                return DepthOut(min(min(d0, d1), min(d2, d3)));
             }
         `;
 

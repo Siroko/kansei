@@ -96,7 +96,9 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         }
 
         fn linearDepth(d: f32, n: f32, f: f32) -> f32 {
-            return (n * f) / (f - d * (f - n));
+            // gl-matrix v3 perspectiveNO maps Z to [-1,1]; WebGPU depth buffer
+            // stores the [0,1] portion after clip. Correct inverse for this range:
+            return (2.0 * n * f) / ((f + n) - d * (f - n));
         }
 
         fn computeCoC(d: f32, p: DoFParams) -> f32 {
@@ -237,6 +239,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
             var nearAccum = vec4f(0.0);
             var farAccum = vec4f(0.0);
+            var farWeight = 0.0;
 
             // Sample 2x2 block
             for (var dy = 0u; dy < 2u; dy++) {
@@ -255,16 +258,26 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                         let coverage = saturate(abs(origCoc) / (params.maxBlur * 0.5));
                         nearAccum += vec4f(color.rgb * coverage, coverage);
                     } else {
-                        // Far-field / in-focus: store color and normalized CoC in alpha
+                        // Far-field: weight by CoC so in-focus pixels (CoC ≈ 0)
+                        // don't contaminate the far blur layer at depth edges.
                         let normCoc = abs(origCoc) / max(params.maxBlur, 0.001);
-                        farAccum += vec4f(color.rgb, normCoc);
+                        let w = smoothstep(0.0, 0.15, normCoc);
+                        farAccum += vec4f(color.rgb * w, normCoc * w);
+                        farWeight += w;
                     }
                 }
             }
 
-            // Average over 4 texels
+            // Near: average over 4 texels (pre-multiplied alpha handles weighting)
             nearAccum *= 0.25;
-            farAccum *= 0.25;
+
+            // Far: normalize by actual contributing weight to avoid
+            // in-focus pixels diluting the far layer color
+            if (farWeight > 0.001) {
+                farAccum /= farWeight;
+            } else {
+                farAccum = vec4f(0.0);
+            }
 
             textureStore(nearOut, halfCoord, nearAccum);
             textureStore(farOut, halfCoord, farAccum);
@@ -313,7 +326,31 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                     maxCoc = max(maxCoc, abs(textureLoad(cocDilated, fc, 0).r));
                 }
             }
-            let halfR = maxCoc * 0.5; // full-res CoC -> half-res pixels
+            var halfR = maxCoc * 0.5; // full-res CoC -> half-res pixels
+
+            // If dilated CoC is tiny but the far layer is empty here, this is
+            // a foreground pixel at a depth edge.  Search for nearby valid far
+            // data and inflate the blur radius so the Vogel gather can fill in
+            // proper background color behind the foreground silhouette.
+            if (halfR < 0.5) {
+                let farProbe = textureLoad(farIn, halfCoord, 0);
+                if (farProbe.a < 0.01) {
+                    let searchMax = params.maxBlur * 0.5;
+                    let sLim = vec2i(i32(halfW) - 1, i32(halfH) - 1);
+                    for (var fi = 0u; fi < 16u; fi++) {
+                        let fuv = vogelDisk(fi, 16u);
+                        let foff = fuv * searchMax;
+                        let fsc = clamp(
+                            vec2i(halfCoord) + vec2i(i32(foff.x), i32(foff.y)),
+                            vec2i(0), sLim
+                        );
+                        let fs = textureLoad(farIn, vec2u(fsc), 0);
+                        if (fs.a > 0.01) {
+                            halfR = max(halfR, fs.a * params.maxBlur * 0.5);
+                        }
+                    }
+                }
+            }
 
             // Early out: nothing to blur
             if (halfR < 0.5) {
@@ -357,7 +394,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                 let centerCovers = smoothstep(dist - 1.0, dist + 1.0, centerFarCocHalf);
                 // Downweight in-focus samples so they don't dilute the far blur at boundaries
                 let cocWeight = smoothstep(0.0, 0.15, sampleFarCocNorm);
-                let coverage = max(sampleCovers, centerCovers) * max(cocWeight, 0.05);
+                let coverage = max(sampleCovers, centerCovers) * cocWeight;
                 farAccum += vec4f(farSample.rgb * coverage, farSample.a * coverage);
                 farWeight += coverage;
             }
@@ -388,27 +425,63 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         @group(0) @binding(4) var outputTex  : texture_storage_2d<rgba16float, write>;
         @group(0) @binding(5) var<uniform> params : DoFParams;
 
-        // Manual bilinear interpolation for half-res textures
-        fn sampleBilinear(tex: texture_2d<f32>, fullCoord: vec2u, halfW: u32, halfH: u32) -> vec4f {
-            // Map full-res pixel center to half-res continuous coordinate
-            // Half-res pixel 0 represents the 2x2 block centered at full-res (0.5, 0.5)
+        // Bilinear half-res coordinate helpers
+        struct HalfResCoords {
+            ix0: u32, iy0: u32, ix1: u32, iy1: u32,
+            frx: f32, fry: f32,
+        }
+
+        fn halfResCoords(fullCoord: vec2u, halfW: u32, halfH: u32) -> HalfResCoords {
             let hc = (vec2f(f32(fullCoord.x), f32(fullCoord.y)) + 0.5) * 0.5 - 0.5;
             let fl = floor(hc);
             let fr = hc - fl;
+            return HalfResCoords(
+                u32(max(i32(fl.x), 0)),
+                u32(max(i32(fl.y), 0)),
+                min(u32(max(i32(fl.x), 0)) + 1u, halfW - 1u),
+                min(u32(max(i32(fl.y), 0)) + 1u, halfH - 1u),
+                fr.x, fr.y,
+            );
+        }
 
-            let ix0 = u32(max(i32(fl.x), 0));
-            let iy0 = u32(max(i32(fl.y), 0));
-            let ix1 = min(ix0 + 1u, halfW - 1u);
-            let iy1 = min(iy0 + 1u, halfH - 1u);
+        // Standard bilinear interpolation for half-res textures (used for near blur)
+        fn sampleBilinear(tex: texture_2d<f32>, fullCoord: vec2u, halfW: u32, halfH: u32) -> vec4f {
+            let c = halfResCoords(fullCoord, halfW, halfH);
+            let s00 = textureLoad(tex, vec2u(c.ix0, c.iy0), 0);
+            let s10 = textureLoad(tex, vec2u(c.ix1, c.iy0), 0);
+            let s01 = textureLoad(tex, vec2u(c.ix0, c.iy1), 0);
+            let s11 = textureLoad(tex, vec2u(c.ix1, c.iy1), 0);
+            let top = mix(s00, s10, c.frx);
+            let bot = mix(s01, s11, c.frx);
+            return mix(top, bot, c.fry);
+        }
 
-            let s00 = textureLoad(tex, vec2u(ix0, iy0), 0);
-            let s10 = textureLoad(tex, vec2u(ix1, iy0), 0);
-            let s01 = textureLoad(tex, vec2u(ix0, iy1), 0);
-            let s11 = textureLoad(tex, vec2u(ix1, iy1), 0);
+        // Alpha-weighted bilinear for the far blur layer.
+        // Samples with near-zero alpha (from zeroed-out in-focus regions in the
+        // downsample) are excluded so they don't create dark fringes at depth edges.
+        fn sampleBilinearFar(tex: texture_2d<f32>, fullCoord: vec2u, halfW: u32, halfH: u32) -> vec4f {
+            let c = halfResCoords(fullCoord, halfW, halfH);
+            let s00 = textureLoad(tex, vec2u(c.ix0, c.iy0), 0);
+            let s10 = textureLoad(tex, vec2u(c.ix1, c.iy0), 0);
+            let s01 = textureLoad(tex, vec2u(c.ix0, c.iy1), 0);
+            let s11 = textureLoad(tex, vec2u(c.ix1, c.iy1), 0);
 
-            let top = mix(s00, s10, fr.x);
-            let bot = mix(s01, s11, fr.x);
-            return mix(top, bot, fr.y);
+            let bw00 = (1.0 - c.frx) * (1.0 - c.fry);
+            let bw10 = c.frx * (1.0 - c.fry);
+            let bw01 = (1.0 - c.frx) * c.fry;
+            let bw11 = c.frx * c.fry;
+
+            // Weight bilinear taps by their alpha (normCoc from blur pass).
+            // In-focus regions have alpha ≈ 0, preventing them from pulling
+            // the interpolated color toward black at depth discontinuities.
+            let w00 = bw00 * s00.a;
+            let w10 = bw10 * s10.a;
+            let w01 = bw01 * s01.a;
+            let w11 = bw11 * s11.a;
+            let total = w00 + w10 + w01 + w11;
+
+            if (total < 0.001) { return vec4f(0.0); }
+            return (s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11) / total;
         }
 
         @compute @workgroup_size(8, 8)
@@ -430,21 +503,21 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             let nearBlur = sampleBilinear(nearBlurTex, coord, halfW, halfH);
             let nearAlpha = saturate(nearBlur.a * 2.0);
 
-            // Early out: truly in-focus pixel with no near-field bleed
-            if (absCoc < 0.5 && nearAlpha < 0.001) {
+            // Early out: in-focus pixel with no near-field bleed.
+            if (absCoc < 1.0 && nearAlpha < 0.001) {
                 textureStore(outputTex, coord, sharp);
                 return;
             }
 
-            let farBlur = sampleBilinear(farBlurTex, coord, halfW, halfH);
+            let farBlur = sampleBilinearFar(farBlurTex, coord, halfW, halfH);
 
             var result = sharp;
 
-            // Far field: smoothstep blend using pixel CoC + blurred CoC for soft boundary
+            // Far field: blend based on the pixel's own CoC only.
+            // The far downsample pre-multiplies by CoC weight so in-focus pixels
+            // don't contaminate the blur layer. Dead zone [0, 1] for sub-pixel CoC.
             if (coc >= 0.0) {
-                let blurredCoc = farBlur.a * params.maxBlur;
-                let effectiveCoc = max(absCoc, blurredCoc * 0.4);
-                let farMix = smoothstep(0.0, params.maxBlur * 0.25, effectiveCoc);
+                let farMix = smoothstep(1.0, max(params.maxBlur * 0.3, 4.0), absCoc);
                 result = mix(sharp, vec4f(farBlur.rgb, sharp.a), farMix);
             }
 
