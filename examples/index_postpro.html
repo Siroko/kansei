@@ -31,9 +31,9 @@
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
-    const GRID_SIZE      = 100;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SIZE      = 200;   // cubes per side (total = GRID_SIZE²)
     const GRID_SPACING   = 1;   // world-space gap between cube centres
-    const NOISE_ZOOM     = 0.08;  // noise frequency — lower = broader hills
+    const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
     const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
 
     // ── Lambert shader (white base colour, single directional/point light) ───
@@ -115,11 +115,13 @@
       height: window.innerHeight,
       devicePixelRatio: 1,
       antialias: true,
-      sampleCount: 1
+      sampleCount: 4
     });
     await renderer.initialize();
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.canvas);
+    renderer.canvas.style.width = '100%';
+    renderer.canvas.style.height = '100%';
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
@@ -157,22 +159,16 @@
       new SSAOEffect({
         radius: 0.8,
         bias: 0.02,
-        kernelSize: 16,
+        kernelSize: 64,
         strength: 0.5
       }),
-      new GodRaysEffect({
-        lightScreenPos: new Vector2(0.5, 0.08),
-        density: 0.95,
-        weight: 0.008,
-        decay: 0.97,
-        exposure: 0.8,
-        numSamples: 80
-      }),
+
       new DepthOfFieldEffect({
         focusDistance: 25,
         focusRange: 15,
-        maxBlur: 8
+        maxBlur: 16
       }),
+      
     ]);
 
     // ── Render loop ───────────────────────────────────────────────────────────
