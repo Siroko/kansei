@@ -7,35 +7,62 @@ export interface DepthOfFieldOptions {
     focusDistance?: number;
     /** Half-extent of the in-focus range (world units). Default 2.0 */
     focusRange?: number;
-    /** Maximum blur radius in pixels (maps to CoC = ±1). Default 14 */
+    /** Maximum blur radius in pixels (maps to CoC = +-1). Default 14 */
     maxBlur?: number;
 }
 
 /**
- * Depth of Field — physically-based Bokeh
- * =========================================
+ * Depth of Field -- Cinematic Multi-Pass Pipeline
+ * ================================================
  *
- * Algorithm (Unreal Cinematic DoF–inspired):
+ * 5-pass (6 dispatches) pipeline that blurs at half resolution:
  *
- *  1. CoC dilation (4-tap cross): expand gather radius at depth discontinuities
- *     so near-field objects correctly bleed onto in-focus / far-field pixels.
+ *  Pass 1 -- CoC Computation (full-res, 1 dispatch)
+ *      Computes signed Circle of Confusion from depth buffer.
  *
- *  2. Scatter-as-gather (80-tap Vogel disk): instead of naively averaging
- *     neighbouring pixels, each gathered sample contributes with a weight
- *     proportional to whether its own CoC disc is large enough to reach the
- *     current pixel.  This creates physically correct hard-disc bokeh highlights
- *     rather than soft blobs.
+ *  Pass 2 -- Near-Field CoC Dilation (full-res, 2 dispatches)
+ *      Separable horizontal + vertical max-filter that expands near-field CoC
+ *      outward so in-focus/far pixels at depth edges gather from the foreground.
  *
- *  3. Near / far separation: near-field (foreground) samples and far-field
- *     (background) samples accumulate into separate layers that are composited
- *     with alpha blending so foreground objects scatter onto the background.
+ *  Pass 3 -- Downsample + Near/Far Separation (full->half, 1 dispatch)
+ *      Downsamples to half-res and separates into pre-multiplied near-field
+ *      and far-field layers.
  *
-*/
+ *  Pass 4 -- Vogel Disk Blur (half-res, 1 dispatch)
+ *      64-tap golden-ratio disk blur on both near and far layers.
+ *
+ *  Pass 5 -- Composite (full-res, 1 dispatch)
+ *      Bilinear upscale of half-res results and alpha-composite onto sharp image.
+ */
 class DepthOfFieldEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
-    private _pipeline: GPUComputePipeline | null = null;
     private _paramsBuffer: GPUBuffer | null = null;
-    private _bindGroup: GPUBindGroup | null = null;
+
+    // Pipelines (6 dispatches across 5 passes)
+    private _cocPipeline: GPUComputePipeline | null = null;
+    private _dilateHPipeline: GPUComputePipeline | null = null;
+    private _dilateVPipeline: GPUComputePipeline | null = null;
+    private _downsamplePipeline: GPUComputePipeline | null = null;
+    private _blurPipeline: GPUComputePipeline | null = null;
+    private _compositePipeline: GPUComputePipeline | null = null;
+
+    // Bind groups
+    private _cocBindGroup: GPUBindGroup | null = null;
+    private _dilateHBindGroup: GPUBindGroup | null = null;
+    private _dilateVBindGroup: GPUBindGroup | null = null;
+    private _downsampleBindGroup: GPUBindGroup | null = null;
+    private _blurBindGroup: GPUBindGroup | null = null;
+    private _compositeBindGroup: GPUBindGroup | null = null;
+
+    // Internal textures
+    private _cocTex: GPUTexture | null = null;
+    private _cocDilTempTex: GPUTexture | null = null;
+    private _nearHalfTex: GPUTexture | null = null;
+    private _farHalfTex: GPUTexture | null = null;
+    private _nearBlurTex: GPUTexture | null = null;
+    private _farBlurTex: GPUTexture | null = null;
+
+    // External texture tracking for bind group invalidation
     private _currentInput: GPUTexture | null = null;
     private _currentDepth: GPUTexture | null = null;
     private _currentOutput: GPUTexture | null = null;
@@ -51,201 +78,441 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         this._maxBlur       = options.maxBlur       ?? 14;
     }
 
-    // ── WGSL compute shader ──────────────────────────────────────────────────
+    // ========================================================================
+    // WGSL Shaders
+    // ========================================================================
 
-    private static readonly _SHADER = /* wgsl */`
+    /** Shared DoFParams struct and linearDepth / computeCoC helpers. */
+    private static readonly _COMMON = /* wgsl */`
         struct DoFParams {
             focusDistance : f32,
-            focusRange    : f32,
-            maxBlur       : f32,   // maximum CoC radius in pixels
-            near          : f32,
-            far           : f32,
-            screenWidth   : f32,
-            screenHeight  : f32,
-            _pad          : f32,
+            focusRange   : f32,
+            maxBlur      : f32,
+            near         : f32,
+            far          : f32,
+            screenWidth  : f32,
+            screenHeight : f32,
+            _pad         : f32,
         }
 
-        @group(0) @binding(0) var colorTex  : texture_2d<f32>;
-        @group(0) @binding(1) var depthTex  : texture_depth_2d;
-        @group(0) @binding(2) var outputTex : texture_storage_2d<rgba16float, write>;
-        @group(0) @binding(3) var<uniform>  params : DoFParams;
-
-        fn linearDepth(d: f32) -> f32 {
-            return (params.near * params.far) / (params.far - d * (params.far - params.near));
+        fn linearDepth(d: f32, n: f32, f: f32) -> f32 {
+            return (n * f) / (f - d * (f - n));
         }
 
-        // Signed Circle of Confusion in pixels.
-        //   positive  → behind the focus plane (far / background)
-        //   negative  → in front of the focus plane (near / foreground)
-        fn computeCoC(d: f32) -> f32 {
-            let ld = linearDepth(d);
-            return clamp((ld - params.focusDistance) / params.focusRange, -1.0, 1.0)
-                   * params.maxBlur;
+        fn computeCoC(d: f32, p: DoFParams) -> f32 {
+            let ld = linearDepth(d, p.near, p.far);
+            return clamp((ld - p.focusDistance) / p.focusRange, -1.0, 1.0) * p.maxBlur;
         }
+    `;
 
-        // ── Vogel golden-ratio disc ───────────────────────────────────────────
-        // Distributes N points uniformly within the unit disc without clustering.
-        // Far superior to fixed Poisson arrays for smooth, grain-free bokeh.
-        const GOLDEN_ANGLE : f32 = 2.39996323; // ≈ 137.5° in radians
+    /** Pass 1: CoC computation (full-res). */
+    private static readonly _COC_SHADER = /* wgsl */`
+        ${DepthOfFieldEffect._COMMON}
 
-        fn vogelDisk(i: u32, n: u32) -> vec2f {
-            let r     = sqrt((f32(i) + 0.5) / f32(n));
-            let theta = f32(i) * GOLDEN_ANGLE;
-            return vec2f(cos(theta), sin(theta)) * r;
-        }
-
-        const NUM_SAMPLES : u32 = 80u;
+        @group(0) @binding(0) var depthTex : texture_depth_2d;
+        @group(0) @binding(1) var cocOut   : texture_storage_2d<r16float, write>;
+        @group(0) @binding(2) var<uniform> params : DoFParams;
 
         @compute @workgroup_size(8, 8)
         fn main(@builtin(global_invocation_id) gid : vec3u) {
             let coord = gid.xy;
-            let w     = u32(params.screenWidth);
-            let h     = u32(params.screenHeight);
+            let w = u32(params.screenWidth);
+            let h = u32(params.screenHeight);
             if (coord.x >= w || coord.y >= h) { return; }
 
-            let depth  = textureLoad(depthTex, coord, 0);
-            let sharp  = textureLoad(colorTex, coord, 0);
-            let coc    = computeCoC(depth);
+            let depth = textureLoad(depthTex, coord, 0);
+            let coc = computeCoC(depth, params);
+            textureStore(cocOut, coord, vec4f(coc, 0.0, 0.0, 0.0));
+        }
+    `;
+
+    /** Pass 2a: Horizontal near-field CoC dilation (full-res). */
+    private static readonly _DILATE_H_SHADER = /* wgsl */`
+        ${DepthOfFieldEffect._COMMON}
+
+        @group(0) @binding(0) var cocIn  : texture_2d<f32>;
+        @group(0) @binding(1) var cocOut : texture_storage_2d<r16float, write>;
+        @group(0) @binding(2) var<uniform> params : DoFParams;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid : vec3u) {
+            let coord = gid.xy;
+            let w = u32(params.screenWidth);
+            let h = u32(params.screenHeight);
+            if (coord.x >= w || coord.y >= h) { return; }
+
+            let ownCoc = textureLoad(cocIn, coord, 0).r;
+            var maxR = max(0.0, -ownCoc); // own near-field radius (positive value)
+
+            let radius = i32(params.maxBlur);
+            let iCoord = vec2i(coord);
+
+            for (var dx = -radius; dx <= radius; dx++) {
+                let sx = clamp(iCoord.x + dx, 0, i32(w) - 1);
+                let sc = vec2u(u32(sx), coord.y);
+                let sCoc = textureLoad(cocIn, sc, 0).r;
+                // Only dilate near-field (negative CoC)
+                if (sCoc < 0.0) {
+                    let sR = -sCoc; // positive radius
+                    let dist = f32(abs(dx));
+                    // Near-field CoC is large enough to reach this pixel
+                    if (sR >= dist) {
+                        maxR = max(maxR, sR);
+                    }
+                }
+            }
+
+            // Store as negative (near-field convention) if dilated, else keep original
+            // We store the dilated gather radius: max of own |CoC| and qualifying neighbors
+            var result = ownCoc;
+            if (maxR > max(0.0, -ownCoc)) {
+                // A near neighbor's CoC reaches us -- use dilated radius (negative = near)
+                result = -maxR;
+            }
+            textureStore(cocOut, coord, vec4f(result, 0.0, 0.0, 0.0));
+        }
+    `;
+
+    /** Pass 2b: Vertical near-field CoC dilation (full-res). */
+    private static readonly _DILATE_V_SHADER = /* wgsl */`
+        ${DepthOfFieldEffect._COMMON}
+
+        @group(0) @binding(0) var cocIn  : texture_2d<f32>;
+        @group(0) @binding(1) var cocOut : texture_storage_2d<r16float, write>;
+        @group(0) @binding(2) var<uniform> params : DoFParams;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid : vec3u) {
+            let coord = gid.xy;
+            let w = u32(params.screenWidth);
+            let h = u32(params.screenHeight);
+            if (coord.x >= w || coord.y >= h) { return; }
+
+            let ownCoc = textureLoad(cocIn, coord, 0).r;
+            var maxR = max(0.0, -ownCoc);
+
+            let radius = i32(params.maxBlur);
+            let iCoord = vec2i(coord);
+
+            for (var dy = -radius; dy <= radius; dy++) {
+                let sy = clamp(iCoord.y + dy, 0, i32(h) - 1);
+                let sc = vec2u(coord.x, u32(sy));
+                let sCoc = textureLoad(cocIn, sc, 0).r;
+                if (sCoc < 0.0) {
+                    let sR = -sCoc;
+                    let dist = f32(abs(dy));
+                    if (sR >= dist) {
+                        maxR = max(maxR, sR);
+                    }
+                }
+            }
+
+            var result = ownCoc;
+            if (maxR > max(0.0, -ownCoc)) {
+                result = -maxR;
+            }
+            textureStore(cocOut, coord, vec4f(result, 0.0, 0.0, 0.0));
+        }
+    `;
+
+    /** Pass 3: Downsample + near/far separation (full->half). */
+    private static readonly _DOWNSAMPLE_SHADER = /* wgsl */`
+        ${DepthOfFieldEffect._COMMON}
+
+        @group(0) @binding(0) var colorTex   : texture_2d<f32>;
+        @group(0) @binding(1) var depthTex   : texture_depth_2d;
+        @group(0) @binding(2) var cocDilated  : texture_2d<f32>;
+        @group(0) @binding(3) var nearOut    : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(4) var farOut     : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(5) var<uniform> params : DoFParams;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid : vec3u) {
+            let halfCoord = gid.xy;
+            let halfW = u32(ceil(params.screenWidth * 0.5));
+            let halfH = u32(ceil(params.screenHeight * 0.5));
+            if (halfCoord.x >= halfW || halfCoord.y >= halfH) { return; }
+
+            let fullW = u32(params.screenWidth);
+            let fullH = u32(params.screenHeight);
+
+            // 2x2 block origin in full-res
+            let base = halfCoord * 2u;
+
+            var nearAccum = vec4f(0.0);
+            var farAccum = vec4f(0.0);
+
+            // Sample 2x2 block
+            for (var dy = 0u; dy < 2u; dy++) {
+                for (var dx = 0u; dx < 2u; dx++) {
+                    let fc = vec2u(
+                        min(base.x + dx, fullW - 1u),
+                        min(base.y + dy, fullH - 1u)
+                    );
+                    let color = textureLoad(colorTex, fc, 0);
+                    let depth = textureLoad(depthTex, fc, 0);
+                    // Recompute original un-dilated CoC from depth
+                    let origCoc = computeCoC(depth, params);
+
+                    if (origCoc < 0.0) {
+                        // Near-field: pre-multiplied alpha
+                        let coverage = saturate(abs(origCoc) / (params.maxBlur * 0.5));
+                        nearAccum += vec4f(color.rgb * coverage, coverage);
+                    }
+                    if (origCoc > 0.0) {
+                        // Far-field: store color and normalized CoC in alpha
+                        let normCoc = abs(origCoc) / params.maxBlur;
+                        farAccum += vec4f(color.rgb, normCoc);
+                    }
+                }
+            }
+
+            // Average over 4 texels
+            nearAccum *= 0.25;
+            farAccum *= 0.25;
+
+            textureStore(nearOut, halfCoord, nearAccum);
+            textureStore(farOut, halfCoord, farAccum);
+        }
+    `;
+
+    /** Pass 4: Vogel disk blur (half-res). */
+    private static readonly _BLUR_SHADER = /* wgsl */`
+        ${DepthOfFieldEffect._COMMON}
+
+        @group(0) @binding(0) var nearIn     : texture_2d<f32>;
+        @group(0) @binding(1) var farIn      : texture_2d<f32>;
+        @group(0) @binding(2) var cocDilated  : texture_2d<f32>;
+        @group(0) @binding(3) var nearOut    : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(4) var farOut     : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(5) var<uniform> params : DoFParams;
+
+        const GOLDEN_ANGLE : f32 = 2.39996323;
+        const NUM_SAMPLES : u32 = 64u;
+
+        fn vogelDisk(i: u32, n: u32) -> vec2f {
+            let r = sqrt((f32(i) + 0.5) / f32(n));
+            let theta = f32(i) * GOLDEN_ANGLE;
+            return vec2f(cos(theta), sin(theta)) * r;
+        }
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid : vec3u) {
+            let halfCoord = gid.xy;
+            let halfW = u32(ceil(params.screenWidth * 0.5));
+            let halfH = u32(ceil(params.screenHeight * 0.5));
+            if (halfCoord.x >= halfW || halfCoord.y >= halfH) { return; }
+
+            // Lookup dilated CoC at corresponding full-res location (center of 2x2 block)
+            let fullCoord = vec2u(
+                min(halfCoord.x * 2u, u32(params.screenWidth) - 1u),
+                min(halfCoord.y * 2u, u32(params.screenHeight) - 1u)
+            );
+            let dilatedCoc = textureLoad(cocDilated, fullCoord, 0).r;
+            let gatherR = abs(dilatedCoc);
+            let halfR = gatherR * 0.5; // full-res CoC -> half-res pixels
+
+            // Early out: nothing to blur
+            if (halfR < 0.5) {
+                textureStore(nearOut, halfCoord, textureLoad(nearIn, halfCoord, 0));
+                textureStore(farOut, halfCoord, textureLoad(farIn, halfCoord, 0));
+                return;
+            }
+
+            var nearAccum = vec4f(0.0);
+            var nearCount = 0.0;
+            var farAccum = vec4f(0.0);
+            var farWeight = 0.0;
+
+            let limHalf = vec2i(i32(halfW) - 1, i32(halfH) - 1);
+
+            for (var i = 0u; i < NUM_SAMPLES; i++) {
+                let uv = vogelDisk(i, NUM_SAMPLES);
+                let off = uv * halfR;
+                let sc = clamp(
+                    vec2i(halfCoord) + vec2i(i32(off.x), i32(off.y)),
+                    vec2i(0), limHalf
+                );
+                let scu = vec2u(sc);
+
+                // Near: uniform accumulation of pre-multiplied samples
+                let nearSample = textureLoad(nearIn, scu, 0);
+                nearAccum += nearSample;
+                nearCount += 1.0;
+
+                // Far: scatter-as-gather with coverage weighting
+                let farSample = textureLoad(farIn, scu, 0);
+                let sampleFarCocNorm = farSample.a; // normalized [0,1]
+                let sampleFarCocHalfRes = sampleFarCocNorm * params.maxBlur * 0.5;
+                let dist = length(off);
+                let coverage = smoothstep(dist - 1.0, dist + 1.0, sampleFarCocHalfRes);
+                farAccum += vec4f(farSample.rgb * coverage, farSample.a * coverage);
+                farWeight += coverage;
+            }
+
+            // Average near (pre-multiplied, so simple average is correct)
+            if (nearCount > 0.0) {
+                nearAccum /= nearCount;
+            }
+
+            // Weighted average for far
+            if (farWeight > 0.001) {
+                farAccum = vec4f(farAccum.rgb / farWeight, farAccum.a / farWeight);
+            }
+
+            textureStore(nearOut, halfCoord, nearAccum);
+            textureStore(farOut, halfCoord, farAccum);
+        }
+    `;
+
+    /** Pass 5: Composite (full-res). */
+    private static readonly _COMPOSITE_SHADER = /* wgsl */`
+        ${DepthOfFieldEffect._COMMON}
+
+        @group(0) @binding(0) var colorTex   : texture_2d<f32>;
+        @group(0) @binding(1) var depthTex   : texture_depth_2d;
+        @group(0) @binding(2) var nearBlurTex : texture_2d<f32>;
+        @group(0) @binding(3) var farBlurTex  : texture_2d<f32>;
+        @group(0) @binding(4) var outputTex  : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(5) var<uniform> params : DoFParams;
+
+        // Manual bilinear interpolation for half-res storage textures
+        fn sampleBilinear(tex: texture_2d<f32>, fullCoord: vec2f, halfW: f32, halfH: f32) -> vec4f {
+            // Map full-res pixel center to half-res coordinates
+            let hc = fullCoord * 0.5 - 0.25;
+            let fl = floor(hc);
+            let fr = hc - fl;
+
+            let c00 = vec2u(clamp(u32(fl.x), 0u, u32(halfW) - 1u), clamp(u32(fl.y), 0u, u32(halfH) - 1u));
+            let c10 = vec2u(clamp(u32(fl.x) + 1u, 0u, u32(halfW) - 1u), clamp(u32(fl.y), 0u, u32(halfH) - 1u));
+            let c01 = vec2u(clamp(u32(fl.x), 0u, u32(halfW) - 1u), clamp(u32(fl.y) + 1u, 0u, u32(halfH) - 1u));
+            let c11 = vec2u(clamp(u32(fl.x) + 1u, 0u, u32(halfW) - 1u), clamp(u32(fl.y) + 1u, 0u, u32(halfH) - 1u));
+
+            let s00 = textureLoad(tex, c00, 0);
+            let s10 = textureLoad(tex, c10, 0);
+            let s01 = textureLoad(tex, c01, 0);
+            let s11 = textureLoad(tex, c11, 0);
+
+            let top = mix(s00, s10, fr.x);
+            let bot = mix(s01, s11, fr.x);
+            return mix(top, bot, fr.y);
+        }
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid : vec3u) {
+            let coord = gid.xy;
+            let w = u32(params.screenWidth);
+            let h = u32(params.screenHeight);
+            if (coord.x >= w || coord.y >= h) { return; }
+
+            let sharp = textureLoad(colorTex, coord, 0);
+            let depth = textureLoad(depthTex, coord, 0);
+            let coc = computeCoC(depth, params);
             let absCoc = abs(coc);
 
-            // ── 1. CoC dilation (4-tap cross) ────────────────────────────────
-            // If a neighbouring pixel is in the near field, enlarge the gather
-            // radius so the current pixel will pick up the near-field bleed.
-            var maxNearR = absCoc;
-            let dilStep  = max(i32(params.maxBlur / 3.0), 2);
-            let lim      = vec2i(i32(w) - 1, i32(h) - 1);
-
-            var dilCoord : vec2i;
-            var dilCoc   : f32;
-
-            dilCoord = clamp(vec2i(coord) + vec2i( dilStep, 0), vec2i(0), lim);
-            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
-            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
-
-            dilCoord = clamp(vec2i(coord) + vec2i(-dilStep, 0), vec2i(0), lim);
-            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
-            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
-
-            dilCoord = clamp(vec2i(coord) + vec2i(0,  dilStep), vec2i(0), lim);
-            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
-            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
-
-            dilCoord = clamp(vec2i(coord) + vec2i(0, -dilStep), vec2i(0), lim);
-            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
-            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
-
-            let gatherR = maxNearR;
-
-            // Fully in-focus pixel with no near-field neighbours → pass through.
-            if (gatherR < 0.5) {
+            // Early out for in-focus pixels
+            if (absCoc < 0.5) {
                 textureStore(outputTex, coord, sharp);
                 return;
             }
 
-            // ── 2. Scatter-as-gather (Vogel disk) ────────────────────────────
-            // Each sample contributes with a weight equal to the probability that
-            // its own bokeh disc is large enough to "scatter" light onto the
-            // current pixel.  This produces physically correct hard-disc bokeh.
-            var farColor  = vec4f(0.0);  var farW  = 0.0;
-            var nearColor = vec4f(0.0);  var nearW = 0.0;
+            let halfW = ceil(params.screenWidth * 0.5);
+            let halfH = ceil(params.screenHeight * 0.5);
+            let fc = vec2f(f32(coord.x), f32(coord.y));
 
-            for (var i = 0u; i < NUM_SAMPLES; i++) {
-                let uv  = vogelDisk(i, NUM_SAMPLES);
-                let off = uv * gatherR;
-                let sc  = clamp(
-                    vec2i(coord) + vec2i(i32(off.x), i32(off.y)),
-                    vec2i(0), lim
-                );
+            let nearBlur = sampleBilinear(nearBlurTex, fc, halfW, halfH);
+            let farBlur = sampleBilinear(farBlurTex, fc, halfW, halfH);
 
-                let sColor = textureLoad(colorTex, sc, 0);
-                let sCoc   = computeCoC(textureLoad(depthTex, sc, 0));
-                let sR     = abs(sCoc);
-                let dist   = length(off);
+            var result = sharp;
 
-                // Hard-disc coverage with a 3-pixel soft anti-aliased edge.
-                // coverage → 1 when the sample's CoC disc fully covers us,
-                //          → 0 when the sample is too sharp to reach this pixel.
-                let coverage = smoothstep(dist - 1.5, dist + 1.5, sR);
-
-                if (sCoc >= 0.0) {
-                    farColor += sColor * coverage;
-                    farW     += coverage;
-                } else {
-                    // Near-field samples scatter forward onto everything.
-                    nearColor += sColor * coverage;
-                    nearW     += coverage;
-                }
+            // Far field blend
+            if (coc > 0.0) {
+                let farMix = saturate(absCoc / 2.0);
+                result = mix(sharp, vec4f(farBlur.rgb, sharp.a), farMix);
             }
 
-            // ── 3. Near / far composite ───────────────────────────────────────
-            let far  = select(sharp, farColor  / farW,  farW  > 0.001);
-            let near = select(sharp, nearColor / nearW, nearW > 0.001);
-
-            // Fraction of the disc covered by near-field bokeh.
-            // Amplified so even a thin near-field region blends noticeably.
-            let nearAlpha = clamp(nearW / f32(NUM_SAMPLES) * 2.5, 0.0, 1.0);
-
-            var bokehResult : vec4f;
-            if (coc < 0.0) {
-                // Near-field pixel: fade from sharp to near bokeh over half maxBlur.
-                let t = clamp(absCoc / max(params.maxBlur * 0.5, 1.0), 0.0, 1.0);
-                bokehResult = mix(sharp, near, t);
-            } else {
-                // Far-field / in-focus: far bokeh with near-field bleed on top.
-                bokehResult = mix(far, near, nearAlpha);
+            // Near field alpha composite on top
+            let nearAlpha = clamp(nearBlur.a * 3.0, 0.0, 1.0);
+            if (nearAlpha > 0.001) {
+                let nearRgb = nearBlur.rgb / max(nearBlur.a, 0.001);
+                result = vec4f(mix(result.rgb, nearRgb, nearAlpha), result.a);
             }
 
-            textureStore(outputTex, coord, bokehResult);
+            textureStore(outputTex, coord, result);
         }
     `;
 
-    // ── PostProcessingEffect interface ───────────────────────────────────────
+    // ========================================================================
+    // PostProcessingEffect interface
+    // ========================================================================
 
     initialize(device: GPUDevice, gbuffer: GBuffer, _camera: Camera): void {
         this._device = device;
 
+        // Shared params buffer: 8 x f32 = 32 bytes
         this._paramsBuffer = device.createBuffer({
             label: 'DoF/Params',
-            size: 32, // 8 × f32
+            size: 32,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        const module = device.createShaderModule({ code: DepthOfFieldEffect._SHADER });
-        const bgl = device.createBindGroupLayout({
-            label: 'DoF/BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            ],
-        });
+        // --- Pass 1: CoC ---
+        this._cocPipeline = this._createPipeline(device, 'DoF/CoC', DepthOfFieldEffect._COC_SHADER, [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r16float' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]);
 
-        this._pipeline = device.createComputePipeline({
-            label: 'DoF/Pipeline',
-            layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
-            compute: { module, entryPoint: 'main' },
-        });
+        // --- Pass 2a: Dilate H ---
+        this._dilateHPipeline = this._createPipeline(device, 'DoF/DilateH', DepthOfFieldEffect._DILATE_H_SHADER, [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r16float' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]);
 
-        this._buildBindGroup(gbuffer.colorTexture, gbuffer.depthTexture, gbuffer.outputTexture);
+        // --- Pass 2b: Dilate V ---
+        this._dilateVPipeline = this._createPipeline(device, 'DoF/DilateV', DepthOfFieldEffect._DILATE_V_SHADER, [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r16float' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]);
+
+        // --- Pass 3: Downsample ---
+        this._downsamplePipeline = this._createPipeline(device, 'DoF/Downsample', DepthOfFieldEffect._DOWNSAMPLE_SHADER, [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]);
+
+        // --- Pass 4: Blur ---
+        this._blurPipeline = this._createPipeline(device, 'DoF/Blur', DepthOfFieldEffect._BLUR_SHADER, [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]);
+
+        // --- Pass 5: Composite ---
+        this._compositePipeline = this._createPipeline(device, 'DoF/Composite', DepthOfFieldEffect._COMPOSITE_SHADER, [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]);
+
+        // Create internal textures
+        this._createInternalTextures(gbuffer.width, gbuffer.height);
+
+        // Build initial bind groups
+        this._buildBindGroups(gbuffer.colorTexture, gbuffer.depthTexture, gbuffer.outputTexture);
         this.initialized = true;
-    }
-
-    private _buildBindGroup(input: GPUTexture, depth: GPUTexture, output: GPUTexture): void {
-        const bgl = this._pipeline!.getBindGroupLayout(0);
-        this._bindGroup = this._device!.createBindGroup({
-            label: 'DoF/BindGroup',
-            layout: bgl,
-            entries: [
-                { binding: 0, resource: input.createView() },
-                { binding: 1, resource: depth.createView() },
-                { binding: 2, resource: output.createView() },
-                { binding: 3, resource: { buffer: this._paramsBuffer! } },
-            ],
-        });
-        this._currentInput  = input;
-        this._currentDepth  = depth;
-        this._currentOutput = output;
     }
 
     render(
@@ -257,12 +524,14 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         width: number,
         height: number
     ): void {
-        if (!this._pipeline) return;
+        if (!this._cocPipeline) return;
 
+        // Rebuild bind groups if external textures changed
         if (input !== this._currentInput || depth !== this._currentDepth || output !== this._currentOutput) {
-            this._buildBindGroup(input, depth, output);
+            this._buildBindGroups(input, depth, output);
         }
 
+        // Write shared params
         const paramsData = new Float32Array([
             this._focusDistance,
             this._focusRange,
@@ -275,23 +544,260 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         ]);
         this._device!.queue.writeBuffer(this._paramsBuffer!, 0, paramsData);
 
-        const wg = (t: number) => Math.ceil(t / 8);
-        const pass = commandEncoder.beginComputePass({ label: 'DoF' });
-        pass.setPipeline(this._pipeline!);
-        pass.setBindGroup(0, this._bindGroup!);
-        pass.dispatchWorkgroups(wg(width), wg(height));
-        pass.end();
+        const wgFull = (t: number) => Math.ceil(t / 8);
+        const halfW = Math.ceil(width / 2);
+        const halfH = Math.ceil(height / 2);
+        const wgHalf = (t: number) => Math.ceil(t / 8);
+
+        // Pass 1: CoC computation (full-res)
+        {
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/CoC' });
+            pass.setPipeline(this._cocPipeline!);
+            pass.setBindGroup(0, this._cocBindGroup!);
+            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.end();
+        }
+
+        // Pass 2a: Dilate horizontal (full-res)
+        {
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateH' });
+            pass.setPipeline(this._dilateHPipeline!);
+            pass.setBindGroup(0, this._dilateHBindGroup!);
+            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.end();
+        }
+
+        // Pass 2b: Dilate vertical (full-res)
+        {
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateV' });
+            pass.setPipeline(this._dilateVPipeline!);
+            pass.setBindGroup(0, this._dilateVBindGroup!);
+            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.end();
+        }
+
+        // Pass 3: Downsample + separation (full->half)
+        {
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/Downsample' });
+            pass.setPipeline(this._downsamplePipeline!);
+            pass.setBindGroup(0, this._downsampleBindGroup!);
+            pass.dispatchWorkgroups(wgHalf(halfW), wgHalf(halfH));
+            pass.end();
+        }
+
+        // Pass 4: Vogel disk blur (half-res)
+        {
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/Blur' });
+            pass.setPipeline(this._blurPipeline!);
+            pass.setBindGroup(0, this._blurBindGroup!);
+            pass.dispatchWorkgroups(wgHalf(halfW), wgHalf(halfH));
+            pass.end();
+        }
+
+        // Pass 5: Composite (full-res)
+        {
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/Composite' });
+            pass.setPipeline(this._compositePipeline!);
+            pass.setBindGroup(0, this._compositeBindGroup!);
+            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.end();
+        }
     }
 
-    resize(_w: number, _h: number, _gbuffer: GBuffer): void {
-        // Params are recalculated every frame; nothing size-dependent to rebuild.
+    resize(w: number, h: number, _gbuffer: GBuffer): void {
+        this._destroyInternalTextures();
+        this._createInternalTextures(w, h);
+        // Invalidate all bind groups so they are rebuilt on next render()
+        this._currentInput = null;
+        this._currentDepth = null;
+        this._currentOutput = null;
     }
 
     destroy(): void {
         this._paramsBuffer?.destroy();
         this._paramsBuffer = null;
-        this._pipeline     = null;
-        this._bindGroup    = null;
+        this._destroyInternalTextures();
+        this._cocPipeline = null;
+        this._dilateHPipeline = null;
+        this._dilateVPipeline = null;
+        this._downsamplePipeline = null;
+        this._blurPipeline = null;
+        this._compositePipeline = null;
+        this._cocBindGroup = null;
+        this._dilateHBindGroup = null;
+        this._dilateVBindGroup = null;
+        this._downsampleBindGroup = null;
+        this._blurBindGroup = null;
+        this._compositeBindGroup = null;
+    }
+
+    // ========================================================================
+    // Private helpers
+    // ========================================================================
+
+    private _createPipeline(
+        device: GPUDevice,
+        label: string,
+        shaderCode: string,
+        entries: GPUBindGroupLayoutEntry[]
+    ): GPUComputePipeline {
+        const module = device.createShaderModule({ label: `${label}/Module`, code: shaderCode });
+        const bgl = device.createBindGroupLayout({ label: `${label}/BGL`, entries });
+        return device.createComputePipeline({
+            label: `${label}/Pipeline`,
+            layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+            compute: { module, entryPoint: 'main' },
+        });
+    }
+
+    private _createInternalTextures(width: number, height: number): void {
+        const device = this._device!;
+        const halfW = Math.ceil(width / 2);
+        const halfH = Math.ceil(height / 2);
+
+        const fullR16Usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
+        const halfRGBA16Usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
+
+        this._cocTex = device.createTexture({
+            label: 'DoF/CoCTex',
+            size: [width, height],
+            format: 'r16float',
+            usage: fullR16Usage,
+        });
+
+        this._cocDilTempTex = device.createTexture({
+            label: 'DoF/CoCDilTempTex',
+            size: [width, height],
+            format: 'r16float',
+            usage: fullR16Usage,
+        });
+
+        this._nearHalfTex = device.createTexture({
+            label: 'DoF/NearHalfTex',
+            size: [halfW, halfH],
+            format: 'rgba16float',
+            usage: halfRGBA16Usage,
+        });
+
+        this._farHalfTex = device.createTexture({
+            label: 'DoF/FarHalfTex',
+            size: [halfW, halfH],
+            format: 'rgba16float',
+            usage: halfRGBA16Usage,
+        });
+
+        this._nearBlurTex = device.createTexture({
+            label: 'DoF/NearBlurTex',
+            size: [halfW, halfH],
+            format: 'rgba16float',
+            usage: halfRGBA16Usage,
+        });
+
+        this._farBlurTex = device.createTexture({
+            label: 'DoF/FarBlurTex',
+            size: [halfW, halfH],
+            format: 'rgba16float',
+            usage: halfRGBA16Usage,
+        });
+    }
+
+    private _destroyInternalTextures(): void {
+        this._cocTex?.destroy();
+        this._cocDilTempTex?.destroy();
+        this._nearHalfTex?.destroy();
+        this._farHalfTex?.destroy();
+        this._nearBlurTex?.destroy();
+        this._farBlurTex?.destroy();
+        this._cocTex = null;
+        this._cocDilTempTex = null;
+        this._nearHalfTex = null;
+        this._farHalfTex = null;
+        this._nearBlurTex = null;
+        this._farBlurTex = null;
+    }
+
+    private _buildBindGroups(input: GPUTexture, depth: GPUTexture, output: GPUTexture): void {
+        const device = this._device!;
+        const params = this._paramsBuffer!;
+
+        // Pass 1: CoC — reads depth, writes cocTex
+        this._cocBindGroup = device.createBindGroup({
+            label: 'DoF/CoC/BG',
+            layout: this._cocPipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: depth.createView() },
+                { binding: 1, resource: this._cocTex!.createView() },
+                { binding: 2, resource: { buffer: params } },
+            ],
+        });
+
+        // Pass 2a: Dilate H — reads cocTex, writes cocDilTempTex
+        this._dilateHBindGroup = device.createBindGroup({
+            label: 'DoF/DilateH/BG',
+            layout: this._dilateHPipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: this._cocTex!.createView() },
+                { binding: 1, resource: this._cocDilTempTex!.createView() },
+                { binding: 2, resource: { buffer: params } },
+            ],
+        });
+
+        // Pass 2b: Dilate V — reads cocDilTempTex, writes cocTex (reuse)
+        this._dilateVBindGroup = device.createBindGroup({
+            label: 'DoF/DilateV/BG',
+            layout: this._dilateVPipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: this._cocDilTempTex!.createView() },
+                { binding: 1, resource: this._cocTex!.createView() },
+                { binding: 2, resource: { buffer: params } },
+            ],
+        });
+
+        // Pass 3: Downsample — reads input, depth, cocTex(dilated), writes nearHalf, farHalf
+        this._downsampleBindGroup = device.createBindGroup({
+            label: 'DoF/Downsample/BG',
+            layout: this._downsamplePipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: input.createView() },
+                { binding: 1, resource: depth.createView() },
+                { binding: 2, resource: this._cocTex!.createView() },
+                { binding: 3, resource: this._nearHalfTex!.createView() },
+                { binding: 4, resource: this._farHalfTex!.createView() },
+                { binding: 5, resource: { buffer: params } },
+            ],
+        });
+
+        // Pass 4: Blur — reads nearHalf, farHalf, cocTex(dilated), writes nearBlur, farBlur
+        this._blurBindGroup = device.createBindGroup({
+            label: 'DoF/Blur/BG',
+            layout: this._blurPipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: this._nearHalfTex!.createView() },
+                { binding: 1, resource: this._farHalfTex!.createView() },
+                { binding: 2, resource: this._cocTex!.createView() },
+                { binding: 3, resource: this._nearBlurTex!.createView() },
+                { binding: 4, resource: this._farBlurTex!.createView() },
+                { binding: 5, resource: { buffer: params } },
+            ],
+        });
+
+        // Pass 5: Composite — reads input, depth, nearBlur, farBlur, writes output
+        this._compositeBindGroup = device.createBindGroup({
+            label: 'DoF/Composite/BG',
+            layout: this._compositePipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: input.createView() },
+                { binding: 1, resource: depth.createView() },
+                { binding: 2, resource: this._nearBlurTex!.createView() },
+                { binding: 3, resource: this._farBlurTex!.createView() },
+                { binding: 4, resource: output.createView() },
+                { binding: 5, resource: { buffer: params } },
+            ],
+        });
+
+        this._currentInput = input;
+        this._currentDepth = depth;
+        this._currentOutput = output;
     }
 }
 
