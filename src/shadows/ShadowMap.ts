@@ -221,7 +221,7 @@ class ShadowMap {
         });
     }
 
-    render(renderer: Renderer, scene: Scene, camera: Camera, lightDir: [number, number, number]): void {
+    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDir: [number, number, number]): void {
         const device = this._device;
 
         scene.prepare(camera);
