@@ -5,24 +5,34 @@ import { PostProcessingEffect } from '../PostProcessingEffect';
 export interface DepthOfFieldOptions {
     /** World-space distance to the in-focus plane. Default 5.0 */
     focusDistance?: number;
-    /** Half-extent of the in-focus range around focusDistance. Default 2.0 */
+    /** Half-extent of the in-focus range (world units). Default 2.0 */
     focusRange?: number;
-    /** Maximum blur radius in pixels. Default 12 */
+    /** Maximum blur radius in pixels (maps to CoC = ±1). Default 14 */
     maxBlur?: number;
 }
 
 /**
- * Depth of Field (DoF) — Bokeh blur
- * ====================================
- * Computes a per-pixel Circle of Confusion (CoC) from the linearised depth
- * buffer, then gathers the colour texture with a 32-tap multi-ring Poisson
- * disc whose radius is proportional to the CoC.  Near-field (in-front-of-focus)
- * and far-field (behind-focus) are handled separately:
+ * Depth of Field — physically-based Bokeh
+ * =========================================
  *
- *  - Far field  (coc > 0): depth-aware weights prevent sharp in-focus geometry
- *                          from bleeding into the bokeh region.
- *  - Near field (coc < 0): all samples contribute equally, so near objects
- *                          naturally bleed (scatter) onto the background.
+ * Algorithm (Unreal Cinematic DoF–inspired):
+ *
+ *  1. CoC dilation (4-tap cross): expand gather radius at depth discontinuities
+ *     so near-field objects correctly bleed onto in-focus / far-field pixels.
+ *
+ *  2. Scatter-as-gather (80-tap Vogel disk): instead of naively averaging
+ *     neighbouring pixels, each gathered sample contributes with a weight
+ *     proportional to whether its own CoC disc is large enough to reach the
+ *     current pixel.  This creates physically correct hard-disc bokeh highlights
+ *     rather than soft blobs.
+ *
+ *  3. Near / far separation: near-field (foreground) samples and far-field
+ *     (background) samples accumulate into separate layers that are composited
+ *     with alpha blending so foreground objects scatter onto the background.
+ *
+ *  4. Focus ramp: the final output is smoothly blended between the sharp source
+ *     and the bokeh result over a transition zone around the focus plane, so
+ *     there is never a hard cut as pixels enter or leave the depth-of-field region.
  */
 class DepthOfFieldEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -41,7 +51,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         super();
         this._focusDistance = options.focusDistance ?? 5.0;
         this._focusRange    = options.focusRange    ?? 2.0;
-        this._maxBlur       = options.maxBlur       ?? 12;
+        this._maxBlur       = options.maxBlur       ?? 14;
     }
 
     // ── WGSL compute shader ──────────────────────────────────────────────────
@@ -50,7 +60,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         struct DoFParams {
             focusDistance : f32,
             focusRange    : f32,
-            maxBlur       : f32,
+            maxBlur       : f32,   // maximum CoC radius in pixels
             near          : f32,
             far           : f32,
             screenWidth   : f32,
@@ -63,40 +73,31 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         @group(0) @binding(2) var outputTex : texture_storage_2d<rgba16float, write>;
         @group(0) @binding(3) var<uniform>  params : DoFParams;
 
-        // Convert raw depth [0,1] to a linear view-space distance.
         fn linearDepth(d: f32) -> f32 {
             return (params.near * params.far) / (params.far - d * (params.far - params.near));
         }
 
         // Signed Circle of Confusion in pixels.
-        //   positive → behind the focus plane (far / background)
-        //   negative → in front of the focus plane (near / foreground)
+        //   positive  → behind the focus plane (far / background)
+        //   negative  → in front of the focus plane (near / foreground)
         fn computeCoC(d: f32) -> f32 {
             let ld = linearDepth(d);
-            return clamp((ld - params.focusDistance) / params.focusRange, -1.0, 1.0) * params.maxBlur;
+            return clamp((ld - params.focusDistance) / params.focusRange, -1.0, 1.0)
+                   * params.maxBlur;
         }
 
-        // 32-tap multi-ring Poisson disc (unit radius).
-        // Arranged as 4 concentric rings: 6 + 8 + 10 + 8 samples.
-        const POISSON_COUNT : u32 = 32u;
-        const poissonDisk = array<vec2f, 32>(
-            // Ring 1 — r ≈ 0.20, 6 samples
-            vec2f( 0.200,  0.000), vec2f( 0.100,  0.173), vec2f(-0.100,  0.173),
-            vec2f(-0.200,  0.000), vec2f(-0.100, -0.173), vec2f( 0.100, -0.173),
-            // Ring 2 — r ≈ 0.40, 8 samples
-            vec2f( 0.370,  0.153), vec2f( 0.153,  0.370), vec2f(-0.153,  0.370),
-            vec2f(-0.370,  0.153), vec2f(-0.370, -0.153), vec2f(-0.153, -0.370),
-            vec2f( 0.153, -0.370), vec2f( 0.370, -0.153),
-            // Ring 3 — r ≈ 0.65, 10 samples
-            vec2f( 0.650,  0.000), vec2f( 0.526,  0.382), vec2f( 0.201,  0.618),
-            vec2f(-0.201,  0.618), vec2f(-0.526,  0.382), vec2f(-0.650,  0.000),
-            vec2f(-0.526, -0.382), vec2f(-0.201, -0.618), vec2f( 0.201, -0.618),
-            vec2f( 0.526, -0.382),
-            // Ring 4 — r ≈ 0.90, 8 samples
-            vec2f( 0.832,  0.345), vec2f( 0.345,  0.832), vec2f(-0.345,  0.832),
-            vec2f(-0.832,  0.345), vec2f(-0.832, -0.345), vec2f(-0.345, -0.832),
-            vec2f( 0.345, -0.832), vec2f( 0.832, -0.345),
-        );
+        // ── Vogel golden-ratio disc ───────────────────────────────────────────
+        // Distributes N points uniformly within the unit disc without clustering.
+        // Far superior to fixed Poisson arrays for smooth, grain-free bokeh.
+        const GOLDEN_ANGLE : f32 = 2.39996323; // ≈ 137.5° in radians
+
+        fn vogelDisk(i: u32, n: u32) -> vec2f {
+            let r     = sqrt((f32(i) + 0.5) / f32(n));
+            let theta = f32(i) * GOLDEN_ANGLE;
+            return vec2f(cos(theta), sin(theta)) * r;
+        }
+
+        const NUM_SAMPLES : u32 = 80u;
 
         @compute @workgroup_size(8, 8)
         fn main(@builtin(global_invocation_id) gid : vec3u) {
@@ -105,48 +106,105 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             let h     = u32(params.screenHeight);
             if (coord.x >= w || coord.y >= h) { return; }
 
-            let depth      = textureLoad(depthTex, coord, 0);
-            let coc        = computeCoC(depth);
-            let blurRadius = abs(coc);
+            let depth  = textureLoad(depthTex, coord, 0);
+            let sharp  = textureLoad(colorTex, coord, 0);
+            let coc    = computeCoC(depth);
+            let absCoc = abs(coc);
 
-            // Pixels near the focus plane are passed through unchanged.
-            if (blurRadius < 0.5) {
-                textureStore(outputTex, coord, textureLoad(colorTex, coord, 0));
+            // ── 1. CoC dilation (4-tap cross) ────────────────────────────────
+            // If a neighbouring pixel is in the near field, enlarge the gather
+            // radius so the current pixel will pick up the near-field bleed.
+            var maxNearR = absCoc;
+            let dilStep  = max(i32(params.maxBlur / 3.0), 2);
+            let lim      = vec2i(i32(w) - 1, i32(h) - 1);
+
+            var dilCoord : vec2i;
+            var dilCoc   : f32;
+
+            dilCoord = clamp(vec2i(coord) + vec2i( dilStep, 0), vec2i(0), lim);
+            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
+            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
+
+            dilCoord = clamp(vec2i(coord) + vec2i(-dilStep, 0), vec2i(0), lim);
+            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
+            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
+
+            dilCoord = clamp(vec2i(coord) + vec2i(0,  dilStep), vec2i(0), lim);
+            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
+            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
+
+            dilCoord = clamp(vec2i(coord) + vec2i(0, -dilStep), vec2i(0), lim);
+            dilCoc   = computeCoC(textureLoad(depthTex, dilCoord, 0));
+            if (dilCoc < 0.0) { maxNearR = max(maxNearR, -dilCoc); }
+
+            let gatherR = maxNearR;
+
+            // Fully in-focus pixel with no near-field neighbours → pass through.
+            if (gatherR < 0.5) {
+                textureStore(outputTex, coord, sharp);
                 return;
             }
 
-            var color       = vec4f(0.0);
-            var totalWeight = 0.0;
+            // ── 2. Scatter-as-gather (Vogel disk) ────────────────────────────
+            // Each sample contributes with a weight equal to the probability that
+            // its own bokeh disc is large enough to "scatter" light onto the
+            // current pixel.  This produces physically correct hard-disc bokeh.
+            var farColor  = vec4f(0.0);  var farW  = 0.0;
+            var nearColor = vec4f(0.0);  var nearW = 0.0;
 
-            for (var i = 0u; i < POISSON_COUNT; i++) {
-                let offset = poissonDisk[i] * blurRadius;
-                let sampleCoord = clamp(
-                    vec2i(coord) + vec2i(i32(offset.x), i32(offset.y)),
-                    vec2i(0),
-                    vec2i(i32(w) - 1, i32(h) - 1)
+            for (var i = 0u; i < NUM_SAMPLES; i++) {
+                let uv  = vogelDisk(i, NUM_SAMPLES);
+                let off = uv * gatherR;
+                let sc  = clamp(
+                    vec2i(coord) + vec2i(i32(off.x), i32(off.y)),
+                    vec2i(0), lim
                 );
 
-                let sampleColor = textureLoad(colorTex, sampleCoord, 0);
-                let sampleCoc   = computeCoC(textureLoad(depthTex, sampleCoord, 0));
+                let sColor = textureLoad(colorTex, sc, 0);
+                let sCoc   = computeCoC(textureLoad(depthTex, sc, 0));
+                let sR     = abs(sCoc);
+                let dist   = length(off);
 
-                // Depth-aware weight:
-                //   Near-field pixel (coc < 0): all samples contribute — near objects
-                //   scatter / bleed onto the background naturally.
-                //   Far-field pixel  (coc > 0): weight by the sample's own defocus so
-                //   sharp in-focus surfaces don't bleed into the bokeh region.
-                //   A small minimum weight (0.05) keeps far bokeh from going black.
-                var w_s: f32;
-                if (coc < 0.0) {
-                    w_s = 1.0;
+                // Hard-disc coverage with a 3-pixel soft anti-aliased edge.
+                // coverage → 1 when the sample's CoC disc fully covers us,
+                //          → 0 when the sample is too sharp to reach this pixel.
+                let coverage = smoothstep(dist - 1.5, dist + 1.5, sR);
+
+                if (sCoc >= 0.0) {
+                    farColor += sColor * coverage;
+                    farW     += coverage;
                 } else {
-                    w_s = max(smoothstep(0.0, 1.0, abs(sampleCoc) / max(1.0, blurRadius)), 0.05);
+                    // Near-field samples scatter forward onto everything.
+                    nearColor += sColor * coverage;
+                    nearW     += coverage;
                 }
-
-                color       += sampleColor * w_s;
-                totalWeight += w_s;
             }
 
-            textureStore(outputTex, coord, color / totalWeight);
+            // ── 3. Near / far composite ───────────────────────────────────────
+            let far  = select(sharp, farColor  / farW,  farW  > 0.001);
+            let near = select(sharp, nearColor / nearW, nearW > 0.001);
+
+            // Fraction of the disc covered by near-field bokeh.
+            // Amplified so even a thin near-field region blends noticeably.
+            let nearAlpha = clamp(nearW / f32(NUM_SAMPLES) * 2.5, 0.0, 1.0);
+
+            var bokehResult : vec4f;
+            if (coc < 0.0) {
+                // Near-field pixel: fade from sharp to near bokeh over half maxBlur.
+                let t = clamp(absCoc / max(params.maxBlur * 0.5, 1.0), 0.0, 1.0);
+                bokehResult = mix(sharp, near, t);
+            } else {
+                // Far-field / in-focus: far bokeh with near-field bleed on top.
+                bokehResult = mix(far, near, nearAlpha);
+            }
+
+            // ── 4. Focus ramp ─────────────────────────────────────────────────
+            // Smoothly blend between sharp and bokeh so there is never a hard
+            // cut at the focus-plane boundary.  The transition spans the first
+            // 25 % of maxBlur (at least 2 px), giving a gentle fade-in of blur.
+            let transitionPx = max(params.maxBlur * 0.25, 2.0);
+            let blendFactor  = smoothstep(0.0, transitionPx, absCoc);
+            textureStore(outputTex, coord, mix(sharp, bokehResult, blendFactor));
         }
     `;
 
@@ -235,7 +293,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
     }
 
     resize(_w: number, _h: number, _gbuffer: GBuffer): void {
-        // Params recalculated every frame; nothing to rebuild.
+        // Params are recalculated every frame; nothing size-dependent to rebuild.
     }
 
     destroy(): void {
