@@ -15,9 +15,14 @@ export interface DepthOfFieldOptions {
  * Depth of Field (DoF) — Bokeh blur
  * ====================================
  * Computes a per-pixel Circle of Confusion (CoC) from the linearised depth
- * buffer, then samples the colour texture in a Poisson-disc pattern whose
- * radius is proportional to the CoC.  Pixels near the focus plane remain
- * sharp; out-of-focus areas acquire a soft, smooth bokeh blur.
+ * buffer, then gathers the colour texture with a 32-tap multi-ring Poisson
+ * disc whose radius is proportional to the CoC.  Near-field (in-front-of-focus)
+ * and far-field (behind-focus) are handled separately:
+ *
+ *  - Far field  (coc > 0): depth-aware weights prevent sharp in-focus geometry
+ *                          from bleeding into the bokeh region.
+ *  - Near field (coc < 0): all samples contribute equally, so near objects
+ *                          naturally bleed (scatter) onto the background.
  */
 class DepthOfFieldEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -63,29 +68,34 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             return (params.near * params.far) / (params.far - d * (params.far - params.near));
         }
 
-        // Circle of Confusion radius in pixels.
+        // Signed Circle of Confusion in pixels.
+        //   positive → behind the focus plane (far / background)
+        //   negative → in front of the focus plane (near / foreground)
         fn computeCoC(d: f32) -> f32 {
-            let ld  = linearDepth(d);
-            let coc = (ld - params.focusDistance) / params.focusRange;
-            return clamp(coc, -1.0, 1.0) * params.maxBlur;
+            let ld = linearDepth(d);
+            return clamp((ld - params.focusDistance) / params.focusRange, -1.0, 1.0) * params.maxBlur;
         }
 
-        // 13-tap Poisson disc kernel (unit radius).
-        const POISSON_COUNT : u32 = 13u;
-        const poissonDisk = array<vec2f, 13>(
-            vec2f(-0.6940,  0.4970),
-            vec2f( 0.7970, -0.3500),
-            vec2f(-0.2630, -0.9260),
-            vec2f( 0.1390,  0.8640),
-            vec2f( 0.4490,  0.4320),
-            vec2f(-0.5160, -0.0870),
-            vec2f( 0.0860, -0.3670),
-            vec2f(-0.9190, -0.1310),
-            vec2f( 0.5900, -0.7870),
-            vec2f(-0.3400,  0.2670),
-            vec2f( 0.2400,  0.1470),
-            vec2f(-0.7620,  0.5840),
-            vec2f( 0.0,     0.0   ),
+        // 32-tap multi-ring Poisson disc (unit radius).
+        // Arranged as 4 concentric rings: 6 + 8 + 10 + 8 samples.
+        const POISSON_COUNT : u32 = 32u;
+        const poissonDisk = array<vec2f, 32>(
+            // Ring 1 — r ≈ 0.20, 6 samples
+            vec2f( 0.200,  0.000), vec2f( 0.100,  0.173), vec2f(-0.100,  0.173),
+            vec2f(-0.200,  0.000), vec2f(-0.100, -0.173), vec2f( 0.100, -0.173),
+            // Ring 2 — r ≈ 0.40, 8 samples
+            vec2f( 0.370,  0.153), vec2f( 0.153,  0.370), vec2f(-0.153,  0.370),
+            vec2f(-0.370,  0.153), vec2f(-0.370, -0.153), vec2f(-0.153, -0.370),
+            vec2f( 0.153, -0.370), vec2f( 0.370, -0.153),
+            // Ring 3 — r ≈ 0.65, 10 samples
+            vec2f( 0.650,  0.000), vec2f( 0.526,  0.382), vec2f( 0.201,  0.618),
+            vec2f(-0.201,  0.618), vec2f(-0.526,  0.382), vec2f(-0.650,  0.000),
+            vec2f(-0.526, -0.382), vec2f(-0.201, -0.618), vec2f( 0.201, -0.618),
+            vec2f( 0.526, -0.382),
+            // Ring 4 — r ≈ 0.90, 8 samples
+            vec2f( 0.832,  0.345), vec2f( 0.345,  0.832), vec2f(-0.345,  0.832),
+            vec2f(-0.832,  0.345), vec2f(-0.832, -0.345), vec2f(-0.345, -0.832),
+            vec2f( 0.345, -0.832), vec2f( 0.832, -0.345),
         );
 
         @compute @workgroup_size(8, 8)
@@ -96,20 +106,44 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             if (coord.x >= w || coord.y >= h) { return; }
 
             let depth      = textureLoad(depthTex, coord, 0);
-            let blurRadius = abs(computeCoC(depth));
+            let coc        = computeCoC(depth);
+            let blurRadius = abs(coc);
+
+            // Pixels near the focus plane are passed through unchanged.
+            if (blurRadius < 0.5) {
+                textureStore(outputTex, coord, textureLoad(colorTex, coord, 0));
+                return;
+            }
 
             var color       = vec4f(0.0);
             var totalWeight = 0.0;
 
             for (var i = 0u; i < POISSON_COUNT; i++) {
-                let offset      = poissonDisk[i] * blurRadius;
+                let offset = poissonDisk[i] * blurRadius;
                 let sampleCoord = clamp(
                     vec2i(coord) + vec2i(i32(offset.x), i32(offset.y)),
                     vec2i(0),
                     vec2i(i32(w) - 1, i32(h) - 1)
                 );
-                color       += textureLoad(colorTex, sampleCoord, 0);
-                totalWeight += 1.0;
+
+                let sampleColor = textureLoad(colorTex, sampleCoord, 0);
+                let sampleCoc   = computeCoC(textureLoad(depthTex, sampleCoord, 0));
+
+                // Depth-aware weight:
+                //   Near-field pixel (coc < 0): all samples contribute — near objects
+                //   scatter / bleed onto the background naturally.
+                //   Far-field pixel  (coc > 0): weight by the sample's own defocus so
+                //   sharp in-focus surfaces don't bleed into the bokeh region.
+                //   A small minimum weight (0.05) keeps far bokeh from going black.
+                var w_s: f32;
+                if (coc < 0.0) {
+                    w_s = 1.0;
+                } else {
+                    w_s = max(smoothstep(0.0, 1.0, abs(sampleCoc) / max(1.0, blurRadius)), 0.05);
+                }
+
+                color       += sampleColor * w_s;
+                totalWeight += w_s;
             }
 
             textureStore(outputTex, coord, color / totalWeight);
