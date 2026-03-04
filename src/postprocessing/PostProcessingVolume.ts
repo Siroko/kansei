@@ -67,7 +67,7 @@ class PostProcessingVolume {
 
         // Lazily create / resize the GBuffer.
         if (!this._gbuffer) {
-            this._gbuffer = new GBuffer(device, w, h);
+            this._gbuffer = new GBuffer(device, w, h, 4); // 4x MSAA for antialiasing
         } else if (this._gbuffer.width !== w || this._gbuffer.height !== h) {
             this._gbuffer.resize(w, h);
             // Invalidate effects so they rebuild their size-dependent state.
