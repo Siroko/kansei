@@ -84,6 +84,18 @@ class Matrix4 extends BufferBase {
         return this;
     }
 
+    lookAt(eye: vec3, center: vec3, up: vec3): Matrix4 {
+        mat4.lookAt(this.internalMat4, eye, center, up);
+        this.updateBuffer();
+        return this;
+    }
+
+    ortho(left: number, right: number, bottom: number, top: number, near: number, far: number): Matrix4 {
+        mat4.ortho(this.internalMat4, left, right, bottom, top, near, far);
+        this.updateBuffer();
+        return this;
+    }
+
     /**
      * Multiplies two matrices and stores the result in this matrix.
      * @param a The first matrix.
