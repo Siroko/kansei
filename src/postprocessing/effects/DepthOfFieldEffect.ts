@@ -660,49 +660,48 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         const halfW = Math.ceil(width / 2);
         const halfH = Math.ceil(height / 2);
 
-        const fullR16Usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
-        const halfRGBA16Usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
+        const texUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
 
         this._cocTex = device.createTexture({
             label: 'DoF/CoCTex',
             size: [width, height],
             format: 'r32float',
-            usage: fullR16Usage,
+            usage: texUsage,
         });
 
         this._cocDilTempTex = device.createTexture({
             label: 'DoF/CoCDilTempTex',
             size: [width, height],
             format: 'r32float',
-            usage: fullR16Usage,
+            usage: texUsage,
         });
 
         this._nearHalfTex = device.createTexture({
             label: 'DoF/NearHalfTex',
             size: [halfW, halfH],
             format: 'rgba16float',
-            usage: halfRGBA16Usage,
+            usage: texUsage,
         });
 
         this._farHalfTex = device.createTexture({
             label: 'DoF/FarHalfTex',
             size: [halfW, halfH],
             format: 'rgba16float',
-            usage: halfRGBA16Usage,
+            usage: texUsage,
         });
 
         this._nearBlurTex = device.createTexture({
             label: 'DoF/NearBlurTex',
             size: [halfW, halfH],
             format: 'rgba16float',
-            usage: halfRGBA16Usage,
+            usage: texUsage,
         });
 
         this._farBlurTex = device.createTexture({
             label: 'DoF/FarBlurTex',
             size: [halfW, halfH],
             format: 'rgba16float',
-            usage: halfRGBA16Usage,
+            usage: texUsage,
         });
     }
 
