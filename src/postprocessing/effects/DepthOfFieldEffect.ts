@@ -257,10 +257,9 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                         // Near-field: pre-multiplied alpha
                         let coverage = saturate(abs(origCoc) / (params.maxBlur * 0.5));
                         nearAccum += vec4f(color.rgb * coverage, coverage);
-                    }
-                    if (origCoc > 0.0) {
-                        // Far-field: store color and normalized CoC in alpha
-                        let normCoc = abs(origCoc) / params.maxBlur;
+                    } else {
+                        // Far-field / in-focus: store color and normalized CoC in alpha
+                        let normCoc = abs(origCoc) / max(params.maxBlur, 0.001);
                         farAccum += vec4f(color.rgb, normCoc);
                     }
                 }
@@ -377,9 +376,9 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Manual bilinear interpolation for half-res textures
         fn sampleBilinear(tex: texture_2d<f32>, fullCoord: vec2u, halfW: u32, halfH: u32) -> vec4f {
-            // Map full-res pixel to half-res continuous coordinate
-            // fullPixel 0 → 0.0, fullPixel 1 → 0.5, fullPixel 2 → 1.0, etc.
-            let hc = vec2f(f32(fullCoord.x), f32(fullCoord.y)) * 0.5;
+            // Map full-res pixel center to half-res continuous coordinate
+            // Half-res pixel 0 represents the 2x2 block centered at full-res (0.5, 0.5)
+            let hc = (vec2f(f32(fullCoord.x), f32(fullCoord.y)) + 0.5) * 0.5 - 0.5;
             let fl = floor(hc);
             let fr = hc - fl;
 
@@ -544,17 +543,16 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         ]);
         this._device!.queue.writeBuffer(this._paramsBuffer!, 0, paramsData);
 
-        const wgFull = (t: number) => Math.ceil(t / 8);
+        const wg = (t: number) => Math.ceil(t / 8);
         const halfW = Math.ceil(width / 2);
         const halfH = Math.ceil(height / 2);
-        const wgHalf = (t: number) => Math.ceil(t / 8);
 
         // Pass 1: CoC computation (full-res)
         {
             const pass = commandEncoder.beginComputePass({ label: 'DoF/CoC' });
             pass.setPipeline(this._cocPipeline!);
             pass.setBindGroup(0, this._cocBindGroup!);
-            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.dispatchWorkgroups(wg(width), wg(height));
             pass.end();
         }
 
@@ -563,7 +561,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateH' });
             pass.setPipeline(this._dilateHPipeline!);
             pass.setBindGroup(0, this._dilateHBindGroup!);
-            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.dispatchWorkgroups(wg(width), wg(height));
             pass.end();
         }
 
@@ -572,7 +570,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateV' });
             pass.setPipeline(this._dilateVPipeline!);
             pass.setBindGroup(0, this._dilateVBindGroup!);
-            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.dispatchWorkgroups(wg(width), wg(height));
             pass.end();
         }
 
@@ -581,7 +579,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             const pass = commandEncoder.beginComputePass({ label: 'DoF/Downsample' });
             pass.setPipeline(this._downsamplePipeline!);
             pass.setBindGroup(0, this._downsampleBindGroup!);
-            pass.dispatchWorkgroups(wgHalf(halfW), wgHalf(halfH));
+            pass.dispatchWorkgroups(wg(halfW), wg(halfH));
             pass.end();
         }
 
@@ -590,7 +588,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             const pass = commandEncoder.beginComputePass({ label: 'DoF/Blur' });
             pass.setPipeline(this._blurPipeline!);
             pass.setBindGroup(0, this._blurBindGroup!);
-            pass.dispatchWorkgroups(wgHalf(halfW), wgHalf(halfH));
+            pass.dispatchWorkgroups(wg(halfW), wg(halfH));
             pass.end();
         }
 
@@ -599,7 +597,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             const pass = commandEncoder.beginComputePass({ label: 'DoF/Composite' });
             pass.setPipeline(this._compositePipeline!);
             pass.setBindGroup(0, this._compositeBindGroup!);
-            pass.dispatchWorkgroups(wgFull(width), wgFull(height));
+            pass.dispatchWorkgroups(wg(width), wg(height));
             pass.end();
         }
     }
@@ -607,7 +605,14 @@ class DepthOfFieldEffect extends PostProcessingEffect {
     resize(w: number, h: number, _gbuffer: GBuffer): void {
         this._destroyInternalTextures();
         this._createInternalTextures(w, h);
-        // Invalidate all bind groups so they are rebuilt on next render()
+        // Null out bind groups referencing destroyed textures
+        this._cocBindGroup = null;
+        this._dilateHBindGroup = null;
+        this._dilateVBindGroup = null;
+        this._downsampleBindGroup = null;
+        this._blurBindGroup = null;
+        this._compositeBindGroup = null;
+        // Force rebuild on next render()
         this._currentInput = null;
         this._currentDepth = null;
         this._currentOutput = null;
@@ -720,77 +725,89 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         const device = this._device!;
         const params = this._paramsBuffer!;
 
-        // Pass 1: CoC — reads depth, writes cocTex
+        // Cache texture views to avoid redundant allocations
+        const depthView     = depth.createView();
+        const inputView     = input.createView();
+        const outputView    = output.createView();
+        const cocView       = this._cocTex!.createView();
+        const cocDilTmpView = this._cocDilTempTex!.createView();
+        const nearHalfView  = this._nearHalfTex!.createView();
+        const farHalfView   = this._farHalfTex!.createView();
+        const nearBlurView  = this._nearBlurTex!.createView();
+        const farBlurView   = this._farBlurTex!.createView();
+        const paramsBuf     = { buffer: params };
+
+        // Pass 1: CoC
         this._cocBindGroup = device.createBindGroup({
             label: 'DoF/CoC/BG',
             layout: this._cocPipeline!.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: depth.createView() },
-                { binding: 1, resource: this._cocTex!.createView() },
-                { binding: 2, resource: { buffer: params } },
+                { binding: 0, resource: depthView },
+                { binding: 1, resource: cocView },
+                { binding: 2, resource: paramsBuf },
             ],
         });
 
-        // Pass 2a: Dilate H — reads cocTex, writes cocDilTempTex
+        // Pass 2a: Dilate H
         this._dilateHBindGroup = device.createBindGroup({
             label: 'DoF/DilateH/BG',
             layout: this._dilateHPipeline!.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: this._cocTex!.createView() },
-                { binding: 1, resource: this._cocDilTempTex!.createView() },
-                { binding: 2, resource: { buffer: params } },
+                { binding: 0, resource: cocView },
+                { binding: 1, resource: cocDilTmpView },
+                { binding: 2, resource: paramsBuf },
             ],
         });
 
-        // Pass 2b: Dilate V — reads cocDilTempTex, writes cocTex (reuse)
+        // Pass 2b: Dilate V
         this._dilateVBindGroup = device.createBindGroup({
             label: 'DoF/DilateV/BG',
             layout: this._dilateVPipeline!.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: this._cocDilTempTex!.createView() },
-                { binding: 1, resource: this._cocTex!.createView() },
-                { binding: 2, resource: { buffer: params } },
+                { binding: 0, resource: cocDilTmpView },
+                { binding: 1, resource: cocView },
+                { binding: 2, resource: paramsBuf },
             ],
         });
 
-        // Pass 3: Downsample — reads input, depth, writes nearHalf, farHalf
+        // Pass 3: Downsample
         this._downsampleBindGroup = device.createBindGroup({
             label: 'DoF/Downsample/BG',
             layout: this._downsamplePipeline!.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: input.createView() },
-                { binding: 1, resource: depth.createView() },
-                { binding: 2, resource: this._nearHalfTex!.createView() },
-                { binding: 3, resource: this._farHalfTex!.createView() },
-                { binding: 4, resource: { buffer: params } },
+                { binding: 0, resource: inputView },
+                { binding: 1, resource: depthView },
+                { binding: 2, resource: nearHalfView },
+                { binding: 3, resource: farHalfView },
+                { binding: 4, resource: paramsBuf },
             ],
         });
 
-        // Pass 4: Blur — reads nearHalf, farHalf, cocTex(dilated), writes nearBlur, farBlur
+        // Pass 4: Blur
         this._blurBindGroup = device.createBindGroup({
             label: 'DoF/Blur/BG',
             layout: this._blurPipeline!.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: this._nearHalfTex!.createView() },
-                { binding: 1, resource: this._farHalfTex!.createView() },
-                { binding: 2, resource: this._cocTex!.createView() },
-                { binding: 3, resource: this._nearBlurTex!.createView() },
-                { binding: 4, resource: this._farBlurTex!.createView() },
-                { binding: 5, resource: { buffer: params } },
+                { binding: 0, resource: nearHalfView },
+                { binding: 1, resource: farHalfView },
+                { binding: 2, resource: cocView },
+                { binding: 3, resource: nearBlurView },
+                { binding: 4, resource: farBlurView },
+                { binding: 5, resource: paramsBuf },
             ],
         });
 
-        // Pass 5: Composite — reads input, depth, nearBlur, farBlur, writes output
+        // Pass 5: Composite
         this._compositeBindGroup = device.createBindGroup({
             label: 'DoF/Composite/BG',
             layout: this._compositePipeline!.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: input.createView() },
-                { binding: 1, resource: depth.createView() },
-                { binding: 2, resource: this._nearBlurTex!.createView() },
-                { binding: 3, resource: this._farBlurTex!.createView() },
-                { binding: 4, resource: output.createView() },
-                { binding: 5, resource: { buffer: params } },
+                { binding: 0, resource: inputView },
+                { binding: 1, resource: depthView },
+                { binding: 2, resource: nearBlurView },
+                { binding: 3, resource: farBlurView },
+                { binding: 4, resource: outputView },
+                { binding: 5, resource: paramsBuf },
             ],
         });
 
