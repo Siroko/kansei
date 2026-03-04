@@ -163,10 +163,8 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             }
 
             // Store as negative (near-field convention) if dilated, else keep original
-            // We store the dilated gather radius: max of own |CoC| and qualifying neighbors
             var result = ownCoc;
             if (maxR > max(0.0, -ownCoc)) {
-                // A near neighbor's CoC reaches us -- use dilated radius (negative = near)
                 result = -maxR;
             }
             textureStore(cocOut, coord, vec4f(result, 0.0, 0.0, 0.0));
@@ -301,14 +299,22 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             let halfH = u32(ceil(params.screenHeight * 0.5));
             if (halfCoord.x >= halfW || halfCoord.y >= halfH) { return; }
 
-            // Lookup dilated CoC at corresponding full-res location (center of 2x2 block)
-            let fullCoord = vec2u(
-                min(halfCoord.x * 2u, u32(params.screenWidth) - 1u),
-                min(halfCoord.y * 2u, u32(params.screenHeight) - 1u)
-            );
-            let dilatedCoc = textureLoad(cocDilated, fullCoord, 0).r;
-            let gatherR = abs(dilatedCoc);
-            let halfR = gatherR * 0.5; // full-res CoC -> half-res pixels
+            // Max absolute CoC across the 2x2 full-res block — ensures depth-edge
+            // pixels always get the larger blur radius, not the in-focus neighbor's.
+            let base = halfCoord * 2u;
+            let fullW = u32(params.screenWidth);
+            let fullH = u32(params.screenHeight);
+            var maxCoc = 0.0;
+            for (var dy = 0u; dy < 2u; dy++) {
+                for (var dx = 0u; dx < 2u; dx++) {
+                    let fc = vec2u(
+                        min(base.x + dx, fullW - 1u),
+                        min(base.y + dy, fullH - 1u)
+                    );
+                    maxCoc = max(maxCoc, abs(textureLoad(cocDilated, fc, 0).r));
+                }
+            }
+            let halfR = maxCoc * 0.5; // full-res CoC -> half-res pixels
 
             // Early out: nothing to blur
             if (halfR < 0.5) {
@@ -316,6 +322,10 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                 textureStore(farOut, halfCoord, textureLoad(farIn, halfCoord, 0));
                 return;
             }
+
+            // Center pixel's far CoC in half-res pixels (for bidirectional gather)
+            let centerFarCocNorm = textureLoad(farIn, halfCoord, 0).a;
+            let centerFarCocHalf = centerFarCocNorm * params.maxBlur * 0.5;
 
             var nearAccum = vec4f(0.0);
             var nearCount = 0.0;
@@ -338,12 +348,17 @@ class DepthOfFieldEffect extends PostProcessingEffect {
                 nearAccum += nearSample;
                 nearCount += 1.0;
 
-                // Far: scatter-as-gather with coverage weighting
+                // Far: bidirectional scatter-as-gather
+                // A sample contributes if its disc covers us OR our disc covers it
                 let farSample = textureLoad(farIn, scu, 0);
-                let sampleFarCocNorm = farSample.a; // normalized [0,1]
-                let sampleFarCocHalfRes = sampleFarCocNorm * params.maxBlur * 0.5;
+                let sampleFarCocNorm = farSample.a;
+                let sampleFarCocHalf = sampleFarCocNorm * params.maxBlur * 0.5;
                 let dist = length(off);
-                let coverage = smoothstep(dist - 1.0, dist + 1.0, sampleFarCocHalfRes);
+                let sampleCovers = smoothstep(dist - 1.0, dist + 1.0, sampleFarCocHalf);
+                let centerCovers = smoothstep(dist - 1.0, dist + 1.0, centerFarCocHalf);
+                // Downweight in-focus samples so they don't dilute the far blur at boundaries
+                let cocWeight = smoothstep(0.0, 0.15, sampleFarCocNorm);
+                let coverage = max(sampleCovers, centerCovers) * max(cocWeight, 0.05);
                 farAccum += vec4f(farSample.rgb * coverage, farSample.a * coverage);
                 farWeight += coverage;
             }
@@ -414,7 +429,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
             // Always sample near blur (needed for foreground bleed onto in-focus pixels)
             let nearBlur = sampleBilinear(nearBlurTex, coord, halfW, halfH);
-            let nearAlpha = clamp(nearBlur.a * 3.0, 0.0, 1.0);
+            let nearAlpha = saturate(nearBlur.a * 2.0);
 
             // Early out: truly in-focus pixel with no near-field bleed
             if (absCoc < 0.5 && nearAlpha < 0.001) {
@@ -426,13 +441,15 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
             var result = sharp;
 
-            // Far field: blend from sharp to blurred based on CoC magnitude
-            if (coc > 0.0) {
-                let farMix = saturate(absCoc / 2.0);
+            // Far field: smoothstep blend using pixel CoC + blurred CoC for soft boundary
+            if (coc >= 0.0) {
+                let blurredCoc = farBlur.a * params.maxBlur;
+                let effectiveCoc = max(absCoc, blurredCoc * 0.4);
+                let farMix = smoothstep(0.0, params.maxBlur * 0.25, effectiveCoc);
                 result = mix(sharp, vec4f(farBlur.rgb, sharp.a), farMix);
             }
 
-            // Near field: alpha-composite blurred foreground on top of everything
+            // Near field: alpha-composite blurred foreground on top
             if (nearAlpha > 0.001) {
                 let nearRgb = nearBlur.rgb / max(nearBlur.a, 0.001);
                 result = vec4f(mix(result.rgb, nearRgb, nearAlpha), result.a);
