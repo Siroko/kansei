@@ -20,10 +20,12 @@
     import { Renderer } from '../src/renderers/Renderer'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
     import { Renderable } from '../src/objects/Renderable'
     import { Scene } from '../src/objects/Scene'
     import { Camera } from '../src/cameras/Camera'
     import { Vector2 } from '../src/math/Vector2'
+    import { Vector3 } from '../src/math/Vector3'
     import { CameraControls } from '../src/controls/CameraControls'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
@@ -117,9 +119,9 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 1,
+      devicePixelRatio: 2,
       antialias: true,
-      sampleCount: 4
+      sampleCount: 1
     });
     await renderer.initialize();
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -128,18 +130,18 @@
     renderer.canvas.style.height = '100%';
 
     // ── Volumetric fog resources ──────────────────────────────────────────
-    const lightDir = [0.5, -0.8, 0.3];
+    const lightDir = [0.5, -0.5, 0.3];
     const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
-      gridW: 160, gridH: 90, gridD: 64,
-      near: 0.1, far: 1000
+      gridW: 160, gridH: 90, gridD: 128,
+      near: 0.5, far: 300
     });
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
-    const camera = new Camera(26, 0.1, 1000, window.innerWidth / window.innerHeight);
+    const camera = new Camera(26, 0.1, 500, window.innerWidth / window.innerHeight);
     const orbitRadius = window.innerWidth < 768 ? 120 : 90;
-    const cameraControls = new CameraControls(camera, scene.position, null, orbitRadius);
+    const cameraControls = new CameraControls(camera, new Vector3(0, 30, 0), null, orbitRadius);
 
     // ── Material (no texture — Lambert only) ──────────────────────────────────
     const material = new Material(lambertShader, { bindings: [] });
@@ -175,28 +177,41 @@
 
     let noiseOffset = 0;
 
+    // ── Floating spheres above the grid ──────────────────────────────────────
+    const sphereGeometry = new SphereGeometry(2, 32, 32);
+    const SPHERE_COUNT = 40;
+    const SPHERE_SPREAD = half * 0.8; // keep within grid bounds
+    const spheres = [];
+    for (let i = 0; i < SPHERE_COUNT; i++) {
+      const sphere = new Renderable(sphereGeometry, material);
+      sphere.position.x = (Math.random() - 0.5) * 2 * SPHERE_SPREAD;
+      sphere.position.y = 20 + Math.random() * 40; // float above columns
+      sphere.position.z = (Math.random() - 0.5) * 2 * SPHERE_SPREAD;
+      const s = 1 + Math.random() * 2;
+      sphere.scale.x = s;
+      sphere.scale.y = s;
+      sphere.scale.z = s;
+      scene.add(sphere);
+      spheres.push(sphere);
+    }
+
     // ── Post-processing volume ────────────────────────────────────────────────
     const volume = new PostProcessingVolume(renderer, [
-      new SSAOEffect({
-        radius: 0.8,
-        bias: 0.02,
-        kernelSize: 64,
-        strength: 0.5
-      }),
+      
 
       new VolumetricFogEffect({
         froxelGrid,
         shadowMap,
         lightDirection: lightDir,
         lightColor: [1.0, 0.95, 0.85],
-        baseDensity: 0.02,
-        heightFalloff: 0.1,
-        anisotropy: 0.6,
+        baseDensity: 0.035,
+        heightFalloff: 0.01,
+        anisotropy: 0.7,
       }),
 
       new DepthOfFieldEffect({
-        focusDistance: 25,
-        focusRange: 15,
+        focusDistance: 35,
+        focusRange: 30,
         maxBlur: 24
       }),
 
@@ -213,16 +228,16 @@
       const dz = SCROLL_SPEED * dt;
       noiseOffset += dz;
 
-      for (let i = 0; i < cubes.length; i++) {
-        const { obj } = cubes[i];
-        obj.position.z += dz;
+      for (let i = 0; i < spheres.length; i++) {
+        const obj = spheres[i];
+        obj.position.y = Math.sin(i + now * 0.0001) * 40 + 40;
 
-        if (obj.position.z > maxZ) {
-          obj.position.z -= gridSpan;
-          // const nz = cubes[i].noiseZ - noiseOffset;
-          // const n  = fbm(obj.position.x * NOISE_ZOOM, nz * NOISE_ZOOM);
-          // obj.scale.y = n * SCALE_Y_STRENGTH + 0.1;
-        }
+        // if (obj.position.z > maxZ) {
+        //   obj.position.z -= gridSpan;
+        //   // const nz = cubes[i].noiseZ - noiseOffset;
+        //   // const n  = fbm(obj.position.x * NOISE_ZOOM, nz * NOISE_ZOOM);
+        //   // obj.scale.y = n * SCALE_Y_STRENGTH + 0.1;
+        // }
       }
 
       cameraControls.update();

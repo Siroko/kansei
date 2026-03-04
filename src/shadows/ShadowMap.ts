@@ -133,6 +133,12 @@ class ShadowMap {
         minZ -= zRange * 2;
 
         mat4.ortho(this._lightProj, minX, maxX, minY, maxY, minZ, maxZ);
+
+        // gl-matrix v3 ortho maps Z to [-1,1]; remap to [0,1] for WebGPU
+        (this._lightProj as unknown as Float32Array)[10] *= 0.5;
+        (this._lightProj as unknown as Float32Array)[14] =
+            (this._lightProj as unknown as Float32Array)[14] * 0.5 + 0.5;
+
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
     }

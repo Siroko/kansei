@@ -75,14 +75,14 @@ class VolumetricFogEffect extends PostProcessingEffect {
             extinctionCoeff : f32,
             windOffset      : vec3f,
             anisotropy      : f32,
-            near            : f32,
-            far             : f32,
+            gridNear        : f32,
+            gridFar         : f32,
             time            : f32,
             gridW           : u32,
             gridH           : u32,
             gridD           : u32,
-            _pad0           : f32,
-            _pad1           : f32,
+            cameraNear      : f32,
+            cameraFar       : f32,
         }
 
         @group(0) @binding(0) var scatterExtTex  : texture_storage_3d<rgba16float, write>;
@@ -98,11 +98,25 @@ class VolumetricFogEffect extends PostProcessingEffect {
         fn main(@builtin(global_invocation_id) gid : vec3u) {
             if (gid.x >= params.gridW || gid.y >= params.gridH || gid.z >= params.gridD) { return; }
 
-            let gridSize = vec3f(f32(params.gridW), f32(params.gridH), f32(params.gridD));
-            let worldPos = froxelToWorld(
-                vec3f(f32(gid.x), f32(gid.y), f32(gid.z)),
-                params.invViewProj, params.near, params.far, gridSize
-            );
+            // Compute world position: use grid near/far for slice depth,
+            // but camera near/far for NDC Z (must match the projection in invViewProj).
+            // gl-matrix v3 perspectiveNO maps Z to [-1,1], so we use that convention.
+            let linearD = sliceDepth(f32(gid.z) + 0.5, params.gridNear, params.gridFar, f32(params.gridD));
+
+            // Skip slices closer than the camera near plane — they can't be
+            // unprojected correctly and would produce garbage world positions.
+            if (linearD < params.cameraNear) {
+                textureStore(scatterExtTex, gid, vec4f(0.0));
+                return;
+            }
+
+            let ndcZ = ((params.cameraFar + params.cameraNear) * linearD - 2.0 * params.cameraFar * params.cameraNear)
+                     / ((params.cameraFar - params.cameraNear) * linearD);
+            let uv = (vec2f(f32(gid.x), f32(gid.y)) + 0.5) / vec2f(f32(params.gridW), f32(params.gridH));
+            let ndcX = uv.x * 2.0 - 1.0;
+            let ndcY = (1.0 - uv.y) * 2.0 - 1.0;
+            let world = params.invViewProj * vec4f(ndcX, ndcY, ndcZ, 1.0);
+            let worldPos = world.xyz / world.w;
 
             // Wind-displaced sample position
             let samplePos = worldPos + params.windOffset;
@@ -111,17 +125,26 @@ class VolumetricFogEffect extends PostProcessingEffect {
             let density = params.baseDensity * exp(-params.heightFalloff * max(samplePos.y, 0.0));
             let extinction = density * params.extinctionCoeff;
 
-            // Shadow map lookup (binary visibility via textureLoad in compute)
+            // Shadow map lookup — 2x2 PCF for softer shadow edges
             let lightClip = params.lightViewProj * vec4f(worldPos, 1.0);
             let lightNDC  = lightClip.xyz / lightClip.w;
             let shadowUV  = vec2f(lightNDC.x * 0.5 + 0.5, 1.0 - (lightNDC.y * 0.5 + 0.5));
 
             var visibility = 1.0;
             if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 && shadowUV.y >= 0.0 && shadowUV.y <= 1.0) {
-                let shadowDim = vec2f(textureDimensions(shadowDepthTex, 0));
-                let shadowCoord = vec2i(vec2f(shadowUV * shadowDim));
-                let shadowDepth = textureLoad(shadowDepthTex, shadowCoord, 0);
-                visibility = select(0.0, 1.0, lightNDC.z <= shadowDepth + 0.002);
+                let shadowDim = textureDimensions(shadowDepthTex, 0);
+                let texelSize = 1.0 / vec2f(shadowDim);
+                let coordF = shadowUV * vec2f(shadowDim) - 0.5;
+                let base = vec2i(floor(coordF));
+                var pcf = 0.0;
+                for (var dy = 0; dy <= 1; dy++) {
+                    for (var dx = 0; dx <= 1; dx++) {
+                        let sc = clamp(base + vec2i(dx, dy), vec2i(0), vec2i(shadowDim) - 1);
+                        let sd = textureLoad(shadowDepthTex, sc, 0);
+                        pcf += select(0.0, 1.0, lightNDC.z <= sd + 0.005);
+                    }
+                }
+                visibility = pcf * 0.25;
             }
 
             // Phase function (Henyey-Greenstein)
@@ -141,10 +164,10 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private static _COMPOSITE_SHADER = FroxelGrid.WGSL_HELPERS + /* wgsl */`
 
         struct CompositeParams {
-            near         : f32,
-            far          : f32,
-            gridW        : f32,
-            gridH        : f32,
+            cameraNear   : f32,
+            cameraFar    : f32,
+            gridNear     : f32,
+            gridFar      : f32,
             gridD        : f32,
             screenWidth  : f32,
             screenHeight : f32,
@@ -158,6 +181,13 @@ class VolumetricFogEffect extends PostProcessingEffect {
         @group(0) @binding(4) var accumSampler : sampler;
         @group(0) @binding(5) var<uniform> cp  : CompositeParams;
 
+        // Screen-space dither to break up froxel slice banding
+        fn screenHash(p: vec2f) -> f32 {
+            var p3 = fract(vec3f(p.xyx) * 0.1031);
+            p3 += dot(p3, p3.yzx + 33.33);
+            return fract((p3.x + p3.y) * p3.z);
+        }
+
         @compute @workgroup_size(8, 8)
         fn main(@builtin(global_invocation_id) gid : vec3u) {
             let coord = gid.xy;
@@ -166,21 +196,21 @@ class VolumetricFogEffect extends PostProcessingEffect {
             let sceneColor = textureLoad(inputTex, coord, 0);
             let depth      = textureLoad(depthTex, coord, 0);
 
-            // Sky — pass through unchanged
-            if (depth >= 1.0) {
-                textureStore(outputTex, coord, sceneColor);
-                return;
-            }
-
             // Reverse-perspective: NDC depth -> linear depth
-            let linearDepth = cp.near * cp.far / (cp.far - depth * (cp.far - cp.near));
+            // gl-matrix v3 perspective maps Z to [-1,1]; depth buffer stores clamped [0,1]
+            let linearDepth = 2.0 * cp.cameraNear * cp.cameraFar
+                            / ((cp.cameraFar + cp.cameraNear) - depth * (cp.cameraFar - cp.cameraNear));
 
-            // Fractional slice in the froxel grid
-            let sliceFloat = depthToSlice(linearDepth, cp.near, cp.far, cp.gridD);
+            // Fractional slice in the froxel grid (uses grid near/far for exponential distribution)
+            let sliceFloat = depthToSlice(linearDepth, cp.gridNear, cp.gridFar, cp.gridD);
+
+            // Per-pixel dither: jitter slice by ±0.5 to smooth banding
+            let jitter = screenHash(vec2f(coord)) - 0.5;
+            let jitteredSlice = clamp((sliceFloat + jitter) / cp.gridD, 0.0, 1.0);
 
             // UVW for 3D texture sampling (trilinear)
             let uv = vec2f(f32(coord.x) / cp.screenWidth, f32(coord.y) / cp.screenHeight);
-            let gridUV = vec3f(uv.x, uv.y, clamp(sliceFloat / cp.gridD, 0.0, 1.0));
+            let gridUV = vec3f(uv.x, uv.y, jitteredSlice);
 
             let fogData = textureSampleLevel(accumTex, accumSampler, gridUV, 0.0);
             let accLight      = fogData.rgb;
@@ -311,6 +341,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
         // ── Update fog params ──
         const vp = mat4.create();
         mat4.multiply(vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
+
+        // Use raw gl-matrix VP inverse — the injection shader computes NDC Z
+        // in [-1,1] to match gl-matrix v3's perspectiveNO convention.
         mat4.invert(this._invVP, vp);
 
         const iv = camera.inverseViewMatrix.internalMat4;
@@ -326,22 +359,24 @@ class VolumetricFogEffect extends PostProcessingEffect {
         fogParams[43] = this._extinctionCoeff;
         fogParams[44] = this._windDir[0] * time; fogParams[45] = this._windDir[1] * time; fogParams[46] = this._windDir[2] * time;
         fogParams[47] = this._anisotropy;
-        fogParams[48] = grid.near;
-        fogParams[49] = grid.far;
+        fogParams[48] = grid.near;                                          // gridNear
+        fogParams[49] = grid.far;                                           // gridFar
         fogParams[50] = time;
         new Uint32Array(fogParams.buffer, 204, 1)[0] = grid.gridW;
         new Uint32Array(fogParams.buffer, 208, 1)[0] = grid.gridH;
         new Uint32Array(fogParams.buffer, 212, 1)[0] = grid.gridD;
+        fogParams[54] = camera.near;                                        // cameraNear
+        fogParams[55] = camera.far;                                         // cameraFar
 
         device.queue.writeBuffer(this._fogParamsBuffer!, 0, fogParams.buffer as ArrayBuffer);
 
         // ── Update composite params ──
         const compositeParams = new Float32Array(8);
-        compositeParams[0] = grid.near;
-        compositeParams[1] = grid.far;
-        compositeParams[2] = grid.gridW;
-        compositeParams[3] = grid.gridH;
-        compositeParams[4] = grid.gridD;
+        compositeParams[0] = camera.near;                                   // cameraNear
+        compositeParams[1] = camera.far;                                    // cameraFar
+        compositeParams[2] = grid.near;                                     // gridNear
+        compositeParams[3] = grid.far;                                      // gridFar
+        compositeParams[4] = grid.gridD;                                    // gridD
         compositeParams[5] = width;
         compositeParams[6] = height;
         device.queue.writeBuffer(this._compositeParamsBuffer!, 0, compositeParams.buffer as ArrayBuffer);
