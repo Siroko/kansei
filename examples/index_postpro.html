@@ -29,6 +29,9 @@
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
     import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
+    import { ShadowMap } from '../src/shadows/ShadowMap'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
     const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
@@ -124,6 +127,14 @@
     renderer.canvas.style.width = '100%';
     renderer.canvas.style.height = '100%';
 
+    // ── Volumetric fog resources ──────────────────────────────────────────
+    const lightDir = [0.5, -0.8, 0.3];
+    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
+    const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
+      gridW: 160, gridH: 90, gridD: 64,
+      near: 0.1, far: 1000
+    });
+
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
     const camera = new Camera(26, 0.1, 1000, window.innerWidth / window.innerHeight);
@@ -173,12 +184,22 @@
         strength: 0.5
       }),
 
+      new VolumetricFogEffect({
+        froxelGrid,
+        shadowMap,
+        lightDirection: lightDir,
+        lightColor: [1.0, 0.95, 0.85],
+        baseDensity: 0.02,
+        heightFalloff: 0.1,
+        anisotropy: 0.6,
+      }),
+
       new DepthOfFieldEffect({
         focusDistance: 25,
         focusRange: 15,
         maxBlur: 24
       }),
-      
+
     ]);
 
     // ── Render loop ───────────────────────────────────────────────────────────
@@ -205,6 +226,7 @@
       }
 
       cameraControls.update();
+      shadowMap.render(renderer, scene, camera, lightDir);
       volume.render(scene, camera);
       requestAnimationFrame(animate);
     }
