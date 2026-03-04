@@ -219,12 +219,11 @@ class DepthOfFieldEffect extends PostProcessingEffect {
     private static readonly _DOWNSAMPLE_SHADER = /* wgsl */`
         ${DepthOfFieldEffect._COMMON}
 
-        @group(0) @binding(0) var colorTex   : texture_2d<f32>;
-        @group(0) @binding(1) var depthTex   : texture_depth_2d;
-        @group(0) @binding(2) var cocDilated  : texture_2d<f32>;
-        @group(0) @binding(3) var nearOut    : texture_storage_2d<rgba16float, write>;
-        @group(0) @binding(4) var farOut     : texture_storage_2d<rgba16float, write>;
-        @group(0) @binding(5) var<uniform> params : DoFParams;
+        @group(0) @binding(0) var colorTex : texture_2d<f32>;
+        @group(0) @binding(1) var depthTex : texture_depth_2d;
+        @group(0) @binding(2) var nearOut  : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(3) var farOut   : texture_storage_2d<rgba16float, write>;
+        @group(0) @binding(4) var<uniform> params : DoFParams;
 
         @compute @workgroup_size(8, 8)
         fn main(@builtin(global_invocation_id) gid : vec3u) {
@@ -483,10 +482,9 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         this._downsamplePipeline = this._createPipeline(device, 'DoF/Downsample', DepthOfFieldEffect._DOWNSAMPLE_SHADER, [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
             { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
             { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-            { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         ]);
 
         // --- Pass 4: Blur ---
@@ -755,17 +753,16 @@ class DepthOfFieldEffect extends PostProcessingEffect {
             ],
         });
 
-        // Pass 3: Downsample — reads input, depth, cocTex(dilated), writes nearHalf, farHalf
+        // Pass 3: Downsample — reads input, depth, writes nearHalf, farHalf
         this._downsampleBindGroup = device.createBindGroup({
             label: 'DoF/Downsample/BG',
             layout: this._downsamplePipeline!.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: input.createView() },
                 { binding: 1, resource: depth.createView() },
-                { binding: 2, resource: this._cocTex!.createView() },
-                { binding: 3, resource: this._nearHalfTex!.createView() },
-                { binding: 4, resource: this._farHalfTex!.createView() },
-                { binding: 5, resource: { buffer: params } },
+                { binding: 2, resource: this._nearHalfTex!.createView() },
+                { binding: 3, resource: this._farHalfTex!.createView() },
+                { binding: 4, resource: { buffer: params } },
             ],
         });
 
