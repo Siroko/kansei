@@ -31,10 +31,11 @@
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
-    const GRID_SIZE      = 200;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
     const GRID_SPACING   = 1;   // world-space gap between cube centres
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
     const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
+    const SCROLL_SPEED   = 35;   // world-units per second along Z
 
     // ── Lambert shader (white base colour, single directional/point light) ───
     // Light sits top-right of the scene: high Y, positive X, slightly back.
@@ -125,7 +126,7 @@
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
-    const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
+    const camera = new Camera(26, 0.1, 1000, window.innerWidth / window.innerHeight);
     const orbitRadius = window.innerWidth < 768 ? 120 : 90;
     const cameraControls = new CameraControls(camera, scene.position, null, orbitRadius);
 
@@ -133,26 +134,35 @@
     const material = new Material(lambertShader, { bindings: [] });
     const geometry = new BoxGeometry(1, 1, 1);
 
-    // ── Grid of cubes — position and scaleY set once, never changed ───────────
-    const half = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
+    // ── Grid of cubes ─────────────────────────────────────────────────────────
+    const half     = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
+    const gridSpan = GRID_SIZE * GRID_SPACING;              // total Z extent
+
+    // Each cube keeps its original grid Z so the noise coordinate is
+    // (worldX, originalZ - noiseOffset), i.e. we slide a window through the
+    // noise field continuously.  When a cube wraps, originalZ shifts by
+    // -gridSpan so the next sample is seamless.
+    const cubes = [];
 
     for (let row = 0; row < GRID_SIZE; row++) {
       for (let col = 0; col < GRID_SIZE; col++) {
         const worldX = col * GRID_SPACING - half;
         const worldZ = row * GRID_SPACING - half;
 
-        // Perlin-like FBM noise keyed to world position
-        const noiseVal = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM);
-        const scaleY   = noiseVal * SCALE_Y_STRENGTH + 0.1;
-
         const renderable = new Renderable(geometry, material);
         renderable.position.x = worldX;
         renderable.position.y = 0;
         renderable.position.z = worldZ;
-        renderable.scale.y    = scaleY;
+
+        const noiseVal = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM);
+        renderable.scale.y = noiseVal * SCALE_Y_STRENGTH + 0.1;
+
         scene.add(renderable);
+        cubes.push({ obj: renderable, noiseZ: worldZ });
       }
     }
+
+    let noiseOffset = 0;
 
     // ── Post-processing volume ────────────────────────────────────────────────
     const volume = new PostProcessingVolume(renderer, [
@@ -166,18 +176,39 @@
       new DepthOfFieldEffect({
         focusDistance: 25,
         focusRange: 15,
-        maxBlur: 16
+        maxBlur: 24
       }),
       
     ]);
 
     // ── Render loop ───────────────────────────────────────────────────────────
-    function animate() {
+    let lastTime = performance.now();
+    const maxZ = half + GRID_SPACING;
+
+    function animate(now) {
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+
+      const dz = SCROLL_SPEED * dt;
+      noiseOffset += dz;
+
+      for (let i = 0; i < cubes.length; i++) {
+        const { obj } = cubes[i];
+        obj.position.z += dz;
+
+        if (obj.position.z > maxZ) {
+          obj.position.z -= gridSpan;
+          // const nz = cubes[i].noiseZ - noiseOffset;
+          // const n  = fbm(obj.position.x * NOISE_ZOOM, nz * NOISE_ZOOM);
+          // obj.scale.y = n * SCALE_Y_STRENGTH + 0.1;
+        }
+      }
+
       cameraControls.update();
       volume.render(scene, camera);
       requestAnimationFrame(animate);
     }
-    animate();
+    requestAnimationFrame(animate);
   </script>
 </body>
 
