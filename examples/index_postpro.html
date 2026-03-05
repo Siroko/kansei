@@ -40,14 +40,16 @@
     const GRID_SPACING   = 1;   // world-space gap between cube centres
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
     const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
-    const SCROLL_SPEED   = 35;   // world-units per second along Z
+    const SCROLL_SPEED   = 15;   // world-units per second along Z
 
-    // ── Lambert shader (white base colour, single directional/point light) ───
-    // Light sits top-right of the scene: high Y, positive X, slightly back.
+    // ── Scene light direction (shared by Lambert shader + volumetric fog) ──
+    const lightDir = [0.5, -0.2, 0.5];
+
+    // ── Lambert shader (white base colour, single directional light) ──────
+    // Uses the same lightDir as the volumetric fog so shading is consistent.
     // Group 0 is intentionally empty — light data is baked as a WGSL constant.
     const lambertShader = /* wgsl */`
-      // World-space light position (top-right of the scene).
-      const LIGHT_POS : vec3f = vec3f(80.0, 150.0, -60.0);
+      const LIGHT_DIR : vec3f = vec3f(${lightDir[0]}, ${lightDir[1]}, ${lightDir[2]});
       const AMBIENT   : f32   = 0.12;
       const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
 
@@ -81,7 +83,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> @location(0) vec4f {
-        let L        = normalize(LIGHT_POS - frag.worldPos);
+        let L        = -normalize(LIGHT_DIR);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
         return vec4f(BASE_COLOR * lighting, 1.0);
@@ -130,7 +132,6 @@
     renderer.canvas.style.height = '100%';
 
     // ── Volumetric fog resources ──────────────────────────────────────────
-    const lightDir = [0.5, -0.5, 0.3];
     const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
@@ -141,7 +142,7 @@
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
-    const camera = new Camera(26, 0.1, 500, window.innerWidth / window.innerHeight);
+    const camera = new Camera(70, 0.1, 500, window.innerWidth / window.innerHeight);
     const orbitRadius = window.innerWidth < 768 ? 120 : 90;
     const cameraControls = new CameraControls(camera, new Vector3(0, 30, 0), null, orbitRadius);
 
@@ -232,14 +233,21 @@
 
       for (let i = 0; i < spheres.length; i++) {
         const obj = spheres[i];
-        obj.position.y = Math.sin(i + now * 0.0001) * 40 + 45 + cubes[i].obj.scale.y * 0.5;
+        obj.position.y = Math.sin(i + now * 0.0001) * 40 + 45;
+        obj.position.z += dz;
+        if (obj.position.z > maxZ) {
+          obj.position.z -= gridSpan;
+        }
+      }
 
-        // if (obj.position.z > maxZ) {
-        //   obj.position.z -= gridSpan;
-        //   // const nz = cubes[i].noiseZ - noiseOffset;
-        //   // const n  = fbm(obj.position.x * NOISE_ZOOM, nz * NOISE_ZOOM);
-        //   // obj.scale.y = n * SCALE_Y_STRENGTH + 0.1;
-        // }
+      for (let i = 0; i < cubes.length; i++) {
+        const obj = cubes[i].obj;
+        obj.position.z += dz;
+        if (obj.position.z > maxZ) {
+          obj.position.z -= gridSpan;
+          const nz = cubes[i].noiseZ - noiseOffset;
+        }
+        
       }
 
       cameraControls.update();

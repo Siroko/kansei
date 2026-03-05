@@ -31,7 +31,7 @@ class Camera extends Object3D {
         super();
         this.viewMatrix = new Matrix4();
         this.inverseViewMatrix = new Matrix4();
-        this.projectionMatrix = new Matrix4().perspective(this.fov, this.aspect, this.near, this.far);
+        this.projectionMatrix = new Matrix4().perspective(this.fov * Math.PI / 180, this.aspect, this.near, this.far);
         this.setUniforms();
     }
 
@@ -39,7 +39,7 @@ class Camera extends Object3D {
      * Updates the projection matrix based on the current camera parameters.
      */
     public updateProjectionMatrix() {
-        this.projectionMatrix.perspective(this.fov, this.aspect, this.near, this.far);
+        this.projectionMatrix.perspective(this.fov * Math.PI / 180, this.aspect, this.near, this.far);
     }
 
     /**
