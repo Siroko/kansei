@@ -34,6 +34,7 @@
     import { ShadowMap } from '../src/shadows/ShadowMap'
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
     const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
@@ -47,9 +48,10 @@
 
     // ── Lambert shader (white base colour, single directional light) ──────
     // Uses the same lightDir as the volumetric fog so shading is consistent.
-    // Group 0 is intentionally empty — light data is baked as a WGSL constant.
+    // Group 0 binding 0 = light direction uniform (updated at runtime via Tweakpane).
+    const lightDirUniform = new Vector3(lightDir[0], lightDir[1], lightDir[2]);
+
     const lambertShader = /* wgsl */`
-      const LIGHT_DIR : vec3f = vec3f(${lightDir[0]}, ${lightDir[1]}, ${lightDir[2]});
       const AMBIENT   : f32   = 0.12;
       const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
 
@@ -59,7 +61,7 @@
         @location(1)       worldNormal: vec3f,
       }
 
-      // Group 0 — no material bindings for this shader
+      @group(0) @binding(0) var<uniform> lightDirection   : vec3f;
       @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
       @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
       @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
@@ -83,7 +85,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> @location(0) vec4f {
-        let L        = -normalize(LIGHT_DIR);
+        let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
         return vec4f(BASE_COLOR * lighting, 1.0);
@@ -147,7 +149,13 @@
     const cameraControls = new CameraControls(camera, new Vector3(0, 30, 0), null, orbitRadius);
 
     // ── Material (no texture — Lambert only) ──────────────────────────────────
-    const material = new Material(lambertShader, { bindings: [] });
+    const material = new Material(lambertShader, {
+      bindings: [{
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        value: lightDirUniform,
+      }],
+    });
     const geometry = new BoxGeometry(1, 1, 1);
 
     // ── Grid of cubes ─────────────────────────────────────────────────────────
@@ -198,27 +206,61 @@
       spheres.push(sphere);
     }
 
-    // ── Post-processing volume ────────────────────────────────────────────────
-    const volume = new PostProcessingVolume(renderer, [
-      
+    // ── Post-processing effects ────────────────────────────────────────────────
+    const fogEffect = new VolumetricFogEffect({
+      froxelGrid,
+      shadowMap,
+      lightDirection: lightDir,
+      lightColor: [1.0, 0.95, 0.85],
+      baseDensity: 0.035,
+      heightFalloff: 0.01,
+      anisotropy: 0.7,
+    });
 
-      new VolumetricFogEffect({
-        froxelGrid,
-        shadowMap,
-        lightDirection: lightDir,
-        lightColor: [1.0, 0.95, 0.85],
-        baseDensity: 0.035,
-        heightFalloff: 0.01,
-        anisotropy: 0.7,
-      }),
+    const dofEffect = new DepthOfFieldEffect({
+      focusDistance: 35,
+      focusRange: 30,
+      maxBlur: 24,
+    });
 
-      new DepthOfFieldEffect({
-        focusDistance: 35,
-        focusRange: 30,
-        maxBlur: 24
-      }),
+    const volume = new PostProcessingVolume(renderer, [fogEffect, dofEffect]);
 
-    ]);
+    // ── Tweakpane ───────────────────────────────────────────────────────────────
+    const params = {
+      scrollSpeed: SCROLL_SPEED,
+      lightX: lightDir[0],
+      lightY: lightDir[1],
+      lightZ: lightDir[2],
+    };
+
+    function syncLightDir() {
+      fogEffect.lightDir[0] = params.lightX;
+      fogEffect.lightDir[1] = params.lightY;
+      fogEffect.lightDir[2] = params.lightZ;
+      lightDirUniform.x = params.lightX;
+      lightDirUniform.y = params.lightY;
+      lightDirUniform.z = params.lightZ;
+      lightDirUniform.needsUpdate = true;
+    }
+
+    const pane = new Pane({ title: 'Controls' });
+
+    const fogFolder = pane.addFolder({ title: 'Volumetric Fog' });
+    fogFolder.addBinding(fogEffect, 'baseDensity',    { min: 0, max: 0.2, step: 0.001 });
+    fogFolder.addBinding(fogEffect, 'heightFalloff',  { min: 0, max: 0.5, step: 0.001 });
+    fogFolder.addBinding(fogEffect, 'extinctionCoeff', { min: 0, max: 5, step: 0.01, label: 'extinction' });
+    fogFolder.addBinding(fogEffect, 'anisotropy',     { min: -1, max: 1, step: 0.01 });
+    fogFolder.addBinding(params, 'lightX', { min: -1, max: 1, step: 0.01, label: 'light X' }).on('change', syncLightDir);
+    fogFolder.addBinding(params, 'lightY', { min: -1, max: 1, step: 0.01, label: 'light Y' }).on('change', syncLightDir);
+    fogFolder.addBinding(params, 'lightZ', { min: -1, max: 1, step: 0.01, label: 'light Z' }).on('change', syncLightDir);
+
+    const dofFolder = pane.addFolder({ title: 'Depth of Field' });
+    dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 200, step: 1 });
+    dofFolder.addBinding(dofEffect, 'focusRange',    { min: 1, max: 100, step: 1 });
+    dofFolder.addBinding(dofEffect, 'maxBlur',       { min: 0, max: 64, step: 1 });
+
+    const sceneFolder = pane.addFolder({ title: 'Scene' });
+    sceneFolder.addBinding(params, 'scrollSpeed', { min: 0, max: 50, step: 0.5, label: 'scroll speed' });
 
     // ── Render loop ───────────────────────────────────────────────────────────
     let lastTime = performance.now();
@@ -228,7 +270,7 @@
       const dt = (now - lastTime) / 1000;
       lastTime = now;
 
-      const dz = SCROLL_SPEED * dt;
+      const dz = params.scrollSpeed * dt;
       noiseOffset += dz;
 
       for (let i = 0; i < spheres.length; i++) {
@@ -251,7 +293,7 @@
       }
 
       cameraControls.update();
-      shadowMap.render(renderer, scene, camera, lightDir);
+      shadowMap.render(renderer, scene, camera, fogEffect.lightDir);
       volume.render(scene, camera);
       requestAnimationFrame(animate);
     }

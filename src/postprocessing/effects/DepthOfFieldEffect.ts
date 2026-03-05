@@ -67,15 +67,15 @@ class DepthOfFieldEffect extends PostProcessingEffect {
     private _currentDepth: GPUTexture | null = null;
     private _currentOutput: GPUTexture | null = null;
 
-    private readonly _focusDistance: number;
-    private readonly _focusRange: number;
-    private readonly _maxBlur: number;
+    focusDistance: number;
+    focusRange: number;
+    maxBlur: number;
 
     constructor(options: DepthOfFieldOptions = {}) {
         super();
-        this._focusDistance = options.focusDistance ?? 5.0;
-        this._focusRange    = options.focusRange    ?? 2.0;
-        this._maxBlur       = options.maxBlur       ?? 14;
+        this.focusDistance = options.focusDistance ?? 5.0;
+        this.focusRange    = options.focusRange    ?? 2.0;
+        this.maxBlur       = options.maxBlur       ?? 14;
     }
 
     // ========================================================================
@@ -621,9 +621,9 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Write shared params
         const paramsData = new Float32Array([
-            this._focusDistance,
-            this._focusRange,
-            this._maxBlur,
+            this.focusDistance,
+            this.focusRange,
+            this.maxBlur,
             camera.near,
             camera.far,
             width,
