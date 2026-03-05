@@ -472,22 +472,18 @@ class Renderer {
             if (!renderable.geometry.initialized) {
                 renderable.geometry.initialize(this.device!);
             }
-            // Ensure the material has a pipeline compiled for the GBuffer config.
+            // Ensure the material has a pipeline compiled for the GBuffer MRT config.
             renderable.material.getPipelineForConfig(
                 this.device!,
                 renderable.geometry.vertexBuffersDescriptors,
                 'rgba16float',
                 gbuffer.msaaSampleCount,
-                'depth32float'
+                'depth32float',
+                2 // MRT: color + emissive
             );
-            if (!renderable.material.initialized) {
-                renderable.material.initialize(
-                    this.device!,
-                    renderable.geometry.vertexBuffersDescriptors,
-                    this._presentationFormat!,
-                    this.sampleCount
-                );
-            }
+            // Mark initialized to skip initialize() which would build a
+            // canvas-format pipeline that fails for shaders with @location(1).
+            renderable.material.initialized = true;
             if (renderable.geometry.isInstancedGeometry) {
                 const geo = renderable.geometry as InstancedGeometry;
                 for (const extraBuffer of geo.extraBuffers) {
@@ -521,7 +517,7 @@ class Renderer {
             this._gbufferLastObjectCount !== orderedObjects.length ||
             this._gbufferLastSampleCount !== gbuffer.msaaSampleCount) {
             this._gbufferBundle = this._buildRenderBundle(
-                orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float'
+                orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 2
             );
             this._gbufferLastObjectCount = orderedObjects.length;
             this._gbufferLastSampleCount = gbuffer.msaaSampleCount;
@@ -538,17 +534,28 @@ class Renderer {
         };
 
         let passDescriptor: GPURenderPassDescriptor;
+        const emissiveClear = { r: 0, g: 0, b: 0, a: 0 };
+
         if (gbuffer.msaaSampleCount > 1 && gbuffer.colorMSAATexture && gbuffer.depthMSAATexture) {
             // MSAA path: render into multi-sample textures, resolve colour automatically.
             // MSAA depth is stored so the depth-copy pass can read it next.
             passDescriptor = {
-                colorAttachments: [{
-                    view: gbuffer.colorMSAATexture.createView(),
-                    resolveTarget: gbuffer.colorTexture.createView(),
-                    clearValue: clearColor,
-                    loadOp: 'clear',
-                    storeOp: 'discard', // MSAA samples discarded after resolve
-                }],
+                colorAttachments: [
+                    {
+                        view: gbuffer.colorMSAATexture.createView(),
+                        resolveTarget: gbuffer.colorTexture.createView(),
+                        clearValue: clearColor,
+                        loadOp: 'clear',
+                        storeOp: 'discard', // MSAA samples discarded after resolve
+                    },
+                    {
+                        view: gbuffer.emissiveMSAATexture!.createView(),
+                        resolveTarget: gbuffer.emissiveTexture.createView(),
+                        clearValue: emissiveClear,
+                        loadOp: 'clear',
+                        storeOp: 'discard',
+                    },
+                ],
                 depthStencilAttachment: {
                     view: gbuffer.depthMSAATexture.createView(),
                     depthClearValue: 1.0,
@@ -557,14 +564,22 @@ class Renderer {
                 },
             };
         } else {
-            // Non-MSAA path (original behaviour).
+            // Non-MSAA path.
             passDescriptor = {
-                colorAttachments: [{
-                    view: gbuffer.colorTexture.createView(),
-                    clearValue: clearColor,
-                    loadOp: 'clear',
-                    storeOp: 'store',
-                }],
+                colorAttachments: [
+                    {
+                        view: gbuffer.colorTexture.createView(),
+                        clearValue: clearColor,
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                    },
+                    {
+                        view: gbuffer.emissiveTexture.createView(),
+                        clearValue: emissiveClear,
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                    },
+                ],
                 depthStencilAttachment: {
                     view: gbuffer.depthTexture.createView(),
                     depthClearValue: 1.0,
@@ -611,10 +626,15 @@ class Renderer {
         cameraBindGroup: GPUBindGroup,
         colorFormat: GPUTextureFormat = this._presentationFormat!,
         sampleCount: number = this.sampleCount,
-        depthFormat: GPUTextureFormat = 'depth24plus'
+        depthFormat: GPUTextureFormat = 'depth24plus',
+        colorTargetCount: number = 1
     ): GPURenderBundle {
+        const colorFormats: (GPUTextureFormat | null)[] = [colorFormat];
+        if (colorTargetCount > 1) {
+            colorFormats.push(colorFormat);
+        }
         const encoder = this.device!.createRenderBundleEncoder({
-            colorFormats: [colorFormat],
+            colorFormats,
             depthStencilFormat: depthFormat,
             sampleCount,
         });
@@ -637,7 +657,8 @@ class Renderer {
                 renderable.geometry.vertexBuffersDescriptors,
                 colorFormat,
                 sampleCount,
-                depthFormat
+                depthFormat,
+                colorTargetCount
             );
             if (!pipeline || !renderable.geometry.initialized) continue;
 

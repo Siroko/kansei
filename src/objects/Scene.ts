@@ -1,6 +1,9 @@
 import { Object3D } from "./Object3D";
 import { Camera } from "../cameras/Camera";
 import { Renderable } from "./Renderable";
+import { Light } from "../lights/Light";
+import { DirectionalLight } from "../lights/DirectionalLight";
+import { PointLight } from "../lights/PointLight";
 
 /**
  * Represents a 3D scene which can contain multiple objects.
@@ -10,6 +13,11 @@ class Scene extends Object3D {
     private opaqueObjects: Renderable[] = [];
     private transparentObjects: Renderable[] = [];
     private orderedObjects: Renderable[] = [];
+    private _directionalLights: DirectionalLight[] = [];
+    private _pointLights: PointLight[] = [];
+
+    public get directionalLights(): readonly DirectionalLight[] { return this._directionalLights; }
+    public get pointLights(): readonly PointLight[] { return this._pointLights; }
 
     /**
      * Constructs a new Scene object.
@@ -22,8 +30,15 @@ class Scene extends Object3D {
         // Clear arrays in-place to avoid allocation
         this.opaqueObjects.length = 0;
         this.transparentObjects.length = 0;
-        // Sort objects into opaque and transparent
+        this._directionalLights.length = 0;
+        this._pointLights.length = 0;
+        // Sort objects into opaque and transparent, collect lights
         this.traverse(this, (object: Object3D) => {
+            if ((object as any).isLight) {
+                const light = object as Light;
+                if (light.lightType === 'directional') this._directionalLights.push(light as DirectionalLight);
+                else if (light.lightType === 'point') this._pointLights.push(light as PointLight);
+            }
             if (object.isRenderable) {
                 const renderable = object as Renderable;
                 if (renderable.material.transparent) {

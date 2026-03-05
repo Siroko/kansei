@@ -29,8 +29,10 @@
 class GBuffer {
     public colorTexture!: GPUTexture;
     public depthTexture!: GPUTexture;
+    public emissiveTexture!: GPUTexture;
     public colorMSAATexture: GPUTexture | null = null;
     public depthMSAATexture: GPUTexture | null = null;
+    public emissiveMSAATexture: GPUTexture | null = null;
     public outputTexture!: GPUTexture;
     public pingPongTexture!: GPUTexture;
     public width: number;
@@ -73,6 +75,13 @@ class GBuffer {
             usage: colorUsage,
         });
 
+        this.emissiveTexture = this.device.createTexture({
+            label: 'GBuffer/Emissive',
+            size: [width, height],
+            format: 'rgba16float',
+            usage: colorUsage,
+        });
+
         // depthTexture: non-MSAA depth for compute-shader reads.
         // Used as RENDER_ATTACHMENT by the depth-copy pass.
         this.depthTexture = this.device.createTexture({
@@ -86,6 +95,14 @@ class GBuffer {
             // MSAA colour — render target only; resolved into colorTexture each frame.
             this.colorMSAATexture = this.device.createTexture({
                 label: 'GBuffer/ColorMSAA',
+                size: [width, height],
+                format: 'rgba16float',
+                sampleCount: this.msaaSampleCount,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            this.emissiveMSAATexture = this.device.createTexture({
+                label: 'GBuffer/EmissiveMSAA',
                 size: [width, height],
                 format: 'rgba16float',
                 sampleCount: this.msaaSampleCount,
@@ -123,9 +140,12 @@ class GBuffer {
     /** Destroys all GPU textures held by this GBuffer. */
     public destroy(): void {
         this.colorTexture?.destroy();
+        this.emissiveTexture?.destroy();
         this.depthTexture?.destroy();
         this.colorMSAATexture?.destroy();
         this.colorMSAATexture = null;
+        this.emissiveMSAATexture?.destroy();
+        this.emissiveMSAATexture = null;
         this.depthMSAATexture?.destroy();
         this.depthMSAATexture = null;
         this.outputTexture?.destroy();

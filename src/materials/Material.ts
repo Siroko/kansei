@@ -11,6 +11,7 @@ class Material {
     public initialized: boolean = false;
     public uuid: string;
     public transparent: boolean = false;
+    public outputsEmissive: boolean = false;
 
     // Cache of render pipelines keyed by "colorFormat:sampleCount:depthFormat".
     // Allows the same material to be used in multiple render passes with different
@@ -47,12 +48,14 @@ class Material {
             cullMode?: GPUCullMode,
             topology?: GPUPrimitiveTopology,
             depthStencilFormat?: GPUTextureFormat,
+            outputsEmissive?: boolean,
         }
     ) {
         this.bindableGroup = new BindableGroup(this.options.bindings || []);
         this.uuid = crypto.randomUUID();
 
         this.transparent = this.options.transparent || false;
+        this.outputsEmissive = this.options.outputsEmissive || false;
         this.depthWriteEnabled = this.options.depthWriteEnabled ?? true;
         this.depthCompare = this.options.depthCompare || 'less';
         this.cullMode = this.options.cullMode || 'back';
@@ -102,7 +105,8 @@ class Material {
         vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
         colorFormat: GPUTextureFormat,
         sampleCount: number,
-        depthFormat: GPUTextureFormat
+        depthFormat: GPUTextureFormat,
+        colorTargetCount: number = 1
     ): GPURenderPipeline {
         const colorTarget: GPUColorTargetState = { format: colorFormat };
         if (this.transparent) {
@@ -120,6 +124,14 @@ class Material {
             };
         }
 
+        const targets: GPUColorTargetState[] = [colorTarget];
+        if (colorTargetCount > 1) {
+            // All materials must write to the emissive attachment so that
+            // depth-tested fragments properly overwrite occluded emissive data.
+            // Non-emissive shaders output black at @location(1).
+            targets.push({ format: colorFormat });
+        }
+
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
             layout: this.bindableGroup.pipelineBindGroupLayout!,
             label: "Render Pipeline",
@@ -132,7 +144,7 @@ class Material {
             fragment: {
                 module: this.shaderRenderModule!,
                 entryPoint: 'fragment_main',
-                targets: [colorTarget]
+                targets,
             } as GPUFragmentState,
             primitive: {
                 topology: this.topology,
@@ -165,14 +177,15 @@ class Material {
         vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
         colorFormat: GPUTextureFormat,
         sampleCount: number,
-        depthFormat: GPUTextureFormat = 'depth24plus'
+        depthFormat: GPUTextureFormat = 'depth24plus',
+        colorTargetCount: number = 1
     ): GPURenderPipeline {
         this._ensureSharedResources(gpuDevice);
-        const key = `${colorFormat}:${sampleCount}:${depthFormat}`;
+        const key = `${colorFormat}:${sampleCount}:${depthFormat}:${colorTargetCount}`;
         if (!this._pipelineCache.has(key)) {
             this._pipelineCache.set(
                 key,
-                this._buildPipeline(gpuDevice, vertexBuffersDescriptors, colorFormat, sampleCount, depthFormat)
+                this._buildPipeline(gpuDevice, vertexBuffersDescriptors, colorFormat, sampleCount, depthFormat, colorTargetCount)
             );
         }
         return this._pipelineCache.get(key)!;

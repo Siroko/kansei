@@ -32,26 +32,36 @@
     import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
     import { ShadowMap } from '../src/shadows/ShadowMap'
+    import { CubeMapShadowMap } from '../src/shadows/CubeMapShadowMap'
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
+    import { ColorGradingEffect } from '../src/postprocessing/effects/ColorGradingEffect'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { PointLight } from '../src/lights/PointLight'
+    import { Float } from '../src/math/Float'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
     const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
     const GRID_SPACING   = 1;   // world-space gap between cube centres
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
-    const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
+    const SCALE_Y_STRENGTH = 190;   // max Y scale applied to each cube
     const SCROLL_SPEED   = 15;   // world-units per second along Z
 
-    // ── Scene light direction (shared by Lambert shader + volumetric fog) ──
-    const lightDir = [0.5, -0.2, 0.5];
+    // ── Scene lights ──────────────────────────────────────────────────────
+    const dirLight = new DirectionalLight([0.5, -0.2, 0.5], [1.0, 0.95, 0.85], 1.0);
+    dirLight.volumetric = true;
 
     // ── Lambert shader (white base colour, single directional light) ──────
     // Uses the same lightDir as the volumetric fog so shading is consistent.
     // Group 0 binding 0 = light direction uniform (updated at runtime via Tweakpane).
-    const lightDirUniform = new Vector3(lightDir[0], lightDir[1], lightDir[2]);
+    const lightDirUniform = new Vector3(dirLight.direction[0], dirLight.direction[1], dirLight.direction[2]);
+    const emissiveColor = new Vector3(1.0, 1.0, 1.0);
+    const emissiveIntensity = new Float(2.0);
 
-    const lambertShader = /* wgsl */`
+    // ── Shared vertex block (used by both shaders) ──────────────────────────
+    const vertexBlock = /* wgsl */`
       const AMBIENT   : f32   = 0.12;
       const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
 
@@ -61,11 +71,11 @@
         @location(1)       worldNormal: vec3f,
       }
 
-      @group(0) @binding(0) var<uniform> lightDirection   : vec3f;
-      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
+      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -77,18 +87,46 @@
         var out : VertexOut;
         out.position    = projectionMatrix * viewMatrix * worldPos;
         out.worldPos    = worldPos.xyz;
-        // normalMatrix is the inverse-transpose model matrix — correct for
-        // non-uniform scales (e.g. the tall, thin noise columns).
         out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
         return out;
       }
+    `;
+
+    // ── Non-emissive shader (outputs black at @location(1) so depth-tested
+    //    fragments properly clear occluded emissive data) ─────────────────
+    const lambertShader = vertexBlock + /* wgsl */`
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+      }
 
       @fragment
-      fn fragment_main(frag : VertexOut) -> @location(0) vec4f {
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
-        return vec4f(BASE_COLOR * lighting, 1.0);
+        return FragmentOutput(vec4f(BASE_COLOR * lighting, 1.0), vec4f(0, 0, 0, 1));
+      }
+    `;
+
+    // ── Emissive shader (dual MRT output) ───────────────────────────────────
+    const emissiveLambertShader = vertexBlock + /* wgsl */`
+      @group(0) @binding(1) var<uniform> emissiveColor     : vec3f;
+      @group(0) @binding(2) var<uniform> emissiveIntensity : f32;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let L        = -normalize(lightDirection);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
+        let emissive = emissiveColor * emissiveIntensity;
+        let color    = BASE_COLOR * lighting + emissive;
+        return FragmentOutput(vec4f(color, 1.0), vec4f(emissive, 1.0));
       }
     `;
 
@@ -142,19 +180,31 @@
       blendFactor: 0.05,
     });
 
+    const cubeMapShadowMap = new CubeMapShadowMap(renderer.gpuDevice, { resolution: 512 });
+
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
     const camera = new Camera(70, 0.1, 500, window.innerWidth / window.innerHeight);
+
+    // Add directional light to scene
+    scene.add(dirLight);
     const orbitRadius = window.innerWidth < 768 ? 120 : 90;
     const cameraControls = new CameraControls(camera, new Vector3(0, 30, 0), null, orbitRadius);
 
-    // ── Material (no texture — Lambert only) ──────────────────────────────────
+    // ── Materials ─────────────────────────────────────────────────────────────
     const material = new Material(lambertShader, {
-      bindings: [{
-        binding: 0,
-        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-        value: lightDirUniform,
-      }],
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+      ],
+    });
+
+    const emissiveMaterial = new Material(emissiveLambertShader, {
+      outputsEmissive: true,
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: emissiveColor },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: emissiveIntensity },
+      ],
     });
     const geometry = new BoxGeometry(1, 1, 1);
 
@@ -193,8 +243,17 @@
     const SPHERE_COUNT = 40;
     const SPHERE_SPREAD = half * 0.8; // keep within grid bounds
     const spheres = [];
+
+    // Randomly pick 5-7 sphere indices to receive the emissive material.
+    const EMISSIVE_COUNT = 5 + Math.floor(Math.random() * 3); // 5, 6, or 7
+    const emissiveIndices = new Set();
+    while (emissiveIndices.size < EMISSIVE_COUNT) {
+      emissiveIndices.add(Math.floor(Math.random() * SPHERE_COUNT));
+    }
+
     for (let i = 0; i < SPHERE_COUNT; i++) {
-      const sphere = new Renderable(sphereGeometry, material);
+      const mat = emissiveIndices.has(i) ? emissiveMaterial : material;
+      const sphere = new Renderable(sphereGeometry, mat);
       sphere.position.x = (Math.random() - 0.5) * 2 * SPHERE_SPREAD;
       sphere.position.y = 20 + Math.random() * 40; // float above columns
       sphere.position.z = (Math.random() - 0.5) * 2 * SPHERE_SPREAD;
@@ -206,15 +265,32 @@
       spheres.push(sphere);
     }
 
+    // ── Point lights ──────────────────────────────────────────────────────────
+    const ptLight1 = new PointLight(30, [1.0, 0.4, 0.1], 5.0);
+    ptLight1.position.set(10, 15, 0);
+    ptLight1.volumetric = true;
+    scene.add(ptLight1);
+
+    const ptLight2 = new PointLight(25, [0.1, 0.4, 1.0], 4.0);
+    ptLight2.position.set(-15, 20, 10);
+    ptLight2.volumetric = true;
+    scene.add(ptLight2);
+
     // ── Post-processing effects ────────────────────────────────────────────────
     const fogEffect = new VolumetricFogEffect({
       froxelGrid,
       shadowMap,
-      lightDirection: lightDir,
-      lightColor: [1.0, 0.95, 0.85],
+      cubeMapShadowMap,
       baseDensity: 0.035,
       heightFalloff: 0.01,
       anisotropy: 0.7,
+    });
+
+    const bloomEffect = new BloomEffect({
+      threshold: 0.0,
+      knee: 0.1,
+      intensity: 0.8,
+      radius: 1.0,
     });
 
     const dofEffect = new DepthOfFieldEffect({
@@ -223,20 +299,39 @@
       maxBlur: 24,
     });
 
-    const volume = new PostProcessingVolume(renderer, [fogEffect, dofEffect]);
+    const colorGradingEffect = new ColorGradingEffect();
+
+    const allEffects = [fogEffect, bloomEffect, dofEffect, colorGradingEffect];
+    const volume = new PostProcessingVolume(renderer, [...allEffects]);
+
+    // ── Effect toggles ──────────────────────────────────────────────────────────
+    const effectToggles = {
+      fog: true,
+      bloom: true,
+      dof: true,
+      colorGrading: true,
+    };
+
+    function rebuildEffectChain() {
+      volume.effects = [];
+      if (effectToggles.fog)          volume.effects.push(fogEffect);
+      if (effectToggles.bloom)        volume.effects.push(bloomEffect);
+      if (effectToggles.dof)          volume.effects.push(dofEffect);
+      if (effectToggles.colorGrading) volume.effects.push(colorGradingEffect);
+    }
 
     // ── Tweakpane ───────────────────────────────────────────────────────────────
     const params = {
       scrollSpeed: SCROLL_SPEED,
-      lightX: lightDir[0],
-      lightY: lightDir[1],
-      lightZ: lightDir[2],
+      lightX: dirLight.direction[0],
+      lightY: dirLight.direction[1],
+      lightZ: dirLight.direction[2],
     };
 
     function syncLightDir() {
-      fogEffect.lightDir[0] = params.lightX;
-      fogEffect.lightDir[1] = params.lightY;
-      fogEffect.lightDir[2] = params.lightZ;
+      dirLight.direction[0] = params.lightX;
+      dirLight.direction[1] = params.lightY;
+      dirLight.direction[2] = params.lightZ;
       lightDirUniform.x = params.lightX;
       lightDirUniform.y = params.lightY;
       lightDirUniform.z = params.lightZ;
@@ -246,6 +341,7 @@
     const pane = new Pane({ title: 'Controls' });
 
     const fogFolder = pane.addFolder({ title: 'Volumetric Fog' });
+    fogFolder.addBinding(effectToggles, 'fog', { label: 'enabled' }).on('change', rebuildEffectChain);
     fogFolder.addBinding(fogEffect, 'baseDensity',    { min: 0, max: 0.2, step: 0.001 });
     fogFolder.addBinding(fogEffect, 'heightFalloff',  { min: 0, max: 0.5, step: 0.001 });
     fogFolder.addBinding(fogEffect, 'extinctionCoeff', { min: 0, max: 5, step: 0.01, label: 'extinction' });
@@ -254,10 +350,78 @@
     fogFolder.addBinding(params, 'lightY', { min: -1, max: 1, step: 0.01, label: 'light Y' }).on('change', syncLightDir);
     fogFolder.addBinding(params, 'lightZ', { min: -1, max: 1, step: 0.01, label: 'light Z' }).on('change', syncLightDir);
 
+    const bloomFolder = pane.addFolder({ title: 'Bloom' });
+    bloomFolder.addBinding(effectToggles, 'bloom', { label: 'enabled' }).on('change', rebuildEffectChain);
+    bloomFolder.addBinding(bloomEffect, 'useEmissive', { label: 'emissive only' });
+    bloomFolder.addBinding(bloomEffect, 'threshold',  { min: 0, max: 3, step: 0.01 });
+    bloomFolder.addBinding(bloomEffect, 'knee',       { min: 0, max: 1, step: 0.01 });
+    bloomFolder.addBinding(bloomEffect, 'intensity',  { min: 0, max: 3, step: 0.01 });
+    bloomFolder.addBinding(bloomEffect, 'radius',     { min: 0, max: 2, step: 0.01 });
+
     const dofFolder = pane.addFolder({ title: 'Depth of Field' });
+    dofFolder.addBinding(effectToggles, 'dof', { label: 'enabled' }).on('change', rebuildEffectChain);
     dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 200, step: 1 });
     dofFolder.addBinding(dofEffect, 'focusRange',    { min: 1, max: 100, step: 1 });
     dofFolder.addBinding(dofEffect, 'maxBlur',       { min: 0, max: 64, step: 1 });
+
+    const gradeFolder = pane.addFolder({ title: 'Color Grading' });
+    gradeFolder.addBinding(effectToggles, 'colorGrading', { label: 'enabled' }).on('change', rebuildEffectChain);
+    gradeFolder.addBinding(colorGradingEffect, 'brightness',  { min: -1, max: 1, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'contrast',    { min: 0, max: 3, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'saturation',  { min: 0, max: 3, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'temperature', { min: -1, max: 1, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'tint',        { min: -1, max: 1, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'highlights',  { min: 0, max: 2, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'shadows',     { min: 0, max: 2, step: 0.01 });
+    gradeFolder.addBinding(colorGradingEffect, 'blackPoint',  { min: 0, max: 0.5, step: 0.01 });
+
+    const emissiveParams = {
+      color: { r: emissiveColor.x, g: emissiveColor.y, b: emissiveColor.z },
+      intensity: emissiveIntensity.value,
+    };
+    const matFolder = pane.addFolder({ title: 'Emissive Spheres' });
+    matFolder.addBinding(emissiveParams, 'color', { color: { type: 'float' }, label: 'emissive' }).on('change', (ev) => {
+      emissiveColor.x = ev.value.r;
+      emissiveColor.y = ev.value.g;
+      emissiveColor.z = ev.value.b;
+      emissiveColor.needsUpdate = true;
+    });
+    matFolder.addBinding(emissiveParams, 'intensity', { min: 0, max: 5, step: 0.01, label: 'emissive str' }).on('change', (ev) => {
+      emissiveIntensity.value = ev.value;
+    });
+
+    // ── Point light controls ──
+    const ptLight1Params = {
+      x: ptLight1.position.x, y: ptLight1.position.y, z: ptLight1.position.z,
+      radius: ptLight1.radius, intensity: ptLight1.intensity, volumetric: ptLight1.volumetric,
+      color: { r: ptLight1.color[0], g: ptLight1.color[1], b: ptLight1.color[2] },
+    };
+    const ptFolder1 = pane.addFolder({ title: 'Point Light 1' });
+    ptFolder1.addBinding(ptLight1Params, 'volumetric').on('change', (ev) => { ptLight1.volumetric = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'x', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.x = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'y', { min: 0, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.y = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'z', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.z = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'radius', { min: 1, max: 100, step: 1 }).on('change', (ev) => { ptLight1.radius = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'intensity', { min: 0, max: 20, step: 0.1 }).on('change', (ev) => { ptLight1.intensity = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'color', { color: { type: 'float' } }).on('change', (ev) => {
+      ptLight1.color[0] = ev.value.r; ptLight1.color[1] = ev.value.g; ptLight1.color[2] = ev.value.b;
+    });
+
+    const ptLight2Params = {
+      x: ptLight2.position.x, y: ptLight2.position.y, z: ptLight2.position.z,
+      radius: ptLight2.radius, intensity: ptLight2.intensity, volumetric: ptLight2.volumetric,
+      color: { r: ptLight2.color[0], g: ptLight2.color[1], b: ptLight2.color[2] },
+    };
+    const ptFolder2 = pane.addFolder({ title: 'Point Light 2' });
+    ptFolder2.addBinding(ptLight2Params, 'volumetric').on('change', (ev) => { ptLight2.volumetric = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'x', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.x = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'y', { min: 0, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.y = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'z', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.z = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'radius', { min: 1, max: 100, step: 1 }).on('change', (ev) => { ptLight2.radius = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'intensity', { min: 0, max: 20, step: 0.1 }).on('change', (ev) => { ptLight2.intensity = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'color', { color: { type: 'float' } }).on('change', (ev) => {
+      ptLight2.color[0] = ev.value.r; ptLight2.color[1] = ev.value.g; ptLight2.color[2] = ev.value.b;
+    });
 
     const sceneFolder = pane.addFolder({ title: 'Scene' });
     sceneFolder.addBinding(params, 'scrollSpeed', { min: 0, max: 50, step: 0.5, label: 'scroll speed' });
@@ -293,7 +457,13 @@
       }
 
       cameraControls.update();
-      shadowMap.render(renderer, scene, camera, fogEffect.lightDir);
+      shadowMap.render(renderer, scene, camera, dirLight);
+      // Only render cubemap shadows for volumetric point lights
+      const volPtLights = scene.pointLights.filter(l => l.volumetric);
+      if (volPtLights.length > 0) {
+        cubeMapShadowMap.render(renderer, scene, camera, volPtLights);
+      }
+      fogEffect.updateLights(scene.directionalLights, scene.pointLights);
       volume.render(scene, camera);
       requestAnimationFrame(animate);
     }
