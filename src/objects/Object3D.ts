@@ -92,18 +92,17 @@ class Object3D {
     }
 
     /**
-     * Updates the normal matrix using the provided view matrix.
-     * @param viewMatrix The view matrix to use for updating the normal matrix.
+     * Updates the normal matrix from the world matrix (inverse-transpose).
+     * @param viewMatrix The view matrix (kept for API compatibility / cache invalidation).
      */
     public updateNormalMatrix(viewMatrix: Matrix4) {
         if (viewMatrix.version === this._lastNormalViewVersion &&
             this.worldMatrix.version === this._lastNormalWorldVersion) return;
 
-        // Compute inverse-transpose directly on internalMat4, then sync to
-        // buffer once at the end. mat4.multiply overwrites nm fully so no
-        // identity() call is needed.
+        // Normal matrix = transpose(inverse(worldMatrix)).
+        // World-space normals stay fixed regardless of camera orientation.
         const nm = this.normalMatrix.internalMat4;
-        mat4.multiply(nm, viewMatrix.internalMat4, this.worldMatrix.internalMat4);
+        mat4.copy(nm, this.worldMatrix.internalMat4);
         mat4.invert(nm, nm);
         mat4.transpose(nm, nm);
         this.normalMatrix.syncBuffer();
