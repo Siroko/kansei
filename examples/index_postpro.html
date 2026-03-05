@@ -46,7 +46,7 @@
     const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
     const GRID_SPACING   = 1;   // world-space gap between cube centres
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
-    const SCALE_Y_STRENGTH = 190;   // max Y scale applied to each cube
+    const SCALE_Y_STRENGTH = 0;   // max Y scale applied to each cube
     const SCROLL_SPEED   = 15;   // world-units per second along Z
 
     // ── Scene lights ──────────────────────────────────────────────────────
@@ -95,6 +95,8 @@
     // ── Non-emissive shader (outputs black at @location(1) so depth-tested
     //    fragments properly clear occluded emissive data) ─────────────────
     const lambertShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
       struct FragmentOutput {
         @location(0) color    : vec4f,
         @location(1) emissive : vec4f,
@@ -102,15 +104,18 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
-        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
         return FragmentOutput(vec4f(BASE_COLOR * lighting, 1.0), vec4f(0, 0, 0, 1));
       }
     `;
 
     // ── Emissive shader (dual MRT output) ───────────────────────────────────
     const emissiveLambertShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
       @group(0) @binding(1) var<uniform> emissiveColor     : vec3f;
       @group(0) @binding(2) var<uniform> emissiveIntensity : f32;
 
@@ -121,9 +126,10 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
-        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
         let emissive = emissiveColor * emissiveIntensity;
         let color    = BASE_COLOR * lighting + emissive;
         return FragmentOutput(vec4f(color, 1.0), vec4f(emissive, 1.0));
@@ -171,8 +177,12 @@
     renderer.canvas.style.width = '100%';
     renderer.canvas.style.height = '100%';
 
+    // ── Shadow receiving on geometry ─────────────────────────────────────
+    renderer.shadowsEnabled = true;
+
     // ── Volumetric fog resources ──────────────────────────────────────────
     const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
+    renderer.shadowMap = shadowMap;
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
       near: 0.5, far: 300,
@@ -425,6 +435,7 @@
 
     const sceneFolder = pane.addFolder({ title: 'Scene' });
     sceneFolder.addBinding(params, 'scrollSpeed', { min: 0, max: 50, step: 0.5, label: 'scroll speed' });
+    sceneFolder.addBinding(renderer, 'shadowsEnabled', { label: 'geometry shadows' });
 
     // ── Render loop ───────────────────────────────────────────────────────────
     let lastTime = performance.now();

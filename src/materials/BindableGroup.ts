@@ -20,6 +20,7 @@ class BindableGroup {
     private bindableGroupLayout?: GPUBindGroupLayout;
     public cameraBindablesGroupLayout?: GPUBindGroupLayout;
     public meshBindablesGroupLayout?: GPUBindGroupLayout;
+    public shadowBindablesGroupLayout?: GPUBindGroupLayout;
 
     /**
      * Constructs a new BindableGroup.
@@ -81,6 +82,15 @@ class BindableGroup {
                     }
                 }
             ]
+        });
+
+        this.shadowBindablesGroupLayout = gpuDevice.createBindGroupLayout({
+            label: 'Shadow BindGroupLayout',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+            ],
         });
     }
 

@@ -283,6 +283,7 @@ class ShadowMap {
 
         for (let i = 0; i < objects.length; i++) {
             const obj = objects[i];
+            if (!obj.castShadow) continue;
             if (!obj.geometry.initialized) continue;
 
             const offset = i * alignment;

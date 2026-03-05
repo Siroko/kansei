@@ -91,7 +91,8 @@ class Material {
                 bindGroupLayouts: [
                     this.bindableGroup.bindGroupLayout!,
                     this.bindableGroup.cameraBindablesGroupLayout!,
-                    this.bindableGroup.meshBindablesGroupLayout!
+                    this.bindableGroup.meshBindablesGroupLayout!,
+                    this.bindableGroup.shadowBindablesGroupLayout!,
                 ]
             });
         }
