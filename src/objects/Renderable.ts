@@ -2,6 +2,7 @@ import { Geometry } from "../buffers/Geometry";
 import { Material } from "../materials/Material";
 import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
+import { PathTracerMaterial } from "../pathtracer/PathTracerMaterial";
 
 /**
  * Represents a 3D renderable object that extends Object3D.
@@ -16,6 +17,9 @@ class Renderable extends Object3D {
 
     /** Whether this object receives shadows (shader must use #include <shadows>). */
     public receiveShadow: boolean = true;
+
+    /** Path tracer material properties. If null, defaults are derived at BVH build time. */
+    public pathTracerMaterial: PathTracerMaterial | null = null;
 
     /** The layout of the bind group for GPU resources. */
     public bindGroupLayout?: GPUBindGroupLayout;
