@@ -22,13 +22,13 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _froxelGrid: FroxelGrid;
     private _shadowMap: ShadowMap;
 
-    private _lightDir: [number, number, number];
-    private _lightColor: [number, number, number];
-    private _baseDensity: number;
-    private _heightFalloff: number;
-    private _extinctionCoeff: number;
-    private _anisotropy: number;
-    private _windDir: [number, number, number];
+    lightDir: [number, number, number];
+    lightColor: [number, number, number];
+    baseDensity: number;
+    heightFalloff: number;
+    extinctionCoeff: number;
+    anisotropy: number;
+    windDir: [number, number, number];
 
     // Injection pass
     private _injectPipeline: GPUComputePipeline | null = null;
@@ -51,13 +51,13 @@ class VolumetricFogEffect extends PostProcessingEffect {
         super();
         this._froxelGrid    = options.froxelGrid;
         this._shadowMap     = options.shadowMap;
-        this._lightDir      = options.lightDirection ?? [0.5, -0.8, 0.3];
-        this._lightColor    = options.lightColor ?? [1.0, 0.95, 0.85];
-        this._baseDensity   = options.baseDensity ?? 0.02;
-        this._heightFalloff = options.heightFalloff ?? 0.1;
-        this._extinctionCoeff = options.extinctionCoeff ?? 1.0;
-        this._anisotropy    = options.anisotropy ?? 0.6;
-        this._windDir       = options.windDirection ?? [0, 0, 0];
+        this.lightDir       = options.lightDirection ?? [0.5, -0.8, 0.3];
+        this.lightColor     = options.lightColor ?? [1.0, 0.95, 0.85];
+        this.baseDensity    = options.baseDensity ?? 0.02;
+        this.heightFalloff  = options.heightFalloff ?? 0.1;
+        this.extinctionCoeff = options.extinctionCoeff ?? 1.0;
+        this.anisotropy     = options.anisotropy ?? 0.6;
+        this.windDir        = options.windDirection ?? [0, 0, 0];
     }
 
     // ── Injection shader ──────────────────────────────────────────────────
@@ -352,13 +352,13 @@ class VolumetricFogEffect extends PostProcessingEffect {
         fogParams.set(this._invVP as unknown as Float32Array, 0);               // invViewProj
         fogParams.set(this._shadowMap.lightViewProjMatrix, 16);                  // lightViewProj
         fogParams[32] = iv[12]; fogParams[33] = iv[13]; fogParams[34] = iv[14]; // cameraPos
-        fogParams[35] = this._baseDensity;
-        fogParams[36] = this._lightDir[0]; fogParams[37] = this._lightDir[1]; fogParams[38] = this._lightDir[2];
-        fogParams[39] = this._heightFalloff;
-        fogParams[40] = this._lightColor[0]; fogParams[41] = this._lightColor[1]; fogParams[42] = this._lightColor[2];
-        fogParams[43] = this._extinctionCoeff;
-        fogParams[44] = this._windDir[0] * time; fogParams[45] = this._windDir[1] * time; fogParams[46] = this._windDir[2] * time;
-        fogParams[47] = this._anisotropy;
+        fogParams[35] = this.baseDensity;
+        fogParams[36] = this.lightDir[0]; fogParams[37] = this.lightDir[1]; fogParams[38] = this.lightDir[2];
+        fogParams[39] = this.heightFalloff;
+        fogParams[40] = this.lightColor[0]; fogParams[41] = this.lightColor[1]; fogParams[42] = this.lightColor[2];
+        fogParams[43] = this.extinctionCoeff;
+        fogParams[44] = this.windDir[0] * time; fogParams[45] = this.windDir[1] * time; fogParams[46] = this.windDir[2] * time;
+        fogParams[47] = this.anisotropy;
         fogParams[48] = grid.near;                                          // gridNear
         fogParams[49] = grid.far;                                           // gridFar
         fogParams[50] = time;
