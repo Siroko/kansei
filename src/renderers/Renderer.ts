@@ -6,6 +6,7 @@ import { Compute } from "../materials/Compute";
 import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
 import { GBuffer } from "../postprocessing/GBuffer";
+import { ShadowMap } from "../shadows/ShadowMap";
 
 /**
  * Configuration options for the WebGPU renderer.
@@ -96,6 +97,22 @@ class Renderer {
     private _sharedMeshBGLayout: GPUBindGroupLayout | null = null;
     private _sharedMeshBG: GPUBindGroup | null = null;
     private _sharedMeshObjectCount: number = -1;
+
+    // ── Shadow resources ─────────────────────────────────────────────────────
+    public shadowsEnabled: boolean = false;
+    private _shadowMap: ShadowMap | null = null;
+    private _shadowBGL: GPUBindGroupLayout | null = null;
+    private _shadowBG: GPUBindGroup | null = null;
+    private _shadowUniformBuf: GPUBuffer | null = null;
+    private _shadowComparisonSampler: GPUSampler | null = null;
+    private _dummyShadowDepthTex: GPUTexture | null = null;
+    private _shadowBGDirty: boolean = true;
+
+    public get shadowMap(): ShadowMap | null { return this._shadowMap; }
+    public set shadowMap(value: ShadowMap | null) {
+        this._shadowMap = value;
+        this._shadowBGDirty = true;
+    }
 
     constructor(
         private options: RendererOptions = {}
@@ -250,6 +267,72 @@ class Renderer {
     }
 
     /**
+     * Creates the shadow GPU resources (dummy depth texture, comparison sampler,
+     * uniform buffer, bind group layout) on first use.
+     */
+    private _ensureShadowResources(): void {
+        if (this._shadowBGL) return;
+
+        this._dummyShadowDepthTex = this.device!.createTexture({
+            label: 'Shadow/DummyDepth',
+            size: [1, 1],
+            format: 'depth32float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+
+        this._shadowComparisonSampler = this.device!.createSampler({
+            label: 'Shadow/ComparisonSampler',
+            compare: 'less',
+            magFilter: 'linear',
+            minFilter: 'linear',
+        });
+
+        // mat4(64) + bias(4) + normalBias(4) + shadowEnabled(4) + _pad(4) = 80 bytes
+        this._shadowUniformBuf = this.device!.createBuffer({
+            label: 'Shadow/Uniforms',
+            size: 80,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        this._shadowBGL = this.device!.createBindGroupLayout({
+            label: 'Shadow BindGroupLayout',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        this._shadowBGDirty = true;
+    }
+
+    /**
+     * Creates or recreates the shadow bind group when the shadow map texture changes.
+     */
+    private _updateShadowBindGroup(): void {
+        if (!this._shadowBGDirty) return;
+        this._ensureShadowResources();
+
+        const depthTex = this._shadowMap
+            ? this._shadowMap.depthTexture
+            : this._dummyShadowDepthTex!;
+
+        this._shadowBG = this.device!.createBindGroup({
+            label: 'Shadow BindGroup',
+            layout: this._shadowBGL!,
+            entries: [
+                { binding: 0, resource: depthTex.createView() },
+                { binding: 1, resource: this._shadowComparisonSampler! },
+                { binding: 2, resource: { buffer: this._shadowUniformBuf! } },
+            ],
+        });
+
+        this._shadowBGDirty = false;
+        this._renderBundle = null;
+        this._gbufferBundle = null;
+    }
+
+    /**
      * Renders a stack using the specified camera.
      *
      * Each frame has three phases:
@@ -315,6 +398,10 @@ class Renderer {
             this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
             this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
         }
+
+        // Upload shadow uniforms.
+        this._uploadShadowUniforms();
+        this._updateShadowBindGroup();
 
         // Invalidate the bundle if any object had its material swapped this frame.
         for (const renderable of orderedObjects) {
@@ -505,6 +592,10 @@ class Renderer {
             this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
         }
 
+        // Upload shadow uniforms.
+        this._uploadShadowUniforms();
+        this._updateShadowBindGroup();
+
         for (const renderable of orderedObjects) {
             if (renderable.materialDirty) {
                 this._gbufferBundle = null;
@@ -615,6 +706,25 @@ class Renderer {
     }
 
     /**
+     * Uploads shadow uniform data (light VP matrix, bias values, enabled flag)
+     * to the GPU buffer every frame.
+     */
+    private _uploadShadowUniforms(): void {
+        this._ensureShadowResources();
+        // 20 floats: mat4(16) + bias(1) + normalBias(1) + shadowEnabled(1) + _pad(1)
+        const staging = new Float32Array(20);
+        if (this._shadowMap && this.shadowsEnabled) {
+            staging.set(this._shadowMap.lightViewProjMatrix, 0);
+            staging[16] = 0.001;  // bias
+            staging[17] = 0.02;   // normalBias
+            staging[18] = 1.0;    // shadowEnabled
+        } else {
+            staging[18] = 0.0;    // shadowEnabled = off
+        }
+        this.device!.queue.writeBuffer(this._shadowUniformBuf!, 0, staging);
+    }
+
+    /**
      * Records all draw commands into a GPURenderBundle.
      *
      * @param colorFormat   Target colour attachment format. Defaults to the canvas presentation format.
@@ -648,6 +758,11 @@ class Renderer {
 
         // Camera bind group is the same for every object — set once.
         encoder.setBindGroup(2, cameraBindGroup);
+
+        // Shadow bind group (Group 3) — same for every object.
+        if (this._shadowBG) {
+            encoder.setBindGroup(3, this._shadowBG);
+        }
 
         for (let i = 0; i < orderedObjects.length; i++) {
             const renderable = orderedObjects[i];

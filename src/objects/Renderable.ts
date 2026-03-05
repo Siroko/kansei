@@ -11,6 +11,12 @@ class Renderable extends Object3D {
     /** Indicates if the object is a mesh. */
     public isRenderable: boolean = true;
 
+    /** Whether this object casts shadows into shadow maps. */
+    public castShadow: boolean = true;
+
+    /** Whether this object receives shadows (shader must use #include <shadows>). */
+    public receiveShadow: boolean = true;
+
     /** The layout of the bind group for GPU resources. */
     public bindGroupLayout?: GPUBindGroupLayout;
 
