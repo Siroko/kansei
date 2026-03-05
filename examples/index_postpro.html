@@ -134,7 +134,9 @@
     const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
-      near: 0.5, far: 300
+      near: 0.5, far: 300,
+      temporal: true,
+      blendFactor: 0.05,
     });
 
     // ── Camera & controls ─────────────────────────────────────────────────────
@@ -230,7 +232,7 @@
 
       for (let i = 0; i < spheres.length; i++) {
         const obj = spheres[i];
-        obj.position.y = Math.sin(i + now * 0.0001) * 40 + 40;
+        obj.position.y = Math.sin(i + now * 0.0001) * 40 + 45 + cubes[i].obj.scale.y * 0.5;
 
         // if (obj.position.z > maxZ) {
         //   obj.position.z -= gridSpan;
