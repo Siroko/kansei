@@ -33,6 +33,10 @@ class GBuffer {
     public colorMSAATexture: GPUTexture | null = null;
     public depthMSAATexture: GPUTexture | null = null;
     public emissiveMSAATexture: GPUTexture | null = null;
+    public normalTexture!: GPUTexture;
+    public albedoTexture!: GPUTexture;
+    public normalMSAATexture: GPUTexture | null = null;
+    public albedoMSAATexture: GPUTexture | null = null;
     public outputTexture!: GPUTexture;
     public pingPongTexture!: GPUTexture;
     public width: number;
@@ -82,6 +86,20 @@ class GBuffer {
             usage: colorUsage,
         });
 
+        this.normalTexture = this.device.createTexture({
+            label: 'GBuffer/Normal',
+            size: [width, height],
+            format: 'rgba16float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+        });
+
+        this.albedoTexture = this.device.createTexture({
+            label: 'GBuffer/Albedo',
+            size: [width, height],
+            format: 'rgba8unorm',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+        });
+
         // depthTexture: non-MSAA depth for compute-shader reads.
         // Used as RENDER_ATTACHMENT by the depth-copy pass.
         this.depthTexture = this.device.createTexture({
@@ -105,6 +123,22 @@ class GBuffer {
                 label: 'GBuffer/EmissiveMSAA',
                 size: [width, height],
                 format: 'rgba16float',
+                sampleCount: this.msaaSampleCount,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            this.normalMSAATexture = this.device.createTexture({
+                label: 'GBuffer/NormalMSAA',
+                size: [width, height],
+                format: 'rgba16float',
+                sampleCount: this.msaaSampleCount,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            this.albedoMSAATexture = this.device.createTexture({
+                label: 'GBuffer/AlbedoMSAA',
+                size: [width, height],
+                format: 'rgba8unorm',
                 sampleCount: this.msaaSampleCount,
                 usage: GPUTextureUsage.RENDER_ATTACHMENT,
             });
@@ -146,6 +180,12 @@ class GBuffer {
         this.colorMSAATexture = null;
         this.emissiveMSAATexture?.destroy();
         this.emissiveMSAATexture = null;
+        this.normalTexture?.destroy();
+        this.albedoTexture?.destroy();
+        this.normalMSAATexture?.destroy();
+        this.normalMSAATexture = null;
+        this.albedoMSAATexture?.destroy();
+        this.albedoMSAATexture = null;
         this.depthMSAATexture?.destroy();
         this.depthMSAATexture = null;
         this.outputTexture?.destroy();
