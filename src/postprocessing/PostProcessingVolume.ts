@@ -40,10 +40,14 @@ class PostProcessingVolume {
     private _blitBindGroup: GPUBindGroup | null = null;
     private _blitLastSource: GPUTexture | null = null;
 
+    public effects: PostProcessingEffect[] = [];
+
     constructor(
         private renderer: Renderer,
-        private effects: PostProcessingEffect[] = []
-    ) {}
+        effects: PostProcessingEffect[] = []
+    ) {
+        this.effects = effects;
+    }
 
     /** Add an effect at the end of the chain. */
     public addEffect(effect: PostProcessingEffect): void {
@@ -111,7 +115,8 @@ class PostProcessingVolume {
                     outputTex,
                     camera,
                     w,
-                    h
+                    h,
+                    this._gbuffer.emissiveTexture
                 );
 
                 currentSource = outputTex;

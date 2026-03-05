@@ -34,3 +34,7 @@ export { PostProcessingVolume } from "./postprocessing/PostProcessingVolume";
 export { SSAOEffect } from "./postprocessing/effects/SSAOEffect";
 export { DepthOfFieldEffect } from "./postprocessing/effects/DepthOfFieldEffect";
 export { GodRaysEffect } from "./postprocessing/effects/GodRaysEffect";
+export { Light } from "./lights/Light";
+export { DirectionalLight } from "./lights/DirectionalLight";
+export { PointLight } from "./lights/PointLight";
+export { CubeMapShadowMap } from "./shadows/CubeMapShadowMap";

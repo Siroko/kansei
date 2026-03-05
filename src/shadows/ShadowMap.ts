@@ -3,6 +3,7 @@ import { Camera } from '../cameras/Camera';
 import { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+import { DirectionalLight } from '../lights/DirectionalLight';
 
 export interface ShadowMapOptions {
     resolution?: number;
@@ -227,8 +228,11 @@ class ShadowMap {
         });
     }
 
-    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDir: [number, number, number]): void {
+    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | [number, number, number]): void {
         const device = this._device;
+        const lightDir: [number, number, number] = Array.isArray(lightDirOrLight)
+            ? lightDirOrLight
+            : lightDirOrLight.direction;
 
         scene.prepare(camera);
         camera.updateViewMatrix();

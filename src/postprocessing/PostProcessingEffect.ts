@@ -47,7 +47,8 @@ abstract class PostProcessingEffect {
         output: GPUTexture,
         camera: Camera,
         width: number,
-        height: number
+        height: number,
+        emissive?: GPUTexture
     ): void;
 
     /**
