@@ -397,10 +397,19 @@ class VolumetricFogEffect extends PostProcessingEffect {
         );
         injectPass.end();
 
-        // ── Pass 2: Front-to-back accumulation ──
+        // ── Pass 2: Temporal reprojection blend ──
+        grid.temporalBlend(
+            commandEncoder,
+            this._invVP as unknown as Float32Array,
+            vp as unknown as Float32Array,
+            camera.near,
+            camera.far
+        );
+
+        // ── Pass 3: Front-to-back accumulation ──
         grid.accumulate(commandEncoder);
 
-        // ── Pass 3: Composite fog onto scene ──
+        // ── Pass 4: Composite fog onto scene ──
         const compositePass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Composite' });
         compositePass.setPipeline(this._compositePipeline!);
         compositePass.setBindGroup(0, this._compositeBG!);

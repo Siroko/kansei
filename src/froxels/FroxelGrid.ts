@@ -4,6 +4,8 @@ export interface FroxelGridOptions {
     gridD?: number;  // default 64
     near?: number;   // default 0.1
     far?: number;    // default 1000
+    temporal?: boolean;     // default false
+    blendFactor?: number;   // default 0.05
 }
 
 class FroxelGrid {
@@ -20,6 +22,19 @@ class FroxelGrid {
     private _accumPipeline: GPUComputePipeline | null = null;
     private _accumBG: GPUBindGroup | null = null;
     private _gridParamsBuffer: GPUBuffer;
+
+    // Temporal reprojection state
+    private _temporal: boolean;
+    private _blendFactor: number;
+    private _historyTex!: [GPUTexture, GPUTexture];
+    private _temporalSampler: GPUSampler | null = null;
+    private _temporalPipeline: GPUComputePipeline | null = null;
+    private _temporalBG!: [GPUBindGroup, GPUBindGroup];
+    private _temporalParamsBuffer: GPUBuffer | null = null;
+    private _accumBGTemporal!: [GPUBindGroup, GPUBindGroup];
+    private _prevVP = new Float32Array(16);
+    private _frameIdx = 0;
+    private _hasPrevFrame = false;
 
     /**
      * WGSL helper functions for exponential depth slicing and coordinate conversion.
@@ -53,6 +68,8 @@ class FroxelGrid {
         this._gridD = options?.gridD ?? 64;
         this._near  = options?.near ?? 0.1;
         this._far   = options?.far ?? 1000;
+        this._temporal = options?.temporal ?? false;
+        this._blendFactor = options?.blendFactor ?? 0.05;
 
         this._createTextures();
 
@@ -64,6 +81,10 @@ class FroxelGrid {
         });
         this._uploadGridParams();
         this._createAccumPipeline();
+
+        if (this._temporal) {
+            this._createTemporalResources();
+        }
     }
 
     get scatterExtinctionTex(): GPUTexture { return this._scatterExtinctionTex; }
@@ -184,14 +205,248 @@ class FroxelGrid {
         });
     }
 
+    // ── Temporal blend shader ──────────────────────────────────────────────
+
+    private static _TEMPORAL_SHADER = FroxelGrid.WGSL_HELPERS + /* wgsl */`
+
+        struct TemporalParams {
+            currentInvVP : mat4x4f,
+            prevVP       : mat4x4f,
+            gridNear     : f32,
+            gridFar      : f32,
+            cameraNear   : f32,
+            cameraFar    : f32,
+            gridW        : u32,
+            gridH        : u32,
+            gridD        : u32,
+            blendFactor  : f32,
+            hasPrevFrame : u32,
+        }
+
+        @group(0) @binding(0) var currentTex  : texture_3d<f32>;
+        @group(0) @binding(1) var historyIn   : texture_3d<f32>;
+        @group(0) @binding(2) var historySamp  : sampler;
+        @group(0) @binding(3) var historyOut  : texture_storage_3d<rgba16float, write>;
+        @group(0) @binding(4) var<uniform> tp : TemporalParams;
+
+        @compute @workgroup_size(4, 4, 4)
+        fn main(@builtin(global_invocation_id) gid : vec3u) {
+            if (gid.x >= tp.gridW || gid.y >= tp.gridH || gid.z >= tp.gridD) { return; }
+
+            let current = textureLoad(currentTex, gid, 0);
+
+            // Compute world position of this froxel
+            let linearD = sliceDepth(f32(gid.z) + 0.5, tp.gridNear, tp.gridFar, f32(tp.gridD));
+            let n = tp.cameraNear;
+            let f = tp.cameraFar;
+            let ndcZ = ((f + n) * linearD - 2.0 * f * n) / ((f - n) * linearD);
+            let uv = (vec2f(f32(gid.x), f32(gid.y)) + 0.5) / vec2f(f32(tp.gridW), f32(tp.gridH));
+            let ndcX = uv.x * 2.0 - 1.0;
+            let ndcY = (1.0 - uv.y) * 2.0 - 1.0;
+            let world = tp.currentInvVP * vec4f(ndcX, ndcY, ndcZ, 1.0);
+            let worldPos = world.xyz / world.w;
+
+            // Reproject into previous frame's clip space
+            let prevClip = tp.prevVP * vec4f(worldPos, 1.0);
+            let prevNDC = prevClip.xyz / prevClip.w;
+
+            // Convert to froxel UVW in previous frame
+            let prevUV = vec2f(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+            let prevLinearD = 2.0 * n * f / ((f + n) - prevNDC.z * (f - n));
+            let prevSlice = depthToSlice(prevLinearD, tp.gridNear, tp.gridFar, f32(tp.gridD));
+            let prevUVW = vec3f(prevUV, (prevSlice + 0.5) / f32(tp.gridD));
+
+            // Bounds check
+            let valid = all(prevUVW >= vec3f(0.0)) && all(prevUVW <= vec3f(1.0)) && tp.hasPrevFrame != 0u;
+
+            // Sample history with trilinear filtering
+            let history = textureSampleLevel(historyIn, historySamp, prevUVW, 0.0);
+
+            // Exponential blend: 100% current when invalid/first frame
+            let alpha = select(1.0, tp.blendFactor, valid);
+            let result = mix(history, current, alpha);
+
+            textureStore(historyOut, gid, result);
+        }
+    `;
+
+    private _createTemporalResources(): void {
+        const device = this._device;
+        const size: GPUExtent3D = [this._gridW, this._gridH, this._gridD];
+        const texUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
+
+        // Ping-pong history textures
+        this._historyTex = [
+            device.createTexture({
+                label: 'FroxelGrid/HistoryTex0',
+                size, dimension: '3d', format: 'rgba16float', usage: texUsage,
+            }),
+            device.createTexture({
+                label: 'FroxelGrid/HistoryTex1',
+                size, dimension: '3d', format: 'rgba16float', usage: texUsage,
+            }),
+        ];
+
+        this._temporalSampler = device.createSampler({
+            label: 'FroxelGrid/TemporalSampler',
+            magFilter: 'linear',
+            minFilter: 'linear',
+        });
+
+        this._temporalParamsBuffer = device.createBuffer({
+            label: 'FroxelGrid/TemporalParams',
+            size: 256,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Temporal blend pipeline
+        const module = device.createShaderModule({
+            label: 'FroxelGrid/TemporalShader',
+            code: FroxelGrid._TEMPORAL_SHADER,
+        });
+
+        const bgl = device.createBindGroupLayout({
+            label: 'FroxelGrid/Temporal BGL',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
+                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        this._temporalPipeline = device.createComputePipeline({
+            label: 'FroxelGrid/TemporalPipeline',
+            layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+            compute: { module, entryPoint: 'main' },
+        });
+
+        // Ping-pong bind groups: [0] reads history0, writes history1; [1] reads history1, writes history0
+        this._temporalBG = [
+            device.createBindGroup({
+                label: 'FroxelGrid/Temporal BG 0',
+                layout: bgl,
+                entries: [
+                    { binding: 0, resource: this._scatterExtinctionTex.createView() },
+                    { binding: 1, resource: this._historyTex[0].createView() },
+                    { binding: 2, resource: this._temporalSampler },
+                    { binding: 3, resource: this._historyTex[1].createView() },
+                    { binding: 4, resource: { buffer: this._temporalParamsBuffer } },
+                ],
+            }),
+            device.createBindGroup({
+                label: 'FroxelGrid/Temporal BG 1',
+                layout: bgl,
+                entries: [
+                    { binding: 0, resource: this._scatterExtinctionTex.createView() },
+                    { binding: 1, resource: this._historyTex[1].createView() },
+                    { binding: 2, resource: this._temporalSampler },
+                    { binding: 3, resource: this._historyTex[0].createView() },
+                    { binding: 4, resource: { buffer: this._temporalParamsBuffer } },
+                ],
+            }),
+        ];
+
+        // Accumulation bind groups that read from history textures instead of scatterExtinctionTex
+        const accumBGL = this._accumPipeline!.getBindGroupLayout(0);
+        this._accumBGTemporal = [
+            device.createBindGroup({
+                label: 'FroxelGrid/Accum BG Temporal 0',
+                layout: accumBGL,
+                entries: [
+                    { binding: 0, resource: this._historyTex[0].createView() },
+                    { binding: 1, resource: this._accumTex.createView() },
+                    { binding: 2, resource: { buffer: this._gridParamsBuffer } },
+                ],
+            }),
+            device.createBindGroup({
+                label: 'FroxelGrid/Accum BG Temporal 1',
+                layout: accumBGL,
+                entries: [
+                    { binding: 0, resource: this._historyTex[1].createView() },
+                    { binding: 1, resource: this._accumTex.createView() },
+                    { binding: 2, resource: { buffer: this._gridParamsBuffer } },
+                ],
+            }),
+        ];
+
+        this._prevVP.fill(0);
+        this._frameIdx = 0;
+        this._hasPrevFrame = false;
+    }
+
+    /**
+     * Temporal reprojection blend pass.
+     * Call after injection and before accumulation.
+     * No-op if temporal is disabled.
+     */
+    temporalBlend(
+        encoder: GPUCommandEncoder,
+        currentInvVP: Float32Array,
+        currentVP: Float32Array,
+        cameraNear: number,
+        cameraFar: number
+    ): void {
+        if (!this._temporal) return;
+
+        const device = this._device;
+        const readIdx = this._frameIdx;
+        const writeIdx = 1 - this._frameIdx;
+
+        // Upload temporal params (256 bytes)
+        const buf = new ArrayBuffer(256);
+        const f32 = new Float32Array(buf);
+        const u32 = new Uint32Array(buf);
+
+        f32.set(currentInvVP, 0);       // currentInvVP: mat4x4f (0..15)
+        f32.set(this._prevVP, 16);       // prevVP: mat4x4f (16..31)
+        f32[32] = this._near;            // gridNear
+        f32[33] = this._far;             // gridFar
+        f32[34] = cameraNear;            // cameraNear
+        f32[35] = cameraFar;             // cameraFar
+        u32[36] = this._gridW;           // gridW
+        u32[37] = this._gridH;           // gridH
+        u32[38] = this._gridD;           // gridD
+        f32[39] = this._blendFactor;     // blendFactor
+        u32[40] = this._hasPrevFrame ? 1 : 0; // hasPrevFrame
+
+        device.queue.writeBuffer(this._temporalParamsBuffer!, 0, buf);
+
+        // Dispatch temporal blend
+        const pass = encoder.beginComputePass({ label: 'FroxelGrid/TemporalBlend' });
+        pass.setPipeline(this._temporalPipeline!);
+        pass.setBindGroup(0, this._temporalBG[readIdx]);
+        pass.dispatchWorkgroups(
+            Math.ceil(this._gridW / 4),
+            Math.ceil(this._gridH / 4),
+            Math.ceil(this._gridD / 4)
+        );
+        pass.end();
+
+        // Store current VP as previous for next frame
+        this._prevVP.set(currentVP);
+        this._hasPrevFrame = true;
+        this._frameIdx = writeIdx;
+    }
+
     /**
      * Front-to-back accumulation pass.
-     * Call after the injection pass has written to scatterExtinctionTex.
+     * Call after the injection pass (and temporal blend if enabled).
      */
     accumulate(encoder: GPUCommandEncoder): void {
         const pass = encoder.beginComputePass({ label: 'FroxelGrid/Accumulate' });
         pass.setPipeline(this._accumPipeline!);
-        pass.setBindGroup(0, this._accumBG!);
+
+        if (this._temporal && this._hasPrevFrame) {
+            // Read from the history texture that was just written
+            // _frameIdx was already toggled, so the last write was to (1 - _frameIdx)
+            const lastWriteIdx = 1 - this._frameIdx;
+            pass.setBindGroup(0, this._accumBGTemporal[lastWriteIdx]);
+        } else {
+            pass.setBindGroup(0, this._accumBG!);
+        }
+
         pass.dispatchWorkgroups(
             Math.ceil(this._gridW / 8),
             Math.ceil(this._gridH / 8)
@@ -210,12 +465,23 @@ class FroxelGrid {
         // Rebuild accumulation bind group with new textures
         this._accumBG = null;
         this._createAccumPipeline();
+
+        if (this._temporal) {
+            this._historyTex[0]?.destroy();
+            this._historyTex[1]?.destroy();
+            this._createTemporalResources();
+        }
     }
 
     destroy(): void {
         this._scatterExtinctionTex?.destroy();
         this._accumTex?.destroy();
         this._gridParamsBuffer?.destroy();
+        if (this._temporal) {
+            this._historyTex[0]?.destroy();
+            this._historyTex[1]?.destroy();
+            this._temporalParamsBuffer?.destroy();
+        }
     }
 }
 
