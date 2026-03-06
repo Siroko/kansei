@@ -23,7 +23,7 @@ fn rayAABB(ray: Ray, bmin: vec3f, bmax: vec3f, tMax: f32) -> f32 {
     let tmin = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
     let tmax = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
     if (tmax < 0.0 || tmin > tmax || tmin > tMax) { return -1.0; }
-    return tmin;
+    return max(tmin, 0.0);
 }
 
 // Möller–Trumbore ray-triangle intersection.
