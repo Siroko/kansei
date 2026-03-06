@@ -192,7 +192,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     ray.dir = sampleDir;
 
     let hit = traceBVH(ray);
+
     var indirect = vec3f(0.0);
+
+    // Sky/ambient contribution for missed rays (provides AO contrast)
+    let skyColor = vec3f(0.15, 0.15, 0.15);
 
     if (hit.hit) {
         let mat = materials[hit.matIndex];
@@ -201,10 +205,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         if ((u32(mat.flags) & 1u) != 0u) {
             indirect = traceRefraction(ray, hit, mat, &rng);
         } else {
-            // Direct lighting at hit point
-            let hitLighting = evaluateDirectLight(hit.worldPos, hit.worldNorm);
-            indirect = hitLighting * mat.albedo;
+            // Direct + ambient lighting at hit point
+            // The ambient term enables single-bounce color bleed from surfaces
+            // not directly lit by the sun (e.g. Cornell box walls)
+            let hitDirect = evaluateDirectLight(hit.worldPos, hit.worldNorm);
+            let hitAmbient = vec3f(0.15);
+            indirect = (hitDirect + hitAmbient) * mat.albedo + mat.emissive * mat.emissiveIntensity;
         }
+    } else {
+        // Ray escaped — sky contribution (open areas get more sky = brighter)
+        indirect = skyColor;
     }
 
     // Specular ray for metallic/glossy surfaces

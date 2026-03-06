@@ -80,6 +80,14 @@ export class PathTracerEffect extends PostProcessingEffect {
     /** Access the BVH builder for external configuration. */
     get bvhBuilder(): BVHBuilder | null { return this._bvhBuilder; }
 
+    /** Temporal blend factor (0 = full history, 1 = current frame only). */
+    get temporalBlend(): number { return this._temporalBlend; }
+    set temporalBlend(v: number) { this._temporalBlend = v; }
+
+    /** Number of à-trous spatial denoise iterations. */
+    get spatialPasses(): number { return this._spatialPasses; }
+    set spatialPasses(v: number) { this._spatialPasses = Math.max(0, Math.round(v)); }
+
     // ── PostProcessingEffect interface ────────────────────────────────────
 
     initialize(device: GPUDevice, gbuffer: GBuffer, _camera: Camera): void {
@@ -113,6 +121,9 @@ export class PathTracerEffect extends PostProcessingEffect {
         height: number,
     ): void {
         if (!this._device || !this._bvhBuilder || !this._gbuffer) return;
+
+        // Clean up scratch buffers from previous frame (safe — prior commands submitted)
+        this._bvhBuilder.cleanupScratchBuffers();
 
         // Build BLAS on first frame (or when geometry changes)
         if (!this._blasBuilt) {
@@ -520,9 +531,14 @@ export class PathTracerEffect extends PostProcessingEffect {
         for (let i = 0; i < this._spatialPasses; i++) {
             const stepSize = 1 << i; // 1, 2, 4, ...
 
-            // SpatialParams layout:
-            // stepSize: u32, sigmaDepth: f32, sigmaNormal: f32, sigmaLum: f32
-            // width: u32, height: u32, _pad: vec2u
+            // Per-iteration param buffer (writeBuffer is immediate, so shared buffer
+            // would be overwritten before GPU reads earlier iterations)
+            const iterParamsBuf = device.createBuffer({
+                label: `PathTracer/SpatialParams/${i}`,
+                size: 32,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
             const params = new Float32Array(8);
             const paramsU32 = new Uint32Array(params.buffer);
             paramsU32[0] = stepSize;
@@ -534,7 +550,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             paramsU32[6] = 0;
             paramsU32[7] = 0;
 
-            device.queue.writeBuffer(this._spatialParamsBuf!, 0, params);
+            device.queue.writeBuffer(iterParamsBuf, 0, params);
 
             const spatialBG = device.createBindGroup({
                 layout: this._spatialBGL!,
@@ -543,7 +559,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                     { binding: 1, resource: currentOutput.createView() },
                     { binding: 2, resource: depth.createView() },
                     { binding: 3, resource: this._gbuffer!.normalTexture.createView() },
-                    { binding: 4, resource: { buffer: this._spatialParamsBuf! } },
+                    { binding: 4, resource: { buffer: iterParamsBuf } },
                 ],
             });
 

@@ -44,12 +44,11 @@ fn transformPointToWorld(p: vec3f, inst: Instance) -> vec3f {
 }
 
 fn transformNormalToWorld(n: vec3f, inst: Instance) -> vec3f {
-    // Use transpose of inverse (which is the original transform for orthonormal)
-    // For general transforms, use the inverse-transpose
+    // Normal transform = (M^-1)^T * n, i.e. columns of the inverse matrix
     return normalize(vec3f(
-        dot(inst.invTransform0.xyz, n),
-        dot(inst.invTransform1.xyz, n),
-        dot(inst.invTransform2.xyz, n),
+        inst.invTransform0.x * n.x + inst.invTransform1.x * n.y + inst.invTransform2.x * n.z,
+        inst.invTransform0.y * n.x + inst.invTransform1.y * n.y + inst.invTransform2.y * n.z,
+        inst.invTransform0.z * n.x + inst.invTransform1.z * n.y + inst.invTransform2.z * n.z,
     ));
 }
 
@@ -71,7 +70,9 @@ fn traverseBLAS(
     stack[0] = nodeOffset; // root of this BLAS
     stackPtr = 1u;
 
-    while (stackPtr > 0u) {
+    var iter = 0u;
+    while (stackPtr > 0u && iter < 16384u) {
+        iter += 1u;
         stackPtr -= 1u;
         let nodeIdx = stack[stackPtr];
         let node = blasNodes[nodeIdx];
@@ -125,7 +126,9 @@ fn traceBVH(ray: Ray) -> HitInfo {
     stack[0] = 0u; // TLAS root
     stackPtr = 1u;
 
-    while (stackPtr > 0u) {
+    var iter = 0u;
+    while (stackPtr > 0u && iter < 16384u) {
+        iter += 1u;
         stackPtr -= 1u;
         let nodeIdx = stack[stackPtr];
         let node = tlasNodes[nodeIdx];

@@ -8,7 +8,9 @@ struct BVHNode {
 
 struct Params {
     leafCount : u32,
-    _pad      : vec3u,
+    _pad0     : u32,
+    _pad1     : u32,
+    _pad2     : u32,
 }
 
 @group(0) @binding(0) var<storage, read>       sortedMorton : array<u32>;
@@ -52,7 +54,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     // Compute upper bound for the length of the range
     var lMax = 2;
-    while (delta(idx, idx + lMax * d, n) > dMin) {
+    while (delta(idx, idx + lMax * d, n) > dMin && lMax < 2 * n) {
         lMax *= 2;
     }
 
@@ -70,14 +72,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // Find the split position
     let dNode = delta(idx, j, n);
     var s = 0;
-    var divider = 2;
-    t = (l + divider - 1) / divider;
+    t = (l + 1) / 2;
     while (t >= 1) {
         if (delta(idx, idx + (s + t) * d, n) > dNode) {
             s += t;
         }
-        divider *= 2;
-        t = (l + divider - 1) / divider;
+        t /= 2;
     }
     let split = idx + s * d + min(d, 0);
 

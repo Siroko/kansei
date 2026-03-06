@@ -37,13 +37,15 @@
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
     import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
     import { ColorGradingEffect } from '../src/postprocessing/effects/ColorGradingEffect'
+    import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
+    import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { PointLight } from '../src/lights/PointLight'
     import { Float } from '../src/math/Float'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
-    const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SIZE      = 60;   // cubes per side (total = GRID_SIZE²)
     const GRID_SPACING   = 1;   // world-space gap between cube centres
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
     const SCALE_Y_STRENGTH = 0;   // max Y scale applied to each cube
@@ -289,15 +291,27 @@
       spheres.push(sphere);
     }
 
+    // ── Refractive glass sphere ──────────────────────────────────────────────
+    const glassSphere = new Renderable(sphereGeometry, material);
+    glassSphere.position.set(0, 30, 0);
+    glassSphere.scale.set(5, 5, 5);
+    glassSphere.pathTracerMaterial = new PathTracerMaterial();
+    glassSphere.pathTracerMaterial.refractive = true;
+    glassSphere.pathTracerMaterial.ior = 1.5;
+    glassSphere.pathTracerMaterial.maxBounces = 4;
+    glassSphere.pathTracerMaterial.absorptionColor = [0.8, 0.95, 1.0];
+    glassSphere.pathTracerMaterial.absorptionDensity = 0.5;
+    scene.add(glassSphere);
+
     // ── Point lights ──────────────────────────────────────────────────────────
     const ptLight1 = new PointLight(30, [1.0, 0.4, 0.1], 5.0);
     ptLight1.position.set(10, 15, 0);
-    ptLight1.volumetric = true;
+    ptLight1.volumetric = false;
     scene.add(ptLight1);
 
     const ptLight2 = new PointLight(25, [0.1, 0.4, 1.0], 4.0);
     ptLight2.position.set(-15, 20, 10);
-    ptLight2.volumetric = true;
+    ptLight2.volumetric = false;
     scene.add(ptLight2);
 
     // ── Post-processing effects ────────────────────────────────────────────────
@@ -325,24 +339,33 @@
 
     const colorGradingEffect = new ColorGradingEffect();
 
-    const allEffects = [fogEffect, bloomEffect, dofEffect, colorGradingEffect];
+    const pathTracerEffect = new PathTracerEffect({
+      scene,
+      temporalBlend: 0.1,
+      spatialPasses: 3,
+    });
+
+    const allEffects = [pathTracerEffect, fogEffect, bloomEffect, dofEffect, colorGradingEffect];
     const volume = new PostProcessingVolume(renderer, [...allEffects]);
 
     // ── Effect toggles ──────────────────────────────────────────────────────────
     const effectToggles = {
-      fog: true,
-      bloom: true,
-      dof: true,
-      colorGrading: true,
+      pathTracer: false,
+      fog: false,
+      bloom: false,
+      dof: false,
+      colorGrading: false,
     };
 
     function rebuildEffectChain() {
       volume.effects = [];
+      if (effectToggles.pathTracer)   volume.effects.push(pathTracerEffect);
       if (effectToggles.fog)          volume.effects.push(fogEffect);
       if (effectToggles.bloom)        volume.effects.push(bloomEffect);
       if (effectToggles.dof)          volume.effects.push(dofEffect);
       if (effectToggles.colorGrading) volume.effects.push(colorGradingEffect);
     }
+    rebuildEffectChain();
 
     // ── Tweakpane ───────────────────────────────────────────────────────────────
     const params = {
@@ -363,6 +386,11 @@
     }
 
     const pane = new Pane({ title: 'Controls' });
+
+    const ptFolder = pane.addFolder({ title: 'Path Tracer' });
+    ptFolder.addBinding(effectToggles, 'pathTracer', { label: 'enabled' }).on('change', rebuildEffectChain);
+    ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
+    ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 5, step: 1 });
 
     const fogFolder = pane.addFolder({ title: 'Volumetric Fog' });
     fogFolder.addBinding(effectToggles, 'fog', { label: 'enabled' }).on('change', rebuildEffectChain);

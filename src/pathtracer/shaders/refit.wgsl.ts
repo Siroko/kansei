@@ -20,13 +20,18 @@ struct Params {
 @group(0) @binding(4) var<storage, read>       parents     : array<i32>;
 @group(0) @binding(5) var<storage, read>       sortedIndices : array<u32>;
 
-fn triAABB(sortedLeafIdx: u32) -> vec2<vec3f> {
+struct AABB {
+    aabbMin : vec3f,
+    aabbMax : vec3f,
+}
+
+fn triAABB(sortedLeafIdx: u32) -> AABB {
     let triIdx = sortedIndices[sortedLeafIdx];
     let base = (params.triOffset + triIdx) * params.triStride;
     let v0 = vec3f(triangles[base+0u], triangles[base+1u], triangles[base+2u]);
     let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
     let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
-    return vec2<vec3f>(min(min(v0, v1), v2), max(max(v0, v1), v2));
+    return AABB(min(min(v0, v1), v2), max(max(v0, v1), v2));
 }
 
 @compute @workgroup_size(256)
@@ -38,15 +43,17 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // Leaf nodes are at indices [n-1, 2n-2]
     let leafNodeIdx = idx + n - 1u;
     let aabb = triAABB(idx);
-    nodes[leafNodeIdx].boundsMin = aabb[0];
-    nodes[leafNodeIdx].boundsMax = aabb[1];
+    nodes[leafNodeIdx].boundsMin = aabb.aabbMin;
+    nodes[leafNodeIdx].boundsMax = aabb.aabbMax;
     // Leaf children encode the sorted triangle index
     nodes[leafNodeIdx].leftChild  = -i32(sortedIndices[idx]) - 1;
     nodes[leafNodeIdx].rightChild = -1;
 
     // Walk up the tree
     var current = parents[leafNodeIdx];
-    while (current >= 0) {
+    var depth = 0u;
+    while (current >= 0 && depth < 64u) {
+        depth += 1u;
         let old = atomicAdd(&atomicFlags[u32(current)], 1u);
         if (old == 0u) { return; } // first child -- bail
 

@@ -19,18 +19,23 @@ struct InstanceData {
     materialIndex: u32,
 }
 
+struct AABB {
+    aabbMin : vec3f,
+    aabbMax : vec3f,
+}
+
 struct Params {
     leafCount : u32,
-    _pad      : vec3u,
+    _pad0     : u32,
+    _pad1     : u32,
+    _pad2     : u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> nodes         : array<BVHNode>;
 @group(0) @binding(1) var<storage, read>       instances     : array<InstanceData>;
 @group(0) @binding(2) var<storage, read>       blasNodes     : array<BVHNode>;
-@group(0) @binding(3) var<storage, read_write> atomicFlags   : array<atomic<u32>>;
-@group(0) @binding(4) var<uniform>             params        : Params;
-@group(0) @binding(5) var<storage, read>       parents       : array<i32>;
-@group(0) @binding(6) var<storage, read>       sortedIndices : array<u32>;
+@group(0) @binding(3) var<uniform>             params        : Params;
+@group(0) @binding(4) var<storage, read>       sortedIndices : array<u32>;
 
 fn transformPoint(inst: InstanceData, p: vec3f) -> vec3f {
     return vec3f(
@@ -40,7 +45,7 @@ fn transformPoint(inst: InstanceData, p: vec3f) -> vec3f {
     );
 }
 
-fn instanceAABB(sortedLeafIdx: u32) -> vec2<vec3f> {
+fn instanceAABB(sortedLeafIdx: u32) -> AABB {
     let instIdx = sortedIndices[sortedLeafIdx];
     let inst = instances[instIdx];
     let blasRoot = blasNodes[inst.blasNodeOffset];
@@ -60,11 +65,12 @@ fn instanceAABB(sortedLeafIdx: u32) -> vec2<vec3f> {
         worldMin = min(worldMin, world);
         worldMax = max(worldMax, world);
     }
-    return vec2<vec3f>(worldMin, worldMax);
+    return AABB(worldMin, worldMax);
 }
 
+// Pass 1: Initialize leaf node bounds from instance world-space AABBs
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
+fn initLeaves(@builtin(global_invocation_id) gid: vec3u) {
     let idx = gid.x;
     let n = params.leafCount;
     if (idx >= n) { return; }
@@ -72,24 +78,24 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // Leaf nodes are at indices [n-1, 2n-2]
     let leafNodeIdx = idx + n - 1u;
     let aabb = instanceAABB(idx);
-    nodes[leafNodeIdx].boundsMin = aabb[0];
-    nodes[leafNodeIdx].boundsMax = aabb[1];
+    nodes[leafNodeIdx].boundsMin = aabb.aabbMin;
+    nodes[leafNodeIdx].boundsMax = aabb.aabbMax;
     // Leaf children encode the sorted instance index
     nodes[leafNodeIdx].leftChild  = -i32(sortedIndices[idx]) - 1;
     nodes[leafNodeIdx].rightChild = -1;
+}
 
-    // Walk up the tree
-    var current = parents[leafNodeIdx];
-    while (current >= 0) {
-        let old = atomicAdd(&atomicFlags[u32(current)], 1u);
-        if (old == 0u) { return; } // first child -- bail
+// Pass 2+: Merge internal node bounds from children (run ceil(log2(N)) times)
+@compute @workgroup_size(256)
+fn mergeNodes(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let n = params.leafCount;
+    // Internal nodes are [0, n-2]
+    if (idx >= n - 1u) { return; }
 
-        let left  = u32(nodes[u32(current)].leftChild);
-        let right = u32(nodes[u32(current)].rightChild);
-        nodes[u32(current)].boundsMin = min(nodes[left].boundsMin, nodes[right].boundsMin);
-        nodes[u32(current)].boundsMax = max(nodes[left].boundsMax, nodes[right].boundsMax);
-
-        current = parents[u32(current)];
-    }
+    let left  = u32(nodes[idx].leftChild);
+    let right = u32(nodes[idx].rightChild);
+    nodes[idx].boundsMin = min(nodes[left].boundsMin, nodes[right].boundsMin);
+    nodes[idx].boundsMax = max(nodes[left].boundsMax, nodes[right].boundsMax);
 }
 `;
