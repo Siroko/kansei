@@ -41,3 +41,4 @@ export { ShadowMap } from "./shadows/ShadowMap";
 export { CubeMapShadowMap } from "./shadows/CubeMapShadowMap";
 export { PathTracerMaterial } from "./pathtracer/PathTracerMaterial";
 export { BVHBuilder } from "./pathtracer/BVHBuilder";
+export { PathTracerEffect } from "./pathtracer/PathTracerEffect";
