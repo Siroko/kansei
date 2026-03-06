@@ -65,52 +65,26 @@ fn traverseBLAS(
 
     if (triCount == 0u) { return hit; }
 
-    var stack: array<u32, BLAS_STACK_SIZE>;
-    var stackPtr = 0u;
-    stack[0] = nodeOffset; // root of this BLAS
-    stackPtr = 1u;
+    // Brute-force: test ALL triangles (bypasses BVH tree for debugging)
+    for (var i = 0u; i < triCount; i++) {
+        let base = (triOffset + i) * TRI_STRIDE;
+        let v0 = vec3f(triangles[base+0u], triangles[base+1u], triangles[base+2u]);
+        let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
+        let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
+        let tuv = rayTriangle(ray, v0, v1, v2);
+        if (tuv.x > 0.0 && tuv.x < hit.t) {
+            hit.t = tuv.x;
+            hit.u = tuv.y;
+            hit.v = tuv.z;
+            hit.triIndex = triOffset + i;
+            hit.hit = true;
 
-    var iter = 0u;
-    while (stackPtr > 0u && iter < 16384u) {
-        iter += 1u;
-        stackPtr -= 1u;
-        let nodeIdx = stack[stackPtr];
-        let node = blasNodes[nodeIdx];
-
-        let tHit = rayAABB(ray, node.boundsMin, node.boundsMax, hit.t);
-        if (tHit < 0.0) { continue; }
-
-        if (node.leftChild < 0) {
-            // Leaf node: leftChild encodes -(triIndex + 1)
-            let triLocalIdx = u32(-(node.leftChild + 1));
-            let base = (triOffset + triLocalIdx) * TRI_STRIDE;
-            let v0 = vec3f(triangles[base+0u], triangles[base+1u], triangles[base+2u]);
-            let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
-            let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
-            let tuv = rayTriangle(ray, v0, v1, v2);
-            if (tuv.x > 0.0 && tuv.x < hit.t) {
-                hit.t = tuv.x;
-                hit.u = tuv.y;
-                hit.v = tuv.z;
-                hit.triIndex = triOffset + triLocalIdx;
-                hit.hit = true;
-
-                // Interpolate normal
-                let n0 = vec3f(triangles[base+9u],  triangles[base+10u], triangles[base+11u]);
-                let n1 = vec3f(triangles[base+12u], triangles[base+13u], triangles[base+14u]);
-                let n2 = vec3f(triangles[base+15u], triangles[base+16u], triangles[base+17u]);
-                let w = 1.0 - tuv.y - tuv.z;
-                hit.worldNorm = normalize(n0 * w + n1 * tuv.y + n2 * tuv.z);
-                hit.worldPos = ray.origin + ray.dir * tuv.x;
-            }
-        } else {
-            // Internal node: push children
-            if (stackPtr < BLAS_STACK_SIZE - 1u) {
-                stack[stackPtr] = u32(node.leftChild);
-                stackPtr += 1u;
-                stack[stackPtr] = u32(node.rightChild);
-                stackPtr += 1u;
-            }
+            let n0 = vec3f(triangles[base+9u],  triangles[base+10u], triangles[base+11u]);
+            let n1 = vec3f(triangles[base+12u], triangles[base+13u], triangles[base+14u]);
+            let n2 = vec3f(triangles[base+15u], triangles[base+16u], triangles[base+17u]);
+            let w = 1.0 - tuv.y - tuv.z;
+            hit.worldNorm = normalize(n0 * w + n1 * tuv.y + n2 * tuv.z);
+            hit.worldPos = ray.origin + ray.dir * tuv.x;
         }
     }
     return hit;
