@@ -182,21 +182,21 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // RNG seed from pixel + frame
     var rng = pcgHash(gid.x + gid.y * traceParams.width + traceParams.frameIndex * 1000003u);
 
-    // Indirect diffuse ray
+    // Cosine-weighted hemisphere sample for indirect lighting
     let r1 = randomFloat(&rng);
     let r2 = randomFloat(&rng);
-    let sampleDir = cosineSampleHemisphere(worldNormal, r1, r2);
-
     var ray: Ray;
     ray.origin = worldPos + worldNormal * 0.001;
-    ray.dir = sampleDir;
+    ray.dir = cosineSampleHemisphere(worldNormal, r1, r2);
 
     let hit = traceBVH(ray);
 
     var indirect = vec3f(0.0);
 
-    // Sky/ambient contribution for missed rays (provides AO contrast)
-    let skyColor = vec3f(0.15, 0.15, 0.15);
+    // Sky/miss: light from escaped rays (dark for enclosed spaces).
+    // Hit ambient: simulates multi-bounce fill — drives color bleed from unlit walls.
+    let skyColor = vec3f(0.05);
+    let hitAmbient = vec3f(0.4);
 
     if (hit.hit) {
         let mat = materials[hit.matIndex];
@@ -205,15 +205,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         if ((u32(mat.flags) & 1u) != 0u) {
             indirect = traceRefraction(ray, hit, mat, &rng);
         } else {
-            // Direct + ambient lighting at hit point
-            // The ambient term enables single-bounce color bleed from surfaces
-            // not directly lit by the sun (e.g. Cornell box walls)
             let hitDirect = evaluateDirectLight(hit.worldPos, hit.worldNorm);
-            let hitAmbient = vec3f(0.15);
             indirect = (hitDirect + hitAmbient) * mat.albedo + mat.emissive * mat.emissiveIntensity;
         }
     } else {
-        // Ray escaped — sky contribution (open areas get more sky = brighter)
         indirect = skyColor;
     }
 

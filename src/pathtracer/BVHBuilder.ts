@@ -203,11 +203,10 @@ export class BVHBuilder {
         const count = this._totalInstances;
         if (count === 0) return;
 
-        // Handle degenerate single-instance case
-        if (count === 1) {
-            this._buildSingleInstanceTLAS();
-            return;
-        }
+        // CPU flat TLAS: bypasses GPU construction for correctness debugging.
+        // Builds a right-skewed binary tree that linearly checks all instances.
+        this._buildCPUFlatTLAS(objects);
+        return;
 
         const nodeCount = 2 * count - 1;
         const workgroupCount = Math.ceil(count / 256);
@@ -434,6 +433,139 @@ export class BVHBuilder {
     }
 
     /**
+     * Build a flat TLAS on the CPU for debugging.
+     * Creates a right-skewed binary tree: each internal node has a leaf on the right
+     * and the next internal node on the left, ensuring all instances are checked.
+     *
+     * Tree layout for N instances:
+     *   Internal nodes: 0..N-2   (N-1 nodes)
+     *   Leaf nodes:     N-1..2N-2 (N nodes)
+     *   Node 0 (root): left=1 (next internal), right=N-1 (leaf for instance 0)
+     *   Node i:         left=i+1,              right=N-1+i (leaf for instance i)
+     *   Node N-2:       left=2N-2 (last leaf),  right=N-1+N-2 (second-to-last leaf)
+     */
+    private _buildCPUFlatTLAS(objects: Renderable[]): void {
+        const N = this._totalInstances;
+        const nodeCount = 2 * N - 1;
+        // BVHNode = 32 bytes: boundsMin(vec3f) + leftChild(i32) + boundsMax(vec3f) + rightChild(i32)
+        const buf = new ArrayBuffer(nodeCount * 32);
+        const f32 = new Float32Array(buf);
+        const i32 = new Int32Array(buf);
+
+        // Compute world-space AABBs for each instance
+        const aabbs: { min: number[]; max: number[] }[] = [];
+        for (let i = 0; i < N; i++) {
+            const obj = objects[i];
+            const m = obj.worldMatrix.internalMat4;
+
+            // Get BLAS root bounds (local space)
+            const geom = obj.geometry.isInstancedGeometry
+                ? ((obj.geometry as any).geometry ?? obj.geometry)
+                : obj.geometry;
+            const blasKey = this._geomToBLASKey.get(geom);
+            const blasEntry = blasKey ? this._blasEntries.get(blasKey) : undefined;
+            if (!blasEntry) {
+                aabbs.push({ min: [-1, -1, -1], max: [1, 1, 1] });
+                continue;
+            }
+
+            // Read BLAS root AABB from the CPU-side data
+            // We'll just compute from the geometry vertices directly
+            const verts = geom.vertices!;
+            const indices = geom.indices!;
+            const VERT_STRIDE = 9;
+            let lmin = [Infinity, Infinity, Infinity];
+            let lmax = [-Infinity, -Infinity, -Infinity];
+            for (let vi = 0; vi < indices.length; vi++) {
+                const idx = indices[vi];
+                const x = verts[idx * VERT_STRIDE + 0];
+                const y = verts[idx * VERT_STRIDE + 1];
+                const z = verts[idx * VERT_STRIDE + 2];
+                lmin[0] = Math.min(lmin[0], x); lmin[1] = Math.min(lmin[1], y); lmin[2] = Math.min(lmin[2], z);
+                lmax[0] = Math.max(lmax[0], x); lmax[1] = Math.max(lmax[1], y); lmax[2] = Math.max(lmax[2], z);
+            }
+
+            // Transform 8 corners to world space
+            let wmin = [Infinity, Infinity, Infinity];
+            let wmax = [-Infinity, -Infinity, -Infinity];
+            for (let c = 0; c < 8; c++) {
+                const lx = (c & 1) ? lmax[0] : lmin[0];
+                const ly = (c & 2) ? lmax[1] : lmin[1];
+                const lz = (c & 4) ? lmax[2] : lmin[2];
+                // Forward transform: row-major dot products
+                const wx = m[0]*lx + m[4]*ly + m[8]*lz + m[12];
+                const wy = m[1]*lx + m[5]*ly + m[9]*lz + m[13];
+                const wz = m[2]*lx + m[6]*ly + m[10]*lz + m[14];
+                wmin[0] = Math.min(wmin[0], wx); wmin[1] = Math.min(wmin[1], wy); wmin[2] = Math.min(wmin[2], wz);
+                wmax[0] = Math.max(wmax[0], wx); wmax[1] = Math.max(wmax[1], wy); wmax[2] = Math.max(wmax[2], wz);
+            }
+            aabbs.push({ min: wmin, max: wmax });
+        }
+
+        // Write leaf nodes [N-1 .. 2N-2]
+        for (let i = 0; i < N; i++) {
+            const nodeIdx = (N - 1) + i;
+            const off = nodeIdx * 8; // 8 floats per node
+            f32[off + 0] = aabbs[i].min[0];
+            f32[off + 1] = aabbs[i].min[1];
+            f32[off + 2] = aabbs[i].min[2];
+            i32[off + 3] = -(i + 1); // leaf encoding: -(instanceIndex + 1)
+            f32[off + 4] = aabbs[i].max[0];
+            f32[off + 5] = aabbs[i].max[1];
+            f32[off + 6] = aabbs[i].max[2];
+            i32[off + 7] = -1;
+        }
+
+        // Write internal nodes [0 .. N-2]
+        // Right-skewed: node i → left = leaf(i), right = node(i+1) or leaf(N-1) for last
+        for (let i = 0; i < N - 1; i++) {
+            const off = i * 8;
+            const leafIdx = (N - 1) + i; // leaf for instance i
+
+            let leftIdx: number;
+            let rightIdx: number;
+            if (i < N - 2) {
+                leftIdx = leafIdx;      // leaf
+                rightIdx = i + 1;       // next internal node
+            } else {
+                // Last internal node: two leaves
+                leftIdx = leafIdx;              // leaf for instance N-2
+                rightIdx = (N - 1) + (N - 1);  // leaf for instance N-1
+            }
+
+            // Compute merged AABB from all descendants
+            // For simplicity, just use scene-wide bounds for internal nodes
+            let imin = [Infinity, Infinity, Infinity];
+            let imax = [-Infinity, -Infinity, -Infinity];
+            for (let j = i; j < N; j++) {
+                imin[0] = Math.min(imin[0], aabbs[j].min[0]);
+                imin[1] = Math.min(imin[1], aabbs[j].min[1]);
+                imin[2] = Math.min(imin[2], aabbs[j].min[2]);
+                imax[0] = Math.max(imax[0], aabbs[j].max[0]);
+                imax[1] = Math.max(imax[1], aabbs[j].max[1]);
+                imax[2] = Math.max(imax[2], aabbs[j].max[2]);
+            }
+
+            f32[off + 0] = imin[0];
+            f32[off + 1] = imin[1];
+            f32[off + 2] = imin[2];
+            i32[off + 3] = leftIdx;
+            f32[off + 4] = imax[0];
+            f32[off + 5] = imax[1];
+            f32[off + 6] = imax[2];
+            i32[off + 7] = rightIdx;
+        }
+
+        this._tlasNodeBuffer?.destroy();
+        this._tlasNodeBuffer = this._device.createBuffer({
+            label: 'TLAS/Nodes/CPUFlat',
+            size: nodeCount * 32,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this._device.queue.writeBuffer(this._tlasNodeBuffer, 0, buf);
+    }
+
+    /**
      * Pack renderable objects into the GPU instance buffer.
      * Each instance = 28 floats/u32 = 112 bytes.
      */
@@ -473,14 +605,15 @@ export class BVHBuilder {
                       + m[8] * (m[1] * m[6]  - m[2] * m[5]);
             const invDet = det !== 0 ? 1.0 / det : 1.0;
 
+            // A^-1 = adj(A) / det — off-diagonals are cofactors transposed
             const inv00 = (m[5] * m[10] - m[6] * m[9])  * invDet;
-            const inv01 = (m[2] * m[9]  - m[1] * m[10]) * invDet;
-            const inv02 = (m[1] * m[6]  - m[2] * m[5])  * invDet;
-            const inv10 = (m[6] * m[8]  - m[4] * m[10]) * invDet;
+            const inv01 = (m[6] * m[8]  - m[4] * m[10]) * invDet;
+            const inv02 = (m[4] * m[9]  - m[5] * m[8])  * invDet;
+            const inv10 = (m[2] * m[9]  - m[1] * m[10]) * invDet;
             const inv11 = (m[0] * m[10] - m[2] * m[8])  * invDet;
-            const inv12 = (m[2] * m[4]  - m[0] * m[6])  * invDet;
-            const inv20 = (m[4] * m[9]  - m[5] * m[8])  * invDet;
-            const inv21 = (m[1] * m[8]  - m[0] * m[9])  * invDet;
+            const inv12 = (m[1] * m[8]  - m[0] * m[9])  * invDet;
+            const inv20 = (m[1] * m[6]  - m[2] * m[5])  * invDet;
+            const inv21 = (m[2] * m[4]  - m[0] * m[6])  * invDet;
             const inv22 = (m[0] * m[5]  - m[1] * m[4])  * invDet;
 
             const tx = m[12], ty = m[13], tz = m[14];

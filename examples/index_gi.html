@@ -151,7 +151,7 @@
     function makePTMat(r, g, b) {
       const m = new PathTracerMaterial();
       m.albedo = [r, g, b];
-      m.roughness = 1.0;
+      m.roughness = 0.5;
       m.maxBounces = 4;
       m.refractive = false;
       return m;
@@ -209,6 +209,7 @@
     const sphere = new Renderable(sphereGeo, whiteMat);
     sphere.position.set(0, 1.5, 0);
     sphere.pathTracerMaterial = makePTMat(0.9, 0.9, 0.9);
+    sphere.pathTracerMaterial.refractive = true;
     scene.add(sphere);
 
     // ── Path tracer effect ────────────────────────────────────────────────
@@ -234,8 +235,8 @@
       intensity: dirLight.intensity,
     };
 
-    sphere.position.x = 3;
-    
+    // sphere.position.x = 3;
+
     function syncLight() {
       dirLight.direction[0] = lightParams.x;
       dirLight.direction[1] = lightParams.y;
