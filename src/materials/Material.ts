@@ -107,30 +107,54 @@ class Material {
         colorFormat: GPUTextureFormat,
         sampleCount: number,
         depthFormat: GPUTextureFormat,
-        colorTargetCount: number = 1
+        colorTargetCount: number = 1,
+        colorFormats?: GPUTextureFormat[]
     ): GPURenderPipeline {
-        const colorTarget: GPUColorTargetState = { format: colorFormat };
-        if (this.transparent) {
-            colorTarget.blend = {
-                color: {
-                    operation: 'add',
-                    srcFactor: 'src-alpha',
-                    dstFactor: 'one-minus-src-alpha'
-                },
-                alpha: {
-                    operation: 'add',
-                    srcFactor: 'one',
-                    dstFactor: 'one-minus-src-alpha'
-                }
-            };
-        }
+        const targets: GPUColorTargetState[] = [];
 
-        const targets: GPUColorTargetState[] = [colorTarget];
-        if (colorTargetCount > 1) {
-            // All materials must write to the emissive attachment so that
-            // depth-tested fragments properly overwrite occluded emissive data.
-            // Non-emissive shaders output black at @location(1).
-            targets.push({ format: colorFormat });
+        if (colorFormats && colorFormats.length > 0) {
+            // Mixed-format MRT: build one target per entry in colorFormats.
+            // Blend is only applied to the first target (@location(0)) for
+            // transparent materials — additional targets receive raw values.
+            for (const fmt of colorFormats) {
+                const target: GPUColorTargetState = { format: fmt };
+                if (targets.length === 0 && this.transparent) {
+                    target.blend = {
+                        color: {
+                            operation: 'add',
+                            srcFactor: 'src-alpha',
+                            dstFactor: 'one-minus-src-alpha'
+                        },
+                        alpha: {
+                            operation: 'add',
+                            srcFactor: 'one',
+                            dstFactor: 'one-minus-src-alpha'
+                        }
+                    };
+                }
+                targets.push(target);
+            }
+        } else {
+            // Single-format path (backwards compatible).
+            const colorTarget: GPUColorTargetState = { format: colorFormat };
+            if (this.transparent) {
+                colorTarget.blend = {
+                    color: {
+                        operation: 'add',
+                        srcFactor: 'src-alpha',
+                        dstFactor: 'one-minus-src-alpha'
+                    },
+                    alpha: {
+                        operation: 'add',
+                        srcFactor: 'one',
+                        dstFactor: 'one-minus-src-alpha'
+                    }
+                };
+            }
+            targets.push(colorTarget);
+            for (let t = 1; t < colorTargetCount; t++) {
+                targets.push({ format: colorFormat });
+            }
         }
 
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
@@ -179,14 +203,17 @@ class Material {
         colorFormat: GPUTextureFormat,
         sampleCount: number,
         depthFormat: GPUTextureFormat = 'depth24plus',
-        colorTargetCount: number = 1
+        colorTargetCount: number = 1,
+        colorFormats?: GPUTextureFormat[]
     ): GPURenderPipeline {
         this._ensureSharedResources(gpuDevice);
-        const key = `${colorFormat}:${sampleCount}:${depthFormat}:${colorTargetCount}`;
+        const key = colorFormats
+            ? `${colorFormats.join(',')}:${sampleCount}:${depthFormat}`
+            : `${colorFormat}:${sampleCount}:${depthFormat}:${colorTargetCount}`;
         if (!this._pipelineCache.has(key)) {
             this._pipelineCache.set(
                 key,
-                this._buildPipeline(gpuDevice, vertexBuffersDescriptors, colorFormat, sampleCount, depthFormat, colorTargetCount)
+                this._buildPipeline(gpuDevice, vertexBuffersDescriptors, colorFormat, sampleCount, depthFormat, colorTargetCount, colorFormats)
             );
         }
         return this._pipelineCache.get(key)!;

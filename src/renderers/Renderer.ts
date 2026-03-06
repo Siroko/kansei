@@ -552,6 +552,14 @@ class Renderer {
         const alignment = this._matrixAlignment;
         const floatsPerSlot = alignment / 4;
 
+        // MRT format array: one entry per color attachment.
+        const mrtFormats: GPUTextureFormat[] = [
+            'rgba16float',  // @location(0) color
+            'rgba16float',  // @location(1) emissive
+            'rgba16float',  // @location(2) normal
+            'rgba8unorm',   // @location(3) albedo
+        ];
+
         // Phase 1 — identical to render(): upload matrices.
         for (let i = 0; i < orderedObjects.length; i++) {
             const renderable = orderedObjects[i];
@@ -566,7 +574,8 @@ class Renderer {
                 'rgba16float',
                 gbuffer.msaaSampleCount,
                 'depth32float',
-                2 // MRT: color + emissive
+                4, // MRT: color + emissive + normal + albedo
+                mrtFormats
             );
             // Mark initialized to skip initialize() which would build a
             // canvas-format pipeline that fails for shaders with @location(1).
@@ -608,7 +617,7 @@ class Renderer {
             this._gbufferLastObjectCount !== orderedObjects.length ||
             this._gbufferLastSampleCount !== gbuffer.msaaSampleCount) {
             this._gbufferBundle = this._buildRenderBundle(
-                orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 2
+                orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats
             );
             this._gbufferLastObjectCount = orderedObjects.length;
             this._gbufferLastSampleCount = gbuffer.msaaSampleCount;
@@ -646,6 +655,20 @@ class Renderer {
                         loadOp: 'clear',
                         storeOp: 'discard',
                     },
+                    {
+                        view: gbuffer.normalMSAATexture!.createView(),
+                        resolveTarget: gbuffer.normalTexture.createView(),
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                        loadOp: 'clear' as const,
+                        storeOp: 'discard' as const,
+                    },
+                    {
+                        view: gbuffer.albedoMSAATexture!.createView(),
+                        resolveTarget: gbuffer.albedoTexture.createView(),
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                        loadOp: 'clear' as const,
+                        storeOp: 'discard' as const,
+                    },
                 ],
                 depthStencilAttachment: {
                     view: gbuffer.depthMSAATexture.createView(),
@@ -669,6 +692,18 @@ class Renderer {
                         clearValue: emissiveClear,
                         loadOp: 'clear',
                         storeOp: 'store',
+                    },
+                    {
+                        view: gbuffer.normalTexture.createView(),
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                        loadOp: 'clear' as const,
+                        storeOp: 'store' as const,
+                    },
+                    {
+                        view: gbuffer.albedoTexture.createView(),
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                        loadOp: 'clear' as const,
+                        storeOp: 'store' as const,
                     },
                 ],
                 depthStencilAttachment: {
@@ -737,14 +772,14 @@ class Renderer {
         colorFormat: GPUTextureFormat = this._presentationFormat!,
         sampleCount: number = this.sampleCount,
         depthFormat: GPUTextureFormat = 'depth24plus',
-        colorTargetCount: number = 1
+        colorTargetCount: number = 1,
+        colorFormats?: GPUTextureFormat[]
     ): GPURenderBundle {
-        const colorFormats: (GPUTextureFormat | null)[] = [colorFormat];
-        if (colorTargetCount > 1) {
-            colorFormats.push(colorFormat);
-        }
+        const formats: (GPUTextureFormat | null)[] = colorFormats
+            ? [...colorFormats]
+            : Array.from({ length: colorTargetCount }, () => colorFormat);
         const encoder = this.device!.createRenderBundleEncoder({
-            colorFormats,
+            colorFormats: formats,
             depthStencilFormat: depthFormat,
             sampleCount,
         });
@@ -773,7 +808,8 @@ class Renderer {
                 colorFormat,
                 sampleCount,
                 depthFormat,
-                colorTargetCount
+                colorTargetCount,
+                colorFormats
             );
             if (!pipeline || !renderable.geometry.initialized) continue;
 
