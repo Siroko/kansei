@@ -71,6 +71,9 @@ class Object3D {
      * Updates the model matrix based on the object's position, rotation, and scale.
      */
     public updateModelMatrix() {
+        // Ensure parent chain is up to date first
+        if (this.parent) this.parent.updateModelMatrix();
+
         const parentWorldVersion = this.parent ? this.parent.worldMatrix.version : -1;
         if (!this.matrixNeedsUpdate && parentWorldVersion === this._lastParentWorldVersion) return;
 

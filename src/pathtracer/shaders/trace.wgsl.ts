@@ -30,9 +30,9 @@ struct TraceParams {
     lightCount  : u32,
     spp         : u32,
     useBlueNoise: u32,
+    fixedSeed   : u32,
     _pad0       : u32,
     _pad1       : u32,
-    _pad2       : u32,
 }
 
 const LIGHT_DIRECTIONAL = 1u;
@@ -81,7 +81,7 @@ fn pcgHash(input: u32) -> u32 {
 
 fn initSampler(pixel: vec2u, frame: u32, sampleIdx: u32) {
     _bnPixel = pixel;
-    _bnFrame = frame * 16u + sampleIdx; // unique temporal offset per sample
+    _bnFrame = select(frame * 16u + sampleIdx, sampleIdx, traceParams.fixedSeed != 0u);
     _bnDim = 0u;
     _rngState = pcgHash(pixel.x + pixel.y * 9999u + _bnFrame * 1000003u);
 }
@@ -315,6 +315,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let roughness = normalData.w;
 
     let albedoData = textureLoad(albedoTex, coord, 0);
+    let isRefractive = albedoData.a < 0.5;
     let metallic = albedoData.a;
 
     let spp = traceParams.spp;
@@ -323,55 +324,74 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     for (var s = 0u; s < spp; s++) {
         initSampler(coord, traceParams.frameIndex, s);
 
-        // Cosine-weighted hemisphere sample for indirect lighting
-        let r1 = nextRandom();
-        let r2 = nextRandom();
-        var ray: Ray;
-        ray.origin = worldPos + worldNormal * 0.001;
-        ray.dir = cosineSampleHemisphere(worldNormal, r1, r2);
+        if (isRefractive) {
+            // Primary refraction: trace ray from camera through this surface
+            var primaryRay: Ray;
+            primaryRay.origin = traceParams.cameraPos;
+            primaryRay.dir = normalize(worldPos - traceParams.cameraPos);
 
-        let hit = traceBVH(ray);
-
-        var indirect = vec3f(0.0);
-
-        if (hit.hit) {
-            let mat = materials[hit.matIndex];
-
-            if ((u32(mat.flags) & 1u) != 0u) {
-                indirect = traceRefraction(ray, hit, mat);
-            } else if (mat.emissiveIntensity > 0.0) {
-                indirect = mat.emissive * mat.emissiveIntensity;
-            } else {
-                let hitDirect = evaluateLighting(hit.worldPos, hit.worldNorm);
-                indirect = hitDirect * mat.albedo;
-            }
-        }
-
-        // Specular ray for metallic/glossy surfaces
-        if (metallic > 0.1 || roughness < 0.5) {
-            let sr1 = nextRandom();
-            let sr2 = nextRandom();
-            let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
-            let viewDir = normalize(traceParams.cameraPos - worldPos);
-            let specDir = reflect(-viewDir, halfVec);
-
-            if (dot(specDir, worldNormal) > 0.0) {
-                var specRay: Ray;
-                specRay.origin = worldPos + worldNormal * 0.001;
-                specRay.dir = specDir;
-                let specHit = traceBVH(specRay);
-                if (specHit.hit) {
-                    let specMat = materials[specHit.matIndex];
-                    let specLighting = evaluateLighting(specHit.worldPos, specHit.worldNorm);
-                    let specular = specLighting * specMat.albedo;
-                    indirect = mix(indirect, specular, metallic);
+            let primaryHit = traceBVH(primaryRay);
+            if (primaryHit.hit) {
+                let mat = materials[primaryHit.matIndex];
+                if ((u32(mat.flags) & 1u) != 0u) {
+                    accumulated += traceRefraction(primaryRay, primaryHit, mat);
+                } else {
+                    let hitDirect = evaluateLighting(primaryHit.worldPos, primaryHit.worldNorm);
+                    accumulated += hitDirect * mat.albedo;
                 }
             }
-        }
+        } else {
+            // Cosine-weighted hemisphere sample for indirect lighting
+            let r1 = nextRandom();
+            let r2 = nextRandom();
+            var ray: Ray;
+            ray.origin = worldPos + worldNormal * 0.001;
+            ray.dir = cosineSampleHemisphere(worldNormal, r1, r2);
 
-        accumulated += indirect;
+            let hit = traceBVH(ray);
+
+            var indirect = vec3f(0.0);
+
+            if (hit.hit) {
+                let mat = materials[hit.matIndex];
+
+                if ((u32(mat.flags) & 1u) != 0u) {
+                    indirect = traceRefraction(ray, hit, mat);
+                } else if (mat.emissiveIntensity > 0.0) {
+                    indirect = mat.emissive * mat.emissiveIntensity;
+                } else {
+                    let hitDirect = evaluateLighting(hit.worldPos, hit.worldNorm);
+                    indirect = hitDirect * mat.albedo;
+                }
+            }
+
+            // Specular ray for metallic/glossy surfaces
+            if (metallic > 0.1 || roughness < 0.5) {
+                let sr1 = nextRandom();
+                let sr2 = nextRandom();
+                let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
+                let viewDir = normalize(traceParams.cameraPos - worldPos);
+                let specDir = reflect(-viewDir, halfVec);
+
+                if (dot(specDir, worldNormal) > 0.0) {
+                    var specRay: Ray;
+                    specRay.origin = worldPos + worldNormal * 0.001;
+                    specRay.dir = specDir;
+                    let specHit = traceBVH(specRay);
+                    if (specHit.hit) {
+                        let specMat = materials[specHit.matIndex];
+                        let specLighting = evaluateLighting(specHit.worldPos, specHit.worldNorm);
+                        let specular = specLighting * specMat.albedo;
+                        indirect = mix(indirect, specular, metallic);
+                    }
+                }
+            }
+
+            accumulated += indirect;
+        }
     }
 
-    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), 1.0));
+    let giAlpha = select(1.0, 0.0, isRefractive);
+    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), giAlpha));
 }
 `;

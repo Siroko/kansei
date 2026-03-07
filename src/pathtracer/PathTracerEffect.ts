@@ -22,6 +22,8 @@ export interface PathTracerOptions {
     spp?: number;
     /** Use blue noise sampling (vs white noise). Default: true */
     useBlueNoise?: boolean;
+    /** Use fixed seed (no temporal animation). Default: false */
+    fixedSeed?: boolean;
 }
 
 /** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
@@ -40,6 +42,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _spatialPasses: number;
     private _spp: number;
     private _useBlueNoise: boolean;
+    private _fixedSeed: boolean;
 
     // Trace pipeline
     private _tracePipeline: GPUComputePipeline | null = null;
@@ -90,6 +93,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._spatialPasses = options.spatialPasses ?? 3;
         this._spp = options.spp ?? 1;
         this._useBlueNoise = options.useBlueNoise ?? true;
+        this._fixedSeed = options.fixedSeed ?? false;
     }
 
     /** Access the BVH builder for external configuration. */
@@ -110,6 +114,10 @@ export class PathTracerEffect extends PostProcessingEffect {
     /** Use blue noise sampling (vs white noise). */
     get useBlueNoise(): boolean { return this._useBlueNoise; }
     set useBlueNoise(v: boolean) { this._useBlueNoise = v; }
+
+    /** Use fixed seed (no temporal animation). */
+    get fixedSeed(): boolean { return this._fixedSeed; }
+    set fixedSeed(v: boolean) { this._fixedSeed = v; }
 
     // ── PostProcessingEffect interface ────────────────────────────────────
 
@@ -539,6 +547,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         paramsU32[22] = lightCount;
         paramsU32[23] = this._spp;
         paramsU32[24] = this._useBlueNoise ? 1 : 0;
+        paramsU32[25] = this._fixedSeed ? 1 : 0;
 
         device.queue.writeBuffer(this._traceParamsBuf!, 0, params);
 
@@ -621,7 +630,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     ): void {
         const device = this._device!;
 
-        let currentInput = this._historyPing ? this._historyTexB! : this._historyTexA!;
+        let currentInput = this._historyPing ? this._historyTexA! : this._historyTexB!;
         let currentOutput = this._spatialScratchTex!;
 
         for (let i = 0; i < this._spatialPasses; i++) {

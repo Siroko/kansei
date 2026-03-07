@@ -27,7 +27,7 @@ class Geometry {
     public vertices?: Float32Array;
 
     /** Raw index data for defining triangles */
-    public indices?: Uint16Array;
+    public indices?: Uint16Array | Uint32Array;
 
     constructor() { }
 
@@ -47,11 +47,12 @@ class Geometry {
 
         this.indexBuffer = gpuDevice.createBuffer({
             label: 'index buffer',
-            size: this.indices!.byteLength,
+            size: Math.ceil(this.indices!.byteLength / 4) * 4,
             usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
             mappedAtCreation: true
         });
-        new Uint16Array(this.indexBuffer.getMappedRange()).set(this.indices!);
+        const IndexArray = this.indexFormat === "uint32" ? Uint32Array : Uint16Array;
+        new IndexArray(this.indexBuffer.getMappedRange()).set(this.indices!);
         this.indexBuffer.unmap();
 
         (this.vertexBuffersDescriptors as Array<GPUVertexBufferLayout>).push({

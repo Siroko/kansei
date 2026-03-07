@@ -32,6 +32,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
+    // Refractive pixels — pass through unfiltered (alpha = 0)
+    if (current.a < 0.5) {
+        textureStore(outputGI, vec2u(gid.xy), current);
+        return;
+    }
+
     // ── Neighborhood statistics (3×3) for color clamping ──
     // This prevents ghosting from moving objects: history samples outside
     // the current neighborhood range are clamped before blending.

@@ -16,13 +16,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= params.width || gid.y >= params.height) { return; }
 
     let coord = vec2u(gid.xy);
-    let direct   = textureLoad(inputTex,   vec2i(coord), 0).rgb;
-    let indirect = textureLoad(denoisedGI, vec2i(coord), 0).rgb;
-    let albedo   = textureLoad(albedoTex,  vec2i(coord), 0).rgb;
+    let direct    = textureLoad(inputTex,   vec2i(coord), 0).rgb;
+    let indirect  = textureLoad(denoisedGI, vec2i(coord), 0).rgb;
+    let albedoRaw = textureLoad(albedoTex,  vec2i(coord), 0);
+    let albedo    = albedoRaw.rgb;
+    let alpha     = albedoRaw.a;
 
-    // Direct already has albedo baked in from rasterizer.
-    // Indirect is raw incoming radiance — multiply by albedo.
-    let hdr = direct + albedo * indirect;
+    // alpha == 0 → transparent/refractive: use indirect as-is (already colored by path tracer)
+    // alpha == 1 → opaque: direct has albedo baked in, indirect is raw radiance * albedo
+    let hdr = select(indirect, direct + albedo * indirect, alpha > 0.5);
 
     // Reinhard tone map to make HDR range visible
     let final_color = hdr / (hdr + vec3f(1.0));
