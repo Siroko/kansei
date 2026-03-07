@@ -19,6 +19,10 @@ export interface PathTracerOptions {
     spatialPasses?: number;
 }
 
+/** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
+const LIGHT_STRIDE_FLOATS = 16; // 64 bytes / 4
+const MAX_LIGHTS = 16;
+
 export class PathTracerEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
     private _scene: Scene;
@@ -34,6 +38,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _tracePipeline: GPUComputePipeline | null = null;
     private _traceBGL: GPUBindGroupLayout | null = null;
     private _traceParamsBuf: GPUBuffer | null = null;
+    private _lightsBuffer: GPUBuffer | null = null;
 
     // Temporal denoise pipeline
     private _temporalPipeline: GPUComputePipeline | null = null;
@@ -189,6 +194,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._bvhBuilder?.destroy();
         this._destroyTextures();
         this._traceParamsBuf?.destroy();
+        this._lightsBuffer?.destroy();
         this._temporalParamsBuf?.destroy();
         this._spatialParamsBuf?.destroy();
         this._compositeParamsBuf?.destroy();
@@ -217,6 +223,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },             // tlasNodes
                 { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },             // instances
                 { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },             // materials
+                { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // sceneLights
             ],
         });
 
@@ -301,11 +308,18 @@ export class PathTracerEffect extends PostProcessingEffect {
     }
 
     private _createParamBuffers(device: GPUDevice): void {
-        // TraceParams: mat4x4f(64) + vec3f(12) + u32(4) + u32(4) + u32(4) + vec2f(8) + f32(4) + vec3f(12) + f32(4) = 116, pad to 128
+        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 4*u32(16) = 96
         this._traceParamsBuf = device.createBuffer({
             label: 'PathTracer/TraceParams',
-            size: 128,
+            size: 96,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Lights buffer: MAX_LIGHTS * 64 bytes
+        this._lightsBuffer = device.createBuffer({
+            label: 'PathTracer/Lights',
+            size: MAX_LIGHTS * LIGHT_STRIDE_FLOATS * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
 
         // TemporalParams: mat4x4f(64) + mat4x4f(64) + f32(4) + f32(4) + f32(4) + u32(4) = 144, pad to 160
@@ -375,6 +389,84 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._spatialScratchTex = null;
     }
 
+    // ── Light packing ─────────────────────────────────────────────────────
+
+    /**
+     * Pack all scene lights into the lights storage buffer.
+     * LightData layout (64 bytes = 16 floats):
+     *   [0-2]  position.xyz   [3]  lightType (as float, bitcast to u32)
+     *   [4-6]  color.rgb      [7]  intensity
+     *   [8-10] normal.xyz     [11] _pad
+     *   [12-15] extra.xyzw
+     */
+    private _packLights(device: GPUDevice): number {
+        const scene = this._scene;
+        const lightData = new Float32Array(MAX_LIGHTS * LIGHT_STRIDE_FLOATS);
+        const lightU32 = new Uint32Array(lightData.buffer);
+        let idx = 0;
+
+        // Directional lights (type = 1)
+        for (const dl of scene.directionalLights) {
+            if (idx >= MAX_LIGHTS) break;
+            const off = idx * LIGHT_STRIDE_FLOATS;
+            lightData[off + 0] = dl.direction[0];
+            lightData[off + 1] = dl.direction[1];
+            lightData[off + 2] = dl.direction[2];
+            lightU32[off + 3] = 1; // LIGHT_DIRECTIONAL
+            lightData[off + 4] = dl.color[0];
+            lightData[off + 5] = dl.color[1];
+            lightData[off + 6] = dl.color[2];
+            lightData[off + 7] = dl.intensity;
+            // normal, extra unused for directional
+            idx++;
+        }
+
+        // Area lights (type = 2)
+        for (const al of scene.areaLights) {
+            if (idx >= MAX_LIGHTS) break;
+            const off = idx * LIGHT_STRIDE_FLOATS;
+            lightData[off + 0] = al.position.x;
+            lightData[off + 1] = al.position.y;
+            lightData[off + 2] = al.position.z;
+            lightU32[off + 3] = 2; // LIGHT_AREA
+            lightData[off + 4] = al.color[0];
+            lightData[off + 5] = al.color[1];
+            lightData[off + 6] = al.color[2];
+            lightData[off + 7] = al.intensity;
+            // Normal: direction the light faces (from position toward target)
+            const dir = al.direction;
+            lightData[off + 8]  = dir[0];
+            lightData[off + 9]  = dir[1];
+            lightData[off + 10] = dir[2];
+            lightData[off + 11] = 0; // _pad
+            // Extra: sizeX, sizeZ
+            lightData[off + 12] = al.size[0];
+            lightData[off + 13] = al.size[1];
+            lightData[off + 14] = 0;
+            lightData[off + 15] = 0;
+            idx++;
+        }
+
+        // Point lights (type = 3)
+        for (const pl of scene.pointLights) {
+            if (idx >= MAX_LIGHTS) break;
+            const off = idx * LIGHT_STRIDE_FLOATS;
+            lightData[off + 0] = pl.position.x;
+            lightData[off + 1] = pl.position.y;
+            lightData[off + 2] = pl.position.z;
+            lightU32[off + 3] = 3; // LIGHT_POINT
+            lightData[off + 4] = pl.color[0];
+            lightData[off + 5] = pl.color[1];
+            lightData[off + 6] = pl.color[2];
+            lightData[off + 7] = pl.intensity;
+            // extra.x = radius (if applicable)
+            idx++;
+        }
+
+        device.queue.writeBuffer(this._lightsBuffer!, 0, lightData);
+        return idx;
+    }
+
     // ── Dispatch helpers ──────────────────────────────────────────────────
 
     private _dispatchTrace(
@@ -388,32 +480,18 @@ export class PathTracerEffect extends PostProcessingEffect {
         const device = this._device!;
         const builder = this._bvhBuilder!;
 
-        // Get sun direction and color from scene's first directional light
-        const dirLights = this._scene.directionalLights;
-        let sunDirX = 0, sunDirY = -1, sunDirZ = 0;
-        let sunR = 1, sunG = 1, sunB = 1, sunIntensity = 1;
-        if (dirLights.length > 0) {
-            const sun = dirLights[0];
-            sunDirX = sun.direction[0];
-            sunDirY = sun.direction[1];
-            sunDirZ = sun.direction[2];
-            const ec = sun.effectiveColor;
-            sunR = ec[0]; sunG = ec[1]; sunB = ec[2];
-            sunIntensity = sun.intensity;
-        }
+        // Pack lights into storage buffer
+        const lightCount = this._packLights(device);
 
-        // TraceParams layout (must match WGSL struct with alignment):
-        // invViewProj  : mat4x4f  offset 0   (16 floats)
-        // cameraPos    : vec3f    offset 64  (float[16..18])
-        // frameIndex   : u32     offset 76  (float[19])
-        // width        : u32     offset 80  (float[20])
-        // height       : u32     offset 84  (float[21])
-        // sunDirection : vec2f   offset 88  (float[22..23])
-        // sunDirZ      : f32     offset 96  (float[24])
-        // _pad_sun     :         offset 100 (float[25..27] padding for vec3f align)
-        // sunColor     : vec3f   offset 112 (float[28..30])
-        // sunIntensity : f32     offset 124 (float[31])
-        const params = new Float32Array(32); // 128 bytes
+        // TraceParams layout (96 bytes = 24 floats):
+        // invViewProj : mat4x4f  offset 0   (float[0..15])
+        // cameraPos   : vec3f    offset 64  (float[16..18])
+        // frameIndex  : u32      offset 76  (float[19])
+        // width       : u32      offset 80  (float[20])
+        // height      : u32      offset 84  (float[21])
+        // lightCount  : u32      offset 88  (float[22])
+        // _pad        : u32      offset 92  (float[23])
+        const params = new Float32Array(24); // 96 bytes
         const paramsU32 = new Uint32Array(params.buffer);
 
         params.set(this._invViewProj as unknown as Float32Array, 0);
@@ -423,14 +501,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         paramsU32[19] = this._frameIndex;
         paramsU32[20] = width;
         paramsU32[21] = height;
-        params[22] = sunDirX;
-        params[23] = sunDirY;
-        params[24] = sunDirZ;
-        // [25-27] padding for vec3f alignment of sunColor
-        params[28] = sunR;
-        params[29] = sunG;
-        params[30] = sunB;
-        params[31] = sunIntensity;
+        paramsU32[22] = lightCount;
+        paramsU32[23] = 0; // _pad
 
         device.queue.writeBuffer(this._traceParamsBuf!, 0, params);
 
@@ -447,6 +519,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 7, resource: { buffer: builder.tlasNodeBuffer! } },
                 { binding: 8, resource: { buffer: builder.instanceBuffer! } },
                 { binding: 9, resource: { buffer: builder.materialBuffer! } },
+                { binding: 10, resource: { buffer: this._lightsBuffer! } },
             ],
         });
 
@@ -466,18 +539,10 @@ export class PathTracerEffect extends PostProcessingEffect {
     ): void {
         const device = this._device!;
 
-        // Determine ping-pong: read from one history, write to the other
         const historyRead = this._historyPing ? this._historyTexA! : this._historyTexB!;
         const historyWrite = this._historyPing ? this._historyTexB! : this._historyTexA!;
 
-        // TemporalParams layout:
-        // currentInvViewProj: mat4x4f (16 floats)
-        // prevViewProj: mat4x4f (16 floats)
-        // blendFactor: f32
-        // width: f32
-        // height: f32
-        // frameIndex: u32
-        const params = new Float32Array(36); // 144 bytes, padded in buffer to 160
+        const params = new Float32Array(36);
         const paramsU32 = new Uint32Array(params.buffer);
 
         params.set(this._invViewProj as unknown as Float32Array, 0);
@@ -508,7 +573,6 @@ export class PathTracerEffect extends PostProcessingEffect {
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
         pass.end();
 
-        // Flip ping-pong
         this._historyPing = !this._historyPing;
     }
 
@@ -520,19 +584,12 @@ export class PathTracerEffect extends PostProcessingEffect {
     ): void {
         const device = this._device!;
 
-        // After temporal denoise, the denoised result is in the history buffer
-        // that was just written to. Since we flipped, "read" side is the one just written.
-        // historyPing was flipped, so the "just written" buffer is:
-        //   if _historyPing is now true => we just wrote to B => read from B
-        //   if _historyPing is now false => we just wrote to A => read from A
         let currentInput = this._historyPing ? this._historyTexB! : this._historyTexA!;
         let currentOutput = this._spatialScratchTex!;
 
         for (let i = 0; i < this._spatialPasses; i++) {
-            const stepSize = 1 << i; // 1, 2, 4, ...
+            const stepSize = 1 << i;
 
-            // Per-iteration param buffer (writeBuffer is immediate, so shared buffer
-            // would be overwritten before GPU reads earlier iterations)
             const iterParamsBuf = device.createBuffer({
                 label: `PathTracer/SpatialParams/${i}`,
                 size: 32,
@@ -542,9 +599,9 @@ export class PathTracerEffect extends PostProcessingEffect {
             const params = new Float32Array(8);
             const paramsU32 = new Uint32Array(params.buffer);
             paramsU32[0] = stepSize;
-            params[1] = 0.01;   // sigmaDepth
-            params[2] = 128.0;  // sigmaNormal
-            params[3] = 4.0;    // sigmaLum
+            params[1] = 0.01;
+            params[2] = 128.0;
+            params[3] = 4.0;
             paramsU32[4] = width;
             paramsU32[5] = height;
             paramsU32[6] = 0;
@@ -569,14 +626,11 @@ export class PathTracerEffect extends PostProcessingEffect {
             pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
             pass.end();
 
-            // Swap input/output for next iteration
             const tmp = currentInput;
             currentInput = currentOutput;
             currentOutput = tmp;
         }
 
-        // After the loop, the final denoised result is in currentInput.
-        // Store reference for composite step.
         this._lastDenoisedTex = currentInput;
     }
 
@@ -590,7 +644,6 @@ export class PathTracerEffect extends PostProcessingEffect {
         const device = this._device!;
         const denoisedGI = this._lastDenoisedTex ?? this._giTexture!;
 
-        // CompositeParams: width, height, _pad
         const params = new Uint32Array([width, height, 0, 0]);
         device.queue.writeBuffer(this._compositeParamsBuf!, 0, params);
 

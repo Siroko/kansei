@@ -22,15 +22,27 @@ struct MaterialData {
 }
 
 struct TraceParams {
-    invViewProj  : mat4x4f,
-    cameraPos    : vec3f,
-    frameIndex   : u32,
-    width        : u32,
-    height       : u32,
-    sunDirection : vec2f, // packed as vec2 for alignment, actually vec3
-    sunDirZ      : f32,
-    sunColor     : vec3f,
-    sunIntensity : f32,
+    invViewProj : mat4x4f,
+    cameraPos   : vec3f,
+    frameIndex  : u32,
+    width       : u32,
+    height      : u32,
+    lightCount  : u32,
+    _pad        : u32,
+}
+
+const LIGHT_DIRECTIONAL = 1u;
+const LIGHT_AREA        = 2u;
+const LIGHT_POINT       = 3u;
+
+struct LightData {
+    position   : vec3f,    // world pos (area/point) or direction (directional)
+    lightType  : u32,      // 1=directional, 2=area, 3=point
+    color      : vec3f,
+    intensity  : f32,
+    normal     : vec3f,    // area light facing direction
+    _pad       : f32,
+    extra      : vec4f,    // area: (sizeX, sizeZ, 0, 0), point: (radius, 0, 0, 0)
 }
 
 @group(0) @binding(0)  var          depthTex   : texture_depth_2d;
@@ -43,6 +55,7 @@ struct TraceParams {
 @group(0) @binding(7)  var<storage, read> tlasNodes  : array<BVHNode>;
 @group(0) @binding(8)  var<storage, read> instances  : array<Instance>;
 @group(0) @binding(9)  var<storage, read> materials  : array<MaterialData>;
+@group(0) @binding(10) var<storage, read> sceneLights : array<LightData>;
 
 // PCG hash for random number generation
 fn pcgHash(input: u32) -> u32 {
@@ -56,16 +69,27 @@ fn randomFloat(state: ptr<function, u32>) -> f32 {
     return f32(*state) / 4294967295.0;
 }
 
+// Robust orthonormal basis from normal (Duff et al. 2017, Frisvad 2012 revised)
+// Branchless, no cross products, numerically stable for all directions.
+fn buildONB(n: vec3f) -> array<vec3f, 2> {
+    let s = select(-1.0, 1.0, n.z >= 0.0);
+    let a = -1.0 / (s + n.z);
+    let b = n.x * n.y * a;
+    return array<vec3f, 2>(
+        vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x),
+        vec3f(b, s + n.y * n.y * a, -n.y),
+    );
+}
+
 // Cosine-weighted hemisphere sampling
 fn cosineSampleHemisphere(n: vec3f, r1: f32, r2: f32) -> vec3f {
     let phi = 2.0 * 3.14159265 * r1;
     let cosTheta = sqrt(1.0 - r2);
     let sinTheta = sqrt(r2);
 
-    // Build orthonormal basis from normal
-    let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(n.x) > 0.9);
-    let tangent = normalize(cross(up, n));
-    let bitangent = cross(n, tangent);
+    let tb = buildONB(n);
+    let tangent = tb[0];
+    let bitangent = tb[1];
 
     return normalize(
         tangent * cos(phi) * sinTheta +
@@ -81,9 +105,9 @@ fn sampleGGX(n: vec3f, roughness: f32, r1: f32, r2: f32) -> vec3f {
     let cosTheta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
     let sinTheta = sqrt(1.0 - cosTheta * cosTheta);
 
-    let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(n.x) > 0.9);
-    let tangent = normalize(cross(up, n));
-    let bitangent = cross(n, tangent);
+    let tb = buildONB(n);
+    let tangent = tb[0];
+    let bitangent = tb[1];
 
     let h = normalize(
         tangent * cos(phi) * sinTheta +
@@ -93,19 +117,104 @@ fn sampleGGX(n: vec3f, roughness: f32, r1: f32, r2: f32) -> vec3f {
     return h;
 }
 
-fn evaluateDirectLight(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
-    let sunDir = normalize(vec3f(traceParams.sunDirection, traceParams.sunDirZ));
-    let nDotL = max(dot(hitNorm, -sunDir), 0.0);
+// ── Per-light-type evaluation ───────────────────────────────────────
+
+fn evaluateDirectionalLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
+    let lightDir = normalize(-light.position); // position stores direction for directional
+    let nDotL = max(dot(hitNorm, lightDir), 0.0);
     if (nDotL <= 0.0) { return vec3f(0.0); }
 
     // Shadow ray
     var shadowRay: Ray;
     shadowRay.origin = hitPos + hitNorm * 0.001;
-    shadowRay.dir = -sunDir;
+    shadowRay.dir = lightDir;
     let shadowHit = traceBVH(shadowRay);
     if (shadowHit.hit) { return vec3f(0.0); }
 
-    return traceParams.sunColor * traceParams.sunIntensity * nDotL;
+    return light.color * light.intensity * nDotL;
+}
+
+fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData, rng: ptr<function, u32>) -> vec3f {
+    let lr1 = randomFloat(rng);
+    let lr2 = randomFloat(rng);
+    let sizeX = light.extra.x;
+    let sizeZ = light.extra.y;
+
+    // Build tangent frame from light normal
+    let ln = light.normal;
+    let lup = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(ln.y) < 0.9);
+    let lt = normalize(cross(lup, ln));
+    let lb = cross(ln, lt);
+
+    let lightPos = light.position
+        + lt * (lr1 - 0.5) * sizeX
+        + lb * (lr2 - 0.5) * sizeZ;
+
+    let toLight = lightPos - hitPos;
+    let dist2 = dot(toLight, toLight);
+    let dist = sqrt(dist2);
+    let lightDir = toLight / dist;
+
+    // Cosine at hit surface
+    let nDotL = max(dot(hitNorm, lightDir), 0.0);
+    if (nDotL <= 0.0) { return vec3f(0.0); }
+
+    // Cosine at light surface: dot(lightNormal, direction_from_light_to_hit)
+    // direction_from_light_to_hit = -lightDir
+    let lightCos = max(dot(ln, -lightDir), 0.0);
+    if (lightCos <= 0.0) { return vec3f(0.0); }
+
+    // Shadow ray
+    var shadowRay: Ray;
+    shadowRay.origin = hitPos + hitNorm * 0.001;
+    shadowRay.dir = lightDir;
+    let shadowHit = traceBVH(shadowRay);
+    if (shadowHit.hit && shadowHit.t < dist - 0.01) {
+        return vec3f(0.0);
+    }
+
+    // L_e * cos_hit * cos_light * A / d^2
+    let area = sizeX * sizeZ;
+    return light.color * light.intensity * nDotL * lightCos * area / dist2;
+}
+
+fn evaluatePointLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
+    let toLight = light.position - hitPos;
+    let dist2 = dot(toLight, toLight);
+    let dist = sqrt(dist2);
+    let lightDir = toLight / dist;
+
+    let nDotL = max(dot(hitNorm, lightDir), 0.0);
+    if (nDotL <= 0.0) { return vec3f(0.0); }
+
+    // Shadow ray
+    var shadowRay: Ray;
+    shadowRay.origin = hitPos + hitNorm * 0.001;
+    shadowRay.dir = lightDir;
+    let shadowHit = traceBVH(shadowRay);
+    if (shadowHit.hit && shadowHit.t < dist - 0.01) {
+        return vec3f(0.0);
+    }
+
+    return light.color * light.intensity * nDotL / dist2;
+}
+
+// ── Evaluate all scene lights at a hit point ────────────────────────
+
+fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, rng: ptr<function, u32>) -> vec3f {
+    var total = vec3f(0.0);
+    let count = traceParams.lightCount;
+    for (var i = 0u; i < count; i++) {
+        let light = sceneLights[i];
+        if (light.lightType == LIGHT_DIRECTIONAL) {
+            total += evaluateDirectionalLight(hitPos, hitNorm, light);
+        } else if (light.lightType == LIGHT_AREA) {
+            total += evaluateAreaLight(hitPos, hitNorm, light, rng);
+        } else if (light.lightType == LIGHT_POINT) {
+            total += evaluatePointLight(hitPos, hitNorm, light);
+        }
+    }
+    return total;
 }
 
 fn traceRefraction(
@@ -127,7 +236,6 @@ fn traceRefraction(
 
         let refracted = refract(ray.dir, faceNorm, eta);
         if (length(refracted) < 0.001) {
-            // Total internal reflection
             ray.origin = currentHit.worldPos + faceNorm * 0.001;
             ray.dir = reflect(ray.dir, faceNorm);
         } else {
@@ -138,20 +246,17 @@ fn traceRefraction(
         let nextHit = traceBVH(ray);
         if (!nextHit.hit) { break; }
 
-        // Beer's law absorption
         let dist = nextHit.t;
         throughput *= exp(-mat.absorptionColor * mat.absorptionDensity * dist);
 
         let nextMat = materials[nextHit.matIndex];
-        if (u32(nextMat.flags) & 1u) == 0u {
-            // Hit opaque surface — shade and return
-            let lighting = evaluateDirectLight(nextHit.worldPos, nextHit.worldNorm);
+        if ((u32(nextMat.flags) & 1u) == 0u) {
+            let lighting = evaluateLighting(nextHit.worldPos, nextHit.worldNorm, rng);
             return throughput * lighting * nextMat.albedo;
         }
         currentHit = nextHit;
     }
-    // Exhausted bounces — discard contribution
-    _ = randomFloat(rng); // suppress unused warning
+    _ = randomFloat(rng);
     return throughput * vec3f(0.0);
 }
 
@@ -193,23 +298,17 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     var indirect = vec3f(0.0);
 
-    // Sky/miss: light from escaped rays (dark for enclosed spaces).
-    // Hit ambient: simulates multi-bounce fill — drives color bleed from unlit walls.
-    let skyColor = vec3f(0.05);
-    let hitAmbient = vec3f(0.4);
-
     if (hit.hit) {
         let mat = materials[hit.matIndex];
 
-        // Check if refractive
         if ((u32(mat.flags) & 1u) != 0u) {
             indirect = traceRefraction(ray, hit, mat, &rng);
+        } else if (mat.emissiveIntensity > 0.0) {
+            indirect = mat.emissive * mat.emissiveIntensity;
         } else {
-            let hitDirect = evaluateDirectLight(hit.worldPos, hit.worldNorm);
-            indirect = (hitDirect + hitAmbient) * mat.albedo + mat.emissive * mat.emissiveIntensity;
+            let hitDirect = evaluateLighting(hit.worldPos, hit.worldNorm, &rng);
+            indirect = hitDirect * mat.albedo;
         }
-    } else {
-        indirect = skyColor;
     }
 
     // Specular ray for metallic/glossy surfaces
@@ -227,7 +326,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let specHit = traceBVH(specRay);
             if (specHit.hit) {
                 let specMat = materials[specHit.matIndex];
-                let specLighting = evaluateDirectLight(specHit.worldPos, specHit.worldNorm);
+                let specLighting = evaluateLighting(specHit.worldPos, specHit.worldNorm, &rng);
                 let specular = specLighting * specMat.albedo;
                 indirect = mix(indirect, specular, metallic);
             }

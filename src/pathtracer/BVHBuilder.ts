@@ -6,7 +6,7 @@ import { PathTracerMaterial } from "./PathTracerMaterial";
 import { mortonShader } from "./shaders/morton.wgsl";
 import { radixSortShader } from "./shaders/radix-sort.wgsl";
 import { treeBuildShader } from "./shaders/tree-build.wgsl";
-import { refitShader } from "./shaders/refit.wgsl";
+import { refitLeavesShader, refitInternalShader } from "./shaders/refit.wgsl";
 import { instanceAABBShader } from "./shaders/instance-aabb.wgsl";
 import { tlasRefitShader } from "./shaders/tlas-refit.wgsl";
 
@@ -58,8 +58,10 @@ export class BVHBuilder {
     private _sortBGL: GPUBindGroupLayout | null = null;
     private _treeBuildPipeline: GPUComputePipeline | null = null;
     private _treeBuildBGL: GPUBindGroupLayout | null = null;
-    private _refitPipeline: GPUComputePipeline | null = null;
-    private _refitBGL: GPUBindGroupLayout | null = null;
+    private _refitLeavesPipeline: GPUComputePipeline | null = null;
+    private _refitLeavesBGL: GPUBindGroupLayout | null = null;
+    private _refitInternalPipeline: GPUComputePipeline | null = null;
+    private _refitInternalBGL: GPUBindGroupLayout | null = null;
     private _mortonParamsBuf: GPUBuffer | null = null;
     private _sortParamsBuf: GPUBuffer | null = null;
     private _treeBuildParamsBuf: GPUBuffer | null = null;
@@ -698,7 +700,143 @@ export class BVHBuilder {
         this._pendingScratchBuffers.length = 0;
     }
 
-    public buildBLASTree(commandEncoder: GPUCommandEncoder): void {
+    public buildBLASTree(_commandEncoder: GPUCommandEncoder): void {
+        // Use CPU BLAS for correctness — bypasses GPU Morton/sort/tree/refit pipeline
+        this._buildCPUBLAS();
+    }
+
+    /**
+     * Build BLAS on CPU using a balanced binary tree (midpoint split).
+     * Tree depth = O(log n), fits within BLAS_STACK_SIZE = 32.
+     */
+    private _buildCPUBLAS(): void {
+        // Pre-calculate total node count
+        let totalNodes = 0;
+        for (const [, entry] of this._blasEntries) {
+            if (entry.triangleCount > 0) {
+                totalNodes += 2 * entry.triangleCount - 1;
+            }
+        }
+        this.totalBLASNodes = totalNodes;
+
+        // Allocate combined BLAS node buffer
+        const combinedBuf = new ArrayBuffer(Math.max(totalNodes * 32, 4));
+        const combinedF32 = new Float32Array(combinedBuf);
+        const combinedI32 = new Int32Array(combinedBuf);
+
+        let nodeOffset = 0;
+        for (const [geoId, entry] of this._blasEntries) {
+            const n = entry.triangleCount;
+            if (n === 0) continue;
+            const nodeCount = 2 * n - 1;
+            entry.nodeOffset = nodeOffset;
+            entry.nodeCount = nodeCount;
+
+            // Compute per-triangle AABBs
+            const triAABBs: { min: number[]; max: number[] }[] = [];
+            let geom: any = null;
+            for (const [g, key] of this._geomToBLASKey) {
+                if (key === geoId) { geom = g; break; }
+            }
+
+            if (geom && geom.vertices && geom.indices) {
+                const verts = geom.vertices;
+                const indices = geom.indices;
+                const VERT_STRIDE = 9;
+                for (let t = 0; t < n; t++) {
+                    const i0 = indices[t * 3 + 0];
+                    const i1 = indices[t * 3 + 1];
+                    const i2 = indices[t * 3 + 2];
+                    const v0x = verts[i0 * VERT_STRIDE], v0y = verts[i0 * VERT_STRIDE + 1], v0z = verts[i0 * VERT_STRIDE + 2];
+                    const v1x = verts[i1 * VERT_STRIDE], v1y = verts[i1 * VERT_STRIDE + 1], v1z = verts[i1 * VERT_STRIDE + 2];
+                    const v2x = verts[i2 * VERT_STRIDE], v2y = verts[i2 * VERT_STRIDE + 1], v2z = verts[i2 * VERT_STRIDE + 2];
+                    triAABBs.push({
+                        min: [Math.min(v0x, v1x, v2x), Math.min(v0y, v1y, v2y), Math.min(v0z, v1z, v2z)],
+                        max: [Math.max(v0x, v1x, v2x), Math.max(v0y, v1y, v2y), Math.max(v0z, v1z, v2z)],
+                    });
+                }
+            } else {
+                const lb = this._blasLocalBounds.get(geoId);
+                for (let t = 0; t < n; t++) {
+                    triAABBs.push({
+                        min: lb ? [lb.min[0], lb.min[1], lb.min[2]] : [-1, -1, -1],
+                        max: lb ? [lb.max[0], lb.max[1], lb.max[2]] : [1, 1, 1],
+                    });
+                }
+            }
+
+            // Build balanced binary tree via recursive midpoint split.
+            // Layout: internal nodes [0..n-2], leaf nodes [n-1..2n-2].
+            // triOrder maps sorted position → original triangle index.
+            const triOrder = Array.from({ length: n }, (_, i) => i);
+            let nextInternal = 0;
+
+            // Recursively build the tree, returns the local node index.
+            const buildNode = (triIndices: number[]): number => {
+                if (triIndices.length === 1) {
+                    // Leaf node
+                    const triIdx = triIndices[0];
+                    const leafLocalIdx = (n - 1) + triIdx;
+                    const globalIdx = nodeOffset + leafLocalIdx;
+                    const off = globalIdx * 8;
+                    combinedF32[off + 0] = triAABBs[triIdx].min[0];
+                    combinedF32[off + 1] = triAABBs[triIdx].min[1];
+                    combinedF32[off + 2] = triAABBs[triIdx].min[2];
+                    combinedI32[off + 3] = -(triIdx + 1);
+                    combinedF32[off + 4] = triAABBs[triIdx].max[0];
+                    combinedF32[off + 5] = triAABBs[triIdx].max[1];
+                    combinedF32[off + 6] = triAABBs[triIdx].max[2];
+                    combinedI32[off + 7] = -1;
+                    return leafLocalIdx;
+                }
+
+                // Allocate internal node
+                const myIdx = nextInternal++;
+                const mid = Math.floor(triIndices.length / 2);
+                const leftChild = buildNode(triIndices.slice(0, mid));
+                const rightChild = buildNode(triIndices.slice(mid));
+
+                // Compute merged AABB
+                let imin = [Infinity, Infinity, Infinity];
+                let imax = [-Infinity, -Infinity, -Infinity];
+                for (const ti of triIndices) {
+                    imin[0] = Math.min(imin[0], triAABBs[ti].min[0]);
+                    imin[1] = Math.min(imin[1], triAABBs[ti].min[1]);
+                    imin[2] = Math.min(imin[2], triAABBs[ti].min[2]);
+                    imax[0] = Math.max(imax[0], triAABBs[ti].max[0]);
+                    imax[1] = Math.max(imax[1], triAABBs[ti].max[1]);
+                    imax[2] = Math.max(imax[2], triAABBs[ti].max[2]);
+                }
+
+                const globalIdx = nodeOffset + myIdx;
+                const off = globalIdx * 8;
+                combinedF32[off + 0] = imin[0];
+                combinedF32[off + 1] = imin[1];
+                combinedF32[off + 2] = imin[2];
+                combinedI32[off + 3] = leftChild;
+                combinedF32[off + 4] = imax[0];
+                combinedF32[off + 5] = imax[1];
+                combinedF32[off + 6] = imax[2];
+                combinedI32[off + 7] = rightChild;
+                return myIdx;
+            };
+
+            buildNode(triOrder);
+
+            nodeOffset += nodeCount;
+        }
+
+        // Upload to GPU
+        this._blasNodeBuffer?.destroy();
+        this._blasNodeBuffer = this._device.createBuffer({
+            label: 'BVH/BLASNodes/CPU',
+            size: Math.max(combinedBuf.byteLength, 4),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this._device.queue.writeBuffer(this._blasNodeBuffer, 0, combinedBuf);
+    }
+
+    public buildBLASTreeGPU(commandEncoder: GPUCommandEncoder): void {
         this._ensureBLASPipelines();
 
         // Pre-calculate total node count for combined buffer
@@ -1019,23 +1157,38 @@ export class BVHBuilder {
             compute: { module: treeBuildModule, entryPoint: 'main' },
         });
 
-        // Refit pipeline
-        this._refitBGL = this._device.createBindGroupLayout({
-            label: 'BVH/RefitBGL',
+        // Refit leaves pipeline
+        this._refitLeavesBGL = this._device.createBindGroupLayout({
+            label: 'BVH/RefitLeavesBGL',
             entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },        // nodes
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // triangles
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },        // ready flags
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },        // params
+                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedIndices
             ],
         });
-        const refitModule = this._device.createShaderModule({ code: refitShader });
-        this._refitPipeline = this._device.createComputePipeline({
-            label: 'BVH/Refit',
-            layout: this._device.createPipelineLayout({ bindGroupLayouts: [this._refitBGL] }),
-            compute: { module: refitModule, entryPoint: 'main' },
+        const refitLeavesModule = this._device.createShaderModule({ code: refitLeavesShader });
+        this._refitLeavesPipeline = this._device.createComputePipeline({
+            label: 'BVH/RefitLeaves',
+            layout: this._device.createPipelineLayout({ bindGroupLayouts: [this._refitLeavesBGL] }),
+            compute: { module: refitLeavesModule, entryPoint: 'main' },
+        });
+
+        // Refit internal pipeline
+        this._refitInternalBGL = this._device.createBindGroupLayout({
+            label: 'BVH/RefitInternalBGL',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },  // nodes
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },  // ready flags
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },  // params
+            ],
+        });
+        const refitInternalModule = this._device.createShaderModule({ code: refitInternalShader });
+        this._refitInternalPipeline = this._device.createComputePipeline({
+            label: 'BVH/RefitInternal',
+            layout: this._device.createPipelineLayout({ bindGroupLayouts: [this._refitInternalBGL] }),
+            compute: { module: refitInternalModule, entryPoint: 'main' },
         });
 
         // Params buffers
@@ -1112,11 +1265,6 @@ export class BVHBuilder {
         // Root (index 0) has no parent — set to -1 so refit walk-up terminates
         this._device.queue.writeBuffer(parentsBuffer, 0, new Int32Array([-1]));
 
-        const atomicFlagsBuffer = this._device.createBuffer({
-            label: 'BVH/AtomicFlags',
-            size: nodeCount * 4,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
         const histogramBuffer = this._device.createBuffer({
             label: 'BVH/Histograms',
             size: 16 * workgroupCount * 4,
@@ -1245,7 +1393,7 @@ export class BVHBuilder {
         treePass.dispatchWorkgroups(Math.ceil((count - 1) / 256));
         treePass.end();
 
-        // --- Step 4: Bottom-up AABB refit ---
+        // --- Step 4: Multi-pass bottom-up AABB refit ---
         const entryRefitParamsBuf = this._device.createBuffer({
             label: 'BVH/RefitParams/Entry', size: 16,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -1258,28 +1406,55 @@ export class BVHBuilder {
         ]);
         this._device.queue.writeBuffer(entryRefitParamsBuf, 0, refitParams);
 
-        const refitBG = this._device.createBindGroup({
-            layout: this._refitBGL!,
+        // Ready flags buffer (zero-initialized by WebGPU)
+        const readyBuffer = this._device.createBuffer({
+            label: 'BVH/ReadyFlags',
+            size: nodeCount * 4,
+            usage: GPUBufferUsage.STORAGE,
+        });
+
+        // Pass A: Initialize leaf AABBs
+        const leavesBG = this._device.createBindGroup({
+            layout: this._refitLeavesBGL!,
             entries: [
                 { binding: 0, resource: { buffer: nodeBuffer } },
                 { binding: 1, resource: { buffer: this._triangleBuffer! } },
-                { binding: 2, resource: { buffer: atomicFlagsBuffer } },
+                { binding: 2, resource: { buffer: readyBuffer } },
                 { binding: 3, resource: { buffer: entryRefitParamsBuf } },
-                { binding: 4, resource: { buffer: parentsBuffer } },
-                { binding: 5, resource: { buffer: sortedVals } },
+                { binding: 4, resource: { buffer: sortedVals } },
             ],
         });
 
-        const refitPass = commandEncoder.beginComputePass();
-        refitPass.setPipeline(this._refitPipeline!);
-        refitPass.setBindGroup(0, refitBG);
-        refitPass.dispatchWorkgroups(workgroupCount);
-        refitPass.end();
+        const leavesPass = commandEncoder.beginComputePass();
+        leavesPass.setPipeline(this._refitLeavesPipeline!);
+        leavesPass.setBindGroup(0, leavesBG);
+        leavesPass.dispatchWorkgroups(workgroupCount);
+        leavesPass.end();
+
+        // Pass B: Converge internal nodes (each dispatch = implicit barrier)
+        const internalBG = this._device.createBindGroup({
+            layout: this._refitInternalBGL!,
+            entries: [
+                { binding: 0, resource: { buffer: nodeBuffer } },
+                { binding: 1, resource: { buffer: readyBuffer } },
+                { binding: 2, resource: { buffer: entryRefitParamsBuf } },
+            ],
+        });
+
+        const internalWG = Math.ceil((count - 1) / 256);
+        const maxDepth = Math.max(Math.ceil(Math.log2(Math.max(count, 2))) + 1, count - 1);
+        for (let level = 0; level < maxDepth; level++) {
+            const intPass = commandEncoder.beginComputePass();
+            intPass.setPipeline(this._refitInternalPipeline!);
+            intPass.setBindGroup(0, internalBG);
+            intPass.dispatchWorkgroups(internalWG);
+            intPass.end();
+        }
 
         // Defer scratch buffer destruction until after command submission
         this._pendingScratchBuffers.push(
             centroidsBuffer, mortonKeysA, mortonValsA, mortonKeysB, mortonValsB,
-            parentsBuffer, atomicFlagsBuffer, histogramBuffer,
+            parentsBuffer, readyBuffer, histogramBuffer,
             entryMortonParamsBuf, ...sortPassParamsBufs, entryTreeBuildParamsBuf, entryRefitParamsBuf,
         );
 
@@ -1316,6 +1491,7 @@ export class BVHBuilder {
         this._sortParamsBuf?.destroy();
         this._treeBuildParamsBuf?.destroy();
         this._refitParamsBuf?.destroy();
+        // Note: refitLeaves/Internal pipelines are not buffers, no destroy needed
         this._instanceAABBParamsBuf?.destroy();
         this._tlasRefitParamsBuf?.destroy();
         for (const buf of this._pendingScratchBuffers) {

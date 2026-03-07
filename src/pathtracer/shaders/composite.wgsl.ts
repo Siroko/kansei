@@ -22,7 +22,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     // Direct already has albedo baked in from rasterizer.
     // Indirect is raw incoming radiance — multiply by albedo.
-    let final_color = direct + albedo * indirect;
+    let hdr = direct + albedo * indirect;
+
+    // Reinhard tone map to make HDR range visible
+    let final_color = hdr / (hdr + vec3f(1.0));
 
     textureStore(outputTex, coord, vec4f(final_color, 1.0));
 }

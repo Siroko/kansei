@@ -30,6 +30,7 @@
     import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { AreaLight } from '../src/lights/AreaLight'
     import { ShadowMap } from '../src/shadows/ShadowMap'
     import { Float } from '../src/math/Float'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
@@ -39,14 +40,20 @@
     const HALF = WALL / 2;
     const THICK = 0.1;  // wall thickness
 
-    // ── Light ─────────────────────────────────────────────────────────────
-    const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 2.0);
+    // ── Lights ──────────────────────────────────────────────────────────
+    // Directional light kept only for raster shadow map (not added to scene).
+    // Intensity 0 so raster pass outputs near-black — all lighting via GI.
+    const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 0.0);
+    const lightDirUniform = new Vector3(0, -1, 0.2);
 
-    const lightDirUniform = new Vector3(dirLight.direction[0], dirLight.direction[1], dirLight.direction[2]);
+    // Area light — drives all path tracer GI
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 5.0, [3, 3]);
+    areaLight.position.set(0, WALL - 0.2, 0);
+    areaLight.target.set(0, 0, 0); // faces down toward floor center
 
     // ── Shader blocks ─────────────────────────────────────────────────────
     const vertexBlock = /* wgsl */`
-      const AMBIENT   : f32   = 0.05;
+      const AMBIENT   : f32   = 0.0;
 
       struct VertexOut {
         @builtin(position) position   : vec4f,
@@ -95,7 +102,7 @@
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
         return FragmentOutput(
-          vec4f(albedo * lighting, 1.0),
+          vec4f(0, 0, 0, 1),             // no direct — all lighting via GI
           vec4f(0, 0, 0, 1),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
           vec4f(albedo, 0.0)
@@ -107,7 +114,7 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 2,
+      devicePixelRatio: 1,
       antialias: true,
       sampleCount: 1
     });
@@ -124,7 +131,7 @@
     // ── Scene ─────────────────────────────────────────────────────────────
     const scene = new Scene();
     const camera = new Camera(50, 0.1, 100, window.innerWidth / window.innerHeight);
-    scene.add(dirLight);
+    scene.add(areaLight);
 
     const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
 
@@ -151,8 +158,8 @@
     function makePTMat(r, g, b) {
       const m = new PathTracerMaterial();
       m.albedo = [r, g, b];
-      m.roughness = 0.5;
-      m.maxBounces = 4;
+      m.roughness = 1.0;
+      m.maxBounces = 20;
       m.refractive = false;
       return m;
     }
@@ -209,14 +216,13 @@
     const sphere = new Renderable(sphereGeo, whiteMat);
     sphere.position.set(0, 1.5, 0);
     sphere.pathTracerMaterial = makePTMat(0.9, 0.9, 0.9);
-    sphere.pathTracerMaterial.refractive = true;
     scene.add(sphere);
 
     // ── Path tracer effect ────────────────────────────────────────────────
     const pathTracerEffect = new PathTracerEffect({
       scene,
-      temporalBlend: 0.05,
-      spatialPasses: 3,
+      temporalBlend: 1.0, // DEBUG: instant feedback, no temporal accumulation
+      spatialPasses: 0,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
@@ -228,38 +234,29 @@
     ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
     ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 5, step: 1 });
 
-    const lightParams = {
-      x: dirLight.direction[0],
-      y: dirLight.direction[1],
-      z: dirLight.direction[2],
-      intensity: dirLight.intensity,
+    const areaLightParams = {
+      intensity: areaLight.intensity,
+      targetX: areaLight.target.x,
+      targetY: areaLight.target.y,
+      targetZ: areaLight.target.z,
     };
-
-    // sphere.position.x = 3;
-
-    function syncLight() {
-      dirLight.direction[0] = lightParams.x;
-      dirLight.direction[1] = lightParams.y;
-      dirLight.direction[2] = lightParams.z;
-      dirLight.intensity = lightParams.intensity;
-      lightDirUniform.x = lightParams.x;
-      lightDirUniform.y = lightParams.y;
-      lightDirUniform.z = lightParams.z;
-      lightDirUniform.needsUpdate = true;
-    }
-
-    const lightFolder = pane.addFolder({ title: 'Light' });
-    lightFolder.addBinding(lightParams, 'x', { min: -1, max: 1, step: 0.01 }).on('change', syncLight);
-    lightFolder.addBinding(lightParams, 'y', { min: -1, max: 1, step: 0.01 }).on('change', syncLight);
-    lightFolder.addBinding(lightParams, 'z', { min: -1, max: 1, step: 0.01 }).on('change', syncLight);
-    lightFolder.addBinding(lightParams, 'intensity', { min: 0, max: 5, step: 0.1 }).on('change', syncLight);
+    const alFolder = pane.addFolder({ title: 'Area Light (GI)' });
+    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 20, step: 0.1 }).on('change', () => {
+      areaLight.intensity = areaLightParams.intensity;
+    });
+    const updateTarget = () => {
+      areaLight.target.set(areaLightParams.targetX, areaLightParams.targetY, areaLightParams.targetZ);
+    };
+    alFolder.addBinding(areaLightParams, 'targetX', { min: -10, max: 10, step: 0.1, label: 'target X' }).on('change', updateTarget);
+    alFolder.addBinding(areaLightParams, 'targetY', { min: -10, max: 10, step: 0.1, label: 'target Y' }).on('change', updateTarget);
+    alFolder.addBinding(areaLightParams, 'targetZ', { min: -10, max: 10, step: 0.1, label: 'target Z' }).on('change', updateTarget);
 
     // ── Render loop ───────────────────────────────────────────────────────
     function animate() {
       cameraControls.update();
       shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
-      // sphere.position.x = Math.sin(performance.now() * 0.001) * 3;
+      sphere.position.x = Math.sin(performance.now() * 0.001) * 3;
       requestAnimationFrame(animate);
     }
     requestAnimationFrame(animate);

@@ -2,13 +2,13 @@ import { Object3D } from "../objects/Object3D";
 
 abstract class Light extends Object3D {
     public readonly isLight = true;
-    public readonly lightType: 'directional' | 'point';
+    public readonly lightType: 'directional' | 'point' | 'area';
     public color: [number, number, number];
     public intensity: number;
     public volumetric: boolean;
 
     constructor(
-        lightType: 'directional' | 'point',
+        lightType: 'directional' | 'point' | 'area',
         color: [number, number, number] = [1, 1, 1],
         intensity: number = 1,
     ) {

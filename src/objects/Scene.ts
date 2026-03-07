@@ -4,6 +4,7 @@ import { Renderable } from "./Renderable";
 import { Light } from "../lights/Light";
 import { DirectionalLight } from "../lights/DirectionalLight";
 import { PointLight } from "../lights/PointLight";
+import { AreaLight } from "../lights/AreaLight";
 
 /**
  * Represents a 3D scene which can contain multiple objects.
@@ -15,9 +16,11 @@ class Scene extends Object3D {
     private orderedObjects: Renderable[] = [];
     private _directionalLights: DirectionalLight[] = [];
     private _pointLights: PointLight[] = [];
+    private _areaLights: AreaLight[] = [];
 
     public get directionalLights(): readonly DirectionalLight[] { return this._directionalLights; }
     public get pointLights(): readonly PointLight[] { return this._pointLights; }
+    public get areaLights(): readonly AreaLight[] { return this._areaLights; }
 
     /**
      * Constructs a new Scene object.
@@ -32,12 +35,14 @@ class Scene extends Object3D {
         this.transparentObjects.length = 0;
         this._directionalLights.length = 0;
         this._pointLights.length = 0;
+        this._areaLights.length = 0;
         // Sort objects into opaque and transparent, collect lights
         this.traverse(this, (object: Object3D) => {
             if ((object as any).isLight) {
                 const light = object as Light;
                 if (light.lightType === 'directional') this._directionalLights.push(light as DirectionalLight);
                 else if (light.lightType === 'point') this._pointLights.push(light as PointLight);
+                else if (light.lightType === 'area') this._areaLights.push(light as AreaLight);
             }
             if (object.isRenderable) {
                 const renderable = object as Renderable;
