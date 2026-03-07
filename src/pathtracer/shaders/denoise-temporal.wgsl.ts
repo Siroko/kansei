@@ -24,7 +24,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (f32(gid.x) >= params.width || f32(gid.y) >= params.height) { return; }
 
     let current = textureLoad(currentGI, coord, 0);
-    let depth = textureLoad(depthTex, vec2u(gid.xy), 0);
+
+    // Map trace-res coord to full-res GBuffer coord
+    let uv_t = (vec2f(gid.xy) + 0.5) / size;
+    let gbufDim = vec2u(textureDimensions(depthTex));
+    let gbufCoord = min(vec2u(vec2f(gbufDim) * uv_t), gbufDim - vec2u(1u));
+    let depth = textureLoad(depthTex, gbufCoord, 0);
 
     // Sky pixels — no history accumulation
     if (depth >= 1.0) {

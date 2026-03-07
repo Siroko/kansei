@@ -58,6 +58,7 @@ fn traverseBLAS(
     triOffset: u32,
     triCount: u32,
     tMax: f32,
+    anyHit: bool,
 ) -> HitInfo {
     var hit: HitInfo;
     hit.t = tMax;
@@ -67,7 +68,7 @@ fn traverseBLAS(
 
     var stack: array<u32, BLAS_STACK_SIZE>;
     var stackPtr = 0u;
-    stack[0] = nodeOffset; // BLAS root is at nodeOffset in the combined buffer
+    stack[0] = nodeOffset;
     stackPtr = 1u;
 
     var iter = 0u;
@@ -81,7 +82,6 @@ fn traverseBLAS(
         if (tHit < 0.0) { continue; }
 
         if (node.leftChild < 0) {
-            // Leaf: triangle index encoded as -(triIdx + 1)
             let triIdx = u32(-(node.leftChild + 1));
             let base = (triOffset + triIdx) * TRI_STRIDE;
             let v0 = vec3f(triangles[base+0u], triangles[base+1u], triangles[base+2u]);
@@ -95,6 +95,8 @@ fn traverseBLAS(
                 hit.triIndex = triOffset + triIdx;
                 hit.hit = true;
 
+                if (anyHit) { return hit; }
+
                 let n0 = vec3f(triangles[base+9u],  triangles[base+10u], triangles[base+11u]);
                 let n1 = vec3f(triangles[base+12u], triangles[base+13u], triangles[base+14u]);
                 let n2 = vec3f(triangles[base+15u], triangles[base+16u], triangles[base+17u]);
@@ -103,26 +105,43 @@ fn traverseBLAS(
                 hit.worldPos = ray.origin + ray.dir * tuv.x;
             }
         } else {
-            // Internal: add nodeOffset since child indices are local to this BLAS
             if (stackPtr < BLAS_STACK_SIZE - 2u) {
-                stack[stackPtr] = nodeOffset + u32(node.leftChild);
-                stackPtr += 1u;
-                stack[stackPtr] = nodeOffset + u32(node.rightChild);
-                stackPtr += 1u;
+                // Ordered traversal: visit nearer child first
+                let leftIdx = nodeOffset + u32(node.leftChild);
+                let rightIdx = nodeOffset + u32(node.rightChild);
+                let leftNode = blasNodes[leftIdx];
+                let rightNode = blasNodes[rightIdx];
+                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t);
+                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t);
+
+                if (tLeft >= 0.0 && tRight >= 0.0) {
+                    // Push farther first (popped last = visited second)
+                    if (tLeft < tRight) {
+                        stack[stackPtr] = rightIdx; stackPtr += 1u;
+                        stack[stackPtr] = leftIdx;  stackPtr += 1u;
+                    } else {
+                        stack[stackPtr] = leftIdx;  stackPtr += 1u;
+                        stack[stackPtr] = rightIdx; stackPtr += 1u;
+                    }
+                } else if (tLeft >= 0.0) {
+                    stack[stackPtr] = leftIdx; stackPtr += 1u;
+                } else if (tRight >= 0.0) {
+                    stack[stackPtr] = rightIdx; stackPtr += 1u;
+                }
             }
         }
     }
     return hit;
 }
 
-fn traceBVH(ray: Ray) -> HitInfo {
+fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
     var hit: HitInfo;
     hit.t = 1e30;
     hit.hit = false;
 
     var stack: array<u32, TLAS_STACK_SIZE>;
     var stackPtr = 0u;
-    stack[0] = 0u; // TLAS root
+    stack[0] = 0u;
     stackPtr = 1u;
 
     var iter = 0u;
@@ -136,40 +155,61 @@ fn traceBVH(ray: Ray) -> HitInfo {
         if (tHit < 0.0) { continue; }
 
         if (node.leftChild < 0) {
-            // Leaf: encodes instance index as -(instIdx + 1)
             let instIdx = u32(-(node.leftChild + 1));
             let inst = instances[instIdx];
-
-            // Transform ray to instance local space
             let localRay = transformRayToLocal(ray, inst);
 
-            // Traverse this instance's BLAS
             let blasHit = traverseBLAS(
                 localRay,
                 inst.blasNodeOffset,
                 inst.blasTriOffset,
                 inst.blasTriCount,
                 hit.t,
+                anyHit,
             );
 
             if (blasHit.hit && blasHit.t < hit.t) {
                 hit = blasHit;
                 hit.instanceId = instIdx;
                 hit.matIndex = inst.materialIndex;
-                // Transform hit back to world space
+                if (anyHit) { return hit; }
                 hit.worldPos = transformPointToWorld(blasHit.worldPos, inst);
                 hit.worldNorm = transformNormalToWorld(blasHit.worldNorm, inst);
             }
         } else {
-            // Internal: push children
-            if (stackPtr < TLAS_STACK_SIZE - 1u) {
-                stack[stackPtr] = u32(node.leftChild);
-                stackPtr += 1u;
-                stack[stackPtr] = u32(node.rightChild);
-                stackPtr += 1u;
+            if (stackPtr < TLAS_STACK_SIZE - 2u) {
+                let leftIdx = u32(node.leftChild);
+                let rightIdx = u32(node.rightChild);
+                let leftNode = tlasNodes[leftIdx];
+                let rightNode = tlasNodes[rightIdx];
+                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t);
+                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t);
+
+                if (tLeft >= 0.0 && tRight >= 0.0) {
+                    if (tLeft < tRight) {
+                        stack[stackPtr] = rightIdx; stackPtr += 1u;
+                        stack[stackPtr] = leftIdx;  stackPtr += 1u;
+                    } else {
+                        stack[stackPtr] = leftIdx;  stackPtr += 1u;
+                        stack[stackPtr] = rightIdx; stackPtr += 1u;
+                    }
+                } else if (tLeft >= 0.0) {
+                    stack[stackPtr] = leftIdx; stackPtr += 1u;
+                } else if (tRight >= 0.0) {
+                    stack[stackPtr] = rightIdx; stackPtr += 1u;
+                }
             }
         }
     }
     return hit;
+}
+
+fn traceBVH(ray: Ray) -> HitInfo {
+    return traceBVHInternal(ray, false);
+}
+
+fn traceBVHShadow(ray: Ray) -> bool {
+    let hit = traceBVHInternal(ray, true);
+    return hit.hit;
 }
 `;

@@ -24,6 +24,8 @@ export interface PathTracerOptions {
     useBlueNoise?: boolean;
     /** Use fixed seed (no temporal animation). Default: false */
     fixedSeed?: boolean;
+    /** GI trace resolution scale (0.25 = quarter res, 0.5 = half res, 1.0 = full). Default: 0.5 */
+    traceScale?: number;
 }
 
 /** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
@@ -43,6 +45,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _spp: number;
     private _useBlueNoise: boolean;
     private _fixedSeed: boolean;
+    private _traceScale: number;
 
     // Trace pipeline
     private _tracePipeline: GPUComputePipeline | null = null;
@@ -94,6 +97,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._spp = options.spp ?? 1;
         this._useBlueNoise = options.useBlueNoise ?? true;
         this._fixedSeed = options.fixedSeed ?? false;
+        this._traceScale = options.traceScale ?? 0.5;
     }
 
     /** Access the BVH builder for external configuration. */
@@ -118,6 +122,21 @@ export class PathTracerEffect extends PostProcessingEffect {
     /** Use fixed seed (no temporal animation). */
     get fixedSeed(): boolean { return this._fixedSeed; }
     set fixedSeed(v: boolean) { this._fixedSeed = v; }
+
+    /** GI trace resolution scale. */
+    get traceScale(): number { return this._traceScale; }
+    set traceScale(v: number) {
+        v = Math.max(0.1, Math.min(1.0, v));
+        if (v !== this._traceScale) {
+            this._traceScale = v;
+            // Force texture recreation on next render
+            if (this._device) {
+                this._destroyTextures();
+                this._createTextures(this._device, this._width, this._height);
+                this._frameIndex = 0;
+            }
+        }
+    }
 
     // ── PostProcessingEffect interface ────────────────────────────────────
 
@@ -162,6 +181,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             this._bvhBuilder.buildBLAS(this._scene);
             this._bvhBuilder.buildBLASTree(commandEncoder);
             this._blasBuilt = true;
+            console.log(`[PathTracer] triangles: ${this._bvhBuilder.totalTriangleCount}, BLAS nodes: ${this._bvhBuilder.totalBLASNodes}, instances: ${this._bvhBuilder.totalInstances}, materials: ${this._bvhBuilder.materialCount}`);
         }
 
         // Build TLAS every frame (transforms may have changed)
@@ -188,17 +208,19 @@ export class PathTracerEffect extends PostProcessingEffect {
         mat4.invert(this._invViewProj, vp);
 
         const iv = camera.inverseViewMatrix.internalMat4;
+        const tw = this._traceWidth(width);
+        const th = this._traceHeight(height);
 
-        // ── Pass 1: Path trace ──
-        this._dispatchTrace(commandEncoder, depth, camera, width, height, iv);
+        // ── Pass 1: Path trace (at reduced resolution) ──
+        this._dispatchTrace(commandEncoder, depth, camera, tw, th, iv);
 
-        // ── Pass 2: Temporal denoise ──
-        this._dispatchTemporalDenoise(commandEncoder, depth, width, height, vp);
+        // ── Pass 2: Temporal denoise (at reduced resolution) ──
+        this._dispatchTemporalDenoise(commandEncoder, depth, tw, th, vp);
 
-        // ── Pass 3: Spatial denoise (a-trous wavelet) ──
-        this._dispatchSpatialDenoise(commandEncoder, depth, width, height);
+        // ── Pass 3: Spatial denoise (at reduced resolution) ──
+        this._dispatchSpatialDenoise(commandEncoder, depth, tw, th);
 
-        // ── Pass 4: Composite GI onto scene ──
+        // ── Pass 4: Composite GI onto scene (full resolution output) ──
         this._dispatchComposite(commandEncoder, input, output, width, height);
 
         // Save current VP as history for next frame
@@ -334,6 +356,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // albedoTex
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // outputTex
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },                       // params
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },                    // giSampler
             ],
         });
 
@@ -387,33 +410,38 @@ export class PathTracerEffect extends PostProcessingEffect {
 
     // ── Texture management ────────────────────────────────────────────────
 
+    private _traceWidth(w: number): number { return Math.max(1, Math.floor(w * this._traceScale)); }
+    private _traceHeight(h: number): number { return Math.max(1, Math.floor(h * this._traceScale)); }
+
     private _createTextures(device: GPUDevice, w: number, h: number): void {
         const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
+        const tw = this._traceWidth(w);
+        const th = this._traceHeight(h);
 
         this._giTexture = device.createTexture({
             label: 'PathTracer/GI',
-            size: [w, h],
+            size: [tw, th],
             format: 'rgba16float',
             usage,
         });
 
         this._historyTexA = device.createTexture({
             label: 'PathTracer/HistoryA',
-            size: [w, h],
+            size: [tw, th],
             format: 'rgba16float',
             usage,
         });
 
         this._historyTexB = device.createTexture({
             label: 'PathTracer/HistoryB',
-            size: [w, h],
+            size: [tw, th],
             format: 'rgba16float',
             usage,
         });
 
         this._spatialScratchTex = device.createTexture({
             label: 'PathTracer/SpatialScratch',
-            size: [w, h],
+            size: [tw, th],
             format: 'rgba16float',
             usage,
         });
@@ -701,6 +729,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 2, resource: this._gbuffer!.albedoTexture.createView() },
                 { binding: 3, resource: output.createView() },
                 { binding: 4, resource: { buffer: this._compositeParamsBuf! } },
+                { binding: 5, resource: this._historySampler! },
             ],
         });
 

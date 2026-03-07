@@ -10,15 +10,20 @@ struct CompositeParams {
 @group(0) @binding(2) var albedoTex   : texture_2d<f32>;
 @group(0) @binding(3) var outputTex   : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var<uniform> params : CompositeParams;
+@group(0) @binding(5) var giSampler   : sampler;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= params.width || gid.y >= params.height) { return; }
 
     let coord = vec2u(gid.xy);
-    let direct    = textureLoad(inputTex,   vec2i(coord), 0).rgb;
-    let indirect  = textureLoad(denoisedGI, vec2i(coord), 0).rgb;
-    let albedoRaw = textureLoad(albedoTex,  vec2i(coord), 0);
+    let uv = (vec2f(gid.xy) + 0.5) / vec2f(f32(params.width), f32(params.height));
+
+    let direct    = textureLoad(inputTex, vec2i(coord), 0).rgb;
+    // Sample low-res GI with bilinear filtering for smooth upscale
+    let giSample  = textureSampleLevel(denoisedGI, giSampler, uv, 0.0);
+    let indirect  = giSample.rgb;
+    let albedoRaw = textureLoad(albedoTex, vec2i(coord), 0);
     let albedo    = albedoRaw.rgb;
     let alpha     = albedoRaw.a;
 

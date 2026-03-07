@@ -283,7 +283,7 @@
     glassMat.roughness = 0.0;
     glassMat.refractive = true;
     glassMat.ior = 1.5;
-    glassMat.maxBounces = 2;
+    glassMat.maxBounces = 10;
     glassMat.absorptionColor = [0.2, 0.5, 0.8];
     glassMat.absorptionDensity = 0.3;
     sphere.pathTracerMaterial = glassMat;
@@ -300,7 +300,7 @@
     const gltfLoader = new GLTFLoader();
     const gltf = await gltfLoader.load('./assets/geom/scene.gltf', whiteMat);
     gltf.scene.scale.set(30, 30, 30);
-    gltf.scene.position.set(0, 3, 0);
+    gltf.scene.position.set(0, -1.5, 0);
     // Assign path tracer material to all loaded meshes
     gltf.scene.traverse(gltf.scene, (obj) => {
       if (obj.isRenderable) {
@@ -316,6 +316,7 @@
       spatialPasses: 0,
       spp: 1,
       useBlueNoise: false,
+      traceScale: 0.5,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
@@ -329,6 +330,7 @@
     ptFolder.addBinding(pathTracerEffect, 'spp', { min: 1, max: 16, step: 1 });
     ptFolder.addBinding(pathTracerEffect, 'useBlueNoise');
     ptFolder.addBinding(pathTracerEffect, 'fixedSeed');
+    ptFolder.addBinding(pathTracerEffect, 'traceScale', { min: 0.1, max: 1.0, step: 0.05 });
 
     const areaLightParams = {
       intensity: areaLight.intensity,
@@ -354,7 +356,7 @@
       volume.render(scene, camera);
       const t = performance.now() * 0.001;
       sphere.position.x = Math.sin(t) * 3;
-      sphere.position.y = Math.cos(t) * 2 + 3.5;
+      sphere.position.y = Math.cos(t) * 2 + 4;
       cube.position.x = Math.sin(t + Math.PI) * 3;
       cube.position.y = Math.cos(t + Math.PI) * 2 + 3.5;
       cube.rotation.x = t * 0.7;

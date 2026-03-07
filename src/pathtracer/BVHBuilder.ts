@@ -434,34 +434,40 @@ export class BVHBuilder {
     }
 
     /**
-     * Build BLAS on CPU using a balanced binary tree (midpoint split).
-     * Tree depth = O(log n), fits within BLAS_STACK_SIZE = 32.
+     * Build BLAS on CPU using SAH (Surface Area Heuristic) with binned splits.
+     * Produces much better BVH quality than midpoint split for complex geometry.
      */
     private _buildCPUBLAS(): void {
-        // Pre-calculate total node count
-        let totalNodes = 0;
+        const SAH_BINS = 12;
+        const SAH_TRAVERSAL_COST = 1.0;
+        const SAH_INTERSECT_COST = 1.0;
+
+        // Pre-calculate max node count (2n - 1 per geometry)
+        let maxTotalNodes = 0;
         for (const [, entry] of this._blasEntries) {
             if (entry.triangleCount > 0) {
-                totalNodes += 2 * entry.triangleCount - 1;
+                maxTotalNodes += 2 * entry.triangleCount - 1;
             }
         }
-        this.totalBLASNodes = totalNodes;
 
-        // Allocate combined BLAS node buffer
-        const combinedBuf = new ArrayBuffer(Math.max(totalNodes * 32, 4));
+        // Allocate combined BLAS node buffer (may use fewer nodes than max)
+        const combinedBuf = new ArrayBuffer(Math.max(maxTotalNodes * 32, 4));
         const combinedF32 = new Float32Array(combinedBuf);
         const combinedI32 = new Int32Array(combinedBuf);
 
-        let nodeOffset = 0;
+        let globalNodeOffset = 0;
+
         for (const [geoId, entry] of this._blasEntries) {
             const n = entry.triangleCount;
             if (n === 0) continue;
-            const nodeCount = 2 * n - 1;
-            entry.nodeOffset = nodeOffset;
-            entry.nodeCount = nodeCount;
 
-            // Compute per-triangle AABBs
-            const triAABBs: { min: number[]; max: number[] }[] = [];
+            entry.nodeOffset = globalNodeOffset;
+
+            // Compute per-triangle AABBs and centroids
+            const triMinX = new Float32Array(n), triMinY = new Float32Array(n), triMinZ = new Float32Array(n);
+            const triMaxX = new Float32Array(n), triMaxY = new Float32Array(n), triMaxZ = new Float32Array(n);
+            const centX = new Float32Array(n), centY = new Float32Array(n), centZ = new Float32Array(n);
+
             let geom: any = null;
             for (const [g, key] of this._geomToBLASKey) {
                 if (key === geoId) { geom = g; break; }
@@ -470,98 +476,216 @@ export class BVHBuilder {
             if (geom && geom.vertices && geom.indices) {
                 const verts = geom.vertices;
                 const indices = geom.indices;
-                const VERT_STRIDE = 9;
+                const VS = 9;
                 for (let t = 0; t < n; t++) {
-                    const i0 = indices[t * 3 + 0];
-                    const i1 = indices[t * 3 + 1];
-                    const i2 = indices[t * 3 + 2];
-                    const v0x = verts[i0 * VERT_STRIDE], v0y = verts[i0 * VERT_STRIDE + 1], v0z = verts[i0 * VERT_STRIDE + 2];
-                    const v1x = verts[i1 * VERT_STRIDE], v1y = verts[i1 * VERT_STRIDE + 1], v1z = verts[i1 * VERT_STRIDE + 2];
-                    const v2x = verts[i2 * VERT_STRIDE], v2y = verts[i2 * VERT_STRIDE + 1], v2z = verts[i2 * VERT_STRIDE + 2];
-                    triAABBs.push({
-                        min: [Math.min(v0x, v1x, v2x), Math.min(v0y, v1y, v2y), Math.min(v0z, v1z, v2z)],
-                        max: [Math.max(v0x, v1x, v2x), Math.max(v0y, v1y, v2y), Math.max(v0z, v1z, v2z)],
-                    });
+                    const i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2];
+                    const ax = verts[i0 * VS], ay = verts[i0 * VS + 1], az = verts[i0 * VS + 2];
+                    const bx = verts[i1 * VS], by = verts[i1 * VS + 1], bz = verts[i1 * VS + 2];
+                    const cx = verts[i2 * VS], cy = verts[i2 * VS + 1], cz = verts[i2 * VS + 2];
+                    triMinX[t] = Math.min(ax, bx, cx); triMinY[t] = Math.min(ay, by, cy); triMinZ[t] = Math.min(az, bz, cz);
+                    triMaxX[t] = Math.max(ax, bx, cx); triMaxY[t] = Math.max(ay, by, cy); triMaxZ[t] = Math.max(az, bz, cz);
+                    centX[t] = (triMinX[t] + triMaxX[t]) * 0.5;
+                    centY[t] = (triMinY[t] + triMaxY[t]) * 0.5;
+                    centZ[t] = (triMinZ[t] + triMaxZ[t]) * 0.5;
                 }
             } else {
                 const lb = this._blasLocalBounds.get(geoId);
+                const mn = lb ? lb.min : [-1, -1, -1], mx = lb ? lb.max : [1, 1, 1];
                 for (let t = 0; t < n; t++) {
-                    triAABBs.push({
-                        min: lb ? [lb.min[0], lb.min[1], lb.min[2]] : [-1, -1, -1],
-                        max: lb ? [lb.max[0], lb.max[1], lb.max[2]] : [1, 1, 1],
-                    });
+                    triMinX[t] = mn[0]; triMinY[t] = mn[1]; triMinZ[t] = mn[2];
+                    triMaxX[t] = mx[0]; triMaxY[t] = mx[1]; triMaxZ[t] = mx[2];
+                    centX[t] = (mn[0] + mx[0]) * 0.5;
+                    centY[t] = (mn[1] + mx[1]) * 0.5;
+                    centZ[t] = (mn[2] + mx[2]) * 0.5;
                 }
             }
 
-            // Build balanced binary tree via recursive midpoint split.
-            // Layout: internal nodes [0..n-2], leaf nodes [n-1..2n-2].
-            // triOrder maps sorted position → original triangle index.
-            const triOrder = Array.from({ length: n }, (_, i) => i);
-            let nextInternal = 0;
+            // Working index array — indices into per-geometry triangle arrays
+            const indices = new Uint32Array(n);
+            for (let i = 0; i < n; i++) indices[i] = i;
 
-            // Recursively build the tree, returns the local node index.
-            const buildNode = (triIndices: number[]): number => {
-                if (triIndices.length === 1) {
-                    // Leaf node
-                    const triIdx = triIndices[0];
-                    const leafLocalIdx = (n - 1) + triIdx;
-                    const globalIdx = nodeOffset + leafLocalIdx;
-                    const off = globalIdx * 8;
-                    combinedF32[off + 0] = triAABBs[triIdx].min[0];
-                    combinedF32[off + 1] = triAABBs[triIdx].min[1];
-                    combinedF32[off + 2] = triAABBs[triIdx].min[2];
-                    combinedI32[off + 3] = -(triIdx + 1);
-                    combinedF32[off + 4] = triAABBs[triIdx].max[0];
-                    combinedF32[off + 5] = triAABBs[triIdx].max[1];
-                    combinedF32[off + 6] = triAABBs[triIdx].max[2];
-                    combinedI32[off + 7] = -1;
-                    return leafLocalIdx;
-                }
+            let nextNode = 0;
 
-                // Allocate internal node
-                const myIdx = nextInternal++;
-                const mid = Math.floor(triIndices.length / 2);
-                const leftChild = buildNode(triIndices.slice(0, mid));
-                const rightChild = buildNode(triIndices.slice(mid));
-
-                // Compute merged AABB
-                let imin = [Infinity, Infinity, Infinity];
-                let imax = [-Infinity, -Infinity, -Infinity];
-                for (const ti of triIndices) {
-                    imin[0] = Math.min(imin[0], triAABBs[ti].min[0]);
-                    imin[1] = Math.min(imin[1], triAABBs[ti].min[1]);
-                    imin[2] = Math.min(imin[2], triAABBs[ti].min[2]);
-                    imax[0] = Math.max(imax[0], triAABBs[ti].max[0]);
-                    imax[1] = Math.max(imax[1], triAABBs[ti].max[1]);
-                    imax[2] = Math.max(imax[2], triAABBs[ti].max[2]);
-                }
-
-                const globalIdx = nodeOffset + myIdx;
-                const off = globalIdx * 8;
-                combinedF32[off + 0] = imin[0];
-                combinedF32[off + 1] = imin[1];
-                combinedF32[off + 2] = imin[2];
-                combinedI32[off + 3] = leftChild;
-                combinedF32[off + 4] = imax[0];
-                combinedF32[off + 5] = imax[1];
-                combinedF32[off + 6] = imax[2];
-                combinedI32[off + 7] = rightChild;
-                return myIdx;
+            const surfaceArea = (mnx: number, mny: number, mnz: number, mxx: number, mxy: number, mxz: number): number => {
+                const dx = mxx - mnx, dy = mxy - mny, dz = mxz - mnz;
+                return 2.0 * (dx * dy + dy * dz + dz * dx);
             };
 
-            buildNode(triOrder);
+            // Build SAH tree recursively. Operates on indices[start..start+count).
+            const buildSAH = (start: number, count: number): number => {
+                const nodeIdx = nextNode++;
+                const globalIdx = globalNodeOffset + nodeIdx;
+                const off = globalIdx * 8;
 
-            nodeOffset += nodeCount;
+                // Compute bounds of all triangles in this subtree
+                let bMinX = Infinity, bMinY = Infinity, bMinZ = Infinity;
+                let bMaxX = -Infinity, bMaxY = -Infinity, bMaxZ = -Infinity;
+                for (let i = start; i < start + count; i++) {
+                    const t = indices[i];
+                    bMinX = Math.min(bMinX, triMinX[t]); bMinY = Math.min(bMinY, triMinY[t]); bMinZ = Math.min(bMinZ, triMinZ[t]);
+                    bMaxX = Math.max(bMaxX, triMaxX[t]); bMaxY = Math.max(bMaxY, triMaxY[t]); bMaxZ = Math.max(bMaxZ, triMaxZ[t]);
+                }
+
+                if (count === 1) {
+                    // Leaf
+                    combinedF32[off + 0] = bMinX; combinedF32[off + 1] = bMinY; combinedF32[off + 2] = bMinZ;
+                    combinedI32[off + 3] = -(indices[start] + 1);
+                    combinedF32[off + 4] = bMaxX; combinedF32[off + 5] = bMaxY; combinedF32[off + 6] = bMaxZ;
+                    combinedI32[off + 7] = -1;
+                    return nodeIdx;
+                }
+
+                // Find best SAH split across 3 axes using binned approach
+                const parentSA = surfaceArea(bMinX, bMinY, bMinZ, bMaxX, bMaxY, bMaxZ);
+                const leafCost = SAH_INTERSECT_COST * count;
+                let bestCost = leafCost;
+                let bestAxis = -1;
+                let bestSplit = -1;
+
+                // Bin data per axis
+                const binCount = new Uint32Array(SAH_BINS);
+                const binMinX = new Float32Array(SAH_BINS), binMinY = new Float32Array(SAH_BINS), binMinZ = new Float32Array(SAH_BINS);
+                const binMaxX = new Float32Array(SAH_BINS), binMaxY = new Float32Array(SAH_BINS), binMaxZ = new Float32Array(SAH_BINS);
+
+                for (let axis = 0; axis < 3; axis++) {
+                    const cent = axis === 0 ? centX : axis === 1 ? centY : centZ;
+                    let cMin = Infinity, cMax = -Infinity;
+                    for (let i = start; i < start + count; i++) {
+                        const c = cent[indices[i]];
+                        cMin = Math.min(cMin, c);
+                        cMax = Math.max(cMax, c);
+                    }
+
+                    if (cMax - cMin < 1e-10) continue; // All centroids at same position on this axis
+
+                    const scale = SAH_BINS / (cMax - cMin);
+
+                    // Clear bins
+                    binCount.fill(0);
+                    binMinX.fill(Infinity); binMinY.fill(Infinity); binMinZ.fill(Infinity);
+                    binMaxX.fill(-Infinity); binMaxY.fill(-Infinity); binMaxZ.fill(-Infinity);
+
+                    // Fill bins
+                    for (let i = start; i < start + count; i++) {
+                        const t = indices[i];
+                        let b = Math.floor((cent[t] - cMin) * scale);
+                        if (b >= SAH_BINS) b = SAH_BINS - 1;
+                        binCount[b]++;
+                        binMinX[b] = Math.min(binMinX[b], triMinX[t]); binMinY[b] = Math.min(binMinY[b], triMinY[t]); binMinZ[b] = Math.min(binMinZ[b], triMinZ[t]);
+                        binMaxX[b] = Math.max(binMaxX[b], triMaxX[t]); binMaxY[b] = Math.max(binMaxY[b], triMaxY[t]); binMaxZ[b] = Math.max(binMaxZ[b], triMaxZ[t]);
+                    }
+
+                    // Sweep from left, accumulating bounds and counts
+                    const leftCount = new Uint32Array(SAH_BINS - 1);
+                    const leftSA = new Float32Array(SAH_BINS - 1);
+                    let lMinX = Infinity, lMinY = Infinity, lMinZ = Infinity;
+                    let lMaxX = -Infinity, lMaxY = -Infinity, lMaxZ = -Infinity;
+                    let lCount = 0;
+                    for (let i = 0; i < SAH_BINS - 1; i++) {
+                        lMinX = Math.min(lMinX, binMinX[i]); lMinY = Math.min(lMinY, binMinY[i]); lMinZ = Math.min(lMinZ, binMinZ[i]);
+                        lMaxX = Math.max(lMaxX, binMaxX[i]); lMaxY = Math.max(lMaxY, binMaxY[i]); lMaxZ = Math.max(lMaxZ, binMaxZ[i]);
+                        lCount += binCount[i];
+                        leftCount[i] = lCount;
+                        leftSA[i] = lCount > 0 ? surfaceArea(lMinX, lMinY, lMinZ, lMaxX, lMaxY, lMaxZ) : 0;
+                    }
+
+                    // Sweep from right
+                    let rMinX = Infinity, rMinY = Infinity, rMinZ = Infinity;
+                    let rMaxX = -Infinity, rMaxY = -Infinity, rMaxZ = -Infinity;
+                    let rCount = 0;
+                    for (let i = SAH_BINS - 1; i >= 1; i--) {
+                        rMinX = Math.min(rMinX, binMinX[i]); rMinY = Math.min(rMinY, binMinY[i]); rMinZ = Math.min(rMinZ, binMinZ[i]);
+                        rMaxX = Math.max(rMaxX, binMaxX[i]); rMaxY = Math.max(rMaxY, binMaxY[i]); rMaxZ = Math.max(rMaxZ, binMaxZ[i]);
+                        rCount += binCount[i];
+                        const rightSA = rCount > 0 ? surfaceArea(rMinX, rMinY, rMinZ, rMaxX, rMaxY, rMaxZ) : 0;
+
+                        const cost = SAH_TRAVERSAL_COST + SAH_INTERSECT_COST * (leftCount[i - 1] * leftSA[i - 1] + rCount * rightSA) / parentSA;
+                        if (cost < bestCost) {
+                            bestCost = cost;
+                            bestAxis = axis;
+                            bestSplit = i;
+                        }
+                    }
+                }
+
+                // No good split found — fallback: split along longest axis at midpoint
+                if (bestAxis === -1) {
+                    const dx = bMaxX - bMinX, dy = bMaxY - bMinY, dz = bMaxZ - bMinZ;
+                    bestAxis = dx >= dy && dx >= dz ? 0 : dy >= dz ? 1 : 2;
+                    const cent = bestAxis === 0 ? centX : bestAxis === 1 ? centY : centZ;
+                    let cMin = Infinity, cMax = -Infinity;
+                    for (let i = start; i < start + count; i++) {
+                        const c = cent[indices[i]];
+                        cMin = Math.min(cMin, c);
+                        cMax = Math.max(cMax, c);
+                    }
+                    const mid = (cMin + cMax) * 0.5;
+
+                    // Partition around midpoint
+                    let l = start, r = start + count - 1;
+                    while (l <= r) {
+                        if (cent[indices[l]] < mid) { l++; }
+                        else { const tmp = indices[l]; indices[l] = indices[r]; indices[r] = tmp; r--; }
+                    }
+                    let leftCount2 = l - start;
+                    if (leftCount2 === 0 || leftCount2 === count) leftCount2 = Math.floor(count / 2);
+
+                    const leftChild = buildSAH(start, leftCount2);
+                    const rightChild = buildSAH(start + leftCount2, count - leftCount2);
+                    combinedF32[off + 0] = bMinX; combinedF32[off + 1] = bMinY; combinedF32[off + 2] = bMinZ;
+                    combinedI32[off + 3] = leftChild;
+                    combinedF32[off + 4] = bMaxX; combinedF32[off + 5] = bMaxY; combinedF32[off + 6] = bMaxZ;
+                    combinedI32[off + 7] = rightChild;
+                    return nodeIdx;
+                }
+
+                // Partition indices according to best bin split
+                {
+                    const cent = bestAxis === 0 ? centX : bestAxis === 1 ? centY : centZ;
+                    let cMin = Infinity, cMax = -Infinity;
+                    for (let i = start; i < start + count; i++) {
+                        const c = cent[indices[i]];
+                        cMin = Math.min(cMin, c);
+                        cMax = Math.max(cMax, c);
+                    }
+                    const scale = SAH_BINS / (cMax - cMin);
+
+                    let l = start, r = start + count - 1;
+                    while (l <= r) {
+                        let b = Math.floor((cent[indices[l]] - cMin) * scale);
+                        if (b >= SAH_BINS) b = SAH_BINS - 1;
+                        if (b < bestSplit) { l++; }
+                        else { const tmp = indices[l]; indices[l] = indices[r]; indices[r] = tmp; r--; }
+                    }
+                    let leftCount2 = l - start;
+                    if (leftCount2 === 0 || leftCount2 === count) leftCount2 = Math.floor(count / 2);
+
+                    const leftChild = buildSAH(start, leftCount2);
+                    const rightChild = buildSAH(start + leftCount2, count - leftCount2);
+                    combinedF32[off + 0] = bMinX; combinedF32[off + 1] = bMinY; combinedF32[off + 2] = bMinZ;
+                    combinedI32[off + 3] = leftChild;
+                    combinedF32[off + 4] = bMaxX; combinedF32[off + 5] = bMaxY; combinedF32[off + 6] = bMaxZ;
+                    combinedI32[off + 7] = rightChild;
+                    return nodeIdx;
+                }
+            };
+
+            buildSAH(0, n);
+            entry.nodeCount = nextNode;
+            globalNodeOffset += nextNode;
         }
 
-        // Upload to GPU
+        this.totalBLASNodes = globalNodeOffset;
+
+        // Upload to GPU (trim to actual size used)
         this._blasNodeBuffer?.destroy();
+        const actualSize = Math.max(globalNodeOffset * 32, 4);
         this._blasNodeBuffer = this._device.createBuffer({
             label: 'BVH/BLASNodes/CPU',
-            size: Math.max(combinedBuf.byteLength, 4),
+            size: actualSize,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        this._device.queue.writeBuffer(this._blasNodeBuffer, 0, combinedBuf);
+        this._device.queue.writeBuffer(this._blasNodeBuffer, 0, combinedBuf, 0, actualSize);
     }
 
     public buildBLASTreeGPU(commandEncoder: GPUCommandEncoder): void {
