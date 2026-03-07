@@ -44,7 +44,7 @@
     // Directional light kept only for raster shadow map (not added to scene).
     // Intensity 0 so raster pass outputs near-black — all lighting via GI.
     const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 0.0);
-    const lightDirUniform = new Vector3(0, -1, 0.2);
+    const lightDirUniform = new Vector3(0, -1, 0.0);
 
     // Area light — drives all path tracer GI
     const areaLight = new AreaLight([1.0, 0.95, 0.8], 5.0, [3, 3]);
@@ -84,6 +84,34 @@
 
     // ── Colored wall shader (takes albedo as uniform) ─────────────────────
     const colorShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
+      @group(0) @binding(1) var<uniform> albedo : vec3f;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let L        = -normalize(lightDirection);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
+        return FragmentOutput(
+          vec4f(albedo * lighting, 1),             // no direct — all lighting via GI
+          vec4f(0, 0, 0, 1),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(albedo, 0.0)
+        );
+      }
+    `;
+
+     // ── Colored wall shader (takes albedo as uniform) ─────────────────────
+     const floorShader = vertexBlock + /* wgsl */`
       #include <shadows>
 
       @group(0) @binding(1) var<uniform> albedo : vec3f;
@@ -146,9 +174,20 @@
       });
     }
 
+    function makeFloorMat(r, g, b) {
+      const albedo = new Vector3(r, g, b);
+      return new Material(floorShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedo },
+        ],
+      });
+    }
+
     const whiteMat = makeMat(0.85, 0.85, 0.85);
     const redMat   = makeMat(0.85, 0.12, 0.08);
     const greenMat = makeMat(0.12, 0.85, 0.15);
+    const floorMat = makeFloorMat(0.5, 0.5, 0.5);
 
     // ── Geometry ──────────────────────────────────────────────────────────
     const wallGeo   = new BoxGeometry(WALL, WALL, THICK);
@@ -159,7 +198,7 @@
       const m = new PathTracerMaterial();
       m.albedo = [r, g, b];
       m.roughness = 1.0;
-      m.maxBounces = 20;
+      m.maxBounces = 2;
       m.refractive = false;
       return m;
     }
@@ -167,10 +206,10 @@
     // ── Build Cornell box ─────────────────────────────────────────────────
 
     // Floor
-    const floor = new Renderable(wallGeo, whiteMat);
+    const floor = new Renderable(wallGeo, floorMat);
     floor.position.set(0, 0, 0);
     floor.rotation.x = -Math.PI / 2;
-    floor.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    floor.pathTracerMaterial = makePTMat(0.5, 0.5, 0.5);
     scene.add(floor);
 
     // Ceiling
@@ -208,7 +247,7 @@
     const lightPTMat = new PathTracerMaterial();
     lightPTMat.albedo = [1, 1, 1];
     lightPTMat.emissive = [1.0, 0.95, 0.8];
-    lightPTMat.emissiveIntensity = 5.0;
+    lightPTMat.emissiveIntensity = 50.0;
     lightPanel.pathTracerMaterial = lightPTMat;
     scene.add(lightPanel);
 
@@ -221,8 +260,9 @@
     // ── Path tracer effect ────────────────────────────────────────────────
     const pathTracerEffect = new PathTracerEffect({
       scene,
-      temporalBlend: 1.0, // DEBUG: instant feedback, no temporal accumulation
-      spatialPasses: 0,
+      temporalBlend: 0.1,
+      spatialPasses: 3,
+      spp: 4,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
@@ -232,7 +272,9 @@
 
     const ptFolder = pane.addFolder({ title: 'Path Tracer' });
     ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
-    ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 5, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 9, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'spp', { min: 1, max: 16, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'useBlueNoise');
 
     const areaLightParams = {
       intensity: areaLight.intensity,
@@ -241,7 +283,7 @@
       targetZ: areaLight.target.z,
     };
     const alFolder = pane.addFolder({ title: 'Area Light (GI)' });
-    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 20, step: 0.1 }).on('change', () => {
+    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 60, step: 0.1 }).on('change', () => {
       areaLight.intensity = areaLightParams.intensity;
     });
     const updateTarget = () => {
@@ -257,6 +299,7 @@
       shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
       sphere.position.x = Math.sin(performance.now() * 0.001) * 3;
+      sphere.position.y = Math.cos(performance.now() * 0.001) * 3 + 3.5;
       requestAnimationFrame(animate);
     }
     requestAnimationFrame(animate);

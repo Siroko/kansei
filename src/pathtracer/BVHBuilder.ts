@@ -80,6 +80,9 @@ export class BVHBuilder {
     private _instanceStaging: Float32Array | null = null;
     private _instanceCapacity: number = 0;
 
+    // Track instance count for TLAS structure rebuild
+    private _lastTLASInstanceCount: number = 0;
+
     // Instance stride: 28 floats/u32 = 112 bytes per instance
     // transform(3*vec4f) + invTransform(3*vec4f) + 4 u32 metadata
     static readonly INSTANCE_STRIDE = 28;
@@ -191,12 +194,15 @@ export class BVHBuilder {
     /**
      * Build TLAS from current instance transforms.
      * Called every frame to account for moving objects.
+     *
+     * Approach: CPU builds a balanced binary tree structure (child pointers only)
+     * once when instance count changes. GPU fills leaf AABBs from instance
+     * transforms, then merges internal AABBs bottom-up in ceil(log2(N)) passes.
      */
     public buildTLAS(commandEncoder: GPUCommandEncoder, scene: Scene): void {
         const objects = scene.getOrderedObjects();
         if (objects.length === 0) return;
 
-        this._ensureBLASPipelines();
         this._ensureTLASPipelines();
 
         // Pack instance data to GPU buffer (reuses buffer if same size)
@@ -205,362 +211,84 @@ export class BVHBuilder {
         const count = this._totalInstances;
         if (count === 0) return;
 
-        // CPU flat TLAS: bypasses GPU construction for correctness debugging.
-        // Builds a right-skewed binary tree that linearly checks all instances.
-        this._buildCPUFlatTLAS(objects);
-        return;
-
-        const nodeCount = 2 * count - 1;
-        const workgroupCount = Math.ceil(count / 256);
-
-        // --- Step 1: Compute instance world-space centroids on GPU ---
-        const centroidsBuffer = this._device.createBuffer({
-            label: 'TLAS/Centroids',
-            size: count * 16,
-            usage: GPUBufferUsage.STORAGE,
-        });
-
-        const aabbParams = new Uint32Array([count, 0, 0, 0]);
-        this._device.queue.writeBuffer(this._instanceAABBParamsBuf!, 0, aabbParams);
-
-        const aabbBG = this._device.createBindGroup({
-            layout: this._instanceAABBBGL!,
-            entries: [
-                { binding: 0, resource: { buffer: this._instanceBuffer! } },
-                { binding: 1, resource: { buffer: this._blasNodeBuffer! } },
-                { binding: 2, resource: { buffer: centroidsBuffer } },
-                { binding: 3, resource: { buffer: this._instanceAABBParamsBuf! } },
-            ],
-        });
-
-        const aabbPass = commandEncoder.beginComputePass({ label: 'TLAS/InstanceAABB' });
-        aabbPass.setPipeline(this._instanceAABBPipeline!);
-        aabbPass.setBindGroup(0, aabbBG);
-        aabbPass.dispatchWorkgroups(workgroupCount);
-        aabbPass.end();
-
-        // --- Step 2: Morton codes from instance centroids ---
-        this._computeInstanceWorldBounds(objects);
-        const extX = this._sceneMax[0] - this._sceneMin[0];
-        const extY = this._sceneMax[1] - this._sceneMin[1];
-        const extZ = this._sceneMax[2] - this._sceneMin[2];
-        const mortonParams = new Float32Array(8);
-        const mortonParamsU32 = new Uint32Array(mortonParams.buffer);
-        mortonParamsU32[0] = count;
-        mortonParams[1] = this._sceneMin[0];
-        mortonParams[2] = this._sceneMin[1];
-        mortonParams[3] = this._sceneMin[2];
-        mortonParams[4] = extX > 0 ? 1.0 / extX : 1.0;
-        mortonParams[5] = extY > 0 ? 1.0 / extY : 1.0;
-        mortonParams[6] = extZ > 0 ? 1.0 / extZ : 1.0;
-        mortonParamsU32[7] = 0;
-        this._device.queue.writeBuffer(this._mortonParamsBuf!, 0, mortonParams);
-
-        // Double-buffered morton keys/vals
-        const mortonKeysA = this._device.createBuffer({ label: 'TLAS/MortonKeysA', size: count * 4, usage: GPUBufferUsage.STORAGE });
-        const mortonValsA = this._device.createBuffer({ label: 'TLAS/MortonValsA', size: count * 4, usage: GPUBufferUsage.STORAGE });
-        const mortonKeysB = this._device.createBuffer({ label: 'TLAS/MortonKeysB', size: count * 4, usage: GPUBufferUsage.STORAGE });
-        const mortonValsB = this._device.createBuffer({ label: 'TLAS/MortonValsB', size: count * 4, usage: GPUBufferUsage.STORAGE });
-
-        const mortonBG = this._device.createBindGroup({
-            layout: this._mortonBGL!,
-            entries: [
-                { binding: 0, resource: { buffer: centroidsBuffer } },
-                { binding: 1, resource: { buffer: mortonKeysA } },
-                { binding: 2, resource: { buffer: mortonValsA } },
-                { binding: 3, resource: { buffer: this._mortonParamsBuf! } },
-            ],
-        });
-
-        const mortonPass = commandEncoder.beginComputePass({ label: 'TLAS/Morton' });
-        mortonPass.setPipeline(this._mortonPipeline!);
-        mortonPass.setBindGroup(0, mortonBG);
-        mortonPass.dispatchWorkgroups(workgroupCount);
-        mortonPass.end();
-
-        // --- Step 3: Radix sort ---
-        const histogramBuffer = this._device.createBuffer({
-            label: 'TLAS/Histograms',
-            size: 16 * workgroupCount * 4,
-            usage: GPUBufferUsage.STORAGE,
-        });
-
-        const tlasBufPairs = [
-            { keys: mortonKeysA, vals: mortonValsA },
-            { keys: mortonKeysB, vals: mortonValsB },
-        ];
-
-        const tlasSortParamsBufs: GPUBuffer[] = [];
-        for (let pass = 0; pass < 8; pass++) {
-            const src = tlasBufPairs[pass & 1];
-            const dst = tlasBufPairs[(pass + 1) & 1];
-            const bitOffset = pass * 4;
-
-            const passSortParamsBuf = this._device.createBuffer({
-                label: `TLAS/SortParams/Pass${pass}`, size: 16,
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            });
-            const sortParams = new Uint32Array([count, bitOffset, workgroupCount, 0]);
-            this._device.queue.writeBuffer(passSortParamsBuf, 0, sortParams);
-            tlasSortParamsBufs.push(passSortParamsBuf);
-
-            const sortBG = this._device.createBindGroup({
-                layout: this._sortBGL!,
-                entries: [
-                    { binding: 0, resource: { buffer: src.keys } },
-                    { binding: 1, resource: { buffer: src.vals } },
-                    { binding: 2, resource: { buffer: dst.keys } },
-                    { binding: 3, resource: { buffer: dst.vals } },
-                    { binding: 4, resource: { buffer: histogramBuffer } },
-                    { binding: 5, resource: { buffer: passSortParamsBuf } },
-                ],
-            });
-
-            const histPass = commandEncoder.beginComputePass();
-            histPass.setPipeline(this._sortHistogramPipeline!);
-            histPass.setBindGroup(0, sortBG);
-            histPass.dispatchWorkgroups(workgroupCount);
-            histPass.end();
-
-            const prefixPass = commandEncoder.beginComputePass();
-            prefixPass.setPipeline(this._sortPrefixPipeline!);
-            prefixPass.setBindGroup(0, sortBG);
-            prefixPass.dispatchWorkgroups(1);
-            prefixPass.end();
-
-            const scatterPass = commandEncoder.beginComputePass();
-            scatterPass.setPipeline(this._sortScatterPipeline!);
-            scatterPass.setBindGroup(0, sortBG);
-            scatterPass.dispatchWorkgroups(workgroupCount);
-            scatterPass.end();
+        // Rebuild balanced tree structure when instance count changes
+        if (count !== this._lastTLASInstanceCount) {
+            this._buildBalancedTLASStructure(count);
+            this._lastTLASInstanceCount = count;
         }
 
-        const sortedKeys = tlasBufPairs[0].keys;
-        const sortedVals = tlasBufPairs[0].vals;
-
-        // --- Step 4: Karras tree build ---
-        const tlasNodeBuffer = this._device.createBuffer({
-            label: 'TLAS/Nodes',
-            size: nodeCount * 32,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        const parentsBuffer = this._device.createBuffer({
-            label: 'TLAS/Parents',
-            size: nodeCount * 4,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-
-        const treeBuildParams = new Uint32Array([count, 0, 0, 0]);
-        this._device.queue.writeBuffer(this._treeBuildParamsBuf!, 0, treeBuildParams);
-
-        const treeBuildBG = this._device.createBindGroup({
-            layout: this._treeBuildBGL!,
-            entries: [
-                { binding: 0, resource: { buffer: sortedKeys } },
-                { binding: 1, resource: { buffer: tlasNodeBuffer } },
-                { binding: 2, resource: { buffer: parentsBuffer } },
-                { binding: 3, resource: { buffer: this._treeBuildParamsBuf! } },
-            ],
-        });
-
-        const treePass = commandEncoder.beginComputePass({ label: 'TLAS/TreeBuild' });
-        treePass.setPipeline(this._treeBuildPipeline!);
-        treePass.setBindGroup(0, treeBuildBG);
-        treePass.dispatchWorkgroups(Math.ceil((count - 1) / 256));
-        treePass.end();
-
-        // --- Step 5: Multi-pass TLAS refit (no atomics — separate passes for memory ordering) ---
+        // Upload params
         const tlasRefitParams = new Uint32Array([count, 0, 0, 0]);
         this._device.queue.writeBuffer(this._tlasRefitParamsBuf!, 0, tlasRefitParams);
 
         const tlasRefitBG = this._device.createBindGroup({
             layout: this._tlasRefitBGL!,
             entries: [
-                { binding: 0, resource: { buffer: tlasNodeBuffer } },
+                { binding: 0, resource: { buffer: this._tlasNodeBuffer! } },
                 { binding: 1, resource: { buffer: this._instanceBuffer! } },
                 { binding: 2, resource: { buffer: this._blasNodeBuffer! } },
                 { binding: 3, resource: { buffer: this._tlasRefitParamsBuf! } },
-                { binding: 4, resource: { buffer: sortedVals } },
             ],
         });
 
-        // Pass A: Initialize leaf bounds
-        const leafPass = commandEncoder.beginComputePass({ label: 'TLAS/Refit/Leaves' });
+        // GPU Pass 1: Fill leaf AABBs from instance transforms + BLAS root bounds
+        const leafWG = Math.ceil(count / 256);
+        const leafPass = commandEncoder.beginComputePass({ label: 'TLAS/InitLeaves' });
         leafPass.setPipeline(this._tlasRefitLeafPipeline!);
         leafPass.setBindGroup(0, tlasRefitBG);
-        leafPass.dispatchWorkgroups(workgroupCount);
+        leafPass.dispatchWorkgroups(leafWG);
         leafPass.end();
 
-        // Passes B: Merge internal nodes bottom-up (ceil(log2(N)) passes)
-        // Each separate compute pass has an implicit memory barrier in WebGPU,
-        // guaranteeing child bounds are visible before parents read them.
-        const mergePasses = count - 1;
-        for (let i = 0; i < mergePasses; i++) {
-            const mergePass = commandEncoder.beginComputePass({ label: `TLAS/Refit/Merge/${i}` });
-            mergePass.setPipeline(this._tlasRefitMergePipeline!);
-            mergePass.setBindGroup(0, tlasRefitBG);
-            mergePass.dispatchWorkgroups(workgroupCount);
-            mergePass.end();
+        // GPU Pass 2+: Merge internal node AABBs bottom-up.
+        // Each compute pass has an implicit memory barrier in WebGPU,
+        // so child bounds are visible before parents read them.
+        // ceil(log2(N)) passes covers the full balanced tree depth.
+        if (count > 1) {
+            const mergeCount = Math.ceil(Math.log2(count));
+            const mergeWG = Math.ceil((count - 1) / 256);
+            for (let i = 0; i < mergeCount; i++) {
+                const mergePass = commandEncoder.beginComputePass({ label: `TLAS/Merge/${i}` });
+                mergePass.setPipeline(this._tlasRefitMergePipeline!);
+                mergePass.setBindGroup(0, tlasRefitBG);
+                mergePass.dispatchWorkgroups(mergeWG);
+                mergePass.end();
+            }
         }
-
-        // Store TLAS node buffer
-        this._tlasNodeBuffer?.destroy();
-        this._tlasNodeBuffer = tlasNodeBuffer;
-
-        // Defer scratch buffer destruction
-        this._pendingScratchBuffers.push(
-            centroidsBuffer, mortonKeysA, mortonValsA, mortonKeysB, mortonValsB,
-            parentsBuffer, histogramBuffer, ...tlasSortParamsBufs,
-        );
     }
 
     /**
-     * Build a trivial single-node TLAS for scenes with exactly one instance.
+     * Build a balanced binary tree structure for the TLAS on CPU.
+     * Only sets child pointers — GPU fills AABBs via initLeaves + mergeNodes.
+     * Layout: internal nodes [0..N-2], leaf nodes [N-1..2N-2].
      */
-    private _buildSingleInstanceTLAS(): void {
-        const nodeData = new Float32Array(8);
-        const nodeDataI32 = new Int32Array(nodeData.buffer);
-        nodeData[0] = -1e30; nodeData[1] = -1e30; nodeData[2] = -1e30;
-        nodeDataI32[3] = -1; // leaf encoding instance 0
-        nodeData[4] = 1e30;  nodeData[5] = 1e30;  nodeData[6] = 1e30;
-        nodeDataI32[7] = -1;
+    private _buildBalancedTLASStructure(N: number): void {
+        const nodeCount = 2 * N - 1;
+        const buf = new ArrayBuffer(nodeCount * 32);
+        const i32 = new Int32Array(buf);
+
+        if (N === 1) {
+            // Single leaf at index 0 — initLeaves handles it
+        } else {
+            let nextInternal = 0;
+            const buildNode = (indices: number[]): number => {
+                if (indices.length === 1) {
+                    return (N - 1) + indices[0]; // leaf index
+                }
+                const myIdx = nextInternal++;
+                const mid = Math.floor(indices.length / 2);
+                const left = buildNode(indices.slice(0, mid));
+                const right = buildNode(indices.slice(mid));
+                const off = myIdx * 8; // 8 int32/float32 per node
+                i32[off + 3] = left;   // leftChild
+                i32[off + 7] = right;  // rightChild
+                return myIdx;
+            };
+            buildNode(Array.from({ length: N }, (_, i) => i));
+        }
 
         this._tlasNodeBuffer?.destroy();
         this._tlasNodeBuffer = this._device.createBuffer({
             label: 'TLAS/Nodes',
-            size: 32,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        this._device.queue.writeBuffer(this._tlasNodeBuffer, 0, nodeData);
-    }
-
-    /**
-     * Build a flat TLAS on the CPU for debugging.
-     * Creates a right-skewed binary tree: each internal node has a leaf on the right
-     * and the next internal node on the left, ensuring all instances are checked.
-     *
-     * Tree layout for N instances:
-     *   Internal nodes: 0..N-2   (N-1 nodes)
-     *   Leaf nodes:     N-1..2N-2 (N nodes)
-     *   Node 0 (root): left=1 (next internal), right=N-1 (leaf for instance 0)
-     *   Node i:         left=i+1,              right=N-1+i (leaf for instance i)
-     *   Node N-2:       left=2N-2 (last leaf),  right=N-1+N-2 (second-to-last leaf)
-     */
-    private _buildCPUFlatTLAS(objects: Renderable[]): void {
-        const N = this._totalInstances;
-        const nodeCount = 2 * N - 1;
-        // BVHNode = 32 bytes: boundsMin(vec3f) + leftChild(i32) + boundsMax(vec3f) + rightChild(i32)
-        const buf = new ArrayBuffer(nodeCount * 32);
-        const f32 = new Float32Array(buf);
-        const i32 = new Int32Array(buf);
-
-        // Compute world-space AABBs for each instance
-        const aabbs: { min: number[]; max: number[] }[] = [];
-        for (let i = 0; i < N; i++) {
-            const obj = objects[i];
-            const m = obj.worldMatrix.internalMat4;
-
-            // Get BLAS root bounds (local space)
-            const geom = obj.geometry.isInstancedGeometry
-                ? ((obj.geometry as any).geometry ?? obj.geometry)
-                : obj.geometry;
-            const blasKey = this._geomToBLASKey.get(geom);
-            const blasEntry = blasKey ? this._blasEntries.get(blasKey) : undefined;
-            if (!blasEntry) {
-                aabbs.push({ min: [-1, -1, -1], max: [1, 1, 1] });
-                continue;
-            }
-
-            // Read BLAS root AABB from the CPU-side data
-            // We'll just compute from the geometry vertices directly
-            const verts = geom.vertices!;
-            const indices = geom.indices!;
-            const VERT_STRIDE = 9;
-            let lmin = [Infinity, Infinity, Infinity];
-            let lmax = [-Infinity, -Infinity, -Infinity];
-            for (let vi = 0; vi < indices.length; vi++) {
-                const idx = indices[vi];
-                const x = verts[idx * VERT_STRIDE + 0];
-                const y = verts[idx * VERT_STRIDE + 1];
-                const z = verts[idx * VERT_STRIDE + 2];
-                lmin[0] = Math.min(lmin[0], x); lmin[1] = Math.min(lmin[1], y); lmin[2] = Math.min(lmin[2], z);
-                lmax[0] = Math.max(lmax[0], x); lmax[1] = Math.max(lmax[1], y); lmax[2] = Math.max(lmax[2], z);
-            }
-
-            // Transform 8 corners to world space
-            let wmin = [Infinity, Infinity, Infinity];
-            let wmax = [-Infinity, -Infinity, -Infinity];
-            for (let c = 0; c < 8; c++) {
-                const lx = (c & 1) ? lmax[0] : lmin[0];
-                const ly = (c & 2) ? lmax[1] : lmin[1];
-                const lz = (c & 4) ? lmax[2] : lmin[2];
-                // Forward transform: row-major dot products
-                const wx = m[0]*lx + m[4]*ly + m[8]*lz + m[12];
-                const wy = m[1]*lx + m[5]*ly + m[9]*lz + m[13];
-                const wz = m[2]*lx + m[6]*ly + m[10]*lz + m[14];
-                wmin[0] = Math.min(wmin[0], wx); wmin[1] = Math.min(wmin[1], wy); wmin[2] = Math.min(wmin[2], wz);
-                wmax[0] = Math.max(wmax[0], wx); wmax[1] = Math.max(wmax[1], wy); wmax[2] = Math.max(wmax[2], wz);
-            }
-            aabbs.push({ min: wmin, max: wmax });
-        }
-
-        // Write leaf nodes [N-1 .. 2N-2]
-        for (let i = 0; i < N; i++) {
-            const nodeIdx = (N - 1) + i;
-            const off = nodeIdx * 8; // 8 floats per node
-            f32[off + 0] = aabbs[i].min[0];
-            f32[off + 1] = aabbs[i].min[1];
-            f32[off + 2] = aabbs[i].min[2];
-            i32[off + 3] = -(i + 1); // leaf encoding: -(instanceIndex + 1)
-            f32[off + 4] = aabbs[i].max[0];
-            f32[off + 5] = aabbs[i].max[1];
-            f32[off + 6] = aabbs[i].max[2];
-            i32[off + 7] = -1;
-        }
-
-        // Write internal nodes [0 .. N-2]
-        // Right-skewed: node i → left = leaf(i), right = node(i+1) or leaf(N-1) for last
-        for (let i = 0; i < N - 1; i++) {
-            const off = i * 8;
-            const leafIdx = (N - 1) + i; // leaf for instance i
-
-            let leftIdx: number;
-            let rightIdx: number;
-            if (i < N - 2) {
-                leftIdx = leafIdx;      // leaf
-                rightIdx = i + 1;       // next internal node
-            } else {
-                // Last internal node: two leaves
-                leftIdx = leafIdx;              // leaf for instance N-2
-                rightIdx = (N - 1) + (N - 1);  // leaf for instance N-1
-            }
-
-            // Compute merged AABB from all descendants
-            // For simplicity, just use scene-wide bounds for internal nodes
-            let imin = [Infinity, Infinity, Infinity];
-            let imax = [-Infinity, -Infinity, -Infinity];
-            for (let j = i; j < N; j++) {
-                imin[0] = Math.min(imin[0], aabbs[j].min[0]);
-                imin[1] = Math.min(imin[1], aabbs[j].min[1]);
-                imin[2] = Math.min(imin[2], aabbs[j].min[2]);
-                imax[0] = Math.max(imax[0], aabbs[j].max[0]);
-                imax[1] = Math.max(imax[1], aabbs[j].max[1]);
-                imax[2] = Math.max(imax[2], aabbs[j].max[2]);
-            }
-
-            f32[off + 0] = imin[0];
-            f32[off + 1] = imin[1];
-            f32[off + 2] = imin[2];
-            i32[off + 3] = leftIdx;
-            f32[off + 4] = imax[0];
-            f32[off + 5] = imax[1];
-            f32[off + 6] = imax[2];
-            i32[off + 7] = rightIdx;
-        }
-
-        this._tlasNodeBuffer?.destroy();
-        this._tlasNodeBuffer = this._device.createBuffer({
-            label: 'TLAS/Nodes/CPUFlat',
             size: nodeCount * 32,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
@@ -997,38 +725,6 @@ export class BVHBuilder {
     }
 
     /**
-     * Compute world-space bounds from instance positions for TLAS morton codes.
-     */
-    private _computeInstanceWorldBounds(objects: Renderable[]): void {
-        let minX = Infinity, minY = Infinity, minZ = Infinity;
-        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-        for (const obj of objects) {
-            const m = obj.worldMatrix.internalMat4;
-            const tx = m[12], ty = m[13], tz = m[14];
-            minX = Math.min(minX, tx);
-            minY = Math.min(minY, ty);
-            minZ = Math.min(minZ, tz);
-            maxX = Math.max(maxX, tx);
-            maxY = Math.max(maxY, ty);
-            maxZ = Math.max(maxZ, tz);
-        }
-
-        if (!isFinite(minX)) {
-            minX = minY = minZ = 0;
-            maxX = maxY = maxZ = 1;
-        }
-
-        const eps = 0.001;
-        if (maxX - minX < eps) { minX -= eps; maxX += eps; }
-        if (maxY - minY < eps) { minY -= eps; maxY += eps; }
-        if (maxZ - minZ < eps) { minZ -= eps; maxZ += eps; }
-
-        this._sceneMin = [minX, minY, minZ];
-        this._sceneMax = [maxX, maxY, maxZ];
-    }
-
-    /**
      * Lazily create GPU compute pipelines for TLAS construction.
      */
     private _ensureTLASPipelines(): void {
@@ -1064,7 +760,6 @@ export class BVHBuilder {
                 { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // instances
                 { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // blasNodes
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },          // params
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedIndices
             ],
         });
         const tlasRefitModule = this._device.createShaderModule({ code: tlasRefitShader });

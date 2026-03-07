@@ -20,6 +20,7 @@ struct TemporalParams {
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let coord = vec2i(gid.xy);
     let size = vec2f(params.width, params.height);
+    let isize = vec2i(i32(params.width), i32(params.height));
     if (f32(gid.x) >= params.width || f32(gid.y) >= params.height) { return; }
 
     let current = textureLoad(currentGI, coord, 0);
@@ -31,44 +32,61 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    // Reconstruct world position from current depth
+    // ── Neighborhood statistics (3×3) for color clamping ──
+    // This prevents ghosting from moving objects: history samples outside
+    // the current neighborhood range are clamped before blending.
+    var nMin = current.rgb;
+    var nMax = current.rgb;
+    var nMean = vec3f(0.0);
+    var nCount = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let nc = coord + vec2i(dx, dy);
+            if (nc.x < 0 || nc.x >= isize.x || nc.y < 0 || nc.y >= isize.y) { continue; }
+            let s = textureLoad(currentGI, nc, 0).rgb;
+            nMin = min(nMin, s);
+            nMax = max(nMax, s);
+            nMean += s;
+            nCount += 1.0;
+        }
+    }
+    nMean /= nCount;
+
+    // Widen the clamp box slightly around the mean to allow some convergence
+    let nExtent = nMax - nMin;
+    let clampMin = nMin - nExtent * 0.1;
+    let clampMax = nMax + nExtent * 0.1;
+
+    // ── Reproject to previous frame ──
     let uv = (vec2f(gid.xy) + 0.5) / size;
     let ndc = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
     let wp = params.currentInvViewProj * ndc;
     let worldPos = wp.xyz / wp.w;
 
-    // Reproject to previous frame
     let prevClip = params.prevViewProj * vec4f(worldPos, 1.0);
     let prevNDC = prevClip.xyz / prevClip.w;
     let prevUV = vec2f(prevNDC.x * 0.5 + 0.5, 1.0 - (prevNDC.y * 0.5 + 0.5));
 
-    // Check if reprojected UV is in bounds
-    if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0) {
-        textureStore(outputGI, vec2u(gid.xy), current);
-        return;
-    }
-
-    // Sample history
-    let history = textureSampleLevel(historyGI, historySamp, prevUV, 0.0);
-
-    // Disocclusion rejection based on normal consistency
-    let currentNormal = textureLoad(normalTex, coord, 0).xyz * 2.0 - 1.0;
-    let prevCoord = vec2i(vec2f(prevUV) * size);
-    let prevNormal = textureLoad(normalTex, prevCoord, 0).xyz * 2.0 - 1.0;
-    let normalDot = dot(normalize(currentNormal), normalize(prevNormal));
-
-    // Reject history if normals diverge significantly
+    // Out-of-bounds or first frame → use current only
     var blend = params.blendFactor;
-    if (normalDot < 0.8) {
-        blend = 1.0; // reject history
+    if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0) {
+        blend = 1.0;
     }
-
-    // First frame has no valid history
     if (params.frameIndex == 0u) {
         blend = 1.0;
     }
 
-    let result = mix(history, current, blend);
+    // Sample history with bilinear filtering
+    let history = textureSampleLevel(historyGI, historySamp, prevUV, 0.0);
+
+    // Clamp history to current neighborhood range (anti-ghosting)
+    let clamped = vec4f(clamp(history.rgb, clampMin, clampMax), 1.0);
+
+    // Increase blend toward current when history was clamped significantly
+    let clampDist = length(history.rgb - clamped.rgb);
+    let adaptiveBlend = max(blend, saturate(clampDist * 0.5));
+
+    let result = mix(clamped, current, adaptiveBlend);
     textureStore(outputGI, vec2u(gid.xy), result);
 }
 `;
