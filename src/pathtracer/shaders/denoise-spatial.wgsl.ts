@@ -44,6 +44,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
+    // Refractive pixels — pass through unfiltered (alpha = 0)
+    if (centerColor.a < 0.5) {
+        textureStore(outputGI, vec2u(gid.xy), centerColor);
+        return;
+    }
+
     var sumColor = vec3f(0.0);
     var sumWeight = 0.0;
     let step = i32(params.stepSize);
@@ -62,6 +68,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let kernelWeight = KERNEL_5x5[kernelIdx];
 
             let sampleColor = textureLoad(inputGI, sampleCoord, 0);
+            // Skip refractive neighbor samples — don't bleed into opaque
+            if (sampleColor.a < 0.5) { continue; }
             let sampleDepth = textureLoad(depthTex, vec2u(sampleCoord), 0);
             let sampleNormal = normalize(textureLoad(normalTex, sampleCoord, 0).xyz * 2.0 - 1.0);
             let sampleLum = luminance(sampleColor.rgb);

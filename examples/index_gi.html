@@ -33,6 +33,7 @@
     import { AreaLight } from '../src/lights/AreaLight'
     import { ShadowMap } from '../src/shadows/ShadowMap'
     import { Float } from '../src/math/Float'
+    import { GLTFLoader } from '../src/loaders/GLTFLoader'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Cornell box dimensions ────────────────────────────────────────────
@@ -47,7 +48,7 @@
     const lightDirUniform = new Vector3(0, -1, 0.0);
 
     // Area light — drives all path tracer GI
-    const areaLight = new AreaLight([1.0, 0.95, 0.8], 5.0, [3, 3]);
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
     areaLight.position.set(0, WALL - 0.2, 0);
     areaLight.target.set(0, 0, 0); // faces down toward floor center
 
@@ -105,12 +106,12 @@
           vec4f(albedo * lighting, 1),             // no direct — all lighting via GI
           vec4f(0, 0, 0, 1),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
-          vec4f(albedo, 0.0)
+          vec4f(albedo, 1.0)
         );
       }
     `;
 
-     // ── Colored wall shader (takes albedo as uniform) ─────────────────────
+     // ── Floor shader (black direct, opaque) ─────────────────────────────────
      const floorShader = vertexBlock + /* wgsl */`
       #include <shadows>
 
@@ -125,15 +126,33 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
-        let L        = -normalize(lightDirection);
-        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
-        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
         return FragmentOutput(
-          vec4f(0, 0, 0, 1),             // no direct — all lighting via GI
+          vec4f(0, 0, 0, 1),
           vec4f(0, 0, 0, 1),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
-          vec4f(albedo, 0.0)
+          vec4f(albedo, 1.0)
+        );
+      }
+    `;
+
+    // ── Glass shader (refractive flag via albedo alpha = 0) ────────────────
+    const glassShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        return FragmentOutput(
+          vec4f(0, 0, 0, 1),
+          vec4f(0, 0, 0, 1),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(1, 1, 1, 0.0)
         );
       }
     `;
@@ -142,7 +161,7 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 1,
+      devicePixelRatio: 0.75,
       antialias: true,
       sampleCount: 1
     });
@@ -198,7 +217,7 @@
       const m = new PathTracerMaterial();
       m.albedo = [r, g, b];
       m.roughness = 1.0;
-      m.maxBounces = 2;
+      m.maxBounces = 1;
       m.refractive = false;
       return m;
     }
@@ -251,18 +270,52 @@
     lightPanel.pathTracerMaterial = lightPTMat;
     scene.add(lightPanel);
 
-    // ── Sphere ────────────────────────────────────────────────────────────
-    const sphere = new Renderable(sphereGeo, whiteMat);
-    sphere.position.set(0, 1.5, 0);
-    sphere.pathTracerMaterial = makePTMat(0.9, 0.9, 0.9);
+    // ── Sphere (glass) ─────────────────────────────────────────────────────
+    const glassRasterMat = new Material(glassShader, {
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+      ],
+    });
+    const sphere = new Renderable(sphereGeo, glassRasterMat);
+    sphere.position.set(0, 1.5, 5);
+    const glassMat = new PathTracerMaterial();
+    glassMat.albedo = [1, 1, 1];
+    glassMat.roughness = 0.0;
+    glassMat.refractive = true;
+    glassMat.ior = 1.5;
+    glassMat.maxBounces = 2;
+    glassMat.absorptionColor = [0.2, 0.5, 0.8];
+    glassMat.absorptionDensity = 0.3;
+    sphere.pathTracerMaterial = glassMat;
     scene.add(sphere);
+
+    // ── Cube ─────────────────────────────────────────────────────────────
+    const cubeGeo = new BoxGeometry(2, 2, 2);
+    const cube = new Renderable(cubeGeo, whiteMat);
+    cube.position.set(0, 1.5, 0);
+    cube.pathTracerMaterial = makePTMat(0.9, 0.9, 0.9);
+    scene.add(cube);
+
+    // ── GLTF Model ──────────────────────────────────────────────────────
+    const gltfLoader = new GLTFLoader();
+    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', whiteMat);
+    gltf.scene.scale.set(30, 30, 30);
+    gltf.scene.position.set(0, 3, 0);
+    // Assign path tracer material to all loaded meshes
+    gltf.scene.traverse(gltf.scene, (obj) => {
+      if (obj.isRenderable) {
+        obj.pathTracerMaterial = makePTMat(0.5, 0.5, 0.5);
+      }
+    });
+    scene.add(gltf.scene);
 
     // ── Path tracer effect ────────────────────────────────────────────────
     const pathTracerEffect = new PathTracerEffect({
       scene,
-      temporalBlend: 0.1,
-      spatialPasses: 3,
-      spp: 4,
+      temporalBlend: 1,
+      spatialPasses: 0,
+      spp: 1,
+      useBlueNoise: false,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
@@ -275,6 +328,7 @@
     ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 9, step: 1 });
     ptFolder.addBinding(pathTracerEffect, 'spp', { min: 1, max: 16, step: 1 });
     ptFolder.addBinding(pathTracerEffect, 'useBlueNoise');
+    ptFolder.addBinding(pathTracerEffect, 'fixedSeed');
 
     const areaLightParams = {
       intensity: areaLight.intensity,
@@ -298,8 +352,14 @@
       cameraControls.update();
       shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
-      sphere.position.x = Math.sin(performance.now() * 0.001) * 3;
-      sphere.position.y = Math.cos(performance.now() * 0.001) * 3 + 3.5;
+      const t = performance.now() * 0.001;
+      sphere.position.x = Math.sin(t) * 3;
+      sphere.position.y = Math.cos(t) * 2 + 3.5;
+      cube.position.x = Math.sin(t + Math.PI) * 3;
+      cube.position.y = Math.cos(t + Math.PI) * 2 + 3.5;
+      cube.rotation.x = t * 0.7;
+      cube.rotation.y = t * 1.1;
+      cube.rotation.z = t * 0.5;
       requestAnimationFrame(animate);
     }
     requestAnimationFrame(animate);

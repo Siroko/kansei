@@ -18,6 +18,7 @@ export { Matrix4 } from "./math/Matrix4";
 export { BindableGroup } from "./materials/BindableGroup";
 export { Texture } from "./buffers/Texture";
 export { TextureLoader } from "./loaders/TextureLoader";
+export { GLTFLoader } from "./loaders/GLTFLoader";
 export { VideoTexture } from "./buffers/VideoTexture";
 export { Sampler } from "./buffers/Sampler";
 export { Compute } from "./materials/Compute";
