@@ -28,7 +28,11 @@ struct TraceParams {
     width       : u32,
     height      : u32,
     lightCount  : u32,
-    _pad        : u32,
+    spp         : u32,
+    useBlueNoise: u32,
+    _pad0       : u32,
+    _pad1       : u32,
+    _pad2       : u32,
 }
 
 const LIGHT_DIRECTIONAL = 1u;
@@ -56,17 +60,47 @@ struct LightData {
 @group(0) @binding(8)  var<storage, read> instances  : array<Instance>;
 @group(0) @binding(9)  var<storage, read> materials  : array<MaterialData>;
 @group(0) @binding(10) var<storage, read> sceneLights : array<LightData>;
+@group(0) @binding(11) var<storage, read> blueNoise   : array<f32>;
 
-// PCG hash for random number generation
+// ── Blue noise hybrid sampler ────────────────────────────────────────
+// First 8 dimensions use blue noise (spatially decorrelated, golden-ratio
+// animated per frame). Higher dimensions fall back to PCG.
+const BN_SIZE : u32 = 128u;
+const GOLDEN_RATIO : f32 = 0.6180339887;
+
+var<private> _bnPixel : vec2u;
+var<private> _bnFrame : u32;
+var<private> _bnDim   : u32;
+var<private> _rngState: u32;
+
 fn pcgHash(input: u32) -> u32 {
     var state = input * 747796405u + 2891336453u;
     let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
 
-fn randomFloat(state: ptr<function, u32>) -> f32 {
-    *state = pcgHash(*state);
-    return f32(*state) / 4294967295.0;
+fn initSampler(pixel: vec2u, frame: u32, sampleIdx: u32) {
+    _bnPixel = pixel;
+    _bnFrame = frame * 16u + sampleIdx; // unique temporal offset per sample
+    _bnDim = 0u;
+    _rngState = pcgHash(pixel.x + pixel.y * 9999u + _bnFrame * 1000003u);
+}
+
+fn nextRandom() -> f32 {
+    let dim = _bnDim;
+    _bnDim += 1u;
+
+    if (dim < 8u && traceParams.useBlueNoise != 0u) {
+        // Blue noise: per-dimension spatial offset (coprime to BN_SIZE) + temporal golden ratio
+        let px = (_bnPixel.x + dim * 17u) % BN_SIZE;
+        let py = (_bnPixel.y + dim * 31u) % BN_SIZE;
+        let bn = blueNoise[py * BN_SIZE + px];
+        return fract(bn + f32(_bnFrame) * GOLDEN_RATIO);
+    }
+
+    // PCG fallback for higher dimensions
+    _rngState = pcgHash(_rngState);
+    return f32(_rngState) / 4294967295.0;
 }
 
 // Robust orthonormal basis from normal (Duff et al. 2017, Frisvad 2012 revised)
@@ -134,9 +168,9 @@ fn evaluateDirectionalLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> 
     return light.color * light.intensity * nDotL;
 }
 
-fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData, rng: ptr<function, u32>) -> vec3f {
-    let lr1 = randomFloat(rng);
-    let lr2 = randomFloat(rng);
+fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
+    let lr1 = nextRandom();
+    let lr2 = nextRandom();
     let sizeX = light.extra.x;
     let sizeZ = light.extra.y;
 
@@ -201,7 +235,7 @@ fn evaluatePointLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f 
 
 // ── Evaluate all scene lights at a hit point ────────────────────────
 
-fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, rng: ptr<function, u32>) -> vec3f {
+fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
     var total = vec3f(0.0);
     let count = traceParams.lightCount;
     for (var i = 0u; i < count; i++) {
@@ -209,7 +243,7 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, rng: ptr<function, u32>) -> v
         if (light.lightType == LIGHT_DIRECTIONAL) {
             total += evaluateDirectionalLight(hitPos, hitNorm, light);
         } else if (light.lightType == LIGHT_AREA) {
-            total += evaluateAreaLight(hitPos, hitNorm, light, rng);
+            total += evaluateAreaLight(hitPos, hitNorm, light);
         } else if (light.lightType == LIGHT_POINT) {
             total += evaluatePointLight(hitPos, hitNorm, light);
         }
@@ -221,7 +255,6 @@ fn traceRefraction(
     inRay: Ray,
     firstHit: HitInfo,
     mat: MaterialData,
-    rng: ptr<function, u32>
 ) -> vec3f {
     var throughput = vec3f(1.0);
     var ray = inRay;
@@ -251,12 +284,12 @@ fn traceRefraction(
 
         let nextMat = materials[nextHit.matIndex];
         if ((u32(nextMat.flags) & 1u) == 0u) {
-            let lighting = evaluateLighting(nextHit.worldPos, nextHit.worldNorm, rng);
+            let lighting = evaluateLighting(nextHit.worldPos, nextHit.worldNorm);
             return throughput * lighting * nextMat.albedo;
         }
         currentHit = nextHit;
     }
-    _ = randomFloat(rng);
+    _ = nextRandom();
     return throughput * vec3f(0.0);
 }
 
@@ -284,55 +317,61 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let albedoData = textureLoad(albedoTex, coord, 0);
     let metallic = albedoData.a;
 
-    // RNG seed from pixel + frame
-    var rng = pcgHash(gid.x + gid.y * traceParams.width + traceParams.frameIndex * 1000003u);
+    let spp = traceParams.spp;
+    var accumulated = vec3f(0.0);
 
-    // Cosine-weighted hemisphere sample for indirect lighting
-    let r1 = randomFloat(&rng);
-    let r2 = randomFloat(&rng);
-    var ray: Ray;
-    ray.origin = worldPos + worldNormal * 0.001;
-    ray.dir = cosineSampleHemisphere(worldNormal, r1, r2);
+    for (var s = 0u; s < spp; s++) {
+        initSampler(coord, traceParams.frameIndex, s);
 
-    let hit = traceBVH(ray);
+        // Cosine-weighted hemisphere sample for indirect lighting
+        let r1 = nextRandom();
+        let r2 = nextRandom();
+        var ray: Ray;
+        ray.origin = worldPos + worldNormal * 0.001;
+        ray.dir = cosineSampleHemisphere(worldNormal, r1, r2);
 
-    var indirect = vec3f(0.0);
+        let hit = traceBVH(ray);
 
-    if (hit.hit) {
-        let mat = materials[hit.matIndex];
+        var indirect = vec3f(0.0);
 
-        if ((u32(mat.flags) & 1u) != 0u) {
-            indirect = traceRefraction(ray, hit, mat, &rng);
-        } else if (mat.emissiveIntensity > 0.0) {
-            indirect = mat.emissive * mat.emissiveIntensity;
-        } else {
-            let hitDirect = evaluateLighting(hit.worldPos, hit.worldNorm, &rng);
-            indirect = hitDirect * mat.albedo;
-        }
-    }
+        if (hit.hit) {
+            let mat = materials[hit.matIndex];
 
-    // Specular ray for metallic/glossy surfaces
-    if (metallic > 0.1 || roughness < 0.5) {
-        let sr1 = randomFloat(&rng);
-        let sr2 = randomFloat(&rng);
-        let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
-        let viewDir = normalize(traceParams.cameraPos - worldPos);
-        let specDir = reflect(-viewDir, halfVec);
-
-        if (dot(specDir, worldNormal) > 0.0) {
-            var specRay: Ray;
-            specRay.origin = worldPos + worldNormal * 0.001;
-            specRay.dir = specDir;
-            let specHit = traceBVH(specRay);
-            if (specHit.hit) {
-                let specMat = materials[specHit.matIndex];
-                let specLighting = evaluateLighting(specHit.worldPos, specHit.worldNorm, &rng);
-                let specular = specLighting * specMat.albedo;
-                indirect = mix(indirect, specular, metallic);
+            if ((u32(mat.flags) & 1u) != 0u) {
+                indirect = traceRefraction(ray, hit, mat);
+            } else if (mat.emissiveIntensity > 0.0) {
+                indirect = mat.emissive * mat.emissiveIntensity;
+            } else {
+                let hitDirect = evaluateLighting(hit.worldPos, hit.worldNorm);
+                indirect = hitDirect * mat.albedo;
             }
         }
+
+        // Specular ray for metallic/glossy surfaces
+        if (metallic > 0.1 || roughness < 0.5) {
+            let sr1 = nextRandom();
+            let sr2 = nextRandom();
+            let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
+            let viewDir = normalize(traceParams.cameraPos - worldPos);
+            let specDir = reflect(-viewDir, halfVec);
+
+            if (dot(specDir, worldNormal) > 0.0) {
+                var specRay: Ray;
+                specRay.origin = worldPos + worldNormal * 0.001;
+                specRay.dir = specDir;
+                let specHit = traceBVH(specRay);
+                if (specHit.hit) {
+                    let specMat = materials[specHit.matIndex];
+                    let specLighting = evaluateLighting(specHit.worldPos, specHit.worldNorm);
+                    let specular = specLighting * specMat.albedo;
+                    indirect = mix(indirect, specular, metallic);
+                }
+            }
+        }
+
+        accumulated += indirect;
     }
 
-    textureStore(giOutput, coord, vec4f(indirect, 1.0));
+    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), 1.0));
 }
 `;

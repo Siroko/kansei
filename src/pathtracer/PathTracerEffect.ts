@@ -3,6 +3,7 @@ import { Scene } from '../objects/Scene';
 import { GBuffer } from '../postprocessing/GBuffer';
 import { PostProcessingEffect } from '../postprocessing/PostProcessingEffect';
 import { BVHBuilder } from './BVHBuilder';
+import { generateBlueNoise } from './blue-noise';
 import { intersectionShader } from './shaders/intersection.wgsl';
 import { traversalShader } from './shaders/traversal.wgsl';
 import { traceShader } from './shaders/trace.wgsl';
@@ -17,6 +18,10 @@ export interface PathTracerOptions {
     temporalBlend?: number;
     /** Number of a-trous spatial denoise iterations. Default: 3 */
     spatialPasses?: number;
+    /** Samples per pixel per frame. Default: 1 */
+    spp?: number;
+    /** Use blue noise sampling (vs white noise). Default: true */
+    useBlueNoise?: boolean;
 }
 
 /** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
@@ -33,12 +38,15 @@ export class PathTracerEffect extends PostProcessingEffect {
     // Options
     private _temporalBlend: number;
     private _spatialPasses: number;
+    private _spp: number;
+    private _useBlueNoise: boolean;
 
     // Trace pipeline
     private _tracePipeline: GPUComputePipeline | null = null;
     private _traceBGL: GPUBindGroupLayout | null = null;
     private _traceParamsBuf: GPUBuffer | null = null;
     private _lightsBuffer: GPUBuffer | null = null;
+    private _blueNoiseBuffer: GPUBuffer | null = null;
 
     // Temporal denoise pipeline
     private _temporalPipeline: GPUComputePipeline | null = null;
@@ -80,6 +88,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._scene = options.scene;
         this._temporalBlend = options.temporalBlend ?? 0.1;
         this._spatialPasses = options.spatialPasses ?? 3;
+        this._spp = options.spp ?? 1;
+        this._useBlueNoise = options.useBlueNoise ?? true;
     }
 
     /** Access the BVH builder for external configuration. */
@@ -92,6 +102,14 @@ export class PathTracerEffect extends PostProcessingEffect {
     /** Number of à-trous spatial denoise iterations. */
     get spatialPasses(): number { return this._spatialPasses; }
     set spatialPasses(v: number) { this._spatialPasses = Math.max(0, Math.round(v)); }
+
+    /** Samples per pixel per frame. */
+    get spp(): number { return this._spp; }
+    set spp(v: number) { this._spp = Math.max(1, Math.round(v)); }
+
+    /** Use blue noise sampling (vs white noise). */
+    get useBlueNoise(): boolean { return this._useBlueNoise; }
+    set useBlueNoise(v: boolean) { this._useBlueNoise = v; }
 
     // ── PostProcessingEffect interface ────────────────────────────────────
 
@@ -109,6 +127,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             minFilter: 'linear',
         });
 
+        this._createBlueNoiseBuffer(device);
         this._createPipelines(device);
         this._createTextures(device, gbuffer.width, gbuffer.height);
         this._createParamBuffers(device);
@@ -195,6 +214,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._destroyTextures();
         this._traceParamsBuf?.destroy();
         this._lightsBuffer?.destroy();
+        this._blueNoiseBuffer?.destroy();
         this._temporalParamsBuf?.destroy();
         this._spatialParamsBuf?.destroy();
         this._compositeParamsBuf?.destroy();
@@ -204,6 +224,18 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._spatialPipeline = null;
         this._compositePipeline = null;
         this._device = null;
+    }
+
+    // ── Blue noise ─────────────────────────────────────────────────────────
+
+    private _createBlueNoiseBuffer(device: GPUDevice): void {
+        const data = generateBlueNoise(128);
+        this._blueNoiseBuffer = device.createBuffer({
+            label: 'PathTracer/BlueNoise',
+            size: data.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(this._blueNoiseBuffer, 0, data);
     }
 
     // ── Pipeline creation ─────────────────────────────────────────────────
@@ -224,6 +256,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },             // instances
                 { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },             // materials
                 { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // sceneLights
+                { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // blueNoise
             ],
         });
 
@@ -308,10 +341,10 @@ export class PathTracerEffect extends PostProcessingEffect {
     }
 
     private _createParamBuffers(device: GPUDevice): void {
-        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 4*u32(16) = 96
+        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 5*u32+3*pad(32) = 112
         this._traceParamsBuf = device.createBuffer({
             label: 'PathTracer/TraceParams',
-            size: 96,
+            size: 112,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -483,15 +516,17 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Pack lights into storage buffer
         const lightCount = this._packLights(device);
 
-        // TraceParams layout (96 bytes = 24 floats):
-        // invViewProj : mat4x4f  offset 0   (float[0..15])
-        // cameraPos   : vec3f    offset 64  (float[16..18])
-        // frameIndex  : u32      offset 76  (float[19])
-        // width       : u32      offset 80  (float[20])
-        // height      : u32      offset 84  (float[21])
-        // lightCount  : u32      offset 88  (float[22])
-        // _pad        : u32      offset 92  (float[23])
-        const params = new Float32Array(24); // 96 bytes
+        // TraceParams layout (112 bytes = 28 floats):
+        // invViewProj  : mat4x4f  offset 0   (float[0..15])
+        // cameraPos    : vec3f    offset 64  (float[16..18])
+        // frameIndex   : u32      offset 76  (float[19])
+        // width        : u32      offset 80  (float[20])
+        // height       : u32      offset 84  (float[21])
+        // lightCount   : u32      offset 88  (float[22])
+        // spp          : u32      offset 92  (float[23])
+        // useBlueNoise : u32      offset 96  (float[24])
+        // _pad0-2      : u32      offset 100-108
+        const params = new Float32Array(28); // 112 bytes
         const paramsU32 = new Uint32Array(params.buffer);
 
         params.set(this._invViewProj as unknown as Float32Array, 0);
@@ -502,7 +537,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         paramsU32[20] = width;
         paramsU32[21] = height;
         paramsU32[22] = lightCount;
-        paramsU32[23] = 0; // _pad
+        paramsU32[23] = this._spp;
+        paramsU32[24] = this._useBlueNoise ? 1 : 0;
 
         device.queue.writeBuffer(this._traceParamsBuf!, 0, params);
 
@@ -520,6 +556,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 8, resource: { buffer: builder.instanceBuffer! } },
                 { binding: 9, resource: { buffer: builder.materialBuffer! } },
                 { binding: 10, resource: { buffer: this._lightsBuffer! } },
+                { binding: 11, resource: { buffer: this._blueNoiseBuffer! } },
             ],
         });
 
@@ -599,9 +636,9 @@ export class PathTracerEffect extends PostProcessingEffect {
             const params = new Float32Array(8);
             const paramsU32 = new Uint32Array(params.buffer);
             paramsU32[0] = stepSize;
-            params[1] = 0.01;
-            params[2] = 128.0;
-            params[3] = 4.0;
+            params[1] = 0.1;   // sigmaDepth — higher = more tolerant of depth variation
+            params[2] = 32.0;  // sigmaNormal — lower = softer edge stopping on curved surfaces
+            params[3] = 2.0;   // sigmaLum — lower = tighter luminance edge stopping
             paramsU32[4] = width;
             paramsU32[5] = height;
             paramsU32[6] = 0;

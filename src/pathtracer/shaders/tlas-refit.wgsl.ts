@@ -31,11 +31,10 @@ struct Params {
     _pad2     : u32,
 }
 
-@group(0) @binding(0) var<storage, read_write> nodes         : array<BVHNode>;
-@group(0) @binding(1) var<storage, read>       instances     : array<InstanceData>;
-@group(0) @binding(2) var<storage, read>       blasNodes     : array<BVHNode>;
-@group(0) @binding(3) var<uniform>             params        : Params;
-@group(0) @binding(4) var<storage, read>       sortedIndices : array<u32>;
+@group(0) @binding(0) var<storage, read_write> nodes     : array<BVHNode>;
+@group(0) @binding(1) var<storage, read>       instances : array<InstanceData>;
+@group(0) @binding(2) var<storage, read>       blasNodes : array<BVHNode>;
+@group(0) @binding(3) var<uniform>             params    : Params;
 
 fn transformPoint(inst: InstanceData, p: vec3f) -> vec3f {
     return vec3f(
@@ -45,8 +44,7 @@ fn transformPoint(inst: InstanceData, p: vec3f) -> vec3f {
     );
 }
 
-fn instanceAABB(sortedLeafIdx: u32) -> AABB {
-    let instIdx = sortedIndices[sortedLeafIdx];
+fn instanceAABB(instIdx: u32) -> AABB {
     let inst = instances[instIdx];
     let blasRoot = blasNodes[inst.blasNodeOffset];
     let localMin = blasRoot.boundsMin;
@@ -68,7 +66,9 @@ fn instanceAABB(sortedLeafIdx: u32) -> AABB {
     return AABB(worldMin, worldMax);
 }
 
-// Pass 1: Initialize leaf node bounds from instance world-space AABBs
+// Pass 1: Initialize leaf node bounds from instance world-space AABBs.
+// Instances are read directly by index (no sorted order needed).
+// Tree structure (child pointers) is pre-uploaded by CPU.
 @compute @workgroup_size(256)
 fn initLeaves(@builtin(global_invocation_id) gid: vec3u) {
     let idx = gid.x;
@@ -80,12 +80,13 @@ fn initLeaves(@builtin(global_invocation_id) gid: vec3u) {
     let aabb = instanceAABB(idx);
     nodes[leafNodeIdx].boundsMin = aabb.aabbMin;
     nodes[leafNodeIdx].boundsMax = aabb.aabbMax;
-    // Leaf children encode the sorted instance index
-    nodes[leafNodeIdx].leftChild  = -i32(sortedIndices[idx]) - 1;
+    // Encode instance index in leaf child pointer
+    nodes[leafNodeIdx].leftChild  = -i32(idx) - 1;
     nodes[leafNodeIdx].rightChild = -1;
 }
 
-// Pass 2+: Merge internal node bounds from children (run ceil(log2(N)) times)
+// Pass 2+: Merge internal node bounds from children (run ceil(log2(N)) times).
+// Child pointers were set by CPU; this pass only computes AABB bounds.
 @compute @workgroup_size(256)
 fn mergeNodes(@builtin(global_invocation_id) gid: vec3u) {
     let idx = gid.x;
