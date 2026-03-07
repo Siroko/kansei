@@ -158,12 +158,11 @@ fn evaluateDirectionalLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> 
     let nDotL = max(dot(hitNorm, lightDir), 0.0);
     if (nDotL <= 0.0) { return vec3f(0.0); }
 
-    // Shadow ray
+    // Shadow ray (any-hit)
     var shadowRay: Ray;
     shadowRay.origin = hitPos + hitNorm * 0.001;
     shadowRay.dir = lightDir;
-    let shadowHit = traceBVH(shadowRay);
-    if (shadowHit.hit) { return vec3f(0.0); }
+    if (traceBVHShadow(shadowRay)) { return vec3f(0.0); }
 
     return light.color * light.intensity * nDotL;
 }
@@ -198,11 +197,11 @@ fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
     let lightCos = max(dot(ln, -lightDir), 0.0);
     if (lightCos <= 0.0) { return vec3f(0.0); }
 
-    // Shadow ray
+    // Shadow ray (any-hit, with max distance)
     var shadowRay: Ray;
     shadowRay.origin = hitPos + hitNorm * 0.001;
     shadowRay.dir = lightDir;
-    let shadowHit = traceBVH(shadowRay);
+    let shadowHit = traceBVHInternal(shadowRay, true);
     if (shadowHit.hit && shadowHit.t < dist - 0.01) {
         return vec3f(0.0);
     }
@@ -225,7 +224,7 @@ fn evaluatePointLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f 
     var shadowRay: Ray;
     shadowRay.origin = hitPos + hitNorm * 0.001;
     shadowRay.dir = lightDir;
-    let shadowHit = traceBVH(shadowRay);
+    let shadowHit = traceBVHInternal(shadowRay, true);
     if (shadowHit.hit && shadowHit.t < dist - 0.01) {
         return vec3f(0.0);
     }
@@ -298,23 +297,29 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= traceParams.width || gid.y >= traceParams.height) { return; }
 
     let coord = vec2u(gid.x, gid.y);
-    let depth = textureLoad(depthTex, coord, 0);
+
+    // Map trace-res coord to full-res GBuffer coord via UV
+    let uv = (vec2f(coord) + 0.5) / vec2f(f32(traceParams.width), f32(traceParams.height));
+    let gbufDim = vec2u(textureDimensions(depthTex));
+    let gbufCoord = vec2u(vec2f(gbufDim) * uv);
+    let gbufClamped = min(gbufCoord, gbufDim - vec2u(1u));
+
+    let depth = textureLoad(depthTex, gbufClamped, 0);
     if (depth >= 1.0) {
         textureStore(giOutput, coord, vec4f(0.0));
         return;
     }
 
     // Reconstruct world position from depth
-    let uv = (vec2f(coord) + 0.5) / vec2f(f32(traceParams.width), f32(traceParams.height));
     let ndc = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
     let wp = traceParams.invViewProj * ndc;
     let worldPos = wp.xyz / wp.w;
 
-    let normalData = textureLoad(normalTex, coord, 0);
+    let normalData = textureLoad(normalTex, vec2i(gbufClamped), 0);
     let worldNormal = normalize(normalData.xyz * 2.0 - 1.0);
     let roughness = normalData.w;
 
-    let albedoData = textureLoad(albedoTex, coord, 0);
+    let albedoData = textureLoad(albedoTex, vec2i(gbufClamped), 0);
     let isRefractive = albedoData.a < 0.5;
     let metallic = albedoData.a;
 

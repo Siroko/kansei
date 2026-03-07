@@ -33,9 +33,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= params.width || gid.y >= params.height) { return; }
 
     let coord = vec2i(gid.xy);
+    let traceSize = vec2f(f32(params.width), f32(params.height));
+    let gbufDim = vec2u(textureDimensions(depthTex));
+    let gbufDimF = vec2f(gbufDim);
+
     let centerColor = textureLoad(inputGI, coord, 0);
-    let centerDepth = textureLoad(depthTex, vec2u(gid.xy), 0);
-    let centerNormal = normalize(textureLoad(normalTex, coord, 0).xyz * 2.0 - 1.0);
+    let centerUV = (vec2f(gid.xy) + 0.5) / traceSize;
+    let centerGBuf = min(vec2u(gbufDimF * centerUV), gbufDim - vec2u(1u));
+    let centerDepth = textureLoad(depthTex, centerGBuf, 0);
+    let centerNormal = normalize(textureLoad(normalTex, vec2i(centerGBuf), 0).xyz * 2.0 - 1.0);
     let centerLum = luminance(centerColor.rgb);
 
     // Sky pixels — pass through
@@ -70,8 +76,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let sampleColor = textureLoad(inputGI, sampleCoord, 0);
             // Skip refractive neighbor samples — don't bleed into opaque
             if (sampleColor.a < 0.5) { continue; }
-            let sampleDepth = textureLoad(depthTex, vec2u(sampleCoord), 0);
-            let sampleNormal = normalize(textureLoad(normalTex, sampleCoord, 0).xyz * 2.0 - 1.0);
+            let sampleUV = (vec2f(sampleCoord) + 0.5) / traceSize;
+            let sampleGBuf = min(vec2u(gbufDimF * sampleUV), gbufDim - vec2u(1u));
+            let sampleDepth = textureLoad(depthTex, sampleGBuf, 0);
+            let sampleNormal = normalize(textureLoad(normalTex, vec2i(sampleGBuf), 0).xyz * 2.0 - 1.0);
             let sampleLum = luminance(sampleColor.rgb);
 
             // Edge-stopping: depth
