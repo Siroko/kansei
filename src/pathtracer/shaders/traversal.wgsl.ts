@@ -66,6 +66,7 @@ fn traverseBLAS(
 
     if (triCount == 0u) { return hit; }
 
+    let invDir = 1.0 / ray.dir;
     var stack: array<u32, BLAS_STACK_SIZE>;
     var stackPtr = 0u;
     stack[0] = nodeOffset;
@@ -78,7 +79,7 @@ fn traverseBLAS(
         let nodeIdx = stack[stackPtr];
         let node = blasNodes[nodeIdx];
 
-        let tHit = rayAABB(ray, node.boundsMin, node.boundsMax, hit.t);
+        let tHit = rayAABB(ray, node.boundsMin, node.boundsMax, hit.t, invDir);
         if (tHit < 0.0) { continue; }
 
         if (node.leftChild < 0) {
@@ -115,8 +116,8 @@ fn traverseBLAS(
                 let rightIdx = nodeOffset + u32(node.rightChild);
                 let leftNode = blasNodes[leftIdx];
                 let rightNode = blasNodes[rightIdx];
-                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t);
-                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t);
+                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t, invDir);
+                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t, invDir);
 
                 if (tLeft >= 0.0 && tRight >= 0.0) {
                     // Push farther first (popped last = visited second)
@@ -143,6 +144,7 @@ fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
     hit.t = 1e30;
     hit.hit = false;
 
+    let tlasInvDir = 1.0 / ray.dir;
     var stack: array<u32, TLAS_STACK_SIZE>;
     var stackPtr = 0u;
     stack[0] = 0u;
@@ -155,7 +157,7 @@ fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
         let nodeIdx = stack[stackPtr];
         let node = tlasNodes[nodeIdx];
 
-        let tHit = rayAABB(ray, node.boundsMin, node.boundsMax, hit.t);
+        let tHit = rayAABB(ray, node.boundsMin, node.boundsMax, hit.t, tlasInvDir);
         if (tHit < 0.0) { continue; }
 
         if (node.leftChild < 0) {
@@ -186,8 +188,8 @@ fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
                 let rightIdx = u32(node.rightChild);
                 let leftNode = tlasNodes[leftIdx];
                 let rightNode = tlasNodes[rightIdx];
-                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t);
-                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t);
+                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t, tlasInvDir);
+                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t, tlasInvDir);
 
                 if (tLeft >= 0.0 && tRight >= 0.0) {
                     if (tLeft < tRight) {
