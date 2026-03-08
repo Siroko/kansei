@@ -96,6 +96,9 @@ export class BVHBuilder {
     // Per-BLAS local-space AABB (for CPU TLAS construction)
     private _blasLocalBounds: Map<string, { min: Float32Array; max: Float32Array }> = new Map();
 
+    // Per-geometry extracted triangle data (for reordering after BVH build)
+    private _blasTriData: Map<string, Float32Array> = new Map();
+
     // Scene bounds computed from centroid data
     private _sceneMin: [number, number, number] = [0, 0, 0];
     private _sceneMax: [number, number, number] = [0, 0, 0];
@@ -149,6 +152,7 @@ export class BVHBuilder {
         this._blasEntries.clear();
         this._centroidsMap.clear();
         this._geomToBLASKey.clear();
+        this._blasTriData.clear();
 
         for (const [geom, data] of geometryMap) {
             const geoId = (geom as any).uuid ?? String(offset);
@@ -160,6 +164,9 @@ export class BVHBuilder {
                 nodeCount: 0,
             };
             allTriangles.set(data.triangles, offset);
+
+            // Store per-geometry triangle data for reordering after BVH build
+            this._blasTriData.set(geoId, data.triangles);
 
             // Compute and cache centroids for this geometry
             const centroids = this._computeCentroids(data.triangles, data.triCount);
@@ -441,6 +448,7 @@ export class BVHBuilder {
         const SAH_BINS = 12;
         const SAH_TRAVERSAL_COST = 1.0;
         const SAH_INTERSECT_COST = 1.0;
+        const MAX_LEAF_SIZE = 4;
 
         // Pre-calculate max node count (2n - 1 per geometry)
         let maxTotalNodes = 0;
@@ -505,6 +513,8 @@ export class BVHBuilder {
             for (let i = 0; i < n; i++) indices[i] = i;
 
             let nextNode = 0;
+            let nextTriSlot = 0;
+            const reorderMap = new Uint32Array(n);
 
             const surfaceArea = (mnx: number, mny: number, mnz: number, mxx: number, mxy: number, mxz: number): number => {
                 const dx = mxx - mnx, dy = mxy - mny, dz = mxz - mnz;
@@ -526,12 +536,17 @@ export class BVHBuilder {
                     bMaxX = Math.max(bMaxX, triMaxX[t]); bMaxY = Math.max(bMaxY, triMaxY[t]); bMaxZ = Math.max(bMaxZ, triMaxZ[t]);
                 }
 
-                if (count === 1) {
-                    // Leaf
+                if (count <= MAX_LEAF_SIZE) {
+                    // Multi-triangle leaf: store contiguous triangle range
+                    const leafTriStart = nextTriSlot;
+                    for (let i = start; i < start + count; i++) {
+                        reorderMap[nextTriSlot] = indices[i];
+                        nextTriSlot++;
+                    }
                     combinedF32[off + 0] = bMinX; combinedF32[off + 1] = bMinY; combinedF32[off + 2] = bMinZ;
-                    combinedI32[off + 3] = -(indices[start] + 1);
+                    combinedI32[off + 3] = -(leafTriStart + 1); // negative start index
                     combinedF32[off + 4] = bMaxX; combinedF32[off + 5] = bMaxY; combinedF32[off + 6] = bMaxZ;
-                    combinedI32[off + 7] = -1;
+                    combinedI32[off + 7] = count; // triangle count in leaf
                     return nodeIdx;
                 }
 
@@ -673,6 +688,22 @@ export class BVHBuilder {
             buildSAH(0, n);
             entry.nodeCount = nextNode;
             globalNodeOffset += nextNode;
+
+            // Reorder triangle data so leaf triangles are contiguous in memory
+            const triData = this._blasTriData.get(geoId);
+            if (triData && this._triangleBuffer) {
+                const stride = BVHBuilder.TRI_STRIDE_FLOATS;
+                const reordered = new Float32Array(n * stride);
+                for (let i = 0; i < n; i++) {
+                    const oldIdx = reorderMap[i];
+                    reordered.set(
+                        triData.subarray(oldIdx * stride, oldIdx * stride + stride),
+                        i * stride,
+                    );
+                }
+                const byteOffset = entry.triangleOffset * stride * 4;
+                this._device.queue.writeBuffer(this._triangleBuffer, byteOffset, reordered);
+            }
         }
 
         this.totalBLASNodes = globalNodeOffset;

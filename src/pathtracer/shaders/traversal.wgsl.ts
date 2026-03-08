@@ -82,27 +82,31 @@ fn traverseBLAS(
         if (tHit < 0.0) { continue; }
 
         if (node.leftChild < 0) {
-            let triIdx = u32(-(node.leftChild + 1));
-            let base = (triOffset + triIdx) * TRI_STRIDE;
-            let v0 = vec3f(triangles[base+0u], triangles[base+1u], triangles[base+2u]);
-            let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
-            let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
-            let tuv = rayTriangle(ray, v0, v1, v2);
-            if (tuv.x > 0.0 && tuv.x < hit.t) {
-                hit.t = tuv.x;
-                hit.u = tuv.y;
-                hit.v = tuv.z;
-                hit.triIndex = triOffset + triIdx;
-                hit.hit = true;
+            let triStart = u32(-(node.leftChild + 1));
+            let triCount = u32(node.rightChild);
+            for (var ti = 0u; ti < triCount; ti++) {
+                let triIdx = triStart + ti;
+                let base = (triOffset + triIdx) * TRI_STRIDE;
+                let v0 = vec3f(triangles[base+0u], triangles[base+1u], triangles[base+2u]);
+                let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
+                let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
+                let tuv = rayTriangle(ray, v0, v1, v2);
+                if (tuv.x > 0.0 && tuv.x < hit.t) {
+                    hit.t = tuv.x;
+                    hit.u = tuv.y;
+                    hit.v = tuv.z;
+                    hit.triIndex = triOffset + triIdx;
+                    hit.hit = true;
 
-                if (anyHit) { return hit; }
+                    if (anyHit) { return hit; }
 
-                let n0 = vec3f(triangles[base+9u],  triangles[base+10u], triangles[base+11u]);
-                let n1 = vec3f(triangles[base+12u], triangles[base+13u], triangles[base+14u]);
-                let n2 = vec3f(triangles[base+15u], triangles[base+16u], triangles[base+17u]);
-                let w = 1.0 - tuv.y - tuv.z;
-                hit.worldNorm = normalize(n0 * w + n1 * tuv.y + n2 * tuv.z);
-                hit.worldPos = ray.origin + ray.dir * tuv.x;
+                    let n0 = vec3f(triangles[base+9u],  triangles[base+10u], triangles[base+11u]);
+                    let n1 = vec3f(triangles[base+12u], triangles[base+13u], triangles[base+14u]);
+                    let n2 = vec3f(triangles[base+15u], triangles[base+16u], triangles[base+17u]);
+                    let w = 1.0 - tuv.y - tuv.z;
+                    hit.worldNorm = normalize(n0 * w + n1 * tuv.y + n2 * tuv.z);
+                    hit.worldPos = ray.origin + ray.dir * tuv.x;
+                }
             }
         } else {
             if (stackPtr < BLAS_STACK_SIZE - 2u) {
