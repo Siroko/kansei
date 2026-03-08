@@ -163,7 +163,7 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 1,
+      devicePixelRatio: 0.75,
       antialias: false,
       sampleCount: 1
     });
@@ -236,7 +236,7 @@
     floorPTMat.albedo = [0.8, 0.8, 0.85];
     floorPTMat.roughness = 0.0;
     floorPTMat.metallic = 1.0;
-    floorPTMat.maxBounces = 2;
+    floorPTMat.maxBounces = 4;
     floor.pathTracerMaterial = floorPTMat;
     scene.add(floor);
 
@@ -286,7 +286,7 @@
       ],
     });
     const sphere = new Renderable(sphereGeo, glassRasterMat);
-    sphere.position.set(0, 1.5, 2);
+    sphere.position.set(0, 1.5, 8);
     const glassMat = new PathTracerMaterial();
     glassMat.albedo = [1, 1, 1];
     glassMat.roughness = 0.0;
@@ -307,20 +307,20 @@
 
     // ── GLTF Model ──────────────────────────────────────────────────────
     const gltfLoader = new GLTFLoader();
-    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', glassRasterMat);
+    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', floorMat);
     gltf.scene.scale.set(30, 30, 30);
-    gltf.scene.position.set(0, -1.5, 5);
+    gltf.scene.position.set(0, -1.5, -3);
     // Assign path tracer material to all loaded meshes
     gltf.scene.traverse(gltf.scene, (obj) => {
       if (obj.isRenderable) {
         const dragonPathMat  = new PathTracerMaterial();
         dragonPathMat.albedo = [1, 1, 1];
-        dragonPathMat.roughness = 0.5;
-        dragonPathMat.refractive = true;
+        dragonPathMat.roughness = 1.0;
+        dragonPathMat.refractive = false;
         dragonPathMat.ior = 1.5;
-        dragonPathMat.maxBounces = 2;
-        dragonPathMat.absorptionColor = [0.2, 0.5, 0.8];
-        dragonPathMat.absorptionDensity = 0.3;
+        dragonPathMat.maxBounces = 4;
+        dragonPathMat.absorptionColor = [0.2, 0.2, 0.2];
+        dragonPathMat.absorptionDensity = 0.9;
         obj.pathTracerMaterial = dragonPathMat;
       }
     });

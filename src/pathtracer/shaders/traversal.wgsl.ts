@@ -3,7 +3,7 @@ export const traversalShader = /* wgsl */`
 // Requires: BVHNode struct, Instance struct, triangle/node/instance storage bindings
 
 const TLAS_STACK_SIZE = 32u;
-const BLAS_STACK_SIZE = 32u;
+const BLAS_STACK_SIZE = 64u;
 const TRI_STRIDE = 24u; // 24 floats per triangle
 
 struct Instance {
@@ -154,7 +154,7 @@ fn traverseBLAS(
         }
 
         // Push internal children sorted farthest-first (nearest popped first)
-        if (hitCount > 0u && stackPtr + hitCount <= BLAS_STACK_SIZE) {
+        if (hitCount > 0u) {
             // Simple insertion sort for up to 4 elements (ascending = farthest first)
             for (var i = 1u; i < hitCount; i++) {
                 let kd = hitDist[i];
@@ -168,7 +168,9 @@ fn traverseBLAS(
                 hitDist[j] = kd;
                 hitIdx[j] = ki;
             }
-            for (var i = 0u; i < hitCount; i++) {
+            // Push as many as fit (sorted farthest-first, so nearest are pushed last = popped first)
+            let pushCount = min(hitCount, BLAS_STACK_SIZE - stackPtr);
+            for (var i = 0u; i < pushCount; i++) {
                 stack[stackPtr] = hitIdx[i];
                 stackPtr += 1u;
             }
