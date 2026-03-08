@@ -51,7 +51,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     // Refractive pixels — pass through unfiltered (alpha = 0)
-    if (centerColor.a < 0.5) {
+    if (centerColor.a < 0.02) {
         textureStore(outputGI, vec2u(gid.xy), centerColor);
         return;
     }
@@ -75,7 +75,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
             let sampleColor = textureLoad(inputGI, sampleCoord, 0);
             // Skip refractive neighbor samples — don't bleed into opaque
-            if (sampleColor.a < 0.5) { continue; }
+            if (sampleColor.a < 0.02) { continue; }
             let sampleUV = (vec2f(sampleCoord) + 0.5) / traceSize;
             let sampleGBuf = min(vec2u(gbufDimF * sampleUV), gbufDim - vec2u(1u));
             let sampleDepth = textureLoad(depthTex, sampleGBuf, 0);
@@ -101,6 +101,6 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     let result = select(centerColor.rgb, sumColor / sumWeight, sumWeight > 1e-6);
-    textureStore(outputGI, vec2u(gid.xy), vec4f(result, 1.0));
+    textureStore(outputGI, vec2u(gid.xy), vec4f(result, centerColor.a));
 }
 `;

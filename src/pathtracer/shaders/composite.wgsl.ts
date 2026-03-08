@@ -23,13 +23,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // Sample low-res GI with bilinear filtering for smooth upscale
     let giSample  = textureSampleLevel(denoisedGI, giSampler, uv, 0.0);
     let indirect  = giSample.rgb;
+    let giAlpha   = giSample.a;
     let albedoRaw = textureLoad(albedoTex, vec2i(coord), 0);
     let albedo    = albedoRaw.rgb;
-    let alpha     = albedoRaw.a;
 
-    // alpha == 0 → transparent/refractive: use indirect as-is (already colored by path tracer)
-    // alpha == 1 → opaque: direct has albedo baked in, indirect is raw radiance * albedo
-    let hdr = select(indirect, direct + albedo * indirect, alpha > 0.5);
+    // giAlpha == 0 → refractive/mirror: use GI as-is (path tracer handles full lighting)
+    // giAlpha >  0 → opaque: max of raster direct and path-traced (direct+indirect),
+    //   so path tracer overrides where rasterizer underestimates (area lights, glass shadows)
+    let hdr = select(indirect, max(direct, albedo * indirect), giAlpha > 0.02);
 
     // Reinhard tone map to make HDR range visible
     let final_color = hdr / (hdr + vec3f(1.0));
