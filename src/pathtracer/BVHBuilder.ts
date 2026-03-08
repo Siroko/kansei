@@ -99,6 +99,10 @@ export class BVHBuilder {
     // Per-geometry extracted triangle data (for reordering after BVH build)
     private _blasTriData: Map<string, Float32Array> = new Map();
 
+    // BVH4 (4-wide) node buffer for trace shader
+    private _bvh4NodeBuffer: GPUBuffer | null = null;
+    public totalBVH4Nodes: number = 0;
+
     // Scene bounds computed from centroid data
     private _sceneMin: [number, number, number] = [0, 0, 0];
     private _sceneMax: [number, number, number] = [0, 0, 0];
@@ -110,6 +114,7 @@ export class BVHBuilder {
     // Public accessors for trace shader bind groups
     get triangleBuffer(): GPUBuffer | null { return this._triangleBuffer; }
     get blasNodeBuffer(): GPUBuffer | null { return this._blasNodeBuffer; }
+    get bvh4NodeBuffer(): GPUBuffer | null { return this._bvh4NodeBuffer; }
     get instanceBuffer(): GPUBuffer | null { return this._instanceBuffer; }
     get tlasNodeBuffer(): GPUBuffer | null { return this._tlasNodeBuffer; }
     get materialBuffer(): GPUBuffer | null { return this._materialBuffer; }
@@ -233,7 +238,7 @@ export class BVHBuilder {
             entries: [
                 { binding: 0, resource: { buffer: this._tlasNodeBuffer! } },
                 { binding: 1, resource: { buffer: this._instanceBuffer! } },
-                { binding: 2, resource: { buffer: this._blasNodeBuffer! } },
+                { binding: 2, resource: { buffer: this._bvh4NodeBuffer! } },
                 { binding: 3, resource: { buffer: this._tlasRefitParamsBuf! } },
             ],
         });
@@ -717,6 +722,117 @@ export class BVHBuilder {
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         this._device.queue.writeBuffer(this._blasNodeBuffer, 0, combinedBuf, 0, actualSize);
+
+        // ── Collapse binary BVH to BVH4 (4-wide) ──
+        // Each BVH4 node = 128 bytes (32 floats = 8 vec4f):
+        //   [0-3]   childMinX[0..3]   [4-7]   childMaxX[0..3]
+        //   [8-11]  childMinY[0..3]   [12-15] childMaxY[0..3]
+        //   [16-19] childMinZ[0..3]   [20-23] childMaxZ[0..3]
+        //   [24-27] children[0..3] (i32: <0 = leaf, >=0 = BVH4 node)
+        //   [28-31] triCounts[0..3] (u32: triangle count for leaves)
+        const BVH4_STRIDE = 32;
+        const bvh4Data = new Float32Array(Math.max(globalNodeOffset * BVH4_STRIDE, 4));
+        const bvh4I32 = new Int32Array(bvh4Data.buffer);
+        const bvh4U32 = new Uint32Array(bvh4Data.buffer);
+        let bvh4TotalNodes = 0;
+
+        for (const [, entry] of this._blasEntries) {
+            if (entry.nodeCount === 0) continue;
+            const binBase = entry.nodeOffset * 8; // binary node start offset (in floats)
+            const bvh4Start = bvh4TotalNodes;
+            let nextBVH4 = 0;
+
+            const isLeaf = (li: number) => combinedI32[binBase + li * 8 + 3] < 0;
+            const getLC  = (li: number) => combinedI32[binBase + li * 8 + 3];
+            const getRC  = (li: number) => combinedI32[binBase + li * 8 + 7];
+            const mnX = (li: number) => combinedF32[binBase + li * 8 + 0];
+            const mnY = (li: number) => combinedF32[binBase + li * 8 + 1];
+            const mnZ = (li: number) => combinedF32[binBase + li * 8 + 2];
+            const mxX = (li: number) => combinedF32[binBase + li * 8 + 4];
+            const mxY = (li: number) => combinedF32[binBase + li * 8 + 5];
+            const mxZ = (li: number) => combinedF32[binBase + li * 8 + 6];
+
+            const initBVH4 = (): number => {
+                const idx = bvh4Start + nextBVH4++;
+                const o = idx * BVH4_STRIDE;
+                for (let i = 0; i < 4; i++) {
+                    bvh4Data[o + i]      =  1e30;  // childMinX
+                    bvh4Data[o + 4 + i]  = -1e30;  // childMaxX
+                    bvh4Data[o + 8 + i]  =  1e30;  // childMinY
+                    bvh4Data[o + 12 + i] = -1e30;  // childMaxY
+                    bvh4Data[o + 16 + i] =  1e30;  // childMinZ
+                    bvh4Data[o + 20 + i] = -1e30;  // childMaxZ
+                    bvh4I32[o + 24 + i]  = -1;  // empty leaf sentinel (0 triangles, never traversed)
+                    bvh4U32[o + 28 + i]  = 0;
+                }
+                return idx;
+            };
+
+            const setChild = (nodeIdx: number, slot: number, binLocalIdx: number, bvh4Idx: number) => {
+                const o = nodeIdx * BVH4_STRIDE;
+                bvh4Data[o + slot]      = mnX(binLocalIdx);
+                bvh4Data[o + 4 + slot]  = mxX(binLocalIdx);
+                bvh4Data[o + 8 + slot]  = mnY(binLocalIdx);
+                bvh4Data[o + 12 + slot] = mxY(binLocalIdx);
+                bvh4Data[o + 16 + slot] = mnZ(binLocalIdx);
+                bvh4Data[o + 20 + slot] = mxZ(binLocalIdx);
+                if (isLeaf(binLocalIdx)) {
+                    bvh4I32[o + 24 + slot] = getLC(binLocalIdx);  // -(triStart+1)
+                    bvh4U32[o + 28 + slot] = getRC(binLocalIdx);  // triCount
+                } else {
+                    bvh4I32[o + 24 + slot] = bvh4Idx;  // global BVH4 node index
+                    bvh4U32[o + 28 + slot] = 0;
+                }
+            };
+
+            const convert = (li: number): number => {
+                const bvh4Idx = initBVH4();
+
+                if (isLeaf(li)) {
+                    // Wrap single leaf
+                    setChild(bvh4Idx, 0, li, 0);
+                    return bvh4Idx;
+                }
+
+                // Collect grandchildren by expanding one level
+                const gc: number[] = [];
+                const L = getLC(li), R = getRC(li);
+
+                if (isLeaf(L)) { gc.push(L); }
+                else { gc.push(getLC(L), getRC(L)); }
+
+                if (isLeaf(R)) { gc.push(R); }
+                else { gc.push(getLC(R), getRC(R)); }
+
+                for (let i = 0; i < gc.length && i < 4; i++) {
+                    const g = gc[i];
+                    if (isLeaf(g)) {
+                        setChild(bvh4Idx, i, g, 0);
+                    } else {
+                        const childBVH4 = convert(g);
+                        setChild(bvh4Idx, i, g, childBVH4);
+                    }
+                }
+                return bvh4Idx;
+            };
+
+            convert(0);
+            entry.nodeOffset = bvh4Start;
+            entry.nodeCount = nextBVH4;
+            bvh4TotalNodes += nextBVH4;
+        }
+
+        this.totalBVH4Nodes = bvh4TotalNodes;
+
+        // Upload BVH4 buffer
+        this._bvh4NodeBuffer?.destroy();
+        const bvh4ByteSize = Math.max(bvh4TotalNodes * 128, 4);
+        this._bvh4NodeBuffer = this._device.createBuffer({
+            label: 'BVH/BVH4Nodes',
+            size: bvh4ByteSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this._device.queue.writeBuffer(this._bvh4NodeBuffer, 0, bvh4Data.buffer, 0, bvh4ByteSize);
     }
 
     public buildBLASTreeGPU(commandEncoder: GPUCommandEncoder): void {
