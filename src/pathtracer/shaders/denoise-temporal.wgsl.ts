@@ -37,10 +37,28 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    // Refractive/mirror pixels — pass through (alpha = 0).
-    // Their neighbors have unrelated colors so neighborhood clamping would corrupt them.
+    // Refractive/mirror pixels — temporal blend WITHOUT neighborhood clamping.
+    // Their neighbors show unrelated reflected/refracted content, so clamping
+    // against them would corrupt colors. Simple exponential blend preserves
+    // definition while reducing noise over time.
     if (current.a < 0.02) {
-        textureStore(outputGI, vec2u(gid.xy), current);
+        let uv_r = (vec2f(gid.xy) + 0.5) / size;
+        let ndc_r = vec4f(uv_r.x * 2.0 - 1.0, (1.0 - uv_r.y) * 2.0 - 1.0, depth, 1.0);
+        let wp_r = params.currentInvViewProj * ndc_r;
+        let worldPos_r = wp_r.xyz / wp_r.w;
+        let prevClip_r = params.prevViewProj * vec4f(worldPos_r, 1.0);
+        let prevNDC_r = prevClip_r.xyz / prevClip_r.w;
+        let prevUV_r = vec2f(prevNDC_r.x * 0.5 + 0.5, 1.0 - (prevNDC_r.y * 0.5 + 0.5));
+
+        var blend_r = params.blendFactor;
+        if (prevUV_r.x < 0.0 || prevUV_r.x > 1.0 || prevUV_r.y < 0.0 || prevUV_r.y > 1.0) {
+            blend_r = 1.0;
+        }
+        if (params.frameIndex == 0u) { blend_r = 1.0; }
+
+        let history_r = textureSampleLevel(historyGI, historySamp, prevUV_r, 0.0);
+        let blended_r = mix(history_r.rgb, current.rgb, blend_r);
+        textureStore(outputGI, vec2u(gid.xy), vec4f(blended_r, current.a));
         return;
     }
 
