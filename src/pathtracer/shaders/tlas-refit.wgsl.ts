@@ -33,7 +33,7 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read_write> nodes     : array<BVHNode>;
 @group(0) @binding(1) var<storage, read>       instances : array<InstanceData>;
-@group(0) @binding(2) var<storage, read>       blasNodes : array<BVHNode>;
+@group(0) @binding(2) var<storage, read>       bvh4Nodes : array<vec4f>;
 @group(0) @binding(3) var<uniform>             params    : Params;
 
 fn transformPoint(inst: InstanceData, p: vec3f) -> vec3f {
@@ -46,9 +46,24 @@ fn transformPoint(inst: InstanceData, p: vec3f) -> vec3f {
 
 fn instanceAABB(instIdx: u32) -> AABB {
     let inst = instances[instIdx];
-    let blasRoot = blasNodes[inst.blasNodeOffset];
-    let localMin = blasRoot.boundsMin;
-    let localMax = blasRoot.boundsMax;
+    // BVH4 root: compute AABB from union of up to 4 children
+    let base = inst.blasNodeOffset * 8u;
+    let childMinX = bvh4Nodes[base + 0u];
+    let childMaxX = bvh4Nodes[base + 1u];
+    let childMinY = bvh4Nodes[base + 2u];
+    let childMaxY = bvh4Nodes[base + 3u];
+    let childMinZ = bvh4Nodes[base + 4u];
+    let childMaxZ = bvh4Nodes[base + 5u];
+    let localMin = vec3f(
+        min(min(childMinX.x, childMinX.y), min(childMinX.z, childMinX.w)),
+        min(min(childMinY.x, childMinY.y), min(childMinY.z, childMinY.w)),
+        min(min(childMinZ.x, childMinZ.y), min(childMinZ.z, childMinZ.w)),
+    );
+    let localMax = vec3f(
+        max(max(childMaxX.x, childMaxX.y), max(childMaxX.z, childMaxX.w)),
+        max(max(childMaxY.x, childMaxY.y), max(childMaxY.z, childMaxY.w)),
+        max(max(childMaxZ.x, childMaxZ.y), max(childMaxZ.z, childMaxZ.w)),
+    );
 
     // Transform all 8 corners to world space
     var worldMin = vec3f(1e30);

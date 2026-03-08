@@ -188,7 +188,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._bvhBuilder.buildTLAS(commandEncoder, this._scene);
 
         // Guard against missing BVH buffers
-        if (!this._bvhBuilder.triangleBuffer || !this._bvhBuilder.blasNodeBuffer ||
+        if (!this._bvhBuilder.triangleBuffer || !this._bvhBuilder.bvh4NodeBuffer ||
             !this._bvhBuilder.tlasNodeBuffer || !this._bvhBuilder.instanceBuffer ||
             !this._bvhBuilder.materialBuffer) {
             return;
@@ -588,7 +588,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 3, resource: this._giTexture!.createView() },
                 { binding: 4, resource: { buffer: this._traceParamsBuf! } },
                 { binding: 5, resource: { buffer: builder.triangleBuffer! } },
-                { binding: 6, resource: { buffer: builder.blasNodeBuffer! } },
+                { binding: 6, resource: { buffer: builder.bvh4NodeBuffer! } },
                 { binding: 7, resource: { buffer: builder.tlasNodeBuffer! } },
                 { binding: 8, resource: { buffer: builder.instanceBuffer! } },
                 { binding: 9, resource: { buffer: builder.materialBuffer! } },
