@@ -106,7 +106,7 @@
           vec4f(albedo * lighting, 1),             // no direct — all lighting via GI
           vec4f(0, 0, 0, 1),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
-          vec4f(albedo, 1.0)
+          vec4f(albedo, 0.04)
         );
       }
     `;
@@ -163,8 +163,8 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 0.75,
-      antialias: true,
+      devicePixelRatio: 1,
+      antialias: false,
       sampleCount: 1
     });
     await renderer.initialize();
@@ -210,7 +210,7 @@
     const whiteMat = makeMat(0.85, 0.85, 0.85);
     const redMat   = makeMat(0.85, 0.12, 0.08);
     const greenMat = makeMat(0.12, 0.85, 0.15);
-    const floorMat = makeFloorMat(0.8, 0.8, 0.85, 0.05, 1.0);
+    const floorMat = makeFloorMat(0.8, 0.8, 0.85, 0.0, 1.0);
 
     // ── Geometry ──────────────────────────────────────────────────────────
     const wallGeo   = new BoxGeometry(WALL, WALL, THICK);
@@ -234,9 +234,9 @@
     floor.rotation.x = -Math.PI / 2;
     const floorPTMat = new PathTracerMaterial();
     floorPTMat.albedo = [0.8, 0.8, 0.85];
-    floorPTMat.roughness = 0.05;
+    floorPTMat.roughness = 0.0;
     floorPTMat.metallic = 1.0;
-    floorPTMat.maxBounces = 4;
+    floorPTMat.maxBounces = 2;
     floor.pathTracerMaterial = floorPTMat;
     scene.add(floor);
 
@@ -286,13 +286,13 @@
       ],
     });
     const sphere = new Renderable(sphereGeo, glassRasterMat);
-    sphere.position.set(0, 1.5, 5);
+    sphere.position.set(0, 1.5, 2);
     const glassMat = new PathTracerMaterial();
     glassMat.albedo = [1, 1, 1];
     glassMat.roughness = 0.0;
     glassMat.refractive = true;
     glassMat.ior = 1.5;
-    glassMat.maxBounces = 10;
+    glassMat.maxBounces = 2;
     glassMat.absorptionColor = [0.2, 0.5, 0.8];
     glassMat.absorptionDensity = 0.3;
     sphere.pathTracerMaterial = glassMat;
@@ -307,13 +307,21 @@
 
     // ── GLTF Model ──────────────────────────────────────────────────────
     const gltfLoader = new GLTFLoader();
-    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', whiteMat);
+    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', glassRasterMat);
     gltf.scene.scale.set(30, 30, 30);
-    gltf.scene.position.set(0, -1.5, 0);
+    gltf.scene.position.set(0, -1.5, 5);
     // Assign path tracer material to all loaded meshes
     gltf.scene.traverse(gltf.scene, (obj) => {
       if (obj.isRenderable) {
-        obj.pathTracerMaterial = makePTMat(0.5, 0.5, 0.5);
+        const dragonPathMat  = new PathTracerMaterial();
+        dragonPathMat.albedo = [1, 1, 1];
+        dragonPathMat.roughness = 0.5;
+        dragonPathMat.refractive = true;
+        dragonPathMat.ior = 1.5;
+        dragonPathMat.maxBounces = 2;
+        dragonPathMat.absorptionColor = [0.2, 0.5, 0.8];
+        dragonPathMat.absorptionDensity = 0.3;
+        obj.pathTracerMaterial = dragonPathMat;
       }
     });
     scene.add(gltf.scene);
@@ -364,8 +372,8 @@
       shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
       const t = performance.now() * 0.001;
-      sphere.position.x = Math.sin(t) * 3;
-      sphere.position.y = Math.cos(t) * 2 + 4;
+      // sphere.position.x = Math.sin(t) * 3;
+      sphere.position.y = 4;
       cube.position.x = Math.sin(t + Math.PI) * 3;
       cube.position.y = Math.cos(t + Math.PI) * 2 + 3.5;
       cube.rotation.x = t * 0.7;

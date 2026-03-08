@@ -37,8 +37,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    // Refractive pixels — pass through unfiltered (alpha = 0)
-    if (current.a < 0.5) {
+    // Refractive/mirror pixels — pass through (alpha = 0).
+    // Their neighbors have unrelated colors so neighborhood clamping would corrupt them.
+    if (current.a < 0.02) {
         textureStore(outputGI, vec2u(gid.xy), current);
         return;
     }
@@ -97,7 +98,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let clampDist = length(history.rgb - clamped.rgb);
     let adaptiveBlend = max(blend, saturate(clampDist * 0.5));
 
-    let result = mix(clamped, current, adaptiveBlend);
-    textureStore(outputGI, vec2u(gid.xy), result);
+    let blended = mix(clamped.rgb, current.rgb, adaptiveBlend);
+    textureStore(outputGI, vec2u(gid.xy), vec4f(blended, current.a));
 }
 `;

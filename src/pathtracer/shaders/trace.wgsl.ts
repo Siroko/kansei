@@ -151,6 +151,26 @@ fn sampleGGX(n: vec3f, roughness: f32, r1: f32, r2: f32) -> vec3f {
     return h;
 }
 
+// ── Shadow test that skips refractive (transparent) surfaces ────────
+
+fn traceShadow(origin: vec3f, dir: vec3f, maxDist: f32) -> bool {
+    var ro = origin;
+    var remaining = maxDist;
+    for (var i = 0u; i < 4u; i++) {
+        var sray: Ray;
+        sray.origin = ro;
+        sray.dir = dir;
+        let hit = traceBVH(sray);
+        if (!hit.hit || hit.t >= remaining) { return false; }
+        let hitMat = materials[hit.matIndex];
+        if ((u32(hitMat.flags) & 1u) == 0u) { return true; }
+        // Transparent surface: advance past it
+        ro = ro + dir * (hit.t + 0.002);
+        remaining -= hit.t + 0.002;
+    }
+    return false;
+}
+
 // ── Per-light-type evaluation ───────────────────────────────────────
 
 fn evaluateDirectionalLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
@@ -158,11 +178,7 @@ fn evaluateDirectionalLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> 
     let nDotL = max(dot(hitNorm, lightDir), 0.0);
     if (nDotL <= 0.0) { return vec3f(0.0); }
 
-    // Shadow ray (any-hit)
-    var shadowRay: Ray;
-    shadowRay.origin = hitPos + hitNorm * 0.001;
-    shadowRay.dir = lightDir;
-    if (traceBVHShadow(shadowRay)) { return vec3f(0.0); }
+    if (traceShadow(hitPos + hitNorm * 0.001, lightDir, 1e30)) { return vec3f(0.0); }
 
     return light.color * light.intensity * nDotL;
 }
@@ -192,19 +208,11 @@ fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
     let nDotL = max(dot(hitNorm, lightDir), 0.0);
     if (nDotL <= 0.0) { return vec3f(0.0); }
 
-    // Cosine at light surface: dot(lightNormal, direction_from_light_to_hit)
-    // direction_from_light_to_hit = -lightDir
+    // Cosine at light surface
     let lightCos = max(dot(ln, -lightDir), 0.0);
     if (lightCos <= 0.0) { return vec3f(0.0); }
 
-    // Shadow ray (any-hit, with max distance)
-    var shadowRay: Ray;
-    shadowRay.origin = hitPos + hitNorm * 0.001;
-    shadowRay.dir = lightDir;
-    let shadowHit = traceBVHInternal(shadowRay, true);
-    if (shadowHit.hit && shadowHit.t < dist - 0.01) {
-        return vec3f(0.0);
-    }
+    if (traceShadow(hitPos + hitNorm * 0.001, lightDir, dist - 0.01)) { return vec3f(0.0); }
 
     // L_e * cos_hit * cos_light * A / d^2
     let area = sizeX * sizeZ;
@@ -220,14 +228,7 @@ fn evaluatePointLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f 
     let nDotL = max(dot(hitNorm, lightDir), 0.0);
     if (nDotL <= 0.0) { return vec3f(0.0); }
 
-    // Shadow ray
-    var shadowRay: Ray;
-    shadowRay.origin = hitPos + hitNorm * 0.001;
-    shadowRay.dir = lightDir;
-    let shadowHit = traceBVHInternal(shadowRay, true);
-    if (shadowHit.hit && shadowHit.t < dist - 0.01) {
-        return vec3f(0.0);
-    }
+    if (traceShadow(hitPos + hitNorm * 0.001, lightDir, dist - 0.01)) { return vec3f(0.0); }
 
     return light.color * light.intensity * nDotL / dist2;
 }
@@ -248,6 +249,85 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
         }
     }
     return total;
+}
+
+// Direct lighting + one-bounce indirect (no specular). Used as building block.
+fn evaluateDirectAndIndirect(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
+    let direct = evaluateLighting(hitPos, hitNorm);
+
+    let ir1 = nextRandom();
+    let ir2 = nextRandom();
+    var bounceRay: Ray;
+    bounceRay.origin = hitPos + hitNorm * 0.001;
+    bounceRay.dir = cosineSampleHemisphere(hitNorm, ir1, ir2);
+
+    var indirect = vec3f(0.0);
+    var bounceHit = traceBVH(bounceRay);
+    // Skip through glass/mirrors — they shouldn't occlude indirect light
+    for (var sk = 0u; sk < 4u; sk++) {
+        if (!bounceHit.hit) { break; }
+        let skMat = materials[bounceHit.matIndex];
+        if ((u32(skMat.flags) & 1u) != 0u) {
+            // Refractive: pass straight through
+            bounceRay.origin = bounceHit.worldPos + bounceRay.dir * 0.002;
+            bounceHit = traceBVH(bounceRay);
+        } else if (skMat.metallic > 0.5) {
+            // Mirror: reflect bounce ray off surface
+            bounceRay.dir = reflect(bounceRay.dir, bounceHit.worldNorm);
+            bounceRay.origin = bounceHit.worldPos + bounceHit.worldNorm * 0.001;
+            bounceHit = traceBVH(bounceRay);
+        } else {
+            break;
+        }
+    }
+    if (bounceHit.hit) {
+        let bounceMat = materials[bounceHit.matIndex];
+        if (bounceMat.emissiveIntensity > 0.0) {
+            indirect = bounceMat.emissive * bounceMat.emissiveIntensity;
+        } else {
+            indirect = evaluateLighting(bounceHit.worldPos, bounceHit.worldNorm) * bounceMat.albedo;
+        }
+    }
+
+    return direct + indirect;
+}
+
+// Full surface evaluation: direct + indirect + specular (if metallic/glossy)
+fn evaluateSurface(hitPos: vec3f, hitNorm: vec3f, viewDir: vec3f, mat: MaterialData) -> vec3f {
+    var result = evaluateDirectAndIndirect(hitPos, hitNorm) * mat.albedo;
+
+    // Specular reflection for metallic/glossy surfaces
+    if (mat.metallic > 0.1 || mat.roughness < 0.5) {
+        let sr1 = nextRandom();
+        let sr2 = nextRandom();
+        let halfVec = sampleGGX(hitNorm, max(mat.roughness, 0.04), sr1, sr2);
+        let specDir = reflect(-viewDir, halfVec);
+
+        if (dot(specDir, hitNorm) > 0.0) {
+            var specRay: Ray;
+            specRay.origin = hitPos + hitNorm * 0.001;
+            specRay.dir = specDir;
+            var specHit = traceBVH(specRay);
+            // Skip through glass on specular path
+            for (var sk = 0u; sk < 4u; sk++) {
+                if (!specHit.hit) { break; }
+                let skMat = materials[specHit.matIndex];
+                if ((u32(skMat.flags) & 1u) != 0u) {
+                    specRay.origin = specHit.worldPos + specRay.dir * 0.002;
+                    specHit = traceBVH(specRay);
+                } else {
+                    break;
+                }
+            }
+            if (specHit.hit) {
+                let specMat = materials[specHit.matIndex];
+                let specular = evaluateDirectAndIndirect(specHit.worldPos, specHit.worldNorm) * specMat.albedo;
+                result = mix(result, specular, mat.metallic);
+            }
+        }
+    }
+
+    return result;
 }
 
 fn traceRefraction(
@@ -283,8 +363,8 @@ fn traceRefraction(
 
         let nextMat = materials[nextHit.matIndex];
         if ((u32(nextMat.flags) & 1u) == 0u) {
-            let lighting = evaluateLighting(nextHit.worldPos, nextHit.worldNorm);
-            return throughput * lighting * nextMat.albedo;
+            let viewDir = -ray.dir;
+            return throughput * evaluateSurface(nextHit.worldPos, nextHit.worldNorm, viewDir, nextMat);
         }
         currentHit = nextHit;
     }
@@ -320,7 +400,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let roughness = normalData.w;
 
     let albedoData = textureLoad(albedoTex, vec2i(gbufClamped), 0);
-    let isRefractive = albedoData.a < 0.5;
+    let isRefractive = albedoData.a < 0.02;
     let metallic = albedoData.a;
 
     let spp = traceParams.spp;
@@ -341,11 +421,43 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 if ((u32(mat.flags) & 1u) != 0u) {
                     accumulated += traceRefraction(primaryRay, primaryHit, mat);
                 } else {
-                    let hitDirect = evaluateLighting(primaryHit.worldPos, primaryHit.worldNorm);
-                    accumulated += hitDirect * mat.albedo;
+                    accumulated += evaluateSurface(primaryHit.worldPos, primaryHit.worldNorm, -primaryRay.dir, mat);
+                }
+            }
+        } else if (metallic > 0.9) {
+            // Fully metallic (mirror): only specular reflection, no diffuse.
+            // Path tracer handles the full reflected scene — composite uses GI directly.
+            let sr1 = nextRandom();
+            let sr2 = nextRandom();
+            let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
+            let viewDir = normalize(traceParams.cameraPos - worldPos);
+            let specDir = reflect(-viewDir, halfVec);
+
+            if (dot(specDir, worldNormal) > 0.0) {
+                var specRay: Ray;
+                specRay.origin = worldPos + worldNormal * 0.001;
+                specRay.dir = specDir;
+                var specHit = traceBVH(specRay);
+                // Skip through glass on specular path
+                for (var sk = 0u; sk < 4u; sk++) {
+                    if (!specHit.hit) { break; }
+                    let skMat = materials[specHit.matIndex];
+                    if ((u32(skMat.flags) & 1u) != 0u) {
+                        specRay.origin = specHit.worldPos + specRay.dir * 0.002;
+                        specHit = traceBVH(specRay);
+                    } else {
+                        break;
+                    }
+                }
+                if (specHit.hit) {
+                    let specMat = materials[specHit.matIndex];
+                    accumulated += evaluateSurface(specHit.worldPos, specHit.worldNorm, -specRay.dir, specMat);
                 }
             }
         } else {
+            // Path-traced direct lighting at primary surface
+            let ptDirect = evaluateLighting(worldPos, worldNormal);
+
             // Cosine-weighted hemisphere sample for indirect lighting
             let r1 = nextRandom();
             let r2 = nextRandom();
@@ -358,19 +470,45 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             var indirect = vec3f(0.0);
 
             if (hit.hit) {
-                let mat = materials[hit.matIndex];
+                var indirectHit = hit;
+                var indirectMat = materials[hit.matIndex];
 
-                if ((u32(mat.flags) & 1u) != 0u) {
-                    indirect = traceRefraction(ray, hit, mat);
-                } else if (mat.emissiveIntensity > 0.0) {
-                    indirect = mat.emissive * mat.emissiveIntensity;
-                } else {
-                    let hitDirect = evaluateLighting(hit.worldPos, hit.worldNorm);
-                    indirect = hitDirect * mat.albedo;
+                // Skip through transparent/reflective surfaces to find the
+                // first opaque hit — glass and mirrors don't occlude indirect lighting
+                for (var skip = 0u; skip < 4u; skip++) {
+                    if ((u32(indirectMat.flags) & 1u) != 0u) {
+                        var passRay: Ray;
+                        passRay.dir = ray.dir;
+                        passRay.origin = indirectHit.worldPos + ray.dir * 0.002;
+                        let passHit = traceBVH(passRay);
+                        if (!passHit.hit) { indirectHit.hit = false; break; }
+                        indirectHit = passHit;
+                        indirectMat = materials[passHit.matIndex];
+                    } else if (indirectMat.metallic > 0.5) {
+                        let reflDir = reflect(ray.dir, indirectHit.worldNorm);
+                        var reflRay: Ray;
+                        reflRay.origin = indirectHit.worldPos + indirectHit.worldNorm * 0.001;
+                        reflRay.dir = reflDir;
+                        let reflHit = traceBVH(reflRay);
+                        if (!reflHit.hit) { indirectHit.hit = false; break; }
+                        indirectHit = reflHit;
+                        indirectMat = materials[reflHit.matIndex];
+                        ray.dir = reflDir;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (indirectHit.hit) {
+                    if (indirectMat.emissiveIntensity > 0.0) {
+                        indirect = indirectMat.emissive * indirectMat.emissiveIntensity;
+                    } else {
+                        indirect = evaluateLighting(indirectHit.worldPos, indirectHit.worldNorm) * indirectMat.albedo;
+                    }
                 }
             }
 
-            // Specular ray for metallic/glossy surfaces
+            // Specular ray for metallic/glossy surfaces (not fully metallic — those use the mirror path)
             if (metallic > 0.1 || roughness < 0.5) {
                 let sr1 = nextRandom();
                 let sr2 = nextRandom();
@@ -382,21 +520,31 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                     var specRay: Ray;
                     specRay.origin = worldPos + worldNormal * 0.001;
                     specRay.dir = specDir;
-                    let specHit = traceBVH(specRay);
+                    var specHit = traceBVH(specRay);
+                    // Skip through glass on specular path
+                    for (var sk = 0u; sk < 4u; sk++) {
+                        if (!specHit.hit) { break; }
+                        let skMat = materials[specHit.matIndex];
+                        if ((u32(skMat.flags) & 1u) != 0u) {
+                            specRay.origin = specHit.worldPos + specRay.dir * 0.002;
+                            specHit = traceBVH(specRay);
+                        } else {
+                            break;
+                        }
+                    }
                     if (specHit.hit) {
                         let specMat = materials[specHit.matIndex];
-                        let specLighting = evaluateLighting(specHit.worldPos, specHit.worldNorm);
-                        let specular = specLighting * specMat.albedo;
+                        let specular = evaluateDirectAndIndirect(specHit.worldPos, specHit.worldNorm) * specMat.albedo;
                         indirect = mix(indirect, specular, metallic);
                     }
                 }
             }
 
-            accumulated += indirect;
+            accumulated += ptDirect + indirect;
         }
     }
 
-    let giAlpha = select(1.0, 0.0, isRefractive);
+    let giAlpha = select(1.0, 0.0, isRefractive || metallic > 0.9);
     textureStore(giOutput, coord, vec4f(accumulated / f32(spp), giAlpha));
 }
 `;
