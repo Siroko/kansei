@@ -85,7 +85,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     // Transient reference to the last denoised texture (set each frame in spatial pass)
     private _lastDenoisedTex: GPUTexture | null = null;
 
-    // Previous frame's view-projection matrix for temporal reprojection
+    // View-projection matrices
     private _prevViewProj = mat4.create();
     private _invViewProj = mat4.create();
 
@@ -372,7 +372,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     }
 
     private _createParamBuffers(device: GPUDevice): void {
-        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 5*u32+3*pad(32) = 112
+        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 6*u32+2*pad(32) = 112
         this._traceParamsBuf = device.createBuffer({
             label: 'PathTracer/TraceParams',
             size: 112,
@@ -561,7 +561,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         // lightCount   : u32      offset 88  (float[22])
         // spp          : u32      offset 92  (float[23])
         // useBlueNoise : u32      offset 96  (float[24])
-        // _pad0-2      : u32      offset 100-108
+        // fixedSeed    : u32      offset 100 (float[25])
+        // _pad0-1      : u32      offset 104-108
         const params = new Float32Array(28); // 112 bytes
         const paramsU32 = new Uint32Array(params.buffer);
 
