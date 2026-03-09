@@ -308,16 +308,18 @@ fn evaluateSurface(hitPos: vec3f, hitNorm: vec3f, viewDir: vec3f, mat: MaterialD
             specRay.origin = hitPos + hitNorm * 0.001;
             specRay.dir = specDir;
             var specHit = traceBVH(specRay);
-            // Skip through glass on specular path
+            // Skip through glass and bounce off mirrors on specular path
             for (var sk = 0u; sk < 4u; sk++) {
                 if (!specHit.hit) { break; }
                 let skMat = materials[specHit.matIndex];
                 if ((u32(skMat.flags) & 1u) != 0u) {
                     specRay.origin = specHit.worldPos + specRay.dir * 0.002;
                     specHit = traceBVH(specRay);
-                } else {
-                    break;
-                }
+                } else if (skMat.metallic > 0.9) {
+                    specRay.dir = reflect(specRay.dir, specHit.worldNorm);
+                    specRay.origin = specHit.worldPos + specHit.worldNorm * 0.001;
+                    specHit = traceBVH(specRay);
+                } else { break; }
             }
             if (specHit.hit) {
                 let specMat = materials[specHit.matIndex];
@@ -363,8 +365,31 @@ fn traceRefraction(
 
         let nextMat = materials[nextHit.matIndex];
         if ((u32(nextMat.flags) & 1u) == 0u) {
-            let viewDir = -ray.dir;
-            return throughput * evaluateSurface(nextHit.worldPos, nextHit.worldNorm, viewDir, nextMat);
+            // Exited glass onto non-refractive surface
+            if (nextMat.metallic > 0.9) {
+                // Mirror: follow reflection bounces to show mirror reflection through glass
+                var mRay: Ray;
+                mRay.dir = reflect(ray.dir, nextHit.worldNorm);
+                mRay.origin = nextHit.worldPos + nextHit.worldNorm * 0.001;
+                var mHit = traceBVH(mRay);
+                for (var mb = 0u; mb < 4u; mb++) {
+                    if (!mHit.hit) { break; }
+                    let mbMat = materials[mHit.matIndex];
+                    if (mbMat.metallic > 0.9 && (u32(mbMat.flags) & 1u) == 0u) {
+                        mRay.dir = reflect(mRay.dir, mHit.worldNorm);
+                        mRay.origin = mHit.worldPos + mHit.worldNorm * 0.001;
+                        mHit = traceBVH(mRay);
+                    } else {
+                        break;
+                    }
+                }
+                if (mHit.hit) {
+                    let mMat = materials[mHit.matIndex];
+                    return throughput * evaluateDirectAndIndirect(mHit.worldPos, mHit.worldNorm) * mMat.albedo;
+                }
+                return throughput * vec3f(0.0);
+            }
+            return throughput * evaluateDirectAndIndirect(nextHit.worldPos, nextHit.worldNorm) * nextMat.albedo;
         }
         currentHit = nextHit;
     }
@@ -425,8 +450,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 }
             }
         } else if (metallic > 0.9) {
-            // Fully metallic (mirror): only specular reflection, no diffuse.
-            // Path tracer handles the full reflected scene — composite uses GI directly.
+            // Mirror surface: trace specular ray to find reflected object,
+            // then evaluate it as a diffuse-lit surface (direct + indirect * albedo)
+            // so reflections show the object's "raster + GI" appearance.
             let sr1 = nextRandom();
             let sr2 = nextRandom();
             let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
@@ -438,20 +464,27 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 specRay.origin = worldPos + worldNormal * 0.001;
                 specRay.dir = specDir;
                 var specHit = traceBVH(specRay);
-                // Skip through glass on specular path
+                // Skip through glass/mirrors to find the first diffuse-like surface
                 for (var sk = 0u; sk < 4u; sk++) {
                     if (!specHit.hit) { break; }
                     let skMat = materials[specHit.matIndex];
                     if ((u32(skMat.flags) & 1u) != 0u) {
                         specRay.origin = specHit.worldPos + specRay.dir * 0.002;
                         specHit = traceBVH(specRay);
-                    } else {
-                        break;
-                    }
+                    } else if (skMat.metallic > 0.9) {
+                        specRay.dir = reflect(specRay.dir, specHit.worldNorm);
+                        specRay.origin = specHit.worldPos + specHit.worldNorm * 0.001;
+                        specHit = traceBVH(specRay);
+                    } else { break; }
                 }
                 if (specHit.hit) {
                     let specMat = materials[specHit.matIndex];
-                    accumulated += evaluateSurface(specHit.worldPos, specHit.worldNorm, -specRay.dir, specMat);
+                    if ((u32(specMat.flags) & 1u) != 0u) {
+                        accumulated += traceRefraction(specRay, specHit, specMat);
+                    } else {
+                        // Evaluate as diffuse-lit surface regardless of metallic
+                        accumulated += evaluateDirectAndIndirect(specHit.worldPos, specHit.worldNorm) * specMat.albedo;
+                    }
                 }
             }
         } else {
@@ -521,16 +554,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                     specRay.origin = worldPos + worldNormal * 0.001;
                     specRay.dir = specDir;
                     var specHit = traceBVH(specRay);
-                    // Skip through glass on specular path
+                    // Skip through glass and bounce off mirrors on specular path
                     for (var sk = 0u; sk < 4u; sk++) {
                         if (!specHit.hit) { break; }
                         let skMat = materials[specHit.matIndex];
                         if ((u32(skMat.flags) & 1u) != 0u) {
                             specRay.origin = specHit.worldPos + specRay.dir * 0.002;
                             specHit = traceBVH(specRay);
-                        } else {
-                            break;
-                        }
+                        } else if (skMat.metallic > 0.9) {
+                            specRay.dir = reflect(specRay.dir, specHit.worldNorm);
+                            specRay.origin = specHit.worldPos + specHit.worldNorm * 0.001;
+                            specHit = traceBVH(specRay);
+                        } else { break; }
                     }
                     if (specHit.hit) {
                         let specMat = materials[specHit.matIndex];
