@@ -35,18 +35,23 @@ class InstancedGeometry extends Geometry {
     public initialize(gpuDevice: GPUDevice) {
         super.initialize(gpuDevice);
         for (const extraBuffer of this.extraBuffers) {
-            (this.vertexBuffersDescriptors! as Array<GPUVertexBufferLayout>).push(
-                {
-                    attributes: [
-                        {
-                            shaderLocation: extraBuffer.shaderLocation! as GPUIndex32,
-                            offset: extraBuffer.offset! as GPUSize64,
-                            format: extraBuffer.format! as GPUVertexFormat
-                        }
-                    ] as Iterable<GPUVertexAttribute>,
-                    arrayStride: extraBuffer.stride!,
-                    stepMode: "instance" as GPUVertexStepMode
-                });
+            const attrs: GPUVertexAttribute[] = extraBuffer.attributes
+                ? extraBuffer.attributes.map(a => ({
+                    shaderLocation: a.shaderLocation as GPUIndex32,
+                    offset: a.offset as GPUSize64,
+                    format: a.format as GPUVertexFormat,
+                }))
+                : [{
+                    shaderLocation: extraBuffer.shaderLocation! as GPUIndex32,
+                    offset: (extraBuffer.offset ?? 0) as GPUSize64,
+                    format: extraBuffer.format! as GPUVertexFormat,
+                }];
+
+            (this.vertexBuffersDescriptors! as Array<GPUVertexBufferLayout>).push({
+                attributes: attrs,
+                arrayStride: extraBuffer.stride!,
+                stepMode: "instance" as GPUVertexStepMode,
+            });
         }
 
         this.initialized = true;

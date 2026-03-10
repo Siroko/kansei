@@ -1,6 +1,15 @@
 import { BufferBase } from "./BufferBase";
 
 /**
+ * Describes a single vertex attribute within a compute buffer.
+ */
+interface IComputeBufferAttribute {
+    shaderLocation: number;
+    offset: number;
+    format: GPUVertexFormat;
+}
+
+/**
  * Configuration options for creating a compute buffer
  */
 interface IComputeBufferOptions {
@@ -18,6 +27,8 @@ interface IComputeBufferOptions {
     stride?: number;
     /** Vertex format for the buffer */
     format?: GPUVertexFormat;
+    /** Multiple vertex attributes from one buffer (overrides shaderLocation/offset/format). */
+    attributes?: IComputeBufferAttribute[];
 }
 
 /**
@@ -27,6 +38,8 @@ interface IComputeBufferOptions {
 class ComputeBuffer extends BufferBase {
     /** Default buffer type for compute operations */
     public type?: string = ComputeBuffer.BUFFER_TYPE_STORAGE;
+    /** Multiple vertex attributes from one buffer. */
+    public attributes?: IComputeBufferAttribute[];
 
     /**
      * Creates a new compute buffer
@@ -41,6 +54,7 @@ class ComputeBuffer extends BufferBase {
         this.offset = options.offset;
         this.stride = options.stride;
         this.format = options.format;
+        this.attributes = options.attributes;
     }
 
     /**
@@ -55,7 +69,8 @@ class ComputeBuffer extends BufferBase {
             shaderLocation: this.shaderLocation,
             offset: this.offset,
             stride: this.stride,
-            format: this.format
+            format: this.format,
+            attributes: this.attributes?.map(a => ({ ...a })),
         });
     }
 }

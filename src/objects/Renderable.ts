@@ -1,4 +1,5 @@
 import { Geometry } from "../buffers/Geometry";
+import { ComputeBuffer } from "../buffers/ComputeBuffer";
 import { Material } from "../materials/Material";
 import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
@@ -20,6 +21,18 @@ class Renderable extends Object3D {
 
     /** Path tracer material properties. If null, defaults are derived at BVH build time. */
     public pathTracerMaterial: PathTracerMaterial | null = null;
+
+    /** GPU-side per-instance data for BVH TLAS expansion.
+     *  When set on an InstancedGeometry renderable, BVHBuilder dispatches a compute pass
+     *  that reads this buffer and writes N TLAS instance entries (transform + inverse + metadata).
+     *  Buffer format depends on gpuInstanceFullTransform:
+     *    false (default) — vec4f per instance: xyz = local position offset
+     *    true            — 3×vec4f per instance: row-major 4×3 affine transform */
+    public gpuInstanceBuffer: ComputeBuffer | null = null;
+
+    /** When true, gpuInstanceBuffer contains 3×vec4f full affine transforms per instance
+     *  instead of vec4f position offsets. Default: false (position-only mode). */
+    public gpuInstanceFullTransform: boolean = false;
 
     /** The layout of the bind group for GPU resources. */
     public bindGroupLayout?: GPUBindGroupLayout;

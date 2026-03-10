@@ -179,26 +179,29 @@ fn traverseBLAS(
     return hit;
 }
 
-fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
+fn traceBVHInternal(ray: Ray, anyHit: bool, maxDist: f32) -> HitInfo {
     var hit: HitInfo;
-    hit.t = 1e30;
+    hit.t = maxDist;
     hit.hit = false;
 
     let tlasInvDir = 1.0 / ray.dir;
-    var stack: array<u32, TLAS_STACK_SIZE>;
+    // Stack stores (nodeIdx, bitcast tMin) — avoids redundant AABB retest at pop
+    var stack: array<vec2u, TLAS_STACK_SIZE>;
     var stackPtr = 0u;
-    stack[0] = 0u;
+    stack[0] = vec2u(0u, 0u); // root, tMin = 0.0
     stackPtr = 1u;
 
     var iter = 0u;
     while (stackPtr > 0u && iter < 16384u) {
         iter += 1u;
         stackPtr -= 1u;
-        let nodeIdx = stack[stackPtr];
-        let node = tlasNodes[nodeIdx];
+        let entry = stack[stackPtr];
+        let nodeIdx = entry.x;
 
-        let tHit = rayAABB(ray, node.boundsMin, node.boundsMax, hit.t, tlasInvDir);
-        if (tHit < 0.0) { continue; }
+        // Fast cull: stored tMin from push-time vs current closest hit
+        if (bitcast<f32>(entry.y) > hit.t) { continue; }
+
+        let node = tlasNodes[nodeIdx];
 
         if (node.leftChild < 0) {
             let instIdx = u32(-(node.leftChild + 1));
@@ -233,16 +236,16 @@ fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
 
                 if (tLeft >= 0.0 && tRight >= 0.0) {
                     if (tLeft < tRight) {
-                        stack[stackPtr] = rightIdx; stackPtr += 1u;
-                        stack[stackPtr] = leftIdx;  stackPtr += 1u;
+                        stack[stackPtr] = vec2u(rightIdx, bitcast<u32>(tRight)); stackPtr += 1u;
+                        stack[stackPtr] = vec2u(leftIdx, bitcast<u32>(tLeft));   stackPtr += 1u;
                     } else {
-                        stack[stackPtr] = leftIdx;  stackPtr += 1u;
-                        stack[stackPtr] = rightIdx; stackPtr += 1u;
+                        stack[stackPtr] = vec2u(leftIdx, bitcast<u32>(tLeft));   stackPtr += 1u;
+                        stack[stackPtr] = vec2u(rightIdx, bitcast<u32>(tRight)); stackPtr += 1u;
                     }
                 } else if (tLeft >= 0.0) {
-                    stack[stackPtr] = leftIdx; stackPtr += 1u;
+                    stack[stackPtr] = vec2u(leftIdx, bitcast<u32>(tLeft)); stackPtr += 1u;
                 } else if (tRight >= 0.0) {
-                    stack[stackPtr] = rightIdx; stackPtr += 1u;
+                    stack[stackPtr] = vec2u(rightIdx, bitcast<u32>(tRight)); stackPtr += 1u;
                 }
             }
         }
@@ -251,11 +254,11 @@ fn traceBVHInternal(ray: Ray, anyHit: bool) -> HitInfo {
 }
 
 fn traceBVH(ray: Ray) -> HitInfo {
-    return traceBVHInternal(ray, false);
+    return traceBVHInternal(ray, false, 1e30);
 }
 
-fn traceBVHShadow(ray: Ray) -> bool {
-    let hit = traceBVHInternal(ray, true);
+fn traceBVHShadow(ray: Ray, maxDist: f32) -> bool {
+    let hit = traceBVHInternal(ray, true, maxDist);
     return hit.hit;
 }
 `;
