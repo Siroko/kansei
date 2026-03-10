@@ -209,7 +209,7 @@ export class PathTracerEffect extends PostProcessingEffect {
 
         // Guard against missing BVH buffers
         if (!this._bvhBuilder.triangleBuffer || !this._bvhBuilder.bvh4NodeBuffer ||
-            !this._bvhBuilder.tlasNodeBuffer || !this._bvhBuilder.instanceBuffer ||
+            !this._bvhBuilder.tlasBvh4Buffer || !this._bvhBuilder.instanceBuffer ||
             !this._bvhBuilder.materialBuffer) {
             return;
         }
@@ -629,7 +629,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 4, resource: { buffer: this._traceParamsBuf! } },
                 { binding: 5, resource: { buffer: builder.triangleBuffer! } },
                 { binding: 6, resource: { buffer: builder.bvh4NodeBuffer! } },
-                { binding: 7, resource: { buffer: builder.tlasNodeBuffer! } },
+                { binding: 7, resource: { buffer: builder.tlasBvh4Buffer! } },
                 { binding: 8, resource: { buffer: builder.instanceBuffer! } },
                 { binding: 9, resource: { buffer: builder.materialBuffer! } },
                 { binding: 10, resource: { buffer: this._lightsBuffer! } },
