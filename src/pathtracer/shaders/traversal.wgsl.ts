@@ -2,7 +2,7 @@ export const traversalShader = /* wgsl */`
 // Requires: intersection.wgsl (Ray, HitInfo, rayAABB, rayTriangle)
 // Requires: BVHNode struct, Instance struct, triangle/node/instance storage bindings
 
-const TLAS_STACK_SIZE = 32u;
+const TLAS_STACK_SIZE = 16u;
 const BLAS_STACK_SIZE = 64u;
 const TRI_STRIDE = 24u; // 24 floats per triangle
 
@@ -184,69 +184,108 @@ fn traceBVHInternal(ray: Ray, anyHit: bool, maxDist: f32) -> HitInfo {
     hit.t = maxDist;
     hit.hit = false;
 
-    let tlasInvDir = 1.0 / ray.dir;
-    // Stack stores (nodeIdx, bitcast tMin) — avoids redundant AABB retest at pop
-    var stack: array<vec2u, TLAS_STACK_SIZE>;
+    let invDir = 1.0 / ray.dir;
+    let ox = vec4f(ray.origin.x);
+    let oy = vec4f(ray.origin.y);
+    let oz = vec4f(ray.origin.z);
+    let idx4 = vec4f(invDir.x);
+    let idy4 = vec4f(invDir.y);
+    let idz4 = vec4f(invDir.z);
+
+    var stack: array<u32, TLAS_STACK_SIZE>;
     var stackPtr = 0u;
-    stack[0] = vec2u(0u, 0u); // root, tMin = 0.0
+    stack[0] = 0u;
     stackPtr = 1u;
 
     var iter = 0u;
     while (stackPtr > 0u && iter < 16384u) {
         iter += 1u;
         stackPtr -= 1u;
-        let entry = stack[stackPtr];
-        let nodeIdx = entry.x;
+        let base = stack[stackPtr] * 8u;
 
-        // Fast cull: stored tMin from push-time vs current closest hit
-        if (bitcast<f32>(entry.y) > hit.t) { continue; }
+        // Read BVH4 node (8 vec4f = 128 bytes, 1 cache line)
+        let childMinX = tlasBvh4Nodes[base + 0u];
+        let childMaxX = tlasBvh4Nodes[base + 1u];
+        let childMinY = tlasBvh4Nodes[base + 2u];
+        let childMaxY = tlasBvh4Nodes[base + 3u];
+        let childMinZ = tlasBvh4Nodes[base + 4u];
+        let childMaxZ = tlasBvh4Nodes[base + 5u];
+        let children  = bitcast<vec4i>(tlasBvh4Nodes[base + 6u]);
+        let childCnts = bitcast<vec4u>(tlasBvh4Nodes[base + 7u]);
 
-        let node = tlasNodes[nodeIdx];
+        // Test all 4 child AABBs simultaneously
+        let t1x = (childMinX - ox) * idx4;
+        let t2x = (childMaxX - ox) * idx4;
+        let t1y = (childMinY - oy) * idy4;
+        let t2y = (childMaxY - oy) * idy4;
+        let t1z = (childMinZ - oz) * idz4;
+        let t2z = (childMaxZ - oz) * idz4;
 
-        if (node.leftChild < 0) {
-            let instIdx = u32(-(node.leftChild + 1));
-            let inst = instances[instIdx];
-            let localRay = transformRayToLocal(ray, inst);
+        let tminV = max(max(min(t1x, t2x), min(t1y, t2y)), min(t1z, t2z));
+        let tmaxV = min(min(max(t1x, t2x), max(t1y, t2y)), max(t1z, t2z));
 
-            let blasHit = traverseBLAS(
-                localRay,
-                inst.blasNodeOffset,
-                inst.blasTriOffset,
-                inst.blasTriCount,
-                hit.t,
-                anyHit,
-            );
+        var hitDist: array<f32, 4>;
+        var hitIdx: array<u32, 4>;
+        var hitCount = 0u;
 
-            if (blasHit.hit && blasHit.t < hit.t) {
-                hit = blasHit;
-                hit.instanceId = instIdx;
-                hit.matIndex = inst.materialIndex;
-                if (anyHit) { return hit; }
-                hit.worldPos = transformPointToWorld(blasHit.worldPos, inst);
-                hit.worldNorm = transformNormalToWorld(blasHit.worldNorm, inst);
-            }
-        } else {
-            if (stackPtr < TLAS_STACK_SIZE - 2u) {
-                let leftIdx = u32(node.leftChild);
-                let rightIdx = u32(node.rightChild);
-                let leftNode = tlasNodes[leftIdx];
-                let rightNode = tlasNodes[rightIdx];
-                let tLeft = rayAABB(ray, leftNode.boundsMin, leftNode.boundsMax, hit.t, tlasInvDir);
-                let tRight = rayAABB(ray, rightNode.boundsMin, rightNode.boundsMax, hit.t, tlasInvDir);
+        for (var ci = 0u; ci < 4u; ci++) {
+            let tmin_c = tminV[ci];
+            let tmax_c = tmaxV[ci];
+            if (tmax_c >= 0.0 && tmin_c <= tmax_c && tmin_c <= hit.t) {
+                let childIdx = children[ci];
 
-                if (tLeft >= 0.0 && tRight >= 0.0) {
-                    if (tLeft < tRight) {
-                        stack[stackPtr] = vec2u(rightIdx, bitcast<u32>(tRight)); stackPtr += 1u;
-                        stack[stackPtr] = vec2u(leftIdx, bitcast<u32>(tLeft));   stackPtr += 1u;
-                    } else {
-                        stack[stackPtr] = vec2u(leftIdx, bitcast<u32>(tLeft));   stackPtr += 1u;
-                        stack[stackPtr] = vec2u(rightIdx, bitcast<u32>(tRight)); stackPtr += 1u;
+                if (childIdx < 0) {
+                    // Leaf: instance intersection (skip sentinels with count 0)
+                    if (childCnts[ci] > 0u) {
+                        let instIdx = u32(-(childIdx + 1));
+                        let inst = instances[instIdx];
+                        let localRay = transformRayToLocal(ray, inst);
+
+                        let blasHit = traverseBLAS(
+                            localRay,
+                            inst.blasNodeOffset,
+                            inst.blasTriOffset,
+                            inst.blasTriCount,
+                            hit.t,
+                            anyHit,
+                        );
+
+                        if (blasHit.hit && blasHit.t < hit.t) {
+                            hit = blasHit;
+                            hit.instanceId = instIdx;
+                            hit.matIndex = inst.materialIndex;
+                            if (anyHit) { return hit; }
+                            hit.worldPos = transformPointToWorld(blasHit.worldPos, inst);
+                            hit.worldNorm = transformNormalToWorld(blasHit.worldNorm, inst);
+                        }
                     }
-                } else if (tLeft >= 0.0) {
-                    stack[stackPtr] = vec2u(leftIdx, bitcast<u32>(tLeft)); stackPtr += 1u;
-                } else if (tRight >= 0.0) {
-                    stack[stackPtr] = vec2u(rightIdx, bitcast<u32>(tRight)); stackPtr += 1u;
+                } else {
+                    // Internal: collect for sorted push
+                    hitDist[hitCount] = max(tmin_c, 0.0);
+                    hitIdx[hitCount] = u32(childIdx);
+                    hitCount += 1u;
                 }
+            }
+        }
+
+        // Push internal children sorted farthest-first (nearest popped first)
+        if (hitCount > 0u) {
+            for (var i = 1u; i < hitCount; i++) {
+                let kd = hitDist[i];
+                let ki = hitIdx[i];
+                var j = i;
+                while (j > 0u && hitDist[j - 1u] < kd) {
+                    hitDist[j] = hitDist[j - 1u];
+                    hitIdx[j] = hitIdx[j - 1u];
+                    j -= 1u;
+                }
+                hitDist[j] = kd;
+                hitIdx[j] = ki;
+            }
+            let pushCount = min(hitCount, TLAS_STACK_SIZE - stackPtr);
+            for (var i = 0u; i < pushCount; i++) {
+                stack[stackPtr] = hitIdx[i];
+                stackPtr += 1u;
             }
         }
     }

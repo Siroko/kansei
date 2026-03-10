@@ -7,10 +7,9 @@ import { mortonShader } from "./shaders/morton.wgsl";
 import { radixSortShader } from "./shaders/radix-sort.wgsl";
 import { treeBuildShader } from "./shaders/tree-build.wgsl";
 import { refitLeavesShader, refitInternalShader } from "./shaders/refit.wgsl";
-import { instanceAABBShader } from "./shaders/instance-aabb.wgsl";
-import { tlasRefitShader } from "./shaders/tlas-refit.wgsl";
 import { instanceExpandShader } from "./shaders/instance-expand.wgsl";
 import { tlasSortShader, tlasGatherShader } from "./shaders/tlas-sort.wgsl";
+import { tlasBuildShader } from "./shaders/tlas-build.wgsl";
 
 export interface BLASEntry {
     geometryId: string;
@@ -69,13 +68,8 @@ export class BVHBuilder {
     private _treeBuildParamsBuf: GPUBuffer | null = null;
     private _refitParamsBuf: GPUBuffer | null = null;
 
-    // TLAS construction pipelines
-    private _instanceAABBPipeline: GPUComputePipeline | null = null;
-    private _instanceAABBBGL: GPUBindGroupLayout | null = null;
+    // TLAS construction (legacy fields, kept for destroy() cleanup)
     private _instanceAABBParamsBuf: GPUBuffer | null = null;
-    private _tlasRefitLeafPipeline: GPUComputePipeline | null = null;
-    private _tlasRefitMergePipeline: GPUComputePipeline | null = null;
-    private _tlasRefitBGL: GPUBindGroupLayout | null = null;
     private _tlasRefitParamsBuf: GPUBuffer | null = null;
 
     // Instance expansion pipelines (GPU-driven instanced geometry)
@@ -99,6 +93,15 @@ export class BVHBuilder {
     private _tlasGatherParamsBuf: GPUBuffer | null = null;
     private _instanceBufferSorted: GPUBuffer | null = null;  // sorted copy
     private _tlasSortCapacity: number = 0;
+
+    // BVH4 TLAS build pipelines
+    private _tlasBvh4Buffer: GPUBuffer | null = null;
+    private _tlasBuildLeafPipeline: GPUComputePipeline | null = null;
+    private _tlasBuildInternalPipeline: GPUComputePipeline | null = null;
+    private _tlasBuildBGL: GPUBindGroupLayout | null = null;
+    private _tlasBuildParamsBufs: GPUBuffer[] = [];
+    private _tlasLevelLayout: { offset: number; count: number }[] = [];
+    private _tlasBvh4NodeCount: number = 0;
 
     // Reusable staging array for instance packing
     private _instanceStaging: Float32Array | null = null;
@@ -141,6 +144,7 @@ export class BVHBuilder {
     get bvh4NodeBuffer(): GPUBuffer | null { return this._bvh4NodeBuffer; }
     get instanceBuffer(): GPUBuffer | null { return this._instanceBuffer; }
     get tlasNodeBuffer(): GPUBuffer | null { return this._tlasNodeBuffer; }
+    get tlasBvh4Buffer(): GPUBuffer | null { return this._tlasBvh4Buffer; }
     get materialBuffer(): GPUBuffer | null { return this._materialBuffer; }
     get totalInstances(): number { return this._totalInstances; }
 
@@ -239,7 +243,7 @@ export class BVHBuilder {
         const objects = scene.getOrderedObjects();
         if (objects.length === 0) return;
 
-        this._ensureTLASPipelines();
+        this._ensureTLASBvh4Pipelines();
 
         // Pack instance data to GPU buffer (CPU instances written, GPU instances reserved)
         this._packInstances(objects);
@@ -247,9 +251,9 @@ export class BVHBuilder {
         const count = this._totalInstances;
         if (count === 0) return;
 
-        // Rebuild balanced tree structure when instance count changes
+        // Rebuild BVH4 tree layout when instance count changes
         if (count !== this._lastTLASInstanceCount) {
-            this._buildBalancedTLASStructure(count);
+            this._computeTLASBvh4Layout(count);
             this._lastTLASInstanceCount = count;
         }
 
@@ -259,83 +263,8 @@ export class BVHBuilder {
         // Sort instances by Morton code for better TLAS spatial coherence
         this._dispatchTLASSort(commandEncoder, count);
 
-        // Upload params
-        const tlasRefitParams = new Uint32Array([count, 0, 0, 0]);
-        this._device.queue.writeBuffer(this._tlasRefitParamsBuf!, 0, tlasRefitParams);
-
-        const tlasRefitBG = this._device.createBindGroup({
-            layout: this._tlasRefitBGL!,
-            entries: [
-                { binding: 0, resource: { buffer: this._tlasNodeBuffer! } },
-                { binding: 1, resource: { buffer: this._instanceBuffer! } },
-                { binding: 2, resource: { buffer: this._bvh4NodeBuffer! } },
-                { binding: 3, resource: { buffer: this._tlasRefitParamsBuf! } },
-            ],
-        });
-
-        // GPU Pass 1: Fill leaf AABBs from instance transforms + BLAS root bounds
-        const leafWG = Math.ceil(count / 256);
-        const leafPass = commandEncoder.beginComputePass({ label: 'TLAS/InitLeaves' });
-        leafPass.setPipeline(this._tlasRefitLeafPipeline!);
-        leafPass.setBindGroup(0, tlasRefitBG);
-        leafPass.dispatchWorkgroups(leafWG);
-        leafPass.end();
-
-        // GPU Pass 2+: Merge internal node AABBs bottom-up.
-        // Each compute pass has an implicit memory barrier in WebGPU,
-        // so child bounds are visible before parents read them.
-        // ceil(log2(N)) passes covers the full balanced tree depth.
-        if (count > 1) {
-            const mergeCount = Math.ceil(Math.log2(count));
-            const mergeWG = Math.ceil((count - 1) / 256);
-            for (let i = 0; i < mergeCount; i++) {
-                const mergePass = commandEncoder.beginComputePass({ label: `TLAS/Merge/${i}` });
-                mergePass.setPipeline(this._tlasRefitMergePipeline!);
-                mergePass.setBindGroup(0, tlasRefitBG);
-                mergePass.dispatchWorkgroups(mergeWG);
-                mergePass.end();
-            }
-        }
-    }
-
-    /**
-     * Build a balanced binary tree structure for the TLAS on CPU.
-     * Only sets child pointers — GPU fills AABBs via initLeaves + mergeNodes.
-     * Layout: internal nodes [0..N-2], leaf nodes [N-1..2N-2].
-     */
-    private _buildBalancedTLASStructure(N: number): void {
-        const nodeCount = 2 * N - 1;
-        const buf = new ArrayBuffer(nodeCount * 32);
-        const i32 = new Int32Array(buf);
-
-        if (N === 1) {
-            // Single leaf at index 0 — initLeaves handles it
-        } else {
-            let nextInternal = 0;
-            // Use index ranges instead of array slicing for O(1) per call
-            const buildNode = (start: number, end: number): number => {
-                if (end - start === 1) {
-                    return (N - 1) + start; // leaf index
-                }
-                const myIdx = nextInternal++;
-                const mid = start + ((end - start) >> 1);
-                const left = buildNode(start, mid);
-                const right = buildNode(mid, end);
-                const off = myIdx * 8; // 8 int32/float32 per node
-                i32[off + 3] = left;   // leftChild
-                i32[off + 7] = right;  // rightChild
-                return myIdx;
-            };
-            buildNode(0, N);
-        }
-
-        this._tlasNodeBuffer?.destroy();
-        this._tlasNodeBuffer = this._device.createBuffer({
-            label: 'TLAS/Nodes',
-            size: nodeCount * 32,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        this._device.queue.writeBuffer(this._tlasNodeBuffer, 0, buf);
+        // Build BVH4 TLAS (leaves + internal levels)
+        this._dispatchTLASBvh4Build(commandEncoder, count);
     }
 
     /** Temporary per-frame expansion group info, built by _packInstances. */
@@ -817,6 +746,149 @@ export class BVHBuilder {
     }
 
     /**
+     * Compute BVH4 tree level layout for the TLAS.
+     * Levels stored top-down: root at offset 0, leaves at the end.
+     */
+    private _computeTLASBvh4Layout(N: number): void {
+        const levels: number[] = [];
+        let count = N;
+        while (count > 1) {
+            count = Math.ceil(count / 4);
+            levels.push(count);
+        }
+        if (N === 1) levels.push(1);
+
+        // Reverse for top-down layout (root first)
+        levels.reverse();
+
+        this._tlasLevelLayout = [];
+        let offset = 0;
+        for (const lvl of levels) {
+            this._tlasLevelLayout.push({ offset, count: lvl });
+            offset += lvl;
+        }
+        this._tlasBvh4NodeCount = offset;
+
+        // Allocate BVH4 TLAS node buffer (128 bytes per node)
+        this._tlasBvh4Buffer?.destroy();
+        this._tlasBvh4Buffer = this._device.createBuffer({
+            label: 'TLAS/BVH4',
+            size: Math.max(this._tlasBvh4NodeCount * 128, 4),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        // Ensure enough param buffers for all build levels
+        while (this._tlasBuildParamsBufs.length < levels.length) {
+            this._tlasBuildParamsBufs.push(this._device.createBuffer({
+                label: `TLAS/BVH4/BuildParams/${this._tlasBuildParamsBufs.length}`,
+                size: 32, // BuildParams: 8 × u32
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            }));
+        }
+    }
+
+    /**
+     * Lazily create GPU pipelines for BVH4 TLAS construction.
+     */
+    private _ensureTLASBvh4Pipelines(): void {
+        if (this._tlasBuildLeafPipeline) return;
+
+        this._tlasBuildBGL = this._device.createBindGroupLayout({
+            label: 'TLAS/BVH4/BuildBGL',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        const module = this._device.createShaderModule({ code: tlasBuildShader });
+        const layout = this._device.createPipelineLayout({ bindGroupLayouts: [this._tlasBuildBGL] });
+
+        this._tlasBuildLeafPipeline = this._device.createComputePipeline({
+            label: 'TLAS/BVH4/BuildLeaves',
+            layout,
+            compute: { module, entryPoint: 'buildLeaves' },
+        });
+
+        this._tlasBuildInternalPipeline = this._device.createComputePipeline({
+            label: 'TLAS/BVH4/BuildInternal',
+            layout,
+            compute: { module, entryPoint: 'buildInternal' },
+        });
+    }
+
+    /**
+     * Dispatch BVH4 TLAS build: leaf nodes first, then internal levels bottom-up.
+     * Each compute pass has an implicit barrier so child data is visible to parents.
+     */
+    private _dispatchTLASBvh4Build(commandEncoder: GPUCommandEncoder, count: number): void {
+        const levels = this._tlasLevelLayout;
+        if (levels.length === 0) return;
+
+        const leafLevel = levels.length - 1;
+
+        // Upload all level params before dispatching (writeBuffer is immediate)
+        for (let i = 0; i < levels.length; i++) {
+            const params = new Uint32Array(8);
+            if (i === leafLevel) {
+                params[0] = count;              // instanceCount
+                params[1] = levels[i].offset;   // nodeOffset
+                params[2] = 0;                  // childOffset (unused for leaves)
+                params[3] = levels[i].count;    // nodeCount
+                params[4] = 0;                  // childCount (unused for leaves)
+            } else {
+                const childLevel = i + 1;
+                params[0] = count;
+                params[1] = levels[i].offset;
+                params[2] = levels[childLevel].offset;
+                params[3] = levels[i].count;
+                params[4] = levels[childLevel].count;
+            }
+            this._device.queue.writeBuffer(this._tlasBuildParamsBufs[i], 0, params);
+        }
+
+        // Dispatch leaf build
+        {
+            const bg = this._device.createBindGroup({
+                layout: this._tlasBuildBGL!,
+                entries: [
+                    { binding: 0, resource: { buffer: this._instanceBuffer! } },
+                    { binding: 1, resource: { buffer: this._bvh4NodeBuffer! } },
+                    { binding: 2, resource: { buffer: this._tlasBvh4Buffer! } },
+                    { binding: 3, resource: { buffer: this._tlasBuildParamsBufs[leafLevel] } },
+                ],
+            });
+            const wg = Math.ceil(levels[leafLevel].count / 256);
+            const pass = commandEncoder.beginComputePass({ label: 'TLAS/BVH4/BuildLeaves' });
+            pass.setPipeline(this._tlasBuildLeafPipeline!);
+            pass.setBindGroup(0, bg);
+            pass.dispatchWorkgroups(wg);
+            pass.end();
+        }
+
+        // Dispatch internal levels bottom-up (from leafLevel-1 down to 0)
+        for (let i = leafLevel - 1; i >= 0; i--) {
+            const bg = this._device.createBindGroup({
+                layout: this._tlasBuildBGL!,
+                entries: [
+                    { binding: 0, resource: { buffer: this._instanceBuffer! } },
+                    { binding: 1, resource: { buffer: this._bvh4NodeBuffer! } },
+                    { binding: 2, resource: { buffer: this._tlasBvh4Buffer! } },
+                    { binding: 3, resource: { buffer: this._tlasBuildParamsBufs[i] } },
+                ],
+            });
+            const wg = Math.ceil(levels[i].count / 256);
+            const pass = commandEncoder.beginComputePass({ label: `TLAS/BVH4/BuildInternal/${i}` });
+            pass.setPipeline(this._tlasBuildInternalPipeline!);
+            pass.setBindGroup(0, bg);
+            pass.dispatchWorkgroups(wg);
+            pass.end();
+        }
+    }
+
+    /**
      * Pack all PathTracerMaterials into the GPU material buffer.
      */
     public updateMaterials(scene: Scene): void {
@@ -930,6 +1002,13 @@ export class BVHBuilder {
                 return 2.0 * (dx * dy + dy * dz + dz * dx);
             };
 
+            // Pre-allocated SAH scratch arrays (reused across all recursive calls — eliminates GC pressure)
+            const sahBinCount = new Uint32Array(SAH_BINS);
+            const sahBinMinX = new Float32Array(SAH_BINS), sahBinMinY = new Float32Array(SAH_BINS), sahBinMinZ = new Float32Array(SAH_BINS);
+            const sahBinMaxX = new Float32Array(SAH_BINS), sahBinMaxY = new Float32Array(SAH_BINS), sahBinMaxZ = new Float32Array(SAH_BINS);
+            const sahLeftCount = new Uint32Array(SAH_BINS - 1);
+            const sahLeftSA = new Float32Array(SAH_BINS - 1);
+
             // Build SAH tree recursively. Operates on indices[start..start+count).
             const buildSAH = (start: number, count: number): number => {
                 const nodeIdx = nextNode++;
@@ -966,51 +1045,57 @@ export class BVHBuilder {
                 let bestAxis = -1;
                 let bestSplit = -1;
 
-                // Bin data per axis
-                const binCount = new Uint32Array(SAH_BINS);
-                const binMinX = new Float32Array(SAH_BINS), binMinY = new Float32Array(SAH_BINS), binMinZ = new Float32Array(SAH_BINS);
-                const binMaxX = new Float32Array(SAH_BINS), binMaxY = new Float32Array(SAH_BINS), binMaxZ = new Float32Array(SAH_BINS);
+                // Cache per-axis centroid ranges to avoid redundant scans
+                const axisCMin = [0, 0, 0], axisCMax = [0, 0, 0];
 
                 for (let axis = 0; axis < 3; axis++) {
                     const cent = axis === 0 ? centX : axis === 1 ? centY : centZ;
                     let cMin = Infinity, cMax = -Infinity;
                     for (let i = start; i < start + count; i++) {
                         const c = cent[indices[i]];
-                        cMin = Math.min(cMin, c);
-                        cMax = Math.max(cMax, c);
+                        if (c < cMin) cMin = c;
+                        if (c > cMax) cMax = c;
                     }
+                    axisCMin[axis] = cMin;
+                    axisCMax[axis] = cMax;
 
-                    if (cMax - cMin < 1e-10) continue; // All centroids at same position on this axis
+                    if (cMax - cMin < 1e-10) continue;
 
                     const scale = SAH_BINS / (cMax - cMin);
 
                     // Clear bins
-                    binCount.fill(0);
-                    binMinX.fill(Infinity); binMinY.fill(Infinity); binMinZ.fill(Infinity);
-                    binMaxX.fill(-Infinity); binMaxY.fill(-Infinity); binMaxZ.fill(-Infinity);
+                    sahBinCount.fill(0);
+                    sahBinMinX.fill(Infinity); sahBinMinY.fill(Infinity); sahBinMinZ.fill(Infinity);
+                    sahBinMaxX.fill(-Infinity); sahBinMaxY.fill(-Infinity); sahBinMaxZ.fill(-Infinity);
 
                     // Fill bins
                     for (let i = start; i < start + count; i++) {
                         const t = indices[i];
-                        let b = Math.floor((cent[t] - cMin) * scale);
+                        let b = ((cent[t] - cMin) * scale) | 0;
                         if (b >= SAH_BINS) b = SAH_BINS - 1;
-                        binCount[b]++;
-                        binMinX[b] = Math.min(binMinX[b], triMinX[t]); binMinY[b] = Math.min(binMinY[b], triMinY[t]); binMinZ[b] = Math.min(binMinZ[b], triMinZ[t]);
-                        binMaxX[b] = Math.max(binMaxX[b], triMaxX[t]); binMaxY[b] = Math.max(binMaxY[b], triMaxY[t]); binMaxZ[b] = Math.max(binMaxZ[b], triMaxZ[t]);
+                        sahBinCount[b]++;
+                        if (triMinX[t] < sahBinMinX[b]) sahBinMinX[b] = triMinX[t];
+                        if (triMinY[t] < sahBinMinY[b]) sahBinMinY[b] = triMinY[t];
+                        if (triMinZ[t] < sahBinMinZ[b]) sahBinMinZ[b] = triMinZ[t];
+                        if (triMaxX[t] > sahBinMaxX[b]) sahBinMaxX[b] = triMaxX[t];
+                        if (triMaxY[t] > sahBinMaxY[b]) sahBinMaxY[b] = triMaxY[t];
+                        if (triMaxZ[t] > sahBinMaxZ[b]) sahBinMaxZ[b] = triMaxZ[t];
                     }
 
                     // Sweep from left, accumulating bounds and counts
-                    const leftCount = new Uint32Array(SAH_BINS - 1);
-                    const leftSA = new Float32Array(SAH_BINS - 1);
                     let lMinX = Infinity, lMinY = Infinity, lMinZ = Infinity;
                     let lMaxX = -Infinity, lMaxY = -Infinity, lMaxZ = -Infinity;
                     let lCount = 0;
                     for (let i = 0; i < SAH_BINS - 1; i++) {
-                        lMinX = Math.min(lMinX, binMinX[i]); lMinY = Math.min(lMinY, binMinY[i]); lMinZ = Math.min(lMinZ, binMinZ[i]);
-                        lMaxX = Math.max(lMaxX, binMaxX[i]); lMaxY = Math.max(lMaxY, binMaxY[i]); lMaxZ = Math.max(lMaxZ, binMaxZ[i]);
-                        lCount += binCount[i];
-                        leftCount[i] = lCount;
-                        leftSA[i] = lCount > 0 ? surfaceArea(lMinX, lMinY, lMinZ, lMaxX, lMaxY, lMaxZ) : 0;
+                        if (sahBinMinX[i] < lMinX) lMinX = sahBinMinX[i];
+                        if (sahBinMinY[i] < lMinY) lMinY = sahBinMinY[i];
+                        if (sahBinMinZ[i] < lMinZ) lMinZ = sahBinMinZ[i];
+                        if (sahBinMaxX[i] > lMaxX) lMaxX = sahBinMaxX[i];
+                        if (sahBinMaxY[i] > lMaxY) lMaxY = sahBinMaxY[i];
+                        if (sahBinMaxZ[i] > lMaxZ) lMaxZ = sahBinMaxZ[i];
+                        lCount += sahBinCount[i];
+                        sahLeftCount[i] = lCount;
+                        sahLeftSA[i] = lCount > 0 ? surfaceArea(lMinX, lMinY, lMinZ, lMaxX, lMaxY, lMaxZ) : 0;
                     }
 
                     // Sweep from right
@@ -1018,12 +1103,16 @@ export class BVHBuilder {
                     let rMaxX = -Infinity, rMaxY = -Infinity, rMaxZ = -Infinity;
                     let rCount = 0;
                     for (let i = SAH_BINS - 1; i >= 1; i--) {
-                        rMinX = Math.min(rMinX, binMinX[i]); rMinY = Math.min(rMinY, binMinY[i]); rMinZ = Math.min(rMinZ, binMinZ[i]);
-                        rMaxX = Math.max(rMaxX, binMaxX[i]); rMaxY = Math.max(rMaxY, binMaxY[i]); rMaxZ = Math.max(rMaxZ, binMaxZ[i]);
-                        rCount += binCount[i];
+                        if (sahBinMinX[i] < rMinX) rMinX = sahBinMinX[i];
+                        if (sahBinMinY[i] < rMinY) rMinY = sahBinMinY[i];
+                        if (sahBinMinZ[i] < rMinZ) rMinZ = sahBinMinZ[i];
+                        if (sahBinMaxX[i] > rMaxX) rMaxX = sahBinMaxX[i];
+                        if (sahBinMaxY[i] > rMaxY) rMaxY = sahBinMaxY[i];
+                        if (sahBinMaxZ[i] > rMaxZ) rMaxZ = sahBinMaxZ[i];
+                        rCount += sahBinCount[i];
                         const rightSA = rCount > 0 ? surfaceArea(rMinX, rMinY, rMinZ, rMaxX, rMaxY, rMaxZ) : 0;
 
-                        const cost = SAH_TRAVERSAL_COST + SAH_INTERSECT_COST * (leftCount[i - 1] * leftSA[i - 1] + rCount * rightSA) / parentSA;
+                        const cost = SAH_TRAVERSAL_COST + SAH_INTERSECT_COST * (sahLeftCount[i - 1] * sahLeftSA[i - 1] + rCount * rightSA) / parentSA;
                         if (cost < bestCost) {
                             bestCost = cost;
                             bestAxis = axis;
@@ -1037,22 +1126,15 @@ export class BVHBuilder {
                     const dx = bMaxX - bMinX, dy = bMaxY - bMinY, dz = bMaxZ - bMinZ;
                     bestAxis = dx >= dy && dx >= dz ? 0 : dy >= dz ? 1 : 2;
                     const cent = bestAxis === 0 ? centX : bestAxis === 1 ? centY : centZ;
-                    let cMin = Infinity, cMax = -Infinity;
-                    for (let i = start; i < start + count; i++) {
-                        const c = cent[indices[i]];
-                        cMin = Math.min(cMin, c);
-                        cMax = Math.max(cMax, c);
-                    }
-                    const mid = (cMin + cMax) * 0.5;
+                    const mid = (axisCMin[bestAxis] + axisCMax[bestAxis]) * 0.5;
 
-                    // Partition around midpoint
                     let l = start, r = start + count - 1;
                     while (l <= r) {
                         if (cent[indices[l]] < mid) { l++; }
                         else { const tmp = indices[l]; indices[l] = indices[r]; indices[r] = tmp; r--; }
                     }
                     let leftCount2 = l - start;
-                    if (leftCount2 === 0 || leftCount2 === count) leftCount2 = Math.floor(count / 2);
+                    if (leftCount2 === 0 || leftCount2 === count) leftCount2 = count >> 1;
 
                     const leftChild = buildSAH(start, leftCount2);
                     const rightChild = buildSAH(start + leftCount2, count - leftCount2);
@@ -1063,26 +1145,21 @@ export class BVHBuilder {
                     return nodeIdx;
                 }
 
-                // Partition indices according to best bin split
+                // Partition indices according to best bin split (use cached cMin/cMax)
                 {
                     const cent = bestAxis === 0 ? centX : bestAxis === 1 ? centY : centZ;
-                    let cMin = Infinity, cMax = -Infinity;
-                    for (let i = start; i < start + count; i++) {
-                        const c = cent[indices[i]];
-                        cMin = Math.min(cMin, c);
-                        cMax = Math.max(cMax, c);
-                    }
+                    const cMin = axisCMin[bestAxis], cMax = axisCMax[bestAxis];
                     const scale = SAH_BINS / (cMax - cMin);
 
                     let l = start, r = start + count - 1;
                     while (l <= r) {
-                        let b = Math.floor((cent[indices[l]] - cMin) * scale);
+                        let b = ((cent[indices[l]] - cMin) * scale) | 0;
                         if (b >= SAH_BINS) b = SAH_BINS - 1;
                         if (b < bestSplit) { l++; }
                         else { const tmp = indices[l]; indices[l] = indices[r]; indices[r] = tmp; r--; }
                     }
                     let leftCount2 = l - start;
-                    if (leftCount2 === 0 || leftCount2 === count) leftCount2 = Math.floor(count / 2);
+                    if (leftCount2 === 0 || leftCount2 === count) leftCount2 = count >> 1;
 
                     const leftChild = buildSAH(start, leftCount2);
                     const rightChild = buildSAH(start + leftCount2, count - leftCount2);
@@ -1189,27 +1266,28 @@ export class BVHBuilder {
                 }
             };
 
+            const gcScratch = new Int32Array(4);
+
             const convert = (li: number): number => {
                 const bvh4Idx = initBVH4();
 
                 if (isLeaf(li)) {
-                    // Wrap single leaf
                     setChild(bvh4Idx, 0, li, 0);
                     return bvh4Idx;
                 }
 
-                // Collect grandchildren by expanding one level
-                const gc: number[] = [];
+                // Collect grandchildren by expanding one level (reuse scratch array)
+                let gcCount = 0;
                 const L = getLC(li), R = getRC(li);
 
-                if (isLeaf(L)) { gc.push(L); }
-                else { gc.push(getLC(L), getRC(L)); }
+                if (isLeaf(L)) { gcScratch[gcCount++] = L; }
+                else { gcScratch[gcCount++] = getLC(L); gcScratch[gcCount++] = getRC(L); }
 
-                if (isLeaf(R)) { gc.push(R); }
-                else { gc.push(getLC(R), getRC(R)); }
+                if (isLeaf(R)) { gcScratch[gcCount++] = R; }
+                else { gcScratch[gcCount++] = getLC(R); gcScratch[gcCount++] = getRC(R); }
 
-                for (let i = 0; i < gc.length && i < 4; i++) {
-                    const g = gc[i];
+                for (let i = 0; i < gcCount && i < 4; i++) {
+                    const g = gcScratch[i];
                     if (isLeaf(g)) {
                         setChild(bvh4Idx, i, g, 0);
                     } else {
@@ -1397,64 +1475,6 @@ export class BVHBuilder {
 
         this._sceneMin = [minX, minY, minZ];
         this._sceneMax = [maxX, maxY, maxZ];
-    }
-
-    /**
-     * Lazily create GPU compute pipelines for TLAS construction.
-     */
-    private _ensureTLASPipelines(): void {
-        if (this._instanceAABBPipeline) return;
-
-        // Instance AABB pipeline
-        this._instanceAABBBGL = this._device.createBindGroupLayout({
-            label: 'TLAS/InstanceAABB_BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            ],
-        });
-        const aabbModule = this._device.createShaderModule({ code: instanceAABBShader });
-        this._instanceAABBPipeline = this._device.createComputePipeline({
-            label: 'TLAS/InstanceAABB',
-            layout: this._device.createPipelineLayout({ bindGroupLayouts: [this._instanceAABBBGL] }),
-            compute: { module: aabbModule, entryPoint: 'main' },
-        });
-
-        this._instanceAABBParamsBuf = this._device.createBuffer({
-            label: 'TLAS/InstanceAABBParams', size: 16,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        // TLAS refit pipelines (two entry points: initLeaves + mergeNodes)
-        this._tlasRefitBGL = this._device.createBindGroupLayout({
-            label: 'TLAS/RefitBGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },          // nodes
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // instances
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // blasNodes
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },          // params
-            ],
-        });
-        const tlasRefitModule = this._device.createShaderModule({ code: tlasRefitShader });
-        const refitLayout = this._device.createPipelineLayout({ bindGroupLayouts: [this._tlasRefitBGL] });
-
-        this._tlasRefitLeafPipeline = this._device.createComputePipeline({
-            label: 'TLAS/Refit/Leaves',
-            layout: refitLayout,
-            compute: { module: tlasRefitModule, entryPoint: 'initLeaves' },
-        });
-        this._tlasRefitMergePipeline = this._device.createComputePipeline({
-            label: 'TLAS/Refit/Merge',
-            layout: refitLayout,
-            compute: { module: tlasRefitModule, entryPoint: 'mergeNodes' },
-        });
-
-        this._tlasRefitParamsBuf = this._device.createBuffer({
-            label: 'TLAS/RefitParams', size: 16,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
     }
 
     /**
@@ -1891,6 +1911,9 @@ export class BVHBuilder {
         this._tlasGatherParamsBuf?.destroy();
         this._instanceBufferSorted?.destroy();
         for (const b of this._tlasSortPassParamsBufs) b.destroy();
+        // BVH4 TLAS buffers
+        this._tlasBvh4Buffer?.destroy();
+        for (const buf of this._tlasBuildParamsBufs) buf.destroy();
         for (const buf of this._pendingScratchBuffers) {
             buf.destroy();
         }

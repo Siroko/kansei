@@ -1,12 +1,5 @@
 export const traceShader = /* wgsl */`
-// Requires: intersection.wgsl, traversal.wgsl, BVHNode struct, storage bindings
-
-struct BVHNode {
-    boundsMin  : vec3f,
-    leftChild  : i32,
-    boundsMax  : vec3f,
-    rightChild : i32,
-}
+// Requires: intersection.wgsl, traversal.wgsl, storage bindings
 
 struct MaterialData {
     albedo       : vec3f,
@@ -58,7 +51,7 @@ struct LightData {
 @group(0) @binding(4)  var<uniform> traceParams : TraceParams;
 @group(0) @binding(5)  var<storage, read> triangles  : array<f32>;
 @group(0) @binding(6)  var<storage, read> bvh4Nodes  : array<vec4f>;
-@group(0) @binding(7)  var<storage, read> tlasNodes  : array<BVHNode>;
+@group(0) @binding(7)  var<storage, read> tlasBvh4Nodes : array<vec4f>;
 @group(0) @binding(8)  var<storage, read> instances  : array<Instance>;
 @group(0) @binding(9)  var<storage, read> materials  : array<MaterialData>;
 @group(0) @binding(10) var<storage, read> sceneLights : array<LightData>;
