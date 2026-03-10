@@ -28,9 +28,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let albedo    = albedoRaw.rgb;
 
     // giAlpha == 0 → refractive/mirror: use GI as-is (path tracer handles full lighting)
-    // giAlpha >  0 → opaque: max of raster direct and path-traced (direct+indirect),
-    //   so path tracer overrides where rasterizer underestimates (area lights, glass shadows)
-    let hdr = select(indirect, max(direct, albedo * indirect), giAlpha > 0.02);
+    // giAlpha >  0 → opaque: GI provides full irradiance (NEE + indirect), multiply by albedo
+    let hdr = select(indirect, albedo * indirect, giAlpha > 0.02);
 
     // Reinhard tone map to make HDR range visible
     let final_color = hdr / (hdr + vec3f(1.0));

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cornell Box – GI + Compute Instances</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Material } from '../src/materials/Material'
+    import { Compute } from '../src/materials/Compute'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
+    import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { AreaLight } from '../src/lights/AreaLight'
+    import { ShadowMap } from '../src/shadows/ShadowMap'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+    // ── Cornell box dimensions ────────────────────────────────────────────
+    const WALL = 10;
+    const HALF = WALL / 2;
+
+    // ── Lights ──────────────────────────────────────────────────────────
+    const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 0.0);
+    const lightDirUniform = new Vector3(0, -1, 0.0);
+
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
+    areaLight.position.set(0, WALL - 0.2, 0);
+    areaLight.target.set(0, 0, 0);
+
+    // ── Shader blocks ─────────────────────────────────────────────────────
+    const vertexBlock = /* wgsl */`
+      const AMBIENT : f32 = 0.0;
+
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
+      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        let worldPos = worldMatrix * position;
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        return out;
+      }
+    `;
+
+    // ── Wall shader ────────────────────────────────────────────────────────
+    const colorShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
+      @group(0) @binding(1) var<uniform> albedo : vec3f;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let L        = -normalize(lightDirection);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
+        return FragmentOutput(
+          vec4f(albedo * lighting, 1),
+          vec4f(0, 0, 0, 1),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(albedo, 0.04)
+        );
+      }
+    `;
+
+    // ── Instanced particle shader (per-instance 3×4 affine transform) ─────
+    const instancedVertexBlock = /* wgsl */`
+      const AMBIENT : f32 = 0.0;
+
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
+      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+        @location(3) instRow0 : vec4f,
+        @location(4) instRow1 : vec4f,
+        @location(5) instRow2 : vec4f,
+      ) -> VertexOut {
+        // Apply per-instance affine transform (rotation + translation)
+        let lp = position.xyz;
+        let ip = vec4f(
+          dot(instRow0.xyz, lp) + instRow0.w,
+          dot(instRow1.xyz, lp) + instRow1.w,
+          dot(instRow2.xyz, lp) + instRow2.w,
+          1.0
+        );
+        let worldPos = worldMatrix * ip;
+        // Transform normal by instance rotation
+        let tn = vec3f(
+          dot(instRow0.xyz, normal),
+          dot(instRow1.xyz, normal),
+          dot(instRow2.xyz, normal),
+        );
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        out.worldNormal = normalize((normalMatrix * vec4f(tn, 0.0)).xyz);
+        return out;
+      }
+    `;
+
+    const instancedShader = instancedVertexBlock + /* wgsl */`
+      #include <shadows>
+
+      @group(0) @binding(1) var<uniform> albedo : vec3f;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let L        = -normalize(lightDirection);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
+        return FragmentOutput(
+          vec4f(albedo * lighting, 1),
+          vec4f(0, 0, 0, 1),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(albedo, 0.04)
+        );
+      }
+    `;
+
+    // ── GPU compute shaders for curl-noise particle animation ─────────────
+    const computeVelocityShader = /* wgsl */`
+      #include <curl>
+
+      // curlParams: x=noiseScale, y=persistence, z=timeScale, w=curlStrength
+      // time: x=elapsed, y=dt, z=damping
+
+      fn cornellCurl(p: vec3f, t: f32) -> vec3f {
+        let sp = p * curlParams.x;
+        let persist = curlParams.y;
+
+        var xDeriv = vec4f(0.0);
+        var yDeriv = vec4f(0.0);
+        var zDeriv = vec4f(0.0);
+
+        for (var i = 0; i < 4; i++) {
+          let freq = pow(2.0, f32(i));
+          let amp  = pow(persist, f32(i)) * 0.5;
+          xDeriv += simplexNoiseDerivatives(vec4f(sp * freq, t)) * amp;
+          yDeriv += simplexNoiseDerivatives(vec4f((sp + vec3f(31.4, -47.2, 91.8)) * freq, t)) * amp;
+          zDeriv += simplexNoiseDerivatives(vec4f((sp + vec3f(-95.3, 62.1, -17.6)) * freq, t)) * amp;
+        }
+
+        return vec3f(
+          zDeriv.y - yDeriv.z,
+          xDeriv.z - zDeriv.x,
+          yDeriv.x - xDeriv.y,
+        );
+      }
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        if (idx >= arrayLength(&positions)) { return; }
+
+        var velocity = velocities[idx];
+        let position = positions[idx];
+
+        let dt = time.y;
+        velocity *= pow(time.z, dt * 60.0);
+
+        let curl_vel = cornellCurl(position, time.x * curlParams.z);
+        velocity += curl_vel * curlParams.w * dt;
+
+        velocities[idx] = velocity;
+      }
+
+      @group(0) @binding(0) var<storage, read_write> velocities : array<vec3<f32>>;
+      @group(0) @binding(1) var<storage, read_write> positions  : array<vec3<f32>>;
+      @group(0) @binding(2) var<uniform>             time       : vec4<f32>;
+      @group(0) @binding(3) var<uniform>             curlParams : vec4<f32>;
+    `;
+
+    const computePositionShader = /* wgsl */`
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        if (idx >= arrayLength(&positions)) { return; }
+
+        var position = positions[idx];
+        var velocity = velocities[idx];
+
+        let dt = time.y;
+        position += velocity * dt * 60.0;
+
+        // Bounce off Cornell box walls
+        let bMin = vec3f(-4.0, 0.3, -4.0);
+        let bMax = vec3f( 4.0, 9.5,  4.0);
+        if (position.x < bMin.x) { position.x = bMin.x; velocity.x *= -0.5; }
+        if (position.x > bMax.x) { position.x = bMax.x; velocity.x *= -0.5; }
+        if (position.y < bMin.y) { position.y = bMin.y; velocity.y *= -0.5; }
+        if (position.y > bMax.y) { position.y = bMax.y; velocity.y *= -0.5; }
+        if (position.z < bMin.z) { position.z = bMin.z; velocity.z *= -0.5; }
+        if (position.z > bMax.z) { position.z = bMax.z; velocity.z *= -0.5; }
+
+        positions[idx] = position;
+        velocities[idx] = velocity;
+
+        // Build rotation from world position (Rz * Ry * Rx)
+        let ax = position.x * 0.5;
+        let ay = position.y * 0.3;
+        let az = position.z * 0.4;
+        let cx = cos(ax); let sx = sin(ax);
+        let cy = cos(ay); let sy = sin(ay);
+        let cz = cos(az); let sz = sin(az);
+
+        // Write 3×vec4f row-major affine transform
+        let base = idx * 3u;
+        transforms[base + 0u] = vec4f(cy*cz, cz*sx*sy - cx*sz, sx*sz + cx*cz*sy, position.x);
+        transforms[base + 1u] = vec4f(cy*sz, cx*cz + sx*sy*sz, cx*sy*sz - cz*sx, position.y);
+        transforms[base + 2u] = vec4f(-sy,   cy*sx,             cx*cy,             position.z);
+      }
+
+      @group(0) @binding(0) var<storage, read_write> positions  : array<vec3<f32>>;
+      @group(0) @binding(1) var<storage, read_write> velocities : array<vec3<f32>>;
+      @group(0) @binding(2) var<storage, read_write> transforms : array<vec4f>;
+      @group(0) @binding(3) var<uniform>             time       : vec4<f32>;
+    `;
+
+    // ── Renderer ──────────────────────────────────────────────────────────
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: 0.75,
+      antialias: false,
+      sampleCount: 1
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas);
+    renderer.canvas.style.width = '100%';
+    renderer.canvas.style.height = '100%';
+    renderer.shadowsEnabled = true;
+
+    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
+    renderer.shadowMap = shadowMap;
+
+    // ── Scene ─────────────────────────────────────────────────────────────
+    const scene = new Scene();
+    const camera = new Camera(50, 0.1, 100, window.innerWidth / window.innerHeight);
+    scene.add(areaLight);
+
+    const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
+
+    // ── Material helpers ──────────────────────────────────────────────────
+    function makeMat(r, g, b) {
+      const albedo = new Vector3(r, g, b);
+      return new Material(colorShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedo },
+        ],
+      });
+    }
+
+    function makePTMat(r, g, b) {
+      const m = new PathTracerMaterial();
+      m.albedo = [r, g, b];
+      m.roughness = 1.0;
+      m.maxBounces = 4;
+      m.refractive = false;
+      return m;
+    }
+
+    const whiteMat = makeMat(0.85, 0.85, 0.85);
+    const redMat   = makeMat(0.85, 0.12, 0.08);
+    const greenMat = makeMat(0.12, 0.85, 0.15);
+
+    // ── Cornell Box geometry ──────────────────────────────────────────────
+    const wallGeo = new BoxGeometry(WALL, WALL, 0.1);
+
+    // Floor
+    const floor = new Renderable(wallGeo, whiteMat);
+    floor.position.set(0, 0, 0);
+    floor.rotation.x = -Math.PI / 2;
+    floor.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    scene.add(floor);
+
+    // Ceiling
+    const ceiling = new Renderable(wallGeo, whiteMat);
+    ceiling.position.set(0, WALL, 0);
+    ceiling.rotation.x = Math.PI / 2;
+    ceiling.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    scene.add(ceiling);
+
+    // Back wall
+    const backWall = new Renderable(wallGeo, whiteMat);
+    backWall.position.set(0, HALF, -HALF);
+    backWall.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    scene.add(backWall);
+
+    // Left wall (RED)
+    const leftWall = new Renderable(wallGeo, redMat);
+    leftWall.position.set(-HALF, HALF, 0);
+    leftWall.rotation.y = Math.PI / 2;
+    leftWall.pathTracerMaterial = makePTMat(0.85, 0.12, 0.08);
+    scene.add(leftWall);
+
+    // Right wall (GREEN)
+    const rightWall = new Renderable(wallGeo, greenMat);
+    rightWall.position.set(HALF, HALF, 0);
+    rightWall.rotation.y = -Math.PI / 2;
+    rightWall.pathTracerMaterial = makePTMat(0.12, 0.85, 0.15);
+    scene.add(rightWall);
+
+    // ── Emissive ceiling light panel ──────────────────────────────────────
+    const lightPanelGeo = new BoxGeometry(3, 0.1, 3);
+    const lightPanel = new Renderable(lightPanelGeo, whiteMat);
+    lightPanel.position.set(0, WALL - 0.06, 0);
+    const lightPTMat = new PathTracerMaterial();
+    lightPTMat.albedo = [1, 1, 1];
+    lightPTMat.emissive = [1.0, 0.95, 0.8];
+    lightPTMat.emissiveIntensity = 50.0;
+    lightPanel.pathTracerMaterial = lightPTMat;
+    scene.add(lightPanel);
+
+    // ── Instanced particles ───────────────────────────────────────────────
+    const numParticles = 500;
+    const particleSize = 0.6;
+    const particleAlbedo = new Vector3(0.9, 0.75, 0.5);
+    const time = new Vector4();
+    const curlParams = new Vector4(0.4, 0.5, 0.15, 0.72); // noiseScale, persistence, timeScale, curlStrength
+
+    // CPU-side initial positions (vec3 + pad per particle for storage array<vec3f>)
+    const initialPositions = new Float32Array(numParticles * 4);
+    for (let i = 0; i < numParticles; i++) {
+      initialPositions[i * 4 + 0] = (Math.random() - 0.5) * 8;
+      initialPositions[i * 4 + 1] = Math.random() * 8 + 1;
+      initialPositions[i * 4 + 2] = (Math.random() - 0.5) * 8;
+      initialPositions[i * 4 + 3] = 0;
+    }
+
+    // Initial transforms: identity rotation + position (3×vec4f per instance)
+    const initialTransforms = new Float32Array(numParticles * 12);
+    for (let i = 0; i < numParticles; i++) {
+      const b = i * 12;
+      const px = initialPositions[i * 4], py = initialPositions[i * 4 + 1], pz = initialPositions[i * 4 + 2];
+      initialTransforms[b + 0] = 1; initialTransforms[b + 1] = 0; initialTransforms[b + 2] = 0; initialTransforms[b + 3] = px;
+      initialTransforms[b + 4] = 0; initialTransforms[b + 5] = 1; initialTransforms[b + 6] = 0; initialTransforms[b + 7] = py;
+      initialTransforms[b + 8] = 0; initialTransforms[b + 9] = 0; initialTransforms[b + 10] = 1; initialTransforms[b + 11] = pz;
+    }
+
+    // GPU buffers for compute animation
+    const computeBufferVelocities = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: new Float32Array(numParticles * 4),
+    });
+
+    const computeBufferPositions = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: initialPositions,
+    });
+
+    // Transforms buffer: 3×vec4f per instance — used for raster vertex attrs + pathtracer
+    const computeBufferTransforms = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: initialTransforms,
+      stride: 48,
+      attributes: [
+        { shaderLocation: 3, offset: 0,  format: "float32x4" },
+        { shaderLocation: 4, offset: 16, format: "float32x4" },
+        { shaderLocation: 5, offset: 32, format: "float32x4" },
+      ],
+    });
+
+    // Initialize GPU buffers
+    computeBufferVelocities.initialize(renderer.gpuDevice);
+    computeBufferPositions.initialize(renderer.gpuDevice);
+    computeBufferTransforms.initialize(renderer.gpuDevice);
+
+    // Instanced geometry + material
+    const instancedGeo = new InstancedGeometry(
+      new BoxGeometry(particleSize, particleSize, particleSize),
+      numParticles,
+      [computeBufferTransforms]
+    );
+
+    const instancedMat = new Material(instancedShader, {
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: particleAlbedo },
+      ],
+    });
+
+    const particles = new Renderable(instancedGeo, instancedMat);
+    const particlePTMat = new PathTracerMaterial();
+    particlePTMat.albedo = [0.9, 0.75, 0.5];
+    particlePTMat.roughness = 1.0;
+    particlePTMat.maxBounces = 4;
+    particles.pathTracerMaterial = particlePTMat;
+    // GPU-side transforms for BVH expansion (full affine, no CPU readback)
+    particles.gpuInstanceBuffer = computeBufferTransforms;
+    particles.gpuInstanceFullTransform = true;
+    scene.add(particles);
+
+    // ── GPU compute dispatchers ──────────────────────────────────────────
+    const computeVelocities = new Compute(computeVelocityShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: computeBufferVelocities },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: computeBufferPositions },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: time },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: curlParams },
+    ]);
+
+    const computePositions = new Compute(computePositionShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: computeBufferPositions },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: computeBufferVelocities },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: computeBufferTransforms },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: time },
+    ]);
+
+    // ── Path tracer effect ────────────────────────────────────────────────
+    const pathTracerEffect = new PathTracerEffect({
+      scene,
+      temporalBlend: 0.1,
+      spatialPasses: 1,
+      spp: 1,
+      useBlueNoise: true,
+      traceScale: 0.5,
+      maxBounces: 3,
+      ambientColor: [0, 0, 0],
+    });
+
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+
+    // ── Tweakpane ─────────────────────────────────────────────────────────
+    const settings = {
+      animate: true,
+      speed: 0.5,
+      noiseScale: 0.4,
+      persistence: 0.5,
+      timeScale: 0.15,
+      curlStrength: 0.72,
+      damping: 0.92,
+    };
+    const pane = new Pane({ title: 'GI + Compute Instances' });
+
+    pane.addBinding(settings, 'animate');
+    pane.addBinding(settings, 'speed', { min: 0, max: 1, step: 0.01 });
+
+    const curlFolder = pane.addFolder({ title: 'Curl Noise' });
+    curlFolder.addBinding(settings, 'noiseScale', { min: 0.05, max: 2.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'persistence', { min: 0.0, max: 1.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'timeScale', { min: 0.0, max: 1.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'curlStrength', { min: 0.0, max: 3.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'damping', { min: 0.5, max: 1.0, step: 0.01 });
+
+    curlFolder.addButton({ title: 'Reset to Grid' }).on('click', () => {
+      const gridSize = Math.ceil(Math.cbrt(numParticles));
+      const spacingX = 8.0 / gridSize, spacingY = 9.0 / gridSize, spacingZ = 8.0 / gridSize;
+      const pos = new Float32Array(numParticles * 4);
+      const vel = new Float32Array(numParticles * 4);
+      const xfm = new Float32Array(numParticles * 12);
+      for (let i = 0; i < numParticles; i++) {
+        const ix = i % gridSize;
+        const iy = Math.floor(i / gridSize) % gridSize;
+        const iz = Math.floor(i / (gridSize * gridSize));
+        const px = -4.0 + spacingX * (ix + 0.5);
+        const py = 0.5 + spacingY * (iy + 0.5);
+        const pz = -4.0 + spacingZ * (iz + 0.5);
+        pos[i * 4] = px; pos[i * 4 + 1] = py; pos[i * 4 + 2] = pz;
+        const b = i * 12;
+        xfm[b] = 1; xfm[b + 3] = px;
+        xfm[b + 5] = 1; xfm[b + 7] = py;
+        xfm[b + 10] = 1; xfm[b + 11] = pz;
+      }
+      const dev = renderer.gpuDevice;
+      dev.queue.writeBuffer(computeBufferPositions.resource.buffer, 0, pos);
+      dev.queue.writeBuffer(computeBufferVelocities.resource.buffer, 0, vel);
+      dev.queue.writeBuffer(computeBufferTransforms.resource.buffer, 0, xfm);
+    });
+
+    // ── Lighting controls ────────────────────────────────────────────────
+    const lightFolder = pane.addFolder({ title: 'Lighting' });
+    const lightParams = { intensity: areaLight.intensity };
+    lightFolder.addBinding(lightParams, 'intensity', { min: 0, max: 100, step: 0.5, label: 'light intensity' }).on('change', () => {
+      areaLight.intensity = lightParams.intensity;
+    });
+    const ambientParams = { color: { r: 0, g: 0, b: 0 } };
+    lightFolder.addBinding(ambientParams, 'color', { label: 'ambient color' }).on('change', () => {
+      pathTracerEffect.ambientColor = [ambientParams.color.r / 255, ambientParams.color.g / 255, ambientParams.color.b / 255];
+    });
+    lightFolder.addBinding(pathTracerEffect, 'maxBounces', { min: 0, max: 8, step: 1, label: 'bounces' });
+
+    // ── Material controls ───────────────────────────────────────────────
+    const matFolder = pane.addFolder({ title: 'Materials' });
+    const wallMatParams = { bounces: floor.pathTracerMaterial.maxBounces };
+    matFolder.addBinding(wallMatParams, 'bounces', { min: 0, max: 8, step: 1, label: 'wall bounces' }).on('change', () => {
+      const v = wallMatParams.bounces;
+      floor.pathTracerMaterial.maxBounces = v;
+      ceiling.pathTracerMaterial.maxBounces = v;
+      backWall.pathTracerMaterial.maxBounces = v;
+      leftWall.pathTracerMaterial.maxBounces = v;
+      rightWall.pathTracerMaterial.maxBounces = v;
+    });
+    const particleMatParams = { bounces: particlePTMat.maxBounces };
+    matFolder.addBinding(particleMatParams, 'bounces', { min: 0, max: 8, step: 1, label: 'particle bounces' }).on('change', () => {
+      particlePTMat.maxBounces = particleMatParams.bounces;
+    });
+
+    const ptFolder = pane.addFolder({ title: 'Path Tracer' });
+    ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
+    ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 9, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'spp', { min: 1, max: 16, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'useBlueNoise');
+    ptFolder.addBinding(pathTracerEffect, 'traceScale', { min: 0.1, max: 1.0, step: 0.05 });
+
+    // ── Render loop ───────────────────────────────────────────────────────
+    let lastTime = performance.now() / 1000;
+
+    function animate() {
+      const now = performance.now() / 1000;
+      const dt = Math.min(now - lastTime, 0.05); // cap to avoid huge jumps
+      lastTime = now;
+      time.x = now;
+      time.y = dt * settings.speed;
+      time.z = settings.damping;
+      curlParams.x = settings.noiseScale;
+      curlParams.y = settings.persistence;
+      curlParams.z = settings.timeScale;
+      curlParams.w = settings.curlStrength;
+      cameraControls.update();
+
+      if (settings.animate) {
+        renderer.compute(computeVelocities, Math.ceil(numParticles / 64));
+        renderer.compute(computePositions, Math.ceil(numParticles / 64));
+      }
+
+      // shadowMap.render(renderer, scene, camera, dirLight);
+      volume.render(scene, camera);
+
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+  </script>
+</body>
+
+</html>

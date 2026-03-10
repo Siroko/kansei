@@ -26,6 +26,10 @@ export interface PathTracerOptions {
     fixedSeed?: boolean;
     /** GI trace resolution scale (0.25 = quarter res, 0.5 = half res, 1.0 = full). Default: 0.5 */
     traceScale?: number;
+    /** Maximum path bounces for indirect illumination. Default: 3 */
+    maxBounces?: number;
+    /** Ambient/sky color added when bounce rays miss geometry. Default: [0, 0, 0] */
+    ambientColor?: [number, number, number];
 }
 
 /** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
@@ -46,6 +50,8 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _useBlueNoise: boolean;
     private _fixedSeed: boolean;
     private _traceScale: number;
+    private _maxBounces: number;
+    private _ambientColor: [number, number, number];
 
     // Trace pipeline
     private _tracePipeline: GPUComputePipeline | null = null;
@@ -64,6 +70,7 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _spatialPipeline: GPUComputePipeline | null = null;
     private _spatialBGL: GPUBindGroupLayout | null = null;
     private _spatialParamsBuf: GPUBuffer | null = null;
+    private _spatialIterParamsBufs: GPUBuffer[] = [];
 
     // Composite pipeline
     private _compositePipeline: GPUComputePipeline | null = null;
@@ -98,6 +105,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._useBlueNoise = options.useBlueNoise ?? true;
         this._fixedSeed = options.fixedSeed ?? false;
         this._traceScale = options.traceScale ?? 0.5;
+        this._maxBounces = options.maxBounces ?? 3;
+        this._ambientColor = options.ambientColor ?? [0, 0, 0];
     }
 
     /** Access the BVH builder for external configuration. */
@@ -137,6 +146,14 @@ export class PathTracerEffect extends PostProcessingEffect {
             }
         }
     }
+
+    /** Maximum path bounces for indirect illumination. */
+    get maxBounces(): number { return this._maxBounces; }
+    set maxBounces(v: number) { this._maxBounces = Math.max(0, Math.round(v)); }
+
+    /** Ambient/sky color added when bounce rays miss geometry. */
+    get ambientColor(): [number, number, number] { return this._ambientColor; }
+    set ambientColor(v: [number, number, number]) { this._ambientColor = v; }
 
     // ── PostProcessingEffect interface ────────────────────────────────────
 
@@ -183,6 +200,9 @@ export class PathTracerEffect extends PostProcessingEffect {
             this._blasBuilt = true;
             console.log(`[PathTracer] triangles: ${this._bvhBuilder.totalTriangleCount}, BLAS nodes: ${this._bvhBuilder.totalBLASNodes}, instances: ${this._bvhBuilder.totalInstances}, materials: ${this._bvhBuilder.materialCount}`);
         }
+
+        // Update materials every frame (runtime slider changes)
+        this._bvhBuilder.updateMaterials(this._scene);
 
         // Build TLAS every frame (transforms may have changed)
         this._bvhBuilder.buildTLAS(commandEncoder, this._scene);
@@ -248,6 +268,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._temporalParamsBuf?.destroy();
         this._spatialParamsBuf?.destroy();
         this._compositeParamsBuf?.destroy();
+        for (const buf of this._spatialIterParamsBufs) buf.destroy();
+        this._spatialIterParamsBufs = [];
         this._bvhBuilder = null;
         this._tracePipeline = null;
         this._temporalPipeline = null;
@@ -372,10 +394,10 @@ export class PathTracerEffect extends PostProcessingEffect {
     }
 
     private _createParamBuffers(device: GPUDevice): void {
-        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 6*u32+2*pad(32) = 112
+        // TraceParams: mat4x4f(64) + vec3f+u32(16) + 8*u32(32) + vec3f+u32(16) = 128
         this._traceParamsBuf = device.createBuffer({
             label: 'PathTracer/TraceParams',
-            size: 112,
+            size: 128,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -406,6 +428,15 @@ export class PathTracerEffect extends PostProcessingEffect {
             size: 16,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+
+        // Pre-allocate spatial denoise per-iteration param buffers (reused each frame)
+        for (let i = 0; i < 5; i++) {
+            this._spatialIterParamsBufs.push(device.createBuffer({
+                label: `PathTracer/SpatialIterParams/${i}`,
+                size: 32,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            }));
+        }
     }
 
     // ── Texture management ────────────────────────────────────────────────
@@ -552,7 +583,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Pack lights into storage buffer
         const lightCount = this._packLights(device);
 
-        // TraceParams layout (112 bytes = 28 floats):
+        // TraceParams layout (128 bytes = 32 floats):
         // invViewProj  : mat4x4f  offset 0   (float[0..15])
         // cameraPos    : vec3f    offset 64  (float[16..18])
         // frameIndex   : u32      offset 76  (float[19])
@@ -562,8 +593,11 @@ export class PathTracerEffect extends PostProcessingEffect {
         // spp          : u32      offset 92  (float[23])
         // useBlueNoise : u32      offset 96  (float[24])
         // fixedSeed    : u32      offset 100 (float[25])
-        // _pad0-1      : u32      offset 104-108
-        const params = new Float32Array(28); // 112 bytes
+        // maxBounces   : u32      offset 104 (float[26])
+        // _pad1        : u32      offset 108 (float[27])
+        // ambientColor : vec3f    offset 112 (float[28..30])
+        // _pad2        : u32      offset 124 (float[31])
+        const params = new Float32Array(32); // 128 bytes
         const paramsU32 = new Uint32Array(params.buffer);
 
         params.set(this._invViewProj as unknown as Float32Array, 0);
@@ -577,6 +611,11 @@ export class PathTracerEffect extends PostProcessingEffect {
         paramsU32[23] = this._spp;
         paramsU32[24] = this._useBlueNoise ? 1 : 0;
         paramsU32[25] = this._fixedSeed ? 1 : 0;
+        paramsU32[26] = this._maxBounces;
+        // float[27] = _pad1
+        params[28] = this._ambientColor[0];
+        params[29] = this._ambientColor[1];
+        params[30] = this._ambientColor[2];
 
         device.queue.writeBuffer(this._traceParamsBuf!, 0, params);
 
@@ -665,11 +704,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         for (let i = 0; i < this._spatialPasses; i++) {
             const stepSize = 1 << i;
 
-            const iterParamsBuf = device.createBuffer({
-                label: `PathTracer/SpatialParams/${i}`,
-                size: 32,
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            });
+            const iterParamsBuf = this._spatialIterParamsBufs[i];
 
             const params = new Float32Array(8);
             const paramsU32 = new Uint32Array(params.buffer);
