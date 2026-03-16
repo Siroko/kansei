@@ -10,6 +10,7 @@ import { traceShader } from './shaders/trace.wgsl';
 import { denoiseTemporalShader } from './shaders/denoise-temporal.wgsl';
 import { denoiseSpatialShader } from './shaders/denoise-spatial.wgsl';
 import { compositeShader } from './shaders/composite.wgsl';
+import { restirGenerateShader, restirSpatialShader } from './shaders/restir-di.wgsl';
 import { mat4 } from 'gl-matrix';
 
 export interface PathTracerOptions {
@@ -30,6 +31,12 @@ export interface PathTracerOptions {
     maxBounces?: number;
     /** Ambient/sky color added when bounce rays miss geometry. Default: [0, 0, 0] */
     ambientColor?: [number, number, number];
+    /** Enable SVGF variance-guided spatial denoising. Default: false */
+    useSVGF?: boolean;
+    /** Enable ReSTIR DI for direct illumination. Default: true */
+    useReSTIR?: boolean;
+    /** ReSTIR temporal history cap. Default: 20 */
+    restirMaxHistory?: number;
 }
 
 /** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
@@ -52,6 +59,9 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _traceScale: number;
     private _maxBounces: number;
     private _ambientColor: [number, number, number];
+    private _useSVGF: boolean;
+    private _useReSTIR: boolean;
+    private _restirMaxHistory: number;
 
     // Trace pipeline
     private _tracePipeline: GPUComputePipeline | null = null;
@@ -84,6 +94,22 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _spatialScratchTex: GPUTexture | null = null;  // spatial denoise scratch
     private _historyPing: boolean = true;                  // which history buffer is "current"
 
+    // SVGF moments textures (rgba16float): R=μ₁, G=μ₂, B=historyLen, A=variance
+    private _momentsTexA: GPUTexture | null = null;
+    private _momentsTexB: GPUTexture | null = null;
+
+    // ReSTIR DI
+    private _restirGenPipeline: GPUComputePipeline | null = null;
+    private _restirGenBGL: GPUBindGroupLayout | null = null;
+    private _restirSpatialPipeline: GPUComputePipeline | null = null;
+    private _restirSpatialBGL: GPUBindGroupLayout | null = null;
+    private _restirParamsBuf: GPUBuffer | null = null;
+    private _reservoirBufA: GPUBuffer | null = null;  // ping
+    private _reservoirBufB: GPUBuffer | null = null;  // pong
+    private _reservoirPing: boolean = true;
+    private _restirDirectTex: GPUTexture | null = null;
+    private _restirDummyTex: GPUTexture | null = null; // 1x1 dummy when ReSTIR disabled
+
     // Cached GBuffer textures for bind group rebuild detection
     private _gbuffer: GBuffer | null = null;
     private _width: number = 0;
@@ -107,6 +133,9 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._traceScale = options.traceScale ?? 0.5;
         this._maxBounces = options.maxBounces ?? 3;
         this._ambientColor = options.ambientColor ?? [0, 0, 0];
+        this._useSVGF = options.useSVGF ?? false;
+        this._useReSTIR = options.useReSTIR ?? true;
+        this._restirMaxHistory = options.restirMaxHistory ?? 20;
     }
 
     /** Access the BVH builder for external configuration. */
@@ -154,6 +183,18 @@ export class PathTracerEffect extends PostProcessingEffect {
     /** Ambient/sky color added when bounce rays miss geometry. */
     get ambientColor(): [number, number, number] { return this._ambientColor; }
     set ambientColor(v: [number, number, number]) { this._ambientColor = v; }
+
+    /** Enable SVGF variance-guided spatial denoising. */
+    get useSVGF(): boolean { return this._useSVGF; }
+    set useSVGF(v: boolean) { this._useSVGF = v; }
+
+    /** Enable ReSTIR DI for direct illumination. */
+    get useReSTIR(): boolean { return this._useReSTIR; }
+    set useReSTIR(v: boolean) { this._useReSTIR = v; }
+
+    /** ReSTIR temporal history cap. */
+    get restirMaxHistory(): number { return this._restirMaxHistory; }
+    set restirMaxHistory(v: number) { this._restirMaxHistory = Math.max(1, Math.round(v)); }
 
     // ── PostProcessingEffect interface ────────────────────────────────────
 
@@ -231,8 +272,16 @@ export class PathTracerEffect extends PostProcessingEffect {
         const tw = this._traceWidth(width);
         const th = this._traceHeight(height);
 
+        // Pack lights (shared by trace + ReSTIR)
+        const lightCount = this._packLights(this._device);
+
+        // ── Pass 0a/0b: ReSTIR DI (at reduced resolution) ──
+        if (this._useReSTIR) {
+            this._dispatchReSTIR(commandEncoder, depth, tw, th, lightCount, iv);
+        }
+
         // ── Pass 1: Path trace (at reduced resolution) ──
-        this._dispatchTrace(commandEncoder, depth, camera, tw, th, iv);
+        this._dispatchTrace(commandEncoder, depth, camera, tw, th, iv, lightCount);
 
         // ── Pass 2: Temporal denoise (at reduced resolution) ──
         this._dispatchTemporalDenoise(commandEncoder, depth, tw, th, vp);
@@ -246,6 +295,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Save current VP as history for next frame
         mat4.copy(this._prevViewProj, vp);
         this._frameIndex++;
+        this._reservoirPing = !this._reservoirPing;
     }
 
     resize(width: number, height: number, gbuffer: GBuffer): void {
@@ -268,6 +318,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._temporalParamsBuf?.destroy();
         this._spatialParamsBuf?.destroy();
         this._compositeParamsBuf?.destroy();
+        this._restirParamsBuf?.destroy();
+        this._restirDummyTex?.destroy();
         for (const buf of this._spatialIterParamsBufs) buf.destroy();
         this._spatialIterParamsBufs = [];
         this._bvhBuilder = null;
@@ -275,6 +327,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._temporalPipeline = null;
         this._spatialPipeline = null;
         this._compositePipeline = null;
+        this._restirGenPipeline = null;
+        this._restirSpatialPipeline = null;
         this._device = null;
     }
 
@@ -310,6 +364,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // sceneLights
                 { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // blueNoise
                 { binding: 12, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // emissive
+                { binding: 13, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // restirDirect
             ],
         });
 
@@ -324,7 +379,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             compute: { module: traceModule, entryPoint: 'main' },
         });
 
-        // Temporal denoise pipeline
+        // Temporal denoise pipeline (SVGF with moments tracking)
         this._temporalBGL = device.createBindGroupLayout({
             label: 'PathTracer/TemporalBGL',
             entries: [
@@ -335,6 +390,8 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // normal
                 { binding: 5, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },                    // historySamp
                 { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },                       // params
+                { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // momentsHistory
+                { binding: 8, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // momentsOutput
             ],
         });
 
@@ -348,7 +405,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             compute: { module: temporalModule, entryPoint: 'main' },
         });
 
-        // Spatial denoise pipeline
+        // Spatial denoise pipeline (SVGF variance-guided)
         this._spatialBGL = device.createBindGroupLayout({
             label: 'PathTracer/SpatialBGL',
             entries: [
@@ -357,6 +414,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },                  // depth
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // normal
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },                       // params
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // momentsTex
             ],
         });
 
@@ -392,6 +450,65 @@ export class PathTracerEffect extends PostProcessingEffect {
             label: 'PathTracer/CompositePipeline',
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._compositeBGL] }),
             compute: { module: compositeModule, entryPoint: 'main' },
+        });
+
+        // ReSTIR DI — Generate + Temporal pipeline
+        const V = GPUShaderStage.COMPUTE;
+        this._restirGenBGL = device.createBindGroupLayout({
+            label: 'PathTracer/ReSTIRGenBGL',
+            entries: [
+                { binding: 0,  visibility: V, texture: { sampleType: 'depth' } },            // depthTex
+                { binding: 1,  visibility: V, texture: { sampleType: 'float' } },            // normalTex
+                { binding: 2,  visibility: V, buffer: { type: 'uniform' } },                 // params
+                { binding: 3,  visibility: V, buffer: { type: 'read-only-storage' } },       // sceneLights
+                { binding: 4,  visibility: V, buffer: { type: 'read-only-storage' } },       // triangles
+                { binding: 5,  visibility: V, buffer: { type: 'read-only-storage' } },       // bvh4Nodes
+                { binding: 6,  visibility: V, buffer: { type: 'read-only-storage' } },       // tlasBvh4Nodes
+                { binding: 7,  visibility: V, buffer: { type: 'read-only-storage' } },       // instances
+                { binding: 8,  visibility: V, buffer: { type: 'read-only-storage' } },       // materials
+                { binding: 9,  visibility: V, buffer: { type: 'read-only-storage' } },       // reservoirPrev
+                { binding: 10, visibility: V, buffer: { type: 'storage' } },                 // reservoirCur
+            ],
+        });
+
+        const restirGenCode = intersectionShader + traversalShader + restirGenerateShader;
+        const restirGenModule = device.createShaderModule({
+            label: 'PathTracer/ReSTIRGenShader',
+            code: restirGenCode,
+        });
+        this._restirGenPipeline = device.createComputePipeline({
+            label: 'PathTracer/ReSTIRGenPipeline',
+            layout: device.createPipelineLayout({ bindGroupLayouts: [this._restirGenBGL] }),
+            compute: { module: restirGenModule, entryPoint: 'main' },
+        });
+
+        // ReSTIR DI — Spatial + Shade pipeline
+        this._restirSpatialBGL = device.createBindGroupLayout({
+            label: 'PathTracer/ReSTIRSpatialBGL',
+            entries: [
+                { binding: 0,  visibility: V, texture: { sampleType: 'depth' } },            // depthTex
+                { binding: 1,  visibility: V, texture: { sampleType: 'float' } },            // normalTex
+                { binding: 2,  visibility: V, buffer: { type: 'uniform' } },                 // params
+                { binding: 3,  visibility: V, buffer: { type: 'read-only-storage' } },       // sceneLights
+                { binding: 4,  visibility: V, buffer: { type: 'read-only-storage' } },       // triangles
+                { binding: 5,  visibility: V, buffer: { type: 'read-only-storage' } },       // bvh4Nodes
+                { binding: 6,  visibility: V, buffer: { type: 'read-only-storage' } },       // tlasBvh4Nodes
+                { binding: 7,  visibility: V, buffer: { type: 'read-only-storage' } },       // instances
+                { binding: 8,  visibility: V, buffer: { type: 'read-only-storage' } },       // materials
+                { binding: 9,  visibility: V, buffer: { type: 'read-only-storage' } },       // reservoirIn
+                { binding: 10, visibility: V, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // directLightOut
+            ],
+        });
+
+        const restirSpatialCode = intersectionShader + traversalShader + restirSpatialShader;
+        const restirSpatialModule = device.createShaderModule({
+            label: 'PathTracer/ReSTIRSpatialShader',
+            code: restirSpatialCode,
+        });
+        this._restirSpatialPipeline = device.createComputePipeline({
+            label: 'PathTracer/ReSTIRSpatialPipeline',
+            layout: device.createPipelineLayout({ bindGroupLayouts: [this._restirSpatialBGL] }),
+            compute: { module: restirSpatialModule, entryPoint: 'main' },
         });
     }
 
@@ -439,6 +556,21 @@ export class PathTracerEffect extends PostProcessingEffect {
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             }));
         }
+
+        // ReSTIR params: mat4x4f(64) + mat4x4f(64) + vec3f(12) + u32(4) + 4*u32(16) = 160
+        this._restirParamsBuf = device.createBuffer({
+            label: 'PathTracer/ReSTIRParams',
+            size: 160,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // 1x1 dummy texture for when ReSTIR is disabled
+        this._restirDummyTex = device.createTexture({
+            label: 'PathTracer/ReSTIRDummy',
+            size: [1, 1],
+            format: 'rgba16float',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+        });
     }
 
     // ── Texture management ────────────────────────────────────────────────
@@ -478,6 +610,42 @@ export class PathTracerEffect extends PostProcessingEffect {
             format: 'rgba16float',
             usage,
         });
+
+        this._momentsTexA = device.createTexture({
+            label: 'PathTracer/MomentsA',
+            size: [tw, th],
+            format: 'rgba16float',
+            usage,
+        });
+
+        this._momentsTexB = device.createTexture({
+            label: 'PathTracer/MomentsB',
+            size: [tw, th],
+            format: 'rgba16float',
+            usage,
+        });
+
+        // ReSTIR direct light output texture
+        this._restirDirectTex = device.createTexture({
+            label: 'PathTracer/ReSTIRDirect',
+            size: [tw, th],
+            format: 'rgba16float',
+            usage,
+        });
+
+        // Reservoir buffers: 3 vec4f (48 bytes) per pixel
+        const reservoirSize = tw * th * 3 * 16;
+        const bufUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+        this._reservoirBufA = device.createBuffer({
+            label: 'PathTracer/ReservoirA',
+            size: reservoirSize,
+            usage: bufUsage,
+        });
+        this._reservoirBufB = device.createBuffer({
+            label: 'PathTracer/ReservoirB',
+            size: reservoirSize,
+            usage: bufUsage,
+        });
     }
 
     private _destroyTextures(): void {
@@ -485,10 +653,20 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._historyTexA?.destroy();
         this._historyTexB?.destroy();
         this._spatialScratchTex?.destroy();
+        this._momentsTexA?.destroy();
+        this._momentsTexB?.destroy();
         this._giTexture = null;
         this._historyTexA = null;
         this._historyTexB = null;
         this._spatialScratchTex = null;
+        this._momentsTexA = null;
+        this._momentsTexB = null;
+        this._restirDirectTex?.destroy();
+        this._reservoirBufA?.destroy();
+        this._reservoirBufB?.destroy();
+        this._restirDirectTex = null;
+        this._reservoirBufA = null;
+        this._reservoirBufB = null;
     }
 
     // ── Light packing ─────────────────────────────────────────────────────
@@ -578,27 +756,12 @@ export class PathTracerEffect extends PostProcessingEffect {
         width: number,
         height: number,
         invView: mat4,
+        lightCount: number,
     ): void {
         const device = this._device!;
         const builder = this._bvhBuilder!;
 
-        // Pack lights into storage buffer
-        const lightCount = this._packLights(device);
-
         // TraceParams layout (128 bytes = 32 floats):
-        // invViewProj  : mat4x4f  offset 0   (float[0..15])
-        // cameraPos    : vec3f    offset 64  (float[16..18])
-        // frameIndex   : u32      offset 76  (float[19])
-        // width        : u32      offset 80  (float[20])
-        // height       : u32      offset 84  (float[21])
-        // lightCount   : u32      offset 88  (float[22])
-        // spp          : u32      offset 92  (float[23])
-        // useBlueNoise : u32      offset 96  (float[24])
-        // fixedSeed    : u32      offset 100 (float[25])
-        // maxBounces   : u32      offset 104 (float[26])
-        // _pad1        : u32      offset 108 (float[27])
-        // ambientColor : vec3f    offset 112 (float[28..30])
-        // _pad2        : u32      offset 124 (float[31])
         const params = new Float32Array(32); // 128 bytes
         const paramsU32 = new Uint32Array(params.buffer);
 
@@ -614,12 +777,16 @@ export class PathTracerEffect extends PostProcessingEffect {
         paramsU32[24] = this._useBlueNoise ? 1 : 0;
         paramsU32[25] = this._fixedSeed ? 1 : 0;
         paramsU32[26] = this._maxBounces;
-        // float[27] = _pad1
+        paramsU32[27] = this._useReSTIR ? 1 : 0; // useReSTIR flag
         params[28] = this._ambientColor[0];
         params[29] = this._ambientColor[1];
         params[30] = this._ambientColor[2];
 
         device.queue.writeBuffer(this._traceParamsBuf!, 0, params);
+
+        // Use ReSTIR direct light texture or dummy when disabled
+        const restirTex = (this._useReSTIR && this._restirDirectTex)
+            ? this._restirDirectTex : this._restirDummyTex!;
 
         const traceBG = device.createBindGroup({
             layout: this._traceBGL!,
@@ -637,6 +804,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 10, resource: { buffer: this._lightsBuffer! } },
                 { binding: 11, resource: { buffer: this._blueNoiseBuffer! } },
                 { binding: 12, resource: this._gbuffer!.emissiveTexture.createView() },
+                { binding: 13, resource: restirTex.createView() },
             ],
         });
 
@@ -658,6 +826,8 @@ export class PathTracerEffect extends PostProcessingEffect {
 
         const historyRead = this._historyPing ? this._historyTexA! : this._historyTexB!;
         const historyWrite = this._historyPing ? this._historyTexB! : this._historyTexA!;
+        const momentsRead = this._historyPing ? this._momentsTexA! : this._momentsTexB!;
+        const momentsWrite = this._historyPing ? this._momentsTexB! : this._momentsTexA!;
 
         const params = new Float32Array(36);
         const paramsU32 = new Uint32Array(params.buffer);
@@ -681,6 +851,8 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 4, resource: this._gbuffer!.normalTexture.createView() },
                 { binding: 5, resource: this._historySampler! },
                 { binding: 6, resource: { buffer: this._temporalParamsBuf! } },
+                { binding: 7, resource: momentsRead.createView() },
+                { binding: 8, resource: momentsWrite.createView() },
             ],
         });
 
@@ -717,10 +889,13 @@ export class PathTracerEffect extends PostProcessingEffect {
             params[3] = 2.0;   // sigmaLum — lower = tighter luminance edge stopping
             paramsU32[4] = width;
             paramsU32[5] = height;
-            paramsU32[6] = 0;
+            paramsU32[6] = this._useSVGF ? 1 : 0;
             paramsU32[7] = 0;
 
             device.queue.writeBuffer(iterParamsBuf, 0, params);
+
+            // Moments texture for SVGF variance — read from whichever was written by temporal pass
+            const momentsTex = this._historyPing ? this._momentsTexA! : this._momentsTexB!;
 
             const spatialBG = device.createBindGroup({
                 layout: this._spatialBGL!,
@@ -730,6 +905,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                     { binding: 2, resource: depth.createView() },
                     { binding: 3, resource: this._gbuffer!.normalTexture.createView() },
                     { binding: 4, resource: { buffer: iterParamsBuf } },
+                    { binding: 5, resource: momentsTex.createView() },
                 ],
             });
 
@@ -778,5 +954,87 @@ export class PathTracerEffect extends PostProcessingEffect {
         pass.setBindGroup(0, compositeBG);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
         pass.end();
+    }
+
+    // ── ReSTIR DI dispatch ──────────────────────────────────────────────
+
+    private _dispatchReSTIR(
+        commandEncoder: GPUCommandEncoder,
+        depth: GPUTexture,
+        width: number,
+        height: number,
+        lightCount: number,
+        invView: mat4,
+    ): void {
+        const device = this._device!;
+        const builder = this._bvhBuilder!;
+
+        // ReSTIRParams: invViewProj(64) + prevViewProj(64) + cameraPos(12) + u32(4) + 4*u32(16) = 160
+        const params = new Float32Array(40); // 160 bytes
+        const paramsU32 = new Uint32Array(params.buffer);
+
+        params.set(this._invViewProj as unknown as Float32Array, 0);
+        params.set(this._prevViewProj as unknown as Float32Array, 16);
+        params[32] = invView[12]; // cameraPos.x
+        params[33] = invView[13]; // cameraPos.y
+        params[34] = invView[14]; // cameraPos.z
+        paramsU32[35] = this._frameIndex;
+        paramsU32[36] = width;
+        paramsU32[37] = height;
+        paramsU32[38] = lightCount;
+        paramsU32[39] = this._restirMaxHistory;
+
+        device.queue.writeBuffer(this._restirParamsBuf!, 0, params);
+
+        const reservoirRead = this._reservoirPing ? this._reservoirBufA! : this._reservoirBufB!;
+        const reservoirWrite = this._reservoirPing ? this._reservoirBufB! : this._reservoirBufA!;
+
+        // Pass 0a: Generate + Temporal reuse
+        const genBG = device.createBindGroup({
+            layout: this._restirGenBGL!,
+            entries: [
+                { binding: 0,  resource: depth.createView() },
+                { binding: 1,  resource: this._gbuffer!.normalTexture.createView() },
+                { binding: 2,  resource: { buffer: this._restirParamsBuf! } },
+                { binding: 3,  resource: { buffer: this._lightsBuffer! } },
+                { binding: 4,  resource: { buffer: builder.triangleBuffer! } },
+                { binding: 5,  resource: { buffer: builder.bvh4NodeBuffer! } },
+                { binding: 6,  resource: { buffer: builder.tlasBvh4Buffer! } },
+                { binding: 7,  resource: { buffer: builder.instanceBuffer! } },
+                { binding: 8,  resource: { buffer: builder.materialBuffer! } },
+                { binding: 9,  resource: { buffer: reservoirRead } },
+                { binding: 10, resource: { buffer: reservoirWrite } },
+            ],
+        });
+
+        const genPass = commandEncoder.beginComputePass({ label: 'PathTracer/ReSTIR-Generate' });
+        genPass.setPipeline(this._restirGenPipeline!);
+        genPass.setBindGroup(0, genBG);
+        genPass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+        genPass.end();
+
+        // Pass 0b: Spatial reuse + shade → directLightOut
+        const spatialBG = device.createBindGroup({
+            layout: this._restirSpatialBGL!,
+            entries: [
+                { binding: 0,  resource: depth.createView() },
+                { binding: 1,  resource: this._gbuffer!.normalTexture.createView() },
+                { binding: 2,  resource: { buffer: this._restirParamsBuf! } },
+                { binding: 3,  resource: { buffer: this._lightsBuffer! } },
+                { binding: 4,  resource: { buffer: builder.triangleBuffer! } },
+                { binding: 5,  resource: { buffer: builder.bvh4NodeBuffer! } },
+                { binding: 6,  resource: { buffer: builder.tlasBvh4Buffer! } },
+                { binding: 7,  resource: { buffer: builder.instanceBuffer! } },
+                { binding: 8,  resource: { buffer: builder.materialBuffer! } },
+                { binding: 9,  resource: { buffer: reservoirWrite } },
+                { binding: 10, resource: this._restirDirectTex!.createView() },
+            ],
+        });
+
+        const spatialPass = commandEncoder.beginComputePass({ label: 'PathTracer/ReSTIR-Spatial' });
+        spatialPass.setPipeline(this._restirSpatialPipeline!);
+        spatialPass.setBindGroup(0, spatialBG);
+        spatialPass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+        spatialPass.end();
     }
 }

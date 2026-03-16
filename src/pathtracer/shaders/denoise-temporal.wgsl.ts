@@ -8,13 +8,19 @@ struct TemporalParams {
     frameIndex         : u32,
 }
 
-@group(0) @binding(0) var currentGI   : texture_2d<f32>;
-@group(0) @binding(1) var historyGI   : texture_2d<f32>;
-@group(0) @binding(2) var outputGI    : texture_storage_2d<rgba16float, write>;
-@group(0) @binding(3) var depthTex    : texture_depth_2d;
-@group(0) @binding(4) var normalTex   : texture_2d<f32>;
+@group(0) @binding(0) var currentGI    : texture_2d<f32>;
+@group(0) @binding(1) var historyGI    : texture_2d<f32>;
+@group(0) @binding(2) var outputGI     : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var depthTex     : texture_depth_2d;
+@group(0) @binding(4) var normalTex    : texture_2d<f32>;
 @group(0) @binding(5) var historySamp  : sampler;
 @group(0) @binding(6) var<uniform> params : TemporalParams;
+@group(0) @binding(7) var momentsHistory : texture_2d<f32>;
+@group(0) @binding(8) var momentsOutput  : texture_storage_2d<rgba16float, write>;
+
+fn luminance(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -24,6 +30,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (f32(gid.x) >= params.width || f32(gid.y) >= params.height) { return; }
 
     let current = textureLoad(currentGI, coord, 0);
+    let curLum = luminance(current.rgb);
 
     // Map trace-res coord to full-res GBuffer coord
     let uv_t = (vec2f(gid.xy) + 0.5) / size;
@@ -31,43 +38,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let gbufCoord = min(vec2u(vec2f(gbufDim) * uv_t), gbufDim - vec2u(1u));
     let depth = textureLoad(depthTex, gbufCoord, 0);
 
-    // Sky pixels — no history accumulation
+    // Sky pixels
     if (depth >= 1.0) {
         textureStore(outputGI, vec2u(gid.xy), current);
+        textureStore(momentsOutput, vec2u(gid.xy), vec4f(0.0));
         return;
     }
 
-    // Refractive/mirror pixels — temporal blend WITHOUT neighborhood clamping.
-    // Their neighbors show unrelated reflected/refracted content, so clamping
-    // against them would corrupt colors. Simple exponential blend preserves
-    // definition while reducing noise over time.
-    if (current.a < 0.02) {
-        let uv_r = (vec2f(gid.xy) + 0.5) / size;
-        let ndc_r = vec4f(uv_r.x * 2.0 - 1.0, (1.0 - uv_r.y) * 2.0 - 1.0, depth, 1.0);
-        let wp_r = params.currentInvViewProj * ndc_r;
-        let worldPos_r = wp_r.xyz / wp_r.w;
-        let prevClip_r = params.prevViewProj * vec4f(worldPos_r, 1.0);
-        let prevNDC_r = prevClip_r.xyz / prevClip_r.w;
-        let prevUV_r = vec2f(prevNDC_r.x * 0.5 + 0.5, 1.0 - (prevNDC_r.y * 0.5 + 0.5));
-
-        var blend_r = params.blendFactor;
-        if (prevUV_r.x < 0.0 || prevUV_r.x > 1.0 || prevUV_r.y < 0.0 || prevUV_r.y > 1.0) {
-            blend_r = 1.0;
-        }
-        if (params.frameIndex == 0u) { blend_r = 1.0; }
-
-        let history_r = textureSampleLevel(historyGI, historySamp, prevUV_r, 0.0);
-        let blended_r = mix(history_r.rgb, current.rgb, blend_r);
-        textureStore(outputGI, vec2u(gid.xy), vec4f(blended_r, current.a));
-        return;
-    }
-
-    // ── Neighborhood statistics (3×3) for color clamping ──
-    // This prevents ghosting from moving objects: history samples outside
-    // the current neighborhood range are clamped before blending.
+    // ── Spatial variance fallback (3x3) for short histories ──
     var nMin = current.rgb;
     var nMax = current.rgb;
     var nMean = vec3f(0.0);
+    var spatialM2 = 0.0;
     var nCount = 0.0;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
@@ -77,12 +59,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             nMin = min(nMin, s);
             nMax = max(nMax, s);
             nMean += s;
+            let sLum = luminance(s);
+            spatialM2 += sLum * sLum;
             nCount += 1.0;
         }
     }
     nMean /= nCount;
+    let spatialMeanLum = luminance(nMean);
+    let spatialVariance = max(spatialM2 / nCount - spatialMeanLum * spatialMeanLum, 0.0);
 
-    // Widen the clamp box slightly around the mean to allow some convergence
+    // Widen the clamp box slightly around the mean
     let nExtent = nMax - nMin;
     let clampMin = nMin - nExtent * 0.1;
     let clampMax = nMax + nExtent * 0.1;
@@ -97,26 +83,63 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let prevNDC = prevClip.xyz / prevClip.w;
     let prevUV = vec2f(prevNDC.x * 0.5 + 0.5, 1.0 - (prevNDC.y * 0.5 + 0.5));
 
-    // Out-of-bounds or first frame → use current only
-    var blend = params.blendFactor;
+    var disoccluded = false;
     if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0) {
-        blend = 1.0;
+        disoccluded = true;
     }
     if (params.frameIndex == 0u) {
-        blend = 1.0;
+        disoccluded = true;
     }
 
-    // Sample history with bilinear filtering
-    let history = textureSampleLevel(historyGI, historySamp, prevUV, 0.0);
+    // Normal consistency: reject history if normals diverge too much
+    let centerNormal = normalize(textureLoad(normalTex, vec2i(gbufCoord), 0).xyz * 2.0 - 1.0);
+    if (!disoccluded) {
+        let prevPixel = vec2i(vec2f(isize) * prevUV);
+        let prevGBuf = min(vec2u(vec2f(gbufDim) * prevUV), gbufDim - vec2u(1u));
+        let prevNormal = normalize(textureLoad(normalTex, vec2i(prevGBuf), 0).xyz * 2.0 - 1.0);
+        if (dot(centerNormal, prevNormal) < 0.5) {
+            disoccluded = true;
+        }
+    }
 
-    // Clamp history to current neighborhood range (anti-ghosting)
-    let clamped = vec4f(clamp(history.rgb, clampMin, clampMax), 1.0);
+    var blendedColor: vec3f;
+    var moment1: f32;
+    var moment2: f32;
+    var historyLen: f32;
+    var variance: f32;
 
-    // Increase blend toward current when history was clamped significantly
-    let clampDist = length(history.rgb - clamped.rgb);
-    let adaptiveBlend = max(blend, saturate(clampDist * 0.5));
+    if (disoccluded) {
+        blendedColor = current.rgb;
+        moment1 = curLum;
+        moment2 = curLum * curLum;
+        historyLen = 1.0;
+        variance = spatialVariance;
+    } else {
+        let history = textureSampleLevel(historyGI, historySamp, prevUV, 0.0);
+        let prevMoments = textureSampleLevel(momentsHistory, historySamp, prevUV, 0.0);
 
-    let blended = mix(clamped.rgb, current.rgb, adaptiveBlend);
-    textureStore(outputGI, vec2u(gid.xy), vec4f(blended, current.a));
+        // Clamp history to current neighborhood range (anti-ghosting)
+        let clamped = clamp(history.rgb, clampMin, clampMax);
+        let clampDist = length(history.rgb - clamped);
+        let adaptiveBlend = max(params.blendFactor, saturate(clampDist * 0.5));
+
+        blendedColor = mix(clamped, current.rgb, adaptiveBlend);
+
+        // Accumulate moments
+        let prevHistLen = prevMoments.b;
+        historyLen = min(prevHistLen + 1.0, 256.0);
+        let alpha = max(1.0 / historyLen, params.blendFactor);
+        moment1 = mix(prevMoments.r, curLum, alpha);
+        moment2 = mix(prevMoments.g, curLum * curLum, alpha);
+        variance = max(moment2 - moment1 * moment1, 0.0);
+
+        // For short history, blend with spatial variance estimate
+        if (historyLen < 4.0) {
+            variance = mix(spatialVariance, variance, historyLen / 4.0);
+        }
+    }
+
+    textureStore(outputGI, vec2u(gid.xy), vec4f(blendedColor, current.a));
+    textureStore(momentsOutput, vec2u(gid.xy), vec4f(moment1, moment2, historyLen, variance));
 }
 `;
