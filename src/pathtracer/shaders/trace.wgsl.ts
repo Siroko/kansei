@@ -152,6 +152,58 @@ fn fresnelSchlick(cosTheta: f32, F0: vec3f) -> vec3f {
     return F0 + (vec3f(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+// ── MIS (Multiple Importance Sampling) helpers ──────────────────────
+
+const PI = 3.14159265;
+
+fn D_GGX(NdotH: f32, a2: f32) -> f32 {
+    let denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom);
+}
+
+fn powerHeuristic(pdfA: f32, pdfB: f32) -> f32 {
+    let a2 = pdfA * pdfA;
+    return a2 / max(a2 + pdfB * pdfB, 1e-10);
+}
+
+// Combined BSDF pdf: specular GGX + diffuse cosine hemisphere
+fn pdfBSDF(N: vec3f, wo: vec3f, wi: vec3f, roughness: f32, metallic: f32, surfAlbedo: vec3f) -> f32 {
+    let cosTheta = max(dot(N, wi), 0.0);
+    if (cosTheta <= 0.0) { return 0.0; }
+
+    let NdotV = max(dot(N, wo), 0.001);
+    let F0 = mix(vec3f(0.04), surfAlbedo, metallic);
+    let F = fresnelSchlick(NdotV, F0);
+    let specAvg = (F.r + F.g + F.b) / 3.0;
+    let diffW = (1.0 - specAvg) * (1.0 - metallic);
+    let totalW = specAvg + diffW;
+    let specProb = clamp(specAvg / max(totalW, 0.001), 0.05, 0.95);
+
+    let pdfDiff = cosTheta / PI;
+
+    let h = normalize(wo + wi);
+    let NdotH = max(dot(N, h), 0.0);
+    let VdotH = max(dot(wo, h), 0.001);
+    let alpha = max(roughness, 0.02) * max(roughness, 0.02);
+    let alpha2 = alpha * alpha;
+    let pdfSpec = D_GGX(NdotH, alpha2) * NdotH / (4.0 * VdotH);
+
+    return specProb * pdfSpec + (1.0 - specProb) * pdfDiff;
+}
+
+// World-space triangle area for MIS on emissive geometry hits
+fn getWorldTriArea(triIdx: u32, instId: u32) -> f32 {
+    let base = triIdx * TRI_STRIDE;
+    let v0 = vec3f(triangles[base], triangles[base+1u], triangles[base+2u]);
+    let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
+    let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
+    let inst = instances[instId];
+    let w0 = transformPointToWorld(v0, inst);
+    let w1 = transformPointToWorld(v1, inst);
+    let w2 = transformPointToWorld(v2, inst);
+    return 0.5 * length(cross(w1 - w0, w2 - w0));
+}
+
 // ── Shadow test that skips refractive (transparent) surfaces ────────
 
 fn traceShadow(origin: vec3f, dir: vec3f, maxDist: f32) -> bool {
@@ -186,11 +238,13 @@ fn evaluateDirectionalLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> 
     return light.color * light.intensity * nDotL;
 }
 
-fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
+fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData,
+                     wo: vec3f, roughness: f32, metallic: f32, surfAlbedo: vec3f) -> vec3f {
     let lr1 = nextRandom();
     let lr2 = nextRandom();
     let sizeX = light.extra.x;
     let sizeZ = light.extra.y;
+    let area = sizeX * sizeZ;
 
     // Build tangent frame from light normal
     let ln = light.normal;
@@ -207,19 +261,20 @@ fn evaluateAreaLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
     let dist = sqrt(dist2);
     let lightDir = toLight / dist;
 
-    // Cosine at hit surface
     let nDotL = max(dot(hitNorm, lightDir), 0.0);
     if (nDotL <= 0.0) { return vec3f(0.0); }
 
-    // Cosine at light surface
     let lightCos = max(dot(ln, -lightDir), 0.0);
     if (lightCos <= 0.0) { return vec3f(0.0); }
 
     if (traceShadow(hitPos + hitNorm * 0.001, lightDir, dist - 0.01)) { return vec3f(0.0); }
 
-    // L_e * cos_hit * cos_light * A / d^2
-    let area = sizeX * sizeZ;
-    return light.color * light.intensity * nDotL * lightCos * area / dist2;
+    // MIS: weight NEE against BSDF probability for this direction
+    let pdfLight = dist2 / max(lightCos * area, 1e-8);
+    let pdfBsdf = pdfBSDF(hitNorm, wo, lightDir, roughness, metallic, surfAlbedo);
+    let misW = powerHeuristic(pdfLight, pdfBsdf);
+
+    return light.color * light.intensity * nDotL * lightCos * area / dist2 * misW;
 }
 
 fn evaluatePointLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f {
@@ -238,7 +293,8 @@ fn evaluatePointLight(hitPos: vec3f, hitNorm: vec3f, light: LightData) -> vec3f 
 
 // ── Evaluate all scene lights at a hit point ────────────────────────
 
-fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
+fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, wo: vec3f,
+                    roughness: f32, metallic: f32, surfAlbedo: vec3f) -> vec3f {
     var total = vec3f(0.0);
     let count = traceParams.lightCount;
     for (var i = 0u; i < count; i++) {
@@ -246,7 +302,7 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
         if (light.lightType == LIGHT_DIRECTIONAL) {
             total += evaluateDirectionalLight(hitPos, hitNorm, light);
         } else if (light.lightType == LIGHT_AREA) {
-            total += evaluateAreaLight(hitPos, hitNorm, light);
+            total += evaluateAreaLight(hitPos, hitNorm, light, wo, roughness, metallic, surfAlbedo);
         } else if (light.lightType == LIGHT_POINT) {
             total += evaluatePointLight(hitPos, hitNorm, light);
         }
@@ -258,10 +314,13 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
 // Returns irradiance at startPos. At each vertex: NEE for direct light,
 // then stochastic PBR bounce (specular or diffuse based on metallic/Fresnel).
 
-fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
+fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32,
+             startWo: vec3f, startRoughness: f32, startMetallic: f32,
+             startAlbedo: vec3f) -> vec3f {
     var accumulated = vec3f(0.0);
     if (skipFirstNEE == 0u) {
-        accumulated = evaluateLighting(startPos, startNorm);
+        accumulated = evaluateLighting(startPos, startNorm, startWo,
+                                       startRoughness, startMetallic, startAlbedo);
     }
     var throughput = vec3f(1.0);
     var pos = startPos;
@@ -269,6 +328,11 @@ fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
     var sampleSpec = false;
     var specRoughness = 1.0f;
     var incomingDir = vec3f(0.0);
+    // Track previous-vertex material for BSDF pdf at emissive hits
+    var prevWo = startWo;
+    var prevRoughness = startRoughness;
+    var prevMetallic = startMetallic;
+    var prevAlbedo = startAlbedo;
     let maxBounces = traceParams.maxBounces;
 
     for (var bounce = 0u; bounce < maxBounces; bounce++) {
@@ -290,6 +354,19 @@ fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
         }
 
         let mat = materials[hit.matIndex];
+
+        // MIS: when BSDF hits emissive geometry, evaluate emission with MIS weight
+        if (mat.emissiveIntensity > 0.0) {
+            let emission = mat.emissive * mat.emissiveIntensity;
+            let hitCos = abs(dot(hit.worldNorm, -bounceRay.dir));
+            let dist2 = hit.t * hit.t;
+            let triArea = getWorldTriArea(hit.triIndex, hit.instanceId);
+            let pdfL = dist2 / max(hitCos * triArea, 1e-8);
+            let pdfB = pdfBSDF(norm, prevWo, bounceRay.dir, prevRoughness, prevMetallic, prevAlbedo);
+            let w = powerHeuristic(pdfB, pdfL);
+            accumulated += throughput * emission * w;
+        }
+
         if (mat.emissiveIntensity > 0.0 || mat.transmission > 0.5) { break; }
 
         // PBR: decide next bounce from this surface
@@ -301,6 +378,8 @@ fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
         let totalW = specAvg + diffW;
         let specProb = clamp(specAvg / max(totalW, 0.001), 0.05, 0.95);
 
+        let hitWo = -bounceRay.dir;
+
         if (nextRandom() < specProb) {
             throughput *= F / specProb;
             sampleSpec = true;
@@ -310,7 +389,8 @@ fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
             sampleSpec = false;
         }
 
-        accumulated += throughput * evaluateLighting(hit.worldPos, hit.worldNorm);
+        accumulated += throughput * evaluateLighting(hit.worldPos, hit.worldNorm, hitWo,
+                                                     mat.roughness, mat.metallic, mat.albedo);
 
         // Russian roulette after first bounce
         if (bounce > 0u) {
@@ -322,6 +402,10 @@ fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
         incomingDir = bounceRay.dir;
         pos = hit.worldPos;
         norm = hit.worldNorm;
+        prevWo = hitWo;
+        prevRoughness = mat.roughness;
+        prevMetallic = mat.metallic;
+        prevAlbedo = mat.albedo;
     }
 
     return accumulated;
@@ -409,7 +493,8 @@ fn traceRefraction(
                 let mH = sampleGGX(exitNorm, max(nextMat.roughness, 0.02), nextRandom(), nextRandom());
                 mRay.dir = reflect(ray.dir, mH);
                 if (dot(mRay.dir, exitNorm) <= 0.0) {
-                    return throughput * tracePath(nextHit.worldPos, exitNorm, 0u) * nextMat.albedo;
+                    return throughput * tracePath(nextHit.worldPos, exitNorm, 0u,
+                        -ray.dir, nextMat.roughness, nextMat.metallic, nextMat.albedo) * nextMat.albedo;
                 }
                 mRay.origin = nextHit.worldPos + exitNorm * 0.001;
                 var mHit = traceBVH(mRay);
@@ -432,13 +517,15 @@ fn traceRefraction(
                 }
                 if (mHit.hit) {
                     let mMat = materials[mHit.matIndex];
-                    return throughput * exitF / exitSpecProb * tracePath(mHit.worldPos, mHit.worldNorm, 0u) * mMat.albedo;
+                    return throughput * exitF / exitSpecProb * tracePath(mHit.worldPos, mHit.worldNorm, 0u,
+                        -mRay.dir, mMat.roughness, mMat.metallic, mMat.albedo) * mMat.albedo;
                 }
                 return throughput * exitF / exitSpecProb * traceParams.ambientColor;
             } else {
                 // Diffuse at exit surface
                 let exitKd = (vec3f(1.0) - exitF) * (1.0 - nextMat.metallic);
-                return throughput * tracePath(nextHit.worldPos, exitNorm, 0u) * nextMat.albedo * exitKd / (1.0 - exitSpecProb);
+                return throughput * tracePath(nextHit.worldPos, exitNorm, 0u,
+                    -ray.dir, nextMat.roughness, nextMat.metallic, nextMat.albedo) * nextMat.albedo * exitKd / (1.0 - exitSpecProb);
             }
         }
         currentHit = nextHit;
@@ -531,7 +618,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                     if (specMat.transmission > 0.5) {
                         accumulated += traceRefraction(specRay, specHit, specMat) * F / specProb;
                     } else {
-                        accumulated += tracePath(specHit.worldPos, specHit.worldNorm, 0u) * specMat.albedo * F / specProb;
+                        accumulated += tracePath(specHit.worldPos, specHit.worldNorm, 0u,
+                            -specRay.dir, specMat.roughness, specMat.metallic, specMat.albedo) * specMat.albedo * F / specProb;
                     }
                 } else {
                     accumulated += traceParams.ambientColor * F / specProb;
@@ -551,7 +639,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                     accumulated += traceRefraction(primaryRay, primaryHit, mat) * weight;
                 } else {
                     // Primary ray hit an opaque surface: treat as diffuse contribution
-                    accumulated += tracePath(primaryHit.worldPos, primaryHit.worldNorm, 0u) * mat.albedo * weight;
+                    accumulated += tracePath(primaryHit.worldPos, primaryHit.worldNorm, 0u,
+                        -primaryRay.dir, mat.roughness, mat.metallic, mat.albedo) * mat.albedo * weight;
                 }
             } else {
                 let weight = (1.0 - specAvg) * (1.0 - metallic) * transmission / transProb;
@@ -561,7 +650,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             // ── Diffuse: multi-bounce path tracing with NEE ──────────
             let diffProb = 1.0 - specProb - transProb;
             let kd = (vec3f(1.0) - F) * (1.0 - metallic) * (1.0 - transmission);
-            accumulated += tracePath(worldPos, worldNormal, 0u) * albedo * kd / max(diffProb, 0.01);
+            accumulated += tracePath(worldPos, worldNormal, 0u,
+                viewDir, roughness, metallic, albedo) * albedo * kd / max(diffProb, 0.01);
         }
     }
 
