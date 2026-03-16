@@ -25,7 +25,7 @@ struct TraceParams {
     useBlueNoise : u32,
     fixedSeed    : u32,
     maxBounces   : u32,
-    _pad1        : u32,
+    useReSTIR    : u32,
     ambientColor : vec3f,
     _pad2        : u32,
 }
@@ -57,6 +57,7 @@ struct LightData {
 @group(0) @binding(10) var<storage, read> sceneLights : array<LightData>;
 @group(0) @binding(11) var<storage, read> blueNoise   : array<f32>;
 @group(0) @binding(12) var          emissiveTex : texture_2d<f32>;
+@group(0) @binding(13) var          restirDirectTex : texture_2d<f32>;
 
 // ── Blue noise hybrid sampler ────────────────────────────────────────
 // First 8 dimensions use blue noise (spatially decorrelated, golden-ratio
@@ -650,12 +651,19 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             // ── Diffuse: multi-bounce path tracing with NEE ──────────
             let diffProb = 1.0 - specProb - transProb;
             let kd = (vec3f(1.0) - F) * (1.0 - metallic) * (1.0 - transmission);
-            accumulated += tracePath(worldPos, worldNormal, 0u,
-                viewDir, roughness, metallic, albedo) * albedo * kd / max(diffProb, 0.01);
+            if (traceParams.useReSTIR != 0u) {
+                // ReSTIR provides primary-surface direct light; skip first NEE in tracePath
+                let restirDirect = textureLoad(restirDirectTex, vec2i(coord), 0).rgb;
+                let indirect = tracePath(worldPos, worldNormal, 1u,
+                    viewDir, roughness, metallic, albedo);
+                accumulated += (restirDirect + indirect) * albedo * kd / max(diffProb, 0.01);
+            } else {
+                accumulated += tracePath(worldPos, worldNormal, 0u,
+                    viewDir, roughness, metallic, albedo) * albedo * kd / max(diffProb, 0.01);
+            }
         }
     }
 
-    // giAlpha=0: trace shader computes full outgoing radiance for all paths
-    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), 0.0));
+    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), 1.0));
 }
 `;
