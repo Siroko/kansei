@@ -7,6 +7,7 @@ import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
 import { GBuffer } from "../postprocessing/GBuffer";
 import { ShadowMap } from "../shadows/ShadowMap";
+import { CubeMapShadowMap } from "../shadows/CubeMapShadowMap";
 
 /**
  * Configuration options for the WebGPU renderer.
@@ -106,11 +107,20 @@ class Renderer {
     private _shadowUniformBuf: GPUBuffer | null = null;
     private _shadowComparisonSampler: GPUSampler | null = null;
     private _dummyShadowDepthTex: GPUTexture | null = null;
+    private _dummyCubeShadowTex: GPUTexture | null = null;
+    private _cubeShadowSampler: GPUSampler | null = null;
+    private _cubeMapShadowMap: CubeMapShadowMap | null = null;
     private _shadowBGDirty: boolean = true;
 
     public get shadowMap(): ShadowMap | null { return this._shadowMap; }
     public set shadowMap(value: ShadowMap | null) {
         this._shadowMap = value;
+        this._shadowBGDirty = true;
+    }
+
+    public get cubeMapShadowMap(): CubeMapShadowMap | null { return this._cubeMapShadowMap; }
+    public set cubeMapShadowMap(value: CubeMapShadowMap | null) {
+        this._cubeMapShadowMap = value;
         this._shadowBGDirty = true;
     }
 
@@ -287,11 +297,36 @@ class Renderer {
             minFilter: 'linear',
         });
 
-        // mat4(64) + bias(4) + normalBias(4) + shadowEnabled(4) + _pad(4) = 80 bytes
+        // mat4(64) + bias(4) + normalBias(4) + shadowEnabled(4) + pointShadowEnabled(4)
+        // + pointLightPos(12) + pointShadowFar(4) = 96 bytes
         this._shadowUniformBuf = this.device!.createBuffer({
             label: 'Shadow/Uniforms',
-            size: 80,
+            size: 96,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Dummy 1×1 6-layer r32float texture for cubemap shadow (filled with large distance)
+        this._dummyCubeShadowTex = this.device!.createTexture({
+            label: 'Shadow/DummyCube',
+            size: [1, 1, 6],
+            format: 'r32float',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        // Fill with large distance so everything is lit by default
+        const farDist = new Float32Array([1e10]);
+        for (let i = 0; i < 6; i++) {
+            this.device!.queue.writeTexture(
+                { texture: this._dummyCubeShadowTex, origin: [0, 0, i] },
+                farDist,
+                { bytesPerRow: 4 },
+                [1, 1, 1],
+            );
+        }
+
+        this._cubeShadowSampler = this.device!.createSampler({
+            label: 'Shadow/CubeSampler',
+            magFilter: 'nearest',
+            minFilter: 'nearest',
         });
 
         this._shadowBGL = this.device!.createBindGroupLayout({
@@ -300,6 +335,8 @@ class Renderer {
                 { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
                 { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
                 { binding: 2, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+                { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float', viewDimension: '2d-array' } },
+                { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
             ],
         });
 
@@ -317,6 +354,10 @@ class Renderer {
             ? this._shadowMap.depthTexture
             : this._dummyShadowDepthTex!;
 
+        const cubeTex = this._cubeMapShadowMap
+            ? this._cubeMapShadowMap.distanceTexture
+            : this._dummyCubeShadowTex!;
+
         this._shadowBG = this.device!.createBindGroup({
             label: 'Shadow BindGroup',
             layout: this._shadowBGL!,
@@ -324,6 +365,8 @@ class Renderer {
                 { binding: 0, resource: depthTex.createView() },
                 { binding: 1, resource: this._shadowComparisonSampler! },
                 { binding: 2, resource: { buffer: this._shadowUniformBuf! } },
+                { binding: 3, resource: cubeTex.createView({ dimension: '2d-array' }) },
+                { binding: 4, resource: this._cubeShadowSampler! },
             ],
         });
 
@@ -746,8 +789,9 @@ class Renderer {
      */
     private _uploadShadowUniforms(): void {
         this._ensureShadowResources();
-        // 20 floats: mat4(16) + bias(1) + normalBias(1) + shadowEnabled(1) + _pad(1)
-        const staging = new Float32Array(20);
+        // 24 floats: mat4(16) + bias(1) + normalBias(1) + shadowEnabled(1) + pointShadowEnabled(1)
+        //          + pointLightPos(3) + pointShadowFar(1)
+        const staging = new Float32Array(24);
         if (this._shadowMap && this.shadowsEnabled) {
             staging.set(this._shadowMap.lightViewProjMatrix, 0);
             staging[16] = 0.001;  // bias
@@ -756,7 +800,22 @@ class Renderer {
         } else {
             staging[18] = 0.0;    // shadowEnabled = off
         }
+        // Point shadow: [enabled, posX, posY, posZ, shadowFar] — must be set each frame
+        staging.set(this._pointShadowParams, 19);
         this.device!.queue.writeBuffer(this._shadowUniformBuf!, 0, staging);
+        // Reset — caller must call setPointShadowParams every frame it wants point shadow
+        this._pointShadowParams.fill(0);
+    }
+
+    /** Point shadow params: [enabled, posX, posY, posZ, shadowFar]. Reset after each upload. */
+    private _pointShadowParams = new Float32Array(5);
+
+    public setPointShadowParams(posX: number, posY: number, posZ: number, shadowFar: number): void {
+        this._pointShadowParams[0] = 1.0;  // enabled
+        this._pointShadowParams[1] = posX;
+        this._pointShadowParams[2] = posY;
+        this._pointShadowParams[3] = posZ;
+        this._pointShadowParams[4] = shadowFar;
     }
 
     /**

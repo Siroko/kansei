@@ -309,6 +309,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },             // materials
                 { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // sceneLights
                 { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // blueNoise
+                { binding: 12, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // emissive
             ],
         });
 
@@ -379,6 +380,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // outputTex
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },                       // params
                 { binding: 5, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },                    // giSampler
+                { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // emissiveTex
             ],
         });
 
@@ -634,6 +636,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 9, resource: { buffer: builder.materialBuffer! } },
                 { binding: 10, resource: { buffer: this._lightsBuffer! } },
                 { binding: 11, resource: { buffer: this._blueNoiseBuffer! } },
+                { binding: 12, resource: this._gbuffer!.emissiveTexture.createView() },
             ],
         });
 
@@ -766,6 +769,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 3, resource: output.createView() },
                 { binding: 4, resource: { buffer: this._compositeParamsBuf! } },
                 { binding: 5, resource: this._historySampler! },
+                { binding: 6, resource: this._gbuffer!.emissiveTexture.createView() },
             ],
         });
 
