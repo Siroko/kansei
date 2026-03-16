@@ -11,6 +11,7 @@ struct CompositeParams {
 @group(0) @binding(3) var outputTex   : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var<uniform> params : CompositeParams;
 @group(0) @binding(5) var giSampler   : sampler;
+@group(0) @binding(6) var emissiveTex : texture_2d<f32>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -19,19 +20,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let coord = vec2u(gid.xy);
     let uv = (vec2f(gid.xy) + 0.5) / vec2f(f32(params.width), f32(params.height));
 
-    let direct    = textureLoad(inputTex, vec2i(coord), 0).rgb;
-    // Sample low-res GI with bilinear filtering for smooth upscale
     let giSample  = textureSampleLevel(denoisedGI, giSampler, uv, 0.0);
     let indirect  = giSample.rgb;
-    let giAlpha   = giSample.a;
-    let albedoRaw = textureLoad(albedoTex, vec2i(coord), 0);
-    let albedo    = albedoRaw.rgb;
 
-    // giAlpha == 0 → refractive/mirror: use GI as-is (path tracer handles full lighting)
-    // giAlpha >  0 → opaque: GI provides full irradiance (NEE + indirect), multiply by albedo
-    let hdr = select(indirect, albedo * indirect, giAlpha > 0.02);
+    // Path tracer provides full outgoing radiance for all surface types
+    let hdr = indirect;
 
-    // Reinhard tone map to make HDR range visible
     let final_color = hdr / (hdr + vec3f(1.0));
 
     textureStore(outputTex, coord, vec4f(final_color, 1.0));

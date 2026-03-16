@@ -5,7 +5,7 @@
   <meta charset="UTF-8" />
   <link rel="icon" type="image/svg+xml" href="/vite.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Cornell Box – GI + Compute Instances</title>
+  <title>Cornell Box – GI + Compute Trail Particles</title>
   <style>
     body {
       margin: 0;
@@ -21,7 +21,6 @@
     import { Material } from '../src/materials/Material'
     import { Compute } from '../src/materials/Compute'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
-    import { SphereGeometry } from '../src/geometries/SphereGeometry'
     import { Renderable } from '../src/objects/Renderable'
     import { Scene } from '../src/objects/Scene'
     import { Camera } from '../src/cameras/Camera'
@@ -37,6 +36,7 @@
     import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
     import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
     import { BufferBase } from '../src/buffers/BufferBase'
+    import { GLTFLoader } from '../src/loaders/GLTFLoader'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Cornell box dimensions ────────────────────────────────────────────
@@ -50,6 +50,13 @@
     const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
     areaLight.position.set(0, WALL - 0.2, 0);
     areaLight.target.set(0, 0, 0);
+
+    // ── Trail parameters ─────────────────────────────────────────────────
+    const NUM_SEGMENTS = 4;
+    const numParticles = 64;
+    const particleSize = 0.1;
+    const trailHeight = particleSize * NUM_SEGMENTS;
+    const trailHalfY = trailHeight / 2;
 
     // ── Shader blocks ─────────────────────────────────────────────────────
     const vertexBlock = /* wgsl */`
@@ -86,7 +93,10 @@
     const colorShader = vertexBlock + /* wgsl */`
       #include <shadows>
 
-      @group(0) @binding(1) var<uniform> albedo : vec3f;
+      // albedoMetal: xyz = albedo, w = metallic
+      // matParams:  x = roughness
+      @group(0) @binding(1) var<uniform> albedoMetal : vec4f;
+      @group(0) @binding(2) var<uniform> matParams   : vec4f;
 
       struct FragmentOutput {
         @location(0) color    : vec4f,
@@ -97,22 +107,24 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let albedo = albedoMetal.rgb;
         let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
         return FragmentOutput(
           vec4f(albedo * lighting, 1),
-          vec4f(0, 0, 0, 1),
-          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
-          vec4f(albedo, 0.04)
+          vec4f(0, 0, 0, matParams.y),
+          vec4f(frag.worldNormal * 0.5 + 0.5, matParams.x),
+          vec4f(albedo, albedoMetal.a)
         );
       }
     `;
 
-    // ── Instanced particle shader (per-instance 3×4 affine transform) ─────
-    const instancedVertexBlock = /* wgsl */`
-      const AMBIENT : f32 = 0.0;
+    // ── Trail particle shader — vertex reads trail storage buffer ─────────
+    const trailShader = /* wgsl */`
+      const BOX_HALF_Y : f32 = ${trailHalfY};
+      const NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
 
       struct VertexOut {
         @builtin(position) position   : vec4f,
@@ -120,45 +132,69 @@
         @location(1)       worldNormal: vec3f,
       }
 
-      @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
-      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+      @group(0) @binding(0) var<uniform> lightDirection      : vec3f;
+      @group(0) @binding(2) var<storage, read> trailTransforms : array<vec4f>;
+      @group(1) @binding(0) var<uniform> normalMatrix         : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix          : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix           : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix     : mat4x4f;
 
       @vertex
       fn vertex_main(
         @location(0) position : vec4f,
         @location(1) normal   : vec3f,
         @location(2) uv       : vec2f,
-        @location(3) instRow0 : vec4f,
-        @location(4) instRow1 : vec4f,
-        @location(5) instRow2 : vec4f,
+        @builtin(instance_index) instanceIdx : u32,
       ) -> VertexOut {
-        // Apply per-instance affine transform (rotation + translation)
-        let lp = position.xyz;
+        // Normalize Y to [0, 1] within the bounding box
+        let normY = (position.y + BOX_HALF_Y) / (2.0 * BOX_HALF_Y);
+
+        // Map normY → segment: normY=1 is head (seg 0), normY=0 is tail (seg N-1)
+        let segFloat = (1.0 - normY) * f32(NUM_SEGMENTS - 1u);
+        let seg0 = u32(floor(segFloat));
+        let seg1 = min(seg0 + 1u, NUM_SEGMENTS - 1u);
+        let frac = segFloat - f32(seg0);
+
+        // Read two adjacent segment transforms and interpolate
+        let base0 = (instanceIdx * NUM_SEGMENTS + seg0) * 3u;
+        let r0_0 = trailTransforms[base0 + 0u];
+        let r0_1 = trailTransforms[base0 + 1u];
+        let r0_2 = trailTransforms[base0 + 2u];
+
+        let base1 = (instanceIdx * NUM_SEGMENTS + seg1) * 3u;
+        let r1_0 = trailTransforms[base1 + 0u];
+        let r1_1 = trailTransforms[base1 + 1u];
+        let r1_2 = trailTransforms[base1 + 2u];
+
+        let row0 = mix(r0_0, r1_0, frac);
+        let row1 = mix(r0_1, r1_1, frac);
+        let row2 = mix(r0_2, r1_2, frac);
+
+        // Apply segment rotation to cross-section (XZ), position from trail
+        let localXZ = vec3f(position.x, 0.0, position.z);
         let ip = vec4f(
-          dot(instRow0.xyz, lp) + instRow0.w,
-          dot(instRow1.xyz, lp) + instRow1.w,
-          dot(instRow2.xyz, lp) + instRow2.w,
+          dot(row0.xyz, localXZ) + row0.w,
+          dot(row1.xyz, localXZ) + row1.w,
+          dot(row2.xyz, localXZ) + row2.w,
           1.0
         );
+
         let worldPos = worldMatrix * ip;
-        // Transform normal by instance rotation
+
+        // Transform normal by segment rotation
         let tn = vec3f(
-          dot(instRow0.xyz, normal),
-          dot(instRow1.xyz, normal),
-          dot(instRow2.xyz, normal),
+          dot(row0.xyz, normal),
+          dot(row1.xyz, normal),
+          dot(row2.xyz, normal),
         );
+
         var out : VertexOut;
         out.position    = projectionMatrix * viewMatrix * worldPos;
         out.worldPos    = worldPos.xyz;
         out.worldNormal = normalize((normalMatrix * vec4f(tn, 0.0)).xyz);
         return out;
       }
-    `;
-
-    const instancedShader = instancedVertexBlock + /* wgsl */`
+    ` + /* wgsl */`
       #include <shadows>
 
       @group(0) @binding(1) var<uniform> albedo : vec3f;
@@ -175,22 +211,21 @@
         let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
-        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
+        let lighting = diffuse * shadow;
         return FragmentOutput(
           vec4f(albedo * lighting, 1),
-          vec4f(0, 0, 0, 1),
+          vec4f(0, 0, 0, 0),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
           vec4f(albedo, 0.04)
         );
       }
     `;
 
-    // ── GPU compute shaders for curl-noise particle animation ─────────────
+    // ── GPU compute shaders ──────────────────────────────────────────────
+
+    // Velocity: curl noise (unchanged)
     const computeVelocityShader = /* wgsl */`
       #include <curl>
-
-      // curlParams: x=noiseScale, y=persistence, z=timeScale, w=curlStrength
-      // time: x=elapsed, y=dt, z=damping
 
       fn cornellCurl(p: vec3f, t: f32) -> vec3f {
         let sp = p * curlParams.x;
@@ -238,7 +273,130 @@
       @group(0) @binding(3) var<uniform>             curlParams : vec4<f32>;
     `;
 
+    // Steering behaviour: separation + alignment + cohesion (boids-like)
+    const computeSteeringShader = /* wgsl */`
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        let count = arrayLength(&positions);
+        if (idx >= count) { return; }
+
+        var velocity = velocities[idx];
+        let position = positions[idx];
+        let dt = time.y;
+
+        // Steering parameters from steerParams uniform
+        let perceptionRadius = steerParams.x;
+        let separationDist   = steerParams.y;
+        let maxSpeed         = steerParams.z;
+        let maxForce         = steerParams.w;
+
+        // Accumulate flocking forces
+        var separation = vec3f(0.0);
+        var alignment  = vec3f(0.0);
+        var cohesion   = vec3f(0.0);
+        var sepCount   = 0u;
+        var flockCount = 0u;
+
+        for (var j = 0u; j < count; j++) {
+          if (j == idx) { continue; }
+          let other = positions[j];
+          let diff = position - other;
+          let dist = length(diff);
+
+          if (dist < perceptionRadius && dist > 0.001) {
+            alignment += velocities[j];
+            cohesion += other;
+            flockCount += 1u;
+
+            if (dist < separationDist) {
+              separation += diff / (dist * dist);
+              sepCount += 1u;
+            }
+          }
+        }
+
+        var steer = vec3f(0.0);
+
+        // Separation
+        if (sepCount > 0u) {
+          separation /= f32(sepCount);
+          separation = normalize(separation) * maxSpeed - velocity;
+          let sepLen = length(separation);
+          if (sepLen > maxForce) { separation = separation / sepLen * maxForce; }
+          steer += separation * steerWeights.x;
+        }
+
+        // Alignment
+        if (flockCount > 0u) {
+          alignment /= f32(flockCount);
+          alignment = normalize(alignment) * maxSpeed - velocity;
+          let aliLen = length(alignment);
+          if (aliLen > maxForce) { alignment = alignment / aliLen * maxForce; }
+          steer += alignment * steerWeights.y;
+        }
+
+        // Cohesion
+        if (flockCount > 0u) {
+          cohesion = cohesion / f32(flockCount) - position;
+          cohesion = normalize(cohesion) * maxSpeed - velocity;
+          let cohLen = length(cohesion);
+          if (cohLen > maxForce) { cohesion = cohesion / cohLen * maxForce; }
+          steer += cohesion * steerWeights.z;
+        }
+
+        // Damping
+        velocity *= pow(time.z, dt * 60.0);
+
+        // Apply steering force
+        velocity += steer * dt;
+
+        // Clamp speed
+        let spd = length(velocity);
+        if (spd > maxSpeed) { velocity = velocity / spd * maxSpeed; }
+
+        velocities[idx] = velocity;
+      }
+
+      @group(0) @binding(0) var<storage, read_write> velocities  : array<vec3<f32>>;
+      @group(0) @binding(1) var<storage, read_write> positions   : array<vec3<f32>>;
+      @group(0) @binding(2) var<uniform>             time        : vec4<f32>;
+      @group(0) @binding(3) var<uniform>             steerParams : vec4<f32>;
+      @group(0) @binding(4) var<uniform>             steerWeights: vec4<f32>;
+    `;
+
+    // Trail propagation: shift segments down (oldest overwritten, head slot freed)
+    const computeTrailPropagateShader = /* wgsl */`
+      const NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        let numParticles = arrayLength(&trail) / (NUM_SEGMENTS * 3u);
+        if (idx >= numParticles) { return; }
+
+        let base = idx * NUM_SEGMENTS * 3u;
+
+        // Shift segments down: seg[9]=seg[8], seg[8]=seg[7], ..., seg[1]=seg[0]
+        for (var i = 0u; i < NUM_SEGMENTS - 1u; i++) {
+          let dstSeg = NUM_SEGMENTS - 1u - i;
+          let srcSeg = dstSeg - 1u;
+          let dst = base + dstSeg * 3u;
+          let src = base + srcSeg * 3u;
+          trail[dst + 0u] = trail[src + 0u];
+          trail[dst + 1u] = trail[src + 1u];
+          trail[dst + 2u] = trail[src + 2u];
+        }
+      }
+
+      @group(0) @binding(0) var<storage, read_write> trail : array<vec4f>;
+    `;
+
+    // Position update: integrates position, builds velocity-based rotation,
+    // writes head transform to trail segment 0
     const computePositionShader = /* wgsl */`
+      const NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
+
       @compute @workgroup_size(64)
       fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         let idx = gid.x;
@@ -263,25 +421,52 @@
         positions[idx] = position;
         velocities[idx] = velocity;
 
-        // Build rotation from world position (Rz * Ry * Rx)
-        let ax = position.x * 0.5;
-        let ay = position.y * 0.3;
-        let az = position.z * 0.4;
-        let cx = cos(ax); let sx = sin(ax);
-        let cy = cos(ay); let sy = sin(ay);
-        let cz = cos(az); let sz = sin(az);
+        let trailBase = idx * NUM_SEGMENTS * 3u;
 
-        // Write 3×vec4f row-major affine transform
-        let base = idx * 3u;
-        transforms[base + 0u] = vec4f(cy*cz, cz*sx*sy - cx*sz, sx*sz + cx*cz*sy, position.x);
-        transforms[base + 1u] = vec4f(cy*sz, cx*cz + sx*sy*sz, cx*sy*sz - cz*sx, position.y);
-        transforms[base + 2u] = vec4f(-sy,   cy*sx,             cx*cy,             position.z);
+        // Build rotation from velocity (parallel transport — twist-free)
+        let speed = length(velocity);
+        var forward = vec3f(0.0, 1.0, 0.0);
+        if (speed > 0.001) {
+          forward = normalize(velocity);
+        }
+
+        // Read previous frame's basis from segment 1 (old head, shifted by propagation)
+        let prevRow0 = trail[trailBase + 3u];
+        let prevRow1 = trail[trailBase + 4u];
+        let prevRow2 = trail[trailBase + 5u];
+        let prevRight = vec3f(prevRow0.x, prevRow1.x, prevRow2.x); // column 0
+
+        // Project previous right onto plane perpendicular to new forward
+        var right = prevRight - forward * dot(prevRight, forward);
+        let rightLen = length(right);
+
+        if (rightLen < 0.001) {
+          // Fallback: previous right was (anti-)parallel to new forward
+          if (abs(forward.y) > 0.99) {
+            right = normalize(cross(vec3f(0.0, 0.0, 1.0), forward));
+          } else {
+            right = normalize(cross(vec3f(0.0, 1.0, 0.0), forward));
+          }
+        } else {
+          right = right / rightLen;
+        }
+        let up = cross(forward, right);
+
+        // Row-major 3×4 affine: columns are [right, forward, up] + translation
+        let row0 = vec4f(right.x, forward.x, up.x, position.x);
+        let row1 = vec4f(right.y, forward.y, up.y, position.y);
+        let row2 = vec4f(right.z, forward.z, up.z, position.z);
+
+        // Write to trail segment 0 (head)
+        trail[trailBase + 0u] = row0;
+        trail[trailBase + 1u] = row1;
+        trail[trailBase + 2u] = row2;
       }
 
       @group(0) @binding(0) var<storage, read_write> positions  : array<vec3<f32>>;
       @group(0) @binding(1) var<storage, read_write> velocities : array<vec3<f32>>;
-      @group(0) @binding(2) var<storage, read_write> transforms : array<vec4f>;
-      @group(0) @binding(3) var<uniform>             time       : vec4<f32>;
+      @group(0) @binding(2) var<uniform>             time       : vec4<f32>;
+      @group(0) @binding(3) var<storage, read_write> trail      : array<vec4f>;
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
@@ -310,12 +495,14 @@
     const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
 
     // ── Material helpers ──────────────────────────────────────────────────
-    function makeMat(r, g, b) {
-      const albedo = new Vector3(r, g, b);
+    function makeMat(r, g, b, metallic = 0.04, roughness = 1.0) {
+      const albedoMetal = new Vector4(r, g, b, metallic);
+      const matParams = new Vector4(roughness, 0, 0, 0);
       return new Material(colorShader, {
         bindings: [
           { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
-          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedo },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedoMetal },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: matParams },
         ],
       });
     }
@@ -325,49 +512,80 @@
       m.albedo = [r, g, b];
       m.roughness = 1.0;
       m.maxBounces = 4;
-      m.refractive = false;
+      m.transmission = 0.0;
       return m;
     }
 
+    function makeWallMat(r, g, b, metallic = 0.04, roughness = 1.0) {
+      const albedoMetal = new Vector4(r, g, b, metallic);
+      const matParams = new Vector4(roughness, 0, 0, 0);
+      const mat = new Material(colorShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedoMetal },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: matParams },
+        ],
+      });
+      return { mat, albedoMetal, matParams };
+    }
+
+    const leftWallRaster  = makeWallMat(0.85, 0.12, 0.08);
+    const rightWallRaster = makeWallMat(0.12, 0.85, 0.15);
+    const backWallRaster  = makeWallMat(0.85, 0.85, 0.85);
+    const ceilingRaster   = makeWallMat(0.85, 0.85, 0.85);
+    const floorAlbedoMetal = new Vector4(0.85, 0.85, 0.85, 0.6);
+    const floorMatParams = new Vector4(0.3, 0, 0, 0);
+    const mirrorMat = new Material(colorShader, {
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: floorAlbedoMetal },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: floorMatParams },
+      ],
+    });
     const whiteMat = makeMat(0.85, 0.85, 0.85);
-    const redMat   = makeMat(0.85, 0.12, 0.08);
-    const greenMat = makeMat(0.12, 0.85, 0.15);
 
     // ── Cornell Box geometry ──────────────────────────────────────────────
     const wallGeo = new BoxGeometry(WALL, WALL, 0.1);
 
     // Floor
-    const floor = new Renderable(wallGeo, whiteMat);
+    const floor = new Renderable(wallGeo, mirrorMat);
     floor.position.set(0, 0, 0);
     floor.rotation.x = -Math.PI / 2;
-    floor.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    const floorPTMat = makePTMat(0.85, 0.85, 0.85);
+    floorPTMat.roughness = 0.3;
+    floorPTMat.metallic = 0.6;
+    floor.pathTracerMaterial = floorPTMat;
     scene.add(floor);
 
     // Ceiling
-    const ceiling = new Renderable(wallGeo, whiteMat);
+    const ceilingPTMat = makePTMat(0.85, 0.85, 0.85);
+    const ceiling = new Renderable(wallGeo, ceilingRaster.mat);
     ceiling.position.set(0, WALL, 0);
     ceiling.rotation.x = Math.PI / 2;
-    ceiling.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    ceiling.pathTracerMaterial = ceilingPTMat;
     scene.add(ceiling);
 
     // Back wall
-    const backWall = new Renderable(wallGeo, whiteMat);
+    const backWallPTMat = makePTMat(0.85, 0.85, 0.85);
+    const backWall = new Renderable(wallGeo, backWallRaster.mat);
     backWall.position.set(0, HALF, -HALF);
-    backWall.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    backWall.pathTracerMaterial = backWallPTMat;
     scene.add(backWall);
 
     // Left wall (RED)
-    const leftWall = new Renderable(wallGeo, redMat);
+    const leftWallPTMat = makePTMat(0.85, 0.12, 0.08);
+    const leftWall = new Renderable(wallGeo, leftWallRaster.mat);
     leftWall.position.set(-HALF, HALF, 0);
     leftWall.rotation.y = Math.PI / 2;
-    leftWall.pathTracerMaterial = makePTMat(0.85, 0.12, 0.08);
+    leftWall.pathTracerMaterial = leftWallPTMat;
     scene.add(leftWall);
 
     // Right wall (GREEN)
-    const rightWall = new Renderable(wallGeo, greenMat);
+    const rightWallPTMat = makePTMat(0.12, 0.85, 0.15);
+    const rightWall = new Renderable(wallGeo, rightWallRaster.mat);
     rightWall.position.set(HALF, HALF, 0);
     rightWall.rotation.y = -Math.PI / 2;
-    rightWall.pathTracerMaterial = makePTMat(0.12, 0.85, 0.15);
+    rightWall.pathTracerMaterial = rightWallPTMat;
     scene.add(rightWall);
 
     // ── Emissive ceiling light panel ──────────────────────────────────────
@@ -381,12 +599,39 @@
     lightPanel.pathTracerMaterial = lightPTMat;
     scene.add(lightPanel);
 
-    // ── Instanced particles ───────────────────────────────────────────────
-    const numParticles = 500;
-    const particleSize = 0.6;
+    // ── GLTF model (refractive glass) ─────────────────────────────────────
+    const glassAlbedoMetal = new Vector4(1.0, 1.0, 1.0, 0.0); // metallic=0 for dielectric glass
+    const glassMatParams = new Vector4(0.0, 1.0, 0, 0);       // x = roughness, y = transmission
+    const glassRasterMat = new Material(colorShader, {
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: glassAlbedoMetal },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: glassMatParams },
+      ],
+    });
+    const glassPTMat = new PathTracerMaterial();
+    glassPTMat.albedo = [1, 1, 1];
+    glassPTMat.roughness = 0.0;
+    glassPTMat.metallic = 0.0;
+    glassPTMat.transmission = 1.0;
+    glassPTMat.ior = 1.5;
+    glassPTMat.maxBounces = 8;
+    glassPTMat.absorptionColor = [0.8, 0.9, 1.0];
+    glassPTMat.absorptionDensity = 0.5;
+
+    const gltfLoader = new GLTFLoader();
+    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', glassRasterMat);
+    gltf.scene.scale.set(30, 30, 30);
+    gltf.scene.position.set(0, -1.5, 0);
+    gltf.scene.traverse(gltf.scene, (obj) => {
+      if (obj.isRenderable) { obj.pathTracerMaterial = glassPTMat; }
+    });
+    scene.add(gltf.scene);
+
+    // ── Instanced trail particles ────────────────────────────────────────
     const particleAlbedo = new Vector3(0.9, 0.75, 0.5);
     const time = new Vector4();
-    const curlParams = new Vector4(0.4, 0.5, 0.15, 0.72); // noiseScale, persistence, timeScale, curlStrength
+    const curlParams = new Vector4(0.4, 0.5, 0.15, 0.72);
 
     // CPU-side initial positions (vec3 + pad per particle for storage array<vec3f>)
     const initialPositions = new Float32Array(numParticles * 4);
@@ -397,17 +642,19 @@
       initialPositions[i * 4 + 3] = 0;
     }
 
-    // Initial transforms: identity rotation + position (3×vec4f per instance)
-    const initialTransforms = new Float32Array(numParticles * 12);
+    // Initial trail: all segments start at the same position with identity rotation
+    const initialTrail = new Float32Array(numParticles * NUM_SEGMENTS * 12);
     for (let i = 0; i < numParticles; i++) {
-      const b = i * 12;
       const px = initialPositions[i * 4], py = initialPositions[i * 4 + 1], pz = initialPositions[i * 4 + 2];
-      initialTransforms[b + 0] = 1; initialTransforms[b + 1] = 0; initialTransforms[b + 2] = 0; initialTransforms[b + 3] = px;
-      initialTransforms[b + 4] = 0; initialTransforms[b + 5] = 1; initialTransforms[b + 6] = 0; initialTransforms[b + 7] = py;
-      initialTransforms[b + 8] = 0; initialTransforms[b + 9] = 0; initialTransforms[b + 10] = 1; initialTransforms[b + 11] = pz;
+      for (let s = 0; s < NUM_SEGMENTS; s++) {
+        const b = (i * NUM_SEGMENTS + s) * 12;
+        initialTrail[b + 0] = 1;  initialTrail[b + 3] = px;
+        initialTrail[b + 5] = 1;  initialTrail[b + 7] = py;
+        initialTrail[b + 10] = 1; initialTrail[b + 11] = pz;
+      }
     }
 
-    // GPU buffers for compute animation
+    // ── GPU buffers ──────────────────────────────────────────────────────
     const computeBufferVelocities = new ComputeBuffer({
       usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
       type: ComputeBuffer.BUFFER_TYPE_STORAGE,
@@ -420,35 +667,41 @@
       buffer: initialPositions,
     });
 
-    // Transforms buffer: 3×vec4f per instance — used for raster vertex attrs + pathtracer
-    const computeBufferTransforms = new ComputeBuffer({
-      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+    // Trail buffer: NUM_SEGMENTS × 3 vec4f per particle (historical transforms)
+    const trailBuffer = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
       type: ComputeBuffer.BUFFER_TYPE_STORAGE,
-      buffer: initialTransforms,
-      stride: 48,
-      attributes: [
-        { shaderLocation: 3, offset: 0,  format: "float32x4" },
-        { shaderLocation: 4, offset: 16, format: "float32x4" },
-        { shaderLocation: 5, offset: 32, format: "float32x4" },
-      ],
+      buffer: initialTrail,
     });
 
-    // Initialize GPU buffers
+    // Initialize all GPU buffers
     computeBufferVelocities.initialize(renderer.gpuDevice);
     computeBufferPositions.initialize(renderer.gpuDevice);
-    computeBufferTransforms.initialize(renderer.gpuDevice);
+    trailBuffer.initialize(renderer.gpuDevice);
 
-    // Instanced geometry + material
+    // Read-only view of trail buffer for vertex shader binding
+    const trailBufferVertex = {
+      type: 'read-only-storage',
+      initialized: true,
+      needsUpdate: false,
+      get resource() { return trailBuffer.resource; },
+      initialize() {},
+      update() {},
+    };
+
+    // ── Instanced geometry + material ────────────────────────────────────
+    // Segmented box: 1×10×1 segmentation so each Y-ring maps to a trail segment
     const instancedGeo = new InstancedGeometry(
-      new BoxGeometry(particleSize, particleSize, particleSize),
+      new BoxGeometry(particleSize, trailHeight, particleSize, 1, NUM_SEGMENTS, 1),
       numParticles,
-      [computeBufferTransforms]
+      [] // no per-instance vertex attributes — trail read from storage buffer
     );
 
-    const instancedMat = new Material(instancedShader, {
+    const instancedMat = new Material(trailShader, {
       bindings: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: particleAlbedo },
+        { binding: 2, visibility: GPUShaderStage.VERTEX,   value: trailBufferVertex },
       ],
     });
 
@@ -458,9 +711,8 @@
     particlePTMat.roughness = 1.0;
     particlePTMat.maxBounces = 4;
     particles.pathTracerMaterial = particlePTMat;
-    // GPU-side transforms for BVH expansion (full affine, no CPU readback)
-    particles.gpuInstanceBuffer = computeBufferTransforms;
-    particles.gpuInstanceFullTransform = true;
+    // Dynamic BLAS: per-instance BLAS copies with GPU deform + refit
+    particles.dynamicBLAS = true;
     scene.add(particles);
 
     // ── GPU compute dispatchers ──────────────────────────────────────────
@@ -471,41 +723,397 @@
       { binding: 3, visibility: GPUShaderStage.COMPUTE, value: curlParams },
     ]);
 
+    // Steering: perceptionRadius, separationDist, maxSpeed, maxForce
+    const steerParams = new Vector4(3.0, 1.5, 2.0, 5.0);
+    // Weights: separation, alignment, cohesion
+    const steerWeights = new Vector4(2.0, 1.0, 1.0, 0.0);
+
+    const computeSteering = new Compute(computeSteeringShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: computeBufferVelocities },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: computeBufferPositions },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: time },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: steerParams },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, value: steerWeights },
+    ]);
+
+    const computeTrailPropagate = new Compute(computeTrailPropagateShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: trailBuffer },
+    ]);
+
     const computePositions = new Compute(computePositionShader, [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, value: computeBufferPositions },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, value: computeBufferVelocities },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: computeBufferTransforms },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: time },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: time },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: trailBuffer },
     ]);
 
     // ── Path tracer effect ────────────────────────────────────────────────
     const pathTracerEffect = new PathTracerEffect({
       scene,
-      temporalBlend: 0.1,
+      temporalBlend: 1,
       spatialPasses: 1,
       spp: 1,
       useBlueNoise: true,
-      traceScale: 0.5,
-      maxBounces: 3,
+      traceScale: 1,
+      maxBounces: 1,
       ambientColor: [0, 0, 0],
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
 
+    // ── GPU BLAS deform + refit shaders ───────────────────────────────────
+    const deformShaderCode = /* wgsl */`
+      const TRI_STRIDE = 24u;
+      const NUM_SEGMENTS = ${NUM_SEGMENTS}u;
+
+      struct DeformParams {
+        numCopies       : u32,
+        triCountPerCopy : u32,
+        copyTriOffset0  : u32,
+        numSegments     : u32,
+        boxHalfY        : f32,
+        _pad0           : u32,
+        _pad1           : u32,
+        _pad2           : u32,
+      }
+
+      @group(0) @binding(0) var<storage, read>       origTris  : array<f32>;
+      @group(0) @binding(1) var<storage, read_write>  tris     : array<f32>;
+      @group(0) @binding(2) var<storage, read>        trail    : array<vec4f>;
+      @group(0) @binding(3) var<uniform>              params   : DeformParams;
+
+      fn getSegTransform(trailBase: u32, py: f32) -> array<vec4f, 3> {
+        let normY = (py + params.boxHalfY) / (2.0 * params.boxHalfY);
+        let segFloat = (1.0 - clamp(normY, 0.0, 1.0)) * f32(params.numSegments - 1u);
+        let seg0 = u32(floor(segFloat));
+        let seg1 = min(seg0 + 1u, params.numSegments - 1u);
+        let frac = segFloat - f32(seg0);
+
+        let b0 = trailBase + seg0 * 3u;
+        let b1 = trailBase + seg1 * 3u;
+        return array<vec4f, 3>(
+          mix(trail[b0], trail[b1], frac),
+          mix(trail[b0 + 1u], trail[b1 + 1u], frac),
+          mix(trail[b0 + 2u], trail[b1 + 2u], frac),
+        );
+      }
+
+      @compute @workgroup_size(256)
+      fn main(@builtin(global_invocation_id) gid : vec3u) {
+        let globalIdx = gid.x;
+        let copyIdx   = globalIdx / params.triCountPerCopy;
+        let localTri  = globalIdx % params.triCountPerCopy;
+        if (copyIdx >= params.numCopies) { return; }
+
+        let srcBase = localTri * TRI_STRIDE;
+        let dstBase = (params.copyTriOffset0 + copyIdx * params.triCountPerCopy + localTri) * TRI_STRIDE;
+        let trailBase = copyIdx * params.numSegments * 3u;
+
+        // Transform 3 vertices
+        for (var vi = 0u; vi < 3u; vi++) {
+          let vOff = vi * 3u;
+          let px = origTris[srcBase + vOff];
+          let py = origTris[srcBase + vOff + 1u];
+          let pz = origTris[srcBase + vOff + 2u];
+
+          let xfm = getSegTransform(trailBase, py);
+          let localXZ = vec3f(px, 0.0, pz);
+          let wp = vec3f(
+            dot(xfm[0].xyz, localXZ) + xfm[0].w,
+            dot(xfm[1].xyz, localXZ) + xfm[1].w,
+            dot(xfm[2].xyz, localXZ) + xfm[2].w,
+          );
+
+          tris[dstBase + vOff]      = wp.x;
+          tris[dstBase + vOff + 1u] = wp.y;
+          tris[dstBase + vOff + 2u] = wp.z;
+        }
+
+        // Transform 3 normals
+        for (var vi = 0u; vi < 3u; vi++) {
+          let nOff = 9u + vi * 3u;
+          let nx = origTris[srcBase + nOff];
+          let ny = origTris[srcBase + nOff + 1u];
+          let nz = origTris[srcBase + nOff + 2u];
+
+          let py = origTris[srcBase + vi * 3u + 1u];
+          let xfm = getSegTransform(trailBase, py);
+          let n = vec3f(nx, ny, nz);
+          let tn = normalize(vec3f(
+            dot(xfm[0].xyz, n),
+            dot(xfm[1].xyz, n),
+            dot(xfm[2].xyz, n),
+          ));
+
+          tris[dstBase + nOff]      = tn.x;
+          tris[dstBase + nOff + 1u] = tn.y;
+          tris[dstBase + nOff + 2u] = tn.z;
+        }
+
+        // Copy material index + padding
+        for (var i = 18u; i < TRI_STRIDE; i++) {
+          tris[dstBase + i] = origTris[srcBase + i];
+        }
+      }
+    `;
+
+    const refitShaderCode = /* wgsl */`
+      const BVH4_STRIDE = 32u;
+      const TRI_STRIDE  = 24u;
+
+      struct RefitParams {
+        nodeCount  : u32,
+        nodeOffset : u32,
+        triOffset  : u32,
+        isLeafPass : u32,
+      }
+
+      @group(0) @binding(0) var<storage, read_write> nodes : array<f32>;
+      @group(0) @binding(1) var<storage, read>       tris  : array<f32>;
+      @group(0) @binding(2) var<uniform>             params: RefitParams;
+
+      @compute @workgroup_size(256)
+      fn main(@builtin(global_invocation_id) gid : vec3u) {
+        let nodeLocalIdx = gid.x;
+        if (nodeLocalIdx >= params.nodeCount) { return; }
+
+        let nodeIdx = params.nodeOffset + nodeLocalIdx;
+        let base = nodeIdx * BVH4_STRIDE;
+
+        for (var c = 0u; c < 4u; c++) {
+          let childIdx = bitcast<i32>(bitcast<u32>(nodes[base + 24u + c]));
+          let childCnt = bitcast<u32>(nodes[base + 28u + c]);
+
+          if (childIdx < 0) {
+            // Leaf child — recompute AABB from deformed triangles (leaf pass only)
+            if (params.isLeafPass == 0u) { continue; }
+            if (childCnt == 0u) { continue; }
+
+            let triStart = u32(-(childIdx + 1));
+            var mnx = f32(1e30); var mny = f32(1e30); var mnz = f32(1e30);
+            var mxx = f32(-1e30); var mxy = f32(-1e30); var mxz = f32(-1e30);
+
+            for (var t = 0u; t < childCnt; t++) {
+              let tb = (params.triOffset + triStart + t) * TRI_STRIDE;
+              for (var v = 0u; v < 3u; v++) {
+                let vb = tb + v * 3u;
+                let vx = tris[vb]; let vy = tris[vb + 1u]; let vz = tris[vb + 2u];
+                mnx = min(mnx, vx); mny = min(mny, vy); mnz = min(mnz, vz);
+                mxx = max(mxx, vx); mxy = max(mxy, vy); mxz = max(mxz, vz);
+              }
+            }
+
+            nodes[base + c]       = mnx;
+            nodes[base + 4u + c]  = mxx;
+            nodes[base + 8u + c]  = mny;
+            nodes[base + 12u + c] = mxy;
+            nodes[base + 16u + c] = mnz;
+            nodes[base + 20u + c] = mxz;
+          } else {
+            // Internal child — union of child node's 4 child AABBs (internal pass only)
+            if (params.isLeafPass == 1u) { continue; }
+
+            let childBase = u32(childIdx) * BVH4_STRIDE;
+            var mnx = f32(1e30); var mny = f32(1e30); var mnz = f32(1e30);
+            var mxx = f32(-1e30); var mxy = f32(-1e30); var mxz = f32(-1e30);
+
+            for (var i = 0u; i < 4u; i++) {
+              let cmnx = nodes[childBase + i];
+              let cmxx = nodes[childBase + 4u + i];
+              if (cmnx <= cmxx) {
+                mnx = min(mnx, cmnx); mxx = max(mxx, cmxx);
+                mny = min(mny, nodes[childBase + 8u + i]);
+                mxy = max(mxy, nodes[childBase + 12u + i]);
+                mnz = min(mnz, nodes[childBase + 16u + i]);
+                mxz = max(mxz, nodes[childBase + 20u + i]);
+              }
+            }
+
+            nodes[base + c]       = mnx;
+            nodes[base + 4u + c]  = mxx;
+            nodes[base + 8u + c]  = mny;
+            nodes[base + 12u + c] = mxy;
+            nodes[base + 16u + c] = mnz;
+            nodes[base + 20u + c] = mxz;
+          }
+        }
+      }
+    `;
+
+    // ── Dynamic BLAS deform+refit state ──────────────────────────────────
+    let deformPipeline = null;
+    let deformBGL = null;
+    let deformParamsBuf = null;
+    let refitPipeline = null;
+    let refitBGL = null;
+    let refitLeafParamsBufs = [];   // one per copy
+    let refitInternalParamsBufs = []; // one per copy
+    let blasInfo = null;
+    let bvhInitialized = false;
+
+    function initDeformRefit() {
+      const bvh = pathTracerEffect.bvhBuilder;
+      if (!bvh) { console.warn('No BVH builder yet'); return; }
+      blasInfo = bvh.getDynamicBLASInfo(particles);
+      if (!blasInfo) {
+        console.warn('No DynamicBLASInfo found for particles',
+          'origTriBuf:', bvh.origTriangleBuffer,
+          'totalBVH4:', bvh.totalBVH4Nodes,
+          'totalTri:', bvh.totalTriangleCount);
+        return;
+      }
+
+      const dev = renderer.gpuDevice;
+
+      // Deform pipeline
+      deformBGL = dev.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ],
+      });
+      deformPipeline = dev.createComputePipeline({
+        layout: dev.createPipelineLayout({ bindGroupLayouts: [deformBGL] }),
+        compute: { module: dev.createShaderModule({ code: deformShaderCode }), entryPoint: 'main' },
+      });
+
+      // Deform params (static)
+      deformParamsBuf = dev.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const dp = new Uint32Array(8);
+      const dpF = new Float32Array(dp.buffer);
+      dp[0] = blasInfo.copies;
+      dp[1] = blasInfo.triCountPerCopy;
+      dp[2] = blasInfo.copyTriOffsets[0];
+      dp[3] = NUM_SEGMENTS;
+      dpF[4] = trailHalfY;
+      dev.queue.writeBuffer(deformParamsBuf, 0, dp);
+
+      // Refit pipeline
+      refitBGL = dev.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ],
+      });
+      refitPipeline = dev.createComputePipeline({
+        layout: dev.createPipelineLayout({ bindGroupLayouts: [refitBGL] }),
+        compute: { module: dev.createShaderModule({ code: refitShaderCode }), entryPoint: 'main' },
+      });
+
+      // Per-copy refit param buffers
+      for (let k = 0; k < blasInfo.copies; k++) {
+        // Leaf pass params
+        const lp = new Uint32Array([blasInfo.nodeCountPerCopy, blasInfo.copyNodeOffsets[k], blasInfo.copyTriOffsets[k], 1]);
+        const lpBuf = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        dev.queue.writeBuffer(lpBuf, 0, lp);
+        refitLeafParamsBufs.push(lpBuf);
+
+        // Internal pass params
+        const ip = new Uint32Array([blasInfo.nodeCountPerCopy, blasInfo.copyNodeOffsets[k], blasInfo.copyTriOffsets[k], 0]);
+        const ipBuf = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        dev.queue.writeBuffer(ipBuf, 0, ip);
+        refitInternalParamsBufs.push(ipBuf);
+      }
+
+      bvhInitialized = true;
+      console.log(`Dynamic BLAS initialized: ${blasInfo.copies} copies, ${blasInfo.triCountPerCopy} tris/copy, ${blasInfo.nodeCountPerCopy} nodes/copy, depth ${blasInfo.maxDepth}`);
+    }
+
+    function dispatchDeformRefit() {
+      const bvh = pathTracerEffect.bvhBuilder;
+      if (!bvh || !blasInfo) return;
+
+      const dev = renderer.gpuDevice;
+      const encoder = dev.createCommandEncoder({ label: 'DeformRefit' });
+
+      // 1. Deform: transform original triangles to world space via trail
+      const deformBG = dev.createBindGroup({
+        layout: deformBGL,
+        entries: [
+          { binding: 0, resource: { buffer: bvh.origTriangleBuffer } },
+          { binding: 1, resource: { buffer: bvh.triangleBuffer } },
+          { binding: 2, resource: { buffer: trailBuffer.resource.buffer } },
+          { binding: 3, resource: { buffer: deformParamsBuf } },
+        ],
+      });
+      const totalTris = blasInfo.copies * blasInfo.triCountPerCopy;
+      const pass0 = encoder.beginComputePass({ label: 'Deform' });
+      pass0.setPipeline(deformPipeline);
+      pass0.setBindGroup(0, deformBG);
+      pass0.dispatchWorkgroups(Math.ceil(totalTris / 256));
+      pass0.end();
+
+      // 2. Refit BVH4: leaf pass then internal passes (per copy)
+      const refitWG = Math.ceil(blasInfo.nodeCountPerCopy / 256);
+      for (let k = 0; k < blasInfo.copies; k++) {
+        // Leaf refit pass
+        const leafBG = dev.createBindGroup({
+          layout: refitBGL,
+          entries: [
+            { binding: 0, resource: { buffer: bvh.bvh4NodeBuffer } },
+            { binding: 1, resource: { buffer: bvh.triangleBuffer } },
+            { binding: 2, resource: { buffer: refitLeafParamsBufs[k] } },
+          ],
+        });
+        const leafPass = encoder.beginComputePass({ label: `Refit/Leaf/${k}` });
+        leafPass.setPipeline(refitPipeline);
+        leafPass.setBindGroup(0, leafBG);
+        leafPass.dispatchWorkgroups(refitWG);
+        leafPass.end();
+
+        // Internal refit passes (maxDepth - 1 iterations for bottom-up propagation)
+        const intBG = dev.createBindGroup({
+          layout: refitBGL,
+          entries: [
+            { binding: 0, resource: { buffer: bvh.bvh4NodeBuffer } },
+            { binding: 1, resource: { buffer: bvh.triangleBuffer } },
+            { binding: 2, resource: { buffer: refitInternalParamsBufs[k] } },
+          ],
+        });
+        const intPasses = Math.max(blasInfo.maxDepth - 1, 1);
+        for (let p = 0; p < intPasses; p++) {
+          const intPass = encoder.beginComputePass({ label: `Refit/Internal/${k}/${p}` });
+          intPass.setPipeline(refitPipeline);
+          intPass.setBindGroup(0, intBG);
+          intPass.dispatchWorkgroups(refitWG);
+          intPass.end();
+        }
+      }
+
+      dev.queue.submit([encoder.finish()]);
+    }
+
     // ── Tweakpane ─────────────────────────────────────────────────────────
     const settings = {
       animate: true,
       speed: 0.5,
+      trailRate: 60,
+      simMode: 'curl',
       noiseScale: 0.4,
       persistence: 0.5,
       timeScale: 0.15,
       curlStrength: 0.72,
       damping: 0.92,
+      perceptionRadius: 3.0,
+      separationDist: 1.5,
+      maxSpeed: 2.0,
+      maxForce: 5.0,
+      separationW: 2.0,
+      alignmentW: 1.0,
+      cohesionW: 1.0,
     };
-    const pane = new Pane({ title: 'GI + Compute Instances' });
+    const pane = new Pane({ title: 'GI + Trail Particles' });
 
     pane.addBinding(settings, 'animate');
     pane.addBinding(settings, 'speed', { min: 0, max: 1, step: 0.01 });
+    pane.addBinding(settings, 'trailRate', { min: 10, max: 144, step: 1, label: 'trail rate (Hz)' });
+    pane.addBinding(settings, 'simMode', {
+      label: 'simulation',
+      options: { 'Curl Noise': 'curl', 'Steering': 'steering' },
+    });
 
     const curlFolder = pane.addFolder({ title: 'Curl Noise' });
     curlFolder.addBinding(settings, 'noiseScale', { min: 0.05, max: 2.0, step: 0.01 });
@@ -514,12 +1122,42 @@
     curlFolder.addBinding(settings, 'curlStrength', { min: 0.0, max: 3.0, step: 0.01 });
     curlFolder.addBinding(settings, 'damping', { min: 0.5, max: 1.0, step: 0.01 });
 
+    const steerFolder = pane.addFolder({ title: 'Steering', expanded: false });
+
+    const steerPresets = {
+      'Boids': { perceptionRadius: 3.0, separationDist: 1.5, maxSpeed: 2.0, maxForce: 5.0, separationW: 2.0, alignmentW: 1.0, cohesionW: 1.0 },
+      'Swarm': { perceptionRadius: 5.0, separationDist: 0.8, maxSpeed: 3.0, maxForce: 8.0, separationW: 1.0, alignmentW: 0.5, cohesionW: 3.0 },
+      'Scatter': { perceptionRadius: 4.0, separationDist: 3.0, maxSpeed: 4.0, maxForce: 10.0, separationW: 5.0, alignmentW: 0.2, cohesionW: 0.1 },
+      'School': { perceptionRadius: 4.0, separationDist: 1.0, maxSpeed: 1.5, maxForce: 3.0, separationW: 1.5, alignmentW: 3.0, cohesionW: 2.0 },
+      'Murmuration': { perceptionRadius: 6.0, separationDist: 1.2, maxSpeed: 3.5, maxForce: 6.0, separationW: 2.5, alignmentW: 4.0, cohesionW: 1.5 },
+    };
+    const presetSel = { preset: 'Boids' };
+
+    function applySteerPreset(name) {
+      const p = steerPresets[name];
+      Object.assign(settings, p);
+      pane.refresh();
+    }
+
+    steerFolder.addBinding(presetSel, 'preset', {
+      label: 'preset',
+      options: Object.fromEntries(Object.keys(steerPresets).map(k => [k, k])),
+    }).on('change', (e) => applySteerPreset(e.value));
+
+    steerFolder.addBinding(settings, 'perceptionRadius', { min: 0.5, max: 8.0, step: 0.1 });
+    steerFolder.addBinding(settings, 'separationDist', { min: 0.2, max: 5.0, step: 0.1 });
+    steerFolder.addBinding(settings, 'maxSpeed', { min: 0.5, max: 10.0, step: 0.1 });
+    steerFolder.addBinding(settings, 'maxForce', { min: 0.5, max: 20.0, step: 0.1 });
+    steerFolder.addBinding(settings, 'separationW', { min: 0.0, max: 5.0, step: 0.1, label: 'separation' });
+    steerFolder.addBinding(settings, 'alignmentW', { min: 0.0, max: 5.0, step: 0.1, label: 'alignment' });
+    steerFolder.addBinding(settings, 'cohesionW', { min: 0.0, max: 5.0, step: 0.1, label: 'cohesion' });
+
     curlFolder.addButton({ title: 'Reset to Grid' }).on('click', () => {
       const gridSize = Math.ceil(Math.cbrt(numParticles));
       const spacingX = 8.0 / gridSize, spacingY = 9.0 / gridSize, spacingZ = 8.0 / gridSize;
       const pos = new Float32Array(numParticles * 4);
       const vel = new Float32Array(numParticles * 4);
-      const xfm = new Float32Array(numParticles * 12);
+      const trl = new Float32Array(numParticles * NUM_SEGMENTS * 12);
       for (let i = 0; i < numParticles; i++) {
         const ix = i % gridSize;
         const iy = Math.floor(i / gridSize) % gridSize;
@@ -528,15 +1166,17 @@
         const py = 0.5 + spacingY * (iy + 0.5);
         const pz = -4.0 + spacingZ * (iz + 0.5);
         pos[i * 4] = px; pos[i * 4 + 1] = py; pos[i * 4 + 2] = pz;
-        const b = i * 12;
-        xfm[b] = 1; xfm[b + 3] = px;
-        xfm[b + 5] = 1; xfm[b + 7] = py;
-        xfm[b + 10] = 1; xfm[b + 11] = pz;
+        for (let s = 0; s < NUM_SEGMENTS; s++) {
+          const tb = (i * NUM_SEGMENTS + s) * 12;
+          trl[tb] = 1; trl[tb + 3] = px;
+          trl[tb + 5] = 1; trl[tb + 7] = py;
+          trl[tb + 10] = 1; trl[tb + 11] = pz;
+        }
       }
       const dev = renderer.gpuDevice;
       dev.queue.writeBuffer(computeBufferPositions.resource.buffer, 0, pos);
       dev.queue.writeBuffer(computeBufferVelocities.resource.buffer, 0, vel);
-      dev.queue.writeBuffer(computeBufferTransforms.resource.buffer, 0, xfm);
+      dev.queue.writeBuffer(trailBuffer.resource.buffer, 0, trl);
     });
 
     // ── Lighting controls ────────────────────────────────────────────────
@@ -567,6 +1207,134 @@
       particlePTMat.maxBounces = particleMatParams.bounces;
     });
 
+    const floorParams = { metallic: 0.6, roughness: 0.3 };
+    matFolder.addBinding(floorParams, 'metallic', { min: 0.0, max: 1.0, step: 0.01, label: 'floor metallic' }).on('change', () => {
+      floorAlbedoMetal.w = floorParams.metallic;
+      floorPTMat.metallic = floorParams.metallic;
+    });
+    matFolder.addBinding(floorParams, 'roughness', { min: 0.0, max: 1.0, step: 0.01, label: 'floor roughness' }).on('change', () => {
+      floorMatParams.x = floorParams.roughness;
+      floorPTMat.roughness = floorParams.roughness;
+    });
+
+    // ── Wall material presets ────────────────────────────────────────────
+    const wallPresets = {
+      'Cornell Box':     { left: [0.85, 0.12, 0.08], right: [0.12, 0.85, 0.15], back: [0.85, 0.85, 0.85], ceil: [0.85, 0.85, 0.85] },
+      'White Room':      { left: [0.9, 0.9, 0.9],    right: [0.9, 0.9, 0.9],    back: [0.9, 0.9, 0.9],    ceil: [0.9, 0.9, 0.9] },
+      'Warm / Cool':     { left: [0.9, 0.3, 0.1],    right: [0.1, 0.3, 0.9],    back: [0.85, 0.85, 0.85], ceil: [0.85, 0.85, 0.85] },
+      'Dark Studio':     { left: [0.15, 0.15, 0.15], right: [0.15, 0.15, 0.15], back: [0.15, 0.15, 0.15], ceil: [0.15, 0.15, 0.15] },
+      'Saturated':       { left: [0.95, 0.05, 0.05], right: [0.05, 0.05, 0.95], back: [0.95, 0.95, 0.05], ceil: [0.9, 0.9, 0.9] },
+      'Pastel':          { left: [0.9, 0.6, 0.6],    right: [0.6, 0.9, 0.6],    back: [0.6, 0.6, 0.9],    ceil: [0.9, 0.85, 0.8] },
+    };
+    const wallColorParams = {
+      leftColor:  { r: 0.85 * 255, g: 0.12 * 255, b: 0.08 * 255 },
+      rightColor: { r: 0.12 * 255, g: 0.85 * 255, b: 0.15 * 255 },
+      backColor:  { r: 0.85 * 255, g: 0.85 * 255, b: 0.85 * 255 },
+      ceilColor:  { r: 0.85 * 255, g: 0.85 * 255, b: 0.85 * 255 },
+    };
+    function syncWallColor(ptMat, rasterAlbedoMetal, rgb) {
+      ptMat.albedo = [...rgb];
+      rasterAlbedoMetal.x = rgb[0];
+      rasterAlbedoMetal.y = rgb[1];
+      rasterAlbedoMetal.z = rgb[2];
+    }
+    function applyWallPreset(name) {
+      const p = wallPresets[name];
+      if (!p) return;
+      syncWallColor(leftWallPTMat,  leftWallRaster.albedoMetal,  p.left);
+      syncWallColor(rightWallPTMat, rightWallRaster.albedoMetal, p.right);
+      syncWallColor(backWallPTMat,  backWallRaster.albedoMetal,  p.back);
+      syncWallColor(ceilingPTMat,   ceilingRaster.albedoMetal,   p.ceil);
+      wallColorParams.leftColor  = { r: p.left[0] * 255,  g: p.left[1] * 255,  b: p.left[2] * 255 };
+      wallColorParams.rightColor = { r: p.right[0] * 255, g: p.right[1] * 255, b: p.right[2] * 255 };
+      wallColorParams.backColor  = { r: p.back[0] * 255,  g: p.back[1] * 255,  b: p.back[2] * 255 };
+      wallColorParams.ceilColor  = { r: p.ceil[0] * 255,  g: p.ceil[1] * 255,  b: p.ceil[2] * 255 };
+      pane.refresh();
+    }
+    matFolder.addBlade({ view: 'list', label: 'wall preset', options: Object.keys(wallPresets).map(k => ({ text: k, value: k })), value: 'Cornell Box' }).on('change', (ev) => {
+      applyWallPreset(ev.value);
+    });
+    matFolder.addBinding(wallColorParams, 'leftColor', { label: 'left wall' }).on('change', () => {
+      const c = wallColorParams.leftColor;
+      syncWallColor(leftWallPTMat, leftWallRaster.albedoMetal, [c.r / 255, c.g / 255, c.b / 255]);
+    });
+    matFolder.addBinding(wallColorParams, 'rightColor', { label: 'right wall' }).on('change', () => {
+      const c = wallColorParams.rightColor;
+      syncWallColor(rightWallPTMat, rightWallRaster.albedoMetal, [c.r / 255, c.g / 255, c.b / 255]);
+    });
+    matFolder.addBinding(wallColorParams, 'backColor', { label: 'back wall' }).on('change', () => {
+      const c = wallColorParams.backColor;
+      syncWallColor(backWallPTMat, backWallRaster.albedoMetal, [c.r / 255, c.g / 255, c.b / 255]);
+    });
+    matFolder.addBinding(wallColorParams, 'ceilColor', { label: 'ceiling' }).on('change', () => {
+      const c = wallColorParams.ceilColor;
+      syncWallColor(ceilingPTMat, ceilingRaster.albedoMetal, [c.r / 255, c.g / 255, c.b / 255]);
+    });
+
+    // ── Glass material controls ──────────────────────────────────────────
+    const glassFolder = pane.addFolder({ title: 'Glass Material' });
+    const glassPresets = {
+      'Clear Glass':    { metallic: 0.0, ior: 1.5,  roughness: 0.0, absColor: [0.8, 0.9, 1.0], absDensity: 0.5,  bounces: 8 },
+      'Diamond':        { metallic: 0.0, ior: 2.42, roughness: 0.0, absColor: [1.0, 1.0, 1.0], absDensity: 0.0,  bounces: 8 },
+      'Water':          { metallic: 0.0, ior: 1.33, roughness: 0.0, absColor: [0.6, 0.8, 1.0], absDensity: 0.3,  bounces: 6 },
+      'Crystal':        { metallic: 0.0, ior: 1.55, roughness: 0.0, absColor: [0.9, 0.7, 1.0], absDensity: 0.8,  bounces: 8 },
+      'Frosted Glass':  { metallic: 0.0, ior: 1.5,  roughness: 0.4, absColor: [0.9, 0.95, 1.0], absDensity: 0.2, bounces: 6 },
+      'Chrome Mirror':  { metallic: 1.0, ior: 2.0,  roughness: 0.0, absColor: [1.0, 1.0, 1.0], absDensity: 0.0,  bounces: 4 },
+      'Brushed Metal':  { metallic: 0.9, ior: 1.5,  roughness: 0.35, absColor: [1.0, 1.0, 1.0], absDensity: 0.0, bounces: 4 },
+    };
+    const glassParams = {
+      preset: 'Clear Glass',
+      metallic: glassPTMat.metallic,
+      ior: glassPTMat.ior,
+      roughness: glassPTMat.roughness,
+      absorptionColor: { r: glassPTMat.absorptionColor[0] * 255, g: glassPTMat.absorptionColor[1] * 255, b: glassPTMat.absorptionColor[2] * 255 },
+      absorptionDensity: glassPTMat.absorptionDensity,
+      maxBounces: glassPTMat.maxBounces,
+    };
+    function applyGlassPreset(name) {
+      const p = glassPresets[name];
+      if (!p) return;
+      glassParams.metallic = p.metallic;
+      glassParams.ior = p.ior;
+      glassParams.roughness = p.roughness;
+      glassParams.absorptionColor = { r: p.absColor[0] * 255, g: p.absColor[1] * 255, b: p.absColor[2] * 255 };
+      glassParams.absorptionDensity = p.absDensity;
+      glassParams.maxBounces = p.bounces;
+      glassPTMat.metallic = p.metallic;
+      glassPTMat.ior = p.ior;
+      glassPTMat.roughness = p.roughness;
+      glassPTMat.absorptionColor = [...p.absColor];
+      glassPTMat.absorptionDensity = p.absDensity;
+      glassPTMat.maxBounces = p.bounces;
+      glassAlbedoMetal.w = p.metallic; // sync raster GBuffer
+      glassMatParams.x = p.roughness;
+      pane.refresh();
+    }
+    glassFolder.addBlade({ view: 'list', label: 'preset', options: Object.keys(glassPresets).map(k => ({ text: k, value: k })), value: 'Clear Glass' }).on('change', (ev) => {
+      glassParams.preset = ev.value;
+      applyGlassPreset(ev.value);
+    });
+    glassFolder.addBinding(glassParams, 'metallic', { min: 0.0, max: 1.0, step: 0.01, label: 'metallic' }).on('change', () => {
+      glassPTMat.metallic = glassParams.metallic;
+      glassAlbedoMetal.w = glassParams.metallic; // sync raster GBuffer
+    });
+    glassFolder.addBinding(glassParams, 'ior', { min: 1.0, max: 3.0, step: 0.01, label: 'IOR' }).on('change', () => {
+      glassPTMat.ior = glassParams.ior;
+    });
+    glassFolder.addBinding(glassParams, 'roughness', { min: 0.0, max: 1.0, step: 0.01, label: 'roughness' }).on('change', () => {
+      glassPTMat.roughness = glassParams.roughness;
+      glassMatParams.x = glassParams.roughness; // sync raster GBuffer
+    });
+    glassFolder.addBinding(glassParams, 'absorptionColor', { label: 'absorption color' }).on('change', () => {
+      glassPTMat.absorptionColor = [glassParams.absorptionColor.r / 255, glassParams.absorptionColor.g / 255, glassParams.absorptionColor.b / 255];
+    });
+    glassFolder.addBinding(glassParams, 'absorptionDensity', { min: 0.0, max: 5.0, step: 0.01, label: 'absorption density' }).on('change', () => {
+      glassPTMat.absorptionDensity = glassParams.absorptionDensity;
+    });
+    glassFolder.addBinding(glassParams, 'maxBounces', { min: 1, max: 16, step: 1, label: 'max bounces' }).on('change', () => {
+      glassPTMat.maxBounces = glassParams.maxBounces;
+    });
+
     const ptFolder = pane.addFolder({ title: 'Path Tracer' });
     ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
     ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 9, step: 1 });
@@ -576,10 +1344,12 @@
 
     // ── Render loop ───────────────────────────────────────────────────────
     let lastTime = performance.now() / 1000;
+    let trailAccum = 0;
+    let initAttempts = 0;
 
     function animate() {
       const now = performance.now() / 1000;
-      const dt = Math.min(now - lastTime, 0.05); // cap to avoid huge jumps
+      const dt = Math.min(now - lastTime, 0.05);
       lastTime = now;
       time.x = now;
       time.y = dt * settings.speed;
@@ -591,12 +1361,49 @@
       cameraControls.update();
 
       if (settings.animate) {
-        renderer.compute(computeVelocities, Math.ceil(numParticles / 64));
+        // Dispatch velocity update based on simulation mode
+        if (settings.simMode === 'steering') {
+          steerParams.x = settings.perceptionRadius;
+          steerParams.y = settings.separationDist;
+          steerParams.z = settings.maxSpeed;
+          steerParams.w = settings.maxForce;
+          steerWeights.x = settings.separationW;
+          steerWeights.y = settings.alignmentW;
+          steerWeights.z = settings.cohesionW;
+          renderer.compute(computeSteering, Math.ceil(numParticles / 64));
+        } else {
+          renderer.compute(computeVelocities, Math.ceil(numParticles / 64));
+        }
+
+        // Fixed-rate trail propagation: decouple from display refresh rate
+        const scaledDt = dt * settings.speed;
+        trailAccum += scaledDt;
+        const trailStep = 1 / settings.trailRate;
+        if (trailAccum >= trailStep) {
+          renderer.compute(computeTrailPropagate, Math.ceil(numParticles / 64));
+          trailAccum -= trailStep;
+          if (trailAccum > trailStep) { trailAccum = trailStep; }
+        }
+
         renderer.compute(computePositions, Math.ceil(numParticles / 64));
       }
 
-      // shadowMap.render(renderer, scene, camera, dirLight);
+      // Deform BLAS triangles + refit BVH4 nodes before TLAS build
+      if (bvhInitialized && settings.animate) {
+        dispatchDeformRefit();
+      }
+
       volume.render(scene, camera);
+
+      // Lazy-init deform/refit after first volume.render() builds the BVH
+      if (!bvhInitialized && initAttempts < 5) {
+        initAttempts++;
+        initDeformRefit();
+        if (bvhInitialized) {
+          const bvh = pathTracerEffect.bvhBuilder;
+          console.log('[DIAG] totalInstances:', bvh.totalInstances, 'totalTriangleCount:', bvh.totalTriangleCount, 'totalBVH4Nodes:', bvh.totalBVH4Nodes);
+        }
+      }
 
       requestAnimationFrame(animate);
     }

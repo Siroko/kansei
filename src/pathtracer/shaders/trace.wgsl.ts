@@ -7,7 +7,7 @@ struct MaterialData {
     metallic     : f32,
     ior          : f32,
     maxBounces   : f32,
-    flags        : f32,  // bit 0 = refractive
+    transmission : f32,  // 0.0 = opaque, 1.0 = fully transmissive
     absorptionColor : vec3f,
     absorptionDensity : f32,
     emissive     : vec3f,
@@ -56,6 +56,7 @@ struct LightData {
 @group(0) @binding(9)  var<storage, read> materials  : array<MaterialData>;
 @group(0) @binding(10) var<storage, read> sceneLights : array<LightData>;
 @group(0) @binding(11) var<storage, read> blueNoise   : array<f32>;
+@group(0) @binding(12) var          emissiveTex : texture_2d<f32>;
 
 // ── Blue noise hybrid sampler ────────────────────────────────────────
 // First 8 dimensions use blue noise (spatially decorrelated, golden-ratio
@@ -146,6 +147,11 @@ fn sampleGGX(n: vec3f, roughness: f32, r1: f32, r2: f32) -> vec3f {
     return h;
 }
 
+// Schlick Fresnel approximation
+fn fresnelSchlick(cosTheta: f32, F0: vec3f) -> vec3f {
+    return F0 + (vec3f(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
 // ── Shadow test that skips refractive (transparent) surfaces ────────
 
 fn traceShadow(origin: vec3f, dir: vec3f, maxDist: f32) -> bool {
@@ -159,8 +165,8 @@ fn traceShadow(origin: vec3f, dir: vec3f, maxDist: f32) -> bool {
         let hit = traceBVHInternal(sray, false, remaining);
         if (!hit.hit) { return false; }
         let hitMat = materials[hit.matIndex];
-        if ((u32(hitMat.flags) & 1u) == 0u) { return true; }
-        // Transparent surface: advance past it
+        if (hitMat.transmission < 0.5) { return true; }
+        // Transmissive surface: advance past it
         ro = ro + dir * (hit.t + 0.002);
         remaining -= hit.t + 0.002;
         if (remaining <= 0.0) { return false; }
@@ -249,41 +255,61 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f) -> vec3f {
 }
 
 // ── Multi-bounce path tracer with NEE ─────────────────────────────────
-// Returns irradiance at startPos (primary surface albedo applied by composite).
-// At each path vertex: sample all lights (NEE), then cosine-weighted random
-// bounce. Throughput accumulates bounce-surface albedos. Emissive surfaces
-// hit by random bounces are skipped (already counted by NEE).
+// Returns irradiance at startPos. At each vertex: NEE for direct light,
+// then stochastic PBR bounce (specular or diffuse based on metallic/Fresnel).
 
-fn tracePath(startPos: vec3f, startNorm: vec3f) -> vec3f {
-    // NEE at primary vertex
-    var accumulated = evaluateLighting(startPos, startNorm);
+fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32) -> vec3f {
+    var accumulated = vec3f(0.0);
+    if (skipFirstNEE == 0u) {
+        accumulated = evaluateLighting(startPos, startNorm);
+    }
     var throughput = vec3f(1.0);
     var pos = startPos;
     var norm = startNorm;
+    var sampleSpec = false;
+    var specRoughness = 1.0f;
+    var incomingDir = vec3f(0.0);
     let maxBounces = traceParams.maxBounces;
 
     for (var bounce = 0u; bounce < maxBounces; bounce++) {
-        let r1 = nextRandom();
-        let r2 = nextRandom();
         var bounceRay: Ray;
         bounceRay.origin = pos + norm * 0.001;
-        bounceRay.dir = cosineSampleHemisphere(norm, r1, r2);
+
+        if (sampleSpec) {
+            let h = sampleGGX(norm, max(specRoughness, 0.02), nextRandom(), nextRandom());
+            bounceRay.dir = reflect(incomingDir, h);
+            if (dot(bounceRay.dir, norm) <= 0.0) { break; }
+        } else {
+            bounceRay.dir = cosineSampleHemisphere(norm, nextRandom(), nextRandom());
+        }
 
         let hit = traceBVH(bounceRay);
         if (!hit.hit) {
-            // Add ambient/sky contribution when ray escapes
             accumulated += throughput * traceParams.ambientColor;
             break;
         }
 
         let mat = materials[hit.matIndex];
+        if (mat.emissiveIntensity > 0.0 || mat.transmission > 0.5) { break; }
 
-        // Stop on emissive (NEE already samples), glass, or mirror —
-        // tracing through these on indirect bounces costs extra BVH
-        // traversals for negligible visual contribution
-        if (mat.emissiveIntensity > 0.0 || (u32(mat.flags) & 1u) != 0u || mat.metallic > 0.5) { break; }
+        // PBR: decide next bounce from this surface
+        let cosTheta = abs(dot(hit.worldNorm, -bounceRay.dir));
+        let F0 = mix(vec3f(0.04), mat.albedo, mat.metallic);
+        let F = fresnelSchlick(cosTheta, F0);
+        let specAvg = (F.r + F.g + F.b) / 3.0;
+        let diffW = (1.0 - specAvg) * (1.0 - mat.metallic);
+        let totalW = specAvg + diffW;
+        let specProb = clamp(specAvg / max(totalW, 0.001), 0.05, 0.95);
 
-        throughput *= mat.albedo;
+        if (nextRandom() < specProb) {
+            throughput *= F / specProb;
+            sampleSpec = true;
+            specRoughness = mat.roughness;
+        } else {
+            throughput *= mat.albedo * (vec3f(1.0) - F) * (1.0 - mat.metallic) / (1.0 - specProb);
+            sampleSpec = false;
+        }
+
         accumulated += throughput * evaluateLighting(hit.worldPos, hit.worldNorm);
 
         // Russian roulette after first bounce
@@ -293,6 +319,7 @@ fn tracePath(startPos: vec3f, startNorm: vec3f) -> vec3f {
             throughput /= p;
         }
 
+        incomingDir = bounceRay.dir;
         pos = hit.worldPos;
         norm = hit.worldNorm;
     }
@@ -309,42 +336,94 @@ fn traceRefraction(
     var ray = inRay;
     var currentHit = firstHit;
     let maxBounces = u32(mat.maxBounces);
+    var insideMedium = false;
 
     for (var bounce = 0u; bounce < maxBounces; bounce++) {
         let n = currentHit.worldNorm;
-        let entering = dot(ray.dir, n) < 0.0;
-        let faceNorm = select(-n, n, entering);
-        let eta = select(mat.ior, 1.0 / mat.ior, entering);
+        // Geometric entering: ensures faceNorm always faces toward incoming ray
+        let geomEntering = dot(ray.dir, n) < 0.0;
+        let faceNorm = select(-n, n, geomEntering);
+        // Medium tracking for eta: more robust than normal direction for complex meshes
+        let mediaEntering = !insideMedium;
+        let eta = select(mat.ior, 1.0 / mat.ior, mediaEntering);
+
+        // Fresnel at each interface
+        let cosI = abs(dot(ray.dir, faceNorm));
+        let f0 = pow((1.0 - mat.ior) / (1.0 + mat.ior), 2.0);
+        let fresnel = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
 
         let refracted = refract(ray.dir, faceNorm, eta);
-        if (length(refracted) < 0.001) {
-            ray.origin = currentHit.worldPos + faceNorm * 0.001;
-            ray.dir = reflect(ray.dir, faceNorm);
+        let tir = length(refracted) < 0.001;
+
+        if (tir || nextRandom() < fresnel) {
+            // Total internal reflection or Fresnel reflection — medium state unchanged
+            let rh = sampleGGX(faceNorm, max(mat.roughness, 0.02), nextRandom(), nextRandom());
+            ray.dir = reflect(ray.dir, rh);
+            if (dot(ray.dir, faceNorm) <= 0.0) {
+                ray.dir = reflect(inRay.dir, faceNorm); // fallback to perfect reflect
+            }
+            ray.origin = currentHit.worldPos + faceNorm * 0.01;
         } else {
-            ray.origin = currentHit.worldPos - faceNorm * 0.001;
-            ray.dir = refracted;
+            // Refraction: toggle medium state
+            insideMedium = !insideMedium;
+            // Refraction with roughness perturbation
+            if (mat.roughness > 0.01) {
+                let rh = sampleGGX(faceNorm, mat.roughness, nextRandom(), nextRandom());
+                let perturbedRefract = refract(ray.dir, rh, eta);
+                if (length(perturbedRefract) > 0.001) {
+                    ray.dir = perturbedRefract;
+                } else {
+                    ray.dir = refracted;
+                }
+            } else {
+                ray.dir = refracted;
+            }
+            ray.origin = currentHit.worldPos - faceNorm * 0.01;
         }
 
         let nextHit = traceBVH(ray);
-        if (!nextHit.hit) { break; }
+        if (!nextHit.hit) {
+            return throughput * traceParams.ambientColor;
+        }
 
         let dist = nextHit.t;
-        throughput *= exp(-mat.absorptionColor * mat.absorptionDensity * dist);
+        if (insideMedium) {
+            throughput *= exp(-mat.absorptionColor * mat.absorptionDensity * dist);
+        }
 
         let nextMat = materials[nextHit.matIndex];
-        if ((u32(nextMat.flags) & 1u) == 0u) {
-            // Exited glass onto non-refractive surface
-            if (nextMat.metallic > 0.9) {
-                // Mirror: follow reflection bounces to show mirror reflection through glass
+        if (nextMat.transmission < 0.5) {
+            // Exited transmissive medium — PBR shading at the exit surface
+            let exitNorm = nextHit.worldNorm;
+            let exitCos = abs(dot(ray.dir, exitNorm));
+            let exitF0 = mix(vec3f(0.04), nextMat.albedo, nextMat.metallic);
+            let exitF = fresnelSchlick(exitCos, exitF0);
+            let exitSpecAvg = (exitF.r + exitF.g + exitF.b) / 3.0;
+            let exitDiffW = (1.0 - exitSpecAvg) * (1.0 - nextMat.metallic);
+            let exitTotalW = exitSpecAvg + exitDiffW;
+            let exitSpecProb = clamp(exitSpecAvg / max(exitTotalW, 0.001), 0.05, 0.95);
+
+            if (nextRandom() < exitSpecProb) {
+                // Specular reflection off the exit surface (GGX)
                 var mRay: Ray;
-                mRay.dir = reflect(ray.dir, nextHit.worldNorm);
-                mRay.origin = nextHit.worldPos + nextHit.worldNorm * 0.001;
+                let mH = sampleGGX(exitNorm, max(nextMat.roughness, 0.02), nextRandom(), nextRandom());
+                mRay.dir = reflect(ray.dir, mH);
+                if (dot(mRay.dir, exitNorm) <= 0.0) {
+                    return throughput * tracePath(nextHit.worldPos, exitNorm, 0u) * nextMat.albedo;
+                }
+                mRay.origin = nextHit.worldPos + exitNorm * 0.001;
                 var mHit = traceBVH(mRay);
+                // Follow specular bounces
                 for (var mb = 0u; mb < 4u; mb++) {
                     if (!mHit.hit) { break; }
                     let mbMat = materials[mHit.matIndex];
-                    if (mbMat.metallic > 0.9 && (u32(mbMat.flags) & 1u) == 0u) {
-                        mRay.dir = reflect(mRay.dir, mHit.worldNorm);
+                    let mbCos = abs(dot(mRay.dir, mHit.worldNorm));
+                    let mbF0 = mix(vec3f(0.04), mbMat.albedo, mbMat.metallic);
+                    let mbSpecAvg = (fresnelSchlick(mbCos, mbF0).r + fresnelSchlick(mbCos, mbF0).g + fresnelSchlick(mbCos, mbF0).b) / 3.0;
+                    if (mbSpecAvg > 0.3 && mbMat.transmission < 0.5) {
+                        let mbH = sampleGGX(mHit.worldNorm, max(mbMat.roughness, 0.02), nextRandom(), nextRandom());
+                        mRay.dir = reflect(mRay.dir, mbH);
+                        if (dot(mRay.dir, mHit.worldNorm) <= 0.0) { break; }
                         mRay.origin = mHit.worldPos + mHit.worldNorm * 0.001;
                         mHit = traceBVH(mRay);
                     } else {
@@ -353,16 +432,19 @@ fn traceRefraction(
                 }
                 if (mHit.hit) {
                     let mMat = materials[mHit.matIndex];
-                    return throughput * tracePath(mHit.worldPos, mHit.worldNorm) * mMat.albedo;
+                    return throughput * exitF / exitSpecProb * tracePath(mHit.worldPos, mHit.worldNorm, 0u) * mMat.albedo;
                 }
-                return throughput * vec3f(0.0);
+                return throughput * exitF / exitSpecProb * traceParams.ambientColor;
+            } else {
+                // Diffuse at exit surface
+                let exitKd = (vec3f(1.0) - exitF) * (1.0 - nextMat.metallic);
+                return throughput * tracePath(nextHit.worldPos, exitNorm, 0u) * nextMat.albedo * exitKd / (1.0 - exitSpecProb);
             }
-            return throughput * tracePath(nextHit.worldPos, nextHit.worldNorm) * nextMat.albedo;
         }
         currentHit = nextHit;
     }
     _ = nextRandom();
-    return throughput * vec3f(0.0);
+    return throughput * traceParams.ambientColor;
 }
 
 @compute @workgroup_size(8, 8)
@@ -393,38 +475,38 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let roughness = normalData.w;
 
     let albedoData = textureLoad(albedoTex, vec2i(gbufClamped), 0);
-    let isRefractive = albedoData.a < 0.02;
+    let albedo = albedoData.rgb;
     let metallic = albedoData.a;
+
+    let emissiveData = textureLoad(emissiveTex, vec2i(gbufClamped), 0);
+    let transmission = emissiveData.a;
 
     let spp = traceParams.spp;
     var accumulated = vec3f(0.0);
 
+    // Unified PBR: energy partition based on metallic, Fresnel, and transmission
+    let viewDir = normalize(traceParams.cameraPos - worldPos);
+    let NdotV = max(dot(worldNormal, viewDir), 0.001);
+    let F0 = mix(vec3f(0.04), albedo, metallic);
+    let F = fresnelSchlick(NdotV, F0);
+    let specAvg = (F.r + F.g + F.b) / 3.0;
+
+    // Three energy lobes: specular, transmission, diffuse
+    let specW  = specAvg;
+    let transW = (1.0 - specAvg) * (1.0 - metallic) * transmission;
+    let diffW  = (1.0 - specAvg) * (1.0 - metallic) * (1.0 - transmission);
+    let totalW = specW + transW + diffW;
+    let specProb  = clamp(specW  / max(totalW, 0.001), 0.02, 0.98);
+    let transProb = clamp(transW / max(totalW, 0.001), 0.0, 0.98 - specProb);
+    // diffProb = 1.0 - specProb - transProb (implicit)
+
     for (var s = 0u; s < spp; s++) {
         initSampler(coord, traceParams.frameIndex, s);
 
-        if (isRefractive) {
-            // Primary refraction: trace ray from camera through this surface
-            var primaryRay: Ray;
-            primaryRay.origin = traceParams.cameraPos;
-            primaryRay.dir = normalize(worldPos - traceParams.cameraPos);
-
-            let primaryHit = traceBVH(primaryRay);
-            if (primaryHit.hit) {
-                let mat = materials[primaryHit.matIndex];
-                if ((u32(mat.flags) & 1u) != 0u) {
-                    accumulated += traceRefraction(primaryRay, primaryHit, mat);
-                } else {
-                    accumulated += tracePath(primaryHit.worldPos, primaryHit.worldNorm) * mat.albedo;
-                }
-            }
-        } else if (metallic > 0.9) {
-            // Mirror surface: trace specular ray to find reflected object,
-            // then evaluate it as a diffuse-lit surface (direct + indirect * albedo)
-            // so reflections show the object's "raster + GI" appearance.
-            let sr1 = nextRandom();
-            let sr2 = nextRandom();
-            let halfVec = sampleGGX(worldNormal, max(roughness, 0.04), sr1, sr2);
-            let viewDir = normalize(traceParams.cameraPos - worldPos);
+        let r = nextRandom();
+        if (r < specProb) {
+            // ── Specular reflection (GGX) ────────────────────────────
+            let halfVec = sampleGGX(worldNormal, max(roughness, 0.02), nextRandom(), nextRandom());
             let specDir = reflect(-viewDir, halfVec);
 
             if (dot(specDir, worldNormal) > 0.0) {
@@ -432,35 +514,58 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 specRay.origin = worldPos + worldNormal * 0.001;
                 specRay.dir = specDir;
                 var specHit = traceBVH(specRay);
-                // Skip through glass/mirrors to find the first diffuse-like surface
+                // Follow metallic bounces (transmissive surfaces handled via traceRefraction)
                 for (var sk = 0u; sk < 4u; sk++) {
                     if (!specHit.hit) { break; }
                     let skMat = materials[specHit.matIndex];
-                    if ((u32(skMat.flags) & 1u) != 0u) {
-                        specRay.origin = specHit.worldPos + specRay.dir * 0.002;
-                        specHit = traceBVH(specRay);
-                    } else if (skMat.metallic > 0.9) {
-                        specRay.dir = reflect(specRay.dir, specHit.worldNorm);
+                    if (skMat.metallic > 0.5 && skMat.transmission < 0.5) {
+                        let h2 = sampleGGX(specHit.worldNorm, max(skMat.roughness, 0.02), nextRandom(), nextRandom());
+                        specRay.dir = reflect(specRay.dir, h2);
+                        if (dot(specRay.dir, specHit.worldNorm) <= 0.0) { break; }
                         specRay.origin = specHit.worldPos + specHit.worldNorm * 0.001;
                         specHit = traceBVH(specRay);
                     } else { break; }
                 }
                 if (specHit.hit) {
                     let specMat = materials[specHit.matIndex];
-                    if ((u32(specMat.flags) & 1u) != 0u) {
-                        accumulated += traceRefraction(specRay, specHit, specMat);
+                    if (specMat.transmission > 0.5) {
+                        accumulated += traceRefraction(specRay, specHit, specMat) * F / specProb;
                     } else {
-                        accumulated += tracePath(specHit.worldPos, specHit.worldNorm) * specMat.albedo;
+                        accumulated += tracePath(specHit.worldPos, specHit.worldNorm, 0u) * specMat.albedo * F / specProb;
                     }
+                } else {
+                    accumulated += traceParams.ambientColor * F / specProb;
                 }
             }
+        } else if (r < specProb + transProb) {
+            // ── Transmission / refraction ────────────────────────────
+            var primaryRay: Ray;
+            primaryRay.origin = traceParams.cameraPos;
+            primaryRay.dir = normalize(worldPos - traceParams.cameraPos);
+
+            let primaryHit = traceBVH(primaryRay);
+            if (primaryHit.hit) {
+                let mat = materials[primaryHit.matIndex];
+                let weight = (1.0 - specAvg) * (1.0 - metallic) * transmission / transProb;
+                if (mat.transmission > 0.5) {
+                    accumulated += traceRefraction(primaryRay, primaryHit, mat) * weight;
+                } else {
+                    // Primary ray hit an opaque surface: treat as diffuse contribution
+                    accumulated += tracePath(primaryHit.worldPos, primaryHit.worldNorm, 0u) * mat.albedo * weight;
+                }
+            } else {
+                let weight = (1.0 - specAvg) * (1.0 - metallic) * transmission / transProb;
+                accumulated += traceParams.ambientColor * weight;
+            }
         } else {
-            // Diffuse surface: multi-bounce path tracing with NEE
-            accumulated += tracePath(worldPos, worldNormal);
+            // ── Diffuse: multi-bounce path tracing with NEE ──────────
+            let diffProb = 1.0 - specProb - transProb;
+            let kd = (vec3f(1.0) - F) * (1.0 - metallic) * (1.0 - transmission);
+            accumulated += tracePath(worldPos, worldNormal, 0u) * albedo * kd / max(diffProb, 0.01);
         }
     }
 
-    let giAlpha = select(1.0, 0.0, isRefractive || metallic > 0.9);
-    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), giAlpha));
+    // giAlpha=0: trace shader computes full outgoing radiance for all paths
+    textureStore(giOutput, coord, vec4f(accumulated / f32(spp), 0.0));
 }
 `;
