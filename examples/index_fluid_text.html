@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fluid Text — Kansei</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: black;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+      }
+      #info {
+        position: absolute;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: white;
+        font-family: sans-serif;
+      }
+      #info a { color: white; }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      import { FontLoader } from '../src/sdf/text/FontLoader'
+      import { Renderer } from '../src/renderers/Renderer'
+      import { Material } from '../src/materials/Material'
+      import { Renderable } from '../src/objects/Renderable'
+      import { Scene } from '../src/objects/Scene'
+      import { Camera } from '../src/cameras/Camera'
+      import { CameraControls } from '../src/controls/CameraControls'
+      import { shaderCode } from '../src/materials/shaders/rendering/msdf/TextRenderShader'
+      import { Sampler } from '../src/buffers/Sampler'
+      import { Vector4 } from '../src/math/Vector4'
+      import { TextGeometry } from '../src/geometries/TextGeometry'
+      import { MouseVectors } from '../src/controls/MouseVectors'
+      import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { PRESETS } from '../src/simulations/fluid/FluidSimulationParams'
+      import { poem } from './assets/copy/poem.js'
+      import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+      // ── Renderer ──────────────────────────────────────────
+      const renderer = new Renderer({
+        alphaMode: 'premultiplied',
+        clearColor: new Vector4(0.02, 0.02, 0.04, 1),
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: Math.min(window.devicePixelRatio, 2),
+        antialias: true,
+        sampleCount: 1,
+      });
+      await renderer.initialize();
+      document.body.appendChild(renderer.canvas);
+
+      // ── Scene ─────────────────────────────────────────────
+      const scene = new Scene();
+      const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
+      const cameraControls = new CameraControls(camera, scene.position);
+      const mouseVectors = new MouseVectors();
+
+      // ── Text Geometry ─────────────────────────────────────
+      const fontLoader = new FontLoader();
+      const fontInfo = await fontLoader.load('assets/fonts/L10-medium.arfont');
+
+      const geometry = new TextGeometry({
+        text: poem,
+        fontInfo: fontInfo,
+        width: 40,
+        height: 100,
+        fontSize: 25,
+        color: new Vector4(1, 1, 1, 1),
+      });
+      const sampler = new Sampler('linear', 'linear');
+      const material = new Material(shaderCode, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: fontInfo.sdfTexture },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: sampler },
+        ],
+        transparent: true,
+      });
+      const mesh = new Renderable(geometry, material);
+      mesh.position.x = -20;
+      mesh.position.y = 8;
+      scene.add(mesh);
+
+      // ── Fluid Simulation ──────────────────────────────────
+      const simSettings = {
+        maxParticles: poem.length,
+        dimensions: 2,
+        smoothingRadius: 1.0,
+        pressureMultiplier: 10.0,
+        nearPressureMultiplier: 18.0,
+        densityTarget: 1.5,
+        viscosity: 0.3,
+        damping: 0.998,
+        gravity: [0, 0, 0],
+        returnToOriginStrength: 0.002,
+        mouseRadius: 0.5,
+        mouseForce: 300.0,
+        substeps: 3,
+        worldBoundsPadding: 0.2,
+      };
+
+      const sim = new FluidSimulation(renderer, simSettings);
+      sim.initialize(
+        geometry.extraBuffers[0],
+        geometry.extraBuffers[0].clone(),
+        {
+          viewMatrix: camera.viewMatrix,
+          projectionMatrix: camera.projectionMatrix,
+          inverseViewMatrix: camera.inverseViewMatrix,
+          worldMatrix: mesh.worldMatrix,
+        }
+      );
+
+      // ── Tweakpane ─────────────────────────────────────────
+      const pane = new Pane({ title: 'Fluid Simulation' });
+
+      // Presets
+      const presetObj = { preset: 'custom' };
+      const presetOptions = { custom: 'custom' };
+      for (const key of Object.keys(PRESETS)) {
+        presetOptions[key] = key;
+      }
+      pane.addBinding(presetObj, 'preset', {
+        label: 'Preset',
+        options: presetOptions,
+      }).on('change', (ev) => {
+        if (ev.value === 'custom') return;
+        sim.setPreset(ev.value);
+        Object.assign(simSettings, sim.params);
+        pane.refresh();
+      });
+
+      // Simulation folder
+      const simFolder = pane.addFolder({ title: 'Simulation' });
+      simFolder.addBinding(simSettings, 'dimensions', { options: { '2D': 2, '3D': 3 } }).on('change', () => { sim.params.dimensions = simSettings.dimensions; });
+      simFolder.addBinding(simSettings, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => { sim.params.substeps = simSettings.substeps; });
+      simFolder.addBinding(simSettings, 'smoothingRadius', { min: 0.1, max: 5.0, step: 0.1, label: 'radius' }).on('change', () => { sim.params.smoothingRadius = simSettings.smoothingRadius; });
+
+      // SPH folder
+      const sphFolder = pane.addFolder({ title: 'SPH Parameters' });
+      sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 1, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
+      sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 1, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
+      sphFolder.addBinding(simSettings, 'densityTarget', { min: 0.1, max: 10.0, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
+      sphFolder.addBinding(simSettings, 'viscosity', { min: 0.0, max: 1.0, step: 0.01 }).on('change', () => { sim.params.viscosity = simSettings.viscosity; });
+      sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
+
+      // Forces folder
+      const forcesFolder = pane.addFolder({ title: 'Forces' });
+      const gravityObj = { x: 0, y: 0, z: 0 };
+      forcesFolder.addBinding(gravityObj, 'y', { min: -20, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [gravityObj.x, gravityObj.y, gravityObj.z]; });
+      forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0.0, max: 0.1, step: 0.001, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
+      forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.1, max: 2.0, step: 0.05, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
+      forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 1000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
+
+      // ── Render loop ───────────────────────────────────────
+      const time = new Vector4(0, 0, 0, 0);
+
+      async function animate() {
+        time.x = performance.now() / 1000;
+        time.y = time.x - time.z;
+        time.z = time.x;
+
+        const dt = Math.min(time.y, 1 / 30); // Cap dt
+        mouseVectors.update(dt);
+        cameraControls.update();
+
+        await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
+
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      // ── Resize ────────────────────────────────────────────
+      function onResize() {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      window.addEventListener('resize', onResize);
+    </script>
+    <div id="info">
+      Made with ❤️ and <a href="https://github.com/siroko/kansei">KANSEI</a> — Fluid Text Demo
+    </div>
+  </body>
+</html>
