@@ -10,6 +10,8 @@ export class PathTracerMaterial {
     public emissiveIntensity: number = 0.0;
     /** Transmission factor: 0.0 = fully opaque, 1.0 = fully transmissive (glass). */
     public transmission: number = 0.0;
+    /** If false, probe rays pass through this material (e.g. dynamic particles). */
+    public probeVisible: boolean = true;
 
     /** Byte size of the packed GPU struct (std140-aligned). */
     static readonly GPU_STRIDE = 64;
@@ -29,7 +31,7 @@ export class PathTracerMaterial {
         target[offset + 3]  = this.roughness;
         target[offset + 4]  = this.metallic;
         target[offset + 5]  = this.ior;
-        target[offset + 6]  = this.maxBounces;
+        target[offset + 6]  = this.probeVisible ? this.maxBounces : -this.maxBounces;
         target[offset + 7]  = this.transmission;
         target[offset + 8]  = this.absorptionColor[0];
         target[offset + 9]  = this.absorptionColor[1];
