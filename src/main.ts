@@ -44,4 +44,5 @@ export { PathTracerMaterial } from "./pathtracer/PathTracerMaterial";
 export { BVHBuilder } from "./pathtracer/BVHBuilder";
 export { PathTracerEffect } from "./pathtracer/PathTracerEffect";
 export { FluidSimulation } from "./simulations/fluid/FluidSimulation";
-export { FluidSimulationOptions, PRESETS as FluidPresets } from "./simulations/fluid/FluidSimulationParams";
+export type { FluidSimulationOptions } from "./simulations/fluid/FluidSimulationParams";
+export { PRESETS as FluidPresets } from "./simulations/fluid/FluidSimulationParams";
