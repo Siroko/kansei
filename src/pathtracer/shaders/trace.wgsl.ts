@@ -1,3 +1,23 @@
+// BVH buffer bindings for the trace pipeline (bindings 5-8)
+export const traceBVHBindings = /* wgsl */`
+@group(0) @binding(5)  var<storage, read> triangles     : array<f32>;
+@group(0) @binding(6)  var<storage, read> bvh4Nodes     : array<vec4f>;
+@group(0) @binding(7)  var<storage, read> tlasBvh4Nodes : array<vec4f>;
+@group(0) @binding(8)  var<storage, read> instances     : array<Instance>;
+
+// Stubs for cone tracing API (only used in voxel mode, never called in BVH mode)
+struct VoxelGridParams {
+    gridMin: vec3f, voxelSize: f32, gridMax: vec3f, gridRes: u32,
+    numLevels: u32, _pad0: u32, _pad1: u32, _pad2: u32,
+    mipOffsets: array<vec4u, 2>,
+}
+fn sampleVoxelMip(pos: vec3f, level: u32) -> vec4f { return vec4f(0.0); }
+fn getVoxelParams() -> VoxelGridParams {
+    var p: VoxelGridParams;
+    return p;
+}
+`;
+
 export const traceShader = /* wgsl */`
 // Requires: intersection.wgsl, traversal.wgsl, storage bindings
 
@@ -27,7 +47,18 @@ struct TraceParams {
     maxBounces   : u32,
     useReSTIR    : u32,
     ambientColor : vec3f,
-    _pad2        : u32,
+    useProbes    : u32,
+    probeGridMin : vec3f,
+    probeStepX   : f32,
+    probeGridDims: vec3u,
+    probeStepY   : f32,
+    probeStepZ    : f32,
+    rasterDirect  : u32,
+    showVoxels       : u32,
+    fogDensity       : f32,       // 0 = no fog, >0 = participating media
+    fogAnisotropy    : f32,       // Henyey-Greenstein g (-1..1)
+    fogHeightFalloff : f32,       // exponential height decay
+    _pad3            : f32,
 }
 
 const LIGHT_DIRECTIONAL = 1u;
@@ -49,15 +80,91 @@ struct LightData {
 @group(0) @binding(2)  var          albedoTex  : texture_2d<f32>;
 @group(0) @binding(3)  var          giOutput   : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4)  var<uniform> traceParams : TraceParams;
-@group(0) @binding(5)  var<storage, read> triangles  : array<f32>;
-@group(0) @binding(6)  var<storage, read> bvh4Nodes  : array<vec4f>;
-@group(0) @binding(7)  var<storage, read> tlasBvh4Nodes : array<vec4f>;
-@group(0) @binding(8)  var<storage, read> instances  : array<Instance>;
+// Bindings 5-8: declared externally by the traversal module (BVH or Voxel DDA)
 @group(0) @binding(9)  var<storage, read> materials  : array<MaterialData>;
 @group(0) @binding(10) var<storage, read> sceneLights : array<LightData>;
 @group(0) @binding(11) var<storage, read> blueNoise   : array<f32>;
 @group(0) @binding(12) var          emissiveTex : texture_2d<f32>;
 @group(0) @binding(13) var          restirDirectTex : texture_2d<f32>;
+@group(0) @binding(14) var<storage, read> probeSH : array<vec4f>;
+
+// ── Voxel-space indirect helpers ─────────────────────────────────────────
+// Mip-interpolated color sample from the voxel color pyramid.
+fn sampleVoxelMipLerp(pos: vec3f, mipF: f32) -> vec4f {
+    let lo = u32(floor(mipF));
+    let hi = min(lo + 1u, getVoxelParams().numLevels - 1u);
+    let frac = mipF - f32(lo);
+    return mix(sampleVoxelMip(pos, lo), sampleVoxelMip(pos, hi), frac);
+}
+
+// ── Irradiance Probe Grid (L2 SH) ──────────────────────────────────
+const SH_STRIDE = 9u;
+
+fn computeSHBasisTrace(d: vec3f) -> array<f32, 9> {
+    let x = d.x; let y = d.y; let z = d.z;
+    var sh: array<f32, 9>;
+    sh[0] = 0.282095;
+    sh[1] = 0.488603 * y;
+    sh[2] = 0.488603 * z;
+    sh[3] = 0.488603 * x;
+    sh[4] = 1.092548 * x * y;
+    sh[5] = 1.092548 * y * z;
+    sh[6] = 0.315392 * (3.0*z*z - 1.0);
+    sh[7] = 1.092548 * x * z;
+    sh[8] = 0.546274 * (x*x - y*y);
+    return sh;
+}
+
+fn evaluateProbeSH(probeIdx: u32, dir: vec3f) -> vec3f {
+    let base = probeIdx * SH_STRIDE;
+    let sh = computeSHBasisTrace(dir);
+    var result = vec3f(0.0);
+    for (var c = 0u; c < 9u; c++) {
+        result += probeSH[base + c].xyz * sh[c];
+    }
+    return max(result, vec3f(0.0));
+}
+
+fn sampleProbeGrid(worldPos: vec3f, dir: vec3f) -> vec3f {
+    let dims = traceParams.probeGridDims;
+    let gridStep = vec3f(traceParams.probeStepX, traceParams.probeStepY, traceParams.probeStepZ);
+
+    // Continuous probe coordinate
+    let localPos = (worldPos - traceParams.probeGridMin) / gridStep;
+    let baseCoord = vec3i(floor(localPos));
+    let frac = localPos - vec3f(baseCoord);
+
+    var totalIrradiance = vec3f(0.0);
+    var totalWeight = 0.0;
+
+    // Pure trilinear interpolation over 8 surrounding probes
+    for (var dz = 0; dz <= 1; dz++) {
+        for (var dy = 0; dy <= 1; dy++) {
+            for (var dx = 0; dx <= 1; dx++) {
+                let probeCoord = baseCoord + vec3i(dx, dy, dz);
+
+                // Clamp to grid bounds
+                let clamped = clamp(probeCoord, vec3i(0), vec3i(dims) - vec3i(1));
+                let probeIdx = u32(clamped.z) * dims.x * dims.y + u32(clamped.y) * dims.x + u32(clamped.x);
+
+                // Trilinear weight
+                let t = vec3f(f32(dx), f32(dy), f32(dz));
+                let weight = (1.0 - abs(t.x - frac.x)) * (1.0 - abs(t.y - frac.y)) * (1.0 - abs(t.z - frac.z));
+
+                if (weight <= 0.0) { continue; }
+
+                let irradiance = evaluateProbeSH(probeIdx, dir);
+                totalIrradiance += irradiance * weight;
+                totalWeight += weight;
+            }
+        }
+    }
+
+    if (totalWeight > 0.0) {
+        return totalIrradiance / totalWeight;
+    }
+    return vec3f(0.0);
+}
 
 // ── Blue noise hybrid sampler ────────────────────────────────────────
 // First 8 dimensions use blue noise (spatially decorrelated, golden-ratio
@@ -192,18 +299,7 @@ fn pdfBSDF(N: vec3f, wo: vec3f, wi: vec3f, roughness: f32, metallic: f32, surfAl
     return specProb * pdfSpec + (1.0 - specProb) * pdfDiff;
 }
 
-// World-space triangle area for MIS on emissive geometry hits
-fn getWorldTriArea(triIdx: u32, instId: u32) -> f32 {
-    let base = triIdx * TRI_STRIDE;
-    let v0 = vec3f(triangles[base], triangles[base+1u], triangles[base+2u]);
-    let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
-    let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
-    let inst = instances[instId];
-    let w0 = transformPointToWorld(v0, inst);
-    let w1 = transformPointToWorld(v1, inst);
-    let w2 = transformPointToWorld(v2, inst);
-    return 0.5 * length(cross(w1 - w0, w2 - w0));
-}
+// getWorldTriArea is defined by the traversal module (BVH or Voxel DDA)
 
 // ── Shadow test that skips refractive (transparent) surfaces ────────
 
@@ -311,6 +407,86 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, wo: vec3f,
     return total;
 }
 
+// ── Volumetric fog (voxel-space ray-marched) ─────────────────────────────
+// Analytically integrated extinction with jittered in-scattering samples.
+// SVO shadow rays at each sample provide volumetric shadows / god rays.
+
+fn henyeyGreenstein(cosTheta: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+}
+
+fn computeVoxelFog(rayOrigin: vec3f, rayDir: vec3f, hitDist: f32) -> vec4f {
+    let density = traceParams.fogDensity;
+    if (density <= 0.0) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+
+    let h = traceParams.fogHeightFalloff;
+    let g = traceParams.fogAnisotropy;
+
+    // Analytical height-integrated optical depth (closed-form for exp height fog)
+    let a = h * rayDir.y;
+    let baseTerm = density * exp(-h * rayOrigin.y);
+    var opticalDepth: f32;
+    if (abs(a) > 0.001) {
+        opticalDepth = baseTerm * (1.0 - exp(-a * hitDist)) / a;
+    } else {
+        opticalDepth = baseTerm * hitDist;
+    }
+    let transmittance = exp(-max(opticalDepth, 0.0));
+
+    // In-scattering: 4 jittered samples with SVO volumetric shadow checks
+    let fogSteps = 4u;
+    let stepLen = hitDist / f32(fogSteps);
+    var inScatter = vec3f(0.0);
+
+    for (var fi = 0u; fi < fogSteps; fi++) {
+        let jitter = nextRandom();
+        let t = (f32(fi) + jitter) / f32(fogSteps) * hitDist;
+        let samplePos = rayOrigin + rayDir * t;
+        let localDensity = density * exp(-h * samplePos.y);
+
+        // Transmittance from camera to this sample
+        var sampleOD: f32;
+        if (abs(a) > 0.001) {
+            sampleOD = baseTerm * (1.0 - exp(-a * t)) / a;
+        } else {
+            sampleOD = baseTerm * t;
+        }
+        let sampleT = exp(-max(sampleOD, 0.0));
+
+        // Evaluate in-scattering from each light
+        for (var li = 0u; li < traceParams.lightCount; li++) {
+            let light = sceneLights[li];
+            var lDir: vec3f;
+            var lColor = light.color * light.intensity;
+            var maxDist = 1e30;
+
+            if (light.lightType == LIGHT_DIRECTIONAL) {
+                lDir = normalize(-light.position);
+            } else {
+                let toLight = light.position - samplePos;
+                let dist2 = dot(toLight, toLight);
+                let dist = sqrt(dist2);
+                lDir = toLight / dist;
+                lColor /= dist2;
+                maxDist = dist;
+            }
+
+            let phase = henyeyGreenstein(dot(rayDir, lDir), g);
+
+            // SVO shadow check — volumetric shadows / god rays
+            var shadowRay: Ray;
+            shadowRay.origin = samplePos;
+            shadowRay.dir = lDir;
+            if (!traceBVHShadow(shadowRay, maxDist)) {
+                inScatter += sampleT * localDensity * lColor * phase * stepLen;
+            }
+        }
+    }
+
+    return vec4f(inScatter, transmittance);
+}
+
 // ── Multi-bounce path tracer with NEE ─────────────────────────────────
 // Returns irradiance at startPos. At each vertex: NEE for direct light,
 // then stochastic PBR bounce (specular or diffuse based on metallic/Fresnel).
@@ -337,6 +513,12 @@ fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32,
     let maxBounces = traceParams.maxBounces;
 
     for (var bounce = 0u; bounce < maxBounces; bounce++) {
+        // Probe fallback: after bounce 0, use probe grid instead of tracing further
+        if (traceParams.useProbes != 0u && bounce >= 1u && !sampleSpec) {
+            accumulated += throughput * sampleProbeGrid(pos + norm * 0.01, norm);
+            break;
+        }
+
         var bounceRay: Ray;
         bounceRay.origin = pos + norm * 0.001;
 
@@ -420,7 +602,7 @@ fn traceRefraction(
     var throughput = vec3f(1.0);
     var ray = inRay;
     var currentHit = firstHit;
-    let maxBounces = u32(mat.maxBounces);
+    let maxBounces = u32(abs(mat.maxBounces));
     var insideMedium = false;
 
     for (var bounce = 0u; bounce < maxBounces; bounce++) {
@@ -543,6 +725,102 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     // Map trace-res coord to full-res GBuffer coord via UV
     let uv = (vec2f(coord) + 0.5) / vec2f(f32(traceParams.width), f32(traceParams.height));
+
+    // ── Direct voxel visualization mode ─────────────────────────────────
+    if (traceParams.showVoxels != 0u) {
+        let ndc = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0, 1.0);
+        let farNdc = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 1.0, 1.0);
+        let nearWp = traceParams.invViewProj * ndc;
+        let farWp = traceParams.invViewProj * farNdc;
+        let nearPos = nearWp.xyz / nearWp.w;
+        let farPos = farWp.xyz / farWp.w;
+
+        var voxRay: Ray;
+        voxRay.origin = traceParams.cameraPos;
+        voxRay.dir = normalize(farPos - nearPos);
+
+        let primaryHit = traceBVH(voxRay);
+        if (!primaryHit.hit) {
+            textureStore(giOutput, coord, vec4f(traceParams.ambientColor, 1.0));
+            return;
+        }
+
+        initSampler(coord, traceParams.frameIndex, 0u);
+
+        // Path tracing loop for voxel view (supports bounces)
+        var throughput = vec3f(1.0);
+        var radiance = vec3f(0.0);
+        var currentHit = primaryHit;
+        var currentDir = voxRay.dir;
+        let maxBounces = traceParams.maxBounces;
+
+        for (var bounce = 0u; bounce <= maxBounces; bounce++) {
+            let mat = materials[currentHit.matIndex];
+            let hitAlbedo = mat.albedo;
+            let norm = currentHit.worldNorm;
+            let wo = -currentDir;
+
+            // Add emissive
+            radiance += throughput * mat.emissive * mat.emissiveIntensity;
+
+            // Evaluate direct lights
+            var directLight = vec3f(0.0);
+            for (var li = 0u; li < traceParams.lightCount; li++) {
+                let light = sceneLights[li];
+                if (light.lightType == LIGHT_DIRECTIONAL) {
+                    directLight += evaluateDirectionalLight(currentHit.worldPos, norm, light);
+                } else if (light.lightType == LIGHT_AREA) {
+                    directLight += evaluateAreaLight(currentHit.worldPos, norm, light,
+                        wo, max(mat.roughness, 0.3), mat.metallic, hitAlbedo);
+                } else if (light.lightType == LIGHT_POINT) {
+                    directLight += evaluatePointLight(currentHit.worldPos, norm, light);
+                }
+            }
+            radiance += throughput * hitAlbedo * directLight;
+
+            // If last bounce, no need to trace further
+            if (bounce >= maxBounces) { break; }
+
+            // ── Single-ray voxel indirect ──
+            // 1 ray per pixel, mip-accelerated SVO traversal, temporal accumulation.
+            // Offset origin by voxelSize along normal to clear surface voxel.
+            let vp = getVoxelParams();
+            let bounceDir = cosineSampleHemisphere(norm, nextRandom(), nextRandom());
+            let NdotL = max(dot(norm, bounceDir), 0.0);
+            if (NdotL < 0.001) { break; }
+
+            throughput *= hitAlbedo;
+
+            // Russian roulette after bounce 1
+            if (bounce > 0u) {
+                let rr = max(max(throughput.r, throughput.g), throughput.b);
+                if (nextRandom() > rr) { break; }
+                throughput /= rr;
+            }
+
+            var bounceRay: Ray;
+            bounceRay.origin = currentHit.worldPos + norm * vp.voxelSize;
+            bounceRay.dir = bounceDir;
+            let bounceHit = traceBVH(bounceRay);
+            if (!bounceHit.hit) {
+                radiance += throughput * traceParams.ambientColor;
+                break;
+            }
+            currentHit = bounceHit;
+            currentDir = bounceDir;
+        }
+
+        radiance += traceParams.ambientColor * materials[primaryHit.matIndex].albedo * 0.1;
+
+        // Volumetric fog between camera and primary hit
+        if (traceParams.fogDensity > 0.0) {
+            let fogResult = computeVoxelFog(traceParams.cameraPos, voxRay.dir, primaryHit.t);
+            radiance = radiance * fogResult.a + fogResult.rgb;
+        }
+
+        textureStore(giOutput, coord, vec4f(radiance, 1.0));
+        return;
+    }
     let gbufDim = vec2u(textureDimensions(depthTex));
     let gbufCoord = vec2u(vec2f(gbufDim) * uv);
     let gbufClamped = min(gbufCoord, gbufDim - vec2u(1u));
@@ -590,6 +868,24 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     for (var s = 0u; s < spp; s++) {
         initSampler(coord, traceParams.frameIndex, s);
+
+        if (traceParams.rasterDirect != 0u && traceParams.useProbes != 0u) {
+            // ── Raster direct mode: no ray tracing at all ────────────
+            // Rasterizer handles direct light + reflections + refractions.
+            // Probes provide indirect illumination only.
+            let probePos = worldPos + worldNormal * 0.01;
+            if (transmission > 0.5 || metallic > 0.5) {
+                // Metallic/transmissive: evaluate SH in reflection direction
+                let reflDir = reflect(-viewDir, worldNormal);
+                let specEnv = sampleProbeGrid(probePos, reflDir);
+                accumulated += (specEnv + traceParams.ambientColor) * albedo * F;
+            } else {
+                let kd = (vec3f(1.0) - F) * (1.0 - metallic);
+                let indirect = sampleProbeGrid(probePos, worldNormal);
+                accumulated += (indirect + traceParams.ambientColor) * albedo * kd;
+            }
+            continue;
+        }
 
         let r = nextRandom();
         if (r < specProb) {
@@ -651,7 +947,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             // ── Diffuse: multi-bounce path tracing with NEE ──────────
             let diffProb = 1.0 - specProb - transProb;
             let kd = (vec3f(1.0) - F) * (1.0 - metallic) * (1.0 - transmission);
-            if (traceParams.useReSTIR != 0u) {
+            if (traceParams.useProbes != 0u) {
+                // Probes: NEE for direct, probe grid for indirect — no bounce tracing needed
+                let direct = evaluateLighting(worldPos, worldNormal, viewDir, roughness, metallic, albedo);
+                let indirect = sampleProbeGrid(worldPos + worldNormal * 0.01, worldNormal);
+                accumulated += (direct + indirect) * albedo * kd / max(diffProb, 0.01);
+            } else if (traceParams.useReSTIR != 0u) {
                 // ReSTIR provides primary-surface direct light; skip first NEE in tracePath
                 let restirDirect = textureLoad(restirDirectTex, vec2i(coord), 0).rgb;
                 let indirect = tracePath(worldPos, worldNormal, 1u,

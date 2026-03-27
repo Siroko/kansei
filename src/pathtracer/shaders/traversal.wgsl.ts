@@ -1,6 +1,6 @@
 export const traversalShader = /* wgsl */`
 // Requires: intersection.wgsl (Ray, HitInfo, rayAABB, rayTriangle)
-// Requires: BVHNode struct, Instance struct, triangle/node/instance storage bindings
+// Requires: BVH bindings (triangles, bvh4Nodes, tlasBvh4Nodes, instances) declared externally
 
 const TLAS_STACK_SIZE = 16u;
 const BLAS_STACK_SIZE = 64u;
@@ -299,5 +299,18 @@ fn traceBVH(ray: Ray) -> HitInfo {
 fn traceBVHShadow(ray: Ray, maxDist: f32) -> bool {
     let hit = traceBVHInternal(ray, true, maxDist);
     return hit.hit;
+}
+
+// World-space triangle area for MIS on emissive geometry hits
+fn getWorldTriArea(triIdx: u32, instId: u32) -> f32 {
+    let base = triIdx * TRI_STRIDE;
+    let v0 = vec3f(triangles[base], triangles[base+1u], triangles[base+2u]);
+    let v1 = vec3f(triangles[base+3u], triangles[base+4u], triangles[base+5u]);
+    let v2 = vec3f(triangles[base+6u], triangles[base+7u], triangles[base+8u]);
+    let inst = instances[instId];
+    let w0 = transformPointToWorld(v0, inst);
+    let w1 = transformPointToWorld(v1, inst);
+    let w2 = transformPointToWorld(v2, inst);
+    return 0.5 * length(cross(w1 - w0, w2 - w0));
 }
 `;

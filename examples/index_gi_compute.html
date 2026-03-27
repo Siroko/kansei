@@ -473,7 +473,7 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 0.75,
+      devicePixelRatio: 2,
       antialias: false,
       sampleCount: 1
     });
@@ -710,6 +710,7 @@
     particlePTMat.albedo = [0.9, 0.75, 0.5];
     particlePTMat.roughness = 1.0;
     particlePTMat.maxBounces = 4;
+    particlePTMat.probeVisible = false;
     particles.pathTracerMaterial = particlePTMat;
     // Dynamic BLAS: per-instance BLAS copies with GPU deform + refit
     particles.dynamicBLAS = true;
@@ -757,6 +758,9 @@
       traceScale: 1,
       maxBounces: 1,
       ambientColor: [0, 0, 0],
+      useProbes: true,
+      rasterDirect: true,
+      useReSTIR: false,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
@@ -1340,7 +1344,21 @@
     ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 9, step: 1 });
     ptFolder.addBinding(pathTracerEffect, 'spp', { min: 1, max: 16, step: 1 });
     ptFolder.addBinding(pathTracerEffect, 'useBlueNoise');
+    ptFolder.addBinding(pathTracerEffect, 'fixedSeed');
     ptFolder.addBinding(pathTracerEffect, 'traceScale', { min: 0.1, max: 1.0, step: 0.05 });
+    ptFolder.addBinding(pathTracerEffect, 'maxBounces', { min: 0, max: 8, step: 1, label: 'bounces' });
+    ptFolder.addBinding(pathTracerEffect, 'useSVGF', { label: 'SVGF' });
+    ptFolder.addBinding(pathTracerEffect, 'useReSTIR');
+    ptFolder.addBinding(pathTracerEffect, 'restirMaxHistory', { min: 1, max: 60, step: 1, label: 'ReSTIR history' });
+    ptFolder.addBinding(pathTracerEffect, 'useProbes', { label: 'Probes (SH)' });
+    ptFolder.addBinding(pathTracerEffect, 'probeSpacing', { min: 0.5, max: 10.0, step: 0.5, label: 'probe spacing' });
+    ptFolder.addBinding(pathTracerEffect, 'probeRaysPerFrame', { min: 4, max: 128, step: 4, label: 'probe rays' });
+    ptFolder.addBinding(pathTracerEffect, 'probeHysteresis', { min: 0, max: 0.99, step: 0.01, label: 'probe hysteresis' });
+    ptFolder.addBinding(pathTracerEffect, 'showProbes', { label: 'Show Probes' });
+    ptFolder.addBinding(pathTracerEffect, 'rasterDirect', { label: 'Raster Direct' });
+    const probeInfo = { count: '' };
+    const probeMonitor = ptFolder.addBinding(probeInfo, 'count', { readonly: true, label: 'probe count' });
+    setInterval(() => { probeInfo.count = String(pathTracerEffect.probeCount); probeMonitor.refresh(); }, 500);
 
     // ── Render loop ───────────────────────────────────────────────────────
     let lastTime = performance.now() / 1000;

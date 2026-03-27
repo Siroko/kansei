@@ -1,8 +1,9 @@
 export const compositeShader = /* wgsl */`
 struct CompositeParams {
-    width  : u32,
-    height : u32,
-    _pad   : vec2u,
+    width        : u32,
+    height       : u32,
+    rasterDirect : u32,
+    _pad         : u32,
 }
 
 @group(0) @binding(0) var inputTex    : texture_2d<f32>;
@@ -23,8 +24,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let giSample  = textureSampleLevel(denoisedGI, giSampler, uv, 0.0);
     let indirect  = giSample.rgb;
 
-    // Path tracer provides full outgoing radiance for all surface types
-    let hdr = indirect;
+    var hdr: vec3f;
+    if (params.rasterDirect != 0u) {
+        // Raster direct mode: rasterized scene has direct light, GI has probe indirect only
+        let rasterColor = textureLoad(inputTex, vec2i(coord), 0).rgb;
+        hdr = rasterColor + indirect;
+    } else {
+        // Full path tracer mode: GI buffer has complete radiance
+        hdr = indirect;
+    }
 
     let final_color = hdr / (hdr + vec3f(1.0));
 

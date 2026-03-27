@@ -42,6 +42,7 @@ export class BVHBuilder {
     private _blasEntries: Map<string, BLASEntry> = new Map();
     public totalTriangleCount: number = 0;
     public totalBLASNodes: number = 0;
+    public totalInstanceTriangles: number = 0; // sum of blasTriCount across all instances (handles shared BLAS)
 
     // TLAS data
     private _instanceBuffer: GPUBuffer | null = null;
@@ -163,6 +164,46 @@ export class BVHBuilder {
     get materialBuffer(): GPUBuffer | null { return this._materialBuffer; }
     get origTriangleBuffer(): GPUBuffer | null { return this._origTriangleBuffer; }
     get totalInstances(): number { return this._totalInstances; }
+    get sceneMin(): [number, number, number] { return this._sceneMin; }
+    get sceneMax(): [number, number, number] { return this._sceneMax; }
+
+    /** Compute world-space scene AABB by transforming per-BLAS local bounds with instance world matrices. */
+    computeWorldBounds(scene: Scene): { min: [number, number, number]; max: [number, number, number] } {
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+        for (const obj of scene.getOrderedObjects()) {
+            const geom = obj.geometry.isInstancedGeometry
+                ? (obj.geometry as InstancedGeometry).geometry ?? obj.geometry
+                : obj.geometry;
+            const blasKey = this._geomToBLASKey.get(geom);
+            if (!blasKey) continue;
+            const lb = this._blasLocalBounds.get(blasKey);
+            if (!lb) continue;
+
+            const m = obj.worldMatrix.internalMat4;
+            // Transform 8 corners of local AABB by world matrix
+            for (let cz = 0; cz < 2; cz++) {
+                for (let cy = 0; cy < 2; cy++) {
+                    for (let cx = 0; cx < 2; cx++) {
+                        const lx = cx === 0 ? lb.min[0] : lb.max[0];
+                        const ly = cy === 0 ? lb.min[1] : lb.max[1];
+                        const lz = cz === 0 ? lb.min[2] : lb.max[2];
+                        // m is column-major (gl-matrix)
+                        const wx = m[0] * lx + m[4] * ly + m[8]  * lz + m[12];
+                        const wy = m[1] * lx + m[5] * ly + m[9]  * lz + m[13];
+                        const wz = m[2] * lx + m[6] * ly + m[10] * lz + m[14];
+                        minX = Math.min(minX, wx); maxX = Math.max(maxX, wx);
+                        minY = Math.min(minY, wy); maxY = Math.max(maxY, wy);
+                        minZ = Math.min(minZ, wz); maxZ = Math.max(maxZ, wz);
+                    }
+                }
+            }
+        }
+
+        if (!isFinite(minX)) { return { min: [0, 0, 0], max: [1, 1, 1] }; }
+        return { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+    }
 
     getDynamicBLASInfo(renderable: Renderable): DynamicBLASInfo | undefined {
         const geom = renderable.geometry.isInstancedGeometry
@@ -508,6 +549,13 @@ export class BVHBuilder {
         }
 
         this._totalInstances = instanceCount;
+
+        // Compute total instance-triangles (each shared BLAS counted per instance)
+        let totalInstTris = 0;
+        for (let k = 0; k < instanceCount; k++) {
+            totalInstTris += instanceDataU32[k * STRIDE + 26];
+        }
+        this.totalInstanceTriangles = totalInstTris;
 
         // Reuse GPU buffer if capacity is sufficient, only recreate if grown
         const byteSize = Math.max(instanceCount * STRIDE * 4, 4);
