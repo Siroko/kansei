@@ -70,9 +70,9 @@
       const fontInfo = await fontLoader.load('assets/fonts/L10-medium.arfont');
 
       const geometry = new TextGeometry({
-        text: poem,
+        text: poem + poem + poem + poem + poem + poem + poem + poem + poem + poem,
         fontInfo: fontInfo,
-        width: 40,
+        width: 100,
         height: 100,
         fontSize: 25,
         color: new Vector4(1, 1, 1, 1),
@@ -86,13 +86,13 @@
         transparent: true,
       });
       const mesh = new Renderable(geometry, material);
-      mesh.position.x = -20;
-      mesh.position.y = 8;
+      mesh.position.x = -50;
+      mesh.position.y = 40;
       scene.add(mesh);
 
       // ── Fluid Simulation ──────────────────────────────────
       const simSettings = {
-        maxParticles: poem.length,
+        maxParticles: geometry.text.length,
         dimensions: 2,
         smoothingRadius: 1.0,
         pressureMultiplier: 10.0,
@@ -156,10 +156,19 @@
       // Forces folder
       const forcesFolder = pane.addFolder({ title: 'Forces' });
       const gravityObj = { x: 0, y: 0, z: 0 };
-      forcesFolder.addBinding(gravityObj, 'y', { min: -20, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [gravityObj.x, gravityObj.y, gravityObj.z]; });
+      forcesFolder.addBinding(gravityObj, 'y', { min: -200, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [gravityObj.x, gravityObj.y, gravityObj.z]; });
       forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0.0, max: 0.1, step: 0.001, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
       forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.1, max: 2.0, step: 0.05, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
-      forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 1000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
+      forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 10000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
+
+      // Bounds folder
+      const boundsFolder = pane.addFolder({ title: 'Boundaries', expanded: false });
+      const boundsMin = { x: sim.worldBoundsMin[0], y: sim.worldBoundsMin[1], z: sim.worldBoundsMin[2] };
+      const boundsMax = { x: sim.worldBoundsMax[0], y: sim.worldBoundsMax[1], z: sim.worldBoundsMax[2] };
+      boundsFolder.addBinding(boundsMin, 'x', { min: -200, max: 0, step: 1, label: 'min X' }).on('change', () => { sim.worldBoundsMin[0] = boundsMin.x; });
+      boundsFolder.addBinding(boundsMin, 'y', { min: -200, max: 0, step: 1, label: 'min Y' }).on('change', () => { sim.worldBoundsMin[1] = boundsMin.y; });
+      boundsFolder.addBinding(boundsMax, 'x', { min: 0, max: 200, step: 1, label: 'max X' }).on('change', () => { sim.worldBoundsMax[0] = boundsMax.x; });
+      boundsFolder.addBinding(boundsMax, 'y', { min: 0, max: 200, step: 1, label: 'max Y' }).on('change', () => { sim.worldBoundsMax[1] = boundsMax.y; });
 
       // Appearance folder
       const appearanceFolder = pane.addFolder({ title: 'Appearance' });

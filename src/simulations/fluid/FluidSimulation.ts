@@ -73,8 +73,8 @@ class FluidSimulation {
     private gridDims: [number, number, number] = [1, 1, 1];
     private gridOrigin: [number, number, number] = [0, 0, 0];
     private totalCells: number = 1;
-    private worldBoundsMin: [number, number, number] = [0, 0, 0];
-    private worldBoundsMax: [number, number, number] = [0, 0, 0];
+    public worldBoundsMin: [number, number, number] = [0, 0, 0];
+    public worldBoundsMax: [number, number, number] = [0, 0, 0];
 
     constructor(renderer: Renderer, options?: Partial<FluidSimulationOptions>) {
         this.renderer = renderer;
