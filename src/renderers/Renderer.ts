@@ -146,7 +146,12 @@ class Renderer {
             throw new Error("No WebGPU adapter found");
         }
 
-        return adapter.requestDevice();
+        const maxStorage = adapter.limits.maxStorageBufferBindingSize;
+        return adapter.requestDevice({
+            requiredLimits: {
+                maxStorageBufferBindingSize: maxStorage,
+            },
+        });
     }
 
     /**
@@ -943,6 +948,28 @@ class Renderer {
         this.device!.queue.submit([commands]);
 
         // Wait for the compute work to complete
+        return this.device!.queue.onSubmittedWorkDone();
+    }
+
+    /**
+     * Executes multiple compute shaders in a single command buffer submission.
+     * Storage buffer writes in pass N are visible to pass N+1 (WebGPU guarantee).
+     * @param passes Array of compute passes with workgroup dimensions
+     * @returns Promise that resolves when all passes complete
+     */
+    public async computeBatch(passes: { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[]): Promise<void> {
+        const commandEncoder = this.device!.createCommandEncoder();
+        for (const pass of passes) {
+            if (!pass.compute.initialized) {
+                pass.compute.initialize(this.device!);
+            }
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setBindGroup(0, pass.compute.getBindGroup(this.device!));
+            passEncoder.setPipeline(pass.compute.pipeline!);
+            passEncoder.dispatchWorkgroups(pass.workgroupsX, pass.workgroupsY ?? 1, pass.workgroupsZ ?? 1);
+            passEncoder.end();
+        }
+        this.device!.queue.submit([commandEncoder.finish()]);
         return this.device!.queue.onSubmittedWorkDone();
     }
 
