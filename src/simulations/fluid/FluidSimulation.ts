@@ -360,6 +360,10 @@ class FluidSimulation {
         Object.assign(this.params, preset);
     }
 
+    public setParams(overrides: Partial<FluidSimulationOptions>): void {
+        Object.assign(this.params, overrides);
+    }
+
     public async update(
         dt: number,
         mousePosition?: { x: number; y: number },

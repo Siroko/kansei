@@ -161,6 +161,13 @@
       forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.1, max: 2.0, step: 0.05, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
       forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 1000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
 
+      // Appearance folder
+      const appearanceFolder = pane.addFolder({ title: 'Appearance' });
+      const colors = { textColor: { r: 1, g: 1, b: 1 }, bgColor: { r: 0.02, g: 0.02, b: 0.04 } };
+      appearanceFolder.addBinding(colors, 'bgColor', { color: { type: 'float' }, label: 'background' }).on('change', () => {
+        renderer.clearColor = new Vector4(colors.bgColor.r, colors.bgColor.g, colors.bgColor.b, 1);
+      });
+
       // ── Render loop ───────────────────────────────────────
       const time = new Vector4(0, 0, 0, 0);
 
