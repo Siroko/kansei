@@ -26,13 +26,13 @@ fn nearPressureFromDensity(nearDensity: f32) -> f32 {
 fn densityDerivative(dist: f32, h: f32) -> f32 {
     if (dist >= h) { return 0.0; }
     let v = h - dist;
-    return -v * params.spikyPow2DerivFactor;
+    return v * params.spikyPow2DerivFactor;
 }
 
 fn nearDensityDerivative(dist: f32, h: f32) -> f32 {
     if (dist >= h) { return 0.0; }
     let v = h - dist;
-    return -v * v * params.spikyPow3DerivFactor;
+    return v * v * params.spikyPow3DerivFactor;
 }
 
 fn viscosityKernel(dist: f32, h: f32) -> f32 {
