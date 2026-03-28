@@ -22,9 +22,17 @@ import { shaderCode as scatterShader } from './shaders/scatter.wgsl';
 import { shaderCode as densityShader } from './shaders/density.wgsl';
 import { shaderCode as forcesShader } from './shaders/forces.wgsl';
 import { shaderCode as integrateShader } from './shaders/integrate.wgsl';
+import { shaderCode as bodyCollisionShader } from './shaders/body-collision.wgsl';
+import { shaderCode as bodyIntegrateShader } from './shaders/body-integrate.wgsl';
+import { FluidBody, FluidBodyOptions } from './FluidBody';
+import { Float } from '../../math/Float';
 
 const MAX_GRID_CELLS = 262144; // 256K
 const PREFIX_SUM_BLOCK_SIZE = 512;
+const MAX_BODIES = 64;
+const MAX_PRIMITIVES = 256;
+const BODY_STATE_FLOATS = 16;
+const PRIMITIVE_FLOATS = 6;
 
 class FluidSimulation {
     public params: FluidSimulationOptions;
@@ -69,6 +77,22 @@ class FluidSimulation {
     private forcesPass!: Compute;
     private integratePass!: Compute;
 
+    // Body system
+    private bodies: FluidBody[] = [];
+    private bodyStatesF32!: Float32Array;
+    private bodyStatesU32!: Uint32Array;
+    private bodyStatesBuffer!: ComputeBuffer;
+    private bodyForcesBuffer!: ComputeBuffer;
+    private bodyPrimitivesF32!: Float32Array;
+    private bodyPrimitivesU32!: Uint32Array;
+    private bodyPrimitivesBuffer!: ComputeBuffer;
+    public bodyTransformsBuffer!: ComputeBuffer;
+    private bodyCountFloat!: Float;
+    private totalPrimitives: number = 0;
+
+    private bodyCollisionPass!: Compute;
+    private bodyIntegratePass!: Compute;
+
     // Grid dimensions
     private gridDims: [number, number, number] = [1, 1, 1];
     private gridOrigin: [number, number, number] = [0, 0, 0];
@@ -111,6 +135,8 @@ class FluidSimulation {
         this.computeGridFromPositions(positionsBuffer);
         this.createBuffers();
         this.createComputePasses();
+        this.createBodyBuffers();
+        this.createBodyComputePasses();
     }
 
     private computeGridFromPositions(positionsBuffer: ComputeBuffer): void {
@@ -231,6 +257,42 @@ class FluidSimulation {
         });
     }
 
+    private createBodyBuffers(): void {
+        this.bodyStatesF32 = new Float32Array(MAX_BODIES * BODY_STATE_FLOATS);
+        this.bodyStatesU32 = new Uint32Array(this.bodyStatesF32.buffer);
+        this.bodyStatesBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+            buffer: this.bodyStatesF32,
+        });
+
+        this.bodyForcesBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE,
+            buffer: new Float32Array(MAX_BODIES * 4),
+        });
+
+        this.bodyPrimitivesF32 = new Float32Array(MAX_PRIMITIVES * PRIMITIVE_FLOATS);
+        this.bodyPrimitivesU32 = new Uint32Array(this.bodyPrimitivesF32.buffer);
+        this.bodyPrimitivesBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+            buffer: this.bodyPrimitivesF32,
+        });
+
+        this.bodyTransformsBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC,
+            buffer: new Float32Array(MAX_BODIES * 4),
+            shaderLocation: 3,
+            offset: 0,
+            stride: 4 * 4,
+            format: 'float32x4' as GPUVertexFormat,
+        });
+
+        this.bodyCountFloat = new Float(0);
+    }
+
     private createComputePasses(): void {
         const C = GPUShaderStage.COMPUTE;
 
@@ -301,6 +363,28 @@ class FluidSimulation {
         ]);
     }
 
+    private createBodyComputePasses(): void {
+        const C = GPUShaderStage.COMPUTE;
+
+        this.bodyCollisionPass = new Compute(bodyCollisionShader, [
+            { binding: 0, visibility: C, value: this.positionsBuffer },
+            { binding: 1, visibility: C, value: this.velocitiesBuffer },
+            { binding: 2, visibility: C, value: this.bodyStatesBuffer },
+            { binding: 3, visibility: C, value: this.bodyPrimitivesBuffer },
+            { binding: 4, visibility: C, value: this.bodyForcesBuffer },
+            { binding: 5, visibility: C, value: this.paramsBuffer },
+            { binding: 6, visibility: C, value: this.bodyCountFloat },
+        ]);
+
+        this.bodyIntegratePass = new Compute(bodyIntegrateShader, [
+            { binding: 0, visibility: C, value: this.bodyStatesBuffer },
+            { binding: 1, visibility: C, value: this.bodyForcesBuffer },
+            { binding: 2, visibility: C, value: this.bodyTransformsBuffer },
+            { binding: 3, visibility: C, value: this.paramsBuffer },
+            { binding: 4, visibility: C, value: this.bodyCountFloat },
+        ]);
+    }
+
     private packParams(dt: number, mouseStrength: number, mousePosition?: { x: number, y: number }, mouseDirection?: { x: number, y: number }): void {
         const p = this.params;
         const f = this.paramsF32;
@@ -364,6 +448,67 @@ class FluidSimulation {
         Object.assign(this.params, overrides);
     }
 
+    public get bodyCount(): number {
+        return this.bodies.length;
+    }
+
+    public addBody(options: FluidBodyOptions): FluidBody {
+        if (this.bodies.length >= MAX_BODIES) {
+            throw new Error(`Max body count (${MAX_BODIES}) reached`);
+        }
+        if (this.totalPrimitives + options.primitives.length > MAX_PRIMITIVES) {
+            throw new Error(`Max primitive count (${MAX_PRIMITIVES}) reached`);
+        }
+
+        const body = new FluidBody(options, this.bodies.length, this.totalPrimitives);
+        this.bodies.push(body);
+
+        // Pack primitives
+        for (let i = 0; i < body.primitiveCount; i++) {
+            const offset = (this.totalPrimitives + i) * PRIMITIVE_FLOATS;
+            FluidBody.packPrimitive(body.primitives[i], this.bodyPrimitivesF32, this.bodyPrimitivesU32, offset);
+        }
+        this.totalPrimitives += body.primitiveCount;
+        this.bodyPrimitivesBuffer.needsUpdate = true;
+
+        // Pack body state
+        this.syncBodyState(body);
+
+        // Update count
+        this.bodyCountFloat.value = this.bodies.length;
+
+        return body;
+    }
+
+    public removeBody(body: FluidBody): void {
+        const idx = this.bodies.indexOf(body);
+        if (idx === -1) return;
+
+        const last = this.bodies[this.bodies.length - 1];
+        if (idx !== this.bodies.length - 1) {
+            const srcOffset = last.index * BODY_STATE_FLOATS;
+            const dstOffset = idx * BODY_STATE_FLOATS;
+            this.bodyStatesF32.copyWithin(dstOffset, srcOffset, srcOffset + BODY_STATE_FLOATS);
+            (last as any).index = idx;
+        }
+
+        this.bodies.splice(idx, 1);
+        this.bodyCountFloat.value = this.bodies.length;
+        this.bodyStatesBuffer.needsUpdate = true;
+    }
+
+    private syncBodyState(body: FluidBody): void {
+        const offset = body.index * BODY_STATE_FLOATS;
+        body.packState(this.bodyStatesF32, this.bodyStatesU32, offset);
+        this.bodyStatesBuffer.needsUpdate = true;
+    }
+
+    public syncBodyParams(): void {
+        for (const body of this.bodies) {
+            this.syncBodyState(body);
+        }
+    }
+
     public async update(
         dt: number,
         mousePosition?: { x: number; y: number },
@@ -378,7 +523,7 @@ class FluidSimulation {
         for (let s = 0; s < this.params.substeps; s++) {
             this.packParams(dt, mouseStrength, mousePosition, mouseDirection);
 
-            await this.renderer.computeBatch([
+            const passes: { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[] = [
                 // Grid build
                 { compute: this.gridClearCountsPass,    workgroupsX: gridWorkgroups },
                 { compute: this.gridClearScatterPass,   workgroupsX: gridWorkgroups },
@@ -393,7 +538,17 @@ class FluidSimulation {
                 { compute: this.densityPass,             workgroupsX: particleWorkgroups },
                 { compute: this.forcesPass,              workgroupsX: particleWorkgroups },
                 { compute: this.integratePass,           workgroupsX: particleWorkgroups },
-            ]);
+            ];
+
+            // Body passes (only if bodies exist)
+            if (this.bodies.length > 0) {
+                passes.push(
+                    { compute: this.bodyCollisionPass,   workgroupsX: particleWorkgroups },
+                    { compute: this.bodyIntegratePass,    workgroupsX: 1 },
+                );
+            }
+
+            await this.renderer.computeBatch(passes);
         }
     }
 }
