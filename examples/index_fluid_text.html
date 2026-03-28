@@ -41,6 +41,9 @@
       import { Vector4 } from '../src/math/Vector4'
       import { TextGeometry } from '../src/geometries/TextGeometry'
       import { MouseVectors } from '../src/controls/MouseVectors'
+      import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+      import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+      import { Vector3 } from '../src/math/Vector3'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
       import { PRESETS } from '../src/simulations/fluid/FluidSimulationParams'
       import { poem } from './assets/copy/poem.js'
@@ -123,6 +126,16 @@
         }
       );
 
+      // ── Floating Body ─────────────────────────────────────
+      const body = sim.addBody({
+        primitives: [
+          { type: 'circle', radius: 3.0, localX: 0, localY: 0 },
+        ],
+        position: new Vector3(20, 20, 0),
+        mass: 8.0,
+        restitution: 0.3,
+      });
+
       // ── Tweakpane ─────────────────────────────────────────
       const pane = new Pane({ title: 'Fluid Simulation' });
 
@@ -172,6 +185,18 @@
       boundsFolder.addBinding(boundsMin, 'y', { min: -200, max: 0, step: 1, label: 'min Y' }).on('change', () => { sim.worldBoundsMin[1] = boundsMin.y; });
       boundsFolder.addBinding(boundsMax, 'x', { min: 0, max: 200, step: 1, label: 'max X' }).on('change', () => { sim.worldBoundsMax[0] = boundsMax.x; });
       boundsFolder.addBinding(boundsMax, 'y', { min: 0, max: 200, step: 1, label: 'max Y' }).on('change', () => { sim.worldBoundsMax[1] = boundsMax.y; });
+
+      // Body folder
+      const bodyFolder = pane.addFolder({ title: 'Floating Body', expanded: false });
+      const bodyParams = { mass: 8.0, restitution: 0.3 };
+      bodyFolder.addBinding(bodyParams, 'mass', { min: 0.5, max: 50, step: 0.5 }).on('change', () => {
+        body.mass = bodyParams.mass;
+        sim.syncBodyParams();
+      });
+      bodyFolder.addBinding(bodyParams, 'restitution', { min: 0.0, max: 1.0, step: 0.05 }).on('change', () => {
+        body.restitution = bodyParams.restitution;
+        sim.syncBodyParams();
+      });
 
       // Appearance folder
       const appearanceFolder = pane.addFolder({ title: 'Appearance' });
