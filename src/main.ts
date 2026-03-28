@@ -46,3 +46,5 @@ export { PathTracerEffect } from "./pathtracer/PathTracerEffect";
 export { FluidSimulation } from "./simulations/fluid/FluidSimulation";
 export type { FluidSimulationOptions } from "./simulations/fluid/FluidSimulationParams";
 export { PRESETS as FluidPresets } from "./simulations/fluid/FluidSimulationParams";
+export { FluidBody } from "./simulations/fluid/FluidBody";
+export type { FluidBodyOptions, FluidBodyPrimitive } from "./simulations/fluid/FluidBody";
