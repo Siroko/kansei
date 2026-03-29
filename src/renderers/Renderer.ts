@@ -42,7 +42,7 @@ class Renderer {
 
     public canvas: HTMLCanvasElement;
     public context: GPUCanvasContext | null;
-    private device?: GPUDevice;
+    public device?: GPUDevice;
     private _presentationFormat?: GPUTextureFormat;
     private sampleCount: number = 4;
     private devicePixelRatio: number = window.devicePixelRatio;

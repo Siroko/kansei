@@ -46,6 +46,10 @@
       import { Vector3 } from '../src/math/Vector3'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
       import { PRESETS } from '../src/simulations/fluid/FluidSimulationParams'
+      import { TextureLoader } from '../src/loaders/TextureLoader'
+      import { Texture } from '../src/buffers/Texture'
+      import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { BufferBase } from '../src/buffers/BufferBase'
       import { poem } from './assets/copy/poem.js'
       import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
@@ -101,7 +105,7 @@
         maxParticles: geometry.text.length,
         dimensions: 2,
         smoothingRadius: 1.0,
-        pressureMultiplier: 2.0,
+        pressureMultiplier: 55.0,
         nearPressureMultiplier: 15.0,
         densityTarget: 7.4,
         viscosity: 1.0,
@@ -110,7 +114,7 @@
         returnToOriginStrength: 0.0,
         mouseRadius: 0.1,
         mouseForce: 1630.0,
-        substeps: 3,
+        substeps: 5,
         worldBoundsPadding: 0.2,
       };
 
@@ -127,14 +131,149 @@
       );
 
       // ── Floating Body ─────────────────────────────────────
+      // Compound SDF matched to moominpapa boat image:
+      //  - capsule hull at bottom (wide, provides buoyancy + off-center torque)
+      //  - circle for moomin body (above hull, mostly above waterline)
+      const bodyW = 5.0;
+      const bodyH = 5.0;
       const body = sim.addBody({
         primitives: [
-          { type: 'circle', radius: 3.0, localX: 0, localY: 0 },
+          { type: 'capsule', radius: 1.0, halfLength: 2.8, localX: -0.3, localY: -1.2 },
+          { type: 'circle', radius: 1.2, localX: -1.0, localY: 1.2 },
         ],
-        position: new Vector3(20, 20, 0),
-        mass: 8.0,
-        restitution: 0.3,
+        position: new Vector3(50, 50, 0),
+        mass: 0.1,
+        restitution: 0.15,
+        reactionMultiplier: 10000.0,
+        maxPushDist: 0.5,
+        forceClampFactor: 1.5,
+        rightingStrength: 34.0,
+        linearDamping: 0.999,
+        angularDamping: 0.999,
+        density: 0.5,
+        mouseScale: 0.1,
       });
+
+      // ── Shore (static collider) ───────────────────────────
+      const shoreSize = 30.0;
+      const shoreHalf = shoreSize * 0.5;
+      // Align plane's bottom-right corner to bounds' bottom-right
+      const shoreX = sim.worldBoundsMax[0] - shoreHalf;
+      const shoreY = sim.worldBoundsMin[1] + shoreHalf;
+      const shore = sim.addBody({
+        primitives: [
+          // Solid right strip
+          { type: 'box', halfW: 5, halfH: 15, localX: 10, localY: 0 },
+          // Upper-right mass (coastline curves from x≈2 at top)
+          { type: 'circle', radius: 10, localX: 7, localY: 3 },
+          // Top coast tip
+          { type: 'circle', radius: 3, localX: 3, localY: 13 },
+          // Lower mass extending left (coast reaches x≈-8 at bottom)
+          { type: 'circle', radius: 12, localX: 4, localY: -7 },
+          // Bottom-left extension
+          { type: 'circle', radius: 6, localX: -5, localY: -12 },
+        ],
+        position: new Vector3(shoreX, shoreY, 0),
+        mass: 0, // static — won't move
+        restitution: 0.3,
+        reactionMultiplier: 5000.0,
+        maxPushDist: 0.5,
+      });
+
+      // Body visual — instanced textured plane driven by bodyTransformsBuffer
+      const texLoader = new TextureLoader();
+      const bodyBitmap = await texLoader.load('assets/textures/moominpapa.png');
+      const bodyTexture = new Texture(bodyBitmap, true);
+      const bodySampler = new Sampler('linear', 'linear');
+
+      const bodyShader = /* wgsl */`
+struct VertexOut {
+    @builtin(position) position : vec4<f32>,
+    @location(1) uv : vec2<f32>,
+};
+
+@group(0) @binding(0) var map : texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+
+@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+
+@vertex
+fn vertex_main(
+    @location(0) position: vec4<f32>,
+    @location(1) normal : vec3<f32>,
+    @location(2) uv : vec2<f32>,
+    @location(3) transform : vec4<f32>,
+) -> VertexOut
+{
+    var output : VertexOut;
+    let angle = transform.w;
+    let cosA = cos(angle);
+    let sinA = sin(angle);
+    let rotated = vec3<f32>(
+        position.x * cosA - position.y * sinA,
+        position.x * sinA + position.y * cosA,
+        position.z
+    );
+    let worldPos = vec4<f32>(rotated + transform.xyz, 1.0);
+    output.position = projectionMatrix * viewMatrix * worldMatrix * worldPos;
+    output.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return output;
+}
+
+@fragment
+fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
+{
+    return textureSample(map, samp, fragData.uv);
+}
+`;
+
+      // Moominpapa visual (body 0 only — 1 instance)
+      const basePlane = new PlaneGeometry(bodyW * 2, bodyH * 2);
+      const bodyGeometry = new InstancedGeometry(basePlane, 1, [sim.bodyTransformsBuffer]);
+      const bodyMaterial = new Material(bodyShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: bodyTexture },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: bodySampler },
+        ],
+        transparent: true,
+      });
+      const bodyMesh = new Renderable(bodyGeometry, bodyMaterial);
+      bodyMesh.position.x = mesh.position.x;
+      bodyMesh.position.y = mesh.position.y;
+      bodyMesh.position.z = mesh.position.z;
+      scene.add(bodyMesh);
+
+      // Shore visual (static — separate transform buffer)
+      const shoreBitmap = await texLoader.load('assets/textures/shore.png');
+      const shoreTexture = new Texture(shoreBitmap, true);
+      const shoreTransformF32 = new Float32Array([shoreX, shoreY, 0, 0]);
+      const shoreTransformBuffer = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_STORAGE,
+        usage: BufferBase.BUFFER_USAGE_VERTEX,
+        buffer: shoreTransformF32,
+        shaderLocation: 3,
+        offset: 0,
+        stride: 4 * 4,
+        format: 'float32x4',
+      });
+      const shorePlane = new PlaneGeometry(shoreSize, shoreSize);
+      const shoreGeometry = new InstancedGeometry(shorePlane, 1, [shoreTransformBuffer]);
+      const shoreMaterial = new Material(bodyShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: shoreTexture },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: bodySampler },
+        ],
+        transparent: true,
+      });
+      const shoreMesh = new Renderable(shoreGeometry, shoreMaterial);
+      shoreMesh.position.x = mesh.position.x;
+      shoreMesh.position.y = mesh.position.y;
+      shoreMesh.position.z = mesh.position.z;
+      scene.add(shoreMesh);
 
       // ── Tweakpane ─────────────────────────────────────────
       const pane = new Pane({ title: 'Fluid Simulation' });
@@ -187,16 +326,30 @@
       boundsFolder.addBinding(boundsMax, 'y', { min: 0, max: 200, step: 1, label: 'max Y' }).on('change', () => { sim.worldBoundsMax[1] = boundsMax.y; });
 
       // Body folder
-      const bodyFolder = pane.addFolder({ title: 'Floating Body', expanded: false });
-      const bodyParams = { mass: 8.0, restitution: 0.3 };
-      bodyFolder.addBinding(bodyParams, 'mass', { min: 0.5, max: 50, step: 0.5 }).on('change', () => {
-        body.mass = bodyParams.mass;
-        sim.syncBodyParams();
-      });
-      bodyFolder.addBinding(bodyParams, 'restitution', { min: 0.0, max: 1.0, step: 0.05 }).on('change', () => {
-        body.restitution = bodyParams.restitution;
-        sim.syncBodyParams();
-      });
+      const bodyFolder = pane.addFolder({ title: 'Floating Body' });
+      const bodyParams = {
+        mass: body.mass,
+        restitution: body.restitution,
+        reactionMultiplier: body.reactionMultiplier,
+        maxPushDist: body.maxPushDist,
+        forceClampFactor: body.forceClampFactor,
+        rightingStrength: body.rightingStrength,
+        linearDamping: body.linearDamping,
+        angularDamping: body.angularDamping,
+        density: body.density,
+        mouseScale: body.mouseScale,
+      };
+      const syncBody = () => { Object.assign(body, bodyParams); sim.syncBodyConfig(); };
+      bodyFolder.addBinding(bodyParams, 'mass', { min: 0.1, max: 20, step: 0.1 }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'restitution', { min: 0.0, max: 1.0, step: 0.05 }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'reactionMultiplier', { min: 100, max: 10000, step: 100, label: 'reaction' }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'maxPushDist', { min: 0.05, max: 2.0, step: 0.05, label: 'max push' }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'forceClampFactor', { min: 1.0, max: 10.0, step: 0.5, label: 'force clamp' }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'rightingStrength', { min: 0.0, max: 50.0, step: 1.0, label: 'righting' }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'linearDamping', { min: 0.9, max: 1.0, step: 0.001, label: 'lin. damping' }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'angularDamping', { min: 0.9, max: 1.0, step: 0.001, label: 'ang. damping' }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'density', { min: 0.01, max: 3.0, step: 0.01 }).on('change', syncBody);
+      bodyFolder.addBinding(bodyParams, 'mouseScale', { min: 0.0, max: 1.0, step: 0.01, label: 'mouse scale' }).on('change', syncBody);
 
       // Appearance folder
       const appearanceFolder = pane.addFolder({ title: 'Appearance' });

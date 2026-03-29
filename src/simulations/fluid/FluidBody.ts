@@ -18,6 +18,14 @@ export interface FluidBodyOptions {
     angularVelocity?: number;
     mass?: number;
     restitution?: number;
+    reactionMultiplier?: number;
+    maxPushDist?: number;
+    forceClampFactor?: number;
+    rightingStrength?: number;
+    linearDamping?: number;
+    angularDamping?: number;
+    density?: number;
+    mouseScale?: number;
 }
 
 const PRIMITIVE_TYPE_MAP: Record<string, number> = {
@@ -33,6 +41,14 @@ class FluidBody {
     public angularVelocity: number;
     public mass: number;
     public restitution: number;
+    public reactionMultiplier: number;
+    public maxPushDist: number;
+    public forceClampFactor: number;
+    public rightingStrength: number;
+    public linearDamping: number;
+    public angularDamping: number;
+    public density: number;
+    public mouseScale: number;
     public primitives: FluidBodyPrimitive[];
 
     readonly index: number;
@@ -46,6 +62,14 @@ class FluidBody {
         this.angularVelocity = options.angularVelocity ?? 0;
         this.mass = options.mass ?? 1.0;
         this.restitution = options.restitution ?? 0.3;
+        this.reactionMultiplier = options.reactionMultiplier ?? 2000.0;
+        this.maxPushDist = options.maxPushDist ?? 0.5;
+        this.forceClampFactor = options.forceClampFactor ?? 3.0;
+        this.rightingStrength = options.rightingStrength ?? 10.0;
+        this.linearDamping = options.linearDamping ?? 0.999;
+        this.angularDamping = options.angularDamping ?? 0.98;
+        this.density = options.density ?? 0.5;
+        this.mouseScale = options.mouseScale ?? 0.1;
         this.primitives = options.primitives;
         this.index = index;
         this.primitiveStart = primitiveStart;
@@ -124,7 +148,16 @@ class FluidBody {
         f32[offset + 12] = this.restitution;
         u32[offset + 13] = this.primitiveStart;
         u32[offset + 14] = this.primitiveCount;
-        f32[offset + 15] = 0;
+        f32[offset + 15] = this.reactionMultiplier;
+        f32[offset + 16] = this.maxPushDist;
+        f32[offset + 17] = this.forceClampFactor;
+        f32[offset + 18] = this.rightingStrength;
+        f32[offset + 19] = this.linearDamping;
+        f32[offset + 20] = this.angularDamping;
+        f32[offset + 21] = this.density;
+        f32[offset + 22] = this.mouseScale;
+        f32[offset + 22] = 0;
+        f32[offset + 23] = 0;
     }
 }
 

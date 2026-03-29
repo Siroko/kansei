@@ -12,7 +12,15 @@ struct BodyState {
     restitution: f32,
     primStart: u32,
     primCount: u32,
-    _pad2: f32,
+    reactionMultiplier: f32,
+    maxPushDist: f32,
+    forceClampFactor: f32,
+    rightingStrength: f32,
+    linearDamping: f32,
+    angularDamping: f32,
+    density: f32,
+    mouseScale: f32,
+    _pad4: f32,
 };
 
 struct BodyPrimitive {
@@ -91,7 +99,7 @@ fn cross2D(a: vec2<f32>, b: vec2<f32>) -> f32 {
 
 fn atomicAddF32(addr: ptr<storage, atomic<u32>, read_write>, value: f32) {
     var old = atomicLoad(addr);
-    loop {
+    for (var i = 0u; i < 128u; i++) {
         let newVal = bitcast<f32>(old) + value;
         let result = atomicCompareExchangeWeak(addr, old, bitcast<u32>(newVal));
         if (result.exchanged) { break; }

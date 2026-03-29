@@ -28,23 +28,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (sdfVal < 0.0) {
             let gradient = sdfGradient(particlePos, body, &bodyPrimitives);
-            let pushDist = -sdfVal;
+
+            let pushDist = min(-sdfVal, body.maxPushDist);
 
             // Push particle out
             let newPos = particlePos + gradient * pushDist;
             pos.x = newPos.x;
             pos.y = newPos.y;
 
-            // Reflect velocity
-            let velXY = vel.xy;
-            let dotVN = dot(velXY, gradient);
-            let reflected = velXY - 2.0 * dotVN * gradient;
-            vel.x = reflected.x * body.restitution;
-            vel.y = reflected.y * body.restitution;
+            // Body velocity at contact point (linear + angular)
+            let r = newPos - body.pos.xy;
+            let bodyVelAt = body.vel.xy + body.angVel * vec2<f32>(-r.y, r.x);
+
+            // Relative velocity collision — particle picks up body's motion
+            let relVel = vel.xy - bodyVelAt;
+            let dotVN = dot(relVel, gradient);
+            if (dotVN < 0.0) {
+                // Only reflect if approaching the surface
+                let impulse = -(1.0 + body.restitution) * dotVN;
+                vel.x += impulse * gradient.x;
+                vel.y += impulse * gradient.y;
+            }
 
             // Accumulate reaction force on body (Newton's 3rd law)
-            let reactionForce = -gradient * pushDist * 50.0;
-            let r = newPos - body.pos.xy;
+            let reactionForce = -gradient * pushDist * body.reactionMultiplier;
             let torque = cross2D(r, reactionForce);
 
             atomicAddF32(&bodyForces[b * 4u + 0u], reactionForce.x);
