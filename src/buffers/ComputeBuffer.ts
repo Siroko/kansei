@@ -18,7 +18,7 @@ interface IComputeBufferOptions {
     /** GPU buffer usage flags */
     usage: GPUFlagsConstant;
     /** Initial buffer data */
-    buffer?: Float32Array;
+    buffer?: Float32Array | Uint32Array | Int32Array;
     /** Binding location in shader */
     shaderLocation?: number;
     /** Byte offset within buffer */

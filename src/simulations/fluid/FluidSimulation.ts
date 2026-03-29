@@ -25,13 +25,12 @@ import { shaderCode as integrateShader } from './shaders/integrate.wgsl';
 import { shaderCode as bodyCollisionShader } from './shaders/body-collision.wgsl';
 import { shaderCode as bodyIntegrateShader } from './shaders/body-integrate.wgsl';
 import { FluidBody, FluidBodyOptions } from './FluidBody';
-import { Float } from '../../math/Float';
 
 const MAX_GRID_CELLS = 262144; // 256K
 const PREFIX_SUM_BLOCK_SIZE = 512;
 const MAX_BODIES = 64;
 const MAX_PRIMITIVES = 256;
-const BODY_STATE_FLOATS = 16;
+const BODY_STATE_FLOATS = 24;
 const PRIMITIVE_FLOATS = 6;
 
 class FluidSimulation {
@@ -86,8 +85,10 @@ class FluidSimulation {
     private bodyPrimitivesF32!: Float32Array;
     private bodyPrimitivesU32!: Uint32Array;
     private bodyPrimitivesBuffer!: ComputeBuffer;
+    private bodyTransformsF32!: Float32Array;
     public bodyTransformsBuffer!: ComputeBuffer;
-    private bodyCountFloat!: Float;
+    private bodyCountU32!: Uint32Array;
+    private bodyCountBuffer!: ComputeBuffer;
     private totalPrimitives: number = 0;
 
     private bodyCollisionPass!: Compute;
@@ -280,17 +281,23 @@ class FluidSimulation {
             buffer: this.bodyPrimitivesF32,
         });
 
+        this.bodyTransformsF32 = new Float32Array(MAX_BODIES * 4);
         this.bodyTransformsBuffer = new ComputeBuffer({
             type: BufferBase.BUFFER_TYPE_STORAGE,
             usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC,
-            buffer: new Float32Array(MAX_BODIES * 4),
+            buffer: this.bodyTransformsF32,
             shaderLocation: 3,
             offset: 0,
             stride: 4 * 4,
             format: 'float32x4' as GPUVertexFormat,
         });
 
-        this.bodyCountFloat = new Float(0);
+        this.bodyCountU32 = new Uint32Array([0]);
+        this.bodyCountBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_UNIFORM,
+            usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+            buffer: this.bodyCountU32,
+        });
     }
 
     private createComputePasses(): void {
@@ -373,7 +380,7 @@ class FluidSimulation {
             { binding: 3, visibility: C, value: this.bodyPrimitivesBuffer },
             { binding: 4, visibility: C, value: this.bodyForcesBuffer },
             { binding: 5, visibility: C, value: this.paramsBuffer },
-            { binding: 6, visibility: C, value: this.bodyCountFloat },
+            { binding: 6, visibility: C, value: this.bodyCountBuffer },
         ]);
 
         this.bodyIntegratePass = new Compute(bodyIntegrateShader, [
@@ -381,7 +388,11 @@ class FluidSimulation {
             { binding: 1, visibility: C, value: this.bodyForcesBuffer },
             { binding: 2, visibility: C, value: this.bodyTransformsBuffer },
             { binding: 3, visibility: C, value: this.paramsBuffer },
-            { binding: 4, visibility: C, value: this.bodyCountFloat },
+            { binding: 4, visibility: C, value: this.bodyCountBuffer },
+            { binding: 5, visibility: C, value: this.viewMatrix },
+            { binding: 6, visibility: C, value: this.projectionMatrix },
+            { binding: 7, visibility: C, value: this.inverseViewMatrix },
+            { binding: 8, visibility: C, value: this.worldMatrix },
         ]);
     }
 
@@ -474,8 +485,17 @@ class FluidSimulation {
         // Pack body state
         this.syncBodyState(body);
 
+        // Initialize transform for rendering
+        const tOff = body.index * 4;
+        this.bodyTransformsF32[tOff] = body.position.x;
+        this.bodyTransformsF32[tOff + 1] = body.position.y;
+        this.bodyTransformsF32[tOff + 2] = body.position.z;
+        this.bodyTransformsF32[tOff + 3] = body.angle;
+        this.bodyTransformsBuffer.needsUpdate = true;
+
         // Update count
-        this.bodyCountFloat.value = this.bodies.length;
+        this.bodyCountU32[0] = this.bodies.length;
+        this.bodyCountBuffer.needsUpdate = true;
 
         return body;
     }
@@ -493,7 +513,8 @@ class FluidSimulation {
         }
 
         this.bodies.splice(idx, 1);
-        this.bodyCountFloat.value = this.bodies.length;
+        this.bodyCountU32[0] = this.bodies.length;
+        this.bodyCountBuffer.needsUpdate = true;
         this.bodyStatesBuffer.needsUpdate = true;
     }
 
@@ -506,6 +527,38 @@ class FluidSimulation {
     public syncBodyParams(): void {
         for (const body of this.bodies) {
             this.syncBodyState(body);
+        }
+    }
+
+    /**
+     * Sync only configurable body parameters (mass, damping, etc.)
+     * without overwriting GPU-owned dynamic state (position, velocity, angle).
+     */
+    public syncBodyConfig(): void {
+        for (const body of this.bodies) {
+            const o = body.index * BODY_STATE_FLOATS;
+            this.bodyStatesF32[o + 10] = body.mass;
+            this.bodyStatesF32[o + 11] = body.computeInertia();
+            this.bodyStatesF32[o + 12] = body.restitution;
+            this.bodyStatesF32[o + 15] = body.reactionMultiplier;
+            this.bodyStatesF32[o + 16] = body.maxPushDist;
+            this.bodyStatesF32[o + 17] = body.forceClampFactor;
+            this.bodyStatesF32[o + 18] = body.rightingStrength;
+            this.bodyStatesF32[o + 19] = body.linearDamping;
+            this.bodyStatesF32[o + 20] = body.angularDamping;
+            this.bodyStatesF32[o + 21] = body.density;
+            this.bodyStatesF32[o + 22] = body.mouseScale;
+        }
+        // Partial write: only the config region (skip first 10 floats = 40 bytes of dynamic state per body)
+        const device = this.renderer.device;
+        const gpuBuffer = (this.bodyStatesBuffer as any)._resource as GPUBuffer;
+        if (device && gpuBuffer) {
+            for (const body of this.bodies) {
+                const byteOffset = (body.index * BODY_STATE_FLOATS + 10) * 4;
+                const byteLength = (BODY_STATE_FLOATS - 10) * 4;
+                device.queue.writeBuffer(gpuBuffer, byteOffset,
+                    this.bodyStatesF32.buffer, this.bodyStatesF32.byteOffset + byteOffset, byteLength);
+            }
         }
     }
 
