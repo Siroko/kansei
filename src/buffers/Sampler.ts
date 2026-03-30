@@ -27,7 +27,8 @@ class Sampler implements IBindable {
     constructor(
         private magFilter: GPUFilterMode,
         private minFilter: GPUFilterMode,
-        private repeatMode: GPUAddressMode = 'repeat'
+        private repeatMode: GPUAddressMode = 'repeat',
+        private maxAnisotropy: number = 1
     ) {
         this.uuid = crypto.randomUUID();
     }
@@ -54,9 +55,10 @@ class Sampler implements IBindable {
         const sampler = gpuDevice.createSampler({
             magFilter: this.magFilter,
             minFilter: this.minFilter,
-            mipmapFilter: this.magFilter,
+            mipmapFilter: this.minFilter,
             addressModeU: this.repeatMode,
             addressModeV: this.repeatMode,
+            maxAnisotropy: this.maxAnisotropy > 1 ? this.maxAnisotropy : undefined,
         });
 
         this.sampler = sampler;

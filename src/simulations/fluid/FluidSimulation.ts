@@ -284,7 +284,7 @@ class FluidSimulation {
         this.bodyTransformsF32 = new Float32Array(MAX_BODIES * 4);
         this.bodyTransformsBuffer = new ComputeBuffer({
             type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC,
+            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC | BufferBase.BUFFER_USAGE_COPY_DST,
             buffer: this.bodyTransformsF32,
             shaderLocation: 3,
             offset: 0,
@@ -528,6 +528,14 @@ class FluidSimulation {
         for (const body of this.bodies) {
             this.syncBodyState(body);
         }
+    }
+
+    public syncBodyPrimitives(body: FluidBody): void {
+        for (let i = 0; i < body.primitiveCount; i++) {
+            const offset = (body.primitiveStart + i) * PRIMITIVE_FLOATS;
+            FluidBody.packPrimitive(body.primitives[i], this.bodyPrimitivesF32, this.bodyPrimitivesU32, offset);
+        }
+        this.bodyPrimitivesBuffer.needsUpdate = true;
     }
 
     /**

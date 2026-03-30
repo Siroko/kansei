@@ -19,6 +19,9 @@ class Renderable extends Object3D {
     /** Whether this object receives shadows (shader must use #include <shadows>). */
     public receiveShadow: boolean = true;
 
+    /** Controls draw order within the same transparency group. Higher values draw later (on top). */
+    public renderOrder: number = 0;
+
     /** Custom WGSL snippet for shadow vertex transform.
      *  Must declare: fn shadowWorldPos(position: vec4f, instanceIdx: u32) -> vec4f
      *  returning the world-space position.  May include @group(2) bindings. */
