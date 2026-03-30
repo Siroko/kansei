@@ -44,7 +44,6 @@
       import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
       import { Vector3 } from '../src/math/Vector3'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
-      import { PRESETS } from '../src/simulations/fluid/FluidSimulationParams'
       import { TextureLoader } from '../src/loaders/TextureLoader'
       import { Texture } from '../src/buffers/Texture'
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
@@ -77,11 +76,15 @@
       for(let i = 0; i < 20; i++) {
         p += poem;
       }
-      let charSize = 25;
+      const charSize = 25;
+      const originalTextW = 100;
+      const pad = 0.2;
+      const viewportW = originalTextW * (1 + 2 * pad); // 140 — the viewport width to preserve
+      const textWidth = viewportW * 0.95; // 133 — text fills 95% of viewport
       const geometry = new TextGeometry({
         text: p,
         fontInfo: fontInfo,
-        width: 100,
+        width: textWidth,
         height: 100,
         fontSize: charSize,
         color: new Vector4(1, 1, 1, 1),
@@ -99,7 +102,7 @@
 
       // ── Fluid Simulation ──────────────────────────────────
       const simSettings = {
-        maxParticles: geometry.text.length,
+        maxParticles: (console.log('Particle count:', geometry.text.length), geometry.text.length),
         dimensions: 2,
         smoothingRadius: 1.0,
         pressureMultiplier: 76.5,
@@ -127,21 +130,28 @@
         }
       );
 
-      // ── Camera framing: bounds fill 90% viewport width, centered ──
+      // Override horizontal bounds to preserve original viewport width (140 units)
+      const textCenterX = textWidth / 2;
+      sim.worldBoundsMin[0] = textCenterX - viewportW / 2;
+      sim.worldBoundsMax[0] = textCenterX + viewportW / 2;
+
+      // ── Camera framing ──
       function frameCamera() {
         const bMinX = sim.worldBoundsMin[0], bMaxX = sim.worldBoundsMax[0];
-        const bMinY = sim.worldBoundsMin[1], bMaxY = sim.worldBoundsMax[1];
+        const bMinY = sim.worldBoundsMin[1];
         const bw = bMaxX - bMinX;
-        const bh = bMaxY - bMinY;
         const aspect = window.innerWidth / window.innerHeight;
         const halfFov = (camera.fov * Math.PI / 180) / 2;
         // Camera distance: bounds fill 100% viewport width
         const camDist = bw / (2 * Math.tan(halfFov) * aspect);
-
         const visH = 2 * camDist * Math.tan(halfFov);
-        // Center horizontally, align bounds bottom to viewport bottom
+        // Center horizontally, position text at 30% of viewport height
         mesh.position.x = -(bMinX + bMaxX) / 2;
-        mesh.position.y = -bMinY - visH / 2;
+        const textCenterY = (sim.worldBoundsMin[1] + sim.worldBoundsMax[1]) / 2;
+        // Align text bottom with bounds bottom (viewport bottom)
+        mesh.position.y = -sim.worldBoundsMin[1] - visH / 2 - visH * 0.3;
+        // Override bounds bottom to align with viewport bottom
+        sim.worldBoundsMin[1] = -mesh.position.y - visH / 2;
 
         scene.position.set(0, 0, 0);
         camera.position.set(0, 0, camDist);
@@ -444,34 +454,29 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
           viscosity: 1.0,
           damping: 0.97,
           returnToOriginStrength: 0.1,
-          gravity: [0, -19.6, 0],
+          gravity: [0, 0, 0],
         },
       };
       const presetObj = { preset: 'default' };
       const presetOptions = { default: 'default', textForm: 'textForm', custom: 'custom' };
-      for (const key of Object.keys(PRESETS)) {
-        presetOptions[key] = key;
-      }
+      let presetTween = null;
+      const tweenKeys = ['pressureMultiplier', 'nearPressureMultiplier', 'densityTarget',
+        'viscosity', 'damping', 'returnToOriginStrength'];
+
       pane.addBinding(presetObj, 'preset', {
         label: 'Preset',
         options: presetOptions,
       }).on('change', (ev) => {
         if (ev.value === 'custom') return;
-        if (localPresets[ev.value]) {
-          Object.assign(sim.params, localPresets[ev.value]);
-        } else {
-          sim.setPreset(ev.value);
-        }
-        Object.assign(simSettings, sim.params);
-        pane.refresh();
+        const target = localPresets[ev.value];
+        if (!target) return;
+        // Snapshot current values
+        const from = {};
+        for (const k of tweenKeys) from[k] = sim.params[k];
+        from.gravity = [...sim.params.gravity];
+        presetTween = { from, to: target, start: performance.now() / 1000, duration: 1.5 };
       });
 
-      // Text folder
-      const textParams = { charSize };
-      const textFolder = pane.addFolder({ title: 'Text', expanded: false });
-      textFolder.addBinding(textParams, 'charSize', { min: 5, max: 80, step: 1, label: 'char size' }).on('change', () => {
-        geometry.fontSize = textParams.charSize;
-      });
 
       // Simulation folder
       const simFolder = pane.addFolder({ title: 'Simulation', expanded: false });
@@ -577,6 +582,33 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
 
         const dt = Math.min(time.y, 1 / 30); // Cap dt
         mouseVectors.update(dt);
+
+        // Tween preset values
+        if (presetTween) {
+          const t = Math.min((time.x - presetTween.start) / presetTween.duration, 1);
+          const e = t * t * (3 - 2 * t); // smoothstep
+          for (const k of tweenKeys) {
+            if (presetTween.to[k] !== undefined) {
+              sim.params[k] = presetTween.from[k] + (presetTween.to[k] - presetTween.from[k]) * e;
+            }
+          }
+          if (presetTween.to.gravity) {
+            sim.params.gravity = sim.params.gravity.map((_, i) =>
+              presetTween.from.gravity[i] + (presetTween.to.gravity[i] - presetTween.from.gravity[i]) * e
+            );
+          }
+          if (t >= 1) {
+            presetTween = null;
+            Object.assign(simSettings, sim.params);
+            // Reset body after tween completes
+            body.position.set(50, 50, 0);
+            body.velocity.set(0, 0, 0);
+            body.angle = 0;
+            body.angularVelocity = 0;
+            sim.syncBodyParams();
+            pane.refresh();
+          }
+        }
 
         await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
 
