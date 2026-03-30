@@ -105,15 +105,15 @@
         maxParticles: geometry.text.length,
         dimensions: 2,
         smoothingRadius: 1.0,
-        pressureMultiplier: 55.0,
-        nearPressureMultiplier: 15.0,
-        densityTarget: 7.4,
+        pressureMultiplier: 76.5,
+        nearPressureMultiplier: 48.5,
+        densityTarget: 7.6,
         viscosity: 1.0,
-        damping: 0.999,
+        damping: 1.0,
         gravity: [0, -19.6, 0],
         returnToOriginStrength: 0.0,
         mouseRadius: 0.1,
-        mouseForce: 1630.0,
+        mouseForce: 2300.0,
         substeps: 5,
         worldBoundsPadding: 0.2,
       };
@@ -150,7 +150,7 @@
         rightingStrength: 34.0,
         linearDamping: 0.999,
         angularDamping: 0.999,
-        density: 0.5,
+        density: 0.40,
         mouseScale: 0.1,
       });
 
@@ -162,16 +162,12 @@
       const shoreY = sim.worldBoundsMin[1] + shoreHalf;
       const shore = sim.addBody({
         primitives: [
-          // Solid right strip
-          { type: 'box', halfW: 5, halfH: 15, localX: 10, localY: 0 },
-          // Upper-right mass (coastline curves from x≈2 at top)
-          { type: 'circle', radius: 10, localX: 7, localY: 3 },
-          // Top coast tip
-          { type: 'circle', radius: 3, localX: 3, localY: 13 },
-          // Lower mass extending left (coast reaches x≈-8 at bottom)
-          { type: 'circle', radius: 12, localX: 4, localY: -7 },
-          // Bottom-left extension
-          { type: 'circle', radius: 6, localX: -5, localY: -12 },
+          { type: 'capsule', radius: 2.8, halfLength: 4.4, localX: 13.0, localY: 11.7, localAngle: -2.94 },
+          { type: 'capsule', radius: 3.8, halfLength: 4.1, localX: 6.2, localY: 6.5, localAngle: -2.12 },
+          { type: 'capsule', radius: 1.4, halfLength: 4.6, localX: -8.2, localY: -12.0, localAngle: -1.64 },
+          { type: 'capsule', radius: 4.9, halfLength: 6.8, localX: 2.6, localY: -4.2, localAngle: 1.37 },
+          { type: 'circle', radius: 14.5, localX: -7.6, localY: -28.3 },
+          { type: 'circle', radius: 2.9, localX: -5.4, localY: -10.9 },
         ],
         position: new Vector3(shoreX, shoreY, 0),
         mass: 0, // static — won't move
@@ -253,7 +249,7 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
       const shoreTransformF32 = new Float32Array([shoreX, shoreY, 0, 0]);
       const shoreTransformBuffer = new ComputeBuffer({
         type: BufferBase.BUFFER_TYPE_STORAGE,
-        usage: BufferBase.BUFFER_USAGE_VERTEX,
+        usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
         buffer: shoreTransformF32,
         shaderLocation: 3,
         offset: 0,
@@ -262,10 +258,15 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
       });
       const shorePlane = new PlaneGeometry(shoreSize, shoreSize);
       const shoreGeometry = new InstancedGeometry(shorePlane, 1, [shoreTransformBuffer]);
-      const shoreMaterial = new Material(bodyShader, {
+      const shoreSampler = new Sampler('linear', 'linear', 'clamp-to-edge', 8);
+      const shoreShader = bodyShader.replace(
+        'return textureSample(map, samp, fragData.uv);',
+        'let c = textureSample(map, samp, fragData.uv); if (c.a < 0.5) { discard; } return c;'
+      );
+      const shoreMaterial = new Material(shoreShader, {
         bindings: [
           { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: shoreTexture },
-          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: bodySampler },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: shoreSampler },
         ],
         transparent: true,
       });
@@ -273,7 +274,135 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
       shoreMesh.position.x = mesh.position.x;
       shoreMesh.position.y = mesh.position.y;
       shoreMesh.position.z = mesh.position.z;
+      shoreMesh.renderOrder = 10;
       scene.add(shoreMesh);
+
+      // ── Debug SDF overlay (lazy — only created when toggled on) ──
+      const debugSdf = { enabled: false, mesh: null, primBuffer: null };
+
+      function buildDebugSdfPrimBuffer() {
+        const prims = shore.primitives;
+        const PRIM_FLOATS = 6;
+        const f32 = new Float32Array(prims.length * PRIM_FLOATS);
+        const u32 = new Uint32Array(f32.buffer);
+        const typeMap = { circle: 0, box: 1, capsule: 2, ellipse: 3 };
+        for (let i = 0; i < prims.length; i++) {
+          const p = prims[i], o = i * PRIM_FLOATS;
+          u32[o] = typeMap[p.type] ?? 0;
+          if (p.type === 'circle')       { f32[o+1] = p.radius ?? 1; f32[o+2] = 0; }
+          else if (p.type === 'box')     { f32[o+1] = p.halfW ?? 1; f32[o+2] = p.halfH ?? 1; }
+          else if (p.type === 'capsule') { f32[o+1] = p.radius ?? 1; f32[o+2] = p.halfLength ?? 1; }
+          else if (p.type === 'ellipse') { f32[o+1] = p.radiusX ?? 1; f32[o+2] = p.radiusY ?? 1; }
+          f32[o+3] = p.localX ?? 0;
+          f32[o+4] = p.localY ?? 0;
+          f32[o+5] = p.localAngle ?? 0;
+        }
+        return f32;
+      }
+
+      function createDebugSdfMesh() {
+        const primF32 = buildDebugSdfPrimBuffer();
+        debugSdf.primBuffer = new ComputeBuffer({
+          type: BufferBase.BUFFER_TYPE_STORAGE,
+          usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+          buffer: primF32,
+        });
+        const debugShader = /* wgsl */`
+struct VertexOut {
+  @builtin(position) position : vec4<f32>,
+  @location(1) uv : vec2<f32>,
+};
+
+struct Prim { primType: u32, param1: f32, param2: f32, localX: f32, localY: f32, localAngle: f32, };
+
+@group(0) @binding(0) var<storage, read_write> prims: array<Prim>;
+
+@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+
+@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+
+@vertex
+fn vertex_main(
+  @location(0) position: vec4<f32>,
+  @location(1) normal : vec3<f32>,
+  @location(2) uv : vec2<f32>,
+  @location(3) transform : vec4<f32>,
+) -> VertexOut {
+  var output : VertexOut;
+  let worldPos = vec4<f32>(position.xyz + transform.xyz, 1.0);
+  output.position = projectionMatrix * viewMatrix * worldMatrix * worldPos;
+  output.uv = uv;
+  return output;
+}
+
+fn sdfCircle(p: vec2<f32>, r: f32) -> f32 { return length(p) - r; }
+
+fn sdfBox(p: vec2<f32>, h: vec2<f32>) -> f32 {
+  let d = abs(p) - h;
+  return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0);
+}
+
+fn sdfCapsule(p: vec2<f32>, r: f32, hl: f32) -> f32 {
+  let px = clamp(p.x, -hl, hl);
+  return length(p - vec2<f32>(px, 0.0)) - r;
+}
+
+@fragment
+fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
+  let halfSize = ${shoreHalf.toFixed(1)};
+  let local = vec2<f32>(
+    (fragData.uv.x - 0.5) * halfSize * 2.0,
+    (fragData.uv.y - 0.5) * halfSize * 2.0
+  );
+
+  let primCount = ${shore.primitives.length}u;
+  var minDist = 999999.0;
+  for (var i = 0u; i < primCount; i++) {
+    let prim = prims[i];
+    var p = local - vec2<f32>(prim.localX, prim.localY);
+    if (abs(prim.localAngle) > 0.0001) {
+      let cp = cos(-prim.localAngle);
+      let sp = sin(-prim.localAngle);
+      p = vec2<f32>(p.x*cp - p.y*sp, p.x*sp + p.y*cp);
+    }
+    var d: f32;
+    if (prim.primType == 0u) { d = sdfCircle(p, prim.param1); }
+    else if (prim.primType == 1u) { d = sdfBox(p, vec2<f32>(prim.param1, prim.param2)); }
+    else { d = sdfCapsule(p, prim.param1, prim.param2); }
+    minDist = min(minDist, d);
+  }
+
+  let border = smoothstep(0.0, 0.3, abs(minDist));
+  let inside = smoothstep(0.1, -0.1, minDist);
+  let borderColor = vec4<f32>(0.0, 1.0, 0.3, 1.0 - border);
+  let fillColor = vec4<f32>(0.0, 0.5, 1.0, inside * 0.15);
+  return max(borderColor, fillColor);
+}
+`;
+        const debugPlane = new PlaneGeometry(shoreSize, shoreSize);
+        const debugGeom = new InstancedGeometry(debugPlane, 1, [shoreTransformBuffer]);
+        const debugMat = new Material(debugShader, {
+          bindings: [
+            { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: debugSdf.primBuffer },
+          ],
+          transparent: true,
+        });
+        debugSdf.mesh = new Renderable(debugGeom, debugMat);
+        debugSdf.mesh.position.x = mesh.position.x;
+        debugSdf.mesh.position.y = mesh.position.y;
+        debugSdf.mesh.position.z = mesh.position.z;
+        debugSdf.mesh.renderOrder = 20;
+        scene.add(debugSdf.mesh);
+      }
+
+      function updateDebugSdfBuffer() {
+        if (!debugSdf.primBuffer) return;
+        const f32 = buildDebugSdfPrimBuffer();
+        debugSdf.primBuffer.buffer.set(f32);
+        debugSdf.primBuffer.needsUpdate = true;
+      }
 
       // ── Tweakpane ─────────────────────────────────────────
       const pane = new Pane({ title: 'Fluid Simulation' });
@@ -350,6 +479,36 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32>
       bodyFolder.addBinding(bodyParams, 'angularDamping', { min: 0.9, max: 1.0, step: 0.001, label: 'ang. damping' }).on('change', syncBody);
       bodyFolder.addBinding(bodyParams, 'density', { min: 0.01, max: 3.0, step: 0.01 }).on('change', syncBody);
       bodyFolder.addBinding(bodyParams, 'mouseScale', { min: 0.0, max: 1.0, step: 0.01, label: 'mouse scale' }).on('change', syncBody);
+
+      // Shore SDF folder
+      const sdfFolder = pane.addFolder({ title: 'Shore SDF', expanded: true });
+      const syncShoreSdf = () => {
+        sim.syncBodyPrimitives(shore);
+        if (debugSdf.enabled) updateDebugSdfBuffer();
+      };
+      sdfFolder.addBinding(debugSdf, 'enabled', { label: 'show SDF' }).on('change', (ev) => {
+        if (ev.value && !debugSdf.mesh) createDebugSdfMesh();
+        if (debugSdf.mesh) {
+          debugSdf.mesh.position.z = ev.value ? mesh.position.z + 0.01 : -99999;
+          if (ev.value) updateDebugSdfBuffer();
+        }
+      });
+      shore.primitives.forEach((prim) => { prim.localAngle = prim.localAngle ?? 0; });
+      shore.primitives.forEach((prim, i) => {
+        const f = sdfFolder.addFolder({ title: `${prim.type} ${i}`, expanded: false });
+        f.addBinding(prim, 'localX', { min: -50, max: 50, step: 0.1, label: 'x' }).on('change', syncShoreSdf);
+        f.addBinding(prim, 'localY', { min: -50, max: 50, step: 0.1, label: 'y' }).on('change', syncShoreSdf);
+        f.addBinding(prim, 'localAngle', { min: -3.14, max: 3.14, step: 0.01, label: 'angle' }).on('change', syncShoreSdf);
+        if (prim.type === 'circle') {
+          f.addBinding(prim, 'radius', { min: 0.5, max: 15, step: 0.1, label: 'r' }).on('change', syncShoreSdf);
+        } else if (prim.type === 'capsule') {
+          f.addBinding(prim, 'radius', { min: 0.5, max: 10, step: 0.1, label: 'r' }).on('change', syncShoreSdf);
+          f.addBinding(prim, 'halfLength', { min: 0.5, max: 15, step: 0.1, label: 'half len' }).on('change', syncShoreSdf);
+        } else if (prim.type === 'ellipse') {
+          f.addBinding(prim, 'radiusX', { min: 0.5, max: 15, step: 0.1, label: 'rx' }).on('change', syncShoreSdf);
+          f.addBinding(prim, 'radiusY', { min: 0.5, max: 15, step: 0.1, label: 'ry' }).on('change', syncShoreSdf);
+        }
+      });
 
       // Appearance folder
       const appearanceFolder = pane.addFolder({ title: 'Appearance' });

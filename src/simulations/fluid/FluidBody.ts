@@ -1,13 +1,16 @@
 import { Vector3 } from '../../math/Vector3';
 
 export interface FluidBodyPrimitive {
-    type: 'circle' | 'box' | 'capsule';
+    type: 'circle' | 'box' | 'capsule' | 'ellipse';
     radius?: number;
     halfW?: number;
     halfH?: number;
     halfLength?: number;
+    radiusX?: number;
+    radiusY?: number;
     localX?: number;
     localY?: number;
+    localAngle?: number;
 }
 
 export interface FluidBodyOptions {
@@ -32,6 +35,7 @@ const PRIMITIVE_TYPE_MAP: Record<string, number> = {
     circle: 0,
     box: 1,
     capsule: 2,
+    ellipse: 3,
 };
 
 class FluidBody {
@@ -105,6 +109,13 @@ class FluidBody {
                     inertia += area * (r * r * 0.5 + l * l / 12 + offsetSq);
                     break;
                 }
+                case 'ellipse': {
+                    const a = prim.radiusX ?? 1;
+                    const b = prim.radiusY ?? 1;
+                    area = Math.PI * a * b;
+                    inertia += area * ((a * a + b * b) / 4 + offsetSq);
+                    break;
+                }
             }
             totalArea += area;
         }
@@ -126,10 +137,14 @@ class FluidBody {
                 f32[offset + 1] = prim.radius ?? 0.5;
                 f32[offset + 2] = prim.halfLength ?? 1;
                 break;
+            case 'ellipse':
+                f32[offset + 1] = prim.radiusX ?? 1;
+                f32[offset + 2] = prim.radiusY ?? 1;
+                break;
         }
         f32[offset + 3] = prim.localX ?? 0;
         f32[offset + 4] = prim.localY ?? 0;
-        f32[offset + 5] = 0;
+        f32[offset + 5] = prim.localAngle ?? 0;
     }
 
     packState(f32: Float32Array, u32: Uint32Array, offset: number): void {
