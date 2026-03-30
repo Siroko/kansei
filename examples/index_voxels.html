@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voxel Tracer – Cornell Box</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
+    import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { AreaLight } from '../src/lights/AreaLight'
+    import { ShadowMap } from '../src/shadows/ShadowMap'
+    import { Float } from '../src/math/Float'
+    import { GLTFLoader } from '../src/loaders/GLTFLoader'
+    import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+    // ── Cornell box dimensions ────────────────────────────────────────────
+    const WALL = 10;
+    const HALF = WALL / 2;
+    const THICK = 0.1;
+
+    // ── Lights ──────────────────────────────────────────────────────────
+    const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 0.0);
+    const lightDirUniform = new Vector3(0, -1, 0.0);
+
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
+    areaLight.position.set(0, WALL - 0.2, 0);
+    areaLight.target.set(0, 0, 0);
+
+    // ── Shader blocks ─────────────────────────────────────────────────────
+    const vertexBlock = /* wgsl */`
+      const AMBIENT   : f32   = 0.0;
+
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
+      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        let worldPos = worldMatrix * position;
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        return out;
+      }
+    `;
+
+    const colorShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
+      @group(0) @binding(1) var<uniform> albedo : vec3f;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let L        = -normalize(lightDirection);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
+        return FragmentOutput(
+          vec4f(albedo * lighting, 1),
+          vec4f(0, 0, 0, 0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(albedo, 0.04)
+        );
+      }
+    `;
+
+    const floorShader = vertexBlock + /* wgsl */`
+      #include <shadows>
+
+      @group(0) @binding(1) var<uniform> albedo     : vec3f;
+      @group(0) @binding(2) var<uniform> roughness  : f32;
+      @group(0) @binding(3) var<uniform> metallic   : f32;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        return FragmentOutput(
+          vec4f(0, 0, 0, 1),
+          vec4f(0, 0, 0, 0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, roughness),
+          vec4f(albedo, metallic)
+        );
+      }
+    `;
+
+    // ── Renderer ──────────────────────────────────────────────────────────
+    const renderer = new Renderer({
+      width: 1280,
+      height: 720,
+      devicePixelRatio: 1,
+      antialias: false,
+      sampleCount: 1
+    });
+    await renderer.initialize();
+    renderer.setSize(1280, 720);
+    document.body.appendChild(renderer.canvas);
+    renderer.shadowsEnabled = true;
+
+    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
+    renderer.shadowMap = shadowMap;
+
+    // ── Scene ─────────────────────────────────────────────────────────────
+    const scene = new Scene();
+    const camera = new Camera(50, 0.1, 100, 1280 / 720);
+    scene.add(areaLight);
+
+    const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
+
+    // ── Material helpers ──────────────────────────────────────────────────
+    function makeMat(r, g, b) {
+      const albedo = new Vector3(r, g, b);
+      return new Material(colorShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedo },
+        ],
+      });
+    }
+
+    function makeFloorMat(r, g, b, rough = 1.0, metal = 0.0) {
+      const albedo = new Vector3(r, g, b);
+      return new Material(floorShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: lightDirUniform },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedo },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: new Float(rough) },
+          { binding: 3, visibility: GPUShaderStage.FRAGMENT, value: new Float(metal) },
+        ],
+      });
+    }
+
+    function makePTMat(r, g, b) {
+      const m = new PathTracerMaterial();
+      m.albedo = [r, g, b];
+      m.roughness = 1.0;
+      m.maxBounces = 1;
+      m.transmission = 0.0;
+      return m;
+    }
+
+    const whiteMat = makeMat(0.85, 0.85, 0.85);
+    const redMat = makeMat(0.85, 0.12, 0.08);
+    const greenMat = makeMat(0.12, 0.85, 0.15);
+    const floorMat = makeFloorMat(0.8, 0.8, 0.85, 0.3, 0.0);
+    const dragonMat = makeFloorMat(0.8, 0.8, 0.85, 0.0, 1.0);
+
+    // ── Geometry ──────────────────────────────────────────────────────────
+    const wallGeo = new BoxGeometry(WALL, WALL, THICK);
+    const sphereGeo = new SphereGeometry(1.5, 48, 48);
+
+    // ── Build Cornell box ─────────────────────────────────────────────────
+
+    // Floor
+    const floor = new Renderable(wallGeo, floorMat);
+    floor.position.set(0, 0, 0);
+    floor.rotation.x = -Math.PI / 2;
+    const floorPTMat = new PathTracerMaterial();
+    floorPTMat.albedo = [0.8, 0.8, 0.85];
+    floorPTMat.roughness = 0.3;
+    floorPTMat.metallic = 0.0;
+    floorPTMat.maxBounces = 2;
+    floor.pathTracerMaterial = floorPTMat;
+    scene.add(floor);
+
+    // Ceiling
+    const ceiling = new Renderable(wallGeo, whiteMat);
+    ceiling.position.set(0, WALL, 0);
+    ceiling.rotation.x = Math.PI / 2;
+    ceiling.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    scene.add(ceiling);
+
+    // Back wall
+    const backWall = new Renderable(wallGeo, whiteMat);
+    backWall.position.set(0, HALF, -HALF);
+    backWall.pathTracerMaterial = makePTMat(0.85, 0.85, 0.85);
+    scene.add(backWall);
+
+    // Left wall (RED)
+    const leftWall = new Renderable(wallGeo, redMat);
+    leftWall.position.set(-HALF, HALF, 0);
+    leftWall.rotation.y = Math.PI / 2;
+    leftWall.pathTracerMaterial = makePTMat(0.85, 0.12, 0.08);
+    scene.add(leftWall);
+
+    // Right wall (GREEN)
+    const rightWall = new Renderable(wallGeo, greenMat);
+    rightWall.position.set(HALF, HALF, 0);
+    rightWall.rotation.y = -Math.PI / 2;
+    rightWall.pathTracerMaterial = makePTMat(0.12, 0.85, 0.15);
+    scene.add(rightWall);
+
+    // ── Emissive ceiling light panel ──────────────────────────────────────
+    const lightPanelGeo = new BoxGeometry(3, 0.1, 3);
+    const lightPanelMat = makeMat(1.0, 1.0, 1.0);
+    const lightPanel = new Renderable(lightPanelGeo, lightPanelMat);
+    lightPanel.position.set(0, WALL - 0.06, 0);
+    const lightPTMat = new PathTracerMaterial();
+    lightPTMat.albedo = [1, 1, 1];
+    lightPTMat.emissive = [1.0, 0.95, 0.8];
+    lightPTMat.emissiveIntensity = 50.0;
+    lightPanel.pathTracerMaterial = lightPTMat;
+    scene.add(lightPanel);
+
+    // ── Sphere ──────────────────────────────────────────────────────────
+    const sphere = new Renderable(sphereGeo, makeFloorMat(0.9, 0.1, 0.1, 0.2, 0.0));
+    sphere.position.set(-2.5, 1.5, 1);
+    const spherePTMat = new PathTracerMaterial();
+    spherePTMat.albedo = [0.9, 0.1, 0.1];
+    spherePTMat.roughness = 0.2;
+    spherePTMat.metallic = 0.0;
+    spherePTMat.maxBounces = 2;
+    sphere.pathTracerMaterial = spherePTMat;
+    scene.add(sphere);
+
+    // ── Cube ──────────────────────────────────────────────────────────────
+    const cubeGeo = new BoxGeometry(2, 2, 2);
+    const cubeMat = makeFloorMat(0.9, 0.9, 0.9, 0.0, 1.0);
+    const cube = new Renderable(cubeGeo, cubeMat);
+    cube.position.set(2.5, 1.5, 0);
+    const cubePTMat = new PathTracerMaterial();
+    cubePTMat.albedo = [0.9, 0.9, 0.9];
+    cubePTMat.metallic = 1.0;
+    cubePTMat.roughness = 0.0;
+    cubePTMat.maxBounces = 4;
+    cube.pathTracerMaterial = cubePTMat;
+    scene.add(cube);
+
+    // ── GLTF Dragon ──────────────────────────────────────────────────────
+    const gltfLoader = new GLTFLoader();
+    const gltf = await gltfLoader.load('./assets/geom/scene.gltf', dragonMat);
+    gltf.scene.scale.set(30, 30, 30);
+    gltf.scene.position.set(0, -1.5, -3);
+    gltf.scene.traverse(gltf.scene, (obj) => {
+      if (obj.isRenderable) {
+        const dragonPathMat = new PathTracerMaterial();
+        dragonPathMat.albedo = [1, 1, 1];
+        dragonPathMat.roughness = 0.0;
+        dragonPathMat.metallic = 1.0;
+        dragonPathMat.maxBounces = 4;
+        obj.pathTracerMaterial = dragonPathMat;
+      }
+    });
+    scene.add(gltf.scene);
+
+    // ── Path tracer effect ────────────────────────────────────────────────
+    const pathTracerEffect = new PathTracerEffect({
+      scene,
+      temporalBlend: 1,
+      spatialPasses: 0,
+      spp: 1,
+      useBlueNoise: false,
+      traceScale: 0.5,
+      maxBounces: 3,
+      ambientColor: [0.15, 0.15, 0.15],
+      useProbes: true,
+      rasterDirect: true,
+      useReSTIR: false,
+      useVoxels: false,
+      voxelResolution: 128,
+    });
+
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+
+    // ── Mode management ──────────────────────────────────────────────────
+    const MODES = {
+      'Path Tracer': () => {
+        pathTracerEffect.useVoxels = false;
+        pathTracerEffect.showVoxels = false;
+        pathTracerEffect.useProbes = false;
+        pathTracerEffect.rasterDirect = false;
+        pathTracerEffect.temporalBlend = 0.1;
+        pathTracerEffect.spatialPasses = 3;
+        pathTracerEffect.maxBounces = 3;
+      },
+      'Voxel Tracer': () => {
+        pathTracerEffect.useVoxels = true;
+        pathTracerEffect.showVoxels = false;
+        pathTracerEffect.useProbes = false;
+        pathTracerEffect.rasterDirect = false;
+        pathTracerEffect.temporalBlend = 0.1;
+        pathTracerEffect.spatialPasses = 3;
+        pathTracerEffect.maxBounces = 3;
+      },
+      'Voxel View': () => {
+        pathTracerEffect.useVoxels = true;
+        pathTracerEffect.showVoxels = true;
+        pathTracerEffect.useProbes = false;
+        pathTracerEffect.rasterDirect = false;
+        pathTracerEffect.temporalBlend = 0.1;
+        pathTracerEffect.spatialPasses = 3;
+        pathTracerEffect.maxBounces = 3;
+      },
+      'Raster + Probes': () => {
+        pathTracerEffect.useVoxels = false;
+        pathTracerEffect.showVoxels = false;
+        pathTracerEffect.useProbes = true;
+        pathTracerEffect.rasterDirect = true;
+        pathTracerEffect.temporalBlend = 1;
+        pathTracerEffect.spatialPasses = 0;
+        pathTracerEffect.maxBounces = 3;
+      },
+    };
+
+    const modeParams = { mode: 'Raster + Probes' };
+    // Apply initial mode
+    MODES[modeParams.mode]();
+
+    // ── Tweakpane ─────────────────────────────────────────────────────────
+    const pane = new Pane({ title: 'Voxel Tracer Demo' });
+
+    // Mode selector
+    const modeFolder = pane.addFolder({ title: 'Render Mode' });
+    modeFolder.addBinding(modeParams, 'mode', {
+      options: {
+        'Path Tracer': 'Path Tracer',
+        'Voxel Tracer': 'Voxel Tracer',
+        'Voxel View': 'Voxel View',
+        'Raster + Probes': 'Raster + Probes',
+      },
+    }).on('change', (ev) => {
+      MODES[ev.value]();
+    });
+
+    // Voxel settings
+    const voxelFolder = pane.addFolder({ title: 'Voxel Settings' });
+    voxelFolder.addBinding(pathTracerEffect, 'voxelResolution', {
+      min: 32, max: 256, step: 16, label: 'resolution',
+    });
+
+    // Volumetric fog
+    const fogFolder = pane.addFolder({ title: 'Volumetric Fog' });
+    fogFolder.addBinding(pathTracerEffect, 'fogDensity', { min: 0, max: 0.15, step: 0.001, label: 'density' });
+    fogFolder.addBinding(pathTracerEffect, 'fogAnisotropy', { min: -0.9, max: 0.9, step: 0.01, label: 'anisotropy' });
+    fogFolder.addBinding(pathTracerEffect, 'fogHeightFalloff', { min: 0, max: 1.0, step: 0.01, label: 'height falloff' });
+
+    // Path tracer settings
+    const ptFolder = pane.addFolder({ title: 'Path Tracer', expanded: false });
+    ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
+    ptFolder.addBinding(pathTracerEffect, 'spatialPasses', { min: 0, max: 9, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'spp', { min: 1, max: 16, step: 1 });
+    ptFolder.addBinding(pathTracerEffect, 'useBlueNoise');
+    ptFolder.addBinding(pathTracerEffect, 'traceScale', { min: 0.1, max: 1.0, step: 0.05 });
+    ptFolder.addBinding(pathTracerEffect, 'maxBounces', { min: 0, max: 8, step: 1, label: 'bounces' });
+    ptFolder.addBinding(pathTracerEffect, 'useSVGF', { label: 'SVGF' });
+
+    // Probe settings
+    const probeFolder = pane.addFolder({ title: 'Probes', expanded: false });
+    probeFolder.addBinding(pathTracerEffect, 'useProbes', { label: 'Enable' });
+    probeFolder.addBinding(pathTracerEffect, 'probeSpacing', { min: 0.5, max: 10.0, step: 0.5 });
+    probeFolder.addBinding(pathTracerEffect, 'probeRaysPerFrame', { min: 4, max: 128, step: 4, label: 'rays/frame' });
+    probeFolder.addBinding(pathTracerEffect, 'probeHysteresis', { min: 0, max: 0.99, step: 0.01 });
+    probeFolder.addBinding(pathTracerEffect, 'showProbes', { label: 'Show Probes' });
+    const probeInfo = { count: '' };
+    const probeMonitor = probeFolder.addBinding(probeInfo, 'count', { readonly: true, label: 'probe count' });
+    setInterval(() => { probeInfo.count = String(pathTracerEffect.probeCount); probeMonitor.refresh(); }, 500);
+
+    // Light settings
+    const alFolder = pane.addFolder({ title: 'Area Light', expanded: false });
+    const areaLightParams = { intensity: areaLight.intensity };
+    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 60, step: 0.1 }).on('change', () => {
+      areaLight.intensity = areaLightParams.intensity;
+    });
+
+    const giAmbientParams = { color: { r: 38, g: 38, b: 38 } };
+    alFolder.addBinding(giAmbientParams, 'color', { label: 'ambient' }).on('change', () => {
+      pathTracerEffect.ambientColor = [giAmbientParams.color.r / 255, giAmbientParams.color.g / 255, giAmbientParams.color.b / 255];
+    });
+
+    // Scene
+    const sceneParams = { animateCube: false };
+    const sceneFolder = pane.addFolder({ title: 'Scene', expanded: false });
+    sceneFolder.addBinding(sceneParams, 'animateCube', { label: 'Animate Cube' });
+
+    // ── Render loop ───────────────────────────────────────────────────────
+    function animate() {
+      cameraControls.update();
+      shadowMap.render(renderer, scene, camera, dirLight);
+      volume.render(scene, camera);
+      if (sceneParams.animateCube) {
+        const t = performance.now() * 0.001;
+        cube.position.x = Math.sin(t + Math.PI) * 3;
+        cube.position.y = Math.cos(t + Math.PI) * 2 + 3.5;
+        cube.rotation.x = t * 0.7;
+        cube.rotation.y = t * 1.1;
+        cube.rotation.z = t * 0.5;
+      }
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+
+</html>

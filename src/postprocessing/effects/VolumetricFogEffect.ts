@@ -1,16 +1,18 @@
 import { Camera } from '../../cameras/Camera';
 import { DirectionalLight } from '../../lights/DirectionalLight';
 import { PointLight } from '../../lights/PointLight';
+import { AreaLight } from '../../lights/AreaLight';
 import { FroxelGrid } from '../../froxels/FroxelGrid';
 import { ShadowMap } from '../../shadows/ShadowMap';
 import { CubeMapShadowMap } from '../../shadows/CubeMapShadowMap';
+import type { PositionalLight } from '../../shadows/CubeMapShadowMap';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
 import { mat4 } from 'gl-matrix';
 
 export interface VolumetricFogOptions {
     froxelGrid: FroxelGrid;
-    shadowMap: ShadowMap;
+    shadowMap?: ShadowMap;
     cubeMapShadowMap?: CubeMapShadowMap;
     baseDensity?: number;
     heightFalloff?: number;
@@ -26,13 +28,20 @@ const POINT_LIGHT_STRIDE = 32;  // vec3f+f32 + vec3f+u32
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
     private _froxelGrid: FroxelGrid;
-    private _shadowMap: ShadowMap;
+    private _shadowMap: ShadowMap | null;
     private _cubeMapShadowMap: CubeMapShadowMap | null;
 
     baseDensity: number;
     heightFalloff: number;
     extinctionCoeff: number;
     anisotropy: number;
+
+    /** Update the shadow map reference (triggers bind-group rebuild). */
+    set shadowMap(sm: ShadowMap | null) {
+        this._shadowMap = sm;
+        this._injectBGDirty = true;
+    }
+    get shadowMap(): ShadowMap | null { return this._shadowMap; }
     windDir: [number, number, number];
 
     // Injection pass
@@ -54,6 +63,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _pointShadowAtlasView: GPUTextureView | null = null;
     private _dummyPointShadowTex: GPUTexture | null = null;
 
+    // Dummy directional shadow depth (used when no ShadowMap is provided)
+    private _dummyDirShadowTex: GPUTexture | null = null;
+
     // Composite pass
     private _compositePipeline: GPUComputePipeline | null = null;
     private _compositeBG: GPUBindGroup | null = null;
@@ -69,7 +81,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
     constructor(options: VolumetricFogOptions) {
         super();
         this._froxelGrid     = options.froxelGrid;
-        this._shadowMap      = options.shadowMap;
+        this._shadowMap      = options.shadowMap ?? null;
         this._cubeMapShadowMap = options.cubeMapShadowMap ?? null;
         this.baseDensity     = options.baseDensity ?? 0.02;
         this.heightFalloff   = options.heightFalloff ?? 0.1;
@@ -100,6 +112,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
             anisotropy      : f32,
             numDirLights    : u32,
             numPointLights  : u32,
+            shadowViewProj  : mat4x4f,
+            hasShadowMap    : u32,
         }
 
         struct DirLightData {
@@ -247,7 +261,12 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 if (dist > pl.radius) { continue; }
 
                 let attenuation = smoothFalloff(dist, pl.radius);
-                let visibility = samplePointShadow(worldPos, pl.position, pl.radius, pl.atlasBase);
+                var visibility: f32;
+                if (params.hasShadowMap > 0u) {
+                    visibility = dirShadowLookup(worldPos, params.shadowViewProj);
+                } else {
+                    visibility = samplePointShadow(worldPos, pl.position, pl.radius, pl.atlasBase);
+                }
                 let phase = henyeyGreenstein(dot(viewDir, normalize(pl.position - worldPos)), params.anisotropy);
                 totalScatter += density * pl.color * attenuation * visibility * phase;
             }
@@ -319,7 +338,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
 
         this._fogParamsBuffer = device.createBuffer({
             label: 'VolumetricFog/FogParams',
-            size: 160,
+            size: 224,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -338,6 +357,14 @@ class VolumetricFogEffect extends PostProcessingEffect {
         // Initial light storage buffers (minimum 1 element each)
         this._ensureLightBuffers(1, 1);
 
+        // Dummy directional shadow depth texture (fallback when no ShadowMap active)
+        this._dummyDirShadowTex = device.createTexture({
+            label: 'VolumetricFog/DummyDirShadow',
+            size: [1, 1],
+            format: 'depth32float',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+
         // Point shadow atlas view
         if (this._cubeMapShadowMap) {
             this._pointShadowAtlasView = this._cubeMapShadowMap.distanceTexture.createView({
@@ -348,8 +375,16 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 label: 'VolumetricFog/DummyPointShadow',
                 size: [1, 1, 6],
                 format: 'r32float',
-                usage: GPUTextureUsage.TEXTURE_BINDING,
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
             });
+            // Fill with large distance so samplePointShadow returns 1.0 (no occlusion)
+            const maxDist = new Float32Array(6).fill(1e10);
+            device.queue.writeTexture(
+                { texture: this._dummyPointShadowTex },
+                maxDist,
+                { bytesPerRow: 4, rowsPerImage: 1 },
+                [1, 1, 6],
+            );
             this._pointShadowAtlasView = this._dummyPointShadowTex.createView({
                 dimension: '2d-array',
             });
@@ -444,7 +479,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
             layout: this._injectBGL,
             entries: [
                 { binding: 0, resource: this._froxelGrid.scatterExtinctionTex.createView() },
-                { binding: 1, resource: this._shadowMap.depthTexture.createView() },
+                { binding: 1, resource: (this._shadowMap?.depthTexture ?? this._dummyDirShadowTex!).createView() },
                 { binding: 2, resource: { buffer: this._fogParamsBuffer! } },
                 { binding: 3, resource: { buffer: this._dirLightsBuffer! } },
                 { binding: 4, resource: { buffer: this._pointLightsBuffer! } },
@@ -457,7 +492,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
     /**
      * Pack light data into storage buffers. Call each frame before render().
      */
-    updateLights(dirLights: readonly DirectionalLight[], pointLights: readonly PointLight[]): void {
+    updateLights(dirLights: readonly DirectionalLight[], pointLights: readonly PointLight[], areaLights: readonly AreaLight[] = []): void {
         if (!this._device) return;
 
         // Filter volumetric directional lights
@@ -466,8 +501,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
             if (dirLights[i].volumetric) volDirLights.push(dirLights[i]);
         }
         this._numDirLights = volDirLights.length;
-        // All point lights are packed (matching CubeMapShadowMap order); non-volumetric get zero color
-        this._numPointLights = pointLights.length;
+        // Merge point lights and area lights (area lights treated as positional for fog)
+        const allPositional: PositionalLight[] = [...pointLights, ...areaLights];
+        this._numPointLights = allPositional.length;
 
         this._ensureLightBuffers(this._numDirLights, this._numPointLights);
         if (this._injectBGDirty) this._rebuildInjectBG();
@@ -487,17 +523,21 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 data[off + 5] = ec[1];
                 data[off + 6] = ec[2];
                 // off+7 = pad
-                data.set(this._shadowMap.lightViewProjMatrix, off + 8);
+                if (this._shadowMap) {
+                    data.set(this._shadowMap.lightViewProjMatrix, off + 8);
+                }
+                // If no shadow map, lightViewProj stays zeroed — dirShadowLookup will
+                // project everything to origin and return 1.0 (outside UV bounds).
             }
             this._device.queue.writeBuffer(this._dirLightsBuffer!, 0, data.buffer as ArrayBuffer);
         }
 
-        // Pack PointLightData (32 bytes = 8 floats each)
+        // Pack PointLightData (32 bytes = 8 floats each) — includes area lights as positional
         if (this._numPointLights > 0) {
             const data = new Float32Array(this._numPointLights * 8);
             const uintView = new Uint32Array(data.buffer);
             for (let i = 0; i < this._numPointLights; i++) {
-                const light = pointLights[i];
+                const light = allPositional[i];
                 light.updateModelMatrix();
                 const wm = light.worldMatrix.internalMat4;
                 const off = i * 8;
@@ -559,7 +599,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
 
         const iv = camera.inverseViewMatrix.internalMat4;
 
-        const fogParams = new Float32Array(40); // 160 bytes
+        const fogParams = new Float32Array(56); // 224 bytes
         fogParams.set(this._invVP as unknown as Float32Array, 0);                  // invViewProj
         fogParams[16] = iv[12]; fogParams[17] = iv[13]; fogParams[18] = iv[14];    // cameraPos
         fogParams[19] = this.baseDensity;
@@ -579,6 +619,11 @@ class VolumetricFogEffect extends PostProcessingEffect {
         fogParams[33] = this.anisotropy;
         new Uint32Array(fogParams.buffer, 136, 1)[0] = this._numDirLights;
         new Uint32Array(fogParams.buffer, 140, 1)[0] = this._numPointLights;
+        // shadowViewProj: mat4x4f @ byte 144 (float index 36)
+        if (this._shadowMap) {
+            fogParams.set(this._shadowMap.lightViewProjMatrix, 36);
+            new Uint32Array(fogParams.buffer, 208, 1)[0] = 1;                     // hasShadowMap
+        }
 
         device.queue.writeBuffer(this._fogParamsBuffer!, 0, fogParams.buffer as ArrayBuffer);
 
@@ -642,6 +687,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         this._dirLightsBuffer?.destroy();
         this._pointLightsBuffer?.destroy();
         this._dummyPointShadowTex?.destroy();
+        this._dummyDirShadowTex?.destroy();
         this._fogParamsBuffer = null;
         this._compositeParamsBuffer = null;
         this._dirLightsBuffer = null;

@@ -4,18 +4,34 @@ import { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
 import { DirectionalLight } from '../lights/DirectionalLight';
+import { PointLight } from '../lights/PointLight';
+import { AreaLight } from '../lights/AreaLight';
 
 export interface ShadowMapOptions {
     resolution?: number;
+    /** Maximum distance from the camera that shadows cover.
+     *  Tighter values give higher effective shadow resolution. */
+    maxShadowDistance?: number;
+    /** Field-of-view (degrees) for perspective shadow maps (area lights). */
+    fov?: number;
+    /** Near plane for perspective shadow maps (area lights). */
+    near?: number;
+    /** Far plane for perspective shadow maps (area lights). 0 = use light radius. */
+    far?: number;
 }
 
 class ShadowMap {
     private _device: GPUDevice;
     private _resolution: number;
+    private _maxShadowDistance: number;
+    private _fov: number;
+    private _near: number;
+    private _far: number;
     private _depthTexture: GPUTexture;
     private _lightVP = new Float32Array(16);
 
     private _pipeline: GPURenderPipeline | null = null;
+    private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
     // Light VP uniform (group 0)
     private _lightVPBuffer: GPUBuffer;
@@ -40,6 +56,10 @@ class ShadowMap {
     constructor(device: GPUDevice, options?: ShadowMapOptions) {
         this._device = device;
         this._resolution = options?.resolution ?? 2048;
+        this._maxShadowDistance = options?.maxShadowDistance ?? 0;
+        this._fov = options?.fov ?? 90;
+        this._near = options?.near ?? 0.1;
+        this._far = options?.far ?? 0;
 
         this._depthTexture = device.createTexture({
             label: 'ShadowMap/Depth',
@@ -80,11 +100,35 @@ class ShadowMap {
 
     get depthTexture(): GPUTexture { return this._depthTexture; }
     get lightViewProjMatrix(): Float32Array { return this._lightVP; }
+    get maxShadowDistance(): number { return this._maxShadowDistance; }
+    set maxShadowDistance(v: number) { this._maxShadowDistance = v; }
+    /** Field-of-view in degrees (perspective shadow maps). */
+    get fov(): number { return this._fov; }
+    set fov(v: number) { this._fov = v; }
+    /** Near plane (perspective shadow maps). */
+    get near(): number { return this._near; }
+    set near(v: number) { this._near = v; }
+    /** Far plane (perspective shadow maps). 0 = use light radius. */
+    get far(): number { return this._far; }
+    set far(v: number) { this._far = v; }
 
     private _computeLightVP(camera: Camera, lightDir: [number, number, number]): void {
-        // Build camera view-projection and invert
+        // When maxShadowDistance is set, build a tighter projection so
+        // the shadow frustum only covers nearby geometry.
+        const useShadowFar = this._maxShadowDistance > 0
+            ? Math.min(this._maxShadowDistance, camera.far)
+            : camera.far;
+
+        // Build a (possibly tighter) view-projection and invert
         const vp = mat4.create();
-        mat4.multiply(vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
+        if (useShadowFar < camera.far) {
+            // Temporary projection with clamped far plane
+            const tmpProj = mat4.create();
+            mat4.perspective(tmpProj, camera.fov * Math.PI / 180, camera.aspect, camera.near, useShadowFar);
+            mat4.multiply(vp, tmpProj, camera.viewMatrix.internalMat4);
+        } else {
+            mat4.multiply(vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
+        }
         mat4.invert(this._invViewProj, vp);
 
         // 8 frustum corners in NDC (WebGPU depth [0,1])
@@ -133,12 +177,76 @@ class ShadowMap {
         const zRange = maxZ - minZ;
         minZ -= zRange * 2;
 
-        mat4.ortho(this._lightProj, minX, maxX, minY, maxY, minZ, maxZ);
+        // gl-matrix ortho expects positive distances for near/far,
+        // but minZ/maxZ are negative view-space Z coords (objects in
+        // front of the light have Z < 0).  Negate & swap so that
+        // near = -maxZ (closest) and far = -minZ (farthest).
+        mat4.ortho(this._lightProj, minX, maxX, minY, maxY, -maxZ, -minZ);
 
         // gl-matrix v3 ortho maps Z to [-1,1]; remap to [0,1] for WebGPU
         (this._lightProj as unknown as Float32Array)[10] *= 0.5;
         (this._lightProj as unknown as Float32Array)[14] =
             (this._lightProj as unknown as Float32Array)[14] * 0.5 + 0.5;
+
+        mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
+        this._lightVP.set(this._lightVPMat as unknown as Float32Array);
+    }
+
+    /**
+     * Compute a perspective light VP from an area light's position/target.
+     */
+    private _computeAreaLightVP(light: AreaLight): void {
+        light.updateModelMatrix();
+        const wm = light.worldMatrix.internalMat4;
+        const lightPos: vec3 = [wm[12], wm[13], wm[14]];
+        const target: vec3 = [light.target.x, light.target.y, light.target.z];
+
+        const up: vec3 = Math.abs(light.direction[1]) < 0.99
+            ? [0, 1, 0]
+            : [1, 0, 0];
+        mat4.lookAt(this._lightView, lightPos, target, up);
+
+        const near = this._near;
+        const far = this._far > 0 ? this._far : light.radius;
+        mat4.perspective(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
+
+        // gl-matrix perspective maps Z to [-1,1]; remap to [0,1] for WebGPU.
+        // For perspective P[11]=-1, the correct remap is:
+        //   P'[10] = P[10]*0.5 + P[11]*0.5
+        //   P'[14] = P[14]*0.5
+        const P = this._lightProj as unknown as Float32Array;
+        P[10] = P[10] * 0.5 + P[11] * 0.5;
+        P[14] = P[14] * 0.5;
+
+        mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
+        this._lightVP.set(this._lightVPMat as unknown as Float32Array);
+    }
+
+    /**
+     * Compute a perspective light VP from a point light's position,
+     * looking toward the provided target (defaults to origin).
+     */
+    private _computePointLightVP(light: PointLight, target: vec3 = [0, 0, 0]): void {
+        light.updateModelMatrix();
+        const wm = light.worldMatrix.internalMat4;
+        const lightPos: vec3 = [wm[12], wm[13], wm[14]];
+
+        const dx = target[0] - lightPos[0];
+        const dy = target[1] - lightPos[1];
+        const dz = target[2] - lightPos[2];
+        const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const dirY = len > 1e-8 ? dy / len : -1;
+
+        const up: vec3 = Math.abs(dirY) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+        mat4.lookAt(this._lightView, lightPos, target, up);
+
+        const near = this._near;
+        const far = this._far > 0 ? this._far : light.radius;
+        mat4.perspective(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
+
+        const P = this._lightProj as unknown as Float32Array;
+        P[10] = P[10] * 0.5 + P[11] * 0.5;
+        P[14] = P[14] * 0.5;
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
@@ -228,18 +336,85 @@ class ShadowMap {
         });
     }
 
-    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | [number, number, number]): void {
+    private _getOrCreateCustomPipeline(
+        shadowVertexCode: string,
+        vertexBuffers: Iterable<GPUVertexBufferLayout | null>,
+        extraBGL: GPUBindGroupLayout | null,
+    ): GPURenderPipeline {
+        let pipeline = this._customPipelines.get(shadowVertexCode);
+        if (pipeline) return pipeline;
+
+        const shaderCode = /* wgsl */`
+            @group(0) @binding(0) var<uniform> lightViewProj : mat4x4f;
+            @group(1) @binding(0) var<uniform> normalMatrix  : mat4x4f;
+            @group(1) @binding(1) var<uniform> worldMatrix   : mat4x4f;
+
+            ${shadowVertexCode}
+
+            @vertex
+            fn shadow_vs(
+                @location(0) position : vec4f,
+                @location(1) normal   : vec3f,
+                @location(2) uv       : vec2f,
+                @builtin(instance_index) instanceIdx : u32,
+            ) -> @builtin(position) vec4f {
+                let wp = shadowWorldPos(position, instanceIdx);
+                return lightViewProj * wp;
+            }
+        `;
+
+        const module = this._device.createShaderModule({
+            label: 'ShadowMap/CustomShader',
+            code: shaderCode,
+        });
+
+        const layouts: GPUBindGroupLayout[] = [this._lightVPBGL, this._meshBGL];
+        if (extraBGL) layouts.push(extraBGL);
+
+        pipeline = this._device.createRenderPipeline({
+            label: 'ShadowMap/CustomPipeline',
+            layout: this._device.createPipelineLayout({
+                label: 'ShadowMap/CustomPipelineLayout',
+                bindGroupLayouts: layouts,
+            }),
+            vertex: {
+                module,
+                entryPoint: 'shadow_vs',
+                buffers: vertexBuffers,
+            },
+            depthStencil: {
+                format: 'depth32float',
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'back',
+            },
+        });
+
+        this._customPipelines.set(shadowVertexCode, pipeline);
+        return pipeline;
+    }
+
+    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
         const device = this._device;
-        const lightDir: [number, number, number] = Array.isArray(lightDirOrLight)
-            ? lightDirOrLight
-            : lightDirOrLight.direction;
 
         scene.prepare(camera);
         camera.updateViewMatrix();
         const objects = scene.getOrderedObjects();
         if (objects.length === 0) return;
 
-        this._computeLightVP(camera, lightDir);
+        if (lightDirOrLight instanceof AreaLight) {
+            this._computeAreaLightVP(lightDirOrLight);
+        } else if (lightDirOrLight instanceof PointLight) {
+            this._computePointLightVP(lightDirOrLight, target ?? [0, 0, 0]);
+        } else {
+            const lightDir: [number, number, number] = Array.isArray(lightDirOrLight)
+                ? lightDirOrLight
+                : lightDirOrLight.direction;
+            this._computeLightVP(camera, lightDir);
+        }
         device.queue.writeBuffer(this._lightVPBuffer, 0, this._lightVP.buffer as ArrayBuffer);
 
         // Ensure pipeline (lazy — needs vertex layout from first geometry)
@@ -275,9 +450,9 @@ class ShadowMap {
             },
         });
 
-        pass.setPipeline(this._pipeline!);
         pass.setBindGroup(0, this._lightVPBG);
 
+        let activePipeline: GPURenderPipeline | null = null;
         let currentVertexBuffer: GPUBuffer | null = null;
         let currentIndexBuffer: GPUBuffer | null = null;
 
@@ -286,8 +461,31 @@ class ShadowMap {
             if (!obj.castShadow) continue;
             if (!obj.geometry.initialized) continue;
 
+            // Select default or custom shadow pipeline
+            let targetPipeline: GPURenderPipeline;
+            if (obj.shadowVertexCode) {
+                targetPipeline = this._getOrCreateCustomPipeline(
+                    obj.shadowVertexCode,
+                    obj.geometry.vertexBuffersDescriptors,
+                    obj.shadowExtraBGL,
+                );
+            } else {
+                targetPipeline = this._pipeline!;
+            }
+
+            if (targetPipeline !== activePipeline) {
+                pass.setPipeline(targetPipeline);
+                activePipeline = targetPipeline;
+                currentVertexBuffer = null;
+                currentIndexBuffer = null;
+            }
+
             const offset = i * alignment;
             pass.setBindGroup(1, this._meshBG!, [offset, offset]);
+
+            if (obj.shadowExtraBG) {
+                pass.setBindGroup(2, obj.shadowExtraBG);
+            }
 
             if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                 pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);
@@ -321,6 +519,7 @@ class ShadowMap {
         this._worldMatBuf?.destroy();
         this._normalMatBuf?.destroy();
         this._pipeline = null;
+        this._customPipelines.clear();
     }
 }
 

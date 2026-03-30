@@ -19,6 +19,16 @@ export interface BLASEntry {
     nodeCount: number;
 }
 
+export interface DynamicBLASInfo {
+    copies: number;
+    nodeCountPerCopy: number;
+    triCountPerCopy: number;
+    copyNodeOffsets: number[];   // root node offset for each copy
+    copyTriOffsets: number[];    // triangle offset for each copy
+    maxDepth: number;            // BVH4 tree depth for refit passes
+    origTriangleData: Float32Array;  // reordered original triangle data (CPU-side)
+}
+
 export class BVHBuilder {
     private _device: GPUDevice;
 
@@ -32,6 +42,7 @@ export class BVHBuilder {
     private _blasEntries: Map<string, BLASEntry> = new Map();
     public totalTriangleCount: number = 0;
     public totalBLASNodes: number = 0;
+    public totalInstanceTriangles: number = 0; // sum of blasTriCount across all instances (handles shared BLAS)
 
     // TLAS data
     private _instanceBuffer: GPUBuffer | null = null;
@@ -103,6 +114,11 @@ export class BVHBuilder {
     private _tlasLevelLayout: { offset: number; count: number }[] = [];
     private _tlasBvh4NodeCount: number = 0;
 
+    // Dynamic BLAS support (per-instance BLAS copies for deformable meshes)
+    private _dynamicBLASCopies: Map<string, number> = new Map();
+    private _dynamicBLASInfos: Map<string, DynamicBLASInfo> = new Map();
+    private _origTriangleBuffer: GPUBuffer | null = null;
+
     // Reusable staging array for instance packing
     private _instanceStaging: Float32Array | null = null;
     private _instanceCapacity: number = 0;
@@ -146,7 +162,56 @@ export class BVHBuilder {
     get tlasNodeBuffer(): GPUBuffer | null { return this._tlasNodeBuffer; }
     get tlasBvh4Buffer(): GPUBuffer | null { return this._tlasBvh4Buffer; }
     get materialBuffer(): GPUBuffer | null { return this._materialBuffer; }
+    get origTriangleBuffer(): GPUBuffer | null { return this._origTriangleBuffer; }
     get totalInstances(): number { return this._totalInstances; }
+    get sceneMin(): [number, number, number] { return this._sceneMin; }
+    get sceneMax(): [number, number, number] { return this._sceneMax; }
+
+    /** Compute world-space scene AABB by transforming per-BLAS local bounds with instance world matrices. */
+    computeWorldBounds(scene: Scene): { min: [number, number, number]; max: [number, number, number] } {
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+        for (const obj of scene.getOrderedObjects()) {
+            const geom = obj.geometry.isInstancedGeometry
+                ? (obj.geometry as InstancedGeometry).geometry ?? obj.geometry
+                : obj.geometry;
+            const blasKey = this._geomToBLASKey.get(geom);
+            if (!blasKey) continue;
+            const lb = this._blasLocalBounds.get(blasKey);
+            if (!lb) continue;
+
+            const m = obj.worldMatrix.internalMat4;
+            // Transform 8 corners of local AABB by world matrix
+            for (let cz = 0; cz < 2; cz++) {
+                for (let cy = 0; cy < 2; cy++) {
+                    for (let cx = 0; cx < 2; cx++) {
+                        const lx = cx === 0 ? lb.min[0] : lb.max[0];
+                        const ly = cy === 0 ? lb.min[1] : lb.max[1];
+                        const lz = cz === 0 ? lb.min[2] : lb.max[2];
+                        // m is column-major (gl-matrix)
+                        const wx = m[0] * lx + m[4] * ly + m[8]  * lz + m[12];
+                        const wy = m[1] * lx + m[5] * ly + m[9]  * lz + m[13];
+                        const wz = m[2] * lx + m[6] * ly + m[10] * lz + m[14];
+                        minX = Math.min(minX, wx); maxX = Math.max(maxX, wx);
+                        minY = Math.min(minY, wy); maxY = Math.max(maxY, wy);
+                        minZ = Math.min(minZ, wz); maxZ = Math.max(maxZ, wz);
+                    }
+                }
+            }
+        }
+
+        if (!isFinite(minX)) { return { min: [0, 0, 0], max: [1, 1, 1] }; }
+        return { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+    }
+
+    getDynamicBLASInfo(renderable: Renderable): DynamicBLASInfo | undefined {
+        const geom = renderable.geometry.isInstancedGeometry
+            ? (renderable.geometry as InstancedGeometry).geometry ?? renderable.geometry
+            : renderable.geometry;
+        const key = this._geomToBLASKey.get(geom);
+        return key ? this._dynamicBLASInfos.get(key) : undefined;
+    }
 
     /**
      * Extract all unique geometries and build BLAS for each.
@@ -176,9 +241,35 @@ export class BVHBuilder {
             }
         }
 
-        // Pack all triangles into one contiguous buffer
+        // Assign consistent geometry IDs (uuid or auto-generated)
+        const geoIdMap = new Map<object, string>();
+        let geoIdCounter = 0;
+        for (const [geom] of geometryMap) {
+            geoIdMap.set(geom, (geom as any).uuid ?? `geo_${geoIdCounter++}`);
+        }
+
+        // Detect dynamic BLAS geometries and compute copy counts
+        this._dynamicBLASCopies.clear();
+        this._dynamicBLASInfos.clear();
+        for (const obj of objects) {
+            if (obj.dynamicBLAS && obj.geometry.isInstancedGeometry) {
+                const geom = (obj.geometry as InstancedGeometry).geometry ?? obj.geometry;
+                const geoKey = geoIdMap.get(geom);
+                if (geoKey && !this._dynamicBLASCopies.has(geoKey)) {
+                    const ig = obj.geometry as InstancedGeometry;
+                    const copies = obj.gpuInstanceCount || ig.instanceCount;
+                    this._dynamicBLASCopies.set(geoKey, copies);
+                }
+            }
+        }
+
+        // Pack all triangles into one contiguous buffer (with space for dynamic copies)
         let totalTris = 0;
-        for (const [, data] of geometryMap) totalTris += data.triCount;
+        for (const [geom, data] of geometryMap) {
+            const geoKey = geoIdMap.get(geom)!;
+            const copies = this._dynamicBLASCopies.get(geoKey) || 1;
+            totalTris += data.triCount * copies;
+        }
 
         const allTriangles = new Float32Array(totalTris * BVHBuilder.TRI_STRIDE_FLOATS);
         let offset = 0;
@@ -188,7 +279,8 @@ export class BVHBuilder {
         this._blasTriData.clear();
 
         for (const [geom, data] of geometryMap) {
-            const geoId = (geom as any).uuid ?? String(offset);
+            const geoId = geoIdMap.get(geom)!;
+            const copies = this._dynamicBLASCopies.get(geoId) || 1;
             const entry: BLASEntry = {
                 geometryId: geoId,
                 triangleOffset: offset / BVHBuilder.TRI_STRIDE_FLOATS,
@@ -208,7 +300,8 @@ export class BVHBuilder {
             // Compute and cache local-space AABB for CPU TLAS construction
             this._blasLocalBounds.set(entry.geometryId, this._computeLocalBounds(data.triangles, data.triCount));
 
-            offset += data.triCount * BVHBuilder.TRI_STRIDE_FLOATS;
+            // Reserve space for all copies (only copy 0 is packed now; rest filled after BVH build)
+            offset += data.triCount * copies * BVHBuilder.TRI_STRIDE_FLOATS;
             this._blasEntries.set(entry.geometryId, entry);
             this._geomToBLASKey.set(geom, geoId);
         }
@@ -223,7 +316,7 @@ export class BVHBuilder {
         this._triangleBuffer = this._device.createBuffer({
             label: 'BVH/Triangles',
             size: Math.max(allTriangles.byteLength, 4),
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
         this._device.queue.writeBuffer(this._triangleBuffer, 0, allTriangles);
 
@@ -289,8 +382,12 @@ export class BVHBuilder {
         // Pre-calculate total instance count
         let totalInstances = 0;
         for (const obj of objects) {
-            if (obj.gpuInstanceBuffer && obj.geometry.isInstancedGeometry) {
-                totalInstances += (obj.geometry as InstancedGeometry).instanceCount;
+            if (obj.dynamicBLAS && obj.geometry.isInstancedGeometry) {
+                // Dynamic BLAS: one TLAS instance per BLAS copy (identity transform)
+                const ig = obj.geometry as InstancedGeometry;
+                totalInstances += obj.gpuInstanceCount || ig.instanceCount;
+            } else if (obj.gpuInstanceBuffer && obj.geometry.isInstancedGeometry) {
+                totalInstances += obj.gpuInstanceCount || (obj.geometry as InstancedGeometry).instanceCount;
             } else {
                 totalInstances++;
             }
@@ -320,10 +417,37 @@ export class BVHBuilder {
             const blasTriOff = blasEntry ? blasEntry.triangleOffset : 0;
             const blasTriCnt = blasEntry ? blasEntry.triangleCount : 0;
 
+            // ── Dynamic BLAS: identity transforms + per-copy BLAS offsets ──
+            if (obj.dynamicBLAS && obj.geometry.isInstancedGeometry) {
+                const ig = obj.geometry as InstancedGeometry;
+                const count = obj.gpuInstanceCount || ig.instanceCount;
+                const info = blasKey ? this._dynamicBLASInfos.get(blasKey) : undefined;
+                if (info) {
+                    for (let k = 0; k < count; k++) {
+                        const off = instanceCount * STRIDE;
+                        // Identity transform rows (row-major 3×4)
+                        instanceData[off + 0] = 1; instanceData[off + 1] = 0; instanceData[off + 2] = 0; instanceData[off + 3] = 0;
+                        instanceData[off + 4] = 0; instanceData[off + 5] = 1; instanceData[off + 6] = 0; instanceData[off + 7] = 0;
+                        instanceData[off + 8] = 0; instanceData[off + 9] = 0; instanceData[off + 10] = 1; instanceData[off + 11] = 0;
+                        // Identity inverse transform rows
+                        instanceData[off + 12] = 1; instanceData[off + 13] = 0; instanceData[off + 14] = 0; instanceData[off + 15] = 0;
+                        instanceData[off + 16] = 0; instanceData[off + 17] = 1; instanceData[off + 18] = 0; instanceData[off + 19] = 0;
+                        instanceData[off + 20] = 0; instanceData[off + 21] = 0; instanceData[off + 22] = 1; instanceData[off + 23] = 0;
+                        // Per-copy BLAS offsets
+                        instanceDataU32[off + 24] = info.copyNodeOffsets[k];
+                        instanceDataU32[off + 25] = info.copyTriOffsets[k];
+                        instanceDataU32[off + 26] = info.triCountPerCopy;
+                        instanceDataU32[off + 27] = i; // materialIndex
+                        instanceCount++;
+                    }
+                    continue;
+                }
+            }
+
             // ── GPU-expanded instances: reserve slots, fill via compute ──
             if (obj.gpuInstanceBuffer && obj.geometry.isInstancedGeometry) {
                 const ig = obj.geometry as InstancedGeometry;
-                const count = ig.instanceCount;
+                const count = obj.gpuInstanceCount || ig.instanceCount;
                 const m = obj.worldMatrix.internalMat4;
 
                 // Parent rotation/scale rows (row-major from column-major gl-matrix)
@@ -425,6 +549,13 @@ export class BVHBuilder {
         }
 
         this._totalInstances = instanceCount;
+
+        // Compute total instance-triangles (each shared BLAS counted per instance)
+        let totalInstTris = 0;
+        for (let k = 0; k < instanceCount; k++) {
+            totalInstTris += instanceDataU32[k * STRIDE + 26];
+        }
+        this.totalInstanceTriangles = totalInstTris;
 
         // Reuse GPU buffer if capacity is sufficient, only recreate if grown
         const byteSize = Math.max(instanceCount * STRIDE * 4, 4);
@@ -1189,6 +1320,16 @@ export class BVHBuilder {
                 }
                 const byteOffset = entry.triangleOffset * stride * 4;
                 this._device.queue.writeBuffer(this._triangleBuffer, byteOffset, reordered);
+
+                // For dynamic BLAS: store reordered data and duplicate triangle copies
+                if (this._dynamicBLASCopies.has(geoId)) {
+                    this._blasTriData.set(geoId + '_reordered', reordered.slice());
+                    const dynCopies = this._dynamicBLASCopies.get(geoId)!;
+                    for (let k = 1; k < dynCopies; k++) {
+                        const copyOffset = (entry.triangleOffset + k * n) * stride * 4;
+                        this._device.queue.writeBuffer(this._triangleBuffer, copyOffset, reordered);
+                    }
+                }
             }
         }
 
@@ -1266,8 +1407,6 @@ export class BVHBuilder {
                 }
             };
 
-            const gcScratch = new Int32Array(4);
-
             const convert = (li: number): number => {
                 const bvh4Idx = initBVH4();
 
@@ -1276,18 +1415,19 @@ export class BVHBuilder {
                     return bvh4Idx;
                 }
 
-                // Collect grandchildren by expanding one level (reuse scratch array)
-                let gcCount = 0;
+                // Collect grandchildren by expanding one level
+                // Use local array — shared scratch was corrupted by recursive calls
+                const gc: number[] = [];
                 const L = getLC(li), R = getRC(li);
 
-                if (isLeaf(L)) { gcScratch[gcCount++] = L; }
-                else { gcScratch[gcCount++] = getLC(L); gcScratch[gcCount++] = getRC(L); }
+                if (isLeaf(L)) { gc.push(L); }
+                else { gc.push(getLC(L), getRC(L)); }
 
-                if (isLeaf(R)) { gcScratch[gcCount++] = R; }
-                else { gcScratch[gcCount++] = getLC(R); gcScratch[gcCount++] = getRC(R); }
+                if (isLeaf(R)) { gc.push(R); }
+                else { gc.push(getLC(R), getRC(R)); }
 
-                for (let i = 0; i < gcCount && i < 4; i++) {
-                    const g = gcScratch[i];
+                for (let i = 0; i < gc.length && i < 4; i++) {
+                    const g = gc[i];
                     if (isLeaf(g)) {
                         setChild(bvh4Idx, i, g, 0);
                     } else {
@@ -1304,17 +1444,121 @@ export class BVHBuilder {
             bvh4TotalNodes += nextBVH4;
         }
 
-        this.totalBVH4Nodes = bvh4TotalNodes;
+        // ── Duplicate BVH4 nodes for dynamic BLAS geometries ──
+        let extraBvh4Nodes = 0;
+        for (const [geoId, entry] of this._blasEntries) {
+            const copies = this._dynamicBLASCopies.get(geoId) || 1;
+            if (copies > 1) extraBvh4Nodes += (copies - 1) * entry.nodeCount;
+        }
+
+        const finalBvh4Total = bvh4TotalNodes + extraBvh4Nodes;
+        let finalBvh4Data: Float32Array;
+        let finalBvh4I32: Int32Array;
+        if (extraBvh4Nodes > 0) {
+            finalBvh4Data = new Float32Array(finalBvh4Total * BVH4_STRIDE);
+            finalBvh4Data.set(bvh4Data.subarray(0, bvh4TotalNodes * BVH4_STRIDE));
+            finalBvh4I32 = new Int32Array(finalBvh4Data.buffer);
+        } else {
+            finalBvh4Data = bvh4Data;
+            finalBvh4I32 = bvh4I32;
+        }
+
+        // Helper: compute BVH4 tree depth from root
+        const bvh4DepthFn = (rootIdx: number): number => {
+            const o = rootIdx * BVH4_STRIDE;
+            let maxD = 0;
+            for (let c = 0; c < 4; c++) {
+                const child = finalBvh4I32[o + 24 + c];
+                if (child >= 0) maxD = Math.max(maxD, bvh4DepthFn(child) + 1);
+            }
+            return maxD;
+        };
+
+        let copyNodeOffset = bvh4TotalNodes;
+        // Also prepare original triangle data for origTriangleBuffer
+        let origTriDataAll: Float32Array | null = null;
+        let origTriDataOffset = 0;
+
+        for (const [geoId, entry] of this._blasEntries) {
+            if (!this._dynamicBLASCopies.has(geoId)) continue;
+            const copies = this._dynamicBLASCopies.get(geoId)!;
+
+            const nodeCount = entry.nodeCount;
+            const triCount = entry.triangleCount;
+            const srcStart = entry.nodeOffset * BVH4_STRIDE;
+
+            const copyNodeOffsets: number[] = [entry.nodeOffset];
+            const copyTriOffsets: number[] = [entry.triangleOffset];
+
+            for (let k = 1; k < copies; k++) {
+                const dstStart = copyNodeOffset * BVH4_STRIDE;
+                // Copy node data
+                finalBvh4Data.set(
+                    finalBvh4Data.subarray(srcStart, srcStart + nodeCount * BVH4_STRIDE),
+                    dstStart,
+                );
+                // Remap internal children (positive child indices)
+                for (let n = 0; n < nodeCount; n++) {
+                    for (let c = 0; c < 4; c++) {
+                        const off = dstStart + n * BVH4_STRIDE + 24 + c;
+                        const child = finalBvh4I32[off];
+                        if (child >= 0) {
+                            finalBvh4I32[off] = child - entry.nodeOffset + copyNodeOffset;
+                        }
+                    }
+                }
+
+                copyNodeOffsets.push(copyNodeOffset);
+                copyTriOffsets.push(entry.triangleOffset + k * triCount);
+                copyNodeOffset += nodeCount;
+            }
+
+            // Get reordered original triangle data
+            const reordered = this._blasTriData.get(geoId + '_reordered');
+
+            this._dynamicBLASInfos.set(geoId, {
+                copies,
+                nodeCountPerCopy: nodeCount,
+                triCountPerCopy: triCount,
+                copyNodeOffsets,
+                copyTriOffsets,
+                maxDepth: bvh4DepthFn(entry.nodeOffset) + 1,
+                origTriangleData: reordered || new Float32Array(0),
+            });
+
+            // Accumulate original triangle data for GPU buffer
+            if (reordered) {
+                if (!origTriDataAll) {
+                    origTriDataAll = new Float32Array(reordered.length);
+                }
+                origTriDataAll.set(reordered, origTriDataOffset);
+                origTriDataOffset += reordered.length;
+            }
+        }
+
+        this.totalBVH4Nodes = finalBvh4Total;
 
         // Upload BVH4 buffer
         this._bvh4NodeBuffer?.destroy();
-        const bvh4ByteSize = Math.max(bvh4TotalNodes * 128, 4);
+        const bvh4ByteSize = Math.max(finalBvh4Total * 128, 4);
         this._bvh4NodeBuffer = this._device.createBuffer({
             label: 'BVH/BVH4Nodes',
             size: bvh4ByteSize,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
-        this._device.queue.writeBuffer(this._bvh4NodeBuffer, 0, bvh4Data.buffer, 0, bvh4ByteSize);
+        this._device.queue.writeBuffer(this._bvh4NodeBuffer, 0, finalBvh4Data.buffer, 0, bvh4ByteSize);
+
+        // Upload original triangle data buffer for deform shader
+        this._origTriangleBuffer?.destroy();
+        this._origTriangleBuffer = null;
+        if (origTriDataAll && origTriDataOffset > 0) {
+            this._origTriangleBuffer = this._device.createBuffer({
+                label: 'BVH/OrigTriangles',
+                size: origTriDataOffset * 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            this._device.queue.writeBuffer(this._origTriangleBuffer, 0, origTriDataAll.buffer, 0, origTriDataOffset * 4);
+        }
     }
 
     public buildBLASTreeGPU(commandEncoder: GPUCommandEncoder): void {

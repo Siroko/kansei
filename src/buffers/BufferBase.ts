@@ -62,7 +62,7 @@ class BufferBase implements IBindable {
     /** Internal GPU buffer reference */
     protected _resource?: GPUBuffer;
     /** Internal buffer data storage */
-    protected buffer?: Float32Array;
+    protected buffer?: Float32Array | Uint32Array | Int32Array;
 
     /**
      * Initializes the GPU buffer with the current data
@@ -74,7 +74,8 @@ class BufferBase implements IBindable {
             size: this.buffer!.byteLength,
             usage: this.usage
         });
-        new Float32Array(this._resource.getMappedRange()).set(this.buffer!);
+        const Ctor = this.buffer!.constructor as new (buf: ArrayBuffer) => Float32Array | Uint32Array | Int32Array;
+        (new Ctor(this._resource.getMappedRange()) as any).set(this.buffer!);
 
         this._resource.unmap();
 

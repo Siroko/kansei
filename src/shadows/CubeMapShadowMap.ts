@@ -2,8 +2,12 @@ import { mat4, vec3 } from 'gl-matrix';
 import { Camera } from '../cameras/Camera';
 import { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { PointLight } from '../lights/PointLight';
+import { AreaLight } from '../lights/AreaLight';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+
+/** Any light with a world-space position and radius, usable for cubemap shadow rendering. */
+export type PositionalLight = PointLight | AreaLight;
 
 export interface CubeMapShadowMapOptions {
     resolution?: number;
@@ -41,6 +45,7 @@ class CubeMapShadowMap {
     private _scratchDepthTexture: GPUTexture;
 
     private _pipeline: GPURenderPipeline | null = null;
+    private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
     // Light VP + light position uniform (group 0, dynamic offset)
     // One slot per face per light, aligned to minUniformBufferOffsetAlignment
@@ -237,7 +242,92 @@ class CubeMapShadowMap {
         });
     }
 
-    render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PointLight[]): void {
+    private _getOrCreateCustomPipeline(
+        shadowVertexCode: string,
+        vertexBuffers: Iterable<GPUVertexBufferLayout | null>,
+        extraBGL: GPUBindGroupLayout | null,
+    ): GPURenderPipeline {
+        let pipeline = this._customPipelines.get(shadowVertexCode);
+        if (pipeline) return pipeline;
+
+        const shaderCode = /* wgsl */`
+            struct LightUniform {
+                lightViewProj : mat4x4f,
+                lightWorldPos : vec3f,
+                _pad          : f32,
+            }
+
+            @group(0) @binding(0) var<uniform> light       : LightUniform;
+            @group(1) @binding(0) var<uniform> normalMatrix : mat4x4f;
+            @group(1) @binding(1) var<uniform> worldMatrix  : mat4x4f;
+
+            ${shadowVertexCode}
+
+            struct VSOut {
+                @builtin(position) position : vec4f,
+                @location(0)       worldPos : vec3f,
+            }
+
+            @vertex
+            fn shadow_vs(
+                @location(0) position : vec4f,
+                @location(1) normal   : vec3f,
+                @location(2) uv       : vec2f,
+                @builtin(instance_index) instanceIdx : u32,
+            ) -> VSOut {
+                let wp = shadowWorldPos(position, instanceIdx);
+                var out : VSOut;
+                out.position = light.lightViewProj * wp;
+                out.worldPos = wp.xyz;
+                return out;
+            }
+
+            @fragment
+            fn shadow_fs(in : VSOut) -> @location(0) f32 {
+                return length(in.worldPos - light.lightWorldPos);
+            }
+        `;
+
+        const module = this._device.createShaderModule({
+            label: 'CubeMapShadow/CustomShader',
+            code: shaderCode,
+        });
+
+        const layouts: GPUBindGroupLayout[] = [this._lightUniformBGL, this._meshBGL];
+        if (extraBGL) layouts.push(extraBGL);
+
+        pipeline = this._device.createRenderPipeline({
+            label: 'CubeMapShadow/CustomPipeline',
+            layout: this._device.createPipelineLayout({
+                label: 'CubeMapShadow/CustomPipelineLayout',
+                bindGroupLayouts: layouts,
+            }),
+            vertex: {
+                module,
+                entryPoint: 'shadow_vs',
+                buffers: vertexBuffers,
+            },
+            fragment: {
+                module,
+                entryPoint: 'shadow_fs',
+                targets: [{ format: 'r32float' }],
+            },
+            depthStencil: {
+                format: 'depth32float',
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'back',
+            },
+        });
+
+        this._customPipelines.set(shadowVertexCode, pipeline);
+        return pipeline;
+    }
+
+    render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PositionalLight[]): void {
         const device = this._device;
         if (pointLights.length === 0) return;
 
@@ -345,9 +435,9 @@ class CubeMapShadowMap {
                     },
                 });
 
-                pass.setPipeline(this._pipeline!);
                 pass.setBindGroup(0, this._lightUniformBG!, [lightOffset]);
 
+                let activePipeline: GPURenderPipeline | null = null;
                 let currentVertexBuffer: GPUBuffer | null = null;
                 let currentIndexBuffer: GPUBuffer | null = null;
 
@@ -356,8 +446,30 @@ class CubeMapShadowMap {
                     if (!obj.castShadow) continue;
                     if (!obj.geometry.initialized) continue;
 
+                    let targetPipeline: GPURenderPipeline;
+                    if (obj.shadowVertexCode) {
+                        targetPipeline = this._getOrCreateCustomPipeline(
+                            obj.shadowVertexCode,
+                            obj.geometry.vertexBuffersDescriptors,
+                            obj.shadowExtraBGL,
+                        );
+                    } else {
+                        targetPipeline = this._pipeline!;
+                    }
+
+                    if (targetPipeline !== activePipeline) {
+                        pass.setPipeline(targetPipeline);
+                        activePipeline = targetPipeline;
+                        currentVertexBuffer = null;
+                        currentIndexBuffer = null;
+                    }
+
                     const offset = i * alignment;
                     pass.setBindGroup(1, this._meshBG!, [offset, offset]);
+
+                    if (obj.shadowExtraBG) {
+                        pass.setBindGroup(2, obj.shadowExtraBG);
+                    }
 
                     if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                         pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);
@@ -395,6 +507,7 @@ class CubeMapShadowMap {
         this._worldMatBuf?.destroy();
         this._normalMatBuf?.destroy();
         this._pipeline = null;
+        this._customPipelines.clear();
     }
 }
 
