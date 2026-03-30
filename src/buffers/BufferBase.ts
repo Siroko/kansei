@@ -74,8 +74,8 @@ class BufferBase implements IBindable {
             size: this.buffer!.byteLength,
             usage: this.usage
         });
-        const Ctor = this.buffer!.constructor as new (buf: ArrayBuffer) => typeof this.buffer;
-        new Ctor(this._resource.getMappedRange()).set(this.buffer!);
+        const Ctor = this.buffer!.constructor as new (buf: ArrayBuffer) => Float32Array | Uint32Array | Int32Array;
+        (new Ctor(this._resource.getMappedRange()) as any).set(this.buffer!);
 
         this._resource.unmap();
 

@@ -176,7 +176,7 @@ class Material {
                 cullMode: this.transparent ? 'none' : this.cullMode,
             } as GPUPrimitiveState,
             depthStencil: {
-                depthWriteEnabled: this.options.depthWriteEnabled ?? (this.transparent ? false : true),
+                depthWriteEnabled: this.options.depthWriteEnabled ?? (this.transparent ? false : this.depthWriteEnabled),
                 depthCompare: this.depthCompare,
                 format: depthFormat,
             },
