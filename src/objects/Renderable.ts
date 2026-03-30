@@ -19,6 +19,20 @@ class Renderable extends Object3D {
     /** Whether this object receives shadows (shader must use #include <shadows>). */
     public receiveShadow: boolean = true;
 
+    /** Controls draw order within the same transparency group. Higher values draw later (on top). */
+    public renderOrder: number = 0;
+
+    /** Custom WGSL snippet for shadow vertex transform.
+     *  Must declare: fn shadowWorldPos(position: vec4f, instanceIdx: u32) -> vec4f
+     *  returning the world-space position.  May include @group(2) bindings. */
+    public shadowVertexCode: string | null = null;
+
+    /** Bind group layout for extra resources used by shadowVertexCode (group 2). */
+    public shadowExtraBGL: GPUBindGroupLayout | null = null;
+
+    /** Bind group for extra resources used by shadowVertexCode (group 2). */
+    public shadowExtraBG: GPUBindGroup | null = null;
+
     /** Path tracer material properties. If null, defaults are derived at BVH build time. */
     public pathTracerMaterial: PathTracerMaterial | null = null;
 
@@ -33,6 +47,16 @@ class Renderable extends Object3D {
     /** When true, gpuInstanceBuffer contains 3×vec4f full affine transforms per instance
      *  instead of vec4f position offsets. Default: false (position-only mode). */
     public gpuInstanceFullTransform: boolean = false;
+
+    /** When true, BVHBuilder creates per-instance BLAS copies that can be deformed
+     *  each frame via a GPU compute pass (deform + refit). The TLAS instances get
+     *  identity transforms since deformed triangles are in world space. */
+    public dynamicBLAS: boolean = false;
+
+    /** Override the number of TLAS instances for path tracing.
+     *  When set (> 0), BVHBuilder uses this instead of geometry.instanceCount,
+     *  allowing the path tracer to see more instances than the rasterizer draws. */
+    public gpuInstanceCount: number = 0;
 
     /** The layout of the bind group for GPU resources. */
     public bindGroupLayout?: GPUBindGroupLayout;

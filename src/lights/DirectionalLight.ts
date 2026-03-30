@@ -1,7 +1,9 @@
 import { Light } from "./Light";
+import { ShadowMap, ShadowMapOptions } from "../shadows/ShadowMap";
 
 class DirectionalLight extends Light {
     public direction: [number, number, number];
+    public shadowMap: ShadowMap | null = null;
 
     constructor(
         direction: [number, number, number] = [0, -1, 0],
@@ -10,6 +12,11 @@ class DirectionalLight extends Light {
     ) {
         super('directional', color, intensity);
         this.direction = direction;
+    }
+
+    enableShadows(device: GPUDevice, options?: ShadowMapOptions): ShadowMap {
+        this.shadowMap = new ShadowMap(device, options);
+        return this.shadowMap;
     }
 }
 

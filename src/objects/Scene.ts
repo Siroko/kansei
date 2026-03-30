@@ -54,9 +54,10 @@ class Scene extends Object3D {
             }
         });
 
-        // Sort transparent objects back-to-front (squared distance avoids sqrt per comparison)
+        // Sort transparent objects by renderOrder first, then back-to-front
         const cameraPosition = camera.position;
         this.transparentObjects.sort((a, b) => {
+            if (a.renderOrder !== b.renderOrder) return a.renderOrder - b.renderOrder;
             const distA = a.position.distanceToSquared(cameraPosition);
             const distB = b.position.distanceToSquared(cameraPosition);
             return distB - distA;

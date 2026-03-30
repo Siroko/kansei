@@ -103,8 +103,8 @@
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
         return FragmentOutput(
-          vec4f(albedo * lighting, 1),             // no direct — all lighting via GI
-          vec4f(0, 0, 0, 1),
+          vec4f(albedo * lighting, 1),
+          vec4f(0, 0, 0, 0),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
           vec4f(albedo, 0.04)
         );
@@ -130,7 +130,7 @@
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
         return FragmentOutput(
           vec4f(0, 0, 0, 1),
-          vec4f(0, 0, 0, 1),
+          vec4f(0, 0, 0, 0),
           vec4f(frag.worldNormal * 0.5 + 0.5, roughness),
           vec4f(albedo, metallic)
         );
@@ -163,9 +163,9 @@
     const renderer = new Renderer({
       width: window.innerWidth,
       height: window.innerHeight,
-      devicePixelRatio: 0.75,
+      devicePixelRatio: 2,
       antialias: false,
-      sampleCount: 1
+      sampleCount: 4
     });
     await renderer.initialize();
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -223,7 +223,7 @@
       m.albedo = [r, g, b];
       m.roughness = 1.0;
       m.maxBounces = 1;
-      m.refractive = false;
+      m.transmission = 0.0;
       return m;
     }
 
@@ -291,7 +291,7 @@
     const glassMat = new PathTracerMaterial();
     glassMat.albedo = [1, 1, 1];
     glassMat.roughness = 0.0;
-    glassMat.refractive = true;
+    glassMat.transmission = 1.0;
     glassMat.ior = 1.5;
     glassMat.maxBounces = 2;
     glassMat.absorptionColor = [0.2, 0.5, 0.8];
@@ -301,9 +301,13 @@
 
     // ── Cube ─────────────────────────────────────────────────────────────
     const cubeGeo = new BoxGeometry(2, 2, 2);
-    const cube = new Renderable(cubeGeo, whiteMat);
+    const cubeMat = makeFloorMat(0.9, 0.9, 0.9, 0.0, 1.0);
+    const cube = new Renderable(cubeGeo, cubeMat);
     cube.position.set(0, 1.5, 0);
-    cube.pathTracerMaterial = makePTMat(0.9, 0.9, 0.9);
+    const cubePTMat = makePTMat(0.9, 0.9, 0.9);
+    cubePTMat.metallic = 1.0;
+    cubePTMat.roughness = 0.0;
+    cube.pathTracerMaterial = cubePTMat;
     scene.add(cube);
 
     // ── GLTF Model ──────────────────────────────────────────────────────
@@ -318,7 +322,7 @@
         dragonPathMat.albedo = [1, 1, 1];
         dragonPathMat.roughness = 0.0;
         dragonPathMat.metallic = 1.0;
-        dragonPathMat.refractive = false;
+        dragonPathMat.transmission = 0.0;
         dragonPathMat.ior = 1.5;
         dragonPathMat.maxBounces = 4;
         dragonPathMat.absorptionColor = [0.2, 0.2, 0.2];
@@ -337,7 +341,10 @@
       useBlueNoise: false,
       traceScale: 0.5,
       maxBounces: 3,
-      ambientColor: [0, 0, 0],
+      ambientColor: [0.15, 0.15, 0.15],
+      useProbes: true,
+      rasterDirect: true,
+      useReSTIR: false,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
@@ -353,7 +360,19 @@
     ptFolder.addBinding(pathTracerEffect, 'fixedSeed');
     ptFolder.addBinding(pathTracerEffect, 'traceScale', { min: 0.1, max: 1.0, step: 0.05 });
     ptFolder.addBinding(pathTracerEffect, 'maxBounces', { min: 0, max: 8, step: 1, label: 'bounces' });
-    const giAmbientParams = { color: { r: 0, g: 0, b: 0 } };
+    ptFolder.addBinding(pathTracerEffect, 'useSVGF', { label: 'SVGF' });
+    ptFolder.addBinding(pathTracerEffect, 'useReSTIR');
+    ptFolder.addBinding(pathTracerEffect, 'restirMaxHistory', { min: 1, max: 60, step: 1, label: 'ReSTIR history' });
+    ptFolder.addBinding(pathTracerEffect, 'useProbes', { label: 'Probes (SH)' });
+    ptFolder.addBinding(pathTracerEffect, 'probeSpacing', { min: 0.5, max: 10.0, step: 0.5, label: 'probe spacing' });
+    ptFolder.addBinding(pathTracerEffect, 'probeRaysPerFrame', { min: 4, max: 128, step: 4, label: 'probe rays' });
+    ptFolder.addBinding(pathTracerEffect, 'probeHysteresis', { min: 0, max: 0.99, step: 0.01, label: 'probe hysteresis' });
+    ptFolder.addBinding(pathTracerEffect, 'showProbes', { label: 'Show Probes' });
+    ptFolder.addBinding(pathTracerEffect, 'rasterDirect', { label: 'Raster Direct' });
+    const probeInfo = { count: '' };
+    const probeMonitor = ptFolder.addBinding(probeInfo, 'count', { readonly: true, label: 'probe count' });
+    setInterval(() => { probeInfo.count = String(pathTracerEffect.probeCount); probeMonitor.refresh(); }, 500);
+    const giAmbientParams = { color: { r: 38, g: 38, b: 38 } };
     ptFolder.addBinding(giAmbientParams, 'color', { label: 'ambient' }).on('change', () => {
       pathTracerEffect.ambientColor = [giAmbientParams.color.r / 255, giAmbientParams.color.g / 255, giAmbientParams.color.b / 255];
     });
@@ -375,19 +394,25 @@
     alFolder.addBinding(areaLightParams, 'targetY', { min: -10, max: 10, step: 0.1, label: 'target Y' }).on('change', updateTarget);
     alFolder.addBinding(areaLightParams, 'targetZ', { min: -10, max: 10, step: 0.1, label: 'target Z' }).on('change', updateTarget);
 
+    const sceneParams = { animateCube: true };
+    const sceneFolder = pane.addFolder({ title: 'Scene' });
+    sceneFolder.addBinding(sceneParams, 'animateCube', { label: 'Animate Cube' });
+
     // ── Render loop ───────────────────────────────────────────────────────
     function animate() {
       cameraControls.update();
       shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
-      const t = performance.now() * 0.001;
-      // sphere.position.x = Math.sin(t) * 3;
-      sphere.position.y = 4;
-      cube.position.x = Math.sin(t + Math.PI) * 3;
-      cube.position.y = Math.cos(t + Math.PI) * 2 + 3.5;
-      cube.rotation.x = t * 0.7;
-      cube.rotation.y = t * 1.1;
-      cube.rotation.z = t * 0.5;
+      if (sceneParams.animateCube) {
+        const t = performance.now() * 0.001;
+        // sphere.position.x = Math.sin(t) * 3;
+        sphere.position.y = 4;
+        cube.position.x = Math.sin(t + Math.PI) * 3;
+        cube.position.y = Math.cos(t + Math.PI) * 2 + 3.5;
+        cube.rotation.x = t * 0.7;
+        cube.rotation.y = t * 1.1;
+        cube.rotation.z = t * 0.5;
+      }
       requestAnimationFrame(animate);
     }
     requestAnimationFrame(animate);

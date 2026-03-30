@@ -1,0 +1,1317 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Curl Volumetric – Scrolling Terrain + Particles</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Material } from '../src/materials/Material'
+    import { Compute } from '../src/materials/Compute'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { Float } from '../src/math/Float'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
+    import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { PointLight } from '../src/lights/PointLight'
+    import { AreaLight } from '../src/lights/AreaLight'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+    // ── Cornell box dimensions ────────────────────────────────────────────
+    const WALL = 10;
+    const HALF = WALL / 2;
+
+    // ── Lights ──────────────────────────────────────────────────────────
+    const dirLight = new DirectionalLight([0, -1, -0.3], [1.0, 0.95, 0.9], 1.5);
+    dirLight.volumetric = true;
+
+    const pointLight = new PointLight(15, [1.0, 0.7, 0.4], 5.0);
+    pointLight.position.set(2, 6, 2);
+    pointLight.volumetric = true;
+
+    const areaLight = new AreaLight([1.0, 0.8, 0.5], 8.0, [2, 2], 15);
+    areaLight.position.set(0, WALL - 0.06, 0);
+    areaLight.target = new Vector3(0, 0, 0);
+    areaLight.volumetric = true;
+
+    const lightToggles = { directional: true, point: true, area: true };
+
+    function computeAreaLightFrame() {
+      const dir = areaLight.direction;
+      const upRef = Math.abs(dir[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+      let rx = upRef[1] * dir[2] - upRef[2] * dir[1];
+      let ry = upRef[2] * dir[0] - upRef[0] * dir[2];
+      let rz = upRef[0] * dir[1] - upRef[1] * dir[0];
+      const rl = Math.sqrt(rx * rx + ry * ry + rz * rz);
+      rx /= rl; ry /= rl; rz /= rl;
+      const fx = dir[1] * rz - dir[2] * ry;
+      const fy = dir[2] * rx - dir[0] * rz;
+      const fz = dir[0] * ry - dir[1] * rx;
+      return { dir, right: [rx, ry, rz], forward: [fx, fy, fz] };
+    }
+
+    // Packed LightParams: 10 × vec4f = 40 floats = 160 bytes
+    const lightParamsData = new Float32Array(40);
+    let lightParamsBuf = null;
+    const lightParamsBindable = {
+      type: 'uniform',
+      initialized: false,
+      needsUpdate: false,
+      get resource() { return { buffer: lightParamsBuf }; },
+      initialize(dev) {
+        lightParamsBuf = dev.createBuffer({
+          size: lightParamsData.byteLength,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new Float32Array(lightParamsBuf.getMappedRange()).set(lightParamsData);
+        lightParamsBuf.unmap();
+        this.initialized = true;
+      },
+      update(dev) {
+        if (lightParamsBuf) dev.queue.writeBuffer(lightParamsBuf, 0, lightParamsData);
+      },
+    };
+
+    function updateLightParams() {
+      lightParamsData[0] = dirLight.direction[0];
+      lightParamsData[1] = dirLight.direction[1];
+      lightParamsData[2] = dirLight.direction[2];
+      lightParamsData[3] = dirLight.intensity;
+      lightParamsData[4] = dirLight.color[0];
+      lightParamsData[5] = dirLight.color[1];
+      lightParamsData[6] = dirLight.color[2];
+      lightParamsData[7] = lightToggles.directional ? 1 : 0;
+      pointLight.updateModelMatrix();
+      const pwm = pointLight.worldMatrix.internalMat4;
+      lightParamsData[8] = pwm[12];
+      lightParamsData[9] = pwm[13];
+      lightParamsData[10] = pwm[14];
+      lightParamsData[11] = pointLight.intensity;
+      lightParamsData[12] = pointLight.color[0];
+      lightParamsData[13] = pointLight.color[1];
+      lightParamsData[14] = pointLight.color[2];
+      lightParamsData[15] = pointLight.radius;
+      areaLight.updateModelMatrix();
+      const awm = areaLight.worldMatrix.internalMat4;
+      lightParamsData[16] = awm[12];
+      lightParamsData[17] = awm[13];
+      lightParamsData[18] = awm[14];
+      lightParamsData[19] = areaLight.intensity;
+      lightParamsData[20] = areaLight.color[0];
+      lightParamsData[21] = areaLight.color[1];
+      lightParamsData[22] = areaLight.color[2];
+      lightParamsData[23] = areaLight.radius;
+      const frame = computeAreaLightFrame();
+      lightParamsData[24] = frame.right[0];
+      lightParamsData[25] = frame.right[1];
+      lightParamsData[26] = frame.right[2];
+      lightParamsData[27] = areaLight.size[0] / 2;
+      lightParamsData[28] = frame.forward[0];
+      lightParamsData[29] = frame.forward[1];
+      lightParamsData[30] = frame.forward[2];
+      lightParamsData[31] = areaLight.size[1] / 2;
+      lightParamsData[32] = frame.dir[0];
+      lightParamsData[33] = frame.dir[1];
+      lightParamsData[34] = frame.dir[2];
+      lightParamsData[35] = lightToggles.area ? 1 : 0;
+      lightParamsData[36] = lightToggles.point ? 1 : 0;
+      lightParamsData[37] = 0.08;
+      lightParamsBindable.needsUpdate = true;
+    }
+    updateLightParams();
+
+    // ── Trail parameters ─────────────────────────────────────────────────
+    const NUM_SEGMENTS = 20;
+    const numParticles = 4096;
+    const particleSize = 0.08;
+    const trailHeight = particleSize * NUM_SEGMENTS;
+    const trailHalfY = trailHeight / 2;
+
+    // ── Shader blocks ─────────────────────────────────────────────────────
+    const LIGHT_FUNCS = /* wgsl */`
+      struct LightParams {
+        dirDirI     : vec4f,
+        dirColorE   : vec4f,
+        ptPosI      : vec4f,
+        ptColorR    : vec4f,
+        areaPosI    : vec4f,
+        areaColorR  : vec4f,
+        areaRightHW : vec4f,
+        areaFwdHH   : vec4f,
+        areaDirE    : vec4f,
+        flags       : vec4f,
+      }
+
+      fn calcDirLight(lp: LightParams, N: vec3f) -> vec3f {
+        if (lp.dirColorE.w < 0.5) { return vec3f(0.0); }
+        let L = normalize(-lp.dirDirI.xyz);
+        let diffuse = max(dot(N, L), 0.0);
+        return lp.dirColorE.rgb * lp.dirDirI.w * diffuse;
+      }
+
+      fn calcPointLight(lp: LightParams, worldPos: vec3f, N: vec3f) -> vec3f {
+        if (lp.flags.x < 0.5) { return vec3f(0.0); }
+        let toLight = lp.ptPosI.xyz - worldPos;
+        let dist = length(toLight);
+        let L = toLight / max(dist, 0.001);
+        let diffuse = max(dot(N, L), 0.0);
+        let r = clamp(dist / lp.ptColorR.w, 0.0, 1.0);
+        let atten = 1.0 - r * r;
+        return lp.ptColorR.rgb * lp.ptPosI.w * diffuse * atten;
+      }
+
+      fn calcAreaLight(lp: LightParams, worldPos: vec3f, N: vec3f) -> vec3f {
+        if (lp.areaDirE.w < 0.5) { return vec3f(0.0); }
+        let right = lp.areaRightHW.xyz;
+        let halfW = lp.areaRightHW.w;
+        let fwd   = lp.areaFwdHH.xyz;
+        let halfH = lp.areaFwdHH.w;
+        let areaPos = lp.areaPosI.xyz;
+        let toP = worldPos - areaPos;
+        let projR = clamp(dot(toP, right), -halfW, halfW);
+        let projF = clamp(dot(toP, fwd),   -halfH, halfH);
+        let closestPt = areaPos + right * projR + fwd * projF;
+        let toLight = closestPt - worldPos;
+        let dist = length(toLight);
+        let L = toLight / max(dist, 0.001);
+        let diffuse = max(dot(N, L), 0.0);
+        let r = clamp(dist / lp.areaColorR.w, 0.0, 1.0);
+        let atten = 1.0 - r * r;
+        let area = 4.0 * halfW * halfH;
+        let solidAngle = area / (dist * dist + area);
+        return lp.areaColorR.rgb * lp.areaPosI.w * diffuse * atten * solidAngle;
+      }
+
+      fn calcAllLights(lp: LightParams, worldPos: vec3f, N: vec3f) -> vec3f {
+        return calcDirLight(lp, N) + calcPointLight(lp, worldPos, N) + calcAreaLight(lp, worldPos, N);
+      }
+    `;
+
+    // ── FBM noise for terrain (inline WGSL) ──────────────────────────────
+    const FBM_WGSL = /* wgsl */`
+      fn terrainRandom(st: vec2f) -> f32 {
+        return fract(sin(dot(st, vec2f(12.9898, 78.233))) * 43758.5453123);
+      }
+
+      fn terrainNoise(st: vec2f) -> f32 {
+        let i = floor(st);
+        let f = fract(st);
+        let a = terrainRandom(i);
+        let b = terrainRandom(i + vec2f(1.0, 0.0));
+        let c = terrainRandom(i + vec2f(0.0, 1.0));
+        let d = terrainRandom(i + vec2f(1.0, 1.0));
+        let u = f * f * (3.0 - 2.0 * f);
+        return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+      }
+
+      fn terrainFBM(st_in: vec2f) -> f32 {
+        var value = 0.0;
+        var amp = 0.5;
+        var st = st_in;
+        for (var i = 0; i < 6; i++) {
+          value += amp * terrainNoise(st);
+          st *= 2.0;
+          amp *= 0.5;
+        }
+        return value;
+      }
+    `;
+
+    const vertexBlock = LIGHT_FUNCS + /* wgsl */`
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> lp : LightParams;
+      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        let worldPos = worldMatrix * position;
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        return out;
+      }
+    `;
+
+    // ── Terrain shader with FBM vertex displacement ──────────────────────
+    const terrainVertexBlock = LIGHT_FUNCS + FBM_WGSL + /* wgsl */`
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> lp : LightParams;
+      @group(0) @binding(3) var<uniform> terrainParams : vec4f; // x: heightScale, y: noiseScale, z: unused, w: unused
+      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+
+      fn getTerrainHeight(xz: vec2f) -> f32 {
+        let ns = terrainParams.y;
+        return (terrainFBM(xz * ns) - 0.5) * terrainParams.x;
+      }
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        let worldPos = (worldMatrix * position).xyz;
+
+        // Displace Y with FBM based on world XZ
+        let h = getTerrainHeight(worldPos.xz);
+        let displaced = vec3f(worldPos.x, worldPos.y + h, worldPos.z);
+
+        // Compute normal from FBM partial derivatives
+        let eps = 0.5;
+        let hx = getTerrainHeight(worldPos.xz + vec2f(eps, 0.0));
+        let hz = getTerrainHeight(worldPos.xz + vec2f(0.0, eps));
+        let N = normalize(vec3f(-(hx - h) / eps, 1.0, -(hz - h) / eps));
+
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * vec4f(displaced, 1.0);
+        out.worldPos    = displaced;
+        out.worldNormal = N;
+        return out;
+      }
+    `;
+
+    // ── Wall shader ────────────────────────────────────────────────────────
+    const colorShader = vertexBlock + /* wgsl */`
+      @group(0) @binding(1) var<uniform> albedoMetal : vec4f;
+      @group(0) @binding(2) var<uniform> matParams   : vec4f;
+
+      #include <shadows>
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let albedo = albedoMetal.rgb;
+        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
+        let lighting = albedo * lp.flags.y + albedo * lit;
+        return FragmentOutput(
+          vec4f(lighting, 1),
+          vec4f(0, 0, 0, 0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, matParams.x),
+          vec4f(albedo, albedoMetal.a)
+        );
+      }
+    `;
+
+    // ── Terrain fragment shader ──────────────────────────────────────────
+    const terrainShader = terrainVertexBlock + /* wgsl */`
+      @group(0) @binding(1) var<uniform> albedoMetal : vec4f;
+      @group(0) @binding(2) var<uniform> matParams   : vec4f;
+
+      #include <shadows>
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let albedo = albedoMetal.rgb;
+        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
+        let lighting = albedo * lp.flags.y + albedo * lit;
+        return FragmentOutput(
+          vec4f(lighting, 1),
+          vec4f(0, 0, 0, 0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, matParams.x),
+          vec4f(albedo, albedoMetal.a)
+        );
+      }
+    `;
+
+    // ── Emissive light panel shader ────────────────────────────────────────
+    const emissiveShader = vertexBlock + /* wgsl */`
+      @group(0) @binding(1) var<uniform> emissiveColor     : vec3f;
+      @group(0) @binding(2) var<uniform> emissiveIntensity  : f32;
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let emissive = emissiveColor * emissiveIntensity;
+        return FragmentOutput(
+          vec4f(emissive, 1),
+          vec4f(emissive, 1),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(1, 1, 1, 0)
+        );
+      }
+    `;
+
+    // ── Trail particle shader ─────────────────────────────────────────────
+    const trailShader = LIGHT_FUNCS + /* wgsl */`
+      const BOX_HALF_Y : f32 = ${trailHalfY};
+      const NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
+
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> lp                    : LightParams;
+      @group(0) @binding(2) var<storage, read> trailTransforms : array<vec4f>;
+      @group(1) @binding(0) var<uniform> normalMatrix          : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix           : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix            : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix      : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+        @builtin(instance_index) instanceIdx : u32,
+      ) -> VertexOut {
+        let normY = (position.y + BOX_HALF_Y) / (2.0 * BOX_HALF_Y);
+        let segFloat = (1.0 - normY) * f32(NUM_SEGMENTS - 1u);
+        let seg0 = u32(floor(segFloat));
+        let seg1 = min(seg0 + 1u, NUM_SEGMENTS - 1u);
+        let frac = segFloat - f32(seg0);
+
+        let base0 = (instanceIdx * NUM_SEGMENTS + seg0) * 3u;
+        let r0_0 = trailTransforms[base0 + 0u];
+        let r0_1 = trailTransforms[base0 + 1u];
+        let r0_2 = trailTransforms[base0 + 2u];
+
+        let base1 = (instanceIdx * NUM_SEGMENTS + seg1) * 3u;
+        let r1_0 = trailTransforms[base1 + 0u];
+        let r1_1 = trailTransforms[base1 + 1u];
+        let r1_2 = trailTransforms[base1 + 2u];
+
+        let row0 = mix(r0_0, r1_0, frac);
+        let row1 = mix(r0_1, r1_1, frac);
+        let row2 = mix(r0_2, r1_2, frac);
+
+        let localXZ = vec3f(position.x, 0.0, position.z);
+        let ip = vec4f(
+          dot(row0.xyz, localXZ) + row0.w,
+          dot(row1.xyz, localXZ) + row1.w,
+          dot(row2.xyz, localXZ) + row2.w,
+          1.0
+        );
+
+        let worldPos = worldMatrix * ip;
+
+        let tn = vec3f(
+          dot(row0.xyz, normal),
+          dot(row1.xyz, normal),
+          dot(row2.xyz, normal),
+        );
+
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        out.worldNormal = normalize((normalMatrix * vec4f(tn, 0.0)).xyz);
+        return out;
+      }
+    ` + /* wgsl */`
+      @group(0) @binding(1) var<uniform> albedo : vec3f;
+
+      #include <shadows>
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
+        let lighting = albedo * lp.flags.y + albedo * lit;
+        return FragmentOutput(
+          vec4f(lighting, 1),
+          vec4f(albedo * 0.5, 1),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(albedo, 0.04)
+        );
+      }
+    `;
+
+    // ── GPU compute shaders ──────────────────────────────────────────────
+
+    // Velocity: curl noise
+    const computeVelocityShader = /* wgsl */`
+      #include <curl>
+
+      fn cornellCurl(p: vec3f, t: f32) -> vec3f {
+        let sp = p * curlParams.x;
+        let persist = curlParams.y;
+
+        var xDeriv = vec4f(0.0);
+        var yDeriv = vec4f(0.0);
+        var zDeriv = vec4f(0.0);
+
+        for (var i = 0; i < 4; i++) {
+          let freq = pow(2.0, f32(i));
+          let amp  = pow(persist, f32(i)) * 0.5;
+          xDeriv += simplexNoiseDerivatives(vec4f(sp * freq, t)) * amp;
+          yDeriv += simplexNoiseDerivatives(vec4f((sp + vec3f(31.4, -47.2, 91.8)) * freq, t)) * amp;
+          zDeriv += simplexNoiseDerivatives(vec4f((sp + vec3f(-95.3, 62.1, -17.6)) * freq, t)) * amp;
+        }
+
+        return vec3f(
+          zDeriv.y - yDeriv.z,
+          xDeriv.z - zDeriv.x,
+          yDeriv.x - xDeriv.y,
+        );
+      }
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        if (idx >= arrayLength(&positions)) { return; }
+
+        var velocity = velocities[idx];
+        let position = positions[idx];
+
+        let dt = time.y;
+        velocity *= pow(time.z, dt * 60.0);
+
+        let curl_vel = cornellCurl(position, time.x * curlParams.z);
+        velocity += curl_vel * curlParams.w * dt;
+
+        velocities[idx] = velocity;
+      }
+
+      @group(0) @binding(0) var<storage, read_write> velocities : array<vec3<f32>>;
+      @group(0) @binding(1) var<storage, read_write> positions  : array<vec3<f32>>;
+      @group(0) @binding(2) var<uniform>             time       : vec4<f32>;
+      @group(0) @binding(3) var<uniform>             curlParams : vec4<f32>;
+    `;
+
+    // Trail propagation
+    const computeTrailPropagateShader = /* wgsl */`
+      const NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        let numParticles = arrayLength(&trail) / (NUM_SEGMENTS * 3u);
+        if (idx >= numParticles) { return; }
+
+        let base = idx * NUM_SEGMENTS * 3u;
+
+        for (var i = 0u; i < NUM_SEGMENTS - 1u; i++) {
+          let dstSeg = NUM_SEGMENTS - 1u - i;
+          let srcSeg = dstSeg - 1u;
+          let dst = base + dstSeg * 3u;
+          let src = base + srcSeg * 3u;
+          trail[dst + 0u] = trail[src + 0u];
+          trail[dst + 1u] = trail[src + 1u];
+          trail[dst + 2u] = trail[src + 2u];
+        }
+      }
+
+      @group(0) @binding(0) var<storage, read_write> trail : array<vec4f>;
+    `;
+
+    // Position update — with scrollZ support
+    const computePositionShader = /* wgsl */`
+      const NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+        let idx = gid.x;
+        if (idx >= arrayLength(&positions)) { return; }
+
+        var position = positions[idx];
+        var velocity = velocities[idx];
+
+        let dt = time.y;
+        position += velocity * dt * 60.0;
+
+        // scrollZ: x = scrollSpeed (applied externally), y = boundsZMin, z = boundsZMax
+        let scrollSpeed = scrollZ.x;
+        position.z -= scrollSpeed * dt * 60.0;
+
+        let bMin = boundsMinMax.xyz;
+        let bMax = vec3f(boundsMinMax.w, boundsMinMax2.x, boundsMinMax2.y);
+
+        // In terrain mode (scrolling), X and Y are free — only Z wraps.
+        // In cornell mode, bounce off all bounds.
+        var zShift = 0.0;
+        if (scrollSpeed > 0.0) {
+          let zRange = bMax.z - bMin.z;
+          if (position.z < bMin.z) { zShift = zRange; position.z += zRange; }
+          if (position.z > bMax.z) { zShift = -zRange; position.z -= zRange; }
+        } else {
+          if (position.x < bMin.x) { position.x = bMin.x; velocity.x *= -0.5; }
+          if (position.x > bMax.x) { position.x = bMax.x; velocity.x *= -0.5; }
+          if (position.y < bMin.y) { position.y = bMin.y; velocity.y *= -0.5; }
+          if (position.y > bMax.y) { position.y = bMax.y; velocity.y *= -0.5; }
+          if (position.z < bMin.z) { position.z = bMin.z; velocity.z *= -0.5; }
+          if (position.z > bMax.z) { position.z = bMax.z; velocity.z *= -0.5; }
+        }
+
+        positions[idx] = position;
+        velocities[idx] = velocity;
+
+        // If particle wrapped on Z, relocate entire trail
+        if (zShift != 0.0) {
+          let tb = idx * NUM_SEGMENTS * 3u;
+          for (var s = 0u; s < NUM_SEGMENTS; s++) {
+            // row2.w holds the Z position of each trail segment
+            let r2idx = tb + s * 3u + 2u;
+            var r2 = trail[r2idx];
+            r2.w += zShift;
+            trail[r2idx] = r2;
+          }
+        }
+
+        let trailBase = idx * NUM_SEGMENTS * 3u;
+
+        let speed = length(velocity);
+        var forward = vec3f(0.0, 1.0, 0.0);
+        if (speed > 0.001) {
+          forward = normalize(velocity);
+        }
+
+        let prevRow0 = trail[trailBase + 3u];
+        let prevRow1 = trail[trailBase + 4u];
+        let prevRow2 = trail[trailBase + 5u];
+        let prevRight = vec3f(prevRow0.x, prevRow1.x, prevRow2.x);
+
+        var right = prevRight - forward * dot(prevRight, forward);
+        let rightLen = length(right);
+
+        if (rightLen < 0.001) {
+          if (abs(forward.y) > 0.99) {
+            right = normalize(cross(vec3f(0.0, 0.0, 1.0), forward));
+          } else {
+            right = normalize(cross(vec3f(0.0, 1.0, 0.0), forward));
+          }
+        } else {
+          right = right / rightLen;
+        }
+        let up = cross(forward, right);
+
+        let row0 = vec4f(right.x, forward.x, up.x, position.x);
+        let row1 = vec4f(right.y, forward.y, up.y, position.y);
+        let row2 = vec4f(right.z, forward.z, up.z, position.z);
+
+        trail[trailBase + 0u] = row0;
+        trail[trailBase + 1u] = row1;
+        trail[trailBase + 2u] = row2;
+      }
+
+      @group(0) @binding(0) var<storage, read_write> positions  : array<vec3<f32>>;
+      @group(0) @binding(1) var<storage, read_write> velocities : array<vec3<f32>>;
+      @group(0) @binding(2) var<uniform>             time       : vec4<f32>;
+      @group(0) @binding(3) var<storage, read_write> trail      : array<vec4f>;
+      @group(0) @binding(4) var<uniform>             boundsMinMax  : vec4<f32>;
+      @group(0) @binding(5) var<uniform>             boundsMinMax2 : vec4<f32>;
+      @group(0) @binding(6) var<uniform>             scrollZ       : vec4<f32>;
+    `;
+
+    // ── Renderer ──────────────────────────────────────────────────────────
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      antialias: true,
+      sampleCount: 1
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas);
+    renderer.canvas.style.width = '100%';
+    renderer.canvas.style.height = '100%';
+    dirLight.enableShadows(renderer.gpuDevice, { resolution: 1024 });
+    pointLight.enableShadows(renderer.gpuDevice, { resolution: 512, near: 0.1, shadowFar: 50 });
+    areaLight.enableShadows(renderer.gpuDevice, { resolution: 1024, fov: 120 });
+    const shadowSource = { value: 'area' };
+    let fogEffectRef = null;
+    renderer.cubeMapShadowMap = pointLight.shadowMap;
+    function updateShadowSource() {
+      let sm = null;
+      if (shadowSource.value === 'directional' && dirLight.shadowMap) {
+        sm = dirLight.shadowMap;
+      } else if (shadowSource.value === 'area' && areaLight.shadowMap) {
+        sm = areaLight.shadowMap;
+      }
+      if (shadowSource.value === 'point') {
+        renderer.shadowMap = null;
+      } else if (sm) {
+        renderer.shadowMap = sm;
+      }
+      if (fogEffectRef) fogEffectRef.shadowMap = sm;
+    }
+    renderer.shadowsEnabled = true;
+    updateShadowSource();
+    const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
+      gridW: 160, gridH: 90, gridD: 128,
+      near: 0.5, far: 100,
+      temporal: true,
+      blendFactor: 0.05,
+    });
+
+    // ── Scene ─────────────────────────────────────────────────────────────
+    const scene = new Scene();
+    const camera = new Camera(50, 0.1, 200, window.innerWidth / window.innerHeight);
+
+    scene.add(dirLight);
+    scene.add(pointLight);
+    scene.add(areaLight);
+
+    const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
+
+    // ── Material helpers ──────────────────────────────────────────────────
+    function makeWallMat(r, g, b, metallic = 0.04, roughness = 1.0) {
+      const albedoMetal = new Vector4(r, g, b, metallic);
+      const matParams = new Vector4(roughness, 0, 0, 0);
+      const mat = new Material(colorShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: lightParamsBindable },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedoMetal },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: matParams },
+        ],
+      });
+      return { mat, albedoMetal, matParams };
+    }
+
+    // Terrain material with extra terrainParams uniform
+    const terrainParamsUniform = new Vector4(5.0, 0.08, 0, 0); // heightScale, noiseScale
+    function makeTerrainMat(r, g, b, metallic = 0.04, roughness = 1.0) {
+      const albedoMetal = new Vector4(r, g, b, metallic);
+      const matParams = new Vector4(roughness, 0, 0, 0);
+      const mat = new Material(terrainShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: lightParamsBindable },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: albedoMetal },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: matParams },
+          { binding: 3, visibility: GPUShaderStage.VERTEX, value: terrainParamsUniform },
+        ],
+      });
+      return { mat, albedoMetal, matParams };
+    }
+
+    const leftWallRaster = makeWallMat(0.85, 0.12, 0.08);
+    const rightWallRaster = makeWallMat(0.12, 0.85, 0.15);
+    const backWallRaster = makeWallMat(0.85, 0.85, 0.85);
+    const ceilingRaster = makeWallMat(0.85, 0.85, 0.85);
+    const floorRaster = makeWallMat(0.85, 0.85, 0.85, 0.3, 0.6);
+    const terrainRaster = makeTerrainMat(0.35, 0.55, 0.25, 0.04, 0.9);
+
+    // ── Cornell Box geometry ──────────────────────────────────────────────
+    const wallGeo = new BoxGeometry(WALL, WALL, 0.1);
+
+    // Floor
+    const floor = new Renderable(wallGeo, floorRaster.mat);
+    floor.position.set(0, 0, 0);
+    floor.rotation.x = -Math.PI / 2;
+    scene.add(floor);
+
+    // Ceiling
+    const ceiling = new Renderable(wallGeo, ceilingRaster.mat);
+    ceiling.position.set(0, WALL, 0);
+    ceiling.rotation.x = Math.PI / 2;
+    ceiling.castShadow = false;
+    scene.add(ceiling);
+
+    // Back wall
+    const backWall = new Renderable(wallGeo, backWallRaster.mat);
+    backWall.position.set(0, HALF, -HALF);
+    scene.add(backWall);
+
+    // Left wall (RED)
+    const leftWall = new Renderable(wallGeo, leftWallRaster.mat);
+    leftWall.position.set(-HALF, HALF, 0);
+    leftWall.rotation.y = Math.PI / 2;
+    scene.add(leftWall);
+
+    // Right wall (GREEN)
+    const rightWall = new Renderable(wallGeo, rightWallRaster.mat);
+    rightWall.position.set(HALF, HALF, 0);
+    rightWall.rotation.y = -Math.PI / 2;
+    scene.add(rightWall);
+
+    const wallObjects = [ceiling, backWall, leftWall, rightWall];
+
+    // ── Emissive ceiling light panel ──────────────────────────────────────
+    const lightPanelGeo = new BoxGeometry(3, 0.1, 3);
+    const lightEmissiveColor = new Vector3(1.0, 0.95, 0.8);
+    const lightEmissiveIntensity = new Float(3.0);
+    const lightPanelMat = new Material(emissiveShader, {
+      outputsEmissive: true,
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: lightParamsBindable },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: lightEmissiveColor },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: lightEmissiveIntensity },
+      ],
+    });
+    const lightPanel = new Renderable(lightPanelGeo, lightPanelMat);
+    lightPanel.position.set(0, WALL - 0.06, 0);
+    lightPanel.castShadow = false;
+    scene.add(lightPanel);
+
+    // ── Terrain planes ────────────────────────────────────────────────────
+    const TERRAIN_SIZE = 20;
+    const TERRAIN_SEGS = 100;
+    const terrainGeo = new PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGS, TERRAIN_SEGS);
+
+    const terrainPlaneA = new Renderable(terrainGeo, terrainRaster.mat);
+    terrainPlaneA.rotation.x = Math.PI / 2;
+    terrainPlaneA.position.set(0, 0, 0);
+
+    const terrainPlaneB = new Renderable(terrainGeo, terrainRaster.mat);
+    terrainPlaneB.rotation.x = Math.PI / 2;
+    terrainPlaneB.position.set(0, 0, 20);
+
+    // Not added to scene yet — terrain mode will add them
+
+    // ── Particle setup ────────────────────────────────────────────────────
+    const particleAlbedo = new Vector3(0.9, 0.75, 0.5);
+    const time = new Vector4();
+    const curlParams = new Vector4(0.4, 0.5, 0.15, 0.72);
+    const scrollZUniform = new Vector4(0, 0, 0, 0); // x: scrollSpeed
+
+    // Bounds uniforms for compute shader
+    const boundsMinMax = new Vector4(-4.0, 0.3, -4.0, 4.0);
+    const boundsMinMax2 = new Vector4(9.5, 4.0, 0, 0);
+
+    // CPU-side initial positions
+    const initialPositions = new Float32Array(numParticles * 4);
+    for (let i = 0; i < numParticles; i++) {
+      initialPositions[i * 4 + 0] = (Math.random() - 0.5) * 8;
+      initialPositions[i * 4 + 1] = Math.random() * 8 + 1;
+      initialPositions[i * 4 + 2] = (Math.random() - 0.5) * 8;
+      initialPositions[i * 4 + 3] = 0;
+    }
+
+    // Initial trail
+    const initialTrail = new Float32Array(numParticles * NUM_SEGMENTS * 12);
+    for (let i = 0; i < numParticles; i++) {
+      const px = initialPositions[i * 4], py = initialPositions[i * 4 + 1], pz = initialPositions[i * 4 + 2];
+      for (let s = 0; s < NUM_SEGMENTS; s++) {
+        const b = (i * NUM_SEGMENTS + s) * 12;
+        initialTrail[b + 0] = 1; initialTrail[b + 3] = px;
+        initialTrail[b + 5] = 1; initialTrail[b + 7] = py;
+        initialTrail[b + 10] = 1; initialTrail[b + 11] = pz;
+      }
+    }
+
+    // ── GPU buffers ──────────────────────────────────────────────────────
+    const computeBufferVelocities = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: new Float32Array(numParticles * 4),
+    });
+
+    const computeBufferPositions = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: initialPositions,
+    });
+
+    const trailBuffer = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: initialTrail,
+    });
+
+    computeBufferVelocities.initialize(renderer.gpuDevice);
+    computeBufferPositions.initialize(renderer.gpuDevice);
+    trailBuffer.initialize(renderer.gpuDevice);
+
+    const trailBufferVertex = {
+      type: 'read-only-storage',
+      initialized: true,
+      needsUpdate: false,
+      get resource() { return trailBuffer.resource; },
+      initialize() { },
+      update() { },
+    };
+
+    // ── Instanced geometry + material ────────────────────────────────────
+    const instancedGeo = new InstancedGeometry(
+      new BoxGeometry(particleSize, trailHeight, particleSize, 1, NUM_SEGMENTS, 1),
+      numParticles,
+      []
+    );
+
+    const instancedMat = new Material(trailShader, {
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: lightParamsBindable },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: particleAlbedo },
+        { binding: 2, visibility: GPUShaderStage.VERTEX, value: trailBufferVertex },
+      ],
+    });
+
+    const particles = new Renderable(instancedGeo, instancedMat);
+
+    // ── Custom shadow vertex code for trail instancing ───────────────────
+    particles.shadowVertexCode = /* wgsl */`
+      const SHADOW_BOX_HALF_Y : f32 = ${trailHalfY};
+      const SHADOW_NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
+
+      @group(2) @binding(0) var<storage, read> trailTransforms : array<vec4f>;
+
+      fn shadowWorldPos(position : vec4f, instanceIdx : u32) -> vec4f {
+        let normY = (position.y + SHADOW_BOX_HALF_Y) / (2.0 * SHADOW_BOX_HALF_Y);
+        let segFloat = (1.0 - normY) * f32(SHADOW_NUM_SEGMENTS - 1u);
+        let seg0 = u32(floor(segFloat));
+        let seg1 = min(seg0 + 1u, SHADOW_NUM_SEGMENTS - 1u);
+        let frac = segFloat - f32(seg0);
+
+        let base0 = (instanceIdx * SHADOW_NUM_SEGMENTS + seg0) * 3u;
+        let r0_0 = trailTransforms[base0 + 0u];
+        let r0_1 = trailTransforms[base0 + 1u];
+        let r0_2 = trailTransforms[base0 + 2u];
+
+        let base1 = (instanceIdx * SHADOW_NUM_SEGMENTS + seg1) * 3u;
+        let r1_0 = trailTransforms[base1 + 0u];
+        let r1_1 = trailTransforms[base1 + 1u];
+        let r1_2 = trailTransforms[base1 + 2u];
+
+        let row0 = mix(r0_0, r1_0, frac);
+        let row1 = mix(r0_1, r1_1, frac);
+        let row2 = mix(r0_2, r1_2, frac);
+
+        let localXZ = vec3f(position.x, 0.0, position.z);
+        let ip = vec4f(
+          dot(row0.xyz, localXZ) + row0.w,
+          dot(row1.xyz, localXZ) + row1.w,
+          dot(row2.xyz, localXZ) + row2.w,
+          1.0
+        );
+
+        return worldMatrix * ip;
+      }
+    `;
+
+    particles.shadowExtraBGL = renderer.gpuDevice.createBindGroupLayout({
+      label: 'ShadowTrail/ExtraBGL',
+      entries: [{
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX,
+        buffer: { type: 'read-only-storage' },
+      }],
+    });
+
+    particles.shadowExtraBG = renderer.gpuDevice.createBindGroup({
+      label: 'ShadowTrail/ExtraBG',
+      layout: particles.shadowExtraBGL,
+      entries: [{
+        binding: 0,
+        resource: { buffer: trailBuffer.resource.buffer },
+      }],
+    });
+
+    scene.add(particles);
+
+    // ── GPU compute dispatchers ──────────────────────────────────────────
+    const WG = Math.ceil(numParticles / 64);
+
+    const computeVelocities = new Compute(computeVelocityShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: computeBufferVelocities },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: computeBufferPositions },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: time },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: curlParams },
+    ]);
+
+    const computeTrailPropagate = new Compute(computeTrailPropagateShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: trailBuffer },
+    ]);
+
+    const computePositions = new Compute(computePositionShader, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: computeBufferPositions },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: computeBufferVelocities },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: time },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, value: trailBuffer },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, value: boundsMinMax },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, value: boundsMinMax2 },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, value: scrollZUniform },
+    ]);
+
+    // ── Post-processing effects ──────────────────────────────────────────
+    const fogEffect = new VolumetricFogEffect({
+      froxelGrid,
+      shadowMap: areaLight.shadowMap,
+      baseDensity: 0.02,
+      heightFalloff: 0.005,
+      anisotropy: 0.6,
+    });
+    fogEffectRef = fogEffect;
+
+    const bloomEffect = new BloomEffect({
+      threshold: 0.8,
+      knee: 0.2,
+      intensity: 0.6,
+      radius: 1.0,
+      useEmissive: true,
+    });
+
+    const dofEffect = new DepthOfFieldEffect({
+      focusDistance: 18,
+      focusRange: 15,
+      maxBlur: 16,
+    });
+
+    const effectToggles = {
+      fog: true,
+      bloom: true,
+      dof: false,
+    };
+
+    const volume = new PostProcessingVolume(renderer, []);
+
+    function rebuildEffectChain() {
+      volume.effects = [];
+      if (effectToggles.fog) volume.effects.push(fogEffect);
+      if (effectToggles.bloom) volume.effects.push(bloomEffect);
+      if (effectToggles.dof) volume.effects.push(dofEffect);
+    }
+    rebuildEffectChain();
+
+    // ── Scene mode management ─────────────────────────────────────────────
+    let currentMode = 'terrain';
+    const cornellObjects = [ceiling, backWall, leftWall, rightWall, lightPanel, floor];
+    const terrainObjects = [terrainPlaneA, terrainPlaneB];
+
+    function removeFromScene(obj) {
+      const idx = obj.parent?.children.indexOf(obj);
+      if (idx !== undefined && idx >= 0) obj.parent.children.splice(idx, 1);
+    }
+
+    function setSceneMode(mode) {
+      if (mode === 'cornell') {
+        terrainObjects.forEach(removeFromScene);
+        cornellObjects.forEach(o => scene.add(o));
+        boundsMinMax.set(-4.0, 0.3, -4.0, 4.0);
+        boundsMinMax2.set(9.5, 4.0, 0, 0);
+        scrollZUniform.x = 0;
+      } else {
+        // terrain
+        cornellObjects.forEach(removeFromScene);
+        terrainObjects.forEach(o => scene.add(o));
+        boundsMinMax.set(-10.0, 1.0, -10.0, 10.0);
+        boundsMinMax2.set(15.0, 30.0, 0, 0);
+        scrollZUniform.x = settings.scrollSpeed;
+        // Reset terrain positions
+        terrainPlaneA.position.set(0, 0, 0);
+        terrainPlaneB.position.set(0, 0, 20);
+      }
+      currentMode = mode;
+      renderer.invalidateBundle();
+      resetParticles();
+    }
+
+    // ── Reset particles ──────────────────────────────────────────────────
+    function resetParticles() {
+      const bMin = [boundsMinMax.x, boundsMinMax.y, boundsMinMax.z];
+      const bMax = [boundsMinMax.w, boundsMinMax2.x, boundsMinMax2.y];
+      const pos = new Float32Array(numParticles * 4);
+      const vel = new Float32Array(numParticles * 4);
+      const trl = new Float32Array(numParticles * NUM_SEGMENTS * 12);
+      for (let i = 0; i < numParticles; i++) {
+        const px = bMin[0] + Math.random() * (bMax[0] - bMin[0]);
+        const py = bMin[1] + Math.random() * (bMax[1] - bMin[1]);
+        const pz = bMin[2] + Math.random() * (bMax[2] - bMin[2]);
+        pos[i * 4] = px; pos[i * 4 + 1] = py; pos[i * 4 + 2] = pz;
+        for (let s = 0; s < NUM_SEGMENTS; s++) {
+          const tb = (i * NUM_SEGMENTS + s) * 12;
+          trl[tb] = 1; trl[tb + 3] = px;
+          trl[tb + 5] = 1; trl[tb + 7] = py;
+          trl[tb + 10] = 1; trl[tb + 11] = pz;
+        }
+      }
+      const dev = renderer.gpuDevice;
+      dev.queue.writeBuffer(computeBufferPositions.resource.buffer, 0, pos);
+      dev.queue.writeBuffer(computeBufferVelocities.resource.buffer, 0, vel);
+      dev.queue.writeBuffer(trailBuffer.resource.buffer, 0, trl);
+    }
+
+    // ── Tweakpane ─────────────────────────────────────────────────────────
+    const settings = {
+      animate: true,
+      speed: 0.5,
+      trailRate: 60,
+      sceneMode: 'terrain',
+      scrollSpeed: 0.15,
+      terrainHeight: 5.0,
+      terrainNoiseScale: 0.08,
+      noiseScale: 0.4,
+      persistence: 0.5,
+      timeScale: 0.15,
+      curlStrength: 0.72,
+      damping: 0.92,
+    };
+    const pane = new Pane({ title: 'Curl Volumetric' });
+
+    pane.addBinding(settings, 'animate');
+    pane.addBinding(settings, 'speed', { min: 0, max: 2, step: 0.01 });
+    pane.addBinding(settings, 'trailRate', { min: 10, max: 144, step: 1, label: 'trail rate (Hz)' });
+    pane.addBinding(settings, 'sceneMode', {
+      label: 'scene',
+      options: { 'Terrain': 'terrain', 'Cornell Box': 'cornell' },
+    }).on('change', (e) => setSceneMode(e.value));
+    pane.addButton({ title: 'Reset Particles' }).on('click', resetParticles);
+
+    // ── Terrain folder ──
+    const terrainFolder = pane.addFolder({ title: 'Terrain' });
+    terrainFolder.addBinding(settings, 'scrollSpeed', { min: 0.0, max: 1.0, step: 0.01, label: 'scroll speed' });
+    terrainFolder.addBinding(settings, 'terrainHeight', { min: 0.0, max: 20.0, step: 0.1, label: 'height' });
+    terrainFolder.addBinding(settings, 'terrainNoiseScale', { min: 0.01, max: 0.5, step: 0.001, label: 'noise scale' });
+
+    // ── Curl folder ──
+    const curlFolder = pane.addFolder({ title: 'Curl Noise' });
+    curlFolder.addBinding(settings, 'noiseScale', { min: 0.05, max: 2.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'persistence', { min: 0.0, max: 1.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'timeScale', { min: 0.0, max: 1.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'curlStrength', { min: 0.0, max: 3.0, step: 0.01 });
+    curlFolder.addBinding(settings, 'damping', { min: 0.5, max: 1.0, step: 0.01 });
+
+    // ── Lighting controls ────────────────────────────────────────────────
+    const lightFolder = pane.addFolder({ title: 'Lighting' });
+    lightFolder.addBinding(shadowSource, 'value', {
+      label: 'shadow source',
+      options: { 'Directional': 'directional', 'Point': 'point', 'Area': 'area' },
+    }).on('change', () => updateShadowSource());
+    const emissiveParams = { intensity: lightEmissiveIntensity.value };
+    lightFolder.addBinding(emissiveParams, 'intensity', { min: 0, max: 10, step: 0.1, label: 'panel glow' }).on('change', () => {
+      lightEmissiveIntensity.value = emissiveParams.intensity;
+    });
+
+    // ── Directional Light ──
+    const dirFolder = pane.addFolder({ title: 'Directional Light', expanded: false });
+    const dirParams = {
+      enabled: lightToggles.directional,
+      intensity: dirLight.intensity,
+      color: { r: dirLight.color[0], g: dirLight.color[1], b: dirLight.color[2] },
+      dirX: dirLight.direction[0],
+      dirY: dirLight.direction[1],
+      dirZ: dirLight.direction[2],
+    };
+    dirFolder.addBinding(dirParams, 'enabled').on('change', () => { lightToggles.directional = dirParams.enabled; });
+    dirFolder.addBinding(dirParams, 'intensity', { min: 0, max: 20, step: 0.1 }).on('change', () => { dirLight.intensity = dirParams.intensity; });
+    dirFolder.addBinding(dirParams, 'color', { color: { type: 'float' } }).on('change', () => {
+      dirLight.color = [dirParams.color.r, dirParams.color.g, dirParams.color.b];
+    });
+    dirFolder.addBinding(dirParams, 'dirX', { min: -1, max: 1, step: 0.01, label: 'dir X' }).on('change', () => { dirLight.direction[0] = dirParams.dirX; });
+    dirFolder.addBinding(dirParams, 'dirY', { min: -1, max: 1, step: 0.01, label: 'dir Y' }).on('change', () => { dirLight.direction[1] = dirParams.dirY; });
+    dirFolder.addBinding(dirParams, 'dirZ', { min: -1, max: 1, step: 0.01, label: 'dir Z' }).on('change', () => { dirLight.direction[2] = dirParams.dirZ; });
+
+    // ── Point Light ──
+    const ptFolder = pane.addFolder({ title: 'Point Light', expanded: false });
+    const ptParams = {
+      enabled: lightToggles.point,
+      intensity: pointLight.intensity,
+      posX: pointLight.position.x,
+      posY: pointLight.position.y,
+      posZ: pointLight.position.z,
+      radius: pointLight.radius,
+    };
+    ptFolder.addBinding(ptParams, 'enabled').on('change', () => { lightToggles.point = ptParams.enabled; });
+    ptFolder.addBinding(ptParams, 'intensity', { min: 0, max: 30, step: 0.5 }).on('change', () => { pointLight.intensity = ptParams.intensity; });
+    ptFolder.addBinding(ptParams, 'posX', { min: -10, max: 10, step: 0.1, label: 'pos X' }).on('change', () => { pointLight.position.x = ptParams.posX; });
+    ptFolder.addBinding(ptParams, 'posY', { min: 0, max: 10, step: 0.1, label: 'pos Y' }).on('change', () => { pointLight.position.y = ptParams.posY; });
+    ptFolder.addBinding(ptParams, 'posZ', { min: -10, max: 10, step: 0.1, label: 'pos Z' }).on('change', () => { pointLight.position.z = ptParams.posZ; });
+    ptFolder.addBinding(ptParams, 'radius', { min: 1, max: 50, step: 0.5, label: 'decay radius' }).on('change', () => { pointLight.radius = ptParams.radius; });
+
+    // ── Area Light ──
+    const areaFolder = pane.addFolder({ title: 'Area Light', expanded: false });
+    const areaParams = {
+      enabled: lightToggles.area,
+      intensity: areaLight.intensity,
+      posX: areaLight.position.x,
+      posY: areaLight.position.y,
+      posZ: areaLight.position.z,
+      targetX: areaLight.target.x,
+      targetY: areaLight.target.y,
+      targetZ: areaLight.target.z,
+      radius: areaLight.radius,
+      sizeW: areaLight.size[0],
+      sizeH: areaLight.size[1],
+    };
+    areaFolder.addBinding(areaParams, 'enabled').on('change', () => { lightToggles.area = areaParams.enabled; });
+    areaFolder.addBinding(areaParams, 'intensity', { min: 0, max: 30, step: 0.5 }).on('change', () => { areaLight.intensity = areaParams.intensity; });
+    areaFolder.addBinding(areaParams, 'posX', { min: -10, max: 10, step: 0.1, label: 'pos X' }).on('change', () => { areaLight.position.x = areaParams.posX; });
+    areaFolder.addBinding(areaParams, 'posY', { min: 0, max: 15, step: 0.1, label: 'pos Y' }).on('change', () => { areaLight.position.y = areaParams.posY; });
+    areaFolder.addBinding(areaParams, 'posZ', { min: -10, max: 10, step: 0.1, label: 'pos Z' }).on('change', () => { areaLight.position.z = areaParams.posZ; });
+    areaFolder.addBinding(areaParams, 'targetX', { min: -10, max: 10, step: 0.1, label: 'target X' }).on('change', () => { areaLight.target.x = areaParams.targetX; });
+    areaFolder.addBinding(areaParams, 'targetY', { min: -10, max: 10, step: 0.1, label: 'target Y' }).on('change', () => { areaLight.target.y = areaParams.targetY; });
+    areaFolder.addBinding(areaParams, 'targetZ', { min: -10, max: 10, step: 0.1, label: 'target Z' }).on('change', () => { areaLight.target.z = areaParams.targetZ; });
+    areaFolder.addBinding(areaParams, 'radius', { min: 1, max: 50, step: 0.5, label: 'decay radius' }).on('change', () => { areaLight.radius = areaParams.radius; });
+    areaFolder.addBinding(areaParams, 'sizeW', { min: 0.1, max: 10, step: 0.1, label: 'width' }).on('change', () => { areaLight.size[0] = areaParams.sizeW; });
+    areaFolder.addBinding(areaParams, 'sizeH', { min: 0.1, max: 10, step: 0.1, label: 'height' }).on('change', () => { areaLight.size[1] = areaParams.sizeH; });
+
+    // ── Volumetric Fog controls ──────────────────────────────────────────
+    const fogFolder = pane.addFolder({ title: 'Volumetric Fog' });
+    fogFolder.addBinding(effectToggles, 'fog', { label: 'enabled' }).on('change', rebuildEffectChain);
+    fogFolder.addBinding(fogEffect, 'baseDensity', { min: 0, max: 0.2, step: 0.001 });
+    fogFolder.addBinding(fogEffect, 'heightFalloff', { min: 0, max: 0.5, step: 0.001 });
+    fogFolder.addBinding(fogEffect, 'extinctionCoeff', { min: 0, max: 5, step: 0.01, label: 'extinction' });
+    fogFolder.addBinding(fogEffect, 'anisotropy', { min: -1, max: 1, step: 0.01 });
+
+    // ── Bloom controls ───────────────────────────────────────────────────
+    const bloomFolder = pane.addFolder({ title: 'Bloom' });
+    bloomFolder.addBinding(effectToggles, 'bloom', { label: 'enabled' }).on('change', rebuildEffectChain);
+    bloomFolder.addBinding(bloomEffect, 'useEmissive', { label: 'emissive only' });
+    bloomFolder.addBinding(bloomEffect, 'threshold', { min: 0, max: 3, step: 0.01 });
+    bloomFolder.addBinding(bloomEffect, 'knee', { min: 0, max: 1, step: 0.01 });
+    bloomFolder.addBinding(bloomEffect, 'intensity', { min: 0, max: 3, step: 0.01 });
+    bloomFolder.addBinding(bloomEffect, 'radius', { min: 0, max: 2, step: 0.01 });
+
+    // ── Depth of Field controls ──────────────────────────────────────────
+    const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
+    dofFolder.addBinding(effectToggles, 'dof', { label: 'enabled' }).on('change', rebuildEffectChain);
+    dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 100, step: 0.5 });
+    dofFolder.addBinding(dofEffect, 'focusRange', { min: 1, max: 50, step: 0.5 });
+    dofFolder.addBinding(dofEffect, 'maxBlur', { min: 0, max: 64, step: 1 });
+
+    // ── Initialize scene mode ────────────────────────────────────────────
+    setSceneMode('terrain');
+
+    // ── Render loop ───────────────────────────────────────────────────────
+    let lastTime = performance.now() / 1000;
+    let trailAccum = 0;
+
+    function animate() {
+      const now = performance.now() / 1000;
+      const dt = Math.min(now - lastTime, 0.05);
+      lastTime = now;
+      time.x = now;
+      time.y = dt * settings.speed;
+      time.z = settings.damping;
+      curlParams.x = settings.noiseScale;
+      curlParams.y = settings.persistence;
+      curlParams.z = settings.timeScale;
+      curlParams.w = settings.curlStrength;
+      cameraControls.update();
+
+      // Update terrain params
+      terrainParamsUniform.x = settings.terrainHeight;
+      terrainParamsUniform.y = settings.terrainNoiseScale;
+
+      // Update scroll speed for compute shader
+      if (currentMode === 'terrain') {
+        scrollZUniform.x = settings.scrollSpeed;
+
+        // Scroll terrain planes
+        const scrollDelta = settings.scrollSpeed * dt * settings.speed * 60.0;
+        terrainPlaneA.position.z -= scrollDelta;
+        terrainPlaneB.position.z -= scrollDelta;
+
+        // Wrap: when a plane goes below -50, teleport to +150
+        if (terrainPlaneA.position.z < -10) { terrainPlaneA.position.z += 40; }
+        if (terrainPlaneB.position.z < -10) { terrainPlaneB.position.z += 40; }
+      } else {
+        scrollZUniform.x = 0;
+      }
+
+      if (settings.animate) {
+        renderer.compute(computeVelocities, WG);
+
+        const scaledDt = dt * settings.speed;
+        trailAccum += scaledDt;
+        const trailStep = 1 / settings.trailRate;
+        if (trailAccum >= trailStep) {
+          renderer.compute(computeTrailPropagate, WG);
+          trailAccum -= trailStep;
+          if (trailAccum > trailStep) { trailAccum = trailStep; }
+        }
+
+        renderer.compute(computePositions, WG);
+      }
+
+      // Update light params uniform + sync volumetric flag for fog
+      dirLight.volumetric = lightToggles.directional;
+      pointLight.volumetric = lightToggles.point;
+      areaLight.volumetric = lightToggles.area;
+      updateLightParams();
+
+      // Render shadow from selected source
+      if (shadowSource.value === 'area' && areaLight.shadowMap) {
+        areaLight.shadowMap.render(renderer, scene, camera, areaLight);
+      } else if (shadowSource.value === 'directional' && dirLight.shadowMap) {
+        dirLight.shadowMap.render(renderer, scene, camera, dirLight);
+      }
+      if (shadowSource.value === 'point' && pointLight.shadowMap) {
+        pointLight.shadowMap.render(renderer, scene, camera, [pointLight]);
+        pointLight.updateModelMatrix();
+        const wm = pointLight.worldMatrix.internalMat4;
+        renderer.setPointShadowParams(wm[12], wm[13], wm[14], pointLight.radius);
+      }
+
+      fogEffect.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
+
+      volume.render(scene, camera);
+
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+  </script>
+</body>
+
+</html>

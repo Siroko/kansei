@@ -8,7 +8,10 @@ export class PathTracerMaterial {
     public absorptionDensity: number = 0.0;
     public emissive: [number, number, number] = [0, 0, 0];
     public emissiveIntensity: number = 0.0;
-    public refractive: boolean = false;
+    /** Transmission factor: 0.0 = fully opaque, 1.0 = fully transmissive (glass). */
+    public transmission: number = 0.0;
+    /** If false, probe rays pass through this material (e.g. dynamic particles). */
+    public probeVisible: boolean = true;
 
     /** Byte size of the packed GPU struct (std140-aligned). */
     static readonly GPU_STRIDE = 64;
@@ -17,7 +20,7 @@ export class PathTracerMaterial {
      * Pack this material into a Float32Array at the given float offset.
      * GPU layout (64 bytes = 16 floats):
      *   [0-2]  albedo.rgb        [3]  roughness
-     *   [4]    metallic          [5]  ior           [6] maxBounces(f32)  [7] flags
+     *   [4]    metallic          [5]  ior           [6] maxBounces(f32)  [7] transmission
      *   [8-10] absorptionColor   [11] absorptionDensity
      *   [12-14] emissive         [15] emissiveIntensity
      */
@@ -28,8 +31,8 @@ export class PathTracerMaterial {
         target[offset + 3]  = this.roughness;
         target[offset + 4]  = this.metallic;
         target[offset + 5]  = this.ior;
-        target[offset + 6]  = this.maxBounces;
-        target[offset + 7]  = (this.refractive ? 1 : 0);
+        target[offset + 6]  = this.probeVisible ? this.maxBounces : -this.maxBounces;
+        target[offset + 7]  = this.transmission;
         target[offset + 8]  = this.absorptionColor[0];
         target[offset + 9]  = this.absorptionColor[1];
         target[offset + 10] = this.absorptionColor[2];
