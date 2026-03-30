@@ -448,9 +448,9 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
           gravity: [0, -19.6, 0],
         },
         textForm: {
-          pressureMultiplier: 1,
-          nearPressureMultiplier: 1,
-          densityTarget: 0.1,
+          pressureMultiplier: 0,
+          nearPressureMultiplier: 0,
+          densityTarget: 0,
           viscosity: 1.0,
           damping: 0.97,
           returnToOriginStrength: 0.1,
@@ -459,9 +459,10 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       };
       const presetObj = { preset: 'default' };
       const presetOptions = { default: 'default', textForm: 'textForm', custom: 'custom' };
-      let presetTween = null;
-      const tweenKeys = ['pressureMultiplier', 'nearPressureMultiplier', 'densityTarget',
-        'viscosity', 'damping', 'returnToOriginStrength'];
+      let presetTweenFast = null;
+      let presetTweenSlow = null;
+      const fastKeys = ['returnToOriginStrength', 'viscosity', 'damping'];
+      const slowKeys = ['pressureMultiplier', 'nearPressureMultiplier', 'densityTarget'];
 
       pane.addBinding(presetObj, 'preset', {
         label: 'Preset',
@@ -470,11 +471,16 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
         if (ev.value === 'custom') return;
         const target = localPresets[ev.value];
         if (!target) return;
-        // Snapshot current values
-        const from = {};
-        for (const k of tweenKeys) from[k] = sim.params[k];
-        from.gravity = [...sim.params.gravity];
-        presetTween = { from, to: target, start: performance.now() / 1000, duration: 1.5 };
+        const now = performance.now() / 1000;
+        // Fast tween (0.5s): gravity, return force
+        const fromFast = {};
+        for (const k of fastKeys) fromFast[k] = sim.params[k];
+        fromFast.gravity = [...sim.params.gravity];
+        presetTweenFast = { from: fromFast, to: target, start: now, duration: 1.5 };
+        // Slow tween (5s): pressure, density
+        const fromSlow = {};
+        for (const k of slowKeys) fromSlow[k] = sim.params[k];
+        presetTweenSlow = { from: fromSlow, to: target, start: now, duration: 5.0 };
       });
 
 
@@ -486,9 +492,9 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
 
       // SPH folder
       const sphFolder = pane.addFolder({ title: 'SPH Parameters', expanded: false });
-      sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 1, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
-      sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 1, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
-      sphFolder.addBinding(simSettings, 'densityTarget', { min: 0.1, max: 10.0, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
+      sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
+      sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
+      sphFolder.addBinding(simSettings, 'densityTarget', { min: 0, max: 10.0, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
       sphFolder.addBinding(simSettings, 'viscosity', { min: 0.0, max: 1.0, step: 0.01 }).on('change', () => { sim.params.viscosity = simSettings.viscosity; });
       sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
 
@@ -496,7 +502,7 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       const forcesFolder = pane.addFolder({ title: 'Forces', expanded: false });
       const gravityObj = { x: 0, y: -19.6, z: 0 };
       forcesFolder.addBinding(gravityObj, 'y', { min: -200, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [gravityObj.x, gravityObj.y, gravityObj.z]; });
-      forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0.0, max: 0.1, step: 0.001, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
+      forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0.0, max: 2.0, step: 0.01, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
       forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.1, max: 2.0, step: 0.05, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
       forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 10000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
 
@@ -583,24 +589,33 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
         const dt = Math.min(time.y, 1 / 30); // Cap dt
         mouseVectors.update(dt);
 
-        // Tween preset values
-        if (presetTween) {
-          const t = Math.min((time.x - presetTween.start) / presetTween.duration, 1);
-          const e = t * t * (3 - 2 * t); // smoothstep
-          for (const k of tweenKeys) {
-            if (presetTween.to[k] !== undefined) {
-              sim.params[k] = presetTween.from[k] + (presetTween.to[k] - presetTween.from[k]) * e;
+        // Tween preset values (fast: gravity/return, slow: pressure/density)
+        if (presetTweenFast) {
+          const t = Math.min((time.x - presetTweenFast.start) / presetTweenFast.duration, 1);
+          const e = t * t * (3 - 2 * t);
+          for (const k of fastKeys) {
+            if (presetTweenFast.to[k] !== undefined) {
+              sim.params[k] = presetTweenFast.from[k] + (presetTweenFast.to[k] - presetTweenFast.from[k]) * e;
             }
           }
-          if (presetTween.to.gravity) {
+          if (presetTweenFast.to.gravity) {
             sim.params.gravity = sim.params.gravity.map((_, i) =>
-              presetTween.from.gravity[i] + (presetTween.to.gravity[i] - presetTween.from.gravity[i]) * e
+              presetTweenFast.from.gravity[i] + (presetTweenFast.to.gravity[i] - presetTweenFast.from.gravity[i]) * e
             );
           }
+          if (t >= 1) presetTweenFast = null;
+        }
+        if (presetTweenSlow) {
+          const t = Math.min((time.x - presetTweenSlow.start) / presetTweenSlow.duration, 1);
+          const e = t * t * (3 - 2 * t);
+          for (const k of slowKeys) {
+            if (presetTweenSlow.to[k] !== undefined) {
+              sim.params[k] = presetTweenSlow.from[k] + (presetTweenSlow.to[k] - presetTweenSlow.from[k]) * e;
+            }
+          }
           if (t >= 1) {
-            presetTween = null;
+            presetTweenSlow = null;
             Object.assign(simSettings, sim.params);
-            // Reset body after tween completes
             body.position.set(50, 50, 0);
             body.velocity.set(0, 0, 0);
             body.angle = 0;
