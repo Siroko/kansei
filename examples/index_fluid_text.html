@@ -35,7 +35,6 @@
       import { Renderable } from '../src/objects/Renderable'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
-      import { CameraControls } from '../src/controls/CameraControls'
       import { shaderCode } from '../src/materials/shaders/rendering/msdf/TextRenderShader'
       import { Sampler } from '../src/buffers/Sampler'
       import { Vector4 } from '../src/math/Vector4'
@@ -69,7 +68,6 @@
       // ── Scene ─────────────────────────────────────────────
       const scene = new Scene();
       const camera = new Camera(20, 0.1, 100000, window.innerWidth / window.innerHeight);
-      const cameraControls = new CameraControls(camera, scene.position);
       const mouseVectors = new MouseVectors();
 
       // ── Text Geometry ─────────────────────────────────────
@@ -79,12 +77,13 @@
       for(let i = 0; i < 20; i++) {
         p += poem;
       }
+      let charSize = 25;
       const geometry = new TextGeometry({
         text: p,
         fontInfo: fontInfo,
         width: 100,
         height: 100,
-        fontSize: 25,
+        fontSize: charSize,
         color: new Vector4(1, 1, 1, 1),
       });
       const sampler = new Sampler('linear', 'linear');
@@ -96,8 +95,6 @@
         transparent: true,
       });
       const mesh = new Renderable(geometry, material);
-      mesh.position.x = -50;
-      mesh.position.y = 170;
       scene.add(mesh);
 
       // ── Fluid Simulation ──────────────────────────────────
@@ -129,6 +126,28 @@
           worldMatrix: mesh.worldMatrix,
         }
       );
+
+      // ── Camera framing: bounds fill 90% viewport width, centered ──
+      function frameCamera() {
+        const bMinX = sim.worldBoundsMin[0], bMaxX = sim.worldBoundsMax[0];
+        const bMinY = sim.worldBoundsMin[1], bMaxY = sim.worldBoundsMax[1];
+        const bw = bMaxX - bMinX;
+        const bh = bMaxY - bMinY;
+        const aspect = window.innerWidth / window.innerHeight;
+        const halfFov = (camera.fov * Math.PI / 180) / 2;
+        // Camera distance: bounds fill 100% viewport width
+        const camDist = bw / (2 * Math.tan(halfFov) * aspect);
+
+        const visH = 2 * camDist * Math.tan(halfFov);
+        // Center horizontally, align bounds bottom to viewport bottom
+        mesh.position.x = -(bMinX + bMaxX) / 2;
+        mesh.position.y = -bMinY - visH / 2;
+
+        scene.position.set(0, 0, 0);
+        camera.position.set(0, 0, camDist);
+        camera.lookAt(scene.position);
+      }
+      frameCamera();
 
       // ── Floating Body ─────────────────────────────────────
       // Compound SDF matched to moominpapa boat image:
@@ -408,8 +427,28 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       const pane = new Pane({ title: 'Fluid Simulation' });
 
       // Presets
-      const presetObj = { preset: 'custom' };
-      const presetOptions = { custom: 'custom' };
+      const localPresets = {
+        default: {
+          pressureMultiplier: 76.5,
+          nearPressureMultiplier: 48.5,
+          densityTarget: 7.6,
+          viscosity: 1.0,
+          damping: 1.0,
+          returnToOriginStrength: 0.0,
+          gravity: [0, -19.6, 0],
+        },
+        textForm: {
+          pressureMultiplier: 1,
+          nearPressureMultiplier: 1,
+          densityTarget: 0.1,
+          viscosity: 1.0,
+          damping: 0.97,
+          returnToOriginStrength: 0.1,
+          gravity: [0, -19.6, 0],
+        },
+      };
+      const presetObj = { preset: 'default' };
+      const presetOptions = { default: 'default', textForm: 'textForm', custom: 'custom' };
       for (const key of Object.keys(PRESETS)) {
         presetOptions[key] = key;
       }
@@ -418,19 +457,30 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
         options: presetOptions,
       }).on('change', (ev) => {
         if (ev.value === 'custom') return;
-        sim.setPreset(ev.value);
+        if (localPresets[ev.value]) {
+          Object.assign(sim.params, localPresets[ev.value]);
+        } else {
+          sim.setPreset(ev.value);
+        }
         Object.assign(simSettings, sim.params);
         pane.refresh();
       });
 
+      // Text folder
+      const textParams = { charSize };
+      const textFolder = pane.addFolder({ title: 'Text', expanded: false });
+      textFolder.addBinding(textParams, 'charSize', { min: 5, max: 80, step: 1, label: 'char size' }).on('change', () => {
+        geometry.fontSize = textParams.charSize;
+      });
+
       // Simulation folder
-      const simFolder = pane.addFolder({ title: 'Simulation' });
+      const simFolder = pane.addFolder({ title: 'Simulation', expanded: false });
       simFolder.addBinding(simSettings, 'dimensions', { options: { '2D': 2, '3D': 3 } }).on('change', () => { sim.params.dimensions = simSettings.dimensions; });
       simFolder.addBinding(simSettings, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => { sim.params.substeps = simSettings.substeps; });
       simFolder.addBinding(simSettings, 'smoothingRadius', { min: 0.1, max: 5.0, step: 0.1, label: 'radius' }).on('change', () => { sim.params.smoothingRadius = simSettings.smoothingRadius; });
 
       // SPH folder
-      const sphFolder = pane.addFolder({ title: 'SPH Parameters' });
+      const sphFolder = pane.addFolder({ title: 'SPH Parameters', expanded: false });
       sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 1, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
       sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 1, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
       sphFolder.addBinding(simSettings, 'densityTarget', { min: 0.1, max: 10.0, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
@@ -438,7 +488,7 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
 
       // Forces folder
-      const forcesFolder = pane.addFolder({ title: 'Forces' });
+      const forcesFolder = pane.addFolder({ title: 'Forces', expanded: false });
       const gravityObj = { x: 0, y: -19.6, z: 0 };
       forcesFolder.addBinding(gravityObj, 'y', { min: -200, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [gravityObj.x, gravityObj.y, gravityObj.z]; });
       forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0.0, max: 0.1, step: 0.001, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
@@ -449,13 +499,13 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       const boundsFolder = pane.addFolder({ title: 'Boundaries', expanded: false });
       const boundsMin = { x: sim.worldBoundsMin[0], y: sim.worldBoundsMin[1], z: sim.worldBoundsMin[2] };
       const boundsMax = { x: sim.worldBoundsMax[0], y: sim.worldBoundsMax[1], z: sim.worldBoundsMax[2] };
-      boundsFolder.addBinding(boundsMin, 'x', { min: -200, max: 0, step: 1, label: 'min X' }).on('change', () => { sim.worldBoundsMin[0] = boundsMin.x; });
-      boundsFolder.addBinding(boundsMin, 'y', { min: -200, max: 0, step: 1, label: 'min Y' }).on('change', () => { sim.worldBoundsMin[1] = boundsMin.y; });
-      boundsFolder.addBinding(boundsMax, 'x', { min: 0, max: 200, step: 1, label: 'max X' }).on('change', () => { sim.worldBoundsMax[0] = boundsMax.x; });
-      boundsFolder.addBinding(boundsMax, 'y', { min: 0, max: 200, step: 1, label: 'max Y' }).on('change', () => { sim.worldBoundsMax[1] = boundsMax.y; });
+      boundsFolder.addBinding(boundsMin, 'x', { min: -500, max: 0, step: 1, label: 'min X' }).on('change', () => { sim.worldBoundsMin[0] = boundsMin.x; });
+      boundsFolder.addBinding(boundsMin, 'y', { min: -500, max: 0, step: 1, label: 'min Y' }).on('change', () => { sim.worldBoundsMin[1] = boundsMin.y; });
+      boundsFolder.addBinding(boundsMax, 'x', { min: 0, max: 500, step: 1, label: 'max X' }).on('change', () => { sim.worldBoundsMax[0] = boundsMax.x; });
+      boundsFolder.addBinding(boundsMax, 'y', { min: 0, max: 500, step: 1, label: 'max Y' }).on('change', () => { sim.worldBoundsMax[1] = boundsMax.y; });
 
       // Body folder
-      const bodyFolder = pane.addFolder({ title: 'Floating Body' });
+      const bodyFolder = pane.addFolder({ title: 'Floating Body', expanded: false });
       const bodyParams = {
         mass: body.mass,
         restitution: body.restitution,
@@ -481,7 +531,7 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       bodyFolder.addBinding(bodyParams, 'mouseScale', { min: 0.0, max: 1.0, step: 0.01, label: 'mouse scale' }).on('change', syncBody);
 
       // Shore SDF folder
-      const sdfFolder = pane.addFolder({ title: 'Shore SDF', expanded: true });
+      const sdfFolder = pane.addFolder({ title: 'Shore SDF', expanded: false });
       const syncShoreSdf = () => {
         sim.syncBodyPrimitives(shore);
         if (debugSdf.enabled) updateDebugSdfBuffer();
@@ -511,7 +561,7 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
       });
 
       // Appearance folder
-      const appearanceFolder = pane.addFolder({ title: 'Appearance' });
+      const appearanceFolder = pane.addFolder({ title: 'Appearance', expanded: false });
       const colors = { textColor: { r: 1, g: 1, b: 1 }, bgColor: { r: 0.02, g: 0.02, b: 0.04 } };
       appearanceFolder.addBinding(colors, 'bgColor', { color: { type: 'float' }, label: 'background' }).on('change', () => {
         renderer.clearColor = new Vector4(colors.bgColor.r, colors.bgColor.g, colors.bgColor.b, 1);
@@ -527,7 +577,6 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
 
         const dt = Math.min(time.y, 1 / 30); // Cap dt
         mouseVectors.update(dt);
-        cameraControls.update();
 
         await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
 
@@ -541,6 +590,7 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
         renderer.setSize(window.innerWidth, window.innerHeight);
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
+        frameCamera();
       }
       window.addEventListener('resize', onResize);
     </script>
