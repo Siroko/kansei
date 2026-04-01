@@ -570,6 +570,84 @@ class FluidSimulation {
         }
     }
 
+    /**
+     * Rebuild the spatial grid from current worldBoundsMin/Max.
+     * Call after changing bounds at runtime.
+     */
+    public rebuildGrid(): void {
+        const cs = this.params.smoothingRadius;
+        const gx = Math.ceil((this.worldBoundsMax[0] - this.worldBoundsMin[0]) / cs);
+        const gy = Math.ceil((this.worldBoundsMax[1] - this.worldBoundsMin[1]) / cs);
+        const gz = this.params.dimensions === 3
+            ? Math.ceil((this.worldBoundsMax[2] - this.worldBoundsMin[2]) / cs)
+            : 1;
+
+        const maxPerAxis2D = Math.floor(Math.sqrt(MAX_GRID_CELLS));
+        const maxPerAxis3D = Math.floor(Math.cbrt(MAX_GRID_CELLS));
+        const maxPerAxis = this.params.dimensions === 3 ? maxPerAxis3D : maxPerAxis2D;
+
+        this.gridDims = [
+            Math.min(Math.max(gx, 1), maxPerAxis),
+            Math.min(Math.max(gy, 1), maxPerAxis),
+            Math.min(Math.max(gz, 1), this.params.dimensions === 3 ? maxPerAxis : 1),
+        ];
+        this.totalCells = this.gridDims[0] * this.gridDims[1] * this.gridDims[2];
+        this.gridOrigin = [...this.worldBoundsMin];
+
+        // Reallocate grid-sized buffers
+        this.cellCountsBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE,
+            buffer: new Float32Array(this.totalCells),
+        });
+        this.cellOffsetsBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE,
+            buffer: new Float32Array(this.totalCells),
+        });
+        this.scatterCountersBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE,
+            buffer: new Float32Array(this.totalCells),
+        });
+        const numBlocks = Math.ceil(this.totalCells / PREFIX_SUM_BLOCK_SIZE);
+        this.blockSumsBuffer = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE,
+            buffer: new Float32Array(Math.max(numBlocks, 1)),
+        });
+
+        // Recreate compute passes with new buffers
+        this.createComputePasses();
+        if (this.bodies.length > 0) {
+            this.createBodyComputePasses();
+        }
+    }
+
+    public get positionsBufferRef(): ComputeBuffer {
+        return this.positionsBuffer;
+    }
+
+    public get paramsBufferRef(): ComputeBuffer {
+        return this.paramsBuffer;
+    }
+
+    public get cellOffsetsBufferRef(): ComputeBuffer {
+        return this.cellOffsetsBuffer;
+    }
+
+    public get sortedIndicesBufferRef(): ComputeBuffer {
+        return this.sortedIndicesBuffer;
+    }
+
+    public get gridDimsRef(): [number, number, number] {
+        return this.gridDims;
+    }
+
+    public get gridOriginRef(): [number, number, number] {
+        return this.gridOrigin;
+    }
+
     public async update(
         dt: number,
         mousePosition?: { x: number; y: number },

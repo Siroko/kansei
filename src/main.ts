@@ -48,3 +48,7 @@ export type { FluidSimulationOptions } from "./simulations/fluid/FluidSimulation
 export { PRESETS as FluidPresets } from "./simulations/fluid/FluidSimulationParams";
 export { FluidBody } from "./simulations/fluid/FluidBody";
 export type { FluidBodyOptions, FluidBodyPrimitive } from "./simulations/fluid/FluidBody";
+export { FluidDensityField } from "./simulations/fluid/FluidDensityField";
+export type { FluidDensityFieldOptions } from "./simulations/fluid/FluidDensityField";
+export { FluidSurfaceEffect } from "./postprocessing/effects/FluidSurfaceEffect";
+export type { FluidSurfaceOptions } from "./postprocessing/effects/FluidSurfaceEffect";
