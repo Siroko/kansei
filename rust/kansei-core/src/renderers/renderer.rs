@@ -59,6 +59,17 @@ pub struct Renderer {
     // Light uniform buffer (packed into camera bind group, binding 2)
     light_buf: Option<wgpu::Buffer>,
     light_uniforms: LightUniforms,
+    // Shadow resources
+    shadow_map: Option<crate::shadows::ShadowMap>,
+    shadow_uniform_buf: Option<wgpu::Buffer>,
+    shadow_bind_group: Option<wgpu::BindGroup>,
+    shadow_comparison_sampler: Option<wgpu::Sampler>,
+    shadow_dummy_depth_tex: Option<wgpu::Texture>,
+    shadow_dummy_depth_view: Option<wgpu::TextureView>,
+    shadow_pipeline: Option<wgpu::RenderPipeline>,
+    shadow_light_vp_bgl: Option<wgpu::BindGroupLayout>,
+    shadow_light_vp_bg: Option<wgpu::BindGroup>,
+    shadows_enabled: bool,
 }
 
 impl Renderer {
@@ -87,6 +98,16 @@ impl Renderer {
             camera_bind_group: None,
             light_buf: None,
             light_uniforms: LightUniforms::new(),
+            shadow_map: None,
+            shadow_uniform_buf: None,
+            shadow_bind_group: None,
+            shadow_comparison_sampler: None,
+            shadow_dummy_depth_tex: None,
+            shadow_dummy_depth_view: None,
+            shadow_pipeline: None,
+            shadow_light_vp_bgl: None,
+            shadow_light_vp_bg: None,
+            shadows_enabled: false,
         }
     }
 
@@ -170,11 +191,63 @@ impl Renderer {
             ],
         });
 
+        // Shadow resources — dummy depth texture + comparison sampler + uniform buffer
+        let dummy_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Renderer/DummyDepth"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_depth_view = dummy_depth.create_view(&Default::default());
+
+        let comparison_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Renderer/ShadowSampler"),
+            compare: Some(wgpu::CompareFunction::Less),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let shadow_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Renderer/ShadowUniforms"),
+            size: 96,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Shadow bind group with dummy depth texture (shadows disabled by default)
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Renderer/ShadowBG"),
+            layout: &shared.shadow_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&dummy_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&comparison_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: shadow_uniform_buf.as_entire_binding(),
+                },
+            ],
+        });
+
         self.shared_layouts = Some(shared);
         self.camera_view_buf = Some(camera_view_buf);
         self.camera_proj_buf = Some(camera_proj_buf);
         self.light_buf = Some(light_buf);
         self.camera_bind_group = Some(camera_bind_group);
+        self.shadow_bind_group = Some(shadow_bind_group);
+        self.shadow_dummy_depth_tex = Some(dummy_depth);
+        self.shadow_dummy_depth_view = Some(dummy_depth_view);
+        self.shadow_comparison_sampler = Some(comparison_sampler);
+        self.shadow_uniform_buf = Some(shadow_uniform_buf);
 
         self.device = Some(device);
         self.queue = Some(queue);
@@ -398,6 +471,101 @@ impl Renderer {
         self.upload_all(scene, camera);
     }
 
+    /// Enable directional shadow mapping.
+    pub fn enable_shadows(&mut self, resolution: u32) {
+        let device = self.device.as_ref().unwrap();
+        let mut sm = crate::shadows::ShadowMap::new(resolution);
+        sm.initialize(device);
+
+        // Rebuild shadow bind group with real depth texture
+        let shared = self.shared_layouts.as_ref().unwrap();
+        self.shadow_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Renderer/ShadowBG"),
+            layout: &shared.shadow_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(sm.depth_view.as_ref().unwrap()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(self.shadow_comparison_sampler.as_ref().unwrap()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.shadow_uniform_buf.as_ref().unwrap().as_entire_binding(),
+                },
+            ],
+        }));
+
+        // Shadow pipeline (depth-only, no fragment)
+        let shadow_light_vp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shadow/LightVPBGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Shadow/PipelineLayout"),
+            bind_group_layouts: &[&shadow_light_vp_bgl, &shared.mesh_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shadow/Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadow_vs.wgsl").into()),
+        });
+
+        self.shadow_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow/Pipeline"),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("shadow_vs"),
+                buffers: &[crate::geometries::Vertex::LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        }));
+
+        // Light VP bind group
+        self.shadow_light_vp_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shadow/LightVPBG"),
+            layout: &shadow_light_vp_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sm.light_vp_buf.as_ref().unwrap().as_entire_binding(),
+            }],
+        }));
+
+        self.shadow_light_vp_bgl = Some(shadow_light_vp_bgl);
+        self.shadow_map = Some(sm);
+        self.shadows_enabled = true;
+    }
+
     /// Render the scene to the canvas surface (simple path).
     pub fn render(&mut self, scene: &mut Scene, camera: &mut Camera) {
         // Phase 0: Update transforms, prepare scene
@@ -440,6 +608,77 @@ impl Renderer {
 
         // Phase 1: Upload camera + per-object matrices
         self.upload_all(scene, camera);
+
+        // Shadow pass
+        if self.shadows_enabled {
+            if let Some(ref mut sm) = self.shadow_map {
+                // Find first directional light
+                let dir_light_dir = scene.lights.iter().find_map(|l| {
+                    if let crate::lights::Light::Directional(dl) = l { Some(dl.direction) } else { None }
+                });
+
+                if let Some(light_dir) = dir_light_dir {
+                    sm.compute_light_vp(camera, &light_dir);
+                    sm.upload(self.queue.as_ref().unwrap());
+
+                    // Upload shadow uniforms (96 bytes)
+                    let mut shadow_data = [0.0f32; 24];
+                    shadow_data[..16].copy_from_slice(sm.light_vp.as_slice());
+                    shadow_data[16] = sm.bias;
+                    shadow_data[17] = sm.normal_bias;
+                    shadow_data[18] = 1.0; // shadowEnabled
+                    if let Some(ref buf) = self.shadow_uniform_buf {
+                        self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
+                    }
+
+                    // Render shadow depth pass
+                    let device = self.device.as_ref().unwrap();
+                    let mut shadow_encoder = device.create_command_encoder(&Default::default());
+                    {
+                        let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Renderer/ShadowPass"),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: sm.depth_view.as_ref().unwrap(),
+                                depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(1.0),
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: None,
+                            }),
+                            ..Default::default()
+                        });
+
+                        pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
+                        pass.set_bind_group(0, self.shadow_light_vp_bg.as_ref().unwrap(), &[]);
+
+                        let alignment = self.matrix_alignment;
+                        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                            let r = &scene.renderables()[scene_idx];
+                            if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                                continue;
+                            }
+
+                            let offset = (draw_idx as u32) * alignment;
+                            pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+
+                            pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
+                            pass.set_index_buffer(r.geometry.index_buffer.as_ref().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
+                        }
+                    }
+                    self.queue.as_ref().unwrap().submit(std::iter::once(shadow_encoder.finish()));
+                }
+            }
+        }
+
+        // Upload disabled shadow uniforms when shadows are off
+        if !self.shadows_enabled {
+            let shadow_data = [0.0f32; 24];
+            if let Some(ref buf) = self.shadow_uniform_buf {
+                self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
+            }
+        }
 
         // Phase 2+3: Create render pass and draw
         let surface = self.surface.as_ref().unwrap();
@@ -490,6 +729,7 @@ impl Renderer {
 
             // Set camera bind group (shared across all objects)
             pass.set_bind_group(2, self.camera_bind_group.as_ref().unwrap(), &[]);
+            pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
 
             for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
                 let r = &scene.renderables()[scene_idx];
