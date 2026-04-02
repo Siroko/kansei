@@ -12,6 +12,29 @@ struct MaterialUniforms {
 @group(2) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 
+// ── Lights (camera group binding 2) ──
+struct DirLight {
+    direction: vec3<f32>,
+    _pad0: f32,
+    color: vec3<f32>,
+    intensity: f32,
+};
+struct PtLight {
+    position: vec3<f32>,
+    radius: f32,
+    color: vec3<f32>,
+    intensity: f32,
+};
+struct LightUniforms {
+    num_directional: u32,
+    num_point: u32,
+    _pad0: u32,
+    _pad1: u32,
+    directional: array<DirLight, 4>,
+    point: array<PtLight, 8>,
+};
+@group(2) @binding(2) var<uniform> lights: LightUniforms;
+
 // ── Vertex I/O ──
 struct VertexInput {
     @location(0) position: vec4<f32>,

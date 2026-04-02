@@ -1,6 +1,7 @@
 use crate::math::Vec4;
 use crate::cameras::Camera;
 use crate::geometries::Vertex;
+use crate::lights::{LightUniforms, LIGHT_UNIFORM_BYTES};
 use crate::objects::Scene;
 use super::gbuffer::GBuffer;
 use super::shared_layouts::SharedLayouts;
@@ -55,6 +56,9 @@ pub struct Renderer {
     camera_view_buf: Option<wgpu::Buffer>,
     camera_proj_buf: Option<wgpu::Buffer>,
     camera_bind_group: Option<wgpu::BindGroup>,
+    // Light uniform buffer (packed into camera bind group, binding 2)
+    light_buf: Option<wgpu::Buffer>,
+    light_uniforms: LightUniforms,
 }
 
 impl Renderer {
@@ -81,6 +85,8 @@ impl Renderer {
             camera_view_buf: None,
             camera_proj_buf: None,
             camera_bind_group: None,
+            light_buf: None,
+            light_uniforms: LightUniforms::new(),
         }
     }
 
@@ -136,6 +142,14 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Create light uniform buffer
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Renderer/Lights"),
+            size: LIGHT_UNIFORM_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Create camera bind group (group 2)
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Renderer/CameraBG"),
@@ -149,12 +163,17 @@ impl Renderer {
                     binding: 1,
                     resource: camera_proj_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: light_buf.as_entire_binding(),
+                },
             ],
         });
 
         self.shared_layouts = Some(shared);
         self.camera_view_buf = Some(camera_view_buf);
         self.camera_proj_buf = Some(camera_proj_buf);
+        self.light_buf = Some(light_buf);
         self.camera_bind_group = Some(camera_bind_group);
 
         self.device = Some(device);
@@ -337,6 +356,12 @@ impl Renderer {
         }
         if let Some(ref buf) = self.camera_proj_buf {
             queue.write_buffer(buf, 0, bytemuck::cast_slice(camera.projection_matrix.as_slice()));
+        }
+
+        // Upload lights
+        self.light_uniforms.pack(&scene.lights);
+        if let Some(ref buf) = self.light_buf {
+            queue.write_buffer(buf, 0, self.light_uniforms.as_bytes());
         }
 
         // Upload per-object matrices
