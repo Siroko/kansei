@@ -133,12 +133,24 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Pick best available present mode: prefer requested, fallback to Mailbox, then Fifo
+        let present_mode = if surface_caps.present_modes.contains(&self.config.present_mode) {
+            self.config.present_mode
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            log::info!("PresentMode::{:?} not supported, using Mailbox", self.config.present_mode);
+            wgpu::PresentMode::Mailbox
+        } else {
+            log::info!("Using PresentMode::Fifo (vsync)");
+            wgpu::PresentMode::Fifo
+        };
+        log::info!("Present mode: {:?} (available: {:?})", present_mode, surface_caps.present_modes);
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: self.config.width,
             height: self.config.height,
-            present_mode: self.config.present_mode,
+            present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
