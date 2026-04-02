@@ -46,6 +46,7 @@ pub(crate) struct PipelineKey {
     pub(crate) color_formats: Vec<wgpu::TextureFormat>,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) sample_count: u32,
+    pub(crate) num_vertex_buffers: usize,
 }
 
 /// A render material — shader + pipeline cache + bind group.
@@ -122,6 +123,7 @@ impl Material {
             color_formats: color_formats.to_vec(),
             depth_format,
             sample_count,
+            num_vertex_buffers: vertex_layouts.len(),
         };
 
         if !self.pipeline_cache.contains_key(&key) {
