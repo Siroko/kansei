@@ -35,6 +35,18 @@ struct LightUniforms {
 };
 @group(2) @binding(2) var<uniform> lights: LightUniforms;
 
+// ── Group 3: Shadows ──
+struct ShadowUniforms {
+    light_view_proj: mat4x4<f32>,
+    bias: f32,
+    normal_bias: f32,
+    shadow_enabled: f32,
+    _pad: f32,
+};
+@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
+@group(3) @binding(1) var shadow_sampler: sampler_comparison;
+@group(3) @binding(2) var<uniform> shadow_uniforms: ShadowUniforms;
+
 // ── Vertex I/O ──
 struct VertexInput {
     @location(0) position: vec4<f32>,

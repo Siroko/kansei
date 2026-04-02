@@ -98,7 +98,7 @@ impl Material {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{}/PipelineLayout", self.label)),
-            bind_group_layouts: &[&material_bgl, &shared.mesh_bgl, &shared.camera_bgl],
+            bind_group_layouts: &[&material_bgl, &shared.mesh_bgl, &shared.camera_bgl, &shared.shadow_bgl],
             push_constant_ranges: &[],
         });
 
