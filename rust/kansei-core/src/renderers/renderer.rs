@@ -379,7 +379,7 @@ impl Renderer {
         camera.update_view_matrix();
         scene.prepare(camera.position());
 
-        // Phase 0.5: Initialize uninitialized geometries + pre-warm material pipelines
+        // Phase 0.5: Initialize geometries, instance buffers, and pre-warm pipelines
         {
             let device = self.device.as_ref().unwrap();
             let shared = self.shared_layouts.as_ref().unwrap();
@@ -391,8 +391,23 @@ impl Renderer {
                 if !r.geometry.initialized {
                     r.geometry.initialize(device);
                 }
+                for ib in &mut r.instance_buffers {
+                    if !ib.initialized {
+                        ib.initialize(device);
+                    }
+                }
+
+                // Build combined vertex layouts (base + instance buffers)
+                let instance_layouts: Vec<_> = r.instance_buffers.iter()
+                    .map(|ib| ib.vertex_layout())
+                    .collect();
+                let mut layouts = vec![Vertex::LAYOUT];
+                for il in &instance_layouts {
+                    layouts.push(il.as_layout());
+                }
+
                 r.material.get_pipeline(
-                    device, shared, &[Vertex::LAYOUT],
+                    device, shared, &layouts,
                     &[format], depth_format, sample_count,
                 );
             }
@@ -451,15 +466,18 @@ impl Renderer {
             // Set camera bind group (shared across all objects)
             pass.set_bind_group(2, self.camera_bind_group.as_ref().unwrap(), &[]);
 
-            let key = crate::materials::PipelineKey {
-                color_formats: vec![format],
-                depth_format,
-                sample_count,
-            };
-
             for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
                 let r = &scene.renderables()[scene_idx];
                 if !r.visible || !r.geometry.initialized { continue; }
+
+                // Per-renderable pipeline key (includes num_vertex_buffers)
+                let num_vb = 1 + r.instance_buffers.len();
+                let key = crate::materials::PipelineKey {
+                    color_formats: vec![format],
+                    depth_format,
+                    sample_count,
+                    num_vertex_buffers: num_vb,
+                };
 
                 // Get the pre-warmed pipeline
                 let pipeline = match r.material.pipeline_cache.get(&key) {
@@ -476,7 +494,15 @@ impl Renderer {
                 let offset = (draw_idx as u32) * alignment;
                 pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
+                // Slot 0: base geometry vertex buffer
                 pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
+                // Slot 1+: instance buffers
+                for (i, ib) in r.instance_buffers.iter().enumerate() {
+                    if let Some(ref buf) = ib.gpu_buffer {
+                        pass.set_vertex_buffer((i + 1) as u32, buf.slice(..));
+                    }
+                }
+
                 pass.set_index_buffer(
                     r.geometry.index_buffer.as_ref().unwrap().slice(..),
                     wgpu::IndexFormat::Uint32,
