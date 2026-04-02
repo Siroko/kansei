@@ -1,0 +1,13 @@
+[package]
+name = "kansei-core"
+version = "0.1.0"
+edition = "2021"
+description = "Kansei WebGPU rendering engine — core library"
+
+[dependencies]
+wgpu = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+image = { workspace = true }
+gltf = { workspace = true }
