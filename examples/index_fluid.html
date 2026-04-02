@@ -287,29 +287,26 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
       boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5, label: 'max Z' }).on('change', syncBounds);
 
 
-      // ── FPS counter (honest: counts real rAF callbacks over wall time) ──
+      // ── FPS counter (inside render loop) ──
       const fpsEl = document.getElementById('fps');
       let fpsFrames = 0, fpsLastTime = performance.now();
-      function fpsLoop() {
-          fpsFrames++;
-          const now = performance.now();
-          const elapsed = now - fpsLastTime;
-          if (elapsed >= 1000) {
-              const realFps = (fpsFrames / elapsed) * 1000;
-              const realMs = elapsed / fpsFrames;
-              fpsEl.textContent = `${realFps.toFixed(0)} FPS (${realMs.toFixed(1)} ms) | 100k particles [TypeScript]`;
-              fpsFrames = 0;
-              fpsLastTime = now;
-          }
-          requestAnimationFrame(fpsLoop);
-      }
-      requestAnimationFrame(fpsLoop);
 
       // ── Render loop ───────────────────────────────────────
       const time = new Vector4(0, 0, 0, 0);
 
       async function animate() {
         const frameStart = performance.now();
+
+        // FPS: count actual animate() calls
+        fpsFrames++;
+        const fpsElapsed = frameStart - fpsLastTime;
+        if (fpsElapsed >= 1000) {
+          const realFps = (fpsFrames / fpsElapsed) * 1000;
+          const realMs = fpsElapsed / fpsFrames;
+          fpsEl.textContent = `${realFps.toFixed(0)} FPS (${realMs.toFixed(1)} ms) | 100k particles [TypeScript]`;
+          fpsFrames = 0;
+          fpsLastTime = frameStart;
+        }
         time.x = frameStart / 1000;
         time.y = time.x - time.z;
         time.z = time.x;
