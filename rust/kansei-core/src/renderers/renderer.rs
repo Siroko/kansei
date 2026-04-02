@@ -781,6 +781,243 @@ impl Renderer {
         output.present();
     }
 
+    /// Render scene with post-processing effects.
+    pub fn render_with_postprocessing(
+        &mut self,
+        scene: &mut Scene,
+        camera: &mut Camera,
+        volume: &mut crate::postprocessing::PostProcessingVolume,
+    ) {
+        // Ensure GBuffer exists
+        let device = self.device.as_ref().unwrap();
+        let width = self.config.width;
+        let height = self.config.height;
+        volume.ensure_gbuffer(device, width, height);
+
+        // Render scene to GBuffer (actually draw into it)
+        {
+            let gbuffer = volume.gbuffer().unwrap();
+            self.render_scene_to_gbuffer(scene, camera, gbuffer);
+        }
+
+        // Get surface texture for blit
+        let surface = self.surface.as_ref().unwrap();
+        let output = surface.get_current_texture().expect("Surface texture");
+        let canvas_view = output.texture.create_view(&Default::default());
+
+        // Run post-processing chain + blit
+        volume.render(
+            self.device.as_ref().unwrap(),
+            self.queue.as_ref().unwrap(),
+            camera,
+            &canvas_view,
+            self.presentation_format,
+            width,
+            height,
+        );
+
+        output.present();
+    }
+
+    /// Private: draw scene into GBuffer MRT (non-MSAA, sample_count=1).
+    fn render_scene_to_gbuffer(
+        &mut self,
+        scene: &mut Scene,
+        camera: &mut Camera,
+        gbuffer: &GBuffer,
+    ) {
+        camera.update_view_matrix();
+        scene.prepare(camera.position());
+
+        // Initialize geometries + pre-warm pipelines for GBuffer formats
+        let device = self.device.as_ref().unwrap();
+        let shared = self.shared_layouts.as_ref().unwrap();
+        let depth_format = GBuffer::DEPTH_FORMAT;
+        let sample_count = gbuffer.sample_count;
+
+        for r in scene.renderables_mut() {
+            if !r.geometry.initialized {
+                r.geometry.initialize(device);
+            }
+            for ib in &mut r.instance_buffers {
+                if !ib.initialized {
+                    ib.initialize(device);
+                }
+            }
+
+            let instance_layouts: Vec<_> = r.instance_buffers.iter()
+                .map(|ib| ib.vertex_layout())
+                .collect();
+            let mut layouts = vec![Vertex::LAYOUT];
+            for il in &instance_layouts {
+                layouts.push(il.as_layout());
+            }
+
+            r.material.get_pipeline(
+                device, shared, &layouts,
+                &GBuffer::MRT_FORMATS, depth_format, sample_count,
+            );
+        }
+
+        // Upload camera + per-object matrices
+        self.upload_all(scene, camera);
+
+        // Shadow pass (if enabled)
+        if self.shadows_enabled {
+            if let Some(ref mut sm) = self.shadow_map {
+                let dir_light_dir = scene.lights.iter().find_map(|l| {
+                    if let crate::lights::Light::Directional(dl) = l { Some(dl.direction) } else { None }
+                });
+
+                if let Some(light_dir) = dir_light_dir {
+                    sm.compute_light_vp(camera, &light_dir);
+                    sm.upload(self.queue.as_ref().unwrap());
+
+                    let mut shadow_data = [0.0f32; 24];
+                    shadow_data[..16].copy_from_slice(sm.light_vp.as_slice());
+                    shadow_data[16] = sm.bias;
+                    shadow_data[17] = sm.normal_bias;
+                    shadow_data[18] = 1.0; // shadowEnabled
+                    if let Some(ref buf) = self.shadow_uniform_buf {
+                        self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
+                    }
+
+                    let device = self.device.as_ref().unwrap();
+                    let mut shadow_encoder = device.create_command_encoder(&Default::default());
+                    {
+                        let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Shadow/GBufferPath"),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: sm.depth_view.as_ref().unwrap(),
+                                depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(1.0),
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: None,
+                            }),
+                            ..Default::default()
+                        });
+
+                        pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
+                        pass.set_bind_group(0, self.shadow_light_vp_bg.as_ref().unwrap(), &[]);
+
+                        let alignment = self.matrix_alignment;
+                        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                            let r = &scene.renderables()[scene_idx];
+                            if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                                continue;
+                            }
+
+                            let offset = (draw_idx as u32) * alignment;
+                            pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+                            pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
+                            pass.set_index_buffer(r.geometry.index_buffer.as_ref().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
+                        }
+                    }
+                    self.queue.as_ref().unwrap().submit(std::iter::once(shadow_encoder.finish()));
+                }
+            }
+        } else {
+            let shadow_data = [0.0f32; 24];
+            if let Some(ref buf) = self.shadow_uniform_buf {
+                self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
+            }
+        }
+
+        // GBuffer MRT render pass (non-MSAA)
+        let device = self.device.as_ref().unwrap();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Renderer/GBufferDraw"),
+        });
+        let cc = &self.config.clear_color;
+        let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
+        let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderer/GBufferDrawPass"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.emissive_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.normal_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.albedo_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &gbuffer.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            pass.set_bind_group(2, self.camera_bind_group.as_ref().unwrap(), &[]);
+            pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
+
+            let alignment = self.matrix_alignment;
+
+            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                let r = &scene.renderables()[scene_idx];
+                if !r.visible || !r.geometry.initialized { continue; }
+
+                let num_vb = 1 + r.instance_buffers.len();
+                let key = crate::materials::PipelineKey {
+                    color_formats: GBuffer::MRT_FORMATS.to_vec(),
+                    depth_format: GBuffer::DEPTH_FORMAT,
+                    sample_count: gbuffer.sample_count,
+                    num_vertex_buffers: num_vb,
+                };
+
+                let pipeline = match r.material.pipeline_cache.get(&key) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                pass.set_pipeline(pipeline);
+
+                if let Some(bg) = r.material.bind_group() {
+                    pass.set_bind_group(0, bg, &[]);
+                }
+
+                let offset = (draw_idx as u32) * alignment;
+                pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+
+                pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
+                for (i, ib) in r.instance_buffers.iter().enumerate() {
+                    if let Some(ref buf) = ib.gpu_buffer {
+                        pass.set_vertex_buffer((i + 1) as u32, buf.slice(..));
+                    }
+                }
+
+                pass.set_index_buffer(
+                    r.geometry.index_buffer.as_ref().unwrap().slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+
+                pass.draw_indexed(0..r.geometry.index_count(), 0, 0..r.instance_count);
+            }
+        }
+
+        self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
+    }
+
     /// Render scene into a GBuffer for post-processing.
     pub fn render_to_gbuffer(&mut self, scene: &mut Scene, camera: &mut Camera, gbuffer: &GBuffer) {
         camera.update_view_matrix();
