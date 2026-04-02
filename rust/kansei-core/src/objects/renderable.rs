@@ -1,4 +1,5 @@
 use super::Object3D;
+use crate::buffers::InstanceBuffer;
 use crate::geometries::Geometry;
 use crate::materials::Material;
 
@@ -8,6 +9,7 @@ pub struct Renderable {
     pub geometry: Geometry,
     pub material: Material,
     pub instance_count: u32,
+    pub instance_buffers: Vec<InstanceBuffer>,
     pub cast_shadow: bool,
     pub receive_shadow: bool,
     pub render_order: i32,
@@ -22,12 +24,39 @@ impl Renderable {
             geometry,
             material,
             instance_count: 1,
+            instance_buffers: Vec::new(),
             cast_shadow: true,
             receive_shadow: true,
             render_order: 0,
             visible: true,
             material_dirty: true,
         }
+    }
+
+    /// Create an instanced renderable with per-instance data buffers.
+    pub fn new_instanced(
+        geometry: Geometry,
+        material: Material,
+        instance_count: u32,
+        instance_buffers: Vec<InstanceBuffer>,
+    ) -> Self {
+        Self {
+            object: Object3D::new(),
+            geometry,
+            material,
+            instance_count,
+            instance_buffers,
+            cast_shadow: true,
+            receive_shadow: true,
+            render_order: 0,
+            visible: true,
+            material_dirty: true,
+        }
+    }
+
+    /// Whether this renderable uses instanced rendering.
+    pub fn is_instanced(&self) -> bool {
+        !self.instance_buffers.is_empty()
     }
 
     /// Whether this renderable uses transparency.
