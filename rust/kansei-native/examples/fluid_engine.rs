@@ -169,6 +169,8 @@ struct App {
     // FPS counter
     frame_count: u64,
     frame_time_accum: f64,
+    current_fps: f64,
+    current_frame_ms: f64,
     // mouse for fluid interaction
     mouse_ndc: [f32; 2],
     mouse_prev_ndc: [f32; 2],
@@ -189,7 +191,7 @@ impl App {
             egui_state: None, egui_renderer: None,
             show_particles: true, particle_size: 0.15,
             last_time: None,
-            frame_count: 0, frame_time_accum: 0.0,
+            frame_count: 0, frame_time_accum: 0.0, current_fps: 0.0, current_frame_ms: 0.0,
             mouse_ndc: [0.0; 2], mouse_prev_ndc: [0.0; 2], mouse_pressed: false,
         }
     }
@@ -228,13 +230,13 @@ impl ApplicationHandler for App {
         let instance = wgpu::Instance::new(&Default::default());
         let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), ..Default::default() });
+        let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), present_mode: wgpu::PresentMode::Immediate, ..Default::default() });
         pollster::block_on(renderer.initialize(surface, &adapter));
         let device = renderer.device();
         let format = renderer.presentation_format();
 
         // Particles
-        let count = 10000usize;
+        let count = 50000usize;
         let radius = 5.0f32;
         let mut positions = vec![0.0f32; count * 4];
         let mut rng: u64 = 12345;
@@ -405,6 +407,8 @@ impl ApplicationHandler for App {
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
                     egui::SidePanel::right("controls").min_width(220.0).show(ctx, |ui| {
                         ui.heading("Fluid Engine");
+                        ui.label(format!("{:.1} FPS  ({:.2} ms)", self.current_fps, self.current_frame_ms));
+                        ui.label(format!("Particles: {}", 50000));
                         ui.separator();
                         ui.checkbox(&mut self.show_particles, "Show particles");
                         ui.add(egui::Slider::new(&mut self.particle_size, 0.01..=0.5).text("Particle size"));
@@ -471,7 +475,8 @@ impl ApplicationHandler for App {
                 self.frame_time_accum += dt as f64;
                 if self.frame_count % 60 == 0 && self.frame_count > 0 {
                     let avg = self.frame_time_accum / 60.0;
-                    log::info!("Frame: {:.2}ms ({:.0} FPS)", avg * 1000.0, 1.0 / avg);
+                    self.current_frame_ms = avg * 1000.0;
+                    self.current_fps = 1.0 / avg;
                     self.frame_time_accum = 0.0;
                 }
                 self.frame_count += 1;

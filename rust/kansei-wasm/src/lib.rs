@@ -204,6 +204,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         particle_size: 0.15, show_particles: true,
         camera: Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32),
         frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
+        current_fps: 0.0, current_frame_ms: 0.0,
     }));
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
@@ -267,6 +268,7 @@ struct State {
     particle_size: f32, show_particles: bool,
     camera: Camera,
     frame_count: u32, frame_time_sum: f64, last_perf_time: f64,
+    current_fps: f64, current_frame_ms: f64,
 }
 
 impl State {
@@ -280,6 +282,8 @@ impl State {
         self.frame_count += 1;
         if self.frame_count % 60 == 0 {
             let avg = self.frame_time_sum / 60.0;
+            self.current_frame_ms = avg;
+            self.current_fps = 1000.0 / avg;
             log::info!("Frame: {:.2}ms ({:.0} FPS)", avg, 1000.0 / avg);
             self.frame_time_sum = 0.0;
         }
@@ -384,18 +388,16 @@ thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCe
 fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
 
 #[wasm_bindgen]
+pub fn get_fps() -> f64 {
+    GLOBAL_STATE.with(|gs| {
+        if let Some(ref rc) = *gs.borrow() { rc.borrow().current_fps } else { 0.0 }
+    })
+}
+
+#[wasm_bindgen]
 pub fn get_frame_time() -> f64 {
     GLOBAL_STATE.with(|gs| {
-        if let Some(ref rc) = *gs.borrow() {
-            let st = rc.borrow();
-            if st.frame_count > 0 {
-                st.frame_time_sum / (st.frame_count % 60).max(1) as f64
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
+        if let Some(ref rc) = *gs.borrow() { rc.borrow().current_frame_ms } else { 0.0 }
     })
 }
 
