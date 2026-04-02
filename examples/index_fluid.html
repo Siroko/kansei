@@ -66,14 +66,14 @@
       // ── Scene & Camera ────────────────────────────────────
       const scene = new Scene();
       const camera = new Camera(45, 0.1, 1000, window.innerWidth / window.innerHeight);
-      camera.position.set(0, 0, 30);
-      camera.lookAt(new Vector3(0, 0, 0));
+      camera.position.set(0, 0, 75);
+      camera.lookAt(new Vector3(0, 3, 0));
 
-      const cameraControls = new CameraControls(camera, new Vector3(0, 0, 0), window, 30);
+      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 75);
       const mouseVectors = new MouseVectors();
 
       // ── Particle positions ────────────────────────────────
-      const particleCount = 50000;
+      const particleCount = 100000;
       const radius = 5.0;
       const positions = new Float32Array(particleCount * 4);
       for (let i = 0; i < particleCount; i++) {
@@ -127,7 +127,7 @@
       });
 
       sim.worldBoundsMin = [-12, -8, -8];
-      sim.worldBoundsMax = [12, 8, 8];
+      sim.worldBoundsMax = [12, 32, 8];
       sim.rebuildGrid();
 
       // ── Density Field ─────────────────────────────────────
@@ -272,7 +272,7 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
       const boundsFolder = pane.addFolder({ title: 'Bounds', expanded: false });
       const boundsObj = {
         minX: -12, minY: -8, minZ: -8,
-        maxX: 12, maxY: 8, maxZ: 8,
+        maxX: 12, maxY: 32, maxZ: 8,
       };
       const syncBounds = () => {
         sim.worldBoundsMin[0] = boundsObj.minX; sim.worldBoundsMin[1] = boundsObj.minY; sim.worldBoundsMin[2] = boundsObj.minZ;
@@ -287,9 +287,23 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
       boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5, label: 'max Z' }).on('change', syncBounds);
 
 
-      // ── FPS counter ──────────────────────────────────────
+      // ── FPS counter (honest: counts real rAF callbacks over wall time) ──
       const fpsEl = document.getElementById('fps');
-      let frameCount = 0, frameTimeSum = 0, lastFrameTime = performance.now();
+      let fpsFrames = 0, fpsLastTime = performance.now();
+      function fpsLoop() {
+          fpsFrames++;
+          const now = performance.now();
+          const elapsed = now - fpsLastTime;
+          if (elapsed >= 1000) {
+              const realFps = (fpsFrames / elapsed) * 1000;
+              const realMs = elapsed / fpsFrames;
+              fpsEl.textContent = `${realFps.toFixed(0)} FPS (${realMs.toFixed(1)} ms) | 100k particles [TypeScript]`;
+              fpsFrames = 0;
+              fpsLastTime = now;
+          }
+          requestAnimationFrame(fpsLoop);
+      }
+      requestAnimationFrame(fpsLoop);
 
       // ── Render loop ───────────────────────────────────────
       const time = new Vector4(0, 0, 0, 0);
@@ -318,17 +332,6 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
           volume.effects.push(surfaceEffect);
         }
         volume.render(scene, camera);
-
-        // FPS measurement
-        const frameEnd = performance.now();
-        frameTimeSum += (frameEnd - frameStart);
-        frameCount++;
-        if (frameCount % 60 === 0) {
-          const avgMs = frameTimeSum / 60;
-          const fps = 1000 / avgMs;
-          fpsEl.textContent = `${fps.toFixed(0)} FPS (${avgMs.toFixed(2)} ms) | 50k particles [TypeScript]`;
-          frameTimeSum = 0;
-        }
 
         requestAnimationFrame(animate);
       }

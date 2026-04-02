@@ -72,13 +72,24 @@
         bounds.addBinding(b, 'maxY', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
 
-        // FPS overlay
+        // FPS overlay — count actual rendered frames over real time
         const fpsEl = document.getElementById('fps');
-        setInterval(() => {
-            const fps = get_fps();
-            const ms = get_frame_time();
-            if (fps > 0) fpsEl.textContent = `${fps.toFixed(0)} FPS (${ms.toFixed(2)} ms) | 50k particles [Rust/WASM]`;
-        }, 250);
+        let fpsFrames = 0;
+        let fpsLastTime = performance.now();
+        function fpsLoop() {
+            fpsFrames++;
+            const now = performance.now();
+            const elapsed = now - fpsLastTime;
+            if (elapsed >= 1000) {
+                const realFps = (fpsFrames / elapsed) * 1000;
+                const realMs = elapsed / fpsFrames;
+                fpsEl.textContent = `${realFps.toFixed(0)} FPS (${realMs.toFixed(1)} ms) | 100k particles [Rust/WASM]`;
+                fpsFrames = 0;
+                fpsLastTime = now;
+            }
+            requestAnimationFrame(fpsLoop);
+        }
+        requestAnimationFrame(fpsLoop);
     </script>
 </body>
 </html>
