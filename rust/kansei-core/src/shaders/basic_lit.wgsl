@@ -73,6 +73,44 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
+fn calcDirectionalShadow(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
+    if (shadow_uniforms.shadow_enabled < 0.5) {
+        return 1.0;
+    }
+
+    let biased_pos = world_pos + world_normal * shadow_uniforms.normal_bias;
+    let ls_pos = shadow_uniforms.light_view_proj * vec4<f32>(biased_pos, 1.0);
+    let ndc = ls_pos.xyz / ls_pos.w;
+
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
+
+    let in_bounds = step(0.0, uv.x) * step(uv.x, 1.0)
+                  * step(0.0, uv.y) * step(uv.y, 1.0)
+                  * step(ndc.z, 1.0);
+    if (in_bounds < 0.5) {
+        return 1.0;
+    }
+
+    let tex_size = vec2<f32>(textureDimensions(shadow_depth_tex));
+    let texel_size = 1.0 / tex_size;
+    let ref_depth = ndc.z - shadow_uniforms.bias;
+
+    var shadow = 0.0;
+    for (var x = -1; x <= 1; x++) {
+        for (var y = -1; y <= 1; y++) {
+            let sample_uv = clamp(
+                uv + vec2<f32>(f32(x), f32(y)) * texel_size,
+                vec2<f32>(0.0), vec2<f32>(1.0)
+            );
+            shadow += textureSampleCompare(
+                shadow_depth_tex, shadow_sampler,
+                sample_uv, ref_depth
+            );
+        }
+    }
+    return shadow / 9.0;
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let n = normalize(input.world_normal);
@@ -130,6 +168,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         specular += pl.color * spec_color * spec * atten;
     }
 
-    let final_color = base_color * (ambient + diffuse) + specular;
+    let shadow = calcDirectionalShadow(input.world_position, n);
+    let final_color = base_color * (ambient + diffuse * shadow) + specular * shadow;
     return vec4<f32>(final_color, material.color.a);
 }
