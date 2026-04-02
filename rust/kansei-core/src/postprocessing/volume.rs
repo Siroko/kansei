@@ -35,7 +35,7 @@ impl PostProcessingVolume {
                 .map(|g| g.width != width || g.height != height)
                 .unwrap_or(false)
         {
-            self.gbuffer = Some(GBuffer::new(device, width, height, 4));
+            self.gbuffer = Some(GBuffer::new(device, width, height, 1));
             for effect in &mut self.effects {
                 effect.resize(width, height, self.gbuffer.as_ref().unwrap());
             }
