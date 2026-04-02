@@ -273,8 +273,19 @@ struct State {
 
 impl State {
     fn render_frame(&mut self) {
+        // Wall clock frame timing (honest FPS)
         let perf = web_sys::window().unwrap().performance().unwrap();
-        let frame_start = perf.now();
+        let now = perf.now();
+        let frame_ms = now - self.last_perf_time;
+        self.last_perf_time = now;
+        self.frame_time_sum += frame_ms;
+        self.frame_count += 1;
+        if self.frame_count % 60 == 0 {
+            let avg = self.frame_time_sum / 60.0;
+            self.current_frame_ms = avg;
+            self.current_fps = 1000.0 / avg;
+            self.frame_time_sum = 0.0;
+        }
 
         let dt = 1.0 / 60.0;
         let target = glam::Vec3::new(0.0, 3.0, 0.0);
@@ -366,20 +377,6 @@ impl State {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-
-        // Measure work time before present (excludes GPU sync wait)
-        let perf = web_sys::window().unwrap().performance().unwrap();
-        let work_ms = perf.now() - frame_start;
-        self.frame_time_sum += work_ms;
-        self.frame_count += 1;
-        if self.frame_count % 60 == 0 {
-            let avg = self.frame_time_sum / 60.0;
-            self.current_frame_ms = avg;
-            self.current_fps = 1000.0 / avg;
-            log::info!("Frame: {:.2}ms ({:.0} FPS)", avg, 1000.0 / avg);
-            self.frame_time_sum = 0.0;
-        }
-
         output.present();
         self.mouse_prev_ndc = self.mouse_ndc;
     }

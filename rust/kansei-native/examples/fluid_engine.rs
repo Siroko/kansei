@@ -469,11 +469,10 @@ impl ApplicationHandler for App {
                 for id in &full_output.textures_delta.free { er.free_texture(id); }
                 self.egui_renderer = Some(er);
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
-                // FPS counter — measure work time before present (excludes vsync wait)
-                let work_time = now.elapsed().as_secs_f64();
-
                 output.present();
-                self.frame_time_accum += work_time;
+
+                // Wall clock FPS (honest frame time including present)
+                self.frame_time_accum += dt as f64;
                 self.frame_count += 1;
                 if self.frame_count % 60 == 0 {
                     let avg = self.frame_time_accum / 60.0;
