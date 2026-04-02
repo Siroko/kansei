@@ -13,6 +13,7 @@ pub struct RendererConfig {
     pub device_pixel_ratio: f32,
     pub sample_count: u32,
     pub clear_color: Vec4,
+    pub present_mode: wgpu::PresentMode,
 }
 
 impl Default for RendererConfig {
@@ -23,6 +24,7 @@ impl Default for RendererConfig {
             device_pixel_ratio: 1.0,
             sample_count: 4,
             clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
+            present_mode: wgpu::PresentMode::Fifo,
         }
     }
 }
@@ -136,7 +138,7 @@ impl Renderer {
             format,
             width: self.config.width,
             height: self.config.height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: self.config.present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
