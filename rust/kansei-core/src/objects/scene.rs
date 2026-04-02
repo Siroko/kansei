@@ -1,9 +1,11 @@
 use super::Renderable;
+use crate::lights::Light;
 use crate::math::Vec3;
 
 /// The scene graph — holds all renderables, sorts opaque/transparent.
 pub struct Scene {
     pub position: Vec3,
+    pub lights: Vec<Light>,
     renderables: Vec<Renderable>,
     opaque_order: Vec<usize>,
     transparent_order: Vec<usize>,
@@ -13,10 +15,16 @@ impl Scene {
     pub fn new() -> Self {
         Self {
             position: Vec3::ZERO,
+            lights: Vec::new(),
             renderables: Vec::new(),
             opaque_order: Vec::new(),
             transparent_order: Vec::new(),
         }
+    }
+
+    /// Add a light to the scene.
+    pub fn add_light(&mut self, light: Light) {
+        self.lights.push(light);
     }
 
     pub fn add(&mut self, renderable: Renderable) -> usize {
