@@ -1,0 +1,4 @@
+/target/
+Cargo.lock
+kansei-wasm/pkg/
+*.DS_Store

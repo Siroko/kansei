@@ -85,8 +85,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     });
 
     // ── Particles ──
-    let count = 100000usize;
-    let radius = 5.0f32;
+    let count = 50000usize;
+    let radius = 10.0f32;
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
@@ -112,8 +112,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     });
     sim.initialize(&positions, &device);
-    sim.world_bounds_min = [-12.0, -8.0, -8.0];
-    sim.world_bounds_max = [12.0, 32.0, 8.0];
+    sim.world_bounds_min = [-25.0, -8.0, -16.0];
+    sim.world_bounds_max = [25.0, 30.0, 16.0];
     sim.rebuild_grid(&device);
 
     // ── Density field + surface renderer ──

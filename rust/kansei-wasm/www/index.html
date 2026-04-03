@@ -63,7 +63,7 @@
         forces.addBinding(p, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => set_substeps(p.substeps));
 
         const bounds = pane.addFolder({ title: 'Bounds', expanded: false });
-        const b = { minX: -12, minY: -8, minZ: -8, maxX: 12, maxY: 8, maxZ: 8 };
+        const b = { minX: -25, minY: -8, minZ: -16, maxX: 25, maxY: 30, maxZ: 16 };
         const syncBounds = () => set_bounds(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
         bounds.addBinding(b, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);

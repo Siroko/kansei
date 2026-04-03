@@ -73,8 +73,8 @@
       const mouseVectors = new MouseVectors();
 
       // ── Particle positions ────────────────────────────────
-      const particleCount = 100000;
-      const radius = 5.0;
+      const particleCount = 50000;
+      const radius = 10.0;
       const positions = new Float32Array(particleCount * 4);
       for (let i = 0; i < particleCount; i++) {
         let x, y, z;
@@ -126,8 +126,8 @@
         worldMatrix: identityMatrix,
       });
 
-      sim.worldBoundsMin = [-12, -8, -8];
-      sim.worldBoundsMax = [12, 32, 8];
+      sim.worldBoundsMin = [-25, -8, -16];
+      sim.worldBoundsMax = [25, 30, 16];
       sim.rebuildGrid();
 
       // ── Density Field ─────────────────────────────────────
@@ -213,7 +213,15 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
       const debugParams = { showParticles: false };
       debugFolder.addBinding(debugParams, 'showParticles', { label: 'show particles' }).on('change', (ev) => {
         showParticles = ev.value;
+        if (ev.value) {
+          if (!scene.children.includes(particleMesh)) scene.add(particleMesh);
+        } else {
+          const idx = scene.children.indexOf(particleMesh);
+          if (idx !== -1) scene.children.splice(idx, 1);
+        }
       });
+      // Start with particles removed from scene (surface mode)
+      scene.children.splice(scene.children.indexOf(particleMesh), 1);
       const scaleParams = { particleSize: 0.01 };
       debugFolder.addBinding(scaleParams, 'particleSize', { min: 0.01, max: 1.0, step: 0.01, label: 'particle size' }).on('change', () => {
         particleScale.value = scaleParams.particleSize;
@@ -271,8 +279,8 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
       // Bounds folder
       const boundsFolder = pane.addFolder({ title: 'Bounds', expanded: false });
       const boundsObj = {
-        minX: -12, minY: -8, minZ: -8,
-        maxX: 12, maxY: 32, maxZ: 8,
+        minX: -25, minY: -8, minZ: -16,
+        maxX: 25, maxY: 30, maxZ: 16,
       };
       const syncBounds = () => {
         sim.worldBoundsMin[0] = boundsObj.minX; sim.worldBoundsMin[1] = boundsObj.minY; sim.worldBoundsMin[2] = boundsObj.minZ;
@@ -311,7 +319,7 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
         time.y = time.x - time.z;
         time.z = time.x;
 
-        const dt = Math.min(time.y, 1 / 30);
+        const dt = 1 / 60;
 
         mouseVectors.update(dt);
         cameraControls.update(time.x);
