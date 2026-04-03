@@ -375,10 +375,10 @@ impl FluidSimulation {
                 );
             }
 
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
             macro_rules! dispatch {
                 ($pass:expr, $wx:expr) => {
                     if let Some(ref p) = $pass {
-                        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                         p.dispatch(&mut cp, $wx, 1, 1);
                     }
                 };
@@ -394,6 +394,7 @@ impl FluidSimulation {
             dispatch!(self.density, particle_wg);
             dispatch!(self.forces, particle_wg);
             dispatch!(self.integrate, particle_wg);
+            drop(cp);
         }
 
         queue.submit(std::iter::once(encoder.finish()));
@@ -413,11 +414,11 @@ impl FluidSimulation {
         }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FluidSim") });
+        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
 
         macro_rules! dispatch {
             ($pass:expr, $wx:expr) => {
                 if let Some(ref p) = $pass {
-                    let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                     p.dispatch(&mut cp, $wx, 1, 1);
                 }
             };
@@ -433,6 +434,7 @@ impl FluidSimulation {
         dispatch!(self.density, particle_wg);
         dispatch!(self.forces, particle_wg);
         dispatch!(self.integrate, particle_wg);
+        drop(cp);
 
         queue.submit(std::iter::once(encoder.finish()));
     }

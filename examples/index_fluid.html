@@ -300,7 +300,8 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
       let fpsFrames = 0, fpsLastTime = performance.now();
 
       // ── Render loop ───────────────────────────────────────
-      const time = new Vector4(0, 0, 0, 0);
+      const startTimeS = performance.now() / 1000;
+      const time = new Vector4(startTimeS, 0, startTimeS, 0);
 
       async function animate() {
         const frameStart = performance.now();
@@ -319,7 +320,7 @@ fn fragment_main(fragData: VertexOut) -> FragOut {
         time.y = time.x - time.z;
         time.z = time.x;
 
-        const dt = 1 / 60;
+        const dt = Math.max(time.y, 1 / 60);
 
         mouseVectors.update(dt);
         cameraControls.update(time.x);
