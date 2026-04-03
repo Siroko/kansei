@@ -9,7 +9,7 @@ use kansei_core::simulations::fluid::{
 };
 
 use winit::application::ApplicationHandler;
-use winit::event::{WindowEvent, ElementState, MouseButton};
+use winit::event::{WindowEvent, ElementState, MouseButton, DeviceEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -33,6 +33,10 @@ impl OrbitCamera {
         let y = self.target.y + self.distance * self.elevation.sin();
         let z = self.target.z + self.distance * self.azimuth.cos() * self.elevation.cos();
         glam::Vec3::new(x, y, z)
+    }
+
+    fn view_matrix(&self) -> glam::Mat4 {
+        glam::Mat4::look_at_rh(self.eye(), self.target, glam::Vec3::Y)
     }
 
     fn on_mouse_move(&mut self, x: f64, y: f64) {
@@ -97,149 +101,6 @@ struct FOut { @location(0) color: vec4<f32>, }
     }
 }
 
-// ── Cornell box renderer ──
-struct CornellBox {
-    pipeline: wgpu::RenderPipeline,
-    vertex_buf: wgpu::Buffer,
-    params_buf: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    vertex_count: u32,
-}
-
-impl CornellBox {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, bounds_min: [f32; 3], bounds_max: [f32; 3]) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("CornellBox"), source: wgpu::ShaderSource::Wgsl(r#"
-struct Params { view: mat4x4<f32>, proj: mat4x4<f32>, }
-@group(0) @binding(0) var<uniform> p: Params;
-
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @location(1) norm: vec3<f32>, }
-
-@vertex fn vs(@location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>) -> VOut {
-    var o: VOut;
-    o.pos = p.proj * p.view * vec4<f32>(position, 1.0);
-    o.col = color;
-    o.norm = normal;
-    return o;
-}
-
-@fragment fn fs(v: VOut) -> @location(0) vec4<f32> {
-    let light = normalize(vec3<f32>(0.3, 1.0, 0.5));
-    let ndotl = max(dot(normalize(v.norm), light), 0.0);
-    let ambient = 0.3;
-    return vec4<f32>(v.col * (ambient + ndotl * 0.7), 1.0);
-}
-"#.into()) });
-
-        // Build 5 quads (no front wall): floor, ceiling, back, left (red), right (green)
-        let [x0, y0, z0] = bounds_min;
-        let [x1, y1, z1] = bounds_max;
-
-        // Each vertex: pos(3) + normal(3) + color(3) = 9 floats
-        // Each quad: 2 triangles = 6 vertices
-        #[rustfmt::skip]
-        let vertices: Vec<f32> = vec![
-            // Floor (y=y0) — white, normal up
-            x0,y0,z0, 0.0,1.0,0.0, 0.7,0.7,0.7,
-            x1,y0,z0, 0.0,1.0,0.0, 0.7,0.7,0.7,
-            x1,y0,z1, 0.0,1.0,0.0, 0.7,0.7,0.7,
-            x0,y0,z0, 0.0,1.0,0.0, 0.7,0.7,0.7,
-            x1,y0,z1, 0.0,1.0,0.0, 0.7,0.7,0.7,
-            x0,y0,z1, 0.0,1.0,0.0, 0.7,0.7,0.7,
-            // Ceiling (y=y1) — white, normal down
-            x0,y1,z1, 0.0,-1.0,0.0, 0.7,0.7,0.7,
-            x1,y1,z1, 0.0,-1.0,0.0, 0.7,0.7,0.7,
-            x1,y1,z0, 0.0,-1.0,0.0, 0.7,0.7,0.7,
-            x0,y1,z1, 0.0,-1.0,0.0, 0.7,0.7,0.7,
-            x1,y1,z0, 0.0,-1.0,0.0, 0.7,0.7,0.7,
-            x0,y1,z0, 0.0,-1.0,0.0, 0.7,0.7,0.7,
-            // Back wall (z=z0) — white, normal +z
-            x0,y0,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
-            x0,y1,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
-            x1,y1,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
-            x0,y0,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
-            x1,y1,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
-            x1,y0,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
-            // Left wall (x=x0) — red, normal +x
-            x0,y0,z0, 1.0,0.0,0.0, 0.8,0.15,0.1,
-            x0,y0,z1, 1.0,0.0,0.0, 0.8,0.15,0.1,
-            x0,y1,z1, 1.0,0.0,0.0, 0.8,0.15,0.1,
-            x0,y0,z0, 1.0,0.0,0.0, 0.8,0.15,0.1,
-            x0,y1,z1, 1.0,0.0,0.0, 0.8,0.15,0.1,
-            x0,y1,z0, 1.0,0.0,0.0, 0.8,0.15,0.1,
-            // Right wall (x=x1) — green, normal -x
-            x1,y0,z1, -1.0,0.0,0.0, 0.15,0.8,0.1,
-            x1,y0,z0, -1.0,0.0,0.0, 0.15,0.8,0.1,
-            x1,y1,z0, -1.0,0.0,0.0, 0.15,0.8,0.1,
-            x1,y0,z1, -1.0,0.0,0.0, 0.15,0.8,0.1,
-            x1,y1,z0, -1.0,0.0,0.0, 0.15,0.8,0.1,
-            x1,y1,z1, -1.0,0.0,0.0, 0.15,0.8,0.1,
-            // Front wall (z=z1) — white, normal -z
-            x1,y0,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
-            x0,y1,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
-            x0,y0,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
-            x1,y0,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
-            x1,y1,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
-            x0,y1,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
-        ];
-
-        use wgpu::util::DeviceExt;
-        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("CornellBox/Vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("CornellBox/Params"), size: 128,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("CornellBox"), layout: None,
-            vertex: wgpu::VertexState {
-                module: &shader, entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 36, step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
-                    ],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader, entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Front), // Single-sided: see through from outside
-                ..Default::default()
-            },
-            depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
-        });
-
-        let bgl = pipeline.get_bind_group_layout(0);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None, layout: &bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() }],
-        });
-
-        Self { pipeline, vertex_buf, params_buf, bind_group, vertex_count: 36 } // 6 quads × 6 verts
-    }
-
-    fn upload(&self, queue: &wgpu::Queue, view: &glam::Mat4, proj: &glam::Mat4) {
-        let mut d = [0.0f32; 32];
-        d[..16].copy_from_slice(&view.to_cols_array());
-        d[16..32].copy_from_slice(&proj.to_cols_array());
-        queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&d));
-    }
-}
-
 // ── Particle renderer ──
 struct ParticleRenderer { pipeline: wgpu::RenderPipeline, bind_group: wgpu::BindGroup, params_buf: wgpu::Buffer, count: u32 }
 
@@ -286,7 +147,6 @@ const Q: array<vec2<f32>,6> = array(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    #[allow(dead_code)]
     scene: Scene,
     camera: Camera,
     orbit: OrbitCamera,
@@ -294,7 +154,6 @@ struct App {
     density_field: Option<FluidDensityField>,
     surface_renderer: Option<FluidSurfaceRenderer>,
     particle_renderer: Option<ParticleRenderer>,
-    cornell_box: Option<CornellBox>,
     blit: Option<BlitPipeline>,
     color_view: Option<wgpu::TextureView>,
     depth_view: Option<wgpu::TextureView>,
@@ -310,11 +169,6 @@ struct App {
     show_particles: bool,
     particle_size: f32,
     last_time: Option<Instant>,
-    // FPS counter
-    frame_count: u64,
-    frame_time_accum: f64,
-    current_fps: f64,
-    current_frame_ms: f64,
     // mouse for fluid interaction
     mouse_ndc: [f32; 2],
     mouse_prev_ndc: [f32; 2],
@@ -328,14 +182,13 @@ impl App {
             camera: Camera::new(45.0, 0.1, 1000.0, 1.0),
             orbit: OrbitCamera::new(glam::Vec3::new(0.0, 3.0, 0.0), 75.0),
             sim: None, density_field: None, surface_renderer: None,
-            particle_renderer: None, cornell_box: None, blit: None,
+            particle_renderer: None, blit: None,
             color_view: None, depth_view: None, output_view: None, color_texture: None,
             surface_bg: None, blit_bg: None,
             egui_ctx: egui::Context::default(),
             egui_state: None, egui_renderer: None,
             show_particles: true, particle_size: 0.15,
             last_time: None,
-            frame_count: 0, frame_time_accum: 0.0, current_fps: 0.0, current_frame_ms: 0.0,
             mouse_ndc: [0.0; 2], mouse_prev_ndc: [0.0; 2], mouse_pressed: false,
         }
     }
@@ -368,20 +221,20 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() { return; }
         let window = Arc::new(el.create_window(Window::default_attributes()
-            .with_title("Kansei — Fluid Engine").with_inner_size(winit::dpi::LogicalSize::new(1280, 720))).unwrap());
+            .with_title("Kansei — Fluid 3D").with_inner_size(winit::dpi::LogicalSize::new(1280, 720))).unwrap());
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&Default::default());
         let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), present_mode: wgpu::PresentMode::Immediate, ..Default::default() });
+        let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), ..Default::default() });
         pollster::block_on(renderer.initialize(surface, &adapter));
         let device = renderer.device();
         let format = renderer.presentation_format();
 
         // Particles
-        let count = 50000usize;
-        let radius = 10.0f32;
+        let count = 10000usize;
+        let radius = 5.0f32;
         let mut positions = vec![0.0f32; count * 4];
         let mut rng: u64 = 12345;
         for i in 0..count {
@@ -403,14 +256,13 @@ impl ApplicationHandler for App {
             ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
         });
         sim.initialize(&positions, device);
-        sim.world_bounds_min = [-25.0, -8.0, -16.0];
-        sim.world_bounds_max = [25.0, 30.0, 16.0];
+        sim.world_bounds_min = [-12.0, -8.0, -8.0];
+        sim.world_bounds_max = [12.0, 32.0, 8.0];
         sim.rebuild_grid(device);
 
         self.density_field = Some(FluidDensityField::new(device, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
         self.surface_renderer = Some(FluidSurfaceRenderer::new(device));
         self.particle_renderer = Some(ParticleRenderer::new(device, sim.positions_buffer().unwrap(), count as u32, format));
-        self.cornell_box = Some(CornellBox::new(device, format, sim.world_bounds_min, sim.world_bounds_max));
         self.blit = Some(BlitPipeline::new(device, format));
         self.sim = Some(sim);
         self.renderer = Some(renderer);
@@ -424,7 +276,7 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.last_time = Some(Instant::now());
         self.rebuild_offscreen(size.width, size.height);
-        log::info!("Fluid Engine — {} particles", count);
+        log::info!("Fluid 3D — {} particles", count);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -472,7 +324,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = 1.0 / 60.0;
+                let dt = self.last_time.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0/60.0).min(1.0/30.0);
                 self.last_time = Some(now);
                 let size = self.window.as_ref().unwrap().inner_size();
 
@@ -482,17 +334,13 @@ impl ApplicationHandler for App {
                 let device = renderer.device();
                 let queue = renderer.queue();
 
-                // Camera — use engine Camera with orbit eye position
-                let eye = self.orbit.eye();
-                self.camera.set_position(eye.x, eye.y, eye.z);
-                self.camera.look_at(&Vec3::new(self.orbit.target.x, self.orbit.target.y, self.orbit.target.z));
+                // Camera
+                let view = self.orbit.view_matrix();
                 let aspect = size.width as f32 / size.height as f32;
-                self.camera.aspect = aspect;
-                self.camera.update_projection_matrix();
-                let view = self.camera.view_matrix.to_glam();
-                let proj = self.camera.projection_matrix.to_glam();
+                let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect, 0.1, 1000.0);
                 let inv_view = view.inverse();
                 let inv_vp = (proj * view).inverse();
+                let eye = self.orbit.eye();
 
                 // Mouse interaction
                 let mouse_dir = [
@@ -516,27 +364,14 @@ impl ApplicationHandler for App {
                 let mut encoder = device.create_command_encoder(&Default::default());
 
                 if self.show_particles {
-                    // Upload cornell box + particle params
-                    if let Some(ref cb) = self.cornell_box { cb.upload(queue, &view, &proj); }
-                    if let Some(ref pr) = self.particle_renderer { pr.upload(queue, &view, &proj, self.particle_size); }
-
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &canvas_view, resolve_target: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
-                        })], ..Default::default()
-                    });
-
-                    // Draw cornell box first
-                    if let Some(ref cb) = self.cornell_box {
-                        pass.set_pipeline(&cb.pipeline);
-                        pass.set_bind_group(0, &cb.bind_group, &[]);
-                        pass.set_vertex_buffer(0, cb.vertex_buf.slice(..));
-                        pass.draw(0..cb.vertex_count, 0..1);
-                    }
-
-                    // Draw particles on top
                     if let Some(ref pr) = self.particle_renderer {
+                        pr.upload(queue, &view, &proj, self.particle_size);
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &canvas_view, resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
+                            })], ..Default::default()
+                        });
                         pass.set_pipeline(&pr.pipeline);
                         pass.set_bind_group(0, &pr.bind_group, &[]);
                         pass.draw(0..pr.count * 6, 0..1);
@@ -564,9 +399,7 @@ impl ApplicationHandler for App {
                 let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(self.window.as_ref().unwrap());
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
                     egui::SidePanel::right("controls").min_width(220.0).show(ctx, |ui| {
-                        ui.heading("Fluid Engine");
-                        ui.label(format!("{:.1} FPS  ({:.2} ms)", self.current_fps, self.current_frame_ms));
-                        ui.label(format!("Particles: {}", 50000));
+                        ui.heading("Fluid 3D");
                         ui.separator();
                         ui.checkbox(&mut self.show_particles, "Show particles");
                         ui.add(egui::Slider::new(&mut self.particle_size, 0.01..=0.5).text("Particle size"));
@@ -628,17 +461,6 @@ impl ApplicationHandler for App {
                 self.egui_renderer = Some(er);
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
                 output.present();
-
-                // Wall clock FPS (honest frame time including present)
-                self.frame_time_accum += dt as f64;
-                self.frame_count += 1;
-                if self.frame_count % 60 == 0 {
-                    let avg = self.frame_time_accum / 60.0;
-                    self.current_frame_ms = avg * 1000.0;
-                    self.current_fps = 1.0 / avg;
-                    self.frame_time_accum = 0.0;
-                }
-
                 if let Some(ref w) = self.window { w.request_redraw(); }
             }
             _ => {}
@@ -648,7 +470,7 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::init();
-    log::info!("Kansei — Fluid Engine");
+    log::info!("Kansei — Fluid 3D");
     let el = EventLoop::new().unwrap();
     el.set_control_flow(winit::event_loop::ControlFlow::Poll);
     el.run_app(&mut App::new()).unwrap();
