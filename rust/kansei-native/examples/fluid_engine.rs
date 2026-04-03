@@ -13,6 +13,8 @@ use winit::event::{WindowEvent, ElementState, MouseButton};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
+const PARTICLE_MSAA_SAMPLES: u32 = 4;
+
 // ── Orbit camera ──
 struct OrbitCamera {
     target: glam::Vec3,
@@ -100,6 +102,7 @@ struct FOut { @location(0) color: vec4<f32>, }
 // ── Cornell box renderer ──
 struct CornellBox {
     pipeline: wgpu::RenderPipeline,
+    depth_pipeline: wgpu::RenderPipeline,
     vertex_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -196,8 +199,27 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @l
             mapped_at_creation: false,
         });
 
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CornellBox/BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("CornellBox/Layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("CornellBox"), layout: None,
+            label: Some("CornellBox"), layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader, entry_point: Some("vs"),
                 buffers: &[wgpu::VertexBufferLayout {
@@ -220,16 +242,56 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @l
                 cull_mode: Some(wgpu::Face::Front), // Single-sided: see through from outside
                 ..Default::default()
             },
-            depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
+            multiview: None, cache: None,
+        });
+        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CornellBox/Depth"), layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader, entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 36, step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader, entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Front),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(), multiview: None, cache: None,
         });
 
-        let bgl = pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None, layout: &bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() }],
         });
 
-        Self { pipeline, vertex_buf, params_buf, bind_group, vertex_count: 36 } // 6 quads × 6 verts
+        Self { pipeline, depth_pipeline, vertex_buf, params_buf, bind_group, vertex_count: 36 } // 6 quads × 6 verts
     }
 
     fn upload(&self, queue: &wgpu::Queue, view: &glam::Mat4, proj: &glam::Mat4) {
@@ -267,7 +329,16 @@ const Q: array<vec2<f32>,6> = array(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(
             label: Some("Particles"), layout: None,
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
+            multiview: None, cache: None,
         });
         let bgl = pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
@@ -299,6 +370,10 @@ struct App {
     color_view: Option<wgpu::TextureView>,
     depth_view: Option<wgpu::TextureView>,
     output_view: Option<wgpu::TextureView>,
+    particle_msaa_tex: Option<wgpu::Texture>,
+    particle_msaa_view: Option<wgpu::TextureView>,
+    particle_depth_tex: Option<wgpu::Texture>,
+    particle_depth_view: Option<wgpu::TextureView>,
     color_texture: Option<wgpu::Texture>,
     surface_bg: Option<wgpu::BindGroup>,
     blit_bg: Option<wgpu::BindGroup>,
@@ -315,6 +390,7 @@ struct App {
     frame_time_accum: f64,
     current_fps: f64,
     current_frame_ms: f64,
+    sim_accumulator: f64,
     // mouse for fluid interaction
     mouse_ndc: [f32; 2],
     mouse_prev_ndc: [f32; 2],
@@ -330,12 +406,15 @@ impl App {
             sim: None, density_field: None, surface_renderer: None,
             particle_renderer: None, cornell_box: None, blit: None,
             color_view: None, depth_view: None, output_view: None, color_texture: None,
+            particle_msaa_tex: None, particle_msaa_view: None,
+            particle_depth_tex: None, particle_depth_view: None,
             surface_bg: None, blit_bg: None,
             egui_ctx: egui::Context::default(),
             egui_state: None, egui_renderer: None,
             show_particles: true, particle_size: 0.15,
             last_time: None,
             frame_count: 0, frame_time_accum: 0.0, current_fps: 0.0, current_frame_ms: 0.0,
+            sim_accumulator: 0.0,
             mouse_ndc: [0.0; 2], mouse_prev_ndc: [0.0; 2], mouse_pressed: false,
         }
     }
@@ -354,8 +433,34 @@ impl App {
         let (ct, cv) = mk("Color", wgpu::TextureFormat::Rgba16Float, cu);
         let (_dt, dv) = mk("Depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
         let (_ot, ov) = mk("Output", wgpu::TextureFormat::Rgba16Float, cu);
+        let particle_msaa_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ParticleMSAA"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: PARTICLE_MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.renderer.as_ref().unwrap().presentation_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let particle_msaa_view = particle_msaa_tex.create_view(&Default::default());
+        let particle_depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ParticleDepth"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: PARTICLE_MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let particle_depth_view = particle_depth_tex.create_view(&Default::default());
         self.color_texture = Some(ct); self.color_view = Some(cv);
         self.depth_view = Some(dv); self.output_view = Some(ov);
+        self.particle_msaa_tex = Some(particle_msaa_tex);
+        self.particle_msaa_view = Some(particle_msaa_view);
+        self.particle_depth_tex = Some(particle_depth_tex);
+        self.particle_depth_view = Some(particle_depth_view);
         // Rebuild bind groups
         if let (Some(sr), Some(df), Some(blit)) = (&self.surface_renderer, &self.density_field, &self.blit) {
             self.surface_bg = Some(sr.create_bind_group(device, self.color_view.as_ref().unwrap(), self.depth_view.as_ref().unwrap(), self.output_view.as_ref().unwrap(), &df.density_view));
@@ -407,7 +512,7 @@ impl ApplicationHandler for App {
         sim.world_bounds_max = [25.0, 30.0, 16.0];
         sim.rebuild_grid(device);
 
-        self.density_field = Some(FluidDensityField::new(device, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
+        self.density_field = Some(FluidDensityField::new(device, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7 }));
         self.surface_renderer = Some(FluidSurfaceRenderer::new(device));
         self.particle_renderer = Some(ParticleRenderer::new(device, sim.positions_buffer().unwrap(), count as u32, format));
         self.cornell_box = Some(CornellBox::new(device, format, sim.world_bounds_min, sim.world_bounds_max));
@@ -472,7 +577,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = 1.0 / 60.0;
+                let frame_dt = self.last_time
+                    .map(|t| now.duration_since(t).as_secs_f64())
+                    .unwrap_or(1.0 / 60.0)
+                    .max(1.0 / 1000.0);
+                let sim_frame_dt = frame_dt.max(1.0 / 60.0);
                 self.last_time = Some(now);
                 let size = self.window.as_ref().unwrap().inner_size();
 
@@ -507,7 +616,16 @@ impl ApplicationHandler for App {
                     sim.set_camera_matrices(queue,
                         &view.to_cols_array(), &proj.to_cols_array(),
                         &inv_view.to_cols_array(), &identity);
-                    sim.update(device, queue, dt, mouse_strength, self.mouse_ndc, mouse_dir);
+
+                    // Fixed-step simulation at 60Hz so behavior is stable across display refresh rates.
+                    const SIM_DT: f32 = 1.0 / 60.0;
+                    self.sim_accumulator = (self.sim_accumulator + sim_frame_dt).min(0.25);
+                    let mut steps = 0u32;
+                    while self.sim_accumulator >= SIM_DT as f64 && steps < 8 {
+                        sim.update(device, queue, SIM_DT, mouse_strength, self.mouse_ndc, mouse_dir);
+                        self.sim_accumulator -= SIM_DT as f64;
+                        steps += 1;
+                    }
                 }
 
                 let surface = renderer.surface().unwrap();
@@ -515,16 +633,26 @@ impl ApplicationHandler for App {
                 let canvas_view = output.texture.create_view(&Default::default());
                 let mut encoder = device.create_command_encoder(&Default::default());
 
+                if let Some(ref cb) = self.cornell_box { cb.upload(queue, &view, &proj); }
                 if self.show_particles {
-                    // Upload cornell box + particle params
-                    if let Some(ref cb) = self.cornell_box { cb.upload(queue, &view, &proj); }
+                    // Upload particle params
                     if let Some(ref pr) = self.particle_renderer { pr.upload(queue, &view, &proj, self.particle_size); }
 
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &canvas_view, resolve_target: None,
+                            view: self.particle_msaa_view.as_ref().unwrap_or(&canvas_view),
+                            resolve_target: self.particle_msaa_view.as_ref().map(|_| &canvas_view),
                             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
-                        })], ..Default::default()
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: self.particle_depth_view.as_ref().unwrap(),
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
                     });
 
                     // Draw cornell box first
@@ -546,11 +674,19 @@ impl ApplicationHandler for App {
                     if let Some(ref mut df) = self.density_field {
                         df.update(&mut encoder, queue, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), sim.params.smoothing_radius);
                     }
-                    { let _p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: self.color_view.as_ref().unwrap(), resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store } })],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: self.depth_view.as_ref().unwrap(), depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                         ..Default::default()
-                    }); }
+                    });
+                        if let Some(ref cb) = self.cornell_box {
+                            pass.set_pipeline(&cb.depth_pipeline);
+                            pass.set_bind_group(0, &cb.bind_group, &[]);
+                            pass.set_vertex_buffer(0, cb.vertex_buf.slice(..));
+                            pass.draw(0..cb.vertex_count, 0..1);
+                        }
+                    }
                     if let Some(ref sr) = self.surface_renderer {
                         sr.render(&mut encoder, queue, self.surface_bg.as_ref().unwrap(), &inv_vp, [eye.x, eye.y, eye.z], sim.world_bounds_min, sim.world_bounds_max, size.width, size.height);
                     }
@@ -629,8 +765,8 @@ impl ApplicationHandler for App {
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
                 output.present();
 
-                // Wall clock FPS (honest frame time including present)
-                self.frame_time_accum += dt as f64;
+                // Wall clock FPS (actual frame duration including present)
+                self.frame_time_accum += frame_dt;
                 self.frame_count += 1;
                 if self.frame_count % 60 == 0 {
                     let avg = self.frame_time_accum / 60.0;
