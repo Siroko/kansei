@@ -135,13 +135,13 @@ impl ApplicationHandler for App {
             gravity: [0.0, -9.8, 0.0], mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
             ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
         });
-        sim.initialize(&positions, renderer.device(), renderer.queue());
+        sim.initialize_from_renderer(&positions, &renderer);
         sim.world_bounds_min = [-12.0, -8.0, -8.0];
         sim.world_bounds_max = [12.0, 32.0, 8.0];
         sim.rebuild_grid();
 
-        self.density_field = Some(FluidDensityField::new(renderer.device(), renderer.queue(), sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
-        self.surface_renderer = Some(FluidSurfaceRenderer::new(renderer.device(), renderer.queue()));
+        self.density_field = Some(FluidDensityField::from_renderer(&renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
+        self.surface_renderer = Some(FluidSurfaceRenderer::from_renderer(&renderer));
         self.particle_renderer = Some(FluidParticleRendererCore::new(
             &renderer,
             sim.positions_buffer().unwrap(),
