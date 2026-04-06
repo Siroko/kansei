@@ -56,10 +56,6 @@ pub struct Renderer {
     shared_layouts: Option<SharedLayouts>,
     // Mesh bind group (group 1) — dynamic offset into matrix buffers
     mesh_bind_group: Option<wgpu::BindGroup>,
-    // Camera uniform buffers + bind group (group 2)
-    camera_view_buf: Option<wgpu::Buffer>,
-    camera_proj_buf: Option<wgpu::Buffer>,
-    camera_bind_group: Option<wgpu::BindGroup>,
     // Light uniform buffer (packed into camera bind group, binding 2)
     light_buf: Option<wgpu::Buffer>,
     light_uniforms: LightUniforms,
@@ -97,9 +93,6 @@ impl Renderer {
             last_object_count: 0,
             shared_layouts: None,
             mesh_bind_group: None,
-            camera_view_buf: None,
-            camera_proj_buf: None,
-            camera_bind_group: None,
             light_buf: None,
             light_uniforms: LightUniforms::new(),
             shadow_map: None,
@@ -165,46 +158,12 @@ impl Renderer {
         // Create shared bind group layouts
         let shared = SharedLayouts::new(&device);
 
-        // Create camera uniform buffers (64 bytes = one mat4x4<f32>)
-        let camera_view_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Renderer/CameraViewBuf"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let camera_proj_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Renderer/CameraProjBuf"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         // Create light uniform buffer
         let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Renderer/Lights"),
             size: LIGHT_UNIFORM_BYTES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-
-        // Create camera bind group (group 2)
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Renderer/CameraBG"),
-            layout: &shared.camera_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_view_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: camera_proj_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: light_buf.as_entire_binding(),
-                },
-            ],
         });
 
         // Shadow resources — dummy depth texture + comparison sampler + uniform buffer
@@ -255,10 +214,7 @@ impl Renderer {
         });
 
         self.shared_layouts = Some(shared);
-        self.camera_view_buf = Some(camera_view_buf);
-        self.camera_proj_buf = Some(camera_proj_buf);
         self.light_buf = Some(light_buf);
-        self.camera_bind_group = Some(camera_bind_group);
         self.shadow_bind_group = Some(shadow_bind_group);
         self.shadow_dummy_depth_tex = Some(dummy_depth);
         self.shadow_dummy_depth_view = Some(dummy_depth_view);
@@ -519,13 +475,8 @@ impl Renderer {
     fn upload_all(&mut self, scene: &Scene, camera: &Camera) {
         let queue = self.queue.as_ref().unwrap();
 
-        // Upload camera matrices
-        if let Some(ref buf) = self.camera_view_buf {
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(camera.view_matrix.as_slice()));
-        }
-        if let Some(ref buf) = self.camera_proj_buf {
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(camera.projection_matrix.as_slice()));
-        }
+        // Upload camera matrices (camera owns its buffers)
+        camera.upload(queue);
 
         // Upload lights
         let lights_vec: Vec<&Light> = scene.lights().collect();
@@ -706,6 +657,13 @@ impl Renderer {
             }
         }
 
+        // Initialize camera GPU resources if needed
+        if !camera.initialized {
+            let device = self.device.as_ref().unwrap();
+            let shared = self.shared_layouts.as_ref().unwrap();
+            camera.gpu_initialize(device, &shared.camera_bgl, self.light_buf.as_ref().unwrap());
+        }
+
         // Phase 1: Upload camera + per-object matrices
         self.upload_all(scene, camera);
 
@@ -828,7 +786,7 @@ impl Renderer {
             });
 
             // Set camera bind group (shared across all objects)
-            pass.set_bind_group(1, self.camera_bind_group.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
             pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
 
             for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
@@ -928,6 +886,13 @@ impl Renderer {
     ) {
         camera.update_view_matrix();
         scene.prepare(camera.position());
+
+        // Initialize camera GPU resources if needed
+        if !camera.initialized {
+            let device = self.device.as_ref().unwrap();
+            let shared = self.shared_layouts.as_ref().unwrap();
+            camera.gpu_initialize(device, &shared.camera_bgl, self.light_buf.as_ref().unwrap());
+        }
 
         // Initialize geometries + pre-warm pipelines for GBuffer formats
         let device = self.device.as_ref().unwrap();
@@ -1071,7 +1036,7 @@ impl Renderer {
                 ..Default::default()
             });
 
-            pass.set_bind_group(1, self.camera_bind_group.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
             pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
 
             let alignment = self.matrix_alignment;

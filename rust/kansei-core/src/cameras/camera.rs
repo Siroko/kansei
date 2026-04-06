@@ -12,6 +12,11 @@ pub struct Camera {
     pub inverse_view_matrix: Mat4,
     pub projection_matrix: Mat4,
     look_at_target: Option<Vec3>,
+    // GPU resources (owned by Camera, created by Renderer on first render)
+    view_buf: Option<wgpu::Buffer>,
+    proj_buf: Option<wgpu::Buffer>,
+    camera_bind_group: Option<wgpu::BindGroup>,
+    pub initialized: bool,
 }
 
 impl Camera {
@@ -28,6 +33,10 @@ impl Camera {
             inverse_view_matrix: Mat4::identity(),
             projection_matrix: projection,
             look_at_target: None,
+            view_buf: None,
+            proj_buf: None,
+            camera_bind_group: None,
+            initialized: false,
         }
     }
 
@@ -53,6 +62,64 @@ impl Camera {
         self.inverse_view_matrix = self.view_matrix.inverse();
         self.object.world_matrix = self.inverse_view_matrix;
         self.object.model_matrix = self.object.world_matrix; // keep in sync
+    }
+
+    /// Called by Renderer during first render. Creates GPU buffers and bind group.
+    pub fn gpu_initialize(
+        &mut self,
+        device: &wgpu::Device,
+        camera_bgl: &wgpu::BindGroupLayout,
+        light_buf: &wgpu::Buffer,
+    ) {
+        if self.initialized {
+            return;
+        }
+        self.view_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera/View"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.proj_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera/Proj"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.camera_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Camera/BG"),
+            layout: camera_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.view_buf.as_ref().unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.proj_buf.as_ref().unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: light_buf.as_entire_binding(),
+                },
+            ],
+        }));
+        self.initialized = true;
+    }
+
+    /// Upload current view + projection matrices to GPU.
+    pub fn upload(&self, queue: &wgpu::Queue) {
+        if let Some(ref buf) = self.view_buf {
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(self.view_matrix.as_slice()));
+        }
+        if let Some(ref buf) = self.proj_buf {
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(self.projection_matrix.as_slice()));
+        }
+    }
+
+    /// Get the camera's bind group (group 1).
+    pub fn bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.camera_bind_group.as_ref()
     }
 
     pub fn position(&self) -> &Vec3 {
