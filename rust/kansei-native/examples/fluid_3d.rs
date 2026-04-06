@@ -1,147 +1,20 @@
 use std::sync::Arc;
 use std::time::Instant;
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{Mat4, Vec3, Vec4};
 use kansei_core::cameras::Camera;
+use kansei_core::controls::{CameraControls, MouseVectors};
 use kansei_core::objects::Scene;
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::simulations::fluid::{
     FluidSimulation, FluidSimulationOptions, FluidDensityField, DensityFieldOptions, FluidSurfaceRenderer,
+    FluidParticleRenderer as FluidParticleRendererCore,
+    FullscreenBlit as FullscreenBlitCore,
 };
 
 use winit::application::ApplicationHandler;
-use winit::event::{WindowEvent, ElementState, MouseButton, DeviceEvent};
+use winit::event::{WindowEvent, ElementState, MouseButton};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
-
-// ── Orbit camera ──
-struct OrbitCamera {
-    target: glam::Vec3,
-    distance: f32,
-    azimuth: f32,   // radians
-    elevation: f32,  // radians
-    dragging: bool,
-    last_mouse: Option<(f64, f64)>,
-}
-
-impl OrbitCamera {
-    fn new(target: glam::Vec3, distance: f32) -> Self {
-        Self { target, distance, azimuth: 0.0, elevation: 0.3, dragging: false, last_mouse: None }
-    }
-
-    fn eye(&self) -> glam::Vec3 {
-        let x = self.target.x + self.distance * self.azimuth.sin() * self.elevation.cos();
-        let y = self.target.y + self.distance * self.elevation.sin();
-        let z = self.target.z + self.distance * self.azimuth.cos() * self.elevation.cos();
-        glam::Vec3::new(x, y, z)
-    }
-
-    fn view_matrix(&self) -> glam::Mat4 {
-        glam::Mat4::look_at_rh(self.eye(), self.target, glam::Vec3::Y)
-    }
-
-    fn on_mouse_move(&mut self, x: f64, y: f64) {
-        if self.dragging {
-            if let Some((lx, ly)) = self.last_mouse {
-                let dx = (x - lx) as f32 * 0.005;
-                let dy = (y - ly) as f32 * 0.005;
-                self.azimuth -= dx;
-                self.elevation = (self.elevation + dy).clamp(-1.5, 1.5);
-            }
-        }
-        self.last_mouse = Some((x, y));
-    }
-
-    fn on_scroll(&mut self, delta: f32) {
-        self.distance = (self.distance - delta * 0.5).clamp(2.0, 100.0);
-    }
-}
-
-// ── Blit pipeline ──
-struct BlitPipeline {
-    pipeline: wgpu::RenderPipeline,
-    sampler: wgpu::Sampler,
-    bgl: wgpu::BindGroupLayout,
-}
-
-impl BlitPipeline {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blit"), source: wgpu::ShaderSource::Wgsl(r#"
-@group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
-    return vec4<f32>(pos[vi], 0.0, 1.0);
-}
-struct FOut { @location(0) color: vec4<f32>, }
-@fragment fn fs(@builtin(position) frag: vec4<f32>) -> FOut {
-    let dims = vec2<f32>(textureDimensions(src));
-    var out: FOut; out.color = textureSample(src, samp, frag.xy / dims); return out;
-}
-"#.into()) });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Blit/BGL"), entries: &[
-            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-        ]});
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Blit"), layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        Self { pipeline, sampler, bgl }
-    }
-    fn bind(&self, device: &wgpu::Device, view: &wgpu::TextureView) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-        ]})
-    }
-}
-
-// ── Particle renderer ──
-struct ParticleRenderer { pipeline: wgpu::RenderPipeline, bind_group: wgpu::BindGroup, params_buf: wgpu::Buffer, count: u32 }
-
-impl ParticleRenderer {
-    fn new(device: &wgpu::Device, pos_buf: &wgpu::Buffer, count: u32, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Particles"), source: wgpu::ShaderSource::Wgsl(r#"
-struct P { view: mat4x4<f32>, proj: mat4x4<f32>, size: f32, }
-@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
-@group(0) @binding(1) var<uniform> p: P;
-struct V { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, }
-const Q: array<vec2<f32>,6> = array(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,-1.),vec2(1.,1.),vec2(-1.,1.));
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> V {
-    let pid=vi/6u; let c=Q[vi%6u]; let pos=positions[pid]; let s=p.size;
-    let r=vec3<f32>(p.view[0][0],p.view[1][0],p.view[2][0]);
-    let u=vec3<f32>(p.view[0][1],p.view[1][1],p.view[2][1]);
-    let wp=pos.xyz+r*c.x*s+u*c.y*s;
-    var o:V; o.pos=p.proj*p.view*vec4<f32>(wp,1.);
-    let t=clamp((pos.y+8.)/16.,0.,1.);
-    o.col=mix(vec3<f32>(0.1,0.3,0.8),vec3<f32>(0.8,0.95,1.0),t); return o;
-}
-@fragment fn fs(v:V)->@location(0) vec4<f32>{return vec4<f32>(v.col,1.);}
-"#.into()) });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 144, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Particles"), layout: None,
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
-        });
-        let bgl = pipeline.get_bind_group_layout(0);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: pos_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
-        ]});
-        Self { pipeline, bind_group, params_buf, count }
-    }
-    fn upload(&self, queue: &wgpu::Queue, view: &glam::Mat4, proj: &glam::Mat4, size: f32) {
-        let mut d = [0.0f32; 36]; d[..16].copy_from_slice(&view.to_cols_array()); d[16..32].copy_from_slice(&proj.to_cols_array()); d[32] = size;
-        queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&d));
-    }
-}
 
 // ── App ──
 struct App {
@@ -149,12 +22,14 @@ struct App {
     renderer: Option<Renderer>,
     scene: Scene,
     camera: Camera,
-    orbit: OrbitCamera,
+    camera_controls: CameraControls,
+    camera_dragging: bool,
+    last_mouse: Option<(f64, f64)>,
     sim: Option<FluidSimulation>,
     density_field: Option<FluidDensityField>,
     surface_renderer: Option<FluidSurfaceRenderer>,
-    particle_renderer: Option<ParticleRenderer>,
-    blit: Option<BlitPipeline>,
+    particle_renderer: Option<FluidParticleRendererCore>,
+    blit: Option<FullscreenBlitCore>,
     color_view: Option<wgpu::TextureView>,
     depth_view: Option<wgpu::TextureView>,
     output_view: Option<wgpu::TextureView>,
@@ -170,9 +45,9 @@ struct App {
     particle_size: f32,
     last_time: Option<Instant>,
     // mouse for fluid interaction
-    mouse_ndc: [f32; 2],
-    mouse_prev_ndc: [f32; 2],
+    mouse_vectors: MouseVectors,
     mouse_pressed: bool,
+    enable_mouse_fluid_interaction: bool,
 }
 
 impl App {
@@ -180,7 +55,13 @@ impl App {
         Self {
             window: None, renderer: None, scene: Scene::new(),
             camera: Camera::new(45.0, 0.1, 1000.0, 1.0),
-            orbit: OrbitCamera::new(glam::Vec3::new(0.0, 3.0, 0.0), 75.0),
+            camera_controls: {
+                let mut c = CameraControls::new(Vec3::new(0.0, 3.0, 0.0), 75.0);
+                c.rotate(0.0, 0.3);
+                c
+            },
+            camera_dragging: false,
+            last_mouse: None,
             sim: None, density_field: None, surface_renderer: None,
             particle_renderer: None, blit: None,
             color_view: None, depth_view: None, output_view: None, color_texture: None,
@@ -189,14 +70,14 @@ impl App {
             egui_state: None, egui_renderer: None,
             show_particles: true, particle_size: 0.15,
             last_time: None,
-            mouse_ndc: [0.0; 2], mouse_prev_ndc: [0.0; 2], mouse_pressed: false,
+            mouse_vectors: MouseVectors::new(), mouse_pressed: false, enable_mouse_fluid_interaction: true,
         }
     }
 
     fn rebuild_offscreen(&mut self, w: u32, h: u32) {
-        let device = self.renderer.as_ref().unwrap().device();
+        let renderer = self.renderer.as_ref().unwrap();
         let mk = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
+            let tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
                 label: Some(label), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: fmt, usage, view_formats: &[],
             });
@@ -211,8 +92,8 @@ impl App {
         self.depth_view = Some(dv); self.output_view = Some(ov);
         // Rebuild bind groups
         if let (Some(sr), Some(df), Some(blit)) = (&self.surface_renderer, &self.density_field, &self.blit) {
-            self.surface_bg = Some(sr.create_bind_group(device, self.color_view.as_ref().unwrap(), self.depth_view.as_ref().unwrap(), self.output_view.as_ref().unwrap(), &df.density_view));
-            self.blit_bg = Some(blit.bind(device, self.output_view.as_ref().unwrap()));
+            self.surface_bg = Some(sr.create_bind_group(self.color_view.as_ref().unwrap(), self.depth_view.as_ref().unwrap(), self.output_view.as_ref().unwrap(), &df.density_view));
+            self.blit_bg = Some(blit.create_bind_group(renderer, self.output_view.as_ref().unwrap()));
         }
     }
 }
@@ -229,7 +110,6 @@ impl ApplicationHandler for App {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })).unwrap();
         let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), ..Default::default() });
         pollster::block_on(renderer.initialize(surface, &adapter));
-        let device = renderer.device();
         let format = renderer.presentation_format();
 
         // Particles
@@ -255,21 +135,28 @@ impl ApplicationHandler for App {
             gravity: [0.0, -9.8, 0.0], mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
             ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
         });
-        sim.initialize(&positions, device);
+        sim.initialize(&positions, renderer.device(), renderer.queue());
         sim.world_bounds_min = [-12.0, -8.0, -8.0];
         sim.world_bounds_max = [12.0, 32.0, 8.0];
-        sim.rebuild_grid(device);
+        sim.rebuild_grid();
 
-        self.density_field = Some(FluidDensityField::new(device, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
-        self.surface_renderer = Some(FluidSurfaceRenderer::new(device));
-        self.particle_renderer = Some(ParticleRenderer::new(device, sim.positions_buffer().unwrap(), count as u32, format));
-        self.blit = Some(BlitPipeline::new(device, format));
+        self.density_field = Some(FluidDensityField::new(renderer.device(), renderer.queue(), sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
+        self.surface_renderer = Some(FluidSurfaceRenderer::new(renderer.device(), renderer.queue()));
+        self.particle_renderer = Some(FluidParticleRendererCore::new(
+            &renderer,
+            sim.positions_buffer().unwrap(),
+            count as u32,
+            format,
+            1,
+            None,
+        ));
+        self.blit = Some(FullscreenBlitCore::new(&renderer, format));
         self.sim = Some(sim);
         self.renderer = Some(renderer);
 
         // egui
         self.egui_state = Some(egui_winit::State::new(self.egui_ctx.clone(), egui::ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), None, None));
-        self.egui_renderer = Some(egui_wgpu::Renderer::new(self.renderer.as_ref().unwrap().device(), format, None, 1, false));
+        self.egui_renderer = Some(self.renderer.as_ref().unwrap().egui_create_renderer(format, 1));
 
         self.camera.aspect = size.width as f32 / size.height as f32;
         self.camera.update_projection_matrix();
@@ -297,22 +184,30 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { button: MouseButton::Left, state: s, .. } => {
-                self.orbit.dragging = s == ElementState::Pressed;
+                self.camera_dragging = s == ElementState::Pressed;
                 self.mouse_pressed = s == ElementState::Pressed;
             }
             WindowEvent::MouseInput { button: MouseButton::Right, state: s, .. } => {
                 self.mouse_pressed = s == ElementState::Pressed;
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.orbit.on_mouse_move(position.x, position.y);
+                let first_mouse = self.last_mouse.is_none();
+                if self.camera_dragging {
+                    if let Some((lx, ly)) = self.last_mouse {
+                        let dx = (position.x - lx) as f32 * 0.005;
+                        let dy = (position.y - ly) as f32 * 0.005;
+                        self.camera_controls.rotate(-dx, dy);
+                    }
+                }
+                self.last_mouse = Some((position.x, position.y));
                 // Track mouse in NDC for fluid interaction
                 if let Some(ref w) = self.window {
                     let s = w.inner_size();
-                    self.mouse_prev_ndc = self.mouse_ndc;
-                    self.mouse_ndc = [
-                        (position.x as f32 / s.width as f32) * 2.0 - 1.0,
-                        (position.y as f32 / s.height as f32) * 2.0 - 1.0,
-                    ];
+                    if first_mouse {
+                        self.mouse_vectors.set_position_from_screen(position.x as f32, position.y as f32, s.width as f32, s.height as f32);
+                    } else {
+                        self.mouse_vectors.set_target_from_screen(position.x as f32, position.y as f32, s.width as f32, s.height as f32);
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -320,7 +215,7 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.1,
                 };
-                self.orbit.on_scroll(dy);
+                self.camera_controls.radius = (self.camera_controls.radius - dy * 0.5).clamp(2.0, 100.0);
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
@@ -331,41 +226,47 @@ impl ApplicationHandler for App {
                 if self.color_texture.is_none() { self.rebuild_offscreen(size.width, size.height); }
 
                 let renderer = self.renderer.as_ref().unwrap();
-                let device = renderer.device();
-                let queue = renderer.queue();
 
-                // Camera
-                let view = self.orbit.view_matrix();
+                // Camera orbit update via engine CameraControls
+                self.camera_controls.update(&mut self.camera, dt);
                 let aspect = size.width as f32 / size.height as f32;
-                let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect, 0.1, 1000.0);
-                let inv_view = view.inverse();
+                self.camera.aspect = aspect;
+                self.camera.update_projection_matrix();
+                let eye = *self.camera.position();
+                let view = self.camera.view_matrix;
+                let proj = self.camera.projection_matrix;
+                let inv_view = self.camera.inverse_view_matrix;
                 let inv_vp = (proj * view).inverse();
-                let eye = self.orbit.eye();
 
                 // Mouse interaction
-                let mouse_dir = [
-                    -(self.mouse_ndc[0] - self.mouse_prev_ndc[0]),
-                    -(self.mouse_ndc[1] - self.mouse_prev_ndc[1]),
-                ];
-                let mouse_strength = (mouse_dir[0] * mouse_dir[0] + mouse_dir[1] * mouse_dir[1]).sqrt().min(1.0);
+                self.mouse_vectors.update(dt);
+                let (mouse_dir, mouse_pos, mouse_strength) = if self.enable_mouse_fluid_interaction {
+                    (
+                        [self.mouse_vectors.direction.x, self.mouse_vectors.direction.y],
+                        [self.mouse_vectors.position.x, self.mouse_vectors.position.y],
+                        self.mouse_vectors.strength,
+                    )
+                } else {
+                    ([0.0, 0.0], [0.0, 0.0], 0.0)
+                };
 
                 // Upload camera matrices + run sim
                 if let Some(ref mut sim) = self.sim {
-                    let identity = glam::Mat4::IDENTITY.to_cols_array();
-                    sim.set_camera_matrices(queue,
-                        &view.to_cols_array(), &proj.to_cols_array(),
-                        &inv_view.to_cols_array(), &identity);
-                    sim.update(device, queue, dt, mouse_strength, self.mouse_ndc, mouse_dir);
+                    let identity = Mat4::identity();
+                    sim.set_camera_matrices(
+                        view.as_slice(), proj.as_slice(),
+                        inv_view.as_slice(), identity.as_slice());
+                    sim.update(dt, mouse_strength, mouse_pos, mouse_dir);
                 }
 
                 let surface = renderer.surface().unwrap();
                 let output = surface.get_current_texture().expect("Surface texture");
                 let canvas_view = output.texture.create_view(&Default::default());
-                let mut encoder = device.create_command_encoder(&Default::default());
+                let mut encoder = renderer.create_command_encoder(&Default::default());
 
                 if self.show_particles {
                     if let Some(ref pr) = self.particle_renderer {
-                        pr.upload(queue, &view, &proj, self.particle_size);
+                        pr.upload(renderer, &view, &proj, self.particle_size);
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                 view: &canvas_view, resolve_target: None,
@@ -379,7 +280,7 @@ impl ApplicationHandler for App {
                 } else {
                     let sim = self.sim.as_ref().unwrap();
                     if let Some(ref mut df) = self.density_field {
-                        df.update(&mut encoder, queue, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), sim.params.smoothing_radius);
+                        df.update_with_encoder(&mut encoder, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), sim.params.smoothing_radius);
                     }
                     { let _p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: self.color_view.as_ref().unwrap(), resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store } })],
@@ -387,7 +288,7 @@ impl ApplicationHandler for App {
                         ..Default::default()
                     }); }
                     if let Some(ref sr) = self.surface_renderer {
-                        sr.render(&mut encoder, queue, self.surface_bg.as_ref().unwrap(), &inv_vp, [eye.x, eye.y, eye.z], sim.world_bounds_min, sim.world_bounds_max, size.width, size.height);
+                        sr.render(&mut encoder, self.surface_bg.as_ref().unwrap(), &inv_vp, [eye.x, eye.y, eye.z], sim.world_bounds_min, sim.world_bounds_max, size.width, size.height);
                     }
                     { let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &canvas_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], ..Default::default()
@@ -414,6 +315,7 @@ impl ApplicationHandler for App {
                             ui.separator();
                             ui.label("Forces");
                             ui.add(egui::Slider::new(&mut sim.params.gravity[1], -20.0..=0.0).text("Gravity Y"));
+                            ui.checkbox(&mut self.enable_mouse_fluid_interaction, "Mouse affects fluid");
                         }
                         if let Some(ref mut sr) = self.surface_renderer {
                             ui.separator();
@@ -423,12 +325,17 @@ impl ApplicationHandler for App {
                             ui.add(egui::Slider::new(&mut sr.absorption, 0.0..=10.0).text("Absorption"));
                         }
                         ui.separator();
-                        ui.label(format!("Camera: dist={:.1} az={:.2} el={:.2}", self.orbit.distance, self.orbit.azimuth, self.orbit.elevation));
+                        ui.label(format!(
+                            "Camera: dist={:.1} az={:.2} el={:.2}",
+                            self.camera_controls.radius,
+                            self.camera_controls.azimuth(),
+                            self.camera_controls.elevation()
+                        ));
                     });
                 });
 
                 // Submit scene encoder first
-                queue.submit(std::iter::once(encoder.finish()));
+                renderer.submit(std::iter::once(encoder.finish()));
 
                 // egui in a separate encoder
                 let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -436,28 +343,9 @@ impl ApplicationHandler for App {
 
                 // Take egui renderer out of self to avoid borrow conflicts
                 let mut er = self.egui_renderer.take().unwrap();
-                for (id, delta) in &full_output.textures_delta.set {
-                    er.update_texture(device, queue, *id, delta);
-                }
-                // Egui: upload buffers in one encoder, render in another
-                let mut upload_enc = device.create_command_encoder(&Default::default());
-                er.update_buffers(device, queue, &mut upload_enc, &paint_jobs, &screen_descriptor);
-                queue.submit([upload_enc.finish()]);
-
-                let mut enc = device.create_command_encoder(&Default::default());
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("egui"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &canvas_view, resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    ..Default::default()
-                }).forget_lifetime();
-                er.render(&mut pass, &paint_jobs, &screen_descriptor);
-                drop(pass);
-                queue.submit([enc.finish()]);
-
-                for id in &full_output.textures_delta.free { er.free_texture(id); }
+                renderer.egui_upload(&mut er, &full_output.textures_delta, &paint_jobs, &screen_descriptor);
+                renderer.egui_render(&mut er, &paint_jobs, &screen_descriptor, &canvas_view);
+                renderer.egui_free_textures(&mut er, &full_output.textures_delta);
                 self.egui_renderer = Some(er);
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
                 output.present();

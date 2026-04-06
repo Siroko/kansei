@@ -1,4 +1,5 @@
 const SURFACE_WGSL: &str = include_str!("shaders/fluid-surface.wgsl");
+use crate::math::Mat4;
 
 /// Screen-space ray-march renderer for the fluid density field.
 pub struct FluidSurfaceRenderer {
@@ -6,6 +7,10 @@ pub struct FluidSurfaceRenderer {
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     params_buffer: wgpu::Buffer,
+
+    // Stored GPU handles (cheap Arc clones)
+    device: wgpu::Device,
+    queue: wgpu::Queue,
 
     pub fluid_color: [f32; 3],
     pub absorption: f32,
@@ -15,7 +20,7 @@ pub struct FluidSurfaceRenderer {
 }
 
 impl FluidSurfaceRenderer {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FluidSurface/Shader"),
             source: wgpu::ShaderSource::Wgsl(SURFACE_WGSL.into()),
@@ -78,6 +83,7 @@ impl FluidSurfaceRenderer {
 
         Self {
             pipeline, bgl, sampler, params_buffer,
+            device: device.clone(), queue: queue.clone(),
             fluid_color: [0.77, 0.96, 1.0],
             absorption: 2.5,
             density_scale: 1.1,
@@ -89,13 +95,12 @@ impl FluidSurfaceRenderer {
     /// Build a bind group for the current set of textures.
     pub fn create_bind_group(
         &self,
-        device: &wgpu::Device,
         input_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         output_view: &wgpu::TextureView,
         density_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("FluidSurface/BG"),
             layout: &self.bgl,
             entries: &[
@@ -113,9 +118,8 @@ impl FluidSurfaceRenderer {
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        queue: &wgpu::Queue,
         bind_group: &wgpu::BindGroup,
-        inv_view_proj: &glam::Mat4,
+        inv_view_proj: &Mat4,
         camera_pos: [f32; 3],
         bounds_min: [f32; 3],
         bounds_max: [f32; 3],
@@ -124,9 +128,9 @@ impl FluidSurfaceRenderer {
     ) {
         // Pack SurfaceParams (144 bytes = 36 floats)
         let mut data = [0.0f32; 36];
-        let u32_view: &mut [u32] = bytemuck::cast_slice_mut(&mut data);
+        let _u32_view: &mut [u32] = bytemuck::cast_slice_mut(&mut data);
 
-        data[..16].copy_from_slice(&inv_view_proj.to_cols_array());
+        data[..16].copy_from_slice(inv_view_proj.as_slice());
         data[16] = camera_pos[0]; data[17] = camera_pos[1]; data[18] = camera_pos[2];
         data[19] = self.density_threshold;
         data[20] = bounds_min[0]; data[21] = bounds_min[1]; data[22] = bounds_min[2];
@@ -139,7 +143,7 @@ impl FluidSurfaceRenderer {
         u32_view[1] = width;
         u32_view[2] = height;
 
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&data));
+        self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&data));
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("FluidSurface/March"), timestamp_writes: None,

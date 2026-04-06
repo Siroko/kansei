@@ -283,15 +283,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     });
-    sim.initialize(&positions, &renderer);
+    sim.initialize(&positions, renderer.device(), renderer.queue());
     sim.world_bounds_min = [-25.0, -8.0, -16.0];
     sim.world_bounds_max = [25.0, 30.0, 16.0];
-    sim.rebuild_grid(&renderer);
+    sim.rebuild_grid();
 
     // ── Density field + surface renderer ──
-    let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
+    let density_field = FluidDensityField::new(renderer.device(), renderer.queue(), sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7 });
-    let surface_renderer = FluidSurfaceRenderer::new(&renderer);
+    let surface_renderer = FluidSurfaceRenderer::new(renderer.device(), renderer.queue());
     let cornell_box = CornellBox::new(&renderer, format, sim.world_bounds_min, sim.world_bounds_max);
 
     // ── Particle pipeline ──
@@ -387,7 +387,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let particle_depth_view = particle_depth_tex.create_view(&Default::default());
 
     // ── Bind groups for surface renderer + blit ──
-    let surface_bg = surface_renderer.create_bind_group(&renderer, &color_view, &depth_view, &output_view, &density_field.density_view);
+    let surface_bg = surface_renderer.create_bind_group(&color_view, &depth_view, &output_view, &density_field.density_view);
     let blit_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
         label: None, layout: &blit_bgl, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_view) },
@@ -565,7 +565,7 @@ impl State {
         let mouse_strength = (mouse_dir[0]*mouse_dir[0] + mouse_dir[1]*mouse_dir[1]).sqrt().min(1.0);
 
         let identity = glam::Mat4::IDENTITY.to_cols_array();
-        self.sim.set_camera_matrices(&self.renderer, &view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
+        self.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
         // Keep simulation cadence stable with configurable fixed step.
         let sim_step_dt = self.sim_dt_step.clamp(1.0 / 240.0, 1.0 / 20.0);
         let scaled_dt = sim_step_dt * self.sim_time_scale.clamp(0.1, 4.0);
@@ -573,9 +573,9 @@ impl State {
         let mut steps = 0u32;
         while self.sim_accumulator >= sim_step_dt as f64 && steps < 8 {
             if self.use_batched_sim {
-                self.sim.update_batched(&self.renderer, scaled_dt, mouse_strength, self.mouse_ndc, mouse_dir);
+                self.sim.update_batched(scaled_dt, mouse_strength, self.mouse_ndc, mouse_dir);
             } else {
-                self.sim.update(&self.renderer, scaled_dt, mouse_strength, self.mouse_ndc, mouse_dir);
+                self.sim.update(scaled_dt, mouse_strength, self.mouse_ndc, mouse_dir);
             }
             self.sim_accumulator -= sim_step_dt as f64;
             steps += 1;
@@ -621,7 +621,7 @@ impl State {
             drop(pass);
         } else if self.render_mode == 1 {
             // Density field update
-            self.density_field.update_with_encoder(&self.renderer, &mut encoder,
+            self.density_field.update_with_encoder(&mut encoder,
                 self.sim.world_bounds_min, self.sim.world_bounds_max,
                 self.sim.particle_count(), self.sim.params.smoothing_radius);
 
@@ -646,7 +646,7 @@ impl State {
 
             // Ray-march
             let inv_vp = Mat4::from(inv_vp);
-            self.surface_renderer.render(&self.renderer, &mut encoder, &self.surface_bg,
+            self.surface_renderer.render(&mut encoder, &self.surface_bg,
                 &inv_vp, [eye.x, eye.y, eye.z],
                 self.sim.world_bounds_min, self.sim.world_bounds_max,
                 self.width, self.height);
@@ -665,7 +665,6 @@ impl State {
         } else {
             // Voxel shell / marching-cubes mode
             self.density_field.update_with_encoder(
-                &self.renderer,
                 &mut encoder,
                 self.sim.world_bounds_min,
                 self.sim.world_bounds_max,
@@ -793,10 +792,10 @@ pub fn get_frame_time() -> f64 {
 #[wasm_bindgen] pub fn set_kernel_scale(v: f32) { with_state(|s| s.density_field.kernel_scale = v); }
 #[wasm_bindgen] pub fn set_density_resolution(v: u32) {
     with_state(|s| {
-        s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
+        s.density_field = FluidDensityField::new(s.renderer.device(), s.renderer.queue(), s.sim.positions_buffer().unwrap(),
             s.sim.world_bounds_min, s.sim.world_bounds_max,
             DensityFieldOptions { resolution: v, kernel_scale: s.density_field.kernel_scale });
-        s.surface_bg = s.surface_renderer.create_bind_group(&s.renderer,
+        s.surface_bg = s.surface_renderer.create_bind_group(
             &s.color_view, &s.depth_view, &s.output_view, &s.density_field.density_view);
         s.marching_cubes_bg = s
             .marching_cubes
@@ -807,12 +806,12 @@ pub fn get_frame_time() -> f64 {
     with_state(|s| {
         s.sim.world_bounds_min = [min_x, min_y, min_z];
         s.sim.world_bounds_max = [max_x, max_y, max_z];
-        s.sim.rebuild_grid(&s.renderer);
+        s.sim.rebuild_grid();
         // Rebuild density field for new bounds
-        s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
+        s.density_field = FluidDensityField::new(s.renderer.device(), s.renderer.queue(), s.sim.positions_buffer().unwrap(),
             s.sim.world_bounds_min, s.sim.world_bounds_max,
             DensityFieldOptions { resolution: 128, kernel_scale: s.density_field.kernel_scale });
-        s.surface_bg = s.surface_renderer.create_bind_group(&s.renderer,
+        s.surface_bg = s.surface_renderer.create_bind_group(
             &s.color_view, &s.depth_view, &s.output_view, &s.density_field.density_view);
         s.marching_cubes_bg = s
             .marching_cubes

@@ -1,5 +1,4 @@
 use super::params::*;
-use crate::buffers::GpuBuffer;
 
 const MAX_GRID_CELLS: u32 = 262144;
 const PREFIX_SUM_BLOCK_SIZE: u32 = 512;
@@ -43,6 +42,10 @@ pub struct FluidSimulation {
     grid_dims: [u32; 3],
     grid_origin: [f32; 3],
     total_cells: u32,
+
+    // Stored GPU handles (cheap Arc clones)
+    device: Option<wgpu::Device>,
+    queue: Option<wgpu::Queue>,
 
     params_data: Vec<f32>,
     params_buffer: Option<wgpu::Buffer>,
@@ -88,6 +91,8 @@ impl FluidSimulation {
             grid_dims: [1, 1, 1],
             grid_origin: [0.0; 3],
             total_cells: 1,
+            device: None,
+            queue: None,
             params_data: vec![0.0; ParamOffsets::BUFFER_SIZE],
             params_buffer: None,
             positions_buffer: None,
@@ -118,7 +123,9 @@ impl FluidSimulation {
         }
     }
 
-    pub fn initialize(&mut self, positions: &[f32], device: &wgpu::Device) {
+    pub fn initialize(&mut self, positions: &[f32], device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.device = Some(device.clone());
+        self.queue = Some(queue.clone());
         self.particle_count = (positions.len() / 4) as u32;
         self.compute_grid_from_positions(positions);
         self.create_buffers(positions, device);
@@ -319,7 +326,8 @@ impl FluidSimulation {
     }
 
     /// Upload camera matrices for mouse interaction in the forces shader.
-    pub fn set_camera_matrices(&self, queue: &wgpu::Queue, view: &[f32; 16], proj: &[f32; 16], inv_view: &[f32; 16], world: &[f32; 16]) {
+    pub fn set_camera_matrices(&self, view: &[f32; 16], proj: &[f32; 16], inv_view: &[f32; 16], world: &[f32; 16]) {
+        let queue = self.queue.as_ref().expect("FluidSimulation not initialized");
         if let Some(ref b) = self.view_matrix_buffer { queue.write_buffer(b, 0, bytemuck::cast_slice(view)); }
         if let Some(ref b) = self.projection_matrix_buffer { queue.write_buffer(b, 0, bytemuck::cast_slice(proj)); }
         if let Some(ref b) = self.inverse_view_matrix_buffer { queue.write_buffer(b, 0, bytemuck::cast_slice(inv_view)); }
@@ -327,17 +335,19 @@ impl FluidSimulation {
     }
 
     /// Pack params and dispatch all substeps — one submit per substep.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32,
-                  mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+    pub fn update(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+        let device = self.device.clone().expect("FluidSimulation not initialized");
+        let queue = self.queue.clone().expect("FluidSimulation not initialized");
         for _s in 0..self.params.substeps {
-            self.update_substep(device, queue, dt, mouse_strength, mouse_pos, mouse_dir);
+            self.update_substep(&device, &queue, dt, mouse_strength, mouse_pos, mouse_dir);
         }
     }
 
     /// Pack params and dispatch all substeps in a SINGLE queue.submit().
     /// Uses per-substep param buffers to avoid writeBuffer overwrite (see MEMORY.md).
-    pub fn update_batched(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32,
-                          mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+    pub fn update_batched(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+        let device = self.device.clone().expect("FluidSimulation not initialized");
+        let queue = self.queue.clone().expect("FluidSimulation not initialized");
         let n = self.particle_count;
         let particle_wg = ((n + 63) / 64) as u32;
         let grid_wg = ((self.total_cells + 255) / 256) as u32;
@@ -401,7 +411,7 @@ impl FluidSimulation {
     }
 
     /// Run a single substep — pack params, dispatch all 10 compute passes, submit.
-    pub fn update_substep(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32,
+    fn update_substep(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32,
                           mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
         let n = self.particle_count;
         let particle_wg = ((n + 63) / 64) as u32;
@@ -494,7 +504,8 @@ impl FluidSimulation {
 
     /// Rebuild spatial grid from current world_bounds_min/max.
     /// Call after changing bounds at runtime.
-    pub fn rebuild_grid(&mut self, device: &wgpu::Device) {
+    pub fn rebuild_grid(&mut self) {
+        let device = self.device.clone().expect("FluidSimulation not initialized");
         let cs = self.params.smoothing_radius;
         let mpa = if self.params.dimensions == 3 {
             (MAX_GRID_CELLS as f32).cbrt() as u32
@@ -526,6 +537,6 @@ impl FluidSimulation {
         self.block_sums_buffer = Some(mk("BlockSums", nb));
 
         // Recreate compute passes with new buffers
-        self.create_passes(device);
+        self.create_passes(&device);
     }
 }
