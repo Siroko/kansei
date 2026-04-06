@@ -6,8 +6,9 @@ pub struct Object3D {
     pub position: Vec3,
     pub rotation: Vec3,
     pub scale: Vec3,
-    pub world_matrix: Mat4,
-    pub normal_matrix: Mat4,
+    pub model_matrix: Mat4,     // local T * Rz * Ry * Rx * S
+    pub world_matrix: Mat4,     // parent.world * model (or just model if root)
+    pub normal_matrix: Mat4,    // transpose(inverse(world_matrix)) — world-space
     children: Vec<usize>, // indices into a scene-level arena
     parent: Option<usize>,
     dirty: bool,
@@ -19,6 +20,7 @@ impl Object3D {
             position: Vec3::ZERO,
             rotation: Vec3::ZERO,
             scale: Vec3::new(1.0, 1.0, 1.0),
+            model_matrix: Mat4::identity(),
             world_matrix: Mat4::identity(),
             normal_matrix: Mat4::identity(),
             children: Vec::new(),
@@ -32,22 +34,28 @@ impl Object3D {
         self.dirty = true;
     }
 
-    /// Recompute the world matrix from position/rotation/scale.
+    /// Recompute the local model matrix from position/rotation/scale.
     pub fn update_model_matrix(&mut self) {
         let t = glam::Mat4::from_translation(self.position.to_glam());
         let rx = glam::Mat4::from_rotation_x(self.rotation.x);
         let ry = glam::Mat4::from_rotation_y(self.rotation.y);
         let rz = glam::Mat4::from_rotation_z(self.rotation.z);
         let s = glam::Mat4::from_scale(self.scale.to_glam());
-        self.world_matrix = Mat4::from(t * rz * ry * rx * s);
+        self.model_matrix = Mat4::from(t * rz * ry * rx * s);
         self.dirty = false;
     }
 
-    /// Compute normal matrix (inverse transpose of model-view).
-    pub fn update_normal_matrix(&mut self, view_matrix: &Mat4) {
-        let mv = view_matrix.to_glam() * self.world_matrix.to_glam();
-        let normal = mv.inverse().transpose();
-        self.normal_matrix = Mat4::from(normal);
+    /// Recompute world matrix: parent.world * model (or just model if root).
+    pub fn update_world_matrix(&mut self, parent_world: Option<&Mat4>) {
+        match parent_world {
+            Some(pw) => self.world_matrix = pw.mul(&self.model_matrix),
+            None => self.world_matrix = self.model_matrix,
+        }
+    }
+
+    /// Compute world-space normal matrix: transpose(inverse(world_matrix)).
+    pub fn update_normal_matrix(&mut self) {
+        self.normal_matrix = Mat4::from(self.world_matrix.to_glam().inverse().transpose());
     }
 
     pub fn look_at(&mut self, target: &Vec3) {

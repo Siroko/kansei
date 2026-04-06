@@ -185,6 +185,7 @@ impl ApplicationHandler for App {
         let mut floor = Renderable::new(floor_geo, floor_mat);
         floor.object.rotation.x = -std::f32::consts::FRAC_PI_2;
         floor.object.update_model_matrix();
+        floor.object.update_world_matrix(None);
         self._mat_bufs.push(floor_buf);
 
         // -- Bright emissive box (to show bloom) --
@@ -198,6 +199,7 @@ impl ApplicationHandler for App {
         let mut box_obj = Renderable::new(box_geo, box_mat);
         box_obj.object.set_position(0.0, 1.0, 0.0);
         box_obj.object.update_model_matrix();
+        box_obj.object.update_world_matrix(None);
         self._mat_bufs.push(box_buf);
 
         // -- Colored sphere --
@@ -211,6 +213,7 @@ impl ApplicationHandler for App {
         let mut sphere = Renderable::new(sphere_geo, sphere_mat);
         sphere.object.set_position(3.5, 1.0, 0.0);
         sphere.object.update_model_matrix();
+        sphere.object.update_world_matrix(None);
         self._mat_bufs.push(sphere_buf);
 
         self.scene.add(floor);
@@ -305,12 +308,13 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.scene.get_mut(1) {
                     r.object.rotation.y = t * 0.3;
                     r.object.update_model_matrix();
+                    r.object.update_world_matrix(None);
                 }
 
                 // Update normal matrices for all objects
                 for i in 0..self.scene.len() {
                     if let Some(r) = self.scene.get_mut(i) {
-                        r.object.update_normal_matrix(&self.camera.view_matrix);
+                        r.object.update_normal_matrix();
                     }
                 }
 

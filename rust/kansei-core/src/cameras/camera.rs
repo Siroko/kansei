@@ -41,6 +41,7 @@ impl Camera {
             self.view_matrix = Mat4::look_at(&self.object.position, &target, &Vec3::UP);
         } else {
             self.object.update_model_matrix();
+            self.object.update_world_matrix(None);
             self.view_matrix = self.object.world_matrix.inverse();
         }
         self.inverse_view_matrix = self.view_matrix.inverse();
@@ -51,6 +52,7 @@ impl Camera {
         self.view_matrix = Mat4::look_at(&self.object.position, target, &Vec3::UP);
         self.inverse_view_matrix = self.view_matrix.inverse();
         self.object.world_matrix = self.inverse_view_matrix;
+        self.object.model_matrix = self.object.world_matrix; // keep in sync
     }
 
     pub fn position(&self) -> &Vec3 {
