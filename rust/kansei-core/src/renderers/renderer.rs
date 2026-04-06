@@ -640,6 +640,7 @@ impl Renderer {
                     }
                 }
                 r.material.ensure_bindables_initialized(self);
+                r.material.initialize(device, shared);
 
                 // Build combined vertex layouts (base + instance buffers)
                 let instance_layouts: Vec<_> = r.instance_buffers.iter()
@@ -651,7 +652,7 @@ impl Renderer {
                 }
 
                 r.material.get_pipeline(
-                    device, shared, &layouts,
+                    device, &layouts,
                     &[format], depth_format, sample_count,
                 );
             }
@@ -912,6 +913,7 @@ impl Renderer {
                 }
             }
             r.material.ensure_bindables_initialized(self);
+            r.material.initialize(device, shared);
 
             let instance_layouts: Vec<_> = r.instance_buffers.iter()
                 .map(|ib| ib.vertex_layout())
@@ -922,7 +924,7 @@ impl Renderer {
             }
 
             r.material.get_pipeline(
-                device, shared, &layouts,
+                device, &layouts,
                 &GBuffer::MRT_FORMATS, depth_format, sample_count,
             );
         }
