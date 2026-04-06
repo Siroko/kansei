@@ -123,6 +123,11 @@ impl FluidSimulation {
         }
     }
 
+    /// Initialize from a Renderer reference (preferred for user-facing code).
+    pub fn initialize_from_renderer(&mut self, positions: &[f32], renderer: &crate::renderers::Renderer) {
+        self.initialize(positions, renderer.device(), renderer.queue());
+    }
+
     pub fn initialize(&mut self, positions: &[f32], device: &wgpu::Device, queue: &wgpu::Queue) {
         self.device = Some(device.clone());
         self.queue = Some(queue.clone());

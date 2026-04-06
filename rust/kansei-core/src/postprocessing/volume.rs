@@ -15,6 +15,14 @@ pub struct PostProcessingVolume {
 }
 
 impl PostProcessingVolume {
+    /// Create from a Renderer reference (preferred for user-facing code).
+    pub fn from_renderer(
+        renderer: &crate::renderers::Renderer,
+        effects: Vec<Box<dyn PostProcessingEffect>>,
+    ) -> Self {
+        Self::new(renderer.device(), renderer.queue(), renderer.presentation_format(), effects)
+    }
+
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

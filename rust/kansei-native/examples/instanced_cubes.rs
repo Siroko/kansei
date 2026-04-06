@@ -236,12 +236,7 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.scene.get_renderable_mut(0) {
                     let matrices = build_instance_matrices(t);
                     if let Some(ib) = r.instance_buffers.get(0) {
-                        if let Some(ref renderer) = self.renderer {
-                            ib.update(
-                                renderer.queue(),
-                                bytemuck::cast_slice(&matrices),
-                            );
-                        }
+                        ib.update(bytemuck::cast_slice(&matrices));
                     }
                 }
 

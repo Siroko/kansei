@@ -578,6 +578,7 @@ impl Renderer {
         // Phase 0.5: Initialize geometries, instance buffers, and pre-warm pipelines
         {
             let device = self.device.as_ref().unwrap();
+            let queue = self.queue.as_ref().unwrap();
             let shared = self.shared_layouts.as_ref().unwrap();
             let format = self.presentation_format;
             let sample_count = self.config.sample_count;
@@ -591,7 +592,7 @@ impl Renderer {
                 }
                 for ib in &mut r.instance_buffers {
                     if !ib.initialized {
-                        ib.initialize(device);
+                        ib.initialize(device, queue);
                     }
                 }
                 r.material.ensure_bindables_initialized(self);
@@ -842,6 +843,7 @@ impl Renderer {
 
         // Initialize geometries + pre-warm pipelines for GBuffer formats
         let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
         let shared = self.shared_layouts.as_ref().unwrap();
         let depth_format = GBuffer::DEPTH_FORMAT;
         let sample_count = gbuffer.sample_count;
@@ -854,7 +856,7 @@ impl Renderer {
             }
             for ib in &mut r.instance_buffers {
                 if !ib.initialized {
-                    ib.initialize(device);
+                    ib.initialize(device, queue);
                 }
             }
             r.material.ensure_bindables_initialized(self);

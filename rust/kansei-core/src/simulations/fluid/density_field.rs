@@ -36,6 +36,17 @@ impl Default for DensityFieldOptions {
 }
 
 impl FluidDensityField {
+    /// Create from a Renderer reference (preferred for user-facing code).
+    pub fn from_renderer(
+        renderer: &crate::renderers::Renderer,
+        positions_buffer: &wgpu::Buffer,
+        bounds_min: [f32; 3],
+        bounds_max: [f32; 3],
+        options: DensityFieldOptions,
+    ) -> Self {
+        Self::new(renderer.device(), renderer.queue(), positions_buffer, bounds_min, bounds_max, options)
+    }
+
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

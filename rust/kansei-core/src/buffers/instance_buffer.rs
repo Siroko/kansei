@@ -14,6 +14,7 @@ pub struct InstanceBuffer {
     pub stride: u64,
     pub attributes: Vec<InstanceAttribute>,
     pub gpu_buffer: Option<wgpu::Buffer>,
+    queue: Option<wgpu::Queue>,
     pub initialized: bool,
 }
 
@@ -26,6 +27,7 @@ impl InstanceBuffer {
             stride,
             attributes,
             gpu_buffer: None,
+            queue: None,
             initialized: false,
         }
     }
@@ -59,20 +61,21 @@ impl InstanceBuffer {
         )
     }
 
-    /// Initialize the GPU buffer.
-    pub fn initialize(&mut self, device: &wgpu::Device) {
+    /// Initialize the GPU buffer, storing the queue for later self-contained updates.
+    pub fn initialize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         use wgpu::util::DeviceExt;
         self.gpu_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("{}/Buffer", self.label)),
             contents: &self.data,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         }));
+        self.queue = Some(queue.clone());
         self.initialized = true;
     }
 
-    /// Update GPU buffer contents.
-    pub fn update(&self, queue: &wgpu::Queue, data: &[u8]) {
-        if let Some(ref buf) = self.gpu_buffer {
+    /// Update GPU buffer contents using the stored queue.
+    pub fn update(&self, data: &[u8]) {
+        if let (Some(ref buf), Some(ref queue)) = (&self.gpu_buffer, &self.queue) {
             queue.write_buffer(buf, 0, data);
         }
     }

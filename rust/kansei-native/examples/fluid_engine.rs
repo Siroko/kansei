@@ -486,8 +486,6 @@ impl ApplicationHandler for App {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })).unwrap();
         let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), present_mode: wgpu::PresentMode::Immediate, ..Default::default() });
         pollster::block_on(renderer.initialize(surface, &adapter));
-        let device = renderer.device();
-        let format = renderer.presentation_format();
 
         // Particles
         let count = 50000usize;
@@ -512,14 +510,13 @@ impl ApplicationHandler for App {
             gravity: [0.0, -9.8, 0.0], mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
             ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
         });
-        sim.initialize(&positions, renderer.device(), renderer.queue());
+        sim.initialize_from_renderer(&positions, &renderer);
         sim.world_bounds_min = [-25.0, -8.0, -16.0];
         sim.world_bounds_max = [25.0, 30.0, 16.0];
         sim.rebuild_grid();
 
-        self.density_field = Some(FluidDensityField::new(
-            renderer.device(),
-            renderer.queue(),
+        self.density_field = Some(FluidDensityField::from_renderer(
+            &renderer,
             sim.positions_buffer().unwrap(),
             sim.world_bounds_min,
             sim.world_bounds_max,
@@ -528,7 +525,9 @@ impl ApplicationHandler for App {
                 kernel_scale: 3.7,
             },
         ));
-        self.surface_renderer = Some(FluidSurfaceRenderer::new(renderer.device(), renderer.queue()));
+        self.surface_renderer = Some(FluidSurfaceRenderer::from_renderer(&renderer));
+        let device = renderer.device();
+        let format = renderer.presentation_format();
         self.particle_renderer = Some(ParticleRenderer::new(device, sim.positions_buffer().unwrap(), count as u32, format));
         self.cornell_box = Some(CornellBox::new(device, format, sim.world_bounds_min, sim.world_bounds_max));
         self.blit = Some(BlitPipeline::new(device, format));
