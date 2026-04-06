@@ -4,6 +4,8 @@ mod sampler;
 mod instance_buffer;
 
 pub use gpu_buffer::{GpuBuffer, BufferType, BufferUsage};
+pub type Buffer = GpuBuffer;
+pub type ComputeBuffer = GpuBuffer;
 pub use texture::Texture;
 pub use sampler::Sampler;
 pub use instance_buffer::{InstanceBuffer, InstanceAttribute, InstanceBufferLayout};

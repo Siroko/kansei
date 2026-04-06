@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 kansei-core = { path = "../kansei-core" }
-wgpu = { workspace = true }
+wgpu = { workspace = true, features = ["webgpu"] }
 glam = { workspace = true }
 bytemuck = { workspace = true }
 wasm-bindgen = "0.2"
