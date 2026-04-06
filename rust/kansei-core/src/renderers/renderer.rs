@@ -802,11 +802,9 @@ impl Renderer {
         camera: &mut Camera,
         volume: &mut crate::postprocessing::PostProcessingVolume,
     ) {
-        // Ensure GBuffer exists
-        let device = self.device.as_ref().unwrap();
         let width = self.config.width;
         let height = self.config.height;
-        volume.ensure_gbuffer(device, width, height);
+        volume.ensure_gbuffer(width, height);
 
         // Render scene to GBuffer (actually draw into it)
         {
@@ -820,15 +818,7 @@ impl Renderer {
         let canvas_view = output.texture.create_view(&Default::default());
 
         // Run post-processing chain + blit
-        volume.render(
-            self.device.as_ref().unwrap(),
-            self.queue.as_ref().unwrap(),
-            camera,
-            &canvas_view,
-            self.presentation_format,
-            width,
-            height,
-        );
+        volume.render(camera, &canvas_view, width, height);
 
         output.present();
     }

@@ -9,16 +9,27 @@ pub struct PostProcessingVolume {
     blit_pipeline: Option<wgpu::RenderPipeline>,
     blit_sampler: Option<wgpu::Sampler>,
     blit_bgl: Option<wgpu::BindGroupLayout>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    presentation_format: wgpu::TextureFormat,
 }
 
 impl PostProcessingVolume {
-    pub fn new(effects: Vec<Box<dyn PostProcessingEffect>>) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        presentation_format: wgpu::TextureFormat,
+        effects: Vec<Box<dyn PostProcessingEffect>>,
+    ) -> Self {
         Self {
             effects,
             gbuffer: None,
             blit_pipeline: None,
             blit_sampler: None,
             blit_bgl: None,
+            device: device.clone(),
+            queue: queue.clone(),
+            presentation_format,
         }
     }
 
@@ -27,7 +38,7 @@ impl PostProcessingVolume {
     }
 
     /// Lazily create or resize the GBuffer, returning a reference to it.
-    pub fn ensure_gbuffer(&mut self, device: &wgpu::Device, width: u32, height: u32) -> &GBuffer {
+    pub fn ensure_gbuffer(&mut self, width: u32, height: u32) -> &GBuffer {
         if self.gbuffer.is_none()
             || self
                 .gbuffer
@@ -35,7 +46,7 @@ impl PostProcessingVolume {
                 .map(|g| g.width != width || g.height != height)
                 .unwrap_or(false)
         {
-            self.gbuffer = Some(GBuffer::new(device, width, height, 1));
+            self.gbuffer = Some(GBuffer::new(&self.device, width, height, 1));
             for effect in &mut self.effects {
                 effect.resize(width, height, self.gbuffer.as_ref().unwrap());
             }
@@ -44,7 +55,9 @@ impl PostProcessingVolume {
     }
 
     /// Lazily initialise the blit render pipeline, bind group layout, and sampler.
-    fn initialize_blit(&mut self, device: &wgpu::Device, surface_format: wgpu::TextureFormat) {
+    fn initialize_blit(&mut self) {
+        let device = &self.device;
+        let surface_format = self.presentation_format;
         if self.blit_pipeline.is_some() {
             return;
         }
@@ -128,27 +141,24 @@ impl PostProcessingVolume {
     /// Render the scene through the post-processing chain and blit to the surface.
     pub fn render(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
         camera: &Camera,
         surface_view: &wgpu::TextureView,
-        surface_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
     ) {
         // Lazily create/resize GBuffer
-        self.ensure_gbuffer(device, width, height);
+        self.ensure_gbuffer(width, height);
 
         // Initialise effects that haven't been set up yet
         {
             let gbuffer = self.gbuffer.as_ref().unwrap();
             for effect in &mut self.effects {
-                effect.initialize(device, gbuffer, camera);
+                effect.initialize(&self.device, gbuffer, camera);
             }
         }
 
         // Lazily create blit pipeline
-        self.initialize_blit(device, surface_format);
+        self.initialize_blit();
 
         // Run effect chain with ping-pong
         // Track which texture holds the final result after the chain.
@@ -159,7 +169,7 @@ impl PostProcessingVolume {
 
         if !self.effects.is_empty() {
             let gbuffer = self.gbuffer.as_ref().unwrap();
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("PostProcessingVolume/EffectsEncoder"),
             });
 
@@ -177,8 +187,8 @@ impl PostProcessingVolume {
                 };
 
                 effect.render(
-                    device,
-                    queue,
+                    &self.device,
+                    &self.queue,
                     &mut encoder,
                     input_view,
                     &gbuffer.depth_view,
@@ -193,7 +203,7 @@ impl PostProcessingVolume {
                 ping = 1 - ping;
             }
 
-            queue.submit(std::iter::once(encoder.finish()));
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
         let gbuffer = self.gbuffer.as_ref().unwrap();
@@ -214,7 +224,7 @@ impl PostProcessingVolume {
         let sampler = self.blit_sampler.as_ref().unwrap();
         let pipeline = self.blit_pipeline.as_ref().unwrap();
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blit BindGroup"),
             layout: bgl,
             entries: &[
@@ -229,7 +239,7 @@ impl PostProcessingVolume {
             ],
         });
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("PostProcessingVolume/BlitEncoder"),
         });
 
@@ -254,6 +264,6 @@ impl PostProcessingVolume {
             rpass.draw(0..3, 0..1);
         }
 
-        queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 }
