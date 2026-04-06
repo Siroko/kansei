@@ -28,6 +28,7 @@ pub struct MaterialOptions {
     pub depth_compare: wgpu::CompareFunction,
     pub cull_mode: CullMode,
     pub topology: wgpu::PrimitiveTopology,
+    pub outputs_emissive: bool,
 }
 
 impl Default for MaterialOptions {
@@ -38,6 +39,7 @@ impl Default for MaterialOptions {
             depth_compare: wgpu::CompareFunction::Less,
             cull_mode: CullMode::Back,
             topology: wgpu::PrimitiveTopology::TriangleList,
+            outputs_emissive: false,
         }
     }
 }
@@ -111,17 +113,23 @@ impl Material {
         self.pipeline_layout = Some(pipeline_layout);
     }
 
+    /// Initialize GPU resources. Called by Renderer during first render.
+    pub fn initialize(&mut self, device: &wgpu::Device, shared: &SharedLayouts) {
+        self.ensure_shared(device, shared);
+    }
+
     /// Get or create a pipeline for the given render target config.
     pub fn get_pipeline(
         &mut self,
         device: &wgpu::Device,
-        shared: &SharedLayouts,
         vertex_layouts: &[wgpu::VertexBufferLayout],
         color_formats: &[wgpu::TextureFormat],
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
     ) -> &wgpu::RenderPipeline {
-        self.ensure_shared(device, shared);
+        // Pipeline layout already created during initialize()
+        // If not initialized yet, this will fail — Renderer must call initialize() first
+        assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
 
         let key = PipelineKey {
             color_formats: color_formats.to_vec(),
