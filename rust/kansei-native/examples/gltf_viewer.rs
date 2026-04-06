@@ -162,6 +162,7 @@ fn load_gltf_scene(
         renderable.object.rotation = gr.rotation;
         renderable.object.scale = gr.scale;
         renderable.object.update_model_matrix();
+        renderable.object.update_world_matrix(None);
         scene.add(renderable);
         mat_bufs.push(mat_buf);
     }
@@ -196,6 +197,7 @@ fn build_fallback_scene(
     let mut floor = Renderable::new(floor_geo, floor_mat);
     floor.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     floor.object.update_model_matrix();
+    floor.object.update_world_matrix(None);
     floor.cast_shadow = false;
     mat_bufs.push(floor_buf);
 
@@ -211,6 +213,7 @@ fn build_fallback_scene(
     let mut box_obj = Renderable::new(box_geo, box_mat);
     box_obj.object.set_position(0.0, 1.0, 0.0);
     box_obj.object.update_model_matrix();
+    box_obj.object.update_world_matrix(None);
     mat_bufs.push(box_buf);
 
     // Sphere
@@ -225,6 +228,7 @@ fn build_fallback_scene(
     let mut sphere = Renderable::new(sphere_geo, sphere_mat);
     sphere.object.set_position(3.0, 1.2, -1.0);
     sphere.object.update_model_matrix();
+    sphere.object.update_world_matrix(None);
     mat_bufs.push(sphere_buf);
 
     scene.add(floor);
@@ -389,7 +393,7 @@ impl ApplicationHandler for App {
                 // Update normal matrices for all objects
                 for i in 0..self.scene.len() {
                     if let Some(r) = self.scene.get_mut(i) {
-                        r.object.update_normal_matrix(&self.camera.view_matrix);
+                        r.object.update_normal_matrix();
                     }
                 }
 
