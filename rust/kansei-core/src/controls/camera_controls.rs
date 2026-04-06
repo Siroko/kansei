@@ -26,4 +26,12 @@ impl CameraControls {
         self.azimuth += dx;
         self.elevation = (self.elevation + dy).clamp(-1.5, 1.5);
     }
+
+    pub fn azimuth(&self) -> f32 {
+        self.azimuth
+    }
+
+    pub fn elevation(&self) -> f32 {
+        self.elevation
+    }
 }

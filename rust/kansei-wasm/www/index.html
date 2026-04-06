@@ -16,7 +16,7 @@
         import init, { start, get_fps, get_frame_time,
             set_pressure, set_near_pressure, set_density_target,
             set_viscosity, set_damping, set_gravity_y, set_mouse_force, set_mouse_radius,
-            set_particle_size, set_substeps, set_show_particles,
+            set_particle_size, set_substeps, set_show_particles, set_render_mode, set_mc_iso_level,
             set_use_batched_sim,
             set_sim_dt_step, set_sim_time_scale, set_max_render_fps,
             set_density_scale, set_density_threshold, set_absorption, set_step_count,
@@ -29,7 +29,7 @@
 
         const pane = new Pane({ title: 'Fluid 3D (WASM)' });
         const p = {
-            showParticles: true, particleSize: 0.15, batchedSim: true,
+            showParticles: true, renderMode: 'Particles', mcIso: 0.05, particleSize: 0.15, batchedSim: true,
             simPreset: 'Balanced',
             simStepDt: 1 / 60,
             simTimeScale: 1.0,
@@ -49,7 +49,19 @@
 
         const debug = pane.addFolder({ title: 'Debug', expanded: true });
         debug.addBinding(p, 'showParticles', { label: 'show particles' }).on('change', () => set_show_particles(p.showParticles));
+        debug.addBinding(p, 'renderMode', {
+            label: 'render mode',
+            options: [
+                { text: 'Particles', value: 'Particles' },
+                { text: 'Raymarch', value: 'Raymarch' },
+                { text: 'Voxel Shell (grid)', value: 'VoxelShell' },
+            ],
+        }).on('change', () => {
+            const mode = p.renderMode === 'Particles' ? 0 : (p.renderMode === 'Raymarch' ? 1 : 2);
+            set_render_mode(mode);
+        });
         debug.addBinding(p, 'particleSize', { min: 0.01, max: 0.5, step: 0.01 }).on('change', () => set_particle_size(p.particleSize));
+        debug.addBinding(p, 'mcIso', { label: 'mc iso', min: 0.001, max: 1.0, step: 0.001 }).on('change', () => set_mc_iso_level(p.mcIso));
         debug.addBinding(p, 'batchedSim', { label: 'batched sim' }).on('change', () => set_use_batched_sim(p.batchedSim));
         debug.addBinding(p, 'simPreset', {
             label: 'sim preset',

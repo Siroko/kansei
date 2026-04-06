@@ -11,3 +11,9 @@ bytemuck = { workspace = true }
 log = { workspace = true }
 image = { workspace = true }
 gltf = { workspace = true }
+egui = { version = "0.31", optional = true }
+egui-wgpu = { version = "0.31", optional = true }
+
+[features]
+default = []
+egui = ["dep:egui", "dep:egui-wgpu"]
