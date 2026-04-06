@@ -5,10 +5,10 @@ use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
 use kansei_core::loaders::{GLTFLoader, GLTFResult};
-use kansei_core::materials::{Binding, BindingResource, CullMode, Material, MaterialOptions};
+use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::renderers::{Renderer, RendererConfig, SharedLayouts};
+use kansei_core::renderers::{Renderer, RendererConfig};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -67,26 +67,15 @@ impl OrbitCamera {
 // ── Helper: create a lit material with color + specular ──
 
 fn create_lit_material(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    shared: &SharedLayouts,
     label: &str,
     color: [f32; 4],
     specular: [f32; 4],
     cull_mode: CullMode,
-) -> (Material, wgpu::Buffer) {
+) -> Material {
     let mat_data: [f32; 8] = [
         color[0], color[1], color[2], color[3],
         specular[0], specular[1], specular[2], specular[3],
     ];
-    let mat_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: 32,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&mat_buf, 0, bytemuck::cast_slice(&mat_data));
-
     let mut material = Material::new(
         label,
         LIT_WGSL,
@@ -96,27 +85,16 @@ fn create_lit_material(
             ..Default::default()
         },
     );
-    material.create_bind_group(device, shared, &[(
-        0,
-        BindingResource::Buffer {
-            buffer: &mat_buf,
-            offset: 0,
-            size: None,
-        },
-    )]);
-
-    (material, mat_buf)
+    material.set_uniform_bindable(0, label, &mat_data);
+    material
 }
 
 // ── Load glTF scene ──
 
 fn load_gltf_scene(
     path: &str,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    shared: &SharedLayouts,
     scene: &mut Scene,
-) -> (Vec<wgpu::Buffer>, glam::Vec3, f32) {
+) -> (glam::Vec3, f32) {
     let result: GLTFResult = GLTFLoader::load(path).unwrap_or_else(|e| {
         log::error!("Failed to load glTF: {}", e);
         std::process::exit(1);
@@ -127,8 +105,6 @@ fn load_gltf_scene(
         result.renderables.len(),
         result.materials.len()
     );
-
-    let mut mat_bufs = Vec::new();
 
     // Compute bounding box for auto-framing
     let mut min_pos = glam::Vec3::splat(f32::MAX);
@@ -143,10 +119,7 @@ fn load_gltf_scene(
             CullMode::Back
         };
 
-        let (material, mat_buf) = create_lit_material(
-            device,
-            queue,
-            shared,
+        let material = create_lit_material(
             &format!("GLTF/Material{}", i),
             mat_info.base_color,
             [0.4, 0.4, 0.4, 0.3],
@@ -164,7 +137,6 @@ fn load_gltf_scene(
         renderable.object.update_model_matrix();
         renderable.object.update_world_matrix(None);
         scene.add(SceneNode::Renderable(renderable));
-        mat_bufs.push(mat_buf);
     }
 
     // Compute framing
@@ -172,23 +144,15 @@ fn load_gltf_scene(
     let extent = (max_pos - min_pos).length();
     let distance = extent.max(5.0) * 1.5;
 
-    (mat_bufs, center, distance)
+    (center, distance)
 }
 
 // ── Build fallback scene (same as shadow_scene) ──
 
-fn build_fallback_scene(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    shared: &SharedLayouts,
-    scene: &mut Scene,
-) -> Vec<wgpu::Buffer> {
-    let mut mat_bufs = Vec::new();
-
+fn build_fallback_scene(scene: &mut Scene) {
     // Floor
     let floor_geo = PlaneGeometry::new(30.0, 30.0);
-    let (floor_mat, floor_buf) = create_lit_material(
-        device, queue, shared,
+    let floor_mat = create_lit_material(
         "FloorMat",
         [0.6, 0.6, 0.6, 1.0],
         [0.15, 0.15, 0.15, 0.05],
@@ -199,12 +163,10 @@ fn build_fallback_scene(
     floor.object.update_model_matrix();
     floor.object.update_world_matrix(None);
     floor.cast_shadow = false;
-    mat_bufs.push(floor_buf);
 
     // Box
     let box_geo = BoxGeometry::new(2.0, 2.0, 2.0);
-    let (box_mat, box_buf) = create_lit_material(
-        device, queue, shared,
+    let box_mat = create_lit_material(
         "BoxMat",
         [0.85, 0.25, 0.2, 1.0],
         [0.5, 0.5, 0.5, 0.3],
@@ -214,12 +176,10 @@ fn build_fallback_scene(
     box_obj.object.set_position(0.0, 1.0, 0.0);
     box_obj.object.update_model_matrix();
     box_obj.object.update_world_matrix(None);
-    mat_bufs.push(box_buf);
 
     // Sphere
     let sphere_geo = SphereGeometry::new(1.2, 32, 16);
-    let (sphere_mat, sphere_buf) = create_lit_material(
-        device, queue, shared,
+    let sphere_mat = create_lit_material(
         "SphereMat",
         [0.2, 0.4, 0.9, 1.0],
         [0.8, 0.8, 0.8, 0.6],
@@ -229,13 +189,10 @@ fn build_fallback_scene(
     sphere.object.set_position(3.0, 1.2, -1.0);
     sphere.object.update_model_matrix();
     sphere.object.update_world_matrix(None);
-    mat_bufs.push(sphere_buf);
 
     scene.add(SceneNode::Renderable(floor));
     scene.add(SceneNode::Renderable(box_obj));
     scene.add(SceneNode::Renderable(sphere));
-
-    mat_bufs
 }
 
 // ── App ──
@@ -248,7 +205,6 @@ struct App {
     camera: Camera,
     orbit: OrbitCamera,
     start_time: Instant,
-    _mat_bufs: Vec<wgpu::Buffer>,
 }
 
 impl App {
@@ -261,7 +217,6 @@ impl App {
             camera: Camera::new(45.0, 0.1, 500.0, 1280.0 / 720.0),
             orbit: OrbitCamera::new(glam::Vec3::new(0.0, 1.0, 0.0), 15.0, 0.5),
             start_time: Instant::now(),
-            _mat_bufs: Vec::new(),
         }
     }
 }
@@ -306,18 +261,12 @@ impl ApplicationHandler for App {
         pollster::block_on(renderer.initialize(surface, &adapter));
         renderer.enable_shadows(2048);
 
-        let device = renderer.device();
-        let queue = renderer.queue();
-        let shared = renderer.shared_layouts();
-
         // Build scene
         let (orbit_target, orbit_distance) = if let Some(ref path) = self.gltf_path {
-            let (bufs, center, distance) =
-                load_gltf_scene(path, device, queue, shared, &mut self.scene);
-            self._mat_bufs = bufs;
+            let (center, distance) = load_gltf_scene(path, &mut self.scene);
             (center, distance)
         } else {
-            self._mat_bufs = build_fallback_scene(device, queue, shared, &mut self.scene);
+            build_fallback_scene(&mut self.scene);
             (glam::Vec3::new(0.0, 1.0, 0.0), 15.0)
         };
 

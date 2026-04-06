@@ -4,7 +4,7 @@ use std::time::Instant;
 use kansei_core::buffers::InstanceBuffer;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::materials::{Binding, BindingResource, Material, MaterialOptions};
+use kansei_core::materials::{Binding, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -150,39 +150,18 @@ impl ApplicationHandler for App {
         });
         pollster::block_on(renderer.initialize(surface, &adapter));
 
-        let device = renderer.device();
-        let queue = renderer.queue();
-        let shared = renderer.shared_layouts();
-
         // Geometry — 1x1x1 box
         let geometry = BoxGeometry::new(1.0, 1.0, 1.0);
 
-        // Material
+        // Material with color uniform — blue-ish
+        let color_data: [f32; 4] = [0.4, 0.7, 0.9, 1.0];
         let mut material = Material::new(
             "InstancedMaterial",
             INSTANCED_WGSL,
             vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
             MaterialOptions::default(),
         );
-
-        // Color uniform — blue-ish
-        let color_data: [f32; 4] = [0.4, 0.7, 0.9, 1.0];
-        let color_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ColorUniform"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&color_buf, 0, bytemuck::cast_slice(&color_data));
-
-        material.create_bind_group(device, shared, &[(
-            0,
-            BindingResource::Buffer {
-                buffer: &color_buf,
-                offset: 0,
-                size: None,
-            },
-        )]);
+        material.set_uniform_bindable(0, "ColorUniform", &color_data);
 
         // Instance buffer with mat4 per instance (locations 3-6)
         let matrices = build_instance_matrices(0.0);

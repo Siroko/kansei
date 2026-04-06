@@ -227,10 +227,21 @@ impl Renderer {
         self.surface_config = Some(surface_config);
     }
 
+    /// Returns a reference to the underlying wgpu device.
+    ///
+    /// Prefer using higher-level APIs (e.g. `material.set_uniform_bindable()`)
+    /// instead of accessing the device directly. This accessor will be removed
+    /// in a future release once all subsystems manage their own GPU resources.
+    #[doc(hidden)]
     pub fn device(&self) -> &wgpu::Device {
         self.device.as_ref().expect("Renderer not initialized")
     }
 
+    /// Returns a reference to the underlying wgpu queue.
+    ///
+    /// Prefer using higher-level APIs instead of accessing the queue directly.
+    /// This accessor will be removed in a future release.
+    #[doc(hidden)]
     pub fn queue(&self) -> &wgpu::Queue {
         self.queue.as_ref().expect("Renderer not initialized")
     }
@@ -259,63 +270,7 @@ impl Renderer {
         ComputeBatch::submit(self.device(), self.queue(), passes);
     }
 
-    pub fn create_shader_module(
-        &self,
-        desc: wgpu::ShaderModuleDescriptor<'_>,
-    ) -> wgpu::ShaderModule {
-        self.device().create_shader_module(desc)
-    }
-
-    pub fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> wgpu::Buffer {
-        self.device().create_buffer(desc)
-    }
-
-    pub fn create_buffer_init(
-        &self,
-        desc: &wgpu::util::BufferInitDescriptor<'_>,
-    ) -> wgpu::Buffer {
-        use wgpu::util::DeviceExt;
-        self.device().create_buffer_init(desc)
-    }
-
-    pub fn create_texture(&self, desc: &wgpu::TextureDescriptor<'_>) -> wgpu::Texture {
-        self.device().create_texture(desc)
-    }
-
-    pub fn create_bind_group_layout(
-        &self,
-        desc: &wgpu::BindGroupLayoutDescriptor<'_>,
-    ) -> wgpu::BindGroupLayout {
-        self.device().create_bind_group_layout(desc)
-    }
-
-    pub fn create_pipeline_layout(
-        &self,
-        desc: &wgpu::PipelineLayoutDescriptor<'_>,
-    ) -> wgpu::PipelineLayout {
-        self.device().create_pipeline_layout(desc)
-    }
-
-    pub fn create_render_pipeline(
-        &self,
-        desc: &wgpu::RenderPipelineDescriptor<'_>,
-    ) -> wgpu::RenderPipeline {
-        self.device().create_render_pipeline(desc)
-    }
-
-    pub fn create_bind_group(&self, desc: &wgpu::BindGroupDescriptor<'_>) -> wgpu::BindGroup {
-        self.device().create_bind_group(desc)
-    }
-
-    pub fn create_sampler(&self, desc: &wgpu::SamplerDescriptor<'_>) -> wgpu::Sampler {
-        self.device().create_sampler(desc)
-    }
-
-    pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: wgpu::BufferAddress, data: &[u8]) {
-        self.queue().write_buffer(buffer, offset, data);
-    }
-
-    pub fn shared_layouts(&self) -> &SharedLayouts {
+    pub(crate) fn shared_layouts(&self) -> &SharedLayouts {
         self.shared_layouts.as_ref().expect("Renderer not initialized")
     }
 
