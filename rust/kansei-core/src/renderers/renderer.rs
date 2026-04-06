@@ -2,7 +2,9 @@ use crate::math::Vec4;
 use crate::cameras::Camera;
 use crate::geometries::Vertex;
 use crate::lights::{LightUniforms, LIGHT_UNIFORM_BYTES};
+use crate::materials::ComputePass;
 use crate::objects::Scene;
+use super::compute_batch::ComputeBatch;
 use super::gbuffer::GBuffer;
 use super::shared_layouts::SharedLayouts;
 
@@ -277,6 +279,86 @@ impl Renderer {
         self.queue.as_ref().expect("Renderer not initialized")
     }
 
+    pub(crate) fn raw_device(&self) -> &wgpu::Device {
+        self.device()
+    }
+
+    pub(crate) fn raw_queue(&self) -> &wgpu::Queue {
+        self.queue()
+    }
+
+    pub fn create_command_encoder(&self, desc: &wgpu::CommandEncoderDescriptor) -> wgpu::CommandEncoder {
+        self.device().create_command_encoder(desc)
+    }
+
+    pub fn submit(&self, command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>) {
+        self.queue().submit(command_buffers);
+    }
+
+    pub fn compute(&self, pass: &ComputePass, workgroups_x: u32, workgroups_y: u32, workgroups_z: u32) {
+        ComputeBatch::submit(self.device(), self.queue(), &[(pass, workgroups_x, workgroups_y, workgroups_z)]);
+    }
+
+    pub fn compute_batch(&self, passes: &[(&ComputePass, u32, u32, u32)]) {
+        ComputeBatch::submit(self.device(), self.queue(), passes);
+    }
+
+    pub fn create_shader_module(
+        &self,
+        desc: wgpu::ShaderModuleDescriptor<'_>,
+    ) -> wgpu::ShaderModule {
+        self.device().create_shader_module(desc)
+    }
+
+    pub fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> wgpu::Buffer {
+        self.device().create_buffer(desc)
+    }
+
+    pub fn create_buffer_init(
+        &self,
+        desc: &wgpu::util::BufferInitDescriptor<'_>,
+    ) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        self.device().create_buffer_init(desc)
+    }
+
+    pub fn create_texture(&self, desc: &wgpu::TextureDescriptor<'_>) -> wgpu::Texture {
+        self.device().create_texture(desc)
+    }
+
+    pub fn create_bind_group_layout(
+        &self,
+        desc: &wgpu::BindGroupLayoutDescriptor<'_>,
+    ) -> wgpu::BindGroupLayout {
+        self.device().create_bind_group_layout(desc)
+    }
+
+    pub fn create_pipeline_layout(
+        &self,
+        desc: &wgpu::PipelineLayoutDescriptor<'_>,
+    ) -> wgpu::PipelineLayout {
+        self.device().create_pipeline_layout(desc)
+    }
+
+    pub fn create_render_pipeline(
+        &self,
+        desc: &wgpu::RenderPipelineDescriptor<'_>,
+    ) -> wgpu::RenderPipeline {
+        self.device().create_render_pipeline(desc)
+    }
+
+    pub fn create_bind_group(&self, desc: &wgpu::BindGroupDescriptor<'_>) -> wgpu::BindGroup {
+        self.device().create_bind_group(desc)
+    }
+
+    pub fn create_sampler(&self, desc: &wgpu::SamplerDescriptor<'_>) -> wgpu::Sampler {
+        self.device().create_sampler(desc)
+    }
+
+    pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: wgpu::BufferAddress, data: &[u8]) {
+        self.queue().write_buffer(buffer, offset, data);
+    }
+
     pub fn shared_layouts(&self) -> &SharedLayouts {
         self.shared_layouts.as_ref().expect("Renderer not initialized")
     }
@@ -529,7 +611,7 @@ impl Renderer {
 
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Shadow/PipelineLayout"),
-            bind_group_layouts: &[&shadow_light_vp_bgl, &shared.mesh_bgl],
+            bind_group_layouts: &[&shadow_light_vp_bgl, &shared.camera_bgl, &shared.mesh_bgl],
             push_constant_ranges: &[],
         });
 
@@ -594,7 +676,9 @@ impl Renderer {
             let sample_count = self.config.sample_count;
             let depth_format = wgpu::TextureFormat::Depth24Plus;
 
-            for r in scene.renderables_mut() {
+            let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
+            for idx in ordered_indices {
+                let r = scene.get_mut(idx).expect("ordered scene index should exist");
                 if !r.geometry.initialized {
                     r.geometry.initialize(device);
                 }
@@ -603,6 +687,7 @@ impl Renderer {
                         ib.initialize(device);
                     }
                 }
+                r.material.ensure_bindables_initialized(self);
 
                 // Build combined vertex layouts (base + instance buffers)
                 let instance_layouts: Vec<_> = r.instance_buffers.iter()
@@ -674,7 +759,7 @@ impl Renderer {
                             }
 
                             let offset = (draw_idx as u32) * alignment;
-                            pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+                            pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
                             pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
                             pass.set_index_buffer(r.geometry.index_buffer.as_ref().unwrap().slice(..), wgpu::IndexFormat::Uint32);
@@ -742,7 +827,7 @@ impl Renderer {
             });
 
             // Set camera bind group (shared across all objects)
-            pass.set_bind_group(2, self.camera_bind_group.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, self.camera_bind_group.as_ref().unwrap(), &[]);
             pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
 
             for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
@@ -771,7 +856,7 @@ impl Renderer {
                 }
 
                 let offset = (draw_idx as u32) * alignment;
-                pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+                pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
                 // Slot 0: base geometry vertex buffer
                 pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
@@ -849,7 +934,9 @@ impl Renderer {
         let depth_format = GBuffer::DEPTH_FORMAT;
         let sample_count = gbuffer.sample_count;
 
-        for r in scene.renderables_mut() {
+        let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
+        for idx in ordered_indices {
+            let r = scene.get_mut(idx).expect("ordered scene index should exist");
             if !r.geometry.initialized {
                 r.geometry.initialize(device);
             }
@@ -858,6 +945,7 @@ impl Renderer {
                     ib.initialize(device);
                 }
             }
+            r.material.ensure_bindables_initialized(self);
 
             let instance_layouts: Vec<_> = r.instance_buffers.iter()
                 .map(|ib| ib.vertex_layout())
@@ -924,7 +1012,7 @@ impl Renderer {
                             }
 
                             let offset = (draw_idx as u32) * alignment;
-                            pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+                            pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
                             pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
                             pass.set_index_buffer(r.geometry.index_buffer.as_ref().unwrap().slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
@@ -982,7 +1070,7 @@ impl Renderer {
                 ..Default::default()
             });
 
-            pass.set_bind_group(2, self.camera_bind_group.as_ref().unwrap(), &[]);
+            pass.set_bind_group(1, self.camera_bind_group.as_ref().unwrap(), &[]);
             pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
 
             let alignment = self.matrix_alignment;
@@ -1011,7 +1099,7 @@ impl Renderer {
                 }
 
                 let offset = (draw_idx as u32) * alignment;
-                pass.set_bind_group(1, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+                pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
                 pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
                 for (i, ib) in r.instance_buffers.iter().enumerate() {
