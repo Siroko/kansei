@@ -1,8 +1,8 @@
 // Shadow pass — depth-only vertex shader
 @group(0) @binding(0) var<uniform> light_view_proj: mat4x4<f32>;
 
-@group(1) @binding(0) var<uniform> _normal_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> _normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
 
 @vertex
 fn shadow_vs(

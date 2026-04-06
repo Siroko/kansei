@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use super::binding::{Binding, BindGroupBuilder, BindingResource};
+use crate::buffers::{BufferType, GpuBuffer};
+use crate::renderers::Renderer;
 use crate::renderers::SharedLayouts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,6 +57,7 @@ pub struct Material {
     pub shader_code: String,
     pub options: MaterialOptions,
     pub bindings: Vec<Binding>,
+    bindables: Vec<(u32, GpuBuffer)>,
     shader_module: Option<wgpu::ShaderModule>,
     material_bgl: Option<wgpu::BindGroupLayout>,
     pipeline_layout: Option<wgpu::PipelineLayout>,
@@ -70,6 +73,7 @@ impl Material {
             shader_code: shader_code.to_string(),
             options,
             bindings,
+            bindables: Vec::new(),
             shader_module: None,
             material_bgl: None,
             pipeline_layout: None,
@@ -98,7 +102,7 @@ impl Material {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{}/PipelineLayout", self.label)),
-            bind_group_layouts: &[&material_bgl, &shared.mesh_bgl, &shared.camera_bgl, &shared.shadow_bgl],
+            bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl, &shared.shadow_bgl],
             push_constant_ranges: &[],
         });
 
@@ -217,5 +221,53 @@ impl Material {
 
     pub fn material_bgl(&self) -> Option<&wgpu::BindGroupLayout> {
         self.material_bgl.as_ref()
+    }
+
+    /// Attach/replace a uniform bindable owned by this material.
+    pub fn set_uniform_bindable<T: bytemuck::Pod>(&mut self, binding: u32, label: &str, data: &[T]) {
+        let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+        let buf = GpuBuffer::from_slice(label, BufferType::Uniform, usage, data);
+        if let Some((_, slot)) = self.bindables.iter_mut().find(|(b, _)| *b == binding) {
+            *slot = buf;
+        } else {
+            self.bindables.push((binding, buf));
+        }
+        self.initialized = false;
+    }
+
+    /// Ensure this material has a bind group from its owned bindables.
+    pub fn ensure_bindables_initialized(&mut self, renderer: &Renderer) {
+        if self.bindables.is_empty() || self.initialized {
+            return;
+        }
+        for (_, buf) in &mut self.bindables {
+            buf.ensure_ready(renderer.raw_device(), renderer.raw_queue());
+        }
+        let buffer_handles: Vec<(u32, wgpu::Buffer)> = self
+            .bindables
+            .iter()
+            .map(|(binding, buf)| {
+                (
+                    *binding,
+                    buf.gpu_buffer()
+                        .expect("Material bindable buffer should be initialized")
+                        .clone(),
+                )
+            })
+            .collect();
+        let resources: Vec<(u32, BindingResource)> = buffer_handles
+            .iter()
+            .map(|(binding, buffer)| {
+                (
+                    *binding,
+                    BindingResource::Buffer {
+                        buffer,
+                        offset: 0,
+                        size: None,
+                    },
+                )
+            })
+            .collect();
+        self.create_bind_group(renderer.raw_device(), renderer.shared_layouts(), &resources);
     }
 }

@@ -4,13 +4,13 @@ struct MaterialUniforms {
 };
 @group(0) @binding(0) var<uniform> material: MaterialUniforms;
 
-// ── Group 1: Mesh (dynamic offset) ──
-@group(1) @binding(0) var<uniform> _normal_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> _world_matrix: mat4x4<f32>;
+// ── Group 1: Camera ──
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 
-// ── Group 2: Camera ──
-@group(2) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+// ── Group 2: Mesh (dynamic offset) ──
+@group(2) @binding(0) var<uniform> _normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> _world_matrix: mat4x4<f32>;
 
 // ── Lights (camera group binding 2) ──
 struct DirLight {
@@ -33,7 +33,7 @@ struct LightUniforms {
     directional: array<DirLight, 4>,
     point: array<PtLight, 8>,
 };
-@group(2) @binding(2) var<uniform> lights: LightUniforms;
+@group(1) @binding(2) var<uniform> lights: LightUniforms;
 
 // ── Group 3: Shadows ──
 struct ShadowUniforms {
