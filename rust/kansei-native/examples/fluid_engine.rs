@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{Mat4, Vec3, Vec4};
 use kansei_core::cameras::Camera;
 use kansei_core::objects::Scene;
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -463,7 +463,12 @@ impl App {
         self.particle_depth_view = Some(particle_depth_view);
         // Rebuild bind groups
         if let (Some(sr), Some(df), Some(blit)) = (&self.surface_renderer, &self.density_field, &self.blit) {
-            self.surface_bg = Some(sr.create_bind_group(device, self.color_view.as_ref().unwrap(), self.depth_view.as_ref().unwrap(), self.output_view.as_ref().unwrap(), &df.density_view));
+            self.surface_bg = Some(sr.create_bind_group(
+                self.color_view.as_ref().unwrap(),
+                self.depth_view.as_ref().unwrap(),
+                self.output_view.as_ref().unwrap(),
+                &df.density_view,
+            ));
             self.blit_bg = Some(blit.bind(device, self.output_view.as_ref().unwrap()));
         }
     }
@@ -507,13 +512,23 @@ impl ApplicationHandler for App {
             gravity: [0.0, -9.8, 0.0], mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
             ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
         });
-        sim.initialize(&positions, device);
+        sim.initialize(&positions, renderer.device(), renderer.queue());
         sim.world_bounds_min = [-25.0, -8.0, -16.0];
         sim.world_bounds_max = [25.0, 30.0, 16.0];
-        sim.rebuild_grid(device);
+        sim.rebuild_grid();
 
-        self.density_field = Some(FluidDensityField::new(device, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7 }));
-        self.surface_renderer = Some(FluidSurfaceRenderer::new(device));
+        self.density_field = Some(FluidDensityField::new(
+            renderer.device(),
+            renderer.queue(),
+            sim.positions_buffer().unwrap(),
+            sim.world_bounds_min,
+            sim.world_bounds_max,
+            DensityFieldOptions {
+                resolution: 128,
+                kernel_scale: 3.7,
+            },
+        ));
+        self.surface_renderer = Some(FluidSurfaceRenderer::new(renderer.device(), renderer.queue()));
         self.particle_renderer = Some(ParticleRenderer::new(device, sim.positions_buffer().unwrap(), count as u32, format));
         self.cornell_box = Some(CornellBox::new(device, format, sim.world_bounds_min, sim.world_bounds_max));
         self.blit = Some(BlitPipeline::new(device, format));
@@ -613,7 +628,7 @@ impl ApplicationHandler for App {
                 // Upload camera matrices + run sim
                 if let Some(ref mut sim) = self.sim {
                     let identity = glam::Mat4::IDENTITY.to_cols_array();
-                    sim.set_camera_matrices(queue,
+                    sim.set_camera_matrices(
                         &view.to_cols_array(), &proj.to_cols_array(),
                         &inv_view.to_cols_array(), &identity);
 
@@ -622,7 +637,7 @@ impl ApplicationHandler for App {
                     self.sim_accumulator = (self.sim_accumulator + sim_frame_dt).min(0.25);
                     let mut steps = 0u32;
                     while self.sim_accumulator >= SIM_DT as f64 && steps < 8 {
-                        sim.update(device, queue, SIM_DT, mouse_strength, self.mouse_ndc, mouse_dir);
+                        sim.update(SIM_DT, mouse_strength, self.mouse_ndc, mouse_dir);
                         self.sim_accumulator -= SIM_DT as f64;
                         steps += 1;
                     }
@@ -672,7 +687,13 @@ impl ApplicationHandler for App {
                 } else {
                     let sim = self.sim.as_ref().unwrap();
                     if let Some(ref mut df) = self.density_field {
-                        df.update(&mut encoder, queue, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), sim.params.smoothing_radius);
+                        df.update_with_encoder(
+                            &mut encoder,
+                            sim.world_bounds_min,
+                            sim.world_bounds_max,
+                            sim.particle_count(),
+                            sim.params.smoothing_radius,
+                        );
                     }
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -688,7 +709,17 @@ impl ApplicationHandler for App {
                         }
                     }
                     if let Some(ref sr) = self.surface_renderer {
-                        sr.render(&mut encoder, queue, self.surface_bg.as_ref().unwrap(), &inv_vp, [eye.x, eye.y, eye.z], sim.world_bounds_min, sim.world_bounds_max, size.width, size.height);
+                        let inv_vp = Mat4::from(inv_vp);
+                        sr.render(
+                            &mut encoder,
+                            self.surface_bg.as_ref().unwrap(),
+                            &inv_vp,
+                            [eye.x, eye.y, eye.z],
+                            sim.world_bounds_min,
+                            sim.world_bounds_max,
+                            size.width,
+                            size.height,
+                        );
                     }
                     { let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &canvas_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], ..Default::default()
