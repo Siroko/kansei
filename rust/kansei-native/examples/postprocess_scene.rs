@@ -6,7 +6,7 @@ use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
 use kansei_core::materials::{Binding, BindingResource, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
-use kansei_core::objects::{Renderable, Scene};
+use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingVolume,
     effects::{BloomEffect, BloomOptions, ColorGradingEffect, ColorGradingOptions},
@@ -216,28 +216,28 @@ impl ApplicationHandler for App {
         sphere.object.update_world_matrix(None);
         self._mat_bufs.push(sphere_buf);
 
-        self.scene.add(floor);
-        self.scene.add(box_obj);
-        self.scene.add(sphere);
+        self.scene.add(SceneNode::Renderable(floor));
+        self.scene.add(SceneNode::Renderable(box_obj));
+        self.scene.add(SceneNode::Renderable(sphere));
 
         // -- Lights --
-        self.scene.add_light(Light::Directional(DirectionalLight::new(
+        self.scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(
             Vec3::new(-0.5, -1.0, -0.3),
             Vec3::new(1.0, 0.95, 0.8),
             0.8,
-        )));
-        self.scene.add_light(Light::Point(PointLight::new(
+        ))));
+        self.scene.add(SceneNode::Light(Light::Point(PointLight::new(
             Vec3::new(3.0, 3.0, 2.0),
             Vec3::new(1.0, 0.6, 0.2),
             3.0,
             15.0,
-        )));
-        self.scene.add_light(Light::Point(PointLight::new(
+        ))));
+        self.scene.add(SceneNode::Light(Light::Point(PointLight::new(
             Vec3::new(-3.0, 2.0, -2.0),
             Vec3::new(0.3, 0.5, 1.0),
             2.0,
             12.0,
-        )));
+        ))));
 
         // Camera
         self.camera.aspect = size.width as f32 / size.height as f32;
@@ -305,15 +305,15 @@ impl ApplicationHandler for App {
                 let t = self.start_time.elapsed().as_secs_f32();
 
                 // Rotate the box slowly on Y
-                if let Some(r) = self.scene.get_mut(1) {
+                if let Some(r) = self.scene.get_renderable_mut(1) {
                     r.object.rotation.y = t * 0.3;
                     r.object.update_model_matrix();
                     r.object.update_world_matrix(None);
                 }
 
                 // Update normal matrices for all objects
-                for i in 0..self.scene.len() {
-                    if let Some(r) = self.scene.get_mut(i) {
+                for i in 0..self.scene.children_len() {
+                    if let Some(r) = self.scene.get_renderable_mut(i) {
                         r.object.update_normal_matrix();
                     }
                 }

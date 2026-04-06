@@ -73,6 +73,57 @@ impl LightUniforms {
         self.data[1] = f32::from_bits(num_point);
     }
 
+    /// Pack lights from references into the uniform buffer.
+    pub fn pack_refs(&mut self, lights: &[&Light]) {
+        self.data.fill(0.0);
+
+        let mut num_dir: u32 = 0;
+        let mut num_point: u32 = 0;
+
+        let dir_offset = HEADER_FLOATS;
+        let point_offset = HEADER_FLOATS + MAX_DIRECTIONAL_LIGHTS * DIR_LIGHT_FLOATS;
+
+        for light in lights {
+            match light {
+                Light::Directional(dl) => {
+                    if (num_dir as usize) < MAX_DIRECTIONAL_LIGHTS {
+                        let i = num_dir as usize;
+                        let o = dir_offset + i * DIR_LIGHT_FLOATS;
+                        let ec = dl.effective_color();
+                        self.data[o] = dl.direction.x;
+                        self.data[o + 1] = dl.direction.y;
+                        self.data[o + 2] = dl.direction.z;
+                        self.data[o + 4] = ec.x;
+                        self.data[o + 5] = ec.y;
+                        self.data[o + 6] = ec.z;
+                        self.data[o + 7] = dl.intensity;
+                        num_dir += 1;
+                    }
+                }
+                Light::Point(pl) => {
+                    if (num_point as usize) < MAX_POINT_LIGHTS {
+                        let i = num_point as usize;
+                        let o = point_offset + i * POINT_LIGHT_FLOATS;
+                        let ec = pl.effective_color();
+                        self.data[o] = pl.position.x;
+                        self.data[o + 1] = pl.position.y;
+                        self.data[o + 2] = pl.position.z;
+                        self.data[o + 3] = pl.radius;
+                        self.data[o + 4] = ec.x;
+                        self.data[o + 5] = ec.y;
+                        self.data[o + 6] = ec.z;
+                        self.data[o + 7] = pl.intensity;
+                        num_point += 1;
+                    }
+                }
+                Light::Area(_) => {}
+            }
+        }
+
+        self.data[0] = f32::from_bits(num_dir);
+        self.data[1] = f32::from_bits(num_point);
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.data)
     }
