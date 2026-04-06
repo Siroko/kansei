@@ -4,7 +4,7 @@ use std::time::Instant;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
-use kansei_core::materials::{Binding, BindingResource, Material, MaterialOptions};
+use kansei_core::materials::{Binding, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -66,41 +66,22 @@ impl OrbitCamera {
 // ── Helper: create a lit material with color + specular ──
 
 fn create_lit_material(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    shared: &kansei_core::renderers::SharedLayouts,
     label: &str,
     color: [f32; 4],
     specular: [f32; 4],
-) -> (Material, wgpu::Buffer) {
+) -> Material {
     let mat_data: [f32; 8] = [
         color[0], color[1], color[2], color[3],
         specular[0], specular[1], specular[2], specular[3],
     ];
-    let mat_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: 32,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&mat_buf, 0, bytemuck::cast_slice(&mat_data));
-
     let mut material = Material::new(
         label,
         LIT_WGSL,
         vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
         MaterialOptions::default(),
     );
-    material.create_bind_group(device, shared, &[(
-        0,
-        BindingResource::Buffer {
-            buffer: &mat_buf,
-            offset: 0,
-            size: None,
-        },
-    )]);
-
-    (material, mat_buf)
+    material.set_uniform_bindable(0, label, &mat_data);
+    material
 }
 
 // ── App ──
@@ -112,8 +93,6 @@ struct App {
     camera: Camera,
     orbit: OrbitCamera,
     start_time: Instant,
-    // Keep material buffers alive
-    _mat_bufs: Vec<wgpu::Buffer>,
 }
 
 impl App {
@@ -125,7 +104,6 @@ impl App {
             camera: Camera::new(45.0, 0.1, 100.0, 1280.0 / 720.0),
             orbit: OrbitCamera::new(glam::Vec3::new(0.0, 1.0, 0.0), 15.0, 0.5),
             start_time: Instant::now(),
-            _mat_bufs: Vec::new(),
         }
     }
 }
@@ -169,14 +147,9 @@ impl ApplicationHandler for App {
         // Enable shadow mapping (2048x2048 shadow map)
         renderer.enable_shadows(2048);
 
-        let device = renderer.device();
-        let queue = renderer.queue();
-        let shared = renderer.shared_layouts();
-
         // ── Floor ──
         let floor_geo = PlaneGeometry::new(30.0, 30.0);
-        let (floor_mat, floor_buf) = create_lit_material(
-            device, queue, shared,
+        let floor_mat = create_lit_material(
             "FloorMat",
             [0.6, 0.6, 0.6, 1.0],        // light grey
             [0.15, 0.15, 0.15, 0.05],     // low specular, very low shininess
@@ -186,12 +159,10 @@ impl ApplicationHandler for App {
         floor.object.update_model_matrix();
         floor.object.update_world_matrix(None);
         floor.cast_shadow = false; // floor should not cast shadows
-        self._mat_bufs.push(floor_buf);
 
         // ── Box ──
         let box_geo = BoxGeometry::new(2.0, 2.0, 2.0);
-        let (box_mat, box_buf) = create_lit_material(
-            device, queue, shared,
+        let box_mat = create_lit_material(
             "BoxMat",
             [0.85, 0.25, 0.2, 1.0],       // reddish
             [0.5, 0.5, 0.5, 0.3],         // medium specular
@@ -200,12 +171,10 @@ impl ApplicationHandler for App {
         box_obj.object.set_position(0.0, 1.0, 0.0);
         box_obj.object.update_model_matrix();
         box_obj.object.update_world_matrix(None);
-        self._mat_bufs.push(box_buf);
 
         // ── Sphere ──
         let sphere_geo = SphereGeometry::new(1.2, 32, 16);
-        let (sphere_mat, sphere_buf) = create_lit_material(
-            device, queue, shared,
+        let sphere_mat = create_lit_material(
             "SphereMat",
             [0.2, 0.4, 0.9, 1.0],         // blue-ish
             [0.8, 0.8, 0.8, 0.6],         // high specular
@@ -214,7 +183,6 @@ impl ApplicationHandler for App {
         sphere.object.set_position(3.0, 1.2, -1.0);
         sphere.object.update_model_matrix();
         sphere.object.update_world_matrix(None);
-        self._mat_bufs.push(sphere_buf);
 
         // Add objects to scene
         self.scene.add(SceneNode::Renderable(floor));
