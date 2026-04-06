@@ -6,7 +6,7 @@ use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
 use kansei_core::materials::{Binding, BindingResource, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
-use kansei_core::objects::{Renderable, Scene};
+use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
 
 use winit::application::ApplicationHandler;
@@ -217,9 +217,9 @@ impl ApplicationHandler for App {
         self._mat_bufs.push(sphere_buf);
 
         // Add objects to scene
-        self.scene.add(floor);
-        self.scene.add(box_obj);
-        self.scene.add(sphere);
+        self.scene.add(SceneNode::Renderable(floor));
+        self.scene.add(SceneNode::Renderable(box_obj));
+        self.scene.add(SceneNode::Renderable(sphere));
 
         // ── Lights ──
         // Directional: warm white from upper-left
@@ -229,15 +229,15 @@ impl ApplicationHandler for App {
             1.0,
         );
         dir_light.cast_shadow = true;
-        self.scene.add_light(Light::Directional(dir_light));
+        self.scene.add(SceneNode::Light(Light::Directional(dir_light)));
 
         // Point: soft warm above-left
-        self.scene.add_light(Light::Point(PointLight::new(
+        self.scene.add(SceneNode::Light(Light::Point(PointLight::new(
             Vec3::new(-3.0, 4.0, 2.0),
             Vec3::new(1.0, 0.8, 0.5),
             2.0,
             20.0,
-        )));
+        ))));
 
         // Camera
         self.camera.aspect = size.width as f32 / size.height as f32;
@@ -290,15 +290,15 @@ impl ApplicationHandler for App {
                 let t = self.start_time.elapsed().as_secs_f32();
 
                 // Rotate the box slowly on Y
-                if let Some(r) = self.scene.get_mut(1) {
+                if let Some(r) = self.scene.get_renderable_mut(1) {
                     r.object.rotation.y = t * 0.3;
                     r.object.update_model_matrix();
                     r.object.update_world_matrix(None);
                 }
 
                 // Update normal matrices for all objects
-                for i in 0..self.scene.len() {
-                    if let Some(r) = self.scene.get_mut(i) {
+                for i in 0..self.scene.children_len() {
+                    if let Some(r) = self.scene.get_renderable_mut(i) {
                         r.object.update_normal_matrix();
                     }
                 }

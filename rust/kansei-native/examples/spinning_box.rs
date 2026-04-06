@@ -1,11 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::cameras::Camera;
-use kansei_core::geometries::BoxGeometry;
-use kansei_core::materials::{Binding, BindingResource, Material, MaterialOptions};
-use kansei_core::objects::{Renderable, Scene};
+use kansei_core::objects::{CornellBox, Scene};
 use kansei_core::renderers::{Renderer, RendererConfig};
 
 use winit::application::ApplicationHandler;
@@ -13,14 +10,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const BASIC_WGSL: &str = include_str!("../../kansei-core/src/shaders/basic.wgsl");
-
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     scene: Scene,
     camera: Camera,
-    start_time: Instant,
 }
 
 impl App {
@@ -30,7 +24,6 @@ impl App {
             renderer: None,
             scene: Scene::new(),
             camera: Camera::new(45.0, 0.1, 100.0, 1280.0 / 720.0),
-            start_time: Instant::now(),
         }
     }
 }
@@ -70,44 +63,9 @@ impl ApplicationHandler for App {
         });
         pollster::block_on(renderer.initialize(surface, &adapter));
 
-        let device = renderer.device();
-        let queue = renderer.queue();
-        let shared = renderer.shared_layouts();
-
-        // Geometry
-        let geometry = BoxGeometry::new(2.0, 2.0, 2.0);
-
-        // Material
-        let mut material = Material::new(
-            "BasicMaterial",
-            BASIC_WGSL,
-            vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
-            MaterialOptions::default(),
-        );
-
-        // Color uniform buffer — reddish color
-        let color_data: [f32; 4] = [0.9, 0.3, 0.2, 1.0];
-        let color_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ColorUniform"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&color_buf, 0, bytemuck::cast_slice(&color_data));
-
-        // Create bind group
-        material.create_bind_group(device, shared, &[(
-            0,
-            BindingResource::Buffer {
-                buffer: &color_buf,
-                offset: 0,
-                size: None,
-            },
-        )]);
-
-        // Renderable + Scene
-        let renderable = Renderable::new(geometry, material);
-        self.scene.add(renderable);
+        // CornellBox object built from 6 PlaneGeometry + shared material uniforms.
+        let cornell_box = CornellBox::new([-4.0, -1.5, -4.0], [4.0, 4.0, 4.0]);
+        cornell_box.add_to_scene(&mut self.scene);
 
         // Camera
         self.camera.aspect = size.width as f32 / size.height as f32;
@@ -117,9 +75,8 @@ impl ApplicationHandler for App {
 
         self.renderer = Some(renderer);
         self.window = Some(window);
-        self.start_time = Instant::now();
 
-        log::info!("Kansei — Spinning Box ready");
+        log::info!("Kansei — CornellBox ready");
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -133,16 +90,6 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let t = self.start_time.elapsed().as_secs_f32();
-
-                // Rotate the box
-                if let Some(r) = self.scene.get_mut(0) {
-                    r.object.rotation.y = t * 0.8;
-                    r.object.rotation.x = t * 0.3;
-                    r.object.update_model_matrix();
-                    r.object.update_normal_matrix(&self.camera.view_matrix);
-                }
-
                 // Render
                 if let Some(ref mut renderer) = self.renderer {
                     renderer.render(&mut self.scene, &mut self.camera);

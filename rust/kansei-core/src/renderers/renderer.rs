@@ -1,7 +1,7 @@
 use crate::math::Vec4;
 use crate::cameras::Camera;
 use crate::geometries::Vertex;
-use crate::lights::{LightUniforms, LIGHT_UNIFORM_BYTES};
+use crate::lights::{Light, LightUniforms, LIGHT_UNIFORM_BYTES};
 use crate::materials::ComputePass;
 use crate::objects::Scene;
 use super::compute_batch::ComputeBatch;
@@ -528,7 +528,8 @@ impl Renderer {
         }
 
         // Upload lights
-        self.light_uniforms.pack(&scene.lights);
+        let lights_vec: Vec<&Light> = scene.lights().collect();
+        self.light_uniforms.pack_refs(&lights_vec);
         if let Some(ref buf) = self.light_buf {
             queue.write_buffer(buf, 0, self.light_uniforms.as_bytes());
         }
@@ -541,7 +542,7 @@ impl Renderer {
         let floats_per_slot = alignment / 4;
 
         for (i, idx) in scene.ordered_indices().enumerate() {
-            if let Some(renderable) = scene.get(idx) {
+            if let Some(renderable) = scene.get_renderable(idx) {
                 let offset = i * floats_per_slot;
                 self.world_matrices_staging[offset..offset + 16]
                     .copy_from_slice(renderable.world_matrix.as_slice());
@@ -678,7 +679,7 @@ impl Renderer {
 
             let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
             for idx in ordered_indices {
-                let r = scene.get_mut(idx).expect("ordered scene index should exist");
+                let r = scene.get_renderable_mut(idx).expect("ordered scene index should exist");
                 if !r.geometry.initialized {
                     r.geometry.initialize(device);
                 }
@@ -712,7 +713,7 @@ impl Renderer {
         if self.shadows_enabled {
             if let Some(ref mut sm) = self.shadow_map {
                 // Find first directional light
-                let dir_light_dir = scene.lights.iter().find_map(|l| {
+                let dir_light_dir = scene.lights().find_map(|l| {
                     if let crate::lights::Light::Directional(dl) = l { Some(dl.direction) } else { None }
                 });
 
@@ -753,7 +754,7 @@ impl Renderer {
 
                         let alignment = self.matrix_alignment;
                         for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
-                            let r = &scene.renderables()[scene_idx];
+                            let r = scene.get_renderable(scene_idx).unwrap();
                             if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                                 continue;
                             }
@@ -831,7 +832,7 @@ impl Renderer {
             pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
 
             for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
-                let r = &scene.renderables()[scene_idx];
+                let r = scene.get_renderable(scene_idx).unwrap();
                 if !r.visible || !r.geometry.initialized { continue; }
 
                 // Per-renderable pipeline key (includes num_vertex_buffers)
@@ -936,7 +937,7 @@ impl Renderer {
 
         let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
         for idx in ordered_indices {
-            let r = scene.get_mut(idx).expect("ordered scene index should exist");
+            let r = scene.get_renderable_mut(idx).expect("ordered scene index should exist");
             if !r.geometry.initialized {
                 r.geometry.initialize(device);
             }
@@ -967,7 +968,7 @@ impl Renderer {
         // Shadow pass (if enabled)
         if self.shadows_enabled {
             if let Some(ref mut sm) = self.shadow_map {
-                let dir_light_dir = scene.lights.iter().find_map(|l| {
+                let dir_light_dir = scene.lights().find_map(|l| {
                     if let crate::lights::Light::Directional(dl) = l { Some(dl.direction) } else { None }
                 });
 
@@ -1006,7 +1007,7 @@ impl Renderer {
 
                         let alignment = self.matrix_alignment;
                         for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
-                            let r = &scene.renderables()[scene_idx];
+                            let r = scene.get_renderable(scene_idx).unwrap();
                             if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                                 continue;
                             }
@@ -1076,7 +1077,7 @@ impl Renderer {
             let alignment = self.matrix_alignment;
 
             for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
-                let r = &scene.renderables()[scene_idx];
+                let r = scene.get_renderable(scene_idx).unwrap();
                 if !r.visible || !r.geometry.initialized { continue; }
 
                 let num_vb = 1 + r.instance_buffers.len();

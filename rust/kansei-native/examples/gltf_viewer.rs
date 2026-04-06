@@ -7,7 +7,7 @@ use kansei_core::lights::{DirectionalLight, Light, PointLight};
 use kansei_core::loaders::{GLTFLoader, GLTFResult};
 use kansei_core::materials::{Binding, BindingResource, CullMode, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
-use kansei_core::objects::{Renderable, Scene};
+use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig, SharedLayouts};
 
 use winit::application::ApplicationHandler;
@@ -163,7 +163,7 @@ fn load_gltf_scene(
         renderable.object.scale = gr.scale;
         renderable.object.update_model_matrix();
         renderable.object.update_world_matrix(None);
-        scene.add(renderable);
+        scene.add(SceneNode::Renderable(renderable));
         mat_bufs.push(mat_buf);
     }
 
@@ -231,9 +231,9 @@ fn build_fallback_scene(
     sphere.object.update_world_matrix(None);
     mat_bufs.push(sphere_buf);
 
-    scene.add(floor);
-    scene.add(box_obj);
-    scene.add(sphere);
+    scene.add(SceneNode::Renderable(floor));
+    scene.add(SceneNode::Renderable(box_obj));
+    scene.add(SceneNode::Renderable(sphere));
 
     mat_bufs
 }
@@ -328,15 +328,15 @@ impl ApplicationHandler for App {
             1.0,
         );
         dir_light.cast_shadow = true;
-        self.scene.add_light(Light::Directional(dir_light));
+        self.scene.add(SceneNode::Light(Light::Directional(dir_light)));
 
         // Point light (soft warm)
-        self.scene.add_light(Light::Point(PointLight::new(
+        self.scene.add(SceneNode::Light(Light::Point(PointLight::new(
             Vec3::new(-3.0, 4.0, 2.0),
             Vec3::new(1.0, 0.8, 0.5),
             2.0,
             20.0,
-        )));
+        ))));
 
         // Configure orbit camera from bounding box
         self.orbit = OrbitCamera::new(orbit_target, orbit_distance, 0.5);
@@ -391,8 +391,8 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 // Update normal matrices for all objects
-                for i in 0..self.scene.len() {
-                    if let Some(r) = self.scene.get_mut(i) {
+                for i in 0..self.scene.children_len() {
+                    if let Some(r) = self.scene.get_renderable_mut(i) {
                         r.object.update_normal_matrix();
                     }
                 }

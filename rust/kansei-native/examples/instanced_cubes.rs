@@ -6,7 +6,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
 use kansei_core::materials::{Binding, BindingResource, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
-use kansei_core::objects::{Renderable, Scene};
+use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
 
 use winit::application::ApplicationHandler;
@@ -195,7 +195,7 @@ impl ApplicationHandler for App {
             INSTANCE_COUNT as u32,
             vec![instance_buf],
         );
-        self.scene.add(renderable);
+        self.scene.add(SceneNode::Renderable(renderable));
 
         // Camera
         self.camera.aspect = size.width as f32 / size.height as f32;
@@ -254,7 +254,7 @@ impl ApplicationHandler for App {
                 let t = self.start_time.elapsed().as_secs_f32();
 
                 // Update instance matrices
-                if let Some(r) = self.scene.get_mut(0) {
+                if let Some(r) = self.scene.get_renderable_mut(0) {
                     let matrices = build_instance_matrices(t);
                     if let Some(ib) = r.instance_buffers.get(0) {
                         if let Some(ref renderer) = self.renderer {
