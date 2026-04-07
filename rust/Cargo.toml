@@ -5,6 +5,15 @@ members = [
     "kansei-wasm",
     "kansei-native",
 ]
+exclude = [
+    "kansei-wasm/examples/spinning-box",
+    "kansei-wasm/examples/instanced-cubes",
+    "kansei-wasm/examples/lit-scene",
+    "kansei-wasm/examples/shadow-scene",
+    "kansei-wasm/examples/postprocess-scene",
+    "kansei-wasm/examples/pathtracer",
+    "kansei-wasm/examples/fluid",
+]
 
 [workspace.dependencies]
 wgpu = "24"

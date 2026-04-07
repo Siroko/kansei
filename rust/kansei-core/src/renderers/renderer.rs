@@ -133,7 +133,51 @@ impl Renderer {
         }
     }
 
-    /// Initialize with a wgpu surface (from winit window or web canvas).
+    /// Create and initialize a Renderer from a wgpu `SurfaceTarget`.
+    ///
+    /// Handles `Instance`, `Surface`, and `Adapter` creation internally so that
+    /// user code does not need to touch raw wgpu bootstrap.
+    ///
+    /// **Native (winit):**
+    /// ```ignore
+    /// let renderer = pollster::block_on(Renderer::create(config, window.clone()));
+    /// ```
+    ///
+    /// **WASM (canvas):**
+    /// ```ignore
+    /// let renderer = Renderer::create(config, wgpu::SurfaceTarget::Canvas(canvas)).await;
+    /// ```
+    pub async fn create(
+        config: RendererConfig,
+        target: impl Into<wgpu::SurfaceTarget<'static>>,
+    ) -> Self {
+        let mut renderer = Self::new(config);
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            #[cfg(target_arch = "wasm32")]
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            #[cfg(not(target_arch = "wasm32"))]
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let surface = instance
+            .create_surface(target)
+            .expect("Failed to create surface");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .expect("No suitable GPU adapter found");
+        renderer.initialize(surface, &adapter).await;
+        renderer
+    }
+
+    /// Low-level initialization with a pre-created surface and adapter.
+    ///
+    /// Prefer [`Renderer::create`] which handles Instance/Surface/Adapter
+    /// creation automatically.
+    #[doc(hidden)]
     pub async fn initialize(&mut self, surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

@@ -71,29 +71,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     canvas.set_width(width);
     canvas.set_height(height);
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::BROWSER_WEBGPU,
-        ..Default::default()
-    });
-    let surface = instance
-        .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-        .map_err(|e| JsValue::from_str(&format!("{e}")))?;
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
+    let mut renderer = Renderer::create(
+        RendererConfig {
+            width,
+            height,
+            sample_count: 1,
+            clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
             ..Default::default()
-        })
-        .await
-        .ok_or("No adapter")?;
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize(surface, &adapter).await;
+        },
+        wgpu::SurfaceTarget::Canvas(canvas.clone()),
+    )
+    .await;
 
     // Enable shadow mapping
     renderer.enable_shadows(2048);

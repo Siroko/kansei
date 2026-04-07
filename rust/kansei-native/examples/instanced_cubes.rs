@@ -130,25 +130,17 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
 
-        // wgpu instance, surface, adapter
-        let instance = wgpu::Instance::new(&Default::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            }))
-            .unwrap();
-
         // Renderer
-        let mut renderer = Renderer::new(RendererConfig {
-            width: size.width,
-            height: size.height,
-            sample_count: 4,
-            clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
-            ..Default::default()
-        });
-        pollster::block_on(renderer.initialize(surface, &adapter));
+        let renderer = pollster::block_on(Renderer::create(
+            RendererConfig {
+                width: size.width,
+                height: size.height,
+                sample_count: 4,
+                clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
+                ..Default::default()
+            },
+            window.clone(),
+        ));
 
         // Geometry — 1x1x1 box
         let geometry = BoxGeometry::new(1.0, 1.0, 1.0);

@@ -26,6 +26,28 @@ impl Mat4 {
         Self::from(glam::Mat4::from_translation(glam::Vec3::new(x, y, z)))
     }
 
+    /// Alias for `translate` that mirrors glam's API.
+    pub fn from_translation(v: Vec3) -> Self {
+        Self::translate(v.x, v.y, v.z)
+    }
+
+    pub fn from_rotation_y(angle: f32) -> Self {
+        Self::from(glam::Mat4::from_rotation_y(angle))
+    }
+
+    pub fn from_rotation_x(angle: f32) -> Self {
+        Self::from(glam::Mat4::from_rotation_x(angle))
+    }
+
+    pub fn from_rotation_z(angle: f32) -> Self {
+        Self::from(glam::Mat4::from_rotation_z(angle))
+    }
+
+    /// Returns the column-major data as a flat array (alias for GPU upload).
+    pub fn to_cols_array(&self) -> [f32; 16] {
+        self.data
+    }
+
     pub fn inverse(&self) -> Self {
         Self::from(self.to_glam().inverse())
     }
