@@ -81,6 +81,9 @@ pub struct Renderer {
     gbuffer_bundle: Option<wgpu::RenderBundle>,
     gbuffer_last_object_count: usize,
     gbuffer_last_sample_count: u32,
+    // Depth-copy pass (resolve MSAA depth for compute shaders)
+    depth_copy_pipeline: Option<wgpu::RenderPipeline>,
+    depth_copy_bgl: Option<wgpu::BindGroupLayout>,
 }
 
 impl Renderer {
@@ -125,6 +128,8 @@ impl Renderer {
             gbuffer_bundle: None,
             gbuffer_last_object_count: 0,
             gbuffer_last_sample_count: 0,
+            depth_copy_pipeline: None,
+            depth_copy_bgl: None,
         }
     }
 
@@ -1481,5 +1486,39 @@ impl Renderer {
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Read data back from a GPU buffer to CPU.
+    /// Creates a staging buffer, copies, maps, and returns the data.
+    pub fn read_back_buffer_sync<T: bytemuck::Pod + Clone>(&self, buffer: &wgpu::Buffer, size: u64) -> Vec<T> {
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Readback/Staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Readback/Encoder"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).ok();
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
     }
 }
