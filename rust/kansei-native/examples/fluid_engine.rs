@@ -504,18 +504,17 @@ impl ApplicationHandler for App {
             }
         }
 
-        let mut sim = FluidSimulation::new(FluidSimulationOptions {
+        let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
             max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0, pressure_multiplier: 46.5,
             near_pressure_multiplier: 20.0, density_target: 8.6, viscosity: 0.36, damping: 0.998,
             gravity: [0.0, -9.8, 0.0], mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
             ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
-        });
-        sim.initialize_from_renderer(&positions, &renderer);
+        }, &positions);
         sim.world_bounds_min = [-25.0, -8.0, -16.0];
         sim.world_bounds_max = [25.0, 30.0, 16.0];
         sim.rebuild_grid();
 
-        self.density_field = Some(FluidDensityField::from_renderer(
+        self.density_field = Some(FluidDensityField::new(
             &renderer,
             sim.positions_buffer().unwrap(),
             sim.world_bounds_min,
@@ -525,7 +524,7 @@ impl ApplicationHandler for App {
                 kernel_scale: 3.7,
             },
         ));
-        self.surface_renderer = Some(FluidSurfaceRenderer::from_renderer(&renderer));
+        self.surface_renderer = Some(FluidSurfaceRenderer::new(&renderer));
         let device = renderer.device();
         let format = renderer.presentation_format();
         self.particle_renderer = Some(ParticleRenderer::new(device, sim.positions_buffer().unwrap(), count as u32, format));
