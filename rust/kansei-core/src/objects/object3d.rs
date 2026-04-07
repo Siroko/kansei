@@ -12,6 +12,9 @@ pub struct Object3D {
     children: Vec<usize>, // indices into a scene-level arena
     parent: Option<usize>,
     dirty: bool,
+    last_position: Vec3,
+    last_rotation: Vec3,
+    last_scale: Vec3,
 }
 
 impl Object3D {
@@ -26,6 +29,9 @@ impl Object3D {
             children: Vec::new(),
             parent: None,
             dirty: true,
+            last_position: Vec3::ZERO,
+            last_rotation: Vec3::ZERO,
+            last_scale: Vec3::new(1.0, 1.0, 1.0),
         }
     }
 
@@ -36,12 +42,27 @@ impl Object3D {
 
     /// Recompute the local model matrix from position/rotation/scale.
     pub fn update_model_matrix(&mut self) {
+        // Auto-detect dirty from direct field mutation
+        if !self.dirty {
+            if self.position.x != self.last_position.x || self.position.y != self.last_position.y || self.position.z != self.last_position.z
+                || self.rotation.x != self.last_rotation.x || self.rotation.y != self.last_rotation.y || self.rotation.z != self.last_rotation.z
+                || self.scale.x != self.last_scale.x || self.scale.y != self.last_scale.y || self.scale.z != self.last_scale.z
+            {
+                self.dirty = true;
+            }
+        }
+        if !self.dirty { return; }
+
         let t = glam::Mat4::from_translation(self.position.to_glam());
         let rx = glam::Mat4::from_rotation_x(self.rotation.x);
         let ry = glam::Mat4::from_rotation_y(self.rotation.y);
         let rz = glam::Mat4::from_rotation_z(self.rotation.z);
         let s = glam::Mat4::from_scale(self.scale.to_glam());
         self.model_matrix = Mat4::from(t * rz * ry * rx * s);
+
+        self.last_position = self.position;
+        self.last_rotation = self.rotation;
+        self.last_scale = self.scale;
         self.dirty = false;
     }
 
