@@ -10,6 +10,7 @@ use std::sync::Arc;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
 use kansei_core::lights::{DirectionalLight, Light};
+use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -273,6 +274,23 @@ impl ApplicationHandler for App {
         box_b.object.set_position(1.5, 0.5, 0.0);
         self.scene.add(SceneNode::Renderable(box_b));
 
+        // Stanford Dragon (glass)
+        if let Ok(result) = GLTFLoader::load("../examples/assets/geom/scene.gltf") {
+            log::info!("Loaded dragon: {} renderables", result.renderables.len());
+            for gr in result.renderables {
+                let mut r = Renderable::new(gr.geometry, make_basic_material("Dragon", [0.9, 0.9, 0.95, 1.0]));
+                // Scale up (model is ~0.17 units tall) and position on floor
+                r.object.position = gr.position;
+                r.object.rotation = gr.rotation;
+                r.object.scale = Vec3::new(gr.scale.x * 20.0, gr.scale.y * 20.0, gr.scale.z * 20.0);
+                r.object.update_model_matrix();
+                r.object.update_world_matrix(None);
+                self.scene.add(SceneNode::Renderable(r));
+            }
+        } else {
+            log::warn!("Could not load dragon model — running without it");
+        }
+
         // Directional light
         let sun = DirectionalLight::new(
             Vec3::new(-0.5, -1.0, -0.3).normalize(),
@@ -304,10 +322,10 @@ impl ApplicationHandler for App {
         let mut pt = PathTracer::new(&renderer);
         pt.resize(size.width, size.height);
         pt.set_spp(1);
-        pt.set_max_bounces(4);
+        pt.set_max_bounces(8); // more bounces for glass refraction
 
-        // Materials: one per renderable (floor=0, boxA=1, boxB=2)
-        pt.set_materials(&[
+        // Materials: one per renderable (floor=0, boxA=1, boxB=2, dragon parts=3+)
+        let mut materials = vec![
             PathTracerMaterial {
                 albedo: [0.7, 0.7, 0.7],
                 ..Default::default()
@@ -320,7 +338,13 @@ impl ApplicationHandler for App {
                 albedo: [0.2, 0.2, 0.9],
                 ..Default::default()
             },
-        ]);
+        ];
+        // Glass material for dragon parts (one per dragon renderable)
+        let dragon_count = gpu_data.instance_count as usize - 3; // subtract floor + 2 boxes
+        for _ in 0..dragon_count {
+            materials.push(PathTracerMaterial::glass(1.5));
+        }
+        pt.set_materials(&materials);
 
         // LightData: direction(vec3), light_type(u32), color(vec3), intensity(f32), normal(vec3), pad, extra(vec4)
         let dir = Vec3::new(-0.5, -1.0, -0.3).normalize();
