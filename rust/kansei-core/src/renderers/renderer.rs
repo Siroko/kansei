@@ -75,6 +75,12 @@ pub struct Renderer {
     shadows_enabled: bool,
     // Cubemap shadow resources (point lights)
     cubemap_shadow_map: Option<crate::shadows::CubeMapShadowMap>,
+    // Render bundle caching
+    render_bundle: Option<wgpu::RenderBundle>,
+    last_bundle_object_count: usize,
+    gbuffer_bundle: Option<wgpu::RenderBundle>,
+    gbuffer_last_object_count: usize,
+    gbuffer_last_sample_count: u32,
 }
 
 impl Renderer {
@@ -114,6 +120,11 @@ impl Renderer {
             shadow_light_vp_bg: None,
             shadows_enabled: false,
             cubemap_shadow_map: None,
+            render_bundle: None,
+            last_bundle_object_count: 0,
+            gbuffer_bundle: None,
+            gbuffer_last_object_count: 0,
+            gbuffer_last_sample_count: 0,
         }
     }
 
@@ -466,6 +477,124 @@ impl Renderer {
         self.world_matrices_buf = Some(world_buf);
         self.normal_matrices_buf = Some(normal_buf);
         self.last_object_count = count;
+
+        // Bind group changed — cached bundles are stale
+        self.render_bundle = None;
+        self.gbuffer_bundle = None;
+    }
+
+    /// Invalidate all cached render bundles.
+    ///
+    /// Call this when scene objects are added/removed, materials change,
+    /// or shadow resources are recreated.
+    pub fn invalidate_bundle(&mut self) {
+        self.render_bundle = None;
+        self.gbuffer_bundle = None;
+    }
+
+    /// Pre-record draw commands into a reusable `RenderBundle`.
+    fn build_render_bundle(
+        &self,
+        scene: &Scene,
+        camera: &Camera,
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> wgpu::RenderBundle {
+        let device = self.device.as_ref().unwrap();
+        let alignment = self.matrix_alignment;
+
+        let formats: Vec<Option<wgpu::TextureFormat>> =
+            color_formats.iter().map(|f| Some(*f)).collect();
+        let mut encoder =
+            device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                label: Some("RenderBundle"),
+                color_formats: &formats,
+                depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                    format: depth_format,
+                    depth_read_only: false,
+                    stencil_read_only: false,
+                }),
+                sample_count,
+                multiview: None,
+            });
+
+        // Set camera bind group (group 1) — same for all objects
+        encoder.set_bind_group(1, camera.bind_group().unwrap(), &[]);
+
+        // Set shadow bind group (group 3) — same for all objects
+        if let Some(ref bg) = self.shadow_bind_group {
+            encoder.set_bind_group(3, bg, &[]);
+        }
+
+        // State tracking for dedup
+        let mut current_pipeline_ptr: usize = 0;
+        let mut current_material_bg_ptr: usize = 0;
+
+        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+            let r = match scene.get_renderable(scene_idx) {
+                Some(r) => r,
+                None => continue,
+            };
+            if !r.visible || !r.geometry.initialized {
+                continue;
+            }
+
+            // Get pipeline
+            let num_vb = 1 + r.instance_buffers.len();
+            let key = crate::materials::PipelineKey {
+                color_formats: color_formats.to_vec(),
+                depth_format,
+                sample_count,
+                num_vertex_buffers: num_vb,
+            };
+            let pipeline = match r.material.pipeline_cache.get(&key) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Set pipeline (skip if same)
+            let pipeline_ptr = pipeline as *const _ as usize;
+            if pipeline_ptr != current_pipeline_ptr {
+                encoder.set_pipeline(pipeline);
+                current_pipeline_ptr = pipeline_ptr;
+                current_material_bg_ptr = 0; // reset material bg tracking
+            }
+
+            // Set material bind group (group 0, skip if same)
+            if let Some(bg) = r.material.bind_group() {
+                let bg_ptr = bg as *const _ as usize;
+                if bg_ptr != current_material_bg_ptr {
+                    encoder.set_bind_group(0, bg, &[]);
+                    current_material_bg_ptr = bg_ptr;
+                }
+            }
+
+            // Set mesh bind group (group 2) with dynamic offsets
+            let offset = (draw_idx as u32) * alignment;
+            encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+
+            // Set vertex buffer
+            encoder.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
+
+            // Set instance buffers
+            for (i, ib) in r.instance_buffers.iter().enumerate() {
+                if let Some(ref buf) = ib.gpu_buffer {
+                    encoder.set_vertex_buffer((i + 1) as u32, buf.slice(..));
+                }
+            }
+
+            // Set index buffer
+            encoder.set_index_buffer(
+                r.geometry.index_buffer.as_ref().unwrap().slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+
+            // Draw
+            encoder.draw_indexed(0..r.geometry.index_count(), 0, 0..r.instance_count);
+        }
+
+        encoder.finish(&Default::default())
     }
 
     /// Upload camera + per-object matrices to GPU.
@@ -621,6 +750,7 @@ impl Renderer {
         self.shadow_light_vp_bgl = Some(shadow_light_vp_bgl);
         self.shadow_map = Some(sm);
         self.shadows_enabled = true;
+        self.invalidate_bundle();
     }
 
     /// Enable cubemap shadow mapping for point lights.
@@ -669,6 +799,7 @@ impl Renderer {
         }));
 
         self.cubemap_shadow_map = Some(csm);
+        self.invalidate_bundle();
     }
 
     /// Run the cubemap shadow pass for point lights.
@@ -947,7 +1078,41 @@ impl Renderer {
             self.run_cubemap_shadow_pass(scene);
         }
 
-        // Phase 2+3: Create render pass and draw
+        // Check material dirty flags → invalidate bundle
+        for idx in scene.ordered_indices() {
+            if let Some(r) = scene.get_renderable(idx) {
+                if r.material_dirty {
+                    self.render_bundle = None;
+                    break;
+                }
+            }
+        }
+
+        // Build render bundle if needed
+        let format = self.presentation_format;
+        let sample_count = self.config.sample_count;
+        let depth_format = wgpu::TextureFormat::Depth24Plus;
+        let object_count = scene.ordered_indices().count();
+        if self.render_bundle.is_none() || self.last_bundle_object_count != object_count {
+            self.render_bundle = Some(self.build_render_bundle(
+                scene,
+                camera,
+                &[format],
+                depth_format,
+                sample_count,
+            ));
+            self.last_bundle_object_count = object_count;
+        }
+
+        // Clear material_dirty flags
+        let ordered: Vec<usize> = scene.ordered_indices().collect();
+        for idx in ordered {
+            if let Some(r) = scene.get_renderable_mut(idx) {
+                r.material_dirty = false;
+            }
+        }
+
+        // Phase 2+3: Create render pass and execute bundle
         let surface = self.surface.as_ref().unwrap();
         let output = surface.get_current_texture().expect("Failed to get surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
@@ -958,10 +1123,6 @@ impl Renderer {
         });
 
         let cc = &self.config.clear_color;
-        let format = self.presentation_format;
-        let sample_count = self.config.sample_count;
-        let depth_format = wgpu::TextureFormat::Depth24Plus;
-        let alignment = self.matrix_alignment;
 
         {
             let color_view = if sample_count > 1 {
@@ -994,54 +1155,7 @@ impl Renderer {
                 ..Default::default()
             });
 
-            // Set camera bind group (shared across all objects)
-            pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
-            pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
-
-            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
-                let r = scene.get_renderable(scene_idx).unwrap();
-                if !r.visible || !r.geometry.initialized { continue; }
-
-                // Per-renderable pipeline key (includes num_vertex_buffers)
-                let num_vb = 1 + r.instance_buffers.len();
-                let key = crate::materials::PipelineKey {
-                    color_formats: vec![format],
-                    depth_format,
-                    sample_count,
-                    num_vertex_buffers: num_vb,
-                };
-
-                // Get the pre-warmed pipeline
-                let pipeline = match r.material.pipeline_cache.get(&key) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                pass.set_pipeline(pipeline);
-
-                if let Some(bg) = r.material.bind_group() {
-                    pass.set_bind_group(0, bg, &[]);
-                }
-
-                let offset = (draw_idx as u32) * alignment;
-                pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
-
-                // Slot 0: base geometry vertex buffer
-                pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
-                // Slot 1+: instance buffers
-                for (i, ib) in r.instance_buffers.iter().enumerate() {
-                    if let Some(ref buf) = ib.gpu_buffer {
-                        pass.set_vertex_buffer((i + 1) as u32, buf.slice(..));
-                    }
-                }
-
-                pass.set_index_buffer(
-                    r.geometry.index_buffer.as_ref().unwrap().slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-
-                pass.draw_indexed(0..r.geometry.index_count(), 0, 0..r.instance_count);
-            }
+            pass.execute_bundles(std::iter::once(self.render_bundle.as_ref().unwrap()));
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
@@ -1200,7 +1314,42 @@ impl Renderer {
             self.run_cubemap_shadow_pass(scene);
         }
 
-        // GBuffer MRT render pass (non-MSAA)
+        // Check material dirty flags → invalidate gbuffer bundle
+        for idx in scene.ordered_indices() {
+            if let Some(r) = scene.get_renderable(idx) {
+                if r.material_dirty {
+                    self.gbuffer_bundle = None;
+                    break;
+                }
+            }
+        }
+
+        // Build GBuffer render bundle if needed
+        let gbuffer_object_count = scene.ordered_indices().count();
+        if self.gbuffer_bundle.is_none()
+            || self.gbuffer_last_object_count != gbuffer_object_count
+            || self.gbuffer_last_sample_count != gbuffer.sample_count
+        {
+            self.gbuffer_bundle = Some(self.build_render_bundle(
+                scene,
+                camera,
+                &GBuffer::MRT_FORMATS,
+                GBuffer::DEPTH_FORMAT,
+                gbuffer.sample_count,
+            ));
+            self.gbuffer_last_object_count = gbuffer_object_count;
+            self.gbuffer_last_sample_count = gbuffer.sample_count;
+        }
+
+        // Clear material_dirty flags
+        let ordered: Vec<usize> = scene.ordered_indices().collect();
+        for idx in ordered {
+            if let Some(r) = scene.get_renderable_mut(idx) {
+                r.material_dirty = false;
+            }
+        }
+
+        // GBuffer MRT render pass
         let device = self.device.as_ref().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Renderer/GBufferDraw"),
@@ -1242,51 +1391,7 @@ impl Renderer {
                 ..Default::default()
             });
 
-            pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
-            pass.set_bind_group(3, self.shadow_bind_group.as_ref().unwrap(), &[]);
-
-            let alignment = self.matrix_alignment;
-
-            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
-                let r = scene.get_renderable(scene_idx).unwrap();
-                if !r.visible || !r.geometry.initialized { continue; }
-
-                let num_vb = 1 + r.instance_buffers.len();
-                let key = crate::materials::PipelineKey {
-                    color_formats: GBuffer::MRT_FORMATS.to_vec(),
-                    depth_format: GBuffer::DEPTH_FORMAT,
-                    sample_count: gbuffer.sample_count,
-                    num_vertex_buffers: num_vb,
-                };
-
-                let pipeline = match r.material.pipeline_cache.get(&key) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                pass.set_pipeline(pipeline);
-
-                if let Some(bg) = r.material.bind_group() {
-                    pass.set_bind_group(0, bg, &[]);
-                }
-
-                let offset = (draw_idx as u32) * alignment;
-                pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
-
-                pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
-                for (i, ib) in r.instance_buffers.iter().enumerate() {
-                    if let Some(ref buf) = ib.gpu_buffer {
-                        pass.set_vertex_buffer((i + 1) as u32, buf.slice(..));
-                    }
-                }
-
-                pass.set_index_buffer(
-                    r.geometry.index_buffer.as_ref().unwrap().slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-
-                pass.draw_indexed(0..r.geometry.index_count(), 0, 0..r.instance_count);
-            }
+            pass.execute_bundles(std::iter::once(self.gbuffer_bundle.as_ref().unwrap()));
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
