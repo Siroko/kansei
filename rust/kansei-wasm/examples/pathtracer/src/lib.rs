@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use kansei_core::cameras::Camera;
+use kansei_core::controls::CameraControls;
 use kansei_core::geometries::BoxGeometry;
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Binding, Material, MaterialOptions};
@@ -188,10 +189,13 @@ struct State {
     renderer: Renderer,
     scene: Scene,
     camera: Camera,
+    controls: CameraControls,
     path_tracer: PathTracer,
     bvh_data: GPUBVHData,
     tlas: TLASBuilder,
     blit: BlitResources,
+    dragging: bool,
+    last_mouse: Option<(f32, f32)>,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -311,15 +315,49 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     log::info!("Kansei — Path Tracer (WASM) ready");
 
+    let controls = CameraControls::new(Vec3::new(0.0, 0.5, 0.0), 8.0);
+
     let state = Rc::new(RefCell::new(State {
         renderer,
         scene,
         camera,
+        controls,
         path_tracer: pt,
         bvh_data: gpu_data,
         tlas,
         blit,
+        dragging: false,
+        last_mouse: None,
     }));
+
+    // Mouse events for orbit controls
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
+        let mut st = s.borrow_mut();
+        if st.dragging {
+            if let Some((lx, ly)) = st.last_mouse {
+                let dx = (e.offset_x() as f32 - lx) * -0.005;
+                let dy = (e.offset_y() as f32 - ly) * 0.005;
+                st.controls.rotate(dx, dy);
+                st.path_tracer.reset_accumulation();
+            }
+        }
+        st.last_mouse = Some((e.offset_x() as f32, e.offset_y() as f32));
+      });
+      canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| { s.borrow_mut().dragging = e.buttons() & 1 != 0; });
+      canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |_: web_sys::MouseEvent| { s.borrow_mut().dragging = false; });
+      canvas.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
+        let mut st = s.borrow_mut();
+        st.controls.zoom(e.delta_y() as f32 * -0.01);
+        st.path_tracer.reset_accumulation();
+      });
+      canvas.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
 
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
@@ -331,13 +369,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let State {
                 ref mut renderer,
                 ref mut camera,
+                ref mut controls,
                 ref mut path_tracer,
                 ref bvh_data,
                 ref tlas,
                 ref blit,
                 ..
             } = *st;
-            camera.update_view_matrix();
+            controls.update(camera, 0.0);
 
             // Get surface texture
             let surface = renderer.surface().unwrap();

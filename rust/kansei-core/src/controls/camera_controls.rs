@@ -27,6 +27,13 @@ impl CameraControls {
         self.elevation = (self.elevation + dy).clamp(-1.5, 1.5);
     }
 
+    pub fn zoom(&mut self, delta: f32) {
+        self.radius = (self.radius - delta).clamp(1.0, 200.0);
+    }
+
+    pub fn set_azimuth(&mut self, a: f32) { self.azimuth = a; }
+    pub fn set_elevation(&mut self, e: f32) { self.elevation = e.clamp(-1.5, 1.5); }
+
     pub fn azimuth(&self) -> f32 {
         self.azimuth
     }
