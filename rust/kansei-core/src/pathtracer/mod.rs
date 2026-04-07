@@ -1,6 +1,7 @@
 mod blue_noise;
 mod buffers;
 mod bvh_builder;
+mod compositor;
 mod material;
 mod path_tracer;
 mod probes;
@@ -13,6 +14,7 @@ mod tlas_builder;
 pub use blue_noise::{generate_blue_noise, BLUE_NOISE_SIZE};
 pub use buffers::*;
 pub use bvh_builder::*;
+pub use compositor::Compositor;
 pub use material::PathTracerMaterial;
 pub use path_tracer::PathTracer;
 pub use probes::ProbeGrid;
