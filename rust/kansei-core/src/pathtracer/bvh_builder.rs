@@ -1,4 +1,10 @@
-use super::buffers::{BVH4Node, BinaryBVHNode, PackedTriangle};
+use wgpu::util::DeviceExt;
+
+use super::buffers::{BVH4Node, BinaryBVHNode, PackedInstance, PackedTriangle};
+use super::TLASBuilder;
+use crate::math::Mat4;
+use crate::objects::Scene;
+use crate::renderers::Renderer;
 
 // ── SAH constants ──────────────────────────────────────────────────────────
 
@@ -137,6 +143,33 @@ impl SAHBins {
     }
 }
 
+// ── GPU BVH output ────────────────────────────────────────────────────────
+
+/// Handles to GPU buffers produced by `BVHBuilder::upload_to_gpu`.
+pub struct GPUBVHData {
+    pub triangles_buf: wgpu::Buffer,
+    pub bvh4_nodes_buf: wgpu::Buffer,
+    pub instances_buf: wgpu::Buffer,
+    pub triangle_count: u32,
+    pub node_count: u32,
+    pub instance_count: u32,
+}
+
+// ── Transform helpers ─────────────────────────────────────────────────────
+
+/// Extract 3x4 row-major rows from a column-major Mat4.
+///
+/// Column-major layout: `d[0..4]=col0, d[4..8]=col1, d[8..12]=col2, d[12..16]=col3`
+/// Row-major 3x4: `[[row0], [row1], [row2]]`
+fn mat4_to_rows(m: &Mat4) -> [[f32; 4]; 3] {
+    let d = m.as_slice();
+    [
+        [d[0], d[4], d[8], d[12]],  // row 0
+        [d[1], d[5], d[9], d[13]],  // row 1
+        [d[2], d[6], d[10], d[14]], // row 2
+    ]
+}
+
 // ── BLAS entry (per-geometry bookkeeping) ──────────────────────────────────
 
 /// Tracks per-geometry triangle and node ranges.
@@ -170,6 +203,12 @@ pub struct BVHBuilder {
     pub bvh4_nodes: Vec<BVH4Node>,
     /// Per-geometry BLAS metadata.
     pub blas_entries: Vec<BLASEntry>,
+    /// Packed instances for TLAS (populated by `pack_instances`).
+    pub packed_instances: Vec<PackedInstance>,
+    /// Scene AABB minimum (computed during `pack_instances`).
+    pub scene_bounds_min: [f32; 3],
+    /// Scene AABB maximum (computed during `pack_instances`).
+    pub scene_bounds_max: [f32; 3],
 
     // ── Temporaries ──
     /// Binary BVH nodes (cleared after collapse).
@@ -195,6 +234,9 @@ impl BVHBuilder {
             triangles: Vec::new(),
             bvh4_nodes: Vec::new(),
             blas_entries: Vec::new(),
+            packed_instances: Vec::new(),
+            scene_bounds_min: [f32::INFINITY; 3],
+            scene_bounds_max: [f32::NEG_INFINITY; 3],
             binary_nodes: Vec::new(),
             aabb_cache: None,
             index_buf: Vec::new(),
@@ -711,6 +753,205 @@ impl BVHBuilder {
         n.child_max_z[slot] = node.bounds_max[2];
         n.children[slot] = child_bvh4_idx as i32;
         n.tri_counts[slot] = 0;
+    }
+
+    // ── Scene integration ─────────────────────────────────────────────────
+
+    /// Pack triangles from all scene renderables into this builder.
+    ///
+    /// Iterates `scene.ordered_indices()`, extracts position/normal data from
+    /// each renderable's `Geometry`, and calls `add_mesh()` for each.
+    pub fn pack_scene(&mut self, scene: &Scene) {
+        for idx in scene.ordered_indices() {
+            let renderable = match scene.get_renderable(idx) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let geo = &renderable.geometry;
+            if geo.indices.is_empty() || geo.vertices.is_empty() {
+                continue;
+            }
+
+            // Extract position [f32;3] and normal [f32;3] from Vertex
+            let positions: Vec<[f32; 3]> = geo
+                .vertices
+                .iter()
+                .map(|v| [v.position[0], v.position[1], v.position[2]])
+                .collect();
+            let normals: Vec<[f32; 3]> = geo
+                .vertices
+                .iter()
+                .map(|v| v.normal)
+                .collect();
+
+            // Material index: use the blas_entries index as a stand-in for now.
+            // Each renderable gets its own BLAS entry; material_index can be refined later.
+            let material_index = self.blas_entries.len() as u32;
+
+            self.add_mesh(&positions, &normals, &geo.indices, material_index);
+        }
+    }
+
+    /// Pack instance data for each renderable in the scene.
+    ///
+    /// Must be called **after** `build_all_blas()` (which includes BVH4 collapse)
+    /// so that `blas_entries` have valid `bvh4_offset`, `bvh4_count`, `tri_offset`,
+    /// and `tri_count`.
+    pub fn pack_instances(&mut self, scene: &Scene) {
+        self.packed_instances.clear();
+        self.scene_bounds_min = [f32::INFINITY; 3];
+        self.scene_bounds_max = [f32::NEG_INFINITY; 3];
+
+        let mut entry_idx = 0usize;
+        for idx in scene.ordered_indices() {
+            let renderable = match scene.get_renderable(idx) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let geo = &renderable.geometry;
+            if geo.indices.is_empty() || geo.vertices.is_empty() {
+                continue;
+            }
+
+            if entry_idx >= self.blas_entries.len() {
+                break;
+            }
+            let entry = &self.blas_entries[entry_idx];
+
+            let world = &renderable.object.world_matrix;
+            let inv_world = world.inverse();
+
+            let transform = mat4_to_rows(world);
+            let inv_transform = mat4_to_rows(&inv_world);
+
+            self.packed_instances.push(PackedInstance {
+                transform,
+                inv_transform,
+                blas_node_offset: entry.bvh4_offset as u32,
+                blas_tri_offset: entry.tri_offset as u32,
+                blas_tri_count: entry.tri_count as u32,
+                material_index: entry_idx as u32,
+            });
+
+            // Expand scene AABB by transforming the BLAS root AABB corners to world space.
+            // The BLAS root is at bvh4_offset; its child bounds define the object-space AABB.
+            if entry.bvh4_count > 0 {
+                let root = &self.bvh4_nodes[entry.bvh4_offset];
+                // Compute the object-space AABB from all used child slots of the root node.
+                let mut obj_min = [f32::INFINITY; 3];
+                let mut obj_max = [f32::NEG_INFINITY; 3];
+                for slot in 0..4 {
+                    if root.children[slot] == -1 && root.tri_counts[slot] == 0 {
+                        continue; // sentinel
+                    }
+                    obj_min[0] = obj_min[0].min(root.child_min_x[slot]);
+                    obj_min[1] = obj_min[1].min(root.child_min_y[slot]);
+                    obj_min[2] = obj_min[2].min(root.child_min_z[slot]);
+                    obj_max[0] = obj_max[0].max(root.child_max_x[slot]);
+                    obj_max[1] = obj_max[1].max(root.child_max_y[slot]);
+                    obj_max[2] = obj_max[2].max(root.child_max_z[slot]);
+                }
+
+                // Transform the 8 AABB corners to world space and expand scene bounds.
+                for cx in 0..2 {
+                    for cy in 0..2 {
+                        for cz in 0..2 {
+                            let corner = crate::math::Vec3::new(
+                                if cx == 0 { obj_min[0] } else { obj_max[0] },
+                                if cy == 0 { obj_min[1] } else { obj_max[1] },
+                                if cz == 0 { obj_min[2] } else { obj_max[2] },
+                            );
+                            let wc = world.transform_point(&corner);
+                            self.scene_bounds_min[0] = self.scene_bounds_min[0].min(wc.x);
+                            self.scene_bounds_min[1] = self.scene_bounds_min[1].min(wc.y);
+                            self.scene_bounds_min[2] = self.scene_bounds_min[2].min(wc.z);
+                            self.scene_bounds_max[0] = self.scene_bounds_max[0].max(wc.x);
+                            self.scene_bounds_max[1] = self.scene_bounds_max[1].max(wc.y);
+                            self.scene_bounds_max[2] = self.scene_bounds_max[2].max(wc.z);
+                        }
+                    }
+                }
+            }
+
+            entry_idx += 1;
+        }
+    }
+
+    /// Upload triangles, BVH4 nodes, and instances to GPU buffers.
+    ///
+    /// Must be called after `build_all_blas()` and `pack_instances()`.
+    pub fn upload_to_gpu(&self, renderer: &Renderer) -> GPUBVHData {
+        let device = renderer.device();
+
+        let triangles_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("BVH/Triangles"),
+            contents: bytemuck::cast_slice(&self.triangles),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let bvh4_nodes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("BVH/BVH4Nodes"),
+            contents: bytemuck::cast_slice(&self.bvh4_nodes),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let instances_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("BVH/Instances"),
+            contents: bytemuck::cast_slice(&self.packed_instances),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        GPUBVHData {
+            triangles_buf,
+            bvh4_nodes_buf,
+            instances_buf,
+            triangle_count: self.triangles.len() as u32,
+            node_count: self.bvh4_nodes.len() as u32,
+            instance_count: self.packed_instances.len() as u32,
+        }
+    }
+
+    /// Orchestrate the full BVH build pipeline:
+    /// 1. `pack_scene` — pack triangles from scene renderables
+    /// 2. `build_all_blas` — CPU SAH build + BVH4 collapse
+    /// 3. `pack_instances` — create instance data with transforms + BLAS offsets
+    /// 4. `upload_to_gpu` — create GPU buffers for triangles, nodes, instances
+    /// 5. `tlas.build` — GPU Morton sort + BVH4 TLAS construction
+    ///
+    /// Returns GPU buffer handles for use in the trace shader.
+    pub fn build_full(
+        &mut self,
+        renderer: &Renderer,
+        scene: &Scene,
+        tlas: &mut TLASBuilder,
+    ) -> GPUBVHData {
+        // Step 1: Pack triangles from scene
+        self.pack_scene(scene);
+
+        // Step 2: CPU SAH build + BVH4 collapse
+        self.build_all_blas();
+
+        // Step 3: Pack instance data
+        self.pack_instances(scene);
+
+        // Step 4: Upload to GPU
+        let gpu_data = self.upload_to_gpu(renderer);
+
+        // Step 5: Build TLAS on GPU (sort + BVH4)
+        if gpu_data.instance_count > 0 {
+            tlas.build(
+                renderer,
+                &gpu_data.instances_buf,
+                &gpu_data.bvh4_nodes_buf,
+                gpu_data.instance_count,
+                self.scene_bounds_min,
+                self.scene_bounds_max,
+            );
+        }
+
+        gpu_data
     }
 }
 
