@@ -77,17 +77,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     canvas.set_height(height);
 
     // sample_count=1 since post-processing GBuffer is non-MSAA
-    let renderer = Renderer::create(
-        RendererConfig {
-            width,
-            height,
-            sample_count: 1,
-            clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
-            ..Default::default()
-        },
-        wgpu::SurfaceTarget::Canvas(canvas.clone()),
-    )
-    .await;
+    let mut renderer = Renderer::new(RendererConfig {
+        width,
+        height,
+        sample_count: 1,
+        clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
+        ..Default::default()
+    });
+    renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas.clone())).await;
 
     let mut scene = Scene::new();
 
