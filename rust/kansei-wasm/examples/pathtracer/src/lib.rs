@@ -7,6 +7,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
 use kansei_core::geometries::BoxGeometry;
 use kansei_core::lights::{DirectionalLight, Light};
+use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -250,6 +251,40 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     box_b.object.set_position(1.5, 0.5, 0.0);
     scene.add(SceneNode::Renderable(box_b));
 
+    // Stanford Dragon (glass) — fetch via HTTP
+    let dragon_loaded = async {
+        let window = web_sys::window().unwrap();
+
+        // Fetch .gltf JSON
+        let gltf_resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str("assets/scene.gltf")).await.ok()?;
+        let gltf_resp: web_sys::Response = gltf_resp.dyn_into().ok()?;
+        let gltf_buf = wasm_bindgen_futures::JsFuture::from(gltf_resp.array_buffer().ok()?).await.ok()?;
+        let gltf_bytes = js_sys::Uint8Array::new(&gltf_buf).to_vec();
+
+        // Fetch .bin buffer
+        let bin_resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str("assets/scene.bin")).await.ok()?;
+        let bin_resp: web_sys::Response = bin_resp.dyn_into().ok()?;
+        let bin_buf = wasm_bindgen_futures::JsFuture::from(bin_resp.array_buffer().ok()?).await.ok()?;
+        let bin_bytes = js_sys::Uint8Array::new(&bin_buf).to_vec();
+
+        GLTFLoader::load_gltf_with_buffers(&gltf_bytes, vec![bin_bytes]).ok()
+    }.await;
+
+    if let Some(result) = dragon_loaded {
+        log::info!("Loaded dragon: {} renderables", result.renderables.len());
+        for gr in result.renderables {
+            let mut r = Renderable::new(gr.geometry, make_basic_material("Dragon", [0.9, 0.9, 0.95, 1.0]));
+            r.object.position = gr.position;
+            r.object.rotation = gr.rotation;
+            r.object.scale = Vec3::new(gr.scale.x * 20.0, gr.scale.y * 20.0, gr.scale.z * 20.0);
+            r.object.update_model_matrix();
+            r.object.update_world_matrix(None);
+            scene.add(SceneNode::Renderable(r));
+        }
+    } else {
+        log::warn!("Could not load dragon model");
+    }
+
     // Directional light
     let sun = DirectionalLight::new(
         Vec3::new(-0.5, -1.0, -0.3).normalize(),
@@ -281,22 +316,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut pt = PathTracer::new(&renderer);
     pt.resize(width, height);
     pt.set_spp(1);
-    pt.set_max_bounces(4);
+    pt.set_max_bounces(8); // more bounces for glass refraction
 
-    pt.set_materials(&[
-        PathTracerMaterial {
-            albedo: [0.7, 0.7, 0.7],
-            ..Default::default()
-        },
-        PathTracerMaterial {
-            albedo: [0.9, 0.2, 0.2],
-            ..Default::default()
-        },
-        PathTracerMaterial {
-            albedo: [0.2, 0.2, 0.9],
-            ..Default::default()
-        },
-    ]);
+    // Materials: floor=0, boxA=1, boxB=2, dragon parts=3+
+    let mut materials = vec![
+        PathTracerMaterial { albedo: [0.7, 0.7, 0.7], ..Default::default() },
+        PathTracerMaterial { albedo: [0.9, 0.2, 0.2], ..Default::default() },
+        PathTracerMaterial { albedo: [0.2, 0.2, 0.9], ..Default::default() },
+    ];
+    let dragon_count = gpu_data.instance_count as usize - 3;
+    for _ in 0..dragon_count {
+        materials.push(PathTracerMaterial::glass(1.5));
+    }
+    pt.set_materials(&materials);
 
     // Light data for path tracer
     let dir = Vec3::new(-0.5, -1.0, -0.3).normalize();
