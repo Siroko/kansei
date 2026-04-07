@@ -41,11 +41,15 @@ struct ShadowUniforms {
     bias: f32,
     normal_bias: f32,
     shadow_enabled: f32,
-    _pad: f32,
+    point_shadow_enabled: f32,
+    point_light_pos: vec3<f32>,
+    point_shadow_far: f32,
 };
 @group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
 @group(3) @binding(1) var shadow_sampler: sampler_comparison;
 @group(3) @binding(2) var<uniform> shadow_uniforms: ShadowUniforms;
+@group(3) @binding(3) var cube_shadow_tex: texture_2d_array<f32>;
+@group(3) @binding(4) var cube_shadow_sampler: sampler;
 
 // ── Vertex I/O ──
 struct VertexInput {
