@@ -322,14 +322,13 @@ impl ApplicationHandler for App {
             },
         ]);
 
-        // Light data for path tracer (directional: type=0, direction, color*intensity)
-        // Layout: [type, dir.x, dir.y, dir.z, r, g, b, intensity, ...pad to 16 floats]
+        // LightData: direction(vec3), light_type(u32), color(vec3), intensity(f32), normal(vec3), pad, extra(vec4)
         let dir = Vec3::new(-0.5, -1.0, -0.3).normalize();
         let light_data: [f32; 16] = [
-            0.0, dir.x, dir.y, dir.z,          // type + direction
-            1.0, 0.95, 0.9, 3.0,               // color + intensity
-            0.0, 0.0, 0.0, 0.0,                // padding
-            0.0, 0.0, 0.0, 0.0,                // padding
+            dir.x, dir.y, dir.z, f32::from_bits(1u32), // direction + LIGHT_DIRECTIONAL=1
+            1.0, 0.95, 0.9, 3.0,                        // color + intensity
+            0.0, 0.0, 0.0, 0.0,                         // normal (unused)
+            0.0, 0.0, 0.0, 0.0,                         // extra
         ];
         pt.set_lights_raw(&light_data);
 

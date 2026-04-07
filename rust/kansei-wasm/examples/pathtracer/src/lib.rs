@@ -194,8 +194,6 @@ struct State {
     bvh_data: GPUBVHData,
     tlas: TLASBuilder,
     blit: BlitResources,
-    dragging: bool,
-    last_mouse: Option<(f32, f32)>,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -302,11 +300,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // Light data for path tracer
     let dir = Vec3::new(-0.5, -1.0, -0.3).normalize();
+    // LightData: position/direction(vec3), light_type(u32), color(vec3), intensity(f32), normal(vec3), pad, extra(vec4)
     let light_data: [f32; 16] = [
-        0.0, dir.x, dir.y, dir.z,
-        1.0, 0.95, 0.9, 3.0,
-        0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0,
+        dir.x, dir.y, dir.z, f32::from_bits(1u32), // direction + LIGHT_DIRECTIONAL=1
+        1.0, 0.95, 0.9, 3.0,                        // color + intensity
+        0.0, 0.0, 0.0, 0.0,                         // normal (unused for directional)
+        0.0, 0.0, 0.0, 0.0,                         // extra
     ];
     pt.set_lights_raw(&light_data);
 
@@ -315,7 +314,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     log::info!("Kansei — Path Tracer (WASM) ready");
 
-    let controls = CameraControls::new(Vec3::new(0.0, 0.5, 0.0), 8.0);
+    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 0.5, 0.0), 8.0);
 
     let state = Rc::new(RefCell::new(State {
         renderer,
@@ -326,38 +325,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         bvh_data: gpu_data,
         tlas,
         blit,
-        dragging: false,
-        last_mouse: None,
     }));
-
-    // Mouse events for orbit controls
-    { let s = state.clone();
-      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
-        let mut st = s.borrow_mut();
-        if st.dragging {
-            if let Some((lx, ly)) = st.last_mouse {
-                let dx = (e.offset_x() as f32 - lx) * -0.005;
-                let dy = (e.offset_y() as f32 - ly) * 0.005;
-                st.controls.rotate(dx, dy);
-                st.path_tracer.reset_accumulation();
-            }
-        }
-        st.last_mouse = Some((e.offset_x() as f32, e.offset_y() as f32));
-      });
-      canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
-    { let s = state.clone();
-      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| { s.borrow_mut().dragging = e.buttons() & 1 != 0; });
-      canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
-    { let s = state.clone();
-      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |_: web_sys::MouseEvent| { s.borrow_mut().dragging = false; });
-      canvas.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
-    { let s = state.clone();
-      let cb = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
-        let mut st = s.borrow_mut();
-        st.controls.zoom(e.delta_y() as f32 * -0.01);
-        st.path_tracer.reset_accumulation();
-      });
-      canvas.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref()).ok(); cb.forget(); }
 
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
@@ -376,6 +344,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 ref blit,
                 ..
             } = *st;
+            if controls.is_dirty() {
+                path_tracer.reset_accumulation();
+            }
             controls.update(camera, 0.0);
 
             // Get surface texture
