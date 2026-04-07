@@ -91,19 +91,18 @@ fn calcDirectionalShadow(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
     let in_bounds = step(0.0, uv.x) * step(uv.x, 1.0)
                   * step(0.0, uv.y) * step(uv.y, 1.0)
                   * step(ndc.z, 1.0);
-    if (in_bounds < 0.5) {
-        return 1.0;
-    }
 
+    // PCF must run in uniform control flow — no early return before textureSampleCompare
     let tex_size = vec2<f32>(textureDimensions(shadow_depth_tex));
     let texel_size = 1.0 / tex_size;
     let ref_depth = ndc.z - shadow_uniforms.bias;
+    let clamped_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
 
     var shadow = 0.0;
     for (var x = -1; x <= 1; x++) {
         for (var y = -1; y <= 1; y++) {
             let sample_uv = clamp(
-                uv + vec2<f32>(f32(x), f32(y)) * texel_size,
+                clamped_uv + vec2<f32>(f32(x), f32(y)) * texel_size,
                 vec2<f32>(0.0), vec2<f32>(1.0)
             );
             shadow += textureSampleCompare(
@@ -112,7 +111,8 @@ fn calcDirectionalShadow(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
             );
         }
     }
-    return shadow / 9.0;
+    // Out-of-bounds → fully lit (1.0); in-bounds → PCF result
+    return mix(1.0, shadow / 9.0, in_bounds);
 }
 
 fn calcPointShadow(world_pos: vec3<f32>) -> f32 {

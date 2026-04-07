@@ -9,3 +9,6 @@ pub type Compute = ComputePass;
 pub use material::{Material, MaterialOptions, CullMode};
 pub(crate) use material::PipelineKey;
 pub use shader_utils::{parse_includes, ShaderChunks};
+
+// Re-export ShaderStages so user code doesn't need to import wgpu directly
+pub use wgpu::ShaderStages;

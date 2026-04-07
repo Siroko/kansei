@@ -6,7 +6,7 @@ use std::rc::Rc;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
-use kansei_core::materials::{Binding, Material, MaterialOptions};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -21,7 +21,7 @@ fn create_lit_material(label: &str, color: [f32; 4], specular: [f32; 4]) -> Mate
     let mut material = Material::new(
         label,
         LIT_WGSL,
-        vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
+        vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
         MaterialOptions::default(),
     );
     material.set_uniform_bindable(0, label, &mat_data);
@@ -78,7 +78,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
         ..Default::default()
     });
-    renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas.clone())).await;
+    renderer.initialize_with_canvas(canvas.clone()).await;
 
     // Enable shadow mapping
     renderer.enable_shadows(2048);
