@@ -217,7 +217,7 @@ impl ApplicationHandler for App {
         self.camera.look_at(&Vec3::new(0.0, 1.0, 0.0));
 
         // -- Post-processing volume with bloom + color grading --
-        let volume = PostProcessingVolume::from_renderer(
+        let volume = PostProcessingVolume::new(
             &renderer,
             vec![
                 Box::new(BloomEffect::new(BloomOptions {

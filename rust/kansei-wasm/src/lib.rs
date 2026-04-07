@@ -276,22 +276,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     // ── Sim ──
-    let mut sim = FluidSimulation::new(FluidSimulationOptions {
+    let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
         max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0,
         pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
         viscosity: 0.36, damping: 0.998, gravity: [0.0, -9.8, 0.0],
         mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
-    });
-    sim.initialize(&positions, renderer.device(), renderer.queue());
+    }, &positions);
     sim.world_bounds_min = [-25.0, -8.0, -16.0];
     sim.world_bounds_max = [25.0, 30.0, 16.0];
     sim.rebuild_grid();
 
     // ── Density field + surface renderer ──
-    let density_field = FluidDensityField::new(renderer.device(), renderer.queue(), sim.positions_buffer().unwrap(),
+    let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7 });
-    let surface_renderer = FluidSurfaceRenderer::new(renderer.device(), renderer.queue());
+    let surface_renderer = FluidSurfaceRenderer::new(&renderer);
     let cornell_box = CornellBox::new(&renderer, format, sim.world_bounds_min, sim.world_bounds_max);
 
     // ── Particle pipeline ──
@@ -792,7 +791,7 @@ pub fn get_frame_time() -> f64 {
 #[wasm_bindgen] pub fn set_kernel_scale(v: f32) { with_state(|s| s.density_field.kernel_scale = v); }
 #[wasm_bindgen] pub fn set_density_resolution(v: u32) {
     with_state(|s| {
-        s.density_field = FluidDensityField::new(s.renderer.device(), s.renderer.queue(), s.sim.positions_buffer().unwrap(),
+        s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
             s.sim.world_bounds_min, s.sim.world_bounds_max,
             DensityFieldOptions { resolution: v, kernel_scale: s.density_field.kernel_scale });
         s.surface_bg = s.surface_renderer.create_bind_group(
@@ -808,7 +807,7 @@ pub fn get_frame_time() -> f64 {
         s.sim.world_bounds_max = [max_x, max_y, max_z];
         s.sim.rebuild_grid();
         // Rebuild density field for new bounds
-        s.density_field = FluidDensityField::new(s.renderer.device(), s.renderer.queue(), s.sim.positions_buffer().unwrap(),
+        s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
             s.sim.world_bounds_min, s.sim.world_bounds_max,
             DensityFieldOptions { resolution: 128, kernel_scale: s.density_field.kernel_scale });
         s.surface_bg = s.surface_renderer.create_bind_group(
