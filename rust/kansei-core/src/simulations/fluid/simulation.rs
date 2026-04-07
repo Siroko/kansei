@@ -81,18 +81,20 @@ pub struct FluidSimulation {
 }
 
 impl FluidSimulation {
-    pub fn new(params: FluidSimulationOptions) -> Self {
-        let pc = params.max_particles;
-        Self {
+    pub fn new(renderer: &crate::renderers::Renderer, params: FluidSimulationOptions, positions: &[f32]) -> Self {
+        let device = renderer.device();
+        let queue = renderer.queue();
+        let particle_count = (positions.len() / 4) as u32;
+        let mut sim = Self {
             params,
             world_bounds_min: [0.0; 3],
             world_bounds_max: [0.0; 3],
-            particle_count: pc,
+            particle_count,
             grid_dims: [1, 1, 1],
             grid_origin: [0.0; 3],
             total_cells: 1,
-            device: None,
-            queue: None,
+            device: Some(device.clone()),
+            queue: Some(queue.clone()),
             params_data: vec![0.0; ParamOffsets::BUFFER_SIZE],
             params_buffer: None,
             positions_buffer: None,
@@ -120,21 +122,11 @@ impl FluidSimulation {
             forces: None,
             integrate: None,
             substep_param_buffers: Vec::new(),
-        }
-    }
-
-    /// Initialize from a Renderer reference (preferred for user-facing code).
-    pub fn initialize_from_renderer(&mut self, positions: &[f32], renderer: &crate::renderers::Renderer) {
-        self.initialize(positions, renderer.device(), renderer.queue());
-    }
-
-    pub fn initialize(&mut self, positions: &[f32], device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.device = Some(device.clone());
-        self.queue = Some(queue.clone());
-        self.particle_count = (positions.len() / 4) as u32;
-        self.compute_grid_from_positions(positions);
-        self.create_buffers(positions, device);
-        self.create_passes(device);
+        };
+        sim.compute_grid_from_positions(positions);
+        sim.create_buffers(positions, device);
+        sim.create_passes(device);
+        sim
     }
 
     fn compute_grid_from_positions(&mut self, positions: &[f32]) {

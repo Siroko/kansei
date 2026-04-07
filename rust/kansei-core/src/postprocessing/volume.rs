@@ -15,18 +15,8 @@ pub struct PostProcessingVolume {
 }
 
 impl PostProcessingVolume {
-    /// Create from a Renderer reference (preferred for user-facing code).
-    pub fn from_renderer(
-        renderer: &crate::renderers::Renderer,
-        effects: Vec<Box<dyn PostProcessingEffect>>,
-    ) -> Self {
-        Self::new(renderer.device(), renderer.queue(), renderer.presentation_format(), effects)
-    }
-
     pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        presentation_format: wgpu::TextureFormat,
+        renderer: &crate::renderers::Renderer,
         effects: Vec<Box<dyn PostProcessingEffect>>,
     ) -> Self {
         Self {
@@ -35,9 +25,9 @@ impl PostProcessingVolume {
             blit_pipeline: None,
             blit_sampler: None,
             blit_bgl: None,
-            device: device.clone(),
-            queue: queue.clone(),
-            presentation_format,
+            device: renderer.device().clone(),
+            queue: renderer.queue().clone(),
+            presentation_format: renderer.presentation_format(),
         }
     }
 

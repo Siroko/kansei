@@ -20,12 +20,9 @@ pub struct FluidSurfaceRenderer {
 }
 
 impl FluidSurfaceRenderer {
-    /// Create from a Renderer reference (preferred for user-facing code).
-    pub fn from_renderer(renderer: &crate::renderers::Renderer) -> Self {
-        Self::new(renderer.device(), renderer.queue())
-    }
-
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    pub fn new(renderer: &crate::renderers::Renderer) -> Self {
+        let device = renderer.device();
+        let queue = renderer.queue();
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FluidSurface/Shader"),
             source: wgpu::ShaderSource::Wgsl(SURFACE_WGSL.into()),

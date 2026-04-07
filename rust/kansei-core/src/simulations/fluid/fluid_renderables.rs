@@ -141,7 +141,7 @@ impl RaymarchingRenderable {
         bounds_min: [f32; 3],
         bounds_max: [f32; 3],
     ) -> Self {
-        let surface_renderer = FluidSurfaceRenderer::new(renderer.raw_device(), renderer.raw_queue());
+        let surface_renderer = FluidSurfaceRenderer::new(renderer);
         let blit = FullscreenBlit::new(renderer, surface_format);
         let density_view = density_field.density_view.clone();
         let (color_texture, color_view, depth_texture, depth_view, output_texture, output_view) =
