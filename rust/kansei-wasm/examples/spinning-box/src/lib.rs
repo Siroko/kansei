@@ -48,7 +48,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
         ..Default::default()
     });
-    renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas.clone())).await;
+    renderer.initialize_with_canvas(canvas.clone()).await;
 
     // Scene: CornellBox
     let mut scene = Scene::new();

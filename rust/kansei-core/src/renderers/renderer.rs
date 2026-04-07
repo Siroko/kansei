@@ -145,11 +145,20 @@ impl Renderer {
     ///
     /// **WASM (canvas):**
     /// ```ignore
+    /// Initialize from an HTML canvas element (WASM only).
+    /// ```ignore
+    /// renderer.initialize_with_canvas(canvas).await;
+    /// ```
+    #[cfg(target_arch = "wasm32")]
+    pub async fn initialize_with_canvas(&mut self, canvas: web_sys::HtmlCanvasElement) {
+        self.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas)).await;
+    }
+
     /// Initialize the Renderer from a platform surface target.
     /// Handles Instance, Surface, Adapter, Device creation internally.
     ///
     /// Native: `renderer.initialize_with_target(window.clone()).await`
-    /// WASM: `renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas)).await`
+    /// WASM: `renderer.initialize_with_canvas(canvas).await`
     pub async fn initialize_with_target(&mut self, target: impl Into<wgpu::SurfaceTarget<'static>>) {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             #[cfg(target_arch = "wasm32")]

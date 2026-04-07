@@ -1,0 +1,10 @@
+/Users/felixmartinez/Documents/dev/kansei/rust/kansei-wasm/examples/shadow-scene/target/wasm32-unknown-unknown/release/deps/libc-d2fe6de033d55e60.d: /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/lib.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/macros.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/mod.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/common/mod.rs
+
+/Users/felixmartinez/Documents/dev/kansei/rust/kansei-wasm/examples/shadow-scene/target/wasm32-unknown-unknown/release/deps/liblibc-d2fe6de033d55e60.rlib: /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/lib.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/macros.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/mod.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/common/mod.rs
+
+/Users/felixmartinez/Documents/dev/kansei/rust/kansei-wasm/examples/shadow-scene/target/wasm32-unknown-unknown/release/deps/liblibc-d2fe6de033d55e60.rmeta: /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/lib.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/macros.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/mod.rs /Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/common/mod.rs
+
+/Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/lib.rs:
+/Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/macros.rs:
+/Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/mod.rs:
+/Users/felixmartinez/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.184/src/new/common/mod.rs:

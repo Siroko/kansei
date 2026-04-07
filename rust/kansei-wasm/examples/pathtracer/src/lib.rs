@@ -222,7 +222,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
         ..Default::default()
     });
-    renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas.clone())).await;
+    renderer.initialize_with_canvas(canvas.clone()).await;
 
     // Build scene
     let mut scene = Scene::new();

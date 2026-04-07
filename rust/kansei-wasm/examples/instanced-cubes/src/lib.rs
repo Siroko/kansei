@@ -6,7 +6,7 @@ use std::rc::Rc;
 use kansei_core::buffers::InstanceBuffer;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::materials::{Binding, Material, MaterialOptions};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Mat4, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -88,7 +88,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
         ..Default::default()
     });
-    renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas.clone())).await;
+    renderer.initialize_with_canvas(canvas.clone()).await;
 
     // Geometry: 1x1x1 box
     let geometry = BoxGeometry::new(1.0, 1.0, 1.0);
@@ -98,7 +98,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut material = Material::new(
         "InstancedMaterial",
         INSTANCED_WGSL,
-        vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
+        vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
         MaterialOptions::default(),
     );
     material.set_uniform_bindable(0, "ColorUniform", &color_data);
