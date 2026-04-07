@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::cameras::Camera;
-use kansei_core::objects::{CornellBox, Scene};
+use kansei_core::lights::{DirectionalLight, Light, PointLight};
+use kansei_core::objects::{CornellBox, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
 
 #[wasm_bindgen(start)]
@@ -54,6 +55,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut scene = Scene::new();
     let cornell_box = CornellBox::new([-4.0, -1.5, -4.0], [4.0, 4.0, 4.0]);
     cornell_box.add_to_scene(&mut scene);
+
+    // Lights
+    scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(
+        Vec3::new(-0.5, -1.0, -0.3),
+        Vec3::new(1.0, 0.95, 0.8),
+        1.0,
+    ))));
+    scene.add(SceneNode::Light(Light::Point(PointLight::new(
+        Vec3::new(0.0, 3.0, 2.0),
+        Vec3::new(1.0, 0.8, 0.6),
+        2.0,
+        15.0,
+    ))));
 
     // Camera
     let mut camera = Camera::new(45.0, 0.1, 100.0, width as f32 / height as f32);
