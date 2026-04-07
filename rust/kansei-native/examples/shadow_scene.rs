@@ -146,6 +146,8 @@ impl ApplicationHandler for App {
 
         // Enable shadow mapping (2048x2048 shadow map)
         renderer.enable_shadows(2048);
+        // Enable point light cubemap shadows (512x512 per face, up to 4 lights)
+        renderer.enable_point_shadows(512, 4);
 
         // ── Floor ──
         let floor_geo = PlaneGeometry::new(30.0, 30.0);
@@ -199,13 +201,15 @@ impl ApplicationHandler for App {
         dir_light.cast_shadow = true;
         self.scene.add(SceneNode::Light(Light::Directional(dir_light)));
 
-        // Point: soft warm above-left
-        self.scene.add(SceneNode::Light(Light::Point(PointLight::new(
+        // Point: soft warm above-left, casting cubemap shadows
+        let mut point = PointLight::new(
             Vec3::new(-3.0, 4.0, 2.0),
             Vec3::new(1.0, 0.8, 0.5),
             2.0,
             20.0,
-        ))));
+        );
+        point.cast_shadow = true;
+        self.scene.add(SceneNode::Light(Light::Point(point)));
 
         // Camera
         self.camera.aspect = size.width as f32 / size.height as f32;
