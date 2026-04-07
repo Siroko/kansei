@@ -353,7 +353,42 @@ impl CubeMapShadowMap {
             ],
         });
 
+        let floats_per_slot = self.matrix_alignment as usize / 4;
+        let total_floats = new_cap * floats_per_slot;
+        self.world_staging.resize(total_floats, 0.0);
+        self.normal_staging.resize(total_floats, 0.0);
+
         self.object_capacity = new_cap;
+    }
+
+    /// Number of floats in the world staging buffer.
+    pub fn world_staging_len(&self) -> usize {
+        self.world_staging.len()
+    }
+
+    /// Write a world matrix into the staging buffer at the given object index.
+    pub fn write_world_matrix(&mut self, index: usize, data: &[f32]) {
+        let floats_per_slot = self.matrix_alignment as usize / 4;
+        let offset = index * floats_per_slot;
+        let end = (offset + 16).min(self.world_staging.len());
+        let count = end - offset;
+        self.world_staging[offset..offset + count].copy_from_slice(&data[..count]);
+    }
+
+    /// Write a normal matrix into the staging buffer at the given object index.
+    pub fn write_normal_matrix(&mut self, index: usize, data: &[f32]) {
+        let floats_per_slot = self.matrix_alignment as usize / 4;
+        let offset = index * floats_per_slot;
+        let end = (offset + 16).min(self.normal_staging.len());
+        let count = end - offset;
+        self.normal_staging[offset..offset + count].copy_from_slice(&data[..count]);
+    }
+
+    /// Upload mesh staging buffers to the GPU.
+    pub fn upload_mesh_matrices(&self, queue: &wgpu::Queue) {
+        if self.object_capacity == 0 { return; }
+        queue.write_buffer(&self.mesh_world_buf, 0, bytemuck::cast_slice(&self.world_staging));
+        queue.write_buffer(&self.mesh_normal_buf, 0, bytemuck::cast_slice(&self.normal_staging));
     }
 
     /// Upload the 6 face view-projection matrices and light position for one

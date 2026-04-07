@@ -73,6 +73,8 @@ pub struct Renderer {
     shadow_light_vp_bgl: Option<wgpu::BindGroupLayout>,
     shadow_light_vp_bg: Option<wgpu::BindGroup>,
     shadows_enabled: bool,
+    // Cubemap shadow resources (point lights)
+    cubemap_shadow_map: Option<crate::shadows::CubeMapShadowMap>,
 }
 
 impl Renderer {
@@ -111,6 +113,7 @@ impl Renderer {
             shadow_light_vp_bgl: None,
             shadow_light_vp_bg: None,
             shadows_enabled: false,
+            cubemap_shadow_map: None,
         }
     }
 
@@ -620,6 +623,194 @@ impl Renderer {
         self.shadows_enabled = true;
     }
 
+    /// Enable cubemap shadow mapping for point lights.
+    pub fn enable_point_shadows(&mut self, resolution: u32, max_lights: u32) {
+        let csm = crate::shadows::CubeMapShadowMap::new(self, resolution, max_lights);
+
+        // Rebuild shadow bind group with real cubemap texture
+        let device = self.device.as_ref().unwrap();
+        let shared = self.shared_layouts.as_ref().unwrap();
+
+        self.shadow_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Renderer/ShadowBG"),
+            layout: &shared.shadow_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        if let Some(ref sm) = self.shadow_map {
+                            sm.depth_view.as_ref().unwrap()
+                        } else {
+                            self.shadow_dummy_depth_view.as_ref().unwrap()
+                        },
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        self.shadow_comparison_sampler.as_ref().unwrap(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.shadow_uniform_buf.as_ref().unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&csm.distance_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(
+                        self.cube_shadow_sampler.as_ref().unwrap(),
+                    ),
+                },
+            ],
+        }));
+
+        self.cubemap_shadow_map = Some(csm);
+    }
+
+    /// Run the cubemap shadow pass for point lights.
+    ///
+    /// This is extracted into its own method to avoid borrow conflicts in render().
+    fn run_cubemap_shadow_pass(&mut self, scene: &Scene) {
+        // Collect shadow-casting point lights
+        let shadow_point_lights: Vec<_> = scene
+            .lights()
+            .filter_map(|l| match l {
+                crate::lights::Light::Point(pl) if pl.cast_shadow => {
+                    Some((pl.position, pl.radius))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let csm = match self.cubemap_shadow_map.as_mut() {
+            Some(csm) => csm,
+            None => return,
+        };
+
+        let max = csm.max_lights as usize;
+        let shadow_point_lights: Vec<_> = shadow_point_lights.into_iter().take(max).collect();
+
+        if shadow_point_lights.is_empty() {
+            return;
+        }
+
+        let (first_light_pos, first_light_radius) = shadow_point_lights[0];
+        let light_pos = [first_light_pos.x, first_light_pos.y, first_light_pos.z];
+
+        let queue = self.queue.as_ref().unwrap();
+        let device = self.device.as_ref().unwrap();
+
+        // Upload face uniforms for first shadow-casting point light
+        csm.upload_face_uniforms(queue, 0, &light_pos, first_light_radius);
+
+        // Ensure mesh buffers sized for scene
+        let renderable_count = scene.ordered_indices().count();
+        csm.ensure_mesh_buffers(device, renderable_count);
+
+        // Upload mesh matrices to cubemap shadow's own buffers
+        let csm_alignment = csm.matrix_alignment();
+        let floats_per_slot = csm_alignment as usize / 4;
+
+        for (i, idx) in scene.ordered_indices().enumerate() {
+            if let Some(r) = scene.get_renderable(idx) {
+                let offset = i * floats_per_slot;
+                if offset + 16 <= csm.world_staging_len() {
+                    csm.write_world_matrix(i, r.world_matrix.as_slice());
+                    csm.write_normal_matrix(i, r.normal_matrix.as_slice());
+                }
+            }
+        }
+        csm.upload_mesh_matrices(queue);
+
+        let shadow_far = csm.shadow_far;
+        let csm_uniform_alignment = csm.uniform_alignment();
+
+        // Render 6 faces
+        for face in 0..6u32 {
+            let face_slot = face as usize; // light 0, face N
+            let color_view = csm.face_color_view(face_slot);
+
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("CubemapShadow"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: shadow_far as f64,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: csm.scratch_depth_view(),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+
+                pass.set_pipeline(csm.pipeline());
+                let light_offset = face * csm_uniform_alignment;
+                pass.set_bind_group(0, csm.light_uniform_bg(), &[light_offset]);
+
+                for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                    if let Some(r) = scene.get_renderable(scene_idx) {
+                        if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                            continue;
+                        }
+
+                        let mesh_offset = (draw_idx as u32) * csm_alignment;
+                        pass.set_bind_group(1, csm.mesh_bg(), &[mesh_offset, mesh_offset]);
+                        pass.set_vertex_buffer(
+                            0,
+                            r.geometry.vertex_buffer.as_ref().unwrap().slice(..),
+                        );
+                        pass.set_index_buffer(
+                            r.geometry.index_buffer.as_ref().unwrap().slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
+                    }
+                }
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Upload point shadow params to shadow uniform buffer
+        let mut shadow_data = [0.0f32; 24];
+        // Preserve existing directional shadow data if present
+        if self.shadows_enabled {
+            if let Some(ref sm) = self.shadow_map {
+                shadow_data[..16].copy_from_slice(sm.light_vp.as_slice());
+                shadow_data[16] = sm.bias;
+                shadow_data[17] = sm.normal_bias;
+                shadow_data[18] = 1.0; // shadowEnabled
+            }
+        }
+        shadow_data[19] = 1.0; // pointShadowEnabled
+        shadow_data[20] = light_pos[0];
+        shadow_data[21] = light_pos[1];
+        shadow_data[22] = light_pos[2];
+        shadow_data[23] = first_light_radius;
+
+        if let Some(ref buf) = self.shadow_uniform_buf {
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
+        }
+    }
+
     /// Render the scene to the canvas surface (simple path).
     pub fn render(&mut self, scene: &mut Scene, camera: &mut Camera) {
         // Phase 0: Update transforms, prepare scene
@@ -744,11 +935,16 @@ impl Renderer {
         }
 
         // Upload disabled shadow uniforms when shadows are off
-        if !self.shadows_enabled {
+        if !self.shadows_enabled && self.cubemap_shadow_map.is_none() {
             let shadow_data = [0.0f32; 24];
             if let Some(ref buf) = self.shadow_uniform_buf {
                 self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
             }
+        }
+
+        // Cubemap shadow pass (point lights)
+        if self.cubemap_shadow_map.is_some() {
+            self.run_cubemap_shadow_pass(scene);
         }
 
         // Phase 2+3: Create render pass and draw
@@ -992,11 +1188,16 @@ impl Renderer {
                     self.queue.as_ref().unwrap().submit(std::iter::once(shadow_encoder.finish()));
                 }
             }
-        } else {
+        } else if self.cubemap_shadow_map.is_none() {
             let shadow_data = [0.0f32; 24];
             if let Some(ref buf) = self.shadow_uniform_buf {
                 self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
             }
+        }
+
+        // Cubemap shadow pass (point lights)
+        if self.cubemap_shadow_map.is_some() {
+            self.run_cubemap_shadow_pass(scene);
         }
 
         // GBuffer MRT render pass (non-MSAA)
