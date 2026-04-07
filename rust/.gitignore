@@ -1,4 +1,7 @@
 /target/
 Cargo.lock
 kansei-wasm/pkg/
+kansei-wasm/examples/*/target/
+kansei-wasm/examples/*/pkg/
+kansei-wasm/examples/*/Cargo.lock
 *.DS_Store
