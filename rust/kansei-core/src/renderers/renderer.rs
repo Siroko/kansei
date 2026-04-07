@@ -1595,4 +1595,14 @@ impl Renderer {
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
     }
+
+    /// Initialize and update a compute system.
+    pub fn run_system(&self, system: &mut dyn crate::systems::ComputeSystem, dt: f32) {
+        if !system.is_initialized() {
+            let device = self.device.as_ref().unwrap();
+            let queue = self.queue.as_ref().unwrap();
+            system.initialize(device, queue);
+        }
+        system.update(dt);
+    }
 }
