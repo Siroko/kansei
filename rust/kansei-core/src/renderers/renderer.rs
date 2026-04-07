@@ -569,7 +569,7 @@ impl Renderer {
                 depth_stencil: Some(wgpu::RenderBundleDepthStencil {
                     format: depth_format,
                     depth_read_only: false,
-                    stencil_read_only: false,
+                    stencil_read_only: true,
                 }),
                 sample_count,
                 multiview: None,
