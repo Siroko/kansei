@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use super::binding::{Binding, BindGroupBuilder, BindingResource};
+use super::shader_utils::ShaderChunks;
 use crate::buffers::{BufferType, GpuBuffer};
 use crate::renderers::Renderer;
 use crate::renderers::SharedLayouts;
@@ -57,6 +58,7 @@ pub(crate) struct PipelineKey {
 pub struct Material {
     pub label: String,
     pub shader_code: String,
+    pub shader_chunks: Option<ShaderChunks>,
     pub options: MaterialOptions,
     pub bindings: Vec<Binding>,
     bindables: Vec<(u32, GpuBuffer)>,
@@ -73,6 +75,7 @@ impl Material {
         Self {
             label: label.to_string(),
             shader_code: shader_code.to_string(),
+            shader_chunks: None,
             options,
             bindings,
             bindables: Vec::new(),
@@ -91,9 +94,15 @@ impl Material {
             return;
         }
 
+        let processed_code = if let Some(ref chunks) = self.shader_chunks {
+            crate::materials::parse_includes(&self.shader_code, chunks)
+        } else {
+            self.shader_code.clone()
+        };
+
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("{}/Shader", self.label)),
-            source: wgpu::ShaderSource::Wgsl(self.shader_code.as_str().into()),
+            source: wgpu::ShaderSource::Wgsl(processed_code.as_str().into()),
         });
 
         let material_bgl = BindGroupBuilder::create_layout(
