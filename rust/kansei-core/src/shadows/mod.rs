@@ -1,6 +1,5 @@
 mod shadow_map;
+mod cubemap_shadow_map;
 
 pub use shadow_map::ShadowMap;
-
-/// Cubemap shadow map for point lights (future).
-pub struct CubeMapShadowMap;
+pub use cubemap_shadow_map::CubeMapShadowMap;
