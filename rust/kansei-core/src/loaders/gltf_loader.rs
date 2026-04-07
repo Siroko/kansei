@@ -53,6 +53,29 @@ impl GLTFLoader {
         })
     }
 
+    /// Load from in-memory glTF JSON + external binary buffer(s).
+    /// Use this for WASM where .gltf + .bin are fetched separately via HTTP.
+    pub fn load_gltf_with_buffers(
+        gltf_json: &[u8],
+        external_buffers: Vec<Vec<u8>>,
+    ) -> Result<GLTFResult, String> {
+        let gltf = gltf::Gltf::from_slice(gltf_json)
+            .map_err(|e| format!("Failed to parse glTF JSON: {}", e))?;
+
+        // Wrap external buffers as gltf::buffer::Data
+        let buffers: Vec<gltf::buffer::Data> = external_buffers
+            .into_iter()
+            .map(gltf::buffer::Data)
+            .collect();
+
+        let materials = Self::parse_materials(&gltf.document);
+        let renderables = Self::parse_scene(&gltf.document, &buffers);
+        Ok(GLTFResult {
+            renderables,
+            materials,
+        })
+    }
+
     fn parse_materials(doc: &gltf::Document) -> Vec<GLTFMaterialInfo> {
         doc.materials()
             .map(|mat| {
