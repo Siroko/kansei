@@ -105,11 +105,10 @@ impl ApplicationHandler for App {
             .with_title("Kansei — Fluid 3D").with_inner_size(winit::dpi::LogicalSize::new(1280, 720))).unwrap());
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&Default::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), ..Default::default() });
-        pollster::block_on(renderer.initialize(surface, &adapter));
+        let mut renderer = pollster::block_on(Renderer::create(
+            RendererConfig { width: size.width, height: size.height, sample_count: 1, clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0), ..Default::default() },
+            window.clone(),
+        ));
         let format = renderer.presentation_format();
 
         // Particles

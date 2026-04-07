@@ -7,7 +7,7 @@ use kansei_core::buffers::InstanceBuffer;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
 use kansei_core::materials::{Binding, Material, MaterialOptions};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{Mat4, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
 
@@ -28,8 +28,8 @@ fn build_instance_matrices(time: f32) -> Vec<f32> {
                 let py = y as f32 * SPACING - offset;
                 let pz = z as f32 * SPACING - offset;
                 let angle = time * 0.5 + (x + y + z) as f32 * 0.3;
-                let m = glam::Mat4::from_translation(glam::Vec3::new(px, py, pz))
-                    * glam::Mat4::from_rotation_y(angle);
+                let m = Mat4::from_translation(Vec3::new(px, py, pz))
+                    * Mat4::from_rotation_y(angle);
                 data[idx..idx + 16].copy_from_slice(&m.to_cols_array());
                 idx += 16;
             }
@@ -81,29 +81,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     canvas.set_width(width);
     canvas.set_height(height);
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::BROWSER_WEBGPU,
-        ..Default::default()
-    });
-    let surface = instance
-        .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-        .map_err(|e| JsValue::from_str(&format!("{e}")))?;
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
+    let renderer = Renderer::create(
+        RendererConfig {
+            width,
+            height,
+            sample_count: 1,
+            clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
             ..Default::default()
-        })
-        .await
-        .ok_or("No adapter")?;
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize(surface, &adapter).await;
+        },
+        wgpu::SurfaceTarget::Canvas(canvas.clone()),
+    )
+    .await;
 
     // Geometry: 1x1x1 box
     let geometry = BoxGeometry::new(1.0, 1.0, 1.0);

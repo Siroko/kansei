@@ -130,24 +130,17 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&Default::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            }))
-            .unwrap();
-
         // Use sample_count=1 since post-processing GBuffer is non-MSAA
-        let mut renderer = Renderer::new(RendererConfig {
-            width: size.width,
-            height: size.height,
-            sample_count: 1,
-            clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
-            ..Default::default()
-        });
-        pollster::block_on(renderer.initialize(surface, &adapter));
+        let renderer = pollster::block_on(Renderer::create(
+            RendererConfig {
+                width: size.width,
+                height: size.height,
+                sample_count: 1,
+                clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
+                ..Default::default()
+            },
+            window.clone(),
+        ));
 
         // -- Floor --
         let floor_geo = PlaneGeometry::new(20.0, 20.0);

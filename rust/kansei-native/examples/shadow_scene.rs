@@ -124,25 +124,17 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
 
-        // wgpu instance, surface, adapter
-        let instance = wgpu::Instance::new(&Default::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            }))
-            .unwrap();
-
         // Renderer with dark background
-        let mut renderer = Renderer::new(RendererConfig {
-            width: size.width,
-            height: size.height,
-            sample_count: 4,
-            clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
-            ..Default::default()
-        });
-        pollster::block_on(renderer.initialize(surface, &adapter));
+        let mut renderer = pollster::block_on(Renderer::create(
+            RendererConfig {
+                width: size.width,
+                height: size.height,
+                sample_count: 4,
+                clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
+                ..Default::default()
+            },
+            window.clone(),
+        ));
 
         // Enable shadow mapping (2048x2048 shadow map)
         renderer.enable_shadows(2048);

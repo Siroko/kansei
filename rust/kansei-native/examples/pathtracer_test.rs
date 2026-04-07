@@ -240,24 +240,17 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
 
-        // ── wgpu init ────────────────────────────────────────────────────
-        let instance = wgpu::Instance::new(&Default::default());
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
+        // ── Renderer ──────────────────────────────────────────────────────
+        let renderer = pollster::block_on(Renderer::create(
+            RendererConfig {
+                width: size.width,
+                height: size.height,
+                sample_count: 1, // no MSAA for path tracer test
+                clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
                 ..Default::default()
-            }))
-            .unwrap();
-
-        let mut renderer = Renderer::new(RendererConfig {
-            width: size.width,
-            height: size.height,
-            sample_count: 1, // no MSAA for path tracer test
-            clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-            ..Default::default()
-        });
-        pollster::block_on(renderer.initialize(surface, &adapter));
+            },
+            window.clone(),
+        ));
 
         // ── Build scene ──────────────────────────────────────────────────
 
