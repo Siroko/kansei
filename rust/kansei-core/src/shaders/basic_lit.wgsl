@@ -115,6 +115,55 @@ fn calcDirectionalShadow(world_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
     return shadow / 9.0;
 }
 
+fn calcPointShadow(world_pos: vec3<f32>) -> f32 {
+    if (shadow_uniforms.point_shadow_enabled < 0.5) {
+        return 1.0;
+    }
+
+    let to_frag = world_pos - shadow_uniforms.point_light_pos;
+    let dist = length(to_frag);
+    let dir = to_frag / max(dist, 1e-6);
+
+    let ax = abs(dir.x);
+    let ay = abs(dir.y);
+    let az = abs(dir.z);
+
+    var face_index: i32;
+    var uv: vec2<f32>;
+
+    if (ax >= ay && ax >= az) {
+        if (dir.x > 0.0) {
+            face_index = 0; uv = vec2<f32>(-dir.z, -dir.y) / ax;
+        } else {
+            face_index = 1; uv = vec2<f32>(dir.z, -dir.y) / ax;
+        }
+    } else if (ay >= ax && ay >= az) {
+        if (dir.y > 0.0) {
+            face_index = 2; uv = vec2<f32>(dir.x, dir.z) / ay;
+        } else {
+            face_index = 3; uv = vec2<f32>(dir.x, -dir.z) / ay;
+        }
+    } else {
+        if (dir.z > 0.0) {
+            face_index = 4; uv = vec2<f32>(dir.x, -dir.y) / az;
+        } else {
+            face_index = 5; uv = vec2<f32>(-dir.x, -dir.y) / az;
+        }
+    }
+
+    uv = uv * 0.5 + 0.5;
+
+    let tex_size = vec2<f32>(textureDimensions(cube_shadow_tex));
+    let tex_coord = vec2<i32>(clamp(uv * tex_size, vec2<f32>(0.0), tex_size - 1.0));
+    let stored_dist = textureLoad(cube_shadow_tex, tex_coord, face_index, 0).r;
+
+    let bias = 0.05;
+    if (dist - bias > stored_dist) {
+        return 0.0;
+    }
+    return 1.0;
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let n = normalize(input.world_normal);
@@ -172,7 +221,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         specular += pl.color * spec_color * spec * atten;
     }
 
-    let shadow = calcDirectionalShadow(input.world_position, n);
+    let dir_shadow = calcDirectionalShadow(input.world_position, n);
+    let point_shadow = calcPointShadow(input.world_position);
+    let shadow = dir_shadow * point_shadow;
     let final_color = base_color * (ambient + diffuse * shadow) + specular * shadow;
     return vec4<f32>(final_color, material.color.a);
 }
