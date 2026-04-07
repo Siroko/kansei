@@ -30,13 +30,11 @@ impl ApplicationHandler for App {
             Window::default_attributes().with_title("Kansei — Basic").with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
         ).unwrap());
         let size = window.inner_size();
-        let renderer = pollster::block_on(Renderer::create(
-            RendererConfig {
-                width: size.width, height: size.height, sample_count: 1,
-                clear_color: Vec4::new(0.1, 0.2, 0.3, 1.0), ..Default::default()
-            },
-            window.clone(),
-        ));
+        let mut renderer = Renderer::new(RendererConfig {
+            width: size.width, height: size.height, sample_count: 1,
+            clear_color: Vec4::new(0.1, 0.2, 0.3, 1.0), ..Default::default()
+        });
+        pollster::block_on(renderer.initialize_with_target(window.clone()));
         self.renderer = Some(renderer);
         self.window = Some(window);
     }

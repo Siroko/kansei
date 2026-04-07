@@ -45,16 +45,14 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
 
         // Renderer
-        let renderer = pollster::block_on(Renderer::create(
-            RendererConfig {
-                width: size.width,
-                height: size.height,
-                sample_count: 4,
-                clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
-                ..Default::default()
-            },
-            window.clone(),
-        ));
+        let mut renderer = Renderer::new(RendererConfig {
+            width: size.width,
+            height: size.height,
+            sample_count: 4,
+            clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
+            ..Default::default()
+        });
+        pollster::block_on(renderer.initialize_with_target(window.clone()));
 
         // CornellBox object built from 6 PlaneGeometry + shared material uniforms.
         let cornell_box = CornellBox::new([-4.0, -1.5, -4.0], [4.0, 4.0, 4.0]);

@@ -81,17 +81,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     canvas.set_width(width);
     canvas.set_height(height);
 
-    let renderer = Renderer::create(
-        RendererConfig {
-            width,
-            height,
-            sample_count: 1,
-            clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
-            ..Default::default()
-        },
-        wgpu::SurfaceTarget::Canvas(canvas.clone()),
-    )
-    .await;
+    let mut renderer = Renderer::new(RendererConfig {
+        width,
+        height,
+        sample_count: 1,
+        clear_color: Vec4::new(0.05, 0.05, 0.08, 1.0),
+        ..Default::default()
+    });
+    renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas.clone())).await;
 
     // Geometry: 1x1x1 box
     let geometry = BoxGeometry::new(1.0, 1.0, 1.0);

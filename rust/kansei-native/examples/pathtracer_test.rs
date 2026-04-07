@@ -241,16 +241,14 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
 
         // ── Renderer ──────────────────────────────────────────────────────
-        let renderer = pollster::block_on(Renderer::create(
-            RendererConfig {
-                width: size.width,
-                height: size.height,
-                sample_count: 1, // no MSAA for path tracer test
-                clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-                ..Default::default()
-            },
-            window.clone(),
-        ));
+        let mut renderer = Renderer::new(RendererConfig {
+            width: size.width,
+            height: size.height,
+            sample_count: 1, // no MSAA for path tracer test
+            clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
+            ..Default::default()
+        });
+        pollster::block_on(renderer.initialize_with_target(window.clone()));
 
         // ── Build scene ──────────────────────────────────────────────────
 

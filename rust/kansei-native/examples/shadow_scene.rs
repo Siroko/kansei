@@ -125,16 +125,14 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
 
         // Renderer with dark background
-        let mut renderer = pollster::block_on(Renderer::create(
-            RendererConfig {
-                width: size.width,
-                height: size.height,
-                sample_count: 4,
-                clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
-                ..Default::default()
-            },
-            window.clone(),
-        ));
+        let mut renderer = Renderer::new(RendererConfig {
+            width: size.width,
+            height: size.height,
+            sample_count: 4,
+            clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
+            ..Default::default()
+        });
+        pollster::block_on(renderer.initialize_with_target(window.clone()));
 
         // Enable shadow mapping (2048x2048 shadow map)
         renderer.enable_shadows(2048);

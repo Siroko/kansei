@@ -145,13 +145,12 @@ impl Renderer {
     ///
     /// **WASM (canvas):**
     /// ```ignore
-    /// let renderer = Renderer::create(config, wgpu::SurfaceTarget::Canvas(canvas)).await;
-    /// ```
-    pub async fn create(
-        config: RendererConfig,
-        target: impl Into<wgpu::SurfaceTarget<'static>>,
-    ) -> Self {
-        let mut renderer = Self::new(config);
+    /// Initialize the Renderer from a platform surface target.
+    /// Handles Instance, Surface, Adapter, Device creation internally.
+    ///
+    /// Native: `renderer.initialize_with_target(window.clone()).await`
+    /// WASM: `renderer.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas)).await`
+    pub async fn initialize_with_target(&mut self, target: impl Into<wgpu::SurfaceTarget<'static>>) {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             #[cfg(target_arch = "wasm32")]
             backends: wgpu::Backends::BROWSER_WEBGPU,
@@ -169,8 +168,7 @@ impl Renderer {
             })
             .await
             .expect("No suitable GPU adapter found");
-        renderer.initialize(surface, &adapter).await;
-        renderer
+        self.initialize(surface, &adapter).await;
     }
 
     /// Low-level initialization with a pre-created surface and adapter.
