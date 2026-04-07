@@ -66,6 +66,9 @@ pub struct Renderer {
     shadow_comparison_sampler: Option<wgpu::Sampler>,
     shadow_dummy_depth_tex: Option<wgpu::Texture>,
     shadow_dummy_depth_view: Option<wgpu::TextureView>,
+    cube_dummy_tex: Option<wgpu::Texture>,
+    cube_dummy_view: Option<wgpu::TextureView>,
+    cube_shadow_sampler: Option<wgpu::Sampler>,
     shadow_pipeline: Option<wgpu::RenderPipeline>,
     shadow_light_vp_bgl: Option<wgpu::BindGroupLayout>,
     shadow_light_vp_bg: Option<wgpu::BindGroup>,
@@ -101,6 +104,9 @@ impl Renderer {
             shadow_comparison_sampler: None,
             shadow_dummy_depth_tex: None,
             shadow_dummy_depth_view: None,
+            cube_dummy_tex: None,
+            cube_dummy_view: None,
+            cube_shadow_sampler: None,
             shadow_pipeline: None,
             shadow_light_vp_bgl: None,
             shadow_light_vp_bg: None,
@@ -186,6 +192,28 @@ impl Renderer {
             ..Default::default()
         });
 
+        // Dummy cubemap distance texture (1x1x6 r32float)
+        let cube_dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Renderer/DummyCubeShadow"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let cube_dummy_view = cube_dummy_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        let cube_shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Renderer/CubeShadowSampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         let shadow_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Renderer/ShadowUniforms"),
             size: 96,
@@ -210,6 +238,14 @@ impl Renderer {
                     binding: 2,
                     resource: shadow_uniform_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&cube_dummy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&cube_shadow_sampler),
+                },
             ],
         });
 
@@ -220,6 +256,9 @@ impl Renderer {
         self.shadow_dummy_depth_view = Some(dummy_depth_view);
         self.shadow_comparison_sampler = Some(comparison_sampler);
         self.shadow_uniform_buf = Some(shadow_uniform_buf);
+        self.cube_dummy_tex = Some(cube_dummy_tex);
+        self.cube_dummy_view = Some(cube_dummy_view);
+        self.cube_shadow_sampler = Some(cube_shadow_sampler);
 
         self.device = Some(device);
         self.queue = Some(queue);
@@ -498,6 +537,18 @@ impl Renderer {
                     binding: 2,
                     resource: self.shadow_uniform_buf.as_ref().unwrap().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(
+                        self.cube_dummy_view.as_ref().unwrap()
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(
+                        self.cube_shadow_sampler.as_ref().unwrap()
+                    ),
+                },
             ],
         }));
 
@@ -642,6 +693,11 @@ impl Renderer {
                     shadow_data[16] = sm.bias;
                     shadow_data[17] = sm.normal_bias;
                     shadow_data[18] = 1.0; // shadowEnabled
+                    shadow_data[19] = 0.0; // pointShadowEnabled
+                    shadow_data[20] = 0.0; // pointLightPos.x
+                    shadow_data[21] = 0.0; // pointLightPos.y
+                    shadow_data[22] = 0.0; // pointLightPos.z
+                    shadow_data[23] = 0.0; // pointShadowFar
                     if let Some(ref buf) = self.shadow_uniform_buf {
                         self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
                     }

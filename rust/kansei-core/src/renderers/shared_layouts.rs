@@ -85,7 +85,7 @@ impl SharedLayouts {
             ],
         });
 
-        // Group 3: shadows (depth texture + comparison sampler + shadow uniforms)
+        // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap)
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Shared/ShadowBGL"),
             entries: &[
@@ -113,6 +113,24 @@ impl SharedLayouts {
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
+                    count: None,
+                },
+                // Binding 3: cubemap distance texture array (point shadows)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 4: non-filtering sampler for cubemap
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
             ],
