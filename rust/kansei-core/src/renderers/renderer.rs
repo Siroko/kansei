@@ -1100,6 +1100,7 @@ impl Renderer {
 
                         pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
                         pass.set_bind_group(0, self.shadow_light_vp_bg.as_ref().unwrap(), &[]);
+                        pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
 
                         let alignment = self.matrix_alignment;
                         for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
@@ -1340,6 +1341,7 @@ impl Renderer {
 
                         pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
                         pass.set_bind_group(0, self.shadow_light_vp_bg.as_ref().unwrap(), &[]);
+                        pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
 
                         let alignment = self.matrix_alignment;
                         for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
