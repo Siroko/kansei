@@ -5,6 +5,9 @@ pub struct GBuffer {
     pub sample_count: u32,
     pub color_texture: wgpu::Texture,
     pub color_view: wgpu::TextureView,
+    /// Snapshot of color after opaque rendering, before refractive/indirect objects.
+    pub background_texture: wgpu::Texture,
+    pub background_view: wgpu::TextureView,
     pub emissive_texture: wgpu::Texture,
     pub emissive_view: wgpu::TextureView,
     pub normal_texture: wgpu::Texture,
@@ -50,7 +53,10 @@ impl GBuffer {
         let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         let storage_usage = tex_usage | wgpu::TextureUsages::STORAGE_BINDING;
 
-        let (color_texture, color_view) = mk("GBuffer/Color", Self::COLOR_FORMAT, storage_usage, 1);
+        let (color_texture, color_view) = mk("GBuffer/Color", Self::COLOR_FORMAT,
+            storage_usage | wgpu::TextureUsages::COPY_SRC, 1);
+        let (background_texture, background_view) = mk("GBuffer/Background", Self::COLOR_FORMAT,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 1);
         let (emissive_texture, emissive_view) = mk("GBuffer/Emissive", Self::COLOR_FORMAT, storage_usage, 1);
         let (normal_texture, normal_view) = mk("GBuffer/Normal", Self::COLOR_FORMAT, tex_usage, 1);
         let (albedo_texture, albedo_view) = mk("GBuffer/Albedo", Self::ALBEDO_FORMAT, tex_usage, 1);
@@ -76,7 +82,8 @@ impl GBuffer {
 
         Self {
             width, height, sample_count,
-            color_texture, color_view, emissive_texture, emissive_view,
+            color_texture, color_view, background_texture, background_view,
+            emissive_texture, emissive_view,
             normal_texture, normal_view, albedo_texture, albedo_view,
             depth_texture, depth_view, output_texture, output_view,
             ping_pong_texture, ping_pong_view,

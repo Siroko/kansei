@@ -112,6 +112,130 @@ struct FOut { @location(0) color: vec4<f32>, }
 }
 "#;
 
+// ── Transmission/refraction shader ──
+const TRANSMISSION_WGSL: &str = r#"
+// Group 0: Material
+struct TransmissionParams {
+    color: vec4<f32>,       // fluid tint color
+    ior: f32,               // index of refraction
+    chromatic_aberration: f32,
+    tint_strength: f32,
+    fresnel_power: f32,
+    roughness: f32,
+    thickness: f32,         // refraction offset scale
+    _pad0: f32,
+    _pad1: f32,
+};
+@group(0) @binding(0) var<uniform> params: TransmissionParams;
+@group(0) @binding(1) var background_tex: texture_2d<f32>;
+@group(0) @binding(2) var background_sampler: sampler;
+
+// Group 1: Camera
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+
+// Group 2: Mesh
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+// Group 3: Shadow (required by pipeline layout, unused here)
+@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
+@group(3) @binding(1) var shadow_sampler: sampler_comparison;
+@group(3) @binding(2) var<uniform> shadow_uniforms: vec4<f32>;
+@group(3) @binding(3) var cube_shadow_tex: texture_2d_array<f32>;
+@group(3) @binding(4) var cube_shadow_sampler: sampler;
+
+struct VOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) world_normal: vec3<f32>,
+};
+
+@vertex
+fn vertex_main(
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+) -> VOut {
+    let wp = (world_matrix * vec4<f32>(position.xyz, 1.0)).xyz;
+    let wn = normalize((normal_matrix * vec4<f32>(normal, 0.0)).xyz);
+    var out: VOut;
+    out.clip_pos = projection_matrix * view_matrix * vec4<f32>(wp, 1.0);
+    out.world_pos = wp;
+    out.world_normal = wn;
+    return out;
+}
+
+@fragment
+fn fragment_main(v: VOut) -> @location(0) vec4<f32> {
+    let N = normalize(v.world_normal);
+    let dims = vec2<f32>(textureDimensions(background_tex));
+    let screen_uv = v.clip_pos.xy / dims;
+
+    // View direction (camera is at the origin of view space; extract from inverse view)
+    let cam_pos = vec3<f32>(
+        view_matrix[0][3] + view_matrix[3][0],
+        view_matrix[1][3] + view_matrix[3][1],
+        view_matrix[2][3] + view_matrix[3][2],
+    );
+    // Simpler: reconstruct from view matrix columns
+    let eye = -vec3<f32>(
+        dot(view_matrix[0].xyz, view_matrix[3].xyz),
+        dot(view_matrix[1].xyz, view_matrix[3].xyz),
+        dot(view_matrix[2].xyz, view_matrix[3].xyz),
+    );
+    let V = normalize(eye - v.world_pos);
+
+    // Fresnel (Schlick approximation)
+    let f0 = pow((1.0 - params.ior) / (1.0 + params.ior), 2.0);
+    let ndotv = max(dot(N, V), 0.0);
+    let fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, params.fresnel_power);
+
+    // Refraction offset in screen space
+    let refract_strength = params.thickness * (1.0 - 1.0 / params.ior);
+    let offset = N.xy * refract_strength * 0.05;
+
+    // Chromatic aberration — scale offset differently per channel
+    let ca = params.chromatic_aberration;
+    let bg_r = textureSample(background_tex, background_sampler, screen_uv + offset * (1.0 + ca)).r;
+    let bg_g = textureSample(background_tex, background_sampler, screen_uv + offset).g;
+    let bg_b = textureSample(background_tex, background_sampler, screen_uv + offset * (1.0 - ca)).b;
+    var refracted = vec3<f32>(bg_r, bg_g, bg_b);
+
+    // Apply tint
+    refracted *= mix(vec3<f32>(1.0), params.color.rgb, params.tint_strength);
+
+    // GGX specular (physically-based)
+    let alpha = params.roughness * params.roughness;
+    let a2 = alpha * alpha;
+
+    // Key light
+    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let H = normalize(V + light_dir);
+    let ndoth = max(dot(N, H), 0.0);
+    let ndotl = max(dot(N, light_dir), 0.0);
+
+    // GGX distribution
+    let denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    let D = a2 / (3.14159 * denom * denom + 0.0001);
+
+    // Geometric attenuation (Smith-Schlick)
+    let k = alpha * 0.5;
+    let G = (ndotv / (ndotv * (1.0 - k) + k)) * (ndotl / (ndotl * (1.0 - k) + k));
+
+    let spec_color = vec3<f32>(fresnel);
+    let specular = spec_color * D * G * ndotl;
+
+    // Rim light (subtle edge glow from environment)
+    let rim = pow(1.0 - ndotv, 3.0) * 0.15;
+
+    // Blend: refracted color + specular + rim via Fresnel
+    let result = refracted * (1.0 - fresnel) + specular + vec3<f32>(rim);
+
+    return vec4<f32>(result, 1.0);
+}
+"#;
+
 const PARTICLE_MSAA_SAMPLES: u32 = 4;
 
 #[wasm_bindgen(start)]
@@ -191,11 +315,30 @@ fn build_mc_renderable_placeholder() -> Renderable {
     let mut opts = MaterialOptions::default();
     opts.cull_mode = CullMode::None;
 
-    let mut r = Renderable::new(
-        geo,
-        make_lit_material("MC/Surface", [0.77, 0.96, 1.0, 1.0], opts),
+    // Transmission material: uniform(0) + texture_2d(1) + sampler(2)
+    let transmission_data: [f32; 12] = [
+        0.77, 0.96, 1.0, 1.0,   // color (light blue tint)
+        1.33,                     // IOR (water)
+        0.02,                     // chromatic_aberration
+        0.3,                      // tint_strength
+        5.0,                      // fresnel_power
+        0.1,                      // roughness
+        1.0,                      // thickness (refraction scale)
+        0.0, 0.0,                 // padding
+    ];
+    let mut mat = Material::new(
+        "MC/Transmission", TRANSMISSION_WGSL,
+        vec![
+            Binding::uniform(0, ShaderStages::FRAGMENT),
+            Binding::texture_2d(1, ShaderStages::FRAGMENT),
+            Binding::sampler(2, ShaderStages::FRAGMENT),
+        ],
+        opts,
     );
-    r.visible = false; // hidden until pointers are set
+    mat.set_uniform_bindable(0, "MC/TransmissionParams", &transmission_data);
+
+    let mut r = Renderable::new(geo, mat);
+    r.visible = false; // hidden until buffer pointers + bind group are set
     r
 }
 
@@ -230,7 +373,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let format = renderer.presentation_format();
 
     // ── Particles ──
-    let count = 50_000usize;
+    let count = 100_000usize;
     let radius = 10.0f32;
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
@@ -379,6 +522,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ],
     });
 
+    // ── Transmission sampler (for MC refraction) ──
+    let transmission_sampler = renderer.device().create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Transmission/Sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
     // ── Blit pipeline (for raymarch mode) ──
     let blit_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Blit"), source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
@@ -455,6 +606,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         sim, density_field, surface_renderer,
         marching_cubes, marching_cubes_bg,
         mc_scene_index, dome_scene_index, light_scene_index,
+        transmission_sampler, transmission_bg_dims: (0u32, 0u32),
         particle_pipeline, particle_bg, particle_params_buf,
         blit_pipeline, blit_bg, surface_bg,
         color_view, depth_view, output_view,
@@ -518,6 +670,8 @@ struct State {
     mc_scene_index: usize,
     dome_scene_index: Option<usize>,
     light_scene_index: usize,
+    transmission_sampler: wgpu::Sampler,
+    transmission_bg_dims: (u32, u32),
     // Custom pipelines for particle + raymarch modes
     particle_pipeline: wgpu::RenderPipeline, particle_bg: wgpu::BindGroup, particle_params_buf: wgpu::Buffer,
     blit_pipeline: wgpu::RenderPipeline, blit_bg: wgpu::BindGroup, surface_bg: wgpu::BindGroup,
@@ -691,6 +845,34 @@ impl State {
                 &self.renderer, &self.marching_cubes_bg, source,
             );
 
+            // Ensure MC material bind group has the background texture from the GBuffer.
+            // The GBuffer is lazily created by render_with_postprocessing → ensure_gbuffer.
+            // We trigger it first, then set up the bind group if dimensions changed.
+            self.volume.ensure_gbuffer(self.width, self.height);
+            let gb = self.volume.gbuffer().unwrap();
+            let gb_dims = (gb.width, gb.height);
+            if gb_dims != self.transmission_bg_dims {
+                self.transmission_bg_dims = gb_dims;
+                if let Some(r) = self.scene.get_renderable_mut(self.mc_scene_index) {
+                    let shared = self.renderer.shared_layouts();
+                    let device = self.renderer.device();
+                    r.material.ensure_bindables_initialized(&self.renderer);
+                    r.material.initialize(device, shared);
+                    // Get buffer pointer before mutable borrow of material
+                    let buf_ptr = r.material.bindable_buffer(0)
+                        .expect("MC uniform") as *const wgpu::Buffer;
+                    let gb = self.volume.gbuffer().unwrap();
+                    // SAFETY: buf_ptr points into material.bindables which isn't moved by create_bind_group
+                    r.material.create_bind_group(device, shared, &[
+                        (0, kansei_core::materials::BindingResource::Buffer {
+                            buffer: unsafe { &*buf_ptr }, offset: 0, size: None,
+                        }),
+                        (1, kansei_core::materials::BindingResource::TextureView(&gb.background_view)),
+                        (2, kansei_core::materials::BindingResource::Sampler(&self.transmission_sampler)),
+                    ]);
+                }
+            }
+
             // Render scene (MC surface) via standard pipeline + DoF post-processing
             self.renderer.render_with_postprocessing(
                 &mut self.scene, &mut self.camera, &mut self.volume,
@@ -855,6 +1037,25 @@ fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Som
     with_state(|s| {
         if let Some(d) = s.volume.effects.get_mut(0).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
             d.options.max_blur = v;
+        }
+    });
+}
+#[wasm_bindgen] pub fn set_transmission_params(
+    ior: f32, chromatic_aberration: f32, tint_strength: f32,
+    fresnel_power: f32, roughness: f32, thickness: f32,
+    r: f32, g: f32, b: f32,
+) {
+    with_state(|s| {
+        if let Some(renderable) = s.scene.get_renderable_mut(s.mc_scene_index) {
+            let data: [f32; 12] = [
+                r, g, b, 1.0,
+                ior, chromatic_aberration, tint_strength, fresnel_power,
+                roughness, thickness, 0.0, 0.0,
+            ];
+            renderable.material.set_uniform_bindable(0, "MC/TransmissionParams", &data);
+            renderable.material_dirty = true;
+            // Force bind group rebuild on next frame
+            s.transmission_bg_dims = (0, 0);
         }
     });
 }
