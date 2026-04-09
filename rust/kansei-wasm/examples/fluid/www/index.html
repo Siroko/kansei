@@ -23,7 +23,8 @@
             set_kernel_scale, set_density_resolution, set_bounds,
             set_stripe_params,
             set_light_direction, set_light_intensity, set_light_color,
-            set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur
+            set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur,
+            set_transmission_params
         } from '../pkg/kansei_wasm_fluid.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
@@ -142,6 +143,25 @@
             .on('change', () => set_dof_focus_range(dof.focusRange));
         dofFolder.addBinding(dof, 'maxBlur', { min: 0, max: 64, step: 1, label: 'max blur' })
             .on('change', () => set_dof_max_blur(dof.maxBlur));
+
+        const txFolder = pane.addFolder({ title: 'Transmission', expanded: true });
+        const tx = {
+            ior: 1.33, chromaticAberration: 0.02, tintStrength: 0.3,
+            fresnelPower: 5.0, roughness: 0.1, thickness: 1.0,
+            color: { r: 0.77, g: 0.96, b: 1.0 },
+        };
+        const syncTx = () => set_transmission_params(
+            tx.ior, tx.chromaticAberration, tx.tintStrength,
+            tx.fresnelPower, tx.roughness, tx.thickness,
+            tx.color.r, tx.color.g, tx.color.b,
+        );
+        txFolder.addBinding(tx, 'ior', { min: 1.0, max: 2.5, step: 0.01 }).on('change', syncTx);
+        txFolder.addBinding(tx, 'chromaticAberration', { min: 0, max: 1.0, step: 0.01, label: 'chromatic' }).on('change', syncTx);
+        txFolder.addBinding(tx, 'tintStrength', { min: 0, max: 1, step: 0.01, label: 'tint' }).on('change', syncTx);
+        txFolder.addBinding(tx, 'fresnelPower', { min: 1, max: 10, step: 0.1, label: 'fresnel' }).on('change', syncTx);
+        txFolder.addBinding(tx, 'roughness', { min: 0, max: 1, step: 0.01 }).on('change', syncTx);
+        txFolder.addBinding(tx, 'thickness', { min: 0, max: 5, step: 0.1 }).on('change', syncTx);
+        txFolder.addBinding(tx, 'color', { color: { type: 'float' }, label: 'fluid color' }).on('change', syncTx);
 
         const stripe = pane.addFolder({ title: 'Dome Stripes', expanded: true });
         const sp = {

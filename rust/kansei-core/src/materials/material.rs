@@ -262,6 +262,13 @@ impl Material {
         self.initialized = false;
     }
 
+    /// Get the GPU buffer for a uniform bindable at the given binding index.
+    pub fn bindable_buffer(&self, binding: u32) -> Option<&wgpu::Buffer> {
+        self.bindables.iter()
+            .find(|(b, _)| *b == binding)
+            .and_then(|(_, buf)| buf.gpu_buffer())
+    }
+
     /// Ensure this material has a bind group from its owned bindables.
     pub fn ensure_bindables_initialized(&mut self, renderer: &Renderer) {
         if self.bindables.is_empty() || self.initialized {

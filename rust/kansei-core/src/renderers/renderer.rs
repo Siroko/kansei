@@ -355,6 +355,10 @@ impl Renderer {
         self.queue.as_ref().expect("Renderer not initialized")
     }
 
+    pub fn shared_layouts(&self) -> &SharedLayouts {
+        self.shared_layouts.as_ref().expect("Renderer not initialized")
+    }
+
     pub(crate) fn raw_device(&self) -> &wgpu::Device {
         self.device()
     }
@@ -377,10 +381,6 @@ impl Renderer {
 
     pub fn compute_batch(&self, passes: &[(&ComputePass, u32, u32, u32)]) {
         ComputeBatch::submit(self.device(), self.queue(), passes);
-    }
-
-    pub(crate) fn shared_layouts(&self) -> &SharedLayouts {
-        self.shared_layouts.as_ref().expect("Renderer not initialized")
     }
 
     pub fn presentation_format(&self) -> wgpu::TextureFormat {
@@ -1487,28 +1487,25 @@ impl Renderer {
         let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
         let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
+        // Pass 1: Opaque objects (render bundle)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Renderer/GBufferDrawPass"),
+                label: Some("Renderer/GBufferOpaquePass"),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.color_view,
-                        resolve_target: None,
+                        view: &gbuffer.color_view, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.emissive_view,
-                        resolve_target: None,
+                        view: &gbuffer.emissive_view, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.normal_view,
-                        resolve_target: None,
+                        view: &gbuffer.normal_view, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.albedo_view,
-                        resolve_target: None,
+                        view: &gbuffer.albedo_view, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                 ],
@@ -1519,10 +1516,46 @@ impl Renderer {
                 }),
                 ..Default::default()
             });
-
             pass.execute_bundles(std::iter::once(self.gbuffer_bundle.as_ref().unwrap()));
+        }
 
-            // Draw GPU-driven indirect renderables (e.g. marching cubes) in the same pass
+        // Copy opaque color → background texture (for refractive objects to sample)
+        encoder.copy_texture_to_texture(
+            gbuffer.color_texture.as_image_copy(),
+            gbuffer.background_texture.as_image_copy(),
+            wgpu::Extent3d { width: gbuffer.width, height: gbuffer.height, depth_or_array_layers: 1 },
+        );
+
+        // Pass 2: Indirect/refractive objects (Load existing MRT + depth)
+        {
+            let load = wgpu::LoadOp::Load;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderer/GBufferIndirectPass"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.color_view, resolve_target: None,
+                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.emissive_view, resolve_target: None,
+                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.normal_view, resolve_target: None,
+                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.albedo_view, resolve_target: None,
+                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &gbuffer.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
             self.draw_indirect_renderables(
                 &mut pass, scene, camera,
                 &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count,
