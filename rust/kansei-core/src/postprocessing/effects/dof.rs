@@ -42,7 +42,8 @@ struct DoFParams {
     _pad         : f32,
 }
 fn linearDepth(d: f32, n: f32, f: f32) -> f32 {
-    return (2.0 * n * f) / ((f + n) - d * (f - n));
+    // glam::perspective_rh maps depth to [0,1] (WebGPU convention)
+    return n * f / (f - d * (f - n));
 }
 fn computeCoC(d: f32, p: DoFParams) -> f32 {
     let ld = linearDepth(d, p.near, p.far);
