@@ -266,4 +266,5 @@ impl PostProcessingEffect for PathTracerEffect {
     fn destroy(&mut self) {
         // Resources are dropped automatically when the struct is dropped.
     }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }

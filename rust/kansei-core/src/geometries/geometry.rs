@@ -102,24 +102,10 @@ impl Geometry {
         }
     }
 
-    /// Create a Geometry backed by externally-owned GPU buffers (zero readback).
-    ///
-    /// Used for compute-generated meshes (e.g. marching cubes) where vertex/index data
-    /// lives entirely on the GPU. The caller must ensure the referenced buffers outlive
-    /// this Geometry.
-    ///
-    /// # Safety
-    /// The buffer pointers must remain valid for the lifetime of this Geometry.
-    /// Typically both live in the same owning struct (e.g. application State).
-    pub unsafe fn from_gpu_buffers(
-        label: &str,
-        vertex_buffer: *const wgpu::Buffer,
-        index_buffer: *const wgpu::Buffer,
-        indirect_args_buffer: Option<*const wgpu::Buffer>,
-    ) -> Self {
-        // SAFETY: Caller guarantees buffers outlive this Geometry.
-        // We create references to extract the wgpu internal Arc handles.
-        // wgpu::Buffer is internally reference-counted; the pointer is stable.
+    /// Create a Geometry placeholder for externally-owned GPU buffers (zero readback).
+    /// Initially has no buffer pointers — call `set_external_buffers()` once the
+    /// owning struct is at its final heap address.
+    pub fn new_indirect_placeholder(label: &str) -> Self {
         Self {
             label: label.to_string(),
             vertices: Vec::new(),
@@ -128,9 +114,9 @@ impl Geometry {
             index_buffer: None,
             indirect_args_buffer: None,
             initialized: true,
-            ext_vertex_buffer: Some(vertex_buffer),
-            ext_index_buffer: Some(index_buffer),
-            ext_indirect_buffer: indirect_args_buffer,
+            ext_vertex_buffer: None,
+            ext_index_buffer: None,
+            ext_indirect_buffer: None,
         }
     }
 
@@ -158,6 +144,22 @@ impl Geometry {
 
     pub fn vertex_count(&self) -> u32 {
         self.vertices.len() as u32
+    }
+
+    /// Update external buffer pointers. Call after the owning struct is at its final
+    /// heap address (e.g., after moving into Rc<RefCell<>>).
+    ///
+    /// # Safety
+    /// Pointers must remain valid for the lifetime of this Geometry.
+    pub unsafe fn set_external_buffers(
+        &mut self,
+        vertex: *const wgpu::Buffer,
+        index: *const wgpu::Buffer,
+        indirect: Option<*const wgpu::Buffer>,
+    ) {
+        self.ext_vertex_buffer = Some(vertex);
+        self.ext_index_buffer = Some(index);
+        self.ext_indirect_buffer = indirect;
     }
 
     /// Returns true if this geometry uses GPU-driven indirect drawing.
