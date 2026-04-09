@@ -118,6 +118,14 @@ impl Scene {
         }
     }
 
+    /// Get a light by scene child index (mutable).
+    pub fn get_light_mut(&mut self, idx: usize) -> Option<&mut Light> {
+        match self.children.get_mut(idx)? {
+            SceneNode::Light(l) => Some(l),
+            _ => None,
+        }
+    }
+
     /// Iterate all lights in the scene.
     pub fn lights(&self) -> impl Iterator<Item = &Light> {
         self.children.iter().filter_map(|node| match node {

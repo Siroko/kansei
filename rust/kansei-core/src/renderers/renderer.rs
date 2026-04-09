@@ -592,7 +592,7 @@ impl Renderer {
                 Some(r) => r,
                 None => continue,
             };
-            if !r.visible || !r.geometry.initialized {
+            if !r.visible || !r.geometry.initialized || r.geometry.is_indirect() {
                 continue;
             }
 
@@ -631,7 +631,7 @@ impl Renderer {
             encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
             // Set vertex buffer
-            encoder.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
+            encoder.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
 
             // Set instance buffers
             for (i, ib) in r.instance_buffers.iter().enumerate() {
@@ -642,7 +642,7 @@ impl Renderer {
 
             // Set index buffer
             encoder.set_index_buffer(
-                r.geometry.index_buffer.as_ref().unwrap().slice(..),
+                r.geometry.active_index_buffer().unwrap().slice(..),
                 wgpu::IndexFormat::Uint32,
             );
 
@@ -651,6 +651,69 @@ impl Renderer {
         }
 
         encoder.finish(&Default::default())
+    }
+
+    /// Draw indirect renderables (GPU-driven geometry like marching cubes)
+    /// directly in a live render pass. Called after executing the render bundle.
+    fn draw_indirect_renderables<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        scene: &'a Scene,
+        camera: &'a Camera,
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) {
+        let alignment = self.matrix_alignment;
+
+        pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
+        if let Some(ref bg) = self.shadow_bind_group {
+            pass.set_bind_group(3, bg, &[]);
+        }
+
+        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+            let r = match scene.get_renderable(scene_idx) {
+                Some(r) => r,
+                None => continue,
+            };
+            if !r.visible || !r.geometry.initialized || !r.geometry.is_indirect() {
+                continue;
+            }
+
+            let num_vb = 1 + r.instance_buffers.len();
+            let key = crate::materials::PipelineKey {
+                color_formats: color_formats.to_vec(),
+                depth_format,
+                sample_count,
+                num_vertex_buffers: num_vb,
+            };
+            let pipeline = match r.material.pipeline_cache.get(&key) {
+                Some(p) => p,
+                None => {
+                    log::warn!("Indirect renderable '{}' missing pipeline for key {:?}",
+                        r.geometry.label, key);
+                    continue;
+                }
+            };
+
+            pass.set_pipeline(pipeline);
+
+            if let Some(bg) = r.material.bind_group() {
+                pass.set_bind_group(0, bg, &[]);
+            }
+
+            let offset = (draw_idx as u32) * alignment;
+            pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+            pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+            pass.set_index_buffer(
+                r.geometry.active_index_buffer().unwrap().slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            pass.draw_indexed_indirect(
+                r.geometry.active_indirect_buffer().unwrap(),
+                0,
+            );
+        }
     }
 
     /// Upload camera + per-object matrices to GPU.
@@ -963,10 +1026,10 @@ impl Renderer {
                         pass.set_bind_group(1, csm.mesh_bg(), &[mesh_offset, mesh_offset]);
                         pass.set_vertex_buffer(
                             0,
-                            r.geometry.vertex_buffer.as_ref().unwrap().slice(..),
+                            r.geometry.active_vertex_buffer().unwrap().slice(..),
                         );
                         pass.set_index_buffer(
-                            r.geometry.index_buffer.as_ref().unwrap().slice(..),
+                            r.geometry.active_index_buffer().unwrap().slice(..),
                             wgpu::IndexFormat::Uint32,
                         );
                         pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
@@ -1112,8 +1175,8 @@ impl Renderer {
                             let offset = (draw_idx as u32) * alignment;
                             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
-                            pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
-                            pass.set_index_buffer(r.geometry.index_buffer.as_ref().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                            pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+                            pass.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
                         }
                     }
@@ -1213,6 +1276,14 @@ impl Renderer {
             });
 
             pass.execute_bundles(std::iter::once(self.render_bundle.as_ref().unwrap()));
+
+            // Draw GPU-driven indirect renderables in the same pass
+            let fmt = self.presentation_format;
+            self.draw_indirect_renderables(
+                &mut pass, scene, camera,
+                &[fmt], wgpu::TextureFormat::Depth24Plus,
+                self.config.sample_count,
+            );
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
@@ -1352,8 +1423,8 @@ impl Renderer {
 
                             let offset = (draw_idx as u32) * alignment;
                             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
-                            pass.set_vertex_buffer(0, r.geometry.vertex_buffer.as_ref().unwrap().slice(..));
-                            pass.set_index_buffer(r.geometry.index_buffer.as_ref().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                            pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+                            pass.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
                         }
                     }
@@ -1450,6 +1521,12 @@ impl Renderer {
             });
 
             pass.execute_bundles(std::iter::once(self.gbuffer_bundle.as_ref().unwrap()));
+
+            // Draw GPU-driven indirect renderables (e.g. marching cubes) in the same pass
+            self.draw_indirect_renderables(
+                &mut pass, scene, camera,
+                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count,
+            );
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));

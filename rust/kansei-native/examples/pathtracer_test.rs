@@ -253,12 +253,41 @@ impl ApplicationHandler for App {
 
         // ── Build scene ──────────────────────────────────────────────────
 
-        // Floor: large flat box
-        let floor_geo = BoxGeometry::new(8.0, 0.2, 8.0);
-        let floor_mat = make_basic_material("Floor", [0.7, 0.7, 0.7, 1.0]);
+        // Cornell box: 8 wide, 6 tall, 8 deep
+        // Floor (white)
+        let floor_geo = BoxGeometry::new(8.0, 0.1, 8.0);
+        let floor_mat = make_basic_material("Floor", [0.73, 0.73, 0.73, 1.0]);
         let mut floor = Renderable::new(floor_geo, floor_mat);
-        floor.object.set_position(0.0, -0.1, 0.0);
+        floor.object.set_position(0.0, -0.05, 0.0);
         self.scene.add(SceneNode::Renderable(floor));
+
+        // Ceiling (white)
+        let ceil_geo = BoxGeometry::new(8.0, 0.1, 8.0);
+        let ceil_mat = make_basic_material("Ceiling", [0.73, 0.73, 0.73, 1.0]);
+        let mut ceil = Renderable::new(ceil_geo, ceil_mat);
+        ceil.object.set_position(0.0, 6.05, 0.0);
+        self.scene.add(SceneNode::Renderable(ceil));
+
+        // Back wall (white)
+        let back_geo = BoxGeometry::new(8.0, 6.0, 0.1);
+        let back_mat = make_basic_material("BackWall", [0.73, 0.73, 0.73, 1.0]);
+        let mut back = Renderable::new(back_geo, back_mat);
+        back.object.set_position(0.0, 3.0, -4.05);
+        self.scene.add(SceneNode::Renderable(back));
+
+        // Left wall (red)
+        let left_geo = BoxGeometry::new(0.1, 6.0, 8.0);
+        let left_mat = make_basic_material("LeftWall", [0.65, 0.05, 0.05, 1.0]);
+        let mut left = Renderable::new(left_geo, left_mat);
+        left.object.set_position(-4.05, 3.0, 0.0);
+        self.scene.add(SceneNode::Renderable(left));
+
+        // Right wall (green)
+        let right_geo = BoxGeometry::new(0.1, 6.0, 8.0);
+        let right_mat = make_basic_material("RightWall", [0.12, 0.45, 0.15, 1.0]);
+        let mut right = Renderable::new(right_geo, right_mat);
+        right.object.set_position(4.05, 3.0, 0.0);
+        self.scene.add(SceneNode::Renderable(right));
 
         // Box A
         let box_a_geo = BoxGeometry::new(1.0, 2.0, 1.0);
@@ -274,15 +303,16 @@ impl ApplicationHandler for App {
         box_b.object.set_position(1.5, 0.5, 0.0);
         self.scene.add(SceneNode::Renderable(box_b));
 
-        // Stanford Dragon (glass)
-        if let Ok(result) = GLTFLoader::load("../examples/assets/geom/scene.gltf") {
+        // Stanford Dragon (glass) — GLB version (smaller, fewer triangles)
+        if let Ok(result) = GLTFLoader::load("../../examples/assets/geom/stanford_dragon_pbr.glb") {
             log::info!("Loaded dragon: {} renderables", result.renderables.len());
+            // GLB is ~100 units tall; scale to ~3 units to fit scene
+            let s = 0.03;
             for gr in result.renderables {
                 let mut r = Renderable::new(gr.geometry, make_basic_material("Dragon", [0.9, 0.9, 0.95, 1.0]));
-                // Scale up (model is ~0.17 units tall) and position on floor
-                r.object.position = gr.position;
+                r.object.position = Vec3::new(gr.position.x, gr.position.y, gr.position.z + 2.5);
                 r.object.rotation = gr.rotation;
-                r.object.scale = Vec3::new(gr.scale.x * 20.0, gr.scale.y * 20.0, gr.scale.z * 20.0);
+                r.object.scale = Vec3::new(gr.scale.x * s, gr.scale.y * s, gr.scale.z * s);
                 r.object.update_model_matrix();
                 r.object.update_world_matrix(None);
                 self.scene.add(SceneNode::Renderable(r));
@@ -301,7 +331,7 @@ impl ApplicationHandler for App {
 
         // Prepare scene (updates transforms, collects renderables)
         self.camera.set_position(0.0, 3.0, 8.0);
-        self.camera.look_at(&Vec3::new(0.0, 0.5, 0.0));
+        self.camera.look_at(&Vec3::new(0.0, 3.0, 0.0));
         self.camera.aspect = size.width as f32 / size.height as f32;
         self.camera.update_projection_matrix();
         self.camera.update_view_matrix();
@@ -324,23 +354,18 @@ impl ApplicationHandler for App {
         pt.set_spp(1);
         pt.set_max_bounces(8); // more bounces for glass refraction
 
-        // Materials: one per renderable (floor=0, boxA=1, boxB=2, dragon parts=3+)
+        // Materials: floor=0, ceiling=1, back=2, left=3, right=4, boxA=5, boxB=6, dragon=7+
         let mut materials = vec![
-            PathTracerMaterial {
-                albedo: [0.7, 0.7, 0.7],
-                ..Default::default()
-            },
-            PathTracerMaterial {
-                albedo: [0.9, 0.2, 0.2],
-                ..Default::default()
-            },
-            PathTracerMaterial {
-                albedo: [0.2, 0.2, 0.9],
-                ..Default::default()
-            },
+            PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // floor
+            PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // ceiling
+            PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // back wall
+            PathTracerMaterial { albedo: [0.65, 0.05, 0.05], ..Default::default() }, // left (red)
+            PathTracerMaterial { albedo: [0.12, 0.45, 0.15], ..Default::default() }, // right (green)
+            PathTracerMaterial { albedo: [0.9, 0.2, 0.2], ..Default::default() },    // box A
+            PathTracerMaterial { albedo: [0.2, 0.2, 0.9], ..Default::default() },    // box B
         ];
         // Glass material for dragon parts (one per dragon renderable)
-        let dragon_count = gpu_data.instance_count as usize - 3; // subtract floor + 2 boxes
+        let dragon_count = gpu_data.instance_count as usize - 7; // subtract 5 walls + 2 boxes
         for _ in 0..dragon_count {
             materials.push(PathTracerMaterial::glass(1.5));
         }

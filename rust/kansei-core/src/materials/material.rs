@@ -148,11 +148,21 @@ impl Material {
         };
 
         if !self.pipeline_cache.contains_key(&key) {
+            // Number of fragment shader outputs: @location(0) always,
+            // @location(1) only if the shader outputs emissive.
+            let shader_output_count = if self.options.outputs_emissive { 2 } else { 1 };
+
             let targets: Vec<Option<wgpu::ColorTargetState>> = color_formats.iter().enumerate().map(|(i, fmt)| {
                 let mut state = wgpu::ColorTargetState {
                     format: *fmt,
                     blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
+                    // Targets beyond what the shader outputs must have empty write mask,
+                    // otherwise WebGPU validation fails ("no corresponding fragment stage output").
+                    write_mask: if i < shader_output_count {
+                        wgpu::ColorWrites::ALL
+                    } else {
+                        wgpu::ColorWrites::empty()
+                    },
                 };
                 if i == 0 && self.options.transparent {
                     state.blend = Some(wgpu::BlendState {

@@ -8,17 +8,29 @@ struct Counter {
     value: atomic<u32>,
 };
 
-struct McVertex {
-    position: vec4<f32>,
-    normal: vec4<f32>,
-};
+// Vertex data written as flat f32 array to avoid WGSL struct alignment padding.
+// 9 floats per vertex = 36 bytes: position(4) + normal(3) + uv(2), matching engine Vertex layout.
+const FLOATS_PER_VERT: u32 = 9u;
 
 @group(0) @binding(0) var densityTex: texture_3d<f32>;
 @group(0) @binding(1) var densitySampler: sampler;
 @group(0) @binding(2) var<uniform> params: Params;
-@group(0) @binding(3) var<storage, read_write> vertices: array<McVertex>;
+@group(0) @binding(3) var<storage, read_write> vertex_data: array<f32>;
 @group(0) @binding(4) var<storage, read_write> indices: array<u32>;
 @group(0) @binding(5) var<storage, read_write> counter: Counter;
+
+fn write_vertex(idx: u32, pos: vec3<f32>, norm: vec3<f32>) {
+    let b = idx * FLOATS_PER_VERT;
+    vertex_data[b + 0u] = pos.x;
+    vertex_data[b + 1u] = pos.y;
+    vertex_data[b + 2u] = pos.z;
+    vertex_data[b + 3u] = 1.0; // w
+    vertex_data[b + 4u] = norm.x;
+    vertex_data[b + 5u] = norm.y;
+    vertex_data[b + 6u] = norm.z;
+    vertex_data[b + 7u] = 0.0; // u
+    vertex_data[b + 8u] = 0.0; // v
+}
 
 fn voxel_center_world(coord: vec3<u32>, dims: vec3<u32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3<f32> {
     let d = max(vec3<f32>(dims), vec3<f32>(1.0, 1.0, 1.0));
@@ -33,22 +45,14 @@ fn sample_density(dims: vec3<u32>, coord: vec3<u32>) -> f32 {
 
 fn emit_triangle(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, n: vec3<f32>, max_tris: u32) {
     let tri_idx = atomicAdd(&counter.value, 1u);
-    if (tri_idx >= max_tris) {
-        return;
-    }
+    if (tri_idx >= max_tris) { return; }
     let vbase = tri_idx * 3u;
-    let ibase = tri_idx * 3u;
-
-    vertices[vbase + 0u].position = vec4<f32>(p0, 1.0);
-    vertices[vbase + 1u].position = vec4<f32>(p1, 1.0);
-    vertices[vbase + 2u].position = vec4<f32>(p2, 1.0);
-    vertices[vbase + 0u].normal = vec4<f32>(n, 0.0);
-    vertices[vbase + 1u].normal = vec4<f32>(n, 0.0);
-    vertices[vbase + 2u].normal = vec4<f32>(n, 0.0);
-
-    indices[ibase + 0u] = vbase + 0u;
-    indices[ibase + 1u] = vbase + 1u;
-    indices[ibase + 2u] = vbase + 2u;
+    write_vertex(vbase + 0u, p0, n);
+    write_vertex(vbase + 1u, p1, n);
+    write_vertex(vbase + 2u, p2, n);
+    indices[vbase + 0u] = vbase + 0u;
+    indices[vbase + 1u] = vbase + 1u;
+    indices[vbase + 2u] = vbase + 2u;
 }
 
 fn emit_quad(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>, n: vec3<f32>, max_tris: u32) {

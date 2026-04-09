@@ -230,12 +230,41 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // Build scene
     let mut scene = Scene::new();
 
-    // Floor: large flat box
-    let floor_geo = BoxGeometry::new(8.0, 0.2, 8.0);
-    let floor_mat = make_basic_material("Floor", [0.7, 0.7, 0.7, 1.0]);
+    // Cornell box: 8 wide, 6 tall, 8 deep, centered at origin
+    // Floor (white)
+    let floor_geo = BoxGeometry::new(8.0, 0.1, 8.0);
+    let floor_mat = make_basic_material("Floor", [0.73, 0.73, 0.73, 1.0]);
     let mut floor = Renderable::new(floor_geo, floor_mat);
-    floor.object.set_position(0.0, -0.1, 0.0);
+    floor.object.set_position(0.0, -0.05, 0.0);
     scene.add(SceneNode::Renderable(floor));
+
+    // Ceiling (white)
+    let ceil_geo = BoxGeometry::new(8.0, 0.1, 8.0);
+    let ceil_mat = make_basic_material("Ceiling", [0.73, 0.73, 0.73, 1.0]);
+    let mut ceil = Renderable::new(ceil_geo, ceil_mat);
+    ceil.object.set_position(0.0, 6.05, 0.0);
+    scene.add(SceneNode::Renderable(ceil));
+
+    // Back wall (white)
+    let back_geo = BoxGeometry::new(8.0, 6.0, 0.1);
+    let back_mat = make_basic_material("BackWall", [0.73, 0.73, 0.73, 1.0]);
+    let mut back = Renderable::new(back_geo, back_mat);
+    back.object.set_position(0.0, 3.0, -4.05);
+    scene.add(SceneNode::Renderable(back));
+
+    // Left wall (red)
+    let left_geo = BoxGeometry::new(0.1, 6.0, 8.0);
+    let left_mat = make_basic_material("LeftWall", [0.65, 0.05, 0.05, 1.0]);
+    let mut left = Renderable::new(left_geo, left_mat);
+    left.object.set_position(-4.05, 3.0, 0.0);
+    scene.add(SceneNode::Renderable(left));
+
+    // Right wall (green)
+    let right_geo = BoxGeometry::new(0.1, 6.0, 8.0);
+    let right_mat = make_basic_material("RightWall", [0.12, 0.45, 0.15, 1.0]);
+    let mut right = Renderable::new(right_geo, right_mat);
+    right.object.set_position(4.05, 3.0, 0.0);
+    scene.add(SceneNode::Renderable(right));
 
     // Box A
     let box_a_geo = BoxGeometry::new(1.0, 2.0, 1.0);
@@ -251,32 +280,29 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     box_b.object.set_position(1.5, 0.5, 0.0);
     scene.add(SceneNode::Renderable(box_b));
 
-    // Stanford Dragon (glass) — fetch via HTTP
+    // Stanford Dragon (glass) — fetch GLB via HTTP
     let dragon_loaded = async {
         let window = web_sys::window().unwrap();
 
-        // Fetch .gltf JSON
-        let gltf_resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str("assets/scene.gltf")).await.ok()?;
-        let gltf_resp: web_sys::Response = gltf_resp.dyn_into().ok()?;
-        let gltf_buf = wasm_bindgen_futures::JsFuture::from(gltf_resp.array_buffer().ok()?).await.ok()?;
-        let gltf_bytes = js_sys::Uint8Array::new(&gltf_buf).to_vec();
+        let resp = wasm_bindgen_futures::JsFuture::from(
+            window.fetch_with_str("assets/stanford_dragon_pbr.glb"),
+        ).await.ok()?;
+        let resp: web_sys::Response = resp.dyn_into().ok()?;
+        let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
+        let bytes = js_sys::Uint8Array::new(&buf).to_vec();
 
-        // Fetch .bin buffer
-        let bin_resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str("assets/scene.bin")).await.ok()?;
-        let bin_resp: web_sys::Response = bin_resp.dyn_into().ok()?;
-        let bin_buf = wasm_bindgen_futures::JsFuture::from(bin_resp.array_buffer().ok()?).await.ok()?;
-        let bin_bytes = js_sys::Uint8Array::new(&bin_buf).to_vec();
-
-        GLTFLoader::load_gltf_with_buffers(&gltf_bytes, vec![bin_bytes]).ok()
+        GLTFLoader::load_glb(&bytes).ok()
     }.await;
 
     if let Some(result) = dragon_loaded {
         log::info!("Loaded dragon: {} renderables", result.renderables.len());
+        // GLB is ~100 units tall; scale to ~3 units to fit scene
+        let s = 0.03;
         for gr in result.renderables {
             let mut r = Renderable::new(gr.geometry, make_basic_material("Dragon", [0.9, 0.9, 0.95, 1.0]));
-            r.object.position = gr.position;
+            r.object.position = Vec3::new(gr.position.x, gr.position.y, gr.position.z + 2.5);
             r.object.rotation = gr.rotation;
-            r.object.scale = Vec3::new(gr.scale.x * 20.0, gr.scale.y * 20.0, gr.scale.z * 20.0);
+            r.object.scale = Vec3::new(gr.scale.x * s, gr.scale.y * s, gr.scale.z * s);
             r.object.update_model_matrix();
             r.object.update_world_matrix(None);
             scene.add(SceneNode::Renderable(r));
@@ -296,7 +322,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // Camera
     let mut camera = Camera::new(45.0, 0.1, 100.0, width as f32 / height as f32);
     camera.set_position(0.0, 3.0, 8.0);
-    camera.look_at(&Vec3::new(0.0, 0.5, 0.0));
+    camera.look_at(&Vec3::new(0.0, 3.0, 0.0));
     camera.update_projection_matrix();
     camera.update_view_matrix();
     scene.prepare(&camera.position());
@@ -318,13 +344,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     pt.set_spp(1);
     pt.set_max_bounces(8); // more bounces for glass refraction
 
-    // Materials: floor=0, boxA=1, boxB=2, dragon parts=3+
+    // Materials: floor=0, ceiling=1, back=2, left=3, right=4, boxA=5, boxB=6, dragon=7+
     let mut materials = vec![
-        PathTracerMaterial { albedo: [0.7, 0.7, 0.7], ..Default::default() },
-        PathTracerMaterial { albedo: [0.9, 0.2, 0.2], ..Default::default() },
-        PathTracerMaterial { albedo: [0.2, 0.2, 0.9], ..Default::default() },
+        PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // floor
+        PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // ceiling
+        PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // back wall
+        PathTracerMaterial { albedo: [0.65, 0.05, 0.05], ..Default::default() }, // left (red)
+        PathTracerMaterial { albedo: [0.12, 0.45, 0.15], ..Default::default() }, // right (green)
+        PathTracerMaterial { albedo: [0.9, 0.2, 0.2], ..Default::default() },    // box A
+        PathTracerMaterial { albedo: [0.2, 0.2, 0.9], ..Default::default() },    // box B
     ];
-    let dragon_count = gpu_data.instance_count as usize - 3;
+    let dragon_count = gpu_data.instance_count as usize - 7;
     for _ in 0..dragon_count {
         materials.push(PathTracerMaterial::glass(1.5));
     }
@@ -346,7 +376,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     log::info!("Kansei — Path Tracer (WASM) ready");
 
-    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 0.5, 0.0), 8.0);
+    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 8.0);
 
     let state = Rc::new(RefCell::new(State {
         renderer,
@@ -407,5 +437,23 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }));
     request_animation_frame(g.borrow().as_ref().unwrap());
 
+    GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
+
     Ok(())
+}
+
+// ── JS interop ──
+thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
+fn with_state<F: FnOnce(&mut State)>(f: F) {
+    GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } });
+}
+
+#[wasm_bindgen] pub fn set_spp(v: u32) { with_state(|s| { s.path_tracer.set_spp(v); s.path_tracer.reset_accumulation(); }); }
+#[wasm_bindgen] pub fn set_max_bounces(v: u32) { with_state(|s| { s.path_tracer.set_max_bounces(v); s.path_tracer.reset_accumulation(); }); }
+#[wasm_bindgen] pub fn set_use_blue_noise(v: bool) { with_state(|s| { s.path_tracer.set_use_blue_noise(v); s.path_tracer.reset_accumulation(); }); }
+#[wasm_bindgen] pub fn reset_accumulation() { with_state(|s| s.path_tracer.reset_accumulation()); }
+#[wasm_bindgen] pub fn get_frame_index() -> u32 {
+    GLOBAL_STATE.with(|gs| {
+        if let Some(ref rc) = *gs.borrow() { rc.borrow().path_tracer.frame_index() } else { 0 }
+    })
 }

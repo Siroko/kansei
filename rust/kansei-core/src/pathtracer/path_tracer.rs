@@ -24,12 +24,15 @@ const TRACE_PARAMS_SIZE: u64 = 192;
 ///   6  bvh4_nodes  storage buffer  (read) — array<vec4<f32>>
 ///   7  tlas_bvh4_nodes storage buffer (read) — array<vec4<f32>>
 ///   8  instances   storage buffer  (read) — array of Instance
+///   9  prev_frame  texture_2d (read) — previous frame for temporal accumulation
 pub struct PathTracer {
     trace_pipeline: Option<wgpu::ComputePipeline>,
     trace_bgl: Option<wgpu::BindGroupLayout>,
     params_buf: Option<wgpu::Buffer>,
     output_texture: Option<wgpu::Texture>,
     output_view: Option<wgpu::TextureView>,
+    prev_texture: Option<wgpu::Texture>,
+    prev_view: Option<wgpu::TextureView>,
     materials_buf: Option<wgpu::Buffer>,
     lights_buf: Option<wgpu::Buffer>,
     blue_noise_buf: Option<wgpu::Buffer>,
@@ -40,6 +43,7 @@ pub struct PathTracer {
     queue: wgpu::Queue,
     spp: u32,
     max_bounces: u32,
+    use_blue_noise: bool,
 }
 
 impl PathTracer {
@@ -183,6 +187,17 @@ impl PathTracer {
                     },
                     count: None,
                 },
+                // 9: prev_frame (previous frame for temporal accumulation)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -226,6 +241,8 @@ impl PathTracer {
             params_buf: Some(params_buf),
             output_texture: None,
             output_view: None,
+            prev_texture: None,
+            prev_view: None,
             materials_buf: None,
             lights_buf: None,
             blue_noise_buf: Some(blue_noise_buf),
@@ -236,6 +253,7 @@ impl PathTracer {
             queue,
             spp: 1,
             max_bounces: 4,
+            use_blue_noise: true,
         }
     }
 
@@ -249,6 +267,11 @@ impl PathTracer {
     /// Set maximum bounce depth.
     pub fn set_max_bounces(&mut self, bounces: u32) {
         self.max_bounces = bounces;
+    }
+
+    /// Enable/disable blue noise sampling (falls back to PCG RNG).
+    pub fn set_use_blue_noise(&mut self, enabled: bool) {
+        self.use_blue_noise = enabled;
     }
 
     // ── Resize / recreate output texture ───────────────────────────
@@ -265,7 +288,7 @@ impl PathTracer {
         self.height = height;
         self.frame_index = 0;
 
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        let tex_desc = wgpu::TextureDescriptor {
             label: Some("PathTracer/Output"),
             size: wgpu::Extent3d {
                 width,
@@ -276,12 +299,24 @@ impl PathTracer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
-        });
+        };
+        let texture = self.device.create_texture(&tex_desc);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.output_texture = Some(texture);
         self.output_view = Some(view);
+
+        let prev = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("PathTracer/PrevFrame"),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            ..tex_desc
+        });
+        let prev_view = prev.create_view(&wgpu::TextureViewDescriptor::default());
+        self.prev_texture = Some(prev);
+        self.prev_view = Some(prev_view);
     }
 
     // ── Material upload ────────────────────────────────────────────
@@ -352,11 +387,12 @@ impl PathTracer {
         light_count: u32,
     ) {
         // Guard: all resources must be present
-        let (Some(pipeline), Some(bgl), Some(params_buf), Some(output_view)) = (
+        let (Some(pipeline), Some(bgl), Some(params_buf), Some(output_view), Some(prev_view)) = (
             self.trace_pipeline.as_ref(),
             self.trace_bgl.as_ref(),
             self.params_buf.as_ref(),
             self.output_view.as_ref(),
+            self.prev_view.as_ref(),
         ) else {
             return;
         };
@@ -424,6 +460,10 @@ impl PathTracer {
                     binding: 8,
                     resource: bvh_data.instances_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(prev_view),
+                },
             ],
         });
 
@@ -438,6 +478,23 @@ impl PathTracer {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
+        drop(pass);
+
+        // Copy output → prev_frame for next frame's accumulation
+        if let (Some(output_tex), Some(prev_tex)) =
+            (self.output_texture.as_ref(), self.prev_texture.as_ref())
+        {
+            let size = wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            };
+            encoder.copy_texture_to_texture(
+                output_tex.as_image_copy(),
+                prev_tex.as_image_copy(),
+                size,
+            );
+        }
 
         // Advance frame index (for temporal jitter / accumulation)
         self.frame_index += 1;
@@ -495,8 +552,8 @@ impl PathTracer {
         // bytes 92-95: u32 spp
         params[23] = f32::from_bits(self.spp);
 
-        // bytes 96-99: u32 use_blue_noise (always enabled)
-        params[24] = f32::from_bits(1u32);
+        // bytes 96-99: u32 use_blue_noise
+        params[24] = f32::from_bits(if self.use_blue_noise { 1u32 } else { 0u32 });
 
         // bytes 100-103: u32 fixed_seed (0 = normal temporal jitter)
         params[25] = f32::from_bits(0u32);
