@@ -23,7 +23,8 @@ struct Params { view: mat4x4<f32>, proj: mat4x4<f32>, color: vec4<f32>, }
 
 struct VSIn {
     @location(0) position: vec4<f32>,
-    @location(1) normal: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 }
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
@@ -34,7 +35,7 @@ struct VSOut {
 fn vs(v: VSIn) -> VSOut {
     var o: VSOut;
     o.pos = p.proj * p.view * vec4<f32>(v.position.xyz, 1.0);
-    o.normal = normalize(v.normal.xyz);
+    o.normal = normalize(v.normal);
     return o;
 }
 
@@ -90,9 +91,14 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
                             shader_location: 0,
                         },
                         wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
+                            format: wgpu::VertexFormat::Float32x3,
                             offset: 16,
                             shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 28,
+                            shader_location: 2,
                         },
                     ],
                 }],
@@ -114,7 +120,7 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
+                format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),

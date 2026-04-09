@@ -75,6 +75,7 @@ struct LightData {
 @group(0) @binding(2) var<storage, read> materials   : array<MaterialData>;
 @group(0) @binding(3) var<storage, read> scene_lights : array<LightData>;
 @group(0) @binding(4) var<storage, read> blue_noise   : array<f32>;
+@group(0) @binding(9) var prev_frame : texture_2d<f32>;
 
 // ── RNG: Blue noise + PCG hybrid sampler ────────────────────────────────────
 
@@ -643,5 +644,14 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         }
     }
 
-    textureStore(output_tex, coord, vec4f(accumulated / f32(spp), 1.0));
+    let current = accumulated / f32(spp);
+
+    // Temporal accumulation: running average over frames
+    if (params.frame_index > 0u) {
+        let prev = textureLoad(prev_frame, coord, 0).rgb;
+        let weight = 1.0 / f32(params.frame_index + 1u);
+        textureStore(output_tex, coord, vec4f(mix(prev, current, weight), 1.0));
+    } else {
+        textureStore(output_tex, coord, vec4f(current, 1.0));
+    }
 }

@@ -4,13 +4,17 @@ use crate::renderers::Renderer;
 
 const MC_RESET_WGSL: &str = include_str!("shaders/marching-cubes-reset.wgsl");
 const MC_EXTRACT_WGSL: &str = include_str!("shaders/marching-cubes-extract.wgsl");
+const MC_CLASSIC_WGSL: &str = include_str!("shaders/marching-cubes-classic.wgsl");
 const MC_FINALIZE_WGSL: &str = include_str!("shaders/marching-cubes-finalize.wgsl");
 
+/// Matches the standard engine `Vertex` layout: position(vec4) + normal(vec3) + uv(vec2) = 36 bytes.
+/// This allows MC output to be consumed directly by standard Materials and the Renderer pipeline.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct MarchingCubesVertex {
     pub position: [f32; 4],
-    pub normal: [f32; 4],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -83,7 +87,9 @@ pub struct MarchingCubesSimulation {
     finalize_bg: wgpu::BindGroup,
     reset_pipeline: wgpu::ComputePipeline,
     extract_pipeline: wgpu::ComputePipeline,
+    classic_extract_pipeline: wgpu::ComputePipeline,
     finalize_pipeline: wgpu::ComputePipeline,
+    use_classic: bool,
 }
 
 impl MarchingCubesSimulation {
@@ -266,6 +272,19 @@ impl MarchingCubesSimulation {
             cache: None,
         });
 
+        let classic_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FluidMarchingCubes/ClassicShader"),
+            source: wgpu::ShaderSource::Wgsl(MC_CLASSIC_WGSL.into()),
+        });
+        let classic_extract_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("FluidMarchingCubes/ClassicExtractPipeline"),
+            layout: Some(&extract_layout),
+            module: &classic_module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let finalize_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("FluidMarchingCubes/FinalizeBGL"),
             entries: &[
@@ -361,7 +380,9 @@ impl MarchingCubesSimulation {
             finalize_bg,
             reset_pipeline,
             extract_pipeline,
+            classic_extract_pipeline,
             finalize_pipeline,
+            use_classic: false,
         }
     }
 
@@ -472,11 +493,16 @@ impl MarchingCubesSimulation {
         }
 
         {
+            let pipeline = if self.use_classic {
+                &self.classic_extract_pipeline
+            } else {
+                &self.extract_pipeline
+            };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FluidMarchingCubes/Extract"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.extract_pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, extract_bind_group, &[]);
             pass.dispatch_workgroups(
                 effective_dims[0].max(1).div_ceil(4),
@@ -600,6 +626,14 @@ impl MarchingCubesSimulation {
 
     pub fn params(&self) -> MarchingCubesSimulationParams {
         self.params
+    }
+
+    pub fn set_use_classic(&mut self, classic: bool) {
+        self.use_classic = classic;
+    }
+
+    pub fn use_classic(&self) -> bool {
+        self.use_classic
     }
 
     pub fn set_iso_level(&mut self, iso_level: f32) {

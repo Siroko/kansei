@@ -1,5 +1,9 @@
 use crate::geometries::{Geometry, Vertex};
+use crate::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
 use crate::math::Vec3;
+use crate::objects::Renderable;
+
+const BASIC_LIT_WGSL: &str = include_str!("../shaders/basic_lit.wgsl");
 
 /// Material properties extracted from glTF PBR metallic-roughness.
 pub struct GLTFMaterialInfo {
@@ -23,6 +27,53 @@ pub struct GLTFRenderable {
 pub struct GLTFResult {
     pub renderables: Vec<GLTFRenderable>,
     pub materials: Vec<GLTFMaterialInfo>,
+}
+
+impl GLTFResult {
+    /// Convert into engine `Renderable`s with basic lit materials derived from glTF PBR data.
+    /// Applies position, rotation, scale, and an optional extra uniform scale multiplier.
+    pub fn into_renderables(self, scale_multiplier: f32) -> Vec<Renderable> {
+        let materials = self.materials;
+        self.renderables
+            .into_iter()
+            .map(|gr| {
+                let mat_info = materials.get(gr.material_index);
+                let (color, double_sided) = match mat_info {
+                    Some(m) => (m.base_color, m.double_sided),
+                    None => ([0.8, 0.8, 0.8, 1.0], false),
+                };
+
+                let mut opts = MaterialOptions::default();
+                if double_sided {
+                    opts.cull_mode = CullMode::None;
+                }
+
+                let label = mat_info
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("GLTF/Material");
+                let uniform: [f32; 8] = [
+                    color[0], color[1], color[2], color[3],
+                    0.15, 0.15, 0.15, 0.5,
+                ];
+                let mut material = Material::new(
+                    label,
+                    BASIC_LIT_WGSL,
+                    vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
+                    opts,
+                );
+                material.set_uniform_bindable(0, &format!("{label}/Color"), &uniform);
+
+                let s = scale_multiplier;
+                let mut r = Renderable::new(gr.geometry, material);
+                r.object.position = gr.position;
+                r.object.rotation = gr.rotation;
+                r.object.scale = Vec3::new(gr.scale.x * s, gr.scale.y * s, gr.scale.z * s);
+                r.object.update_model_matrix();
+                r.object.update_world_matrix(None);
+                r
+            })
+            .collect()
+    }
 }
 
 /// Loads glTF 2.0 files into engine objects.
