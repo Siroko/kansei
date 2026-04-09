@@ -11,6 +11,7 @@ use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Mat4, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::postprocessing::{PostProcessingVolume, effects::{DepthOfFieldEffect, DepthOfFieldOptions}};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use wgpu::util::DeviceExt;
 use kansei_core::simulations::fluid::{
@@ -183,24 +184,19 @@ fn build_cornell_box(scene: &mut Scene, bounds_min: [f32; 3], bounds_max: [f32; 
     scene.add(SceneNode::Renderable(front));
 }
 
-// ── Helper: create MC surface renderable from GPU buffers ──
-/// SAFETY: The returned Renderable holds raw pointers to mc's buffers.
-/// Both must live in the same State struct to guarantee lifetime.
-unsafe fn build_mc_renderable(mc: &FluidMarchingCubes) -> Renderable {
-    let geo = Geometry::from_gpu_buffers(
-        "MC/Surface",
-        mc.vertex_buffer() as *const _,
-        mc.index_buffer() as *const _,
-        Some(mc.indirect_args_buffer() as *const _),
-    );
+// ── Helper: create MC surface renderable (placeholder — no buffer ptrs yet) ──
+fn build_mc_renderable_placeholder() -> Renderable {
+    let geo = Geometry::new_indirect_placeholder("MC/Surface");
 
     let mut opts = MaterialOptions::default();
-    opts.cull_mode = CullMode::None; // double-sided MC surface
+    opts.cull_mode = CullMode::None;
 
-    Renderable::new(
+    let mut r = Renderable::new(
         geo,
         make_lit_material("MC/Surface", [0.77, 0.96, 1.0, 1.0], opts),
-    )
+    );
+    r.visible = false; // hidden until pointers are set
+    r
 }
 
 #[wasm_bindgen]
@@ -321,9 +317,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         }
     }
 
-    // MC surface renderable (GPU-driven indirect draw)
-    // SAFETY: marching_cubes and mc_renderable both live in State
-    let mc_renderable = unsafe { build_mc_renderable(&marching_cubes) };
+    // MC surface renderable — placeholder geometry, pointers set after State is stable
+    let mc_renderable = build_mc_renderable_placeholder();
     let mc_scene_index = scene.add(SceneNode::Renderable(mc_renderable));
 
     // Light
@@ -339,6 +334,18 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     camera.look_at(&Vec3::new(0.0, 3.0, 0.0));
     camera.update_projection_matrix();
     camera.update_view_matrix();
+
+    // ── Post-processing: DoF ──
+    let volume = PostProcessingVolume::new(
+        &renderer,
+        vec![
+            Box::new(DepthOfFieldEffect::new(DepthOfFieldOptions {
+                focus_distance: 50.0,
+                focus_range: 20.0,
+                max_blur: 14.0,
+            })),
+        ],
+    );
 
     // ── Particle pipeline (custom — not a standard Renderable) ──
     let particle_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -442,7 +449,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let perf_now = window.performance().map(|p| p.now()).unwrap_or(0.0);
     let state = Rc::new(RefCell::new(State {
-        renderer, scene, camera, controls, mouse,
+        renderer, scene, camera, controls, mouse, volume,
         sim, density_field, surface_renderer,
         marching_cubes, marching_cubes_bg,
         mc_scene_index, dome_scene_index, light_scene_index,
@@ -460,6 +467,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }));
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
+
+    // Now State is at its final heap address — fix up MC buffer pointers.
+    // Get raw pointers first (immutable borrow), then set them (mutable borrow).
+    {
+        let st = state.borrow();
+        let vb = st.marching_cubes.vertex_buffer() as *const wgpu::Buffer;
+        let ib = st.marching_cubes.index_buffer() as *const wgpu::Buffer;
+        let ab = st.marching_cubes.indirect_args_buffer() as *const wgpu::Buffer;
+        let idx = st.mc_scene_index;
+        drop(st);
+        let mut st = state.borrow_mut();
+        if let Some(r) = st.scene.get_renderable_mut(idx) {
+            unsafe { r.geometry.set_external_buffers(vb, ib, Some(ab)); }
+        }
+    }
 
     // Animation loop
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
@@ -485,6 +507,7 @@ struct State {
     camera: Camera,
     controls: CameraControls,
     mouse: MouseVectors,
+    volume: PostProcessingVolume,
     sim: FluidSimulation,
     density_field: FluidDensityField,
     surface_renderer: FluidSurfaceRenderer,
@@ -666,8 +689,10 @@ impl State {
                 &self.renderer, &self.marching_cubes_bg, source,
             );
 
-            // Render scene (MC surface) via standard pipeline
-            self.renderer.render(&mut self.scene, &mut self.camera);
+            // Render scene (MC surface) via standard pipeline + DoF post-processing
+            self.renderer.render_with_postprocessing(
+                &mut self.scene, &mut self.camera, &mut self.volume,
+            );
         }
     }
 }
@@ -677,10 +702,18 @@ thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCe
 fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
 
 #[wasm_bindgen] pub fn get_fps() -> f64 {
-    GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { rc.borrow().current_fps } else { 0.0 } })
+    GLOBAL_STATE.with(|gs| {
+        if let Some(ref rc) = *gs.borrow() {
+            rc.try_borrow().map(|s| s.current_fps).unwrap_or(0.0)
+        } else { 0.0 }
+    })
 }
 #[wasm_bindgen] pub fn get_frame_time() -> f64 {
-    GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { rc.borrow().current_frame_ms } else { 0.0 } })
+    GLOBAL_STATE.with(|gs| {
+        if let Some(ref rc) = *gs.borrow() {
+            rc.try_borrow().map(|s| s.current_frame_ms).unwrap_or(0.0)
+        } else { 0.0 }
+    })
 }
 
 #[wasm_bindgen] pub fn set_pressure(v: f32) { with_state(|s| s.sim.params.pressure_multiplier = v); }
@@ -799,6 +832,27 @@ fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Som
     with_state(|s| {
         if let Some(Light::Directional(dl)) = s.scene.get_light_mut(s.light_scene_index) {
             dl.color = Vec3::new(r, g, b);
+        }
+    });
+}
+#[wasm_bindgen] pub fn set_dof_focus_distance(v: f32) {
+    with_state(|s| {
+        if let Some(d) = s.volume.effects.get_mut(0).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
+            d.options.focus_distance = v;
+        }
+    });
+}
+#[wasm_bindgen] pub fn set_dof_focus_range(v: f32) {
+    with_state(|s| {
+        if let Some(d) = s.volume.effects.get_mut(0).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
+            d.options.focus_range = v;
+        }
+    });
+}
+#[wasm_bindgen] pub fn set_dof_max_blur(v: f32) {
+    with_state(|s| {
+        if let Some(d) = s.volume.effects.get_mut(0).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
+            d.options.max_blur = v;
         }
     });
 }

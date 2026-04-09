@@ -124,4 +124,5 @@ impl PostProcessingEffect for ColorGradingEffect {
 
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {}
     fn destroy(&mut self) { self.initialized = false; }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }
