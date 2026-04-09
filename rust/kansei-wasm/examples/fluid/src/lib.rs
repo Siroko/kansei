@@ -214,21 +214,23 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = document.get_element_by_id(canvas_id)
         .ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
 
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
+    let dpr = window.device_pixel_ratio().min(2.0).max(1.0);
+    let width = ((canvas.client_width() as f64) * dpr) as u32;
+    let height = ((canvas.client_height() as f64) * dpr) as u32;
     canvas.set_width(width);
     canvas.set_height(height);
 
     let mut renderer = Renderer::new(RendererConfig {
         width, height,
-        sample_count: 1,
+        sample_count: 4,
+        device_pixel_ratio: dpr as f32,
         ..Default::default()
     });
     renderer.initialize_with_canvas(canvas.clone()).await;
     let format = renderer.presentation_format();
 
     // ── Particles ──
-    let count = 100_000usize;
+    let count = 50_000usize;
     let radius = 10.0f32;
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;

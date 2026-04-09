@@ -43,8 +43,9 @@ impl MouseVectors {
         use wasm_bindgen::prelude::*;
         use wasm_bindgen::JsCast;
 
-        let w = canvas.width() as f32;
-        let h = canvas.height() as f32;
+        // Use CSS dimensions (client_width/height) since mouse events report CSS pixels
+        let w = canvas.client_width().max(1) as f32;
+        let h = canvas.client_height().max(1) as f32;
 
         let shared = Rc::new(RefCell::new(MouseTarget { x: 0.0, y: 0.0 }));
 
