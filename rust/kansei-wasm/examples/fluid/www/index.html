@@ -33,7 +33,7 @@
 
         const pane = new Pane({ title: 'Fluid 3D (WASM)' });
         const p = {
-            showParticles: true, renderMode: 'MarchingCubes', mcIso: 0.37, mcResolution: 256, particleSize: 0.15, batchedSim: true,
+            showParticles: true, renderMode: 'MarchingCubes', mcIso: 0.37, mcResolution: 128, particleSize: 0.15, batchedSim: true,
             simPreset: 'Balanced',
             simStepDt: 1 / 60,
             simTimeScale: 1.85,
@@ -136,7 +136,7 @@
         lightFolder.addBinding(lt, 'color', { color: { type: 'float' } }).on('change', () => set_light_color(lt.color.r, lt.color.g, lt.color.b));
 
         const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: true });
-        const dof = { focusDistance: 50, focusRange: 20, maxBlur: 14 };
+        const dof = { focusDistance: 42, focusRange: 37, maxBlur: 14 };
         dofFolder.addBinding(dof, 'focusDistance', { min: 1, max: 200, step: 1, label: 'focus dist' })
             .on('change', () => set_dof_focus_distance(dof.focusDistance));
         dofFolder.addBinding(dof, 'focusRange', { min: 1, max: 100, step: 1, label: 'focus range' })
@@ -146,8 +146,8 @@
 
         const txFolder = pane.addFolder({ title: 'Transmission', expanded: true });
         const tx = {
-            ior: 1.33, chromaticAberration: 0.02, tintStrength: 0.3,
-            fresnelPower: 5.0, roughness: 0.1, thickness: 1.0,
+            ior: 1.41, chromaticAberration: 0.05, tintStrength: 0.30,
+            fresnelPower: 2.3, roughness: 0.28, thickness: 2.4,
             color: { r: 0.77, g: 0.96, b: 1.0 },
         };
         const syncTx = () => set_transmission_params(
@@ -167,8 +167,8 @@
         const sp = {
             colorA: { r: 0, g: 0, b: 0 },
             colorB: { r: 1, g: 1, b: 1 },
-            thicknessA: 1.0,
-            thicknessB: 1.0,
+            thicknessA: 8.9,
+            thicknessB: 9.6,
         };
         const syncStripes = () => set_stripe_params(
             sp.colorA.r, sp.colorA.g, sp.colorA.b,
@@ -190,6 +190,10 @@
         set_mouse_force(p.mouseForce);
         set_substeps(p.substeps);
         set_kernel_scale(p.kernelScale);
+        set_dof_focus_distance(dof.focusDistance);
+        set_dof_focus_range(dof.focusRange);
+        syncTx();
+        syncStripes();
 
         // FPS overlay — read from Rust side (measured inside render_frame which IS the rAF callback)
         const fpsEl = document.getElementById('fps');

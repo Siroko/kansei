@@ -486,6 +486,7 @@ impl PostProcessingEffect for DepthOfFieldEffect {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        _gbuffer: &GBuffer,
         input: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         output: &wgpu::TextureView,
@@ -638,5 +639,6 @@ impl PostProcessingEffect for DepthOfFieldEffect {
         self.near_blur_tex = None; self.near_blur_view = None;
         self.far_blur_tex = None; self.far_blur_view = None;
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }
