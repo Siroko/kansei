@@ -10,6 +10,9 @@ use std::rc::Rc;
 struct MouseTarget {
     x: f32,
     y: f32,
+    /// When true, the next update should snap position without interpolation
+    /// (used when focus is lost or the mouse re-enters the canvas after a jump).
+    snap: bool,
 }
 
 /// Mouse position/direction tracker (mirrors TS MouseVectors).
@@ -47,8 +50,9 @@ impl MouseVectors {
         let w = canvas.client_width().max(1) as f32;
         let h = canvas.client_height().max(1) as f32;
 
-        let shared = Rc::new(RefCell::new(MouseTarget { x: 0.0, y: 0.0 }));
+        let shared = Rc::new(RefCell::new(MouseTarget { x: 0.0, y: 0.0, snap: true }));
 
+        // mousemove: update target
         { let s = shared.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
             let mut t = s.borrow_mut();
@@ -57,6 +61,36 @@ impl MouseVectors {
           });
           canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).ok();
           cb.forget();
+        }
+
+        // mouseenter: snap on next update (mouse re-entered after leaving)
+        { let s = shared.clone();
+          let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
+            let mut t = s.borrow_mut();
+            t.x = (e.offset_x() as f32 / w - 0.5) * 2.0;
+            t.y = (e.offset_y() as f32 / h - 0.5) * 2.0;
+            t.snap = true;
+          });
+          canvas.add_event_listener_with_callback("mouseenter", cb.as_ref().unchecked_ref()).ok();
+          cb.forget();
+        }
+
+        // window blur / focus: snap on next update (focus lost/regained)
+        if let Some(window) = web_sys::window() {
+            { let s = shared.clone();
+              let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+                s.borrow_mut().snap = true;
+              });
+              window.add_event_listener_with_callback("blur", cb.as_ref().unchecked_ref()).ok();
+              cb.forget();
+            }
+            { let s = shared.clone();
+              let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+                s.borrow_mut().snap = true;
+              });
+              window.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref()).ok();
+              cb.forget();
+            }
         }
 
         Self {
@@ -100,8 +134,17 @@ impl MouseVectors {
     pub fn update(&mut self, dt: f32) {
         #[cfg(target_arch = "wasm32")]
         if let Some(ref shared) = self.shared {
-            let t = shared.borrow();
+            let mut t = shared.borrow_mut();
             self.end = Vec2::new(t.x, t.y);
+            // If focus was lost / mouse re-entered, snap without interpolation
+            // so we don't produce a huge direction vector on the next frame.
+            if t.snap {
+                self.position = self.end;
+                self.direction = Vec2::ZERO;
+                self.strength = 0.0;
+                t.snap = false;
+                return;
+            }
         }
 
         let prev = self.position;

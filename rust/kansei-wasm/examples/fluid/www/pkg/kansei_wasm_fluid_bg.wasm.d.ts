@@ -42,6 +42,7 @@ export const wasm_bindgen__convert__closures_____invoke__hd699ab66e63e7540: (a: 
 export const wasm_bindgen__convert__closures_____invoke__h13a80c2f90f1693f: (a: number, b: number, c: any, d: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__h2a063713ed6b4590: (a: number, b: number, c: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__h2a063713ed6b4590_2: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h2a063713ed6b4590_3: (a: number, b: number, c: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__h5f54063ab07cf8c7: (a: number, b: number) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
