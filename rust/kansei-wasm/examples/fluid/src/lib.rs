@@ -471,20 +471,25 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let format = renderer.presentation_format();
 
     // ── Particles ──
-    let count = 100_000usize;
-    let radius = 10.0f32;
+    // Spread in an ellipsoid centered on the sim bounds (~70% of bounds extent).
+    let count = 75_000usize;
+    let center = [0.0f32, 11.0, 0.0]; // (min+max)/2 of bounds
+    let half = [18.0f32, 13.0, 11.0]; // 70% of bounds half-extent
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
         loop {
             rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let x = ((rng as f32 / u64::MAX as f32) * 2.0 - 1.0) * radius;
+            let ux = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
             rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let y = ((rng as f32 / u64::MAX as f32) * 2.0 - 1.0) * radius;
+            let uy = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
             rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let z = ((rng as f32 / u64::MAX as f32) * 2.0 - 1.0) * radius;
-            if x*x + y*y + z*z <= radius * radius {
-                positions[i*4]=x; positions[i*4+1]=y; positions[i*4+2]=z; positions[i*4+3]=1.0;
+            let uz = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
+            if ux*ux + uy*uy + uz*uz <= 1.0 {
+                positions[i*4]   = center[0] + ux * half[0];
+                positions[i*4+1] = center[1] + uy * half[1];
+                positions[i*4+2] = center[2] + uz * half[2];
+                positions[i*4+3] = 1.0;
                 break;
             }
         }
@@ -691,12 +696,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             Box::new(DepthOfFieldEffect::new(DepthOfFieldOptions {
                 focus_distance: 42.0,
                 focus_range: 37.0,
-                max_blur: 14.0,
+                max_blur: 7.0,
             })),
         ],
     );
 
-    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 75.0);
+    // Camera: start on the back diagonal (azimuth = 5π/4), 20% closer (radius 60 instead of 75)
+    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 60.0);
+    controls.set_azimuth(std::f32::consts::PI + std::f32::consts::FRAC_PI_4);
     let mouse = MouseVectors::from_canvas(&canvas);
 
     let perf_now = window.performance().map(|p| p.now()).unwrap_or(0.0);

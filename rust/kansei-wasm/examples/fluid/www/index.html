@@ -2,15 +2,13 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Kansei — Fluid 3D (WASM)</title>
+    <title>Kansei</title>
     <style>
         body { margin: 0; background: #000; overflow: hidden; }
         canvas { width: 100vw; height: 100vh; display: block; }
-        #fps { position: fixed; top: 10px; left: 10px; color: #0f0; font: bold 16px monospace; z-index: 1000; text-shadow: 0 0 4px #000; pointer-events: none; }
     </style>
 </head>
 <body>
-    <div id="fps">-- FPS</div>
     <canvas id="kansei"></canvas>
     <script type="module">
         import init, { start, get_fps, get_frame_time,
@@ -31,7 +29,7 @@
         await init();
         await start('kansei');
 
-        const pane = new Pane({ title: 'Fluid 3D (WASM)' });
+        const pane = new Pane({ title: 'Fluid 3D (WASM)', expanded: false });
         const p = {
             showParticles: true, renderMode: 'MarchingCubes', mcIso: 0.37, mcResolution: 128, particleSize: 0.15, batchedSim: true,
             simPreset: 'Balanced',
@@ -51,7 +49,7 @@
             'Stable':     { step: 1 / 75, scale: 1.0 },
         };
 
-        const debug = pane.addFolder({ title: 'Debug', expanded: true });
+        const debug = pane.addFolder({ title: 'Debug', expanded: false });
         debug.addBinding(p, 'showParticles', { label: 'show particles' }).on('change', () => set_show_particles(p.showParticles));
         debug.addBinding(p, 'renderMode', {
             label: 'render mode',
@@ -122,7 +120,7 @@
         bounds.addBinding(b, 'maxY', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
 
-        const lightFolder = pane.addFolder({ title: 'Light', expanded: true });
+        const lightFolder = pane.addFolder({ title: 'Light', expanded: false });
         const lt = {
             dirX: 0.3, dirY: -1.0, dirZ: 0.5,
             intensity: 2.0,
@@ -135,8 +133,8 @@
         lightFolder.addBinding(lt, 'intensity', { min: 0, max: 10, step: 0.1 }).on('change', () => set_light_intensity(lt.intensity));
         lightFolder.addBinding(lt, 'color', { color: { type: 'float' } }).on('change', () => set_light_color(lt.color.r, lt.color.g, lt.color.b));
 
-        const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: true });
-        const dof = { focusDistance: 42, focusRange: 37, maxBlur: 14 };
+        const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
+        const dof = { focusDistance: 42, focusRange: 37, maxBlur: 7 };
         dofFolder.addBinding(dof, 'focusDistance', { min: 1, max: 200, step: 1, label: 'focus dist' })
             .on('change', () => set_dof_focus_distance(dof.focusDistance));
         dofFolder.addBinding(dof, 'focusRange', { min: 1, max: 100, step: 1, label: 'focus range' })
@@ -144,7 +142,7 @@
         dofFolder.addBinding(dof, 'maxBlur', { min: 0, max: 64, step: 1, label: 'max blur' })
             .on('change', () => set_dof_max_blur(dof.maxBlur));
 
-        const txFolder = pane.addFolder({ title: 'Transmission', expanded: true });
+        const txFolder = pane.addFolder({ title: 'Transmission', expanded: false });
         const tx = {
             ior: 1.41, chromaticAberration: 0.05, tintStrength: 0.30,
             fresnelPower: 2.3, roughness: 0.28, thickness: 2.4,
@@ -163,7 +161,7 @@
         txFolder.addBinding(tx, 'thickness', { min: 0, max: 5, step: 0.1 }).on('change', syncTx);
         txFolder.addBinding(tx, 'color', { color: { type: 'float' }, label: 'fluid color' }).on('change', syncTx);
 
-        const stripe = pane.addFolder({ title: 'Dome Stripes', expanded: true });
+        const stripe = pane.addFolder({ title: 'Dome Stripes', expanded: false });
         const sp = {
             colorA: { r: 0, g: 0, b: 0 },
             colorB: { r: 1, g: 1, b: 1 },
@@ -192,16 +190,9 @@
         set_kernel_scale(p.kernelScale);
         set_dof_focus_distance(dof.focusDistance);
         set_dof_focus_range(dof.focusRange);
+        set_dof_max_blur(dof.maxBlur);
         syncTx();
         syncStripes();
-
-        // FPS overlay — read from Rust side (measured inside render_frame which IS the rAF callback)
-        const fpsEl = document.getElementById('fps');
-        setInterval(() => {
-            const fps = get_fps();
-            const ms = get_frame_time();
-            if (fps > 0) fpsEl.textContent = `${fps.toFixed(0)} FPS (${ms.toFixed(1)} ms) | 100k particles [Rust/WASM]`;
-        }, 500);
     </script>
 </body>
 </html>
