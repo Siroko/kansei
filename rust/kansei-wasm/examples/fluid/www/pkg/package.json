@@ -1,0 +1,15 @@
+{
+  "name": "kansei-wasm-fluid",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "kansei_wasm_fluid_bg.wasm",
+    "kansei_wasm_fluid.js",
+    "kansei_wasm_fluid.d.ts"
+  ],
+  "main": "kansei_wasm_fluid.js",
+  "types": "kansei_wasm_fluid.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
