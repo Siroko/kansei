@@ -34,10 +34,10 @@
             showParticles: true, renderMode: 'MarchingCubes', mcIso: 0.37, mcResolution: 128, particleSize: 0.15, batchedSim: true,
             simPreset: 'Balanced',
             simStepDt: 1 / 60,
-            simTimeScale: 1.85,
+            simTimeScale: 2.65,
             renderFps: 0,
             pressure: 46.5, nearPressure: 20.0, densityTarget: 8.6,
-            viscosity: 1.0, damping: 1.0, gravityY: -9.8,
+            viscosity: 1.0, damping: 0.997, gravityY: -12.8,
             mouseForce: 5000, mouseRadius: 0.1, substeps: 2,
             densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
             resolution: 128, kernelScale: 0.6,
@@ -185,6 +185,7 @@
         set_sim_time_scale(p.simTimeScale);
         set_viscosity(p.viscosity);
         set_damping(p.damping);
+        set_gravity_y(p.gravityY);
         set_mouse_force(p.mouseForce);
         set_substeps(p.substeps);
         set_kernel_scale(p.kernelScale);
