@@ -30,6 +30,10 @@ pub struct MaterialOptions {
     pub cull_mode: CullMode,
     pub topology: wgpu::PrimitiveTopology,
     pub outputs_emissive: bool,
+    /// Number of MRT fragment outputs this shader writes.
+    /// None (default) = auto-detect (1 if !outputs_emissive, 2 if outputs_emissive).
+    /// Some(N) = shader writes to the first N GBuffer targets.
+    pub mrt_output_count: Option<usize>,
 }
 
 impl Default for MaterialOptions {
@@ -41,6 +45,7 @@ impl Default for MaterialOptions {
             cull_mode: CullMode::Back,
             topology: wgpu::PrimitiveTopology::TriangleList,
             outputs_emissive: false,
+            mrt_output_count: None,
         }
     }
 }
@@ -150,7 +155,8 @@ impl Material {
         if !self.pipeline_cache.contains_key(&key) {
             // Number of fragment shader outputs: @location(0) always,
             // @location(1) only if the shader outputs emissive.
-            let shader_output_count = if self.options.outputs_emissive { 2 } else { 1 };
+            let shader_output_count = self.options.mrt_output_count.unwrap_or_else(||
+                if self.options.outputs_emissive { 2 } else { 1 });
 
             let targets: Vec<Option<wgpu::ColorTargetState>> = color_formats.iter().enumerate().map(|(i, fmt)| {
                 let mut state = wgpu::ColorTargetState {

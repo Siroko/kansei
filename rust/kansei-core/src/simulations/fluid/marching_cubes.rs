@@ -522,6 +522,19 @@ impl MarchingCubesSimulation {
         }
     }
 
+    /// Update with explicit encoder + queue (no Renderer needed).
+    pub fn update_with_encoder_and_queue(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        extract_bind_group: &wgpu::BindGroup,
+        source: SurfaceExtractionSourceContract,
+    ) {
+        if source.version != SurfaceContractVersion::V1 { return; }
+        self.update_with_queue(encoder, queue, extract_bind_group,
+            source.field_dims, source.world_bounds_min, source.world_bounds_max);
+    }
+
     pub fn update_with_encoder(
         &self,
         encoder: &mut wgpu::CommandEncoder,

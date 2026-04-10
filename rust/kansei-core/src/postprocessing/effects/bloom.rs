@@ -305,7 +305,7 @@ impl PostProcessingEffect for BloomEffect {
 
     fn render(
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
-        input: &wgpu::TextureView, _depth: &wgpu::TextureView, output: &wgpu::TextureView,
+        _gbuffer: &GBuffer, input: &wgpu::TextureView, _depth: &wgpu::TextureView, output: &wgpu::TextureView,
         _camera: &Camera, width: u32, height: u32,
     ) {
         if !self.initialized { return; }
@@ -466,5 +466,6 @@ impl PostProcessingEffect for BloomEffect {
         self.upsample_params.clear();
         self.initialized = false;
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }

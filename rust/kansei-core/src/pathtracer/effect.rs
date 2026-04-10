@@ -224,6 +224,7 @@ impl PostProcessingEffect for PathTracerEffect {
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        _gbuffer: &crate::renderers::GBuffer,
         _input: &wgpu::TextureView,
         _depth: &wgpu::TextureView,
         _output: &wgpu::TextureView,
@@ -266,5 +267,6 @@ impl PostProcessingEffect for PathTracerEffect {
     fn destroy(&mut self) {
         // Resources are dropped automatically when the struct is dropped.
     }
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }

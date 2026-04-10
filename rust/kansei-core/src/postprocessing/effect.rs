@@ -9,6 +9,7 @@ pub trait PostProcessingEffect {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        gbuffer: &GBuffer,
         input: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         output: &wgpu::TextureView,
@@ -19,5 +20,6 @@ pub trait PostProcessingEffect {
     fn resize(&mut self, width: u32, height: u32, gbuffer: &GBuffer);
     fn destroy(&mut self);
     /// Downcast support for runtime access to concrete effect types.
+    fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }

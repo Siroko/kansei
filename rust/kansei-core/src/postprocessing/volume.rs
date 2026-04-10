@@ -188,6 +188,7 @@ impl PostProcessingVolume {
                     &self.device,
                     &self.queue,
                     &mut encoder,
+                    gbuffer,
                     input_view,
                     &gbuffer.depth_view,
                     output_view,

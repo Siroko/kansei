@@ -94,7 +94,7 @@ impl PostProcessingEffect for ColorGradingEffect {
 
     fn render(
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
-        input: &wgpu::TextureView, _depth: &wgpu::TextureView, output: &wgpu::TextureView,
+        _gbuffer: &GBuffer, input: &wgpu::TextureView, _depth: &wgpu::TextureView, output: &wgpu::TextureView,
         _camera: &Camera, width: u32, height: u32,
     ) {
         let pipeline = match &self.pipeline { Some(p) => p, None => return };
@@ -124,5 +124,6 @@ impl PostProcessingEffect for ColorGradingEffect {
 
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {}
     fn destroy(&mut self) { self.initialized = false; }
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }
