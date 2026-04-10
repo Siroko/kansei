@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kansei — Path Tracer</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #fps {
+            position: fixed; top: 10px; left: 10px;
+            color: #0f0; font: 14px monospace;
+            background: rgba(0,0,0,0.6); padding: 4px 8px;
+            border-radius: 4px; z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <div id="fps">FPS: --</div>
+    <script type="module">
+        import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
+        import init, {
+            start,
+            set_spp,
+            set_max_bounces,
+            set_use_blue_noise,
+            reset_accumulation,
+            get_frame_index,
+        } from '../pkg/kansei_wasm_pathtracer.js';
+
+        await init();
+        await start('kansei');
+
+        // ── Tweakpane ──────────────────────────────────────────────
+        const params = {
+            spp: 1,
+            maxBounces: 4,
+            blueNoise: true,
+            frameIndex: 0,
+        };
+
+        const pane = new Pane({ title: 'Path Tracer' });
+
+        pane.addBinding(params, 'spp', { min: 1, max: 16, step: 1, label: 'SPP' })
+            .on('change', (ev) => set_spp(ev.value));
+
+        pane.addBinding(params, 'maxBounces', { min: 1, max: 16, step: 1, label: 'Max Bounces' })
+            .on('change', (ev) => set_max_bounces(ev.value));
+
+        pane.addBinding(params, 'blueNoise', { label: 'Blue Noise' })
+            .on('change', (ev) => set_use_blue_noise(ev.value));
+
+        pane.addButton({ title: 'Reset Accumulation' })
+            .on('click', () => reset_accumulation());
+
+        const frameMonitor = pane.addBinding(params, 'frameIndex', {
+            readonly: true,
+            label: 'Frame',
+            format: (v) => v.toFixed(0),
+        });
+
+        // ── FPS Counter ────────────────────────────────────────────
+        const fpsEl = document.getElementById('fps');
+        let lastTime = performance.now();
+        let frames = 0;
+
+        function tick() {
+            frames++;
+            const now = performance.now();
+            if (now - lastTime >= 1000) {
+                const fps = Math.round(frames * 1000 / (now - lastTime));
+                fpsEl.textContent = `FPS: ${fps}`;
+                frames = 0;
+                lastTime = now;
+            }
+            params.frameIndex = get_frame_index();
+            frameMonitor.refresh();
+            requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+    </script>
+</body>
+</html>

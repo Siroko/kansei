@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fluid 3D — Kansei</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: black;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+      }
+      #fps {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        color: #0f0;
+        font: bold 16px monospace;
+        z-index: 1000;
+        text-shadow: 0 0 4px #000;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="fps">-- FPS</div>
+    <script type="module">
+      import { Renderer } from '../src/renderers/Renderer'
+      import { Scene } from '../src/objects/Scene'
+      import { Camera } from '../src/cameras/Camera'
+      import { CameraControls } from '../src/controls/CameraControls'
+      import { Vector3 } from '../src/math/Vector3'
+      import { Vector4 } from '../src/math/Vector4'
+      import { Matrix4 } from '../src/math/Matrix4'
+      import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { BufferBase } from '../src/buffers/BufferBase'
+      import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
+      import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
+      import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+      import { MouseVectors } from '../src/controls/MouseVectors'
+      import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+      import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+      import { Material } from '../src/materials/Material'
+      import { Renderable } from '../src/objects/Renderable'
+      import { Float } from '../src/math/Float'
+      import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+      // ── Renderer ──────────────────────────────────────────
+      const renderer = new Renderer({
+        clearColor: new Vector4(0.02, 0.02, 0.04, 1),
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: Math.min(window.devicePixelRatio, 2),
+        sampleCount: 1,
+      });
+      await renderer.initialize();
+      document.body.appendChild(renderer.canvas);
+
+      // ── Scene & Camera ────────────────────────────────────
+      const scene = new Scene();
+      const camera = new Camera(45, 0.1, 1000, window.innerWidth / window.innerHeight);
+      camera.position.set(0, 0, 75);
+      camera.lookAt(new Vector3(0, 3, 0));
+
+      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 75);
+      const mouseVectors = new MouseVectors();
+
+      // ── Particle positions ────────────────────────────────
+      const particleCount = 100000;
+      const radius = 10.0;
+      const positions = new Float32Array(particleCount * 4);
+      for (let i = 0; i < particleCount; i++) {
+        let x, y, z;
+        do {
+          x = (Math.random() * 2 - 1) * radius;
+          y = (Math.random() * 2 - 1) * radius;
+          z = (Math.random() * 2 - 1) * radius;
+        } while (x * x + y * y + z * z > radius * radius);
+        positions[i * 4]     = x;
+        positions[i * 4 + 1] = y;
+        positions[i * 4 + 2] = z;
+        positions[i * 4 + 3] = 1;
+      }
+
+      const positionsBuffer = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_STORAGE,
+        usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC,
+        buffer: positions,
+        shaderLocation: 3,
+        offset: 0,
+        stride: 4 * 4,
+        format: 'float32x4',
+      });
+
+      // ── Fluid Simulation ──────────────────────────────────
+      const simSettings = {
+        maxParticles: particleCount,
+        dimensions: 3,
+        smoothingRadius: 1.0,
+        pressureMultiplier: 46.5,
+        nearPressureMultiplier: 20.0,
+        densityTarget: 8.6,
+        viscosity: 0.36,
+        damping: 0.998,
+        gravity: [0, -9.8, 0],
+        returnToOriginStrength: 0.0,
+        mouseRadius: 0.1,
+        mouseForce: 1520.0,
+        substeps: 3,
+        worldBoundsPadding: 0.3,
+      };
+
+      const sim = new FluidSimulation(renderer, simSettings);
+      const identityMatrix = new Matrix4(); // particles are already in world space
+      sim.initialize(positionsBuffer, positionsBuffer.clone(), {
+        viewMatrix: camera.viewMatrix,
+        projectionMatrix: camera.projectionMatrix,
+        inverseViewMatrix: camera.inverseViewMatrix,
+        worldMatrix: identityMatrix,
+      });
+
+      sim.worldBoundsMin = [-25, -8, -16];
+      sim.worldBoundsMax = [25, 30, 16];
+      sim.rebuildGrid();
+
+      // ── Density Field ─────────────────────────────────────
+      let densityField = new FluidDensityField(renderer.device, sim, {
+        resolution: 128,
+        kernelScale: 3.7,
+      });
+
+      // ── Surface Effect & Post-Processing Volume ───────────
+      const surfaceEffect = new FluidSurfaceEffect({
+        densityField,
+        fluidColor: [0.77, 0.96, 1.0],
+        densityScale: 1.1,
+        densityThreshold: 1.09,
+        absorption: 2.5,
+        stepCount: 128,
+      });
+
+      const volume = new PostProcessingVolume(renderer, [surfaceEffect]);
+
+      // ── Debug particle view ───────────────────────────────
+      const particleScale = new Float(0.01);
+      const particleShader = /* wgsl */`
+struct VertexOut {
+    @builtin(position) position : vec4<f32>,
+    @location(0) color : vec3<f32>,
+};
+struct FragOut {
+    @location(0) color    : vec4<f32>,
+    @location(1) emissive : vec4<f32>,
+    @location(2) normal   : vec4<f32>,
+    @location(3) albedo   : vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> scale: f32;
+@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+
+@vertex
+fn vertex_main(
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) instancePos: vec4<f32>,
+) -> VertexOut {
+    var output : VertexOut;
+    let right = vec3<f32>(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+    let up = vec3<f32>(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+    let worldPos = instancePos.xyz + right * position.x * scale + up * position.y * scale;
+    output.position = projectionMatrix * viewMatrix * vec4<f32>(worldPos, 1.0);
+    output.color = vec3<f32>(0.3, 0.6, 1.0);
+    return output;
+}
+
+@fragment
+fn fragment_main(fragData: VertexOut) -> FragOut {
+    var out: FragOut;
+    out.color = vec4<f32>(fragData.color, 1.0);
+    out.emissive = vec4<f32>(0.0);
+    out.normal = vec4<f32>(0.0, 0.0, 1.0, 0.0);
+    out.albedo = vec4<f32>(fragData.color, 1.0);
+    return out;
+}
+`;
+      const particlePlane = new PlaneGeometry(1, 1);
+      const particleGeom = new InstancedGeometry(particlePlane, particleCount, [positionsBuffer]);
+      const particleMat = new Material(particleShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX, value: particleScale },
+        ],
+        cullMode: 'none',
+      });
+      const particleMesh = new Renderable(particleGeom, particleMat);
+      scene.add(particleMesh);
+      let showParticles = false;
+
+      // ── Tweakpane ─────────────────────────────────────────
+      const pane = new Pane({ title: 'Fluid 3D' });
+
+      // Debug
+      const debugFolder = pane.addFolder({ title: 'Debug', expanded: false });
+      const debugParams = { showParticles: false };
+      debugFolder.addBinding(debugParams, 'showParticles', { label: 'show particles' }).on('change', (ev) => {
+        showParticles = ev.value;
+        if (ev.value) {
+          if (!scene.children.includes(particleMesh)) scene.add(particleMesh);
+        } else {
+          const idx = scene.children.indexOf(particleMesh);
+          if (idx !== -1) scene.children.splice(idx, 1);
+        }
+      });
+      // Start with particles removed from scene (surface mode)
+      scene.children.splice(scene.children.indexOf(particleMesh), 1);
+      const scaleParams = { particleSize: 0.01 };
+      debugFolder.addBinding(scaleParams, 'particleSize', { min: 0.01, max: 1.0, step: 0.01, label: 'particle size' }).on('change', () => {
+        particleScale.value = scaleParams.particleSize;
+      });
+
+      // Appearance folder
+      const appearanceFolder = pane.addFolder({ title: 'Appearance', expanded: false });
+      const colorObj = { r: 0.77, g: 0.96, b: 1.0 };
+      const syncColor = () => { surfaceEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
+      appearanceFolder.addBinding(colorObj, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', syncColor);
+      appearanceFolder.addBinding(colorObj, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', syncColor);
+      appearanceFolder.addBinding(colorObj, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', syncColor);
+      appearanceFolder.addBinding(surfaceEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
+      appearanceFolder.addBinding(surfaceEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
+      appearanceFolder.addBinding(surfaceEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
+      appearanceFolder.addBinding(surfaceEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
+
+      // Density field folder
+      const fieldFolder = pane.addFolder({ title: 'Density Field', expanded: false });
+      const fieldParams = { resolution: 128, kernelScale: 3.7 };
+      fieldFolder.addBinding(fieldParams, 'resolution', { min: 16, max: 256, step: 16 }).on('change', () => {
+        densityField.destroy();
+        densityField = new FluidDensityField(renderer.device, sim, {
+          resolution: fieldParams.resolution,
+          kernelScale: fieldParams.kernelScale,
+        });
+        surfaceEffect._densityField = densityField;
+        surfaceEffect._currentInput = null;
+      });
+      fieldFolder.addBinding(fieldParams, 'kernelScale', { min: 0.1, max: 5.0, step: 0.1, label: 'kernel scale' }).on('change', () => {
+        densityField._kernelScale = fieldParams.kernelScale;
+      });
+
+      // Simulation folder
+      const simFolder = pane.addFolder({ title: 'Simulation', expanded: false });
+      simFolder.addBinding(simSettings, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => { sim.params.substeps = simSettings.substeps; });
+      simFolder.addBinding(simSettings, 'smoothingRadius', { min: 0.1, max: 3.0, step: 0.1, label: 'radius' }).on('change', () => { sim.params.smoothingRadius = simSettings.smoothingRadius; });
+
+      // SPH folder
+      const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
+      sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
+      sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
+      sphFolder.addBinding(simSettings, 'densityTarget', { min: 0, max: 10, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
+      sphFolder.addBinding(simSettings, 'viscosity', { min: 0, max: 1, step: 0.01 }).on('change', () => { sim.params.viscosity = simSettings.viscosity; });
+      sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
+
+      // Forces folder
+      const forcesFolder = pane.addFolder({ title: 'Forces', expanded: false });
+      const gravityObj = { y: simSettings.gravity[1] };
+      forcesFolder.addBinding(gravityObj, 'y', { min: -20, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [0, gravityObj.y, 0]; });
+      forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0, max: 2, step: 0.01, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
+      forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.01, max: 2, step: 0.01, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
+      forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 5000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
+
+      // Bounds folder
+      const boundsFolder = pane.addFolder({ title: 'Bounds', expanded: false });
+      const boundsObj = {
+        minX: -25, minY: -8, minZ: -16,
+        maxX: 25, maxY: 30, maxZ: 16,
+      };
+      const syncBounds = () => {
+        sim.worldBoundsMin[0] = boundsObj.minX; sim.worldBoundsMin[1] = boundsObj.minY; sim.worldBoundsMin[2] = boundsObj.minZ;
+        sim.worldBoundsMax[0] = boundsObj.maxX; sim.worldBoundsMax[1] = boundsObj.maxY; sim.worldBoundsMax[2] = boundsObj.maxZ;
+        sim.rebuildGrid();
+      };
+      boundsFolder.addBinding(boundsObj, 'minX', { min: -50, max: 0, step: 0.5, label: 'min X' }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'minY', { min: -50, max: 0, step: 0.5, label: 'min Y' }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'minZ', { min: -50, max: 0, step: 0.5, label: 'min Z' }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'maxX', { min: 0, max: 50, step: 0.5, label: 'max X' }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'maxY', { min: 0, max: 50, step: 0.5, label: 'max Y' }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5, label: 'max Z' }).on('change', syncBounds);
+
+
+      // ── FPS counter (inside render loop) ──
+      const fpsEl = document.getElementById('fps');
+      let fpsFrames = 0, fpsLastTime = performance.now();
+
+      // ── Render loop ───────────────────────────────────────
+      const startTimeS = performance.now() / 1000;
+      const time = new Vector4(startTimeS, 0, startTimeS, 0);
+
+      async function animate() {
+        const frameStart = performance.now();
+
+        // FPS: count actual animate() calls
+        fpsFrames++;
+        const fpsElapsed = frameStart - fpsLastTime;
+        if (fpsElapsed >= 1000) {
+          const realFps = (fpsFrames / fpsElapsed) * 1000;
+          const realMs = fpsElapsed / fpsFrames;
+          fpsEl.textContent = `${realFps.toFixed(0)} FPS (${realMs.toFixed(1)} ms) | 100k particles [TypeScript]`;
+          fpsFrames = 0;
+          fpsLastTime = frameStart;
+        }
+        time.x = frameStart / 1000;
+        time.y = time.x - time.z;
+        time.z = time.x;
+
+        const dt = Math.max(time.y, 1 / 60);
+
+        mouseVectors.update(dt);
+        cameraControls.update(time.x);
+        await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
+
+        // Always update density field
+        const encoder = renderer.device.createCommandEncoder();
+        densityField.update(encoder);
+        renderer.device.queue.submit([encoder.finish()]);
+
+        // Toggle surface effect: remove from chain when showing particles
+        if (showParticles && volume.effects.length > 0) {
+          volume.effects.length = 0;
+        } else if (!showParticles && volume.effects.length === 0) {
+          volume.effects.push(surfaceEffect);
+        }
+        volume.render(scene, camera);
+
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      // ── Resize ────────────────────────────────────────────
+      function onResize() {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      window.addEventListener('resize', onResize);
+    </script>
+  </body>
+</html>
