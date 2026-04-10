@@ -1,0 +1,18 @@
+[package]
+name = "kansei-native"
+version = "0.1.0"
+edition = "2021"
+description = "Kansei engine — native desktop runner"
+
+[dependencies]
+kansei-core = { path = "../kansei-core", features = ["egui"] }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+pollster = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+winit = "0.30"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"

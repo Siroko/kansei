@@ -1,0 +1,819 @@
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use kansei_core::cameras::Camera;
+use kansei_core::math::{Mat4, Vec3};
+use kansei_core::renderers::{Renderer, RendererConfig};
+use wgpu::util::DeviceExt;
+use kansei_core::simulations::fluid::{
+    DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
+    FluidSurfaceRenderer, MarchingCubesOptions, SimulationRenderable, SimulationRenderableInputContract,
+    SurfaceContractVersion, SurfaceExtractionSourceContract,
+};
+
+const PARTICLE_MSAA_SAMPLES: u32 = 4;
+
+#[wasm_bindgen(start)]
+pub fn init() {
+    console_error_panic_hook::set_once();
+    console_log::init_with_level(log::Level::Info).ok();
+    log::info!("Kansei WASM initialized");
+}
+
+// ── Blit shader (fullscreen triangle) ──
+const BLIT_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+    return vec4<f32>(pos[vi], 0.0, 1.0);
+}
+struct FOut { @location(0) color: vec4<f32>, }
+@fragment fn fs(@builtin(position) frag: vec4<f32>) -> FOut {
+    let dims = vec2<f32>(textureDimensions(src));
+    var out: FOut; out.color = textureSample(src, samp, frag.xy / dims); return out;
+}
+"#;
+
+// ── Particle billboard shader ──
+const PARTICLE_WGSL: &str = r#"
+struct P { view: mat4x4<f32>, proj: mat4x4<f32>, size: f32, }
+@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> p: P;
+struct V { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, }
+const Q: array<vec2<f32>,6> = array(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,-1.),vec2(1.,1.),vec2(-1.,1.));
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> V {
+    let pid=vi/6u; let c=Q[vi%6u]; let pos=positions[pid]; let s=p.size;
+    let r=vec3<f32>(p.view[0][0],p.view[1][0],p.view[2][0]);
+    let u=vec3<f32>(p.view[0][1],p.view[1][1],p.view[2][1]);
+    let wp=pos.xyz+r*c.x*s+u*c.y*s;
+    var o:V; o.pos=p.proj*p.view*vec4<f32>(wp,1.);
+    let t=clamp((pos.y+8.)/16.,0.,1.);
+    o.col=mix(vec3<f32>(0.1,0.3,0.8),vec3<f32>(0.8,0.95,1.0),t); return o;
+}
+@fragment fn fs(v:V)->@location(0) vec4<f32>{return vec4<f32>(v.col,1.);}
+"#;
+
+// ── Cornell box shader ──
+const CORNELL_WGSL: &str = r#"
+struct Params { view: mat4x4<f32>, proj: mat4x4<f32>, }
+@group(0) @binding(0) var<uniform> p: Params;
+
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @location(1) norm: vec3<f32>, }
+
+@vertex fn vs(@location(0) position: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>) -> VOut {
+    var o: VOut;
+    o.pos = p.proj * p.view * vec4<f32>(position, 1.0);
+    o.col = color;
+    o.norm = normal;
+    return o;
+}
+
+@fragment fn fs(v: VOut) -> @location(0) vec4<f32> {
+    let light = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let ndotl = max(dot(normalize(v.norm), light), 0.0);
+    let ambient = 0.3;
+    return vec4<f32>(v.col * (ambient + ndotl * 0.7), 1.0);
+}
+"#;
+
+struct CornellBox {
+    pipeline: wgpu::RenderPipeline,
+    depth_pipeline: wgpu::RenderPipeline,
+    vertex_buf: wgpu::Buffer,
+    params_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    vertex_count: u32,
+}
+
+impl CornellBox {
+    fn new(renderer: &Renderer, format: wgpu::TextureFormat, bounds_min: [f32; 3], bounds_max: [f32; 3]) -> Self {
+        let shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CornellBox"),
+            source: wgpu::ShaderSource::Wgsl(CORNELL_WGSL.into()),
+        });
+
+        let [x0, y0, z0] = bounds_min;
+        let [x1, y1, z1] = bounds_max;
+        #[rustfmt::skip]
+        let vertices: Vec<f32> = vec![
+            x0,y0,z0, 0.0,1.0,0.0, 0.7,0.7,0.7, x1,y0,z0, 0.0,1.0,0.0, 0.7,0.7,0.7, x1,y0,z1, 0.0,1.0,0.0, 0.7,0.7,0.7,
+            x0,y0,z0, 0.0,1.0,0.0, 0.7,0.7,0.7, x1,y0,z1, 0.0,1.0,0.0, 0.7,0.7,0.7, x0,y0,z1, 0.0,1.0,0.0, 0.7,0.7,0.7,
+            x0,y1,z1, 0.0,-1.0,0.0, 0.7,0.7,0.7, x1,y1,z1, 0.0,-1.0,0.0, 0.7,0.7,0.7, x1,y1,z0, 0.0,-1.0,0.0, 0.7,0.7,0.7,
+            x0,y1,z1, 0.0,-1.0,0.0, 0.7,0.7,0.7, x1,y1,z0, 0.0,-1.0,0.0, 0.7,0.7,0.7, x0,y1,z0, 0.0,-1.0,0.0, 0.7,0.7,0.7,
+            x0,y0,z0, 0.0,0.0,1.0, 0.7,0.7,0.7, x0,y1,z0, 0.0,0.0,1.0, 0.7,0.7,0.7, x1,y1,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
+            x0,y0,z0, 0.0,0.0,1.0, 0.7,0.7,0.7, x1,y1,z0, 0.0,0.0,1.0, 0.7,0.7,0.7, x1,y0,z0, 0.0,0.0,1.0, 0.7,0.7,0.7,
+            x0,y0,z0, 1.0,0.0,0.0, 0.8,0.15,0.1, x0,y0,z1, 1.0,0.0,0.0, 0.8,0.15,0.1, x0,y1,z1, 1.0,0.0,0.0, 0.8,0.15,0.1,
+            x0,y0,z0, 1.0,0.0,0.0, 0.8,0.15,0.1, x0,y1,z1, 1.0,0.0,0.0, 0.8,0.15,0.1, x0,y1,z0, 1.0,0.0,0.0, 0.8,0.15,0.1,
+            x1,y0,z1, -1.0,0.0,0.0, 0.15,0.8,0.1, x1,y0,z0, -1.0,0.0,0.0, 0.15,0.8,0.1, x1,y1,z0, -1.0,0.0,0.0, 0.15,0.8,0.1,
+            x1,y0,z1, -1.0,0.0,0.0, 0.15,0.8,0.1, x1,y1,z0, -1.0,0.0,0.0, 0.15,0.8,0.1, x1,y1,z1, -1.0,0.0,0.0, 0.15,0.8,0.1,
+            x1,y0,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7, x0,y1,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7, x0,y0,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
+            x1,y0,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7, x1,y1,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7, x0,y1,z1, 0.0,0.0,-1.0, 0.7,0.7,0.7,
+        ];
+        let vertex_buf = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CornellBox/Vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let params_buf = renderer.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("CornellBox/Params"),
+            size: 128,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let vertex_layout = [wgpu::VertexBufferLayout {
+            array_stride: 36,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
+            ],
+        }];
+        let primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Front),
+            ..Default::default()
+        };
+
+        let bgl = renderer.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CornellBox/BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = renderer.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("CornellBox/Layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = renderer.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CornellBox"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &vertex_layout, compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+            primitive,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
+            multiview: None,
+            cache: None,
+        });
+        let depth_pipeline = renderer.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CornellBox/Depth"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &vertex_layout, compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let bind_group = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() }],
+        });
+
+        Self { pipeline, depth_pipeline, vertex_buf, params_buf, bind_group, vertex_count: 36 }
+    }
+
+    fn upload(&self, renderer: &Renderer, view: &glam::Mat4, proj: &glam::Mat4) {
+        let mut d = [0.0f32; 32];
+        d[..16].copy_from_slice(&view.to_cols_array());
+        d[16..32].copy_from_slice(&proj.to_cols_array());
+        renderer.queue().write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&d));
+    }
+}
+
+#[wasm_bindgen]
+pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = canvas_id;
+        return Err(JsValue::from_str("kansei-wasm start() is only supported on wasm32"));
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+    let window = web_sys::window().unwrap();
+    let document = window.document().unwrap();
+    let canvas = document.get_element_by_id(canvas_id)
+        .ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
+
+    let css_width = (canvas.client_width().max(1)) as u32;
+    let css_height = (canvas.client_height().max(1)) as u32;
+    let dpr = window.device_pixel_ratio().clamp(1.0, 2.0);
+    let width = ((css_width as f64) * dpr).round().max(1.0) as u32;
+    let height = ((css_height as f64) * dpr).round().max(1.0) as u32;
+    canvas.set_width(width);
+    canvas.set_height(height);
+
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::BROWSER_WEBGPU, ..Default::default()
+    });
+    let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+        .map_err(|e| JsValue::from_str(&format!("{e}")))?;
+    let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+        compatible_surface: Some(&surface), ..Default::default()
+    }).await.ok_or("No adapter")?;
+    let mut renderer = Renderer::new(RendererConfig {
+        width,
+        height,
+        sample_count: 1,
+        present_mode: wgpu::PresentMode::Fifo,
+        ..Default::default()
+    });
+    renderer.initialize(surface, &adapter).await;
+    let format = renderer.presentation_format();
+
+    // ── Particles ──
+    let count = 100000usize;
+    let radius = 10.0f32;
+    let mut positions = vec![0.0f32; count * 4];
+    let mut rng: u64 = 12345;
+    for i in 0..count {
+        loop {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let x = ((rng as f32 / u64::MAX as f32) * 2.0 - 1.0) * radius;
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let y = ((rng as f32 / u64::MAX as f32) * 2.0 - 1.0) * radius;
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let z = ((rng as f32 / u64::MAX as f32) * 2.0 - 1.0) * radius;
+            if x*x + y*y + z*z <= radius * radius {
+                positions[i*4]=x; positions[i*4+1]=y; positions[i*4+2]=z; positions[i*4+3]=1.0; break;
+            }
+        }
+    }
+
+    // ── Sim ──
+    let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
+        max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0,
+        pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
+        viscosity: 0.36, damping: 0.998, gravity: [0.0, -9.8, 0.0],
+        mouse_force: 1520.0, substeps: 3, world_bounds_padding: 0.3,
+        ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
+    }, &positions);
+    sim.world_bounds_min = [-25.0, -8.0, -16.0];
+    sim.world_bounds_max = [25.0, 30.0, 16.0];
+    sim.rebuild_grid();
+
+    // ── Density field + surface renderer ──
+    let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
+        sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7 });
+    let surface_renderer = FluidSurfaceRenderer::new(&renderer);
+    let cornell_box = CornellBox::new(&renderer, format, sim.world_bounds_min, sim.world_bounds_max);
+
+    // ── Particle pipeline ──
+    let particle_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Particles"), source: wgpu::ShaderSource::Wgsl(PARTICLE_WGSL.into()),
+    });
+    let particle_params_buf = renderer.device().create_buffer(&wgpu::BufferDescriptor {
+        label: None, size: 144, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let particle_pipeline = renderer.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Particles"), layout: None,
+        vertex: wgpu::VertexState { module: &particle_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &particle_shader, entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            compilation_options: Default::default() }),
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
+        multiview: None,
+        cache: None,
+    });
+    let particle_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &particle_pipeline.get_bind_group_layout(0), entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: sim.positions_buffer().unwrap().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: particle_params_buf.as_entire_binding() },
+        ],
+    });
+
+    // ── Blit pipeline ──
+    let blit_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Blit"), source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+    });
+    let blit_bgl = renderer.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None, entries: &[
+            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+        ],
+    });
+    let blit_pipeline = renderer.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Blit"), layout: Some(&renderer.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&blit_bgl], push_constant_ranges: &[] })),
+        vertex: wgpu::VertexState { module: &blit_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &blit_shader, entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            compilation_options: Default::default() }),
+        primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
+    });
+    let blit_sampler = renderer.device().create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+
+    // ── Offscreen textures ──
+    let mk_tex = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+        let tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: fmt, usage, view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    };
+    let cu = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
+    let (_color_tex, color_view) = mk_tex("Color", wgpu::TextureFormat::Rgba16Float, cu);
+    let (_depth_tex, depth_view) = mk_tex("Depth", wgpu::TextureFormat::Depth32Float,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
+    let (_output_tex, output_view) = mk_tex("Output", wgpu::TextureFormat::Rgba16Float, cu);
+    let particle_msaa_tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("ParticleMSAA"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: PARTICLE_MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let particle_msaa_view = particle_msaa_tex.create_view(&Default::default());
+    let particle_depth_tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("ParticleDepth"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: PARTICLE_MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let particle_depth_view = particle_depth_tex.create_view(&Default::default());
+
+    // ── Bind groups for surface renderer + blit ──
+    let surface_bg = surface_renderer.create_bind_group(&color_view, &depth_view, &output_view, &density_field.density_view);
+    let blit_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &blit_bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&blit_sampler) },
+        ],
+    });
+    let marching_cubes = FluidMarchingCubes::new(
+        &renderer,
+        MarchingCubesOptions {
+            max_triangles: 262_144,
+            iso_level: 0.05,
+        },
+    );
+    let marching_cubes_bg = marching_cubes.create_bind_group(&renderer, &density_field.density_view);
+    let marching_cubes_renderer = SimulationRenderable::new(&renderer, format, 1);
+
+    let perf_now = window.performance().map(|p| p.now()).unwrap_or(0.0);
+    let state = Rc::new(RefCell::new(State {
+        renderer,
+        sim, density_field, surface_renderer,
+        particle_pipeline, particle_bg, particle_params_buf,
+        cornell_box,
+        blit_pipeline, blit_bg, surface_bg,
+        marching_cubes, marching_cubes_bg, marching_cubes_renderer,
+        color_view, depth_view, output_view,
+        particle_msaa_tex, particle_msaa_view, particle_depth_tex, particle_depth_view,
+        count: count as u32, width, height,
+        css_width, css_height,
+        mouse_ndc: [0.0; 2], mouse_prev_ndc: [0.0; 2],
+        azimuth: 0.0, elevation: 0.3, distance: 75.0,
+        dragging: false, last_mouse: None,
+        particle_size: 0.15, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
+        use_batched_sim: true,
+        camera: Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32),
+        sim_accumulator: 0.0,
+        sim_dt_step: 1.0 / 60.0,
+        sim_time_scale: 1.0,
+        max_render_fps: 0.0,
+        render_accumulator: 0.0,
+        frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
+        current_fps: 0.0, current_frame_ms: 0.0,
+    }));
+
+    GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
+
+    // Mouse events
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
+        let mut st = s.borrow_mut();
+        let nx = (e.offset_x() as f32 / st.css_width as f32) * 2.0 - 1.0;
+        let ny = (e.offset_y() as f32 / st.css_height as f32) * 2.0 - 1.0;
+        st.mouse_prev_ndc = st.mouse_ndc; st.mouse_ndc = [nx, ny];
+        if st.dragging {
+            if let Some((lx, ly)) = st.last_mouse {
+                st.azimuth -= (e.offset_x() as f32 - lx) * 0.005;
+                st.elevation = (st.elevation + (e.offset_y() as f32 - ly) * 0.005).clamp(-1.5, 1.5);
+            }
+        }
+        st.last_mouse = Some((e.offset_x() as f32, e.offset_y() as f32));
+      });
+      canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())?; cb.forget(); }
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| { s.borrow_mut().dragging = e.buttons() & 1 != 0; });
+      canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref())?; cb.forget(); }
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |_: web_sys::MouseEvent| { s.borrow_mut().dragging = false; });
+      canvas.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())?; cb.forget(); }
+    { let s = state.clone();
+      let cb = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
+        let mut st = s.borrow_mut();
+        st.distance = (st.distance + e.delta_y() as f32 * 0.01).clamp(2.0, 100.0);
+      });
+      canvas.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())?; cb.forget(); }
+
+    // Animation loop
+    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    let g = f.clone(); let s = state.clone();
+    *g.borrow_mut() = Some(Closure::new(move || {
+        s.borrow_mut().render_frame();
+        request_animation_frame(f.borrow().as_ref().unwrap());
+    }));
+    request_animation_frame(g.borrow().as_ref().unwrap());
+
+    log::info!("Kansei WASM — {} particles, [toggle via tweakpane]", count);
+    Ok(())
+    }
+}
+
+fn request_animation_frame(f: &Closure<dyn FnMut()>) {
+    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
+}
+
+struct State {
+    renderer: Renderer,
+    sim: FluidSimulation, density_field: FluidDensityField, surface_renderer: FluidSurfaceRenderer,
+    particle_pipeline: wgpu::RenderPipeline, particle_bg: wgpu::BindGroup, particle_params_buf: wgpu::Buffer,
+    cornell_box: CornellBox,
+    blit_pipeline: wgpu::RenderPipeline, blit_bg: wgpu::BindGroup, surface_bg: wgpu::BindGroup,
+    marching_cubes: FluidMarchingCubes,
+    marching_cubes_bg: wgpu::BindGroup,
+    marching_cubes_renderer: SimulationRenderable,
+    color_view: wgpu::TextureView, depth_view: wgpu::TextureView, output_view: wgpu::TextureView,
+    particle_msaa_tex: wgpu::Texture, particle_msaa_view: wgpu::TextureView,
+    particle_depth_tex: wgpu::Texture, particle_depth_view: wgpu::TextureView,
+    count: u32, width: u32, height: u32,
+    css_width: u32, css_height: u32,
+    mouse_ndc: [f32; 2], mouse_prev_ndc: [f32; 2],
+    azimuth: f32, elevation: f32, distance: f32,
+    dragging: bool, last_mouse: Option<(f32, f32)>,
+    particle_size: f32, show_particles: bool, render_mode: u32, mc_iso_level: f32,
+    use_batched_sim: bool,
+    camera: Camera,
+    sim_accumulator: f64,
+    sim_dt_step: f32,
+    sim_time_scale: f32,
+    max_render_fps: f64,
+    render_accumulator: f64,
+    frame_count: u32, frame_time_sum: f64, last_perf_time: f64,
+    current_fps: f64, current_frame_ms: f64,
+}
+
+impl State {
+    fn render_frame(&mut self) {
+        // Wall clock timing from browser rAF cadence
+        let perf = web_sys::window().unwrap().performance().unwrap();
+        let now = perf.now();
+        let frame_ms = (now - self.last_perf_time).max(0.0);
+        self.last_perf_time = now;
+
+        // Render pacing: lock to a stable present cadence to avoid 120Hz "miss jitter".
+        self.render_accumulator += frame_ms * 0.001;
+        let target_render_dt = if self.max_render_fps > 0.0 { 1.0 / self.max_render_fps } else { 0.0 };
+        if target_render_dt > 0.0 && self.render_accumulator < target_render_dt {
+            return;
+        }
+        let render_dt = if target_render_dt > 0.0 {
+            let dt = self.render_accumulator;
+            self.render_accumulator = 0.0;
+            dt
+        } else {
+            frame_ms * 0.001
+        };
+
+        self.frame_time_sum += render_dt * 1000.0;
+        self.frame_count += 1;
+        if self.frame_count % 60 == 0 {
+            let avg = self.frame_time_sum / 60.0;
+            self.current_frame_ms = avg;
+            self.current_fps = 1000.0 / avg;
+            self.frame_time_sum = 0.0;
+        }
+
+        let frame_dt = render_dt.max(1.0 / 1000.0);
+        let target = glam::Vec3::new(0.0, 3.0, 0.0);
+        let eye_offset = glam::Vec3::new(
+            self.distance * self.azimuth.sin() * self.elevation.cos(),
+            self.distance * self.elevation.sin(),
+            self.distance * self.azimuth.cos() * self.elevation.cos(),
+        );
+        let eye = target + eye_offset;
+        self.camera.set_position(eye.x, eye.y, eye.z);
+        self.camera.look_at(&Vec3::new(target.x, target.y, target.z));
+        self.camera.aspect = self.width as f32 / self.height as f32;
+        self.camera.update_projection_matrix();
+        let view = self.camera.view_matrix.to_glam();
+        let proj = self.camera.projection_matrix.to_glam();
+        let inv_view = self.camera.inverse_view_matrix.to_glam();
+        let inv_vp = (proj * view).inverse();
+        self.cornell_box.upload(&self.renderer, &view, &proj);
+
+        let mouse_dir = [
+            -(self.mouse_ndc[0] - self.mouse_prev_ndc[0]),
+            -(self.mouse_ndc[1] - self.mouse_prev_ndc[1]),
+        ];
+        let mouse_strength = (mouse_dir[0]*mouse_dir[0] + mouse_dir[1]*mouse_dir[1]).sqrt().min(1.0);
+
+        let identity = glam::Mat4::IDENTITY.to_cols_array();
+        self.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
+        // Keep simulation cadence stable with configurable fixed step.
+        let sim_step_dt = self.sim_dt_step.clamp(1.0 / 240.0, 1.0 / 20.0);
+        let scaled_dt = sim_step_dt * self.sim_time_scale.clamp(0.1, 4.0);
+        self.sim_accumulator = (self.sim_accumulator + frame_dt).min(0.25);
+        let mut steps = 0u32;
+        while self.sim_accumulator >= sim_step_dt as f64 && steps < 8 {
+            if self.use_batched_sim {
+                self.sim.update_batched(scaled_dt, mouse_strength, self.mouse_ndc, mouse_dir);
+            } else {
+                self.sim.update(scaled_dt, mouse_strength, self.mouse_ndc, mouse_dir);
+            }
+            self.sim_accumulator -= sim_step_dt as f64;
+            steps += 1;
+        }
+
+        let output = self.renderer.surface().unwrap().get_current_texture().unwrap();
+        let canvas_view = output.texture.create_view(&Default::default());
+        let mut encoder = self.renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("WasmFluid/Frame"),
+        });
+
+        if self.show_particles && self.render_mode == 0 {
+            // Upload particle params
+            let mut data = [0.0f32; 36];
+            data[..16].copy_from_slice(&view.to_cols_array());
+            data[16..32].copy_from_slice(&proj.to_cols_array());
+            data[32] = self.particle_size;
+            self.renderer
+                .queue().write_buffer(&self.particle_params_buf, 0, bytemuck::cast_slice(&data));
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.particle_msaa_view, resolve_target: Some(&canvas_view),
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.particle_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            }).forget_lifetime();
+            pass.set_pipeline(&self.cornell_box.pipeline);
+            pass.set_bind_group(0, &self.cornell_box.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.cornell_box.vertex_buf.slice(..));
+            pass.draw(0..self.cornell_box.vertex_count, 0..1);
+            pass.set_pipeline(&self.particle_pipeline);
+            pass.set_bind_group(0, &self.particle_bg, &[]);
+            pass.draw(0..self.count * 6, 0..1);
+            drop(pass);
+        } else if self.render_mode == 1 {
+            // Density field update
+            self.density_field.update_with_encoder(&mut encoder,
+                self.sim.world_bounds_min, self.sim.world_bounds_max,
+                self.sim.particle_count(), self.sim.params.smoothing_radius);
+
+            // Clear offscreen color + depth
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.color_view, resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }), ..Default::default()
+                });
+                pass.set_pipeline(&self.cornell_box.depth_pipeline);
+                pass.set_bind_group(0, &self.cornell_box.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.cornell_box.vertex_buf.slice(..));
+                pass.draw(0..self.cornell_box.vertex_count, 0..1);
+            }
+
+            // Ray-march
+            let inv_vp = Mat4::from(inv_vp);
+            self.surface_renderer.render(&mut encoder, &self.surface_bg,
+                &inv_vp, [eye.x, eye.y, eye.z],
+                self.sim.world_bounds_min, self.sim.world_bounds_max,
+                self.width, self.height);
+
+            // Blit to canvas
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &canvas_view, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })], ..Default::default()
+            }).forget_lifetime();
+            pass.set_pipeline(&self.blit_pipeline);
+            pass.set_bind_group(0, &self.blit_bg, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+        } else {
+            // Voxel shell / marching-cubes mode
+            self.density_field.update_with_encoder(
+                &mut encoder,
+                self.sim.world_bounds_min,
+                self.sim.world_bounds_max,
+                self.sim.particle_count(),
+                self.sim.params.smoothing_radius,
+            );
+            self.marching_cubes.set_iso_level(self.mc_iso_level);
+            let source = SurfaceExtractionSourceContract {
+                version: SurfaceContractVersion::V1,
+                field_dims: self.density_field.tex_dims(),
+                world_bounds_min: self.sim.world_bounds_min,
+                world_bounds_max: self.sim.world_bounds_max,
+                iso_value: self.mc_iso_level,
+            };
+            self.marching_cubes.update_from_source_with_encoder(
+                &mut encoder,
+                &self.renderer,
+                &self.marching_cubes_bg,
+                source,
+            );
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &canvas_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.02,
+                                g: 0.02,
+                                b: 0.04,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.particle_depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            let view_m = Mat4::from(view);
+            let proj_m = Mat4::from(proj);
+            self.marching_cubes_renderer.render_surface_mesh(
+                &self.renderer,
+                &mut pass,
+                SimulationRenderableInputContract {
+                    version: SurfaceContractVersion::V1,
+                    mesh: self.marching_cubes.mesh_contract(),
+                },
+                &view_m,
+                &proj_m,
+                [0.77, 0.96, 1.0, 1.0],
+            );
+            drop(pass);
+        }
+
+        self.renderer.submit(std::iter::once(encoder.finish()));
+        output.present();
+        self.mouse_prev_ndc = self.mouse_ndc;
+    }
+}
+
+// ── JS interop ──
+thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
+fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
+
+#[wasm_bindgen]
+pub fn get_fps() -> f64 {
+    GLOBAL_STATE.with(|gs| {
+        if let Some(ref rc) = *gs.borrow() { rc.borrow().current_fps } else { 0.0 }
+    })
+}
+
+#[wasm_bindgen]
+pub fn get_frame_time() -> f64 {
+    GLOBAL_STATE.with(|gs| {
+        if let Some(ref rc) = *gs.borrow() { rc.borrow().current_frame_ms } else { 0.0 }
+    })
+}
+
+#[wasm_bindgen] pub fn set_pressure(v: f32) { with_state(|s| s.sim.params.pressure_multiplier = v); }
+#[wasm_bindgen] pub fn set_near_pressure(v: f32) { with_state(|s| s.sim.params.near_pressure_multiplier = v); }
+#[wasm_bindgen] pub fn set_density_target(v: f32) { with_state(|s| s.sim.params.density_target = v); }
+#[wasm_bindgen] pub fn set_viscosity(v: f32) { with_state(|s| s.sim.params.viscosity = v); }
+#[wasm_bindgen] pub fn set_damping(v: f32) { with_state(|s| s.sim.params.damping = v); }
+#[wasm_bindgen] pub fn set_gravity_y(v: f32) { with_state(|s| s.sim.params.gravity[1] = v); }
+#[wasm_bindgen] pub fn set_mouse_force(v: f32) { with_state(|s| s.sim.params.mouse_force = v); }
+#[wasm_bindgen] pub fn set_mouse_radius(v: f32) { with_state(|s| s.sim.params.mouse_radius = v); }
+#[wasm_bindgen] pub fn set_particle_size(v: f32) { with_state(|s| s.particle_size = v); }
+#[wasm_bindgen] pub fn set_substeps(v: u32) { with_state(|s| s.sim.params.substeps = v); }
+#[wasm_bindgen] pub fn set_show_particles(v: bool) { with_state(|s| { s.show_particles = v; s.render_mode = if v { 0 } else { 1 }; }); }
+#[wasm_bindgen] pub fn set_render_mode(v: u32) {
+    with_state(|s| {
+        s.render_mode = v.min(2);
+        s.show_particles = s.render_mode == 0;
+    });
+}
+#[wasm_bindgen] pub fn set_mc_iso_level(v: f32) {
+    with_state(|s| {
+        let iso = v.max(0.0);
+        s.mc_iso_level = iso;
+        s.surface_renderer.density_threshold = iso;
+        s.marching_cubes.set_iso_level(iso);
+    });
+}
+#[wasm_bindgen] pub fn set_use_batched_sim(v: bool) { with_state(|s| s.use_batched_sim = v); }
+#[wasm_bindgen] pub fn set_sim_dt_step(v: f32) { with_state(|s| s.sim_dt_step = v.max(1.0 / 1000.0)); }
+#[wasm_bindgen] pub fn set_sim_time_scale(v: f32) { with_state(|s| s.sim_time_scale = v.max(0.01)); }
+#[wasm_bindgen] pub fn set_max_render_fps(v: f32) { with_state(|s| s.max_render_fps = v.max(0.0) as f64); }
+#[wasm_bindgen] pub fn set_density_scale(v: f32) { with_state(|s| s.surface_renderer.density_scale = v); }
+#[wasm_bindgen] pub fn set_density_threshold(v: f32) {
+    with_state(|s| {
+        s.surface_renderer.density_threshold = v;
+        s.mc_iso_level = v.max(0.0);
+    });
+}
+#[wasm_bindgen] pub fn set_absorption(v: f32) { with_state(|s| s.surface_renderer.absorption = v); }
+#[wasm_bindgen] pub fn set_step_count(v: u32) { with_state(|s| s.surface_renderer.step_count = v); }
+#[wasm_bindgen] pub fn set_kernel_scale(v: f32) { with_state(|s| s.density_field.kernel_scale = v); }
+#[wasm_bindgen] pub fn set_density_resolution(v: u32) {
+    with_state(|s| {
+        s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
+            s.sim.world_bounds_min, s.sim.world_bounds_max,
+            DensityFieldOptions { resolution: v, kernel_scale: s.density_field.kernel_scale });
+        s.surface_bg = s.surface_renderer.create_bind_group(
+            &s.color_view, &s.depth_view, &s.output_view, &s.density_field.density_view);
+        s.marching_cubes_bg = s
+            .marching_cubes
+            .create_bind_group(&s.renderer, &s.density_field.density_view);
+    });
+}
+#[wasm_bindgen] pub fn set_bounds(min_x: f32, min_y: f32, min_z: f32, max_x: f32, max_y: f32, max_z: f32) {
+    with_state(|s| {
+        s.sim.world_bounds_min = [min_x, min_y, min_z];
+        s.sim.world_bounds_max = [max_x, max_y, max_z];
+        s.sim.rebuild_grid();
+        // Rebuild density field for new bounds
+        s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
+            s.sim.world_bounds_min, s.sim.world_bounds_max,
+            DensityFieldOptions { resolution: 128, kernel_scale: s.density_field.kernel_scale });
+        s.surface_bg = s.surface_renderer.create_bind_group(
+            &s.color_view, &s.depth_view, &s.output_view, &s.density_field.density_view);
+        s.marching_cubes_bg = s
+            .marching_cubes
+            .create_bind_group(&s.renderer, &s.density_field.density_view);
+    });
+}

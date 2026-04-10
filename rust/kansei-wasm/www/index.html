@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kansei — Fluid 3D (WASM)</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #fps { position: fixed; top: 10px; left: 10px; color: #0f0; font: bold 16px monospace; z-index: 1000; text-shadow: 0 0 4px #000; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <div id="fps">-- FPS</div>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        import init, { start, get_fps, get_frame_time,
+            set_pressure, set_near_pressure, set_density_target,
+            set_viscosity, set_damping, set_gravity_y, set_mouse_force, set_mouse_radius,
+            set_particle_size, set_substeps, set_show_particles, set_render_mode, set_mc_iso_level,
+            set_use_batched_sim,
+            set_sim_dt_step, set_sim_time_scale, set_max_render_fps,
+            set_density_scale, set_density_threshold, set_absorption, set_step_count,
+            set_kernel_scale, set_density_resolution, set_bounds
+        } from '../pkg/kansei_wasm.js';
+        import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
+
+        await init();
+        await start('kansei');
+
+        const pane = new Pane({ title: 'Fluid 3D (WASM)' });
+        const p = {
+            showParticles: true, renderMode: 'Particles', mcIso: 0.05, particleSize: 0.15, batchedSim: true,
+            simPreset: 'Balanced',
+            simStepDt: 1 / 60,
+            simTimeScale: 1.0,
+            renderFps: 0,
+            pressure: 46.5, nearPressure: 20.0, densityTarget: 8.6,
+            viscosity: 0.36, damping: 0.998, gravityY: -9.8,
+            mouseForce: 1520, mouseRadius: 0.1, substeps: 3,
+            densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
+            resolution: 128, kernelScale: 3.7,
+        };
+        const simPresets = {
+            'Balanced':   { step: 1 / 60, scale: 1.0 },
+            'Fast 1.5x':  { step: 1 / 60, scale: 1.5 },
+            'Slow 0.75x': { step: 1 / 60, scale: 0.75 },
+            'Stable':     { step: 1 / 75, scale: 1.0 },
+        };
+
+        const debug = pane.addFolder({ title: 'Debug', expanded: true });
+        debug.addBinding(p, 'showParticles', { label: 'show particles' }).on('change', () => set_show_particles(p.showParticles));
+        debug.addBinding(p, 'renderMode', {
+            label: 'render mode',
+            options: [
+                { text: 'Particles', value: 'Particles' },
+                { text: 'Raymarch', value: 'Raymarch' },
+                { text: 'Voxel Shell (grid)', value: 'VoxelShell' },
+            ],
+        }).on('change', () => {
+            const mode = p.renderMode === 'Particles' ? 0 : (p.renderMode === 'Raymarch' ? 1 : 2);
+            set_render_mode(mode);
+        });
+        debug.addBinding(p, 'particleSize', { min: 0.01, max: 0.5, step: 0.01 }).on('change', () => set_particle_size(p.particleSize));
+        debug.addBinding(p, 'mcIso', { label: 'mc iso', min: 0.001, max: 1.0, step: 0.001 }).on('change', () => set_mc_iso_level(p.mcIso));
+        debug.addBinding(p, 'batchedSim', { label: 'batched sim' }).on('change', () => set_use_batched_sim(p.batchedSim));
+        debug.addBinding(p, 'simPreset', {
+            label: 'sim preset',
+            options: Object.keys(simPresets).map((k) => ({ text: k, value: k })),
+        }).on('change', () => {
+            const pr = simPresets[p.simPreset];
+            p.simStepDt = pr.step;
+            p.simTimeScale = pr.scale;
+            set_sim_dt_step(p.simStepDt);
+            set_sim_time_scale(p.simTimeScale);
+            pane.refresh();
+        });
+        debug.addBinding(p, 'simStepDt', { label: 'sim dt step', min: 1 / 240, max: 1 / 20, step: 1 / 240 }).on('change', () => set_sim_dt_step(p.simStepDt));
+        debug.addBinding(p, 'simTimeScale', { label: 'sim scale', min: 0.1, max: 4.0, step: 0.05 }).on('change', () => set_sim_time_scale(p.simTimeScale));
+        debug.addBinding(p, 'renderFps', { label: 'render fps', options: [
+            { text: '60', value: 60 },
+            { text: '90', value: 90 },
+            { text: '120', value: 120 },
+            { text: 'Unlimited', value: 0 },
+        ]}).on('change', () => set_max_render_fps(p.renderFps));
+
+        const surface = pane.addFolder({ title: 'Surface', expanded: false });
+        surface.addBinding(p, 'densityScale', { min: 0.1, max: 10, step: 0.1 }).on('change', () => set_density_scale(p.densityScale));
+        surface.addBinding(p, 'threshold', { min: 0.01, max: 5, step: 0.01 }).on('change', () => set_density_threshold(p.threshold));
+        surface.addBinding(p, 'absorption', { min: 0, max: 10, step: 0.1 }).on('change', () => set_absorption(p.absorption));
+        surface.addBinding(p, 'steps', { min: 16, max: 128, step: 1 }).on('change', () => set_step_count(p.steps));
+
+        const field = pane.addFolder({ title: 'Density Field', expanded: false });
+        field.addBinding(p, 'resolution', { min: 16, max: 256, step: 16 }).on('change', () => set_density_resolution(p.resolution));
+        field.addBinding(p, 'kernelScale', { min: 0.1, max: 10, step: 0.1 }).on('change', () => set_kernel_scale(p.kernelScale));
+
+        const sph = pane.addFolder({ title: 'SPH', expanded: false });
+        sph.addBinding(p, 'pressure', { min: 0, max: 100, step: 0.5 }).on('change', () => set_pressure(p.pressure));
+        sph.addBinding(p, 'nearPressure', { min: 0, max: 100, step: 0.5 }).on('change', () => set_near_pressure(p.nearPressure));
+        sph.addBinding(p, 'densityTarget', { min: 0, max: 20, step: 0.1 }).on('change', () => set_density_target(p.densityTarget));
+        sph.addBinding(p, 'viscosity', { min: 0, max: 1, step: 0.01 }).on('change', () => set_viscosity(p.viscosity));
+        sph.addBinding(p, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => set_damping(p.damping));
+
+        const forces = pane.addFolder({ title: 'Forces', expanded: false });
+        forces.addBinding(p, 'gravityY', { min: -20, max: 0, step: 0.1 }).on('change', () => set_gravity_y(p.gravityY));
+        forces.addBinding(p, 'mouseForce', { min: 0, max: 5000, step: 10 }).on('change', () => set_mouse_force(p.mouseForce));
+        forces.addBinding(p, 'mouseRadius', { min: 0.01, max: 2, step: 0.01 }).on('change', () => set_mouse_radius(p.mouseRadius));
+        forces.addBinding(p, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => set_substeps(p.substeps));
+
+        const bounds = pane.addFolder({ title: 'Bounds', expanded: false });
+        const b = { minX: -25, minY: -8, minZ: -16, maxX: 25, maxY: 30, maxZ: 16 };
+        const syncBounds = () => set_bounds(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
+        bounds.addBinding(b, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'minZ', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'maxX', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'maxY', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
+
+        // FPS overlay — read from Rust side (measured inside render_frame which IS the rAF callback)
+        const fpsEl = document.getElementById('fps');
+        setInterval(() => {
+            const fps = get_fps();
+            const ms = get_frame_time();
+            if (fps > 0) fpsEl.textContent = `${fps.toFixed(0)} FPS (${ms.toFixed(1)} ms) | 100k particles [Rust/WASM]`;
+        }, 500);
+    </script>
+</body>
+</html>

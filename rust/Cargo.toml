@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "kansei-core",
+    "kansei-wasm",
+    "kansei-native",
+]
+exclude = [
+    "kansei-wasm/examples/spinning-box",
+    "kansei-wasm/examples/instanced-cubes",
+    "kansei-wasm/examples/lit-scene",
+    "kansei-wasm/examples/shadow-scene",
+    "kansei-wasm/examples/postprocess-scene",
+    "kansei-wasm/examples/pathtracer",
+    "kansei-wasm/examples/fluid",
+]
+
+[workspace.dependencies]
+wgpu = "24"
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+pollster = "0.4"
+image = "0.25"
+gltf = { version = "1", features = ["utils"] }
