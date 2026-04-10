@@ -162,8 +162,17 @@ impl CameraControls {
         }
     }
 
-    pub fn set_azimuth(&mut self, a: f32) { self.azimuth = a; }
-    pub fn set_elevation(&mut self, e: f32) { self.elevation = e.clamp(-1.5, 1.5); }
+    pub fn set_azimuth(&mut self, a: f32) {
+        self.azimuth = a;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared) = self.shared { shared.borrow_mut().azimuth = a; }
+    }
+    pub fn set_elevation(&mut self, e: f32) {
+        let e = e.clamp(-1.5, 1.5);
+        self.elevation = e;
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared) = self.shared { shared.borrow_mut().elevation = e; }
+    }
     pub fn azimuth(&self) -> f32 { self.azimuth }
     pub fn elevation(&self) -> f32 { self.elevation }
 }
