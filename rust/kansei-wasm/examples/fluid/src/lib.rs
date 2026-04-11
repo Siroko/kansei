@@ -499,7 +499,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
         max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0,
         pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
-        viscosity: 1.0, damping: 0.997, gravity: [0.0, -12.8, 0.0],
+        viscosity: 1.0, damping: 0.997, gravity: [0.0, -9.8, 0.0],
         mouse_force: 950.0, substeps: 2, world_bounds_padding: 0.3,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     }, &positions);
