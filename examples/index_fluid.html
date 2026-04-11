@@ -348,16 +348,25 @@ fn fragment_main(v: VOut) -> FragOut {
       });
 
       // ── Sim Timing ─────────────────────────────────────────
-      // simTimeScale — multiplier applied to the sim dt (user-facing speed).
-      // simMaxStepDt — upper cap (in seconds) on the raw dt passed to the sim.
-      //   SPH pressure forces become unstable at large dt. Capping here means
-      //   that when the renderer slows below ~60 fps the simulation falls into
-      //   slow-motion instead of exploding — you get stable physics at the
-      //   cost of wall-clock accuracy, which is the right trade-off here.
-      const timing = { simTimeScale: 1.9, simMaxStepDt: 1 / 60 };
+      // True framerate-independent simulation via a fixed-step accumulator.
+      //
+      //   simStepDt    — real-world duration of a single sim step. The sim
+      //                  is integrated in chunks of this size regardless of
+      //                  the current render framerate, so behaviour is
+      //                  deterministic at 30, 33, 60, 90, 144 fps.
+      //   simTimeScale — speed multiplier applied to the sim dt (user facing).
+      //                  Changes how fast the sim advances vs. wall clock
+      //                  without changing the number of steps per second.
+      //   maxSimSteps  — upper bound on how many sim steps we're allowed to
+      //                  run per rendered frame. Prevents the classic
+      //                  "spiral of death" where a slow frame triggers more
+      //                  catch-up work which makes the next frame even slower.
+      //                  Extra accumulated time is simply discarded.
+      const timing = { simStepDt: 1 / 60, simTimeScale: 1.9, maxSimSteps: 4 };
       const timingFolder = pane.addFolder({ title: 'Sim Timing', expanded: false });
+      timingFolder.addBinding(timing, 'simStepDt',    { min: 1 / 240, max: 1 / 30, step: 1 / 240, label: 'sim dt step' });
       timingFolder.addBinding(timing, 'simTimeScale', { min: 0.1, max: 4.0, step: 0.05, label: 'sim scale' });
-      timingFolder.addBinding(timing, 'simMaxStepDt', { min: 1 / 240, max: 1 / 30, step: 1 / 240, label: 'max step dt' });
+      timingFolder.addBinding(timing, 'maxSimSteps',  { min: 1, max: 8, step: 1, label: 'max steps/frame' });
 
       // ── SPH ──
       const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
@@ -490,31 +499,50 @@ fn fragment_main(v: VOut) -> FragOut {
       boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
 
       // ── Render loop ───────────────────────────────────────
-      const startTimeS = performance.now() / 1000;
-      const time = new Vector4(startTimeS, 0, startTimeS, 0);
+      // Fixed-timestep simulation: drain an accumulator in chunks of exactly
+      // `simStepDt`, calling `sim.updateBatched()` with the number of steps
+      // to run in a single command encoder. This gives framerate-independent
+      // behaviour — 30 / 33 / 60 / 90 / 144 fps all produce the same sim
+      // evolution over the same wall-clock window.
+      let lastPerf     = performance.now();
+      let simAccumulator = 0;
 
-      async function animate() {
-        const frameStart = performance.now();
-        time.x = frameStart / 1000;
-        time.y = time.x - time.z;
-        time.z = time.x;
+      function animate() {
+        requestAnimationFrame(animate);
 
-        // Frame dt for animation (camera, mouse interpolation). Clamped just
-        // enough to prevent zero and absurdly long pauses.
-        const frameDt = Math.min(Math.max(time.y, 1 / 1000), 1 / 20);
-
-        // Sim dt: independently capped more aggressively than frameDt. SPH
-        // pressure integration blows up with a big dt, so when the renderer
-        // drops below 60 fps we prefer to run the sim in slow-motion rather
-        // than feed it an unstable timestep. Also catches devtools pauses
-        // and returning from a hidden tab.
-        const simDt = Math.min(frameDt, timing.simMaxStepDt) * timing.simTimeScale;
+        const now = performance.now();
+        // Raw frame delta. Clamped to avoid zero-division and to drop huge
+        // pauses (hidden tab, devtools, GC stall) on the floor so we don't
+        // try to catch up hundreds of steps.
+        const frameDt = Math.min(Math.max((now - lastPerf) / 1000, 1 / 1000), 0.1);
+        lastPerf = now;
 
         mouseVectors.update(frameDt);
-        cameraControls.update(time.x);
-        await sim.update(simDt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
+        cameraControls.update(now / 1000);
 
-        // Density field update — engine handles its own encoder/submit (no device in user code)
+        // Accumulate wall-clock, convert to sim-clock via simTimeScale.
+        simAccumulator += frameDt * timing.simTimeScale;
+        const stepDt = timing.simStepDt;
+        let steps = 0;
+        while (simAccumulator >= stepDt && steps < timing.maxSimSteps) {
+          simAccumulator -= stepDt;
+          steps++;
+        }
+        // If we still have a large leftover after maxSimSteps, the renderer
+        // can't keep up — drop the excess so we don't spiral on the next frame.
+        if (simAccumulator > stepDt) simAccumulator = stepDt;
+
+        if (steps > 0) {
+          sim.updateBatched(
+            stepDt,
+            steps,
+            mouseVectors.mousePosition,
+            mouseVectors.mouseDirection,
+            mouseVectors.mouseStrength,
+          );
+        }
+
+        // Density field update — engine handles its own encoder/submit.
         densityField.update();
 
         // Marching cubes: rebuild the mesh each frame from the density field.
@@ -524,7 +552,6 @@ fn fragment_main(v: VOut) -> FragOut {
         }
 
         volume.render(scene, camera);
-        requestAnimationFrame(animate);
       }
       animate();
 

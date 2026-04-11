@@ -655,47 +655,117 @@ class FluidSimulation {
         return this.gridOrigin;
     }
 
+    /** Build the list of compute passes that make up one full SPH iteration.
+     *  Shared by `update()` and `updateBatched()`. */
+    private _buildSimPasses(): { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[] {
+        const N = this.particleCount;
+        const particleWorkgroups  = Math.ceil(N / 64);
+        const gridWorkgroups      = Math.ceil(this.totalCells / 256);
+        const prefixSumWorkgroups = Math.ceil(this.totalCells / PREFIX_SUM_BLOCK_SIZE);
+        const passes: { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[] = [
+            // Grid build
+            { compute: this.gridClearCountsPass,    workgroupsX: gridWorkgroups },
+            { compute: this.gridClearScatterPass,   workgroupsX: gridWorkgroups },
+            { compute: this.gridAssignPass,         workgroupsX: particleWorkgroups },
+            // Prefix sum
+            { compute: this.prefixSumLocalPass,      workgroupsX: Math.max(prefixSumWorkgroups, 1) },
+            { compute: this.prefixSumTopPass,        workgroupsX: 1 },
+            { compute: this.prefixSumDistributePass, workgroupsX: Math.max(prefixSumWorkgroups, 1) },
+            // Scatter
+            { compute: this.scatterPass,             workgroupsX: particleWorkgroups },
+            // SPH
+            { compute: this.densityPass,             workgroupsX: particleWorkgroups },
+            { compute: this.forcesPass,              workgroupsX: particleWorkgroups },
+            { compute: this.integratePass,           workgroupsX: particleWorkgroups },
+        ];
+        // Body passes (only if bodies exist)
+        if (this.bodies.length > 0) {
+            passes.push(
+                { compute: this.bodyCollisionPass,   workgroupsX: particleWorkgroups },
+                { compute: this.bodyIntegratePass,    workgroupsX: 1 },
+            );
+        }
+        return passes;
+    }
+
+    /**
+     * Standard sim update. Runs `params.substeps` iterations of the SPH
+     * pipeline, each with `dt / substeps` as the integration timestep.
+     * Each iteration is a separate submit + `onSubmittedWorkDone` sync — fine
+     * for single-step-per-frame callers, not ideal for fixed-timestep loops.
+     * For a framerate-independent loop prefer `updateBatched()`.
+     */
     public async update(
         dt: number,
         mousePosition?: { x: number; y: number },
         mouseDirection?: { x: number; y: number },
         mouseStrength: number = 0
     ): Promise<void> {
-        const N = this.particleCount;
-        const particleWorkgroups = Math.ceil(N / 64);
-        const gridWorkgroups = Math.ceil(this.totalCells / 256);
-        const prefixSumWorkgroups = Math.ceil(this.totalCells / PREFIX_SUM_BLOCK_SIZE);
-
+        const passes = this._buildSimPasses();
         for (let s = 0; s < this.params.substeps; s++) {
             this.packParams(dt, mouseStrength, mousePosition, mouseDirection);
-
-            const passes: { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[] = [
-                // Grid build
-                { compute: this.gridClearCountsPass,    workgroupsX: gridWorkgroups },
-                { compute: this.gridClearScatterPass,   workgroupsX: gridWorkgroups },
-                { compute: this.gridAssignPass,         workgroupsX: particleWorkgroups },
-                // Prefix sum
-                { compute: this.prefixSumLocalPass,      workgroupsX: Math.max(prefixSumWorkgroups, 1) },
-                { compute: this.prefixSumTopPass,        workgroupsX: 1 },
-                { compute: this.prefixSumDistributePass, workgroupsX: Math.max(prefixSumWorkgroups, 1) },
-                // Scatter
-                { compute: this.scatterPass,             workgroupsX: particleWorkgroups },
-                // SPH
-                { compute: this.densityPass,             workgroupsX: particleWorkgroups },
-                { compute: this.forcesPass,              workgroupsX: particleWorkgroups },
-                { compute: this.integratePass,           workgroupsX: particleWorkgroups },
-            ];
-
-            // Body passes (only if bodies exist)
-            if (this.bodies.length > 0) {
-                passes.push(
-                    { compute: this.bodyCollisionPass,   workgroupsX: particleWorkgroups },
-                    { compute: this.bodyIntegratePass,    workgroupsX: 1 },
-                );
-            }
-
             await this.renderer.computeBatch(passes);
         }
+    }
+
+    /**
+     * Framerate-independent update — runs `steps * substeps` iterations of the
+     * SPH pipeline inside a **single command encoder** with one queue submit
+     * and zero CPU-GPU sync. Each iteration integrates over a fixed `stepDt`
+     * (the *total* advance passed to one call of `update()`), so the simulation
+     * evolves deterministically regardless of how many steps are batched.
+     *
+     * Intended use: drive from an accumulator in the render loop so the sim
+     * advances at a constant real-time rate even when the renderer drops
+     * frames. Because there's no sync, batching 2 steps costs ~2× the GPU
+     * work but almost zero extra CPU time.
+     *
+     * @param stepDt         Total advance per step (seconds). Equivalent to
+     *                       what you would pass to `update()`. Packed once
+     *                       and reused for all batched steps.
+     * @param steps          Number of sim steps to run this frame.
+     * @param mousePosition  Screen-space NDC position (or undefined).
+     * @param mouseDirection Screen-space NDC direction (or undefined).
+     * @param mouseStrength  Scalar impulse magnitude.
+     */
+    public updateBatched(
+        stepDt: number,
+        steps: number,
+        mousePosition?: { x: number; y: number },
+        mouseDirection?: { x: number; y: number },
+        mouseStrength: number = 0
+    ): void {
+        if (steps <= 0) return;
+        this.packParams(stepDt, mouseStrength, mousePosition, mouseDirection);
+
+        const passes = this._buildSimPasses();
+        const device = this.renderer.gpuDevice;
+        const commandEncoder = this.renderer.createCommandEncoder('FluidSim/Batched');
+
+        // Initialise compute passes on first use so we can skip the check
+        // inside the hot inner loop.
+        for (const p of passes) {
+            if (!p.compute.initialized) p.compute.initialize(device);
+        }
+
+        // Each iteration of the outer loop is one `update()`-equivalent:
+        // `substeps` inner SPH iterations, all integrating with the same dt.
+        const totalIters = steps * this.params.substeps;
+        for (let i = 0; i < totalIters; i++) {
+            for (const pass of passes) {
+                const passEncoder = commandEncoder.beginComputePass();
+                passEncoder.setBindGroup(0, pass.compute.getBindGroup(device));
+                passEncoder.setPipeline(pass.compute.pipeline!);
+                passEncoder.dispatchWorkgroups(pass.workgroupsX, pass.workgroupsY ?? 1, pass.workgroupsZ ?? 1);
+                passEncoder.end();
+            }
+        }
+
+        // Single submit, no CPU-GPU sync. Pacing is left to the browser —
+        // `requestAnimationFrame` naturally throttles us to the display's
+        // vsync cadence, and the subsequent render commands implicitly
+        // serialise behind these compute passes via WebGPU's queue order.
+        this.renderer.submit(commandEncoder.finish());
     }
 }
 
