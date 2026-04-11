@@ -321,17 +321,23 @@ fn fragment_main(v: VOut) -> FragOut {
       // ── Tweakpane ─────────────────────────────────────────
       const pane = new Pane({ title: 'Fluid 3D', expanded: false });
 
+      // ── Effect chain builder ──
+      // Rebuilds volume.effects from the current mode + DoF toggle. Effects that
+      // are disabled are completely removed from the chain, so the renderer
+      // doesn't dispatch their compute passes at all (no ping-pong, no work).
+      const dofOpts = { enabled: true };
+      const rebuildEffectChain = () => {
+        const base = renderMode.mode === 'raymarch' ? surfaceEffect : transmissionEffect;
+        volume.effects = dofOpts.enabled ? [base, dofEffect] : [base];
+      };
+
       // ── Render Mode ──
       const modeFolder = pane.addFolder({ title: 'Render Mode', expanded: false });
       modeFolder.addBinding(renderMode, 'mode', {
         options: { Mesh: 'mesh', Raymarch: 'raymarch' },
       }).on('change', (ev) => {
-        if (ev.value === 'raymarch') {
-          volume.effects = [surfaceEffect, dofEffect];
-          mc.clear(); // hide the MC mesh until we flip back
-        } else {
-          volume.effects = [transmissionEffect, dofEffect];
-        }
+        if (ev.value === 'raymarch') mc.clear(); // hide the MC mesh until we flip back
+        rebuildEffectChain();
       });
       const mcOpts = { classic: true, iso: 0.37 };
       modeFolder.addBinding(mcOpts, 'classic', { label: 'MC classic' }).on('change', () => {
@@ -340,6 +346,11 @@ fn fragment_main(v: VOut) -> FragOut {
       modeFolder.addBinding(mcOpts, 'iso', { min: 0.001, max: 1.0, step: 0.001, label: 'MC iso' }).on('change', () => {
         mc.isoLevel = mcOpts.iso;
       });
+
+      // ── Sim Timing ─────────────────────────────────────────
+      const timing = { simTimeScale: 1.9 };
+      const timingFolder = pane.addFolder({ title: 'Sim Timing', expanded: false });
+      timingFolder.addBinding(timing, 'simTimeScale', { min: 0.1, max: 4.0, step: 0.05, label: 'sim scale' });
 
       // ── SPH ──
       const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
@@ -430,6 +441,7 @@ fn fragment_main(v: VOut) -> FragOut {
 
       // ── Depth of Field ──
       const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
+      dofFolder.addBinding(dofOpts, 'enabled', { label: 'enabled' }).on('change', rebuildEffectChain);
       dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 200, step: 1, label: 'focus dist' });
       dofFolder.addBinding(dofEffect, 'focusRange', { min: 1, max: 100, step: 1, label: 'focus range' });
       dofFolder.addBinding(dofEffect, 'maxBlur', { min: 0, max: 64, step: 1, label: 'max blur' });
@@ -473,7 +485,6 @@ fn fragment_main(v: VOut) -> FragOut {
       // ── Render loop ───────────────────────────────────────
       const startTimeS = performance.now() / 1000;
       const time = new Vector4(startTimeS, 0, startTimeS, 0);
-      const simTimeScale = 1.9;
 
       async function animate() {
         const frameStart = performance.now();
@@ -481,7 +492,7 @@ fn fragment_main(v: VOut) -> FragOut {
         time.y = time.x - time.z;
         time.z = time.x;
 
-        const dt = Math.max(time.y, 1 / 60) * simTimeScale;
+        const dt = Math.max(time.y, 1 / 60) * timing.simTimeScale;
 
         mouseVectors.update(dt);
         cameraControls.update(time.x);
