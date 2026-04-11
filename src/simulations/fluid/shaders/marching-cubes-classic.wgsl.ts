@@ -20,12 +20,19 @@ const FLOATS_PER_VERT: u32 = 9u;
 @group(0) @binding(3) var<storage, read_write> vertex_data: array<f32>;
 @group(0) @binding(4) var<storage, read_write> indices: array<u32>;
 @group(0) @binding(5) var<storage, read_write> counter: Counter;
-// Paul Bourke lookup tables. Originally module-scope const arrays, moved to
-// storage buffers because Safari/WebKit's WGSL→Metal translator hangs for
-// tens of seconds compiling a shader with a 4096-entry const array. Tables
-// are uploaded once at pipeline init from marching-cubes-tables.ts.
-@group(0) @binding(6) var<storage, read> edge_table: array<u32>;
-@group(0) @binding(7) var<storage, read> tri_table:  array<i32>;
+// Paul Bourke lookup tables. Originally module-scope const arrays, moved
+// out of the shader because Safari/WebKit's WGSL→Metal translator hangs for
+// tens of seconds compiling a shader with a 4096-entry const array.
+//
+// Uploaded once at pipeline init from marching-cubes-tables.ts. We bind them
+// as uniform buffers (not storage) so Chrome/Dawn routes the lookups through
+// the GPU's constant cache — noticeably faster for random-access tables.
+// Each entry is packed 4-per-vec4 to match the WGSL uniform-array 16-byte
+// stride, while keeping the upload as a flat byte copy of the u32/i32 arrays.
+//   edge_table[i]  ≡ edge_table_vec[i >> 2u][i & 3u]
+//   tri_table[i]   ≡ tri_table_vec[i >> 2u][i & 3u]
+@group(0) @binding(6) var<uniform> edge_table_vec: array<vec4<u32>, 64>;
+@group(0) @binding(7) var<uniform> tri_table_vec:  array<vec4<i32>, 1024>;
 
 fn write_vertex(idx: u32, pos: vec3<f32>, norm: vec3<f32>) {
     let b = idx * FLOATS_PER_VERT;
@@ -138,7 +145,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (corner_val[6] >= iso) { cube_index |= 64u; }
     if (corner_val[7] >= iso) { cube_index |= 128u; }
 
-    let edges = edge_table[cube_index];
+    let edges = edge_table_vec[cube_index >> 2u][cube_index & 3u];
     if (edges == 0u) { return; }
 
     // Interpolate edge vertices
@@ -157,10 +164,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Emit triangles from lookup table
     let base = cube_index * 16u;
     for (var t = 0u; t < 15u; t += 3u) {
-        let e0 = tri_table[base + t];
+        let i0 = base + t;
+        let i1 = i0 + 1u;
+        let i2 = i0 + 2u;
+        let e0 = tri_table_vec[i0 >> 2u][i0 & 3u];
         if (e0 < 0) { break; }
-        let e1 = tri_table[base + t + 1u];
-        let e2 = tri_table[base + t + 2u];
+        let e1 = tri_table_vec[i1 >> 2u][i1 & 3u];
+        let e2 = tri_table_vec[i2 >> 2u][i2 & 3u];
         emit_mc_triangle(
             edge_verts[e0], edge_verts[e1], edge_verts[e2],
             dims_f, bmin, bmax, max_tris,
