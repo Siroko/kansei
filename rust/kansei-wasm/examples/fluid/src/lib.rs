@@ -473,8 +473,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // ── Particles ──
     // Spread in an ellipsoid centered on the sim bounds (~70% of bounds extent).
     let count = 50_000usize;
-    let center = [0.0f32, 11.0, 0.0]; // (min+max)/2 of bounds
-    let half = [22.0f32, 17.0, 14.0]; // ~90% of bounds half-extent (more spread → less pressure)
+    let center = [0.0f32, 11.0, 4.0]; // (min+max)/2 of bounds
+    let half = [22.0f32, 17.0, 10.0]; // ~90% of bounds half-extent (more spread → less pressure)
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
@@ -499,11 +499,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
         max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0,
         pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
-        viscosity: 1.0, damping: 0.997, gravity: [0.0, -9.8, 0.0],
+        viscosity: 1.0, damping: 1.0, gravity: [0.0, -9.8, 0.0],
         mouse_force: 1600.0, substeps: 2, world_bounds_padding: 0.3,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     }, &positions);
-    sim.world_bounds_min = [-25.0, -8.0, -16.0];
+    sim.world_bounds_min = [-25.0, -8.0, -8.0];
     sim.world_bounds_max = [25.0, 30.0, 16.0];
     sim.rebuild_grid();
 
