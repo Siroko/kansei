@@ -5,6 +5,7 @@ mod surface_renderer;
 mod particle_renderer;
 mod blit_pipeline;
 mod marching_cubes;
+mod marching_cubes_tables;
 mod contracts;
 mod simulation_renderer;
 mod cornell_box;

@@ -1,6 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 use super::{SurfaceContractVersion, SurfaceExtractionSourceContract, SurfaceMeshGpuContract};
+use super::marching_cubes_tables::{EDGE_TABLE, TRI_TABLE};
 use crate::renderers::Renderer;
+use wgpu::util::DeviceExt;
 
 const MC_RESET_WGSL: &str = include_str!("shaders/marching-cubes-reset.wgsl");
 const MC_EXTRACT_WGSL: &str = include_str!("shaders/marching-cubes-extract.wgsl");
@@ -81,6 +83,10 @@ pub struct MarchingCubesSimulation {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     indirect_args_buffer: wgpu::Buffer,
+    /// Paul Bourke edge intersection bitmask table (256 × u32). Uploaded once.
+    edge_table_buffer: wgpu::Buffer,
+    /// Paul Bourke triangle lookup table (4096 × i32, sentinel -1). Uploaded once.
+    tri_table_buffer: wgpu::Buffer,
     sampler: wgpu::Sampler,
     extract_bgl: wgpu::BindGroupLayout,
     reset_bg: wgpu::BindGroup,
@@ -132,6 +138,20 @@ impl MarchingCubesSimulation {
             size: 5 * std::mem::size_of::<u32>() as u64,
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+
+        // Marching-cubes lookup tables — uploaded once as read-only storage
+        // buffers. Moved out of the shader source to dodge a Safari/WebKit
+        // WGSL→Metal compiler hang on large module-scope const arrays.
+        let edge_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("FluidMarchingCubes/EdgeTable"),
+            contents: bytemuck::cast_slice(&EDGE_TABLE),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let tri_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("FluidMarchingCubes/TriTable"),
+            contents: bytemuck::cast_slice(&TRI_TABLE),
+            usage: wgpu::BufferUsages::STORAGE,
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -256,6 +276,28 @@ impl MarchingCubesSimulation {
                     },
                     count: None,
                 },
+                // binding 6 — EDGE_TABLE (classic MC only; voxel shell ignores it)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 7 — TRI_TABLE (classic MC only; voxel shell ignores it)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let extract_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -374,6 +416,8 @@ impl MarchingCubesSimulation {
             vertex_buffer,
             index_buffer,
             indirect_args_buffer,
+            edge_table_buffer,
+            tri_table_buffer,
             sampler,
             extract_bgl,
             reset_bg,
@@ -442,6 +486,14 @@ impl MarchingCubesSimulation {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.tri_counter_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.edge_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.tri_table_buffer.as_entire_binding(),
                 },
             ],
         })

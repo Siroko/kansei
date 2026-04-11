@@ -3,6 +3,7 @@ import { shaderCode as resetShader } from './shaders/marching-cubes-reset.wgsl';
 import { shaderCode as extractShader } from './shaders/marching-cubes-extract.wgsl';
 import { shaderCode as classicExtractShader } from './shaders/marching-cubes-classic.wgsl';
 import { shaderCode as finalizeShader } from './shaders/marching-cubes-finalize.wgsl';
+import { EDGE_TABLE, TRI_TABLE } from './marching-cubes-tables';
 import { FluidDensityField } from './FluidDensityField';
 
 export interface MarchingCubesOptions {
@@ -28,6 +29,10 @@ export class FluidMarchingCubes {
     private _vertexBuffer: GPUBuffer;
     private _indexBuffer: GPUBuffer;
     private _indirectArgsBuffer: GPUBuffer;
+    /** Paul Bourke edge-intersection bitmask table (256 × u32). Uploaded once. */
+    private _edgeTableBuffer: GPUBuffer;
+    /** Paul Bourke triangle lookup table (4096 × i32, sentinel -1). Uploaded once. */
+    private _triTableBuffer: GPUBuffer;
     private _resetPipeline: GPUComputePipeline;
     private _extractPipeline: GPUComputePipeline;
     private _classicExtractPipeline: GPUComputePipeline;
@@ -71,6 +76,23 @@ export class FluidMarchingCubes {
             size: 20,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
+
+        // Marching-cubes lookup tables — uploaded once as read-only storage
+        // buffers. Moved out of the shader source to dodge a Safari/WebKit
+        // WGSL→Metal compiler hang on large module-scope const arrays.
+        this._edgeTableBuffer = device.createBuffer({
+            label: 'FluidMarchingCubes/EdgeTable',
+            size: EDGE_TABLE.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(this._edgeTableBuffer, 0, EDGE_TABLE);
+        this._triTableBuffer = device.createBuffer({
+            label: 'FluidMarchingCubes/TriTable',
+            size: TRI_TABLE.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(this._triTableBuffer, 0, TRI_TABLE);
+
         this._sampler = device.createSampler({
             magFilter: 'linear',
             minFilter: 'linear',
@@ -80,7 +102,9 @@ export class FluidMarchingCubes {
             addressModeW: 'clamp-to-edge',
         });
 
-        // Shared explicit BGL for both extract pipelines (so the bind group is interchangeable)
+        // Shared explicit BGL for both extract pipelines (so the bind group is interchangeable).
+        // Bindings 6 and 7 are classic-MC-only lookup tables; the voxel shell shader
+        // simply ignores them, which is allowed by WGSL.
         this._extractBGL = device.createBindGroupLayout({
             label: 'FluidMarchingCubes/ExtractBGL',
             entries: [
@@ -90,6 +114,8 @@ export class FluidMarchingCubes {
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
                 { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
             ],
         });
         const extractLayout = device.createPipelineLayout({
@@ -166,6 +192,8 @@ export class FluidMarchingCubes {
                 { binding: 3, resource: { buffer: this._vertexBuffer } },
                 { binding: 4, resource: { buffer: this._indexBuffer } },
                 { binding: 5, resource: { buffer: this._triangleCounterBuffer } },
+                { binding: 6, resource: { buffer: this._edgeTableBuffer } },
+                { binding: 7, resource: { buffer: this._triTableBuffer } },
             ],
         });
     }

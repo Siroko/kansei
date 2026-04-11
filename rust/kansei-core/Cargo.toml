@@ -17,6 +17,7 @@ egui-wgpu = { version = "0.31", optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
     "HtmlCanvasElement", "MouseEvent", "WheelEvent", "EventTarget",
+    "TouchEvent", "Touch", "TouchList",
 ] }
 wasm-bindgen = "0.2"
 
