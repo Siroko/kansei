@@ -718,7 +718,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         count: count as u32, width, height,
         particle_size: 0.15, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
         use_batched_sim: true,
-        sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: 1.0,
+        sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: 1.0, max_sim_steps: 4,
         max_render_fps: 0.0, render_accumulator: 0.0,
         frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
         current_fps: 0.0, current_frame_ms: 0.0,
@@ -779,7 +779,7 @@ struct State {
     count: u32, width: u32, height: u32,
     particle_size: f32, show_particles: bool, render_mode: u32, mc_iso_level: f32,
     use_batched_sim: bool,
-    sim_accumulator: f64, sim_dt_step: f32, sim_time_scale: f32,
+    sim_accumulator: f64, sim_dt_step: f32, sim_time_scale: f32, max_sim_steps: u32,
     max_render_fps: f64, render_accumulator: f64,
     frame_count: u32, frame_time_sum: f64, last_perf_time: f64,
     current_fps: f64, current_frame_ms: f64,
@@ -824,20 +824,36 @@ impl State {
         let mouse_dir = [self.mouse.direction.x, self.mouse.direction.y];
         let mouse_strength = self.mouse.strength.min(1.0);
 
-        // Step fluid simulation (owned by FluidSurfaceEffect in the volume)
+        // Step fluid simulation (owned by FluidSurfaceEffect in the volume).
+        //
+        // True framerate-independent sim via a fixed-step accumulator: drain
+        // the accumulator in chunks of exactly `sim_dt_step * sim_time_scale`
+        // so the sim evolves identically at 30, 33, 60, 90, 144 fps.
+        //
+        // `update_batched` already encodes all substeps into a single submit
+        // with no CPU-GPU sync, so running 2-3 steps on a slow frame costs
+        // ~2-3× compute but almost zero CPU overhead. The `max_sim_steps`
+        // cap prevents the classic spiral of death — extra leftover time is
+        // discarded rather than accumulated forever.
         let identity = glam::Mat4::IDENTITY.to_cols_array();
         if let Some(fse) = self.volume.effects.get_mut(0)
             .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>())
         {
             fse.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
-            let sim_step_dt = self.sim_dt_step.clamp(1.0 / 240.0, 1.0 / 20.0);
-            let scaled_dt = sim_step_dt * self.sim_time_scale.clamp(0.1, 4.0);
-            self.sim_accumulator = (self.sim_accumulator + frame_dt).min(0.25);
+            let step_dt  = self.sim_dt_step.clamp(1.0 / 240.0, 1.0 / 20.0);
+            let scale    = self.sim_time_scale.clamp(0.1, 4.0);
+            let scaled_dt = step_dt * scale;
+            self.sim_accumulator += frame_dt * scale as f64;
             let mut steps = 0u32;
-            while self.sim_accumulator >= sim_step_dt as f64 && steps < 8 {
+            while self.sim_accumulator >= step_dt as f64 && steps < self.max_sim_steps {
                 fse.step_simulation(scaled_dt, mouse_strength, mouse_ndc, mouse_dir, self.use_batched_sim);
-                self.sim_accumulator -= sim_step_dt as f64;
+                self.sim_accumulator -= step_dt as f64;
                 steps += 1;
+            }
+            // Drop excess if we're running slower than the sim needs — keeps
+            // the next frame from inheriting a huge backlog.
+            if self.sim_accumulator > step_dt as f64 {
+                self.sim_accumulator = step_dt as f64;
             }
         }
 
