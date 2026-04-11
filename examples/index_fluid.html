@@ -24,11 +24,14 @@
       import { BufferBase } from '../src/buffers/BufferBase'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
+      import { FluidMarchingCubes } from '../src/simulations/fluid/FluidMarchingCubes'
       import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
+      import { FluidTransmissionEffect } from '../src/postprocessing/effects/FluidTransmissionEffect'
       import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
       import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
       import { Material } from '../src/materials/Material'
       import { Renderable } from '../src/objects/Renderable'
+      import { Geometry } from '../src/buffers/Geometry'
       import { GLTFLoader } from '../src/loaders/GLTFLoader'
       import { DirectionalLight } from '../src/lights/DirectionalLight'
       import { Float } from '../src/math/Float'
@@ -126,7 +129,95 @@
         kernelScale: 0.6,
       });
 
-      // ── Post-processing chain: FluidSurface (raymarched) → DoF ──
+      // ── Marching Cubes (runs compute → standard Renderable via Geometry.fromGpuBuffers) ──
+      const mc = new FluidMarchingCubes(renderer, {
+        maxTriangles: 1_000_000,
+        isoLevel: 0.37,
+        useClassic: true,
+      });
+      const mcExtractBG = mc.createBindGroup(densityField);
+      const mcGeometry = Geometry.fromGpuBuffers(
+        mc.vertexBuffer,
+        mc.indexBuffer,
+        mc.indirectArgsBuffer,
+        'uint32',
+      );
+
+      // Fluid mesh material: writes base colour + world-space normal to the GBuffer.
+      // It is marked `transmissive: true` so the renderer splits the GBuffer pass,
+      // snapshots the opaque-only colour into GBuffer.backgroundTexture, and then
+      // draws the mesh — so FluidTransmissionEffect can refract the background.
+      const fluidMeshShader = /* wgsl */`
+@group(0) @binding(0) var<uniform> fluidColor: vec4<f32>;
+@group(1) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) worldNormal: vec3<f32>,
+};
+struct FragOut {
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec4<f32>,
+    @location(2) normal: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
+};
+
+@vertex
+fn vertex_main(
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+) -> VOut {
+    let wp = (worldMatrix * vec4<f32>(position.xyz, 1.0)).xyz;
+    let wn = normalize((normalMatrix * vec4<f32>(normal, 0.0)).xyz);
+    var out: VOut;
+    out.pos = projectionMatrix * viewMatrix * vec4<f32>(wp, 1.0);
+    out.worldNormal = wn;
+    return out;
+}
+
+@fragment
+fn fragment_main(v: VOut) -> FragOut {
+    let n = normalize(v.worldNormal);
+    // Simple lit base (the transmission effect later overwrites this with a
+    // proper refraction composite wherever the normal is non-zero).
+    let light = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let ndotl = max(dot(n, light), 0.0);
+    let lit = fluidColor.rgb * (0.2 + ndotl * 0.8);
+    var out: FragOut;
+    out.color = vec4<f32>(lit, 1.0);
+    out.emissive = vec4<f32>(0.0);
+    out.normal = vec4<f32>(n, 1.0);
+    out.albedo = vec4<f32>(fluidColor.rgb, 1.0);
+    return out;
+}
+`;
+      const fluidColorU = new Vector4(0.77, 0.96, 1.0, 1.0);
+      const fluidMeshMat = new Material(fluidMeshShader, {
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: fluidColorU },
+        ],
+        cullMode: 'none',
+        transmissive: true,
+      });
+      const fluidMesh = new Renderable(mcGeometry, fluidMeshMat);
+      scene.add(fluidMesh);
+
+      // ── Post-processing chain ──
+      // Mesh mode:     [FluidTransmissionEffect, DepthOfFieldEffect]
+      // Raymarch mode: [FluidSurfaceEffect,      DepthOfFieldEffect]
+      const transmissionEffect = new FluidTransmissionEffect({
+        color: [0.77, 0.96, 1.0],
+        ior: 1.41,
+        chromaticAberration: 0.05,
+        tintStrength: 0.30,
+        fresnelPower: 2.3,
+        roughness: 0.28,
+        thickness: 2.4,
+      });
       const surfaceEffect = new FluidSurfaceEffect({
         densityField,
         fluidColor: [0.77, 0.96, 1.0],
@@ -140,7 +231,12 @@
         focusRange: 37,
         maxBlur: 7,
       });
-      const volume = new PostProcessingVolume(renderer, [surfaceEffect, dofEffect]);
+      const volume = new PostProcessingVolume(renderer, [transmissionEffect, dofEffect]);
+
+      // ── Render mode switcher ──
+      // 'mesh'      — GPU-built marching cubes mesh rendered as a standard Renderable
+      // 'raymarch'  — density field raymarched in a post-processing effect
+      const renderMode = { mode: 'mesh' };
 
       // ── Dome (loaded from GLB, with op-art stripe shader) ──
       // Three Vector4 uniforms (engine-managed): colorA, colorB, thickness (xy + 2 pad)
@@ -193,7 +289,8 @@ fn fragment_main(v: VOut) -> FragOut {
     var out: FragOut;
     out.color = vec4<f32>(lit, 1.0);
     out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n, 1.0);
+    // normal.w = 0 → dome is NOT transmissive (FluidTransmissionEffect ignores it)
+    out.normal = vec4<f32>(n, 0.0);
     out.albedo = vec4<f32>(base, 1.0);
     return out;
 }
@@ -223,6 +320,26 @@ fn fragment_main(v: VOut) -> FragOut {
 
       // ── Tweakpane ─────────────────────────────────────────
       const pane = new Pane({ title: 'Fluid 3D', expanded: false });
+
+      // ── Render Mode ──
+      const modeFolder = pane.addFolder({ title: 'Render Mode', expanded: false });
+      modeFolder.addBinding(renderMode, 'mode', {
+        options: { Mesh: 'mesh', Raymarch: 'raymarch' },
+      }).on('change', (ev) => {
+        if (ev.value === 'raymarch') {
+          volume.effects = [surfaceEffect, dofEffect];
+          mc.clear(); // hide the MC mesh until we flip back
+        } else {
+          volume.effects = [transmissionEffect, dofEffect];
+        }
+      });
+      const mcOpts = { classic: true, iso: 0.37 };
+      modeFolder.addBinding(mcOpts, 'classic', { label: 'MC classic' }).on('change', () => {
+        mc.useClassic = mcOpts.classic;
+      });
+      modeFolder.addBinding(mcOpts, 'iso', { min: 0.001, max: 1.0, step: 0.001, label: 'MC iso' }).on('change', () => {
+        mc.isoLevel = mcOpts.iso;
+      });
 
       // ── SPH ──
       const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
@@ -268,8 +385,39 @@ fn fragment_main(v: VOut) -> FragOut {
       lightFolder.addBinding(lt, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', () => { sun.color[1] = lt.g; });
       lightFolder.addBinding(lt, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', () => { sun.color[2] = lt.b; });
 
-      // ── Surface ──
-      const surfaceFolder = pane.addFolder({ title: 'Surface', expanded: false });
+      // ── Transmission (mesh mode) ──
+      const txFolder = pane.addFolder({ title: 'Transmission', expanded: false });
+      const tx = {
+        ior: 1.41,
+        chromaticAberration: 0.05,
+        tintStrength: 0.30,
+        fresnelPower: 2.3,
+        roughness: 0.28,
+        thickness: 2.4,
+        color: { r: 0.77, g: 0.96, b: 1.0 },
+      };
+      const syncTx = () => {
+        transmissionEffect.ior = tx.ior;
+        transmissionEffect.chromaticAberration = tx.chromaticAberration;
+        transmissionEffect.tintStrength = tx.tintStrength;
+        transmissionEffect.fresnelPower = tx.fresnelPower;
+        transmissionEffect.roughness = tx.roughness;
+        transmissionEffect.thickness = tx.thickness;
+        transmissionEffect.color = [tx.color.r, tx.color.g, tx.color.b];
+        fluidColorU.x = tx.color.r;
+        fluidColorU.y = tx.color.g;
+        fluidColorU.z = tx.color.b;
+      };
+      txFolder.addBinding(tx, 'ior', { min: 1.0, max: 2.5, step: 0.01 }).on('change', syncTx);
+      txFolder.addBinding(tx, 'chromaticAberration', { min: 0, max: 1.0, step: 0.01, label: 'chromatic' }).on('change', syncTx);
+      txFolder.addBinding(tx, 'tintStrength', { min: 0, max: 1, step: 0.01, label: 'tint' }).on('change', syncTx);
+      txFolder.addBinding(tx, 'fresnelPower', { min: 1, max: 10, step: 0.1, label: 'fresnel' }).on('change', syncTx);
+      txFolder.addBinding(tx, 'roughness', { min: 0, max: 1, step: 0.01 }).on('change', syncTx);
+      txFolder.addBinding(tx, 'thickness', { min: 0, max: 5, step: 0.1 }).on('change', syncTx);
+      txFolder.addBinding(tx, 'color', { color: { type: 'float' }, label: 'fluid color' }).on('change', syncTx);
+
+      // ── Surface (raymarch mode) ──
+      const surfaceFolder = pane.addFolder({ title: 'Surface (Raymarch)', expanded: false });
       const colorObj = { r: 0.77, g: 0.96, b: 1.0 };
       const syncColor = () => { surfaceEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
       surfaceFolder.addBinding(colorObj, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', syncColor);
@@ -341,6 +489,12 @@ fn fragment_main(v: VOut) -> FragOut {
 
         // Density field update — engine handles its own encoder/submit (no device in user code)
         densityField.update();
+
+        // Marching cubes: rebuild the mesh each frame from the density field.
+        // Skipped in raymarch mode to save GPU time.
+        if (renderMode.mode === 'mesh') {
+          mc.update(mcExtractBG, densityField);
+        }
 
         volume.render(scene, camera);
         requestAnimationFrame(animate);
