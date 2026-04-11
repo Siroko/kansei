@@ -4,37 +4,19 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Fluid 3D — Kansei</title>
+    <title>Kansei</title>
     <style>
-      body {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background-color: black;
-      }
-      canvas {
-        width: 100%;
-        height: 100%;
-      }
-      #fps {
-        position: fixed;
-        top: 10px;
-        left: 10px;
-        color: #0f0;
-        font: bold 16px monospace;
-        z-index: 1000;
-        text-shadow: 0 0 4px #000;
-        pointer-events: none;
-      }
+      body { margin: 0; padding: 0; overflow: hidden; background-color: black; }
+      canvas { width: 100%; height: 100%; }
     </style>
   </head>
   <body>
-    <div id="fps">-- FPS</div>
     <script type="module">
       import { Renderer } from '../src/renderers/Renderer'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
       import { CameraControls } from '../src/controls/CameraControls'
+      import { MouseVectors } from '../src/controls/MouseVectors'
       import { Vector3 } from '../src/math/Vector3'
       import { Vector4 } from '../src/math/Vector4'
       import { Matrix4 } from '../src/math/Matrix4'
@@ -43,12 +25,12 @@
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
       import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
+      import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
       import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
-      import { MouseVectors } from '../src/controls/MouseVectors'
-      import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
-      import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
       import { Material } from '../src/materials/Material'
       import { Renderable } from '../src/objects/Renderable'
+      import { GLTFLoader } from '../src/loaders/GLTFLoader'
+      import { DirectionalLight } from '../src/lights/DirectionalLight'
       import { Float } from '../src/math/Float'
       import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
@@ -57,8 +39,8 @@
         clearColor: new Vector4(0.02, 0.02, 0.04, 1),
         width: window.innerWidth,
         height: window.innerHeight,
-        devicePixelRatio: Math.min(window.devicePixelRatio, 2),
-        sampleCount: 1,
+        devicePixelRatio: 1,
+        sampleCount: 4,
       });
       await renderer.initialize();
       document.body.appendChild(renderer.canvas);
@@ -66,26 +48,33 @@
       // ── Scene & Camera ────────────────────────────────────
       const scene = new Scene();
       const camera = new Camera(45, 0.1, 1000, window.innerWidth / window.innerHeight);
-      camera.position.set(0, 0, 75);
+      camera.position.set(0, 3, 30);
       camera.lookAt(new Vector3(0, 3, 0));
 
-      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 75);
+      // Camera: back view aligned with long X axis (azimuth = π), radius 30
+      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 30);
+      if (typeof cameraControls.azimuth !== 'undefined') cameraControls.azimuth = Math.PI;
       const mouseVectors = new MouseVectors();
 
-      // ── Particle positions ────────────────────────────────
-      const particleCount = 100000;
-      const radius = 10.0;
+      // ── Directional Light ────────────────────────────────
+      const sun = new DirectionalLight([0.3, -1.0, 0.5], [1, 1, 1], 2.0);
+      scene.add(sun);
+
+      // ── Particle positions: 75k particles in an ellipsoid centered on the bounds ──
+      const particleCount = 75000;
+      const center = [0, 11, 0]; // (min+max)/2 of bounds
+      const half = [22, 17, 14];  // ~88% of bounds half-extent
       const positions = new Float32Array(particleCount * 4);
       for (let i = 0; i < particleCount; i++) {
-        let x, y, z;
+        let ux, uy, uz;
         do {
-          x = (Math.random() * 2 - 1) * radius;
-          y = (Math.random() * 2 - 1) * radius;
-          z = (Math.random() * 2 - 1) * radius;
-        } while (x * x + y * y + z * z > radius * radius);
-        positions[i * 4]     = x;
-        positions[i * 4 + 1] = y;
-        positions[i * 4 + 2] = z;
+          ux = Math.random() * 2 - 1;
+          uy = Math.random() * 2 - 1;
+          uz = Math.random() * 2 - 1;
+        } while (ux * ux + uy * uy + uz * uz > 1);
+        positions[i * 4]     = center[0] + ux * half[0];
+        positions[i * 4 + 1] = center[1] + uy * half[1];
+        positions[i * 4 + 2] = center[2] + uz * half[2];
         positions[i * 4 + 3] = 1;
       }
 
@@ -107,36 +96,37 @@
         pressureMultiplier: 46.5,
         nearPressureMultiplier: 20.0,
         densityTarget: 8.6,
-        viscosity: 0.36,
-        damping: 0.998,
-        gravity: [0, -9.8, 0],
+        viscosity: 1.0,
+        damping: 0.997,
+        gravity: [0, -12.8, 0],
+        gravityCenter: [0, 11, 0],
+        radialGravity: false,
         returnToOriginStrength: 0.0,
         mouseRadius: 0.1,
-        mouseForce: 1520.0,
-        substeps: 3,
+        mouseForce: 5000.0,
+        substeps: 2,
         worldBoundsPadding: 0.3,
       };
 
       const sim = new FluidSimulation(renderer, simSettings);
-      const identityMatrix = new Matrix4(); // particles are already in world space
+      const identityMatrix = new Matrix4();
       sim.initialize(positionsBuffer, positionsBuffer.clone(), {
         viewMatrix: camera.viewMatrix,
         projectionMatrix: camera.projectionMatrix,
         inverseViewMatrix: camera.inverseViewMatrix,
         worldMatrix: identityMatrix,
       });
-
       sim.worldBoundsMin = [-25, -8, -16];
       sim.worldBoundsMax = [25, 30, 16];
       sim.rebuildGrid();
 
-      // ── Density Field ─────────────────────────────────────
-      let densityField = new FluidDensityField(renderer.device, sim, {
+      // ── Density field (constructed via Renderer, no GPUDevice in user code) ──
+      let densityField = new FluidDensityField(renderer, sim, {
         resolution: 128,
-        kernelScale: 3.7,
+        kernelScale: 0.6,
       });
 
-      // ── Surface Effect & Post-Processing Volume ───────────
+      // ── Post-processing chain: FluidSurface (raymarched) → DoF ──
       const surfaceEffect = new FluidSurfaceEffect({
         densityField,
         fluidColor: [0.77, 0.96, 1.0],
@@ -145,211 +135,224 @@
         absorption: 2.5,
         stepCount: 128,
       });
+      const dofEffect = new DepthOfFieldEffect({
+        focusDistance: 42,
+        focusRange: 37,
+        maxBlur: 7,
+      });
+      const volume = new PostProcessingVolume(renderer, [surfaceEffect, dofEffect]);
 
-      const volume = new PostProcessingVolume(renderer, [surfaceEffect]);
+      // ── Dome (loaded from GLB, with op-art stripe shader) ──
+      // Three Vector4 uniforms (engine-managed): colorA, colorB, thickness (xy + 2 pad)
+      const stripeShader = /* wgsl */`
+@group(0) @binding(0) var<uniform> colorA: vec4<f32>;
+@group(0) @binding(1) var<uniform> colorB: vec4<f32>;
+@group(0) @binding(2) var<uniform> thickness: vec4<f32>; // x = thicknessA, y = thicknessB
+@group(1) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
 
-      // ── Debug particle view ───────────────────────────────
-      const particleScale = new Float(0.01);
-      const particleShader = /* wgsl */`
-struct VertexOut {
-    @builtin(position) position : vec4<f32>,
-    @location(0) color : vec3<f32>,
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) worldPos: vec3<f32>,
+    @location(1) worldNormal: vec3<f32>,
 };
 struct FragOut {
-    @location(0) color    : vec4<f32>,
-    @location(1) emissive : vec4<f32>,
-    @location(2) normal   : vec4<f32>,
-    @location(3) albedo   : vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec4<f32>,
+    @location(2) normal: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
 };
-@group(0) @binding(0) var<uniform> scale: f32;
-@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
-@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
 
 @vertex
 fn vertex_main(
     @location(0) position: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
-    @location(3) instancePos: vec4<f32>,
-) -> VertexOut {
-    var output : VertexOut;
-    let right = vec3<f32>(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
-    let up = vec3<f32>(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
-    let worldPos = instancePos.xyz + right * position.x * scale + up * position.y * scale;
-    output.position = projectionMatrix * viewMatrix * vec4<f32>(worldPos, 1.0);
-    output.color = vec3<f32>(0.3, 0.6, 1.0);
-    return output;
+) -> VOut {
+    let wp = (worldMatrix * vec4<f32>(position.xyz, 1.0)).xyz;
+    let wn = normalize((normalMatrix * vec4<f32>(normal, 0.0)).xyz);
+    var out: VOut;
+    out.pos = projectionMatrix * viewMatrix * vec4<f32>(wp, 1.0);
+    out.worldPos = wp;
+    out.worldNormal = wn;
+    return out;
 }
 
 @fragment
-fn fragment_main(fragData: VertexOut) -> FragOut {
+fn fragment_main(v: VOut) -> FragOut {
+    let period = thickness.x + thickness.y;
+    let t = ((v.worldPos.x % period) + period) % period;
+    let inA = t < thickness.x;
+    let base = select(colorB.rgb, colorA.rgb, inA);
+    let n = normalize(v.worldNormal);
+    let lightDir = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let ndotl = max(dot(n, lightDir), 0.0);
+    let lit = base * (0.3 + ndotl * 0.7);
     var out: FragOut;
-    out.color = vec4<f32>(fragData.color, 1.0);
+    out.color = vec4<f32>(lit, 1.0);
     out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(0.0, 0.0, 1.0, 0.0);
-    out.albedo = vec4<f32>(fragData.color, 1.0);
+    out.normal = vec4<f32>(n, 1.0);
+    out.albedo = vec4<f32>(base, 1.0);
     return out;
 }
 `;
-      const particlePlane = new PlaneGeometry(1, 1);
-      const particleGeom = new InstancedGeometry(particlePlane, particleCount, [positionsBuffer]);
-      const particleMat = new Material(particleShader, {
+      const stripeColorA = new Vector4(0, 0, 0, 1);
+      const stripeColorB = new Vector4(1, 1, 1, 1);
+      const stripeThickness = new Vector4(8.9, 9.6, 0, 0);
+      const stripeMat = new Material(stripeShader, {
         bindings: [
-          { binding: 0, visibility: GPUShaderStage.VERTEX, value: particleScale },
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: stripeColorA },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: stripeColorB },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: stripeThickness },
         ],
-        cullMode: 'none',
+        cullMode: 'front', // see-through from outside
       });
-      const particleMesh = new Renderable(particleGeom, particleMat);
-      scene.add(particleMesh);
-      let showParticles = false;
+
+      const gltfLoader = new GLTFLoader();
+      try {
+        const gltf = await gltfLoader.load('./assets/dome.glb', stripeMat);
+        // Scale up the dome so it encloses the sim volume
+        gltf.scene.scale.set(20, 20, 20);
+        gltf.scene.position.set(0, 3, 0);
+        scene.add(gltf.scene);
+      } catch (e) {
+        console.warn('Could not load dome.glb', e);
+      }
 
       // ── Tweakpane ─────────────────────────────────────────
-      const pane = new Pane({ title: 'Fluid 3D' });
+      const pane = new Pane({ title: 'Fluid 3D', expanded: false });
 
-      // Debug
-      const debugFolder = pane.addFolder({ title: 'Debug', expanded: false });
-      const debugParams = { showParticles: false };
-      debugFolder.addBinding(debugParams, 'showParticles', { label: 'show particles' }).on('change', (ev) => {
-        showParticles = ev.value;
-        if (ev.value) {
-          if (!scene.children.includes(particleMesh)) scene.add(particleMesh);
-        } else {
-          const idx = scene.children.indexOf(particleMesh);
-          if (idx !== -1) scene.children.splice(idx, 1);
-        }
-      });
-      // Start with particles removed from scene (surface mode)
-      scene.children.splice(scene.children.indexOf(particleMesh), 1);
-      const scaleParams = { particleSize: 0.01 };
-      debugFolder.addBinding(scaleParams, 'particleSize', { min: 0.01, max: 1.0, step: 0.01, label: 'particle size' }).on('change', () => {
-        particleScale.value = scaleParams.particleSize;
-      });
-
-      // Appearance folder
-      const appearanceFolder = pane.addFolder({ title: 'Appearance', expanded: false });
-      const colorObj = { r: 0.77, g: 0.96, b: 1.0 };
-      const syncColor = () => { surfaceEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
-      appearanceFolder.addBinding(colorObj, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', syncColor);
-      appearanceFolder.addBinding(colorObj, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', syncColor);
-      appearanceFolder.addBinding(colorObj, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', syncColor);
-      appearanceFolder.addBinding(surfaceEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
-      appearanceFolder.addBinding(surfaceEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
-      appearanceFolder.addBinding(surfaceEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
-      appearanceFolder.addBinding(surfaceEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
-
-      // Density field folder
-      const fieldFolder = pane.addFolder({ title: 'Density Field', expanded: false });
-      const fieldParams = { resolution: 128, kernelScale: 3.7 };
-      fieldFolder.addBinding(fieldParams, 'resolution', { min: 16, max: 256, step: 16 }).on('change', () => {
-        densityField.destroy();
-        densityField = new FluidDensityField(renderer.device, sim, {
-          resolution: fieldParams.resolution,
-          kernelScale: fieldParams.kernelScale,
-        });
-        surfaceEffect._densityField = densityField;
-        surfaceEffect._currentInput = null;
-      });
-      fieldFolder.addBinding(fieldParams, 'kernelScale', { min: 0.1, max: 5.0, step: 0.1, label: 'kernel scale' }).on('change', () => {
-        densityField._kernelScale = fieldParams.kernelScale;
-      });
-
-      // Simulation folder
-      const simFolder = pane.addFolder({ title: 'Simulation', expanded: false });
-      simFolder.addBinding(simSettings, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => { sim.params.substeps = simSettings.substeps; });
-      simFolder.addBinding(simSettings, 'smoothingRadius', { min: 0.1, max: 3.0, step: 0.1, label: 'radius' }).on('change', () => { sim.params.smoothingRadius = simSettings.smoothingRadius; });
-
-      // SPH folder
+      // ── SPH ──
       const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
       sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
       sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
-      sphFolder.addBinding(simSettings, 'densityTarget', { min: 0, max: 10, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
+      sphFolder.addBinding(simSettings, 'densityTarget', { min: 0, max: 20, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
       sphFolder.addBinding(simSettings, 'viscosity', { min: 0, max: 1, step: 0.01 }).on('change', () => { sim.params.viscosity = simSettings.viscosity; });
       sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
 
-      // Forces folder
+      // ── Forces ──
       const forcesFolder = pane.addFolder({ title: 'Forces', expanded: false });
       const gravityObj = { y: simSettings.gravity[1] };
       forcesFolder.addBinding(gravityObj, 'y', { min: -20, max: 0, step: 0.1, label: 'gravity Y' }).on('change', () => { sim.params.gravity = [0, gravityObj.y, 0]; });
-      forcesFolder.addBinding(simSettings, 'returnToOriginStrength', { min: 0, max: 2, step: 0.01, label: 'return force' }).on('change', () => { sim.params.returnToOriginStrength = simSettings.returnToOriginStrength; });
-      forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.01, max: 2, step: 0.01, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
       forcesFolder.addBinding(simSettings, 'mouseForce', { min: 0, max: 5000, step: 10, label: 'mouse force' }).on('change', () => { sim.params.mouseForce = simSettings.mouseForce; });
+      forcesFolder.addBinding(simSettings, 'mouseRadius', { min: 0.01, max: 2, step: 0.01, label: 'mouse radius' }).on('change', () => { sim.params.mouseRadius = simSettings.mouseRadius; });
+      forcesFolder.addBinding(simSettings, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => { sim.params.substeps = simSettings.substeps; });
 
-      // Bounds folder
-      const boundsFolder = pane.addFolder({ title: 'Bounds', expanded: false });
-      const boundsObj = {
-        minX: -25, minY: -8, minZ: -16,
-        maxX: 25, maxY: 30, maxZ: 16,
+      // ── Radial Gravity (Planet) ──
+      const planetFolder = pane.addFolder({ title: 'Radial Gravity (Planet)', expanded: false });
+      const pl = { enabled: false, cx: 0, cy: 11, cz: 0 };
+      const syncPlanet = () => {
+        sim.params.gravityCenter = [pl.cx, pl.cy, pl.cz];
       };
+      planetFolder.addBinding(pl, 'enabled', { label: 'radial' }).on('change', () => { sim.params.radialGravity = pl.enabled; });
+      planetFolder.addBinding(pl, 'cx', { min: -30, max: 30, step: 0.5, label: 'center X' }).on('change', syncPlanet);
+      planetFolder.addBinding(pl, 'cy', { min: -10, max: 30, step: 0.5, label: 'center Y' }).on('change', syncPlanet);
+      planetFolder.addBinding(pl, 'cz', { min: -20, max: 20, step: 0.5, label: 'center Z' }).on('change', syncPlanet);
+
+      // ── Light ──
+      const lightFolder = pane.addFolder({ title: 'Light', expanded: false });
+      const lt = { dirX: 0.3, dirY: -1.0, dirZ: 0.5, intensity: 2.0, r: 1, g: 1, b: 1 };
+      const syncLightDir = () => {
+        const len = Math.hypot(lt.dirX, lt.dirY, lt.dirZ) || 1;
+        sun.direction[0] = lt.dirX / len;
+        sun.direction[1] = lt.dirY / len;
+        sun.direction[2] = lt.dirZ / len;
+      };
+      lightFolder.addBinding(lt, 'dirX', { min: -1, max: 1, step: 0.01, label: 'dir X' }).on('change', syncLightDir);
+      lightFolder.addBinding(lt, 'dirY', { min: -1, max: 1, step: 0.01, label: 'dir Y' }).on('change', syncLightDir);
+      lightFolder.addBinding(lt, 'dirZ', { min: -1, max: 1, step: 0.01, label: 'dir Z' }).on('change', syncLightDir);
+      lightFolder.addBinding(lt, 'intensity', { min: 0, max: 10, step: 0.1 }).on('change', () => { sun.intensity = lt.intensity; });
+      lightFolder.addBinding(lt, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', () => { sun.color[0] = lt.r; });
+      lightFolder.addBinding(lt, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', () => { sun.color[1] = lt.g; });
+      lightFolder.addBinding(lt, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', () => { sun.color[2] = lt.b; });
+
+      // ── Surface ──
+      const surfaceFolder = pane.addFolder({ title: 'Surface', expanded: false });
+      const colorObj = { r: 0.77, g: 0.96, b: 1.0 };
+      const syncColor = () => { surfaceEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
+      surfaceFolder.addBinding(colorObj, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', syncColor);
+      surfaceFolder.addBinding(colorObj, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', syncColor);
+      surfaceFolder.addBinding(colorObj, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', syncColor);
+      surfaceFolder.addBinding(surfaceEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
+      surfaceFolder.addBinding(surfaceEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
+      surfaceFolder.addBinding(surfaceEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
+      surfaceFolder.addBinding(surfaceEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
+
+      // ── Depth of Field ──
+      const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
+      dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 200, step: 1, label: 'focus dist' });
+      dofFolder.addBinding(dofEffect, 'focusRange', { min: 1, max: 100, step: 1, label: 'focus range' });
+      dofFolder.addBinding(dofEffect, 'maxBlur', { min: 0, max: 64, step: 1, label: 'max blur' });
+
+      // ── Dome Stripes ──
+      const stripeFolder = pane.addFolder({ title: 'Dome Stripes', expanded: false });
+      const sp = {
+        colorA: { r: 0, g: 0, b: 0 },
+        colorB: { r: 1, g: 1, b: 1 },
+        thicknessA: 8.9,
+        thicknessB: 9.6,
+      };
+      stripeFolder.addBinding(sp, 'colorA', { color: { type: 'float' }, label: 'color A' }).on('change', () => {
+        stripeColorA.x = sp.colorA.r; stripeColorA.y = sp.colorA.g; stripeColorA.z = sp.colorA.b;
+      });
+      stripeFolder.addBinding(sp, 'colorB', { color: { type: 'float' }, label: 'color B' }).on('change', () => {
+        stripeColorB.x = sp.colorB.r; stripeColorB.y = sp.colorB.g; stripeColorB.z = sp.colorB.b;
+      });
+      stripeFolder.addBinding(sp, 'thicknessA', { min: 0.1, max: 20, step: 0.1, label: 'thickness A' }).on('change', () => {
+        stripeThickness.x = sp.thicknessA;
+      });
+      stripeFolder.addBinding(sp, 'thicknessB', { min: 0.1, max: 20, step: 0.1, label: 'thickness B' }).on('change', () => {
+        stripeThickness.y = sp.thicknessB;
+      });
+
+      // ── Bounds ──
+      const boundsFolder = pane.addFolder({ title: 'Bounds', expanded: false });
+      const boundsObj = { minX: -25, minY: -8, minZ: -16, maxX: 25, maxY: 30, maxZ: 16 };
       const syncBounds = () => {
-        sim.worldBoundsMin[0] = boundsObj.minX; sim.worldBoundsMin[1] = boundsObj.minY; sim.worldBoundsMin[2] = boundsObj.minZ;
-        sim.worldBoundsMax[0] = boundsObj.maxX; sim.worldBoundsMax[1] = boundsObj.maxY; sim.worldBoundsMax[2] = boundsObj.maxZ;
+        sim.worldBoundsMin = [boundsObj.minX, boundsObj.minY, boundsObj.minZ];
+        sim.worldBoundsMax = [boundsObj.maxX, boundsObj.maxY, boundsObj.maxZ];
         sim.rebuildGrid();
       };
-      boundsFolder.addBinding(boundsObj, 'minX', { min: -50, max: 0, step: 0.5, label: 'min X' }).on('change', syncBounds);
-      boundsFolder.addBinding(boundsObj, 'minY', { min: -50, max: 0, step: 0.5, label: 'min Y' }).on('change', syncBounds);
-      boundsFolder.addBinding(boundsObj, 'minZ', { min: -50, max: 0, step: 0.5, label: 'min Z' }).on('change', syncBounds);
-      boundsFolder.addBinding(boundsObj, 'maxX', { min: 0, max: 50, step: 0.5, label: 'max X' }).on('change', syncBounds);
-      boundsFolder.addBinding(boundsObj, 'maxY', { min: 0, max: 50, step: 0.5, label: 'max Y' }).on('change', syncBounds);
-      boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5, label: 'max Z' }).on('change', syncBounds);
-
-
-      // ── FPS counter (inside render loop) ──
-      const fpsEl = document.getElementById('fps');
-      let fpsFrames = 0, fpsLastTime = performance.now();
+      boundsFolder.addBinding(boundsObj, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'minZ', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'maxX', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'maxY', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
+      boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
 
       // ── Render loop ───────────────────────────────────────
       const startTimeS = performance.now() / 1000;
       const time = new Vector4(startTimeS, 0, startTimeS, 0);
+      const simTimeScale = 1.9;
 
       async function animate() {
         const frameStart = performance.now();
-
-        // FPS: count actual animate() calls
-        fpsFrames++;
-        const fpsElapsed = frameStart - fpsLastTime;
-        if (fpsElapsed >= 1000) {
-          const realFps = (fpsFrames / fpsElapsed) * 1000;
-          const realMs = fpsElapsed / fpsFrames;
-          fpsEl.textContent = `${realFps.toFixed(0)} FPS (${realMs.toFixed(1)} ms) | 100k particles [TypeScript]`;
-          fpsFrames = 0;
-          fpsLastTime = frameStart;
-        }
         time.x = frameStart / 1000;
         time.y = time.x - time.z;
         time.z = time.x;
 
-        const dt = Math.max(time.y, 1 / 60);
+        const dt = Math.max(time.y, 1 / 60) * simTimeScale;
 
         mouseVectors.update(dt);
         cameraControls.update(time.x);
         await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
 
-        // Always update density field
-        const encoder = renderer.device.createCommandEncoder();
-        densityField.update(encoder);
-        renderer.device.queue.submit([encoder.finish()]);
+        // Density field update — engine handles its own encoder/submit (no device in user code)
+        densityField.update();
 
-        // Toggle surface effect: remove from chain when showing particles
-        if (showParticles && volume.effects.length > 0) {
-          volume.effects.length = 0;
-        } else if (!showParticles && volume.effects.length === 0) {
-          volume.effects.push(surfaceEffect);
-        }
         volume.render(scene, camera);
-
         requestAnimationFrame(animate);
       }
       animate();
 
       // ── Resize ────────────────────────────────────────────
-      function onResize() {
+      window.addEventListener('resize', () => {
         renderer.setSize(window.innerWidth, window.innerHeight);
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
-      }
-      window.addEventListener('resize', onResize);
+      });
     </script>
   </body>
 </html>

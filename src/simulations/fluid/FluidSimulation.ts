@@ -446,6 +446,13 @@ class FluidSimulation {
         f[PARAMS.spikyPow2DerivFactor] = kernels.spikyPow2Deriv;
         f[PARAMS.spikyPow3DerivFactor] = kernels.spikyPow3Deriv;
 
+        // Radial gravity
+        const gc = p.gravityCenter ?? [0, 0, 0];
+        f[PARAMS.gravityCenterX] = gc[0];
+        f[PARAMS.gravityCenterY] = gc[1];
+        f[PARAMS.gravityCenterZ] = gc[2];
+        f[PARAMS.radialGravity] = p.radialGravity ? 1.0 : 0.0;
+
         this.paramsBuffer.needsUpdate = true;
     }
 

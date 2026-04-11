@@ -68,6 +68,20 @@ class Renderer {
     /** Alignment stride for the shared matrix buffers (device minimum, typically 256). */
     public get matrixAlignment(): number { return this._matrixAlignment; }
 
+    /**
+     * Create a new GPU command encoder. Use this instead of touching the device.
+     * Submit the encoder's finished command buffer with `submit()`.
+     */
+    public createCommandEncoder(label?: string): GPUCommandEncoder {
+        return this.device!.createCommandEncoder(label ? { label } : undefined);
+    }
+
+    /** Submit one or more finished command buffers to the GPU queue. */
+    public submit(commands: GPUCommandBuffer[] | GPUCommandBuffer): void {
+        const list = Array.isArray(commands) ? commands : [commands];
+        this.device!.queue.submit(list);
+    }
+
     // Pre-recorded bundle for the standard canvas render pass.
     private _renderBundle: GPURenderBundle | null = null;
     private _lastObjectCount: number = -1;

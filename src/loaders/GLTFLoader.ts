@@ -84,10 +84,74 @@ class GLTFLoader {
     async load(url: string, defaultMaterial: Material): Promise<GLTFResult> {
         this.baseUrl = url.substring(0, url.lastIndexOf("/") + 1);
 
+        // Detect GLB (binary glTF) by extension or by fetching the magic bytes
+        if (url.toLowerCase().endsWith('.glb')) {
+            return this.loadGLB(url, defaultMaterial);
+        }
+
         const response = await fetch(url);
         this.gltf = await response.json();
 
         await this.loadBuffers();
+
+        const materials = this.parseMaterials();
+        const geometries = this.parseMeshes();
+        const scene = this.buildScene(geometries, defaultMaterial);
+
+        return { scene, geometries, materials };
+    }
+
+    /**
+     * Load a binary glTF (.glb) file. The GLB container format is:
+     *   header: u32 magic ("glTF") + u32 version + u32 totalLength
+     *   chunk0 (JSON): u32 length + u32 type ("JSON") + JSON bytes
+     *   chunk1 (BIN, optional): u32 length + u32 type ("BIN ") + binary bytes
+     */
+    private async loadGLB(url: string, defaultMaterial: Material): Promise<GLTFResult> {
+        const response = await fetch(url);
+        const buffer = await response.arrayBuffer();
+        const view = new DataView(buffer);
+
+        const magic = view.getUint32(0, true);
+        if (magic !== 0x46546c67) {
+            throw new Error(`GLTFLoader: not a valid GLB file (magic = ${magic.toString(16)})`);
+        }
+        // const version = view.getUint32(4, true);
+        // const totalLength = view.getUint32(8, true);
+
+        let offset = 12;
+        let jsonChunk: string | null = null;
+        let binChunk: ArrayBuffer | null = null;
+
+        while (offset < buffer.byteLength) {
+            const chunkLength = view.getUint32(offset, true);
+            const chunkType = view.getUint32(offset + 4, true);
+            const chunkStart = offset + 8;
+
+            if (chunkType === 0x4e4f534a) { // "JSON"
+                const bytes = new Uint8Array(buffer, chunkStart, chunkLength);
+                jsonChunk = new TextDecoder().decode(bytes);
+            } else if (chunkType === 0x004e4942) { // "BIN\0"
+                binChunk = buffer.slice(chunkStart, chunkStart + chunkLength);
+            }
+            offset = chunkStart + chunkLength;
+        }
+
+        if (!jsonChunk) throw new Error('GLTFLoader: GLB has no JSON chunk');
+
+        this.gltf = JSON.parse(jsonChunk);
+        // Use the BIN chunk for any buffer with no URI (the standard GLB convention).
+        const bufferDefs = this.gltf.buffers || [];
+        this.buffers = await Promise.all(
+            bufferDefs.map(async (buf: any) => {
+                if (!buf.uri) {
+                    if (!binChunk) throw new Error('GLTFLoader: GLB references binary buffer but no BIN chunk');
+                    return binChunk;
+                }
+                const resp = await fetch(this.baseUrl + buf.uri);
+                return resp.arrayBuffer();
+            })
+        );
 
         const materials = this.parseMaterials();
         const geometries = this.parseMeshes();
