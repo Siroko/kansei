@@ -38,7 +38,7 @@
             simTimeScale: 1.9,
             renderFps: 0,
             pressure: 46.5, nearPressure: 20.0, densityTarget: 8.6,
-            viscosity: 1.0, damping: 0.997, gravityY: -9.8,
+            viscosity: 1.0, damping: 1.0, gravityY: -9.8,
             mouseForce: 1600, mouseRadius: 0.1, substeps: 2,
             densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
             resolution: 128, kernelScale: 0.6,
@@ -120,7 +120,7 @@
         planet.addBinding(pl, 'cz', { min: -20, max: 20, step: 0.5, label: 'center Z' }).on('change', syncPlanet);
 
         const bounds = pane.addFolder({ title: 'Bounds', expanded: false });
-        const b = { minX: -25, minY: -8, minZ: -16, maxX: 25, maxY: 30, maxZ: 16 };
+        const b = { minX: -25, minY: -8, minZ: -8, maxX: 25, maxY: 30, maxZ: 16 };
         const syncBounds = () => set_bounds(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
         bounds.addBinding(b, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
