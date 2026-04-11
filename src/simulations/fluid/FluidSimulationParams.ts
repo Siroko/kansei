@@ -8,6 +8,10 @@ export interface FluidSimulationOptions {
     viscosity: number;
     damping: number;
     gravity: [number, number, number];
+    /** World-space center for radial gravity (only used when `radialGravity` is true). */
+    gravityCenter?: [number, number, number];
+    /** If true, gravity points toward `gravityCenter` with magnitude |gravity|. */
+    radialGravity?: boolean;
     returnToOriginStrength: number;
     mouseRadius: number;
     mouseForce: number;
@@ -25,6 +29,8 @@ export const DEFAULT_OPTIONS: FluidSimulationOptions = {
     viscosity: 1.0,
     damping: 0.999,
     gravity: [0, -19.6, 0],
+    gravityCenter: [0, 0, 0],
+    radialGravity: false,
     returnToOriginStrength: 0.0,
     mouseRadius: 0.1,
     mouseForce: 1630.0,
@@ -129,7 +135,12 @@ export const PARAMS = {
     spikyPow2DerivFactor:    37,  // f32
     spikyPow3DerivFactor:    38,  // f32
     _pad:                    39,  // f32 padding (struct size must be 16-byte multiple)
-    BUFFER_SIZE:             40,  // total f32 count
+    // --- 16-byte aligned boundary (offset 160) ---
+    gravityCenterX:          40,  // vec3<f32> gravityCenter
+    gravityCenterY:          41,
+    gravityCenterZ:          42,
+    radialGravity:           43,  // f32 (0 or 1)
+    BUFFER_SIZE:             44,  // total f32 count
 } as const;
 
 export function computeKernelFactors2D(h: number) {

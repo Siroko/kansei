@@ -108,8 +108,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let safeDensity = max(myDensity.x, 0.001);
     vel += (pressureForce / safeDensity + viscosityForce * params.viscosity) * params.dt;
 
-    // Gravity
-    vel += params.gravity * params.dt;
+    // Gravity (directional or radial toward params.gravityCenter)
+    if (params.radialGravity > 0.5) {
+        let toCenter = params.gravityCenter - pos;
+        let dist = length(toCenter) + 0.0001;
+        let dir = toCenter / dist;
+        let gMag = length(params.gravity);
+        vel += dir * gMag * params.dt;
+    } else {
+        vel += params.gravity * params.dt;
+    }
 
     // Return to original position
     let origPos = originalPositions[idx].xyz;

@@ -1,3 +1,4 @@
+import { Renderer } from '../../renderers/Renderer';
 import { FluidSimulation } from './FluidSimulation';
 import { shaderCode as clearShader } from './shaders/density-field-clear.wgsl';
 import { shaderCode as splatShader } from './shaders/density-field-splat.wgsl';
@@ -9,6 +10,7 @@ export interface FluidDensityFieldOptions {
 }
 
 class FluidDensityField {
+    private _renderer: Renderer;
     private _device: GPUDevice;
     private _sim: FluidSimulation;
 
@@ -30,8 +32,9 @@ class FluidDensityField {
     private _texDims: [number, number, number];
     private _kernelScale: number;
 
-    constructor(device: GPUDevice, sim: FluidSimulation, options?: FluidDensityFieldOptions) {
-        this._device = device;
+    constructor(renderer: Renderer, sim: FluidSimulation, options?: FluidDensityFieldOptions) {
+        this._renderer = renderer;
+        this._device = renderer.gpuDevice;
         this._sim = sim;
 
         const maxRes = options?.resolution ?? 64;
@@ -188,7 +191,21 @@ class FluidDensityField {
         this._device.queue.writeBuffer(this._paramsBuffer, 0, this._paramsData);
     }
 
-    update(commandEncoder: GPUCommandEncoder): void {
+    /**
+     * Run the density field update (clear → splat → copy).
+     * If no encoder is provided, creates a new one and submits it immediately.
+     */
+    update(commandEncoder?: GPUCommandEncoder): void {
+        if (!commandEncoder) {
+            const encoder = this._renderer.createCommandEncoder('DensityField/Encoder');
+            this._record(encoder);
+            this._renderer.submit([encoder.finish()]);
+            return;
+        }
+        this._record(commandEncoder);
+    }
+
+    private _record(commandEncoder: GPUCommandEncoder): void {
         // Lazily build bind groups on first update (sim buffers are now GPU-initialized)
         if (!this._splatBG) {
             const posRef = this._sim.positionsBufferRef;
