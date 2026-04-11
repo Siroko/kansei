@@ -54,8 +54,13 @@
       camera.position.set(0, 3, 30);
       camera.lookAt(new Vector3(0, 3, 0));
 
-      // Camera: orbit target, radius 30, initial azimuth flipped 180° around Y
-      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 30, { invertWheel: true });
+      // Camera: orbit target, initial azimuth flipped 180° around Y.
+      // Mobile gets 2x the orbit radius so the fluid fits comfortably on
+      // narrow portrait viewports without having to pinch-zoom out.
+      const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+        || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+      const cameraRadius = isMobile ? 60 : 30;
+      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, cameraRadius, { invertWheel: true });
       cameraControls.azimuth = Math.PI;
       const mouseVectors = new MouseVectors();
 
