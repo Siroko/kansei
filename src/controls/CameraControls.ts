@@ -36,6 +36,9 @@ class CameraControls {
 
     private time: number;
     private domElement: HTMLElement | Window;
+    /** When true, scroll-wheel zoom direction is inverted
+     *  (scroll up → zoom in instead of zoom out). */
+    public invertWheel: boolean = false;
 
     private mouseWheelHandler?: (e: WheelEvent) => void;
     private mouseDownHandler?: (e: MouseEvent) => void;
@@ -47,11 +50,21 @@ class CameraControls {
 
     /**
      * Creates an instance of CameraControls.
-     * @param camera - The camera to control.
-     * @param target - The target vector for the camera to look at.
-     * @param domElement - The DOM element to attach event listeners to.
+     * @param camera      - The camera to control.
+     * @param target      - The target vector for the camera to look at.
+     * @param domElement  - The DOM element to attach event listeners to.
+     * @param radius      - Initial orbit radius. Defaults to 20.
+     * @param options     - Optional behaviour flags.
+     * @param options.invertWheel - Invert the scroll-wheel zoom direction.
      */
-    constructor(camera: Camera, target: Vector3, domElement: HTMLElement | Window, radius: number = 20) {
+    constructor(
+        camera: Camera,
+        target: Vector3,
+        domElement: HTMLElement | Window,
+        radius: number = 20,
+        options: { invertWheel?: boolean } = {},
+    ) {
+        this.invertWheel = options.invertWheel ?? false;
 
         this.camera = camera;
         this.target = target;
@@ -167,7 +180,8 @@ class CameraControls {
             e.preventDefault();
         }
         const delta = e.deltaY;
-        this.wheelDelta -= delta * 0.1;
+        const sign = this.invertWheel ? 1 : -1;
+        this.wheelDelta += sign * delta * 0.1;
 
         this._mouseX = e.pageX;
         this._mouseY = e.pageY;
@@ -248,6 +262,21 @@ class CameraControls {
 
         if (this.onMove) this.onMove();
 
+    }
+
+    /**
+     * Horizontal orbit angle in radians. Get/set the camera's azimuth around
+     * the target on the XZ plane. 0 = +Z side, π = -Z side, π/2 = +X side.
+     * Setting this snaps the camera without easing.
+     */
+    public get azimuth(): number {
+        return this.currentAngles.x * this.PI * 2;
+    }
+    public set azimuth(radians: number) {
+        const fraction = radians / (this.PI * 2);
+        this.currentAngles.x = fraction;
+        this.prevAngles.x    = fraction;
+        this.finalRadians.x  = radians;
     }
 
     /**

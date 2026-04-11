@@ -54,9 +54,9 @@
       camera.position.set(0, 3, 30);
       camera.lookAt(new Vector3(0, 3, 0));
 
-      // Camera: back view aligned with long X axis (azimuth = π), radius 30
-      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 30);
-      if (typeof cameraControls.azimuth !== 'undefined') cameraControls.azimuth = Math.PI;
+      // Camera: orbit target, radius 30, initial azimuth flipped 180° around Y
+      const cameraControls = new CameraControls(camera, new Vector3(0, 3, 0), window, 30, { invertWheel: true });
+      cameraControls.azimuth = Math.PI;
       const mouseVectors = new MouseVectors();
 
       // ── Directional Light ────────────────────────────────
@@ -492,11 +492,15 @@ fn fragment_main(v: VOut) -> FragOut {
         time.y = time.x - time.z;
         time.z = time.x;
 
-        const dt = Math.max(time.y, 1 / 60) * timing.simTimeScale;
+        // Clamp raw frame delta so returning from a hidden tab, a devtools
+        // pause, or any long GC stall can't feed the sim an enormous dt that
+        // would explode pressure/density in a single step.
+        const rawDt = Math.min(Math.max(time.y, 1 / 60), 1 / 30);
+        const dt = rawDt * timing.simTimeScale;
 
         mouseVectors.update(dt);
         cameraControls.update(time.x);
-        await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
+        await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength * 0.5);
 
         // Density field update — engine handles its own encoder/submit (no device in user code)
         densityField.update();
