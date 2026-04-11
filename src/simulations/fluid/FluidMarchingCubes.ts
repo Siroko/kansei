@@ -77,19 +77,23 @@ export class FluidMarchingCubes {
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
 
-        // Marching-cubes lookup tables — uploaded once as read-only storage
-        // buffers. Moved out of the shader source to dodge a Safari/WebKit
-        // WGSL→Metal compiler hang on large module-scope const arrays.
+        // Marching-cubes lookup tables — uploaded once as uniform buffers so
+        // Chrome/Dawn routes the lookups through the GPU's constant cache
+        // (much faster than storage memory for random-access tables). The
+        // classic MC shader declares them as `array<vec4<u32>, 64>` /
+        // `array<vec4<i32>, 1024>` so the 16-byte uniform-array stride
+        // exactly matches the natural vec4 packing of the flat u32/i32
+        // arrays — no CPU-side repacking needed.
         this._edgeTableBuffer = device.createBuffer({
             label: 'FluidMarchingCubes/EdgeTable',
             size: EDGE_TABLE.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(this._edgeTableBuffer, 0, EDGE_TABLE);
         this._triTableBuffer = device.createBuffer({
             label: 'FluidMarchingCubes/TriTable',
             size: TRI_TABLE.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(this._triTableBuffer, 0, TRI_TABLE);
 
@@ -114,8 +118,8 @@ export class FluidMarchingCubes {
                 { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
                 { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
                 { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-                { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+                { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
             ],
         });
         const extractLayout = device.createPipelineLayout({

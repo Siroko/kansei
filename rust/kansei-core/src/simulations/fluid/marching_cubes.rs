@@ -140,18 +140,23 @@ impl MarchingCubesSimulation {
             mapped_at_creation: false,
         });
 
-        // Marching-cubes lookup tables — uploaded once as read-only storage
-        // buffers. Moved out of the shader source to dodge a Safari/WebKit
-        // WGSL→Metal compiler hang on large module-scope const arrays.
+        // Marching-cubes lookup tables — uploaded once as uniform buffers so
+        // Chrome/Dawn routes the lookups through the GPU's constant cache
+        // (much faster than storage memory for random-access tables). In the
+        // shader they're declared as `array<vec4<u32>, 64>` / `array<vec4<i32>, 1024>`
+        // so the 16-byte uniform-array stride matches the natural packing
+        // of 4 consecutive u32/i32 entries into one vec4 slot — meaning the
+        // byte layout is identical to a flat storage buffer and we can
+        // upload `EDGE_TABLE` / `TRI_TABLE` as-is with no repacking.
         let edge_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("FluidMarchingCubes/EdgeTable"),
             contents: bytemuck::cast_slice(&EDGE_TABLE),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::UNIFORM,
         });
         let tri_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("FluidMarchingCubes/TriTable"),
             contents: bytemuck::cast_slice(&TRI_TABLE),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::UNIFORM,
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -276,23 +281,24 @@ impl MarchingCubesSimulation {
                     },
                     count: None,
                 },
-                // binding 6 — EDGE_TABLE (classic MC only; voxel shell ignores it)
+                // binding 6 — EDGE_TABLE (classic MC only; voxel shell ignores it).
+                // Uniform buffer so Dawn routes lookups through constant cache.
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
                     count: None,
                 },
-                // binding 7 — TRI_TABLE (classic MC only; voxel shell ignores it)
+                // binding 7 — TRI_TABLE (classic MC only; voxel shell ignores it).
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
