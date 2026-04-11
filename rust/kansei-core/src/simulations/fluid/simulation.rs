@@ -492,6 +492,10 @@ impl FluidSimulation {
         f[ParamOffsets::SPIKY_POW3_FACTOR] = k.spiky_pow3;
         f[ParamOffsets::SPIKY_POW2_DERIV_FACTOR] = k.spiky_pow2_deriv;
         f[ParamOffsets::SPIKY_POW3_DERIV_FACTOR] = k.spiky_pow3_deriv;
+        f[ParamOffsets::GRAVITY_CENTER_X] = p.gravity_center[0];
+        f[ParamOffsets::GRAVITY_CENTER_Y] = p.gravity_center[1];
+        f[ParamOffsets::GRAVITY_CENTER_Z] = p.gravity_center[2];
+        f[ParamOffsets::RADIAL_GRAVITY] = if p.radial_gravity { 1.0 } else { 0.0 };
     }
 
     pub fn particle_count(&self) -> u32 { self.particle_count }
