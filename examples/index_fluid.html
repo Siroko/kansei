@@ -106,7 +106,7 @@
         radialGravity: false,
         returnToOriginStrength: 0.0,
         mouseRadius: 0.1,
-        mouseForce: 5000.0,
+        mouseForce: 2500.0,
         substeps: 2,
         worldBoundsPadding: 0.3,
       };
@@ -500,7 +500,7 @@ fn fragment_main(v: VOut) -> FragOut {
 
         mouseVectors.update(dt);
         cameraControls.update(time.x);
-        await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength * 0.5);
+        await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
 
         // Density field update — engine handles its own encoder/submit (no device in user code)
         densityField.update();
