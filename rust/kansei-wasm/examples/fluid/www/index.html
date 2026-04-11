@@ -14,6 +14,7 @@
         import init, { start, get_fps, get_frame_time,
             set_pressure, set_near_pressure, set_density_target,
             set_viscosity, set_damping, set_gravity_y, set_mouse_force, set_mouse_radius,
+            set_radial_gravity, set_gravity_center,
             set_particle_size, set_substeps, set_show_particles, set_render_mode, set_mc_iso_level, set_mc_resolution,
             set_use_batched_sim,
             set_sim_dt_step, set_sim_time_scale, set_max_render_fps,
@@ -109,6 +110,14 @@
         forces.addBinding(p, 'mouseForce', { min: 0, max: 5000, step: 10 }).on('change', () => set_mouse_force(p.mouseForce));
         forces.addBinding(p, 'mouseRadius', { min: 0.01, max: 2, step: 0.01 }).on('change', () => set_mouse_radius(p.mouseRadius));
         forces.addBinding(p, 'substeps', { min: 1, max: 8, step: 1 }).on('change', () => set_substeps(p.substeps));
+
+        const planet = pane.addFolder({ title: 'Radial Gravity (Planet)', expanded: false });
+        const pl = { enabled: false, cx: 0.0, cy: 11.0, cz: 0.0 };
+        const syncPlanet = () => set_gravity_center(pl.cx, pl.cy, pl.cz);
+        planet.addBinding(pl, 'enabled', { label: 'radial' }).on('change', () => set_radial_gravity(pl.enabled));
+        planet.addBinding(pl, 'cx', { min: -30, max: 30, step: 0.5, label: 'center X' }).on('change', syncPlanet);
+        planet.addBinding(pl, 'cy', { min: -10, max: 30, step: 0.5, label: 'center Y' }).on('change', syncPlanet);
+        planet.addBinding(pl, 'cz', { min: -20, max: 20, step: 0.5, label: 'center Z' }).on('change', syncPlanet);
 
         const bounds = pane.addFolder({ title: 'Bounds', expanded: false });
         const b = { minX: -25, minY: -8, minZ: -16, maxX: 25, maxY: 30, maxZ: 16 };

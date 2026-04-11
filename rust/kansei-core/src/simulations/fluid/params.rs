@@ -10,6 +10,10 @@ pub struct FluidSimulationOptions {
     pub viscosity: f32,
     pub damping: f32,
     pub gravity: [f32; 3],
+    /// World-space center for radial gravity (only used when `radial_gravity` is true).
+    pub gravity_center: [f32; 3],
+    /// If true, gravity points toward `gravity_center` with magnitude `|gravity|`.
+    pub radial_gravity: bool,
     pub return_to_origin_strength: f32,
     pub mouse_radius: f32,
     pub mouse_force: f32,
@@ -27,6 +31,8 @@ pub const DEFAULT_OPTIONS: FluidSimulationOptions = FluidSimulationOptions {
     viscosity: 0.3,
     damping: 0.998,
     gravity: [0.0, -9.8, 0.0],
+    gravity_center: [0.0, 0.0, 0.0],
+    radial_gravity: false,
     return_to_origin_strength: 0.0,
     mouse_radius: 0.1,
     mouse_force: 500.0,
@@ -77,7 +83,11 @@ impl ParamOffsets {
     pub const SPIKY_POW2_DERIV_FACTOR: usize = 37;
     pub const SPIKY_POW3_DERIV_FACTOR: usize = 38;
     pub const PAD: usize = 39;
-    pub const BUFFER_SIZE: usize = 40;
+    pub const GRAVITY_CENTER_X: usize = 40;
+    pub const GRAVITY_CENTER_Y: usize = 41;
+    pub const GRAVITY_CENTER_Z: usize = 42;
+    pub const RADIAL_GRAVITY: usize = 43;
+    pub const BUFFER_SIZE: usize = 44;
 }
 
 /// Compute SPH kernel factors for 2D.

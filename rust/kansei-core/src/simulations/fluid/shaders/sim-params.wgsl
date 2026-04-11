@@ -36,6 +36,9 @@ struct SimParams {
     spikyPow2DerivFactor: f32,
     spikyPow3DerivFactor: f32,
     _pad: f32,
+
+    gravityCenter: vec3<f32>,
+    radialGravity: f32, // 0 = directional, 1 = radial toward gravityCenter
 };
 
 fn getCellCoord(pos: vec3<f32>, params: SimParams) -> vec3<i32> {

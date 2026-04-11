@@ -970,6 +970,12 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
 #[wasm_bindgen] pub fn set_viscosity(v: f32) { with_fluid(|f| f.sim.params.viscosity = v); }
 #[wasm_bindgen] pub fn set_damping(v: f32) { with_fluid(|f| f.sim.params.damping = v); }
 #[wasm_bindgen] pub fn set_gravity_y(v: f32) { with_fluid(|f| f.sim.params.gravity[1] = v); }
+#[wasm_bindgen] pub fn set_radial_gravity(enabled: bool) {
+    with_fluid(|f| f.sim.params.radial_gravity = enabled);
+}
+#[wasm_bindgen] pub fn set_gravity_center(x: f32, y: f32, z: f32) {
+    with_fluid(|f| f.sim.params.gravity_center = [x, y, z]);
+}
 #[wasm_bindgen] pub fn set_mouse_force(v: f32) { with_fluid(|f| f.sim.params.mouse_force = v); }
 #[wasm_bindgen] pub fn set_mouse_radius(v: f32) { with_fluid(|f| f.sim.params.mouse_radius = v); }
 #[wasm_bindgen] pub fn set_particle_size(v: f32) { with_state(|s| s.particle_size = v); }

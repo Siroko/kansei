@@ -27,6 +27,8 @@ export function set_dof_focus_range(v: number): void;
 
 export function set_dof_max_blur(v: number): void;
 
+export function set_gravity_center(x: number, y: number, z: number): void;
+
 export function set_gravity_y(v: number): void;
 
 export function set_kernel_scale(v: number): void;
@@ -52,6 +54,8 @@ export function set_near_pressure(v: number): void;
 export function set_particle_size(v: number): void;
 
 export function set_pressure(v: number): void;
+
+export function set_radial_gravity(enabled: boolean): void;
 
 export function set_render_mode(v: number): void;
 
@@ -85,6 +89,7 @@ export interface InitOutput {
     readonly set_dof_focus_distance: (a: number) => void;
     readonly set_dof_focus_range: (a: number) => void;
     readonly set_dof_max_blur: (a: number) => void;
+    readonly set_gravity_center: (a: number, b: number, c: number) => void;
     readonly set_gravity_y: (a: number) => void;
     readonly set_kernel_scale: (a: number) => void;
     readonly set_light_color: (a: number, b: number, c: number) => void;
@@ -95,6 +100,7 @@ export interface InitOutput {
     readonly set_mouse_radius: (a: number) => void;
     readonly set_near_pressure: (a: number) => void;
     readonly set_pressure: (a: number) => void;
+    readonly set_radial_gravity: (a: number) => void;
     readonly set_render_mode: (a: number) => void;
     readonly set_show_particles: (a: number) => void;
     readonly set_stripe_params: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
