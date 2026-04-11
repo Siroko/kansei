@@ -87,8 +87,15 @@ class Renderer {
     private _lastObjectCount: number = -1;
 
     // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float).
+    // When the scene contains transmissive objects, rendering is split into two
+    // sub-bundles so the renderer can snapshot the opaque result into
+    // GBuffer.backgroundTexture before drawing the transmissive ones.
     private _gbufferBundle: GPURenderBundle | null = null;
+    private _gbufferOpaqueBundle: GPURenderBundle | null = null;
+    private _gbufferTransmissiveBundle: GPURenderBundle | null = null;
     private _gbufferLastObjectCount: number = -1;
+    private _gbufferLastOpaqueCount: number = -1;
+    private _gbufferLastTransmissiveCount: number = -1;
     private _gbufferLastSampleCount: number = -1;
 
     // Depth-copy pipeline: resolves MSAA depth from depthMSAATexture → depthTexture.
@@ -667,25 +674,51 @@ class Renderer {
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
 
+        const opaqueCount = stack.opaqueCount;
+        const transmissiveCount = stack.transmissiveCount;
+        const hasTransmissive = transmissiveCount > 0;
+
         for (const renderable of orderedObjects) {
             if (renderable.materialDirty) {
                 this._gbufferBundle = null;
+                this._gbufferOpaqueBundle = null;
+                this._gbufferTransmissiveBundle = null;
                 renderable.materialDirty = false;
             }
         }
 
-        // Phase 2 — build GBuffer bundle if stale.
-        if (!this._gbufferBundle ||
+        // Phase 2 — build GBuffer bundle(s) if stale.
+        const bundleStale =
             this._gbufferLastObjectCount !== orderedObjects.length ||
-            this._gbufferLastSampleCount !== gbuffer.msaaSampleCount) {
+            this._gbufferLastOpaqueCount !== opaqueCount ||
+            this._gbufferLastTransmissiveCount !== transmissiveCount ||
+            this._gbufferLastSampleCount !== gbuffer.msaaSampleCount;
+
+        if (hasTransmissive) {
+            if (bundleStale || !this._gbufferOpaqueBundle || !this._gbufferTransmissiveBundle) {
+                const opaqueSlice = orderedObjects.slice(0, opaqueCount);
+                const transmissiveSlice = orderedObjects.slice(opaqueCount, opaqueCount + transmissiveCount);
+                this._gbufferOpaqueBundle = this._buildRenderBundle(
+                    opaqueSlice, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, 0
+                );
+                this._gbufferTransmissiveBundle = this._buildRenderBundle(
+                    transmissiveSlice, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, opaqueCount
+                );
+                this._gbufferBundle = null;
+            }
+        } else if (bundleStale || !this._gbufferBundle) {
             this._gbufferBundle = this._buildRenderBundle(
                 orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats
             );
-            this._gbufferLastObjectCount = orderedObjects.length;
-            this._gbufferLastSampleCount = gbuffer.msaaSampleCount;
+            this._gbufferOpaqueBundle = null;
+            this._gbufferTransmissiveBundle = null;
         }
+        this._gbufferLastObjectCount = orderedObjects.length;
+        this._gbufferLastOpaqueCount = opaqueCount;
+        this._gbufferLastTransmissiveCount = transmissiveCount;
+        this._gbufferLastSampleCount = gbuffer.msaaSampleCount;
 
-        // Phase 3 — execute into the GBuffer render pass.
+        // Phase 3 — execute into the GBuffer render pass(es).
         const commandEncoder = this.device!.createCommandEncoder();
 
         const clearColor = {
@@ -694,92 +727,122 @@ class Renderer {
             b: this.options.clearColor?.z || 0.0,
             a: this.options.clearColor?.w || 0.0,
         };
-
-        let passDescriptor: GPURenderPassDescriptor;
         const emissiveClear = { r: 0, g: 0, b: 0, a: 0 };
+        const blackClear = { r: 0, g: 0, b: 0, a: 0 };
 
-        if (gbuffer.msaaSampleCount > 1 && gbuffer.colorMSAATexture && gbuffer.depthMSAATexture) {
-            // MSAA path: render into multi-sample textures, resolve colour automatically.
-            // MSAA depth is stored so the depth-copy pass can read it next.
-            passDescriptor = {
-                colorAttachments: [
-                    {
-                        view: gbuffer.colorMSAATexture.createView(),
-                        resolveTarget: gbuffer.colorTexture.createView(),
-                        clearValue: clearColor,
-                        loadOp: 'clear',
-                        storeOp: 'discard', // MSAA samples discarded after resolve
+        // Build a pass descriptor configured for the given stage.
+        // `loadExisting` = true for the second (transmissive) pass — it loads the
+        // previously-rendered MSAA samples and continues drawing on top.
+        const makePassDescriptor = (loadExisting: boolean): GPURenderPassDescriptor => {
+            const colorLoad: GPULoadOp = loadExisting ? 'load' : 'clear';
+            // Depth must be preserved in the MSAA path between pass 1 and pass 2,
+            // AND kept until the depth-copy pass runs afterwards.
+            const depthStoreOp: GPUStoreOp = 'store';
+
+            if (gbuffer.msaaSampleCount > 1 && gbuffer.colorMSAATexture && gbuffer.depthMSAATexture) {
+                // MSAA path: samples are kept between passes 1 and 2 via storeOp:'store'
+                // and consumed on pass 2 via loadOp:'load'. Resolve happens at end of each pass.
+                const colorStoreOp: GPUStoreOp = hasTransmissive && !loadExisting ? 'store' : 'discard';
+                return {
+                    colorAttachments: [
+                        {
+                            view: gbuffer.colorMSAATexture.createView(),
+                            resolveTarget: gbuffer.colorTexture.createView(),
+                            clearValue: clearColor,
+                            loadOp: colorLoad,
+                            storeOp: colorStoreOp,
+                        },
+                        {
+                            view: gbuffer.emissiveMSAATexture!.createView(),
+                            resolveTarget: gbuffer.emissiveTexture.createView(),
+                            clearValue: emissiveClear,
+                            loadOp: colorLoad,
+                            storeOp: colorStoreOp,
+                        },
+                        {
+                            view: gbuffer.normalMSAATexture!.createView(),
+                            resolveTarget: gbuffer.normalTexture.createView(),
+                            clearValue: blackClear,
+                            loadOp: colorLoad,
+                            storeOp: colorStoreOp,
+                        },
+                        {
+                            view: gbuffer.albedoMSAATexture!.createView(),
+                            resolveTarget: gbuffer.albedoTexture.createView(),
+                            clearValue: blackClear,
+                            loadOp: colorLoad,
+                            storeOp: colorStoreOp,
+                        },
+                    ],
+                    depthStencilAttachment: {
+                        view: gbuffer.depthMSAATexture.createView(),
+                        depthClearValue: 1.0,
+                        depthLoadOp: loadExisting ? 'load' : 'clear',
+                        depthStoreOp,
                     },
-                    {
-                        view: gbuffer.emissiveMSAATexture!.createView(),
-                        resolveTarget: gbuffer.emissiveTexture.createView(),
-                        clearValue: emissiveClear,
-                        loadOp: 'clear',
-                        storeOp: 'discard',
-                    },
-                    {
-                        view: gbuffer.normalMSAATexture!.createView(),
-                        resolveTarget: gbuffer.normalTexture.createView(),
-                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-                        loadOp: 'clear' as const,
-                        storeOp: 'discard' as const,
-                    },
-                    {
-                        view: gbuffer.albedoMSAATexture!.createView(),
-                        resolveTarget: gbuffer.albedoTexture.createView(),
-                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-                        loadOp: 'clear' as const,
-                        storeOp: 'discard' as const,
-                    },
-                ],
-                depthStencilAttachment: {
-                    view: gbuffer.depthMSAATexture.createView(),
-                    depthClearValue: 1.0,
-                    depthLoadOp: 'clear',
-                    depthStoreOp: 'store', // keep MSAA depth for the depth-copy pass
-                },
-            };
-        } else {
+                };
+            }
+
             // Non-MSAA path.
-            passDescriptor = {
+            return {
                 colorAttachments: [
                     {
                         view: gbuffer.colorTexture.createView(),
                         clearValue: clearColor,
-                        loadOp: 'clear',
+                        loadOp: colorLoad,
                         storeOp: 'store',
                     },
                     {
                         view: gbuffer.emissiveTexture.createView(),
                         clearValue: emissiveClear,
-                        loadOp: 'clear',
+                        loadOp: colorLoad,
                         storeOp: 'store',
                     },
                     {
                         view: gbuffer.normalTexture.createView(),
-                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-                        loadOp: 'clear' as const,
-                        storeOp: 'store' as const,
+                        clearValue: blackClear,
+                        loadOp: colorLoad,
+                        storeOp: 'store',
                     },
                     {
                         view: gbuffer.albedoTexture.createView(),
-                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-                        loadOp: 'clear' as const,
-                        storeOp: 'store' as const,
+                        clearValue: blackClear,
+                        loadOp: colorLoad,
+                        storeOp: 'store',
                     },
                 ],
                 depthStencilAttachment: {
                     view: gbuffer.depthTexture.createView(),
                     depthClearValue: 1.0,
-                    depthLoadOp: 'clear',
-                    depthStoreOp: 'store',
+                    depthLoadOp: loadExisting ? 'load' : 'clear',
+                    depthStoreOp,
                 },
             };
-        }
+        };
 
-        const pass = commandEncoder.beginRenderPass(passDescriptor);
-        pass.executeBundles([this._gbufferBundle!]);
-        pass.end();
+        if (hasTransmissive) {
+            // Pass 1 — opaque objects.
+            const opaquePass = commandEncoder.beginRenderPass(makePassDescriptor(false));
+            opaquePass.executeBundles([this._gbufferOpaqueBundle!]);
+            opaquePass.end();
+
+            // Snapshot the opaque-only colour into backgroundTexture so that a
+            // downstream transmission effect can sample the undistorted background.
+            commandEncoder.copyTextureToTexture(
+                { texture: gbuffer.colorTexture },
+                { texture: gbuffer.backgroundTexture },
+                { width: gbuffer.width, height: gbuffer.height, depthOrArrayLayers: 1 },
+            );
+
+            // Pass 2 — transmissive objects (continues drawing on top of the opaque result).
+            const transmissivePass = commandEncoder.beginRenderPass(makePassDescriptor(true));
+            transmissivePass.executeBundles([this._gbufferTransmissiveBundle!]);
+            transmissivePass.end();
+        } else {
+            const pass = commandEncoder.beginRenderPass(makePassDescriptor(false));
+            pass.executeBundles([this._gbufferBundle!]);
+            pass.end();
+        }
 
         // Depth-copy pass: resolve MSAA depth → non-MSAA depthTexture for compute shaders.
         if (gbuffer.msaaSampleCount > 1 && gbuffer.depthMSAATexture) {
@@ -840,9 +903,13 @@ class Renderer {
     /**
      * Records all draw commands into a GPURenderBundle.
      *
-     * @param colorFormat   Target colour attachment format. Defaults to the canvas presentation format.
-     * @param sampleCount   MSAA sample count of the render pass. Defaults to the renderer's sampleCount.
-     * @param depthFormat   Depth-stencil format. Defaults to 'depth24plus'.
+     * @param colorFormat       Target colour attachment format. Defaults to the canvas presentation format.
+     * @param sampleCount       MSAA sample count of the render pass. Defaults to the renderer's sampleCount.
+     * @param depthFormat       Depth-stencil format. Defaults to 'depth24plus'.
+     * @param baseObjectIndex   Index offset used when computing per-object dynamic offsets.
+     *                          When the caller passes a sliced subrange (e.g. the
+     *                          transmissive objects from the middle of the ordered list),
+     *                          this keeps the dynamic offsets aligned with the full list.
      */
     private _buildRenderBundle(
         orderedObjects: Renderable[],
@@ -851,7 +918,8 @@ class Renderer {
         sampleCount: number = this.sampleCount,
         depthFormat: GPUTextureFormat = 'depth24plus',
         colorTargetCount: number = 1,
-        colorFormats?: GPUTextureFormat[]
+        colorFormats?: GPUTextureFormat[],
+        baseObjectIndex: number = 0,
     ): GPURenderBundle {
         const formats: (GPUTextureFormat | null)[] = colorFormats
             ? [...colorFormats]
@@ -923,12 +991,14 @@ class Renderer {
 
             // Bake the per-object dynamic offset: both bindings (normalMatrix,
             // worldMatrix) live in separate buffers but share the same stride.
-            const offset = i * alignment;
+            const offset = (baseObjectIndex + i) * alignment;
             encoder.setBindGroup(1, this._sharedMeshBG!, [offset, offset]);
 
             if (renderable.geometry.isInstancedGeometry) {
                 const geo = renderable.geometry as InstancedGeometry;
                 encoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
+            } else if (renderable.geometry.indirectArgsBuffer) {
+                encoder.drawIndexedIndirect(renderable.geometry.indirectArgsBuffer, 0);
             } else {
                 encoder.drawIndexed(renderable.geometry.vertexCount);
             }

@@ -1,17 +1,27 @@
+import { Renderer } from '../../renderers/Renderer';
 import { shaderCode as resetShader } from './shaders/marching-cubes-reset.wgsl';
 import { shaderCode as extractShader } from './shaders/marching-cubes-extract.wgsl';
+import { shaderCode as classicExtractShader } from './shaders/marching-cubes-classic.wgsl';
 import { shaderCode as finalizeShader } from './shaders/marching-cubes-finalize.wgsl';
 import { FluidDensityField } from './FluidDensityField';
 
 export interface MarchingCubesOptions {
     maxTriangles?: number;
     isoLevel?: number;
+    /** When true, use the classic Paul Bourke lookup-table marching cubes (smooth surfaces).
+     *  When false, use the voxel-shell approach (axis-aligned faces). Default: false. */
+    useClassic?: boolean;
 }
 
+/** Bytes per emitted vertex (matches engine standard Vertex layout: pos vec4 + normal vec3 + uv vec2). */
+export const MC_VERTEX_STRIDE = 36;
+
 export class FluidMarchingCubes {
+    private _renderer: Renderer;
     private _device: GPUDevice;
     private _maxTriangles: number;
     private _isoLevel: number;
+    private _useClassic: boolean;
     private _sampler: GPUSampler;
     private _paramsBuffer: GPUBuffer;
     private _triangleCounterBuffer: GPUBuffer;
@@ -20,15 +30,19 @@ export class FluidMarchingCubes {
     private _indirectArgsBuffer: GPUBuffer;
     private _resetPipeline: GPUComputePipeline;
     private _extractPipeline: GPUComputePipeline;
+    private _classicExtractPipeline: GPUComputePipeline;
     private _finalizePipeline: GPUComputePipeline;
     private _resetBG: GPUBindGroup;
     private _finalizeBG: GPUBindGroup;
     private _extractBGL: GPUBindGroupLayout;
 
-    constructor(device: GPUDevice, options?: MarchingCubesOptions) {
-        this._device = device;
+    constructor(renderer: Renderer, options?: MarchingCubesOptions) {
+        this._renderer = renderer;
+        this._device = renderer.gpuDevice;
+        const device = this._device;
         this._maxTriangles = Math.max(options?.maxTriangles ?? 262144, 1);
         this._isoLevel = options?.isoLevel ?? 1.0;
+        this._useClassic = options?.useClassic ?? false;
 
         const maxVertices = this._maxTriangles * 3;
         const maxIndices = this._maxTriangles * 3;
@@ -44,7 +58,7 @@ export class FluidMarchingCubes {
         });
         this._vertexBuffer = device.createBuffer({
             label: 'FluidMarchingCubes/Vertices',
-            size: maxVertices * 32,
+            size: maxVertices * MC_VERTEX_STRIDE,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_SRC,
         });
         this._indexBuffer = device.createBuffer({
@@ -66,6 +80,23 @@ export class FluidMarchingCubes {
             addressModeW: 'clamp-to-edge',
         });
 
+        // Shared explicit BGL for both extract pipelines (so the bind group is interchangeable)
+        this._extractBGL = device.createBindGroupLayout({
+            label: 'FluidMarchingCubes/ExtractBGL',
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            ],
+        });
+        const extractLayout = device.createPipelineLayout({
+            label: 'FluidMarchingCubes/ExtractLayout',
+            bindGroupLayouts: [this._extractBGL],
+        });
+
         this._resetPipeline = device.createComputePipeline({
             label: 'FluidMarchingCubes/ResetPipeline',
             layout: 'auto',
@@ -73,8 +104,13 @@ export class FluidMarchingCubes {
         });
         this._extractPipeline = device.createComputePipeline({
             label: 'FluidMarchingCubes/ExtractPipeline',
-            layout: 'auto',
+            layout: extractLayout,
             compute: { module: device.createShaderModule({ code: extractShader }), entryPoint: 'main' },
+        });
+        this._classicExtractPipeline = device.createComputePipeline({
+            label: 'FluidMarchingCubes/ClassicExtractPipeline',
+            layout: extractLayout,
+            compute: { module: device.createShaderModule({ code: classicExtractShader }), entryPoint: 'main' },
         });
         this._finalizePipeline = device.createComputePipeline({
             label: 'FluidMarchingCubes/FinalizePipeline',
@@ -99,7 +135,6 @@ export class FluidMarchingCubes {
                 { binding: 2, resource: { buffer: this._paramsBuffer } },
             ],
         });
-        this._extractBGL = this._extractPipeline.getBindGroupLayout(0);
     }
 
     get vertexBuffer(): GPUBuffer { return this._vertexBuffer; }
@@ -108,9 +143,16 @@ export class FluidMarchingCubes {
     get triangleCounterBuffer(): GPUBuffer { return this._triangleCounterBuffer; }
     get maxTriangles(): number { return this._maxTriangles; }
     get isoLevel(): number { return this._isoLevel; }
+    get useClassic(): boolean { return this._useClassic; }
 
-    set isoLevel(v: number) {
-        this._isoLevel = v;
+    set isoLevel(v: number) { this._isoLevel = v; }
+    set useClassic(v: boolean) { this._useClassic = v; }
+
+    /** Zero the indirect-draw args so the mesh Renderable draws nothing
+     *  until the next `update()` call repopulates them. */
+    clear(): void {
+        const zero = new Uint32Array([0, 1, 0, 0, 0]);
+        this._device.queue.writeBuffer(this._indirectArgsBuffer, 0, zero);
     }
 
     createBindGroup(densityField: FluidDensityField): GPUBindGroup {
@@ -128,7 +170,21 @@ export class FluidMarchingCubes {
         });
     }
 
-    update(commandEncoder: GPUCommandEncoder, extractBindGroup: GPUBindGroup, densityField: FluidDensityField): void {
+    /**
+     * Run reset → extract → finalize compute passes.
+     * If `commandEncoder` is omitted, the engine creates and submits its own.
+     */
+    update(extractBindGroup: GPUBindGroup, densityField: FluidDensityField, commandEncoder?: GPUCommandEncoder): void {
+        if (!commandEncoder) {
+            const enc = this._renderer.createCommandEncoder('FluidMarchingCubes/Encoder');
+            this._record(enc, extractBindGroup, densityField);
+            this._renderer.submit([enc.finish()]);
+            return;
+        }
+        this._record(commandEncoder, extractBindGroup, densityField);
+    }
+
+    private _record(commandEncoder: GPUCommandEncoder, extractBindGroup: GPUBindGroup, densityField: FluidDensityField): void {
         const dims = densityField.texDims;
         const bmin = densityField.boundsMin;
         const bmax = densityField.boundsMax;
@@ -156,7 +212,8 @@ export class FluidMarchingCubes {
         resetPass.end();
 
         const extractPass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Extract' });
-        extractPass.setPipeline(this._extractPipeline);
+        const pipeline = this._useClassic ? this._classicExtractPipeline : this._extractPipeline;
+        extractPass.setPipeline(pipeline);
         extractPass.setBindGroup(0, extractBindGroup);
         extractPass.dispatchWorkgroups(
             Math.ceil(Math.max(dims[0], 1) / 4),

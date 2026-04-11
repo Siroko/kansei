@@ -12,8 +12,14 @@ import { AreaLight } from "../lights/AreaLight";
  */
 class Scene extends Object3D {
     private opaqueObjects: Renderable[] = [];
+    private transmissiveObjects: Renderable[] = [];
     private transparentObjects: Renderable[] = [];
     private orderedObjects: Renderable[] = [];
+    /** Number of opaque objects at the front of orderedObjects. The renderer
+     *  draws `[0, opaqueCount)` into the GBuffer, copies colour to background,
+     *  then draws `[opaqueCount, opaqueCount + transmissiveCount)`. */
+    public opaqueCount: number = 0;
+    public transmissiveCount: number = 0;
     private _directionalLights: DirectionalLight[] = [];
     private _pointLights: PointLight[] = [];
     private _areaLights: AreaLight[] = [];
@@ -32,11 +38,12 @@ class Scene extends Object3D {
     public prepare(camera: Camera) {
         // Clear arrays in-place to avoid allocation
         this.opaqueObjects.length = 0;
+        this.transmissiveObjects.length = 0;
         this.transparentObjects.length = 0;
         this._directionalLights.length = 0;
         this._pointLights.length = 0;
         this._areaLights.length = 0;
-        // Sort objects into opaque and transparent, collect lights
+        // Sort objects into opaque, transmissive, and transparent; collect lights
         this.traverse(this, (object: Object3D) => {
             if ((object as any).isLight) {
                 const light = object as Light;
@@ -48,6 +55,8 @@ class Scene extends Object3D {
                 const renderable = object as Renderable;
                 if (renderable.material.transparent) {
                     this.transparentObjects.push(renderable);
+                } else if (renderable.material.transmissive) {
+                    this.transmissiveObjects.push(renderable);
                 } else {
                     this.opaqueObjects.push(renderable);
                 }
@@ -63,10 +72,16 @@ class Scene extends Object3D {
             return distB - distA;
         });
 
-        // Build ordered list in-place: opaque first, then transparent
+        // Build ordered list in-place: opaque → transmissive → transparent.
+        // The renderer relies on this ordering to split the GBuffer render pass
+        // at the transmissive boundary (background capture happens between them).
         this.orderedObjects.length = 0;
         for (let i = 0; i < this.opaqueObjects.length; i++) this.orderedObjects.push(this.opaqueObjects[i]);
+        for (let i = 0; i < this.transmissiveObjects.length; i++) this.orderedObjects.push(this.transmissiveObjects[i]);
         for (let i = 0; i < this.transparentObjects.length; i++) this.orderedObjects.push(this.transparentObjects[i]);
+
+        this.opaqueCount = this.opaqueObjects.length;
+        this.transmissiveCount = this.transmissiveObjects.length;
     }
 
     public getOrderedObjects(): Renderable[] {

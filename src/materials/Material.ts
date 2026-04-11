@@ -12,6 +12,11 @@ class Material {
     public uuid: string;
     public transparent: boolean = false;
     public outputsEmissive: boolean = false;
+    /** When true, the renderer draws this object AFTER opaque geometry and AFTER
+     *  snapshotting the opaque result into GBuffer.backgroundTexture — so a
+     *  downstream post-processing effect can sample the undistorted background
+     *  to compute screen-space refraction. */
+    public transmissive: boolean = false;
 
     // Cache of render pipelines keyed by "colorFormat:sampleCount:depthFormat".
     // Allows the same material to be used in multiple render passes with different
@@ -43,6 +48,7 @@ class Material {
         private options: {
             bindings?: BindGroupDescriptor[],
             transparent?: boolean,
+            transmissive?: boolean,
             depthWriteEnabled?: boolean,
             depthCompare?: GPUCompareFunction,
             cullMode?: GPUCullMode,
@@ -55,6 +61,7 @@ class Material {
         this.uuid = crypto.randomUUID();
 
         this.transparent = this.options.transparent || false;
+        this.transmissive = this.options.transmissive || false;
         this.outputsEmissive = this.options.outputsEmissive || false;
         this.depthWriteEnabled = this.options.depthWriteEnabled ?? true;
         this.depthCompare = this.options.depthCompare || 'less';

@@ -25,6 +25,11 @@
  *                   Ping-pong pair used by the effect chain.  Each effect reads from
  *                   one and writes to the other.  The final result is blitted to the
  *                   canvas.
+ *
+ * backgroundTexture rgba16float  RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_DST
+ *                   A copy of colorTexture taken AFTER opaque objects are drawn but
+ *                   BEFORE transmissive objects. Transmission post-processing effects
+ *                   sample it to do screen-space refraction (e.g. the fluid surface).
  */
 class GBuffer {
     public colorTexture!: GPUTexture;
@@ -37,6 +42,7 @@ class GBuffer {
     public albedoTexture!: GPUTexture;
     public normalMSAATexture: GPUTexture | null = null;
     public albedoMSAATexture: GPUTexture | null = null;
+    public backgroundTexture!: GPUTexture;
     public outputTexture!: GPUTexture;
     public pingPongTexture!: GPUTexture;
     public width: number;
@@ -67,10 +73,13 @@ class GBuffer {
         const { width, height } = this;
 
         // colorTexture is the resolve target (MSAA path) or direct render target (non-MSAA).
+        // COPY_SRC is required so the transmissive-split path can snapshot the opaque
+        // result into backgroundTexture between render passes.
         const colorUsage =
             GPUTextureUsage.RENDER_ATTACHMENT |
             GPUTextureUsage.TEXTURE_BINDING |
-            GPUTextureUsage.STORAGE_BINDING;
+            GPUTextureUsage.STORAGE_BINDING |
+            GPUTextureUsage.COPY_SRC;
 
         this.colorTexture = this.device.createTexture({
             label: 'GBuffer/Color',
@@ -154,6 +163,17 @@ class GBuffer {
             });
         }
 
+        // Background capture texture — filled via copyTextureToTexture after the
+        // opaque pass, consumed by transmission effects for screen-space refraction.
+        this.backgroundTexture = this.device.createTexture({
+            label: 'GBuffer/Background',
+            size: [width, height],
+            format: 'rgba16float',
+            usage:
+                GPUTextureUsage.TEXTURE_BINDING |
+                GPUTextureUsage.COPY_DST,
+        });
+
         const effectUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
 
         this.outputTexture = this.device.createTexture({
@@ -188,6 +208,7 @@ class GBuffer {
         this.albedoMSAATexture = null;
         this.depthMSAATexture?.destroy();
         this.depthMSAATexture = null;
+        this.backgroundTexture?.destroy();
         this.outputTexture?.destroy();
         this.pingPongTexture?.destroy();
     }
