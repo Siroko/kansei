@@ -503,6 +503,16 @@ impl FluidSimulation {
     pub fn positions_buffer(&self) -> Option<&wgpu::Buffer> { self.positions_buffer.as_ref() }
     pub fn params_buffer(&self) -> Option<&wgpu::Buffer> { self.params_buffer.as_ref() }
 
+    /// Return the positions buffer wrapped as a `ComputeBuffer` with vec4 vertex
+    /// layout at `shader_location`, ready for use with `InstancedGeometry`.
+    pub fn positions_as_compute_buffer(&self, shader_location: u32) -> Option<crate::buffers::ComputeBuffer> {
+        let buf = self.positions_buffer.as_ref()?.clone();
+        Some(
+            crate::buffers::ComputeBuffer::from_external("Positions", buf, crate::buffers::BufferType::Storage)
+                .with_vertex_vec4(shader_location)
+        )
+    }
+
     /// Rebuild spatial grid from current world_bounds_min/max.
     /// Call after changing bounds at runtime.
     pub fn rebuild_grid(&mut self) {

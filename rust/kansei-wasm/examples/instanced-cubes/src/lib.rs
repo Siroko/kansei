@@ -3,9 +3,9 @@ use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use kansei_core::buffers::InstanceBuffer;
+use kansei_core::buffers::{ComputeBuffer, BufferType, BufferUsage};
 use kansei_core::cameras::Camera;
-use kansei_core::geometries::BoxGeometry;
+use kansei_core::geometries::{BoxGeometry, InstancedGeometry};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Mat4, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -103,16 +103,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     );
     material.set_uniform_bindable(0, "ColorUniform", &color_data);
 
-    // Instance buffer
     let matrices = build_instance_matrices(0.0);
-    let instance_buf = InstanceBuffer::from_mat4("InstanceMatrices", &matrices, 3);
+    let instance_buf = ComputeBuffer::from_slice(
+        "InstanceMatrices", BufferType::Storage, BufferUsage::VERTEX, &matrices,
+    ).with_vertex_mat4(3);
 
-    let renderable = Renderable::new_instanced(
-        geometry,
-        material,
-        INSTANCE_COUNT as u32,
-        vec![instance_buf],
-    );
+    let instanced_geo = InstancedGeometry::new(geometry, INSTANCE_COUNT as u32, vec![instance_buf]);
+    let renderable = Renderable::new(instanced_geo, material);
 
     let mut scene = Scene::new();
     scene.add(SceneNode::Renderable(renderable));
@@ -151,11 +148,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             } = *st;
             let t = (now_secs() - *start_ms) as f32;
 
-            // Update instance matrices
             if let Some(r) = scene.get_renderable_mut(0) {
                 let matrices = build_instance_matrices(t);
-                if let Some(ib) = r.instance_buffers.get(0) {
-                    ib.update(bytemuck::cast_slice(&matrices));
+                if let Some(cb) = r.geometry.instance_buffers.get_mut(0) {
+                    cb.write(&matrices);
                 }
             }
 

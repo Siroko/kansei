@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use super::binding::{Binding, BindGroupBuilder, BindingResource};
 use super::shader_utils::ShaderChunks;
-use crate::buffers::{BufferType, GpuBuffer};
+use crate::buffers::{BufferType, ComputeBuffer};
 use crate::renderers::Renderer;
 use crate::renderers::SharedLayouts;
 
@@ -66,7 +66,7 @@ pub struct Material {
     pub shader_chunks: Option<ShaderChunks>,
     pub options: MaterialOptions,
     pub bindings: Vec<Binding>,
-    bindables: Vec<(u32, GpuBuffer)>,
+    bindables: Vec<(u32, ComputeBuffer)>,
     shader_module: Option<wgpu::ShaderModule>,
     material_bgl: Option<wgpu::BindGroupLayout>,
     pipeline_layout: Option<wgpu::PipelineLayout>,
@@ -259,7 +259,7 @@ impl Material {
     /// Attach/replace a uniform bindable owned by this material.
     pub fn set_uniform_bindable<T: bytemuck::Pod>(&mut self, binding: u32, label: &str, data: &[T]) {
         let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
-        let buf = GpuBuffer::from_slice(label, BufferType::Uniform, usage, data);
+        let buf = ComputeBuffer::from_slice(label, BufferType::Uniform, usage, data);
         if let Some((_, slot)) = self.bindables.iter_mut().find(|(b, _)| *b == binding) {
             *slot = buf;
         } else {

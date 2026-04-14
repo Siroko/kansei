@@ -597,7 +597,7 @@ impl Renderer {
             }
 
             // Get pipeline
-            let num_vb = 1 + r.instance_buffers.len();
+            let num_vb = 1 + r.geometry.instance_buffers.len();
             let key = crate::materials::PipelineKey {
                 color_formats: color_formats.to_vec(),
                 depth_format,
@@ -633,9 +633,8 @@ impl Renderer {
             // Set vertex buffer
             encoder.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
 
-            // Set instance buffers
-            for (i, ib) in r.instance_buffers.iter().enumerate() {
-                if let Some(ref buf) = ib.gpu_buffer {
+            for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
+                if let Some(buf) = cb.gpu_buffer() {
                     encoder.set_vertex_buffer((i + 1) as u32, buf.slice(..));
                 }
             }
@@ -647,7 +646,7 @@ impl Renderer {
             );
 
             // Draw
-            encoder.draw_indexed(0..r.geometry.index_count(), 0, 0..r.instance_count);
+            encoder.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
         }
 
         encoder.finish(&Default::default())
@@ -680,7 +679,7 @@ impl Renderer {
                 continue;
             }
 
-            let num_vb = 1 + r.instance_buffers.len();
+            let num_vb = 1 + r.geometry.instance_buffers.len();
             let key = crate::materials::PipelineKey {
                 color_formats: color_formats.to_vec(),
                 depth_format,
@@ -1082,17 +1081,14 @@ impl Renderer {
                 if !r.geometry.initialized {
                     r.geometry.initialize(device);
                 }
-                for ib in &mut r.instance_buffers {
-                    if !ib.initialized {
-                        ib.initialize(device, queue);
-                    }
+                for cb in &mut r.geometry.instance_buffers {
+                    cb.ensure_ready(device, queue);
                 }
                 r.material.ensure_bindables_initialized(self);
                 r.material.initialize(device, shared);
 
-                // Build combined vertex layouts (base + instance buffers)
-                let instance_layouts: Vec<_> = r.instance_buffers.iter()
-                    .map(|ib| ib.vertex_layout())
+                let instance_layouts: Vec<_> = r.geometry.instance_buffers.iter()
+                    .filter_map(|cb| cb.vertex_layout())
                     .collect();
                 let mut layouts = vec![Vertex::LAYOUT];
                 for il in &instance_layouts {
@@ -1348,16 +1344,14 @@ impl Renderer {
             if !r.geometry.initialized {
                 r.geometry.initialize(device);
             }
-            for ib in &mut r.instance_buffers {
-                if !ib.initialized {
-                    ib.initialize(device, queue);
-                }
+            for cb in &mut r.geometry.instance_buffers {
+                cb.ensure_ready(device, queue);
             }
             r.material.ensure_bindables_initialized(self);
             r.material.initialize(device, shared);
 
-            let instance_layouts: Vec<_> = r.instance_buffers.iter()
-                .map(|ib| ib.vertex_layout())
+            let instance_layouts: Vec<_> = r.geometry.instance_buffers.iter()
+                .filter_map(|cb| cb.vertex_layout())
                 .collect();
             let mut layouts = vec![Vertex::LAYOUT];
             for il in &instance_layouts {
