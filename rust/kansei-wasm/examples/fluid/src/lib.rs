@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use kansei_core::cameras::Camera;
 use kansei_core::controls::{CameraControls, MouseVectors};
-use kansei_core::geometries::{BoxGeometry, Geometry};
+use kansei_core::geometries::{BoxGeometry, Geometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
@@ -16,7 +16,6 @@ use kansei_core::postprocessing::{PostProcessingVolume, effects::{
     FluidSurfaceEffect, FluidSurfaceOptions,
 }};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use wgpu::util::DeviceExt;
 use kansei_core::simulations::fluid::{
     DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
     FluidSurfaceRenderer, MarchingCubesOptions,
@@ -80,24 +79,8 @@ fn fragment_main(v: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-// ── Particle billboard shader (custom — not a standard Renderable) ──
-const PARTICLE_WGSL: &str = r#"
-struct P { view: mat4x4<f32>, proj: mat4x4<f32>, size: f32, }
-@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
-@group(0) @binding(1) var<uniform> p: P;
-struct V { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, }
-const Q: array<vec2<f32>,6> = array(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,-1.),vec2(1.,1.),vec2(-1.,1.));
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> V {
-    let pid=vi/6u; let c=Q[vi%6u]; let pos=positions[pid]; let s=p.size;
-    let r=vec3<f32>(p.view[0][0],p.view[1][0],p.view[2][0]);
-    let u=vec3<f32>(p.view[0][1],p.view[1][1],p.view[2][1]);
-    let wp=pos.xyz+r*c.x*s+u*c.y*s;
-    var o:V; o.pos=p.proj*p.view*vec4<f32>(wp,1.);
-    let t=clamp((pos.y+8.)/16.,0.,1.);
-    o.col=mix(vec3<f32>(0.1,0.3,0.8),vec3<f32>(0.8,0.95,1.0),t); return o;
-}
-@fragment fn fs(v:V)->@location(0) vec4<f32>{return vec4<f32>(v.col,1.);}
-"#;
+// ── Particle billboard shader (engine-compatible instanced Renderable) ──
+const PARTICLE_BILLBOARD_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/particle_billboard.wgsl");
 
 // ── Blit shader (fullscreen triangle) ──
 const BLIT_WGSL: &str = r#"
@@ -346,8 +329,6 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-const PARTICLE_MSAA_SAMPLES: u32 = 4;
-
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -583,40 +564,27 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     camera.update_projection_matrix();
     camera.update_view_matrix();
 
-    // ── Particle pipeline (must be created BEFORE sim moves into effect) ──
-    let particle_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Particles"), source: wgpu::ShaderSource::Wgsl(PARTICLE_WGSL.into()),
-    });
-    let particle_params_buf = renderer.device().create_buffer(&wgpu::BufferDescriptor {
-        label: None, size: 144,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let particle_pipeline = renderer.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Particles"), layout: None,
-        vertex: wgpu::VertexState { module: &particle_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &particle_shader, entry_point: Some("fs"),
-            targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-            compilation_options: Default::default() }),
-        primitive: Default::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias: Default::default(),
-        }),
-        multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
-        multiview: None, cache: None,
-    });
-    let particle_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None, layout: &particle_pipeline.get_bind_group_layout(0), entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: sim.positions_buffer().unwrap().as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: particle_params_buf.as_entire_binding() },
-        ],
-    });
+    // ── Particle renderable (must be created BEFORE sim moves into effect) ──
+    let positions_cb = sim.positions_as_compute_buffer(3).expect("sim should be initialized");
+    let billboard_geo = PlaneGeometry::new(1.0, 1.0);
+    let instanced_geo = InstancedGeometry::new(billboard_geo, count as u32, vec![positions_cb]);
+
+    let particle_params: [f32; 12] = [
+        0.15, -8.0, 8.0, 0.0,            // size, height_min, height_max, pad
+        0.1, 0.3, 0.8, 1.0,              // color_low (blue)
+        0.8, 0.95, 1.0, 1.0,             // color_high (white-blue)
+    ];
+    let mut particle_mat = Material::new(
+        "Particles/Billboard", PARTICLE_BILLBOARD_WGSL,
+        vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
+        MaterialOptions { cull_mode: CullMode::None, ..Default::default() },
+    );
+    particle_mat.set_uniform_bindable(0, "ParticleParams", &particle_params);
+
+    let particle_renderable = Renderable::new(instanced_geo, particle_mat);
+    let particle_scene_index = scene.add(SceneNode::Renderable(particle_renderable));
 
     // ── Post-processing: FluidSurface (compute + refraction) → DoF ──
-    // Must be created after particle_bg (which references sim.positions_buffer)
-    // but before offscreen textures (which reference density_field.density_view).
-    // Create surface_bg first since it needs density_field.density_view.
 
     // ── Blit pipeline (for raymarch mode) ──
     let blit_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -645,7 +613,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default()
     });
 
-    // ── Offscreen textures (for raymarch + particle modes) ──
+    // ── Offscreen textures (for raymarch mode) ──
     let mk_tex = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
         let tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
             label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -660,22 +628,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let (_depth_tex, depth_view) = mk_tex("Depth", wgpu::TextureFormat::Depth32Float,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
     let (_output_tex, output_view) = mk_tex("Output", wgpu::TextureFormat::Rgba16Float, cu);
-    let particle_msaa_tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
-        label: Some("ParticleMSAA"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: PARTICLE_MSAA_SAMPLES,
-        dimension: wgpu::TextureDimension::D2, format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
-    });
-    let particle_msaa_view = particle_msaa_tex.create_view(&Default::default());
-    let particle_depth_tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
-        label: Some("ParticleDepth"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: PARTICLE_MSAA_SAMPLES,
-        dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
-    });
-    let particle_depth_view = particle_depth_tex.create_view(&Default::default());
 
     let surface_bg = surface_renderer.create_bind_group(&color_view, &depth_view, &output_view, &density_field.density_view);
     let blit_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
@@ -711,10 +663,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         renderer, scene, camera, controls, mouse, volume,
         surface_renderer,
         mc_scene_index, dome_scene_index, light_scene_index,
-        particle_pipeline, particle_bg, particle_params_buf,
+        particle_scene_index,
         blit_pipeline, blit_bg, surface_bg,
         color_view, depth_view, output_view,
-        particle_msaa_view, particle_depth_view,
         count: count as u32, width, height,
         particle_size: 0.15, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
         use_batched_sim: true,
@@ -771,11 +722,10 @@ struct State {
     mc_scene_index: usize,
     dome_scene_index: Option<usize>,
     light_scene_index: usize,
-    // Custom pipelines for particle + raymarch modes
-    particle_pipeline: wgpu::RenderPipeline, particle_bg: wgpu::BindGroup, particle_params_buf: wgpu::Buffer,
+    particle_scene_index: usize,
+    // Custom pipeline for raymarch mode only
     blit_pipeline: wgpu::RenderPipeline, blit_bg: wgpu::BindGroup, surface_bg: wgpu::BindGroup,
     color_view: wgpu::TextureView, depth_view: wgpu::TextureView, output_view: wgpu::TextureView,
-    particle_msaa_view: wgpu::TextureView, particle_depth_view: wgpu::TextureView,
     count: u32, width: u32, height: u32,
     particle_size: f32, show_particles: bool, render_mode: u32, mc_iso_level: f32,
     use_batched_sim: bool,
@@ -857,39 +807,19 @@ impl State {
             }
         }
 
-        // ── Render mode 0: Particles (custom pipeline) ──
+        // ── Render mode 0: Particles (standard engine path via InstancedGeometry) ──
         if self.render_mode == 0 {
-            let mut data = [0.0f32; 36];
-            data[..16].copy_from_slice(&view.to_cols_array());
-            data[16..32].copy_from_slice(&proj.to_cols_array());
-            data[32] = self.particle_size;
-            self.renderer.queue().write_buffer(&self.particle_params_buf, 0, bytemuck::cast_slice(&data));
-
-            let output = self.renderer.surface().unwrap().get_current_texture().unwrap();
-            let canvas_view = output.texture.create_view(&Default::default());
-            let mut encoder = self.renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("WasmFluid/Particles"),
-            });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.particle_msaa_view, resolve_target: Some(&canvas_view),
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }),
-                            store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.particle_depth_view,
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                        stencil_ops: None,
-                    }),
-                    ..Default::default()
-                }).forget_lifetime();
-                pass.set_pipeline(&self.particle_pipeline);
-                pass.set_bind_group(0, &self.particle_bg, &[]);
-                pass.draw(0..self.count * 6, 0..1);
+            if let Some(r) = self.scene.get_renderable(self.particle_scene_index) {
+                if let Some(buf) = r.material.bindable_buffer(0) {
+                    let params: [f32; 12] = [
+                        self.particle_size, -8.0, 8.0, 0.0,
+                        0.1, 0.3, 0.8, 1.0,
+                        0.8, 0.95, 1.0, 1.0,
+                    ];
+                    self.renderer.queue().write_buffer(buf, 0, bytemuck::cast_slice(&params));
+                }
             }
-            self.renderer.submit(std::iter::once(encoder.finish()));
-            output.present();
+            self.renderer.render(&mut self.scene, &mut self.camera);
 
         // ── Render mode 1: Raymarch (custom compute + blit) ──
         } else if self.render_mode == 1 {
@@ -997,7 +927,13 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
 #[wasm_bindgen] pub fn set_particle_size(v: f32) { with_state(|s| s.particle_size = v); }
 #[wasm_bindgen] pub fn set_substeps(v: u32) { with_fluid(|f| f.sim.params.substeps = v); }
 #[wasm_bindgen] pub fn set_show_particles(v: bool) {
-    with_state(|s| { s.show_particles = v; s.render_mode = if v { 0 } else { 2 }; });
+    with_state(|s| {
+        s.show_particles = v;
+        s.render_mode = if v { 0 } else { 2 };
+        if let Some(r) = s.scene.get_renderable_mut(s.particle_scene_index) {
+            r.visible = v;
+        }
+    });
 }
 #[wasm_bindgen] pub fn set_render_mode(v: u32) {
     with_state(|s| {
@@ -1009,6 +945,9 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         }
         if let Some(r) = s.scene.get_renderable_mut(s.mc_scene_index) {
             r.visible = s.render_mode >= 2;
+        }
+        if let Some(r) = s.scene.get_renderable_mut(s.particle_scene_index) {
+            r.visible = s.render_mode == 0;
         }
     });
 }

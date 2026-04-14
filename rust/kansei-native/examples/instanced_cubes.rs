@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use kansei_core::buffers::InstanceBuffer;
+use kansei_core::buffers::{ComputeBuffer, BufferType, BufferUsage};
 use kansei_core::cameras::Camera;
-use kansei_core::geometries::BoxGeometry;
+use kansei_core::geometries::{BoxGeometry, InstancedGeometry};
 use kansei_core::materials::{Binding, Material, MaterialOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -153,17 +153,13 @@ impl ApplicationHandler for App {
         );
         material.set_uniform_bindable(0, "ColorUniform", &color_data);
 
-        // Instance buffer with mat4 per instance (locations 3-6)
         let matrices = build_instance_matrices(0.0);
-        let instance_buf = InstanceBuffer::from_mat4("InstanceMatrices", &matrices, 3);
+        let instance_buf = ComputeBuffer::from_slice(
+            "InstanceMatrices", BufferType::Storage, BufferUsage::VERTEX, &matrices,
+        ).with_vertex_mat4(3);
 
-        // Instanced renderable
-        let renderable = Renderable::new_instanced(
-            geometry,
-            material,
-            INSTANCE_COUNT as u32,
-            vec![instance_buf],
-        );
+        let instanced_geo = InstancedGeometry::new(geometry, INSTANCE_COUNT as u32, vec![instance_buf]);
+        let renderable = Renderable::new(instanced_geo, material);
         self.scene.add(SceneNode::Renderable(renderable));
 
         // Camera
@@ -222,11 +218,10 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let t = self.start_time.elapsed().as_secs_f32();
 
-                // Update instance matrices
                 if let Some(r) = self.scene.get_renderable_mut(0) {
                     let matrices = build_instance_matrices(t);
-                    if let Some(ib) = r.instance_buffers.get(0) {
-                        ib.update(bytemuck::cast_slice(&matrices));
+                    if let Some(cb) = r.geometry.instance_buffers.get_mut(0) {
+                        cb.write(&matrices);
                     }
                 }
 

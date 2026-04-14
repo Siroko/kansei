@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use crate::buffers::ComputeBuffer;
 
 /// A single vertex attribute descriptor.
 #[derive(Debug, Clone)]
@@ -44,7 +45,10 @@ impl Vertex {
     };
 }
 
-/// A GPU geometry — vertex + index buffers.
+/// A GPU geometry — vertex + index buffers, with optional instancing data.
+///
+/// Plain geometries have `instance_count == 1` and empty `instance_buffers`.
+/// `InstancedGeometry::new()` produces a `Geometry` with those fields populated.
 pub struct Geometry {
     pub label: String,
     pub vertices: Vec<Vertex>,
@@ -58,6 +62,10 @@ pub struct Geometry {
     ext_vertex_buffer: Option<*const wgpu::Buffer>,
     ext_index_buffer: Option<*const wgpu::Buffer>,
     ext_indirect_buffer: Option<*const wgpu::Buffer>,
+    /// Number of instances to draw (1 = non-instanced).
+    pub instance_count: u32,
+    /// Per-instance vertex buffers (empty for non-instanced geometry).
+    pub instance_buffers: Vec<ComputeBuffer>,
 }
 
 // SAFETY: wgpu::Buffer is internally Arc-based and Send+Sync.
@@ -99,6 +107,8 @@ impl Geometry {
             ext_vertex_buffer: None,
             ext_index_buffer: None,
             ext_indirect_buffer: None,
+            instance_count: 1,
+            instance_buffers: Vec::new(),
         }
     }
 
@@ -117,6 +127,8 @@ impl Geometry {
             ext_vertex_buffer: None,
             ext_index_buffer: None,
             ext_indirect_buffer: None,
+            instance_count: 1,
+            instance_buffers: Vec::new(),
         }
     }
 
@@ -144,6 +156,11 @@ impl Geometry {
 
     pub fn vertex_count(&self) -> u32 {
         self.vertices.len() as u32
+    }
+
+    /// Whether this geometry uses instanced rendering.
+    pub fn is_instanced(&self) -> bool {
+        !self.instance_buffers.is_empty()
     }
 
     /// Update external buffer pointers. Call after the owning struct is at its final

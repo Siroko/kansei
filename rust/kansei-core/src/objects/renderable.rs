@@ -1,15 +1,14 @@
 use super::Object3D;
-use crate::buffers::InstanceBuffer;
 use crate::geometries::Geometry;
 use crate::materials::Material;
 
 /// A renderable object — owns geometry + material + transform.
+/// Instance count and per-instance buffers live on `Geometry`
+/// (populated by `InstancedGeometry::new`).
 pub struct Renderable {
     pub object: Object3D,
     pub geometry: Geometry,
     pub material: Material,
-    pub instance_count: u32,
-    pub instance_buffers: Vec<InstanceBuffer>,
     pub cast_shadow: bool,
     pub receive_shadow: bool,
     pub render_order: i32,
@@ -18,34 +17,11 @@ pub struct Renderable {
 }
 
 impl Renderable {
-    pub fn new(geometry: Geometry, material: Material) -> Self {
+    pub fn new(geometry: impl Into<Geometry>, material: Material) -> Self {
         Self {
             object: Object3D::new(),
-            geometry,
+            geometry: geometry.into(),
             material,
-            instance_count: 1,
-            instance_buffers: Vec::new(),
-            cast_shadow: true,
-            receive_shadow: true,
-            render_order: 0,
-            visible: true,
-            material_dirty: true,
-        }
-    }
-
-    /// Create an instanced renderable with per-instance data buffers.
-    pub fn new_instanced(
-        geometry: Geometry,
-        material: Material,
-        instance_count: u32,
-        instance_buffers: Vec<InstanceBuffer>,
-    ) -> Self {
-        Self {
-            object: Object3D::new(),
-            geometry,
-            material,
-            instance_count,
-            instance_buffers,
             cast_shadow: true,
             receive_shadow: true,
             render_order: 0,
@@ -56,7 +32,7 @@ impl Renderable {
 
     /// Whether this renderable uses instanced rendering.
     pub fn is_instanced(&self) -> bool {
-        !self.instance_buffers.is_empty()
+        self.geometry.is_instanced()
     }
 
     /// Whether this renderable uses transparency.
