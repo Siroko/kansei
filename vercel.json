@@ -12,10 +12,6 @@
             "value": "require-corp"
           },
           {
-            "key": "X-Frame-Options",
-            "value": "ALLOW-FROM https://felixmartinez.dev"
-          },
-          {
             "key": "Content-Security-Policy",
             "value": "frame-ancestors 'self' http://localhost:* http://localhost https://felixmartinez.dev https://*.felixmartinez.dev https://kansei.graphics https://*.kansei.graphics"
           }
