@@ -46,3 +46,14 @@ impl Sampler {
         self.gpu_sampler.as_ref()
     }
 }
+
+impl super::Bindable for Sampler {
+    fn ensure_ready(&mut self, device: &wgpu::Device, _queue: &wgpu::Queue) {
+        if self.gpu_sampler.is_none() {
+            self.initialize(device);
+        }
+    }
+    fn binding_resource(&self) -> Option<crate::materials::BindingResource> {
+        self.gpu_sampler().map(crate::materials::BindingResource::Sampler)
+    }
+}

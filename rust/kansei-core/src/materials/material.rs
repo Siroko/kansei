@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use super::binding::{Binding, BindGroupBuilder, BindingResource};
 use super::shader_utils::ShaderChunks;
-use crate::buffers::{BufferType, ComputeBuffer};
+use crate::buffers::{BufferType, ComputeBuffer, Texture, Sampler, Bindable};
 use crate::renderers::Renderer;
 use crate::renderers::SharedLayouts;
 
@@ -66,7 +66,7 @@ pub struct Material {
     pub shader_chunks: Option<ShaderChunks>,
     pub options: MaterialOptions,
     pub bindings: Vec<Binding>,
-    bindables: Vec<(u32, ComputeBuffer)>,
+    bindables: Vec<(u32, Box<dyn Bindable>)>,
     shader_module: Option<wgpu::ShaderModule>,
     material_bgl: Option<wgpu::BindGroupLayout>,
     pipeline_layout: Option<wgpu::PipelineLayout>,
@@ -256,58 +256,83 @@ impl Material {
         self.material_bgl.as_ref()
     }
 
-    /// Attach/replace a uniform bindable owned by this material.
-    pub fn set_uniform_bindable<T: bytemuck::Pod>(&mut self, binding: u32, label: &str, data: &[T]) {
-        let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
-        let buf = ComputeBuffer::from_slice(label, BufferType::Uniform, usage, data);
+    /// Attach any Bindable (Texture, Sampler, ComputeBuffer, …) to a binding
+    /// slot. The renderer lazily initializes it before the first draw.
+    pub fn set_bindable(&mut self, binding: u32, resource: impl Bindable + 'static) {
         if let Some((_, slot)) = self.bindables.iter_mut().find(|(b, _)| *b == binding) {
-            *slot = buf;
+            *slot = Box::new(resource);
         } else {
-            self.bindables.push((binding, buf));
+            self.bindables.push((binding, Box::new(resource)));
         }
         self.initialized = false;
     }
 
-    /// Get the GPU buffer for a uniform bindable at the given binding index.
-    pub fn bindable_buffer(&self, binding: u32) -> Option<&wgpu::Buffer> {
+    /// Convenience: attach a uniform buffer from typed data.
+    pub fn set_uniform_bindable<T: bytemuck::Pod>(&mut self, binding: u32, label: &str, data: &[T]) {
+        let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+        let buf = ComputeBuffer::from_slice(label, BufferType::Uniform, usage, data);
+        self.set_bindable(binding, buf);
+    }
+
+    /// Get the GPU buffer for a bindable at the given binding index.
+    /// Only works after the bindable has been initialized (i.e. after
+    /// the first `renderer.render()` call). Returns None if the binding
+    /// doesn't exist or isn't a buffer type.
+    pub fn bindable_buffer(&self, binding: u32) -> Option<wgpu::Buffer> {
         self.bindables.iter()
             .find(|(b, _)| *b == binding)
-            .and_then(|(_, buf)| buf.gpu_buffer())
+            .and_then(|(_, bindable)| {
+                if let Some(BindingResource::Buffer { buffer, .. }) = bindable.binding_resource() {
+                    Some(buffer.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Ensure this material has a bind group from its owned bindables.
+    /// Called automatically by the renderer before the first draw.
     pub fn ensure_bindables_initialized(&mut self, renderer: &Renderer) {
         if self.bindables.is_empty() || self.initialized {
             return;
         }
-        for (_, buf) in &mut self.bindables {
-            buf.ensure_ready(renderer.raw_device(), renderer.raw_queue());
+        let device = renderer.raw_device();
+        let queue = renderer.raw_queue();
+
+        // Initialize all bindables (Texture, Sampler, ComputeBuffer, …)
+        for (_, bindable) in &mut self.bindables {
+            bindable.ensure_ready(device, queue);
         }
-        let buffer_handles: Vec<(u32, wgpu::Buffer)> = self
-            .bindables
-            .iter()
-            .map(|(binding, buf)| {
-                (
-                    *binding,
-                    buf.gpu_buffer()
-                        .expect("Material bindable buffer should be initialized")
-                        .clone(),
-                )
+
+        // Collect binding resources. We must break the borrow on self.bindables
+        // before calling create_bind_group(&mut self). BindingResource holds
+        // references, so we clone the underlying GPU handles into locals.
+        enum OwnedResource {
+            Buffer(wgpu::Buffer),
+            TextureView(wgpu::TextureView),
+            Sampler(wgpu::Sampler),
+        }
+        let owned: Vec<(u32, OwnedResource)> = self.bindables.iter()
+            .filter_map(|(b, bindable)| {
+                bindable.binding_resource().map(|r| {
+                    let owned = match r {
+                        BindingResource::Buffer { buffer, .. } => OwnedResource::Buffer(buffer.clone()),
+                        BindingResource::TextureView(v) => OwnedResource::TextureView(v.clone()),
+                        BindingResource::Sampler(s) => OwnedResource::Sampler(s.clone()),
+                        BindingResource::StorageTexture(v) => OwnedResource::TextureView(v.clone()),
+                    };
+                    (*b, owned)
+                })
             })
             .collect();
-        let resources: Vec<(u32, BindingResource)> = buffer_handles
-            .iter()
-            .map(|(binding, buffer)| {
-                (
-                    *binding,
-                    BindingResource::Buffer {
-                        buffer,
-                        offset: 0,
-                        size: None,
-                    },
-                )
+        let resources: Vec<(u32, BindingResource)> = owned.iter()
+            .map(|(b, r)| match r {
+                OwnedResource::Buffer(buf) => (*b, BindingResource::Buffer { buffer: buf, offset: 0, size: None }),
+                OwnedResource::TextureView(v) => (*b, BindingResource::TextureView(v)),
+                OwnedResource::Sampler(s) => (*b, BindingResource::Sampler(s)),
             })
             .collect();
-        self.create_bind_group(renderer.raw_device(), renderer.shared_layouts(), &resources);
+
+        self.create_bind_group(device, renderer.shared_layouts(), &resources);
     }
 }

@@ -2,7 +2,7 @@ use crate::math::Vec4;
 use crate::cameras::Camera;
 use crate::geometries::Vertex;
 use crate::lights::{Light, LightUniforms, LIGHT_UNIFORM_BYTES};
-use crate::materials::ComputePass;
+use crate::materials::{ComputePass, Material};
 use crate::objects::Scene;
 use super::compute_batch::ComputeBatch;
 use super::gbuffer::GBuffer;
@@ -189,7 +189,7 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Kansei Device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::FLOAT32_FILTERABLE,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
             }, None)
@@ -373,6 +373,55 @@ impl Renderer {
 
     pub fn submit(&self, command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>) {
         self.queue().submit(command_buffers);
+    }
+
+    /// Create a 2D RGBA texture from raw bytes, ready for use as a material binding.
+    /// The texture is initialized on the GPU and the data is uploaded immediately.
+    pub fn create_texture_from_rgba(&self, label: &str, width: u32, height: u32, data: &[u8]) -> crate::buffers::Texture {
+        let device = self.device();
+        let queue = self.queue();
+        let mut tex = crate::buffers::Texture::new_2d(
+            label, width, height,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        tex.initialize(device);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex.gpu_texture().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        tex
+    }
+
+    /// Create a linear-filtering sampler for texture sampling.
+    pub fn create_sampler_linear(&self) -> wgpu::Sampler {
+        self.device().create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        })
+    }
+
+    /// Build a material's bind group using this renderer's shared layouts.
+    /// Convenience wrapper so user code doesn't need to access `device()` or
+    /// `shared_layouts()` directly.
+    pub fn build_material_bind_group(
+        &self,
+        material: &mut Material,
+        resources: &[(u32, crate::materials::BindingResource)],
+    ) {
+        material.create_bind_group(self.device(), self.shared_layouts(), resources);
     }
 
     pub fn compute(&self, pass: &ComputePass, workgroups_x: u32, workgroups_y: u32, workgroups_z: u32) {

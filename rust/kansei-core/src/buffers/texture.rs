@@ -8,6 +8,9 @@ pub struct Texture {
     usage: wgpu::TextureUsages,
     dimension: wgpu::TextureDimension,
     mip_levels: u32,
+    /// Optional initial data (RGBA bytes). Written to the GPU texture on first
+    /// `initialize_with_data` call, then discarded.
+    initial_data: Option<Vec<u8>>,
 }
 
 impl Texture {
@@ -21,6 +24,7 @@ impl Texture {
             usage,
             dimension: wgpu::TextureDimension::D2,
             mip_levels: 1,
+            initial_data: None,
         }
     }
 
@@ -34,6 +38,25 @@ impl Texture {
             usage,
             dimension: wgpu::TextureDimension::D3,
             mip_levels: 1,
+            initial_data: None,
+        }
+    }
+
+    /// Create a 2D RGBA texture from raw byte data. The data is stored and
+    /// uploaded to the GPU on the first `initialize_with_data()` call (which
+    /// the renderer triggers automatically when this texture is used as a
+    /// material bindable).
+    pub fn from_rgba(label: &str, width: u32, height: u32, data: &[u8]) -> Self {
+        Self {
+            label: label.to_string(),
+            gpu_texture: None,
+            view: None,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            dimension: wgpu::TextureDimension::D2,
+            mip_levels: 1,
+            initial_data: Some(data.to_vec()),
         }
     }
 
@@ -52,6 +75,34 @@ impl Texture {
         self.gpu_texture = Some(texture);
     }
 
+    /// Initialize the texture and upload any initial data. Called automatically
+    /// by the renderer when this texture is used as a material bindable.
+    pub fn initialize_with_data(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.gpu_texture.is_some() { return; }
+        self.initialize(device);
+        if let Some(data) = self.initial_data.take() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: self.gpu_texture.as_ref().unwrap(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.size.width * 4),
+                    rows_per_image: None,
+                },
+                self.size,
+            );
+        }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.gpu_texture.is_some()
+    }
+
     pub fn gpu_texture(&self) -> Option<&wgpu::Texture> {
         self.gpu_texture.as_ref()
     }
@@ -66,5 +117,14 @@ impl Texture {
 
     pub fn size(&self) -> wgpu::Extent3d {
         self.size
+    }
+}
+
+impl super::Bindable for Texture {
+    fn ensure_ready(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.initialize_with_data(device, queue);
+    }
+    fn binding_resource(&self) -> Option<crate::materials::BindingResource> {
+        self.view().map(crate::materials::BindingResource::TextureView)
     }
 }
