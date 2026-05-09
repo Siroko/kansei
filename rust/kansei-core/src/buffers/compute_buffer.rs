@@ -46,7 +46,10 @@ impl ComputeBuffer {
     /// Wrap a pre-existing `wgpu::Buffer` (e.g. one created by a simulation).
     /// CPU-side staging data is empty — the buffer is already on the GPU.
     /// Internal only — callers should not touch wgpu types directly.
-    pub(crate) fn from_external(label: &str, buffer: wgpu::Buffer, buffer_type: BufferType) -> Self {
+    /// Wrap a pre-existing GPU buffer. The ComputeBuffer takes ownership but
+    /// does not manage the data — the original creator is responsible for
+    /// writing to it. Useful for sharing buffers between compute and vertex.
+    pub fn from_external(label: &str, buffer: wgpu::Buffer, buffer_type: BufferType) -> Self {
         Self {
             label: label.to_string(),
             buffer_type,
@@ -172,5 +175,18 @@ impl ComputeBuffer {
 
     pub fn byte_len(&self) -> usize {
         self.data.len()
+    }
+}
+
+impl super::Bindable for ComputeBuffer {
+    fn ensure_ready(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        ComputeBuffer::ensure_ready(self, device, queue);
+    }
+    fn binding_resource(&self) -> Option<crate::materials::BindingResource> {
+        self.gpu_buffer().map(|buf| crate::materials::BindingResource::Buffer {
+            buffer: buf,
+            offset: 0,
+            size: None,
+        })
     }
 }

@@ -816,7 +816,7 @@ impl State {
                         0.1, 0.3, 0.8, 1.0,
                         0.8, 0.95, 1.0, 1.0,
                     ];
-                    self.renderer.queue().write_buffer(buf, 0, bytemuck::cast_slice(&params));
+                    self.renderer.queue().write_buffer(&buf, 0, bytemuck::cast_slice(&params));
                 }
             }
             self.renderer.render(&mut self.scene, &mut self.camera);
