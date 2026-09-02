@@ -1162,3 +1162,16 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         f.options.color = [r, g, b, 1.0];
     });
 }
+
+#[wasm_bindgen] pub fn set_attr_stiffness(v: f32) { with_state(|s| s.attr_stiffness = v); }
+#[wasm_bindgen] pub fn set_attr_max_speed(v: f32) { with_state(|s| s.attr_max_speed = v); }
+#[wasm_bindgen] pub fn set_attr_basin(v: f32) { with_state(|s| s.attr_basin = v); }
+#[wasm_bindgen] pub fn set_per_slot_count(v: u32) { with_state(|s| s.per_slot_count = v); }
+#[wasm_bindgen] pub fn set_capture_scale(v: f32) { with_state(|s| s.capture_scale = v); }
+#[wasm_bindgen] pub fn set_cooldown_frames(v: u32) { with_state(|s| s.cooldown_frames = v); }
+#[wasm_bindgen] pub fn resume_audio() {
+    with_state(|s| {
+        s.ensure_audio();
+        if let Some(c) = s.audio_ctx.as_ref() { let _ = c.resume(); }
+    });
+}
