@@ -942,8 +942,29 @@ impl State {
         }
     }
 
-    fn beep_for_change(&mut self, _h: u32, _m: u32, _s: u32) {
-        // Audio implemented in a later task (Task 7).
+    fn ensure_audio(&mut self) {
+        if self.audio_ctx.is_none() {
+            self.audio_ctx = web_sys::AudioContext::new().ok();
+        }
+    }
+
+    /// Beep once per second: hour rollover (m==0 && s==0) highest, minute
+    /// rollover (s==0) higher, ordinary second base.
+    fn beep_for_change(&mut self, _h: u32, m: u32, s: u32) {
+        self.ensure_audio();
+        let Some(ctx) = self.audio_ctx.as_ref() else { return; };
+        let freq: f32 = if m == 0 && s == 0 { 880.0 } else if s == 0 { 660.0 } else { 440.0 };
+        let (Ok(osc), Ok(gain)) = (ctx.create_oscillator(), ctx.create_gain()) else { return; };
+        osc.set_type(web_sys::OscillatorType::Sine);
+        osc.frequency().set_value(freq);
+        let now = ctx.current_time();
+        gain.gain().set_value(0.0001);
+        let _ = gain.gain().exponential_ramp_to_value_at_time(0.12, now + 0.01);
+        let _ = gain.gain().exponential_ramp_to_value_at_time(0.0001, now + 0.13);
+        let _ = osc.connect_with_audio_node(&gain);
+        let _ = gain.connect_with_audio_node(&ctx.destination());
+        let _ = osc.start_with_when(now);
+        let _ = osc.stop_with_when(now + 0.14);
     }
 }
 
