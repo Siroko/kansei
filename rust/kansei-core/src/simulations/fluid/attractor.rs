@@ -40,6 +40,20 @@ pub(crate) struct GpuAttractorParams {
     pub _pad: f32,
 }
 
+/// GPU params for the tagging passes (16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuTagParams {
+    /// Bit `k` set = slot `k`'s digit changed this frame (drives release).
+    pub changed_mask: u32,
+    /// Max particles a slot may hold (atomic budget cap).
+    pub per_slot_count: u32,
+    /// Frames a released particle stays ineligible for recruitment.
+    pub cooldown_frames: u32,
+    /// Capture-box scale (>=1.0 enlarges the slot box slightly for recruitment).
+    pub capture_scale: f32,
+}
+
 /// Number of glyphs packed into the atlas (`0`–`9` and `:`).
 const ATLAS_GLYPHS: u32 = 11;
 
@@ -235,6 +249,83 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const TAGGER_WGSL: &str = r#"
+struct Slot {
+    world_min: vec4<f32>,
+    world_size: vec4<f32>,
+    glyph_id: i32,
+    _pad0: i32, _pad1: i32, _pad2: i32,
+};
+struct TagParams {
+    changed_mask: u32,
+    per_slot_count: u32,
+    cooldown_frames: u32,
+    capture_scale: f32,
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> tags: array<i32>;
+@group(0) @binding(2) var<storage, read_write> cooldown: array<u32>;
+@group(0) @binding(3) var<storage, read_write> slot_fill: array<atomic<u32>, 8>;
+@group(0) @binding(4) var<uniform> slots: array<Slot, 8>;
+@group(0) @binding(5) var<uniform> params: TagParams;
+
+@compute @workgroup_size(8)
+fn clear_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < 8u) { atomicStore(&slot_fill[gid.x], 0u); }
+}
+
+@compute @workgroup_size(64)
+fn count_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&positions)) { return; }
+    let t = tags[idx];
+    if (t >= 0 && t < 8) { atomicAdd(&slot_fill[t], 1u); }
+}
+
+@compute @workgroup_size(64)
+fn release(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&positions)) { return; }
+    let t = tags[idx];
+    if (t >= 0 && t < 8) {
+        if ((params.changed_mask & (1u << u32(t))) != 0u) {
+            tags[idx] = -1;
+            cooldown[idx] = params.cooldown_frames;
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn recruit(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&positions)) { return; }
+
+    let cd = cooldown[idx];
+    if (cd > 0u) { cooldown[idx] = cd - 1u; return; }
+
+    if (tags[idx] >= 0) { return; }
+
+    let pos = positions[idx].xyz;
+    for (var k: i32 = 0; k < 8; k = k + 1) {
+        let slot = slots[k];
+        if (slot.glyph_id < 0) { continue; }
+        let half = 0.5 * slot.world_size.xyz * params.capture_scale;
+        let center = slot.world_min.xyz + 0.5 * slot.world_size.xyz;
+        let d = abs(pos - center);
+        if (all(d <= half)) {
+            let n = atomicAdd(&slot_fill[k], 1u);
+            if (n < params.per_slot_count) {
+                tags[idx] = k;
+            } else {
+                atomicSub(&slot_fill[k], 1u);
+            }
+            return;
+        }
+    }
+}
+"#;
+
 use crate::buffers::Texture;
 use crate::renderers::Renderer;
 
@@ -253,6 +344,14 @@ pub struct GlyphAttractor {
     res_xy: u32,
     res_z: u32,
     glyph_count: u32,
+    cooldown_buf: wgpu::Buffer,
+    slot_fill_buf: wgpu::Buffer,
+    tag_params_buf: wgpu::Buffer,
+    tag_bgl: wgpu::BindGroupLayout,
+    clear_fill_pipeline: wgpu::ComputePipeline,
+    count_fill_pipeline: wgpu::ComputePipeline,
+    release_pipeline: wgpu::ComputePipeline,
+    recruit_pipeline: wgpu::ComputePipeline,
 }
 
 impl GlyphAttractor {
@@ -340,8 +439,8 @@ impl GlyphAttractor {
                 entry(0, storage(true)),
                 entry(1, storage(false)),
                 entry(2, storage(true)),
-                entry(3, uniform),
-                entry(4, uniform),
+                entry(3, uniform.clone()),
+                entry(4, uniform.clone()),
                 entry(5, wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D3,
@@ -363,11 +462,67 @@ impl GlyphAttractor {
             cache: None,
         });
 
+        // --- tagging passes (release/recruit) ---
+        let cooldown_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlyphAttractor/Cooldown"),
+            size: (particle_count as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let slot_fill_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlyphAttractor/SlotFill"),
+            size: (NUM_SLOTS as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let tag_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlyphAttractor/TagParams"),
+            size: std::mem::size_of::<GpuTagParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&cooldown_buf, 0, bytemuck::cast_slice(&vec![0u32; particle_count as usize]));
+
+        let tag_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("GlyphAttractor/TaggerShader"),
+            source: wgpu::ShaderSource::Wgsl(TAGGER_WGSL.into()),
+        });
+        let tag_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GlyphAttractor/TagBGL"),
+            entries: &[
+                entry(0, storage(true)),
+                entry(1, storage(false)),
+                entry(2, storage(false)),
+                entry(3, storage(false)),
+                entry(4, uniform.clone()),
+                entry(5, uniform.clone()),
+            ],
+        });
+        let tag_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("GlyphAttractor/TagPL"),
+            bind_group_layouts: &[&tag_bgl],
+            push_constant_ranges: &[],
+        });
+        let mk = |ep: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GlyphAttractor/TagPipeline"),
+            layout: Some(&tag_layout),
+            module: &tag_module,
+            entry_point: Some(ep),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let clear_fill_pipeline = mk("clear_fill");
+        let count_fill_pipeline = mk("count_fill");
+        let release_pipeline = mk("release");
+        let recruit_pipeline = mk("recruit");
+
         GlyphAttractor {
             device, queue, pipeline, bgl, tex_view,
             tags_buf, slots_buf, params_buf,
             particle_count,
             res_xy: atlas.res_xy, res_z: atlas.res_z, glyph_count: atlas.glyph_count,
+            cooldown_buf, slot_fill_buf, tag_params_buf, tag_bgl,
+            clear_fill_pipeline, count_fill_pipeline, release_pipeline, recruit_pipeline,
         }
     }
 
@@ -429,6 +584,46 @@ impl GlyphAttractor {
         cpass.set_bind_group(0, &bind_group, &[]);
         let wg = (self.particle_count + 63) / 64;
         cpass.dispatch_workgroups(wg, 1, 1);
+    }
+
+    /// Run the GPU tagging passes: (re)count committed particles, release the
+    /// changed slots, and recruit untagged in-box particles up to the budget.
+    /// Call once per frame BEFORE `dispatch`.
+    pub fn retag(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        positions: &wgpu::Buffer,
+        changed_mask: u32,
+        per_slot_count: u32,
+        cooldown_frames: u32,
+        capture_scale: f32,
+    ) {
+        let p = GpuTagParams { changed_mask, per_slot_count, cooldown_frames, capture_scale };
+        self.queue.write_buffer(&self.tag_params_buf, 0, bytemuck::bytes_of(&p));
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GlyphAttractor/TagBG"),
+            layout: &self.tag_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: positions.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.tags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.cooldown_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.slot_fill_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.slots_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.tag_params_buf.as_entire_binding() },
+            ],
+        });
+        let pwg = (self.particle_count + 63) / 64;
+        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("GlyphAttractor/Tagging"), timestamp_writes: None,
+        });
+        cp.set_bind_group(0, &bg, &[]);
+        cp.set_pipeline(&self.clear_fill_pipeline);  cp.dispatch_workgroups(1, 1, 1);
+        cp.set_pipeline(&self.count_fill_pipeline);  cp.dispatch_workgroups(pwg, 1, 1);
+        cp.set_pipeline(&self.release_pipeline);     cp.dispatch_workgroups(pwg, 1, 1);
+        cp.set_pipeline(&self.clear_fill_pipeline);  cp.dispatch_workgroups(1, 1, 1);
+        cp.set_pipeline(&self.count_fill_pipeline);  cp.dispatch_workgroups(pwg, 1, 1);
+        cp.set_pipeline(&self.recruit_pipeline);     cp.dispatch_workgroups(pwg, 1, 1);
     }
 }
 
