@@ -77,6 +77,45 @@ impl GlyphVolume {
     }
 }
 
+/// The 11 glyph volumes a clock needs: digits `0`–`9` (indices 0..=9) and `:` (index 10).
+pub struct GlyphVolumeSet {
+    pub res_xy: u32,
+    pub res_z: u32,
+    /// 11 volumes; `[0..=9]` = digits, `[10]` = colon. `None` if a glyph was missing.
+    volumes: Vec<Option<GlyphVolume>>,
+}
+
+impl GlyphVolumeSet {
+    /// Build volumes for `'0'..'9'` and `':'`. Missing glyphs yield `None` slots.
+    pub fn for_clock(atlas: &FontAtlas, res_xy: u32, res_z: u32, half_depth: f32) -> GlyphVolumeSet {
+        let codepoints: Vec<u32> = ('0'..='9').chain([':'].into_iter()).map(|c| c as u32).collect();
+        let volumes = codepoints
+            .iter()
+            .map(|cp| {
+                atlas
+                    .glyphs
+                    .iter()
+                    .find(|g| g.codepoint == *cp)
+                    .map(|g| GlyphVolume::extrude(atlas, g, res_xy, res_z, half_depth))
+            })
+            .collect();
+        GlyphVolumeSet { res_xy, res_z, volumes }
+    }
+
+    /// Volume for digit `d` (0..=9), or `None` if `d > 9` or the glyph was missing.
+    pub fn volume_for_digit(&self, d: u32) -> Option<&GlyphVolume> {
+        if d > 9 {
+            return None;
+        }
+        self.volumes.get(d as usize).and_then(|v| v.as_ref())
+    }
+
+    /// The colon (`:`) volume, or `None` if it was missing.
+    pub fn colon(&self) -> Option<&GlyphVolume> {
+        self.volumes.get(10).and_then(|v| v.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +155,25 @@ mod tests {
         let (ix, iy) = inside_xy.expect("glyph '1' must have interior cells");
         assert!(vol.data[idx(ix, iy, 4)] > 0.0, "mid-depth interior should be inside");
         assert!(vol.data[idx(ix, iy, 0)] <= vol.data[idx(ix, iy, 4)], "cap should be <= mid");
+    }
+
+    #[test]
+    fn builds_all_eleven_clock_glyphs() {
+        let atlas = FontAtlas::parse(FONT).unwrap();
+        let set = GlyphVolumeSet::for_clock(&atlas, 32, 8, 0.5);
+        // Indices 0..=9 are digits; index 10 is ':'.
+        for d in 0u32..=9 {
+            assert!(set.volume_for_digit(d).is_some(), "missing digit {d}");
+        }
+        assert!(set.colon().is_some(), "missing colon volume");
+        assert_eq!(set.res_xy, 32);
+        assert_eq!(set.res_z, 8);
+    }
+
+    #[test]
+    fn digit_lookup_out_of_range_is_none() {
+        let atlas = FontAtlas::parse(FONT).unwrap();
+        let set = GlyphVolumeSet::for_clock(&atlas, 16, 4, 0.5);
+        assert!(set.volume_for_digit(10).is_none());
     }
 }
