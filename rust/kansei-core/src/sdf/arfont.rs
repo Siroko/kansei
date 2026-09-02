@@ -133,10 +133,13 @@ fn parse_glyphs(
     variants_offset: usize,
 ) -> Result<(Vec<GlyphMetrics>, f32, f32), ArFontError> {
     let metrics_off = variants_offset + 48; // past the 6+6 u32 fixed fields
+    let counts_off = metrics_off + 32 * 4; // metrics[32] REALs
+    if counts_off + 16 > buf.len() {
+        return Err(ArFontError::TooShort);
+    }
     let distance_range = rd_f32(buf, metrics_off + 4);
     let em_size = rd_f32(buf, metrics_off + 8);
 
-    let counts_off = metrics_off + 32 * 4; // metrics[32] REALs
     let name_length = rd_u32(buf, counts_off) as usize;
     let metadata_length = rd_u32(buf, counts_off + 4) as usize;
     let glyph_count = rd_u32(buf, counts_off + 8) as usize;
@@ -174,13 +177,14 @@ fn parse_glyphs(
 /// Decode the embedded atlas image (PNG, `encoding == 8`) to RGBA8.
 fn decode_atlas_image(buf: &[u8], header: &ArFontHeader) -> Result<(u32, u32, Vec<u8>), ArFontError> {
     let img_off = header.images_offset;
+    if img_off + 16 > buf.len() {
+        return Err(ArFontError::ImageDecode);
+    }
     // Image sub-header (verified layout, all u32):
     //   flags(+0) encoding(+4) width(+8) height(+12) channels(+16) pixelFormat(+20)
     //   imageType(+24) rowLength(+28) orientation(+32) childImages(+36) textureFlags(+40)
     //   reserved... metadataLength then dataLength immediately before the pixel data.
     let encoding = rd_u32(buf, img_off + 4);
-    let width = rd_u32(buf, img_off + 8);
-    let height = rd_u32(buf, img_off + 12);
 
     // The PNG stream begins at the `\x89PNG` magic within this image block. Locate it
     // robustly rather than hardcoding the sub-header size.
@@ -198,6 +202,7 @@ fn decode_atlas_image(buf: &[u8], header: &ArFontHeader) -> Result<(u32, u32, Ve
     let dynimg = image::load_from_memory(&buf[png_start..block_end.min(buf.len())])
         .map_err(|_| ArFontError::ImageDecode)?;
     let rgba = dynimg.to_rgba8();
+    let (width, height) = rgba.dimensions();
     Ok((width, height, rgba.into_raw()))
 }
 
