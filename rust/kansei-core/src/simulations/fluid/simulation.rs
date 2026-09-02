@@ -501,6 +501,11 @@ impl FluidSimulation {
     pub fn particle_count(&self) -> u32 { self.particle_count }
     pub fn grid_dims(&self) -> [u32; 3] { self.grid_dims }
     pub fn positions_buffer(&self) -> Option<&wgpu::Buffer> { self.positions_buffer.as_ref() }
+    /// The per-particle velocity buffer (`array<vec4<f32>>`), for external
+    /// additive passes such as the glyph attractor. `None` before initialization.
+    pub fn velocities_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.velocities_buffer.as_ref()
+    }
     pub fn params_buffer(&self) -> Option<&wgpu::Buffer> { self.params_buffer.as_ref() }
 
     /// Return the positions buffer wrapped as a `ComputeBuffer` with vec4 vertex
