@@ -11,6 +11,7 @@ mod simulation_renderer;
 mod cornell_box;
 mod fluid_renderables;
 mod attractor;
+mod clock;
 
 pub use params::{FluidSimulationOptions, DEFAULT_OPTIONS};
 pub use simulation::FluidSimulation;
@@ -42,3 +43,4 @@ pub use fluid_renderables::{
     MarchingCubesRenderable,
 };
 pub use attractor::{GlyphVolumeAtlas, AttractorSlot, SlotLayout, GlyphAttractor, NUM_SLOTS};
+pub use clock::ClockState;
