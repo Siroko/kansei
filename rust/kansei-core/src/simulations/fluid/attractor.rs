@@ -401,7 +401,9 @@ impl GlyphAttractor {
         let tags_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GlyphAttractor/Tags"),
             size: (particle_count as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -524,6 +526,11 @@ impl GlyphAttractor {
             cooldown_buf, slot_fill_buf, tag_params_buf, tag_bgl,
             clear_fill_pipeline, count_fill_pipeline, release_pipeline, recruit_pipeline,
         }
+    }
+
+    /// The per-particle tag buffer (`array<i32>`), for readback in tests/tools.
+    pub fn tags_buffer(&self) -> &wgpu::Buffer {
+        &self.tags_buf
     }
 
     /// Upload per-particle slot tags (`-1` = unattracted, else slot 0..NUM_SLOTS-1).
