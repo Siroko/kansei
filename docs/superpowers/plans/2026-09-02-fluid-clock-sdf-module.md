@@ -339,17 +339,28 @@ The Artery Font Format variant layout is: fixed header fields, then a length-pre
 then a length-prefixed `metadata` string, then `glyphCount`/`glyphsLength`/`kernCount`/`kernsLength`,
 then the glyph array. Strings are stored as `{u32 length; bytes; padding to 4-byte alignment}`.
 
+**CORRECTED against the authoritative `Chlumsky/artery-font-format` spec** (`structures.h` +
+`serialization.hpp`) during implementation. Two errors in the original draft were fixed: the metrics
+block is **32 reals (128 bytes)**, not 8; and the glyph field order is
+`codepoint, image, planeBounds, imageBounds, advance` — not advance-first. Strings are
+`{len bytes + 1 NUL, pad to 4}` and their lengths come from `nameLength`/`metadataLength` in the
+counts block, so `skip_string` takes a known length rather than reading its own prefix word.
+
 ```rust
-/// Read a `{u32 length; bytes; pad to 4}` string block, returning the offset past it.
-fn skip_string(buf: &[u8], off: usize) -> usize {
-    let len = rd_u32(buf, off) as usize;
-    let padded = (len + 3) & !3usize; // 4-byte align
-    off + 4 + padded
+/// Advance past a string block of `len` payload bytes: `{len bytes + 1 NUL, pad to 4}`.
+/// Writes nothing when `len == 0`.
+fn skip_string(off: usize, len: usize) -> usize {
+    if len == 0 {
+        return off;
+    }
+    let total = len + 1; // trailing NUL
+    let padded = (total + 3) & !3usize; // 4-byte align
+    off + padded
 }
 
 /// One glyph record: 2×u32 + 10×f32 = 48 bytes.
-/// Layout: codepoint, image, advance.h, advance.v,
-/// planeBounds(l,b,r,t), imageBounds(l,b,r,t).
+/// Layout (artery-font-format): codepoint, image, planeBounds(l,b,r,t),
+/// imageBounds(l,b,r,t), advance(h,v).
 const GLYPH_STRIDE: usize = 48;
 
 fn parse_glyphs(
@@ -358,22 +369,22 @@ fn parse_glyphs(
 ) -> Result<(Vec<GlyphMetrics>, f32, f32), ArFontError> {
     // Variant fixed header: flags,weight,codepointType,imageType,fallbackVariant,
     // fallbackGlyph (6×u32) then reserved[6] (6×u32) = 48 bytes, then metrics.
-    let mut off = variants_offset + 48;
+    let metrics_off = variants_offset + 48;
 
-    // Metrics block (reals): fontSize, distanceRange, emSize, ascender, descender,
-    // lineHeight, underlineY, underlineThickness, ... We only need distanceRange & emSize.
-    let distance_range = rd_f32(buf, off + 4);
-    let em_size = rd_f32(buf, off + 8);
-    // Metrics block is 8 reals wide in this file (verified: fontSize..underlineThickness).
-    off += 8 * 4;
+    // Metrics block: REAL metrics[32] = fontSize, distanceRange, emSize, ascender,
+    // descender, lineHeight, underlineY, underlineThickness, distanceRangeMiddle, reserved[23].
+    let distance_range = rd_f32(buf, metrics_off + 4);
+    let em_size = rd_f32(buf, metrics_off + 8);
 
-    // name string, then metadata string.
-    off = skip_string(buf, off);
-    off = skip_string(buf, off);
+    // Counts block after the 32-real metrics: nameLength, metadataLength, glyphCount, kernPairCount.
+    let counts_off = metrics_off + 32 * 4;
+    let name_length = rd_u32(buf, counts_off) as usize;
+    let metadata_length = rd_u32(buf, counts_off + 4) as usize;
+    let glyph_count = rd_u32(buf, counts_off + 8) as usize;
 
-    // glyphCount, glyphsLength, kernCount, kernsLength.
-    let glyph_count = rd_u32(buf, off) as usize;
-    off += 16; // 4 × u32
+    let mut off = counts_off + 16; // past the 4 count u32s
+    off = skip_string(off, name_length);
+    off = skip_string(off, metadata_length);
 
     let mut glyphs = Vec::with_capacity(glyph_count);
     for i in 0..glyph_count {
@@ -382,19 +393,19 @@ fn parse_glyphs(
             break;
         }
         let codepoint = rd_u32(buf, g);
-        let advance = rd_f32(buf, g + 8); // advance.horizontal
         let plane_bounds = [
+            rd_f32(buf, g + 8),
+            rd_f32(buf, g + 12),
             rd_f32(buf, g + 16),
             rd_f32(buf, g + 20),
-            rd_f32(buf, g + 24),
-            rd_f32(buf, g + 28),
         ];
         let image_bounds = [
+            rd_f32(buf, g + 24),
+            rd_f32(buf, g + 28),
             rd_f32(buf, g + 32),
             rd_f32(buf, g + 36),
-            rd_f32(buf, g + 40),
-            rd_f32(buf, g + 44),
         ];
+        let advance = rd_f32(buf, g + 40); // advance.horizontal
         glyphs.push(GlyphMetrics { codepoint, advance, image_bounds, plane_bounds });
     }
 
@@ -402,11 +413,10 @@ fn parse_glyphs(
 }
 ```
 
-> **Implementer note:** The variant sub-offsets (metrics width, string padding, glyph stride) follow
-> the Artery Font Format spec but are not byte-verified in this plan. The Task 3 test fails loudly if
-> any offset is wrong (missing glyph / out-of-range bounds). If it fails, hexdump around
-> `variants_offset` (`0x70`) and adjust: confirm the metrics-block width and the two string blocks
-> before `glyphCount`. The header/image facts in this plan ARE byte-verified.
+> **Verified offsets for `L10-medium.arfont`:** variant fixed header `0x70`–`0xA0` (48 B), metrics
+> `0xA0`–`0x120` (128 B), counts at `0x120` (`nameLength=0, metadataLength=0, glyphCount=95`), glyph
+> array `0x130`–`0x1300` (95 × 48 B), images block at `0x1300`. `'0'` image_bounds ≈
+> `(121.5, 170.5, 164.5, 226.5)`, `':'` ≈ `(424.5, 231.5, 440.5, 272.5)`.
 
 - [ ] **Step 5: Implement `FontAtlas::parse` (header + glyphs + PNG decode) — glyphs first**
 
