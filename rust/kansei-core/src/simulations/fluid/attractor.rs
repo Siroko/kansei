@@ -3,6 +3,42 @@
 //! after the SPH solver; modifies velocities only, leaving the solver untouched.
 
 use crate::sdf::GlyphVolumeSet;
+use bytemuck::{Pod, Zeroable};
+
+/// GPU layout of one slot: 3 × vec4f = 48 bytes (std140-friendly).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuSlot {
+    pub world_min: [f32; 4],  // xyz + pad
+    pub world_size: [f32; 4], // xyz + pad
+    pub glyph_id: i32,
+    pub _pad: [i32; 3],
+}
+
+impl From<&AttractorSlot> for GpuSlot {
+    fn from(s: &AttractorSlot) -> Self {
+        GpuSlot {
+            world_min: [s.world_min[0], s.world_min[1], s.world_min[2], 0.0],
+            world_size: [s.world_size[0], s.world_size[1], s.world_size[2], 0.0],
+            glyph_id: s.glyph_id,
+            _pad: [0; 3],
+        }
+    }
+}
+
+/// GPU attractor parameters (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuAttractorParams {
+    pub res_xy: u32,
+    pub res_z: u32,
+    pub glyph_count: u32,
+    pub stiffness: f32,
+    pub dt: f32,
+    pub max_speed: f32,
+    pub basin_strength: f32,
+    pub _pad: f32,
+}
 
 /// Number of glyphs packed into the atlas (`0`–`9` and `:`).
 const ATLAS_GLYPHS: u32 = 11;
@@ -178,5 +214,22 @@ mod tests {
         assert_eq!(layout.slots[1].glyph_id, 9);
         assert_eq!(layout.slots[3].glyph_id, 0);
         assert_eq!(layout.slots[4].glyph_id, 5);
+    }
+
+    #[test]
+    fn gpu_slot_packing_is_std140_sized() {
+        // Each GPU slot is 3 × vec4 = 48 bytes (world_min+pad, world_size+pad, glyph_id+pad).
+        assert_eq!(std::mem::size_of::<GpuSlot>(), 48);
+        let slot = AttractorSlot { glyph_id: 7, world_min: [1.0, 2.0, 3.0], world_size: [4.0, 5.0, 6.0] };
+        let g = GpuSlot::from(&slot);
+        assert_eq!(g.world_min, [1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(g.world_size, [4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(g.glyph_id, 7);
+    }
+
+    #[test]
+    fn gpu_params_packing_is_sized() {
+        // res_xy, res_z, glyph_count, stiffness | dt, max_speed, basin_strength, _pad
+        assert_eq!(std::mem::size_of::<GpuAttractorParams>(), 32);
     }
 }
