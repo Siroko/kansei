@@ -4,6 +4,7 @@ use crate::sdf::{FontAtlas, GlyphMetrics};
 
 /// A single glyph's SDF cropped to a fixed square resolution, values in [-1, 1]
 /// where positive is inside the glyph.
+/// data is bottom-up in Y (row 0 = glyph bottom), matching the atlas crop.
 pub struct GlyphSdf2d {
     pub res: u32,
     /// `res * res` signed values, row-major, +inside / -outside.
@@ -37,11 +38,12 @@ pub fn crop_glyph_sdf(atlas: &FontAtlas, glyph: &GlyphMetrics, res: u32) -> Glyp
 /// A glyph's SDF extruded into a 3D volume of `res_xy × res_xy × res_z` cells.
 /// Values are signed (+inside). Z spans [-1, 1] scaled so `half_depth` is the
 /// front/back face of the slab.
+/// data is bottom-up in Y (row 0 = glyph bottom), matching the atlas crop.
 pub struct GlyphVolume {
     pub res_xy: u32,
     pub res_z: u32,
     pub half_depth: f32,
-    /// Row-major `x + res_xy*(y + res_xy_z_stride)`; index as ((z*res_xy)+y)*res_xy + x.
+    /// Row-major; index as ((z*res_xy)+y)*res_xy + x.
     pub data: Vec<f32>,
 }
 
@@ -113,6 +115,12 @@ impl GlyphVolumeSet {
     /// The colon (`:`) volume, or `None` if it was missing.
     pub fn colon(&self) -> Option<&GlyphVolume> {
         self.volumes.get(10).and_then(|v| v.as_ref())
+    }
+
+    /// All 11 volume slots in order: indices 0..=9 are digits, index 10 is `:`.
+    /// `None` marks a glyph that was missing from the atlas.
+    pub fn volumes(&self) -> &[Option<GlyphVolume>] {
+        &self.volumes
     }
 }
 

@@ -45,3 +45,18 @@ fn atlas_alpha_channel_is_populated_sdf() {
     assert!(max_a > min_a, "alpha channel is flat — PNG not decoded");
     assert!(max_a > 200 && min_a < 55, "alpha does not span SDF range: {min_a}..{max_a}");
 }
+
+#[test]
+fn truncated_body_after_valid_header_errors_gracefully() {
+    // Take the real font's first 200 bytes: valid 112-byte header, but the
+    // variants/image blocks are truncated. Must return Err, not panic.
+    let truncated = &FONT[..200];
+    let result = std::panic::catch_unwind(|| FontAtlas::parse(truncated));
+    assert!(result.is_ok(), "parse panicked on truncated input instead of returning Err");
+    assert!(result.unwrap().is_err(), "expected an ArFontError for truncated input");
+}
+
+#[test]
+fn empty_input_errors() {
+    assert!(FontAtlas::parse(&[]).is_err());
+}
