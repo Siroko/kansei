@@ -147,6 +147,285 @@ impl SlotLayout {
     }
 }
 
+const ATTRACTOR_WGSL: &str = r#"
+struct Slot {
+    world_min: vec4<f32>,
+    world_size: vec4<f32>,
+    glyph_id: i32,
+    _pad0: i32,
+    _pad1: i32,
+    _pad2: i32,
+};
+
+struct Params {
+    res_xy: u32,
+    res_z: u32,
+    glyph_count: u32,
+    stiffness: f32,
+    dt: f32,
+    max_speed: f32,
+    basin_strength: f32,
+    _pad: f32,
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> velocities: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> tags: array<i32>;
+@group(0) @binding(3) var<uniform> slots: array<Slot, 8>;
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var sdf_tex: texture_3d<f32>;
+
+// Load the SDF for glyph g at integer voxel (x,y,z), clamped into the glyph's Z band.
+fn load_sdf(g: i32, x: i32, y: i32, z: i32) -> f32 {
+    let rx = i32(params.res_xy);
+    let rz = i32(params.res_z);
+    let cx = clamp(x, 0, rx - 1);
+    let cy = clamp(y, 0, rx - 1);
+    let cz = clamp(z, 0, rz - 1);
+    let abs_z = g * rz + cz;
+    return textureLoad(sdf_tex, vec3<i32>(cx, cy, abs_z), 0).r;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&positions)) { return; }
+    let slot_id = tags[idx];
+    if (slot_id < 0) { return; }
+
+    let slot = slots[slot_id];
+    if (slot.glyph_id < 0) { return; }
+
+    let pos = positions[idx].xyz;
+    let local = (pos - slot.world_min.xyz) / slot.world_size.xyz; // [0,1] inside box
+    let inside_box = all(local >= vec3<f32>(0.0)) && all(local <= vec3<f32>(1.0));
+
+    var force = vec3<f32>(0.0);
+    if (inside_box) {
+        // Voxel coordinate in the glyph's local grid.
+        let rx = f32(params.res_xy);
+        let rz = f32(params.res_z);
+        let vx = i32(local.x * (rx - 1.0));
+        let vy = i32(local.y * (rx - 1.0));
+        let vz = i32(local.z * (rz - 1.0));
+        // SDF gradient via central differences (points toward increasing SDF = inside).
+        let gx = load_sdf(slot.glyph_id, vx + 1, vy, vz) - load_sdf(slot.glyph_id, vx - 1, vy, vz);
+        let gy = load_sdf(slot.glyph_id, vx, vy + 1, vz) - load_sdf(slot.glyph_id, vx, vy - 1, vz);
+        let gz = load_sdf(slot.glyph_id, vx, vy, vz + 1) - load_sdf(slot.glyph_id, vx, vy, vz - 1);
+        let grad = vec3<f32>(gx, gy, gz);
+        let s = load_sdf(slot.glyph_id, vx, vy, vz);
+        // Pull toward the surface/interior: if outside (s<0) climb the gradient.
+        if (length(grad) > 1e-5) {
+            force = normalize(grad) * params.stiffness * max(-s, 0.0);
+        }
+    } else {
+        // Coarse basin: pull toward the box center.
+        let center = slot.world_min.xyz + 0.5 * slot.world_size.xyz;
+        let to_center = center - pos;
+        force = to_center * params.basin_strength;
+    }
+
+    var vel = velocities[idx].xyz + force * params.dt;
+    let sp = length(vel);
+    if (sp > params.max_speed) { vel = vel / sp * params.max_speed; }
+    velocities[idx] = vec4<f32>(vel, velocities[idx].w);
+}
+"#;
+
+use crate::buffers::Texture;
+use crate::renderers::Renderer;
+
+/// Additive glyph attractor compute pass. Owns the packed SDF 3D texture,
+/// the per-particle tag buffer, the slot uniform buffer, and its params.
+pub struct GlyphAttractor {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    tex_view: wgpu::TextureView,
+    tags_buf: wgpu::Buffer,
+    slots_buf: wgpu::Buffer,
+    params_buf: wgpu::Buffer,
+    particle_count: u32,
+    res_xy: u32,
+    res_z: u32,
+    glyph_count: u32,
+}
+
+impl GlyphAttractor {
+    /// Build the attractor for `particle_count` particles using the packed
+    /// glyph atlas derived from `set`.
+    pub fn new(renderer: &Renderer, set: &GlyphVolumeSet, particle_count: u32) -> Self {
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
+        let atlas = GlyphVolumeAtlas::from_set(set);
+
+        // --- 3D SDF texture (R32Float, sampled via textureLoad) ---
+        let mut tex = Texture::new_3d(
+            "GlyphAttractor/SDF",
+            atlas.res_xy,
+            atlas.res_xy,
+            atlas.depth(),
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        tex.initialize(&device);
+        let gpu_tex = tex.gpu_texture().expect("texture created");
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: gpu_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&atlas.data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.res_xy * 4),
+                rows_per_image: Some(atlas.res_xy),
+            },
+            wgpu::Extent3d {
+                width: atlas.res_xy,
+                height: atlas.res_xy,
+                depth_or_array_layers: atlas.depth(),
+            },
+        );
+        let tex_view = gpu_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+
+        // --- buffers ---
+        let tags_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlyphAttractor/Tags"),
+            size: (particle_count as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlyphAttractor/Slots"),
+            size: (std::mem::size_of::<GpuSlot>() * NUM_SLOTS) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GlyphAttractor/Params"),
+            size: std::mem::size_of::<GpuAttractorParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // --- pipeline ---
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("GlyphAttractor/Shader"),
+            source: wgpu::ShaderSource::Wgsl(ATTRACTOR_WGSL.into()),
+        });
+        let c = wgpu::ShaderStages::COMPUTE;
+        let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+            binding, visibility: c, ty, count: None,
+        };
+        let storage = |ro: bool| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: ro },
+            has_dynamic_offset: false, min_binding_size: None,
+        };
+        let uniform = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GlyphAttractor/BGL"),
+            entries: &[
+                entry(0, storage(true)),
+                entry(1, storage(false)),
+                entry(2, storage(true)),
+                entry(3, uniform),
+                entry(4, uniform),
+                entry(5, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                }),
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("GlyphAttractor/PL"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GlyphAttractor/Pipeline"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        GlyphAttractor {
+            device, queue, pipeline, bgl, tex_view,
+            tags_buf, slots_buf, params_buf,
+            particle_count,
+            res_xy: atlas.res_xy, res_z: atlas.res_z, glyph_count: atlas.glyph_count,
+        }
+    }
+
+    /// Upload per-particle slot tags (`-1` = unattracted, else slot 0..NUM_SLOTS-1).
+    pub fn set_tags(&self, tags: &[i32]) {
+        debug_assert_eq!(tags.len() as u32, self.particle_count);
+        self.queue.write_buffer(&self.tags_buf, 0, bytemuck::cast_slice(tags));
+    }
+
+    /// Upload the current slot layout (glyph ids + world boxes).
+    pub fn set_slots(&self, layout: &SlotLayout) {
+        let gpu: Vec<GpuSlot> = layout.slots.iter().map(GpuSlot::from).collect();
+        self.queue.write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(&gpu));
+    }
+
+    /// Update per-frame parameters.
+    pub fn set_params(&self, dt: f32, stiffness: f32, max_speed: f32, basin_strength: f32) {
+        let p = GpuAttractorParams {
+            res_xy: self.res_xy,
+            res_z: self.res_z,
+            glyph_count: self.glyph_count,
+            stiffness,
+            dt,
+            max_speed,
+            basin_strength,
+            _pad: 0.0,
+        };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+    }
+
+    /// Encode the attractor compute pass. Reads `positions`, read-writes `velocities`.
+    /// Call AFTER `FluidSimulation::update_batched`, in a separate encoder.
+    pub fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        positions: &wgpu::Buffer,
+        velocities: &wgpu::Buffer,
+    ) {
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GlyphAttractor/BG"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: positions.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: velocities.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.tags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.slots_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.tex_view) },
+            ],
+        });
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("GlyphAttractor/Pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        let wg = (self.particle_count + 63) / 64;
+        cpass.dispatch_workgroups(wg, 1, 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

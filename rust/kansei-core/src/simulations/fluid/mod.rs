@@ -41,4 +41,4 @@ pub use fluid_renderables::{
     RaymarchingRenderable,
     MarchingCubesRenderable,
 };
-pub use attractor::GlyphVolumeAtlas;
+pub use attractor::{GlyphVolumeAtlas, AttractorSlot, SlotLayout, GlyphAttractor, NUM_SLOTS};
