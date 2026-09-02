@@ -454,28 +454,25 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let format = renderer.presentation_format();
 
     // ── Particles ──
-    // Spread in an ellipsoid centered on the sim bounds (~70% of bounds extent).
-    let count = 50_000usize;
-    let center = [0.0f32, 11.0, 4.0]; // (min+max)/2 of bounds
-    let half = [22.0f32, 17.0, 10.0]; // ~90% of bounds half-extent (more spread → less pressure)
+    // Fill a box spanning the clock band (x ∈ [-17,17], y ∈ [-2,2]) plus a
+    // pool region below/around it, so every slot box has particles nearby
+    // for the recruit pass to pull from.
+    let count = 120_000usize; // tunable; lower if the browser struggles
+    let center = [0.0f32, 0.0, 0.0];
+    let half = [18.0f32, 8.0, 2.0]; // spawn box: x∈[-18,18], y∈[-8,8], z∈[-2,2]
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
-        loop {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let ux = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let uy = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let uz = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
-            if ux*ux + uy*uy + uz*uz <= 1.0 {
-                positions[i*4]   = center[0] + ux * half[0];
-                positions[i*4+1] = center[1] + uy * half[1];
-                positions[i*4+2] = center[2] + uz * half[2];
-                positions[i*4+3] = 1.0;
-                break;
-            }
-        }
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        let ux = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        let uy = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        let uz = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
+        positions[i*4]   = center[0] + ux * half[0];
+        positions[i*4+1] = center[1] + uy * half[1];
+        positions[i*4+2] = center[2] + uz * half[2];
+        positions[i*4+3] = 1.0;
     }
 
     // ── Sim ──
@@ -483,11 +480,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0,
         pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
         viscosity: 1.0, damping: 1.0, gravity: [0.0, -9.8, 0.0],
-        mouse_force: 1600.0, substeps: 2, world_bounds_padding: 0.3,
+        mouse_force: 1600.0, substeps: 2, world_bounds_padding: 2.0,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     }, &positions);
-    sim.world_bounds_min = [-25.0, -8.0, -8.0];
-    sim.world_bounds_max = [25.0, 30.0, 16.0];
+    // World bounds contain the spawn box (clock band + pool) plus margin for
+    // falling/settling under gravity.
+    sim.world_bounds_min = [-22.0, -10.0, -6.0];
+    sim.world_bounds_max = [22.0, 20.0, 6.0];
     sim.rebuild_grid();
 
     // ── Glyph attractor: GPU tagging + clock-driven slot layout ──
@@ -573,8 +572,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // ── Camera ──
     let mut camera = Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32);
-    camera.set_position(0.0, 20.0, 75.0);
-    camera.look_at(&Vec3::new(0.0, 3.0, 0.0));
+    camera.set_position(0.0, 10.0, 50.0);
+    camera.look_at(&Vec3::new(0.0, 0.0, 0.0));
     camera.update_projection_matrix();
     camera.update_view_matrix();
 
@@ -667,8 +666,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ],
     );
 
-    // Camera: back view aligned with long X axis (azimuth = π), radius 30
-    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 30.0);
+    // Camera: back view aligned with long X axis (azimuth = π), radius wide
+    // enough to see the full ~34-unit clock band (slots span x ∈ [-17, 17]).
+    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 0.0, 0.0), 50.0);
     controls.set_azimuth(std::f32::consts::PI);
     let mouse = MouseVectors::from_canvas(&canvas);
 
