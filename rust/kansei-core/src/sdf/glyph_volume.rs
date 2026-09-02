@@ -88,7 +88,7 @@ pub struct GlyphVolumeSet {
 impl GlyphVolumeSet {
     /// Build volumes for `'0'..'9'` and `':'`. Missing glyphs yield `None` slots.
     pub fn for_clock(atlas: &FontAtlas, res_xy: u32, res_z: u32, half_depth: f32) -> GlyphVolumeSet {
-        let codepoints: Vec<u32> = ('0'..='9').chain([':'].into_iter()).map(|c| c as u32).collect();
+        let codepoints: Vec<u32> = ('0'..='9').chain([':']).map(|c| c as u32).collect();
         let volumes = codepoints
             .iter()
             .map(|cp| {
