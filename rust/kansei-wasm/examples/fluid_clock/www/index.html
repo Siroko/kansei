@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Kansei</title>
+    <title>Kansei — Fluid Clock</title>
     <style>
         body { margin: 0; background: #000; overflow: hidden; }
         canvas { width: 100vw; height: 100vh; display: block; }
@@ -23,8 +23,11 @@
             set_stripe_params,
             set_light_direction, set_light_intensity, set_light_color,
             set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur,
-            set_transmission_params
-        } from './pkg/kansei_wasm_fluid.js';
+            set_transmission_params,
+            set_attr_stiffness, set_attr_max_speed, set_attr_basin,
+            set_per_slot_count, set_capture_scale, set_cooldown_frames,
+            resume_audio
+        } from '../pkg/kansei_wasm_fluid_clock.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
         await init();
@@ -203,6 +206,16 @@
         set_dof_max_blur(dof.maxBlur);
         syncTx();
         syncStripes();
+
+        const cp = { stiffness: 40, maxSpeed: 20, basin: 5, perSlot: 7500, capture: 1.15, cooldown: 45, sound: false };
+        const cf = pane.addFolder({ title: 'Clock' });
+        cf.addBinding(cp, 'stiffness', { min: 0, max: 200, step: 1 }).on('change', e => set_attr_stiffness(e.value));
+        cf.addBinding(cp, 'maxSpeed', { min: 1, max: 60, step: 1 }).on('change', e => set_attr_max_speed(e.value));
+        cf.addBinding(cp, 'basin', { min: 0, max: 30, step: 0.5 }).on('change', e => set_attr_basin(e.value));
+        cf.addBinding(cp, 'perSlot', { min: 500, max: 30000, step: 500 }).on('change', e => set_per_slot_count(e.value));
+        cf.addBinding(cp, 'capture', { min: 1.0, max: 2.0, step: 0.05 }).on('change', e => set_capture_scale(e.value));
+        cf.addBinding(cp, 'cooldown', { min: 0, max: 180, step: 5 }).on('change', e => set_cooldown_frames(e.value));
+        cf.addBinding(cp, 'sound').on('change', e => { if (e.value) resume_audio(); });
     </script>
 </body>
 </html>
