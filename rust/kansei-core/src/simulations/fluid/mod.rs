@@ -10,6 +10,7 @@ mod contracts;
 mod simulation_renderer;
 mod cornell_box;
 mod fluid_renderables;
+mod attractor;
 
 pub use params::{FluidSimulationOptions, DEFAULT_OPTIONS};
 pub use simulation::FluidSimulation;
@@ -40,3 +41,4 @@ pub use fluid_renderables::{
     RaymarchingRenderable,
     MarchingCubesRenderable,
 };
+pub use attractor::GlyphVolumeAtlas;
