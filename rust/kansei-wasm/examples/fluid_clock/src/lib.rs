@@ -16,12 +16,14 @@ use kansei_core::postprocessing::{PostProcessingVolume, effects::{
     FluidSurfaceEffect, FluidSurfaceOptions,
 }};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::sdf::{FontAtlas, GlyphVolumeSet};
 use kansei_core::simulations::fluid::{
-    DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
-    FluidSurfaceRenderer, MarchingCubesOptions,
+    ClockState, DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation,
+    FluidSimulationOptions, FluidSurfaceRenderer, GlyphAttractor, MarchingCubesOptions, SlotLayout,
 };
 
 const BASIC_LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
+const FONT: &[u8] = include_bytes!("../../../../kansei-core/tests/fixtures/L10-medium.arfont");
 
 // ── Op-art stripe shader (matches engine bind group layout) ──
 const STRIPE_WGSL: &str = r#"
@@ -488,6 +490,18 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     sim.world_bounds_max = [25.0, 30.0, 16.0];
     sim.rebuild_grid();
 
+    // ── Glyph attractor: GPU tagging + clock-driven slot layout ──
+    let font = FontAtlas::parse(FONT).expect("parse font");
+    let glyph_set = GlyphVolumeSet::for_clock(&font, 32, 8, 0.5);
+    let attractor = GlyphAttractor::new(&renderer, &glyph_set, count as u32);
+
+    let mut slot_layout = SlotLayout::hh_mm_ss(4.0, 1.5);
+    let mut clock = ClockState::new();
+    let (h0, m0, s0) = now_hms();
+    let _ = clock.update(&mut slot_layout, h0, m0, s0);
+    attractor.set_slots(&slot_layout);
+    attractor.set_tags(&vec![-1i32; count]); // start all ordinary fluid
+
     // ── Density field + surface renderer (for raymarch mode) ──
     let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max,
@@ -673,6 +687,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         max_render_fps: 0.0, render_accumulator: 0.0,
         frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
         current_fps: 0.0, current_frame_ms: 0.0,
+        attractor, slot_layout, clock,
+        per_slot_count: (count as u32 / 16).max(1),
+        cooldown_frames: 45,
+        capture_scale: 1.15,
+        attr_stiffness: 40.0,
+        attr_max_speed: 20.0,
+        attr_basin: 5.0,
+        audio_ctx: None,
+        last_second: -1,
     }));
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
@@ -733,6 +756,17 @@ struct State {
     max_render_fps: f64, render_accumulator: f64,
     frame_count: u32, frame_time_sum: f64, last_perf_time: f64,
     current_fps: f64, current_frame_ms: f64,
+    attractor: GlyphAttractor,
+    slot_layout: SlotLayout,
+    clock: ClockState,
+    per_slot_count: u32,
+    cooldown_frames: u32,
+    capture_scale: f32,
+    attr_stiffness: f32,
+    attr_max_speed: f32,
+    attr_basin: f32,
+    audio_ctx: Option<web_sys::AudioContext>,
+    last_second: i32,
 }
 
 impl State {
@@ -764,7 +798,7 @@ impl State {
         self.camera.aspect = self.width as f32 / self.height as f32;
         self.camera.update_projection_matrix();
 
-        let eye = self.camera.position();
+        let eye = *self.camera.position();
         let view = self.camera.view_matrix.to_glam();
         let proj = self.camera.projection_matrix.to_glam();
         let inv_view = self.camera.inverse_view_matrix.to_glam();
@@ -804,6 +838,30 @@ impl State {
             // the next frame from inheriting a huge backlog.
             if self.sim_accumulator > step_dt as f64 {
                 self.sim_accumulator = step_dt as f64;
+            }
+        }
+
+        // ── Clock → GPU tagging → attractor (all GPU; no readback) ──────
+        let (h, m, s) = now_hms();
+        let changed = self.clock.update(&mut self.slot_layout, h, m, s);
+        let changed_mask = ClockState::changed_mask(&changed);
+        if !changed.is_empty() {
+            self.attractor.set_slots(&self.slot_layout);
+        }
+        if s as i32 != self.last_second {
+            self.beep_for_change(h, m, s);
+            self.last_second = s as i32;
+        }
+        self.attractor.set_params(1.0 / 60.0, self.attr_stiffness, self.attr_max_speed, self.attr_basin);
+
+        if let Some(fse) = self.volume.effects.get(0)
+            .and_then(|e| e.as_any().downcast_ref::<FluidSurfaceEffect>())
+        {
+            if let (Some(pos_buf), Some(vel_buf)) = (fse.sim.positions_buffer(), fse.sim.velocities_buffer()) {
+                let mut enc = self.renderer.device().create_command_encoder(&Default::default());
+                self.attractor.retag(&mut enc, pos_buf, changed_mask, self.per_slot_count, self.cooldown_frames, self.capture_scale);
+                self.attractor.dispatch(&mut enc, pos_buf, vel_buf);
+                self.renderer.queue().submit(std::iter::once(enc.finish()));
             }
         }
 
@@ -883,6 +941,15 @@ impl State {
             );
         }
     }
+
+    fn beep_for_change(&mut self, _h: u32, _m: u32, _s: u32) {
+        // Audio implemented in a later task (Task 7).
+    }
+}
+
+fn now_hms() -> (u32, u32, u32) {
+    let d = js_sys::Date::new_0();
+    (d.get_hours(), d.get_minutes(), d.get_seconds())
 }
 
 // ── JS interop ──
