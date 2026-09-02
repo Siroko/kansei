@@ -625,8 +625,13 @@ impl GlyphAttractor {
             label: Some("GlyphAttractor/Tagging"), timestamp_writes: None,
         });
         cp.set_bind_group(0, &bg, &[]);
-        cp.set_pipeline(&self.clear_fill_pipeline);  cp.dispatch_workgroups(1, 1, 1);
-        cp.set_pipeline(&self.count_fill_pipeline);  cp.dispatch_workgroups(pwg, 1, 1);
+        // Deliberately ONE compute pass for all four dispatches: wgpu inserts the
+        // needed memory barriers between consecutive writable-storage dispatches
+        // within a pass, so release→clear→count→recruit is correctly ordered.
+        // (This is intentionally different from the multi-pass ComputeBatch style.)
+        // release keys off each particle's current tag (not slot_fill), so it runs
+        // first; then clear+count recompute slot_fill for the remaining committed
+        // particles so recruit only tops slots up to per_slot_count.
         cp.set_pipeline(&self.release_pipeline);     cp.dispatch_workgroups(pwg, 1, 1);
         cp.set_pipeline(&self.clear_fill_pipeline);  cp.dispatch_workgroups(1, 1, 1);
         cp.set_pipeline(&self.count_fill_pipeline);  cp.dispatch_workgroups(pwg, 1, 1);
