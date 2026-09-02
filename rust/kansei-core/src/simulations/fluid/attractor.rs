@@ -171,6 +171,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> velocities: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> tags: array<i32>;
+// The array length (8) must equal NUM_SLOTS in the Rust module.
 @group(0) @binding(3) var<uniform> slots: array<Slot, 8>;
 @group(0) @binding(4) var<uniform> params: Params;
 @group(0) @binding(5) var sdf_tex: texture_3d<f32>;
@@ -192,6 +193,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= arrayLength(&positions)) { return; }
     let slot_id = tags[idx];
     if (slot_id < 0) { return; }
+    // NUM_SLOTS (Rust) = 8; keep this literal in sync with it.
+    if (slot_id >= 8) { return; }
 
     let slot = slots[slot_id];
     if (slot.glyph_id < 0) { return; }
@@ -370,7 +373,10 @@ impl GlyphAttractor {
 
     /// Upload per-particle slot tags (`-1` = unattracted, else slot 0..NUM_SLOTS-1).
     pub fn set_tags(&self, tags: &[i32]) {
-        debug_assert_eq!(tags.len() as u32, self.particle_count);
+        assert_eq!(
+            tags.len() as u32, self.particle_count,
+            "set_tags: expected {} tags, got {}", self.particle_count, tags.len()
+        );
         self.queue.write_buffer(&self.tags_buf, 0, bytemuck::cast_slice(tags));
     }
 
