@@ -171,19 +171,34 @@ fn parse_glyphs(
     Ok((glyphs, distance_range, em_size))
 }
 
-/// Image sub-header (verified against the real asset):
-/// flags(0), encoding(4), width(8), height(12), channels(16)...
-///
-/// TEMPORARY stub (replaced in Task 4 with real PNG decode). Returns a zeroed
-/// RGBA buffer sized to the atlas so glyph-metric tests can run independently.
-fn decode_atlas_image(
-    buf: &[u8],
-    header: &ArFontHeader,
-) -> Result<(u32, u32, Vec<u8>), ArFontError> {
+/// Decode the embedded atlas image (PNG, `encoding == 8`) to RGBA8.
+fn decode_atlas_image(buf: &[u8], header: &ArFontHeader) -> Result<(u32, u32, Vec<u8>), ArFontError> {
     let img_off = header.images_offset;
+    // Image sub-header (verified layout, all u32):
+    //   flags(+0) encoding(+4) width(+8) height(+12) channels(+16) pixelFormat(+20)
+    //   imageType(+24) rowLength(+28) orientation(+32) childImages(+36) textureFlags(+40)
+    //   reserved... metadataLength then dataLength immediately before the pixel data.
+    let encoding = rd_u32(buf, img_off + 4);
     let width = rd_u32(buf, img_off + 8);
     let height = rd_u32(buf, img_off + 12);
-    Ok((width, height, vec![0u8; (width * height * 4) as usize]))
+
+    // The PNG stream begins at the `\x89PNG` magic within this image block. Locate it
+    // robustly rather than hardcoding the sub-header size.
+    const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let block_end = header.images_offset + header.images_length as usize;
+    let search = &buf[img_off..block_end.min(buf.len())];
+    let rel = search
+        .windows(8)
+        .position(|w| w == PNG_MAGIC)
+        .ok_or(ArFontError::ImageDecode)?;
+    let png_start = img_off + rel;
+
+    debug_assert_eq!(encoding, 8, "expected PNG encoding");
+
+    let dynimg = image::load_from_memory(&buf[png_start..block_end.min(buf.len())])
+        .map_err(|_| ArFontError::ImageDecode)?;
+    let rgba = dynimg.to_rgba8();
+    Ok((width, height, rgba.into_raw()))
 }
 
 impl FontAtlas {

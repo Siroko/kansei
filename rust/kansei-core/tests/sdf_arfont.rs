@@ -31,3 +31,17 @@ fn reports_atlas_dimensions_and_metrics() {
     assert!(atlas.distance_range > 0.0);
     assert!(atlas.em_size > 0.0);
 }
+
+#[test]
+fn atlas_alpha_channel_is_populated_sdf() {
+    let atlas = FontAtlas::parse(FONT).expect("parse .arfont");
+    // A real MTSDF alpha channel spans the full range across the atlas.
+    let mut min_a = 255u8;
+    let mut max_a = 0u8;
+    for px in atlas.rgba.chunks_exact(4) {
+        min_a = min_a.min(px[3]);
+        max_a = max_a.max(px[3]);
+    }
+    assert!(max_a > min_a, "alpha channel is flat — PNG not decoded");
+    assert!(max_a > 200 && min_a < 55, "alpha does not span SDF range: {min_a}..{max_a}");
+}
