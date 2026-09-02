@@ -94,6 +94,111 @@ impl ArFontHeader {
     }
 }
 
+/// Read a string block written by the upstream `artery-font-format` encoder:
+/// when `len == 0` nothing is written; otherwise `len` bytes + 1 NUL byte,
+/// padded to a 4-byte boundary. Returns the offset past the block.
+fn skip_string(off: usize, len: usize) -> usize {
+    if len == 0 {
+        off
+    } else {
+        let total = len + 1; // + NUL terminator
+        let padded = (total + 3) & !3usize; // 4-byte align
+        off + padded
+    }
+}
+
+/// One glyph record: 2×u32 + 10×f32 = 48 bytes.
+/// Layout (from `artery_font::Glyph<REAL>`): codepoint, image,
+/// planeBounds(l,b,r,t), imageBounds(l,b,r,t), advance(h,v).
+const GLYPH_STRIDE: usize = 48;
+
+/// Parse the glyph array out of the first variant block.
+///
+/// Layout (from upstream `artery-font-format`'s `FontVariantHeader`, verified
+/// byte-for-byte against `tests/fixtures/L10-medium.arfont`):
+/// ```text
+/// u32 flags, weight, codepointType, imageType, fallbackVariant, fallbackGlyph;  // 24 bytes
+/// u32 reserved[6];                                                              // 24 bytes
+/// REAL metrics[32]; // fontSize, distanceRange, emSize, ascender, descender,
+///                    // lineHeight, underlineY, underlineThickness,
+///                    // distanceRangeMiddle, reserved[23]                       // 128 bytes
+/// u32 nameLength, metadataLength, glyphCount, kernPairCount;                    // 16 bytes
+/// // name bytes (if nameLength > 0): nameLength+1 bytes, padded to 4
+/// // metadata bytes (if metadataLength > 0): metadataLength+1 bytes, padded to 4
+/// // glyphCount × Glyph<REAL> (48 bytes each)
+/// // kernPairCount × KernPair<REAL>
+/// ```
+fn parse_glyphs(
+    buf: &[u8],
+    variants_offset: usize,
+) -> Result<(Vec<GlyphMetrics>, f32, f32), ArFontError> {
+    let metrics_off = variants_offset + 48; // past the 6+6 u32 fixed fields
+    let distance_range = rd_f32(buf, metrics_off + 4);
+    let em_size = rd_f32(buf, metrics_off + 8);
+
+    let counts_off = metrics_off + 32 * 4; // metrics[32] REALs
+    let name_length = rd_u32(buf, counts_off) as usize;
+    let metadata_length = rd_u32(buf, counts_off + 4) as usize;
+    let glyph_count = rd_u32(buf, counts_off + 8) as usize;
+
+    let mut off = counts_off + 16; // past nameLength,metadataLength,glyphCount,kernPairCount
+    off = skip_string(off, name_length);
+    off = skip_string(off, metadata_length);
+
+    let mut glyphs = Vec::with_capacity(glyph_count);
+    for i in 0..glyph_count {
+        let g = off + i * GLYPH_STRIDE;
+        if g + GLYPH_STRIDE > buf.len() {
+            break;
+        }
+        let codepoint = rd_u32(buf, g);
+        let plane_bounds = [
+            rd_f32(buf, g + 8),
+            rd_f32(buf, g + 12),
+            rd_f32(buf, g + 16),
+            rd_f32(buf, g + 20),
+        ];
+        let image_bounds = [
+            rd_f32(buf, g + 24),
+            rd_f32(buf, g + 28),
+            rd_f32(buf, g + 32),
+            rd_f32(buf, g + 36),
+        ];
+        let advance = rd_f32(buf, g + 40); // advance.horizontal
+        glyphs.push(GlyphMetrics { codepoint, advance, image_bounds, plane_bounds });
+    }
+
+    Ok((glyphs, distance_range, em_size))
+}
+
+/// Image sub-header (verified against the real asset):
+/// flags(0), encoding(4), width(8), height(12), channels(16)...
+///
+/// TEMPORARY stub (replaced in Task 4 with real PNG decode). Returns a zeroed
+/// RGBA buffer sized to the atlas so glyph-metric tests can run independently.
+fn decode_atlas_image(
+    buf: &[u8],
+    header: &ArFontHeader,
+) -> Result<(u32, u32, Vec<u8>), ArFontError> {
+    let img_off = header.images_offset;
+    let width = rd_u32(buf, img_off + 8);
+    let height = rd_u32(buf, img_off + 12);
+    Ok((width, height, vec![0u8; (width * height * 4) as usize]))
+}
+
+impl FontAtlas {
+    /// Parse a `.arfont` byte buffer into a decoded atlas + glyph metrics.
+    pub fn parse(buf: &[u8]) -> Result<FontAtlas, ArFontError> {
+        let header = ArFontHeader::parse(buf)?;
+        if header.image_count == 0 {
+            return Err(ArFontError::NoImage);
+        }
+        let (glyphs, distance_range, em_size) = parse_glyphs(buf, header.variants_offset)?;
+        let (width, height, rgba) = decode_atlas_image(buf, &header)?;
+        Ok(FontAtlas { width, height, rgba, glyphs, distance_range, em_size })
+    }
+}
+
 #[cfg(test)]
 mod header_tests {
     use super::*;
