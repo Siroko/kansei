@@ -14,6 +14,12 @@ pub struct FluidSurfaceOptions {
     pub roughness: f32,
     pub thickness: f32,
     pub color: [f32; 4],
+    /// Key light: the direction the light travels (engine `DirectionalLight`
+    /// convention), its intensity, and color. Drives the specular highlight
+    /// and tints the rim.
+    pub light_direction: [f32; 3],
+    pub light_intensity: f32,
+    pub light_color: [f32; 3],
 }
 
 impl Default for FluidSurfaceOptions {
@@ -22,6 +28,9 @@ impl Default for FluidSurfaceOptions {
             ior: 1.41, chromatic_aberration: 0.05, tint_strength: 0.3,
             fresnel_power: 2.3, roughness: 0.28, thickness: 2.4,
             color: [0.77, 0.96, 1.0, 1.0],
+            light_direction: [0.3, -1.0, 0.5],
+            light_intensity: 2.0,
+            light_color: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -39,6 +48,8 @@ struct CompositeParams {
     thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    light_dir: [f32; 4],   // xyz = direction light travels (world), w = intensity
+    light_color: [f32; 4],
 }
 
 const COMPOSITE_SHADER: &str = r#"
@@ -53,6 +64,8 @@ struct Params {
     thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    light_dir: vec4<f32>,   // xyz = direction light travels (world), w = intensity
+    light_color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -121,11 +134,26 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let reflect_uv = clamp(screen_uv + reflect_offset, vec2<f32>(0.0), vec2<f32>(1.0));
     let reflected = textureLoad(background_tex, vec2u(dims_f * reflect_uv), 0).rgb;
 
-    // Rim light for edge glow
-    let rim = pow(1.0 - ndotv, 3.0) * 0.15;
+    // Key-light GGX specular (view space: V = (0,0,1)).
+    let L = normalize(view3 * normalize(-params.light_dir.xyz));
+    let V = vec3<f32>(0.0, 0.0, 1.0);
+    let H = normalize(L + V);
+    let ndotl = max(dot(N_view, L), 0.0);
+    let ndoth = max(dot(N_view, H), 0.0);
+    let alpha = max(params.roughness * params.roughness, 1e-3);
+    let a2 = alpha * alpha;
+    let denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    let D = a2 / (3.14159 * denom * denom + 1e-4);
+    let k = alpha * 0.5;
+    let G = (ndotv / (ndotv * (1.0 - k) + k)) * (ndotl / (ndotl * (1.0 - k) + k));
+    let light_rgb = params.light_color.rgb * params.light_dir.w;
+    let specular = fresnel * D * G * ndotl * light_rgb * 0.5;
 
-    // Final: mix refracted (transmitted) and reflected (environment) via Fresnel, + rim
-    let result = mix(refracted, reflected, fresnel) + vec3<f32>(rim);
+    // Rim light for edge glow, tinted by the key light
+    let rim = pow(1.0 - ndotv, 3.0) * 0.15 * params.light_color.rgb * (0.5 + 0.25 * params.light_dir.w);
+
+    // Final: mix refracted (transmitted) and reflected (environment) via Fresnel, + specular + rim
+    let result = mix(refracted, reflected, fresnel) + specular + rim;
 
     textureStore(output_tex, coord, vec4<f32>(result, 1.0));
 }
@@ -264,6 +292,14 @@ impl PostProcessingEffect for FluidSurfaceEffect {
             thickness: self.options.thickness,
             screen_width: width as f32,
             screen_height: height as f32,
+            light_dir: [
+                self.options.light_direction[0], self.options.light_direction[1],
+                self.options.light_direction[2], self.options.light_intensity,
+            ],
+            light_color: [
+                self.options.light_color[0], self.options.light_color[1],
+                self.options.light_color[2], 1.0,
+            ],
         };
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(&params));
 

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::sdf::{FontAtlas, GlyphVolumeSet};
-use kansei_core::simulations::fluid::{GlyphAttractor, SlotLayout};
+use kansei_core::simulations::fluid::{GlyphAttractor, SlotLayout, RetagParams};
 
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -113,6 +113,12 @@ impl App {
             contents: bytemuck::cast_slice(&positions),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Velocities are only touched by retag when emitting; a zeroed buffer suffices here.
+        let velocities_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("velocities"),
+            contents: bytemuck::cast_slice(&vec![0.0f32; total as usize * 4]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         // ── Attractor ────────────────────────────────────────────────────
         let attractor = GlyphAttractor::new(&renderer, &set, total);
@@ -151,7 +157,7 @@ impl App {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("TaggerTest/Recruit"),
             });
-            attractor.retag(&mut enc, &positions_buf, 0u32, BUDGET, COOLDOWN_FRAMES, 1.0);
+            attractor.retag(&mut enc, &positions_buf, &velocities_buf, &RetagParams { changed_mask: 0, per_slot_count: BUDGET, cooldown_frames: COOLDOWN_FRAMES, capture_scale: 1.0, ..Default::default() });
             queue.submit(std::iter::once(enc.finish()));
         }
         let tags_after_recruit = read_tags(device, queue);
@@ -190,7 +196,7 @@ impl App {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("TaggerTest/Release"),
             });
-            attractor.retag(&mut enc, &positions_buf, 1u32 << 0, BUDGET, COOLDOWN_FRAMES, 1.0);
+            attractor.retag(&mut enc, &positions_buf, &velocities_buf, &RetagParams { changed_mask: 1 << 0, per_slot_count: BUDGET, cooldown_frames: COOLDOWN_FRAMES, capture_scale: 1.0, ..Default::default() });
             queue.submit(std::iter::once(enc.finish()));
         }
         let tags_after_release = read_tags(device, queue);

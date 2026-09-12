@@ -1,0 +1,159 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<meta http-equiv="x-frame-options" content="sameorigin">
+<meta name="viewport" content="width=device-width; initial-scale=1.0" />
+<title>movistar</title>
+<link href="/mhs/css/style.css" rel="stylesheet" type="text/css" />
+<script src="/mhs/js/jquery-1.6.3.min.js" type="text/javascript"></script>
+<script src="/mhs/js/base64.js" type="text/javascript"></script>
+</head>
+
+<body>
+	<!--loading-->
+    <div id="pageloading">
+      <div id="loadingimg"><img src="/mhs/images/loading.gif" width="102" height="116" /></div>
+    </div>
+    
+<div class="layout" id="cont">
+    
+    <!--top-->
+	<div class="topBorder">
+			<div class="top_LBox logoBox_in"><img src="/mhs/img/logo.png"/></div>
+			<div class="top_RBox toptitle">Router Smart WiFi</div>
+	</div><!--top END-->
+	<!--stlye_mins-->
+	<div class="topBorder2">
+		<div class="toptitle2">Router Smart WiFi</div>
+	</div>
+	<!--stlye_mins end-->
+
+    <!--MAIN-->
+	<div class="mainBorder">
+	<form name="passWarning"  method="post" id="login" action="login-login.cgi" onsubmit="uiApply()" autocomplete="off">
+		<div class="artBox black2">Bienvenido al configurador de tu router Fibra Óptica. Por favor, para poder configurar tu router debes introducir la contraseña que encontrarás en la pegatina situada debajo de tu router denominada "Datos de acceso al Router" , siempre que no la hayas modificado anteriormente. En este caso, deberás introducir la nueva contraseña de acceso.
+		<span class="sub"><a href="#" onclick="window.alert('Si has olvidado la nueva contraseña que estableciste para acceder a tu router deberás realizar un RESET de fábrica. Pulsa durante al menos 10 segundos el botón RESET situado en la parte trasera de tu equipo.')">¿Has olvidado tu contraseña?</a></span></div>
+			<div class="artBox">
+			<input name="sessionKey" type="HIDDEN" id="sessionKey" />
+			<div class="tabInput"><input name="pass"  id="pass" type="password" autocomplete="new-password" class="txtBox2 gray" /></div>
+			<div id="dau" class="tabID">
+			<input name="acceptLogin" type="button" id="acceptLogin" class="sendBtu2" value="Comprobar" /></div>
+			</div>		
+			<div class="artBox">
+				<div class="sampleImg"></div>
+			</div>
+	</form>    
+	</div><!--main END-->
+    
+    <!--footer-->
+    <div class="footerBorder">
+        <div class="logo"></div>
+        <ul>
+            <li class="first">© Telefónica de España, SAU. Todos los derechos reservados. </li>
+            <li>Initial version: v1.0</li>
+        </ul>
+    </div><!--footer END-->
+    
+</div><!--layout end-->
+
+<script type="text/javascript">
+
+base64 = {};
+base64.PADCHAR = '=';
+base64.ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+base64.getbyte64 = function(s,i) {
+    // This is oddly fast, except on Chrome/V8.
+    //  Minimal or no improvement in performance by using a
+    //   object with properties mapping chars to value (eg. 'A': 0)
+    var idx = base64.ALPHA.indexOf(s.charAt(i));
+    if (idx == -1) {
+        throw "Cannot decode base64";
+    }
+    return idx;
+}
+
+base64.getbyte = function(s,i) {
+    var x = s.charCodeAt(i);
+    if (x > 255) {
+        throw "INVALID_CHARACTER_ERR: DOM Exception 5";
+    }
+    return x;
+}
+
+base64.encode = function(s) {
+    if (arguments.length != 1) {
+        throw "SyntaxError: Not enough arguments";
+    }
+    var padchar = base64.PADCHAR;
+    var alpha   = base64.ALPHA;
+    var getbyte = base64.getbyte;
+
+    var i, b10;
+    var x = [];
+
+    // convert to string
+    s = "" + s;
+
+    var imax = s.length - s.length % 3;
+
+    if (s.length == 0) {
+        return s;
+    }
+    for (i = 0; i < imax; i += 3) {
+        b10 = (getbyte(s,i) << 16) | (getbyte(s,i+1) << 8) | getbyte(s,i+2);
+        x.push(alpha.charAt(b10 >> 18));
+        x.push(alpha.charAt((b10 >> 12) & 0x3F));
+        x.push(alpha.charAt((b10 >> 6) & 0x3f));
+        x.push(alpha.charAt(b10 & 0x3f));
+    }
+    switch (s.length - imax) {
+    case 1:
+        b10 = getbyte(s,i) << 16;
+        x.push(alpha.charAt(b10 >> 18) + alpha.charAt((b10 >> 12) & 0x3F) +
+               padchar + padchar);
+        break;
+    case 2:
+        b10 = (getbyte(s,i) << 16) | (getbyte(s,i+1) << 8);
+        x.push(alpha.charAt(b10 >> 18) + alpha.charAt((b10 >> 12) & 0x3F) +
+               alpha.charAt((b10 >> 6) & 0x3f) + padchar);
+        break;
+    }
+    return x.join('');
+}
+
+$(document).ready(function() {
+
+	$('#acceptLogin').click(function(){		 
+		  var passwd   = document.passWarning.pass.value;   
+		   if (passwd=="" || passwd.length >64){
+			   alert("Su contraseña es incorrecta!");
+			   return false;
+		   }		  
+		  var username = 1234;
+		  var string=username+':'+passwd;
+		  var encodedData = base64.encode(string); 
+		  document.passWarning.sessionKey.value = encodedData;
+  		  document.passWarning.pass.value="";
+		  document.passWarning.submit();
+	});	
+});
+
+function uiApply()
+{
+	var passwd = document.passWarning.pass.value;
+	if ( passwd == "" || passwd.length > 64 )
+	{
+		alert( "Su contraseña es incorrecta!" );
+		return false;
+	}
+	var username = 1234;
+	var string = username + ':' + passwd;
+	var encodedData = base64.encode( string );
+	document.passWarning.sessionKey.value = encodedData;
+	document.passWarning.pass.value = "";
+	document.passWarning.submit();
+}
+</script>	
+</body>
+</html>
