@@ -192,9 +192,43 @@ struct State {
     camera: Camera,
     controls: CameraControls,
     path_tracer: PathTracer,
+    bvh: BVHBuilder,
     bvh_data: GPUBVHData,
     tlas: TLASBuilder,
     blit: BlitResources,
+    // Interactive scene controls
+    box_a_idx: usize,
+    box_b_idx: usize,
+    dragon_parts: Vec<(usize, Vec3)>,
+    light_dir: Vec3,
+    light_color: Vec3,
+    light_intensity: f32,
+    animate: bool,
+    scene_dirty: bool,
+}
+
+fn directional_light_data(dir: Vec3, color: Vec3, intensity: f32) -> [f32; 16] {
+    let d = if dir.length() > 1e-6 {
+        dir.normalize()
+    } else {
+        Vec3::new(0.0, -1.0, 0.0)
+    };
+    // LightData: direction(vec3) + LIGHT_DIRECTIONAL=1, color(vec3) + intensity,
+    // normal(vec3, unused) + pad, extra(vec4)
+    [
+        d.x, d.y, d.z, f32::from_bits(1u32),
+        color.x, color.y, color.z, intensity,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+    ]
+}
+
+fn move_object(scene: &mut Scene, idx: usize, pos: Vec3) {
+    if let Some(r) = scene.get_renderable_mut(idx) {
+        r.object.position = pos;
+        r.object.update_model_matrix();
+        r.object.update_world_matrix(None);
+    }
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -271,14 +305,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let box_a_mat = make_basic_material("BoxA", [0.9, 0.2, 0.2, 1.0]);
     let mut box_a = Renderable::new(box_a_geo, box_a_mat);
     box_a.object.set_position(-1.5, 1.0, 0.0);
-    scene.add(SceneNode::Renderable(box_a));
+    let box_a_idx = scene.add(SceneNode::Renderable(box_a));
 
     // Box B
     let box_b_geo = BoxGeometry::new(1.0, 1.0, 1.0);
     let box_b_mat = make_basic_material("BoxB", [0.2, 0.2, 0.9, 1.0]);
     let mut box_b = Renderable::new(box_b_geo, box_b_mat);
     box_b.object.set_position(1.5, 0.5, 0.0);
-    scene.add(SceneNode::Renderable(box_b));
+    let box_b_idx = scene.add(SceneNode::Renderable(box_b));
 
     // Stanford Dragon (glass) — fetch GLB via HTTP
     let dragon_loaded = async {
@@ -294,18 +328,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         GLTFLoader::load_glb(&bytes).ok()
     }.await;
 
+    let mut dragon_parts: Vec<(usize, Vec3)> = Vec::new();
     if let Some(result) = dragon_loaded {
         log::info!("Loaded dragon: {} renderables", result.renderables.len());
         // GLB is ~100 units tall; scale to ~3 units to fit scene
         let s = 0.03;
         for gr in result.renderables {
             let mut r = Renderable::new(gr.geometry, make_basic_material("Dragon", [0.9, 0.9, 0.95, 1.0]));
-            r.object.position = Vec3::new(gr.position.x, gr.position.y, gr.position.z + 2.5);
+            let base_pos = Vec3::new(gr.position.x, gr.position.y, gr.position.z + 2.5);
+            r.object.position = base_pos;
             r.object.rotation = gr.rotation;
             r.object.scale = Vec3::new(gr.scale.x * s, gr.scale.y * s, gr.scale.z * s);
             r.object.update_model_matrix();
             r.object.update_world_matrix(None);
-            scene.add(SceneNode::Renderable(r));
+            let idx = scene.add(SceneNode::Renderable(r));
+            dragon_parts.push((idx, base_pos));
         }
     } else {
         log::warn!("Could not load dragon model");
@@ -361,15 +398,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     pt.set_materials(&materials);
 
     // Light data for path tracer
-    let dir = Vec3::new(-0.5, -1.0, -0.3).normalize();
-    // LightData: position/direction(vec3), light_type(u32), color(vec3), intensity(f32), normal(vec3), pad, extra(vec4)
-    let light_data: [f32; 16] = [
-        dir.x, dir.y, dir.z, f32::from_bits(1u32), // direction + LIGHT_DIRECTIONAL=1
-        1.0, 0.95, 0.9, 3.0,                        // color + intensity
-        0.0, 0.0, 0.0, 0.0,                         // normal (unused for directional)
-        0.0, 0.0, 0.0, 0.0,                         // extra
-    ];
-    pt.set_lights_raw(&light_data);
+    let light_dir = Vec3::new(-0.5, -1.0, -0.3);
+    let light_color = Vec3::new(1.0, 0.95, 0.9);
+    let light_intensity = 3.0;
+    pt.set_lights_raw(&directional_light_data(light_dir, light_color, light_intensity));
 
     // Blit pipeline
     let blit = BlitResources::new(renderer.device(), renderer.presentation_format());
@@ -384,9 +416,18 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         camera,
         controls,
         path_tracer: pt,
+        bvh,
         bvh_data: gpu_data,
         tlas,
         blit,
+        box_a_idx,
+        box_b_idx,
+        dragon_parts,
+        light_dir,
+        light_color,
+        light_intensity,
+        animate: false,
+        scene_dirty: false,
     }));
 
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
@@ -398,18 +439,46 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let mut st = s.borrow_mut();
             let State {
                 ref mut renderer,
+                ref mut scene,
                 ref mut camera,
                 ref mut controls,
                 ref mut path_tracer,
+                ref mut bvh,
                 ref bvh_data,
-                ref tlas,
+                ref mut tlas,
                 ref blit,
+                box_b_idx,
+                animate,
+                ref mut scene_dirty,
                 ..
             } = *st;
             if controls.is_dirty() {
                 path_tracer.reset_accumulation();
             }
             controls.update(camera, 0.0);
+
+            // Animate box B in an orbit (mirrors the TS example's animated cube)
+            if animate {
+                let t = (web_sys::window()
+                    .and_then(|w| w.performance())
+                    .map(|p| p.now())
+                    .unwrap_or(0.0)
+                    * 0.001) as f32;
+                if let Some(r) = scene.get_renderable_mut(box_b_idx) {
+                    r.object.position = Vec3::new(t.sin() * 2.5, t.cos() * 1.5 + 2.5, 0.0);
+                    r.object.rotation = Vec3::new(t * 0.7, t * 1.1, t * 0.5);
+                    r.object.update_model_matrix();
+                    r.object.update_world_matrix(None);
+                }
+                *scene_dirty = true;
+            }
+
+            // Objects moved: re-pack instance transforms + rebuild TLAS (BLAS untouched)
+            if *scene_dirty {
+                bvh.refresh_transforms(renderer, scene, bvh_data, tlas);
+                path_tracer.reset_accumulation();
+                *scene_dirty = false;
+            }
 
             // Get surface texture
             let surface = renderer.surface().unwrap();
@@ -446,6 +515,67 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
 fn with_state<F: FnOnce(&mut State)>(f: F) {
     GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } });
+}
+
+fn upload_lights(s: &mut State) {
+    s.path_tracer.set_lights_raw(&directional_light_data(
+        s.light_dir,
+        s.light_color,
+        s.light_intensity,
+    ));
+    s.path_tracer.reset_accumulation();
+}
+
+#[wasm_bindgen]
+pub fn set_light_dir(x: f32, y: f32, z: f32) {
+    with_state(|s| {
+        s.light_dir = Vec3::new(x, y, z);
+        upload_lights(s);
+    });
+}
+
+#[wasm_bindgen]
+pub fn set_light_color(r: f32, g: f32, b: f32) {
+    with_state(|s| {
+        s.light_color = Vec3::new(r, g, b);
+        upload_lights(s);
+    });
+}
+
+#[wasm_bindgen]
+pub fn set_light_intensity(v: f32) {
+    with_state(|s| {
+        s.light_intensity = v;
+        upload_lights(s);
+    });
+}
+
+/// Move an object: 0 = box A, 1 = box B, 2 = dragon (offset from load position).
+#[wasm_bindgen]
+pub fn set_object_position(id: u32, x: f32, y: f32, z: f32) {
+    with_state(|s| {
+        match id {
+            0 => move_object(&mut s.scene, s.box_a_idx, Vec3::new(x, y, z)),
+            1 => move_object(&mut s.scene, s.box_b_idx, Vec3::new(x, y, z)),
+            2 => {
+                let parts = s.dragon_parts.clone();
+                for (idx, base) in parts {
+                    let pos = Vec3::new(base.x + x, base.y + y, base.z + z);
+                    move_object(&mut s.scene, idx, pos);
+                }
+            }
+            _ => return,
+        }
+        s.scene_dirty = true;
+    });
+}
+
+#[wasm_bindgen]
+pub fn set_animate(v: bool) {
+    with_state(|s| {
+        s.animate = v;
+        s.scene_dirty = true;
+    });
 }
 
 #[wasm_bindgen] pub fn set_spp(v: u32) { with_state(|s| { s.path_tracer.set_spp(v); s.path_tracer.reset_accumulation(); }); }

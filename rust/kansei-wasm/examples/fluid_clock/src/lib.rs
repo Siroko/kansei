@@ -19,8 +19,7 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::sdf::{FontAtlas, GlyphVolumeSet};
 use kansei_core::simulations::fluid::{
     ClockState, DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation,
-    FluidSimulationOptions, FluidSurfaceRenderer, GlyphAttractor, MarchingCubesOptions, SlotLayout,
-};
+    FluidSimulationOptions, FluidSurfaceRenderer, GlyphAttractor, MarchingCubesOptions, SlotLayout, RetagParams};
 
 const BASIC_LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
 const FONT: &[u8] = include_bytes!("../../../../kansei-core/tests/fixtures/L10-medium.arfont");
@@ -43,6 +42,8 @@ struct StripeParams {
     thickness_b: f32,
     _pad0: f32,
     _pad1: f32,
+    light_dir: vec4<f32>,   // xyz = direction light travels, w = intensity
+    light_color: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> params: StripeParams;
 
@@ -74,9 +75,10 @@ fn fragment_main(v: VOut) -> @location(0) vec4<f32> {
     let in_a = t < params.thickness_a;
     let base = select(params.color_b.rgb, params.color_a.rgb, in_a);
 
-    let light = normalize(vec3<f32>(0.3, 1.0, 0.5));
+    let light = normalize(-params.light_dir.xyz);
     let ndotl = max(dot(normalize(v.world_normal), light), 0.0);
-    let lit = base * (0.3 + ndotl * 0.7);
+    // intensity 2 reproduces the old fixed 0.3 + 0.7·ndotl
+    let lit = base * (0.3 + ndotl * 0.35 * params.light_dir.w) * params.light_color.rgb;
     return vec4<f32>(lit, 1.0);
 }
 "#;
@@ -454,12 +456,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let format = renderer.presentation_format();
 
     // ── Particles ──
-    // Fill a box spanning the clock band (x ∈ [-17,17], y ∈ [-2,2]) plus a
-    // pool region below/around it, so every slot box has particles nearby
-    // for the recruit pass to pull from.
-    let count = 120_000usize; // tunable; lower if the browser struggles
-    let center = [0.0f32, 0.0, 0.0];
-    let half = [18.0f32, 8.0, 2.0]; // spawn box: x∈[-18,18], y∈[-8,8], z∈[-2,2]
+    // Portrait tank for the stacked HH / MM / SS layout (rows of two 14-unit
+    // glyphs). At rest density (~6.4/unit³) 80K particles are ~12500 units³:
+    // ~12.5 units deep on the 50×20 floor, surface near y ≈ 2.5 (measured
+    // with kansei-native's clock_fill_test).
+    let count = 80_000usize;
+    let center = [0.0f32, -3.0, 0.0];
+    let half = [23.0f32, 6.0, 9.0]; // spawn box: x∈[-23,23], y∈[-9,3], z∈[-9,9]
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
@@ -485,16 +488,27 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }, &positions);
     // World bounds contain the spawn box (clock band + pool) plus margin for
     // falling/settling under gravity.
-    sim.world_bounds_min = [-22.0, -10.0, -6.0];
-    sim.world_bounds_max = [22.0, 20.0, 6.0];
+    sim.world_bounds_min = [-25.0, -10.0, -10.0];
+    sim.world_bounds_max = [25.0, 60.0, 10.0];
     sim.rebuild_grid();
 
     // ── Glyph attractor: GPU tagging + clock-driven slot layout ──
     let font = FontAtlas::parse(FONT).expect("parse font");
-    let glyph_set = GlyphVolumeSet::for_clock(&font, 32, 8, 0.5);
+    // Inside threshold 0.35 (< 0.5 = bolder strokes) and a 6-deep box: the
+    // glyph holds ~2x the fluid of the plain outline at depth 4.
+    let glyph_set = GlyphVolumeSet::for_clock_with_threshold(&font, 256, 8, 0.5, GLYPH_BOLD);
     let attractor = GlyphAttractor::new(&renderer, &glyph_set, count as u32);
 
-    let mut slot_layout = SlotLayout::hh_mm_ss(4.0, 1.5);
+    // 10-unit cells, 4 deep: holds ~400 particles per digit at rest density
+    // (measured with kansei-native's glyph_form_test; 4-unit cells hold ~50).
+    let mut slot_layout = SlotLayout::stacked_hh_mm_ss(CLOCK_CELL, CLOCK_DEPTH, ROW_SPACING);
+    let slot_base_y: [f32; 8] = std::array::from_fn(|i| slot_layout.slots[i].world_min[1]);
+    // Raise the stack so the SS row's box bottom sits ~1.5 units under the
+    // pool surface (~2.5): SS center = -1.3·14 = -18.2, bottom = -25.2 → +29.
+    let glyph_y = 28.0f32;
+    apply_glyph_y(&mut slot_layout, &slot_base_y, glyph_y);
+    let per_slot_count = 2000u32; // ~1800 fit a bold 14-unit, 6-deep stroke at rest density (glyph_form_test)
+    apply_budgets(&mut slot_layout, per_slot_count);
     let mut clock = ClockState::new();
     let (h0, m0, s0) = now_hms();
     let _ = clock.update(&mut slot_layout, h0, m0, s0);
@@ -504,7 +518,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // ── Density field + surface renderer (for raymarch mode) ──
     let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max,
-        DensityFieldOptions { resolution: 128, kernel_scale: 0.6 });
+        DensityFieldOptions { resolution: 128, kernel_scale: 0.6 }); // max-axis cells; ~0.55 units/cell on the 70-tall tank (192/256 looked the same)
     let surface_renderer = FluidSurfaceRenderer::new(&renderer);
 
     // ── Marching cubes (compute only — render via standard Renderable) ──
@@ -536,12 +550,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let mut opts = MaterialOptions::default();
             opts.cull_mode = CullMode::Front;
 
-            let stripe_data: [f32; 12] = [
-                0.0, 0.0, 0.0, 1.0,   // color_a (black)
-                1.0, 1.0, 1.0, 1.0,   // color_b (white)
-                1.0, 1.0,             // thickness_a, thickness_b
-                0.0, 0.0,             // padding
-            ];
+            let stripe_data = stripe_uniform(&DEFAULT_STRIPES, [-0.13, 0.22, 0.5], 4.0, [1.0, 1.0, 1.0]);
             let mut mat = Material::new(
                 "Dome/Stripes", STRIPE_WGSL,
                 vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
@@ -565,15 +574,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // Light
     let sun = DirectionalLight::new(
-        Vec3::new(0.3, -1.0, 0.5).normalize(),
-        Vec3::new(1.0, 1.0, 1.0), 2.0,
+        Vec3::new(-0.13, 0.22, 0.5).normalize(),
+        Vec3::new(1.0, 1.0, 1.0), 4.0,
     );
     let light_scene_index = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // ── Camera ──
     let mut camera = Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32);
-    camera.set_position(0.0, 10.0, 50.0);
-    camera.look_at(&Vec3::new(0.0, 0.0, 0.0));
+    camera.set_position(0.0, 24.0, 95.0);
+    camera.look_at(&Vec3::new(0.0, 22.0, 0.0));
     camera.update_projection_matrix();
     camera.update_view_matrix();
 
@@ -659,7 +668,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 FluidSurfaceOptions::default(),
             )),
             Box::new(DepthOfFieldEffect::new(DepthOfFieldOptions {
-                focus_distance: 42.0,
+                focus_distance: 90.0,
                 focus_range: 37.0,
                 max_blur: 7.0,
             })),
@@ -668,7 +677,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // Camera: back view aligned with long X axis (azimuth = π), radius wide
     // enough to see the full ~34-unit clock band (slots span x ∈ [-17, 17]).
-    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 0.0, 0.0), 50.0);
+    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 22.0, 0.0), 95.0);
     controls.set_azimuth(std::f32::consts::PI);
     let mouse = MouseVectors::from_canvas(&canvas);
 
@@ -687,13 +696,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         max_render_fps: 0.0, render_accumulator: 0.0,
         frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
         current_fps: 0.0, current_frame_ms: 0.0,
-        attractor, slot_layout, clock,
-        per_slot_count: (count as u32 / 16).max(1),
+        attractor, slot_layout, clock, glyph_y, slot_base_y, stripes: DEFAULT_STRIPES,
+        per_slot_count,
         cooldown_frames: 45,
         capture_scale: 1.15,
-        attr_stiffness: 40.0,
-        attr_max_speed: 20.0,
+        capture_below: 45.0, // recruit columns reach from the top row down into the pool
+        emit_height: 1.0,    // recruits appear in the gap just above their glyph and fall in
+        emit_spread: 2.5,
+        emit_rate: 100,      // per slot per frame: 2000 over ~20 frames
+        attr_stiffness: 90.0,
+        attr_max_speed: 12.0, // ~0.2 units/step: must stay small vs. the stroke width
         attr_basin: 5.0,
+        attr_target: 0.34,
+        attr_drag: 3.0,
         audio_ctx: None,
         last_second: -1,
     }));
@@ -759,12 +774,21 @@ struct State {
     attractor: GlyphAttractor,
     slot_layout: SlotLayout,
     clock: ClockState,
+    glyph_y: f32,
+    slot_base_y: [f32; 8],
+    stripes: [f32; 8],
     per_slot_count: u32,
     cooldown_frames: u32,
     capture_scale: f32,
+    capture_below: f32,
+    emit_height: f32,
+    emit_spread: f32,
+    emit_rate: u32,
     attr_stiffness: f32,
     attr_max_speed: f32,
     attr_basin: f32,
+    attr_target: f32,
+    attr_drag: f32,
     audio_ctx: Option<web_sys::AudioContext>,
     last_second: i32,
 }
@@ -820,6 +844,8 @@ impl State {
         // cap prevents the classic spiral of death — extra leftover time is
         // discarded rather than accumulated forever.
         let identity = glam::Mat4::IDENTITY.to_cols_array();
+        // Sim time advanced this frame (the attractor integrates over it).
+        let mut sim_dt_frame = 0.0f32;
         if let Some(fse) = self.volume.effects.get_mut(0)
             .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>())
         {
@@ -834,6 +860,7 @@ impl State {
                 self.sim_accumulator -= step_dt as f64;
                 steps += 1;
             }
+            sim_dt_frame = steps as f32 * scaled_dt;
             // Drop excess if we're running slower than the sim needs — keeps
             // the next frame from inheriting a huge backlog.
             if self.sim_accumulator > step_dt as f64 {
@@ -852,14 +879,18 @@ impl State {
             self.beep_for_change(h, m, s);
             self.last_second = s as i32;
         }
-        self.attractor.set_params(1.0 / 60.0, self.attr_stiffness, self.attr_max_speed, self.attr_basin);
+        self.attractor.set_params(sim_dt_frame, self.attr_stiffness, self.attr_max_speed, self.attr_basin, self.attr_target, self.attr_drag);
 
         if let Some(fse) = self.volume.effects.get(0)
             .and_then(|e| e.as_any().downcast_ref::<FluidSurfaceEffect>())
         {
             if let (Some(pos_buf), Some(vel_buf)) = (fse.sim.positions_buffer(), fse.sim.velocities_buffer()) {
                 let mut enc = self.renderer.device().create_command_encoder(&Default::default());
-                self.attractor.retag(&mut enc, pos_buf, changed_mask, self.per_slot_count, self.cooldown_frames, self.capture_scale);
+                self.attractor.retag(&mut enc, pos_buf, vel_buf, &RetagParams {
+                    changed_mask, per_slot_count: self.per_slot_count, cooldown_frames: self.cooldown_frames,
+                    capture_scale: self.capture_scale, capture_below: self.capture_below,
+                    emit_height: self.emit_height, emit_spread: self.emit_spread, emit_rate: self.emit_rate,
+                });
                 self.attractor.dispatch(&mut enc, pos_buf, vel_buf);
                 self.renderer.queue().submit(std::iter::once(enc.finish()));
             }
@@ -976,6 +1007,29 @@ fn now_hms() -> (u32, u32, u32) {
 // ── JS interop ──
 thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
 fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
+
+const CLOCK_CELL: f32 = 14.0;
+const CLOCK_DEPTH: f32 = 6.0;
+/// Row pitch of the stacked layout as a multiple of the cell (0.3·cell gap).
+const ROW_SPACING: f32 = 1.3;
+/// Atlas-alpha inside threshold: 0.5 = true outline, lower = bolder.
+const GLYPH_BOLD: f32 = 0.35;
+/// Fraction of a digit's budget the `:` slots get (their stroke area is
+/// under half a digit's).
+const COLON_BUDGET_SCALE: f32 = 0.45;
+
+/// Shift the whole stack vertically by `offset` from its layout-time position.
+fn apply_glyph_y(layout: &mut SlotLayout, base_y: &[f32; 8], offset: f32) {
+    for (s, b) in layout.slots.iter_mut().zip(base_y.iter()) {
+        s.world_min[1] = b + offset;
+    }
+}
+/// Digits use the global per-slot count (budget 0); colons get a smaller cap.
+fn apply_budgets(layout: &mut SlotLayout, per_slot: u32) {
+    for s in layout.slots.iter_mut() {
+        s.budget = if s.glyph_id == 10 { ((per_slot as f32) * COLON_BUDGET_SCALE) as u32 } else { 0 };
+    }
+}
 fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
     with_state(|s| {
         if let Some(fse) = s.volume.effects.get_mut(0)
@@ -1085,24 +1139,51 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         f.sim.rebuild_grid();
     });
 }
+/// Dome stripe settings: color_a rgb, color_b rgb, thickness_a, thickness_b.
+const DEFAULT_STRIPES: [f32; 8] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+
+/// Pack stripe settings + key light into the dome's `StripeParams` uniform.
+fn stripe_uniform(st: &[f32; 8], light_dir: [f32; 3], intensity: f32, light_color: [f32; 3]) -> [f32; 20] {
+    [
+        st[0], st[1], st[2], 1.0,
+        st[3], st[4], st[5], 1.0,
+        st[6], st[7], 0.0, 0.0,
+        light_dir[0], light_dir[1], light_dir[2], intensity,
+        light_color[0], light_color[1], light_color[2], 1.0,
+    ]
+}
+
+/// Push the scene's directional light into everything that shades with it
+/// but isn't an engine-lit material: the dome stripes and the fluid surface.
+fn sync_light(s: &mut State) {
+    let (dir, intensity, color) = match s.scene.get_light_mut(s.light_scene_index) {
+        Some(Light::Directional(dl)) => ([dl.direction.x, dl.direction.y, dl.direction.z], dl.intensity, [dl.color.x, dl.color.y, dl.color.z]),
+        _ => return,
+    };
+    if let Some(idx) = s.dome_scene_index {
+        if let Some(r) = s.scene.get_renderable_mut(idx) {
+            let data = stripe_uniform(&s.stripes, dir, intensity, color);
+            r.material.set_uniform_bindable(0, "Dome/StripeParams", &data);
+            r.material_dirty = true;
+        }
+    }
+    if let Some(fse) = s.volume.effects.get_mut(0)
+        .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>())
+    {
+        fse.options.light_direction = dir;
+        fse.options.light_intensity = intensity;
+        fse.options.light_color = color;
+    }
+}
+
 #[wasm_bindgen] pub fn set_stripe_params(
     r1: f32, g1: f32, b1: f32,
     r2: f32, g2: f32, b2: f32,
     thick_a: f32, thick_b: f32,
 ) {
     with_state(|s| {
-        if let Some(idx) = s.dome_scene_index {
-            if let Some(r) = s.scene.get_renderable_mut(idx) {
-                let data: [f32; 12] = [
-                    r1, g1, b1, 1.0,
-                    r2, g2, b2, 1.0,
-                    thick_a, thick_b,
-                    0.0, 0.0,
-                ];
-                r.material.set_uniform_bindable(0, "Dome/StripeParams", &data);
-                r.material_dirty = true;
-            }
-        }
+        s.stripes = [r1, g1, b1, r2, g2, b2, thick_a, thick_b];
+        sync_light(s);
     });
 }
 #[wasm_bindgen] pub fn set_light_direction(x: f32, y: f32, z: f32) {
@@ -1110,6 +1191,7 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         if let Some(Light::Directional(dl)) = s.scene.get_light_mut(s.light_scene_index) {
             dl.direction = Vec3::new(x, y, z).normalize();
         }
+        sync_light(s);
     });
 }
 #[wasm_bindgen] pub fn set_light_intensity(v: f32) {
@@ -1117,6 +1199,7 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         if let Some(Light::Directional(dl)) = s.scene.get_light_mut(s.light_scene_index) {
             dl.intensity = v;
         }
+        sync_light(s);
     });
 }
 #[wasm_bindgen] pub fn set_light_color(r: f32, g: f32, b: f32) {
@@ -1124,6 +1207,7 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         if let Some(Light::Directional(dl)) = s.scene.get_light_mut(s.light_scene_index) {
             dl.color = Vec3::new(r, g, b);
         }
+        sync_light(s);
     });
 }
 #[wasm_bindgen] pub fn set_dof_focus_distance(v: f32) {
@@ -1166,8 +1250,15 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
 #[wasm_bindgen] pub fn set_attr_stiffness(v: f32) { with_state(|s| s.attr_stiffness = v); }
 #[wasm_bindgen] pub fn set_attr_max_speed(v: f32) { with_state(|s| s.attr_max_speed = v); }
 #[wasm_bindgen] pub fn set_attr_basin(v: f32) { with_state(|s| s.attr_basin = v); }
-#[wasm_bindgen] pub fn set_per_slot_count(v: u32) { with_state(|s| s.per_slot_count = v); }
+#[wasm_bindgen] pub fn set_attr_target(v: f32) { with_state(|s| s.attr_target = v); }
+#[wasm_bindgen] pub fn set_attr_drag(v: f32) { with_state(|s| s.attr_drag = v); }
+#[wasm_bindgen] pub fn set_per_slot_count(v: u32) { with_state(|s| { s.per_slot_count = v; apply_budgets(&mut s.slot_layout, v); s.attractor.set_slots(&s.slot_layout); }); }
 #[wasm_bindgen] pub fn set_capture_scale(v: f32) { with_state(|s| s.capture_scale = v); }
+#[wasm_bindgen] pub fn set_capture_below(v: f32) { with_state(|s| s.capture_below = v); }
+#[wasm_bindgen] pub fn set_emit_height(v: f32) { with_state(|s| s.emit_height = v); }
+#[wasm_bindgen] pub fn set_emit_spread(v: f32) { with_state(|s| s.emit_spread = v); }
+#[wasm_bindgen] pub fn set_emit_rate(v: u32) { with_state(|s| s.emit_rate = v); }
+#[wasm_bindgen] pub fn set_glyph_y(v: f32) { with_state(|s| { s.glyph_y = v; let base = s.slot_base_y; apply_glyph_y(&mut s.slot_layout, &base, v); s.attractor.set_slots(&s.slot_layout); }); }
 #[wasm_bindgen] pub fn set_cooldown_frames(v: u32) { with_state(|s| s.cooldown_frames = v); }
 #[wasm_bindgen] pub fn resume_audio() {
     with_state(|s| {

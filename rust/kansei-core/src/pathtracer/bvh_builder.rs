@@ -900,7 +900,9 @@ impl BVHBuilder {
         let instances_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("BVH/Instances"),
             contents: bytemuck::cast_slice(&self.packed_instances),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
         });
 
         GPUBVHData {
@@ -952,6 +954,44 @@ impl BVHBuilder {
         }
 
         gpu_data
+    }
+
+    /// Refresh instance transforms after objects have moved, without rebuilding
+    /// any BLAS. Re-packs instances from the scene, writes them into the
+    /// existing GPU instances buffer, and rebuilds the TLAS.
+    ///
+    /// The scene must contain the same renderables (same count, same order)
+    /// as when `build_full` was called — only their transforms may change.
+    pub fn refresh_transforms(
+        &mut self,
+        renderer: &Renderer,
+        scene: &Scene,
+        gpu_data: &GPUBVHData,
+        tlas: &mut TLASBuilder,
+    ) {
+        self.pack_instances(scene);
+        debug_assert_eq!(
+            self.packed_instances.len() as u32,
+            gpu_data.instance_count,
+            "refresh_transforms: instance count changed since build_full"
+        );
+
+        renderer.queue().write_buffer(
+            &gpu_data.instances_buf,
+            0,
+            bytemuck::cast_slice(&self.packed_instances),
+        );
+
+        if gpu_data.instance_count > 0 {
+            tlas.build(
+                renderer,
+                &gpu_data.instances_buf,
+                &gpu_data.bvh4_nodes_buf,
+                gpu_data.instance_count,
+                self.scene_bounds_min,
+                self.scene_bounds_max,
+            );
+        }
     }
 }
 

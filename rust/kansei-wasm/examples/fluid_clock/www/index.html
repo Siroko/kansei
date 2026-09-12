@@ -24,9 +24,9 @@
             set_light_direction, set_light_intensity, set_light_color,
             set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur,
             set_transmission_params,
-            set_attr_stiffness, set_attr_max_speed, set_attr_basin,
-            set_per_slot_count, set_capture_scale, set_cooldown_frames,
-            resume_audio
+            set_attr_stiffness, set_attr_max_speed, set_attr_basin, set_attr_target, set_attr_drag,
+            set_per_slot_count, set_capture_scale, set_capture_below, set_emit_height, set_emit_spread, set_emit_rate, set_cooldown_frames,
+            set_glyph_y, resume_audio
         } from '../pkg/kansei_wasm_fluid_clock.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
@@ -123,19 +123,19 @@
         planet.addBinding(pl, 'cz', { min: -20, max: 20, step: 0.5, label: 'center Z' }).on('change', syncPlanet);
 
         const bounds = pane.addFolder({ title: 'Bounds', expanded: false });
-        const b = { minX: -25, minY: -8, minZ: -8, maxX: 25, maxY: 30, maxZ: 16 };
+        const b = { minX: -25, minY: -10, minZ: -10, maxX: 25, maxY: 60, maxZ: 10 };
         const syncBounds = () => set_bounds(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
-        bounds.addBinding(b, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'minX', { min: -80, max: 0, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'minZ', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
-        bounds.addBinding(b, 'maxX', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
-        bounds.addBinding(b, 'maxY', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'maxX', { min: 0, max: 80, step: 0.5 }).on('change', syncBounds);
+        bounds.addBinding(b, 'maxY', { min: 0, max: 100, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
 
         const lightFolder = pane.addFolder({ title: 'Light', expanded: false });
         const lt = {
-            dirX: 0.3, dirY: -1.0, dirZ: 0.5,
-            intensity: 2.0,
+            dirX: -0.13, dirY: 0.22, dirZ: 0.5,
+            intensity: 4.0,
             color: { r: 1, g: 1, b: 1 },
         };
         const syncLightDir = () => set_light_direction(lt.dirX, lt.dirY, lt.dirZ);
@@ -146,7 +146,7 @@
         lightFolder.addBinding(lt, 'color', { color: { type: 'float' } }).on('change', () => set_light_color(lt.color.r, lt.color.g, lt.color.b));
 
         const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
-        const dof = { focusDistance: 42, focusRange: 37, maxBlur: 7 };
+        const dof = { focusDistance: 90, focusRange: 37, maxBlur: 7 };
         dofFolder.addBinding(dof, 'focusDistance', { min: 1, max: 200, step: 1, label: 'focus dist' })
             .on('change', () => set_dof_focus_distance(dof.focusDistance));
         dofFolder.addBinding(dof, 'focusRange', { min: 1, max: 100, step: 1, label: 'focus range' })
@@ -201,19 +201,29 @@
         set_mouse_force(p.mouseForce);
         set_substeps(p.substeps);
         set_kernel_scale(p.kernelScale);
+        syncLightDir();
+        set_light_intensity(lt.intensity);
+        set_light_color(lt.color.r, lt.color.g, lt.color.b);
         set_dof_focus_distance(dof.focusDistance);
         set_dof_focus_range(dof.focusRange);
         set_dof_max_blur(dof.maxBlur);
         syncTx();
         syncStripes();
 
-        const cp = { stiffness: 40, maxSpeed: 20, basin: 5, perSlot: 7500, capture: 1.15, cooldown: 45, sound: false };
+        const cp = { glyphY: 28, stiffness: 90, maxSpeed: 12, basin: 5, target: 0.34, drag: 3, perSlot: 2000, capture: 1.15, captureBelow: 45, emitHeight: 1, emitSpread: 2.5, emitRate: 100, cooldown: 45, sound: false };
         const cf = pane.addFolder({ title: 'Clock' });
+        cf.addBinding(cp, 'glyphY', { min: -10, max: 60, step: 0.5, label: 'stack offset Y' }).on('change', e => set_glyph_y(e.value));
         cf.addBinding(cp, 'stiffness', { min: 0, max: 200, step: 1 }).on('change', e => set_attr_stiffness(e.value));
         cf.addBinding(cp, 'maxSpeed', { min: 1, max: 60, step: 1 }).on('change', e => set_attr_max_speed(e.value));
         cf.addBinding(cp, 'basin', { min: 0, max: 30, step: 0.5 }).on('change', e => set_attr_basin(e.value));
-        cf.addBinding(cp, 'perSlot', { min: 500, max: 30000, step: 500 }).on('change', e => set_per_slot_count(e.value));
-        cf.addBinding(cp, 'capture', { min: 1.0, max: 2.0, step: 0.05 }).on('change', e => set_capture_scale(e.value));
+        cf.addBinding(cp, 'target', { min: -0.2, max: 0.35, step: 0.01, label: 'shell target' }).on('change', e => set_attr_target(e.value));
+        cf.addBinding(cp, 'drag', { min: 0, max: 20, step: 0.5, label: 'drag (1/s)' }).on('change', e => set_attr_drag(e.value));
+        cf.addBinding(cp, 'perSlot', { min: 50, max: 4000, step: 50 }).on('change', e => set_per_slot_count(e.value));
+        cf.addBinding(cp, 'capture', { min: 0.8, max: 2.0, step: 0.05 }).on('change', e => set_capture_scale(e.value));
+        cf.addBinding(cp, 'captureBelow', { min: 0, max: 60, step: 0.5, label: 'capture below' }).on('change', e => set_capture_below(e.value));
+        cf.addBinding(cp, 'emitHeight', { min: 0, max: 15, step: 0.5, label: 'emit height (0=off)' }).on('change', e => set_emit_height(e.value));
+        cf.addBinding(cp, 'emitSpread', { min: 0, max: 10, step: 0.5, label: 'emit spread' }).on('change', e => set_emit_spread(e.value));
+        cf.addBinding(cp, 'emitRate', { min: 0, max: 2000, step: 10, label: 'emit rate/frame (0=all)' }).on('change', e => set_emit_rate(e.value));
         cf.addBinding(cp, 'cooldown', { min: 0, max: 180, step: 5 }).on('change', e => set_cooldown_frames(e.value));
         cf.addBinding(cp, 'sound').on('change', e => { if (e.value) resume_audio(); });
     </script>

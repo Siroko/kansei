@@ -103,8 +103,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let safeDensity = max(myDensity.x, 0.001);
     vel += (pressureForce / safeDensity + viscosityForce * params.viscosity) * params.dt;
 
+    // velocity.w is a per-particle "held" flag (1 = held by an external
+    // attractor, e.g. GlyphAttractor). Held particles get no gravity here, so
+    // the cancellation is exact per substep instead of a once-per-frame kick
+    // that leaves them sagging. Preserved through this pass; integrate keeps it.
+    let held = velocities[idx].w > 0.5;
+
     // Gravity (directional or radial toward params.gravityCenter)
-    if (params.radialGravity > 0.5) {
+    if (held) {
+        // no gravity
+    } else if (params.radialGravity > 0.5) {
         let toCenter = params.gravityCenter - pos;
         let dist = length(toCenter) + 0.0001;
         let dir = toCenter / dist;
@@ -148,5 +156,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         vel = vel / speed * maxVel;
     }
 
-    velocities[idx] = vec4<f32>(vel, 0.0);
+    velocities[idx] = vec4<f32>(vel, select(0.0, 1.0, held));
 }

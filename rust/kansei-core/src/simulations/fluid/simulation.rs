@@ -42,6 +42,9 @@ pub struct FluidSimulation {
     grid_dims: [u32; 3],
     grid_origin: [f32; 3],
     total_cells: u32,
+    /// Hash-grid cell size: the smoothing radius, coarsened only if the tank
+    /// would otherwise need more than `MAX_GRID_CELLS` cells.
+    cell_size: f32,
 
     // Stored GPU handles (cheap Arc clones)
     device: Option<wgpu::Device>,
@@ -93,6 +96,7 @@ impl FluidSimulation {
             grid_dims: [1, 1, 1],
             grid_origin: [0.0; 3],
             total_cells: 1,
+            cell_size: 1.0,
             device: Some(device.clone()),
             queue: Some(queue.clone()),
             params_data: vec![0.0; ParamOffsets::BUFFER_SIZE],
@@ -145,14 +149,36 @@ impl FluidSimulation {
             self.world_bounds_min[d] = min[d] - range * pad;
             self.world_bounds_max[d] = max[d] + range * pad;
         }
-        let cs = self.params.smoothing_radius;
-        let mpa = if self.params.dimensions == 3 { (MAX_GRID_CELLS as f32).cbrt() as u32 } else { (MAX_GRID_CELLS as f32).sqrt() as u32 };
-        for d in 0..3 {
-            let g = ((self.world_bounds_max[d] - self.world_bounds_min[d]) / cs).ceil() as u32;
-            let lim = if d == 2 && self.params.dimensions == 2 { 1 } else { mpa };
-            self.grid_dims[d] = g.max(1).min(lim);
+        self.fit_grid();
+    }
+
+    /// Size the hash grid to the world bounds. Cells are `smoothing_radius`
+    /// wide (the neighbor search only visits ±1 cell, so they must not be
+    /// smaller) and are coarsened uniformly if the tank needs more than
+    /// `MAX_GRID_CELLS`. Clamping each axis to the cube root of the cap
+    /// instead (the old behavior) silently folded every particle beyond 64
+    /// cells on an axis into the edge cell: tens of thousands of neighbors
+    /// per particle, broken pressure, and a collapsed pool.
+    fn fit_grid(&mut self) {
+        let mut cell = self.params.smoothing_radius;
+        loop {
+            let mut dims = [1u32; 3];
+            for d in 0..3 {
+                if d == 2 && self.params.dimensions == 2 {
+                    continue;
+                }
+                let g = ((self.world_bounds_max[d] - self.world_bounds_min[d]) / cell).ceil() as u32;
+                dims[d] = g.max(1);
+            }
+            let total = dims[0] as u64 * dims[1] as u64 * dims[2] as u64;
+            if total <= MAX_GRID_CELLS as u64 {
+                self.grid_dims = dims;
+                self.total_cells = total as u32;
+                break;
+            }
+            cell *= 1.25;
         }
-        self.total_cells = self.grid_dims[0] * self.grid_dims[1] * self.grid_dims[2];
+        self.cell_size = cell;
         self.grid_origin = self.world_bounds_min;
     }
 
@@ -474,7 +500,7 @@ impl FluidSimulation {
         f[ParamOffsets::GRID_DIMS_X] = f32::from_ne_bytes(self.grid_dims[0].to_ne_bytes());
         f[ParamOffsets::GRID_DIMS_Y] = f32::from_ne_bytes(self.grid_dims[1].to_ne_bytes());
         f[ParamOffsets::GRID_DIMS_Z] = f32::from_ne_bytes(self.grid_dims[2].to_ne_bytes());
-        f[ParamOffsets::CELL_SIZE] = p.smoothing_radius;
+        f[ParamOffsets::CELL_SIZE] = self.cell_size;
         f[ParamOffsets::GRID_ORIGIN_X] = self.grid_origin[0];
         f[ParamOffsets::GRID_ORIGIN_Y] = self.grid_origin[1];
         f[ParamOffsets::GRID_ORIGIN_Z] = self.grid_origin[2];
@@ -522,19 +548,7 @@ impl FluidSimulation {
     /// Call after changing bounds at runtime.
     pub fn rebuild_grid(&mut self) {
         let device = self.device.clone().expect("FluidSimulation not initialized");
-        let cs = self.params.smoothing_radius;
-        let mpa = if self.params.dimensions == 3 {
-            (MAX_GRID_CELLS as f32).cbrt() as u32
-        } else {
-            (MAX_GRID_CELLS as f32).sqrt() as u32
-        };
-        for d in 0..3 {
-            let g = ((self.world_bounds_max[d] - self.world_bounds_min[d]) / cs).ceil() as u32;
-            let lim = if d == 2 && self.params.dimensions == 2 { 1 } else { mpa };
-            self.grid_dims[d] = g.max(1).min(lim);
-        }
-        self.total_cells = self.grid_dims[0] * self.grid_dims[1] * self.grid_dims[2];
-        self.grid_origin = self.world_bounds_min;
+        self.fit_grid();
 
         // Reallocate grid-sized buffers
         let tc = self.total_cells as usize;

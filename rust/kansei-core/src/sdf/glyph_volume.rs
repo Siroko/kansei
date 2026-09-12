@@ -11,28 +11,152 @@ pub struct GlyphSdf2d {
     pub data: Vec<f32>,
 }
 
-/// Sample the atlas alpha (SDF) for `glyph`, resampled to `res × res`.
-/// Atlas alpha stores SDF as unsigned [0,255] with 0.5 (=127.5) at the outline;
-/// we remap to signed [-1, 1] (+inside).
+/// Build a full-range signed distance field for `glyph`, resampled to `res × res`.
+///
+/// The baked atlas alpha is only a *narrow-band* SDF (a usable gradient exists
+/// within a few texels of the outline; beyond that it saturates flat). A flat
+/// field gives an attractor no direction, so particles far from a stroke never
+/// get pulled onto the glyph. Instead we threshold the atlas alpha into an
+/// inside/outside mask and run a signed Euclidean distance transform, producing
+/// a field whose gradient points toward the glyph from *anywhere* in the cell.
+/// Values are normalized to [-1, 1] (+inside), so the pull reaches the whole box.
 pub fn crop_glyph_sdf(atlas: &FontAtlas, glyph: &GlyphMetrics, res: u32) -> GlyphSdf2d {
+    crop_glyph_sdf_with_threshold(atlas, glyph, res, 0.5)
+}
+
+/// Like [`crop_glyph_sdf`], with an explicit inside threshold on the atlas
+/// alpha. 0.5 is the true outline; lower values dilate the strokes (bolder),
+/// which is the lever for how much fluid a glyph can hold.
+pub fn crop_glyph_sdf_with_threshold(atlas: &FontAtlas, glyph: &GlyphMetrics, res: u32, threshold: f32) -> GlyphSdf2d {
     let [l, b, r, t] = glyph.image_bounds;
-    let mut data = vec![0.0f32; (res * res) as usize];
     let aw = atlas.width as f32;
     let ah = atlas.height as f32;
+    let n = (res * res) as usize;
+
+    // 1. Sample the atlas alpha (bilinear, so a high `res` doesn't inherit the
+    //    atlas's pixel staircase) into an inside/outside mask.
+    let sample_alpha = |ax: f32, ay: f32| -> f32 {
+        let x0 = ax.floor().clamp(0.0, aw - 1.0);
+        let y0 = ay.floor().clamp(0.0, ah - 1.0);
+        let x1 = (x0 + 1.0).min(aw - 1.0);
+        let y1 = (y0 + 1.0).min(ah - 1.0);
+        let fx = (ax - x0).clamp(0.0, 1.0);
+        let fy = (ay - y0).clamp(0.0, 1.0);
+        let a = |x: f32, y: f32| atlas.rgba[((y as u32 * atlas.width + x as u32) * 4 + 3) as usize] as f32 / 255.0;
+        let top = a(x0, y0) * (1.0 - fx) + a(x1, y0) * fx;
+        let bot = a(x0, y1) * (1.0 - fx) + a(x1, y1) * fx;
+        top * (1.0 - fy) + bot * fy
+    };
+    let mut inside = vec![false; n];
     for y in 0..res {
         for x in 0..res {
-            // Map output cell to atlas pixel (bilinear-nearest is fine for the field).
             let u = (x as f32 + 0.5) / res as f32;
             let v = (y as f32 + 0.5) / res as f32;
-            let ax = (l + u * (r - l)).clamp(0.0, aw - 1.0);
+            // Pixel centers: atlas texel (i, j) covers [i, i+1); sample at -0.5.
+            let ax = (l + u * (r - l) - 0.5).clamp(0.0, aw - 1.0);
             // image_bounds y is bottom-up; atlas rows are top-down.
-            let ay = (ah - (b + v * (t - b))).clamp(0.0, ah - 1.0);
-            let idx = ((ay as u32 * atlas.width + ax as u32) * 4 + 3) as usize;
-            let alpha = atlas.rgba[idx] as f32 / 255.0;
-            data[(y * res + x) as usize] = (alpha - 0.5) * 2.0; // [-1,1], +inside
+            let ay = (ah - (b + v * (t - b)) - 0.5).clamp(0.0, ah - 1.0);
+            inside[(y * res + x) as usize] = sample_alpha(ax, ay) > threshold;
         }
     }
+
+    // 2. Signed Euclidean distance transform: distance to the nearest cell of
+    //    opposite membership, signed +inside, normalized so a half-box
+    //    distance maps to ~1. Exact separable transform (Felzenszwalb &
+    //    Huttenlocher), O(res²) — the old brute force was O(res⁴).
+    let norm = (res as f32) * 0.5;
+    let d_to_outside = edt_squared(&inside, res, false); // for inside cells
+    let d_to_inside = edt_squared(&inside, res, true); // for outside cells
+    let mut data = vec![0.0f32; n];
+    for i in 0..n {
+        let here = inside[i];
+        let d2 = if here { d_to_outside[i] } else { d_to_inside[i] };
+        let dist = if d2.is_finite() { d2.sqrt() } else { norm };
+        let signed = if here { dist } else { -dist };
+        data[i] = (signed / norm).clamp(-1.0, 1.0);
+    }
     GlyphSdf2d { res, data }
+}
+
+/// Squared Euclidean distance from every cell to the nearest cell whose mask
+/// value equals `target` (INFINITY if there is none). Cells at distance 0
+/// are those already equal to `target`. Felzenszwalb & Huttenlocher's
+/// separable lower-envelope transform: rows, then columns.
+fn edt_squared(mask: &[bool], res: u32, target: bool) -> Vec<f32> {
+    let n = res as usize;
+    let inf = f32::INFINITY;
+    let mut f = vec![inf; n * n];
+    for i in 0..n * n {
+        if mask[i] == target {
+            f[i] = 0.0;
+        }
+    }
+    let mut d = vec![0.0f32; n];
+    let mut v = vec![0usize; n];
+    let mut z = vec![0.0f32; n + 1];
+    let mut row = vec![0.0f32; n];
+    // 1D transform of `row` into `d`.
+    let mut dt1d = |row: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]| {
+        let mut k = 0usize;
+        v[0] = 0;
+        z[0] = -inf;
+        z[1] = inf;
+        for q in 1..n {
+            if row[q] == inf {
+                continue;
+            }
+            loop {
+                let vk = v[k];
+                if row[vk] == inf {
+                    // Parabola at vk is absent; replace it.
+                    v[k] = q;
+                    if k == 0 { z[0] = -inf; z[1] = inf; }
+                    break;
+                }
+                let s = ((row[q] + (q * q) as f32) - (row[vk] + (vk * vk) as f32)) / (2.0 * (q as f32 - vk as f32));
+                if s <= z[k] {
+                    if k == 0 {
+                        v[0] = q;
+                        z[0] = -inf;
+                        z[1] = inf;
+                        break;
+                    }
+                    k -= 1;
+                } else {
+                    k += 1;
+                    v[k] = q;
+                    z[k] = s;
+                    z[k + 1] = inf;
+                    break;
+                }
+            }
+        }
+        let mut k = 0usize;
+        for q in 0..n {
+            while z[k + 1] < q as f32 {
+                k += 1;
+            }
+            let vk = v[k];
+            d[q] = if row[vk] == inf { inf } else { (q as f32 - vk as f32).powi(2) + row[vk] };
+        }
+    };
+    // Rows.
+    for y in 0..n {
+        row.copy_from_slice(&f[y * n..(y + 1) * n]);
+        dt1d(&row, &mut d, &mut v, &mut z);
+        f[y * n..(y + 1) * n].copy_from_slice(&d);
+    }
+    // Columns.
+    for x in 0..n {
+        for y in 0..n {
+            row[y] = f[y * n + x];
+        }
+        dt1d(&row, &mut d, &mut v, &mut z);
+        for y in 0..n {
+            f[y * n + x] = d[y];
+        }
+    }
+    f
 }
 
 /// A glyph's SDF extruded into a 3D volume of `res_xy × res_xy × res_z` cells.
@@ -57,7 +181,20 @@ impl GlyphVolume {
         res_z: u32,
         half_depth: f32,
     ) -> GlyphVolume {
-        let sdf2d = crop_glyph_sdf(atlas, glyph, res_xy);
+        Self::extrude_with_threshold(atlas, glyph, res_xy, res_z, half_depth, 0.5)
+    }
+
+    /// [`extrude`](Self::extrude) with an explicit inside threshold (see
+    /// [`crop_glyph_sdf_with_threshold`]).
+    pub fn extrude_with_threshold(
+        atlas: &FontAtlas,
+        glyph: &GlyphMetrics,
+        res_xy: u32,
+        res_z: u32,
+        half_depth: f32,
+        threshold: f32,
+    ) -> GlyphVolume {
+        let sdf2d = crop_glyph_sdf_with_threshold(atlas, glyph, res_xy, threshold);
         let mut data = vec![0.0f32; (res_xy * res_xy * res_z) as usize];
         for z in 0..res_z {
             // z in [-1, 1]
@@ -90,6 +227,12 @@ pub struct GlyphVolumeSet {
 impl GlyphVolumeSet {
     /// Build volumes for `'0'..'9'` and `':'`. Missing glyphs yield `None` slots.
     pub fn for_clock(atlas: &FontAtlas, res_xy: u32, res_z: u32, half_depth: f32) -> GlyphVolumeSet {
+        Self::for_clock_with_threshold(atlas, res_xy, res_z, half_depth, 0.5)
+    }
+
+    /// [`for_clock`](Self::for_clock) with an explicit inside threshold on the
+    /// atlas alpha: 0.5 = true outline, lower = bolder strokes.
+    pub fn for_clock_with_threshold(atlas: &FontAtlas, res_xy: u32, res_z: u32, half_depth: f32, threshold: f32) -> GlyphVolumeSet {
         let codepoints: Vec<u32> = ('0'..='9').chain([':']).map(|c| c as u32).collect();
         let volumes = codepoints
             .iter()
@@ -98,7 +241,7 @@ impl GlyphVolumeSet {
                     .glyphs
                     .iter()
                     .find(|g| g.codepoint == *cp)
-                    .map(|g| GlyphVolume::extrude(atlas, g, res_xy, res_z, half_depth))
+                    .map(|g| GlyphVolume::extrude_with_threshold(atlas, g, res_xy, res_z, half_depth, threshold))
             })
             .collect();
         GlyphVolumeSet { res_xy, res_z, volumes }
@@ -183,5 +326,73 @@ mod tests {
         let atlas = FontAtlas::parse(FONT).unwrap();
         let set = GlyphVolumeSet::for_clock(&atlas, 16, 4, 0.5);
         assert!(set.volume_for_digit(10).is_none());
+    }
+
+    /// DEBUG (run with --nocapture): print a glyph field as ASCII to verify the
+    /// SDF actually carries the digit's shape.
+    #[test]
+    fn sdf_peak_per_digit() {
+        let atlas = FontAtlas::parse(FONT).unwrap();
+        for res in [32u32, 64] {
+            for c in ('0'..='9').chain([':']) {
+                let g = atlas.glyphs.iter().find(|g| g.codepoint == c as u32).unwrap();
+                let sdf = crop_glyph_sdf(&atlas, g, res);
+                let mx = sdf.data.iter().cloned().fold(f32::MIN, f32::max);
+                let inside = sdf.data.iter().filter(|v| **v > 0.0).count();
+                println!("res {res} glyph '{c}': max sdf {mx:.3}, inside frac {:.3}", inside as f32 / sdf.data.len() as f32);
+            }
+        }
+    }
+
+    #[test]
+    fn edt_matches_brute_force() {
+        let res = 24u32;
+        let n = (res * res) as usize;
+        let mut rng: u64 = 0x1234_5678;
+        let mask: Vec<bool> = (0..n)
+            .map(|_| {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                (rng >> 33) % 5 == 0
+            })
+            .collect();
+        for target in [true, false] {
+            let fast = edt_squared(&mask, res, target);
+            let r = res as i32;
+            for y in 0..r {
+                for x in 0..r {
+                    let mut best = f32::INFINITY;
+                    for yy in 0..r {
+                        for xx in 0..r {
+                            if mask[(yy * r + xx) as usize] == target {
+                                let d2 = ((x - xx) * (x - xx) + (y - yy) * (y - yy)) as f32;
+                                best = best.min(d2);
+                            }
+                        }
+                    }
+                    let got = fast[(y * r + x) as usize];
+                    assert!((got - best).abs() < 1e-3 || (got.is_infinite() && best.is_infinite()),
+                        "mismatch at ({x},{y}) target={target}: fast={got} brute={best}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dump_glyph_ascii() {
+        let atlas = FontAtlas::parse(FONT).unwrap();
+        let res = 40u32;
+        for target in ['2', '5'] {
+            let g = atlas.glyphs.iter().find(|g| g.codepoint == target as u32).unwrap();
+            let sdf = crop_glyph_sdf(&atlas, g, res);
+            println!("--- glyph '{target}' SDF sign map ({res}x{res}), # inside / . near-edge ---");
+            for y in (0..res).rev() {
+                let mut line = String::new();
+                for x in 0..res {
+                    let v = sdf.data[(y * res + x) as usize];
+                    line.push(if v > 0.0 { '#' } else if v > -0.15 { '.' } else { ' ' });
+                }
+                println!("|{line}|");
+            }
+        }
     }
 }
