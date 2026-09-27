@@ -25,7 +25,7 @@ struct FogParams {
     hasPointShadows : u32,
     extinctionCoeff : f32,
     anisotropy      : f32,
-    _pad0           : f32,
+    startDistance   : f32,
     _pad1           : f32,
     _pad2           : f32,
 }
@@ -133,7 +133,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
                                  params.invViewProj);
 
     let samplePos = worldPos + params.windOffset;
-    let density = params.baseDensity * exp(-params.heightFalloff * max(samplePos.y - params.fogHeight, 0.0));
+    // no fog closer than startDistance (UE's fog start distance), faded in over one slice
+    let sliceThickness = linearD * (pow(params.gridFar / params.gridNear, 1.0 / gridSize.z) - 1.0);
+    let start = saturate((linearD - params.startDistance) / max(sliceThickness, 1e-3) + 0.5);
+    let density = start * params.baseDensity * exp(-params.heightFalloff * max(samplePos.y - params.fogHeight, 0.0));
     let extinction = density * params.extinctionCoeff;
 
     let viewDir = normalize(worldPos - params.cameraPos);

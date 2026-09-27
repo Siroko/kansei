@@ -32,6 +32,8 @@ pub struct VolumetricFogOptions {
     pub extinction_coeff: f32,
     /// Henyey-Greenstein g: 0 isotropic, > 0 forward scattering.
     pub anisotropy: f32,
+    /// View distance before which there is no fog (UE's fog start distance).
+    pub start_distance: f32,
     /// Density field drift, in metres per second of `time`.
     pub wind_direction: Vec3,
     /// Radiance of a uniform sky around the fog (scatters as density * ambient). Zero matches the
@@ -48,6 +50,7 @@ impl Default for VolumetricFogOptions {
             fog_height: 0.0,
             extinction_coeff: 1.0,
             anisotropy: 0.6,
+            start_distance: 0.0,
             wind_direction: Vec3::ZERO,
             ambient: Vec3::ZERO,
         }
@@ -79,7 +82,8 @@ struct FogParamsGpu {
     has_point_shadows: u32,
     extinction_coeff: f32,
     anisotropy: f32,
-    _pad: [f32; 3],
+    start_distance: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -147,6 +151,7 @@ pub struct VolumetricFogEffect {
     pub fog_height: f32,
     pub extinction_coeff: f32,
     pub anisotropy: f32,
+    pub start_distance: f32,
     pub wind_direction: Vec3,
     pub ambient: Vec3,
     /// Seconds, drives the wind offset. The effect has no clock of its own; set it per frame.
@@ -169,6 +174,7 @@ impl VolumetricFogEffect {
             fog_height: options.fog_height,
             extinction_coeff: options.extinction_coeff,
             anisotropy: options.anisotropy,
+            start_distance: options.start_distance,
             wind_direction: options.wind_direction,
             ambient: options.ambient,
             time: 0.0,
@@ -571,7 +577,8 @@ impl PostProcessingEffect for VolumetricFogEffect {
             has_point_shadows: self.point_shadows.is_some() as u32,
             extinction_coeff: self.extinction_coeff,
             anisotropy: self.anisotropy,
-            _pad: [0.0; 3],
+            start_distance: self.start_distance,
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&gpu.fog_params, 0, bytemuck::bytes_of(&params));
         let composite = CompositeParamsGpu {
