@@ -10,6 +10,7 @@ pub mod lights;
 pub mod shadows;
 pub mod postprocessing;
 pub mod froxels;
+pub mod atmosphere;
 pub mod simulations;
 pub mod pathtracer;
 pub mod loaders;
