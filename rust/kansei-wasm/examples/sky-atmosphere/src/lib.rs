@@ -25,7 +25,9 @@ use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::froxels::FroxelGridOptions;
-use kansei_core::postprocessing::effects::{AtmosphereEffect, LocalFogVolume, VolumetricFogEffect, VolumetricFogOptions};
+use kansei_core::postprocessing::effects::{
+    AtmosphereEffect, HeightFogEffect, HeightFogLayer, LocalFogVolume, VolumetricFogEffect, VolumetricFogOptions,
+};
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
 
@@ -215,7 +217,16 @@ fn settings() -> (Settings, web_sys::UrlSearchParams) {
     let search = web_sys::window().unwrap().location().search().unwrap_or_default();
     let q = web_sys::UrlSearchParams::new_with_str(&search).unwrap();
     let num = |k: &str| q.get(k).and_then(|v| v.parse::<f32>().ok());
-    let s = Settings { elevation: num("elevation"), bearing: num("bearing").unwrap_or(140.0), look: num("look"), pitch: num("pitch").unwrap_or(6.0), height: num("height").unwrap_or(1.7), ev: num("ev") };
+    // preset=midsommar: the Unreal intro's light block (sun 2.5 degrees down, EV100 3.9)
+    let midsommar = q.get("preset").as_deref() == Some("midsommar");
+    let s = Settings {
+        elevation: num("elevation").or(midsommar.then_some(-2.5)),
+        bearing: num("bearing").unwrap_or(140.0),
+        look: num("look"),
+        pitch: num("pitch").unwrap_or(6.0),
+        height: num("height").unwrap_or(1.7),
+        ev: num("ev").or(midsommar.then_some(3.9)),
+    };
     (s, q)
 }
 
@@ -373,8 +384,37 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the chain: the sky and its aerial perspective, the fog in front of them, the display transform
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(AtmosphereEffect::new(&sky))];
+    let midsommar = q.get("preset").as_deref() == Some("midsommar");
+    if midsommar {
+        // intro_scene.json's light block, as create_intro_scene.py applies it in Unreal
+        sky.params.mie_scattering_scale = 0.003996 * 1.7; // haze
+        sky.params.other_absorption_scale = 0.8; // ozone, set absolute by the script
+        // 100 000 lux, light colour (255, 222, 196) in linear
+        sky.sun.illuminance = Vec3::new(100_000.0, 73_000.0, 55_200.0);
+        let layer = HeightFogLayer::from_unreal(0.03, 0.1, 0.0);
+        // far: Unreal's exponential height fog beyond its volumetric fog distance (120 m)
+        let mut height_fog = HeightFogEffect::new(layer);
+        height_fog.inscattering = Vec3::new(1.2, 1.45, 1.8);
+        height_fog.sky_ambient_scale = 1.0;
+        height_fog.start_distance = 120.0;
+        height_fog.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        effects.push(Box::new(height_fog));
+        // near: volumetric fog in the same layer, extinction scale 1.2, albedo (0.85, 0.88, 0.93)
+        let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+            grid: FroxelGridOptions { near: 0.5, far: 120.0, grid_d: 48, temporal: true, blend_factor: 0.1, ..Default::default() },
+            base_density: layer.density,
+            height_falloff: layer.height_falloff,
+            extinction_coeff: 1.2,
+            albedo: Vec3::new(0.85 * 1.2, 0.88 * 1.2, 0.93 * 1.2),
+            anisotropy: 0.3,
+            ..Default::default()
+        });
+        fog.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        fog.set_shadow_map(renderer.shadow_map());
+        effects.push(Box::new(fog));
+    }
     let fog_density = q.get("fog").and_then(|v| v.parse::<f32>().ok());
-    if fog_density.is_some() || q.get("mist").is_some() {
+    if !midsommar && (fog_density.is_some() || q.get("mist").is_some()) {
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
             grid: FroxelGridOptions { near: 1.0, far: 2500.0, temporal: true, blend_factor: 0.1, ..Default::default() },
             base_density: fog_density.unwrap_or(0.0),
