@@ -486,7 +486,8 @@ impl VolumetricFogEffect {
     /// same grid, lights and media but only the fog above the plane, and the reflection
     /// composites it over what it saw. A lake then mirrors the glow of beams and lamps in the mist
     /// (the main fog already covers the camera's path to the water). It costs about one more
-    /// injection. Call again if the plane moves.
+    /// injection, and nothing while the reflection is disabled (`PlanarReflection::enabled`) or
+    /// the camera is under its plane. Call again if the plane moves.
     ///
     /// ```ignore
     /// let fog_in_reflection = fog.reflection_fog(&renderer, &reflection);
@@ -516,6 +517,7 @@ impl VolumetricFogEffect {
             let params_size = std::mem::size_of::<ReflectionFogParamsGpu>();
             let grid = FroxelGrid::new(device, queue, &self.grid_options);
             let shared = ReflectionFog {
+                drawn: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 volume: grid.accum_view().clone(),
                 params: buffer("VolumetricFog/ReflectionFogParams", params_size, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             };
@@ -984,7 +986,8 @@ impl PostProcessingEffect for VolumetricFogEffect {
 
         // the same from the camera mirrored in the reflection's plane, above the plane only
         if let (Some(r), Some((n, d))) = (gpu.reflection.as_mut(), self.reflection_plane) {
-            let above = n.dot(glam::Vec3::new(cam.x, cam.y, cam.z)) + d > 0.0;
+            // skipped whenever the reflection is not drawn (disabled, or the camera under its plane)
+            let above = n.dot(glam::Vec3::new(cam.x, cam.y, cam.z)) + d > 0.0 && r.shared.drawn.load(std::sync::atomic::Ordering::Relaxed);
             let view = mirrored_view(camera.view_matrix.to_glam(), n, d);
             let m_vp = flip_x() * camera.projection_matrix.to_glam() * view;
             let m_inv = m_vp.inverse();
@@ -1226,6 +1229,45 @@ mod tests {
         let near = at(&mirrored, 8, 15, 10);
         assert!(near[3] > 0.99 && near[1] < 1e-3, "mirrored view before the water: {near:?}");
         eprintln!("main {m:?}, mirrored below {below:?}, rising {rising:?}, before the water {near:?}");
+    }
+
+    /// While the reflection is not drawn (disabled, or the camera under its plane) the fog builds
+    /// no volume for it.
+    #[test]
+    fn a_reflection_not_drawn_gets_no_fog_volume() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (64u32, 32u32);
+        let tex = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
+                .create_view(&Default::default())
+        };
+        let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+        let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
+        let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+            grid: FroxelGridOptions { grid_w: 16, grid_h: 16, grid_d: 32, near: 0.5, far: 200.0, temporal: false, blend_factor: 1.0 },
+            base_density: 0.02,
+            height_falloff: 0.0,
+            fog_height: 100.0,
+            ambient: Vec3::new(1.0, 1.0, 1.0),
+            ..Default::default()
+        });
+        let seen = fog.mirrored_fog(&device, &queue, (glam::Vec3::Y, 0.0));
+        seen.drawn.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut camera = Camera::new(60.0, 0.5, 1000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 5.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 5.0, -10.0));
+        camera.update_view_matrix();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        fog.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+        queue.submit(std::iter::once(encoder.finish()));
+        // never written: the zero-initialised texture
+        let mirrored = read_volume(&device, &queue, fog.reflection_froxel_grid().unwrap());
+        assert!(mirrored.iter().all(|v| *v == [0.0; 4]), "a volume was built for a reflection that was not drawn");
     }
 }
 
