@@ -175,3 +175,115 @@ fn aerial_perspective_matches_the_optical_depth_along_its_rays() {
     assert!(far.z > far.x, "{far}");
     eprintln!("aerial perspective at {distance} km: scattering {far}, transmittance {last} (cpu {expected})");
 }
+
+fn read_floats(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<f32> {
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: buffer.size(),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
+    queue.submit(std::iter::once(encoder.finish()));
+    staging.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+    device.poll(wgpu::Maintain::Wait);
+    let floats = bytemuck::cast_slice::<u8, f32>(&staging.slice(..).get_mapped_range()).to_vec();
+    floats
+}
+
+/// Irradiance from order-2 SH (Ramamoorthi and Hanrahan), as `skyIrradiance` in WGSL.
+fn sh_irradiance(sh: &[f32], n: glam::Vec3) -> glam::Vec3 {
+    let c = |i: usize| glam::Vec3::new(sh[i * 4], sh[i * 4 + 1], sh[i * 4 + 2]);
+    let (x, y, z) = (n.x, n.y, n.z);
+    c(0) * 0.282095 * std::f32::consts::PI
+        + (c(1) * y + c(2) * z + c(3) * x) * 0.488603 * (2.0 * std::f32::consts::PI / 3.0)
+        + (c(4) * (1.092548 * x * y) + c(5) * (1.092548 * y * z) + c(6) * (0.315392 * (3.0 * z * z - 1.0))
+            + c(7) * (1.092548 * x * z) + c(8) * (0.546274 * (x * x - y * y)))
+            * (std::f32::consts::PI / 4.0)
+}
+
+#[test]
+fn sky_lighting_sh_matches_the_sky_it_projects() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let options = SkyAtmosphereOptions::default();
+    let mut sky = SkyAtmosphere::new(&device, options);
+    sky.sun.illuminance = Vec3::new(1.0, 1.0, 1.0);
+
+    for elevation in [35.0f32, 3.0, -2.5] {
+        // no ground bounce: the SH is the sky alone
+        sky.sky_light_ground_albedo = Some(Vec3::ZERO);
+        let lut = sky_view(&device, &queue, &mut sky, elevation);
+        let sh = read_floats(&device, &queue, &sky.bindings().sky_lighting);
+
+        // integrate cos-weighted radiance over the upper hemisphere straight from the LUT texels
+        let bottom = sky.params.bottom_radius_km;
+        let r = bottom + 0.005;
+        let theta_h = (-((r - bottom) * (r + bottom)).sqrt() / r).acos();
+        let zenith = |v: f32| {
+            if v < 0.5 {
+                let c = 1.0 - 2.0 * v;
+                theta_h * (1.0 - c * c)
+            } else {
+                let c = 2.0 * v - 1.0;
+                theta_h + (std::f32::consts::PI - theta_h) * c * c
+            }
+        };
+        let (w, h) = options.sky_view_size;
+        // and over the lower hemisphere onto a downward-facing surface (the air below the horizon),
+        // and project the texels onto SH as the GPU pass should
+        let (mut e_up, mut e_air_down) = (glam::Vec3::ZERO, glam::Vec3::ZERO);
+        let mut sh_cpu = [glam::Vec3::ZERO; 9];
+        for j in 0..h {
+            let (t0, t1) = (zenith(j as f32 / h as f32), zenith((j + 1) as f32 / h as f32));
+            let t = zenith((j as f32 + 0.5) / h as f32);
+            for i in 0..w {
+                let d_omega = t.sin() * (t1 - t0) * (std::f32::consts::TAU / w as f32);
+                let e = lut.at(i, j) * t.cos() * d_omega;
+                if t < std::f32::consts::FRAC_PI_2 {
+                    e_up += e;
+                } else {
+                    e_air_down -= e;
+                }
+                let phi = (i as f32 + 0.5) / w as f32 * std::f32::consts::TAU;
+                let d = glam::Vec3::new(t.sin() * phi.cos(), t.cos(), t.sin() * phi.sin());
+                let basis = [
+                    0.282095,
+                    0.488603 * d.y, 0.488603 * d.z, 0.488603 * d.x,
+                    1.092548 * d.x * d.y, 1.092548 * d.y * d.z, 0.315392 * (3.0 * d.z * d.z - 1.0),
+                    1.092548 * d.x * d.z, 0.546274 * (d.x * d.x - d.y * d.y),
+                ];
+                for k in 0..9 {
+                    sh_cpu[k] += lut.at(i, j) * basis[k] * d_omega;
+                }
+            }
+        }
+        let scale = sh_cpu[0].max_element();
+        for k in 0..9 {
+            let gpu = glam::Vec3::new(sh[k * 4], sh[k * 4 + 1], sh[k * 4 + 2]);
+            assert!((gpu - sh_cpu[k]).abs().max_element() < 0.03 * scale, "sun {elevation}: SH[{k}] GPU {gpu} vs CPU {}", sh_cpu[k]);
+        }
+        // order-2 SH fits the clamped cosine to about 10% for a sky peaked at the horizon
+        let from_sh = sh_irradiance(&sh, glam::Vec3::Y);
+        assert!(((from_sh - e_up) / e_up).abs().max_element() < 0.12, "sun {elevation}: SH {from_sh} vs LUT {e_up}");
+        assert!(sh_irradiance(&sh, -glam::Vec3::Y).max_element() < 0.2 * e_up.max_element(), "sun {elevation}: lower hemisphere without ground");
+
+        // the sun at the camera agrees with the CPU helper
+        let sun = glam::Vec3::new(sh[36], sh[37], sh[38]);
+        let cpu = sky.sun_illuminance_at(Vec3::new(0.0, 5.0, 0.0)).to_glam();
+        assert!((sun - cpu).abs().max_element() <= 0.01 * cpu.max_element().max(1e-4), "sun {elevation}: GPU {sun} vs CPU {cpu}");
+
+        // with a ground, the downward-facing irradiance is the ground's bounce: albedo x (sky + sun)
+        sky.sky_light_ground_albedo = Some(Vec3::new(0.3, 0.3, 0.3));
+        let _ = sky_view(&device, &queue, &mut sky, elevation);
+        let sh = read_floats(&device, &queue, &sky.bindings().sky_lighting);
+        let ground_e = e_up + cpu * sky.sun.direction.to_glam().y.max(0.0);
+        let down = sh_irradiance(&sh, -glam::Vec3::Y);
+        let expected = 0.3 * ground_e + e_air_down;
+        assert!(((down - expected) / expected).abs().max_element() < 0.2, "sun {elevation}: down {down} vs {expected}");
+        eprintln!("sun {elevation}: E_up SH {from_sh} LUT {e_up}; sun {sun}; E_down {down}");
+    }
+}
