@@ -74,7 +74,13 @@ impl CameraLens {
 
 pub struct CinematicDepthOfFieldOptions {
     pub lens: CameraLens,
-    /// Largest CoC radius, full-resolution pixels (bigger blur is clamped to it).
+    /// Largest CoC radius as a fraction of the image width (bigger blur is clamped to it), so
+    /// the picture looks the same at any resolution. 0.025 is Unreal's default
+    /// (`r.DOF.Kernel.MaxBackgroundRadius` and `MaxForegroundRadius`).
+    pub max_coc_fraction: f32,
+    /// Largest CoC radius, full-resolution pixels, whatever the width: a ceiling for cost and
+    /// sampling density (the gather samples discs up to 96 px at full density). The tighter of
+    /// this and `max_coc_fraction` applies.
     pub max_coc_px: f32,
     /// Gather samples per half-resolution pixel. Discs wider than 12 half-resolution pixels read
     /// a coarser level of the half-resolution image, so this count holds their density too.
@@ -86,7 +92,7 @@ pub struct CinematicDepthOfFieldOptions {
 
 impl Default for CinematicDepthOfFieldOptions {
     fn default() -> Self {
-        Self { lens: CameraLens::default(), max_coc_px: 48.0, sample_count: 72, temporal_noise: false }
+        Self { lens: CameraLens::default(), max_coc_fraction: 0.025, max_coc_px: 96.0, sample_count: 72, temporal_noise: false }
     }
 }
 
@@ -154,6 +160,7 @@ struct Gpu {
 /// after the fog and the TAA resolve, before bloom and the tonemapper.
 pub struct CinematicDepthOfFieldEffect {
     pub lens: CameraLens,
+    pub max_coc_fraction: f32,
     pub max_coc_px: f32,
     pub sample_count: u32,
     pub temporal_noise: bool,
@@ -169,6 +176,7 @@ impl CinematicDepthOfFieldEffect {
     pub fn new(options: CinematicDepthOfFieldOptions) -> Self {
         Self {
             lens: options.lens,
+            max_coc_fraction: options.max_coc_fraction,
             max_coc_px: options.max_coc_px,
             sample_count: options.sample_count,
             temporal_noise: options.temporal_noise,
@@ -177,10 +185,16 @@ impl CinematicDepthOfFieldEffect {
         }
     }
 
+    /// Largest CoC radius in pixels for an image `width_px` wide.
+    pub fn max_coc_radius_px(&self, width_px: u32) -> f32 {
+        (self.max_coc_fraction * width_px as f32).min(self.max_coc_px).max(0.0)
+    }
+
     /// Signed CoC radius in pixels of a point at `view_depth_m` for this camera and image width.
     pub fn coc_radius_px(&self, camera: &Camera, width_px: u32, view_depth_m: f32) -> f32 {
         let r = self.lens.coc_radius_px(self.lens.focal_length(camera), width_px, view_depth_m);
-        r.clamp(-self.max_coc_px, self.max_coc_px)
+        let max = self.max_coc_radius_px(width_px);
+        r.clamp(-max, max)
     }
 
     #[cfg(test)]
@@ -344,7 +358,7 @@ impl PostProcessingEffect for CinematicDepthOfFieldEffect {
         let params = DofParamsGpu {
             coc_scale: self.lens.coc_scale(focal, width),
             focus_distance: self.lens.focus_distance_m.max(1e-3),
-            max_coc: self.max_coc_px.max(0.0),
+            max_coc: self.max_coc_radius_px(width),
             camera_near: camera.near,
             camera_far: camera.far,
             width,
@@ -447,6 +461,27 @@ mod tests {
         assert!((f8.coc_scale(85.0, 3600) * 4.0 - lens.coc_scale(85.0, 3600)).abs() < 1e-3);
         let wide = CameraLens { focal_length_mm: Some(26.0), f_stop: 8.0, focus_distance_m: 20.0, sensor_width_mm: 23.76, ..Default::default() };
         assert!(wide.coc_scale(26.0, 1920) < 0.5);
+    }
+
+    #[test]
+    fn the_blur_cap_is_the_same_fraction_of_any_picture() {
+        // 45 mm wide open, focused at 0.4 m: distant bokeh bigger than the cap
+        let lens = CameraLens { focal_length_mm: Some(45.0), f_stop: 2.8, focus_distance_m: 0.4, ..Default::default() };
+        let camera = Camera::new(20.0, 0.1, 1000.0, 2.39);
+        let fx = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions { lens, ..Default::default() });
+        for width in [1280u32, 1920, 2560, 3024] {
+            let r = fx.coc_radius_px(&camera, width, 100.0);
+            assert!((r / width as f32 - 0.025).abs() < 1e-6, "{width} px: {r}");
+        }
+        // up to the pixel ceiling
+        assert_eq!(fx.max_coc_radius_px(7680), 96.0);
+        // below the cap, the lens' own blur, in proportion to the width
+        let f8 = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+            lens: CameraLens { f_stop: 8.0, focus_distance_m: 5.0, ..lens },
+            ..Default::default()
+        });
+        let (a, b) = (f8.coc_radius_px(&camera, 1280, 100.0), f8.coc_radius_px(&camera, 2560, 100.0));
+        assert!(a > 1.0 && a < 0.025 * 1280.0 && (b - 2.0 * a).abs() < 1e-4, "{a} {b}");
     }
 
     #[test]
