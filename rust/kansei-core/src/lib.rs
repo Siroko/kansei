@@ -11,6 +11,7 @@ pub mod shadows;
 pub mod postprocessing;
 pub mod froxels;
 pub mod atmosphere;
+pub mod culling;
 pub mod simulations;
 pub mod pathtracer;
 pub mod loaders;
