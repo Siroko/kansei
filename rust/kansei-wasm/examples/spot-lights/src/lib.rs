@@ -3,7 +3,9 @@
 //! the volumetric fog (spot shadow atlas + cone injection); surfaces use a GGX material that
 //! includes `lights::SPOT_LIGHTS_WGSL`. Exposure is the intro's EV100 3.9, through ToneMapEffect.
 //!
-//! URL parameters: `cam=front|behind|top`, `drive=1`, `t=<seconds>` (freeze), `shadows=0`, `fog=0`.
+//! URL parameters: `cam=front|behind|top|wall`, `cull=main` (CPU-cull the trunks to the camera
+//! only, the bug GPU per-view culling avoids), `drive=1`, `t=<seconds>` (freeze), `shadows=0`,
+//! `fog=0`, `stats=1` (log the CPU time of the render call), `casters=<n>` (n more renderables).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -12,6 +14,7 @@ use std::rc::Rc;
 
 use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer};
 use kansei_core::cameras::Camera;
+use kansei_core::culling::{frustum_planes, InstanceCulling};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
@@ -143,6 +146,10 @@ struct State {
     frozen_t: Option<f32>,
     cam: String,
     drive: bool,
+    /// `cull=main`: (trunks, their buffer, scene index) to cull on the CPU against the camera.
+    cpu_cull: Option<(Vec<f32>, wgpu::Buffer, usize)>,
+    /// `stats=1`: CPU milliseconds spent in render_with_postprocessing, summed over a window.
+    stats: Option<(f64, u32)>,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -216,20 +223,53 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the forest: one instanced draw of unit trunks, everywhere but a small clearing around the
     // car, which stands at the forest edge with its lights into the trees
+    let cam = query_param("cam").unwrap_or_default();
+    // `cam=wall`: a corridor to a pale wall 20 m ahead, and a row of poles right by the lamps
+    // that the camera (between them and the wall) doesn't see; their shadows on the wall show
+    // that shadow casters are culled per light, not to the camera
+    let wall_test = cam == "wall";
     let mut trunks: Vec<f32> = Vec::new();
     for i in 0..1400u32 {
         let x = -45.0 + hash(i) * 90.0;
         let z = -90.0 + hash(i + 13) * 110.0;
-        if (x - 1.75).abs() < 3.5 && z > -9.0 {
+        if (x - 1.75).abs() < 3.5 && z > -9.0 || wall_test && (x - 1.75).abs() < 9.0 && z > -21.0 {
             continue;
         }
         let h = 9.0 + hash(i + 29) * 8.0;
         trunks.extend_from_slice(&[x, h * 0.5, z, h]);
     }
+    if wall_test {
+        for k in 0..6 {
+            trunks.extend_from_slice(&[-1.0 + k as f32 * 1.1, 1.5, -5.0, 3.0]);
+        }
+        let mut wall = Renderable::new(BoxGeometry::new(16.0, 6.0, 0.3), lit_material("Wall", [0.6, 0.6, 0.6], 0.9, false));
+        wall.object.set_position(1.75, 3.0, -20.0);
+        scene.add(SceneNode::Renderable(wall));
+    }
     let count = trunks.len() as u32 / 4;
-    let instances = ComputeBuffer::from_slice("Trunks", BufferType::Storage, BufferUsage::VERTEX, &trunks).with_vertex_vec4(3);
-    let forest = InstancedGeometry::new(BoxGeometry::new(0.35, 1.0, 0.35), count, vec![instances]);
-    scene.add(SceneNode::Renderable(Renderable::new(forest, lit_material("Trunks", [0.22, 0.18, 0.15], 0.8, true))));
+    // all trunks, in a buffer the GPU culls per view: the camera, and each shadowed spot light's
+    // own frustum, so trunks outside the picture still shadow the beams in it
+    let all_trunks = {
+        use wgpu::util::DeviceExt;
+        renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Trunks"),
+            contents: bytemuck::cast_slice(&trunks),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        })
+    };
+    // `cull=main` instead culls on the CPU against the camera only (as an app would): the bug
+    // this avoids, where trunks leaving the frame stop casting shadows
+    let cull_main = query_param("cull").as_deref() == Some("main");
+    let instances = ComputeBuffer::from_external("Trunks", all_trunks.clone(), BufferType::Storage).with_vertex_vec4(3);
+    let mut forest = Renderable::new(
+        InstancedGeometry::new(BoxGeometry::new(0.35, 1.0, 0.35), count, vec![instances]),
+        lit_material("Trunks", [0.22, 0.18, 0.15], 0.8, true),
+    );
+    if !cull_main {
+        // sphere at the trunk's middle (position.y = h/2) with radius h/2 + a margin: scale by h
+        forest.instance_culling = Some(InstanceCulling::new(all_trunks.clone(), count, 16, 0, 0.55).with_radius_scale(12));
+    }
+    let forest = scene.add(SceneNode::Renderable(forest));
 
     // the car: a dark body, two lens emitters (4000 cd/m², the intro's headlight_lens) and two
     // 22 000 cd dipped beams, 10° inner / 30° outer, 70 m; both shadowed
@@ -246,6 +286,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         lights[k] = scene.add(SceneNode::Light(Light::Spot(beam)));
     }
     let car = Car { body, lenses, lights };
+
+    // `casters=N`: N more renderables (one draw each), to measure per-draw CPU cost
+    let extra: u32 = query_param("casters").and_then(|v| v.parse().ok()).unwrap_or(0);
+    for i in 0..extra {
+        let mut post = Renderable::new(BoxGeometry::new(0.2, 2.0, 0.2), lit_material("Post", [0.3, 0.3, 0.3], 0.8, false));
+        post.object.set_position(-3.0 + (i % 10) as f32 * 0.9, 1.0, -12.0 - (i / 10) as f32 * 1.5);
+        scene.add(SceneNode::Renderable(post));
+    }
 
     let tonemap = {
         let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
@@ -268,7 +316,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
         effects.push(Box::new(fog));
     }
-    effects.push(Box::new(BloomEffect::new(BloomOptions { threshold: 0.0, intensity: 0.05, exposure: tonemap.total_exposure(), ..Default::default() })));
+    effects.push(Box::new(BloomEffect::new(BloomOptions { threshold: 0.0, intensity: 0.05, ..Default::default() }).with_exposure(tonemap.total_exposure())));
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
 
@@ -278,15 +326,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     log::info!("Kansei — Spot Lights (WASM) ready: {count} instanced trunks, shadows {shadows}");
 
     let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let cam = query_param("cam").unwrap_or_default();
     let drive = query_param("drive").as_deref() == Some("1");
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, car, start_ms: now_secs(), frozen_t, cam, drive }));
+    let cpu_cull = cull_main.then(|| (trunks.clone(), all_trunks.clone(), forest));
+    let stats = (query_param("stats").as_deref() == Some("1")).then_some((0.0, 0));
+    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, car, start_ms: now_secs(), frozen_t, cam, drive, cpu_cull, stats }));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
         {
             let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref car, ref start_ms, frozen_t, ref cam, ref drive } = *st;
+            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref car, ref start_ms, frozen_t, ref cam, ref drive, ref cpu_cull, ref mut stats } = *st;
             let clock = (now_secs() - *start_ms) as f32;
             let t = frozen_t.unwrap_or(clock);
 
@@ -302,6 +351,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                     camera.set_position(1.75, 5.0, z + 10.0);
                     camera.look_at(&Vec3::new(1.75, 1.0, z - 20.0));
                 }
+                // facing the wall, with the poles behind the camera
+                "wall" => {
+                    camera.set_position(1.75, 2.2, z - 9.0);
+                    camera.look_at(&Vec3::new(1.75, 2.0, z - 20.0));
+                }
                 // above the canopy, looking down on the beams through the trees
                 "top" => {
                     camera.set_position(-10.0, 24.0, z + 6.0);
@@ -315,7 +369,32 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 }
             }
 
+            if let Some((all, buffer, forest)) = cpu_cull {
+                camera.update_view_matrix();
+                let planes = frustum_planes(camera.projection_matrix.to_glam() * camera.view_matrix.to_glam());
+                let visible: Vec<f32> = all
+                    .chunks_exact(4)
+                    .filter(|t| planes.iter().all(|p| p.x * t[0] + p.y * t[1] + p.z * t[2] + p.w >= -t[3] * 0.55))
+                    .flatten()
+                    .copied()
+                    .collect();
+                renderer.queue().write_buffer(buffer, 0, bytemuck::cast_slice(&visible));
+                if let Some(r) = scene.get_renderable_mut(*forest) {
+                    r.geometry.instance_count = visible.len() as u32 / 4;
+                }
+                renderer.invalidate_bundle();
+            }
+            let before = now_secs();
             renderer.render_with_postprocessing(scene, camera, volume);
+            if let Some((sum, frames)) = stats {
+                *sum += (now_secs() - before) * 1000.0;
+                *frames += 1;
+                if *frames == 240 {
+                    log::info!("render_with_postprocessing: {:.2} ms CPU per frame", *sum / 240.0);
+                    *sum = 0.0;
+                    *frames = 0;
+                }
+            }
         }
         request_animation_frame(f.borrow().as_ref().unwrap());
     }));

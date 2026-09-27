@@ -14,6 +14,9 @@ pub struct Renderable {
     pub render_order: i32,
     pub visible: bool,
     pub material_dirty: bool,
+    /// Cull the instances on the GPU per view (camera, each shadow map) instead of drawing the
+    /// geometry's instance buffer as is; see `InstanceCulling`.
+    pub instance_culling: Option<crate::culling::InstanceCulling>,
 }
 
 impl Renderable {
@@ -27,6 +30,7 @@ impl Renderable {
             render_order: 0,
             visible: true,
             material_dirty: true,
+            instance_culling: None,
         }
     }
 
