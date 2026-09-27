@@ -4,7 +4,7 @@
 //! foreground spills over what is behind it. Skipped (passes) when no adapter is available.
 
 use kansei_core::cameras::Camera;
-use kansei_core::postprocessing::effects::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions};
+use kansei_core::postprocessing::effects::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, HighlightOptions};
 use kansei_core::postprocessing::{GBuffer, PostProcessingEffect};
 
 const W: u32 = 384;
@@ -304,8 +304,9 @@ fn large_bokeh_keep_their_energy() {
     eprintln!("CoC {coc:.2} px: energy {total:.0} of 10000");
 }
 
-/// Cost of the effect at 1920x1080 with the largest blur everywhere (the worst case): wall time
-/// of submit-and-wait minus an empty submit. Run by hand:
+/// Cost of the effect at 1920x1080: the worst case (the largest blur on every pixel) and a
+/// typical frame (in focus but for a blurred band), with and without scattered highlights. Wall
+/// time of ten frames per submit-and-wait, minus an empty submit, per frame. Run by hand:
 /// `cargo test -p kansei-core --release --test dof_gpu -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -325,36 +326,39 @@ fn dof_frame_cost_at_1080p() {
         })
     };
     let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
-    let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
     let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
-    let (input_view, depth_view, output_view) = (input.create_view(&Default::default()), depth.create_view(&Default::default()), output.create_view(&Default::default()));
-    // depth 1.0 everywhere: the sky, with the largest CoC
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: None,
-        color_attachments: &[],
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: &depth_view,
-            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-            stencil_ops: None,
-        }),
-        timestamp_writes: None,
-        occlusion_query_set: None,
-    });
-    queue.submit(std::iter::once(encoder.finish()));
+    let (input_view, output_view) = (input.create_view(&Default::default()), output.create_view(&Default::default()));
+    let depth_at = |value: f32| {
+        let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(value), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        queue.submit(std::iter::once(encoder.finish()));
+        view
+    };
+    // depth 1.0: the sky, the largest CoC; the focus plane at 2 m: in focus
+    let sky = depth_at(1.0);
+    let focus_ndc = FAR * (2.0 - NEAR) / (2.0 * (FAR - NEAR));
+    let in_focus = depth_at(focus_ndc);
     let gbuffer = GBuffer::new(&device, w, h, 1);
     let camera = Camera::new(40.0, NEAR, FAR, w as f32 / h as f32);
-    let mut fx = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
-        lens: CameraLens { focal_length_mm: Some(85.0), f_stop: 1.4, focus_distance_m: 2.0, sensor_width_mm: 23.76, ..Default::default() },
-        ..Default::default()
-    });
     let time = |f: &mut dyn FnMut()| {
         let mut samples = Vec::new();
-        for i in 0..120 {
+        for i in 0..60 {
             let t0 = std::time::Instant::now();
             f();
             device.poll(wgpu::Maintain::Wait);
-            if i >= 20 {
+            if i >= 10 {
                 samples.push(t0.elapsed().as_secs_f64() * 1e3);
             }
         }
@@ -364,12 +368,188 @@ fn dof_frame_cost_at_1080p() {
     let empty = time(&mut || {
         queue.submit(std::iter::once(device.create_command_encoder(&Default::default()).finish()));
     });
-    let dof = time(&mut || {
-        let mut encoder = device.create_command_encoder(&Default::default());
-        fx.render(&device, &queue, &mut encoder, &gbuffer, &input_view, &depth_view, &output_view, &camera, w, h);
-        queue.submit(std::iter::once(encoder.finish()));
+    const FRAMES: u32 = 10;
+    for (label, depth, scatter, samples) in [
+        ("worst case, 48 px everywhere", &sky, true, 72),
+        ("worst case, no scatter", &sky, false, 72),
+        ("worst case, 48 samples", &sky, true, 48),
+        ("all in focus", &in_focus, true, 72),
+    ] {
+        let mut fx = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+            lens: CameraLens { focal_length_mm: Some(85.0), f_stop: 1.4, focus_distance_m: 2.0, sensor_width_mm: 23.76, ..Default::default() },
+            sample_count: samples,
+            highlights: HighlightOptions { enabled: scatter, ..Default::default() },
+            ..Default::default()
+        });
+        let t = time(&mut || {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            for _ in 0..FRAMES {
+                fx.render(&device, &queue, &mut encoder, &gbuffer, &input_view, depth, &output_view, &camera, w, h);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+        });
+        eprintln!("CinematicDepthOfFieldEffect at {w}x{h}, {label}: {:.3} ms per frame", (t - empty) / FRAMES as f64);
+    }
+}
+
+#[test]
+fn the_gather_alone_keeps_a_point_light_energy_too() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let mut fx = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+        sample_count: 96,
+        highlights: HighlightOptions { enabled: false, ..Default::default() },
+        ..options()
     });
-    eprintln!("CinematicDepthOfFieldEffect at {w}x{h}, CoC {:.0} px everywhere: {:.3} ms (empty submit {:.3} ms)", fx.coc_radius_px(&camera, w, FAR), dof - empty, empty);
+    let (cx, cy) = (W / 2, H / 2);
+    let mut color = vec![[0.0f32; 3]; (W * H) as usize];
+    color[(cy * W + cx) as usize] = [1000.0, 1000.0, 1000.0];
+    let out = h.run(&mut fx, &color, &vec![100.0; (W * H) as usize]);
+    let total: f32 = out.iter().map(|c| c[0]).sum();
+    assert!((total - 1000.0).abs() < 150.0, "energy {total}");
+}
+
+#[test]
+fn a_scattered_highlight_does_not_shine_over_a_sharper_object_in_front() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let edge = W / 2;
+    let y = H / 2;
+    // left: a dark object on the focus plane; right: a black far background with one bright light
+    // 4 px past the edge
+    let mut color = vec![[0.0f32; 3]; (W * H) as usize];
+    color[(y * W + edge + 4) as usize] = [1000.0, 1000.0, 1000.0];
+    let depth: Vec<f32> = (0..W * H).map(|i| if i % W < edge { 5.0 } else { 100.0 }).collect();
+    let out = h.run(&mut effect(), &color, &depth);
+    for x in edge - 8..edge {
+        let c = at(&out, x, y)[0];
+        assert!(c < 0.05, "sharp side x={x}: {c}");
+    }
+    let disc = at(&out, edge + 8, y)[0];
+    assert!(disc > 0.5, "the bokeh behind it {disc}");
+}
+
+/// Largest change between neighbouring pixels of a row, over [x0, x1).
+fn max_step(img: &[[f32; 3]], y: u32, x0: u32, x1: u32, channel: usize) -> f32 {
+    (x0..x1 - 1).map(|x| (at(img, x + 1, y)[channel] - at(img, x, y)[channel]).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn a_blurred_foreground_fades_smoothly_across_its_silhouette() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let mut fx = effect();
+    let edge = W / 2;
+    // an opaque green object 2.5 m away (CoC ~11 px) over an in-focus white wall
+    let color: Vec<[f32; 3]> = (0..W * H).map(|i| if i % W < edge { [0.0, 1.0, 0.0] } else { [1.0, 1.0, 1.0] }).collect();
+    let depth: Vec<f32> = (0..W * H).map(|i| if i % W < edge { 2.5 } else { 5.0 }).collect();
+    let camera = Camera::new(40.0, NEAR, FAR, W as f32 / H as f32);
+    let coc = -fx.coc_radius_px(&camera, W, 2.5);
+    let out = h.run(&mut fx, &color, &depth);
+    let y = H / 2;
+    let (x0, x1) = (edge - 2 * coc as u32, edge + 2 * coc as u32);
+    // the red channel ramps from the object (0) to the wall (1) with no step at the silhouette
+    let step = max_step(&out, y, x0, x1, 0);
+    assert!(step < 0.12, "largest step {step} across a {coc:.1} px blur");
+    assert!(at(&out, x0, y)[0] < 0.05 && at(&out, x1, y)[0] > 0.95);
+    eprintln!("opaque near edge: largest step {step:.3}");
+}
+
+#[test]
+fn a_porous_foreground_shows_the_background_through_it_without_a_seam() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let mut fx = effect();
+    let edge = W / 2;
+    // left half: a green screen 2.5 m away with every other column open (like leaves or a fence),
+    // over an in-focus white wall seen through it; right half: the wall alone
+    let screen = |i: u32| i % W < edge && (i % W).is_multiple_of(2);
+    let color: Vec<[f32; 3]> = (0..W * H).map(|i| if screen(i) { [0.0, 1.0, 0.0] } else { [1.0, 1.0, 1.0] }).collect();
+    let depth: Vec<f32> = (0..W * H).map(|i| if screen(i) { 2.5 } else { 5.0 }).collect();
+    let out = h.run(&mut fx, &color, &depth);
+    let y = H / 2;
+    // well inside, half the aperture sees the wall through the gaps
+    let inside = at(&out, edge / 2, y)[0];
+    assert!((inside - 0.5).abs() < 0.12, "through the screen {inside}");
+    // across the screen's edge, a smooth fade: no seam where the gaps end
+    let step = max_step(&out, y, edge - 30, edge + 30, 0);
+    assert!(step < 0.08, "largest step {step} across the screen's edge");
+    assert!(at(&out, edge + 30, y)[0] > 0.95, "past the blur {:?}", at(&out, edge + 30, y));
+    eprintln!("porous near screen: {inside:.3} through it, largest step across its edge {step:.3}");
+}
+
+#[test]
+fn a_thin_foreground_line_keeps_its_occlusion_when_spread() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let x_line = W / 2;
+    // a 1 px black line (a wire, a twig) 2.5 m away over an in-focus white wall
+    let color: Vec<[f32; 3]> = (0..W * H).map(|i| if i % W == x_line { [0.0, 0.0, 0.0] } else { [1.0, 1.0, 1.0] }).collect();
+    let depth: Vec<f32> = (0..W * H).map(|i| if i % W == x_line { 2.5 } else { 5.0 }).collect();
+    let out = h.run(&mut effect(), &color, &depth);
+    let y = H / 2;
+    let occlusion: f32 = (0..W).map(|x| 1.0 - at(&out, x, y)[0]).sum();
+    let deepest = (0..W).map(|x| 1.0 - at(&out, x, y)[0]).fold(0.0, f32::max);
+    assert!((occlusion - 1.0).abs() < 0.25 && deepest < 0.2, "occlusion {occlusion} px, deepest {deepest}");
+    eprintln!("thin near line: occlusion {occlusion:.3} px, deepest {deepest:.3}");
+}
+
+#[test]
+fn the_background_hidden_behind_a_blurred_foreground_continues_the_visible_one() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let edge = W / 2;
+    // left: a green object 2.5 m away (CoC ~11 px); right: the in-focus background, a dark band
+    // 6 px wide along the object's silhouette, then white. Behind the object's blurred edge the
+    // hidden background must continue the dark band: if it is filled from the white beyond, the
+    // silhouette shows through the blur as a hard line.
+    let color: Vec<[f32; 3]> = (0..W * H)
+        .map(|i| {
+            let x = i % W;
+            if x < edge { [0.0, 1.0, 0.0] } else if x < edge + 6 { [0.1, 0.1, 0.1] } else { [1.0, 1.0, 1.0] }
+        })
+        .collect();
+    let depth: Vec<f32> = (0..W * H).map(|i| if i % W < edge { 2.5 } else { 5.0 }).collect();
+    let out = h.run(&mut effect(), &color, &depth);
+    let y = H / 2;
+    // red: 0 in the object, 0.1 in the band, 1 beyond; across the silhouette it must not jump
+    let step = (edge - 3..edge + 3).map(|x| (at(&out, x + 1, y)[0] - at(&out, x, y)[0]).abs()).fold(0.0, f32::max);
+    assert!(step < 0.08, "largest step at the silhouette {step}: {:?}", (edge - 3..edge + 4).map(|x| at(&out, x, y)[0]).collect::<Vec<_>>());
+    eprintln!("hidden background: largest step at the silhouette {step:.3}");
+}
+
+#[test]
+fn a_blurred_distance_does_not_flood_the_background_hidden_behind_a_near_object() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    let edge = W / 2;
+    // left: a green object 2.5 m away (CoC ~11 px); right: an in-focus dark pillar 6 px wide
+    // along its silhouette, then a white distance 100 m away (CoC ~10 px). The pillar hides the
+    // distance, so its blur must not reach the pillar, visible or hidden behind the object: if it
+    // floods the hidden part, the silhouette shows through the object's blur as a hard line.
+    let color: Vec<[f32; 3]> = (0..W * H)
+        .map(|i| {
+            let x = i % W;
+            if x < edge { [0.0, 1.0, 0.0] } else if x < edge + 6 { [0.1, 0.1, 0.1] } else { [1.0, 1.0, 1.0] }
+        })
+        .collect();
+    let depth: Vec<f32> = (0..W * H).map(|i| if i % W < edge { 2.5 } else if i % W < edge + 6 { 5.0 } else { 100.0 }).collect();
+    let out = h.run(&mut effect(), &color, &depth);
+    let y = H / 2;
+    let step = (edge - 6..edge + 3).map(|x| (at(&out, x + 1, y)[0] - at(&out, x, y)[0]).abs()).fold(0.0, f32::max);
+    assert!(step < 0.08, "largest step at the silhouette {step}: {:?}", (edge - 6..edge + 4).map(|x| at(&out, x, y)[0]).collect::<Vec<_>>());
+    eprintln!("blurred distance behind a pillar: largest step at the silhouette {step:.3}");
+}
+
+#[test]
+fn a_dense_field_of_highlights_keeps_its_energy_when_the_bins_overflow() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    // 256 small lights 4 px apart, 100 m away (CoC ~10 px): more than a sprite bin lists, so
+    // some are gathered instead of scattered, and none of their light is lost
+    let mut color = vec![[0.0f32; 3]; (W * H) as usize];
+    let (x0, y0) = (W / 2 - 32, H / 2 - 32);
+    for j in 0..16 {
+        for i in 0..16 {
+            color[((y0 + 4 * j) * W + x0 + 4 * i) as usize] = [100.0, 100.0, 100.0];
+        }
+    }
+    let out = h.run(&mut effect(), &color, &vec![100.0; (W * H) as usize]);
+    let total: f32 = out.iter().map(|c| c[0]).sum();
+    assert!((total - 25600.0).abs() < 0.1 * 25600.0, "energy {total} of 25600");
+    eprintln!("dense highlights: energy {total:.0} of 25600");
 }
 
 #[test]
