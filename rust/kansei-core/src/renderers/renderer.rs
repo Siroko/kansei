@@ -83,6 +83,8 @@ pub struct Renderer {
     spot_shadow_sampler: Option<wgpu::Sampler>,
     // GPU instance culling (renderables with `instance_culling`)
     cull_pipeline: Option<crate::culling::CullPipeline>,
+    // Planar reflections, drawn after the shadow maps and before the main pass
+    planar_reflections: Vec<crate::reflections::PlanarReflection>,
     // Render bundle caching
     render_bundle: Option<wgpu::RenderBundle>,
     last_bundle_object_count: usize,
@@ -137,6 +139,7 @@ impl Renderer {
             spot_dummy_atlas_view: None,
             spot_shadow_sampler: None,
             cull_pipeline: None,
+            planar_reflections: Vec::new(),
             render_bundle: None,
             last_bundle_object_count: 0,
             gbuffer_bundle: None,
@@ -981,6 +984,110 @@ impl Renderer {
         self.spot_light_buf.as_ref().expect("Renderer not initialized")
     }
 
+    /// Create a camera's GPU resources (bind group with this renderer's lights).
+    pub(crate) fn init_camera(&self, camera: &mut Camera) {
+        let shared = self.shared_layouts.as_ref().expect("Renderer not initialized");
+        camera.gpu_initialize(self.device(), &shared.camera_bgl, self.light_buf.as_ref().unwrap());
+    }
+
+    /// Register a planar reflection; the renderer draws it every frame, after the shadow maps
+    /// and before the main pass. Returns its index for `planar_reflection(_mut)`.
+    pub fn add_planar_reflection(&mut self, reflection: crate::reflections::PlanarReflection) -> usize {
+        self.planar_reflections.push(reflection);
+        self.planar_reflections.len() - 1
+    }
+
+    pub fn planar_reflection(&self, index: usize) -> Option<&crate::reflections::PlanarReflection> {
+        self.planar_reflections.get(index)
+    }
+
+    pub fn planar_reflection_mut(&mut self, index: usize) -> Option<&mut crate::reflections::PlanarReflection> {
+        self.planar_reflections.get_mut(index)
+    }
+
+    /// Point every planar reflection's mirrored camera for this frame (before culling, which
+    /// culls for them too).
+    fn update_planar_reflection_cameras(&mut self, camera: &Camera) {
+        let queue = self.queue.as_ref().unwrap();
+        for reflection in &mut self.planar_reflections {
+            reflection.update_camera(queue, camera);
+        }
+    }
+
+    /// Cull view of planar reflection `index`, after the camera and the spot shadow layers.
+    fn reflection_view(&self, index: usize) -> usize {
+        1 + self.spot_shadow_atlas.as_ref().map_or(0, |a| a.layers as usize) + index
+    }
+
+    /// Draw every planar reflection: the scene from the mirrored camera (only renderables on the
+    /// reflection's layer mask) with the materials' GBuffer pipelines, then its resolve and mips.
+    fn render_planar_reflections(&mut self, scene: &Scene) {
+        if self.planar_reflections.is_empty() {
+            return;
+        }
+        let queue = self.queue.as_ref().unwrap();
+        let device = self.device.as_ref().unwrap();
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let alignment = self.matrix_alignment;
+        let cc = &self.config.clear_color;
+        let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/PlanarReflections") });
+        for (index, reflection) in self.planar_reflections.iter().enumerate().filter(|(_, r)| r.is_active()) {
+            let view = self.reflection_view(index);
+            {
+                let targets = reflection.color_attachments();
+                let attachment = |view, load| Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                });
+                let black = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Renderer/PlanarReflectionPass"),
+                    color_attachments: &[
+                        attachment(targets[0], wgpu::LoadOp::Clear(clear)),
+                        attachment(targets[1], black),
+                        attachment(targets[2], black),
+                        attachment(targets[3], black),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: reflection.depth_attachment(),
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_bind_group(1, reflection.camera().bind_group().unwrap(), &[]);
+                if let Some(bg) = &self.shadow_bind_group {
+                    pass.set_bind_group(3, bg, &[]);
+                }
+                for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                    let Some(r) = scene.get_renderable(scene_idx) else { continue };
+                    if !r.visible || !r.geometry.initialized || r.layers & reflection.layer_mask == 0 {
+                        continue;
+                    }
+                    let key = crate::materials::PipelineKey {
+                        color_formats: GBuffer::MRT_FORMATS.to_vec(),
+                        depth_format: GBuffer::DEPTH_FORMAT,
+                        sample_count: 1,
+                        num_vertex_buffers: 1 + r.geometry.instance_buffers.len(),
+                    };
+                    let Some(pipeline) = r.material.pipeline_cache.get(&key) else { continue };
+                    pass.set_pipeline(pipeline);
+                    if let Some(bg) = r.material.bind_group() {
+                        pass.set_bind_group(0, bg, &[]);
+                    }
+                    let offset = draw_idx as u32 * alignment;
+                    pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+                    // culled against the mirrored view, whose near plane is the water
+                    draw_geometry(&mut pass, r, view);
+                }
+            }
+            reflection.resolve(queue, &mut encoder);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Render each shadowed spot light's depth into its atlas layer: every visible shadow caster,
     /// with its material's depth pipeline and the light's camera in group 1.
     fn run_spot_shadow_pass(&mut self, scene: &Scene) {
@@ -1034,7 +1141,8 @@ impl Renderer {
     }
 
     /// The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then `spot_view(l)`
-    /// for every layer of the spot shadow atlas (`None` when no light uses it this frame).
+    /// for every layer of the spot shadow atlas (`None` when no light uses it this frame), then
+    /// `reflection_view(r)` for every planar reflection.
     fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
         let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false })];
         if let Some(atlas) = &self.spot_shadow_atlas {
@@ -1043,6 +1151,13 @@ impl Renderer {
                 views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true });
             }
         }
+        // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
+        views.extend(self.planar_reflections.iter().map(|r| {
+            r.is_active().then(|| crate::culling::CullView {
+                view_proj: r.camera().projection_matrix.to_glam() * r.camera().view_matrix.to_glam(),
+                casters_only: false,
+            })
+        }));
         views
     }
 
@@ -1242,6 +1357,7 @@ impl Renderer {
             let sample_count = self.config.sample_count;
             let depth_format = wgpu::TextureFormat::Depth24Plus;
             let spot_shadows = self.spot_shadow_atlas.is_some();
+            let reflections = !self.planar_reflections.is_empty();
 
             let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
             for idx in ordered_indices {
@@ -1270,6 +1386,9 @@ impl Renderer {
                 if spot_shadows && r.cast_shadow {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
                 }
+                if reflections {
+                    r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
+                }
             }
         }
 
@@ -1283,7 +1402,8 @@ impl Renderer {
         // Phase 1: Upload camera + per-object matrices
         self.upload_all(scene, camera);
 
-        // GPU instance culling for every view (camera, spot shadows)
+        // GPU instance culling for every view (camera, spot shadows, reflections)
+        self.update_planar_reflection_cameras(camera);
         self.run_instance_culling(scene, camera);
 
         // Shadow pass
@@ -1370,6 +1490,9 @@ impl Renderer {
 
         // Spot light shadow maps
         self.run_spot_shadow_pass(scene);
+
+        // Planar reflections (they sample this frame's shadow maps)
+        self.render_planar_reflections(scene);
 
         // Check material dirty flags → invalidate bundle
         for idx in scene.ordered_indices() {
@@ -1548,7 +1671,8 @@ impl Renderer {
         // Upload camera + per-object matrices
         self.upload_all(scene, camera);
 
-        // GPU instance culling for every view (camera, spot shadows)
+        // GPU instance culling for every view (camera, spot shadows, reflections)
+        self.update_planar_reflection_cameras(camera);
         self.run_instance_culling(scene, camera);
 
         // Shadow pass (if enabled)
@@ -1623,6 +1747,9 @@ impl Renderer {
 
         // Spot light shadow maps
         self.run_spot_shadow_pass(scene);
+
+        // Planar reflections (they sample this frame's shadow maps)
+        self.render_planar_reflections(scene);
 
         // Check material dirty flags → invalidate gbuffer bundle
         for idx in scene.ordered_indices() {
