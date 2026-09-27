@@ -11,6 +11,8 @@ use crate::shadows::{CubeMapShadowMap, ShadowMap};
 const INJECT_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
     include_str!("../../shaders/volumetric_fog_inject.wgsl"),
+    include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("../../shaders/volumetric_fog_media.wgsl"),
 );
 const COMPOSITE_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
@@ -39,6 +41,12 @@ pub struct VolumetricFogOptions {
     /// Radiance of a uniform sky around the fog (scatters as density * ambient). Zero matches the
     /// TS effect; set it so fog stays lit with no direct light (dusk, overcast). Far fog tends to it.
     pub ambient: Vec3,
+    /// Scattering albedo: scattering = density * albedo (extinction = density * extinction_coeff).
+    /// Unreal's volumetric fog maps as albedo = its albedo * its extinction scale,
+    /// extinction_coeff = its extinction scale.
+    pub albedo: Vec3,
+    /// Scales the sky's light on the fog once a sky is bound (`set_sky_lighting`); 1 is physical.
+    pub sky_ambient_scale: f32,
 }
 
 impl Default for VolumetricFogOptions {
@@ -53,6 +61,8 @@ impl Default for VolumetricFogOptions {
             start_distance: 0.0,
             wind_direction: Vec3::ZERO,
             ambient: Vec3::ZERO,
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            sky_ambient_scale: 1.0,
         }
     }
 }
@@ -117,6 +127,117 @@ struct CompositeParamsGpu {
     _pad: f32,
 }
 
+/// A local fog volume: an ellipsoid of mist (over a lake, in a hollow) injected into the fog's
+/// froxels, after Unreal's `LocalFogVolume`. In the volume's unit sphere `q` (|q| < 1) the
+/// extinction is `radial_extinction * (1 - |q|^2) + height_extinction * exp(-height_falloff *
+/// max(q.y - height_offset, 0))`, faded to zero over the outer `edge_fade` of the radius. It
+/// scatters the fog's lights and sky with its own albedo; wind and start distance leave it alone.
+///
+/// Unreal's `radial_fog_extinction`, `height_fog_extinction`, `height_fog_falloff`,
+/// `height_fog_offset` and `fog_albedo` carry over; the shapes of the two terms are kansei's
+/// own, so the look may need a trim.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalFogVolume {
+    pub center: Vec3,
+    /// Semi-axes of the ellipsoid, metres.
+    pub radii: Vec3,
+    /// Rotation about +Y, radians (as `Object3D::rotation.y`).
+    pub yaw: f32,
+    /// Extinction per metre at the centre, falling to zero at the surface.
+    pub radial_extinction: f32,
+    /// Extinction per metre at and below `height_offset`, falling off above it.
+    pub height_extinction: f32,
+    /// Exponential falloff per unit of the volume's half height.
+    pub height_falloff: f32,
+    /// Height in the unit sphere (-1 bottom, 1 top) below which the height term is at full strength.
+    pub height_offset: f32,
+    pub albedo: Vec3,
+    /// Fraction of the radius over which the fog fades out at the surface (0: a hard edge).
+    pub edge_fade: f32,
+}
+
+impl LocalFogVolume {
+    /// An axis-aligned ellipsoid of `radius` across and `half_height` up and down, with Unreal's
+    /// defaults otherwise: radial extinction 1, no height term, a soft edge.
+    pub fn new(center: Vec3, radius: f32, half_height: f32) -> Self {
+        Self {
+            center,
+            radii: Vec3::new(radius, half_height, radius),
+            yaw: 0.0,
+            radial_extinction: 1.0,
+            height_extinction: 0.0,
+            height_falloff: 1000.0,
+            height_offset: 0.0,
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            edge_fade: 0.25,
+        }
+    }
+
+    /// Extinction per metre at a world-space point, as the fog shader computes it.
+    pub fn extinction_at(&self, p: Vec3) -> f32 {
+        let g = self.gpu();
+        let d = glam::Vec3::new(p.x - g.center[0], p.y - g.center[1], p.z - g.center[2]);
+        let q = glam::Vec3::new(g.cos_yaw * d.x - g.sin_yaw * d.z, d.y, g.sin_yaw * d.x + g.cos_yaw * d.z) * glam::Vec3::from(g.inv_radii);
+        let r2 = q.length_squared();
+        if r2 >= 1.0 {
+            return 0.0;
+        }
+        let edge = if g.edge_fade > 0.0 {
+            let t = ((1.0 - r2.sqrt()) / g.edge_fade).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        } else {
+            1.0
+        };
+        let radial = g.radial_extinction * (1.0 - r2);
+        let height = g.height_extinction * (-g.height_falloff * (q.y - g.height_offset).max(0.0)).exp();
+        (radial + height) * edge
+    }
+
+    fn gpu(&self) -> LocalFogVolumeGpu {
+        let inv = |r: f32| 1.0 / r.max(1e-3);
+        LocalFogVolumeGpu {
+            center: [self.center.x, self.center.y, self.center.z],
+            radial_extinction: self.radial_extinction.max(0.0),
+            inv_radii: [inv(self.radii.x), inv(self.radii.y), inv(self.radii.z)],
+            height_extinction: self.height_extinction.max(0.0),
+            albedo: [self.albedo.x, self.albedo.y, self.albedo.z],
+            height_falloff: self.height_falloff,
+            cos_yaw: self.yaw.cos(),
+            sin_yaw: self.yaw.sin(),
+            height_offset: self.height_offset,
+            edge_fade: self.edge_fade.clamp(0.0, 1.0),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LocalFogVolumeGpu {
+    center: [f32; 3],
+    radial_extinction: f32,
+    inv_radii: [f32; 3],
+    height_extinction: f32,
+    albedo: [f32; 3],
+    height_falloff: f32,
+    cos_yaw: f32,
+    sin_yaw: f32,
+    height_offset: f32,
+    edge_fade: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FogMediaParamsGpu {
+    albedo: [f32; 3],
+    sky_ambient_scale: f32,
+    num_volumes: u32,
+    has_sky_lighting: u32,
+    _pad: [u32; 2],
+}
+
+/// Size of the WGSL `SkyLighting` struct (atmosphere::SKY_LIGHTING_WGSL).
+const SKY_LIGHTING_BYTES: u64 = std::mem::size_of::<crate::atmosphere::params::SkyLightingGpu>() as u64;
+
 struct Gpu {
     grid: FroxelGrid,
     inject_pipeline: wgpu::ComputePipeline,
@@ -132,6 +253,9 @@ struct Gpu {
     dummy_depth: wgpu::TextureView,
     dummy_atlas: wgpu::TextureView,
     dummy_vp: wgpu::Buffer,
+    media_params: wgpu::Buffer,
+    volumes: wgpu::Buffer,
+    dummy_sky_lighting: wgpu::Buffer,
 }
 
 /// Froxel volumetric fog, ported from the TS `VolumetricFogEffect`.
@@ -154,6 +278,10 @@ pub struct VolumetricFogEffect {
     pub start_distance: f32,
     pub wind_direction: Vec3,
     pub ambient: Vec3,
+    pub albedo: Vec3,
+    pub sky_ambient_scale: f32,
+    /// Local fog volumes, uploaded every frame (keep it to tens).
+    pub local_volumes: Vec<LocalFogVolume>,
     /// Seconds, drives the wind offset. The effect has no clock of its own; set it per frame.
     pub time: f32,
     grid_options: FroxelGridOptions,
@@ -161,6 +289,7 @@ pub struct VolumetricFogEffect {
     point_data: Vec<PointLightGpu>,
     shadow_map: Option<(wgpu::TextureView, wgpu::Buffer)>,
     point_shadows: Option<wgpu::TextureView>,
+    sky_lighting: Option<wgpu::Buffer>,
     lights_dirty: bool,
     bindings_dirty: bool,
     gpu: Option<Gpu>,
@@ -177,12 +306,16 @@ impl VolumetricFogEffect {
             start_distance: options.start_distance,
             wind_direction: options.wind_direction,
             ambient: options.ambient,
+            albedo: options.albedo,
+            sky_ambient_scale: options.sky_ambient_scale,
+            local_volumes: Vec::new(),
             time: 0.0,
             grid_options: options.grid,
             dir_data: Vec::new(),
             point_data: Vec::new(),
             shadow_map: None,
             point_shadows: None,
+            sky_lighting: None,
             lights_dirty: true,
             bindings_dirty: true,
             gpu: None,
@@ -269,6 +402,16 @@ impl VolumetricFogEffect {
         self.bindings_dirty = true;
     }
 
+    /// Light the fog with a sky: `SkyAtmosphere::bindings().sky_lighting`. The sky's radiance,
+    /// convolved with the fog's phase function, scatters in every froxel (times
+    /// `sky_ambient_scale`), on top of `ambient`, so the fog takes the sky's colour and stays lit
+    /// at dusk. Put the `AtmosphereEffect` before the fog in the chain, so the fog lies in front of
+    /// the sky and its aerial perspective.
+    pub fn set_sky_lighting(&mut self, sky_lighting: Option<&wgpu::Buffer>) {
+        self.sky_lighting = sky_lighting.cloned();
+        self.bindings_dirty = true;
+    }
+
     fn init_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let grid = FroxelGrid::new(device, queue, &self.grid_options);
 
@@ -326,6 +469,9 @@ impl VolumetricFogEffect {
                     count: None,
                 },
                 uniform(6),
+                uniform(10),
+                storage(11),
+                uniform(12),
             ],
         });
         let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -438,6 +584,10 @@ impl VolumetricFogEffect {
         let dummy_vp = buffer("VolumetricFog/DummyLightVP", 64, wgpu::BufferUsages::UNIFORM);
         queue.write_buffer(&dummy_vp, 0, bytemuck::cast_slice(Mat4::identity().as_slice()));
 
+        let volumes = buffer("VolumetricFog/LocalVolumes", std::mem::size_of::<LocalFogVolumeGpu>(), wgpu::BufferUsages::STORAGE);
+        let dummy_sky_lighting = buffer("VolumetricFog/NoSkyLighting", SKY_LIGHTING_BYTES as usize, wgpu::BufferUsages::UNIFORM);
+        let media_params = buffer("VolumetricFog/MediaParams", std::mem::size_of::<FogMediaParamsGpu>(), wgpu::BufferUsages::UNIFORM);
+
         self.gpu = Some(Gpu {
             grid,
             inject_pipeline: pipeline("VolumetricFog/Inject", INJECT_WGSL, &inject_bgl),
@@ -458,6 +608,9 @@ impl VolumetricFogEffect {
             dummy_depth,
             dummy_atlas,
             dummy_vp,
+            media_params,
+            volumes,
+            dummy_sky_lighting,
         });
         self.lights_dirty = true;
         self.bindings_dirty = true;
@@ -493,6 +646,33 @@ impl VolumetricFogEffect {
         self.lights_dirty = false;
     }
 
+    /// Upload the media parameters and the local volumes, growing the volume buffer if needed.
+    fn upload_media(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some(gpu) = &mut self.gpu else { return };
+        let volumes: Vec<LocalFogVolumeGpu> = self.local_volumes.iter().map(LocalFogVolume::gpu).collect();
+        let needed = std::mem::size_of_val(volumes.as_slice()) as u64;
+        if needed > gpu.volumes.size() {
+            gpu.volumes = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("VolumetricFog/LocalVolumes"),
+                size: needed.next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.bindings_dirty = true;
+        }
+        if !volumes.is_empty() {
+            queue.write_buffer(&gpu.volumes, 0, bytemuck::cast_slice(&volumes));
+        }
+        let params = FogMediaParamsGpu {
+            albedo: [self.albedo.x, self.albedo.y, self.albedo.z],
+            sky_ambient_scale: self.sky_ambient_scale,
+            num_volumes: volumes.len() as u32,
+            has_sky_lighting: self.sky_lighting.is_some() as u32,
+            _pad: [0; 2],
+        };
+        queue.write_buffer(&gpu.media_params, 0, bytemuck::bytes_of(&params));
+    }
+
     fn rebuild_inject_bind_group(&mut self, device: &wgpu::Device) {
         let Some(gpu) = &mut self.gpu else { return };
         let (depth, vp) = match &self.shadow_map {
@@ -500,6 +680,7 @@ impl VolumetricFogEffect {
             None => (&gpu.dummy_depth, &gpu.dummy_vp),
         };
         let atlas = self.point_shadows.as_ref().unwrap_or(&gpu.dummy_atlas);
+        let sky_lighting = self.sky_lighting.as_ref().unwrap_or(&gpu.dummy_sky_lighting);
         gpu.inject_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("VolumetricFog/InjectBG"),
             layout: &gpu.inject_bgl,
@@ -511,6 +692,9 @@ impl VolumetricFogEffect {
                 wgpu::BindGroupEntry { binding: 4, resource: gpu.point_lights.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(atlas) },
                 wgpu::BindGroupEntry { binding: 6, resource: vp.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: gpu.media_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: gpu.volumes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: sky_lighting.as_entire_binding() },
             ],
         }));
         self.bindings_dirty = false;
@@ -546,6 +730,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
         if self.lights_dirty {
             self.upload_lights(device, queue);
         }
+        self.upload_media(device, queue);
         if self.bindings_dirty {
             self.rebuild_inject_bind_group(device);
         }
@@ -664,6 +849,35 @@ mod tests {
         assert_eq!(sizes["CompositeParams"], std::mem::size_of::<CompositeParamsGpu>());
         assert_eq!(sizes["GridParams"], std::mem::size_of::<crate::froxels::froxel_grid::GridParamsGpu>());
         assert_eq!(sizes["TemporalParams"], std::mem::size_of::<crate::froxels::froxel_grid::TemporalParamsGpu>());
+        assert_eq!(sizes["FogMediaParams"], std::mem::size_of::<FogMediaParamsGpu>());
+        assert_eq!(sizes["LocalFogVolume"], std::mem::size_of::<LocalFogVolumeGpu>());
+        assert_eq!(sizes["SkyLighting"] as u64, SKY_LIGHTING_BYTES);
+    }
+
+    #[test]
+    fn local_fog_volumes_are_ellipsoids_with_a_low_lying_height_term() {
+        // the Midsommar lake mist: 230 m across, 8 m up and down, height extinction 0.05
+        let mut lake = LocalFogVolume::new(Vec3::new(320.0, 3.0, -50.0), 230.0, 8.0);
+        lake.radial_extinction = 0.01;
+        lake.height_extinction = 0.05;
+        lake.height_falloff = 3.0;
+        let at = |x: f32, y: f32, z: f32| lake.extinction_at(Vec3::new(x, y, z));
+        // at the water: both terms; 4 m up the height term has fallen by e^-1.5
+        assert!((at(320.0, 3.0, -50.0) - 0.06).abs() < 1e-6);
+        let up = at(320.0, 7.0, -50.0);
+        let expected = 0.01 * 0.75 + 0.05 * (-1.5f32).exp();
+        assert!((up - expected).abs() < 1e-5, "{up} vs {expected}");
+        // outside the ellipsoid, and fading out toward its rim
+        assert_eq!(at(320.0, 11.5, -50.0), 0.0);
+        assert_eq!(at(551.0, 3.0, -50.0), 0.0);
+        assert!(at(540.0, 3.0, -50.0) < at(450.0, 3.0, -50.0));
+
+        // yaw turns the long axis: a quarter turn about +Y puts local x along world z
+        let mut bar = LocalFogVolume::new(Vec3::ZERO, 10.0, 2.0);
+        bar.radii = Vec3::new(10.0, 2.0, 1.0);
+        bar.yaw = std::f32::consts::FRAC_PI_2;
+        assert!(bar.extinction_at(Vec3::new(0.0, 0.0, 8.0)) > 0.0);
+        assert_eq!(bar.extinction_at(Vec3::new(8.0, 0.0, 0.0)), 0.0);
     }
 
     #[test]

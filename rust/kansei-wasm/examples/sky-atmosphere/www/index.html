@@ -20,6 +20,8 @@
         //   height     camera height in metres (default 1.7; above ~30 it sees over the trees)
         //   ev         EV100 exposure (default: follows the sun)
         //   haze       Mie scattering x (Unreal's haze); ozone: absorbing layer x; moon=1: add a moon
+        //   fog        froxel height fog, base density per metre (e.g. 0.01), lit by the sun and the sky
+        //   mist=1     a local fog volume in the clearing
         document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
         import init, { start } from '../pkg/kansei_wasm_sky_atmosphere.js';
         await init();
