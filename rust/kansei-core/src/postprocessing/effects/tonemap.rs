@@ -62,13 +62,15 @@ pub struct ColorGrade {
     pub white_tint: f32,
     /// Power about middle grey (0.18): above 1 more contrast.
     pub contrast: f32,
-    pub saturation: f32,
+    /// Per channel, as UE's ColorSaturation (its rgb times its w): each channel's distance from
+    /// the luminance is scaled, so (0.9, 0.95, 1.0) desaturates reds most.
+    pub saturation: Vec3,
     /// Per-channel multiplier.
     pub gain: Vec3,
     pub shadow_gain: Vec3,
-    pub shadow_saturation: f32,
+    pub shadow_saturation: Vec3,
     pub highlight_gain: Vec3,
-    pub highlight_saturation: f32,
+    pub highlight_saturation: Vec3,
     /// Luminance below which a pixel counts as shadow (fading out toward it).
     pub shadows_max: f32,
     /// Luminance above which a pixel starts to count as highlight (fully at 1).
@@ -81,12 +83,12 @@ impl Default for ColorGrade {
             white_temperature: 6500.0,
             white_tint: 0.0,
             contrast: 1.0,
-            saturation: 1.0,
+            saturation: Vec3::new(1.0, 1.0, 1.0),
             gain: Vec3::new(1.0, 1.0, 1.0),
             shadow_gain: Vec3::new(1.0, 1.0, 1.0),
-            shadow_saturation: 1.0,
+            shadow_saturation: Vec3::new(1.0, 1.0, 1.0),
             highlight_gain: Vec3::new(1.0, 1.0, 1.0),
-            highlight_saturation: 1.0,
+            highlight_saturation: Vec3::new(1.0, 1.0, 1.0),
             shadows_max: 0.09,
             highlights_min: 0.5,
         }
@@ -219,14 +221,14 @@ struct ToneMapParamsGpu {
     gain: [f32; 3],
     exposure: f32,
     shadow_gain: [f32; 3],
-    saturation: f32,
-    highlight_gain: [f32; 3],
     contrast: f32,
-    shadow_saturation: f32,
-    highlight_saturation: f32,
+    highlight_gain: [f32; 3],
     shadows_max: f32,
+    saturation: [f32; 3],
     highlights_min: f32,
+    shadow_saturation: [f32; 3],
     vignette: f32,
+    highlight_saturation: [f32; 3],
     chromatic_aberration: f32,
     grain: f32,
     grain_size: f32,
@@ -235,7 +237,7 @@ struct ToneMapParamsGpu {
     frame: u32,
     tonemapper: u32,
     flags: u32,
-    _pad: [u32; 3],
+    _pad: u32,
 }
 
 const FLAG_ENCODE_SRGB: u32 = 1;
@@ -275,7 +277,7 @@ impl ToneMapEffect {
     }
 
     /// The linear factor applied to scene light: exposure times 2^compensation. Pass it to
-    /// `BloomOptions::exposure` so the bloom threshold is in the same units.
+    /// `BloomEffect::exposure` so the bloom threshold is in the same units.
     pub fn total_exposure(&self) -> f32 {
         self.options.exposure * 2f32.powf(self.options.exposure_compensation)
     }
@@ -291,14 +293,14 @@ impl ToneMapEffect {
             gain: v3(g.gain),
             exposure: self.total_exposure(),
             shadow_gain: v3(g.shadow_gain),
-            saturation: g.saturation,
-            highlight_gain: v3(g.highlight_gain),
             contrast: g.contrast,
-            shadow_saturation: g.shadow_saturation,
-            highlight_saturation: g.highlight_saturation,
+            highlight_gain: v3(g.highlight_gain),
             shadows_max: g.shadows_max.max(1e-4),
+            saturation: v3(g.saturation),
             highlights_min: g.highlights_min.min(0.999),
+            shadow_saturation: v3(g.shadow_saturation),
             vignette: o.vignette.max(0.0),
+            highlight_saturation: v3(g.highlight_saturation),
             chromatic_aberration: o.chromatic_aberration.max(0.0),
             grain: o.grain.max(0.0),
             grain_size: o.grain_size.max(1.0),
@@ -307,7 +309,7 @@ impl ToneMapEffect {
             frame: self.frame,
             tonemapper: o.tonemapper.gpu_id(),
             flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 },
-            _pad: [0; 3],
+            _pad: 0,
         }
     }
 

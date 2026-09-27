@@ -4,7 +4,7 @@ use crate::postprocessing::PostProcessingEffect;
 
 /// Bloom works on scene-linear HDR, so it belongs before the tonemapper in the chain.
 pub struct BloomOptions {
-    /// Luminance, in exposed units (see `exposure`), above which light blooms. Zero or below
+    /// Luminance, in exposed units (see `BloomEffect::exposure`), above which light blooms. Zero or below
     /// disables the threshold: physically based bloom, where every light scatters a little and
     /// `intensity` is the scattered fraction (energy-conserving; try 0.03-0.1).
     pub threshold: f32,
@@ -12,15 +12,11 @@ pub struct BloomOptions {
     /// With a threshold, the gain of the bloom added on top of the scene.
     pub intensity: f32,
     pub radius: f32,
-    /// Scene multiplier the threshold and firefly filter see, so they work in the tonemapper's
-    /// exposed units with physical light values: set it to `ToneMapEffect::total_exposure()`.
-    /// 1 compares raw scene values, as before.
-    pub exposure: f32,
 }
 
 impl Default for BloomOptions {
     fn default() -> Self {
-        Self { threshold: 1.0, knee: 0.1, intensity: 0.8, radius: 1.0, exposure: 1.0 }
+        Self { threshold: 1.0, knee: 0.1, intensity: 0.8, radius: 1.0 }
     }
 }
 
@@ -28,6 +24,10 @@ const MIP_COUNT: usize = 6;
 
 pub struct BloomEffect {
     pub options: BloomOptions,
+    /// Scene multiplier the threshold and firefly filter see, so they work in the tonemapper's
+    /// exposed units with physical light values: set it to `ToneMapEffect::total_exposure()`.
+    /// 1 (the default) compares raw scene values, as before.
+    pub exposure: f32,
     // Pipelines
     downsample_pipeline: Option<wgpu::ComputePipeline>,
     upsample_pipeline: Option<wgpu::ComputePipeline>,
@@ -58,6 +58,7 @@ impl BloomEffect {
     pub fn new(options: BloomOptions) -> Self {
         Self {
             options,
+            exposure: 1.0,
             downsample_pipeline: None,
             upsample_pipeline: None,
             composite_pipeline: None,
@@ -76,6 +77,12 @@ impl BloomEffect {
             height: 0,
             initialized: false,
         }
+    }
+
+    /// Set `exposure` (builder style).
+    pub fn with_exposure(mut self, exposure: f32) -> Self {
+        self.exposure = exposure;
+        self
     }
 
     fn create_mip_textures(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -348,7 +355,7 @@ impl PostProcessingEffect for BloomEffect {
                     o.threshold, o.knee, o.intensity, o.radius,
                     src_w as f32, src_h as f32,
                     f32::from_bits(level as u32), // level as u32 bits
-                    o.exposure,
+                    self.exposure,
                 ];
                 queue.write_buffer(&self.downsample_params[level], 0, bytemuck::cast_slice(&data));
 
@@ -401,7 +408,7 @@ impl PostProcessingEffect for BloomEffect {
                     o.threshold, o.knee, o.intensity, o.radius,
                     smaller_w as f32, smaller_h as f32,
                     f32::from_bits(level as u32),
-                    o.exposure,
+                    self.exposure,
                 ];
                 queue.write_buffer(&self.upsample_params[pass_idx], 0, bytemuck::cast_slice(&data));
 
@@ -431,7 +438,7 @@ impl PostProcessingEffect for BloomEffect {
                 o.threshold, o.knee, o.intensity, o.radius,
                 width as f32, height as f32,
                 f32::from_bits(MIP_COUNT as u32), // levels summed into the bloom texture
-                o.exposure,
+                self.exposure,
             ];
             queue.write_buffer(self.composite_params.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
 
