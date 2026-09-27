@@ -242,6 +242,19 @@ pub(crate) struct SkyFrameGpu {
     pub moon_disk_luminance: f32,
     pub sky_luminance_factor: [f32; 3],
     pub _pad0: f32,
+    pub sky_light_ground_albedo: [f32; 3],
+    pub _pad1: f32,
+}
+
+/// The WGSL `SkyLighting` struct: sky radiance SH and the lights at the camera.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct SkyLightingGpu {
+    pub sh: [[f32; 4]; 9],
+    pub sun_illuminance: [f32; 4],
+    pub sun_direction: [f32; 4],
+    pub moon_illuminance: [f32; 4],
+    pub moon_direction: [f32; 4],
 }
 
 #[cfg(test)]

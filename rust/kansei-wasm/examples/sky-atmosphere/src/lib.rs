@@ -1,7 +1,8 @@
 //! Physically based sky (Hillaire 2020) from noon to the Midsommar intro's dusk: a clearing in a
 //! ring of dark spruce proxies, with hills out to 15 km behind it, under a SkyAtmosphere with
-//! aerial perspective, lit by the sun the sky is rendered with (`SkyAtmosphere::sun_illuminance_at`),
-//! in physical units (lux, cd/m^2) exposed by EV100.
+//! aerial perspective. Surfaces are lit by the sun the sky is rendered with
+//! (`SkyAtmosphere::sun_illuminance_at`) and by the sky itself (`SkyLighting` SH), in physical units
+//! (lux, cd/m^2) exposed by EV100.
 //! See www/index.html for the URL parameters.
 
 mod display;
@@ -11,7 +12,8 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions};
+use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SKY_LIGHTING_WGSL};
+use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
@@ -23,11 +25,13 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 
 use display::DisplayEffect;
 
-/// Lambertian surfaces lit by the scene's directional lights (in lux) with the renderer's
-/// shadow map: radiance = albedo / pi * E * cos.
+/// Lambertian surfaces lit by the scene's directional lights (in lux) with the renderer's shadow
+/// map, and by the sky: radiance = albedo / pi * (E_sun * cos * shadow + E_sky(n)). Prefixed with
+/// SKY_LIGHTING_WGSL.
 const SURFACE_WGSL: &str = r#"
 struct MaterialUniforms { albedo: vec4<f32> };
 @group(0) @binding(0) var<uniform> material: MaterialUniforms;
+@group(0) @binding(1) var<uniform> sky: SkyLighting;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -85,13 +89,19 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let l = lights.directional[i];
         e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
     }
-    return vec4<f32>(material.albedo.rgb / 3.14159265 * e, 1.0);
+    return vec4<f32>(material.albedo.rgb / 3.14159265 * (e + skyIrradiance(sky, n)), 1.0);
 }
 "#;
 
-fn surface(label: &str, albedo: [f32; 3]) -> Material {
-    let mut m = Material::new(label, SURFACE_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
+fn surface(label: &str, albedo: [f32; 3], sky: &SkyAtmosphere) -> Material {
+    let mut m = Material::new(
+        label,
+        &format!("{SKY_LIGHTING_WGSL}\n{SURFACE_WGSL}"),
+        vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::uniform(1, ShaderStages::FRAGMENT)],
+        MaterialOptions::default(),
+    );
     m.set_uniform_bindable(0, label, &[albedo[0], albedo[1], albedo[2], 1.0]);
+    m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
     m
 }
 
@@ -210,7 +220,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     let mut scene = Scene::new();
-    let mut ground = Renderable::new(PlaneGeometry::new(40000.0, 40000.0), surface("Ground", [0.08, 0.1, 0.06]));
+    let mut ground = Renderable::new(PlaneGeometry::new(40000.0, 40000.0), surface("Ground", [0.08, 0.1, 0.06], &sky));
     ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     scene.add(SceneNode::Renderable(ground));
 
@@ -221,12 +231,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let r = 55.0 + hash(i + 1000) * 70.0;
         let h = 12.0 + hash(i + 2000) * 14.0;
         let w = 1.5 + hash(i + 3000) * 2.5;
-        let mut tree = Renderable::new(BoxGeometry::new(w, h, w), surface("Spruce", [0.04, 0.06, 0.035]));
+        let mut tree = Renderable::new(BoxGeometry::new(w, h, w), surface("Spruce", [0.04, 0.06, 0.035], &sky));
         tree.object.set_position(a.sin() * r, h * 0.5, -a.cos() * r);
         tree.object.rotation.y = hash(i + 4000) * 3.0;
         scene.add(SceneNode::Renderable(tree));
     }
-    let mut stone = Renderable::new(BoxGeometry::new(2.0, 1.2, 1.4), surface("Stone", [0.3, 0.3, 0.28]));
+    let mut stone = Renderable::new(BoxGeometry::new(2.0, 1.2, 1.4), surface("Stone", [0.3, 0.3, 0.28], &sky));
     let d = direction_from_elevation_bearing(0.0, settings.look.unwrap_or(settings.bearing));
     stone.object.set_position(d.x * 9.0 - 1.5, 0.6, d.z * 9.0);
     stone.object.rotation.y = 0.6;
@@ -237,7 +247,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let a = i as f32 / 28.0 * std::f32::consts::TAU + hash(i + 5000) * 0.2;
         let r = 1500.0 * 10f32.powf(hash(i + 6000));
         let (rx, ry) = (r * (0.12 + hash(i + 7000) * 0.2), r * (0.02 + hash(i + 8000) * 0.03));
-        let mut hill = Renderable::new(SphereGeometry::new(1.0, 48, 24), surface("Hill", [0.05, 0.08, 0.045]));
+        let mut hill = Renderable::new(SphereGeometry::new(1.0, 48, 24), surface("Hill", [0.05, 0.08, 0.045], &sky));
         hill.object.set_position(a.sin() * r, 0.0, -a.cos() * r);
         hill.object.scale = Vec3::new(rx, ry, rx * 0.6);
         hill.object.rotation.y = a;
