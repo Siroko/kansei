@@ -1,8 +1,9 @@
-// Fog injection: per froxel, height-falloff density and the light scattered toward the camera
-// (Henyey-Greenstein phase) from directional and point lights, with shadows, plus an optional
-// ambient term: the radiance of a uniform sky around the fog (phase integrates to 1 over the
-// sphere, so it scatters as density * ambient). Distant fog tends to that colour, and it keeps
-// fog lit when no direct light reaches it (dusk, overcast).
+// Fog injection: per froxel, height-falloff density (plus local fog volumes) and the light
+// scattered toward the camera (Henyey-Greenstein phase) from directional and point lights, with
+// shadows, plus ambient terms: the radiance of a uniform sky around the fog (phase integrates to 1
+// over the sphere, so it scatters as density * ambient), and the actual sky's light when a
+// SkyAtmosphere is bound (volumetric_fog_media.wgsl). Distant fog tends to that colour, and it
+// keeps fog lit when no direct light reaches it (dusk, overcast).
 
 struct FogParams {
     invViewProj     : mat4x4f,
@@ -136,8 +137,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     // no fog closer than startDistance (UE's fog start distance), faded in over one slice
     let sliceThickness = linearD * (pow(params.gridFar / params.gridNear, 1.0 / gridSize.z) - 1.0);
     let start = saturate((linearD - params.startDistance) / max(sliceThickness, 1e-3) + 0.5);
-    let density = start * params.baseDensity * exp(-params.heightFalloff * max(samplePos.y - params.fogHeight, 0.0));
-    let extinction = density * params.extinctionCoeff;
+    let heightFog = start * params.baseDensity * exp(-params.heightFalloff * max(samplePos.y - params.fogHeight, 0.0));
+    // the height fog plus local fog volumes (volumetric_fog_media.wgsl): the lights below scale
+    // with the total density, and the media's albedo colours what they scatter
+    let media = fogMedia(worldPos, heightFog);
+    let density = media.density;
+    let extinction = media.extinction;
 
     let viewDir = normalize(worldPos - params.cameraPos);
     var totalScatter = density * params.ambient;
@@ -165,5 +170,6 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         totalScatter += density * pl.color * smoothFalloff(dist, pl.radius) * visibility * phase;
     }
 
+    totalScatter = (totalScatter + density * skyAmbient(viewDir)) * media.albedo;
     textureStore(scatterExtTex, gid, vec4f(totalScatter, extinction));
 }

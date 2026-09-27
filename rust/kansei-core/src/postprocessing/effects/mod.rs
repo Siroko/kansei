@@ -9,4 +9,4 @@ pub use bloom::{BloomEffect, BloomOptions};
 pub use color_grading::{ColorGradingEffect, ColorGradingOptions};
 pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
 pub use fluid_surface::{FluidSurfaceEffect, FluidSurfaceOptions};
-pub use volumetric_fog::{VolumetricFogEffect, VolumetricFogOptions};
+pub use volumetric_fog::{LocalFogShape, LocalFogVolume, VolumetricFogEffect, VolumetricFogOptions};
