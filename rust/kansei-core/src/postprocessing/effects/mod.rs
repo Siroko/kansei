@@ -1,5 +1,6 @@
 mod atmosphere;
 mod bloom;
+mod clouds;
 mod cinematic_dof;
 mod color_grading;
 mod dof;
@@ -11,6 +12,7 @@ mod tonemap;
 mod volumetric_fog;
 pub use atmosphere::AtmosphereEffect;
 pub use bloom::{BloomEffect, BloomOptions};
+pub use clouds::{CloudLayer, VolumetricCloudsEffect, VolumetricCloudsOptions};
 pub use cinematic_dof::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DofDebugView, HighlightOptions};
 pub use color_grading::{ColorGradingEffect, ColorGradingOptions};
 pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
