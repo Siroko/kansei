@@ -95,6 +95,7 @@ pub struct FroxelGrid {
     blend_factor: f32,
     scatter_extinction: wgpu::Texture,
     scatter_extinction_view: wgpu::TextureView,
+    accum: wgpu::Texture,
     accum_view: wgpu::TextureView,
     accum_pipeline: wgpu::ComputePipeline,
     accum_bg: wgpu::BindGroup,
@@ -109,7 +110,7 @@ fn storage_texture_3d(device: &wgpu::Device, label: &str, w: u32, h: u32, d: u32
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
         format: FORMAT,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }
@@ -275,6 +276,7 @@ impl FroxelGrid {
             blend_factor: options.blend_factor,
             scatter_extinction,
             scatter_extinction_view,
+            accum,
             accum_view,
             accum_pipeline,
             accum_bg,
@@ -294,6 +296,7 @@ impl FroxelGrid {
     pub fn scatter_extinction_view(&self) -> &wgpu::TextureView { &self.scatter_extinction_view }
     /// Integrated result: rgb scattered light toward the camera, a transmittance.
     pub fn accum_view(&self) -> &wgpu::TextureView { &self.accum_view }
+    pub fn accum_texture(&self) -> &wgpu::Texture { &self.accum }
 
     /// Forget the temporal history, so the next frame uses only its own injection. Call on a
     /// camera cut, or reprojection smears the previous shot's fog into the new one.

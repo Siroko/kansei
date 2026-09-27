@@ -1,10 +1,13 @@
 //! Planar reflection: the Midsommar lake shot in miniature. A still lake at dusk mirrors the far
 //! shore's treeline, a red cottage with lit windows and the sky, through a PlanarReflection
 //! (mirrored camera, oblique clip plane at the water, the water itself left out by its layer).
-//! The water material adds Fresnel, wind ripples that displace the lookup, a roughness that
-//! picks the reflection's mips, and fog along the reflected path.
+//! The water material adds Fresnel, wind ripples that displace the lookup and a roughness that
+//! picks the reflection's mips. A lamp on the far bank throws a beam through the mist, and the
+//! volumetric fog is composited into the reflection too (`VolumetricFogEffect::reflection_fog`),
+//! so the lake mirrors the beam's glow.
 //!
-//! URL parameters: `ripples=<strength>` (0 = mirror), `rough=<0..1>`, `t=<seconds>` (freeze).
+//! URL parameters: `ripples=<strength>` (0 = mirror), `rough=<0..1>`, `t=<seconds>` (freeze),
+//! `fogrefl=0` (no fog in the reflection: the water fogs the reflected path with a flat colour).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -17,6 +20,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{Light, SpotLight};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -266,8 +270,23 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     near_bank.object.set_position(0.0, -1.2, 44.0);
     scene.add(SceneNode::Renderable(near_bank));
 
+    // a searchlight on the far bank beside the cottage (5e7 cd), its beam rising across the lake through
+    // the mist
+    let lamp_pos = Vec3::new(-32.0, 11.0, -126.0);
+    let mut lamp = SpotLight::new(
+        lamp_pos,
+        Vec3::new(40.0 - lamp_pos.x, 45.0 - lamp_pos.y, -50.0 - lamp_pos.z).normalize(),
+        Vec3::new(1.0, 0.82, 0.6),
+        5.0e7,
+        300.0,
+        3f32.to_radians(),
+        7f32.to_radians(),
+    );
+    lamp.volumetric_scale = 1.0;
+    scene.add(SceneNode::Light(Light::Spot(lamp)));
+
     // the reflection: half resolution, everything but the water
-    let reflection = PlanarReflection::new(
+    let mut reflection = PlanarReflection::new(
         &renderer,
         Vec3::new(0.0, LAKE_LEVEL, 0.0),
         Vec3::new(0.0, 1.0, 0.0),
@@ -275,8 +294,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     );
     let ripples: f32 = query_param("ripples").and_then(|v| v.parse().ok()).unwrap_or(0.03);
     let roughness: f32 = query_param("rough").and_then(|v| v.parse().ok()).unwrap_or(0.05);
+    // the fog in the reflection (fogrefl=0 leaves it out, and the water fogs the reflected path
+    // with a flat colour instead, as before)
+    let fog_in_reflection = query_param("fogrefl").as_deref() != Some("0");
     // time, ripples, roughness, - | fog colour, fog density | deep body colour
-    let water_params: [f32; 12] = [0.0, ripples, roughness, 0.0, 45.0, 48.0, 58.0, 0.0012, 0.2, 0.3, 0.3, 1.0];
+    let water_fog = if fog_in_reflection { 0.0 } else { 0.0012 };
+    let water_params: [f32; 12] = [0.0, ripples, roughness, 0.0, 45.0, 48.0, 58.0, water_fog, 0.2, 0.3, 0.3, 1.0];
     let mut water_material = Material::new(
         "Water",
         &format!("{PLANAR_REFLECTION_WGSL}\n{WATER_WGSL}"),
@@ -290,6 +313,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     water_material.set_uniform_bindable(0, "Water", &water_params);
     water_material.set_bindable(1, reflection.material_texture());
     water_material.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
+
+    let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+        grid: FroxelGridOptions { near: 1.0, far: 800.0, temporal: true, ..Default::default() },
+        base_density: 0.0012,
+        height_falloff: 0.04,
+        anisotropy: 0.3,
+        ambient: Vec3::new(38.0, 40.0, 50.0),
+        ..Default::default()
+    });
+    fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
+    if fog_in_reflection {
+        let seen = fog.reflection_fog(&renderer, &reflection);
+        reflection.set_fog(&renderer, Some(&seen));
+    }
     renderer.add_planar_reflection(reflection);
     let mut lake = Renderable::new(PlaneGeometry::new(1600.0, 400.0), water_material);
     lake.object.rotation.x = -std::f32::consts::FRAC_PI_2;
@@ -305,14 +342,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         options.grain = 0.22;
         ToneMapEffect::new(options)
     };
-    let fog = VolumetricFogEffect::new(VolumetricFogOptions {
-        grid: FroxelGridOptions { near: 1.0, far: 800.0, temporal: true, ..Default::default() },
-        base_density: 0.0012,
-        height_falloff: 0.04,
-        anisotropy: 0.3,
-        ambient: Vec3::new(38.0, 40.0, 50.0),
-        ..Default::default()
-    });
     let effects: Vec<Box<dyn PostProcessingEffect>> = vec![
         Box::new(fog),
         Box::new(BloomEffect::new(BloomOptions { threshold: 0.0, intensity: 0.04, ..Default::default() }).with_exposure(tonemap.total_exposure())),
