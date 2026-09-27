@@ -25,6 +25,11 @@ pub trait PostProcessingEffect {
         height: u32,
     );
     fn resize(&mut self, width: u32, height: u32, gbuffer: &GBuffer);
+    /// Whether the effect runs this frame. An inactive effect is skipped: the next effect reads
+    /// what it would have read, and it costs nothing (a toggle for expensive effects).
+    fn is_active(&self) -> bool {
+        true
+    }
     /// Whether the effect wants the scene rendered with a sub-pixel jittered projection (TAA).
     fn wants_jitter(&self) -> bool {
         false
