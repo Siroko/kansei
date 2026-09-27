@@ -84,6 +84,7 @@ impl AtmosphereEffect {
             ("multi_scattering_lut", s::multi_scattering_source()),
             ("sky_view_lut", s::sky_view_source()),
             ("aerial_perspective_lut", s::aerial_perspective_source()),
+            ("sky_lighting", s::sky_lighting_source()),
             ("sky_composite", composite_source()),
         ]
     }
@@ -153,7 +154,7 @@ impl PostProcessingEffect for AtmosphereEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atmosphere::params::{AtmosphereGpu, SkyFrameGpu};
+    use crate::atmosphere::params::{AtmosphereGpu, SkyFrameGpu, SkyLightingGpu};
 
     /// Every atmosphere WGSL module parses and validates with naga, and the Rust uniform structs
     /// have exactly the size of their WGSL counterparts.
@@ -173,5 +174,6 @@ mod tests {
         }
         assert_eq!(sizes["Atmosphere"], std::mem::size_of::<AtmosphereGpu>());
         assert_eq!(sizes["SkyFrame"], std::mem::size_of::<SkyFrameGpu>());
+        assert_eq!(sizes["SkyLighting"], std::mem::size_of::<SkyLightingGpu>());
     }
 }

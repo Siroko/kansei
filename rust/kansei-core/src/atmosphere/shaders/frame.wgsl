@@ -19,4 +19,6 @@ struct SkyFrame {
     moonDiskLuminance  : f32,
     skyLuminanceFactor : vec3f,
     _pad0              : f32,
+    skyLightGroundAlbedo : vec3f, // the ground below the horizon, for sky lighting
+    _pad1              : f32,
 }

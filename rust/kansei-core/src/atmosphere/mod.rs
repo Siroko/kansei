@@ -1,5 +1,6 @@
-//! Physically based sky and atmosphere (Hillaire 2020): transmittance, multiple-scattering and
-//! sky-view LUTs built on the GPU, rendered by [`crate::postprocessing::effects::AtmosphereEffect`].
+//! Physically based sky and atmosphere (Hillaire 2020): transmittance, multiple-scattering,
+//! sky-view and aerial-perspective LUTs built on the GPU, rendered by
+//! [`crate::postprocessing::effects::AtmosphereEffect`], and sky lighting for materials.
 
 pub(crate) mod params;
 pub(crate) mod sky_atmosphere;
@@ -11,3 +12,9 @@ pub use sky_atmosphere::{SkyAtmosphere, SkyAtmosphereBindings, SkyAtmosphereOpti
 /// functions, ray-sphere tests, LUT parameterisations), for shaders that read the atmosphere.
 /// Such a shader declares `atm : Atmosphere` and, for the frame helpers, `frame : SkyFrame`.
 pub const ATMOSPHERE_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), include_str!("shaders/frame.wgsl"));
+
+/// The WGSL `SkyLighting` struct and its helpers, for materials and media lit by the sky:
+/// `skyIrradiance(sky, n)`, `skyRadiance(sky, d)` and `skyInscatter(sky, viewDir, g)`. Bind
+/// `SkyAtmosphereBindings::sky_lighting` as a uniform of type `SkyLighting`, for example with
+/// `ComputeBuffer::from_external(.., BufferType::Uniform)`.
+pub const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
