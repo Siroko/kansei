@@ -632,12 +632,14 @@ impl Renderer {
                         size: std::num::NonZeroU64::new(64),
                     }),
                 },
+                // world matrix, then last frame's (for motion vectors): shaders may declare
+                // either a mat4x4 or `KanseiMeshTransforms` (cameras::MOTION_VECTORS_WGSL)
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &world_buf,
                         offset: 0,
-                        size: std::num::NonZeroU64::new(64),
+                        size: std::num::NonZeroU64::new(128),
                     }),
                 },
             ],
@@ -838,12 +840,15 @@ impl Renderer {
 
         let alignment = self.matrix_alignment as usize;
         let floats_per_slot = alignment / 4;
+        debug_assert!(alignment >= 128, "mesh slots hold two matrices");
 
         for (i, idx) in scene.ordered_indices().enumerate() {
             if let Some(renderable) = scene.get_renderable(idx) {
                 let offset = i * floats_per_slot;
-                self.world_matrices_staging[offset..offset + 16]
-                    .copy_from_slice(renderable.world_matrix.as_slice());
+                let world = renderable.world_matrix;
+                let previous = renderable.previous_world_matrix.replace(Some(world)).unwrap_or(world);
+                self.world_matrices_staging[offset..offset + 16].copy_from_slice(world.as_slice());
+                self.world_matrices_staging[offset + 16..offset + 32].copy_from_slice(previous.as_slice());
                 self.normal_matrices_staging[offset..offset + 16]
                     .copy_from_slice(renderable.normal_matrix.as_slice());
             }
@@ -1086,6 +1091,51 @@ impl Renderer {
             reflection.resolve(queue, &mut encoder);
         }
         queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// The velocity pass: clear the GBuffer's velocity texture to `NO_VELOCITY`, then redraw the
+    /// opaque renderables whose material has `outputs_velocity` with its velocity pipeline (the
+    /// same shader, only @location(4) kept), depth-tested against the GBuffer.
+    fn draw_velocity(&self, encoder: &mut wgpu::CommandEncoder, scene: &Scene, camera: &Camera, gbuffer: &GBuffer) {
+        let no_velocity = GBuffer::NO_VELOCITY as f64;
+        let mut attachments: [Option<wgpu::RenderPassColorAttachment>; GBuffer::VELOCITY_TARGET + 1] = Default::default();
+        attachments[GBuffer::VELOCITY_TARGET] = Some(wgpu::RenderPassColorAttachment {
+            view: &gbuffer.velocity_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color { r: no_velocity, g: no_velocity, b: 0.0, a: 0.0 }),
+                store: wgpu::StoreOp::Store,
+            },
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Renderer/VelocityPass"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &gbuffer.depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
+        if let Some(bg) = &self.shadow_bind_group {
+            pass.set_bind_group(3, bg, &[]);
+        }
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+            let Some(r) = scene.get_renderable(scene_idx) else { continue };
+            if !r.visible || !r.geometry.initialized || !r.material.options.outputs_velocity || r.is_transparent() {
+                continue;
+            }
+            let Some(pipeline) = r.material.velocity_pipeline_cache.get(&(1 + r.geometry.instance_buffers.len())) else { continue };
+            pass.set_pipeline(pipeline);
+            if let Some(bg) = r.material.bind_group() {
+                pass.set_bind_group(0, bg, &[]);
+            }
+            let offset = draw_idx as u32 * self.matrix_alignment;
+            pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+            draw_geometry(&mut pass, r, MAIN_VIEW);
+        }
     }
 
     /// Render each shadowed spot light's depth into its atlas layer: every visible shadow caster,
@@ -1584,6 +1634,7 @@ impl Renderer {
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
         output.present();
+        camera.end_frame();
     }
 
     /// Render scene with post-processing effects.
@@ -1596,6 +1647,14 @@ impl Renderer {
         let width = self.config.width;
         let height = self.config.height;
         volume.ensure_gbuffer(width, height);
+
+        // sub-pixel jitter for temporal anti-aliasing: an 8-phase Halton (2, 3) sequence
+        camera.jitter = if volume.wants_jitter() {
+            let i = camera.frame() % 8 + 1;
+            [(2.0 * halton(i, 2) - 1.0) / width as f32, (2.0 * halton(i, 3) - 1.0) / height as f32]
+        } else {
+            [0.0, 0.0]
+        };
 
         // Render scene to GBuffer (actually draw into it)
         {
@@ -1612,6 +1671,7 @@ impl Renderer {
         volume.render(camera, &canvas_view, width, height);
 
         output.present();
+        camera.end_frame();
     }
 
     /// Private: draw scene into GBuffer MRT (non-MSAA, sample_count=1).
@@ -1665,6 +1725,9 @@ impl Renderer {
             );
             if spot_shadows && r.cast_shadow {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
+            }
+            if r.material.options.outputs_velocity {
+                r.material.get_velocity_pipeline(device, &layouts);
             }
         }
 
@@ -1869,6 +1932,10 @@ impl Renderer {
                 &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count,
             );
         }
+
+        // Pass 3: motion vectors of the materials that write them, against the GBuffer depth;
+        // the rest of the velocity texture keeps NO_VELOCITY
+        self.draw_velocity(&mut encoder, scene, camera, gbuffer);
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
     }
@@ -2106,5 +2173,30 @@ fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
         enc.draw_indexed_indirect(r.geometry.active_indirect_buffer().unwrap(), 0);
     } else {
         enc.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
+    }
+}
+
+/// The `index`-th element (from 1) of the Halton sequence in `base`, in [0, 1).
+fn halton(mut index: u32, base: u32) -> f32 {
+    let mut result = 0.0;
+    let mut f = 1.0;
+    while index > 0 {
+        f /= base as f32;
+        result += f * (index % base) as f32;
+        index /= base;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn halton_sequence() {
+        assert_eq!(super::halton(1, 2), 0.5);
+        assert_eq!(super::halton(2, 2), 0.25);
+        assert_eq!(super::halton(3, 2), 0.75);
+        assert!((super::halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((super::halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((super::halton(4, 3) - 4.0 / 9.0).abs() < 1e-6);
     }
 }
