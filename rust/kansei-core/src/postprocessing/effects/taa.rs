@@ -40,7 +40,7 @@ struct TaaParamsGpu {
     variance_gamma: f32,
     has_history: u32,
     has_velocity: u32,
-    _pad: [u32; 2],
+    input_size: [f32; 2],
 }
 
 struct Gpu {
@@ -67,6 +67,11 @@ struct Gpu {
 /// History is also dropped per pixel where it saw another surface: its view depth is kept in the
 /// history's alpha and compared with where this pixel's surface was last frame, which keeps
 /// swaying foliage (which uncovers and covers itself every frame) from smearing.
+///
+/// It is also the chain's temporal upscaler: with `Renderer::set_render_scale` below 1 it reads
+/// the GBuffer-size frame and writes (and keeps its history at) the display size, placing each
+/// jittered sample where it fell among the display's pixels, so the history gathers detail
+/// finer than a rendered pixel over the frames. At scale 1 it is the plain 1:1 resolve.
 pub struct TemporalAAEffect {
     pub options: TemporalAAOptions,
     has_history: bool,
@@ -164,7 +169,8 @@ impl TemporalAAEffect {
             .create_view(&Default::default())
     }
 
-    fn params(&self, camera: &Camera, width: u32, height: u32, has_velocity: bool) -> TaaParamsGpu {
+    /// Resolve parameters for an output of `width` x `height` from a frame rendered at `input`.
+    fn params(&self, camera: &Camera, input: (u32, u32), width: u32, height: u32, has_velocity: bool) -> TaaParamsGpu {
         let view = camera.view_matrix.to_glam();
         let jittered = camera.jittered_projection().to_glam() * view;
         let view_proj = camera.view_projection().to_glam();
@@ -173,7 +179,7 @@ impl TemporalAAEffect {
             inv_view_proj: jittered.inverse().to_cols_array(),
             view_proj: view_proj.to_cols_array(),
             prev_view_proj: camera.previous_view_projection().map(|m| m.to_glam()).unwrap_or(view_proj).to_cols_array(),
-            jitter_px: [camera.jitter[0] * width as f32 * 0.5, -camera.jitter[1] * height as f32 * 0.5],
+            jitter_px: [camera.jitter[0] * input.0 as f32 * 0.5, -camera.jitter[1] * input.1 as f32 * 0.5],
             size: [width as f32, height as f32],
             feedback_min: o.feedback_min.clamp(0.0, 0.99),
             feedback_max: o.feedback_max.clamp(0.0, 0.99),
@@ -181,7 +187,7 @@ impl TemporalAAEffect {
             variance_gamma: o.variance_gamma.max(0.1),
             has_history: self.has_history as u32,
             has_velocity: has_velocity as u32,
-            _pad: [0; 2],
+            input_size: [input.0 as f32, input.1 as f32],
         }
     }
 
@@ -216,7 +222,8 @@ impl PostProcessingEffect for TemporalAAEffect {
             gpu.size = (width, height);
             self.has_history = false;
         }
-        let params = self.params(camera, width, height, true);
+        // the input is at the GBuffer's size (the effects before the upscaler run at it)
+        let params = self.params(camera, (gbuffer.width, gbuffer.height), width, height, true);
         let gpu = self.gpu.as_mut().unwrap();
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let velocity = &gbuffer.velocity_view;
@@ -245,11 +252,15 @@ impl PostProcessingEffect for TemporalAAEffect {
         self.has_history = true;
     }
 
-    fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {
-        self.has_history = false;
-    }
+    // The history is at the output size and starts over when that changes (see `render`), so a
+    // new render scale keeps it.
+    fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {}
 
     fn wants_jitter(&self) -> bool {
+        true
+    }
+
+    fn upscales_to_display(&self) -> bool {
         true
     }
 
@@ -328,7 +339,7 @@ mod tests {
     fn jitter_in_pixels_matches_the_jittered_projection() {
         let mut camera = Camera::new(50.0, 0.1, 100.0, 16.0 / 9.0);
         camera.jitter = [0.3 * 2.0 / 1280.0, -0.2 * 2.0 / 720.0]; // +0.3 px right, +0.2 px down
-        let p = TemporalAAEffect::new(Default::default()).params(&camera, 1280, 720, false);
+        let p = TemporalAAEffect::new(Default::default()).params(&camera, (1280, 720), 2560, 1440, false);
         assert!((p.jitter_px[0] - 0.3).abs() < 1e-5 && (p.jitter_px[1] - 0.2).abs() < 1e-5, "{:?}", p.jitter_px);
         // a point at the screen centre moves by the same amount under the jittered projection
         let point = glam::Vec4::new(0.0, 0.0, -10.0, 1.0);
