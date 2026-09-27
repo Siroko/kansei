@@ -22,6 +22,8 @@
         //   haze       Mie scattering x (Unreal's haze); ozone: absorbing layer x; moon=1: add a moon
         //   fog        froxel height fog, base density per metre (e.g. 0.01), lit by the sun and the sky
         //   mist=1     a local fog volume in the clearing (mist=box: a box-shaped one)
+        //   preset=midsommar  the Unreal intro's light block: sun -2.5, haze 1.7, ozone 0.8, EV100 3.9,
+        //              analytic height fog past 120 m and volumetric fog inside it
         document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
         import init, { start } from '../pkg/kansei_wasm_sky_atmosphere.js';
         await init();
