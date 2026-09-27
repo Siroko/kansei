@@ -2,7 +2,8 @@
 //! ring of dark spruce proxies, with hills out to 15 km behind it, under a SkyAtmosphere with
 //! aerial perspective. Surfaces are lit by the sun the sky is rendered with
 //! (`SkyAtmosphere::sun_illuminance_at`) and by the sky itself (`SkyLighting` SH), in physical units
-//! (lux, cd/m^2) exposed by EV100.
+//! (lux, cd/m^2) exposed by EV100. With `fog=`, froxel height fog lit by the same sun and sky
+//! lies in front of the atmosphere; with `mist=1`, a local fog volume fills the clearing.
 //! See www/index.html for the URL parameters.
 
 mod display;
@@ -20,7 +21,9 @@ use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::postprocessing::{effects::AtmosphereEffect, PostProcessingVolume};
+use kansei_core::froxels::FroxelGridOptions;
+use kansei_core::postprocessing::effects::{AtmosphereEffect, LocalFogVolume, VolumetricFogEffect, VolumetricFogOptions};
+use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
 
 use display::DisplayEffect;
@@ -183,8 +186,14 @@ impl State {
             l.color = self.sky.sun_illuminance_at(eye);
             l.intensity = 1.0;
         }
-        if let Some(display) = self.volume.effects[1].as_any_mut().downcast_mut::<DisplayEffect>() {
-            display.ev100 = s.ev.unwrap_or_else(|| auto_ev100(elevation));
+        let ev100 = s.ev.unwrap_or_else(|| auto_ev100(elevation));
+        for effect in &mut self.volume.effects {
+            if let Some(display) = effect.as_any_mut().downcast_mut::<DisplayEffect>() {
+                display.ev100 = ev100;
+            } else if let Some(fog) = effect.as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+                fog.update_lights(self.scene.lights());
+                fog.time = t;
+            }
         }
 
         self.sky.update(self.renderer.device(), self.renderer.queue(), &mut self.camera);
@@ -258,7 +267,33 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     sun.cast_shadow = true;
     let sun_light = scene.add(SceneNode::Light(Light::Directional(sun)));
 
-    let volume = PostProcessingVolume::new(&renderer, vec![Box::new(AtmosphereEffect::new(&sky)), Box::new(DisplayEffect::new(encode_srgb))]);
+    // the chain: the sky and its aerial perspective, the fog in front of them, the display transform
+    let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(AtmosphereEffect::new(&sky))];
+    let fog_density = q.get("fog").and_then(|v| v.parse::<f32>().ok());
+    if fog_density.is_some() || q.get("mist").is_some() {
+        let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+            grid: FroxelGridOptions { near: 1.0, far: 2500.0, temporal: true, blend_factor: 0.1, ..Default::default() },
+            base_density: fog_density.unwrap_or(0.0),
+            height_falloff: 0.04,
+            anisotropy: 0.6,
+            albedo: Vec3::new(0.9, 0.92, 0.95),
+            ..Default::default()
+        });
+        fog.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        fog.set_shadow_map(renderer.shadow_map());
+        if q.get("mist").is_some() {
+            // mist lying in the clearing, thickest on the ground
+            let mut mist = LocalFogVolume::new(Vec3::new(0.0, 0.0, 0.0), 60.0, 5.0);
+            mist.radial_extinction = 0.01;
+            mist.height_extinction = 0.08;
+            mist.height_falloff = 3.0;
+            mist.albedo = Vec3::new(0.8, 0.84, 0.9);
+            fog.local_volumes.push(mist);
+        }
+        effects.push(Box::new(fog));
+    }
+    effects.push(Box::new(DisplayEffect::new(encode_srgb)));
+    let volume = PostProcessingVolume::new(&renderer, effects);
     let camera = Camera::new(62.0, 0.5, 60000.0, width as f32 / height as f32);
 
     log::info!("Kansei — Sky Atmosphere (WASM) ready, {:?}", renderer.presentation_format());
