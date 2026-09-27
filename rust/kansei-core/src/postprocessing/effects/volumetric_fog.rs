@@ -6,7 +6,7 @@ use crate::lights::Light;
 use crate::math::{Mat4, Vec3};
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
-use crate::shadows::{CubeMapShadowMap, ShadowMap, SpotShadowAtlas};
+use crate::shadows::{CascadedShadowMap, CubeMapShadowMap, ShadowMap, SpotShadowAtlas};
 
 const INJECT_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
@@ -434,6 +434,13 @@ impl VolumetricFogEffect {
     /// one the renderer computed this frame.
     pub fn set_shadow_map(&mut self, shadow_map: Option<&ShadowMap>) {
         self.shadow_map = shadow_map.and_then(|sm| Some((sm.depth_view.clone()?, sm.light_vp_buf.clone()?)));
+        self.bindings_dirty = true;
+    }
+
+    /// Shafts from the renderer's cascaded shadow map (`Renderer::cascaded_shadow_map()`): its
+    /// widest cascade, whose matrix is rewritten every frame. Use instead of `set_shadow_map`.
+    pub fn set_cascaded_shadow_map(&mut self, csm: Option<&CascadedShadowMap>) {
+        self.shadow_map = csm.map(|c| (c.far_view.clone(), c.far_view_proj.clone()));
         self.bindings_dirty = true;
     }
 

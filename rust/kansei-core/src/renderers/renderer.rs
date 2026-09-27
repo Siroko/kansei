@@ -81,6 +81,9 @@ pub struct Renderer {
     spot_shadow_atlas: Option<crate::shadows::SpotShadowAtlas>,
     spot_dummy_atlas_view: Option<wgpu::TextureView>,
     spot_shadow_sampler: Option<wgpu::Sampler>,
+    // Cascaded sun/moon shadows (group 3, bindings 10-12), and a count-0 stand-in without them
+    cascaded_shadows: Option<crate::shadows::CascadedShadowMap>,
+    cascade_dummy_buf: Option<wgpu::Buffer>,
     // Clustered light lists (group 3, bindings 8-9)
     light_clusters: Option<crate::lights::light_clusters::LightClusters>,
     clustered_lights: bool,
@@ -141,6 +144,8 @@ impl Renderer {
             spot_shadow_atlas: None,
             spot_dummy_atlas_view: None,
             spot_shadow_sampler: None,
+            cascaded_shadows: None,
+            cascade_dummy_buf: None,
             light_clusters: None,
             clustered_lights: true,
             cull_pipeline: None,
@@ -356,6 +361,13 @@ impl Renderer {
         self.cube_dummy_view = Some(cube_dummy_view);
         self.cube_shadow_sampler = Some(cube_shadow_sampler);
         self.light_clusters = Some(crate::lights::light_clusters::LightClusters::new(&device, &spot_light_buf));
+        // zero-initialised: cascade count 0, everything lit
+        self.cascade_dummy_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Renderer/NoCascades"),
+            size: 384,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        }));
         self.spot_light_buf = Some(spot_light_buf);
         self.spot_dummy_atlas_view = Some(spot_dummy_atlas_view);
         self.spot_shadow_sampler = Some(spot_shadow_sampler);
@@ -372,11 +384,17 @@ impl Renderer {
     fn rebuild_shadow_bind_group(&mut self) {
         let device = self.device.as_ref().unwrap();
         let shared = self.shared_layouts.as_ref().unwrap();
+        // the cascaded map's widest cascade stands in for the single directional map
         let dir_view = self
-            .shadow_map
+            .cascaded_shadows
             .as_ref()
-            .and_then(|sm| sm.depth_view.as_ref())
+            .map(|c| &c.far_view)
+            .or_else(|| self.shadow_map.as_ref().and_then(|sm| sm.depth_view.as_ref()))
             .unwrap_or_else(|| self.shadow_dummy_depth_view.as_ref().unwrap());
+        let (cascade_view, cascade_buf) = match &self.cascaded_shadows {
+            Some(c) => (&c.array_view, &c.uniform),
+            None => (self.spot_dummy_atlas_view.as_ref().unwrap(), self.cascade_dummy_buf.as_ref().unwrap()),
+        };
         let cube_view = self
             .cubemap_shadow_map
             .as_ref()
@@ -404,6 +422,9 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 7, resource: sampler(self.spot_shadow_sampler.as_ref().unwrap()) },
                 wgpu::BindGroupEntry { binding: 8, resource: clusters.params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: clusters.lights.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: view(cascade_view) },
+                wgpu::BindGroupEntry { binding: 11, resource: cascade_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: sampler(self.spot_shadow_sampler.as_ref().unwrap()) },
             ],
         }));
         self.invalidate_bundle();
@@ -975,6 +996,109 @@ impl Renderer {
         self.rebuild_shadow_bind_group();
     }
 
+    /// Enable cascaded shadow maps for the scene's first directional light, when it has
+    /// `cast_shadow` (the sun, or the moon at night): stable cascades, drawn through the casters' own vertex shaders and
+    /// culled per cascade, sampled with contact-hardening PCSS by materials that include
+    /// `shadows::CASCADED_SHADOWS_WGSL`. It replaces `enable_shadows`: the widest cascade also
+    /// serves shaders that read the single directional map (group 3 binding 0).
+    pub fn enable_cascaded_shadows(&mut self, options: crate::shadows::CascadedShadowOptions) {
+        let device = self.device.as_ref().unwrap();
+        let shared = self.shared_layouts.as_ref().unwrap();
+        self.cascaded_shadows = Some(crate::shadows::CascadedShadowMap::new(device, &shared.camera_bgl, self.light_buf.as_ref().unwrap(), options));
+        self.rebuild_shadow_bind_group();
+    }
+
+    /// The cascaded shadow map, once `enable_cascaded_shadows` has been called.
+    pub fn cascaded_shadow_map(&self) -> Option<&crate::shadows::CascadedShadowMap> {
+        self.cascaded_shadows.as_ref()
+    }
+
+    /// Fit the cascades to the camera for the first directional light (if it casts shadows), and point
+    /// the single-map shadow uniforms at the widest cascade (before culling, which culls for the
+    /// cascades too).
+    fn update_cascaded_shadows(&mut self, scene: &Scene, camera: &Camera) {
+        let Some(csm) = self.cascaded_shadows.as_mut() else { return };
+        let queue = self.queue.as_ref().unwrap();
+        // the scene's first directional light, when it casts shadows (as the fog assumes)
+        let sun = scene
+            .lights()
+            .find_map(|l| match l {
+                crate::lights::Light::Directional(d) => Some(d),
+                _ => None,
+            })
+            .filter(|d| d.cast_shadow);
+        let Some(sun) = sun else {
+            csm.disable(queue);
+            if let Some(buf) = &self.shadow_uniform_buf {
+                queue.write_buffer(buf, 0, bytemuck::cast_slice(&[0.0f32; 24]));
+            }
+            return;
+        };
+        let dir = glam::Vec3::new(sun.direction.x, sun.direction.y, sun.direction.z);
+        let color = sun.effective_color();
+        csm.fit(camera, dir);
+        let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        csm.upload(queue, dir, glam::Vec3::new(color.x, color.y, color.z), eye);
+        if let (Some(buf), Some(vp)) = (&self.shadow_uniform_buf, csm.far_view_projection()) {
+            let mut data = [0.0f32; 24];
+            data[..16].copy_from_slice(&vp.to_cols_array());
+            data[16] = 0.0005; // bias (the single-map path of basic_lit.wgsl)
+            data[17] = 2.0 * csm.options.max_distance / csm.options.resolution as f32; // normal bias
+            data[18] = 1.0; // shadowEnabled
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+        }
+    }
+
+    /// Cull view of cascade `index`, after the camera, the spot layers and the reflections.
+    fn cascade_view(&self, index: usize) -> usize {
+        self.reflection_view(self.planar_reflections.len()) + index
+    }
+
+    /// Render each cascade: every visible shadow caster, culled to the cascade.
+    fn run_cascade_shadow_pass(&mut self, scene: &Scene) {
+        let Some(csm) = self.cascaded_shadows.as_ref() else { return };
+        if csm.slots.is_empty() {
+            return;
+        }
+        let device = self.device.as_ref().unwrap();
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/CascadedShadows") });
+        for cascade in 0..csm.slots.len() {
+            let view = self.cascade_view(cascade);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderer/CascadePass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: csm.layer_view(cascade),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_bind_group(1, csm.camera(cascade).bind_group().unwrap(), &[]);
+            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                let Some(r) = scene.get_renderable(scene_idx) else { continue };
+                if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                    continue;
+                }
+                let key = crate::materials::DepthPipelineKey::new(
+                    crate::shadows::CascadedShadowMap::FORMAT,
+                    1 + r.geometry.instance_buffers.len(),
+                    crate::shadows::CascadedShadowMap::DEPTH_BIAS,
+                );
+                let Some(pipeline) = r.material.depth_pipeline_cache.get(&key) else { continue };
+                pass.set_pipeline(pipeline);
+                if let Some(bg) = r.material.bind_group() {
+                    pass.set_bind_group(0, bg, &[]);
+                }
+                let offset = draw_idx as u32 * self.matrix_alignment;
+                pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+                draw_geometry(&mut pass, r, view);
+            }
+        }
+        self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
+    }
+
     /// Shade spot lights through the clustered light lists (the default): each fragment visits
     /// only the lights whose range and cone reach its cluster. Off, every fragment visits every
     /// light (for comparisons and debugging).
@@ -1208,7 +1332,7 @@ impl Renderer {
 
     /// The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then `spot_view(l)`
     /// for every layer of the spot shadow atlas (`None` when no light uses it this frame), then
-    /// `reflection_view(r)` for every planar reflection.
+    /// `reflection_view(r)` for every planar reflection, then `cascade_view(c)` for every cascade.
     fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
         let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false })];
         if let Some(atlas) = &self.spot_shadow_atlas {
@@ -1224,6 +1348,10 @@ impl Renderer {
                 casters_only: false,
             })
         }));
+        // then the cascades (`cascade_view`)
+        if let Some(csm) = &self.cascaded_shadows {
+            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true })));
+        }
         views
     }
 
@@ -1389,7 +1517,13 @@ impl Renderer {
         // Upload point shadow params to shadow uniform buffer
         let mut shadow_data = [0.0f32; 24];
         // Preserve existing directional shadow data if present
-        if self.shadows_enabled {
+        if let Some(vp) = self.cascaded_shadows.as_ref().and_then(|c| c.far_view_projection()) {
+            let csm = self.cascaded_shadows.as_ref().unwrap();
+            shadow_data[..16].copy_from_slice(&vp.to_cols_array());
+            shadow_data[16] = 0.0005;
+            shadow_data[17] = 2.0 * csm.options.max_distance / csm.options.resolution as f32;
+            shadow_data[18] = 1.0; // shadowEnabled
+        } else if self.shadows_enabled {
             if let Some(ref sm) = self.shadow_map {
                 shadow_data[..16].copy_from_slice(sm.light_vp.as_slice());
                 shadow_data[16] = sm.bias;
@@ -1423,6 +1557,7 @@ impl Renderer {
             let sample_count = self.config.sample_count;
             let depth_format = wgpu::TextureFormat::Depth24Plus;
             let spot_shadows = self.spot_shadow_atlas.is_some();
+            let cascades = self.cascaded_shadows.is_some();
             let reflections = !self.planar_reflections.is_empty();
 
             let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
@@ -1452,6 +1587,9 @@ impl Renderer {
                 if spot_shadows && r.cast_shadow {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
                 }
+                if cascades && r.cast_shadow {
+                    r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
+                }
                 if reflections {
                     r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
                 }
@@ -1468,12 +1606,13 @@ impl Renderer {
         // Phase 1: Upload camera + per-object matrices
         self.upload_all(scene, camera);
 
-        // GPU instance culling for every view (camera, spot shadows, reflections)
+        // GPU instance culling for every view (camera, spot shadows, reflections, cascades)
         self.update_planar_reflection_cameras(camera);
+        self.update_cascaded_shadows(scene, camera);
         self.run_instance_culling(scene, camera);
 
         // Shadow pass
-        if self.shadows_enabled {
+        if self.shadows_enabled && self.cascaded_shadows.is_none() {
             if let Some(ref mut sm) = self.shadow_map {
                 // Find first directional light
                 let dir_light_dir = scene.lights().find_map(|l| {
@@ -1542,7 +1681,7 @@ impl Renderer {
         }
 
         // Upload disabled shadow uniforms when shadows are off
-        if !self.shadows_enabled && self.cubemap_shadow_map.is_none() {
+        if !self.shadows_enabled && self.cubemap_shadow_map.is_none() && self.cascaded_shadows.is_none() {
             let shadow_data = [0.0f32; 24];
             if let Some(ref buf) = self.shadow_uniform_buf {
                 self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
@@ -1556,6 +1695,8 @@ impl Renderer {
 
         // Spot light shadow maps
         self.run_spot_shadow_pass(scene);
+        // Cascaded sun/moon shadows
+        self.run_cascade_shadow_pass(scene);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -1724,6 +1865,7 @@ impl Renderer {
         let depth_format = GBuffer::DEPTH_FORMAT;
         let sample_count = gbuffer.sample_count;
         let spot_shadows = self.spot_shadow_atlas.is_some();
+            let cascades = self.cascaded_shadows.is_some();
 
         let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
         for idx in ordered_indices {
@@ -1752,6 +1894,9 @@ impl Renderer {
             if spot_shadows && r.cast_shadow {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
             }
+            if cascades && r.cast_shadow {
+                r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
+            }
             if r.material.options.outputs_velocity {
                 r.material.get_velocity_pipeline(device, &layouts);
             }
@@ -1760,12 +1905,13 @@ impl Renderer {
         // Upload camera + per-object matrices
         self.upload_all(scene, camera);
 
-        // GPU instance culling for every view (camera, spot shadows, reflections)
+        // GPU instance culling for every view (camera, spot shadows, reflections, cascades)
         self.update_planar_reflection_cameras(camera);
+        self.update_cascaded_shadows(scene, camera);
         self.run_instance_culling(scene, camera);
 
         // Shadow pass (if enabled)
-        if self.shadows_enabled {
+        if self.shadows_enabled && self.cascaded_shadows.is_none() {
             if let Some(ref mut sm) = self.shadow_map {
                 let dir_light_dir = scene.lights().find_map(|l| {
                     if let crate::lights::Light::Directional(dl) = l { Some(dl.direction) } else { None }
@@ -1822,7 +1968,7 @@ impl Renderer {
                     self.queue.as_ref().unwrap().submit(std::iter::once(shadow_encoder.finish()));
                 }
             }
-        } else if self.cubemap_shadow_map.is_none() {
+        } else if self.cubemap_shadow_map.is_none() && self.cascaded_shadows.is_none() {
             let shadow_data = [0.0f32; 24];
             if let Some(ref buf) = self.shadow_uniform_buf {
                 self.queue.as_ref().unwrap().write_buffer(buf, 0, bytemuck::cast_slice(&shadow_data));
@@ -1836,6 +1982,8 @@ impl Renderer {
 
         // Spot light shadow maps
         self.run_spot_shadow_pass(scene);
+        // Cascaded sun/moon shadows
+        self.run_cascade_shadow_pass(scene);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
