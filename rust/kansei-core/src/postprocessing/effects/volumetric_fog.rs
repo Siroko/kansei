@@ -5,7 +5,8 @@ use crate::froxels::{FroxelGrid, FroxelGridOptions};
 use crate::lights::Light;
 use crate::math::{Mat4, Vec3};
 use crate::postprocessing::PostProcessingEffect;
-use crate::renderers::GBuffer;
+use crate::reflections::{flip_x, mirrored_view, PlanarReflection, ReflectionFog, ReflectionFogParamsGpu};
+use crate::renderers::{GBuffer, Renderer};
 use crate::shadows::{CascadedShadowMap, CubeMapShadowMap, ShadowMap, SpotShadowAtlas};
 
 const INJECT_WGSL: &str = concat!(
@@ -97,6 +98,7 @@ struct FogParamsGpu {
     start_distance: f32,
     jitter_frame: u32,
     _pad: f32,
+    clip_plane: [f32; 4],
 }
 
 #[repr(C)]
@@ -283,6 +285,19 @@ struct Gpu {
     dummy_spot_lights: wgpu::Buffer,
     dummy_spot_atlas: wgpu::TextureView,
     spot_sampler: wgpu::Sampler,
+    reflection: Option<ReflectionGpu>,
+}
+
+/// The fog as a planar reflection sees it: a second froxel grid, built from the mirrored camera
+/// with the fog below the mirror left out.
+struct ReflectionGpu {
+    grid: FroxelGrid,
+    fog_params: wgpu::Buffer,
+    inject_bg: Option<wgpu::BindGroup>,
+    /// The volume's lookup parameters, staged here each frame and copied into the shared buffer
+    /// after the volume is built, so the reflection reads parameters and volume from one frame.
+    staging: wgpu::Buffer,
+    shared: ReflectionFog,
 }
 
 /// Froxel volumetric fog, ported from the TS `VolumetricFogEffect`.
@@ -325,6 +340,8 @@ pub struct VolumetricFogEffect {
     sky_lighting: Option<wgpu::Buffer>,
     spot_lights: Option<wgpu::Buffer>,
     spot_shadows: Option<wgpu::TextureView>,
+    /// The mirror plane (unit normal, d) of the reflection fog, if any.
+    reflection_plane: Option<(glam::Vec3, f32)>,
     lights_dirty: bool,
     bindings_dirty: bool,
     gpu: Option<Gpu>,
@@ -354,6 +371,7 @@ impl VolumetricFogEffect {
             sky_lighting: None,
             spot_lights: None,
             spot_shadows: None,
+            reflection_plane: None,
             lights_dirty: true,
             bindings_dirty: true,
             gpu: None,
@@ -369,6 +387,9 @@ impl VolumetricFogEffect {
     pub fn reset_history(&mut self) {
         if let Some(g) = &mut self.gpu {
             g.grid.reset_history();
+            if let Some(r) = &mut g.reflection {
+                r.grid.reset_history();
+            }
         }
     }
 
@@ -458,6 +479,56 @@ impl VolumetricFogEffect {
     pub fn set_sky_lighting(&mut self, sky_lighting: Option<&wgpu::Buffer>) {
         self.sky_lighting = sky_lighting.cloned();
         self.bindings_dirty = true;
+    }
+
+    /// The fog as `reflection` sees it, for `PlanarReflection::set_fog`: every frame the effect
+    /// also builds a froxel volume from the camera mirrored in the reflection's plane, with the
+    /// same grid, lights and media but only the fog above the plane, and the reflection
+    /// composites it over what it saw. A lake then mirrors the glow of beams and lamps in the mist
+    /// (the main fog already covers the camera's path to the water). It costs about one more
+    /// injection. Call again if the plane moves.
+    ///
+    /// ```ignore
+    /// let fog_in_reflection = fog.reflection_fog(&renderer, &reflection);
+    /// reflection.set_fog(&renderer, Some(&fog_in_reflection));
+    /// renderer.add_planar_reflection(reflection);
+    /// ```
+    pub fn reflection_fog(&mut self, renderer: &Renderer, reflection: &PlanarReflection) -> ReflectionFog {
+        self.mirrored_fog(renderer.device(), renderer.queue(), reflection.plane())
+    }
+
+    /// The froxel grid the reflection fog is built in (available after `reflection_fog`).
+    pub fn reflection_froxel_grid(&self) -> Option<&FroxelGrid> {
+        self.gpu.as_ref().and_then(|g| g.reflection.as_ref()).map(|r| &r.grid)
+    }
+
+    /// `reflection_fog` for the plane `n·p + d = 0` (`n` unit length).
+    pub(crate) fn mirrored_fog(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, plane: (glam::Vec3, f32)) -> ReflectionFog {
+        if self.gpu.is_none() {
+            self.init_gpu(device, queue);
+        }
+        self.reflection_plane = Some(plane);
+        let gpu = self.gpu.as_mut().unwrap();
+        if gpu.reflection.is_none() {
+            let buffer = |label: &str, size: usize, usage: wgpu::BufferUsages| {
+                device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage, mapped_at_creation: false })
+            };
+            let params_size = std::mem::size_of::<ReflectionFogParamsGpu>();
+            let grid = FroxelGrid::new(device, queue, &self.grid_options);
+            let shared = ReflectionFog {
+                volume: grid.accum_view().clone(),
+                params: buffer("VolumetricFog/ReflectionFogParams", params_size, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            };
+            gpu.reflection = Some(ReflectionGpu {
+                grid,
+                fog_params: buffer("VolumetricFog/ReflectionParams", std::mem::size_of::<FogParamsGpu>(), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+                inject_bg: None,
+                staging: buffer("VolumetricFog/ReflectionFogStaging", params_size, wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST),
+                shared,
+            });
+            self.bindings_dirty = true;
+        }
+        gpu.reflection.as_ref().unwrap().shared.clone()
     }
 
     /// Scatter the renderer's spot lights (`Renderer::spot_lights_buffer()`, rewritten every
@@ -714,6 +785,7 @@ impl VolumetricFogEffect {
             dummy_spot_lights,
             dummy_spot_atlas,
             spot_sampler,
+            reflection: None,
         });
         self.lights_dirty = true;
         self.bindings_dirty = true;
@@ -786,25 +858,33 @@ impl VolumetricFogEffect {
         let sky_lighting = self.sky_lighting.as_ref().unwrap_or(&gpu.dummy_sky_lighting);
         let spot_lights = self.spot_lights.as_ref().unwrap_or(&gpu.dummy_spot_lights);
         let spot_atlas = self.spot_shadows.as_ref().unwrap_or(&gpu.dummy_spot_atlas);
-        gpu.inject_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("VolumetricFog/InjectBG"),
-            layout: &gpu.inject_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(gpu.grid.scatter_extinction_view()) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
-                wgpu::BindGroupEntry { binding: 2, resource: gpu.fog_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: gpu.dir_lights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: gpu.point_lights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(atlas) },
-                wgpu::BindGroupEntry { binding: 6, resource: vp.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: gpu.media_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: gpu.volumes.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: sky_lighting.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: spot_lights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(spot_atlas) },
-                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&gpu.spot_sampler) },
-            ],
-        }));
+        let group = |label: &str, output: &wgpu::TextureView, params: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &gpu.inject_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(output) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
+                    wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: gpu.dir_lights.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: gpu.point_lights.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(atlas) },
+                    wgpu::BindGroupEntry { binding: 6, resource: vp.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: gpu.media_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: gpu.volumes.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: sky_lighting.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: spot_lights.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(spot_atlas) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&gpu.spot_sampler) },
+                ],
+            })
+        };
+        let main = group("VolumetricFog/InjectBG", gpu.grid.scatter_extinction_view(), &gpu.fog_params);
+        let reflection = gpu.reflection.as_ref().map(|r| group("VolumetricFog/ReflectionInjectBG", r.grid.scatter_extinction_view(), &r.fog_params));
+        gpu.inject_bg = Some(main);
+        if let Some(r) = &mut gpu.reflection {
+            r.inject_bg = reflection;
+        }
         self.bindings_dirty = false;
     }
 
@@ -873,6 +953,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
             start_distance: self.start_distance,
             jitter_frame: if grid.is_temporal() { self.frame } else { 0 },
             _pad: 0.0,
+            clip_plane: [0.0, 0.0, 0.0, 1.0],
         };
         self.frame = self.frame % 1024 + 1;
         queue.write_buffer(&gpu.fog_params, 0, bytemuck::bytes_of(&params));
@@ -900,6 +981,39 @@ impl PostProcessingEffect for VolumetricFogEffect {
         // 2. temporal reprojection (no-op unless temporal), 3. front-to-back accumulation
         gpu.grid.temporal_blend(queue, encoder, &Mat4::from(inv_vp), &Mat4::from(vp), camera.near, camera.far);
         gpu.grid.accumulate(encoder);
+
+        // the same from the camera mirrored in the reflection's plane, above the plane only
+        if let (Some(r), Some((n, d))) = (gpu.reflection.as_mut(), self.reflection_plane) {
+            let above = n.dot(glam::Vec3::new(cam.x, cam.y, cam.z)) + d > 0.0;
+            let view = mirrored_view(camera.view_matrix.to_glam(), n, d);
+            let m_vp = flip_x() * camera.projection_matrix.to_glam() * view;
+            let m_inv = m_vp.inverse();
+            let m_cam = view.inverse().w_axis;
+            let mut mirrored = params;
+            mirrored.inv_view_proj = m_inv.to_cols_array();
+            mirrored.camera_pos = [m_cam.x, m_cam.y, m_cam.z];
+            mirrored.clip_plane = [n.x, n.y, n.z, d];
+            queue.write_buffer(&r.fog_params, 0, bytemuck::bytes_of(&mirrored));
+            if above {
+                let (gw, gh, gd) = (r.grid.grid_w(), r.grid.grid_h(), r.grid.grid_d());
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/ReflectionInject"), ..Default::default() });
+                pass.set_pipeline(&gpu.inject_pipeline);
+                pass.set_bind_group(0, r.inject_bg.as_ref().unwrap(), &[]);
+                pass.dispatch_workgroups(gw.div_ceil(4), gh.div_ceil(4), gd.div_ceil(4));
+                drop(pass);
+                r.grid.temporal_blend(queue, encoder, &Mat4::from(m_inv), &Mat4::from(m_vp), camera.near, camera.far);
+                r.grid.accumulate(encoder);
+            }
+            let lookup = ReflectionFogParamsGpu {
+                view_proj: m_vp.to_cols_array(),
+                grid_near: r.grid.near(),
+                grid_far: r.grid.far(),
+                grid_d: r.grid.grid_d() as f32,
+                enabled: above as u32,
+            };
+            queue.write_buffer(&r.staging, 0, bytemuck::bytes_of(&lookup));
+            encoder.copy_buffer_to_buffer(&r.staging, 0, &r.shared.params, 0, std::mem::size_of::<ReflectionFogParamsGpu>() as u64);
+        }
 
         // 4. composite over the scene
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1020,4 +1134,98 @@ mod tests {
         assert_eq!(fog.point_data.iter().map(|p| p.shadow_layer).collect::<Vec<_>>(), [0, NO_SHADOW, NO_SHADOW]);
         assert_eq!(fog.point_data[2].color, [0.0, 0.0, 0.0]);
     }
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let frac = (h & 0x3ff) as f32;
+        sign * match exp {
+            0 => frac * 2f32.powi(-24),
+            31 => f32::INFINITY,
+            e => (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    fn read_volume(device: &wgpu::Device, queue: &wgpu::Queue, grid: &FroxelGrid) -> Vec<[f32; 4]> {
+        let (w, h, d) = (grid.grid_w(), grid.grid_h(), grid.grid_d());
+        let row = (w * 8).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h * d) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: grid.accum_texture(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: d },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = buffer.slice(..).get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * d) as usize);
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    let o = ((z * h + y) * row + x * 8) as usize;
+                    let c = |i: usize| f16_to_f32(u16::from_le_bytes([data[o + 2 * i], data[o + 2 * i + 1]]));
+                    out.push([c(0), c(1), c(2), c(3)]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The reflection's volume, built from the camera mirrored in the water, holds only the fog
+    /// above the water: a mirrored ray below the plane crosses no fog, one rising through it does.
+    #[test]
+    fn the_reflection_fog_lies_only_above_the_mirror() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (64u32, 32u32);
+        let tex = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
+                .create_view(&Default::default())
+        };
+        let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+        let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
+        let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        // uniform fog lit by a uniform sky, the camera 5 m above still water looking along it
+        let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+            grid: FroxelGridOptions { grid_w: 16, grid_h: 16, grid_d: 32, near: 0.5, far: 200.0, temporal: false, blend_factor: 1.0 },
+            base_density: 0.02,
+            height_falloff: 0.0,
+            fog_height: 100.0,
+            ambient: Vec3::new(1.0, 1.0, 1.0),
+            ..Default::default()
+        });
+        let _ = fog.mirrored_fog(&device, &queue, (glam::Vec3::Y, 0.0));
+        let mut camera = Camera::new(60.0, 0.5, 1000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 5.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 5.0, -10.0));
+        camera.update_view_matrix();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        fog.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+        queue.submit(std::iter::once(encoder.finish()));
+        let main = read_volume(&device, &queue, fog.froxel_grid().unwrap());
+        let mirrored = read_volume(&device, &queue, fog.reflection_froxel_grid().unwrap());
+        let at = |v: &[[f32; 4]], x: u32, y: u32, z: u32| v[((z * 16 + y) * 16 + x) as usize];
+        let last = 31;
+        // the main view: fog all along its middle row
+        let m = at(&main, 8, 8, last);
+        assert!(m[3] < 0.5 && m[1] > 0.1, "main view, far slice: {m:?}");
+        // the mirrored camera sits 5 m below the water, and its image is the reflection's: what
+        // lies above the water shows in its lower rows. Its upper rows never rise above the water
+        let below = at(&mirrored, 8, 4, last);
+        assert!(below[3] > 0.99 && below[1] < 1e-3, "mirrored view below the water: {below:?}");
+        // its bottom row rises through the water into the fog beyond it
+        let rising = at(&mirrored, 8, 15, last);
+        assert!(rising[3] < 0.95 && rising[1] > 0.01, "mirrored view rising through the water: {rising:?}");
+        // and nothing before it crosses the plane, 5 m / tan(28 degrees) = 9.2 m out, about slice
+        // 15 of 32 between 0.5 and 200 m
+        let near = at(&mirrored, 8, 15, 10);
+        assert!(near[3] > 0.99 && near[1] < 1e-3, "mirrored view before the water: {near:?}");
+        eprintln!("main {m:?}, mirrored below {below:?}, rising {rising:?}, before the water {near:?}");
+    }
 }
+

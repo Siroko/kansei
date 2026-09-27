@@ -5,7 +5,7 @@ use crate::cameras::Camera;
 use crate::math::Vec3;
 use crate::renderers::{GBuffer, Renderer};
 
-const RESOLVE_WGSL: &str = include_str!("../shaders/planar_reflection_resolve.wgsl");
+const RESOLVE_WGSL: &str = concat!(include_str!("../shaders/froxel_common.wgsl"), include_str!("../shaders/planar_reflection_resolve.wgsl"));
 const DOWNSAMPLE_WGSL: &str = include_str!("../shaders/planar_reflection_downsample.wgsl");
 
 /// Reflection about the plane `n·p + d = 0` (`n` unit length).
@@ -32,6 +32,39 @@ pub fn oblique_near_plane(projection: glam::Mat4, clip_plane: glam::Vec4) -> gla
     m.z_axis.z = c.z;
     m.w_axis.z = c.w;
     m
+}
+
+/// The mirrored view of `view` across the plane `n·p + d = 0`, and the projection that renders
+/// it with the winding flipped back (x negated in clip space), without the oblique near plane.
+pub(crate) fn mirrored_view(view: glam::Mat4, n: glam::Vec3, d: f32) -> glam::Mat4 {
+    view * reflection_matrix(n, d)
+}
+
+pub(crate) fn flip_x() -> glam::Mat4 {
+    glam::Mat4::from_scale(glam::Vec3::new(-1.0, 1.0, 1.0))
+}
+
+/// The volumetric fog as a planar reflection sees it (`VolumetricFogEffect::reflection_fog`): a
+/// froxel volume built from the mirrored camera, holding only the fog above the mirror (the main
+/// fog already covers the camera's path to the water). Give it to the reflection with
+/// `PlanarReflection::set_fog`; its resolve composites the fog over what the mirror saw, so a
+/// lake mirrors the glow of beams and lamps in the mist. The volume is the one the fog built in
+/// the previous frame, looked up by world position, so it stays in place as the camera moves.
+#[derive(Clone)]
+pub struct ReflectionFog {
+    pub(crate) volume: wgpu::TextureView,
+    pub(crate) params: wgpu::Buffer,
+}
+
+/// What the resolve needs to look up a `ReflectionFog` volume (the WGSL `ReflectionFogParams`).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct ReflectionFogParamsGpu {
+    pub view_proj: [f32; 16],
+    pub grid_near: f32,
+    pub grid_far: f32,
+    pub grid_d: f32,
+    pub enabled: u32,
 }
 
 pub struct PlanarReflectionOptions {
@@ -100,10 +133,41 @@ pub struct PlanarReflection {
     texture_view: wgpu::TextureView,
     // (the per-mip views are held by the resolve and downsample bind groups)
     resolve_pipeline: wgpu::ComputePipeline,
+    resolve_bgl: wgpu::BindGroupLayout,
     resolve_bg: wgpu::BindGroup,
     resolve_params: wgpu::Buffer,
+    mip0_view: wgpu::TextureView,
+    fog_sampler: wgpu::Sampler,
+    // no fog: an empty volume and parameters that say so
+    no_fog: ReflectionFog,
     downsample_pipeline: wgpu::ComputePipeline,
     downsample_bgs: Vec<wgpu::BindGroup>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    mip0: &wgpu::TextureView,
+    params: &wgpu::Buffer,
+    fog_sampler: &wgpu::Sampler,
+    fog: &ReflectionFog,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("PlanarReflection/ResolveBG"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(mip0) },
+            wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&fog.volume) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(fog_sampler) },
+            wgpu::BindGroupEntry { binding: 6, resource: fog.params.as_entire_binding() },
+        ],
+    })
 }
 
 impl PlanarReflection {
@@ -179,6 +243,13 @@ impl PlanarReflection {
                 }),
                 entry(2, storage),
                 entry(3, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+                entry(4, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                }),
+                entry(5, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(6, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
             ],
         });
         let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -211,16 +282,37 @@ impl PlanarReflection {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("PlanarReflection/ResolveBG"),
-            layout: &resolve_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&color_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&mip_views[0]) },
-                wgpu::BindGroupEntry { binding: 3, resource: resolve_params.as_entire_binding() },
-            ],
+        let fog_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("PlanarReflection/FogSampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
         });
+        let no_fog = ReflectionFog {
+            volume: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("PlanarReflection/NoFog"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
+            // zeroed: enabled = 0
+            params: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("PlanarReflection/NoFogParams"),
+                size: std::mem::size_of::<ReflectionFogParamsGpu>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            }),
+        };
+        let resolve_bg = resolve_bind_group(device, &resolve_bgl, &color_view, &depth_view, &mip_views[0], &resolve_params, &fog_sampler, &no_fog);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("PlanarReflection/Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -263,11 +355,38 @@ impl PlanarReflection {
             texture,
             texture_view,
             resolve_pipeline: pipeline("PlanarReflection/Resolve", RESOLVE_WGSL, &resolve_bgl),
+            resolve_bgl,
             resolve_bg,
             resolve_params,
+            mip0_view: mip_views[0].clone(),
+            fog_sampler,
+            no_fog,
             downsample_pipeline: pipeline("PlanarReflection/Downsample", DOWNSAMPLE_WGSL, &downsample_bgl),
             downsample_bgs,
         }
+    }
+
+    /// Composite a volumetric fog over the reflection (`VolumetricFogEffect::reflection_fog`), or
+    /// none. Materials then fog only what lies beyond the fog's volume along the reflected path.
+    pub fn set_fog(&mut self, renderer: &Renderer, fog: Option<&ReflectionFog>) {
+        let fog = fog.unwrap_or(&self.no_fog);
+        self.resolve_bg = resolve_bind_group(
+            renderer.device(),
+            &self.resolve_bgl,
+            &self.color_view,
+            &self.depth_view,
+            &self.mip0_view,
+            &self.resolve_params,
+            &self.fog_sampler,
+            fog,
+        );
+    }
+
+    /// The plane as (unit normal, d) with `n·p + d = 0`.
+    pub(crate) fn plane(&self) -> (glam::Vec3, f32) {
+        let n = glam::Vec3::new(self.plane_normal.x, self.plane_normal.y, self.plane_normal.z).normalize_or(glam::Vec3::Y);
+        let p = glam::Vec3::new(self.plane_point.x, self.plane_point.y, self.plane_point.z);
+        (n, -n.dot(p))
     }
 
     /// The reflection (all mips) as a material bindable: `texture_2d<f32>` in WGSL.
@@ -296,16 +415,14 @@ impl PlanarReflection {
     /// Point the mirrored camera for this frame. Returns false when the main camera is not on the
     /// reflected side of the plane (nothing to render).
     pub(crate) fn update_camera(&mut self, queue: &wgpu::Queue, main: &Camera) -> bool {
-        let n = glam::Vec3::new(self.plane_normal.x, self.plane_normal.y, self.plane_normal.z).normalize_or(glam::Vec3::Y);
-        let p = glam::Vec3::new(self.plane_point.x, self.plane_point.y, self.plane_point.z);
-        let d = -n.dot(p);
+        let (n, d) = self.plane();
         let view = main.view_matrix.to_glam();
         let cam_pos = view.inverse().w_axis.truncate();
         self.active = self.enabled && n.dot(cam_pos) + d > 0.0;
         if !self.active {
             return false;
         }
-        let mirrored_view = view * reflection_matrix(n, d);
+        let mirrored_view = mirrored_view(view, n, d);
         // clip plane (lowered by the bias) in the mirrored view space: planes transform by the
         // inverse transpose
         let plane_world = glam::Vec4::new(n.x, n.y, n.z, d + self.clip_bias);
@@ -313,10 +430,9 @@ impl PlanarReflection {
         let projection = oblique_near_plane(main.projection_matrix.to_glam(), plane_view);
         // the mirror flips triangle winding; flipping x in clip space flips it back, so the
         // materials' back-face culling still works (samplers flip u back, see the WGSL helper)
-        let flip_x = glam::Mat4::from_scale(glam::Vec3::new(-1.0, 1.0, 1.0));
         self.camera.view_matrix = mirrored_view.into();
         self.camera.inverse_view_matrix = mirrored_view.inverse().into();
-        self.camera.projection_matrix = (flip_x * projection).into();
+        self.camera.projection_matrix = (flip_x() * projection).into();
         self.camera.upload(queue);
         true
     }
@@ -447,5 +563,6 @@ mod tests {
             }
         }
         assert_eq!(sizes["ResolveParams"], std::mem::size_of::<ResolveParamsGpu>());
+        assert_eq!(sizes["ReflectionFogParams"], std::mem::size_of::<ReflectionFogParamsGpu>());
     }
 }
