@@ -5,7 +5,8 @@
 //!
 //! URL parameters: `taa=0` (off), `vel=0` (no motion vectors: the car and grass reproject by
 //! depth only), `wind=<scale>`, `t=<seconds>` (freeze the camera; the car and the wind keep
-//! moving, the jitter keeps accumulating).
+//! moving, the jitter keeps accumulating), `scale=<0.25..1>` (render the scene at that fraction
+//! of the canvas and let the TAA upscale it), `stats=1` (log the interval between frames).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -162,6 +163,8 @@ struct State {
     last_t: f32,
     frozen_t: Option<f32>,
     wind: f32,
+    /// `stats=1`: frames in the current window and when it started.
+    stats: Option<(u32, f64)>,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -200,6 +203,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ..Default::default()
     });
     renderer.initialize_with_canvas(canvas.clone()).await;
+    if let Some(scale) = query_param("scale").and_then(|v| v.parse().ok()) {
+        renderer.set_render_scale(scale);
+    }
     let velocity = query_param("vel").as_deref() != Some("0");
 
     let mut scene = Scene::new();
@@ -263,17 +269,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut camera = Camera::new(40.0, 0.1, 1000.0, width as f32 / height as f32);
     camera.update_projection_matrix();
 
-    log::info!("Kansei — Temporal AA (WASM) ready: motion vectors {velocity}");
+    let (render_width, render_height) = renderer.render_size();
+    log::info!("Kansei — Temporal AA (WASM) ready: motion vectors {velocity}, rendering {render_width}x{render_height} for {width}x{height}");
 
     let frozen_t = query_param("t").and_then(|v| v.parse().ok());
     let wind: f32 = query_param("wind").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, animated, car, start_ms: now_secs(), last_t: 0.0, frozen_t, wind }));
+    let stats = (query_param("stats").as_deref() == Some("1")).then(|| (0, now_secs()));
+    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, animated, car, start_ms: now_secs(), last_t: 0.0, frozen_t, wind, stats }));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
         {
             let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref animated, car, ref start_ms, ref mut last_t, frozen_t, ref wind } = *st;
+            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref animated, car, ref start_ms, ref mut last_t, frozen_t, ref wind, ref mut stats } = *st;
             let clock = (now_secs() - *start_ms) as f32;
             let t = frozen_t.unwrap_or(clock);
 
@@ -294,6 +302,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             camera.look_at(&Vec3::new(-2.0 + t * 0.4, 2.2, -20.0));
 
             renderer.render_with_postprocessing(scene, camera, volume);
+            if let Some((frames, window_start)) = stats {
+                *frames += 1;
+                if *frames == 240 {
+                    log::info!("frame interval: {:.2} ms", (now_secs() - *window_start) * 1000.0 / 240.0);
+                    *frames = 0;
+                    *window_start = now_secs();
+                }
+            }
         }
         request_animation_frame(f.borrow().as_ref().unwrap());
     }));

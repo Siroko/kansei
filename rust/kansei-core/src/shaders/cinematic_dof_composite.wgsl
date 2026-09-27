@@ -13,7 +13,7 @@
 fn main(@builtin(global_invocation_id) gid : vec3u) {
     if (gid.x >= p.width || gid.y >= p.height) { return; }
     let sharp = textureLoad(colorTex, gid.xy, 0);
-    let coc = clamp(cocFromDepth(textureLoad(depthTex, gid.xy, 0)), -p.maxCoc, p.maxCoc);
+    let coc = clamp(cocFromDepth(loadDepth(depthTex, vec2i(gid.xy))), -p.maxCoc, p.maxCoc);
 
     let hs = halfSize();
     let h = (vec2f(gid.xy) + 0.5) * 0.5 - 0.5;

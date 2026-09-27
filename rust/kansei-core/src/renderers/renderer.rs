@@ -129,6 +129,8 @@ pub struct Renderer {
     // Depth-copy pass (resolve MSAA depth for compute shaders)
     depth_copy_pipeline: Option<wgpu::RenderPipeline>,
     depth_copy_bgl: Option<wgpu::BindGroupLayout>,
+    // Fraction of the surface size the post-processing path renders the scene at
+    render_scale: f32,
 }
 
 impl Renderer {
@@ -186,6 +188,7 @@ impl Renderer {
             gbuffer_last_sample_count: 0,
             depth_copy_pipeline: None,
             depth_copy_bgl: None,
+            render_scale: 1.0,
         }
     }
 
@@ -578,6 +581,25 @@ impl Renderer {
 
     pub fn width(&self) -> u32 { self.config.width }
     pub fn height(&self) -> u32 { self.config.height }
+
+    /// Render the scene at `scale` times the surface size (clamped to 0.25..=1) in
+    /// `render_with_postprocessing`. The GBuffer and every scene pass run at `render_size()`;
+    /// the post-processing chain's upscaler (`TemporalAAEffect`) reconstructs the surface size
+    /// from the jittered frames, and the effects after it run at the surface size. Without an
+    /// upscaler in the chain the blit stretches the image to the surface.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        self.render_scale = if scale.is_finite() { scale.clamp(0.25, 1.0) } else { 1.0 };
+    }
+
+    pub fn render_scale(&self) -> f32 {
+        self.render_scale
+    }
+
+    /// The size the post-processing path renders the scene at: the surface size times the
+    /// render scale, rounded.
+    pub fn render_size(&self) -> (u32, u32) {
+        scaled_size(self.config.width, self.config.height, self.render_scale)
+    }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width;
@@ -1855,12 +1877,15 @@ impl Renderer {
     ) {
         let width = self.config.width;
         let height = self.config.height;
-        volume.ensure_gbuffer(width, height);
+        let (render_width, render_height) = self.render_size();
+        volume.ensure_gbuffer(render_width, render_height);
 
-        // sub-pixel jitter for temporal anti-aliasing: an 8-phase Halton (2, 3) sequence
+        // sub-pixel jitter for temporal anti-aliasing, in rendered pixels: a Halton (2, 3)
+        // sequence of 8 phases per displayed pixel, so each one still sees 8 samples when
+        // rendering below the display size
         camera.jitter = if volume.wants_jitter() {
-            let i = camera.frame() % 8 + 1;
-            [(2.0 * halton(i, 2) - 1.0) / width as f32, (2.0 * halton(i, 3) - 1.0) / height as f32]
+            let i = camera.frame() % jitter_phases(self.render_scale) + 1;
+            [(2.0 * halton(i, 2) - 1.0) / render_width as f32, (2.0 * halton(i, 3) - 1.0) / render_height as f32]
         } else {
             [0.0, 0.0]
         };
@@ -2035,7 +2060,8 @@ impl Renderer {
         self.render_planar_reflections(scene);
         let clusters = self.light_clusters.as_ref().unwrap();
         if self.clustered_lights {
-            clusters.build(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera, self.config.width, self.config.height);
+            // tiles of the GBuffer's pixels (the render size)
+            clusters.build(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera, gbuffer.width, gbuffer.height);
         } else {
             clusters.disable(self.queue.as_ref().unwrap());
         }
@@ -2402,6 +2428,17 @@ fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
     }
 }
 
+/// `width` x `height` times `scale`, rounded, at least 1 x 1.
+fn scaled_size(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    let scaled = |n: u32| ((n as f32 * scale).round() as u32).max(1);
+    (scaled(width), scaled(height))
+}
+
+/// Jitter phases for a render scale: 8 per displayed pixel.
+fn jitter_phases(scale: f32) -> u32 {
+    (8.0 / (scale * scale)).round() as u32
+}
+
 /// The `index`-th element (from 1) of the Halton sequence in `base`, in [0, 1).
 fn halton(mut index: u32, base: u32) -> f32 {
     let mut result = 0.0;
@@ -2424,5 +2461,15 @@ mod tests {
         assert!((super::halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
         assert!((super::halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
         assert!((super::halton(4, 3) - 4.0 / 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn render_size_and_jitter_phases_follow_the_scale() {
+        assert_eq!(super::scaled_size(1920, 1080, 1.0), (1920, 1080));
+        assert_eq!(super::scaled_size(1920, 1080, 0.5), (960, 540));
+        assert_eq!(super::scaled_size(1920, 1080, 0.67), (1286, 724));
+        assert_eq!(super::scaled_size(1, 1, 0.25), (1, 1));
+        assert_eq!(super::jitter_phases(1.0), 8);
+        assert_eq!(super::jitter_phases(0.5), 32);
     }
 }

@@ -168,6 +168,8 @@ struct Settings {
     off: bool,
     taa: bool,
     samples: u32,
+    /// Render scale (the TAA upscales to the canvas).
+    scale: f32,
     /// Fixed time for the rack focus, seconds (screenshots).
     time: Option<f32>,
 }
@@ -186,6 +188,7 @@ fn settings() -> Settings {
         off: q.get("dof").as_deref() == Some("0"),
         taa: q.get("taa").as_deref() != Some("0"),
         samples: num("samples").unwrap_or(72.0) as u32,
+        scale: num("scale").unwrap_or(1.0),
         time: num("t"),
     }
 }
@@ -245,6 +248,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     renderer.initialize_with_canvas(canvas).await;
     renderer.enable_shadows(2048);
     let settings = settings();
+    renderer.set_render_scale(settings.scale);
 
     // a low sun ahead, backlighting the set
     let mut sky = SkyAtmosphere::new(renderer.device(), SkyAtmosphereOptions::default());

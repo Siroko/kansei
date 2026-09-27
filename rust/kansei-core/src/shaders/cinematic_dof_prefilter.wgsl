@@ -19,7 +19,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     for (var i = 0u; i < 4u; i++) {
         let fc = min(base + vec2i(i32(i & 1u), i32(i >> 1u)), lim);
         sum += min(textureLoad(colorTex, fc, 0).rgb, vec3f(65000.0));
-        minDepth = min(minDepth, textureLoad(depthTex, fc, 0));
+        minDepth = min(minDepth, loadDepth(depthTex, fc));
     }
     textureStore(halfOut, gid.xy, vec4f(sum * 0.25, cocFromDepth(minDepth) * 0.5));
 }

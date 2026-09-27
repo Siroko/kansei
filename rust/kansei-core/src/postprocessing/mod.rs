@@ -7,7 +7,8 @@
 //! 1. the sky and aerial perspective ([`effects::AtmosphereEffect`]), then the far height fog
 //!    ([`effects::HeightFogEffect`]);
 //! 2. volumetric fog (composited over the lit scene by depth);
-//! 3. anti-aliasing, while samples are still linear;
+//! 3. anti-aliasing, while samples are still linear ([`effects::TemporalAAEffect`], which also
+//!    upscales to the display size under `Renderer::set_render_scale`; what follows runs at it);
 //! 4. depth of field (lens blur of scene light);
 //! 5. bloom (scattering in the lens, on scene light);
 //! 6. [`effects::ToneMapEffect`] (exposure, lens vignetting and fringing, grade, tone curve, grain,
