@@ -1,5 +1,6 @@
 use crate::atmosphere::sky_atmosphere::{
-    compute_pipeline, sampler_entry, texture_entry, uniform_entry, COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL,
+    compute_pipeline, sampler_entry, texture_3d_entry, texture_entry, uniform_entry, AERIAL_PERSPECTIVE_LOOKUP_WGSL, COMMON_WGSL,
+    FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL,
 };
 use crate::atmosphere::{SkyAtmosphere, SkyAtmosphereBindings};
 use crate::cameras::Camera;
@@ -9,11 +10,12 @@ use crate::renderers::GBuffer;
 const COMPOSITE_WGSL: &str = include_str!("../../atmosphere/shaders/sky_composite.wgsl");
 
 fn composite_source() -> String {
-    [COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, COMPOSITE_WGSL].concat()
+    [COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, AERIAL_PERSPECTIVE_LOOKUP_WGSL, COMPOSITE_WGSL].concat()
 }
 
 /// Renders a [`SkyAtmosphere`]: the sky, the sun and the moon wherever the scene left the depth
-/// buffer at the far plane. Put it first in the chain, before the fog and the tonemapper, and
+/// buffer at the far plane, and aerial perspective (the atmosphere between the camera and each
+/// surface) everywhere else. Put it first in the chain, before the fog and the tonemapper, and
 /// call `SkyAtmosphere::update` every frame before rendering.
 pub struct AtmosphereEffect {
     sky: SkyAtmosphereBindings,
@@ -66,6 +68,8 @@ impl AtmosphereEffect {
                     },
                     count: None,
                 },
+                texture_3d_entry(9),
+                texture_3d_entry(10),
             ],
         });
         let pipeline = compute_pipeline(device, "Atmosphere/Composite", &composite_source(), &bgl);
@@ -79,6 +83,7 @@ impl AtmosphereEffect {
             ("transmittance_lut", s::transmittance_source()),
             ("multi_scattering_lut", s::multi_scattering_source()),
             ("sky_view_lut", s::sky_view_source()),
+            ("aerial_perspective_lut", s::aerial_perspective_source()),
             ("sky_composite", composite_source()),
         ]
     }
@@ -120,6 +125,8 @@ impl PostProcessingEffect for AtmosphereEffect {
             tex(input),
             tex(depth),
             tex(output),
+            tex(&s.ap_scattering),
+            tex(&s.ap_transmittance),
         ];
         let entries: Vec<_> = resources
             .into_iter()

@@ -1,5 +1,5 @@
 // AtmosphereEffect composite: the sky, the sun and the moon behind the scene, where the depth
-// buffer is still at the far plane. The rest of the image passes through.
+// buffer is still at the far plane, and aerial perspective over the scene everywhere else.
 
 @group(0) @binding(0) var<uniform> atm : Atmosphere;
 @group(0) @binding(1) var<uniform> frame : SkyFrame;
@@ -10,17 +10,15 @@
 @group(0) @binding(6) var inputTex : texture_2d<f32>;
 @group(0) @binding(7) var depthTex : texture_depth_2d;
 @group(0) @binding(8) var outputTex : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(9) var apScattering : texture_3d<f32>;
+@group(0) @binding(10) var apTransmittance : texture_3d<f32>;
 
 const SUN_LIMB_DARKENING : f32 = 0.6;
 const MAX_HALF : f32 = 65000.0;
 
-// World-space direction of the ray through a pixel centre.
-fn viewRay(pixel: vec2u, size: vec2u) -> vec3f {
-    let uv = (vec2f(pixel) + 0.5) / vec2f(size);
-    let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let n = frame.invViewProj * vec4f(ndc, 0.0, 1.0);
-    let f = frame.invViewProj * vec4f(ndc, 1.0, 1.0);
-    return normalize(f.xyz / f.w - n.xyz / n.w);
+fn unproject(uv: vec2f, depth: f32) -> vec3f {
+    let p = frame.invViewProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    return p.xyz / p.w;
 }
 
 @compute @workgroup_size(8, 8)
@@ -29,12 +27,14 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     if (gid.x >= size.x || gid.y >= size.y) { return; }
     let color = textureLoad(inputTex, gid.xy, 0);
     let depth = textureLoad(depthTex, gid.xy, 0);
+    let uv = (vec2f(gid.xy) + 0.5) / vec2f(size);
     if (depth < 1.0) {
-        textureStore(outputTex, gid.xy, color);
+        let ap = aerialPerspective(uv, unproject(uv, depth));
+        textureStore(outputTex, gid.xy, vec4f(color.rgb * ap.transmittance + ap.scattering, color.a));
         return;
     }
 
-    let rd = viewRay(gid.xy, size);
+    let rd = normalize(unproject(uv, 1.0) - unproject(uv, 0.0));
     let ro = frame.cameraPos;
     let r = length(ro);
     var lum = skyViewLuminance(rd);
