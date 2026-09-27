@@ -7,6 +7,13 @@
 //! depth only), `wind=<scale>`, `t=<seconds>` (freeze the camera; the car and the wind keep
 //! moving, the jitter keeps accumulating), `scale=<0.25..1>` (render the scene at that fraction
 //! of the canvas and let the TAA upscale it), `stats=1` (log the interval between frames).
+//!
+//! Motion blur: `mblur=<amount>` (e.g. 0.5, a 180-degree shutter) adds a `MotionBlurEffect`
+//! after the TAA, scaled to 30 fps and capped at 4 % of the width as the Midsommar intro's
+//! (`mbfps=<fps>`, 0 for per-frame; `mbmax=<fraction>`). `pan=<deg/s>` swings the camera,
+//! `car=<m/s>` sets the car's speed (9), and `step=<seconds>` with `t` alternates the camera and
+//! the car between t and t + step every frame: a still picture that is moving, for comparing
+//! the blur on and off.
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -21,7 +28,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
-    effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, MotionBlurEffect, MotionBlurOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 
@@ -161,10 +168,15 @@ struct State {
     car: usize,
     start_ms: f64,
     last_t: f32,
+    last_clock: f32,
     frozen_t: Option<f32>,
+    step: Option<f32>,
+    frame: u32,
     wind: f32,
     /// `stats=1`: frames in the current window and when it started.
     stats: Option<(u32, f64)>,
+    pan: f32,
+    car_speed: f32,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -263,6 +275,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     if query_param("taa").as_deref() != Some("0") {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
+    let mblur: f32 = query_param("mblur").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    if mblur > 0.0 {
+        let fps: f32 = query_param("mbfps").and_then(|v| v.parse().ok()).unwrap_or(30.0);
+        effects.push(Box::new(MotionBlurEffect::new(MotionBlurOptions {
+            amount: mblur,
+            max: query_param("mbmax").and_then(|v| v.parse().ok()).unwrap_or(0.04),
+            target_fps: (fps > 0.0).then_some(fps),
+            ..Default::default()
+        })));
+    }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
 
@@ -270,20 +292,42 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     camera.update_projection_matrix();
 
     let (render_width, render_height) = renderer.render_size();
-    log::info!("Kansei — Temporal AA (WASM) ready: motion vectors {velocity}, rendering {render_width}x{render_height} for {width}x{height}");
+    log::info!("Kansei — Temporal AA (WASM) ready: motion vectors {velocity}, motion blur {mblur}, rendering {render_width}x{render_height} for {width}x{height}");
 
     let frozen_t = query_param("t").and_then(|v| v.parse().ok());
+    let step = query_param("step").and_then(|v| v.parse().ok()).filter(|_| frozen_t.is_some());
     let wind: f32 = query_param("wind").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let stats = (query_param("stats").as_deref() == Some("1")).then(|| (0, now_secs()));
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, animated, car, start_ms: now_secs(), last_t: 0.0, frozen_t, wind, stats }));
+    let pan: f32 = query_param("pan").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let car_speed: f32 = query_param("car").and_then(|v| v.parse().ok()).unwrap_or(9.0);
+    let state = Rc::new(RefCell::new(State {
+        renderer, scene, camera, volume, animated, car, start_ms: now_secs(), last_t: 0.0, last_clock: 0.0, frozen_t, step, frame: 0, wind, stats, pan, car_speed,
+    }));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
         {
             let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref animated, car, ref start_ms, ref mut last_t, frozen_t, ref wind, ref mut stats } = *st;
-            let clock = (now_secs() - *start_ms) as f32;
-            let t = frozen_t.unwrap_or(clock);
+            let State {
+                ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref animated, car, ref start_ms, ref mut last_t, ref mut last_clock,
+                frozen_t, step, ref mut frame, ref wind, ref mut stats, pan, car_speed,
+            } = *st;
+            let mut clock = (now_secs() - *start_ms) as f32;
+            let mut t = frozen_t.unwrap_or(clock);
+            // a still picture in motion: alternate between t and t + step
+            let mut frame_time = clock - *last_clock;
+            *last_clock = clock;
+            if let Some(step) = step {
+                t += (*frame % 2) as f32 * step;
+                clock = t;
+                frame_time = step;
+            }
+            *frame += 1;
+            for effect in volume.effects.iter_mut() {
+                if let Some(mb) = effect.as_any_mut().downcast_mut::<MotionBlurEffect>() {
+                    mb.set_frame_time(frame_time);
+                }
+            }
 
             // wind time, this frame's and last frame's
             for &idx in animated {
@@ -296,10 +340,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             *last_t = clock;
 
             if let Some(r) = scene.get_renderable_mut(car) {
-                r.object.set_position(-30.0 + (clock * 9.0) % 60.0, 0.85, -8.0);
+                r.object.set_position(-30.0 + (clock * car_speed) % 60.0, 0.85, -8.0);
             }
+            // swinging left and right at up to `pan` degrees a second
+            let yaw = pan.to_radians() / 0.8 * (0.8 * t).sin();
             camera.set_position(-2.0 + t * 0.4, 1.3, 6.0);
-            camera.look_at(&Vec3::new(-2.0 + t * 0.4, 2.2, -20.0));
+            camera.look_at(&Vec3::new(-2.0 + t * 0.4 + 26.0 * yaw.sin(), 2.2, 6.0 - 26.0 * yaw.cos()));
 
             renderer.render_with_postprocessing(scene, camera, volume);
             if let Some((frames, window_start)) = stats {
