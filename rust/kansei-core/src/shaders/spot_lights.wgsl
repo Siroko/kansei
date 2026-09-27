@@ -1,16 +1,46 @@
 // Kansei spot lights for materials: the renderer's spot lights and their shadow atlas, bound in
-// the shared shadow group (group 3, bindings 5-7), with contact-hardening shadows and a GGX /
-// Lambert BRDF. Prepend `lights::SPOT_LIGHTS_WGSL` to a material shader (it includes
-// spot_light_types.wgsl), then either call
+// the shared shadow group (group 3, bindings 5-9), clustered so each fragment only visits the
+// lights that reach it, with contact-hardening shadows and a GGX / Lambert BRDF. Prepend
+// `lights::SPOT_LIGHTS_WGSL` to a material shader (it includes spot_light_types.wgsl), then
+// either call
 //
 //     kansei_spot_lights_radiance(worldPos, N, V, baseColor, roughness, metallic, fragCoord.xy)
 //
 // for the light all spots reflect toward the viewer (cd/m², in the same units as the lights),
-// or loop over kansei_spot_lights.lights yourself with kansei_spot_sample/kansei_spot_shadow.
+// or loop over the fragment's lights yourself: kansei_light_cluster, kansei_cluster_light_count
+// and kansei_cluster_light give the indices into kansei_spot_lights.lights, and
+// kansei_spot_sample/kansei_spot_shadow evaluate one.
 
 @group(3) @binding(5) var kansei_spot_shadow_atlas   : texture_depth_2d_array;
 @group(3) @binding(6) var<storage, read> kansei_spot_lights : KanseiSpotLights;
 @group(3) @binding(7) var kansei_spot_shadow_sampler : sampler_comparison;
+@group(3) @binding(8) var<uniform> kansei_clusters : KanseiClusterParams;
+@group(3) @binding(9) var<storage, read> kansei_cluster_lights : array<u32>;
+
+const KANSEI_NO_CLUSTER : u32 = 0xffffffffu;
+
+// The light cluster a fragment is in (its screen tile and view depth), or KANSEI_NO_CLUSTER in
+// views the clusters weren't built for.
+fn kansei_light_cluster(worldPos: vec3f, pixel: vec2f) -> u32 {
+    if (kansei_clusters.enabled == 0u) { return KANSEI_NO_CLUSTER; }
+    let g = kansei_clusters.grid;
+    let depth = -(kansei_clusters.view * vec4f(worldPos, 1.0)).z;
+    let slice = log(max(depth, kansei_clusters.near) / kansei_clusters.near) / log(kansei_clusters.far / kansei_clusters.near);
+    let z = min(u32(max(slice, 0.0) * f32(g.z)), g.z - 1u);
+    let tile = min(vec2u(pixel / kansei_clusters.screen * vec2f(g.xy)), g.xy - 1u);
+    return (z * g.y + tile.y) * g.x + tile.x;
+}
+
+// How many lights shade a fragment in `cluster`, and the `k`-th of them.
+fn kansei_cluster_light_count(cluster: u32) -> u32 {
+    if (cluster == KANSEI_NO_CLUSTER) { return kansei_spot_lights.count; }
+    return kansei_cluster_lights[cluster * KANSEI_CLUSTER_SLOTS];
+}
+
+fn kansei_cluster_light(cluster: u32, k: u32) -> u32 {
+    if (cluster == KANSEI_NO_CLUSTER) { return k; }
+    return kansei_cluster_lights[cluster * KANSEI_CLUSTER_SLOTS + 1u + k];
+}
 
 const KANSEI_PI : f32 = 3.14159265;
 const KANSEI_GOLDEN_ANGLE : f32 = 2.39996323;
@@ -103,8 +133,11 @@ fn kansei_brdf(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, m
 fn kansei_spot_lights_radiance(worldPos: vec3f, N: vec3f, V: vec3f, baseColor: vec3f, roughness: f32,
                                metallic: f32, pixel: vec2f) -> vec3f {
     var radiance = vec3f(0.0);
-    for (var i = 0u; i < kansei_spot_lights.count; i++) {
-        let light = kansei_spot_lights.lights[i];
+    // only the lights of this fragment's cluster (every light in views without clusters)
+    let cluster = kansei_light_cluster(worldPos, pixel);
+    let count = kansei_cluster_light_count(cluster);
+    for (var k = 0u; k < count; k++) {
+        let light = kansei_spot_lights.lights[kansei_cluster_light(cluster, k)];
         let s = kansei_spot_sample(light, worldPos);
         if (max(s.illuminance.r, max(s.illuminance.g, s.illuminance.b)) <= 0.0) { continue; }
         let brdf = kansei_brdf(N, V, s.toLight, baseColor, roughness, metallic);
