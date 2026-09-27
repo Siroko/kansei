@@ -17,6 +17,10 @@ const SKY_VIEW_WGSL: &str = include_str!("shaders/sky_view_lut.wgsl");
 const AERIAL_PERSPECTIVE_WGSL: &str = include_str!("shaders/aerial_perspective_lut.wgsl");
 pub(crate) const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
 const SKY_LIGHTING_PASS_WGSL: &str = include_str!("shaders/sky_lighting_pass.wgsl");
+const ENVIRONMENT_PASS_WGSL: &str = include_str!("shaders/sky_environment_pass.wgsl");
+
+/// GGX samples per texel for the environment's rough mips.
+const ENVIRONMENT_SAMPLES: u32 = 96;
 
 pub(crate) const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -46,6 +50,10 @@ pub(crate) fn sky_lighting_source() -> String {
     shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, SKY_LIGHTING_PASS_WGSL])
 }
 
+pub(crate) fn environment_source() -> String {
+    shader(&[COMMON_WGSL, FRAME_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, ENVIRONMENT_PASS_WGSL])
+}
+
 pub(crate) fn aerial_perspective_source() -> String {
     shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, LOOKUP_MULTI_SCATTERING_WGSL, SCATTERING_WGSL, AERIAL_PERSPECTIVE_WGSL])
 }
@@ -61,6 +69,8 @@ pub struct SkyAtmosphereOptions {
     pub aerial_perspective_size: (u32, u32, u32),
     /// Distance covered by the aerial-perspective volume, km (farther surfaces use its last slice).
     pub aerial_perspective_distance_km: f32,
+    /// Face size of the sky environment cubemap; its mips are GGX-prefiltered (roughness 0 to 1).
+    pub environment_size: u32,
 }
 
 impl Default for SkyAtmosphereOptions {
@@ -71,6 +81,7 @@ impl Default for SkyAtmosphereOptions {
             sky_view_size: (256, 128),
             aerial_perspective_size: (32, 32, 32),
             aerial_perspective_distance_km: 32.0,
+            environment_size: 64,
         }
     }
 }
@@ -91,6 +102,11 @@ pub struct SkyAtmosphereBindings {
     /// `SkyLighting` (see `SKY_LIGHTING_WGSL`): the sky's radiance as order-2 SH and the sun and
     /// the moon at the camera, rewritten by every update. Usable as a uniform or a storage buffer.
     pub sky_lighting: wgpu::Buffer,
+    /// The sky around the camera as a cube (no sun disk), mip m prefiltered for GGX roughness
+    /// m / (mips - 1): sample it with `environment_sampler` and `SKY_ENVIRONMENT_WGSL`.
+    pub environment: wgpu::TextureView,
+    /// Trilinear, for the environment cubemap's mips.
+    pub environment_sampler: wgpu::Sampler,
     /// Linear, clamping: for the transmittance and multiple-scattering LUTs.
     pub lut_sampler: wgpu::Sampler,
     /// Linear, repeating in u (the azimuth): for the sky-view LUT.
@@ -108,6 +124,9 @@ struct Pipelines {
     aerial_perspective_bg: wgpu::BindGroup,
     sky_lighting: wgpu::ComputePipeline,
     sky_lighting_bg: wgpu::BindGroup,
+    environment: wgpu::ComputePipeline,
+    /// One per mip, each with its own storage view and parameters.
+    environment_bgs: Vec<wgpu::BindGroup>,
 }
 
 /// A physically based sky and atmosphere after Hillaire 2020, as the LUTs the sky, the aerial
@@ -119,7 +138,9 @@ struct Pipelines {
 ///   camera and the transmittance in front of every surface, every frame;
 /// - **sky lighting**: the sky's radiance as order-2 spherical harmonics (with light bounced off
 ///   the ground below the horizon) and the sun and the moon at the camera, every frame, for
-///   materials (`SKY_LIGHTING_WGSL`) so a scene's ambient light comes from its sky.
+///   materials (`SKY_LIGHTING_WGSL`) so a scene's ambient light comes from its sky;
+/// - **environment** (64x64 cube): the sky as a GGX-prefiltered cubemap, every frame, for the
+///   specular reflection of the sky (`SKY_ENVIRONMENT_WGSL`).
 ///
 /// The first two depend only on [`AtmosphereParams`] and are rebuilt when they change. The sun can
 /// be anywhere, including below the horizon at dusk, where the sky is lit only by the light
@@ -151,6 +172,7 @@ pub struct SkyAtmosphere {
     luts: [wgpu::Texture; 3],
     /// Aerial-perspective scattering and transmittance volumes.
     ap_volumes: [wgpu::Texture; 2],
+    environment: wgpu::Texture,
     pipelines: Pipelines,
     transmittance_size: (u32, u32),
     multi_scattering_size: u32,
@@ -298,6 +320,18 @@ impl SkyAtmosphere {
             volume_3d(device, "SkyAtmosphere/AerialPerspectiveScattering", ap_size),
             volume_3d(device, "SkyAtmosphere/AerialPerspectiveTransmittance", ap_size),
         ];
+        let env_size = options.environment_size.max(1);
+        let env_mips = env_size.ilog2() + 1;
+        let environment = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SkyAtmosphere/Environment"),
+            size: wgpu::Extent3d { width: env_size, height: env_size, depth_or_array_layers: 6 },
+            mip_level_count: env_mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LUT_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
         let bindings = SkyAtmosphereBindings {
             atmosphere: uniform("SkyAtmosphere/Atmosphere", std::mem::size_of::<AtmosphereGpu>()),
@@ -312,6 +346,18 @@ impl SkyAtmosphere {
                 size: std::mem::size_of::<SkyLightingGpu>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
+            }),
+            environment: environment.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("SkyAtmosphere/EnvironmentCube"),
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                ..Default::default()
+            }),
+            environment_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("SkyAtmosphere/EnvironmentSampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
             }),
             lut_sampler: sampler("SkyAtmosphere/LutSampler", wgpu::AddressMode::ClampToEdge),
             sky_view_sampler: sampler("SkyAtmosphere/SkyViewSampler", wgpu::AddressMode::Repeat),
@@ -363,6 +409,59 @@ impl SkyAtmosphere {
                 },
             ],
         );
+        let environment_bgl = bgl(
+            "SkyAtmosphere/EnvironmentBGL",
+            &[
+                uniform_entry(0),
+                uniform_entry(1),
+                texture_entry(2),
+                sampler_entry(3),
+                uniform_entry(4),
+                storage_entry_dim(5, wgpu::TextureViewDimension::D2Array),
+                uniform_entry(6),
+            ],
+        );
+        let environment_bgs = (0..env_mips)
+            .map(|mip| {
+                let target = environment.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("SkyAtmosphere/EnvironmentMip"),
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    base_mip_level: mip,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                // each mip has its own parameters, written once: a shared buffer rewritten per
+                // dispatch would hold only the last write by the time the passes run
+                let roughness = if env_mips > 1 { mip as f32 / (env_mips - 1) as f32 } else { 0.0 };
+                let params = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("SkyAtmosphere/EnvironmentMipParams"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                    mapped_at_creation: true,
+                });
+                params.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&[
+                    roughness.to_bits(),
+                    ENVIRONMENT_SAMPLES,
+                    0,
+                    0,
+                ]));
+                params.unmap();
+                bind_group(
+                    device,
+                    "SkyAtmosphere/EnvironmentBG",
+                    &environment_bgl,
+                    &[
+                        b.atmosphere.as_entire_binding(),
+                        b.frame.as_entire_binding(),
+                        wgpu::BindingResource::TextureView(&b.sky_view),
+                        wgpu::BindingResource::Sampler(&b.sky_view_sampler),
+                        b.sky_lighting.as_entire_binding(),
+                        wgpu::BindingResource::TextureView(&target),
+                        params.as_entire_binding(),
+                    ],
+                )
+            })
+            .collect();
         let tex = wgpu::BindingResource::TextureView;
         let pipelines = Pipelines {
             transmittance: compute_pipeline(device, "SkyAtmosphere/Transmittance", &transmittance_source(), &transmittance_bgl),
@@ -428,6 +527,8 @@ impl SkyAtmosphere {
                     b.sky_lighting.as_entire_binding(),
                 ],
             ),
+            environment: compute_pipeline(device, "SkyAtmosphere/Environment", &environment_source(), &environment_bgl),
+            environment_bgs,
         };
 
         Self {
@@ -439,6 +540,7 @@ impl SkyAtmosphere {
             bindings,
             luts,
             ap_volumes,
+            environment,
             pipelines,
             transmittance_size: options.transmittance_size,
             multi_scattering_size: ms,
@@ -551,6 +653,12 @@ impl SkyAtmosphere {
         pass.set_pipeline(&p.sky_lighting);
         pass.set_bind_group(0, &p.sky_lighting_bg, &[]);
         pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&p.environment);
+        for (mip, bg) in p.environment_bgs.iter().enumerate() {
+            let size = (self.environment.width() >> mip).max(1);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 6);
+        }
     }
 
     /// `encode` on a fresh encoder, submitted at once. Call every frame after placing the camera
@@ -570,6 +678,11 @@ impl SkyAtmosphere {
     /// The aerial-perspective volumes: scattering, transmittance (rgba16float, 3D).
     pub fn aerial_perspective_textures(&self) -> &[wgpu::Texture; 2] {
         &self.ap_volumes
+    }
+
+    /// The sky environment cubemap texture (6 layers, GGX-prefiltered mips).
+    pub fn environment_texture(&self) -> &wgpu::Texture {
+        &self.environment
     }
 
     /// Force the transmittance and multiple-scattering LUTs to be rebuilt on the next update.

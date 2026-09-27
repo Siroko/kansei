@@ -18,3 +18,9 @@ pub const ATMOSPHERE_WGSL: &str = concat!(include_str!("shaders/common.wgsl"), i
 /// `SkyAtmosphereBindings::sky_lighting` as a uniform of type `SkyLighting`, for example with
 /// `ComputeBuffer::from_external(.., BufferType::Uniform)`.
 pub const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
+
+/// `skyEnvironment(env, envSampler, r, roughness)`: the prefiltered sky along a reflection, from
+/// `SkyAtmosphereBindings::environment` (bind as `texture_cube<f32>`, e.g. `Binding::texture_cube`
+/// with `Texture::from_view`) and `environment_sampler`; and `skyEnvironmentBrdf(f0, roughness,
+/// n_dot_v)`, the split sum's analytic environment BRDF to scale it by.
+pub const SKY_ENVIRONMENT_WGSL: &str = include_str!("shaders/sky_environment.wgsl");

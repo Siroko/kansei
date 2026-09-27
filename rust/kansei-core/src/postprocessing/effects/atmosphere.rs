@@ -85,6 +85,8 @@ impl AtmosphereEffect {
             ("sky_view_lut", s::sky_view_source()),
             ("aerial_perspective_lut", s::aerial_perspective_source()),
             ("sky_lighting", s::sky_lighting_source()),
+            ("environment", s::environment_source()),
+            ("sky_environment_helpers", crate::atmosphere::SKY_ENVIRONMENT_WGSL.to_string()),
             ("sky_composite", composite_source()),
         ]
     }
