@@ -2,16 +2,25 @@ use crate::cameras::Camera;
 use crate::renderers::GBuffer;
 use crate::postprocessing::PostProcessingEffect;
 
+/// Bloom works on scene-linear HDR, so it belongs before the tonemapper in the chain.
 pub struct BloomOptions {
+    /// Luminance, in exposed units (see `exposure`), above which light blooms. Zero or below
+    /// disables the threshold: physically based bloom, where every light scatters a little and
+    /// `intensity` is the scattered fraction (energy-conserving; try 0.03-0.1).
     pub threshold: f32,
     pub knee: f32,
+    /// With a threshold, the gain of the bloom added on top of the scene.
     pub intensity: f32,
     pub radius: f32,
+    /// Scene multiplier the threshold and firefly filter see, so they work in the tonemapper's
+    /// exposed units with physical light values: set it to `ToneMapEffect::total_exposure()`.
+    /// 1 compares raw scene values, as before.
+    pub exposure: f32,
 }
 
 impl Default for BloomOptions {
     fn default() -> Self {
-        Self { threshold: 1.0, knee: 0.1, intensity: 0.8, radius: 1.0 }
+        Self { threshold: 1.0, knee: 0.1, intensity: 0.8, radius: 1.0, exposure: 1.0 }
     }
 }
 
@@ -339,7 +348,7 @@ impl PostProcessingEffect for BloomEffect {
                     o.threshold, o.knee, o.intensity, o.radius,
                     src_w as f32, src_h as f32,
                     f32::from_bits(level as u32), // level as u32 bits
-                    0.0, // _pad
+                    o.exposure,
                 ];
                 queue.write_buffer(&self.downsample_params[level], 0, bytemuck::cast_slice(&data));
 
@@ -392,7 +401,7 @@ impl PostProcessingEffect for BloomEffect {
                     o.threshold, o.knee, o.intensity, o.radius,
                     smaller_w as f32, smaller_h as f32,
                     f32::from_bits(level as u32),
-                    0.0,
+                    o.exposure,
                 ];
                 queue.write_buffer(&self.upsample_params[pass_idx], 0, bytemuck::cast_slice(&data));
 
@@ -421,7 +430,8 @@ impl PostProcessingEffect for BloomEffect {
             let data: [f32; 8] = [
                 o.threshold, o.knee, o.intensity, o.radius,
                 width as f32, height as f32,
-                0.0, 0.0,
+                f32::from_bits(MIP_COUNT as u32), // levels summed into the bloom texture
+                o.exposure,
             ];
             queue.write_buffer(self.composite_params.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
 
@@ -468,4 +478,33 @@ impl PostProcessingEffect for BloomEffect {
     }
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every bloom WGSL module validates, and they all agree on the 32-byte BloomParams the
+    /// effect writes as `[f32; 8]`.
+    #[test]
+    fn shaders_validate_and_share_the_params_layout() {
+        let sources = [
+            ("bloom_downsample", include_str!("../../shaders/bloom_downsample.wgsl")),
+            ("bloom_upsample", include_str!("../../shaders/bloom_upsample.wgsl")),
+            ("bloom_composite", include_str!("../../shaders/bloom_composite.wgsl")),
+        ];
+        for (name, code) in sources {
+            let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let span = module
+                .types
+                .iter()
+                .find_map(|(_, ty)| match (&ty.name, &ty.inner) {
+                    (Some(n), naga::TypeInner::Struct { span, .. }) if n == "BloomParams" => Some(*span),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(span, 32, "{name}");
+        }
+    }
 }

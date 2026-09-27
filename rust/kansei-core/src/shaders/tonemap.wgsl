@@ -1,0 +1,265 @@
+// Display transform, the last effect of the HDR chain. Per pixel, in order:
+//   lens:    lateral chromatic aberration (spectral taps), then physical exposure and a cos^4
+//            vignette, all on scene-linear light;
+//   grade:   white balance, contrast about middle grey, and saturation/gain per tonal zone,
+//            on exposed scene-linear light (UE applies its colour grading at this point too);
+//   curve:   a filmic tone curve to display-linear [0, 1];
+//   film:    monochrome grain and a triangular dither, in the sRGB-encoded signal;
+//   output:  sRGB-encoded for non-sRGB targets, decoded back to linear for sRGB ones.
+
+struct ToneMapParams {
+    whiteBalance        : mat3x3f,
+    gain                : vec3f,
+    exposure            : f32,
+    shadowGain          : vec3f,
+    saturation          : f32,
+    highlightGain       : vec3f,
+    contrast            : f32,
+    shadowSaturation    : f32,
+    highlightSaturation : f32,
+    shadowsMax          : f32,
+    highlightsMin       : f32,
+    vignette            : f32,
+    chromaticAberration : f32,
+    grain               : f32,
+    grainSize           : f32,
+    width               : u32,
+    height              : u32,
+    frame               : u32,
+    tonemapper          : u32,
+    flags               : u32,
+    _pad0               : u32,
+    _pad1               : u32,
+    _pad2               : u32,
+}
+
+@group(0) @binding(0) var inputTex      : texture_2d<f32>;
+@group(0) @binding(1) var outputTex     : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> p    : ToneMapParams;
+@group(0) @binding(3) var linearSampler : sampler;
+
+const TONEMAP_NONE           : u32 = 0u;
+const TONEMAP_ACES_FITTED    : u32 = 1u;
+const TONEMAP_AGX            : u32 = 2u;
+const TONEMAP_AGX_PUNCHY     : u32 = 3u;
+const TONEMAP_KHRONOS_NEUTRAL: u32 = 4u;
+
+const FLAG_ENCODE_SRGB : u32 = 1u;
+const FLAG_DITHER      : u32 = 2u;
+
+const MIDDLE_GREY : f32 = 0.18;
+
+fn luminance(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// ── Noise ──
+
+// PCG-based 3D hash (Jarzynski & Olano, "Hash Functions for GPU Rendering", 2020).
+fn pcg3d(v0: vec3u) -> vec3u {
+    var v = v0 * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> vec3u(16u);
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+
+fn hash3(pix: vec2i, frame: u32) -> vec3f {
+    return vec3f(pcg3d(vec3u(bitcast<vec2u>(pix), frame))) * (1.0 / 4294967296.0);
+}
+
+// Film grain: value noise on a lattice of `grainSize` pixels, a new pattern every frame.
+// Each lattice value is triangular in [-1, 1] (two uniforms), which reads like film, not TV static.
+fn grainNoise(pix: vec2f) -> f32 {
+    let q = pix / max(p.grainSize, 1.0);
+    let i = vec2i(floor(q));
+    let f = fract(q);
+    let s = f * f * (3.0 - 2.0 * f);
+    let n00 = hash3(i, p.frame);
+    let n10 = hash3(i + vec2i(1, 0), p.frame);
+    let n01 = hash3(i + vec2i(0, 1), p.frame);
+    let n11 = hash3(i + vec2i(1, 1), p.frame);
+    let v = mix(mix(n00.x + n00.y, n10.x + n10.y, s.x), mix(n01.x + n01.y, n11.x + n11.y, s.x), s.y);
+    return v - 1.0;
+}
+
+// ── Lens ──
+
+// Lateral chromatic aberration: the image magnification varies with wavelength, so 7 taps from
+// red (scaled out) to blue (scaled in), weighted by a coarse spectrum-to-RGB table whose columns
+// each sum to one (white stays white).
+fn sampleLens(coord: vec2u, uv: vec2f) -> vec3f {
+    if (p.chromaticAberration <= 0.0) {
+        return textureLoad(inputTex, coord, 0).rgb;
+    }
+    let weights = array<vec3f, 7>(
+        vec3f(1.00, 0.00, 0.00) / vec3f(2.1, 2.8, 2.1),
+        vec3f(0.75, 0.25, 0.00) / vec3f(2.1, 2.8, 2.1),
+        vec3f(0.35, 0.65, 0.00) / vec3f(2.1, 2.8, 2.1),
+        vec3f(0.00, 1.00, 0.00) / vec3f(2.1, 2.8, 2.1),
+        vec3f(0.00, 0.65, 0.35) / vec3f(2.1, 2.8, 2.1),
+        vec3f(0.00, 0.25, 0.75) / vec3f(2.1, 2.8, 2.1),
+        vec3f(0.00, 0.00, 1.00) / vec3f(2.1, 2.8, 2.1),
+    );
+    // at intensity 1, red and blue differ in magnification by 1 % (about 10 px at a 1080p edge)
+    let amount = p.chromaticAberration * 0.005;
+    let d = uv - 0.5;
+    var acc = vec3f(0.0);
+    for (var i = 0; i < 7; i++) {
+        let scale = 1.0 + amount * (1.0 - f32(i) / 3.0);
+        acc += textureSampleLevel(inputTex, linearSampler, 0.5 + d * scale, 0.0).rgb * weights[i];
+    }
+    return acc;
+}
+
+// Natural vignetting, the cos^4 law of an ideal lens: tan^2 of the field angle grows with the
+// squared image radius (1 at the corners), scaled by the vignette intensity.
+fn vignetteMask(uv: vec2f) -> f32 {
+    let aspect = f32(p.width) / f32(p.height);
+    let d = (uv - 0.5) * vec2f(aspect, 1.0);
+    let r2 = dot(d, d) / (0.25 * (aspect * aspect + 1.0));
+    let cos2 = 1.0 / (1.0 + 0.5 * p.vignette * r2);
+    return cos2 * cos2;
+}
+
+// ── Grade (exposed scene-linear) ──
+
+fn grade(c0: vec3f) -> vec3f {
+    var c = max(p.whiteBalance * c0, vec3f(0.0));
+    c = MIDDLE_GREY * pow(c / MIDDLE_GREY, vec3f(p.contrast));
+    let luma = luminance(c);
+    let wShadow = 1.0 - smoothstep(0.0, p.shadowsMax, luma);
+    let wHighlight = smoothstep(p.highlightsMin, 1.0, luma) * (1.0 - wShadow);
+    let wMid = 1.0 - wShadow - wHighlight;
+    let sat = p.saturation * (wShadow * p.shadowSaturation + wMid + wHighlight * p.highlightSaturation);
+    c = max(mix(vec3f(luma), c, sat), vec3f(0.0));
+    return c * p.gain * (wShadow * p.shadowGain + wMid + wHighlight * p.highlightGain);
+}
+
+// ── Tone curves (display-linear out) ──
+
+// ACES RRT + sRGB ODT, Stephen Hill's fit (BakingLab, MIT). The matrices are written row by row,
+// so they are applied as `v * M`.
+fn acesFitted(c: vec3f) -> vec3f {
+    let inputRows = mat3x3f(
+        vec3f(0.59719, 0.35458, 0.04823),
+        vec3f(0.07600, 0.90834, 0.01566),
+        vec3f(0.02840, 0.13383, 0.83777),
+    );
+    let outputRows = mat3x3f(
+        vec3f( 1.60475, -0.53108, -0.07367),
+        vec3f(-0.10208,  1.10813, -0.00605),
+        vec3f(-0.00327, -0.07276,  1.07602),
+    );
+    let v = c * inputRows;
+    let a = v * (v + 0.0245786) - 0.000090537;
+    let b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return saturate((a / b) * outputRows);
+}
+
+// AgX (Troy Sobotka), with the Rec.2020 inset/outset matrices from Filament and the 6th-order
+// sigmoid fit of Blender's default contrast; `punchy` is Blender's Punchy look (ASC CDL power 1.35,
+// saturation 1.4).
+fn agx(c: vec3f, punchy: bool) -> vec3f {
+    let srgbTo2020 = mat3x3f(
+        vec3f(0.6274, 0.0691, 0.0164),
+        vec3f(0.3293, 0.9195, 0.0880),
+        vec3f(0.0433, 0.0113, 0.8956),
+    );
+    let rec2020ToSrgb = mat3x3f(
+        vec3f( 1.6605, -0.1246, -0.0182),
+        vec3f(-0.5876,  1.1329, -0.1006),
+        vec3f(-0.0728, -0.0083,  1.1187),
+    );
+    let inset = mat3x3f(
+        vec3f(0.856627153315983, 0.137318972929847, 0.11189821299995),
+        vec3f(0.0951212405381588, 0.761241990602591, 0.0767994186031903),
+        vec3f(0.0482516061458583, 0.101439036467562, 0.811302368396859),
+    );
+    let outset = mat3x3f(
+        vec3f( 1.1271005818144368, -0.1413297634984383, -0.14132976349843826),
+        vec3f(-0.11060664309660323, 1.157823702216272, -0.11060664309660294),
+        vec3f(-0.016493938717834573, -0.016493938717834257, 1.2519364065950405),
+    );
+    let minEv = -12.47393;  // log2(2^-10 * 0.18)
+    let maxEv = 4.026069;   // log2(2^6.5 * 0.18)
+
+    var v = inset * (srgbTo2020 * c);
+    v = saturate((log2(max(v, vec3f(1e-10))) - minEv) / (maxEv - minEv));
+    let x2 = v * v;
+    let x4 = x2 * x2;
+    v = 15.5 * x4 * x2 - 40.14 * x4 * v + 31.96 * x4 - 6.868 * x2 * v + 0.4298 * x2 + 0.1191 * v - 0.00232;
+    if (punchy) {
+        let luma = luminance(v);
+        v = pow(max(v, vec3f(0.0)), vec3f(1.35));
+        v = luma + 1.4 * (v - luma);
+    }
+    v = pow(max(outset * v, vec3f(0.0)), vec3f(2.2));
+    return saturate(rec2020ToSrgb * v);
+}
+
+// Khronos PBR Neutral: hue- and value-preserving up to 0.76, a smooth shoulder above (for
+// product/material shots where colours must stay what they were authored as).
+fn khronosNeutral(c0: vec3f) -> vec3f {
+    let startCompression = 0.8 - 0.04;
+    let desaturation = 0.15;
+    var c = c0;
+    let x = min(c.r, min(c.g, c.b));
+    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+    c -= offset;
+    let peak = max(c.r, max(c.g, c.b));
+    if (peak < startCompression) {
+        return saturate(c);
+    }
+    let d = 1.0 - startCompression;
+    let newPeak = 1.0 - d * d / (peak + d - startCompression);
+    c *= newPeak / peak;
+    let g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return saturate(mix(c, vec3f(newPeak), g));
+}
+
+fn toneCurve(c: vec3f) -> vec3f {
+    switch (p.tonemapper) {
+        case TONEMAP_ACES_FITTED: { return acesFitted(c); }
+        case TONEMAP_AGX: { return agx(c, false); }
+        case TONEMAP_AGX_PUNCHY: { return agx(c, true); }
+        case TONEMAP_KHRONOS_NEUTRAL: { return khronosNeutral(c); }
+        default: { return saturate(c); }
+    }
+}
+
+// ── Encoding ──
+
+fn srgbEncode(c: vec3f) -> vec3f {
+    return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3f(0.0031308));
+}
+
+fn srgbDecode(c: vec3f) -> vec3f {
+    return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92, c <= vec3f(0.04045));
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+    if (gid.x >= p.width || gid.y >= p.height) { return; }
+    let pix = vec2f(gid.xy) + 0.5;
+    let uv = pix / vec2f(f32(p.width), f32(p.height));
+
+    let scene = sampleLens(gid.xy, uv) * (p.exposure * vignetteMask(uv));
+    let display = toneCurve(grade(scene));
+
+    // film grain, strongest in the midtones of the encoded signal (where film shows it)
+    var encoded = srgbEncode(display);
+    if (p.grain > 0.0) {
+        let l = luminance(encoded);
+        encoded += p.grain * 0.12 * grainNoise(pix) * (4.0 * l * (1.0 - l));
+    }
+    // triangular dither of one 8-bit step, so dusk gradients don't band on 8-bit swapchains
+    if ((p.flags & FLAG_DITHER) != 0u) {
+        let h = hash3(vec2i(gid.xy), p.frame ^ 0x9e3779b9u);
+        encoded += (h.x + h.y - 1.0) / 255.0;
+    }
+    encoded = saturate(encoded);
+
+    let out = select(srgbDecode(encoded), encoded, (p.flags & FLAG_ENCODE_SRGB) != 0u);
+    textureStore(outputTex, gid.xy, vec4f(out, 1.0));
+}
