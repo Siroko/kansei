@@ -1,8 +1,10 @@
+mod atmosphere;
 mod bloom;
 mod color_grading;
 mod dof;
 mod fluid_surface;
 mod volumetric_fog;
+pub use atmosphere::AtmosphereEffect;
 pub use bloom::{BloomEffect, BloomOptions};
 pub use color_grading::{ColorGradingEffect, ColorGradingOptions};
 pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
