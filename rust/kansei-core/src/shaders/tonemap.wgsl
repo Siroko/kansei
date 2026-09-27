@@ -12,14 +12,14 @@ struct ToneMapParams {
     gain                : vec3f,
     exposure            : f32,
     shadowGain          : vec3f,
-    saturation          : f32,
-    highlightGain       : vec3f,
     contrast            : f32,
-    shadowSaturation    : f32,
-    highlightSaturation : f32,
+    highlightGain       : vec3f,
     shadowsMax          : f32,
+    saturation          : vec3f,   // per channel, as UE's ColorSaturation
     highlightsMin       : f32,
+    shadowSaturation    : vec3f,
     vignette            : f32,
+    highlightSaturation : vec3f,
     chromaticAberration : f32,
     grain               : f32,
     grainSize           : f32,
@@ -29,8 +29,6 @@ struct ToneMapParams {
     tonemapper          : u32,
     flags               : u32,
     _pad0               : u32,
-    _pad1               : u32,
-    _pad2               : u32,
 }
 
 @group(0) @binding(0) var inputTex      : texture_2d<f32>;
@@ -131,7 +129,7 @@ fn grade(c0: vec3f) -> vec3f {
     let wShadow = 1.0 - smoothstep(0.0, p.shadowsMax, luma);
     let wHighlight = smoothstep(p.highlightsMin, 1.0, luma) * (1.0 - wShadow);
     let wMid = 1.0 - wShadow - wHighlight;
-    let sat = p.saturation * (wShadow * p.shadowSaturation + wMid + wHighlight * p.highlightSaturation);
+    let sat = p.saturation * (wShadow * p.shadowSaturation + wMid + wHighlight * p.highlightSaturation);   // per channel
     c = max(mix(vec3f(luma), c, sat), vec3f(0.0));
     return c * p.gain * (wShadow * p.shadowGain + wMid + wHighlight * p.highlightGain);
 }

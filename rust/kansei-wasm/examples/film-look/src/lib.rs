@@ -201,12 +201,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(fog)];
     if query_param("bloom").as_deref() != Some("0") {
-        effects.push(Box::new(BloomEffect::new(BloomOptions {
-            threshold: 0.0, // physically based: every light scatters a little
-            intensity: 0.06,
-            exposure: tonemap.total_exposure(),
-            ..Default::default()
-        })));
+        effects.push(Box::new(
+            BloomEffect::new(BloomOptions {
+                threshold: 0.0, // physically based: every light scatters a little
+                intensity: 0.06,
+                ..Default::default()
+            })
+            .with_exposure(tonemap.total_exposure()),
+        ));
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
