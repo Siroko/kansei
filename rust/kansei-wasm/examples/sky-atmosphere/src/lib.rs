@@ -283,7 +283,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         fog.set_shadow_map(renderer.shadow_map());
         if q.get("mist").is_some() {
             // mist lying in the clearing, thickest on the ground
-            let mut mist = LocalFogVolume::new(Vec3::new(0.0, 0.0, 0.0), 60.0, 5.0);
+            let mut mist = if q.get("mist").as_deref() == Some("box") {
+                LocalFogVolume::new_box(Vec3::new(0.0, 0.0, 0.0), Vec3::new(30.0, 5.0, 30.0))
+            } else {
+                LocalFogVolume::new(Vec3::new(0.0, 0.0, 0.0), 60.0, 5.0)
+            };
             mist.radial_extinction = 0.01;
             mist.height_extinction = 0.08;
             mist.height_falloff = 3.0;

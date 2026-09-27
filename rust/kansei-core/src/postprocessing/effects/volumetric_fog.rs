@@ -127,19 +127,29 @@ struct CompositeParamsGpu {
     _pad: f32,
 }
 
-/// A local fog volume: an ellipsoid of mist (over a lake, in a hollow) injected into the fog's
-/// froxels, after Unreal's `LocalFogVolume`. In the volume's unit sphere `q` (|q| < 1) the
-/// extinction is `radial_extinction * (1 - |q|^2) + height_extinction * exp(-height_falloff *
-/// max(q.y - height_offset, 0))`, faded to zero over the outer `edge_fade` of the radius. It
-/// scatters the fog's lights and sky with its own albedo; wind and start distance leave it alone.
+/// The shape of a [`LocalFogVolume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalFogShape {
+    #[default]
+    Ellipsoid,
+    Box,
+}
+
+/// A local fog volume: an ellipsoid or box of mist (over a lake, in a hollow) injected into the
+/// fog's froxels, after Unreal's `LocalFogVolume`. In the volume's unit shape `q`, with `r` = |q|
+/// (the largest |q_i| for a box) below 1, the extinction is `radial_extinction * (1 - r^2) +
+/// height_extinction * exp(-height_falloff * max(q.y - height_offset, 0))`, faded to zero over
+/// the outer `edge_fade` of the radius. It scatters the fog's lights and sky with its own albedo;
+/// wind and start distance leave it alone.
 ///
 /// Unreal's `radial_fog_extinction`, `height_fog_extinction`, `height_fog_falloff`,
 /// `height_fog_offset` and `fog_albedo` carry over; the shapes of the two terms are kansei's
 /// own, so the look may need a trim.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalFogVolume {
+    pub shape: LocalFogShape,
     pub center: Vec3,
-    /// Semi-axes of the ellipsoid, metres.
+    /// Semi-axes of the ellipsoid, or half extents of the box, metres.
     pub radii: Vec3,
     /// Rotation about +Y, radians (as `Object3D::rotation.y`).
     pub yaw: f32,
@@ -161,6 +171,7 @@ impl LocalFogVolume {
     /// defaults otherwise: radial extinction 1, no height term, a soft edge.
     pub fn new(center: Vec3, radius: f32, half_height: f32) -> Self {
         Self {
+            shape: LocalFogShape::Ellipsoid,
             center,
             radii: Vec3::new(radius, half_height, radius),
             yaw: 0.0,
@@ -173,17 +184,23 @@ impl LocalFogVolume {
         }
     }
 
+    /// A box of `half_extents`, with radial extinction 1, no height term and a soft edge.
+    pub fn new_box(center: Vec3, half_extents: Vec3) -> Self {
+        Self { shape: LocalFogShape::Box, radii: half_extents, ..Self::new(center, 1.0, 1.0) }
+    }
+
     /// Extinction per metre at a world-space point, as the fog shader computes it.
     pub fn extinction_at(&self, p: Vec3) -> f32 {
         let g = self.gpu();
         let d = glam::Vec3::new(p.x - g.center[0], p.y - g.center[1], p.z - g.center[2]);
         let q = glam::Vec3::new(g.cos_yaw * d.x - g.sin_yaw * d.z, d.y, g.sin_yaw * d.x + g.cos_yaw * d.z) * glam::Vec3::from(g.inv_radii);
-        let r2 = q.length_squared();
-        if r2 >= 1.0 {
+        let r = if g.shape == 1 { q.abs().max_element() } else { q.length() };
+        if r >= 1.0 {
             return 0.0;
         }
+        let r2 = r * r;
         let edge = if g.edge_fade > 0.0 {
-            let t = ((1.0 - r2.sqrt()) / g.edge_fade).clamp(0.0, 1.0);
+            let t = ((1.0 - r) / g.edge_fade).clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         } else {
             1.0
@@ -206,6 +223,8 @@ impl LocalFogVolume {
             sin_yaw: self.yaw.sin(),
             height_offset: self.height_offset,
             edge_fade: self.edge_fade.clamp(0.0, 1.0),
+            shape: (self.shape == LocalFogShape::Box) as u32,
+            _pad: [0; 3],
         }
     }
 }
@@ -223,6 +242,8 @@ struct LocalFogVolumeGpu {
     sin_yaw: f32,
     height_offset: f32,
     edge_fade: f32,
+    shape: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -878,6 +899,14 @@ mod tests {
         bar.yaw = std::f32::consts::FRAC_PI_2;
         assert!(bar.extinction_at(Vec3::new(0.0, 0.0, 8.0)) > 0.0);
         assert_eq!(bar.extinction_at(Vec3::new(8.0, 0.0, 0.0)), 0.0);
+
+        // a box fills its corners, where the ellipsoid of the same extents is empty
+        let corner = Vec3::new(8.0, 8.0, 8.0);
+        let mut cube = LocalFogVolume::new_box(Vec3::ZERO, Vec3::new(10.0, 10.0, 10.0));
+        cube.edge_fade = 0.1;
+        assert!(cube.extinction_at(corner) > 0.0);
+        assert_eq!(LocalFogVolume::new(Vec3::ZERO, 10.0, 10.0).extinction_at(corner), 0.0);
+        assert_eq!(cube.extinction_at(Vec3::new(10.5, 0.0, 0.0)), 0.0);
     }
 
     #[test]
