@@ -29,6 +29,9 @@ struct FogParams {
     startDistance   : f32,
     jitterFrame     : u32,   // 0: sample froxel centres; n > 0: the n-th temporal jitter
     _pad2           : f32,
+    // world plane (n, d): the fog lies only where n.p + d >= 0 (a planar reflection's view sees
+    // the fog above its mirror); (0, 0, 0, 1) keeps all of it
+    clipPlane       : vec4f,
 }
 
 struct DirLightData {
@@ -147,8 +150,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     // the height fog plus local fog volumes (volumetric_fog_media.wgsl): the lights below scale
     // with the total density, and the media's albedo colours what they scatter
     let media = fogMedia(worldPos, heightFog);
-    let density = media.density;
-    let extinction = media.extinction;
+    // faded in over a slice across the clip plane
+    let above = saturate((dot(params.clipPlane.xyz, worldPos) + params.clipPlane.w) / max(sliceThickness, 1e-3) + 0.5);
+    let density = media.density * above;
+    let extinction = media.extinction * above;
 
     let viewDir = normalize(worldPos - params.cameraPos);
     var totalScatter = density * params.ambient;
