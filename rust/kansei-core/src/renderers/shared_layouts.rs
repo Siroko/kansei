@@ -55,6 +55,18 @@ impl SharedLayouts {
                     },
                     count: None,
                 },
+                // Binding 3: temporal data (unjittered and previous view-projection, jitter) for
+                // motion vectors (cameras::MOTION_VECTORS_WGSL)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
