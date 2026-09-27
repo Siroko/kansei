@@ -98,7 +98,8 @@ impl SharedLayouts {
         });
 
         // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap) and
-        // spot lights (shadow atlas + light buffer + comparison sampler + clustered light lists)
+        // spot lights (shadow atlas + light buffer + comparison sampler + clustered light lists) and
+        // cascaded shadows (depth array + cascades + comparison sampler)
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Shared/ShadowBGL"),
             entries: &[
@@ -195,6 +196,35 @@ impl SharedLayouts {
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
+                    count: None,
+                },
+                // Binding 10: cascaded shadow map (shadows::CASCADED_SHADOWS_WGSL)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 11: the cascades (matrices, light, filter settings)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 12: comparison sampler for the cascades
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
             ],
