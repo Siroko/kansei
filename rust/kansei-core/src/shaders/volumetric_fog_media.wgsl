@@ -1,9 +1,10 @@
 // Fog media beyond the height fog, appended to volumetric_fog_inject.wgsl (after the sky lighting
 // helpers): a scattering albedo, local fog volumes, and ambient light from the sky.
 //
-// Local fog volumes are ellipsoids (as Unreal's LocalFogVolume: mist over a lake, in a hollow)
-// with two terms in the volume's unit sphere q (|q| < 1):
-//   radial: radialExtinction * (1 - |q|^2), densest at the centre
+// Local fog volumes are ellipsoids (as Unreal's LocalFogVolume: mist over a lake, in a hollow) or
+// boxes, with two terms in the volume's unit shape q (|q| < 1, or max |q_i| < 1 for a box; r is
+// that norm):
+//   radial: radialExtinction * (1 - r^2), densest at the centre
 //   height: heightExtinction * exp(-heightFalloff * max(q.y - heightOffset, 0)), lying low
 // both faded to zero over the outer `edgeFade` of the radius. They take the fog's lights and
 // ambient with their own albedo, and neither the wind nor the start distance moves them.
@@ -28,6 +29,10 @@ struct LocalFogVolume {
     sinYaw           : f32,
     heightOffset     : f32,    // in the unit sphere: -1 bottom .. 1 top
     edgeFade         : f32,    // fraction of the radius
+    shape            : u32,    // 0 ellipsoid, 1 box
+    _pad0            : u32,
+    _pad1            : u32,
+    _pad2            : u32,
 }
 
 @group(0) @binding(10) var<uniform> mediaParams : FogMediaParams;
@@ -44,11 +49,13 @@ fn localFogExtinction(v: LocalFogVolume, worldPos: vec3f) -> f32 {
     let d = worldPos - v.center;
     // into the unit sphere: undo the yaw (about +Y), then divide by the radii
     let q = vec3f(v.cosYaw * d.x - v.sinYaw * d.z, d.y, v.sinYaw * d.x + v.cosYaw * d.z) * v.invRadii;
-    let r2 = dot(q, q);
-    if (r2 >= 1.0) { return 0.0; }
+    var r = length(q);
+    if (v.shape == 1u) { r = max(abs(q.x), max(abs(q.y), abs(q.z))); }
+    if (r >= 1.0) { return 0.0; }
+    let r2 = r * r;
     var edge = 1.0;
     if (v.edgeFade > 0.0) {
-        let t = saturate((1.0 - sqrt(r2)) / v.edgeFade);
+        let t = saturate((1.0 - r) / v.edgeFade);
         edge = t * t * (3.0 - 2.0 * t);
     }
     let radial = v.radialExtinction * (1.0 - r2);
