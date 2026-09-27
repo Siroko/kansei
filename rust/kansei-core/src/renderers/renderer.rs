@@ -81,6 +81,8 @@ pub struct Renderer {
     spot_shadow_atlas: Option<crate::shadows::SpotShadowAtlas>,
     spot_dummy_atlas_view: Option<wgpu::TextureView>,
     spot_shadow_sampler: Option<wgpu::Sampler>,
+    // GPU instance culling (renderables with `instance_culling`)
+    cull_pipeline: Option<crate::culling::CullPipeline>,
     // Render bundle caching
     render_bundle: Option<wgpu::RenderBundle>,
     last_bundle_object_count: usize,
@@ -134,6 +136,7 @@ impl Renderer {
             spot_shadow_atlas: None,
             spot_dummy_atlas_view: None,
             spot_shadow_sampler: None,
+            cull_pipeline: None,
             render_bundle: None,
             last_bundle_object_count: 0,
             gbuffer_bundle: None,
@@ -737,23 +740,8 @@ impl Renderer {
             let offset = (draw_idx as u32) * alignment;
             encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
-            // Set vertex buffer
-            encoder.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
-
-            for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
-                if let Some(buf) = cb.gpu_buffer() {
-                    encoder.set_vertex_buffer((i + 1) as u32, buf.slice(..));
-                }
-            }
-
-            // Set index buffer
-            encoder.set_index_buffer(
-                r.geometry.active_index_buffer().unwrap().slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
-
-            // Draw
-            encoder.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
+            // Vertex/index buffers and the draw (the camera's culled instances, if culled)
+            draw_geometry(&mut encoder, r, MAIN_VIEW);
         }
 
         encoder.finish(&Default::default())
@@ -1038,21 +1026,65 @@ impl Renderer {
                 }
                 let offset = draw_idx as u32 * alignment;
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
-                pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
-                for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
-                    if let Some(buf) = cb.gpu_buffer() {
-                        pass.set_vertex_buffer((i + 1) as u32, buf.slice(..));
+                // culled against this light's frustum, not the camera's
+                draw_geometry(&mut pass, r, spot_view(slot.layer));
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then `spot_view(l)`
+    /// for every layer of the spot shadow atlas (`None` when no light uses it this frame).
+    fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
+        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false })];
+        if let Some(atlas) = &self.spot_shadow_atlas {
+            views.resize(1 + atlas.layers as usize, None);
+            for slot in &self.spot_lights.shadows {
+                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true });
+            }
+        }
+        views
+    }
+
+    /// Cull every renderable with `instance_culling` for every view (after the frame's uploads,
+    /// before its shadow and main passes).
+    fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera) {
+        let culled: Vec<usize> = scene
+            .ordered_indices()
+            .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.instance_culling.is_some() && r.geometry.initialized))
+            .collect();
+        if culled.is_empty() {
+            return;
+        }
+        let views = self.cull_views(camera);
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let pipeline = self.cull_pipeline.get_or_insert_with(|| crate::culling::CullPipeline::new(device));
+        let lod_origin = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        let mut stale_bundles = false;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), ..Default::default() });
+            pass.set_pipeline(&pipeline.pipeline);
+            for idx in culled {
+                let r = scene.get_renderable_mut(idx).unwrap();
+                let (world, index_count, casts) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow);
+                let culling = r.instance_culling.as_mut().unwrap();
+                stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
+                for (slot, view) in views.iter().enumerate() {
+                    let Some(view) = view else { continue };
+                    if view.casters_only && !casts {
+                        continue;
                     }
-                }
-                pass.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
-                if r.geometry.is_indirect() {
-                    pass.draw_indexed_indirect(r.geometry.active_indirect_buffer().unwrap(), 0);
-                } else {
-                    pass.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
+                    let params = culling.params(view, world, lod_origin);
+                    culling.dispatch(queue, &mut pass, slot, &params, index_count);
                 }
             }
         }
         queue.submit(std::iter::once(encoder.finish()));
+        if stale_bundles {
+            self.invalidate_bundle();
+        }
     }
 
     /// Run the cubemap shadow pass for point lights.
@@ -1250,6 +1282,9 @@ impl Renderer {
 
         // Phase 1: Upload camera + per-object matrices
         self.upload_all(scene, camera);
+
+        // GPU instance culling for every view (camera, spot shadows)
+        self.run_instance_culling(scene, camera);
 
         // Shadow pass
         if self.shadows_enabled {
@@ -1512,6 +1547,9 @@ impl Renderer {
 
         // Upload camera + per-object matrices
         self.upload_all(scene, camera);
+
+        // GPU instance culling for every view (camera, spot shadows)
+        self.run_instance_culling(scene, camera);
 
         // Shadow pass (if enabled)
         if self.shadows_enabled {
@@ -1910,5 +1948,36 @@ impl Renderer {
             system.initialize(device, queue);
         }
         system.update(dt);
+    }
+}
+
+/// Cull view of the camera; spot shadow layer `l` is `spot_view(l)`.
+const MAIN_VIEW: usize = 0;
+
+fn spot_view(layer: u32) -> usize {
+    1 + layer as usize
+}
+
+/// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
+/// compacted instances (indirect) when it has `InstanceCulling`, otherwise its geometry as is.
+fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
+    let culled = r.instance_culling.as_ref().and_then(|c| c.view(view));
+    enc.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+    for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
+        let buffer = match culled {
+            Some((instances, _)) if i == 0 => Some(instances),
+            _ => cb.gpu_buffer(),
+        };
+        if let Some(buffer) = buffer {
+            enc.set_vertex_buffer(i as u32 + 1, buffer.slice(..));
+        }
+    }
+    enc.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+    if let Some((_, args)) = culled {
+        enc.draw_indexed_indirect(args, 0);
+    } else if r.geometry.is_indirect() {
+        enc.draw_indexed_indirect(r.geometry.active_indirect_buffer().unwrap(), 0);
+    } else {
+        enc.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
     }
 }
