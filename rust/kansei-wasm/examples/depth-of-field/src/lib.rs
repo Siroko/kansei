@@ -18,7 +18,8 @@ use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, Shade
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
-    exposure_from_ev100, AtmosphereEffect, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, TemporalAAEffect,
+    exposure_from_ev100, AtmosphereEffect, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DofDebugView, HighlightOptions,
+    TemporalAAEffect,
     TemporalAAOptions, ToneMapEffect, ToneMapOptions,
 };
 use kansei_core::postprocessing::PostProcessingVolume;
@@ -167,6 +168,10 @@ struct Settings {
     ev: f32,
     off: bool,
     taa: bool,
+    dof_after_taa: bool,
+    /// DofDebugView: 1 background, 2 near layer, 3 near alpha, 4 CoC.
+    debug: u32,
+    scatter: bool,
     samples: u32,
     /// Render scale (the TAA upscales to the canvas).
     scale: f32,
@@ -187,6 +192,9 @@ fn settings() -> Settings {
         ev: num("ev").unwrap_or(10.8),
         off: q.get("dof").as_deref() == Some("0"),
         taa: q.get("taa").as_deref() != Some("0"),
+        dof_after_taa: q.get("order").as_deref() == Some("after"),
+        debug: num("debug").unwrap_or(0.0) as u32,
+        scatter: q.get("scatter").as_deref() != Some("0"),
         samples: num("samples").unwrap_or(72.0) as u32,
         scale: num("scale").unwrap_or(1.0),
         time: num("t"),
@@ -317,14 +325,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let vfov = 2.0 * ((hfov * 0.5).tan() / aspect).atan();
     let camera = Camera::new(vfov.to_degrees(), 0.1, 4000.0, aspect);
 
-    // the chain: sky and aerial perspective, TAA, depth of field, then exposure and tonemapping
-    let tonemap = ToneMapEffect::new(ToneMapOptions { exposure: exposure_from_ev100(settings.ev), ..ToneMapOptions::for_surface(renderer.presentation_format()) });
+    // the chain: sky and aerial perspective, depth of field on the jittered frame (each pixel's
+    // colour and depth still agree), TAA resolving both, then exposure and tonemapping.
+    // order=after puts the DoF after TAA instead, for comparison.
+    // The alpha and CoC debug views are [0, 1] values rather than radiance: show them unexposed.
+    let exposure = if matches!(settings.debug, 3 | 4) { 1.0 } else { exposure_from_ev100(settings.ev) };
+    let tonemap = ToneMapEffect::new(ToneMapOptions { exposure, ..ToneMapOptions::for_surface(renderer.presentation_format()) });
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(AtmosphereEffect::new(&sky))];
-    if settings.taa {
-        effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
+    let taa = || Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() }));
+    if settings.taa && settings.dof_after_taa {
+        effects.push(taa());
     }
     if !settings.off {
-        effects.push(Box::new(CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+        let mut dof = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
             lens: CameraLens {
                 focal_length_mm: None, // from the camera: the blur matches the picture
                 f_stop: settings.f_stop,
@@ -334,8 +347,22 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 blade_rotation_deg: 15.0,
             },
             sample_count: settings.samples,
+            highlights: HighlightOptions { enabled: settings.scatter, ..Default::default() },
+            // resolved by the TAA after it
+            temporal_noise: settings.taa && !settings.dof_after_taa,
             ..Default::default()
-        })));
+        });
+        dof.debug_view = match settings.debug {
+            1 => DofDebugView::Background,
+            2 => DofDebugView::Near,
+            3 => DofDebugView::NearAlpha,
+            4 => DofDebugView::Coc,
+            _ => DofDebugView::None,
+        };
+        effects.push(Box::new(dof));
+    }
+    if settings.taa && !settings.dof_after_taa {
+        effects.push(taa());
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
