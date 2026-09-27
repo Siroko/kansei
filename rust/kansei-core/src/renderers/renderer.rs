@@ -8,6 +8,32 @@ use super::compute_batch::ComputeBatch;
 use super::gbuffer::GBuffer;
 use super::shared_layouts::SharedLayouts;
 
+/// Device limits the renderer requests from the adapter.
+#[derive(Debug, Clone, Default)]
+pub enum RequiredLimits {
+    /// WebGPU's default limits, which every adapter supports (for example 16 sampled textures
+    /// and 8 storage buffers per shader stage, 4 bind groups).
+    #[default]
+    Default,
+    /// Everything the adapter supports: more sampled textures and storage buffers per shader
+    /// stage, larger textures and buffers. Query what was granted with `Renderer::limits()`.
+    Adapter,
+    /// Exactly these limits; device creation fails if the adapter cannot meet them. Start from
+    /// `wgpu::Limits::default()` and raise what you need.
+    Custom(wgpu::Limits),
+}
+
+impl RequiredLimits {
+    /// The limits to request from an adapter that supports `adapter`.
+    pub fn resolve(&self, adapter: &wgpu::Limits) -> wgpu::Limits {
+        match self {
+            RequiredLimits::Default => wgpu::Limits::default(),
+            RequiredLimits::Adapter => adapter.clone(),
+            RequiredLimits::Custom(limits) => limits.clone(),
+        }
+    }
+}
+
 /// Core WebGPU renderer configuration.
 pub struct RendererConfig {
     pub width: u32,
@@ -16,6 +42,8 @@ pub struct RendererConfig {
     pub sample_count: u32,
     pub clear_color: Vec4,
     pub present_mode: wgpu::PresentMode,
+    /// Device limits to request (WebGPU's defaults unless raised).
+    pub required_limits: RequiredLimits,
 }
 
 impl Default for RendererConfig {
@@ -27,6 +55,7 @@ impl Default for RendererConfig {
             sample_count: 4,
             clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
             present_mode: wgpu::PresentMode::Fifo,
+            required_limits: RequiredLimits::Default,
         }
     }
 }
@@ -220,11 +249,19 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Kansei Device"),
                 required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
-                required_limits: wgpu::Limits::default(),
+                required_limits: self.config.required_limits.resolve(&adapter.limits()),
                 memory_hints: wgpu::MemoryHints::default(),
             }, None)
             .await
             .expect("Failed to create device");
+        let limits = device.limits();
+        log::info!(
+            "device limits: {} sampled textures, {} samplers, {} storage buffers per shader stage; textures up to {}",
+            limits.max_sampled_textures_per_shader_stage,
+            limits.max_samplers_per_shader_stage,
+            limits.max_storage_buffers_per_shader_stage,
+            limits.max_texture_dimension_2d
+        );
 
         self.matrix_alignment = device.limits().min_uniform_buffer_offset_alignment;
 
@@ -445,6 +482,11 @@ impl Renderer {
     /// Prefer using higher-level APIs instead of accessing the queue directly.
     /// This accessor will be removed in a future release.
     #[doc(hidden)]
+    /// The limits the device was created with (see `RendererConfig::required_limits`).
+    pub fn limits(&self) -> wgpu::Limits {
+        self.device().limits()
+    }
+
     pub fn queue(&self) -> &wgpu::Queue {
         self.queue.as_ref().expect("Renderer not initialized")
     }
