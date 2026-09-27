@@ -7,8 +7,10 @@ pub struct Texture {
     size: wgpu::Extent3d,
     usage: wgpu::TextureUsages,
     dimension: wgpu::TextureDimension,
+    /// The bound view's dimension; `None` lets wgpu pick it from the texture.
+    view_dimension: Option<wgpu::TextureViewDimension>,
     mip_levels: u32,
-    /// Optional initial data (RGBA bytes). Written to the GPU texture on first
+    /// Optional initial data (tightly packed rows, layer after layer). Written to the GPU texture on first
     /// `initialize_with_data` call, then discarded.
     initial_data: Option<Vec<u8>>,
 }
@@ -23,6 +25,7 @@ impl Texture {
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             usage,
             dimension: wgpu::TextureDimension::D2,
+            view_dimension: None,
             mip_levels: 1,
             initial_data: None,
         }
@@ -37,6 +40,7 @@ impl Texture {
             size: wgpu::Extent3d { width, height, depth_or_array_layers: depth },
             usage,
             dimension: wgpu::TextureDimension::D3,
+            view_dimension: None,
             mip_levels: 1,
             initial_data: None,
         }
@@ -55,9 +59,42 @@ impl Texture {
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             dimension: wgpu::TextureDimension::D2,
+            view_dimension: None,
             mip_levels: 1,
             initial_data: Some(data.to_vec()),
         }
+    }
+
+    /// A 2D texture array of `layers` equal layers, bound as `texture_2d_array` (see
+    /// `Binding::texture_2d_array`), for example terrain materials packed into one binding.
+    pub fn new_2d_array(label: &str, width: u32, height: u32, layers: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> Self {
+        Self {
+            label: label.to_string(),
+            gpu_texture: None,
+            view: None,
+            format,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: layers.max(1) },
+            usage,
+            dimension: wgpu::TextureDimension::D2,
+            view_dimension: Some(wgpu::TextureViewDimension::D2Array),
+            mip_levels: 1,
+            initial_data: None,
+        }
+    }
+
+    /// An RGBA8 2D texture array from one `width` x `height` image per layer, uploaded on first
+    /// use like `from_rgba`.
+    pub fn from_rgba_layers(label: &str, width: u32, height: u32, layers: &[&[u8]]) -> Self {
+        let mut texture = Self::new_2d_array(
+            label,
+            width,
+            height,
+            layers.len() as u32,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        texture.initial_data = Some(layers.concat());
+        texture
     }
 
     /// Wrap a texture created elsewhere (a render target, a LUT, a cubemap) with the view to bind,
@@ -69,6 +106,7 @@ impl Texture {
             size: texture.size(),
             usage: texture.usage(),
             dimension: texture.dimension(),
+            view_dimension: None,
             mip_levels: texture.mip_level_count(),
             gpu_texture: Some(texture),
             view: Some(view),
@@ -87,7 +125,7 @@ impl Texture {
             usage: self.usage,
             view_formats: &[],
         });
-        self.view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.view = Some(texture.create_view(&wgpu::TextureViewDescriptor { dimension: self.view_dimension, ..Default::default() }));
         self.gpu_texture = Some(texture);
     }
 
@@ -107,8 +145,8 @@ impl Texture {
                 &data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.size.width * 4),
-                    rows_per_image: None,
+                    bytes_per_row: Some(self.size.width * self.format.block_copy_size(None).unwrap_or(4)),
+                    rows_per_image: Some(self.size.height),
                 },
                 self.size,
             );

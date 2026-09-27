@@ -49,6 +49,14 @@ impl Binding {
         }}
     }
 
+    /// A `texture_2d_array<f32>` (filterable): layers of equal size, such as terrain materials.
+    pub fn texture_2d_array(index: u32, visibility: wgpu::ShaderStages) -> Self {
+        Self { index, visibility, ty: BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+        }}
+    }
+
     pub fn texture_cube(index: u32, visibility: wgpu::ShaderStages) -> Self {
         Self { index, visibility, ty: BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
