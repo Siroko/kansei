@@ -13,6 +13,7 @@ exclude = [
     "kansei-wasm/examples/postprocess-scene",
     "kansei-wasm/examples/pathtracer",
     "kansei-wasm/examples/fluid",
+    "kansei-wasm/examples/volumetric-fog",
 ]
 
 [workspace.dependencies]

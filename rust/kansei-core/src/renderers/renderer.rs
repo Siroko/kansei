@@ -923,6 +923,16 @@ impl Renderer {
         self.invalidate_bundle();
     }
 
+    /// The directional shadow map, once `enable_shadows` has been called.
+    pub fn shadow_map(&self) -> Option<&crate::shadows::ShadowMap> {
+        self.shadow_map.as_ref()
+    }
+
+    /// The point-light cube shadow atlas, once `enable_point_shadows` has been called.
+    pub fn cubemap_shadow_map(&self) -> Option<&crate::shadows::CubeMapShadowMap> {
+        self.cubemap_shadow_map.as_ref()
+    }
+
     /// Enable cubemap shadow mapping for point lights.
     pub fn enable_point_shadows(&mut self, resolution: u32, max_lights: u32) {
         let csm = crate::shadows::CubeMapShadowMap::new(self, resolution, max_lights);
