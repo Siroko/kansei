@@ -21,6 +21,10 @@ web-sys = { version = "0.3", features = [
 ] }
 wasm-bindgen = "0.2"
 
+[dev-dependencies]
+# validates the WGSL modules in unit tests (same naga as wgpu 24)
+naga = { version = "24", features = ["wgsl-in"] }
+
 [features]
 default = []
 egui = ["dep:egui", "dep:egui-wgpu"]
