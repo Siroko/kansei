@@ -171,8 +171,14 @@ impl Harness {
     }
 }
 
+/// The test pictures are small (W px) with film-sized blur: lift the width-relative cap, leaving
+/// the pixel ceiling.
+fn options() -> CinematicDepthOfFieldOptions {
+    CinematicDepthOfFieldOptions { lens: lens(), max_coc_fraction: 1.0, ..Default::default() }
+}
+
 fn effect() -> CinematicDepthOfFieldEffect {
-    CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions { lens: lens(), sample_count: 96, ..Default::default() })
+    CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions { sample_count: 96, ..options() })
 }
 
 fn at(img: &[[f32; 3]], x: u32, y: u32) -> [f32; 3] {
@@ -281,11 +287,11 @@ fn a_near_point_light_becomes_a_flat_disc_over_what_is_behind_it() {
 #[test]
 fn large_bokeh_keep_their_energy() {
     let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
-    // f/0.28: a CoC near the 48 px cap, where the gather takes more samples
+    // f/0.28: a CoC of about 37 px, where the gather reads the coarsest level
     let mut fx = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
         lens: CameraLens { f_stop: 0.28, ..lens() },
         sample_count: 72,
-        ..Default::default()
+        ..options()
     });
     let camera = Camera::new(40.0, NEAR, FAR, W as f32 / H as f32);
     let coc = fx.coc_radius_px(&camera, W, 100.0);
@@ -364,4 +370,36 @@ fn dof_frame_cost_at_1080p() {
         queue.submit(std::iter::once(encoder.finish()));
     });
     eprintln!("CinematicDepthOfFieldEffect at {w}x{h}, CoC {:.0} px everywhere: {:.3} ms (empty submit {:.3} ms)", fx.coc_radius_px(&camera, w, FAR), dof - empty, empty);
+}
+
+#[test]
+fn bokeh_bigger_than_the_cap_stop_at_a_fraction_of_the_width() {
+    let Some(h) = Harness::new() else { return eprintln!("no GPU adapter: skipping") };
+    // f/0.28 gives a light 100 m away a CoC of about 37 px; the cap is 5 % of 384 px
+    let mut fx = CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+        lens: CameraLens { f_stop: 0.28, ..lens() },
+        max_coc_fraction: 0.05,
+        ..Default::default()
+    });
+    let camera = Camera::new(40.0, NEAR, FAR, W as f32 / H as f32);
+    let cap = 0.05 * W as f32;
+    assert_eq!(fx.coc_radius_px(&camera, W, 100.0), cap);
+    let (cx, cy) = (W / 2, H / 2);
+    let mut color = vec![[0.0f32; 3]; (W * H) as usize];
+    color[(cy * W + cx) as usize] = [10000.0, 10000.0, 10000.0];
+    let out = h.run(&mut fx, &color, &vec![100.0; (W * H) as usize]);
+    // a flat disc's mean squared radius is half its radius squared
+    let (mut total, mut r2) = (0.0f32, 0.0f32);
+    for y in 0..H {
+        for x in 0..W {
+            let e = at(&out, x, y)[0];
+            let (dx, dy) = (x as f32 + 0.5 - (cx as f32 + 0.5), y as f32 + 0.5 - (cy as f32 + 0.5));
+            total += e;
+            r2 += e * (dx * dx + dy * dy);
+        }
+    }
+    let radius = (2.0 * r2 / total).sqrt();
+    // (a one-texel light's energy is estimated from the samples that land on it: within 25 % here)
+    assert!((radius - cap).abs() < 0.1 * cap && (total - 10000.0).abs() < 2500.0, "disc radius {radius} px (cap {cap}), energy {total}");
+    eprintln!("capped bokeh: radius {radius:.2} px (cap {cap:.2}), energy {total:.0}");
 }
