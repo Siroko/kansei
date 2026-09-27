@@ -330,3 +330,49 @@ fn environment_cubemap_faces_follow_the_webgpu_layout_and_the_sky() {
     assert!(e1.is_finite() && w1.min_element() > 0.0 && e1.x > w1.x && e1.x / w1.x < east.x / west.x, "rough east {e1}, west {w1}");
     eprintln!("env: east {east} west {west} zenith {zenith} nadir {nadir}; roughest east {e1} west {w1}");
 }
+
+/// Per-frame cost of `SkyAtmosphere::update` (sky view, aerial perspective, sky lighting and
+/// environment passes): wall time of submit-and-wait, minus that of an empty submit. Run by hand:
+/// `cargo test -p kansei-core --release --test atmosphere_gpu -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn atmosphere_frame_cost() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sky = SkyAtmosphere::new(&device, SkyAtmosphereOptions::default());
+    let mut camera = Camera::new(60.0, 0.1, 1000.0, 16.0 / 9.0);
+    camera.set_position(0.0, 2.0, 0.0);
+    camera.look_at(&Vec3::new(0.0, 2.0, -10.0));
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let mut time = |f: &mut dyn FnMut()| {
+        let mut samples = Vec::new();
+        for i in 0..220 {
+            let t0 = std::time::Instant::now();
+            f();
+            device.poll(wgpu::Maintain::Wait);
+            if i >= 20 {
+                samples.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        median(samples)
+    };
+    let empty = time(&mut || {
+        queue.submit(std::iter::once(device.create_command_encoder(&Default::default()).finish()));
+    });
+    // one frame, then the static LUTs are cached as in a running app
+    sky.update(&device, &queue, &mut camera);
+    let update = time(&mut || sky.update(&device, &queue, &mut camera));
+    sky.invalidate();
+    let rebuild = time(&mut || {
+        sky.invalidate();
+        sky.update(&device, &queue, &mut camera)
+    });
+    eprintln!(
+        "SkyAtmosphere::update: {:.3} ms per frame ({:.3} ms with the static LUTs rebuilt), over an empty submit of {:.3} ms",
+        update - empty,
+        rebuild - empty,
+        empty
+    );
+}
