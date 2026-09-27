@@ -20,6 +20,8 @@ pub struct Renderable {
     /// Bitmask of the layers this renderable is on (bit 0 by default). Secondary views such
     /// as planar reflections draw only renderables whose layers intersect their mask.
     pub layers: u32,
+    /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
+    pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
 
 impl Renderable {
@@ -38,7 +40,14 @@ impl Renderable {
             material_dirty: true,
             instance_culling: None,
             layers: Self::DEFAULT_LAYERS,
+            previous_world_matrix: std::cell::Cell::new(None),
         }
+    }
+
+    /// Forget last frame's transform, so the next frame has no motion from this object (after a
+    /// teleport, or on a camera cut).
+    pub fn reset_motion(&mut self) {
+        self.previous_world_matrix.set(None);
     }
 
     /// Whether this renderable uses instanced rendering.

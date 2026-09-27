@@ -18,6 +18,10 @@ pub trait PostProcessingEffect {
         height: u32,
     );
     fn resize(&mut self, width: u32, height: u32, gbuffer: &GBuffer);
+    /// Whether the effect wants the scene rendered with a sub-pixel jittered projection (TAA).
+    fn wants_jitter(&self) -> bool {
+        false
+    }
     fn destroy(&mut self);
     /// Downcast support for runtime access to concrete effect types.
     fn as_any(&self) -> &dyn std::any::Any;

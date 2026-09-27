@@ -38,6 +38,11 @@ pub struct MaterialOptions {
     /// foliage cards: it runs with no colour targets and should `discard` cut-out texels, and it
     /// must not use group 3. `None` renders shadow depth from `vertex_main` alone.
     pub shadow_fragment_entry: Option<&'static str>,
+    /// The fragment shader also writes screen-space motion at @location(4) (see
+    /// `cameras::MOTION_VECTORS_WGSL`), for TAA: the renderer redraws the material in a velocity
+    /// pass that keeps only that output. Without it, TAA reprojects the material's pixels by
+    /// depth, which only follows the camera (fine for static things).
+    pub outputs_velocity: bool,
 }
 
 impl Default for MaterialOptions {
@@ -51,6 +56,7 @@ impl Default for MaterialOptions {
             outputs_emissive: false,
             mrt_output_count: None,
             shadow_fragment_entry: None,
+            outputs_velocity: false,
         }
     }
 }
@@ -94,6 +100,8 @@ pub struct Material {
     depth_pipeline_layout: Option<wgpu::PipelineLayout>,
     pub(crate) pipeline_cache: HashMap<PipelineKey, wgpu::RenderPipeline>,
     pub(crate) depth_pipeline_cache: HashMap<DepthPipelineKey, wgpu::RenderPipeline>,
+    /// Velocity-pass pipelines by vertex-buffer count.
+    pub(crate) velocity_pipeline_cache: HashMap<usize, wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
 }
@@ -113,6 +121,7 @@ impl Material {
             depth_pipeline_layout: None,
             pipeline_cache: HashMap::new(),
             depth_pipeline_cache: HashMap::new(),
+            velocity_pipeline_cache: HashMap::new(),
             bind_group: None,
             initialized: false,
         }
@@ -312,6 +321,59 @@ impl Material {
             self.depth_pipeline_cache.insert(key.clone(), pipeline);
         }
         self.depth_pipeline_cache.get(&key).unwrap()
+    }
+
+    /// Get or create the pipeline of the renderer's velocity pass: this material's shader with
+    /// only its @location(4) output kept (a Rg16Float target at index 4, nothing before it),
+    /// depth-tested against the GBuffer without writing depth.
+    pub(crate) fn get_velocity_pipeline(&mut self, device: &wgpu::Device, vertex_layouts: &[wgpu::VertexBufferLayout]) -> &wgpu::RenderPipeline {
+        assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        use crate::renderers::GBuffer;
+        let key = vertex_layouts.len();
+        if !self.velocity_pipeline_cache.contains_key(&key) {
+            let module = self.shader_module.as_ref().unwrap();
+            let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![None; GBuffer::VELOCITY_TARGET];
+            targets.push(Some(wgpu::ColorTargetState {
+                format: GBuffer::VELOCITY_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            }));
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("{}/VelocityPipeline", self.label)),
+                layout: self.pipeline_layout.as_ref(),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vertex_main"),
+                    buffers: vertex_layouts,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fragment_main"),
+                    targets: &targets,
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: self.options.topology,
+                    cull_mode: self.options.cull_mode.to_wgpu(),
+                    ..Default::default()
+                },
+                // the GBuffer pass and this one must produce the same depths: mark the position
+                // output @invariant; the small bias toward the camera covers compilers that differ
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: GBuffer::DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState { constant: -4, slope_scale: -1.0, clamp: 0.0 },
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
+            self.velocity_pipeline_cache.insert(key, pipeline);
+        }
+        self.velocity_pipeline_cache.get(&key).unwrap()
     }
 
     /// Create (or recreate) the material bind group from the given resources.

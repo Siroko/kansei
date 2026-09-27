@@ -18,6 +18,7 @@ exclude = [
     "kansei-wasm/examples/film-look",
     "kansei-wasm/examples/spot-lights",
     "kansei-wasm/examples/planar-reflection",
+    "kansei-wasm/examples/taa",
 ]
 
 [workspace.dependencies]

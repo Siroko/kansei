@@ -31,6 +31,11 @@ impl PostProcessingVolume {
         }
     }
 
+    /// Whether any effect wants a jittered projection (the renderer then jitters the camera).
+    pub fn wants_jitter(&self) -> bool {
+        self.effects.iter().any(|e| e.wants_jitter())
+    }
+
     pub fn gbuffer(&self) -> Option<&GBuffer> {
         self.gbuffer.as_ref()
     }
