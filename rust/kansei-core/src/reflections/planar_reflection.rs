@@ -54,6 +54,9 @@ pub(crate) fn flip_x() -> glam::Mat4 {
 pub struct ReflectionFog {
     pub(crate) volume: wgpu::TextureView,
     pub(crate) params: wgpu::Buffer,
+    /// Whether the reflection was drawn this frame (it is drawn before the post chain), so the
+    /// fog builds no volume for a reflection that is disabled or whose plane the camera is under.
+    pub(crate) drawn: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What the resolve needs to look up a `ReflectionFog` volume (the WGSL `ReflectionFogParams`).
@@ -140,6 +143,8 @@ pub struct PlanarReflection {
     fog_sampler: wgpu::Sampler,
     // no fog: an empty volume and parameters that say so
     no_fog: ReflectionFog,
+    // the attached fog's flag, told each frame whether the reflection is drawn
+    fog_drawn: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     downsample_pipeline: wgpu::ComputePipeline,
     downsample_bgs: Vec<wgpu::BindGroup>,
 }
@@ -311,6 +316,7 @@ impl PlanarReflection {
                 usage: wgpu::BufferUsages::UNIFORM,
                 mapped_at_creation: false,
             }),
+            drawn: Default::default(),
         };
         let resolve_bg = resolve_bind_group(device, &resolve_bgl, &color_view, &depth_view, &mip_views[0], &resolve_params, &fog_sampler, &no_fog);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -361,6 +367,7 @@ impl PlanarReflection {
             mip0_view: mip_views[0].clone(),
             fog_sampler,
             no_fog,
+            fog_drawn: None,
             downsample_pipeline: pipeline("PlanarReflection/Downsample", DOWNSAMPLE_WGSL, &downsample_bgl),
             downsample_bgs,
         }
@@ -369,6 +376,7 @@ impl PlanarReflection {
     /// Composite a volumetric fog over the reflection (`VolumetricFogEffect::reflection_fog`), or
     /// none. Materials then fog only what lies beyond the fog's volume along the reflected path.
     pub fn set_fog(&mut self, renderer: &Renderer, fog: Option<&ReflectionFog>) {
+        self.fog_drawn = fog.map(|f| f.drawn.clone());
         let fog = fog.unwrap_or(&self.no_fog);
         self.resolve_bg = resolve_bind_group(
             renderer.device(),
@@ -419,6 +427,9 @@ impl PlanarReflection {
         let view = main.view_matrix.to_glam();
         let cam_pos = view.inverse().w_axis.truncate();
         self.active = self.enabled && n.dot(cam_pos) + d > 0.0;
+        if let Some(drawn) = &self.fog_drawn {
+            drawn.store(self.active, std::sync::atomic::Ordering::Relaxed);
+        }
         if !self.active {
             return false;
         }
