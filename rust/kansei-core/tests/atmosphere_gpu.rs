@@ -346,7 +346,7 @@ fn atmosphere_frame_cost() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    let mut time = |f: &mut dyn FnMut()| {
+    let time = |f: &mut dyn FnMut()| {
         let mut samples = Vec::new();
         for i in 0..220 {
             let t0 = std::time::Instant::now();

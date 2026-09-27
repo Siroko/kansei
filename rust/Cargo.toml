@@ -20,6 +20,7 @@ exclude = [
     "kansei-wasm/examples/planar-reflection",
     "kansei-wasm/examples/taa",
     "kansei-wasm/examples/cascaded-shadows",
+    "kansei-wasm/examples/depth-of-field",
 ]
 
 [workspace.dependencies]
