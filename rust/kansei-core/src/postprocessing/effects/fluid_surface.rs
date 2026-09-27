@@ -177,6 +177,10 @@ pub struct FluidSurfaceEffect {
     composite_bg: Option<wgpu::BindGroup>,
     cached_input_ptr: usize,
     initialized: bool,
+    /// Splat radius for the surface density field. `None` = the sim's smoothing
+    /// radius. Set it explicitly when the sim radius is smaller than a field voxel,
+    /// otherwise the field is sparse and the surface shatters into shards.
+    pub splat_radius: Option<f32>,
 }
 
 impl FluidSurfaceEffect {
@@ -190,7 +194,7 @@ impl FluidSurfaceEffect {
         Self {
             options, sim, density_field, marching_cubes, marching_cubes_bg,
             composite_pipeline: None, composite_bgl: None, params_buf: None,
-            composite_bg: None, cached_input_ptr: 0, initialized: false,
+            composite_bg: None, cached_input_ptr: 0, initialized: false, splat_radius: None,
         }
     }
 
@@ -265,7 +269,7 @@ impl PostProcessingEffect for FluidSurfaceEffect {
         // 1. Density field + MC extract compute passes
         self.density_field.update_with_encoder(encoder,
             self.sim.world_bounds_min, self.sim.world_bounds_max,
-            self.sim.particle_count(), self.sim.params.smoothing_radius);
+            self.sim.particle_count(), self.splat_radius.unwrap_or(self.sim.params.smoothing_radius));
 
         let source = SurfaceExtractionSourceContract {
             version: SurfaceContractVersion::V1,

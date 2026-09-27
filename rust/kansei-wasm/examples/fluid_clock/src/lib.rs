@@ -427,8 +427,61 @@ fn build_mc_renderable_placeholder() -> Renderable {
     r
 }
 
+/// Everything that has to move together when the particle count changes. All of it is
+/// derived from the tuned 80K @ h=1.0 setup by keeping the fluid volume constant:
+/// radius ∝ count^(-1/3), density_target ∝ n/h (kernels integrate to 2n/h), near
+/// pressure ∝ h, glyph budgets ∝ count. Pressure multiplier and sim time scale are
+/// the measured stable pairs per count band (clock_fill_test, ≥7 s of sim time):
+/// the stable substep shrinks ~1/sqrt(k), and near pressure — not k — provides the
+/// incompressibility, so k can drop without changing the pool shape.
+#[derive(Clone, Copy)]
+pub struct SimTuning {
+    pub count: u32, pub radius: f32, pub pressure: f32, pub near_pressure: f32,
+    pub density_target: f32, pub viscosity: f32, pub time_scale: f32,
+    pub per_slot: u32, pub emit_rate: u32, pub particle_size: f32, pub kernel_scale: f32,
+}
+
+pub fn tuning_for(count: u32) -> SimTuning {
+    let ratio = count as f32 / 80_000.0;
+    let radius = ratio.powf(-1.0 / 3.0);
+    let (pressure, time_scale) = if count <= 100_000 { (46.5, 1.9) }
+        else if count <= 200_000 { (12.0, 1.9) }
+        else if count <= 300_000 { (12.0, 1.4) }
+        else { (6.0, 1.0) };
+    SimTuning {
+        count, radius, pressure,
+        near_pressure: 20.0 * radius,
+        density_target: 8.6 * ratio / radius,
+        viscosity: 1.0,
+        time_scale,
+        per_slot: (2000.0 * ratio).round() as u32,
+        emit_rate: (100.0 * ratio).round() as u32,
+        particle_size: 0.15 * radius,
+        kernel_scale: 0.6 / ratio,
+    }
+}
+
+thread_local! { static TUNING: std::cell::Cell<Option<SimTuning>> = const { std::cell::Cell::new(None) }; }
+
+/// The effective sim configuration as a JS object (for the page's tweakpane defaults).
 #[wasm_bindgen]
-pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
+pub fn sim_config() -> JsValue {
+    let t = TUNING.with(|c| c.get()).unwrap_or_else(|| tuning_for(500_000));
+    let o = js_sys::Object::new();
+    let set = |k: &str, v: f64| { let _ = js_sys::Reflect::set(&o, &JsValue::from_str(k), &JsValue::from_f64(v)); };
+    set("count", t.count as f64); set("radius", t.radius as f64); set("pressure", t.pressure as f64);
+    set("nearPressure", t.near_pressure as f64); set("densityTarget", t.density_target as f64);
+    set("viscosity", t.viscosity as f64); set("timeScale", t.time_scale as f64);
+    set("perSlot", t.per_slot as f64); set("emitRate", t.emit_rate as f64);
+    set("particleSize", t.particle_size as f64); set("kernelScale", t.kernel_scale as f64);
+    o.into()
+}
+
+/// `count` = 0 selects the default (500K).
+#[wasm_bindgen]
+pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
+    let tuning = tuning_for(if count == 0 { 500_000 } else { count.clamp(10_000, 2_000_000) });
+    TUNING.with(|c| c.set(Some(tuning)));
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = canvas_id;
@@ -442,8 +495,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = document.get_element_by_id(canvas_id)
         .ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
 
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
+    // Render at device resolution (CSS size × devicePixelRatio, capped at 2×): the page
+    // stretches the canvas to the viewport, so a CSS-pixel backing store gets upscaled
+    // by the browser on Retina displays and every edge looks aliased.
+    let dpr = window.device_pixel_ratio().clamp(1.0, 2.0);
+    let width = (canvas.client_width() as f64 * dpr) as u32;
+    let height = (canvas.client_height() as f64 * dpr) as u32;
     canvas.set_width(width);
     canvas.set_height(height);
 
@@ -457,12 +514,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // ── Particles ──
     // Portrait tank for the stacked HH / MM / SS layout (rows of two 14-unit
-    // glyphs). At rest density (~6.4/unit³) 80K particles are ~12500 units³:
-    // ~12.5 units deep on the 50×20 floor, surface near y ≈ 2.5 (measured
-    // with kansei-native's clock_fill_test).
-    let count = 80_000usize;
-    let center = [0.0f32, -3.0, 0.0];
-    let half = [23.0f32, 6.0, 9.0]; // spawn box: x∈[-23,23], y∈[-9,3], z∈[-9,9]
+    // glyphs). Whatever the count, the particles fill the same ~12500 units³
+    // as the original 80K @ h=1.0 (see `tuning_for`): ~12.5 units deep on the
+    // 50×20 floor, surface near y ≈ 2.5 (clock_fill_test, equal sim time).
+    let count = tuning.count as usize;
+    let center = [0.0f32, -1.5, 0.0];
+    let half = [23.0f32, 7.5, 9.0]; // spawn box at rest density: x∈[-23,23], y∈[-9,6], z∈[-9,9]
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
@@ -480,9 +537,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // ── Sim ──
     let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
-        max_particles: count as u32, dimensions: 3, smoothing_radius: 1.0,
-        pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
-        viscosity: 1.0, damping: 1.0, gravity: [0.0, -9.8, 0.0],
+        max_particles: count as u32, dimensions: 3, smoothing_radius: tuning.radius,
+        pressure_multiplier: tuning.pressure, near_pressure_multiplier: tuning.near_pressure,
+        density_target: tuning.density_target,
+        viscosity: tuning.viscosity, damping: 1.0, gravity: [0.0, -9.8, 0.0],
         mouse_force: 1600.0, substeps: 2, world_bounds_padding: 2.0,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     }, &positions);
@@ -507,7 +565,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // pool surface (~2.5): SS center = -1.3·14 = -18.2, bottom = -25.2 → +29.
     let glyph_y = 28.0f32;
     apply_glyph_y(&mut slot_layout, &slot_base_y, glyph_y);
-    let per_slot_count = 2000u32; // ~1800 fit a bold 14-unit, 6-deep stroke at rest density (glyph_form_test)
+    let per_slot_count = tuning.per_slot; // 2000 @ 80K (~1800 fit a bold 14-unit, 6-deep stroke, glyph_form_test), ∝ count
     apply_budgets(&mut slot_layout, per_slot_count);
     let mut clock = ClockState::new();
     let (h0, m0, s0) = now_hms();
@@ -518,7 +576,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // ── Density field + surface renderer (for raymarch mode) ──
     let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max,
-        DensityFieldOptions { resolution: 128, kernel_scale: 0.6 }); // max-axis cells; ~0.55 units/cell on the 70-tall tank (192/256 looked the same)
+        DensityFieldOptions { resolution: 128, kernel_scale: tuning.kernel_scale }); // max-axis cells; ~0.55 units/cell on the 70-tall tank (192/256 looked the same)
     let surface_renderer = FluidSurfaceRenderer::new(&renderer);
 
     // ── Marching cubes (compute only — render via standard Renderable) ──
@@ -663,10 +721,18 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let volume = PostProcessingVolume::new(
         &renderer,
         vec![
-            Box::new(FluidSurfaceEffect::new(
-                sim, density_field, marching_cubes, marching_cubes_bg,
-                FluidSurfaceOptions::default(),
-            )),
+            Box::new({
+                let mut fse = FluidSurfaceEffect::new(
+                    sim, density_field, marching_cubes, marching_cubes_bg,
+                    FluidSurfaceOptions::default(),
+                );
+                // Surface field is splatted at the h=1.0 radius regardless of the sim
+                // radius (0.543 < one 0.55-unit voxel would give a sparse, shattered
+                // field); kernel scale divided by the 6.25x particle count keeps the
+                // field values — and the tuned iso level — where they were at 80K.
+                fse.splat_radius = Some(SURFACE_SPLAT_RADIUS);
+                fse
+            }),
             Box::new(DepthOfFieldEffect::new(DepthOfFieldOptions {
                 focus_distance: 90.0,
                 focus_range: 37.0,
@@ -690,9 +756,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         blit_pipeline, blit_bg, surface_bg,
         color_view, depth_view, output_view,
         count: count as u32, width, height,
-        particle_size: 0.15, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
+        particle_size: tuning.particle_size, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
         use_batched_sim: true,
-        sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: 1.0, max_sim_steps: 4,
+        sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: tuning.time_scale, max_sim_steps: 4,
         max_render_fps: 0.0, render_accumulator: 0.0,
         frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
         current_fps: 0.0, current_frame_ms: 0.0,
@@ -703,7 +769,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         capture_below: 45.0, // recruit columns reach from the top row down into the pool
         emit_height: 1.0,    // recruits appear in the gap just above their glyph and fall in
         emit_spread: 2.5,
-        emit_rate: 100,      // per slot per frame: 2000 over ~20 frames
+        emit_rate: tuning.emit_rate, // per slot per frame: the budget over ~20 frames
         attr_stiffness: 90.0,
         attr_max_speed: 12.0, // ~0.2 units/step: must stay small vs. the stroke width
         attr_basin: 5.0,
@@ -921,7 +987,7 @@ impl State {
             let fse = self.volume.effects[0].as_any_mut().downcast_mut::<FluidSurfaceEffect>().unwrap();
             fse.density_field.update_with_encoder(&mut encoder,
                 fse.sim.world_bounds_min, fse.sim.world_bounds_max,
-                fse.sim.particle_count(), fse.sim.params.smoothing_radius);
+                fse.sim.particle_count(), SURFACE_SPLAT_RADIUS);
 
             // Clear offscreen color + depth (raymarch reads depth to know geometry)
             {
@@ -1008,6 +1074,8 @@ fn now_hms() -> (u32, u32, u32) {
 thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
 fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
 
+/// Surface density-field splat radius and kernel scale (see FluidSurfaceEffect::splat_radius).
+const SURFACE_SPLAT_RADIUS: f32 = 1.0;
 const CLOCK_CELL: f32 = 14.0;
 const CLOCK_DEPTH: f32 = 6.0;
 /// Row pitch of the stacked layout as a multiple of the cell (0.3·cell gap).

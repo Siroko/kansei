@@ -1,6 +1,9 @@
-@group(0) @binding(0) var<storage, read_write> positions: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read_write> velocities: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> densities: array<vec2<f32>>;
+// One thread per *sorted* slot (see density.wgsl). Inputs are the cell-ordered copies
+// written by scatter; the result is written back to the particle's original index so
+// `velocities` stays in original order for everything outside the sim.
+@group(0) @binding(0) var<storage, read_write> sortedPositions: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> sortedVelocities: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> densities: array<vec2<f32>>; // sorted order
 @group(0) @binding(3) var<storage, read_write> originalPositions: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> cellOffsets: array<u32>;
 @group(0) @binding(5) var<storage, read_write> sortedIndices: array<u32>;
@@ -9,6 +12,7 @@
 @group(0) @binding(8) var<uniform> projectionMatrix: mat4x4<f32>;
 @group(0) @binding(9) var<uniform> inverseViewMatrix: mat4x4<f32>;
 @group(0) @binding(10) var<uniform> worldMatrix: mat4x4<f32>;
+@group(0) @binding(11) var<storage, read_write> velocities: array<vec4<f32>>; // original order (output)
 
 fn pressureFromDensity(density: f32) -> f32 {
     return (density - params.densityTarget) * params.pressureMultiplier;
@@ -18,34 +22,19 @@ fn nearPressureFromDensity(nearDensity: f32) -> f32 {
     return nearDensity * params.nearPressureMultiplier;
 }
 
-fn densityDerivative(dist: f32, h: f32) -> f32 {
-    if (dist >= h) { return 0.0; }
-    let v = h - dist;
-    return v * params.spikyPow2DerivFactor;
-}
-
-fn nearDensityDerivative(dist: f32, h: f32) -> f32 {
-    if (dist >= h) { return 0.0; }
-    let v = h - dist;
-    return v * v * params.spikyPow3DerivFactor;
-}
-
-fn viscosityKernel(dist: f32, h: f32) -> f32 {
-    if (dist >= h) { return 0.0; }
-    let v = h * h - dist * dist;
-    return v * v * v * params.poly6Factor;
-}
-
-@compute @workgroup_size(64)
+@compute @workgroup_size(__NEIGHBOR_WG__)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if (idx >= params.particleCount) { return; }
+    let slot = gid.x;
+    if (slot >= params.particleCount) { return; }
+    let idx = sortedIndices[slot];
 
-    let pos = positions[idx].xyz;
-    var vel = velocities[idx].xyz;
-    let myDensity = densities[idx];
+    let pos = sortedPositions[slot].xyz;
+    let myVel = sortedVelocities[slot];
+    var vel = myVel.xyz;
+    let myDensity = densities[slot];
     let coord = getCellCoord(pos, params);
     let h = params.smoothingRadius;
+    let h2 = h * h;
 
     let pressure = pressureFromDensity(myDensity.x);
     let nearPressure = nearPressureFromDensity(myDensity.y);
@@ -69,31 +58,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let cellEnd = select(cellOffsets[neighborCell + 1u], params.particleCount, neighborCell + 1u >= params.totalCells);
 
                 for (var j = cellStart; j < cellEnd; j++) {
-                    let neighborIdx = sortedIndices[j];
-                    if (neighborIdx == idx) { continue; }
+                    if (j == slot) { continue; }
 
-                    let neighborPos = positions[neighborIdx].xyz;
-                    let neighborVel = velocities[neighborIdx].xyz;
-                    let neighborDensity = densities[neighborIdx];
+                    let diff = pos - sortedPositions[j].xyz;
+                    let d2 = dot(diff, diff);
+                    // One range test per pair; only then touch velocity/density.
+                    if (d2 >= h2 || d2 < 1e-8) { continue; }
 
-                    let diff = pos - neighborPos;
-                    let dist = length(diff);
-                    if (dist < 0.0001) { continue; }
+                    let neighborVel = sortedVelocities[j].xyz;
+                    let neighborDensity = densities[j];
 
+                    let dist = sqrt(d2);
                     let dir = diff / dist;
+                    let v = h - dist;
 
-                    // Pressure force
+                    // Pressure force: spiky derivatives (h-r) and (h-r)^2, normalised once below
                     let neighborPressure = pressureFromDensity(neighborDensity.x);
                     let neighborNearPressure = nearPressureFromDensity(neighborDensity.y);
                     let sharedPressure = (pressure + neighborPressure) * 0.5;
                     let sharedNearPressure = (nearPressure + neighborNearPressure) * 0.5;
+                    pressureForce += dir * (v * params.spikyPow2DerivFactor * sharedPressure
+                                          + v * v * params.spikyPow3DerivFactor * sharedNearPressure);
 
-                    pressureForce += dir * (densityDerivative(dist, h) * sharedPressure
-                                          + nearDensityDerivative(dist, h) * sharedNearPressure);
-
-                    // Viscosity force
-                    let viscWeight = viscosityKernel(dist, h);
-                    viscosityForce += (neighborVel - vel) * viscWeight;
+                    // Viscosity: poly6 (h²-r²)^3, normalised once below
+                    let q = h2 - d2;
+                    viscosityForce += (neighborVel - vel) * (q * q * q);
                 }
             }
         }
@@ -101,13 +90,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Apply pressure + viscosity
     let safeDensity = max(myDensity.x, 0.001);
-    vel += (pressureForce / safeDensity + viscosityForce * params.viscosity) * params.dt;
+    vel += (pressureForce / safeDensity + viscosityForce * (params.poly6Factor * params.viscosity)) * params.dt;
 
     // velocity.w is a per-particle "held" flag (1 = held by an external
     // attractor, e.g. GlyphAttractor). Held particles get no gravity here, so
     // the cancellation is exact per substep instead of a once-per-frame kick
     // that leaves them sagging. Preserved through this pass; integrate keeps it.
-    let held = velocities[idx].w > 0.5;
+    let held = myVel.w > 0.5;
 
     // Gravity (directional or radial toward params.gravityCenter)
     if (held) {

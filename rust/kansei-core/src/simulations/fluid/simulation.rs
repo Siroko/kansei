@@ -1,7 +1,13 @@
 use super::params::*;
 
-const MAX_GRID_CELLS: u32 = 262144;
+/// Cap on hash-grid cells (3 × u32 per cell → 24 MB at the cap). Large enough that the
+/// cell stays equal to the smoothing radius for the tanks we use; `fit_grid` still
+/// widens the cell if a scene would exceed it.
+const MAX_GRID_CELLS: u32 = 2_097_152;
 const PREFIX_SUM_BLOCK_SIZE: u32 = 512;
+/// Workgroup size of the neighbor-search passes (density, forces). Substituted into the
+/// WGSL as `__NEIGHBOR_WG__` so the dispatch count and the shader cannot disagree.
+const NEIGHBOR_WG: u32 = 64;
 
 const SIM_PARAMS_WGSL: &str = include_str!("shaders/sim-params.wgsl");
 const GRID_CLEAR_WGSL: &str = include_str!("shaders/grid-clear.wgsl");
@@ -16,7 +22,7 @@ const INTEGRATE_WGSL: &str = include_str!("shaders/integrate.wgsl");
 
 /// Prepend SimParams struct to a shader that needs it.
 fn with_params(shader: &str) -> String {
-    format!("{}\n{}", SIM_PARAMS_WGSL, shader)
+    format!("{}\n{}", SIM_PARAMS_WGSL, shader).replace("__NEIGHBOR_WG__", &NEIGHBOR_WG.to_string())
 }
 
 /// A single compute pass — pipeline + bind group.
@@ -58,6 +64,8 @@ pub struct FluidSimulation {
     densities_buffer: Option<wgpu::Buffer>,
     cell_indices_buffer: Option<wgpu::Buffer>,
     cell_counts_buffer: Option<wgpu::Buffer>,
+    sorted_positions_buffer: Option<wgpu::Buffer>,
+    sorted_velocities_buffer: Option<wgpu::Buffer>,
     cell_offsets_buffer: Option<wgpu::Buffer>,
     scatter_counters_buffer: Option<wgpu::Buffer>,
     sorted_indices_buffer: Option<wgpu::Buffer>,
@@ -69,8 +77,7 @@ pub struct FluidSimulation {
     world_matrix_buffer: Option<wgpu::Buffer>,
 
     // 10 compute passes
-    grid_clear_counts: Option<Pass>,
-    grid_clear_scatter: Option<Pass>,
+    grid_clear: Option<Pass>,
     grid_assign: Option<Pass>,
     prefix_sum_local: Option<Pass>,
     prefix_sum_top: Option<Pass>,
@@ -107,6 +114,8 @@ impl FluidSimulation {
             densities_buffer: None,
             cell_indices_buffer: None,
             cell_counts_buffer: None,
+            sorted_positions_buffer: None,
+            sorted_velocities_buffer: None,
             cell_offsets_buffer: None,
             scatter_counters_buffer: None,
             sorted_indices_buffer: None,
@@ -115,8 +124,7 @@ impl FluidSimulation {
             projection_matrix_buffer: None,
             inverse_view_matrix_buffer: None,
             world_matrix_buffer: None,
-            grid_clear_counts: None,
-            grid_clear_scatter: None,
+            grid_clear: None,
             grid_assign: None,
             prefix_sum_local: None,
             prefix_sum_top: None,
@@ -215,7 +223,10 @@ impl FluidSimulation {
 
         self.original_positions_buffer = Some(mk_storage("OrigPositions", positions));
         self.velocities_buffer = Some(mk_storage("Velocities", &vec![0.0f32; n * 4]));
+        // Densities are stored in *sorted* (cell) order — see density.wgsl.
         self.densities_buffer = Some(mk_storage("Densities", &vec![0.0f32; n * 2]));
+        self.sorted_positions_buffer = Some(mk_storage("SortedPositions", &vec![0.0f32; n * 4]));
+        self.sorted_velocities_buffer = Some(mk_storage("SortedVelocities", &vec![0.0f32; n * 4]));
         self.cell_indices_buffer = Some(mk_storage("CellIndices", &vec![0.0f32; n]));
         self.sorted_indices_buffer = Some(mk_storage("SortedIndices", &vec![0.0f32; n]));
         self.cell_counts_buffer = Some(mk_storage("CellCounts", &vec![0.0f32; tc]));
@@ -295,14 +306,12 @@ impl FluidSimulation {
         let si = self.sorted_indices_buffer.as_ref().unwrap();
         let bs = self.block_sums_buffer.as_ref().unwrap();
         let par = self.params_buffer.as_ref().unwrap();
+        let spos = self.sorted_positions_buffer.as_ref().unwrap();
+        let svel = self.sorted_velocities_buffer.as_ref().unwrap();
 
-        // 1. Grid clear counts — clears cell_counts
-        self.grid_clear_counts = Some(Self::make_pass(device, "GridClearCounts", GRID_CLEAR_WGSL,
-            &[storage(0)], vec![buf!(0, cc)]));
-
-        // 2. Grid clear scatter — clears scatter_counters
-        self.grid_clear_scatter = Some(Self::make_pass(device, "GridClearScatter", GRID_CLEAR_WGSL,
-            &[storage(0)], vec![buf!(0, sc)]));
+        // 1. Grid clear — clears cell_counts and scatter_counters in one dispatch
+        self.grid_clear = Some(Self::make_pass(device, "GridClear", GRID_CLEAR_WGSL,
+            &[storage(0), storage(1)], vec![buf!(0, cc), buf!(1, sc)]));
 
         // 3. Grid assign
         self.grid_assign = Some(Self::make_pass(device, "GridAssign", &with_params(GRID_ASSIGN_WGSL),
@@ -325,13 +334,13 @@ impl FluidSimulation {
 
         // 7. Scatter
         self.scatter = Some(Self::make_pass(device, "Scatter", &with_params(SCATTER_WGSL),
-            &[storage(0), storage(1), storage(2), storage(3), uniform(4)],
-            vec![buf!(0, ci), buf!(1, co), buf!(2, sc), buf!(3, si), buf!(4, par)]));
+            &[storage(0), storage(1), storage(2), storage(3), uniform(4), storage(5), storage(6), storage(7), storage(8)],
+            vec![buf!(0, ci), buf!(1, co), buf!(2, sc), buf!(3, si), buf!(4, par), buf!(5, pos), buf!(6, vel), buf!(7, spos), buf!(8, svel)]));
 
         // 8. Density
         self.density = Some(Self::make_pass(device, "Density", &with_params(DENSITY_WGSL),
-            &[storage(0), storage(1), storage(2), storage(3), uniform(4)],
-            vec![buf!(0, pos), buf!(1, co), buf!(2, si), buf!(3, dens), buf!(4, par)]));
+            &[storage(0), storage(1), storage(2), uniform(3)],
+            vec![buf!(0, spos), buf!(1, co), buf!(2, dens), buf!(3, par)]));
 
         // 9. Forces (bindings 7-10 are camera matrices for mouse interaction)
         let vm = self.view_matrix_buffer.as_ref().unwrap();
@@ -339,8 +348,8 @@ impl FluidSimulation {
         let ivm = self.inverse_view_matrix_buffer.as_ref().unwrap();
         let wm = self.world_matrix_buffer.as_ref().unwrap();
         self.forces = Some(Self::make_pass(device, "Forces", &with_params(FORCES_WGSL),
-            &[storage(0), storage(1), storage(2), storage(3), storage(4), storage(5), uniform(6), uniform(7), uniform(8), uniform(9), uniform(10)],
-            vec![buf!(0, pos), buf!(1, vel), buf!(2, dens), buf!(3, orig), buf!(4, co), buf!(5, si), buf!(6, par), buf!(7, vm), buf!(8, pm), buf!(9, ivm), buf!(10, wm)]));
+            &[storage(0), storage(1), storage(2), storage(3), storage(4), storage(5), uniform(6), uniform(7), uniform(8), uniform(9), uniform(10), storage(11)],
+            vec![buf!(0, spos), buf!(1, svel), buf!(2, dens), buf!(3, orig), buf!(4, co), buf!(5, si), buf!(6, par), buf!(7, vm), buf!(8, pm), buf!(9, ivm), buf!(10, wm), buf!(11, vel)]));
 
         // 10. Integrate
         self.integrate = Some(Self::make_pass(device, "Integrate", &with_params(INTEGRATE_WGSL),
@@ -373,6 +382,7 @@ impl FluidSimulation {
         let queue = self.queue.clone().expect("FluidSimulation not initialized");
         let n = self.particle_count;
         let particle_wg = ((n + 63) / 64) as u32;
+        let neighbor_wg = (n + NEIGHBOR_WG - 1) / NEIGHBOR_WG;
         let grid_wg = ((self.total_cells + 255) / 256) as u32;
         let prefix_wg = ((self.total_cells + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE).max(1) as u32;
         let substeps = self.params.substeps;
@@ -417,15 +427,14 @@ impl FluidSimulation {
                 };
             }
 
-            dispatch!(self.grid_clear_counts, grid_wg);
-            dispatch!(self.grid_clear_scatter, grid_wg);
+            dispatch!(self.grid_clear, grid_wg);
             dispatch!(self.grid_assign, particle_wg);
             dispatch!(self.prefix_sum_local, prefix_wg.max(1));
             dispatch!(self.prefix_sum_top, 1);
             dispatch!(self.prefix_sum_distribute, prefix_wg.max(1));
             dispatch!(self.scatter, particle_wg);
-            dispatch!(self.density, particle_wg);
-            dispatch!(self.forces, particle_wg);
+            dispatch!(self.density, neighbor_wg);
+            dispatch!(self.forces, neighbor_wg);
             dispatch!(self.integrate, particle_wg);
             drop(cp);
         }
@@ -438,6 +447,7 @@ impl FluidSimulation {
                           mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
         let n = self.particle_count;
         let particle_wg = ((n + 63) / 64) as u32;
+        let neighbor_wg = (n + NEIGHBOR_WG - 1) / NEIGHBOR_WG;
         let grid_wg = ((self.total_cells + 255) / 256) as u32;
         let prefix_wg = ((self.total_cells + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE).max(1) as u32;
 
@@ -457,15 +467,14 @@ impl FluidSimulation {
             };
         }
 
-        dispatch!(self.grid_clear_counts, grid_wg);
-        dispatch!(self.grid_clear_scatter, grid_wg);
+        dispatch!(self.grid_clear, grid_wg);
         dispatch!(self.grid_assign, particle_wg);
         dispatch!(self.prefix_sum_local, prefix_wg.max(1));
         dispatch!(self.prefix_sum_top, 1);
         dispatch!(self.prefix_sum_distribute, prefix_wg.max(1));
         dispatch!(self.scatter, particle_wg);
-        dispatch!(self.density, particle_wg);
-        dispatch!(self.forces, particle_wg);
+        dispatch!(self.density, neighbor_wg);
+        dispatch!(self.forces, neighbor_wg);
         dispatch!(self.integrate, particle_wg);
         drop(cp);
 

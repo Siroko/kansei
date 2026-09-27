@@ -126,10 +126,10 @@ impl App {
                 near_pressure_multiplier: env_f32("NEAR", 20.0),
                 density_target: env_f32("TARGET", 8.6),
                 viscosity: env_f32("VISC", 1.0),
-                damping: 1.0,
+                damping: env_f32("DAMP", 1.0),
                 gravity: [0.0, gravity_y, 0.0],
                 mouse_force: 1600.0,
-                substeps: 2,
+                substeps: env_u32("SUBSTEPS", 2),
                 world_bounds_padding: 2.0,
                 ..DEFAULT_OPTIONS
             },

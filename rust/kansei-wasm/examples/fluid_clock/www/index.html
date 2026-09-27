@@ -11,7 +11,7 @@
 <body>
     <canvas id="kansei"></canvas>
     <script type="module">
-        import init, { start, get_fps, get_frame_time,
+        import init, { start, sim_config, get_fps, get_frame_time,
             set_pressure, set_near_pressure, set_density_target,
             set_viscosity, set_damping, set_gravity_y, set_mouse_force, set_mouse_radius,
             set_radial_gravity, set_gravity_center,
@@ -31,26 +31,31 @@
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
         await init();
-        await start('kansei');
+        // ?n=<particles> picks the count; the sim parameters follow (see tuning_for in lib.rs).
+        const requested = parseInt(new URLSearchParams(location.search).get('n') || '0', 10) || 0;
+        await start('kansei', requested);
+        const cfg = sim_config();
+        document.title = `Fluid clock — ${cfg.count.toLocaleString()} particles`;
 
         const pane = new Pane({ title: 'Fluid 3D (WASM)', expanded: false });
         const p = {
-            showParticles: true, renderMode: 'MarchingCubes', mcIso: 0.37, mcResolution: 128, particleSize: 0.15, batchedSim: true,
+            showParticles: true, renderMode: 'MarchingCubes', mcIso: 0.37, mcResolution: 128, particleSize: cfg.particleSize, batchedSim: true,
             simPreset: 'Balanced',
             simStepDt: 1 / 60,
-            simTimeScale: 1.9,
+            simTimeScale: cfg.timeScale, // measured stable ceiling for this count (see tuning_for)
             renderFps: 0,
-            pressure: 46.5, nearPressure: 20.0, densityTarget: 8.6,
-            viscosity: 1.0, damping: 1.0, gravityY: -9.8,
+            pressure: cfg.pressure, nearPressure: cfg.nearPressure, densityTarget: cfg.densityTarget,
+            viscosity: cfg.viscosity, damping: 1.0, gravityY: -9.8,
             mouseForce: 1600, mouseRadius: 0.1, substeps: 2,
             densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
-            resolution: 128, kernelScale: 0.6,
+            resolution: 128, kernelScale: cfg.kernelScale, // 0.6 at 80K, ∝ 1/count (splat radius stays 1.0)
         };
         const simPresets = {
-            'Balanced':   { step: 1 / 60, scale: 1.0 },
-            'Fast 1.5x':  { step: 1 / 60, scale: 1.5 },
-            'Slow 0.75x': { step: 1 / 60, scale: 0.75 },
-            'Stable':     { step: 1 / 75, scale: 1.0 },
+            // relative to the measured stable ceiling for this count
+            'Balanced':   { step: 1 / 60, scale: cfg.timeScale },
+            'Fast 1.4x':  { step: 1 / 60, scale: cfg.timeScale * 1.4 },
+            'Slow 0.6x':  { step: 1 / 60, scale: cfg.timeScale * 0.6 },
+            'Stable':     { step: 1 / 120, scale: cfg.timeScale },
         };
 
         const debug = pane.addFolder({ title: 'Debug', expanded: false });
@@ -99,12 +104,12 @@
 
         const field = pane.addFolder({ title: 'Density Field', expanded: false });
         field.addBinding(p, 'resolution', { min: 16, max: 256, step: 16 }).on('change', () => set_density_resolution(p.resolution));
-        field.addBinding(p, 'kernelScale', { min: 0.1, max: 10, step: 0.1 }).on('change', () => set_kernel_scale(p.kernelScale));
+        field.addBinding(p, 'kernelScale', { min: 0.01, max: 10, step: 0.01 }).on('change', () => set_kernel_scale(p.kernelScale));
 
         const sph = pane.addFolder({ title: 'SPH', expanded: false });
         sph.addBinding(p, 'pressure', { min: 0, max: 100, step: 0.5 }).on('change', () => set_pressure(p.pressure));
         sph.addBinding(p, 'nearPressure', { min: 0, max: 100, step: 0.5 }).on('change', () => set_near_pressure(p.nearPressure));
-        sph.addBinding(p, 'densityTarget', { min: 0, max: 20, step: 0.1 }).on('change', () => set_density_target(p.densityTarget));
+        sph.addBinding(p, 'densityTarget', { min: 0, max: 200, step: 0.5 }).on('change', () => set_density_target(p.densityTarget));
         sph.addBinding(p, 'viscosity', { min: 0, max: 1, step: 0.01 }).on('change', () => set_viscosity(p.viscosity));
         sph.addBinding(p, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => set_damping(p.damping));
 
@@ -210,7 +215,7 @@
         syncTx();
         syncStripes();
 
-        const cp = { glyphY: 28, stiffness: 90, maxSpeed: 12, basin: 5, target: 0.34, drag: 3, perSlot: 2000, capture: 1.15, captureBelow: 45, emitHeight: 1, emitSpread: 2.5, emitRate: 100, cooldown: 45, sound: false };
+        const cp = { glyphY: 28, stiffness: 90, maxSpeed: 12, basin: 5, target: 0.34, drag: 3, perSlot: cfg.perSlot, capture: 1.15, captureBelow: 45, emitHeight: 1, emitSpread: 2.5, emitRate: cfg.emitRate, cooldown: 45, sound: false };
         const cf = pane.addFolder({ title: 'Clock' });
         cf.addBinding(cp, 'glyphY', { min: -10, max: 60, step: 0.5, label: 'stack offset Y' }).on('change', e => set_glyph_y(e.value));
         cf.addBinding(cp, 'stiffness', { min: 0, max: 200, step: 1 }).on('change', e => set_attr_stiffness(e.value));
@@ -218,12 +223,12 @@
         cf.addBinding(cp, 'basin', { min: 0, max: 30, step: 0.5 }).on('change', e => set_attr_basin(e.value));
         cf.addBinding(cp, 'target', { min: -0.2, max: 0.35, step: 0.01, label: 'shell target' }).on('change', e => set_attr_target(e.value));
         cf.addBinding(cp, 'drag', { min: 0, max: 20, step: 0.5, label: 'drag (1/s)' }).on('change', e => set_attr_drag(e.value));
-        cf.addBinding(cp, 'perSlot', { min: 50, max: 4000, step: 50 }).on('change', e => set_per_slot_count(e.value));
+        cf.addBinding(cp, 'perSlot', { min: 250, max: 25000, step: 250 }).on('change', e => set_per_slot_count(e.value));
         cf.addBinding(cp, 'capture', { min: 0.8, max: 2.0, step: 0.05 }).on('change', e => set_capture_scale(e.value));
         cf.addBinding(cp, 'captureBelow', { min: 0, max: 60, step: 0.5, label: 'capture below' }).on('change', e => set_capture_below(e.value));
         cf.addBinding(cp, 'emitHeight', { min: 0, max: 15, step: 0.5, label: 'emit height (0=off)' }).on('change', e => set_emit_height(e.value));
         cf.addBinding(cp, 'emitSpread', { min: 0, max: 10, step: 0.5, label: 'emit spread' }).on('change', e => set_emit_spread(e.value));
-        cf.addBinding(cp, 'emitRate', { min: 0, max: 2000, step: 10, label: 'emit rate/frame (0=all)' }).on('change', e => set_emit_rate(e.value));
+        cf.addBinding(cp, 'emitRate', { min: 0, max: 5000, step: 25, label: 'emit rate/frame (0=all)' }).on('change', e => set_emit_rate(e.value));
         cf.addBinding(cp, 'cooldown', { min: 0, max: 180, step: 5 }).on('change', e => set_cooldown_frames(e.value));
         cf.addBinding(cp, 'sound').on('change', e => { if (e.value) resume_audio(); });
     </script>
