@@ -14,6 +14,7 @@ exclude = [
     "kansei-wasm/examples/pathtracer",
     "kansei-wasm/examples/fluid",
     "kansei-wasm/examples/volumetric-fog",
+    "kansei-wasm/examples/sky-atmosphere",
 ]
 
 [workspace.dependencies]

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kansei — Sky Atmosphere</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #label { position: fixed; left: 12px; bottom: 10px; color: #fff8; font: 12px ui-monospace, monospace; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <div id="label"></div>
+    <script type="module">
+        // URL parameters (all optional):
+        //   elevation  sun elevation in degrees (negative: below the horizon); default: a day cycle
+        //   bearing    sun bearing, degrees clockwise from north (default 140, the Midsommar sun)
+        //   look       view bearing (default: the sun's); pitch: view pitch in degrees (default 6)
+        //   ev         EV100 exposure (default: follows the sun)
+        //   haze       Mie scattering x (Unreal's haze); ozone: absorbing layer x; moon=1: add a moon
+        document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
+        import init, { start } from '../pkg/kansei_wasm_sky_atmosphere.js';
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>
