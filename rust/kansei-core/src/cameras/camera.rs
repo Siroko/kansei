@@ -193,8 +193,9 @@ impl Camera {
         self.prev_view_proj = None;
     }
 
-    /// Called by the renderer after a frame: this frame's view becomes the previous one.
-    pub(crate) fn end_frame(&mut self) {
+    /// Called by the renderer after a frame: this frame's view becomes the previous one. Call it
+    /// yourself when driving the post-processing effects without the renderer.
+    pub fn end_frame(&mut self) {
         self.prev_view_proj = Some(self.view_projection());
         self.prev_jitter = self.jitter;
         self.frame = self.frame.wrapping_add(1);
