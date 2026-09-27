@@ -15,6 +15,7 @@ exclude = [
     "kansei-wasm/examples/fluid",
     "kansei-wasm/examples/volumetric-fog",
     "kansei-wasm/examples/sky-atmosphere",
+    "kansei-wasm/examples/film-look",
 ]
 
 [workspace.dependencies]
