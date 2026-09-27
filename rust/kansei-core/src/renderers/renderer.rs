@@ -186,10 +186,13 @@ impl Renderer {
     /// creation automatically.
     #[doc(hidden)]
     pub async fn initialize(&mut self, surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) {
+        // Optional features: requested only where the adapter offers them, so devices without
+        // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs).
+        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Kansei Device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
             }, None)
