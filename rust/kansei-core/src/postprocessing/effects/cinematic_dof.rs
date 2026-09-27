@@ -10,12 +10,23 @@ const TILES: &str = include_str!("../../shaders/cinematic_dof_tiles.wgsl");
 const GATHER: &str = include_str!("../../shaders/cinematic_dof_gather.wgsl");
 const POSTFILTER: &str = include_str!("../../shaders/cinematic_dof_postfilter.wgsl");
 const DOWNSAMPLE: &str = include_str!("../../shaders/cinematic_dof_downsample.wgsl");
+const HIGHLIGHTS: &str = include_str!("../../shaders/cinematic_dof_highlights.wgsl");
+const SPRITES: &str = include_str!("../../shaders/cinematic_dof_sprites.wgsl");
+/// Bytes per scattered highlight (the WGSL `Sprite`).
+const SPRITE_BYTES: u64 = 32;
+/// The sprite bins' size in half-resolution pixels and the sprites each lists (the WGSL `BIN`
+/// and `BIN_CAPACITY`).
+const BIN: u32 = 16;
+const BIN_CAPACITY: u64 = 64;
 const COMPOSITE: &str = include_str!("../../shaders/cinematic_dof_composite.wgsl");
 
 /// Half-resolution texels per tile side (the shaders' TILE).
 const TILE: u32 = 8;
 /// Levels of the half-resolution chain the gather reads (the gather shader's LEVELS).
 const LEVELS: u32 = 3;
+/// Levels of the background chain, which also fills what the near field hides: all of them, down
+/// to a single texel.
+const FILL_LEVELS: u32 = 16;
 
 /// A physical camera lens, as Unreal's CineCamera: the circle of confusion follows from the
 /// thin-lens equation.
@@ -85,15 +96,53 @@ pub struct CinematicDepthOfFieldOptions {
     /// Gather samples per half-resolution pixel. Discs wider than 12 half-resolution pixels read
     /// a coarser level of the half-resolution image, so this count holds their density too.
     pub sample_count: u32,
-    /// Rotate the sample pattern every frame, for a temporal resolve after the DoF to average
-    /// away. Leave off when the DoF runs after TAA (as `TemporalAAEffect` expects).
+    /// Rotate the sample pattern every frame, for the TAA after the DoF to average away (the
+    /// recommended order). Leave off when the DoF runs after the TAA.
     pub temporal_noise: bool,
+    /// Scatter bright highlights as crisp, aperture-shaped bokeh sprites instead of gathering
+    /// them (a gather leaves small bright sources grainy).
+    pub highlights: HighlightOptions,
+}
+
+/// Which pixels scatter their light as bokeh sprites.
+#[derive(Debug, Clone, Copy)]
+pub struct HighlightOptions {
+    pub enabled: bool,
+    /// A half-resolution pixel scatters what exceeds this multiple of its neighbours' mean
+    /// luminance.
+    pub contrast: f32,
+    /// Only pixels blurred by more than this CoC radius (full-resolution pixels) scatter.
+    pub min_coc_px: f32,
+    /// Sprites per frame; brighter pixels beyond it are gathered as usual.
+    pub max_sprites: u32,
+}
+
+impl Default for HighlightOptions {
+    fn default() -> Self {
+        Self { enabled: true, contrast: 3.0, min_coc_px: 4.0, max_sprites: 8192 }
+    }
 }
 
 impl Default for CinematicDepthOfFieldOptions {
     fn default() -> Self {
-        Self { lens: CameraLens::default(), max_coc_fraction: 0.025, max_coc_px: 96.0, sample_count: 72, temporal_noise: false }
+        Self {
+            lens: CameraLens::default(),
+            max_coc_fraction: 0.025,
+            max_coc_px: 96.0,
+            sample_count: 72,
+            temporal_noise: false,
+            highlights: HighlightOptions::default(),
+        }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HighlightParamsGpu {
+    contrast: f32,
+    min_coc: f32,
+    max_sprites: u32,
+    enabled: u32,
 }
 
 #[repr(C)]
@@ -110,34 +159,50 @@ struct DofParamsGpu {
     blade_count: u32,
     blade_rotation: f32,
     frame: u32,
-    _pad: u32,
+    debug_view: u32,
+}
+
+/// A half-resolution layer: its chain of levels (sampled, all levels) and each level alone.
+struct Layer {
+    raw: wgpu::TextureView,
+    chain: wgpu::TextureView,
+    levels: Vec<wgpu::TextureView>,
 }
 
 struct Targets {
     width: u32,
     height: u32,
-    /// The half-resolution chain, all levels (sampled).
-    half: wgpu::TextureView,
-    /// Each level alone, for writing it (storage) and for reading it into the next.
-    half_levels: Vec<wgpu::TextureView>,
+    near: Layer,
+    far: Layer,
     tiles: wgpu::TextureView,
     tiles_dilated: wgpu::TextureView,
     bg: wgpu::TextureView,
     fg: wgpu::TextureView,
     bg_filtered: wgpu::TextureView,
     fg_filtered: wgpu::TextureView,
+    /// Per sprite bin: how many sprites reach it, and their indices.
+    bin_count: wgpu::Buffer,
+    bin_list: wgpu::Buffer,
 }
 
 struct Gpu {
     params: wgpu::Buffer,
+    highlight_params: wgpu::Buffer,
+    sprites: wgpu::Buffer,
+    /// The extraction pass counts its sprites here.
+    sprite_count: wgpu::Buffer,
+    max_sprites: u32,
     prefilter: wgpu::ComputePipeline,
     prefilter_bgl: wgpu::BindGroupLayout,
-    downsample: wgpu::ComputePipeline,
+    highlights: wgpu::ComputePipeline,
+    highlights_bgl: wgpu::BindGroupLayout,
+    downsample_near: wgpu::ComputePipeline,
+    downsample_far: wgpu::ComputePipeline,
     downsample_bgl: wgpu::BindGroupLayout,
-    tiles: wgpu::ComputePipeline,
     dilate: wgpu::ComputePipeline,
     tiles_bgl: wgpu::BindGroupLayout,
-    gather: wgpu::ComputePipeline,
+    gather_near: wgpu::ComputePipeline,
+    gather_far: wgpu::ComputePipeline,
     gather_bgl: wgpu::BindGroupLayout,
     postfilter: wgpu::ComputePipeline,
     postfilter_bgl: wgpu::BindGroupLayout,
@@ -146,24 +211,53 @@ struct Gpu {
     targets: Option<Targets>,
 }
 
+/// What the effect outputs: the image, or one of its layers for inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DofDebugView {
+    #[default]
+    None = 0,
+    /// The background layer (in focus and behind), with what the near field hides filled in.
+    Background = 1,
+    /// The near-field layer's colour.
+    Near = 2,
+    /// The near-field layer's coverage: how much of the aperture it hides at each pixel.
+    NearAlpha = 3,
+    /// The CoC: red in front of the focus plane, blue behind, green in focus.
+    Coc = 4,
+}
+
 /// Physically based depth of field, always on like a real lens: the circle of confusion comes
 /// from the camera's focal length, f-stop, focus distance and filmback (`CameraLens`, as
-/// Unreal's CineCamera), and the blur is gathered as scattered bokeh at half resolution:
-/// - bokeh keep their energy (a small highlight becomes a large, dimmer disc) and take the
-///   aperture's shape (round, or polygonal with `blade_count`);
-/// - a blurred foreground spills over whatever is behind it, while a blurred background never
-///   bleeds over a sharper object in front of it (no halos at depth edges);
-/// - in-focus pixels stay the full-resolution image, so fine detail such as alpha-tested
-///   foliage stays crisp.
+/// Unreal's CineCamera), and the blur is gathered as scattered bokeh at half resolution in two
+/// layers, as Unreal's DiaphragmDOF:
+/// - the **near field** (in front of the focus plane) is gathered with its coverage and
+///   composited over everything behind it, so a blurred foreground spreads softly past its own
+///   silhouette, and a porous one (leaves, a fence) shows the background through it;
+/// - the **background** (in focus and behind) never bleeds over a sharper surface in front of it,
+///   so there are no halos at depth edges;
+/// - every 2x2 block is split between the layers by CoC before anything is averaged, so no pixel
+///   is mixed across depth and each keeps its energy: a small highlight becomes a large, dimmer
+///   disc in the aperture's shape (round, or polygonal with `blade_count`), and bright ones are
+///   scattered as crisp sprites (`HighlightOptions`);
+/// - in-focus pixels stay the full-resolution image.
 ///
-/// Focus, aperture and focal length are public and can change every frame (focus pulls). Put it
-/// after the fog and the TAA resolve, before bloom and the tonemapper.
+/// Focus, aperture and focal length are public and can change every frame (focus pulls).
+///
+/// Put it after the fog and **before** `TemporalAAEffect`, with `temporal_noise` on, as Unreal
+/// orders them: every pixel's colour and depth then agree, the TAA averages the gather's noise
+/// away, and with a render scale the DoF runs at the smaller render size. Bloom and the
+/// tonemapper follow the TAA. It also works after the TAA (with `temporal_noise` off), but there
+/// the resolved colours along depth edges blend layers that the single jittered depth sample
+/// cannot tell apart, which leaves near objects with cut-out silhouettes.
 pub struct CinematicDepthOfFieldEffect {
     pub lens: CameraLens,
     pub max_coc_fraction: f32,
     pub max_coc_px: f32,
     pub sample_count: u32,
     pub temporal_noise: bool,
+    pub highlights: HighlightOptions,
+    /// Output a layer instead of the image, for tuning and debugging.
+    pub debug_view: DofDebugView,
     frame: u32,
     gpu: Option<Gpu>,
 }
@@ -171,6 +265,13 @@ pub struct CinematicDepthOfFieldEffect {
 fn source(pass: &str) -> String {
     format!("{COMMON}\n{pass}")
 }
+
+/// A pass that reads or writes the scattered highlights.
+fn sprite_source(pass: &str) -> String {
+    format!("{COMMON}\n{SPRITES}\n{pass}")
+}
+
+const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 impl CinematicDepthOfFieldEffect {
     pub fn new(options: CinematicDepthOfFieldOptions) -> Self {
@@ -180,6 +281,8 @@ impl CinematicDepthOfFieldEffect {
             max_coc_px: options.max_coc_px,
             sample_count: options.sample_count,
             temporal_noise: options.temporal_noise,
+            highlights: options.highlights,
+            debug_view: DofDebugView::None,
             frame: 0,
             gpu: None,
         }
@@ -204,7 +307,8 @@ impl CinematicDepthOfFieldEffect {
             ("downsample", source(DOWNSAMPLE)),
             ("tiles", source(TILES)),
             ("gather", source(GATHER)),
-            ("postfilter", source(POSTFILTER)),
+            ("postfilter", sprite_source(POSTFILTER)),
+            ("highlights", sprite_source(HIGHLIGHTS)),
             ("composite", source(COMPOSITE)),
         ]
     }
@@ -224,24 +328,50 @@ impl CinematicDepthOfFieldEffect {
             ty: BindingType::Texture { sample_type: TextureSampleType::Depth, view_dimension: TextureViewDimension::D2, multisampled: false },
             count: None,
         };
-        let storage = |binding| BindGroupLayoutEntry {
+        let storage_format = |binding, format| BindGroupLayoutEntry {
             binding,
             visibility: compute,
-            ty: BindingType::StorageTexture { access: StorageTextureAccess::WriteOnly, format: TextureFormat::Rgba16Float, view_dimension: TextureViewDimension::D2 },
+            ty: BindingType::StorageTexture { access: StorageTextureAccess::WriteOnly, format, view_dimension: TextureViewDimension::D2 },
             count: None,
         };
+        let storage = |binding| storage_format(binding, TextureFormat::Rgba16Float);
+        let layer_storage = |binding| storage_format(binding, LAYER_FORMAT);
         let uniform = |binding| BindGroupLayoutEntry {
             binding,
             visibility: compute,
             ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
+        let buffer_entry = |binding, visibility, read_only| BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
         let bgl = |label: &str, entries: &[BindGroupLayoutEntry]| device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: Some(label), entries });
-        let prefilter_bgl = bgl("CinematicDoF/PrefilterBGL", &[tex(0), depth(1), storage(2), uniform(3)]);
-        let downsample_bgl = bgl("CinematicDoF/DownsampleBGL", &[tex(0), storage(1), uniform(2)]);
+        let prefilter_bgl = bgl("CinematicDoF/PrefilterBGL", &[tex(0), depth(1), layer_storage(2), uniform(3), layer_storage(4), storage(5)]);
+        let highlights_bgl = bgl(
+            "CinematicDoF/HighlightsBGL",
+            &[
+                tex(0),
+                tex(1),
+                layer_storage(2),
+                layer_storage(3),
+                uniform(4),
+                buffer_entry(5, compute, false),
+                buffer_entry(6, compute, false),
+                uniform(7),
+                buffer_entry(8, compute, false),
+                buffer_entry(9, compute, false),
+            ],
+        );
+        let downsample_bgl = bgl("CinematicDoF/DownsampleBGL", &[tex(0), layer_storage(1), uniform(2)]);
         let tiles_bgl = bgl("CinematicDoF/TilesBGL", &[tex(0), storage(1), uniform(2)]);
-        let gather_bgl = bgl("CinematicDoF/GatherBGL", &[tex(0), tex(1), storage(2), storage(3), uniform(4)]);
-        let postfilter_bgl = bgl("CinematicDoF/PostfilterBGL", &[tex(0), tex(1), storage(2), storage(3), uniform(4)]);
+        let gather_bgl = bgl("CinematicDoF/GatherBGL", &[tex(0), tex(1), storage(2), tex(3), uniform(4)]);
+        let postfilter_bgl = bgl(
+            "CinematicDoF/PostfilterBGL",
+            &[tex(0), tex(1), storage(2), storage(3), uniform(4), buffer_entry(5, compute, true), buffer_entry(6, compute, true), buffer_entry(7, compute, true)],
+        );
         let composite_bgl = bgl("CinematicDoF/CompositeBGL", &[tex(0), depth(1), tex(2), tex(3), storage(4), uniform(5)]);
         let pipeline = |label: &str, code: &str, entry: &str, bgl: &BindGroupLayout| {
             let module = device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(code.into()) });
@@ -255,26 +385,30 @@ impl CinematicDepthOfFieldEffect {
                 cache: None,
             })
         };
-        let tiles_src = source(TILES);
+        let max_sprites = self.highlights.max_sprites.max(1);
+        let buffer = |label: &str, size: u64, usage: BufferUsages| device.create_buffer(&BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
+        let (downsample_src, tiles_src, gather_src) = (source(DOWNSAMPLE), source(TILES), source(GATHER));
         self.gpu = Some(Gpu {
-            params: device.create_buffer(&BufferDescriptor {
-                label: Some("CinematicDoF/Params"),
-                size: std::mem::size_of::<DofParamsGpu>() as u64,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
+            params: buffer("CinematicDoF/Params", std::mem::size_of::<DofParamsGpu>() as u64, BufferUsages::UNIFORM | BufferUsages::COPY_DST),
+            highlight_params: buffer("CinematicDoF/HighlightParams", std::mem::size_of::<HighlightParamsGpu>() as u64, BufferUsages::UNIFORM | BufferUsages::COPY_DST),
+            sprites: buffer("CinematicDoF/Sprites", max_sprites as u64 * SPRITE_BYTES, BufferUsages::STORAGE),
+            sprite_count: buffer("CinematicDoF/SpriteCount", 4, BufferUsages::STORAGE | BufferUsages::COPY_DST),
+            max_sprites,
             prefilter: pipeline("CinematicDoF/Prefilter", &source(PREFILTER), "main", &prefilter_bgl),
-            downsample: pipeline("CinematicDoF/Downsample", &source(DOWNSAMPLE), "main", &downsample_bgl),
+            prefilter_bgl,
+            highlights: pipeline("CinematicDoF/Highlights", &sprite_source(HIGHLIGHTS), "main", &highlights_bgl),
+            highlights_bgl,
+            downsample_near: pipeline("CinematicDoF/DownsampleNear", &downsample_src, "downsampleNear", &downsample_bgl),
+            downsample_far: pipeline("CinematicDoF/DownsampleFar", &downsample_src, "downsampleFar", &downsample_bgl),
             downsample_bgl,
-            tiles: pipeline("CinematicDoF/Tiles", &tiles_src, "tiles", &tiles_bgl),
             dilate: pipeline("CinematicDoF/Dilate", &tiles_src, "dilate", &tiles_bgl),
-            gather: pipeline("CinematicDoF/Gather", &source(GATHER), "main", &gather_bgl),
-            postfilter: pipeline("CinematicDoF/Postfilter", &source(POSTFILTER), "main", &postfilter_bgl),
+            tiles_bgl,
+            gather_near: pipeline("CinematicDoF/GatherNear", &gather_src, "gatherNear", &gather_bgl),
+            gather_far: pipeline("CinematicDoF/GatherFar", &gather_src, "gatherFar", &gather_bgl),
+            gather_bgl,
+            postfilter: pipeline("CinematicDoF/Postfilter", &sprite_source(POSTFILTER), "main", &postfilter_bgl),
             postfilter_bgl,
             composite: pipeline("CinematicDoF/Composite", &source(COMPOSITE), "main", &composite_bgl),
-            prefilter_bgl,
-            tiles_bgl,
-            gather_bgl,
             composite_bgl,
             targets: None,
         });
@@ -285,47 +419,48 @@ impl CinematicDepthOfFieldEffect {
         if gpu.targets.as_ref().is_some_and(|t| t.width == width && t.height == height) {
             return;
         }
-        let target_format = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
+        let texture = |label: &str, w: u32, h: u32, levels: u32, format: wgpu::TextureFormat, extra: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+                mip_level_count: levels,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | extra,
+                view_formats: &[],
+            })
         };
-        let target = |label: &str, w: u32, h: u32| target_format(label, w, h, wgpu::TextureFormat::Rgba16Float);
+        let target = |label: &str, w: u32, h: u32, extra| texture(label, w, h, 1, wgpu::TextureFormat::Rgba16Float, extra).create_view(&Default::default());
+        let none = wgpu::TextureUsages::empty();
         let (hw, hh) = (width.div_ceil(2), height.div_ceil(2));
         let (tw, th) = (hw.div_ceil(TILE), hh.div_ceil(TILE));
-        let half = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("CinematicDoF/Half"),
-            size: wgpu::Extent3d { width: hw.max(1), height: hh.max(1), depth_or_array_layers: 1 },
-            mip_level_count: LEVELS,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let half_levels = (0..LEVELS)
-            .map(|level| half.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() }))
-            .collect();
+        let bins = (hw.div_ceil(BIN) * hh.div_ceil(BIN)) as u64;
+        let buffer = |label: &str, size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
+        let layer = |label: &str, levels: u32| {
+            let levels = levels.min(hw.max(hh).max(1).ilog2() + 1);
+            let chain = texture(label, hw, hh, levels, LAYER_FORMAT, none);
+            Layer {
+                raw: texture(label, hw, hh, 1, LAYER_FORMAT, none).create_view(&Default::default()),
+                levels: (0..levels)
+                    .map(|level| chain.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() }))
+                    .collect(),
+                chain: chain.create_view(&Default::default()),
+            }
+        };
         gpu.targets = Some(Targets {
             width,
             height,
-            half: half.create_view(&Default::default()),
-            half_levels,
-            tiles: target("CinematicDoF/Tiles", tw, th),
-            tiles_dilated: target("CinematicDoF/TilesDilated", tw, th),
-            bg: target("CinematicDoF/Background", hw, hh),
-            fg: target("CinematicDoF/Foreground", hw, hh),
-            bg_filtered: target("CinematicDoF/BackgroundFiltered", hw, hh),
-            fg_filtered: target("CinematicDoF/ForegroundFiltered", hw, hh),
+            near: layer("CinematicDoF/Near", LEVELS),
+            far: layer("CinematicDoF/Far", FILL_LEVELS),
+            tiles: target("CinematicDoF/Tiles", tw, th, none),
+            tiles_dilated: target("CinematicDoF/TilesDilated", tw, th, none),
+            bg: target("CinematicDoF/Background", hw, hh, none),
+            fg: target("CinematicDoF/Foreground", hw, hh, none),
+            bg_filtered: target("CinematicDoF/BackgroundFiltered", hw, hh, none),
+            fg_filtered: target("CinematicDoF/ForegroundFiltered", hw, hh, none),
+            bin_count: buffer("CinematicDoF/SpriteBinCount", bins * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST),
+            bin_list: buffer("CinematicDoF/SpriteBinList", bins * BIN_CAPACITY * 4, wgpu::BufferUsages::STORAGE),
         });
     }
 }
@@ -367,43 +502,98 @@ impl PostProcessingEffect for CinematicDepthOfFieldEffect {
             blade_count: self.lens.blade_count,
             blade_rotation: self.lens.blade_rotation_deg.to_radians(),
             frame: if self.temporal_noise { self.frame % 64 + 1 } else { 0 },
-            _pad: 0,
+            debug_view: self.debug_view as u32,
         };
         self.frame = self.frame.wrapping_add(1);
         let gpu = self.gpu.as_ref().unwrap();
         let t = gpu.targets.as_ref().unwrap();
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
+        let highlights = HighlightParamsGpu {
+            contrast: self.highlights.contrast.max(1.0),
+            min_coc: self.highlights.min_coc_px.max(0.5) * 0.5,
+            max_sprites: gpu.max_sprites,
+            enabled: self.highlights.enabled as u32,
+        };
+        queue.write_buffer(&gpu.highlight_params, 0, bytemuck::bytes_of(&highlights));
 
-        let group = |layout: &wgpu::BindGroupLayout, resources: Vec<wgpu::BindingResource>| {
-            let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
+        let group = |layout: &wgpu::BindGroupLayout, resources: Vec<(u32, wgpu::BindingResource)>| {
+            let entries: Vec<_> = resources.into_iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource }).collect();
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("CinematicDoF/BG"), layout, entries: &entries })
         };
         let view = wgpu::BindingResource::TextureView;
         let params_res = || gpu.params.as_entire_binding();
-        let prefilter = group(&gpu.prefilter_bgl, vec![view(input), view(depth), view(&t.half_levels[0]), params_res()]);
-        let downsamples: Vec<_> = (1..LEVELS as usize)
-            .map(|l| group(&gpu.downsample_bgl, vec![view(&t.half_levels[l - 1]), view(&t.half_levels[l]), params_res()]))
-            .collect();
-        let tiles = group(&gpu.tiles_bgl, vec![view(&t.half), view(&t.tiles), params_res()]);
-        let dilate = group(&gpu.tiles_bgl, vec![view(&t.tiles), view(&t.tiles_dilated), params_res()]);
-        let gather = group(&gpu.gather_bgl, vec![view(&t.half), view(&t.tiles_dilated), view(&t.bg), view(&t.fg), params_res()]);
-        let postfilter = group(&gpu.postfilter_bgl, vec![view(&t.bg), view(&t.fg), view(&t.bg_filtered), view(&t.fg_filtered), params_res()]);
-        let composite = group(&gpu.composite_bgl, vec![view(input), view(depth), view(&t.bg_filtered), view(&t.fg_filtered), view(output), params_res()]);
+        let prefilter = group(
+            &gpu.prefilter_bgl,
+            vec![(0, view(input)), (1, view(depth)), (2, view(&t.near.raw)), (3, params_res()), (4, view(&t.far.raw)), (5, view(&t.tiles))],
+        );
+        let highlights_bg = group(
+            &gpu.highlights_bgl,
+            vec![
+                (0, view(&t.near.raw)),
+                (1, view(&t.far.raw)),
+                (2, view(&t.near.levels[0])),
+                (3, view(&t.far.levels[0])),
+                (4, params_res()),
+                (5, gpu.sprites.as_entire_binding()),
+                (6, gpu.sprite_count.as_entire_binding()),
+                (7, gpu.highlight_params.as_entire_binding()),
+                (8, t.bin_count.as_entire_binding()),
+                (9, t.bin_list.as_entire_binding()),
+            ],
+        );
+        let downsamples = |layer: &Layer| -> Vec<wgpu::BindGroup> {
+            (1..layer.levels.len())
+                .map(|l| {
+                    let (src, dst) = (&layer.levels[l - 1], &layer.levels[l]);
+                    group(&gpu.downsample_bgl, vec![(0, wgpu::BindingResource::TextureView(src)), (1, wgpu::BindingResource::TextureView(dst)), (2, params_res())])
+                })
+                .collect()
+        };
+        let (near_downsamples, far_downsamples) = (downsamples(&t.near), downsamples(&t.far));
+        let dilate = group(&gpu.tiles_bgl, vec![(0, view(&t.tiles)), (1, view(&t.tiles_dilated)), (2, params_res())]);
+        let gather_near = group(&gpu.gather_bgl, vec![(0, view(&t.near.chain)), (1, view(&t.tiles_dilated)), (2, view(&t.fg)), (3, view(&t.near.levels[0])), (4, params_res())]);
+        let gather_far = group(&gpu.gather_bgl, vec![(0, view(&t.far.chain)), (1, view(&t.tiles_dilated)), (2, view(&t.bg)), (3, view(&t.near.levels[0])), (4, params_res())]);
+        let postfilter = group(
+            &gpu.postfilter_bgl,
+            vec![
+                (0, view(&t.bg)),
+                (1, view(&t.fg)),
+                (2, view(&t.bg_filtered)),
+                (3, view(&t.fg_filtered)),
+                (4, params_res()),
+                (5, gpu.sprites.as_entire_binding()),
+                (6, t.bin_count.as_entire_binding()),
+                (7, t.bin_list.as_entire_binding()),
+            ],
+        );
+        let composite = group(
+            &gpu.composite_bgl,
+            vec![(0, view(input)), (1, view(depth)), (2, view(&t.bg_filtered)), (3, view(&t.fg_filtered)), (4, view(output)), (5, params_res())],
+        );
 
         let (hw, hh) = (width.div_ceil(2), height.div_ceil(2));
         let (tw, th) = (hw.div_ceil(TILE), hh.div_ceil(TILE));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("CinematicDoF"), ..Default::default() });
-        let mut passes = vec![(&gpu.prefilter, &prefilter, (hw, hh))];
-        for (l, bind_group) in downsamples.iter().enumerate() {
-            passes.push((&gpu.downsample, bind_group, ((hw >> (l + 1)).max(1), (hh >> (l + 1)).max(1))));
+        let mut passes: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32))> =
+            vec![(&gpu.prefilter, &prefilter, (hw, hh)), (&gpu.highlights, &highlights_bg, (hw, hh))];
+        for (l, far) in far_downsamples.iter().enumerate() {
+            let size = ((hw >> (l + 1)).max(1), (hh >> (l + 1)).max(1));
+            if let Some(near) = near_downsamples.get(l) {
+                passes.push((&gpu.downsample_near, near, size));
+            }
+            passes.push((&gpu.downsample_far, far, size));
         }
-        for (pipeline, bind_group, (x, y)) in passes.into_iter().chain([
-            (&gpu.tiles, &tiles, (tw, th)),
+        passes.extend([
             (&gpu.dilate, &dilate, (tw, th)),
-            (&gpu.gather, &gather, (hw, hh)),
+            (&gpu.gather_near, &gather_near, (hw, hh)),
+            (&gpu.gather_far, &gather_far, (hw, hh)),
             (&gpu.postfilter, &postfilter, (hw, hh)),
             (&gpu.composite, &composite, (width, height)),
-        ]) {
+        ]);
+        // the highlights are counted and binned afresh every frame
+        encoder.clear_buffer(&gpu.sprite_count, 0, None);
+        encoder.clear_buffer(&t.bin_count, 0, None);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("CinematicDoF"), ..Default::default() });
+        for (pipeline, bind_group, (x, y)) in passes {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(x.div_ceil(8), y.div_ceil(8), 1);
@@ -436,6 +626,13 @@ mod tests {
                 _ => None,
             });
             assert_eq!(span, Some(std::mem::size_of::<DofParamsGpu>()), "{name}");
+            for (_, t) in module.types.iter() {
+                match (t.name.as_deref(), &t.inner) {
+                    (Some("HighlightParams"), naga::TypeInner::Struct { span, .. }) => assert_eq!(*span as usize, std::mem::size_of::<HighlightParamsGpu>(), "{name}"),
+                    (Some("Sprite"), naga::TypeInner::Struct { span, .. }) => assert_eq!(*span as u64, SPRITE_BYTES, "{name}"),
+                    _ => {}
+                }
+            }
         }
     }
 

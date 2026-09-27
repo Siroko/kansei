@@ -10,7 +10,7 @@ mod tonemap;
 mod volumetric_fog;
 pub use atmosphere::AtmosphereEffect;
 pub use bloom::{BloomEffect, BloomOptions};
-pub use cinematic_dof::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions};
+pub use cinematic_dof::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DofDebugView, HighlightOptions};
 pub use color_grading::{ColorGradingEffect, ColorGradingOptions};
 pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
 pub use fluid_surface::{FluidSurfaceEffect, FluidSurfaceOptions};
