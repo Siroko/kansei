@@ -26,7 +26,8 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::postprocessing::effects::{
-    AtmosphereEffect, HeightFogEffect, HeightFogLayer, LocalFogVolume, VolumetricFogEffect, VolumetricFogOptions,
+    AtmosphereEffect, CloudLayer, HeightFogEffect, HeightFogLayer, LocalFogVolume, VolumetricCloudsEffect, VolumetricCloudsOptions,
+    VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -291,6 +292,8 @@ impl State {
             } else if let Some(fog) = effect.as_any_mut().downcast_mut::<VolumetricFogEffect>() {
                 fog.update_lights(self.scene.lights());
                 fog.time = t;
+            } else if let Some(clouds) = effect.as_any_mut().downcast_mut::<VolumetricCloudsEffect>() {
+                clouds.time = t;
             }
         }
 
@@ -384,6 +387,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the chain: the sky and its aerial perspective, the fog in front of them, the display transform
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(AtmosphereEffect::new(&sky))];
+    // clouds=<coverage 0..1> (clouds=0 none), cloudtype=<0 stratus .. 1 cumulus>, cloudbase=<m>
+    let clouds = q.get("clouds").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.45);
+    if clouds > 0.0 {
+        let num = |k: &str, d: f32| q.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+        let base = num("cloudbase", 1500.0);
+        let layer = CloudLayer { coverage: clouds, cloud_type: num("cloudtype", 0.7), bottom_m: base, top_m: base + num("cloudthick", 2500.0), ..Default::default() };
+        effects.push(Box::new(VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer, ..Default::default() })));
+    }
     let midsommar = q.get("preset").as_deref() == Some("midsommar");
     if midsommar {
         // intro_scene.json's light block, as create_intro_scene.py applies it in Unreal
