@@ -34,6 +34,10 @@ pub struct MaterialOptions {
     /// None (default) = auto-detect (1 if !outputs_emissive, 2 if outputs_emissive).
     /// Some(N) = shader writes to the first N GBuffer targets.
     pub mrt_output_count: Option<usize>,
+    /// Fragment entry point for shadow (depth-only) passes, for alpha-tested casters such as
+    /// foliage cards: it runs with no colour targets and should `discard` cut-out texels, and it
+    /// must not use group 3. `None` renders shadow depth from `vertex_main` alone.
+    pub shadow_fragment_entry: Option<&'static str>,
 }
 
 impl Default for MaterialOptions {
@@ -46,6 +50,7 @@ impl Default for MaterialOptions {
             topology: wgpu::PrimitiveTopology::TriangleList,
             outputs_emissive: false,
             mrt_output_count: None,
+            shadow_fragment_entry: None,
         }
     }
 }
@@ -59,6 +64,21 @@ pub(crate) struct PipelineKey {
     pub(crate) num_vertex_buffers: usize,
 }
 
+/// Depth-only (shadow) pipeline cache key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DepthPipelineKey {
+    pub(crate) depth_format: wgpu::TextureFormat,
+    pub(crate) num_vertex_buffers: usize,
+    pub(crate) bias_constant: i32,
+    pub(crate) bias_slope_bits: u32,
+}
+
+impl DepthPipelineKey {
+    pub(crate) fn new(depth_format: wgpu::TextureFormat, num_vertex_buffers: usize, bias: wgpu::DepthBiasState) -> Self {
+        Self { depth_format, num_vertex_buffers, bias_constant: bias.constant, bias_slope_bits: bias.slope_scale.to_bits() }
+    }
+}
+
 /// A render material — shader + pipeline cache + bind group.
 pub struct Material {
     pub label: String,
@@ -70,7 +90,10 @@ pub struct Material {
     shader_module: Option<wgpu::ShaderModule>,
     material_bgl: Option<wgpu::BindGroupLayout>,
     pipeline_layout: Option<wgpu::PipelineLayout>,
+    /// Groups 0-2 only: shadow passes render into textures that group 3 samples.
+    depth_pipeline_layout: Option<wgpu::PipelineLayout>,
     pub(crate) pipeline_cache: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    pub(crate) depth_pipeline_cache: HashMap<DepthPipelineKey, wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
 }
@@ -87,7 +110,9 @@ impl Material {
             shader_module: None,
             material_bgl: None,
             pipeline_layout: None,
+            depth_pipeline_layout: None,
             pipeline_cache: HashMap::new(),
+            depth_pipeline_cache: HashMap::new(),
             bind_group: None,
             initialized: false,
         }
@@ -122,9 +147,16 @@ impl Material {
             push_constant_ranges: &[],
         });
 
+        let depth_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{}/DepthPipelineLayout", self.label)),
+            bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl],
+            push_constant_ranges: &[],
+        });
+
         self.shader_module = Some(module);
         self.material_bgl = Some(material_bgl);
         self.pipeline_layout = Some(pipeline_layout);
+        self.depth_pipeline_layout = Some(depth_pipeline_layout);
     }
 
     /// Initialize GPU resources. Called by Renderer during first render.
@@ -229,6 +261,57 @@ impl Material {
         }
 
         self.pipeline_cache.get(&key).unwrap()
+    }
+
+    /// Get or create the depth-only pipeline shadow passes draw this material with: its own
+    /// `vertex_main` (so instancing and vertex animation cast matching shadows), with the camera
+    /// group bound to the light's view, plus `shadow_fragment_entry` if set.
+    pub(crate) fn get_depth_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        vertex_layouts: &[wgpu::VertexBufferLayout],
+        depth_format: wgpu::TextureFormat,
+        bias: wgpu::DepthBiasState,
+    ) -> &wgpu::RenderPipeline {
+        assert!(self.depth_pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        let key = DepthPipelineKey::new(depth_format, vertex_layouts.len(), bias);
+        if !self.depth_pipeline_cache.contains_key(&key) {
+            let module = self.shader_module.as_ref().unwrap();
+            let fragment = self.options.shadow_fragment_entry.map(|entry| wgpu::FragmentState {
+                module,
+                entry_point: Some(entry),
+                targets: &[],
+                compilation_options: Default::default(),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("{}/DepthPipeline", self.label)),
+                layout: self.depth_pipeline_layout.as_ref(),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vertex_main"),
+                    buffers: vertex_layouts,
+                    compilation_options: Default::default(),
+                },
+                fragment,
+                primitive: wgpu::PrimitiveState {
+                    topology: self.options.topology,
+                    cull_mode: self.options.cull_mode.to_wgpu(),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias,
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
+            self.depth_pipeline_cache.insert(key.clone(), pipeline);
+        }
+        self.depth_pipeline_cache.get(&key).unwrap()
     }
 
     /// Create (or recreate) the material bind group from the given resources.

@@ -1,5 +1,5 @@
 // Fog injection: per froxel, height-falloff density (plus local fog volumes) and the light
-// scattered toward the camera (Henyey-Greenstein phase) from directional and point lights, with
+// scattered toward the camera (Henyey-Greenstein phase) from directional, point and spot lights, with
 // shadows, plus ambient terms: the radiance of a uniform sky around the fog (phase integrates to 1
 // over the sphere, so it scatters as density * ambient), and the actual sky's light when a
 // SkyAtmosphere is bound (volumetric_fog_media.wgsl). Distant fog tends to that colour, and it
@@ -27,7 +27,7 @@ struct FogParams {
     extinctionCoeff : f32,
     anisotropy      : f32,
     startDistance   : f32,
-    _pad1           : f32,
+    jitterFrame     : u32,   // 0: sample froxel centres; n > 0: the n-th temporal jitter
     _pad2           : f32,
 }
 
@@ -129,7 +129,13 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         return;
     }
 
-    let worldPos = froxelToWorld(vec3f(f32(gid.x), f32(gid.y), f32(gid.z) + 0.5), gridSize,
+    // with temporal accumulation, each frame samples a different point of the froxel (R2
+    // sequence), so the history resolves detail finer than the grid: shadow edges in beams
+    var jitter = vec3f(0.0);
+    if (params.jitterFrame != 0u) {
+        jitter = fract(vec3f(0.5) + f32(params.jitterFrame) * vec3f(0.8191725, 0.6710436, 0.5497005)) - 0.5;
+    }
+    let worldPos = froxelToWorld(vec3f(f32(gid.x) + jitter.x, f32(gid.y) + jitter.y, f32(gid.z) + 0.5 + jitter.z), gridSize,
                                  params.gridNear, params.gridFar, params.cameraNear, params.cameraFar,
                                  params.invViewProj);
 
@@ -169,6 +175,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         let phase = henyeyGreenstein(dot(viewDir, normalize(pl.position - worldPos)), params.anisotropy);
         totalScatter += density * pl.color * smoothFalloff(dist, pl.radius) * visibility * phase;
     }
+
+    // spot lights: cones with shadows (volumetric_fog_spot.wgsl)
+    totalScatter += density * spotInScatter(worldPos, viewDir, max(sliceThickness, 0.25));
 
     totalScatter = (totalScatter + density * skyAmbient(viewDir)) * media.albedo;
     textureStore(scatterExtTex, gid, vec4f(totalScatter, extinction));

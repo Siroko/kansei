@@ -75,6 +75,14 @@ pub struct Renderer {
     shadows_enabled: bool,
     // Cubemap shadow resources (point lights)
     cubemap_shadow_map: Option<crate::shadows::CubeMapShadowMap>,
+    // Spot lights: storage buffer, shadow atlas and comparison sampler (group 3, bindings 5-7)
+    spot_lights: crate::lights::spot_lights_gpu::SpotLightsGpu,
+    spot_light_buf: Option<wgpu::Buffer>,
+    spot_shadow_atlas: Option<crate::shadows::SpotShadowAtlas>,
+    spot_dummy_atlas_view: Option<wgpu::TextureView>,
+    spot_shadow_sampler: Option<wgpu::Sampler>,
+    // GPU instance culling (renderables with `instance_culling`)
+    cull_pipeline: Option<crate::culling::CullPipeline>,
     // Render bundle caching
     render_bundle: Option<wgpu::RenderBundle>,
     last_bundle_object_count: usize,
@@ -123,6 +131,12 @@ impl Renderer {
             shadow_light_vp_bg: None,
             shadows_enabled: false,
             cubemap_shadow_map: None,
+            spot_lights: crate::lights::spot_lights_gpu::SpotLightsGpu::new(),
+            spot_light_buf: None,
+            spot_shadow_atlas: None,
+            spot_dummy_atlas_view: None,
+            spot_shadow_sampler: None,
+            cull_pipeline: None,
             render_bundle: None,
             last_bundle_object_count: 0,
             gbuffer_bundle: None,
@@ -294,37 +308,38 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        // Shadow bind group with dummy depth texture (shadows disabled by default)
-        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Renderer/ShadowBG"),
-            layout: &shared.shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&dummy_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&comparison_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: shadow_uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&cube_dummy_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&cube_shadow_sampler),
-                },
-            ],
+        // Spot lights: a fixed-capacity storage buffer (so bind groups never go stale), a 1x1
+        // dummy atlas until spot shadows are enabled, and the atlas' comparison sampler
+        let spot_light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Renderer/SpotLights"),
+            size: crate::lights::spot_lights_gpu::SPOT_LIGHTS_BUFFER_BYTES as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let spot_dummy_atlas_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("Renderer/DummySpotShadowAtlas"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::shadows::SpotShadowAtlas::FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let spot_shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Renderer/SpotShadowSampler"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
         });
 
         self.shared_layouts = Some(shared);
         self.light_buf = Some(light_buf);
-        self.shadow_bind_group = Some(shadow_bind_group);
         self.shadow_dummy_depth_tex = Some(dummy_depth);
         self.shadow_dummy_depth_view = Some(dummy_depth_view);
         self.shadow_comparison_sampler = Some(comparison_sampler);
@@ -332,11 +347,54 @@ impl Renderer {
         self.cube_dummy_tex = Some(cube_dummy_tex);
         self.cube_dummy_view = Some(cube_dummy_view);
         self.cube_shadow_sampler = Some(cube_shadow_sampler);
+        self.spot_light_buf = Some(spot_light_buf);
+        self.spot_dummy_atlas_view = Some(spot_dummy_atlas_view);
+        self.spot_shadow_sampler = Some(spot_shadow_sampler);
 
         self.device = Some(device);
         self.queue = Some(queue);
         self.surface = Some(surface);
         self.surface_config = Some(surface_config);
+        self.rebuild_shadow_bind_group();
+    }
+
+    /// (Re)create the shared shadow bind group (group 3) from the enabled shadow resources, with
+    /// 1x1 dummies standing in for the others.
+    fn rebuild_shadow_bind_group(&mut self) {
+        let device = self.device.as_ref().unwrap();
+        let shared = self.shared_layouts.as_ref().unwrap();
+        let dir_view = self
+            .shadow_map
+            .as_ref()
+            .and_then(|sm| sm.depth_view.as_ref())
+            .unwrap_or_else(|| self.shadow_dummy_depth_view.as_ref().unwrap());
+        let cube_view = self
+            .cubemap_shadow_map
+            .as_ref()
+            .map(|c| &c.distance_view)
+            .unwrap_or_else(|| self.cube_dummy_view.as_ref().unwrap());
+        let spot_view = self
+            .spot_shadow_atlas
+            .as_ref()
+            .map(|a| &a.array_view)
+            .unwrap_or_else(|| self.spot_dummy_atlas_view.as_ref().unwrap());
+        let view = wgpu::BindingResource::TextureView;
+        let sampler = wgpu::BindingResource::Sampler;
+        self.shadow_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Renderer/ShadowBG"),
+            layout: &shared.shadow_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: view(dir_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: sampler(self.shadow_comparison_sampler.as_ref().unwrap()) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.shadow_uniform_buf.as_ref().unwrap().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: view(cube_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: sampler(self.cube_shadow_sampler.as_ref().unwrap()) },
+                wgpu::BindGroupEntry { binding: 5, resource: view(spot_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: self.spot_light_buf.as_ref().unwrap().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: sampler(self.spot_shadow_sampler.as_ref().unwrap()) },
+            ],
+        }));
+        self.invalidate_bundle();
     }
 
     /// Returns a reference to the underlying wgpu device.
@@ -682,23 +740,8 @@ impl Renderer {
             let offset = (draw_idx as u32) * alignment;
             encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
-            // Set vertex buffer
-            encoder.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
-
-            for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
-                if let Some(buf) = cb.gpu_buffer() {
-                    encoder.set_vertex_buffer((i + 1) as u32, buf.slice(..));
-                }
-            }
-
-            // Set index buffer
-            encoder.set_index_buffer(
-                r.geometry.active_index_buffer().unwrap().slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
-
-            // Draw
-            encoder.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
+            // Vertex/index buffers and the draw (the camera's culled instances, if culled)
+            draw_geometry(&mut encoder, r, MAIN_VIEW);
         }
 
         encoder.finish(&Default::default())
@@ -780,6 +823,11 @@ impl Renderer {
         if let Some(ref buf) = self.light_buf {
             queue.write_buffer(buf, 0, self.light_uniforms.as_bytes());
         }
+        let (spot_layers, spot_resolution) = self.spot_shadow_atlas.as_ref().map(|a| (a.layers, a.resolution)).unwrap_or((0, 0));
+        self.spot_lights.pack(scene.lights(), spot_layers, spot_resolution);
+        if let Some(ref buf) = self.spot_light_buf {
+            queue.write_buffer(buf, 0, self.spot_lights.as_bytes());
+        }
 
         // Upload per-object matrices
         let count = scene.len();
@@ -821,38 +869,7 @@ impl Renderer {
         let mut sm = crate::shadows::ShadowMap::new(resolution);
         sm.initialize(device);
 
-        // Rebuild shadow bind group with real depth texture
         let shared = self.shared_layouts.as_ref().unwrap();
-        self.shadow_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Renderer/ShadowBG"),
-            layout: &shared.shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(sm.depth_view.as_ref().unwrap()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(self.shadow_comparison_sampler.as_ref().unwrap()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.shadow_uniform_buf.as_ref().unwrap().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(
-                        self.cube_dummy_view.as_ref().unwrap()
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(
-                        self.cube_shadow_sampler.as_ref().unwrap()
-                    ),
-                },
-            ],
-        }));
 
         // Shadow pipeline (depth-only, no fragment)
         let shadow_light_vp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -920,7 +937,7 @@ impl Renderer {
         self.shadow_light_vp_bgl = Some(shadow_light_vp_bgl);
         self.shadow_map = Some(sm);
         self.shadows_enabled = true;
-        self.invalidate_bundle();
+        self.rebuild_shadow_bind_group();
     }
 
     /// The directional shadow map, once `enable_shadows` has been called.
@@ -937,49 +954,137 @@ impl Renderer {
     pub fn enable_point_shadows(&mut self, resolution: u32, max_lights: u32) {
         let csm = crate::shadows::CubeMapShadowMap::new(self, resolution, max_lights);
 
-        // Rebuild shadow bind group with real cubemap texture
+        self.cubemap_shadow_map = Some(csm);
+        self.rebuild_shadow_bind_group();
+    }
+
+    /// Enable perspective shadow maps for spot lights: each frame, the first `max_lights` spot
+    /// lights with `cast_shadow` (in scene order) render a `resolution`² layer of the spot shadow
+    /// atlas, drawing every caster through its material's own vertex shader.
+    pub fn enable_spot_shadows(&mut self, resolution: u32, max_lights: u32) {
         let device = self.device.as_ref().unwrap();
         let shared = self.shared_layouts.as_ref().unwrap();
+        let atlas = crate::shadows::SpotShadowAtlas::new(device, &shared.camera_bgl, self.light_buf.as_ref().unwrap(), resolution, max_lights);
+        self.spot_shadow_atlas = Some(atlas);
+        self.rebuild_shadow_bind_group();
+    }
 
-        self.shadow_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Renderer/ShadowBG"),
-            layout: &shared.shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        if let Some(ref sm) = self.shadow_map {
-                            sm.depth_view.as_ref().unwrap()
-                        } else {
-                            self.shadow_dummy_depth_view.as_ref().unwrap()
-                        },
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(
-                        self.shadow_comparison_sampler.as_ref().unwrap(),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.shadow_uniform_buf.as_ref().unwrap().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&csm.distance_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(
-                        self.cube_shadow_sampler.as_ref().unwrap(),
-                    ),
-                },
-            ],
-        }));
+    /// The spot-light shadow atlas, once `enable_spot_shadows` has been called.
+    pub fn spot_shadow_atlas(&self) -> Option<&crate::shadows::SpotShadowAtlas> {
+        self.spot_shadow_atlas.as_ref()
+    }
 
-        self.cubemap_shadow_map = Some(csm);
-        self.invalidate_bundle();
+    /// The storage buffer holding the scene's spot lights (`KanseiSpotLights` in
+    /// `lights::SPOT_LIGHT_TYPES_WGSL`), rewritten every frame. Materials see it at group 3
+    /// binding 6; effects such as the volumetric fog bind it themselves.
+    pub fn spot_lights_buffer(&self) -> &wgpu::Buffer {
+        self.spot_light_buf.as_ref().expect("Renderer not initialized")
+    }
+
+    /// Render each shadowed spot light's depth into its atlas layer: every visible shadow caster,
+    /// with its material's depth pipeline and the light's camera in group 1.
+    fn run_spot_shadow_pass(&mut self, scene: &Scene) {
+        let Some(atlas) = self.spot_shadow_atlas.as_mut() else { return };
+        if self.spot_lights.shadows.is_empty() {
+            return;
+        }
+        let queue = self.queue.as_ref().unwrap();
+        for slot in &self.spot_lights.shadows {
+            atlas.update_camera(queue, slot.layer, slot.view, slot.projection);
+        }
+        let atlas = self.spot_shadow_atlas.as_ref().unwrap();
+        let device = self.device.as_ref().unwrap();
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let alignment = self.matrix_alignment;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/SpotShadows") });
+        for slot in &self.spot_lights.shadows {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderer/SpotShadowPass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: atlas.layer_view(slot.layer),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_bind_group(1, atlas.camera(slot.layer).bind_group().unwrap(), &[]);
+            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                let Some(r) = scene.get_renderable(scene_idx) else { continue };
+                if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                    continue;
+                }
+                let key = crate::materials::DepthPipelineKey::new(
+                    crate::shadows::SpotShadowAtlas::FORMAT,
+                    1 + r.geometry.instance_buffers.len(),
+                    crate::shadows::SpotShadowAtlas::DEPTH_BIAS,
+                );
+                let Some(pipeline) = r.material.depth_pipeline_cache.get(&key) else { continue };
+                pass.set_pipeline(pipeline);
+                if let Some(bg) = r.material.bind_group() {
+                    pass.set_bind_group(0, bg, &[]);
+                }
+                let offset = draw_idx as u32 * alignment;
+                pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+                // culled against this light's frustum, not the camera's
+                draw_geometry(&mut pass, r, spot_view(slot.layer));
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then `spot_view(l)`
+    /// for every layer of the spot shadow atlas (`None` when no light uses it this frame).
+    fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
+        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false })];
+        if let Some(atlas) = &self.spot_shadow_atlas {
+            views.resize(1 + atlas.layers as usize, None);
+            for slot in &self.spot_lights.shadows {
+                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true });
+            }
+        }
+        views
+    }
+
+    /// Cull every renderable with `instance_culling` for every view (after the frame's uploads,
+    /// before its shadow and main passes).
+    fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera) {
+        let culled: Vec<usize> = scene
+            .ordered_indices()
+            .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.instance_culling.is_some() && r.geometry.initialized))
+            .collect();
+        if culled.is_empty() {
+            return;
+        }
+        let views = self.cull_views(camera);
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let pipeline = self.cull_pipeline.get_or_insert_with(|| crate::culling::CullPipeline::new(device));
+        let lod_origin = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        let mut stale_bundles = false;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), ..Default::default() });
+            pass.set_pipeline(&pipeline.pipeline);
+            for idx in culled {
+                let r = scene.get_renderable_mut(idx).unwrap();
+                let (world, index_count, casts) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow);
+                let culling = r.instance_culling.as_mut().unwrap();
+                stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
+                for (slot, view) in views.iter().enumerate() {
+                    let Some(view) = view else { continue };
+                    if view.casters_only && !casts {
+                        continue;
+                    }
+                    let params = culling.params(view, world, lod_origin);
+                    culling.dispatch(queue, &mut pass, slot, &params, index_count);
+                }
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        if stale_bundles {
+            self.invalidate_bundle();
+        }
     }
 
     /// Run the cubemap shadow pass for point lights.
@@ -1136,6 +1241,7 @@ impl Renderer {
             let format = self.presentation_format;
             let sample_count = self.config.sample_count;
             let depth_format = wgpu::TextureFormat::Depth24Plus;
+            let spot_shadows = self.spot_shadow_atlas.is_some();
 
             let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
             for idx in ordered_indices {
@@ -1161,6 +1267,9 @@ impl Renderer {
                     device, &layouts,
                     &[format], depth_format, sample_count,
                 );
+                if spot_shadows && r.cast_shadow {
+                    r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
+                }
             }
         }
 
@@ -1173,6 +1282,9 @@ impl Renderer {
 
         // Phase 1: Upload camera + per-object matrices
         self.upload_all(scene, camera);
+
+        // GPU instance culling for every view (camera, spot shadows)
+        self.run_instance_culling(scene, camera);
 
         // Shadow pass
         if self.shadows_enabled {
@@ -1255,6 +1367,9 @@ impl Renderer {
         if self.cubemap_shadow_map.is_some() {
             self.run_cubemap_shadow_pass(scene);
         }
+
+        // Spot light shadow maps
+        self.run_spot_shadow_pass(scene);
 
         // Check material dirty flags → invalidate bundle
         for idx in scene.ordered_indices() {
@@ -1399,6 +1514,7 @@ impl Renderer {
         let shared = self.shared_layouts.as_ref().unwrap();
         let depth_format = GBuffer::DEPTH_FORMAT;
         let sample_count = gbuffer.sample_count;
+        let spot_shadows = self.spot_shadow_atlas.is_some();
 
         let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
         for idx in ordered_indices {
@@ -1424,10 +1540,16 @@ impl Renderer {
                 device, &layouts,
                 &GBuffer::MRT_FORMATS, depth_format, sample_count,
             );
+            if spot_shadows && r.cast_shadow {
+                r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
+            }
         }
 
         // Upload camera + per-object matrices
         self.upload_all(scene, camera);
+
+        // GPU instance culling for every view (camera, spot shadows)
+        self.run_instance_culling(scene, camera);
 
         // Shadow pass (if enabled)
         if self.shadows_enabled {
@@ -1498,6 +1620,9 @@ impl Renderer {
         if self.cubemap_shadow_map.is_some() {
             self.run_cubemap_shadow_pass(scene);
         }
+
+        // Spot light shadow maps
+        self.run_spot_shadow_pass(scene);
 
         // Check material dirty flags → invalidate gbuffer bundle
         for idx in scene.ordered_indices() {
@@ -1823,5 +1948,36 @@ impl Renderer {
             system.initialize(device, queue);
         }
         system.update(dt);
+    }
+}
+
+/// Cull view of the camera; spot shadow layer `l` is `spot_view(l)`.
+const MAIN_VIEW: usize = 0;
+
+fn spot_view(layer: u32) -> usize {
+    1 + layer as usize
+}
+
+/// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
+/// compacted instances (indirect) when it has `InstanceCulling`, otherwise its geometry as is.
+fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
+    let culled = r.instance_culling.as_ref().and_then(|c| c.view(view));
+    enc.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+    for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
+        let buffer = match culled {
+            Some((instances, _)) if i == 0 => Some(instances),
+            _ => cb.gpu_buffer(),
+        };
+        if let Some(buffer) = buffer {
+            enc.set_vertex_buffer(i as u32 + 1, buffer.slice(..));
+        }
+    }
+    enc.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+    if let Some((_, args)) = culled {
+        enc.draw_indexed_indirect(args, 0);
+    } else if r.geometry.is_indirect() {
+        enc.draw_indexed_indirect(r.geometry.active_indirect_buffer().unwrap(), 0);
+    } else {
+        enc.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
     }
 }
