@@ -2,7 +2,7 @@
 /// Group 0: Material-specific (owned by Material)
 /// Group 1: Camera — view + projection matrices (owned by Renderer)
 /// Group 2: Mesh transforms — dynamic offsets into bulk matrix buffers (owned by Renderer)
-/// Group 3: Shadows (future — Plan 2)
+/// Group 3: Shadows and spot lights (owned by Renderer)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum BindGroupSlot {
@@ -85,7 +85,8 @@ impl SharedLayouts {
             ],
         });
 
-        // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap)
+        // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap) and
+        // spot lights (shadow atlas + light buffer + comparison sampler)
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Shared/ShadowBGL"),
             entries: &[
@@ -131,6 +132,35 @@ impl SharedLayouts {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                // Binding 5: spot-light shadow atlas (lights::SPOT_LIGHTS_WGSL)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 6: spot lights (count + array), physical units
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 7: comparison sampler for the spot shadow atlas
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
             ],

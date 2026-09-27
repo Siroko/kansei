@@ -6,13 +6,15 @@ use crate::lights::Light;
 use crate::math::{Mat4, Vec3};
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
-use crate::shadows::{CubeMapShadowMap, ShadowMap};
+use crate::shadows::{CubeMapShadowMap, ShadowMap, SpotShadowAtlas};
 
 const INJECT_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
     include_str!("../../shaders/volumetric_fog_inject.wgsl"),
     include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("../../shaders/volumetric_fog_media.wgsl"),
+    include_str!("../../shaders/spot_light_types.wgsl"),
+    include_str!("../../shaders/volumetric_fog_spot.wgsl"),
 );
 const COMPOSITE_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
@@ -93,7 +95,8 @@ struct FogParamsGpu {
     extinction_coeff: f32,
     anisotropy: f32,
     start_distance: f32,
-    _pad: [f32; 2],
+    jitter_frame: u32,
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -277,6 +280,9 @@ struct Gpu {
     media_params: wgpu::Buffer,
     volumes: wgpu::Buffer,
     dummy_sky_lighting: wgpu::Buffer,
+    dummy_spot_lights: wgpu::Buffer,
+    dummy_spot_atlas: wgpu::TextureView,
+    spot_sampler: wgpu::Sampler,
 }
 
 /// Froxel volumetric fog, ported from the TS `VolumetricFogEffect`.
@@ -288,8 +294,12 @@ struct Gpu {
 /// ```ignore
 /// let mut fog = VolumetricFogEffect::new(VolumetricFogOptions { base_density: 0.03, ..Default::default() });
 /// fog.set_shadow_map(renderer.shadow_map());          // optional: shafts from the sun
+/// fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas()); // beams
 /// fog.update_lights(scene.lights());                  // each frame, or when lights change
 /// ```
+///
+/// With a temporal grid, the injection samples a different point of each froxel every frame, so
+/// the history resolves shadow detail (shafts, the shadows of trunks in beams) finer than the grid.
 pub struct VolumetricFogEffect {
     pub base_density: f32,
     pub height_falloff: f32,
@@ -305,12 +315,16 @@ pub struct VolumetricFogEffect {
     pub local_volumes: Vec<LocalFogVolume>,
     /// Seconds, drives the wind offset. The effect has no clock of its own; set it per frame.
     pub time: f32,
+    /// Temporal jitter index of the injection (1..=1024), advanced every frame.
+    frame: u32,
     grid_options: FroxelGridOptions,
     dir_data: Vec<DirLightGpu>,
     point_data: Vec<PointLightGpu>,
     shadow_map: Option<(wgpu::TextureView, wgpu::Buffer)>,
     point_shadows: Option<wgpu::TextureView>,
     sky_lighting: Option<wgpu::Buffer>,
+    spot_lights: Option<wgpu::Buffer>,
+    spot_shadows: Option<wgpu::TextureView>,
     lights_dirty: bool,
     bindings_dirty: bool,
     gpu: Option<Gpu>,
@@ -331,12 +345,15 @@ impl VolumetricFogEffect {
             sky_ambient_scale: options.sky_ambient_scale,
             local_volumes: Vec::new(),
             time: 0.0,
+            frame: 1,
             grid_options: options.grid,
             dir_data: Vec::new(),
             point_data: Vec::new(),
             shadow_map: None,
             point_shadows: None,
             sky_lighting: None,
+            spot_lights: None,
+            spot_shadows: None,
             lights_dirty: true,
             bindings_dirty: true,
             gpu: None,
@@ -359,7 +376,8 @@ impl VolumetricFogEffect {
     /// shadow map if they are the scene's first directional light and `cast_shadow` is set
     /// (that is the light the renderer's `ShadowMap` follows); the first shadow-casting point
     /// light uses the cube shadow atlas. Area lights are treated as point lights at their
-    /// position, as in the TS effect.
+    /// position, as in the TS effect. Spot lights are not collected here: the fog reads them,
+    /// with their shadows, from the renderer (`set_spot_lights`).
     pub fn update_lights<'a>(&mut self, lights: impl IntoIterator<Item = &'a Light>) {
         self.dir_data.clear();
         self.point_data.clear();
@@ -404,6 +422,8 @@ impl VolumetricFogEffect {
                         shadow_layer: NO_SHADOW,
                     });
                 }
+                // spot lights come from the renderer's buffer (set_spot_lights), with its shadows
+                Light::Spot(_) => {}
             }
         }
         self.lights_dirty = true;
@@ -430,6 +450,16 @@ impl VolumetricFogEffect {
     /// the sky and its aerial perspective.
     pub fn set_sky_lighting(&mut self, sky_lighting: Option<&wgpu::Buffer>) {
         self.sky_lighting = sky_lighting.cloned();
+        self.bindings_dirty = true;
+    }
+
+    /// Scatter the renderer's spot lights (`Renderer::spot_lights_buffer()`, rewritten every
+    /// frame) in their cones, shadowed by its spot shadow atlas (`Renderer::spot_shadow_atlas()`).
+    /// Call again after `Renderer::enable_spot_shadows`. Each light's `volumetric_scale` scales
+    /// its scattering; 0 keeps it out of the fog.
+    pub fn set_spot_lights(&mut self, lights: Option<&wgpu::Buffer>, shadow_atlas: Option<&SpotShadowAtlas>) {
+        self.spot_lights = lights.cloned();
+        self.spot_shadows = shadow_atlas.map(|a| a.array_view.clone());
         self.bindings_dirty = true;
     }
 
@@ -493,6 +523,23 @@ impl VolumetricFogEffect {
                 uniform(10),
                 storage(11),
                 uniform(12),
+                storage(7),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
         let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -604,6 +651,31 @@ impl VolumetricFogEffect {
             .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let dummy_vp = buffer("VolumetricFog/DummyLightVP", 64, wgpu::BufferUsages::UNIFORM);
         queue.write_buffer(&dummy_vp, 0, bytemuck::cast_slice(Mat4::identity().as_slice()));
+        // no spot lights: a buffer whose count is 0 (zero-initialised), and a 1x1 atlas
+        let dummy_spot_lights = buffer(
+            "VolumetricFog/DummySpotLights",
+            16 + std::mem::size_of::<crate::lights::spot_lights_gpu::SpotLightGpu>(),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let dummy_spot_atlas = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("VolumetricFog/DummySpotShadow"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: SpotShadowAtlas::FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let spot_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("VolumetricFog/SpotShadowSampler"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let volumes = buffer("VolumetricFog/LocalVolumes", std::mem::size_of::<LocalFogVolumeGpu>(), wgpu::BufferUsages::STORAGE);
         let dummy_sky_lighting = buffer("VolumetricFog/NoSkyLighting", SKY_LIGHTING_BYTES as usize, wgpu::BufferUsages::UNIFORM);
@@ -632,6 +704,9 @@ impl VolumetricFogEffect {
             media_params,
             volumes,
             dummy_sky_lighting,
+            dummy_spot_lights,
+            dummy_spot_atlas,
+            spot_sampler,
         });
         self.lights_dirty = true;
         self.bindings_dirty = true;
@@ -702,6 +777,8 @@ impl VolumetricFogEffect {
         };
         let atlas = self.point_shadows.as_ref().unwrap_or(&gpu.dummy_atlas);
         let sky_lighting = self.sky_lighting.as_ref().unwrap_or(&gpu.dummy_sky_lighting);
+        let spot_lights = self.spot_lights.as_ref().unwrap_or(&gpu.dummy_spot_lights);
+        let spot_atlas = self.spot_shadows.as_ref().unwrap_or(&gpu.dummy_spot_atlas);
         gpu.inject_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("VolumetricFog/InjectBG"),
             layout: &gpu.inject_bgl,
@@ -716,6 +793,9 @@ impl VolumetricFogEffect {
                 wgpu::BindGroupEntry { binding: 10, resource: gpu.media_params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: gpu.volumes.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: sky_lighting.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: spot_lights.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(spot_atlas) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&gpu.spot_sampler) },
             ],
         }));
         self.bindings_dirty = false;
@@ -784,8 +864,10 @@ impl PostProcessingEffect for VolumetricFogEffect {
             extinction_coeff: self.extinction_coeff,
             anisotropy: self.anisotropy,
             start_distance: self.start_distance,
-            _pad: [0.0; 2],
+            jitter_frame: if grid.is_temporal() { self.frame } else { 0 },
+            _pad: 0.0,
         };
+        self.frame = self.frame % 1024 + 1;
         queue.write_buffer(&gpu.fog_params, 0, bytemuck::bytes_of(&params));
         let composite = CompositeParamsGpu {
             camera_near: camera.near,
