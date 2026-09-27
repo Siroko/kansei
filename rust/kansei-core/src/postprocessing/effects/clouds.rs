@@ -146,7 +146,9 @@ struct Gpu {
 /// the sky and over any surface they are in front of.
 ///
 /// Put it right after the `AtmosphereEffect` (before the fogs), and set `time` every frame for
-/// the wind. `layer` can change every frame (coverage for the weather of a shot).
+/// the wind. `layer` can change every frame (coverage for the weather of a shot). The clouds are
+/// part of the sky: `AtmosphereParams::sky_luminance_factor` scales the light they send like the
+/// sky's.
 pub struct VolumetricCloudsEffect {
     pub layer: CloudLayer,
     /// Seconds, drives the wind.
@@ -591,8 +593,8 @@ mod tests {
         let mut sky = crate::atmosphere::SkyAtmosphere::new(&device, Default::default());
         sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(60.0, 180.0);
         sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0);
-        let mut run = |coverage: f32| -> Vec<[f32; 4]> {
-            let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer: CloudLayer { coverage, ..Default::default() }, ..Default::default() });
+        let run = |sky: &mut crate::atmosphere::SkyAtmosphere, coverage: f32| -> Vec<[f32; 4]> {
+            let mut fx = VolumetricCloudsEffect::new(sky, VolumetricCloudsOptions { layer: CloudLayer { coverage, ..Default::default() }, ..Default::default() });
             for _ in 0..30 {
                 let mut encoder = device.create_command_encoder(&Default::default());
                 sky.encode(&queue, &mut encoder, &camera);
@@ -622,14 +624,21 @@ mod tests {
                 [half(o), half(o + 2), half(o + 4), half(o + 6)]
             }).collect()
         };
-        let clear = run(0.0);
+        let clear = run(&mut sky, 0.0);
         let worst = clear.iter().map(|c| (c[0] - 1000.0).abs().max((c[2] - 1000.0).abs())).fold(0.0, f32::max);
         assert!(worst < 1.0, "a clear sky changed by {worst}");
-        let overcast = run(1.0);
+        let overcast = run(&mut sky, 1.0);
         assert!(overcast.iter().all(|c| c.iter().all(|v| v.is_finite())), "non-finite cloud light");
         let mean: f32 = overcast.iter().map(|c| c[1]).sum::<f32>() / overcast.len() as f32;
         // the background barely shows through a closed deck
         assert!(mean > 500.0 && mean < 20_000.0, "overcast base luminance {mean}");
         eprintln!("overcast base seen from below: {mean:.0} cd/m2 under a 100 000 lux sun");
+
+        // the clouds follow the sky's luminance factor, as the sky they cover does
+        sky.params.sky_luminance_factor = Vec3::new(0.25, 0.25, 0.25);
+        let scaled = run(&mut sky, 1.0);
+        let scaled_mean: f32 = scaled.iter().map(|c| c[1]).sum::<f32>() / scaled.len() as f32;
+        let ratio = scaled_mean / mean;
+        assert!((ratio - 0.25).abs() < 0.03, "with the sky scaled by 0.25 the clouds scale by {ratio}");
     }
 }
