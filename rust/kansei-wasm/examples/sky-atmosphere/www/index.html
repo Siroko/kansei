@@ -17,6 +17,7 @@
         //   elevation  sun elevation in degrees (negative: below the horizon); default: a day cycle
         //   bearing    sun bearing, degrees clockwise from north (default 140, the Midsommar sun)
         //   look       view bearing (default: the sun's); pitch: view pitch in degrees (default 6)
+        //   height     camera height in metres (default 1.7; above ~30 it sees over the trees)
         //   ev         EV100 exposure (default: follows the sun)
         //   haze       Mie scattering x (Unreal's haze); ozone: absorbing layer x; moon=1: add a moon
         document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');

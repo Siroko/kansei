@@ -39,6 +39,10 @@ pub struct AtmosphereParams {
     pub multi_scattering_factor: f32,
     /// Artistic tint of the sky's luminance (not of the aerial perspective); 1 is physical.
     pub sky_luminance_factor: Vec3,
+    /// Aerial perspective as if the scene were this many times farther away; 1 is physical.
+    pub aerial_perspective_view_distance_scale: f32,
+    /// Distance from the camera before which there is no aerial perspective, km.
+    pub aerial_perspective_start_depth_km: f32,
 }
 
 impl Default for AtmosphereParams {
@@ -70,6 +74,8 @@ impl AtmosphereParams {
             other_tent_width_km: 15.0,
             multi_scattering_factor: 1.0,
             sky_luminance_factor: Vec3::new(1.0, 1.0, 1.0),
+            aerial_perspective_view_distance_scale: 1.0,
+            aerial_perspective_start_depth_km: 0.1,
         }
     }
 
@@ -221,9 +227,11 @@ pub(crate) struct AtmosphereGpu {
 pub(crate) struct SkyFrameGpu {
     pub inv_view_proj: [f32; 16],
     pub camera_pos: [f32; 3],
-    pub _pad0: f32,
+    pub ap_distance: f32,
     pub world_origin: [f32; 3],
-    pub _pad1: f32,
+    pub ap_start_depth: f32,
+    pub camera_world: [f32; 3],
+    pub ap_distance_scale: f32,
     pub sun_direction: [f32; 3],
     pub sun_angular_radius: f32,
     pub sun_illuminance: [f32; 3],
@@ -233,7 +241,7 @@ pub(crate) struct SkyFrameGpu {
     pub moon_illuminance: [f32; 3],
     pub moon_disk_luminance: f32,
     pub sky_luminance_factor: [f32; 3],
-    pub _pad2: f32,
+    pub _pad0: f32,
 }
 
 #[cfg(test)]

@@ -25,22 +25,27 @@ fn f16_to_f32(h: u16) -> f32 {
 
 struct Lut {
     width: u32,
+    height: u32,
     texels: Vec<[f32; 4]>,
 }
 
 impl Lut {
     fn at(&self, x: u32, y: u32) -> glam::Vec3 {
-        let t = self.texels[(y * self.width + x) as usize];
+        self.at3(x, y, 0)
+    }
+
+    fn at3(&self, x: u32, y: u32, z: u32) -> glam::Vec3 {
+        let t = self.texels[((z * self.height + y) * self.width + x) as usize];
         glam::Vec3::new(t[0], t[1], t[2])
     }
 }
 
 fn read(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Lut {
-    let (w, h) = (texture.width(), texture.height());
+    let (w, h, d) = (texture.width(), texture.height(), texture.depth_or_array_layers());
     let row = (w * 8).div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: (row * h) as u64,
+        size: (row * h * d) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -57,15 +62,15 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> 
     buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
     device.poll(wgpu::Maintain::Wait);
     let data = buffer.slice(..).get_mapped_range();
-    let mut texels = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
+    let mut texels = Vec::with_capacity((w * h * d) as usize);
+    for y in 0..h * d {
         for x in 0..w {
             let o = (y * row + x * 8) as usize;
             let c = |i: usize| f16_to_f32(u16::from_le_bytes([data[o + 2 * i], data[o + 2 * i + 1]]));
             texels.push([c(0), c(1), c(2), c(3)]);
         }
     }
-    Lut { width: w, texels }
+    Lut { width: w, height: h, texels }
 }
 
 /// The sky-view LUT with the sun at `elevation` degrees, bearing 180 (azimuth u = 0.25).
@@ -125,4 +130,48 @@ fn atmosphere_luts_match_the_cpu_model_and_the_sky_from_noon_to_dusk() {
     let dusk_glow = dusk.at(toward_sun, horizon);
     assert!(dusk_glow.max_element() > dusk.at(away, horizon).max_element(), "dusk horizon {dusk_glow}");
     eprintln!("noon zenith {zenith}; sunset horizon toward/away {hs} / {ha}; dusk zenith {dz}, horizon toward sun {dusk_glow}");
+}
+
+#[test]
+fn aerial_perspective_matches_the_optical_depth_along_its_rays() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let options = SkyAtmosphereOptions::default();
+    let mut sky = SkyAtmosphere::new(&device, options);
+    let _ = sky_view(&device, &queue, &mut sky, 20.0);
+    let scattering = read(&device, &queue, &sky.aerial_perspective_textures()[0]);
+    let transmittance = read(&device, &queue, &sky.aerial_perspective_textures()[1]);
+    let (w, h, d) = options.aerial_perspective_size;
+    let (x, y) = (w / 2, h / 2);
+
+    // the ray through that column: the camera looks along -Z with a 60 degree vertical fov
+    let ndc = glam::Vec2::new((x as f32 + 0.5) / w as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / h as f32 * 2.0);
+    let t = 30f32.to_radians().tan();
+    let rd = glam::Vec3::new(ndc.x * t, ndc.y * t, -1.0).normalize();
+    // from the camera, clamped 5 m above the ground as the LUTs are
+    let bottom = sky.params.bottom_radius_km;
+    let ro = glam::Vec3::new(0.0, bottom + 0.005, 0.0);
+    let distance = options.aerial_perspective_distance_km;
+    let steps = 4000;
+    let mut depth = glam::Vec3::ZERO;
+    for i in 0..steps {
+        let p = ro + rd * ((i as f32 + 0.5) / steps as f32 * distance);
+        depth += sky.params.extinction_at(p.length() - bottom) * (distance / steps as f32);
+    }
+    let expected = (-depth).exp();
+    let last = transmittance.at3(x, y, d - 1);
+    assert!(((last - expected) / expected).abs().max_element() < 0.02, "{last} vs {expected}");
+
+    // front to back, the air only adds light and only removes transmittance
+    for z in 1..d {
+        let (s0, s1) = (scattering.at3(x, y, z - 1), scattering.at3(x, y, z));
+        let (t0, t1) = (transmittance.at3(x, y, z - 1), transmittance.at3(x, y, z));
+        assert!(s1.cmpge(s0 * 0.999).all() && t1.cmple(t0 * 1.001).all(), "slice {z}: {s0} -> {s1}, {t0} -> {t1}");
+    }
+    // distant haze is blue by day
+    let far = scattering.at3(x, y, d - 1);
+    assert!(far.z > far.x, "{far}");
+    eprintln!("aerial perspective at {distance} km: scattering {far}, transmittance {last} (cpu {expected})");
 }
