@@ -9,10 +9,12 @@ pub(crate) const LOOKUP_TRANSMITTANCE_WGSL: &str = include_str!("shaders/lookup_
 pub(crate) const LOOKUP_MULTI_SCATTERING_WGSL: &str = include_str!("shaders/lookup_multi_scattering.wgsl");
 pub(crate) const SCATTERING_WGSL: &str = include_str!("shaders/scattering.wgsl");
 pub(crate) const SKY_LOOKUP_WGSL: &str = include_str!("shaders/sky_lookup.wgsl");
+pub(crate) const AERIAL_PERSPECTIVE_LOOKUP_WGSL: &str = include_str!("shaders/aerial_perspective_lookup.wgsl");
 
 const TRANSMITTANCE_WGSL: &str = include_str!("shaders/transmittance_lut.wgsl");
 const MULTI_SCATTERING_WGSL: &str = include_str!("shaders/multi_scattering_lut.wgsl");
 const SKY_VIEW_WGSL: &str = include_str!("shaders/sky_view_lut.wgsl");
+const AERIAL_PERSPECTIVE_WGSL: &str = include_str!("shaders/aerial_perspective_lut.wgsl");
 
 pub(crate) const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -38,6 +40,10 @@ pub(crate) fn sky_view_source() -> String {
     shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, LOOKUP_MULTI_SCATTERING_WGSL, SCATTERING_WGSL, SKY_VIEW_WGSL])
 }
 
+pub(crate) fn aerial_perspective_source() -> String {
+    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, LOOKUP_MULTI_SCATTERING_WGSL, SCATTERING_WGSL, AERIAL_PERSPECTIVE_WGSL])
+}
+
 /// LUT resolutions. The defaults are Hillaire 2020's, except the sky-view LUT, which spans the
 /// full world azimuth (so the sun and the moon can share it) and has more columns for that.
 #[derive(Debug, Clone, Copy)]
@@ -45,11 +51,21 @@ pub struct SkyAtmosphereOptions {
     pub transmittance_size: (u32, u32),
     pub multi_scattering_size: u32,
     pub sky_view_size: (u32, u32),
+    /// Aerial-perspective volume: screen-aligned columns and depth slices.
+    pub aerial_perspective_size: (u32, u32, u32),
+    /// Distance covered by the aerial-perspective volume, km (farther surfaces use its last slice).
+    pub aerial_perspective_distance_km: f32,
 }
 
 impl Default for SkyAtmosphereOptions {
     fn default() -> Self {
-        Self { transmittance_size: (256, 64), multi_scattering_size: 32, sky_view_size: (256, 128) }
+        Self {
+            transmittance_size: (256, 64),
+            multi_scattering_size: 32,
+            sky_view_size: (256, 128),
+            aerial_perspective_size: (32, 32, 32),
+            aerial_perspective_distance_km: 32.0,
+        }
     }
 }
 
@@ -63,6 +79,9 @@ pub struct SkyAtmosphereBindings {
     pub transmittance: wgpu::TextureView,
     pub multi_scattering: wgpu::TextureView,
     pub sky_view: wgpu::TextureView,
+    /// Aerial-perspective volume (3D): in-scattered light toward the camera, and transmittance.
+    pub ap_scattering: wgpu::TextureView,
+    pub ap_transmittance: wgpu::TextureView,
     /// Linear, clamping: for the transmittance and multiple-scattering LUTs.
     pub lut_sampler: wgpu::Sampler,
     /// Linear, repeating in u (the azimuth): for the sky-view LUT.
@@ -76,13 +95,17 @@ struct Pipelines {
     multi_scattering_bg: wgpu::BindGroup,
     sky_view: wgpu::ComputePipeline,
     sky_view_bg: wgpu::BindGroup,
+    aerial_perspective: wgpu::ComputePipeline,
+    aerial_perspective_bg: wgpu::BindGroup,
 }
 
 /// A physically based sky and atmosphere after Hillaire 2020, as the LUTs the sky, the aerial
 /// perspective and the sky lighting are rendered from:
 /// - **transmittance** (256x64): transmittance to space by altitude and zenith angle;
 /// - **multiple scattering** (32x32): all scattering orders >= 2, per unit illuminance;
-/// - **sky view** (256x128): the sky's luminance around the camera, every frame.
+/// - **sky view** (256x128): the sky's luminance around the camera, every frame;
+/// - **aerial perspective** (32x32x32 camera froxels, to 32 km): the light scattered toward the
+///   camera and the transmittance in front of every surface, every frame.
 ///
 /// The first two depend only on [`AtmosphereParams`] and are rebuilt when they change. The sun can
 /// be anywhere, including below the horizon at dusk, where the sky is lit only by the light
@@ -109,10 +132,14 @@ pub struct SkyAtmosphere {
     bindings: SkyAtmosphereBindings,
     /// Transmittance, multiple-scattering and sky-view LUT textures (the views are in `bindings`).
     luts: [wgpu::Texture; 3],
+    /// Aerial-perspective scattering and transmittance volumes.
+    ap_volumes: [wgpu::Texture; 2],
     pipelines: Pipelines,
     transmittance_size: (u32, u32),
     multi_scattering_size: u32,
     sky_view_size: (u32, u32),
+    ap_size: (u32, u32, u32),
+    ap_distance_km: f32,
     /// Atmosphere the static LUTs were last built for.
     built_for: Option<AtmosphereGpu>,
 }
@@ -124,6 +151,19 @@ fn lut_2d(device: &wgpu::Device, label: &str, (w, h): (u32, u32)) -> wgpu::Textu
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
+        format: LUT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+fn volume_3d(device: &wgpu::Device, label: &str, (w, h, d): (u32, u32, u32)) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: d.max(1) },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
         format: LUT_FORMAT,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
@@ -152,6 +192,19 @@ pub(crate) fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+pub(crate) fn texture_3d_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 pub(crate) fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -162,14 +215,14 @@ pub(crate) fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 pub(crate) fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    storage_entry_dim(binding, wgpu::TextureViewDimension::D2)
+}
+
+fn storage_entry_dim(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format: LUT_FORMAT,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
+        ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: LUT_FORMAT, view_dimension },
         count: None,
     }
 }
@@ -223,6 +276,11 @@ impl SkyAtmosphere {
             lut_2d(device, "SkyAtmosphere/MultiScatteringLUT", (ms, ms)),
             lut_2d(device, "SkyAtmosphere/SkyViewLUT", options.sky_view_size),
         ];
+        let ap_size = options.aerial_perspective_size;
+        let ap_volumes = [
+            volume_3d(device, "SkyAtmosphere/AerialPerspectiveScattering", ap_size),
+            volume_3d(device, "SkyAtmosphere/AerialPerspectiveTransmittance", ap_size),
+        ];
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
         let bindings = SkyAtmosphereBindings {
             atmosphere: uniform("SkyAtmosphere/Atmosphere", std::mem::size_of::<AtmosphereGpu>()),
@@ -230,6 +288,8 @@ impl SkyAtmosphere {
             transmittance: view(&luts[0]),
             multi_scattering: view(&luts[1]),
             sky_view: view(&luts[2]),
+            ap_scattering: view(&ap_volumes[0]),
+            ap_transmittance: view(&ap_volumes[1]),
             lut_sampler: sampler("SkyAtmosphere/LutSampler", wgpu::AddressMode::ClampToEdge),
             sky_view_sampler: sampler("SkyAtmosphere/SkyViewSampler", wgpu::AddressMode::Repeat),
         };
@@ -246,6 +306,18 @@ impl SkyAtmosphere {
         let sky_view_bgl = bgl(
             "SkyAtmosphere/SkyViewBGL",
             &[uniform_entry(0), uniform_entry(1), texture_entry(2), texture_entry(3), sampler_entry(4), storage_entry(5)],
+        );
+        let aerial_perspective_bgl = bgl(
+            "SkyAtmosphere/AerialPerspectiveBGL",
+            &[
+                uniform_entry(0),
+                uniform_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                sampler_entry(4),
+                storage_entry_dim(5, wgpu::TextureViewDimension::D3),
+                storage_entry_dim(6, wgpu::TextureViewDimension::D3),
+            ],
         );
         let tex = wgpu::BindingResource::TextureView;
         let pipelines = Pipelines {
@@ -282,6 +354,21 @@ impl SkyAtmosphere {
                     tex(&b.sky_view),
                 ],
             ),
+            aerial_perspective: compute_pipeline(device, "SkyAtmosphere/AerialPerspective", &aerial_perspective_source(), &aerial_perspective_bgl),
+            aerial_perspective_bg: bind_group(
+                device,
+                "SkyAtmosphere/AerialPerspectiveBG",
+                &aerial_perspective_bgl,
+                &[
+                    b.atmosphere.as_entire_binding(),
+                    b.frame.as_entire_binding(),
+                    tex(&b.transmittance),
+                    tex(&b.multi_scattering),
+                    wgpu::BindingResource::Sampler(&b.lut_sampler),
+                    tex(&b.ap_scattering),
+                    tex(&b.ap_transmittance),
+                ],
+            ),
         };
 
         Self {
@@ -291,10 +378,13 @@ impl SkyAtmosphere {
             origin_altitude_m: 0.0,
             bindings,
             luts,
+            ap_volumes,
             pipelines,
             transmittance_size: options.transmittance_size,
             multi_scattering_size: ms,
             sky_view_size: options.sky_view_size,
+            ap_size,
+            ap_distance_km: options.aerial_perspective_distance_km.max(1e-3),
             built_for: None,
         }
     }
@@ -350,9 +440,11 @@ impl SkyAtmosphere {
         SkyFrameGpu {
             inv_view_proj: view_proj.inverse().to_cols_array(),
             camera_pos: camera_pos.to_array(),
-            _pad0: 0.0,
+            ap_distance: self.ap_distance_km,
             world_origin: origin.to_array(),
-            _pad1: 0.0,
+            ap_start_depth: self.params.aerial_perspective_start_depth_km.max(0.0),
+            camera_world: [eye.x, eye.y, eye.z],
+            ap_distance_scale: self.params.aerial_perspective_view_distance_scale.max(0.0),
             sun_direction: dir(&self.sun),
             sun_angular_radius: self.sun.angular_radius(),
             sun_illuminance: rgb(self.sun.illuminance),
@@ -362,7 +454,7 @@ impl SkyAtmosphere {
             moon_illuminance: rgb(self.moon.illuminance),
             moon_disk_luminance: self.moon.disk_luminance(0.0),
             sky_luminance_factor: [f.x, f.y, f.z],
-            _pad2: 0.0,
+            _pad0: 0.0,
         }
     }
 
@@ -391,6 +483,9 @@ impl SkyAtmosphere {
         pass.set_pipeline(&p.sky_view);
         pass.set_bind_group(0, &p.sky_view_bg, &[]);
         pass.dispatch_workgroups(self.sky_view_size.0.div_ceil(8), self.sky_view_size.1.div_ceil(8), 1);
+        pass.set_pipeline(&p.aerial_perspective);
+        pass.set_bind_group(0, &p.aerial_perspective_bg, &[]);
+        pass.dispatch_workgroups(self.ap_size.0.div_ceil(8), self.ap_size.1.div_ceil(8), 1);
     }
 
     /// `encode` on a fresh encoder, submitted at once. Call every frame after placing the camera
@@ -405,6 +500,11 @@ impl SkyAtmosphere {
     /// The LUT textures: transmittance, multiple scattering, sky view (rgba16float).
     pub fn lut_textures(&self) -> &[wgpu::Texture; 3] {
         &self.luts
+    }
+
+    /// The aerial-perspective volumes: scattering, transmittance (rgba16float, 3D).
+    pub fn aerial_perspective_textures(&self) -> &[wgpu::Texture; 2] {
+        &self.ap_volumes
     }
 
     /// Force the transmittance and multiple-scattering LUTs to be rebuilt on the next update.
