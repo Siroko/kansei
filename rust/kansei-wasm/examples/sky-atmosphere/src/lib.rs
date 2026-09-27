@@ -1,6 +1,7 @@
 //! Physically based sky (Hillaire 2020) from noon to the Midsommar intro's dusk: a clearing in a
-//! ring of dark spruce proxies under a SkyAtmosphere, lit by the sun the sky is rendered with
-//! (`SkyAtmosphere::sun_illuminance_at`), in physical units (lux, cd/m^2) exposed by EV100.
+//! ring of dark spruce proxies, with hills out to 15 km behind it, under a SkyAtmosphere with
+//! aerial perspective, lit by the sun the sky is rendered with (`SkyAtmosphere::sun_illuminance_at`),
+//! in physical units (lux, cd/m^2) exposed by EV100.
 //! See www/index.html for the URL parameters.
 
 mod display;
@@ -12,7 +13,7 @@ use wasm_bindgen::JsCast;
 
 use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions};
 use kansei_core::cameras::Camera;
-use kansei_core::geometries::{BoxGeometry, PlaneGeometry};
+use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
@@ -106,6 +107,7 @@ struct Settings {
     bearing: f32,
     look: Option<f32>,
     pitch: f32,
+    height: f32,
     ev: Option<f32>,
 }
 
@@ -113,7 +115,7 @@ fn settings() -> (Settings, web_sys::UrlSearchParams) {
     let search = web_sys::window().unwrap().location().search().unwrap_or_default();
     let q = web_sys::UrlSearchParams::new_with_str(&search).unwrap();
     let num = |k: &str| q.get(k).and_then(|v| v.parse::<f32>().ok());
-    let s = Settings { elevation: num("elevation"), bearing: num("bearing").unwrap_or(140.0), look: num("look"), pitch: num("pitch").unwrap_or(6.0), ev: num("ev") };
+    let s = Settings { elevation: num("elevation"), bearing: num("bearing").unwrap_or(140.0), look: num("look"), pitch: num("pitch").unwrap_or(6.0), height: num("height").unwrap_or(1.7), ev: num("ev") };
     (s, q)
 }
 
@@ -160,7 +162,7 @@ impl State {
         self.sky.sun.direction = sun_dir;
 
         let look = s.look.unwrap_or(s.bearing);
-        let eye = Vec3::new(0.0, 1.7, 0.0);
+        let eye = Vec3::new(0.0, s.height, 0.0);
         let d = direction_from_elevation_bearing(s.pitch, look);
         self.camera.set_position(eye.x, eye.y, eye.z);
         self.camera.look_at(&Vec3::new(eye.x + d.x, eye.y + d.y, eye.z + d.z));
@@ -208,7 +210,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     let mut scene = Scene::new();
-    let mut ground = Renderable::new(PlaneGeometry::new(4000.0, 4000.0), surface("Ground", [0.08, 0.1, 0.06]));
+    let mut ground = Renderable::new(PlaneGeometry::new(40000.0, 40000.0), surface("Ground", [0.08, 0.1, 0.06]));
     ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     scene.add(SceneNode::Renderable(ground));
 
@@ -230,12 +232,24 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     stone.object.rotation.y = 0.6;
     scene.add(SceneNode::Renderable(stone));
 
+    // hills from 1.5 to 15 km away, half buried ellipsoids: aerial perspective fades them into the sky
+    for i in 0..28u32 {
+        let a = i as f32 / 28.0 * std::f32::consts::TAU + hash(i + 5000) * 0.2;
+        let r = 1500.0 * 10f32.powf(hash(i + 6000));
+        let (rx, ry) = (r * (0.12 + hash(i + 7000) * 0.2), r * (0.02 + hash(i + 8000) * 0.03));
+        let mut hill = Renderable::new(SphereGeometry::new(1.0, 48, 24), surface("Hill", [0.05, 0.08, 0.045]));
+        hill.object.set_position(a.sin() * r, 0.0, -a.cos() * r);
+        hill.object.scale = Vec3::new(rx, ry, rx * 0.6);
+        hill.object.rotation.y = a;
+        scene.add(SceneNode::Renderable(hill));
+    }
+
     let mut sun = DirectionalLight::new(Vec3::new(0.0, -1.0, 0.0), Vec3::ZERO, 1.0);
     sun.cast_shadow = true;
     let sun_light = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     let volume = PostProcessingVolume::new(&renderer, vec![Box::new(AtmosphereEffect::new(&sky)), Box::new(DisplayEffect::new(encode_srgb))]);
-    let camera = Camera::new(62.0, 0.5, 20000.0, width as f32 / height as f32);
+    let camera = Camera::new(62.0, 0.5, 60000.0, width as f32 / height as f32);
 
     log::info!("Kansei — Sky Atmosphere (WASM) ready, {:?}", renderer.presentation_format());
     let state = Rc::new(RefCell::new(State { renderer, scene, camera, sky, volume, sun_light, settings, start: now_secs() }));
