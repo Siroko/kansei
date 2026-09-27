@@ -5,7 +5,9 @@
 //!
 //! URL parameters: `cam=front|behind|top|wall`, `cull=main` (CPU-cull the trunks to the camera
 //! only, the bug GPU per-view culling avoids), `drive=1`, `t=<seconds>` (freeze), `shadows=0`,
-//! `fog=0`, `stats=1` (log the CPU time of the render call), `casters=<n>` (n more renderables).
+//! `fog=0`, `stats=1` (log the CPU time of the render call and the frame interval, which is the
+//! GPU time when the browser runs without vsync), `casters=<n>` (n more
+//! renderables), `lamps=<n>` (n small downlights), `clusters=0` (every light at every pixel).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -150,6 +152,8 @@ struct State {
     cpu_cull: Option<(Vec<f32>, wgpu::Buffer, usize)>,
     /// `stats=1`: CPU milliseconds spent in render_with_postprocessing, summed over a window.
     stats: Option<(f64, u32)>,
+    /// `stats=1`: when the window started, for the frame interval (GPU-bound without vsync).
+    window_start: f64,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -287,6 +291,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     let car = Car { body, lenses, lights };
 
+    // `lamps=N`: N small unshadowed downlights over the forest, in random colours (clustered
+    // light culling keeps them cheap; `clusters=0` shades every pixel with every light)
+    let lamps: u32 = query_param("lamps").and_then(|v| v.parse().ok()).unwrap_or(0);
+    for i in 0..lamps {
+        let pos = Vec3::new(-30.0 + hash(i + 501) * 60.0, 2.5 + hash(i + 503) * 2.0, -70.0 + hash(i + 507) * 75.0);
+        let hue = hash(i + 509) * 6.0;
+        let color = Vec3::new((hue - 3.0).abs() - 1.0, 2.0 - (hue - 2.0).abs(), 2.0 - (hue - 4.0).abs());
+        let color = Vec3::new(color.x.clamp(0.0, 1.0), color.y.clamp(0.0, 1.0), color.z.clamp(0.0, 1.0));
+        let mut lamp = SpotLight::new(pos, Vec3::new(0.0, -1.0, 0.0), color, 800.0, 7.0, 25f32.to_radians(), 50f32.to_radians());
+        lamp.volumetric_scale = 0.0;
+        scene.add(SceneNode::Light(Light::Spot(lamp)));
+    }
+    renderer.set_clustered_lights(query_param("clusters").as_deref() != Some("0"));
+
     // `casters=N`: N more renderables (one draw each), to measure per-draw CPU cost
     let extra: u32 = query_param("casters").and_then(|v| v.parse().ok()).unwrap_or(0);
     for i in 0..extra {
@@ -329,13 +347,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let drive = query_param("drive").as_deref() == Some("1");
     let cpu_cull = cull_main.then(|| (trunks.clone(), all_trunks.clone(), forest));
     let stats = (query_param("stats").as_deref() == Some("1")).then_some((0.0, 0));
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, car, start_ms: now_secs(), frozen_t, cam, drive, cpu_cull, stats }));
+    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, car, start_ms: now_secs(), frozen_t, cam, drive, cpu_cull, stats, window_start: now_secs() }));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
         {
             let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref car, ref start_ms, frozen_t, ref cam, ref drive, ref cpu_cull, ref mut stats } = *st;
+            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref car, ref start_ms, frozen_t, ref cam, ref drive, ref cpu_cull, ref mut stats, ref mut window_start } = *st;
             let clock = (now_secs() - *start_ms) as f32;
             let t = frozen_t.unwrap_or(clock);
 
@@ -390,9 +408,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 *sum += (now_secs() - before) * 1000.0;
                 *frames += 1;
                 if *frames == 240 {
-                    log::info!("render_with_postprocessing: {:.2} ms CPU per frame", *sum / 240.0);
+                    let interval = (now_secs() - *window_start) * 1000.0 / 240.0;
+                    log::info!("frame: {:.2} ms CPU in render_with_postprocessing, {interval:.2} ms between frames", *sum / 240.0);
                     *sum = 0.0;
                     *frames = 0;
+                    *window_start = now_secs();
                 }
             }
         }
