@@ -49,6 +49,13 @@ impl Binding {
         }}
     }
 
+    pub fn texture_cube(index: u32, visibility: wgpu::ShaderStages) -> Self {
+        Self { index, visibility, ty: BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::Cube,
+        }}
+    }
+
     pub fn texture_depth(index: u32, visibility: wgpu::ShaderStages) -> Self {
         Self { index, visibility, ty: BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Depth,

@@ -41,7 +41,11 @@ impl Lut {
 }
 
 fn read(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Lut {
-    let (w, h, d) = (texture.width(), texture.height(), texture.depth_or_array_layers());
+    read_mip(device, queue, texture, 0)
+}
+
+fn read_mip(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, mip: u32) -> Lut {
+    let (w, h, d) = ((texture.width() >> mip).max(1), (texture.height() >> mip).max(1), texture.depth_or_array_layers());
     let row = (w * 8).div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -51,12 +55,12 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> 
     });
     let mut encoder = device.create_command_encoder(&Default::default());
     encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
+        wgpu::TexelCopyTextureInfo { texture, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         wgpu::TexelCopyBufferInfo {
             buffer: &buffer,
             layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
         },
-        texture.size(),
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: d },
     );
     queue.submit(std::iter::once(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
@@ -286,4 +290,43 @@ fn sky_lighting_sh_matches_the_sky_it_projects() {
         assert!(((down - expected) / expected).abs().max_element() < 0.2, "sun {elevation}: down {down} vs {expected}");
         eprintln!("sun {elevation}: E_up SH {from_sh} LUT {e_up}; sun {sun}; E_down {down}");
     }
+}
+
+#[test]
+fn environment_cubemap_faces_follow_the_webgpu_layout_and_the_sky() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let options = SkyAtmosphereOptions::default();
+    let mut sky = SkyAtmosphere::new(&device, options);
+    // a low sun in the east (+X)
+    sky.sun.direction = direction_from_elevation_bearing(4.0, 90.0);
+    let mut camera = Camera::new(60.0, 0.1, 1000.0, 1.0);
+    camera.set_position(0.0, 2.0, 0.0);
+    camera.look_at(&Vec3::new(0.0, 2.0, -10.0));
+    sky.update(&device, &queue, &mut camera);
+    let env = read(&device, &queue, sky.environment_texture());
+    let lut = read(&device, &queue, &sky.lut_textures()[2]);
+    let c = options.environment_size / 2;
+    // layers +X, -X, +Y, -Y, +Z, -Z; the face centres look along the axes (t runs down the side
+    // faces, so two rows above the centre look 2 degrees above the horizon)
+    let face = |layer: u32| env.at3(c, if layer == 2 || layer == 3 { c } else { c - 2 }, layer);
+    let (east, west, zenith, nadir) = (face(0), face(1), face(2), face(3));
+    assert!(east.x > 3.0 * west.x, "east {east}, west {west}");
+    assert!(zenith.z > zenith.x, "zenith {zenith}");
+    // the zenith face centre is the sky-view LUT's top row
+    let lut_zenith = lut.at(0, 0);
+    assert!(((zenith - lut_zenith) / lut_zenith).abs().max_element() < 0.03, "{zenith} vs {lut_zenith}");
+    // below the horizon: the ground's bounce, far dimmer than the sky toward the sun
+    assert!(nadir.max_element() > 0.0 && nadir.max_element() < east.max_element());
+    // +Z (south) and -Z (north) are symmetric about the east-west sun plane
+    let (south, north) = (face(4), face(5));
+    assert!(((south - north) / north).abs().max_element() < 0.05, "south {south}, north {north}");
+    // the prefiltered mips are filled, and the roughest spreads the sunset glow round the cube
+    let mips = sky.environment_texture().mip_level_count();
+    let last = read_mip(&device, &queue, sky.environment_texture(), mips - 1);
+    let (e1, w1) = (last.at3(0, 0, 0), last.at3(0, 0, 1));
+    assert!(e1.is_finite() && w1.min_element() > 0.0 && e1.x > w1.x && e1.x / w1.x < east.x / west.x, "rough east {e1}, west {w1}");
+    eprintln!("env: east {east} west {west} zenith {zenith} nadir {nadir}; roughest east {e1} west {w1}");
 }

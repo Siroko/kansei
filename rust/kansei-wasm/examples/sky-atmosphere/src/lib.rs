@@ -3,7 +3,8 @@
 //! aerial perspective. Surfaces are lit by the sun the sky is rendered with
 //! (`SkyAtmosphere::sun_illuminance_at`) and by the sky itself (`SkyLighting` SH), in physical units
 //! (lux, cd/m^2) exposed by EV100. With `fog=`, froxel height fog lit by the same sun and sky
-//! lies in front of the atmosphere; with `mist=1`, a local fog volume fills the clearing.
+//! lies in front of the atmosphere; with `mist=1`, a local fog volume fills the clearing. A chrome
+//! ball, a rough metal ball and a pond reflect the sky through the prefiltered environment cubemap.
 //! See www/index.html for the URL parameters.
 
 mod display;
@@ -13,8 +14,10 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SKY_LIGHTING_WGSL};
-use kansei_core::buffers::{BufferType, ComputeBuffer};
+use kansei_core::atmosphere::{
+    direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SKY_ENVIRONMENT_WGSL, SKY_LIGHTING_WGSL,
+};
+use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
@@ -95,6 +98,90 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(material.albedo.rgb / 3.14159265 * (e + skyIrradiance(sky, n)), 1.0);
 }
 "#;
+
+/// Reflective surfaces: the sky's prefiltered environment (split sum) and a GGX sun highlight
+/// over a diffuse base. Prefixed with SKY_LIGHTING_WGSL and SKY_ENVIRONMENT_WGSL.
+const REFLECTIVE_WGSL: &str = r#"
+struct Surface { albedo: vec4<f32>, f0_roughness: vec4<f32> };
+@group(0) @binding(0) var<uniform> material: Surface;
+@group(0) @binding(1) var<uniform> sky: SkyLighting;
+@group(0) @binding(2) var env: texture_cube<f32>;
+@group(0) @binding(3) var env_sampler: sampler;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+struct DirLight { direction: vec3<f32>, _pad0: f32, color: vec3<f32>, intensity: f32 };
+struct PtLight { position: vec3<f32>, radius: f32, color: vec3<f32>, intensity: f32 };
+struct LightUniforms { num_directional: u32, num_point: u32, _pad0: u32, _pad1: u32,
+                       directional: array<DirLight, 4>, point: array<PtLight, 8> };
+@group(1) @binding(2) var<uniform> lights: LightUniforms;
+
+struct VertexInput { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
+struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) world_position: vec3<f32>,
+                      @location(1) world_normal: vec3<f32> };
+
+@vertex
+fn vertex_main(input: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let world_pos = world_matrix * input.position;
+    out.clip_position = projection_matrix * view_matrix * world_pos;
+    out.world_position = world_pos.xyz;
+    out.world_normal = (normal_matrix * vec4<f32>(input.normal, 0.0)).xyz;
+    return out;
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let n = normalize(input.world_normal);
+    let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+    let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
+    let v = normalize(camera_pos - input.world_position);
+    let nv = max(dot(n, v), 1e-3);
+    let f0 = material.f0_roughness.rgb;
+    let roughness = max(material.f0_roughness.a, 0.02);
+
+    // the sky: diffuse from the SH, specular from the prefiltered cubemap (split sum)
+    let spec_brdf = skyEnvironmentBrdf(f0, roughness, nv);
+    var color = material.albedo.rgb / 3.14159265 * skyIrradiance(sky, n) * (1.0 - spec_brdf)
+              + skyEnvironment(env, env_sampler, reflect(-v, n), roughness) * spec_brdf;
+
+    // the sun: Lambert + GGX with Schlick's Fresnel and a Smith visibility approximation
+    let a2 = roughness * roughness * roughness * roughness;
+    for (var i = 0u; i < lights.num_directional; i++) {
+        let l = -normalize(lights.directional[i].direction);
+        let nl = max(dot(n, l), 0.0);
+        let h = normalize(l + v);
+        let nh = max(dot(n, h), 0.0);
+        let d = a2 / (3.14159265 * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
+        let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0);
+        let k = roughness * roughness * 0.5;
+        let vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
+        color += lights.directional[i].color * nl * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
+    }
+    return vec4<f32>(color, 1.0);
+}
+"#;
+
+fn reflective(label: &str, albedo: [f32; 3], f0: [f32; 3], roughness: f32, sky: &SkyAtmosphere) -> Material {
+    let mut m = Material::new(
+        label,
+        &format!("{SKY_LIGHTING_WGSL}\n{SKY_ENVIRONMENT_WGSL}\n{REFLECTIVE_WGSL}"),
+        vec![
+            Binding::uniform(0, ShaderStages::FRAGMENT),
+            Binding::uniform(1, ShaderStages::FRAGMENT),
+            Binding::texture_cube(2, ShaderStages::FRAGMENT),
+            Binding::sampler(3, ShaderStages::FRAGMENT),
+        ],
+        MaterialOptions::default(),
+    );
+    m.set_uniform_bindable(0, label, &[albedo[0], albedo[1], albedo[2], 1.0, f0[0], f0[1], f0[2], roughness]);
+    m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
+    m.set_bindable(2, Texture::from_view("SkyEnvironment", sky.environment_texture().clone(), sky.bindings().environment.clone()));
+    m.set_bindable(3, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
+    m
+}
 
 fn surface(label: &str, albedo: [f32; 3], sky: &SkyAtmosphere) -> Material {
     let mut m = Material::new(
@@ -250,6 +337,23 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     stone.object.set_position(d.x * 9.0 - 1.5, 0.6, d.z * 9.0);
     stone.object.rotation.y = 0.6;
     scene.add(SceneNode::Renderable(stone));
+
+    // sky reflections: a chrome ball, a rough metal ball and a still pond
+    let side = Vec3::new(-d.z, 0.0, d.x);
+    let place = |ahead: f32, across: f32| (d.x * ahead + side.x * across, d.z * ahead + side.z * across);
+    let (x, z) = place(7.0, 2.2);
+    let mut chrome = Renderable::new(SphereGeometry::new(0.8, 64, 32), reflective("Chrome", [0.0, 0.0, 0.0], [0.95, 0.93, 0.88], 0.03, &sky));
+    chrome.object.set_position(x, 0.8, z);
+    scene.add(SceneNode::Renderable(chrome));
+    let (x, z) = place(8.0, 4.2);
+    let mut rough = Renderable::new(SphereGeometry::new(0.8, 64, 32), reflective("RoughMetal", [0.0, 0.0, 0.0], [0.9, 0.7, 0.45], 0.45, &sky));
+    rough.object.set_position(x, 0.8, z);
+    scene.add(SceneNode::Renderable(rough));
+    let (x, z) = place(16.0, -1.0);
+    let mut pond = Renderable::new(PlaneGeometry::new(16.0, 9.0), reflective("Pond", [0.01, 0.012, 0.012], [0.02, 0.02, 0.02], 0.04, &sky));
+    pond.object.rotation.x = -std::f32::consts::FRAC_PI_2;
+    pond.object.set_position(x, 0.03, z);
+    scene.add(SceneNode::Renderable(pond));
 
     // hills from 1.5 to 15 km away, half buried ellipsoids: aerial perspective fades them into the sky
     for i in 0..28u32 {

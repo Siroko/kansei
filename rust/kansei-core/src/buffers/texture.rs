@@ -60,6 +60,22 @@ impl Texture {
         }
     }
 
+    /// Wrap a texture created elsewhere (a render target, a LUT, a cubemap) with the view to bind,
+    /// so it can be attached to a material like any other Texture.
+    pub fn from_view(label: &str, texture: wgpu::Texture, view: wgpu::TextureView) -> Self {
+        Self {
+            label: label.to_string(),
+            format: texture.format(),
+            size: texture.size(),
+            usage: texture.usage(),
+            dimension: texture.dimension(),
+            mip_levels: texture.mip_level_count(),
+            gpu_texture: Some(texture),
+            view: Some(view),
+            initial_data: None,
+        }
+    }
+
     pub fn initialize(&mut self, device: &wgpu::Device) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&self.label),
