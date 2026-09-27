@@ -65,7 +65,7 @@ impl PostProcessingVolume {
 
     /// Whether any effect wants a jittered projection (the renderer then jitters the camera).
     pub fn wants_jitter(&self) -> bool {
-        self.effects.iter().any(|e| e.wants_jitter())
+        self.effects.iter().any(|e| e.is_active() && e.wants_jitter())
     }
 
     pub fn gbuffer(&self) -> Option<&GBuffer> {
@@ -215,7 +215,7 @@ impl PostProcessingVolume {
             (gbuffer.width, gbuffer.height)
         };
         let display_size = (width, height);
-        let upscaling = render_size != display_size && self.effects.iter().any(|e| e.upscales_to_display());
+        let upscaling = render_size != display_size && self.effects.iter().any(|e| e.is_active() && e.upscales_to_display());
         if upscaling {
             self.ensure_display_targets(display_size);
         }
@@ -243,6 +243,9 @@ impl PostProcessingVolume {
             });
 
             for effect in &mut self.effects {
+                if !effect.is_active() {
+                    continue;
+                }
                 let at_display = matches!(source, Slot::Display(_)) || (upscaling && effect.upscales_to_display());
                 let target = match source {
                     _ if at_display => Slot::Display(if source == Slot::Display(0) { 1 } else { 0 }),
