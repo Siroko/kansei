@@ -36,5 +36,14 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     }
     bg = select(sharp.rgb, bg / bgW, bgW > 1e-6);
     let base = mix(sharp.rgb, bg, smoothstep(0.5, 1.5, abs(coc)));
-    textureStore(outputTex, gid.xy, vec4f(base * (1.0 - fg.a) + fg.rgb, sharp.a));
+    var result = base * (1.0 - fg.a) + fg.rgb;
+    switch (p.debugView) {
+        case 1u: { result = base; }
+        case 2u: { result = fg.rgb / max(fg.a, 1e-3); }
+        case 3u: { result = vec3f(fg.a); }
+        // CoC: red in front of the focus plane, blue behind, a pixel of CoC per 1/16
+        case 4u: { result = vec3f(saturate(-coc / 16.0), 1.0 - saturate(abs(coc) / 1.5), saturate(coc / 16.0)); }
+        default: {}
+    }
+    textureStore(outputTex, gid.xy, vec4f(result, sharp.a));
 }
