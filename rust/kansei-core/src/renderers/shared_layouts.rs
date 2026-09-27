@@ -98,7 +98,7 @@ impl SharedLayouts {
         });
 
         // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap) and
-        // spot lights (shadow atlas + light buffer + comparison sampler)
+        // spot lights (shadow atlas + light buffer + comparison sampler + clustered light lists)
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Shared/ShadowBGL"),
             entries: &[
@@ -173,6 +173,28 @@ impl SharedLayouts {
                     binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                // Binding 8: light-cluster parameters (lights::light_clusters)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 9: per-cluster light lists
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],

@@ -81,6 +81,9 @@ pub struct Renderer {
     spot_shadow_atlas: Option<crate::shadows::SpotShadowAtlas>,
     spot_dummy_atlas_view: Option<wgpu::TextureView>,
     spot_shadow_sampler: Option<wgpu::Sampler>,
+    // Clustered light lists (group 3, bindings 8-9)
+    light_clusters: Option<crate::lights::light_clusters::LightClusters>,
+    clustered_lights: bool,
     // GPU instance culling (renderables with `instance_culling`)
     cull_pipeline: Option<crate::culling::CullPipeline>,
     // Planar reflections, drawn after the shadow maps and before the main pass
@@ -138,6 +141,8 @@ impl Renderer {
             spot_shadow_atlas: None,
             spot_dummy_atlas_view: None,
             spot_shadow_sampler: None,
+            light_clusters: None,
+            clustered_lights: true,
             cull_pipeline: None,
             planar_reflections: Vec::new(),
             render_bundle: None,
@@ -350,6 +355,7 @@ impl Renderer {
         self.cube_dummy_tex = Some(cube_dummy_tex);
         self.cube_dummy_view = Some(cube_dummy_view);
         self.cube_shadow_sampler = Some(cube_shadow_sampler);
+        self.light_clusters = Some(crate::lights::light_clusters::LightClusters::new(&device, &spot_light_buf));
         self.spot_light_buf = Some(spot_light_buf);
         self.spot_dummy_atlas_view = Some(spot_dummy_atlas_view);
         self.spot_shadow_sampler = Some(spot_shadow_sampler);
@@ -383,6 +389,7 @@ impl Renderer {
             .unwrap_or_else(|| self.spot_dummy_atlas_view.as_ref().unwrap());
         let view = wgpu::BindingResource::TextureView;
         let sampler = wgpu::BindingResource::Sampler;
+        let clusters = self.light_clusters.as_ref().unwrap();
         self.shadow_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Renderer/ShadowBG"),
             layout: &shared.shadow_bgl,
@@ -395,6 +402,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 5, resource: view(spot_view) },
                 wgpu::BindGroupEntry { binding: 6, resource: self.spot_light_buf.as_ref().unwrap().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: sampler(self.spot_shadow_sampler.as_ref().unwrap()) },
+                wgpu::BindGroupEntry { binding: 8, resource: clusters.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: clusters.lights.as_entire_binding() },
             ],
         }));
         self.invalidate_bundle();
@@ -964,6 +973,13 @@ impl Renderer {
 
         self.cubemap_shadow_map = Some(csm);
         self.rebuild_shadow_bind_group();
+    }
+
+    /// Shade spot lights through the clustered light lists (the default): each fragment visits
+    /// only the lights whose range and cone reach its cluster. Off, every fragment visits every
+    /// light (for comparisons and debugging).
+    pub fn set_clustered_lights(&mut self, enabled: bool) {
+        self.clustered_lights = enabled;
     }
 
     /// Enable perspective shadow maps for spot lights: each frame, the first `max_lights` spot
@@ -1541,8 +1557,18 @@ impl Renderer {
         // Spot light shadow maps
         self.run_spot_shadow_pass(scene);
 
-        // Planar reflections (they sample this frame's shadow maps)
+        // Planar reflections (they sample this frame's shadow maps), shaded with every light,
+        // then the light clusters for the camera's passes
+        if !self.planar_reflections.is_empty() {
+            self.light_clusters.as_ref().unwrap().disable(self.queue.as_ref().unwrap());
+        }
         self.render_planar_reflections(scene);
+        let clusters = self.light_clusters.as_ref().unwrap();
+        if self.clustered_lights {
+            clusters.build(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera, self.config.width, self.config.height);
+        } else {
+            clusters.disable(self.queue.as_ref().unwrap());
+        }
 
         // Check material dirty flags → invalidate bundle
         for idx in scene.ordered_indices() {
@@ -1811,8 +1837,18 @@ impl Renderer {
         // Spot light shadow maps
         self.run_spot_shadow_pass(scene);
 
-        // Planar reflections (they sample this frame's shadow maps)
+        // Planar reflections (they sample this frame's shadow maps), shaded with every light,
+        // then the light clusters for the camera's passes
+        if !self.planar_reflections.is_empty() {
+            self.light_clusters.as_ref().unwrap().disable(self.queue.as_ref().unwrap());
+        }
         self.render_planar_reflections(scene);
+        let clusters = self.light_clusters.as_ref().unwrap();
+        if self.clustered_lights {
+            clusters.build(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera, self.config.width, self.config.height);
+        } else {
+            clusters.disable(self.queue.as_ref().unwrap());
+        }
 
         // Check material dirty flags → invalidate gbuffer bundle
         for idx in scene.ordered_indices() {

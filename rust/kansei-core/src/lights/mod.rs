@@ -3,6 +3,7 @@ mod point;
 mod area;
 mod spot;
 pub(crate) mod spot_lights_gpu;
+pub(crate) mod light_clusters;
 mod light_uniforms;
 
 pub use directional::DirectionalLight;
@@ -10,6 +11,7 @@ pub use point::PointLight;
 pub use area::AreaLight;
 pub use spot::SpotLight;
 pub use spot_lights_gpu::MAX_SPOT_LIGHTS;
+pub use light_clusters::CLUSTER_GRID;
 pub use light_uniforms::{LightUniforms, LIGHT_UNIFORM_BYTES};
 
 /// WGSL for the spot-light data (`KanseiSpotLight`, `KanseiSpotLights`) and the light's own

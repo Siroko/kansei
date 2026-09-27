@@ -27,6 +27,19 @@ struct KanseiSpotLights {
     lights : array<KanseiSpotLight>,
 }
 
+// Clustered culling (light_clusters.wgsl): per cluster, a count then up to 31 light indices.
+const KANSEI_CLUSTER_SLOTS : u32 = 32u;
+
+struct KanseiClusterParams {
+    view    : mat4x4f,   // world -> view space of the camera the clusters were built for
+    invProj : mat4x4f,   // its (jittered) projection, inverted
+    screen  : vec2f,     // pixels
+    near    : f32,       // depth range the slices span, exponentially
+    far     : f32,
+    grid    : vec3u,     // tiles x, tiles y, slices
+    enabled : u32,       // 0: shade with every light (views such as planar reflections)
+}
+
 struct KanseiLightSample {
     toLight     : vec3f,   // unit vector from the point to the light
     illuminance : vec3f,   // lux times colour on a surface facing the light
