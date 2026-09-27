@@ -1,0 +1,414 @@
+use crate::cameras::Camera;
+use crate::math::Vec3;
+
+use super::params::{AtmosphereGpu, AtmosphereParams, CelestialLight, SkyFrameGpu};
+
+pub(crate) const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
+pub(crate) const FRAME_WGSL: &str = include_str!("shaders/frame.wgsl");
+pub(crate) const LOOKUP_TRANSMITTANCE_WGSL: &str = include_str!("shaders/lookup_transmittance.wgsl");
+pub(crate) const LOOKUP_MULTI_SCATTERING_WGSL: &str = include_str!("shaders/lookup_multi_scattering.wgsl");
+pub(crate) const SCATTERING_WGSL: &str = include_str!("shaders/scattering.wgsl");
+pub(crate) const SKY_LOOKUP_WGSL: &str = include_str!("shaders/sky_lookup.wgsl");
+
+const TRANSMITTANCE_WGSL: &str = include_str!("shaders/transmittance_lut.wgsl");
+const MULTI_SCATTERING_WGSL: &str = include_str!("shaders/multi_scattering_lut.wgsl");
+const SKY_VIEW_WGSL: &str = include_str!("shaders/sky_view_lut.wgsl");
+
+pub(crate) const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Limb darkening of the sun's disk (the moon's is flat); the composite shader uses the same.
+pub(crate) const SUN_LIMB_DARKENING: f32 = 0.6;
+
+/// Lowest camera altitude the LUTs are built for, km: below it the horizon maths loses precision.
+const MIN_CAMERA_ALTITUDE_KM: f32 = 0.005;
+
+fn shader(parts: &[&str]) -> String {
+    parts.concat()
+}
+
+pub(crate) fn transmittance_source() -> String {
+    shader(&[COMMON_WGSL, TRANSMITTANCE_WGSL])
+}
+
+pub(crate) fn multi_scattering_source() -> String {
+    shader(&[COMMON_WGSL, LOOKUP_TRANSMITTANCE_WGSL, MULTI_SCATTERING_WGSL])
+}
+
+pub(crate) fn sky_view_source() -> String {
+    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, LOOKUP_MULTI_SCATTERING_WGSL, SCATTERING_WGSL, SKY_VIEW_WGSL])
+}
+
+/// LUT resolutions. The defaults are Hillaire 2020's, except the sky-view LUT, which spans the
+/// full world azimuth (so the sun and the moon can share it) and has more columns for that.
+#[derive(Debug, Clone, Copy)]
+pub struct SkyAtmosphereOptions {
+    pub transmittance_size: (u32, u32),
+    pub multi_scattering_size: u32,
+    pub sky_view_size: (u32, u32),
+}
+
+impl Default for SkyAtmosphereOptions {
+    fn default() -> Self {
+        Self { transmittance_size: (256, 64), multi_scattering_size: 32, sky_view_size: (256, 128) }
+    }
+}
+
+/// The GPU handles an effect or a material needs to read the atmosphere. Cheap to clone.
+#[derive(Clone)]
+pub struct SkyAtmosphereBindings {
+    /// `Atmosphere` uniform (the WGSL struct in `ATMOSPHERE_WGSL`).
+    pub atmosphere: wgpu::Buffer,
+    /// `SkyFrame` uniform, rewritten by every `SkyAtmosphere::update`.
+    pub frame: wgpu::Buffer,
+    pub transmittance: wgpu::TextureView,
+    pub multi_scattering: wgpu::TextureView,
+    pub sky_view: wgpu::TextureView,
+    /// Linear, clamping: for the transmittance and multiple-scattering LUTs.
+    pub lut_sampler: wgpu::Sampler,
+    /// Linear, repeating in u (the azimuth): for the sky-view LUT.
+    pub sky_view_sampler: wgpu::Sampler,
+}
+
+struct Pipelines {
+    transmittance: wgpu::ComputePipeline,
+    transmittance_bg: wgpu::BindGroup,
+    multi_scattering: wgpu::ComputePipeline,
+    multi_scattering_bg: wgpu::BindGroup,
+    sky_view: wgpu::ComputePipeline,
+    sky_view_bg: wgpu::BindGroup,
+}
+
+/// A physically based sky and atmosphere after Hillaire 2020, as the LUTs the sky, the aerial
+/// perspective and the sky lighting are rendered from:
+/// - **transmittance** (256x64): transmittance to space by altitude and zenith angle;
+/// - **multiple scattering** (32x32): all scattering orders >= 2, per unit illuminance;
+/// - **sky view** (256x128): the sky's luminance around the camera, every frame.
+///
+/// The first two depend only on [`AtmosphereParams`] and are rebuilt when they change. The sun can
+/// be anywhere, including below the horizon at dusk, where the sky is lit only by the light
+/// scattered high above the planet's shadow. A moon (off by default) scatters as a second light.
+///
+/// World space is metres, Y up, with the planet's surface at `y = -origin_altitude_m` and its
+/// centre straight below the world origin.
+///
+/// ```ignore
+/// let mut sky = SkyAtmosphere::new(renderer.device(), SkyAtmosphereOptions::default());
+/// sky.sun.direction = direction_from_elevation_bearing(-2.5, 140.0);
+/// sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0); // lux
+/// let volume = PostProcessingVolume::new(&renderer, vec![Box::new(AtmosphereEffect::new(&sky)), ...]);
+/// // each frame, once the camera is placed:
+/// sky.update(renderer.device(), renderer.queue(), &mut camera);
+/// renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
+/// ```
+pub struct SkyAtmosphere {
+    pub params: AtmosphereParams,
+    pub sun: CelestialLight,
+    pub moon: CelestialLight,
+    /// Altitude of the world origin above the planet's surface, metres.
+    pub origin_altitude_m: f32,
+    bindings: SkyAtmosphereBindings,
+    /// Transmittance, multiple-scattering and sky-view LUT textures (the views are in `bindings`).
+    luts: [wgpu::Texture; 3],
+    pipelines: Pipelines,
+    transmittance_size: (u32, u32),
+    multi_scattering_size: u32,
+    sky_view_size: (u32, u32),
+    /// Atmosphere the static LUTs were last built for.
+    built_for: Option<AtmosphereGpu>,
+}
+
+fn lut_2d(device: &wgpu::Device, label: &str, (w, h): (u32, u32)) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: LUT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
+pub(crate) fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+pub(crate) fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+pub(crate) fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: LUT_FORMAT,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
+pub(crate) fn compute_pipeline(device: &wgpu::Device, label: &str, code: &str, bgl: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn bind_group(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, resources: &[wgpu::BindingResource]) -> wgpu::BindGroup {
+    let entries: Vec<_> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| wgpu::BindGroupEntry { binding: i as u32, resource: r.clone() })
+        .collect();
+    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
+}
+
+impl SkyAtmosphere {
+    pub fn new(device: &wgpu::Device, options: SkyAtmosphereOptions) -> Self {
+        let uniform = |label: &str, size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let sampler = |label: &str, u: wgpu::AddressMode| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some(label),
+                address_mode_u: u,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            })
+        };
+        let ms = options.multi_scattering_size.max(2);
+        let luts = [
+            lut_2d(device, "SkyAtmosphere/TransmittanceLUT", options.transmittance_size),
+            lut_2d(device, "SkyAtmosphere/MultiScatteringLUT", (ms, ms)),
+            lut_2d(device, "SkyAtmosphere/SkyViewLUT", options.sky_view_size),
+        ];
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let bindings = SkyAtmosphereBindings {
+            atmosphere: uniform("SkyAtmosphere/Atmosphere", std::mem::size_of::<AtmosphereGpu>()),
+            frame: uniform("SkyAtmosphere/Frame", std::mem::size_of::<SkyFrameGpu>()),
+            transmittance: view(&luts[0]),
+            multi_scattering: view(&luts[1]),
+            sky_view: view(&luts[2]),
+            lut_sampler: sampler("SkyAtmosphere/LutSampler", wgpu::AddressMode::ClampToEdge),
+            sky_view_sampler: sampler("SkyAtmosphere/SkyViewSampler", wgpu::AddressMode::Repeat),
+        };
+
+        let b = &bindings;
+        let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries })
+        };
+        let transmittance_bgl = bgl("SkyAtmosphere/TransmittanceBGL", &[uniform_entry(0), storage_entry(1)]);
+        let multi_scattering_bgl = bgl(
+            "SkyAtmosphere/MultiScatteringBGL",
+            &[uniform_entry(0), texture_entry(1), sampler_entry(2), storage_entry(3)],
+        );
+        let sky_view_bgl = bgl(
+            "SkyAtmosphere/SkyViewBGL",
+            &[uniform_entry(0), uniform_entry(1), texture_entry(2), texture_entry(3), sampler_entry(4), storage_entry(5)],
+        );
+        let tex = wgpu::BindingResource::TextureView;
+        let pipelines = Pipelines {
+            transmittance: compute_pipeline(device, "SkyAtmosphere/Transmittance", &transmittance_source(), &transmittance_bgl),
+            transmittance_bg: bind_group(
+                device,
+                "SkyAtmosphere/TransmittanceBG",
+                &transmittance_bgl,
+                &[b.atmosphere.as_entire_binding(), tex(&b.transmittance)],
+            ),
+            multi_scattering: compute_pipeline(device, "SkyAtmosphere/MultiScattering", &multi_scattering_source(), &multi_scattering_bgl),
+            multi_scattering_bg: bind_group(
+                device,
+                "SkyAtmosphere/MultiScatteringBG",
+                &multi_scattering_bgl,
+                &[
+                    b.atmosphere.as_entire_binding(),
+                    tex(&b.transmittance),
+                    wgpu::BindingResource::Sampler(&b.lut_sampler),
+                    tex(&b.multi_scattering),
+                ],
+            ),
+            sky_view: compute_pipeline(device, "SkyAtmosphere/SkyView", &sky_view_source(), &sky_view_bgl),
+            sky_view_bg: bind_group(
+                device,
+                "SkyAtmosphere/SkyViewBG",
+                &sky_view_bgl,
+                &[
+                    b.atmosphere.as_entire_binding(),
+                    b.frame.as_entire_binding(),
+                    tex(&b.transmittance),
+                    tex(&b.multi_scattering),
+                    wgpu::BindingResource::Sampler(&b.lut_sampler),
+                    tex(&b.sky_view),
+                ],
+            ),
+        };
+
+        Self {
+            params: AtmosphereParams::earth(),
+            sun: CelestialLight::sun(),
+            moon: CelestialLight::moon(),
+            origin_altitude_m: 0.0,
+            bindings,
+            luts,
+            pipelines,
+            transmittance_size: options.transmittance_size,
+            multi_scattering_size: ms,
+            sky_view_size: options.sky_view_size,
+            built_for: None,
+        }
+    }
+
+    /// GPU handles for effects and materials that read the atmosphere.
+    pub fn bindings(&self) -> &SkyAtmosphereBindings {
+        &self.bindings
+    }
+
+    /// Planet-frame position (km) of a world-space point (metres).
+    pub fn to_planet_km(&self, world: Vec3) -> glam::Vec3 {
+        glam::Vec3::new(world.x, world.y + self.origin_altitude_m, world.z) * 0.001
+            + glam::Vec3::new(0.0, self.params.bottom_radius_km, 0.0)
+    }
+
+    /// Transmittance of the atmosphere from a world-space point toward the sun: 0 when the sun is
+    /// below that point's horizon. Multiply the sun's illuminance by it to light the scene with
+    /// the colour the sky is rendered with.
+    pub fn sun_transmittance(&self, world: Vec3) -> Vec3 {
+        let p = self.to_planet_km(world);
+        let r = p.length().max(self.params.bottom_radius_km);
+        let mu = (p / p.length()).dot(self.sun.direction.to_glam().normalize_or(glam::Vec3::Y));
+        // the part of the disk above the horizon, as the shaders' horizonVisibility
+        let bottom = self.params.bottom_radius_km;
+        let horizon = -((r - bottom) * (r + bottom)).max(0.0).sqrt() / r;
+        let w = self.sun.angular_radius();
+        let x = ((mu - horizon + w) / (2.0 * w)).clamp(0.0, 1.0);
+        let visibility = x * x * (3.0 - 2.0 * x);
+        let t = self.params.transmittance_to_space(r - bottom, mu.max(horizon + 1e-5)) * visibility;
+        Vec3::new(t.x, t.y, t.z)
+    }
+
+    /// The sun's illuminance after the atmosphere at a world-space point: the colour (times
+    /// intensity) of a directional light that agrees with the sky.
+    pub fn sun_illuminance_at(&self, world: Vec3) -> Vec3 {
+        let t = self.sun_transmittance(world);
+        Vec3::new(self.sun.illuminance.x * t.x, self.sun.illuminance.y * t.y, self.sun.illuminance.z * t.z)
+    }
+
+    fn frame(&self, camera: &Camera) -> SkyFrameGpu {
+        let view_proj = camera.projection_matrix.to_glam() * camera.view_matrix.to_glam();
+        let eye = camera.inverse_view_matrix.to_glam().w_axis;
+        let bottom = self.params.bottom_radius_km;
+        let top = self.params.top_radius_km();
+        // keep the camera inside the atmosphere, above the ground by a few metres
+        let p = self.to_planet_km(Vec3::new(eye.x, eye.y, eye.z));
+        let r = p.length().clamp(bottom + MIN_CAMERA_ALTITUDE_KM, top - 1e-3);
+        let camera_pos = p.normalize_or(glam::Vec3::Y) * r;
+        let origin = self.to_planet_km(Vec3::ZERO);
+        let dir = |l: &CelestialLight| l.direction.to_glam().normalize_or(glam::Vec3::Y).to_array();
+        let rgb = |v: Vec3| [v.x, v.y, v.z];
+        let f = self.params.sky_luminance_factor;
+        SkyFrameGpu {
+            inv_view_proj: view_proj.inverse().to_cols_array(),
+            camera_pos: camera_pos.to_array(),
+            _pad0: 0.0,
+            world_origin: origin.to_array(),
+            _pad1: 0.0,
+            sun_direction: dir(&self.sun),
+            sun_angular_radius: self.sun.angular_radius(),
+            sun_illuminance: rgb(self.sun.illuminance),
+            sun_disk_luminance: self.sun.disk_luminance(SUN_LIMB_DARKENING),
+            moon_direction: dir(&self.moon),
+            moon_angular_radius: self.moon.angular_radius(),
+            moon_illuminance: rgb(self.moon.illuminance),
+            moon_disk_luminance: self.moon.disk_luminance(0.0),
+            sky_luminance_factor: [f.x, f.y, f.z],
+            _pad2: 0.0,
+        }
+    }
+
+    /// Record this frame's LUT passes: the transmittance and multiple-scattering LUTs when the
+    /// atmosphere changed, then the sky-view LUT for the camera. Uses the camera's current view
+    /// and projection matrices, so place the camera first.
+    pub fn encode(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, camera: &Camera) {
+        let atmosphere = self.params.gpu_layout();
+        let b = &self.bindings;
+        let p = &self.pipelines;
+        if self.built_for != Some(atmosphere) {
+            queue.write_buffer(&b.atmosphere, 0, bytemuck::bytes_of(&atmosphere));
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/StaticLUTs"), ..Default::default() });
+            pass.set_pipeline(&p.transmittance);
+            pass.set_bind_group(0, &p.transmittance_bg, &[]);
+            pass.dispatch_workgroups(self.transmittance_size.0.div_ceil(8), self.transmittance_size.1.div_ceil(8), 1);
+            // one workgroup per texel
+            pass.set_pipeline(&p.multi_scattering);
+            pass.set_bind_group(0, &p.multi_scattering_bg, &[]);
+            pass.dispatch_workgroups(self.multi_scattering_size, self.multi_scattering_size, 1);
+            self.built_for = Some(atmosphere);
+        }
+
+        queue.write_buffer(&b.frame, 0, bytemuck::bytes_of(&self.frame(camera)));
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/SkyView"), ..Default::default() });
+        pass.set_pipeline(&p.sky_view);
+        pass.set_bind_group(0, &p.sky_view_bg, &[]);
+        pass.dispatch_workgroups(self.sky_view_size.0.div_ceil(8), self.sky_view_size.1.div_ceil(8), 1);
+    }
+
+    /// `encode` on a fresh encoder, submitted at once. Call every frame after placing the camera
+    /// and before rendering: the scene's materials and the post effects read what it writes.
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, camera: &mut Camera) {
+        camera.update_view_matrix();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("SkyAtmosphere") });
+        self.encode(queue, &mut encoder, camera);
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// The LUT textures: transmittance, multiple scattering, sky view (rgba16float).
+    pub fn lut_textures(&self) -> &[wgpu::Texture; 3] {
+        &self.luts
+    }
+
+    /// Force the transmittance and multiple-scattering LUTs to be rebuilt on the next update.
+    pub fn invalidate(&mut self) {
+        self.built_for = None;
+    }
+}
