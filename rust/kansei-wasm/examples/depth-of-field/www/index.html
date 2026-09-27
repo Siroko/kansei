@@ -21,6 +21,7 @@
         //   blades   aperture blades (default 0: round bokeh)
         //   samples  gather samples per half-resolution pixel (default 72)
         //   ev       EV100 exposure (default 10.8); dof=0 turns the depth of field off, taa=0 the TAA
+        //   scale    render scale, 0.25 to 1 (default 1): the TAA upscales to the canvas
         document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
         import init, { start } from '../pkg/kansei_wasm_depth_of_field.js';
         await init();

@@ -37,6 +37,14 @@ fn layerTolerance(coc: f32) -> f32 {
     return 0.5 + 0.2 * abs(coc);
 }
 
+// The depth under full-resolution pixel `px`. The depth buffer is at the scene's render size,
+// below this pass's when a temporal upscaler before it reconstructs the display size.
+fn loadDepth(tex: texture_depth_2d, px: vec2i) -> f32 {
+    let dims = vec2i(textureDimensions(tex));
+    let q = vec2i((vec2f(px) + 0.5) * vec2f(dims) / vec2f(f32(p.width), f32(p.height)));
+    return textureLoad(tex, min(q, dims - 1), 0);
+}
+
 fn halfSize() -> vec2u {
     return vec2u((p.width + 1u) / 2u, (p.height + 1u) / 2u);
 }
