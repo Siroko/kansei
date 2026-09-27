@@ -9,6 +9,10 @@
 //   multiple scattering, which a diffusion term takes over from deep inside thick cloud; plus
 //   the sky's light (its SH), dimmer toward the base.
 // - The atmosphere in front of the cloud: the aerial-perspective LUT at the cloud's depth.
+// - Like the sky they cover, the clouds follow the atmosphere's sky luminance factor: the sun
+//   they scatter and the air in front of them are scaled by it (their sky light is the sky
+//   lighting's, scaled already), so a sky darkened by the factor stays consistent where clouds
+//   cover it.
 // - Each frame jitters the march and blends with the previous frames, reprojected by the
 //   cloud's depth, so a few dozen steps resolve smoothly.
 // Output: rgb the light the cloud sends to the camera (after the atmosphere), a its
@@ -192,7 +196,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
                 let sigma = density * cp.extinction;
                 let up = p / r;
                 // the sun after the atmosphere above this point, and after the cloud toward it
-                let sunIn = frame.sunIlluminance * transmittanceToTop(r, dot(up, sunDir)) * horizonVisibility(r, dot(up, sunDir), frame.sunAngularRadius);
+                // the clouds are part of the sky, so they follow its luminance factor (their sky light
+                // comes from the sky lighting, which already does)
+                let sunIn = frame.sunIlluminance * frame.skyLuminanceFactor * transmittanceToTop(r, dot(up, sunDir))
+                          * horizonVisibility(r, dot(up, sunDir), frame.sunAngularRadius);
                 let od = sunOpticalDepth(p, sunDir, rBottom, rTop) * cp.extinction;
                 // multiple scattering (Wrenninge 2013): octaves of weaker extinction, flatter phase
                 var ms = 0.0;
@@ -226,7 +233,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let world = frame.cameraWorld + rd * (cloudKm * 1000.0);
     if (depthWeight > 1e-4) {
         let ap = aerialPerspective(uv, world);
-        light = light * ap.transmittance + ap.scattering * (1.0 - transmittance);
+        light = light * ap.transmittance + ap.scattering * frame.skyLuminanceFactor * (1.0 - transmittance);
     }
     var result = vec4f(light, transmittance);
 
