@@ -16,6 +16,11 @@ pub struct GBuffer {
     pub albedo_view: wgpu::TextureView,
     pub depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
+    /// Screen-space motion (uv per frame, current minus previous) of the materials with
+    /// `outputs_velocity`, drawn in the renderer's velocity pass; `NO_VELOCITY` elsewhere (TAA
+    /// reprojects those pixels by depth).
+    pub velocity_texture: wgpu::Texture,
+    pub velocity_view: wgpu::TextureView,
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
     pub ping_pong_texture: wgpu::Texture,
@@ -37,6 +42,13 @@ impl GBuffer {
     pub const MRT_FORMATS: [wgpu::TextureFormat; 4] = [
         Self::COLOR_FORMAT, Self::COLOR_FORMAT, Self::COLOR_FORMAT, Self::ALBEDO_FORMAT,
     ];
+    pub const VELOCITY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+    /// Fragment output location (and colour target index in the velocity pass) of the velocity.
+    /// It sits after the MRT targets, so a material's one shader serves both passes.
+    pub const VELOCITY_TARGET: usize = 4;
+    /// What the velocity texture is cleared to: no motion vector drawn here (an impossible
+    /// velocity, far outside the screen).
+    pub const NO_VELOCITY: f32 = 1.0e4;
 
     pub fn new(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> Self {
         let mk = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages, sc: u32| {
@@ -61,6 +73,7 @@ impl GBuffer {
         let (normal_texture, normal_view) = mk("GBuffer/Normal", Self::COLOR_FORMAT, tex_usage, 1);
         let (albedo_texture, albedo_view) = mk("GBuffer/Albedo", Self::ALBEDO_FORMAT, tex_usage, 1);
         let (depth_texture, depth_view) = mk("GBuffer/Depth", Self::DEPTH_FORMAT, tex_usage, 1);
+        let (velocity_texture, velocity_view) = mk("GBuffer/Velocity", Self::VELOCITY_FORMAT, tex_usage, 1);
         let (output_texture, output_view) = mk("GBuffer/Output", Self::COLOR_FORMAT, storage_usage, 1);
         let (ping_pong_texture, ping_pong_view) = mk("GBuffer/PingPong", Self::COLOR_FORMAT, storage_usage, 1);
 
@@ -85,7 +98,7 @@ impl GBuffer {
             color_texture, color_view, background_texture, background_view,
             emissive_texture, emissive_view,
             normal_texture, normal_view, albedo_texture, albedo_view,
-            depth_texture, depth_view, output_texture, output_view,
+            depth_texture, depth_view, velocity_texture, velocity_view, output_texture, output_view,
             ping_pong_texture, ping_pong_view,
             color_msaa_view, emissive_msaa_view, normal_msaa_view,
             albedo_msaa_view, depth_msaa_view, _msaa_textures,
