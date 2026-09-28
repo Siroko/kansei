@@ -20,12 +20,15 @@ pub struct HeightFogLayer {
 }
 
 impl HeightFogLayer {
-    /// From Unreal's `FogDensity`, `FogHeightFalloff` and the fog actor's height in metres,
-    /// assuming Unreal's convention of both coefficients per 1000 cm in base 2 (the conversion
-    /// midsommar-web's `Look::apply_fog` uses): per metre, x 0.1 and x ln 2.
+    /// From Unreal's `FogDensity`, `FogHeightFalloff` and the fog actor's height in metres, so the
+    /// fog is as opaque as Unreal draws it. Unreal takes both coefficients per 1000 cm and in base
+    /// 2 (`SceneCore.cpp`: `/ 1000`), and its line integral, `(1 - 2^-F) / F` times the density
+    /// and the ray's length (`HeightFogCommon.ush`), is ln 2 times the base-2 integral; its
+    /// transmittance is `2^-integral`. Per metre in base e: the falloff is x 0.1 x ln 2, the
+    /// density x 0.1 x (ln 2)^2.
     pub fn from_unreal(fog_density: f32, fog_height_falloff: f32, height_m: f32) -> Self {
-        let k = 0.1 * std::f32::consts::LN_2;
-        Self { density: fog_density * k, height_falloff: fog_height_falloff * k, height: height_m }
+        let ln2 = std::f32::consts::LN_2;
+        Self { density: fog_density * 0.1 * ln2 * ln2, height_falloff: fog_height_falloff * 0.1 * ln2, height: height_m }
     }
 
     /// Optical depth along `origin + dir * t`, t in [t0, t1] (dir unit), as the shader computes it.
@@ -280,6 +283,34 @@ impl PostProcessingEffect for HeightFogEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `from_unreal` fogs a ray as Unreal's shader does: its transmittance is `2^-I`, with
+    /// I = density x 2^(-falloff (z0 - height)) x (1 - 2^-F) / F x length, F = falloff x the ray's
+    /// rise, all in centimetres, the coefficients / 1000 (HeightFogCommon.ush, SceneCore.cpp).
+    #[test]
+    fn from_unreal_matches_unreal_s_line_integral() {
+        let (fog_density, falloff, height) = (0.03f32, 0.1f32, -20.0f32);
+        let layer = HeightFogLayer::from_unreal(fog_density, falloff, height);
+        let unreal = |origin: glam::Vec3, dir: glam::Vec3, len_m: f32| -> f32 {
+            let (rho, k) = (fog_density as f64 / 1000.0, falloff as f64 / 1000.0);
+            let origin_terms = rho * 2f64.powf(-k * (origin.y as f64 - height as f64) * 100.0);
+            let f = k * dir.y as f64 * len_m as f64 * 100.0;
+            let integral = if f.abs() > 1e-9 { (1.0 - 2f64.powf(-f)) / f } else { std::f64::consts::LN_2 };
+            2f64.powf(-origin_terms * integral * len_m as f64 * 100.0) as f32
+        };
+        for (origin, dir, len) in [
+            (glam::Vec3::new(0.0, 6.0, 0.0), glam::Vec3::Y, 5000.0),
+            (glam::Vec3::new(0.0, 6.0, 0.0), glam::Vec3::new(0.0, 0.1, 1.0).normalize(), 3000.0),
+            (glam::Vec3::new(0.0, 200.0, 0.0), glam::Vec3::new(0.3, -0.2, 0.9).normalize(), 800.0),
+            (glam::Vec3::new(0.0, 1.0, 0.0), glam::Vec3::X, 300.0),
+        ] {
+            let kansei = (-layer.optical_depth(origin, dir, 0.0, len)).exp();
+            let want = unreal(origin, dir, len);
+            assert!((kansei - want).abs() < 1e-3 * want.max(1e-3), "{origin} {dir} {len} m: kansei {kansei}, Unreal {want}");
+        }
+        // the film's fog (0.03, 0.1) is 1.44e-3 per metre at its height
+        assert!((HeightFogLayer::from_unreal(0.03, 0.1, 0.0).density - 1.4414e-3).abs() < 1e-6);
+    }
 
     #[test]
     fn shader_validates_and_the_params_layout_matches() {
