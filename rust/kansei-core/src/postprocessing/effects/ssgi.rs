@@ -22,6 +22,11 @@ fn composite_source() -> String {
     [COMMON_WGSL, NORMAL_WGSL, crate::atmosphere::SKY_LIGHTING_WGSL, COMPOSITE_WGSL].concat()
 }
 
+/// The search radius on screen at most, as a share of the image's height. A quarter held the
+/// radius to about 0.3 times the depth in metres whatever `radius_m` asked, and a Cornell box got
+/// 10-40 % of its bounce; the full height costs no more (the steps stay as many) and gets 70-95 %.
+const MAX_RADIUS_SCREEN: f32 = 1.0;
+
 /// How much work the global illumination does per frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GiQuality {
@@ -90,7 +95,7 @@ struct SsgiParamsGpu {
     max_radius_px: f32,
     blend: f32,
     has_sky: u32,
-    _pad: f32,
+    debug: u32,
 }
 
 struct Targets {
@@ -131,6 +136,9 @@ pub struct ScreenSpaceGIEffect {
     pub intensity: f32,
     pub ambient_occlusion: f32,
     pub temporal_blend: f32,
+    /// Debug view: output only the light the bounce adds (albedo / pi times its irradiance),
+    /// black elsewhere, in place of the lit image.
+    pub show_indirect: bool,
     sky_lighting: Option<wgpu::Buffer>,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
@@ -148,6 +156,7 @@ impl ScreenSpaceGIEffect {
             intensity: options.intensity,
             ambient_occlusion: options.ambient_occlusion,
             temporal_blend: options.temporal_blend,
+            show_indirect: false,
             sky_lighting: None,
             prev_view_proj: None,
             last_camera_frame: None,
@@ -331,10 +340,10 @@ impl PostProcessingEffect for ScreenSpaceGIEffect {
             steps,
             frame: self.frame,
             history_valid: self.prev_view_proj.is_some() as u32,
-            max_radius_px: height as f32 * 0.25,
+            max_radius_px: height as f32 * MAX_RADIUS_SCREEN,
             blend: self.temporal_blend.clamp(0.01, 1.0),
             has_sky: self.sky_lighting.is_some() as u32,
-            _pad: 0.0,
+            debug: self.show_indirect as u32,
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let current = (self.frame % 2) as usize;
@@ -412,45 +421,58 @@ mod tests {
     const W: u32 = 384;
     const H: u32 = 256;
 
-    /// Renders a scene of up to two planes into the GBuffer's depth (a fullscreen pass writing
-    /// frag_depth), fills colour and albedo per pixel, runs the effect for a few frames, and
-    /// returns the output.
-    fn run(device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, wall_z: f32, color: impl Fn(glam::Vec3) -> [f32; 3], albedo: f32, fx: &mut ScreenSpaceGIEffect) -> Vec<[f32; 4]> {
-        let gbuffer = GBuffer::new(device, W, H, 1);
+    /// What a camera ray meets: the lit colour there, the material's albedo (none: no albedo
+    /// written) and its normal (none: rebuilt from depth).
+    struct Hit {
+        t: f32,
+        color: glam::Vec3,
+        albedo: glam::Vec3,
+        normal: Option<glam::Vec3>,
+    }
+
+    /// The world ray through a pixel's centre.
+    fn pixel_ray(camera: &Camera, x: u32, y: u32) -> (glam::Vec3, glam::Vec3) {
         let inv_vp = (camera.projection_matrix.to_glam() * camera.view_matrix.to_glam()).inverse();
-        let vp = camera.projection_matrix.to_glam() * camera.view_matrix.to_glam();
         let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
-        // the scene per pixel: the floor y = 0 and a wall z = wall_z, whichever the ray meets first
+        let ndc = glam::Vec2::new((x as f32 + 0.5) / W as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / H as f32 * 2.0);
+        let far = inv_vp * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        (eye, (far.truncate() / far.w - eye).normalize())
+    }
+
+    /// Renders an analytic scene (`scene(origin, direction)`) into the GBuffer: its depth, normal
+    /// and albedo through a fullscreen pass, its lit colour as the input. Runs the effect for a
+    /// few frames and returns the output.
+    fn run(device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, scene: impl Fn(glam::Vec3, glam::Vec3) -> Option<Hit>, fx: &mut ScreenSpaceGIEffect) -> Vec<[f32; 4]> {
+        let gbuffer = GBuffer::new(device, W, H, 1);
+        let vp = camera.projection_matrix.to_glam() * camera.view_matrix.to_glam();
         let mut depth = vec![1.0f32; (W * H) as usize];
         let mut rgba = vec![0.0f32; (W * H * 4) as usize];
+        let mut normal = vec![0.0f32; (W * H * 4) as usize];
+        let mut albedo = vec![0.0f32; (W * H * 4) as usize];
         for y in 0..H {
             for x in 0..W {
-                let ndc = glam::Vec2::new((x as f32 + 0.5) / W as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / H as f32 * 2.0);
-                let far = inv_vp * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
-                let dir = (far.truncate() / far.w - eye).normalize();
-                let mut t = f32::INFINITY;
-                if dir.y < 0.0 { t = t.min(-eye.y / dir.y); }
-                if dir.z < 0.0 { t = t.min((wall_z - eye.z) / dir.z); }
-                if t.is_finite() {
-                    let p = eye + dir * t;
-                    let clip = vp * p.extend(1.0);
-                    depth[(y * W + x) as usize] = clip.z / clip.w;
-                    let c = color(p);
-                    rgba[((y * W + x) * 4) as usize..((y * W + x) * 4 + 3) as usize].copy_from_slice(&c);
+                let (eye, dir) = pixel_ray(camera, x, y);
+                let Some(hit) = scene(eye, dir) else { continue };
+                let i = (y * W + x) as usize;
+                let clip = vp * (eye + dir * hit.t).extend(1.0);
+                depth[i] = clip.z / clip.w;
+                rgba[i * 4..i * 4 + 3].copy_from_slice(&hit.color.to_array());
+                albedo[i * 4..i * 4 + 3].copy_from_slice(&hit.albedo.to_array());
+                if let Some(n) = hit.normal {
+                    normal[i * 4..i * 4 + 3].copy_from_slice(&(n * 0.5 + 0.5).to_array());
                 }
             }
         }
-        // depth and albedo through a fullscreen pass that writes them from storage buffers
-        let a = albedo;
-        let albedo_px: Vec<f32> = depth.iter().map(|&d| if d < 1.0 { a } else { 0.0 }).collect();
         let buffer = |data: &[f32]| { use wgpu::util::DeviceExt; device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE }) };
-        let (depth_buf, albedo_buf) = (buffer(&depth), buffer(&albedo_px));
+        let (depth_buf, normal_buf, albedo_buf) = (buffer(&depth), buffer(&normal), buffer(&albedo));
         let code = format!("@group(0) @binding(0) var<storage, read> d : array<f32>;\n\
-            @group(0) @binding(1) var<storage, read> a : array<f32>;\n\
+            @group(0) @binding(1) var<storage, read> n : array<vec4f>;\n\
+            @group(0) @binding(2) var<storage, read> a : array<vec4f>;\n\
             @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {{ let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)); return vec4f(p * 2.0 - 1.0, 0.0, 1.0); }}\n\
-            struct O {{ @builtin(frag_depth) depth : f32, @location(0) albedo : vec4f }};\n\
-            @fragment fn fs(@builtin(position) pos : vec4f) -> O {{ var o : O; let i = u32(pos.y) * {W}u + u32(pos.x); o.depth = d[i]; o.albedo = vec4f(vec3f(a[i]), 1.0); return o; }}");
+            struct O {{ @builtin(frag_depth) depth : f32, @location(0) normal : vec4f, @location(1) albedo : vec4f }};\n\
+            @fragment fn fs(@builtin(position) pos : vec4f) -> O {{ var o : O; let i = u32(pos.y) * {W}u + u32(pos.x); o.depth = d[i]; o.normal = n[i]; o.albedo = a[i]; return o; }}");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let target = |format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: None,
@@ -458,7 +480,7 @@ mod tests {
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState { format: GBuffer::ALBEDO_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[target(GBuffer::MRT_FORMATS[2]), target(GBuffer::ALBEDO_FORMAT)],
                 compilation_options: Default::default(),
             }),
             primitive: Default::default(),
@@ -470,17 +492,18 @@ mod tests {
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: depth_buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: albedo_buf.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: depth_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: normal_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: albedo_buf.as_entire_binding() },
+            ],
         });
         let mut encoder = device.create_command_encoder(&Default::default());
         {
+            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.albedo_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
+                color_attachments: &[attachment(&gbuffer.normal_view), attachment(&gbuffer.albedo_view)],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &gbuffer.depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -527,6 +550,17 @@ mod tests {
         (0..H * W).map(|i| { let o = ((i / W) * row + (i % W) * 8) as usize; [half(o), half(o + 2), half(o + 4), half(o + 6)] }).collect()
     }
 
+    /// The floor y = 0 and a wall z = wall_z facing +z, coloured by `color(point)`, with a grey
+    /// albedo (0: none written) and normals rebuilt from depth.
+    fn floor_and_wall(wall_z: f32, color: impl Fn(glam::Vec3) -> [f32; 3], albedo: f32) -> impl Fn(glam::Vec3, glam::Vec3) -> Option<Hit> {
+        move |eye, dir| {
+            let mut t = f32::INFINITY;
+            if dir.y < 0.0 { t = t.min(-eye.y / dir.y); }
+            if dir.z < 0.0 { t = t.min((wall_z - eye.z) / dir.z); }
+            t.is_finite().then(|| Hit { t, color: glam::Vec3::from(color(eye + dir * t)), albedo: glam::Vec3::splat(albedo), normal: None })
+        }
+    }
+
     fn camera() -> Camera {
         let mut camera = Camera::new(60.0, 0.1, 100.0, W as f32 / H as f32);
         camera.set_position(0.0, 1.5, 4.0);
@@ -542,25 +576,25 @@ mod tests {
         let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
         let camera = camera();
         let mut fx = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality: GiQuality::Ultra, ..Default::default() });
-        let out = run(&device, &queue, &camera, -1000.0, |_| [0.5, 0.5, 0.5], 0.0, &mut fx);
+        let out = run(&device, &queue, &camera, floor_and_wall(-1000.0, |_| [0.5, 0.5, 0.5], 0.0), &mut fx);
         let worst = out.iter().map(|c| (c[0] - 0.5).abs()).fold(0.0, f32::max);
         assert!(worst < 2e-3, "changed without albedo: {worst}");
         let mut fx = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality: GiQuality::Ultra, ..Default::default() });
-        let out = run(&device, &queue, &camera, -1000.0, |_| [0.5, 0.5, 0.5], 0.5, &mut fx);
+        let out = run(&device, &queue, &camera, floor_and_wall(-1000.0, |_| [0.5, 0.5, 0.5], 0.5), &mut fx);
         let worst = out.iter().map(|c| (c[0] - 0.5).abs()).fold(0.0, f32::max);
         assert!(worst < 0.01, "an open floor changed by {worst}");
     }
 
-    /// A black floor meets a white wall: near the corner the floor receives about half the wall's
-    /// light (the view factor of a wall from the floor is 1/2), times its albedo; beyond the search
-    /// radius, none.
+    /// A black floor meets a white wall: 0.1-0.4 m from it the floor sees the wall over 0.446 of
+    /// its cosine-weighted hemisphere within the 3 m radius (by Monte Carlo), so it receives
+    /// 0.446 x 0.5 (its albedo) = 0.223 of the wall's light; beyond the search radius, none.
     #[test]
     fn a_floor_by_a_bright_wall_receives_its_light() {
         let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
         let camera = camera();
-        let mut fx = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality: GiQuality::Ultra, radius_m: 3.0, ..Default::default() });
+        let mut fx = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality: GiQuality::Ultra, radius_m: 3.0, thickness_m: std::env::var("T").map(|v| v.parse().unwrap()).unwrap_or(0.5), ..Default::default() });
         let wall_z = -2.0;
-        let out = run(&device, &queue, &camera, wall_z, |p| if p.z <= wall_z + 1e-3 { [1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0] }, 0.5, &mut fx);
+        let out = run(&device, &queue, &camera, floor_and_wall(wall_z, |p| if p.z <= wall_z + 1e-3 { [1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0] }, 0.5), &mut fx);
         // floor pixels by their distance to the wall
         let inv_vp = (camera.projection_matrix.to_glam() * camera.view_matrix.to_glam()).inverse();
         let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
@@ -581,10 +615,122 @@ mod tests {
             }
         }
         let (near, far) = (near / n_near.max(1) as f32, far / n_far.max(1) as f32);
-        eprintln!("floor 0.1-0.4 m from the wall: {near:.3} ({n_near} px); beyond 3.5 m: {far:.3} ({n_far} px); ideal near 0.5 x 0.5 = 0.25");
+        eprintln!("floor 0.1-0.4 m from the wall: {near:.3} ({n_near} px, exact 0.223); beyond 3.5 m: {far:.3} ({n_far} px)");
         assert!(n_near > 10 && n_far > 10, "{n_near} {n_far}");
-        assert!(near > 0.12 && near < 0.3, "the floor by the wall receives {near}");
+        assert!(near > 0.19 && near < 0.24, "the floor by the wall receives {near}");
         assert!(far < 0.02, "the floor far from the wall receives {far}");
+    }
+
+    /// A 2 m Cornell box, open toward the camera: white floor, ceiling and back wall, a red wall
+    /// on the left and a green one on the right, lit by a downlight under the ceiling.
+    const BOX_LIGHT: glam::Vec3 = glam::Vec3::new(0.0, 1.95, -1.0);
+
+    fn box_hit(o: glam::Vec3, d: glam::Vec3) -> Option<(f32, glam::Vec3, glam::Vec3)> {
+        use glam::Vec3;
+        let white = Vec3::splat(0.73);
+        let faces = [
+            (Vec3::Y, 0.0, white),
+            (-Vec3::Y, -2.0, white),
+            (Vec3::X, -1.0, Vec3::new(0.63, 0.065, 0.05)),
+            (-Vec3::X, -1.0, Vec3::new(0.14, 0.45, 0.09)),
+            (Vec3::Z, -2.0, white),
+        ];
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        for (n, c, albedo) in faces {
+            let dn = n.dot(d);
+            if dn >= 0.0 { continue; }
+            let t = (c - n.dot(o)) / dn;
+            if t <= 1e-4 || best.is_some_and(|b| b.0 <= t) { continue; }
+            let p = o + d * t;
+            if p.x.abs() > 1.001 || p.y < -0.001 || p.y > 2.001 || p.z < -2.001 || p.z > 0.001 { continue; }
+            best = Some((t, n, albedo));
+        }
+        best
+    }
+
+    /// The light a point of the box sends out: a 10 cd downlight whose intensity falls off with
+    /// the cosine from straight down, so the ceiling gets none directly.
+    fn box_radiance(p: glam::Vec3, n: glam::Vec3, albedo: glam::Vec3) -> glam::Vec3 {
+        let l = BOX_LIGHT - p;
+        let d2 = l.length_squared();
+        let l = l / d2.sqrt();
+        albedo / std::f32::consts::PI * (10.0 * l.y.max(0.0) * n.dot(l).max(0.0) / d2)
+    }
+
+    fn cornell_box(eye: glam::Vec3, dir: glam::Vec3) -> Option<Hit> {
+        box_hit(eye, dir).map(|(t, n, albedo)| Hit { t, color: box_radiance(eye + dir * t, n, albedo), albedo, normal: Some(n) })
+    }
+
+    fn rnd(i: u32) -> f32 {
+        let mut x = i.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7FEB_352D);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846C_A68B);
+        x ^= x >> 16;
+        (x >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// The irradiance the box's lit surfaces send onto p (normal n) in one bounce, by Monte Carlo.
+    fn box_one_bounce(p: glam::Vec3, n: glam::Vec3, seed: u32) -> glam::Vec3 {
+        let (t, b) = n.any_orthonormal_pair();
+        let samples = 1024u32;
+        let mut sum = glam::Vec3::ZERO;
+        for j in 0..samples {
+            let (u1, u2) = (rnd(seed.wrapping_mul(7919) + j * 2), rnd(seed.wrapping_mul(7919) + j * 2 + 1));
+            let (r, phi) = (u1.sqrt(), 2.0 * std::f32::consts::PI * u2);
+            let d = t * (r * phi.cos()) + b * (r * phi.sin()) + n * (1.0 - u1).max(0.0).sqrt();
+            if let Some((th, hn, albedo)) = box_hit(p + n * 1e-4, d) {
+                sum += box_radiance(p + n * 1e-4 + d * th, hn, albedo);
+            }
+        }
+        sum * (std::f32::consts::PI / samples as f32)
+    }
+
+    /// In the Cornell box, the bounce the effect adds (as irradiance) against the one-bounce
+    /// reference: the colour bleeding from the red and green walls onto the floor and the back
+    /// wall, and the ceiling lit only by the bounce. What is missing is what the screen cannot
+    /// see (the search radius, the gaps between depth slabs, the open front).
+    #[test]
+    fn a_cornell_box_gets_most_of_its_one_bounce() {
+        let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+        let mut camera = Camera::new(60.0, 0.1, 100.0, W as f32 / H as f32);
+        camera.set_position(0.0, 1.0, 0.9);
+        camera.look_at(&crate::math::Vec3::new(0.0, 1.0, -1.0));
+        camera.update_view_matrix();
+        let mut fx = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality: GiQuality::Ultra, ..Default::default() });
+        let out = run(&device, &queue, &camera, cornell_box, &mut fx);
+        let regions: [(&str, fn(glam::Vec3) -> bool); 4] = [
+            ("floor by the red wall", |p| p.y < 1e-3 && p.x < -0.6 && p.z > -1.6 && p.z < -0.4),
+            ("floor by the green wall", |p| p.y < 1e-3 && p.x > 0.6 && p.z > -1.6 && p.z < -0.4),
+            ("ceiling", |p| p.y > 2.0 - 1e-3 && p.x.abs() < 0.6),
+            ("back wall", |p| p.z < -2.0 + 1e-3 && p.x.abs() < 0.6 && p.y > 0.4 && p.y < 1.6),
+        ];
+        for (name, inside) in regions {
+            let (mut got, mut want, mut pixels) = (glam::Vec3::ZERO, glam::Vec3::ZERO, 0);
+            for y in (0..H).step_by(5) {
+                for x in (0..W).step_by(5) {
+                    let (eye, dir) = pixel_ray(&camera, x, y);
+                    let Some((t, n, albedo)) = box_hit(eye, dir) else { continue };
+                    let p = eye + dir * t;
+                    if !inside(p) { continue; }
+                    let i = (y * W + x) as usize;
+                    // the albedo as the GBuffer stores it (8 bits)
+                    let a = (albedo * 255.0).round() / 255.0;
+                    let added = glam::Vec3::new(out[i][0], out[i][1], out[i][2]) - box_radiance(p, n, albedo);
+                    got += added * std::f32::consts::PI / a;
+                    want += box_one_bounce(p, n, i as u32);
+                    pixels += 1;
+                }
+            }
+            let ratio = got / want;
+            eprintln!("{name}: {pixels} px, bounce {:.3} {:.3} {:.3} of the reference {:.3} {:.3} {:.3}: {:.2} {:.2} {:.2}",
+                got.x / pixels as f32, got.y / pixels as f32, got.z / pixels as f32, want.x / pixels as f32, want.y / pixels as f32, want.z / pixels as f32, ratio.x, ratio.y, ratio.z);
+            assert!(pixels > 20, "{name}: {pixels} px");
+            // the colour bled from the nearest wall arrives almost in full; the rest of the light
+            // mostly, less what comes from the box's parts off screen
+            assert!(ratio.min_element() > 0.6 && ratio.max_element() < 1.05, "{name}: {ratio}");
+        }
     }
 }
 
