@@ -1,6 +1,7 @@
-// Projects the sky-view LUT, with the clouds in front of it (cloud_map.wgsl), onto order-2 SH
-// (radiance), adds light bounced off the ground below the horizon, and evaluates the sun and the
-// moon at the camera. One workgroup.
+// Projects the sky-view LUT, with the clouds in front of it (cloud_map.wgsl) and the capture fog
+// in front of both (sky_capture.wgsl), onto order-2 SH (radiance), adds light bounced off the
+// ground below the horizon (unless the capture covers it), and evaluates the sun and the moon at
+// the camera. One workgroup.
 
 @group(0) @binding(0) var<uniform> atm : Atmosphere;
 @group(0) @binding(1) var<uniform> frame : SkyFrame;
@@ -10,6 +11,7 @@
 @group(0) @binding(5) var skyViewSampler : sampler;
 @group(0) @binding(6) var<storage, read_write> skyLightingOut : SkyLighting;
 @group(0) @binding(7) var cloudMap : texture_2d<f32>;
+@group(0) @binding(8) var<uniform> capture : SkyCapture;
 
 // The sky with the clouds in front of it (cloud_map.wgsl)
 fn skyWithClouds(d: vec3f) -> vec3f {
@@ -39,7 +41,7 @@ fn main(@builtin(local_invocation_index) li : u32) {
         let cosT = 1.0 - 2.0 * (f32(cell / N_PHI) + 0.5) / f32(N_COS);
         let sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
         let d = vec3f(sinT * cos(phi), cosT, sinT * sin(phi));
-        let lum = skyWithClouds(d) * cellSolidAngle;
+        let lum = capturedSky(d, skyWithClouds(d)) * cellSolidAngle;
         var y = skyShBasis(d);
         for (var i = 0u; i < 9u; i++) { sh[i] += lum * y[i]; }
         up += lum * max(cosT, 0.0);
@@ -73,7 +75,7 @@ fn main(@builtin(local_invocation_index) li : u32) {
     // lower hemisphere (y < 0) projects onto band 0 as 2 pi 0.282095 c and onto y as -pi 0.488603 c
     let groundIrradiance = sharedUp[0] + sun * max(dot(vec3f(0.0, 1.0, 0.0), frame.sunDirection), 0.0)
                          + moon * max(dot(vec3f(0.0, 1.0, 0.0), frame.moonDirection), 0.0);
-    let ground = frame.skyLightGroundAlbedo / PI * groundIrradiance;
+    let ground = select(frame.skyLightGroundAlbedo / PI * groundIrradiance, vec3f(0.0), captureCoversGround());
     var out : SkyLighting;
     for (var i = 0u; i < 9u; i++) { out.sh[i] = vec4f(sharedSh[0][i], 0.0); }
     out.sh[0] += vec4f(ground * (2.0 * PI * 0.282095), 0.0);

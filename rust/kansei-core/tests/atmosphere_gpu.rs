@@ -2,7 +2,8 @@
 //! transmittance LUT against the CPU model, and the sky's colour and brightness from noon to dusk.
 //! Skipped (passes) when no adapter is available.
 
-use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions};
+use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SkyCaptureFog, SkyLowerHemisphere};
+use kansei_core::postprocessing::effects::HeightFogLayer;
 use kansei_core::cameras::Camera;
 use kansei_core::math::Vec3;
 
@@ -290,6 +291,63 @@ fn sky_lighting_sh_matches_the_sky_it_projects() {
         assert!(((down - expected) / expected).abs().max_element() < 0.2, "sun {elevation}: down {down} vs {expected}");
         eprintln!("sun {elevation}: E_up SH {from_sh} LUT {e_up}; sun {sun}; E_down {down}");
     }
+}
+
+/// With a capture fog the sky lighting sees the sky through it (Unreal's real-time capture): an
+/// opaque fog is its colour all round, one capped at half opacity is half the sky and half the fog
+/// from every side (the projection is linear), and the environment cubemap agrees. A lower
+/// hemisphere colour replaces what is below the horizon.
+#[test]
+fn sky_lighting_captures_the_height_fog() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let options = SkyAtmosphereOptions::default();
+    let mut sky = SkyAtmosphere::new(&device, options);
+    sky.sun.illuminance = Vec3::new(1.0, 1.0, 1.0);
+    // no ground bounce, so the clear SH is the sky alone
+    sky.sky_light_ground_albedo = Some(Vec3::ZERO);
+    let irradiance = |sky: &mut SkyAtmosphere| {
+        let _ = sky_view(&device, &queue, sky, 20.0);
+        let sh = read_floats(&device, &queue, &sky.bindings().sky_lighting);
+        [glam::Vec3::Y, -glam::Vec3::Y, glam::Vec3::X].map(|n| sh_irradiance(&sh, n))
+    };
+    let clear = irradiance(&mut sky);
+    let c = Vec3::new(0.02, 0.03, 0.05);
+    let pi_c = c.to_glam() * std::f32::consts::PI;
+    let dense = HeightFogLayer { density: 1.0, height_falloff: 1e-4, height: 0.0 };
+    let fog = |max_opacity: f32| SkyCaptureFog { layers: [dense, HeightFogLayer::default()], inscattering: c, max_opacity, capture_height_m: 6.0 };
+
+    sky.capture_fog = Some(fog(1.0));
+    let opaque = irradiance(&mut sky);
+    for e in opaque {
+        assert!(((e - pi_c) / pi_c).abs().max_element() < 0.01, "an opaque fog gives {e}, not pi C {pi_c}");
+    }
+    // the environment is the fog's colour, overhead and below
+    let env = read(&device, &queue, sky.environment_texture());
+    let centre = options.environment_size / 2;
+    for layer in [2, 3] {
+        let l = env.at3(centre, centre, layer);
+        assert!(((l - c.to_glam()) / c.to_glam()).abs().max_element() < 0.01, "environment {l} under an opaque fog of {c:?}");
+    }
+
+    sky.capture_fog = Some(fog(0.5));
+    let half = irradiance(&mut sky);
+    for (e, e_clear) in half.iter().zip(clear) {
+        let want = 0.5 * e_clear + 0.5 * pi_c;
+        assert!(((*e - want) / want).abs().max_element() < 0.01, "half the fog gives {e}, not {want}");
+    }
+
+    // Unreal's lower-hemisphere colour, without fog: the ground is gone, the colour is below
+    sky.capture_fog = None;
+    let low = Vec3::new(0.2, 0.3, 0.4);
+    sky.lower_hemisphere = SkyLowerHemisphere::Color(low);
+    let [up, down, _] = irradiance(&mut sky);
+    let want = low.to_glam() * std::f32::consts::PI;
+    assert!(((down - want) / want).abs().max_element() < 0.1, "down {down} with the lower hemisphere {want}");
+    assert!(((up - clear[0]) / clear[0]).abs().max_element() < 0.1, "up {up} vs {}", clear[0]);
+    eprintln!("clear {clear:?}; opaque fog {opaque:?} (pi C {pi_c}); half {half:?}; lower colour: up {up} down {down}");
 }
 
 #[test]
