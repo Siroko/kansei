@@ -219,6 +219,8 @@ struct Pipelines {
     // with the cloud map, and without it (no clouds wrote it last frame)
     sky_lighting_bgs: [wgpu::BindGroup; 2],
     environment: wgpu::ComputePipeline,
+    // the rough mips, a workgroup per texel
+    environment_rough: wgpu::ComputePipeline,
     /// One per mip, each with its own storage view and parameters.
     environment_bgs: Vec<[wgpu::BindGroup; 2]>,
 }
@@ -369,13 +371,17 @@ fn storage_entry_dim(binding: u32, view_dimension: wgpu::TextureViewDimension) -
 }
 
 pub(crate) fn compute_pipeline(device: &wgpu::Device, label: &str, code: &str, bgl: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
+    compute_pipeline_at(device, label, code, bgl, "main")
+}
+
+fn compute_pipeline_at(device: &wgpu::Device, label: &str, code: &str, bgl: &wgpu::BindGroupLayout, entry_point: &str) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: Some(&layout),
         module: &module,
-        entry_point: Some("main"),
+        entry_point: Some(entry_point),
         compilation_options: Default::default(),
         cache: None,
     })
@@ -707,6 +713,7 @@ impl SkyAtmosphere {
                 )
             }),
             environment: compute_pipeline(device, "SkyAtmosphere/Environment", &environment_source(), &environment_bgl),
+            environment_rough: compute_pipeline_at(device, "SkyAtmosphere/EnvironmentRough", &environment_source(), &environment_bgl, "rough"),
             environment_bgs,
         };
 
@@ -853,11 +860,18 @@ impl SkyAtmosphere {
         pass.set_pipeline(&p.sky_lighting);
         pass.set_bind_group(0, &p.sky_lighting_bgs[clouds], &[]);
         pass.dispatch_workgroups(1, 1, 1);
-        pass.set_pipeline(&p.environment);
         for (mip, bg) in p.environment_bgs.iter().map(|bgs| &bgs[clouds]).enumerate() {
             let size = (self.environment.width() >> mip).max(1);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 6);
+            if mip == 0 {
+                // the mirror: a copy of the sky, an invocation per texel
+                pass.set_pipeline(&p.environment);
+                pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 6);
+            } else {
+                // GGX-prefiltered: a workgroup per texel shares its samples
+                pass.set_pipeline(&p.environment_rough);
+                pass.dispatch_workgroups(size, size, 6);
+            }
         }
     }
 
@@ -917,5 +931,89 @@ impl SkyAtmosphere {
     /// Force the transmittance and multiple-scattering LUTs to be rebuilt on the next update.
     pub fn invalidate(&mut self) {
         self.built_for = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let frac = (h & 0x3ff) as f32;
+        sign * match exp {
+            0 => frac * 2f32.powi(-24),
+            31 => f32::INFINITY,
+            _ => (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+        }
+    }
+
+    /// Every texel of mip `mip` of the environment (6 faces, rgb).
+    fn read_mip(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, mip: u32) -> Vec<f32> {
+        let size = (texture.width() >> mip).max(1);
+        let row = (size * 8).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * size * 6) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size) } },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 6 },
+        );
+        queue.submit(Some(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let bytes = buffer.slice(..).get_mapped_range();
+        let halves: &[u16] = bytemuck::cast_slice(&bytes);
+        let mut out = Vec::new();
+        for face in 0..6 {
+            for y in 0..size {
+                let start = ((face * size + y) * row / 2) as usize;
+                for x in 0..size as usize {
+                    out.extend((0..3).map(|c| f16_to_f32(halves[start + x * 4 + c])));
+                }
+            }
+        }
+        out
+    }
+
+    /// The rough mips, a workgroup per texel sharing its GGX samples, match one invocation per
+    /// texel taking all of them (the same samples, summed in another order).
+    #[test]
+    fn rough_mips_match_one_invocation_per_texel() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let mut sky = SkyAtmosphere::new(&device, SkyAtmosphereOptions::default());
+        // a low sun: the sky's radiance varies round the cube
+        sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(4.0, 90.0);
+        let mut camera = Camera::new(60.0, 0.1, 1000.0, 1.0);
+        camera.set_position(0.0, 2.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 2.0, -10.0));
+        sky.update(&device, &queue, &mut camera);
+        let mips = sky.environment.mip_level_count();
+        let shared: Vec<_> = (1..mips).map(|mip| read_mip(&device, &queue, &sky.environment, mip)).collect();
+        // the rough mips again, one invocation per texel (no clouds drawn: bind group 1)
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&sky.pipelines.environment);
+            for mip in 1..mips {
+                let size = (sky.environment.width() >> mip).max(1);
+                pass.set_bind_group(0, &sky.pipelines.environment_bgs[mip as usize][1], &[]);
+                pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 6);
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+        for mip in 1..mips {
+            let alone = read_mip(&device, &queue, &sky.environment, mip);
+            let a = &shared[mip as usize - 1];
+            let worst = a.iter().zip(&alone).map(|(s, o)| (s - o).abs() / o.abs().max(1e-3)).fold(0.0f32, f32::max);
+            assert!(a.iter().all(|v| v.is_finite() && *v >= 0.0), "mip {mip}");
+            assert!(worst < 2e-3, "mip {mip}: relative difference {worst}");
+        }
     }
 }
