@@ -93,8 +93,6 @@ fn sampleLens(coord: vec2u, uv: vec2f) -> vec3f {
     return acc;
 }
 
-// Natural vignetting, the cos^4 law of an ideal lens: tan^2 of the field angle grows with the
-// squared image radius (1 at the corners), scaled by the vignette intensity.
 // Unreal's local exposure (its bilateral method, PostProcessHistogramCommon.ush's
 // CalculateBaseLogLuminance and CalculateLocalExposure): the factor on this pixel's scene light
 // that scales the contrast of its surroundings' luminance about middle grey (the highlight or
@@ -116,11 +114,19 @@ fn localExposure(scene: vec3f, uv: vec2f) -> f32 {
     return exp2(middleGrey + (base - middleGrey) * contrast + (y - base) * p.localExposure.z - y);
 }
 
+// Unreal's cosine-fourth vignette (PostProcessCommon.ush's VignetteSpace and
+// ComputeVignetteMask): the position in the frame's [-1, 1] viewport, scaled so its corners lie
+// on a circle of radius sqrt(2), times the intensity, is the tangent of the angle off the axis.
+// A letterboxed picture is the centre crop of its frame (frameAspect), whose vignette it shows.
 fn vignetteMask(uv: vec2f) -> f32 {
     let aspect = f32(p.width) / f32(p.height);
-    let d = (uv - 0.5) * vec2f(aspect, 1.0);
-    let r2 = dot(d, d) / (0.25 * (aspect * aspect + 1.0));
-    let cos2 = 1.0 / (1.0 + 0.5 * p.vignette * r2);
+    let frame = select(aspect, p.frameAspect, p.frameAspect > 0.0);
+    // the picture's height as a share of the frame's
+    let band = frame / aspect;
+    let pos = vec2f(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * band);
+    let heightByWidth = 1.0 / frame;
+    let circle = pos * vec2f(1.0, heightByWidth) * (sqrt(2.0) / sqrt(1.0 + heightByWidth * heightByWidth)) * p.vignette;
+    let cos2 = 1.0 / (1.0 + dot(circle, circle));
     return cos2 * cos2;
 }
 
