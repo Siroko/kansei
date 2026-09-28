@@ -105,8 +105,9 @@ impl Default for SkyAtmosphereOptions {
 /// The scene's exponential height fog as the sky lighting and the environment cubemap capture it
 /// (`SkyAtmosphere::capture_fog`): composited at infinite distance over the sky and the clouds, as
 /// seen from `capture_height_m`, as Unreal's real-time sky-light capture does with its
-/// ExponentialHeightFog. Seen from low down it covers the horizon and, opaque below it, replaces
-/// the ground, so the ambient light and the reflections take the fog's colour where the fog is.
+/// ExponentialHeightFog. Seen from low down it covers the horizon and, opaque below it, the
+/// ground, so the reflections take the fog's colour where the fog is; the sky lighting still sees
+/// the lit ground below the horizon unless `SkyAtmosphere::lighting_sees_ground` is off.
 #[derive(Debug, Clone, Copy)]
 pub struct SkyCaptureFog {
     /// The fog's layers (as `HeightFogEffect::layers`); the second is off while its density is 0.
@@ -135,8 +136,9 @@ impl SkyCaptureFog {
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SkyLowerHemisphere {
     /// A Lambertian ground of `sky_light_ground_albedo` lit by the sky and the lights, behind the
-    /// air; under a capture fog, the fog, which is opaque below the horizon (Unreal's capture with
-    /// `bLowerHemisphereIsBlack` off).
+    /// air. Under a capture fog the environment sees the fog, which is opaque below the horizon
+    /// (Unreal's capture with `bLowerHemisphereIsBlack` off), and so does the sky lighting when
+    /// `SkyAtmosphere::lighting_sees_ground` is off.
     #[default]
     Ground,
     /// This radiance, whatever the fog (Unreal's `bLowerHemisphereIsBlack` with its
@@ -157,7 +159,7 @@ pub(crate) struct SkyCaptureGpu {
     capture_height: f32,
     max_opacity: f32,
     sky_ambient_scale: f32,
-    _pad: f32,
+    lighting_sees_ground: u32,
 }
 
 #[derive(Clone)]
@@ -260,6 +262,12 @@ pub struct SkyAtmosphere {
     pub capture_fog: Option<SkyCaptureFog>,
     /// What the sky lighting and the environment see below the horizon.
     pub lower_hemisphere: SkyLowerHemisphere,
+    /// Under a capture fog, whether the sky lighting (the SH that lights materials and media) sees
+    /// the lit ground below the horizon (the default), as Unreal lights its scene with Lumen, whose
+    /// rays toward the ground hit it rather than the captured sky; when off, it sees the fog there,
+    /// as Unreal's SkyLight captures it (and lights the scene without Lumen). The environment
+    /// (reflections) sees the fog below the horizon either way.
+    pub lighting_sees_ground: bool,
     pub params: AtmosphereParams,
     pub sun: CelestialLight,
     pub moon: CelestialLight,
@@ -725,6 +733,7 @@ impl SkyAtmosphere {
             sky_light_ground_albedo: None,
             capture_fog: None,
             lower_hemisphere: SkyLowerHemisphere::Ground,
+            lighting_sees_ground: true,
             bindings,
             capture,
             luts,
@@ -917,7 +926,7 @@ impl SkyAtmosphere {
                 capture_height: fog.capture_height_m,
                 max_opacity: fog.max_opacity.clamp(0.0, 1.0),
                 sky_ambient_scale: fog.sky_ambient_scale.max(0.0),
-                _pad: 0.0,
+                lighting_sees_ground: self.lighting_sees_ground as u32,
             },
             None => SkyCaptureGpu { lower_color, lower_mode, ..Zeroable::zeroed() },
         }
