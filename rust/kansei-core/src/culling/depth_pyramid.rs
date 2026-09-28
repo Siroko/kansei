@@ -62,6 +62,8 @@ pub struct DepthPyramid {
     from_mip: wgpu::ComputePipeline,
     depth_bgl: wgpu::BindGroupLayout,
     mip_bgl: wgpu::BindGroupLayout,
+    // `build_linear`'s first pass, its layout and uniform
+    linear: (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Buffer),
 }
 
 struct Mip {
@@ -102,6 +104,14 @@ impl DepthPyramid {
                 dst,
             ],
         });
+        let linear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DepthPyramid/FromDepthLinearBGL"),
+            entries: &[
+                entry(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }),
+                dst,
+                entry(3, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+            ],
+        });
         let mip_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("DepthPyramid/FromMipBGL"),
             entries: &[
@@ -123,8 +133,10 @@ impl DepthPyramid {
         };
         let from_depth = pipeline(&depth_bgl, "from_depth");
         let from_mip = pipeline(&mip_bgl, "from_mip");
+        let linearize = device.create_buffer(&wgpu::BufferDescriptor { label: Some("DepthPyramid/Linearize"), size: 80, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let linear = (pipeline(&linear_bgl, "from_depth_linear"), linear_bgl, linearize);
         let (texture, view, mips) = Self::create_mips(device, &mip_bgl, width, height, reduction);
-        Self { reduction, source_size: (width, height), texture, view, mips, from_depth, from_mip, depth_bgl, mip_bgl }
+        Self { reduction, source_size: (width, height), texture, view, mips, from_depth, from_mip, depth_bgl, mip_bgl, linear }
     }
 
     fn create_mips(device: &wgpu::Device, mip_bgl: &wgpu::BindGroupLayout, width: u32, height: u32, reduction: DepthReduction) -> (wgpu::Texture, wgpu::TextureView, Vec<Mip>) {
@@ -188,11 +200,38 @@ impl DepthPyramid {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.mips[0].storage) },
             ],
         });
+        self.record(encoder, &self.from_depth, &first);
+    }
+
+    /// `build`, of view distances (-z in view space) instead of depths: each depth unprojected
+    /// with `inverse_projection` (the inverse of the projection it was rasterized with); where
+    /// nothing was drawn, infinitely far. For projections whose depth does not grow with the
+    /// distance alike on every pixel, as with an oblique near plane (planar reflections).
+    pub fn build_linear(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, depth: &wgpu::TextureView, inverse_projection: glam::Mat4) {
+        let (pipeline, bgl, linearize) = &self.linear;
+        let mut uniform = [0.0f32; 20];
+        uniform[..16].copy_from_slice(&inverse_projection.to_cols_array());
+        uniform[16] = self.source_size.0 as f32;
+        uniform[17] = self.source_size.1 as f32;
+        queue.write_buffer(linearize, 0, bytemuck::cast_slice(&uniform));
+        let first = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("DepthPyramid/FromDepthLinear"),
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.mips[0].storage) },
+                wgpu::BindGroupEntry { binding: 3, resource: linearize.as_entire_binding() },
+            ],
+        });
+        self.record(encoder, pipeline, &first);
+    }
+
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, first_pipeline: &wgpu::ComputePipeline, first: &wgpu::BindGroup) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DepthPyramid"), timestamp_writes: crate::profiling::gpu_pass("DepthPyramid").as_ref().map(crate::profiling::PassStamp::compute) });
         for (level, mip) in self.mips.iter().enumerate() {
             if level == 0 {
-                pass.set_pipeline(&self.from_depth);
-                pass.set_bind_group(0, &first, &[]);
+                pass.set_pipeline(first_pipeline);
+                pass.set_bind_group(0, first, &[]);
             } else {
                 if level == 1 {
                     pass.set_pipeline(&self.from_mip);

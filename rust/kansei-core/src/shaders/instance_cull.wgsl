@@ -4,7 +4,8 @@
 // (the main camera) is inside the renderable's LOD band; survivors are copied, word by word, into
 // the view's region of the compacted instances, and counted into its indirect draw.
 //
-// Two-phase occlusion culling (the main camera, for renderables that opt in):
+// Two-phase occlusion culling (the views that ask for it, FLAG_OCCLUSION: the camera, planar
+// reflections; for renderables that opt in, FLAG_TWO_PHASE):
 // - `early`: of the survivors, keep those that were visible last frame (`visibility`).
 // - The renderer draws them with the rest of the opaque scene and builds a depth pyramid (Hi-Z)
 //   from that depth.
@@ -28,21 +29,26 @@ struct CullInstances {
     scaleWord    : u32,               // word offset of an f32 the bounds scale by, or NO_WORD
     flags        : u32,               // FLAG_BOX, FLAG_CASTS_SHADOW, FLAG_TWO_PHASE
     indexCount   : u32,               // the indirect draw's (its args are cleared every frame)
-    firstView    : u32,               // `main`: the view of the dispatch's first row (y = 0)
+    firstView    : u32,               // `main`: the view of the dispatch's first row (y = 0);
+                                      // `early`: the first view of occlusionView's chunk
     capacity     : u32,               // instances per view region in `dst`
-    lateSlot     : u32,               // `late`: its draw in `args`
+    lateSlot     : u32,               // `late`: occlusionView's second phase's draw in `args`
     layers       : u32,               // the renderable's (`Renderable::layers`)
     shadowLod    : vec2f,             // the LOD band in shadow maps (FLAG_CASTERS_ONLY views)
     reflectionLod: vec2f,             // the LOD band in planar reflections (FLAG_REFLECTION views)
+    occlusionView: u32,               // `early` and `late`: the view culled in two phases
+    _pad0        : u32,
+    _pad1        : u32,
+    _pad2        : u32,
 }
 
 // A view: all of them in one buffer, written once a frame.
 struct CullView {
     planes       : array<vec4f, 6>,   // world-space frustum planes, normalized, inside >= 0
-    view         : mat4x4f,           // occlusion: the camera's view
-    proj         : mat4x4f,           // occlusion: the camera's projection, jittered as rasterized
+    view         : mat4x4f,           // occlusion: the view's view matrix
+    proj         : mat4x4f,           // occlusion: its projection, as rasterized (jittered)
     lodOrigin    : vec3f,             // the main camera, for every view
-    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_REFLECTION, FLAG_LAYERED, FLAG_STATS, FLAG_REVERSE_Z
+    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_REFLECTION, FLAG_LAYERED, FLAG_OCCLUSION, FLAG_STATS, FLAG_REVERSE_Z
     depthSize    : vec2f,             // occlusion: the depth buffer's size in pixels
     lodScale     : f32,               // the view's LOD distance scale (reflections pick finer LODs)
     layerMask    : u32,               // FLAG_LAYERED: the layers it draws (a reflection's)
@@ -63,7 +69,7 @@ struct DrawArgs {
 @group(0) @binding(2) var<storage, read_write> dst : array<u32>;
 // every view's draw, then the second phase's (`lateSlot`)
 @group(0) @binding(3) var<storage, read_write> args : array<DrawArgs>;
-// `early` and `late`: 1 where the instance was visible to the camera last frame
+// `early` and `late`: 1 where the instance was visible in occlusionView last frame
 @group(0) @binding(4) var<storage, read_write> visibility : array<u32>;
 @group(1) @binding(0) var<storage, read> views : array<CullView>;
 // `late`: the depth pyramid (farthest depth per texel, see culling::DepthPyramid)
@@ -79,8 +85,8 @@ const FLAG_VIEW : u32 = 32u;
 const FLAG_CASTERS_ONLY : u32 = 64u;
 const FLAG_LAYERED : u32 = 128u;
 const FLAG_REFLECTION : u32 = 256u;
-// the camera's view
-const MAIN_VIEW : u32 = 0u;
+const FLAG_OCCLUSION : u32 = 512u;
+const FLAG_LINEAR_DEPTH : u32 = 1024u;
 
 // what became of an instance
 const KEPT : u32 = 0u;
@@ -140,15 +146,18 @@ fn cull(b : Bounds, v : u32) -> u32 {
 }
 
 // Whether the bounds are hidden: the rectangle they cover on screen, from their nearest depth,
-// is behind the farthest depth under it in the pyramid.
-fn occluded(b : Bounds) -> bool {
-    let reverse = (views[MAIN_VIEW].flags & FLAG_REVERSE_Z) != 0u;
+// is behind the farthest depth under it in the pyramid (with FLAG_LINEAR_DEPTH, from their
+// nearest view distance, against a pyramid of view distances).
+fn occluded(b : Bounds, view : u32) -> bool {
+    let reverse = (views[view].flags & FLAG_REVERSE_Z) != 0u;
+    let linear = (views[view].flags & FLAG_LINEAR_DEPTH) != 0u;
     let isBox = (ci.flags & FLAG_BOX) != 0u;
-    let modelView = views[MAIN_VIEW].view * ci.world;
+    let modelView = views[view].view * ci.world;
     let centerView = (modelView * vec4f(b.local, 1.0)).xyz;
     var lo = vec2f(1e30);
     var hi = vec2f(-1e30);
     var nearest = select(1e30, -1e30, reverse);
+    var nearestDistance = 1e30;
     for (var k = 0u; k < 8u; k++) {
         let corner = vec3f(f32(k & 1u), f32((k >> 1u) & 1u), f32((k >> 2u) & 1u)) * 2.0 - 1.0;
         // the box's corners, or those of a view-aligned cube round the sphere
@@ -156,19 +165,24 @@ fn occluded(b : Bounds) -> bool {
         if (isBox) {
             v = modelView * vec4f(b.local + corner * b.half, 1.0);
         }
-        let clip = views[MAIN_VIEW].proj * v;
+        let clip = views[view].proj * v;
         if (clip.w <= 0.0) { return false; }   // reaching behind the eye
         let ndc = clip.xyz / clip.w;
         lo = min(lo, ndc.xy);
         hi = max(hi, ndc.xy);
         nearest = select(min(nearest, ndc.z), max(nearest, ndc.z), reverse);
+        nearestDistance = min(nearestDistance, -v.z / v.w);
     }
-    // reaching in front of the near plane
-    if ((!reverse && nearest < 0.0) || (reverse && nearest > 1.0)) { return false; }
+    if (linear) {
+        nearest = nearestDistance;
+    } else if ((!reverse && nearest < 0.0) || (reverse && nearest > 1.0)) {
+        // reaching in front of the near plane
+        return false;
+    }
     // the rectangle in depth pixels (y down), clamped to the buffer
-    let last = views[MAIN_VIEW].depthSize - 1.0;
-    let q0 = vec2u(clamp((vec2f(lo.x, -hi.y) * 0.5 + 0.5) * views[MAIN_VIEW].depthSize, vec2f(0.0), last));
-    let q1 = vec2u(clamp((vec2f(hi.x, -lo.y) * 0.5 + 0.5) * views[MAIN_VIEW].depthSize, vec2f(0.0), last));
+    let last = views[view].depthSize - 1.0;
+    let q0 = vec2u(clamp((vec2f(lo.x, -hi.y) * 0.5 + 0.5) * views[view].depthSize, vec2f(0.0), last));
+    let q1 = vec2u(clamp((vec2f(hi.x, -lo.y) * 0.5 + 0.5) * views[view].depthSize, vec2f(0.0), last));
     // the finest mip where it spans at most 2 x 2 texels: texel t of mip L covers the pixels
     // [t, t + 1) * 2^(L + 1)
     let span = max(q1.x - q0.x, q1.y - q0.y);
@@ -215,15 +229,15 @@ fn tally(outcome : u32, lid : u32, draw : u32, viewFlags : u32) {
     }
 }
 
-// Whether the renderable is drawn in view `v`: the view is in use (a shadowed light's), the
-// renderable casts shadows if only casters draw there and is on a layer the view draws, and the
-// camera's is not culled in phases (as `CullView::draws`).
+// Whether the renderable is drawn in view `v` by this pass: the view is in use (a shadowed
+// light's), the renderable casts shadows if only casters draw there and is on a layer the view
+// draws (as `CullView::draws`), and the view does not cull it in two phases.
 fn drawnIn(v : u32) -> bool {
     let flags = views[v].flags;
     return (flags & FLAG_VIEW) != 0u
         && ((flags & FLAG_CASTERS_ONLY) == 0u || (ci.flags & FLAG_CASTS_SHADOW) != 0u)
         && ((flags & FLAG_LAYERED) == 0u || (views[v].layerMask & ci.layers) != 0u)
-        && !(v == MAIN_VIEW && (ci.flags & FLAG_TWO_PHASE) != 0u);
+        && !((flags & FLAG_OCCLUSION) != 0u && (ci.flags & FLAG_TWO_PHASE) != 0u);
 }
 
 // Frustum and LOD culling, a row of workgroups per view.
@@ -240,23 +254,24 @@ fn main(@builtin(global_invocation_id) gid : vec3u, @builtin(workgroup_id) wg : 
     tally(outcome, lid, v, views[v].flags);
 }
 
-// Occlusion, first phase: the instances in view that were visible last frame.
+// Occlusion, first phase in occlusionView: the instances in view that were visible last frame.
 @compute @workgroup_size(64)
 fn early(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_index) lid : u32) {
     let i = gid.x;
-    begin(i, MAIN_VIEW);
+    let v = ci.occlusionView;
+    begin(i, v);
     var outcome = UNCOUNTED;
     if (i < ci.count) {
-        outcome = cull(bounds(i), MAIN_VIEW);
+        outcome = cull(bounds(i), v);
         if (outcome == KEPT) {
             if (visibility[i] != 0u) {
-                emit(i, MAIN_VIEW, MAIN_VIEW);
+                emit(i, v - ci.firstView, v);
             } else {
                 outcome = UNCOUNTED;   // left to `late`
             }
         }
     }
-    tally(outcome, lid, MAIN_VIEW, views[MAIN_VIEW].flags);
+    tally(outcome, lid, v, views[v].flags);
 }
 
 // Occlusion, second phase: the instances in view and not hidden in the pyramid of the first
@@ -264,12 +279,13 @@ fn early(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_i
 @compute @workgroup_size(64)
 fn late(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_index) lid : u32) {
     let i = gid.x;
+    let v = ci.occlusionView;
     begin(i, ci.lateSlot);
     var outcome = UNCOUNTED;
     if (i < ci.count) {
         let b = bounds(i);
-        let inView = cull(b, MAIN_VIEW) == KEPT;
-        let visible = inView && !occluded(b);
+        let inView = cull(b, v) == KEPT;
+        let visible = inView && !occluded(b, v);
         if (inView && visibility[i] == 0u) {
             if (visible) {
                 emit(i, 0u, ci.lateSlot);
@@ -279,5 +295,5 @@ fn late(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_in
         }
         visibility[i] = select(0u, 1u, visible);
     }
-    tally(outcome, lid, ci.lateSlot, views[MAIN_VIEW].flags);
+    tally(outcome, lid, ci.lateSlot, views[v].flags);
 }

@@ -182,6 +182,12 @@ pub struct PlanarReflection {
     /// from below, where coarse LODs built to read from the side (flat cards, dropped detail)
     /// show; 1 (the default) picks the camera's.
     pub lod_distance_scale: f32,
+    /// Occlusion culling in the mirrored view (off by default): instanced renderables with
+    /// `InstanceCulling::with_occlusion` also skip the instances hidden behind the rest of what
+    /// the mirror draws, in two phases as for the camera, against a depth pyramid of the mirror's
+    /// own depth. It pays where much of what the mirror sees is hidden (a far shore behind a near
+    /// one); it costs a second pass over the reflection's targets, a pyramid and a second cull.
+    pub occlusion_culling: bool,
     /// World-space bounds of the reflecting surface (its min and max corners), if known. Materials
     /// sample the reflection by screen position, so it is then drawn only where the surface is
     /// on screen: its pass is scissored to the surface's rectangle (plus `screen_margin`), its
@@ -422,6 +428,7 @@ impl PlanarReflection {
             clip_bias: options.clip_bias,
             enabled: true,
             lod_distance_scale: 1.0,
+            occlusion_culling: false,
             surface_bounds: None,
             screen_margin: 0.05,
             screen_rect: None,
@@ -536,6 +543,20 @@ impl PlanarReflection {
 
     pub(crate) fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    /// What occlusion culling projects the mirrored view's bounds with: its view and projection
+    /// as rasterized, and the targets' size. Its depth pyramid holds view distances: with the
+    /// near plane at the water, the depth of what is seen at a grazing angle hardly grows with
+    /// its distance, which a depth pyramid could not tell apart.
+    pub(crate) fn occlusion_view(&self) -> crate::culling::OcclusionView {
+        crate::culling::OcclusionView {
+            view: self.camera.view_matrix.to_glam(),
+            proj: self.camera.projection_matrix.to_glam(),
+            depth_size: (self.width, self.height),
+            reverse_z: false,
+            linear_depth: true,
+        }
     }
 
     /// The view-projection to cull this frame's instances with: the mirrored camera's, cropped
