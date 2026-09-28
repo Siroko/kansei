@@ -544,7 +544,7 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
         let gpu = self.gpu.as_mut().unwrap();
         if !gpu.noise_ready {
             let (shape, detail, weather, bg) = &gpu.noise;
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Clouds/Noise"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Clouds/Noise"), timestamp_writes: crate::profiling::gpu_pass("Clouds/Noise").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_bind_group(0, bg, &[]);
             pass.set_pipeline(shape);
             pass.dispatch_workgroups(SHAPE_SIZE / 4, SHAPE_SIZE / 4, SHAPE_SIZE / 4);
@@ -660,7 +660,7 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
         } else {
             None
         };
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Clouds"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Clouds"), timestamp_writes: crate::profiling::gpu_pass("Clouds").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&gpu.march);
         pass.set_bind_group(0, &march_bg, &[]);
         pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);

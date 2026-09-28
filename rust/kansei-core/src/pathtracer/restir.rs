@@ -496,7 +496,7 @@ impl ReSTIR {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ReSTIR/Generate"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("ReSTIR/Generate").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.generate_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
@@ -507,7 +507,7 @@ impl ReSTIR {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ReSTIR/Spatial"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("ReSTIR/Spatial").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.spatial_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);

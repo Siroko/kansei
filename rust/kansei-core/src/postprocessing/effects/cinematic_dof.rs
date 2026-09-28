@@ -592,7 +592,7 @@ impl PostProcessingEffect for CinematicDepthOfFieldEffect {
         // the highlights are counted and binned afresh every frame
         encoder.clear_buffer(&gpu.sprite_count, 0, None);
         encoder.clear_buffer(&t.bin_count, 0, None);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("CinematicDoF"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("CinematicDoF"), timestamp_writes: crate::profiling::gpu_pass("CinematicDoF").as_ref().map(crate::profiling::PassStamp::compute) });
         for (pipeline, bind_group, (x, y)) in passes {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);

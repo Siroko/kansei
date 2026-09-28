@@ -370,7 +370,7 @@ impl PostProcessingEffect for BloomEffect {
                 });
 
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Bloom/Downsample"), ..Default::default()
+                    label: Some("Bloom/Downsample"), timestamp_writes: crate::profiling::gpu_pass("Bloom/Downsample").as_ref().map(crate::profiling::PassStamp::compute)
                 });
                 pass.set_pipeline(ds_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
@@ -424,7 +424,7 @@ impl PostProcessingEffect for BloomEffect {
                 });
 
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Bloom/Upsample"), ..Default::default()
+                    label: Some("Bloom/Upsample"), timestamp_writes: crate::profiling::gpu_pass("Bloom/Upsample").as_ref().map(crate::profiling::PassStamp::compute)
                 });
                 pass.set_pipeline(us_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
@@ -454,7 +454,7 @@ impl PostProcessingEffect for BloomEffect {
             });
 
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Bloom/Composite"), ..Default::default()
+                label: Some("Bloom/Composite"), timestamp_writes: crate::profiling::gpu_pass("Bloom/Composite").as_ref().map(crate::profiling::PassStamp::compute)
             });
             pass.set_pipeline(comp_pipeline);
             pass.set_bind_group(0, &bg, &[]);

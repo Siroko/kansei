@@ -1162,7 +1162,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
         // 1. inject density + lighting into the froxels
         {
             let (w, h, d) = (grid.grid_w(), grid.grid_h(), grid.grid_d());
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Inject"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Inject"), timestamp_writes: crate::profiling::gpu_pass("VolumetricFog/Inject").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&gpu.inject_pipeline);
             pass.set_bind_group(0, gpu.inject_bg.as_ref().unwrap(), &[]);
             pass.dispatch_workgroups(w.div_ceil(4), h.div_ceil(4), d.div_ceil(4));
@@ -1189,7 +1189,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
             queue.write_buffer(&r.fog_params, 0, bytemuck::bytes_of(&mirrored));
             if above {
                 let (gw, gh, gd) = (r.grid.grid_w(), r.grid.grid_h(), r.grid.grid_d());
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/ReflectionInject"), ..Default::default() });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/ReflectionInject"), timestamp_writes: crate::profiling::gpu_pass("VolumetricFog/ReflectionInject").as_ref().map(crate::profiling::PassStamp::compute) });
                 pass.set_pipeline(&gpu.inject_pipeline);
                 pass.set_bind_group(0, r.inject_bg.as_ref().unwrap(), &[]);
                 pass.dispatch_workgroups(gw.div_ceil(4), gh.div_ceil(4), gd.div_ceil(4));
@@ -1285,7 +1285,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
                     (4, wgpu::BindingResource::Sampler(&gpu.accum_sampler)),
                 ],
             );
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Shafts"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Shafts"), timestamp_writes: crate::profiling::gpu_pass("VolumetricFog/Shafts").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&sg.trace);
             pass.set_bind_group(0, &trace_bg, &[]);
             pass.dispatch_workgroups(sw.div_ceil(8), sh.div_ceil(8), 1);
@@ -1310,7 +1310,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(shafts_view.as_ref().unwrap_or(&gpu.shafts.none)) },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Composite"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Composite"), timestamp_writes: crate::profiling::gpu_pass("VolumetricFog/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&gpu.composite_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);

@@ -400,7 +400,7 @@ impl TemporalDenoise {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("TemporalDenoise"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("TemporalDenoise").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);

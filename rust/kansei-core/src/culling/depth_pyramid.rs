@@ -188,7 +188,7 @@ impl DepthPyramid {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.mips[0].storage) },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DepthPyramid"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DepthPyramid"), timestamp_writes: crate::profiling::gpu_pass("DepthPyramid").as_ref().map(crate::profiling::PassStamp::compute) });
         for (level, mip) in self.mips.iter().enumerate() {
             if level == 0 {
                 pass.set_pipeline(&self.from_depth);
