@@ -13,6 +13,7 @@ pub mod froxels;
 pub mod atmosphere;
 pub mod culling;
 pub mod profiling;
+pub mod pacing;
 pub mod reflections;
 pub mod impostors;
 pub mod simulations;
