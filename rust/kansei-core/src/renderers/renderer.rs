@@ -620,6 +620,25 @@ impl Renderer {
         }
     }
 
+    /// Make `r`'s cluster depth pipelines for the shadow passes it casts into (the spot atlas;
+    /// the cascades and the sky's top-down view), or drop its cluster LOD with a warning when the
+    /// cluster path can't draw it.
+    fn prepare_cluster_depth_pipelines(&self, r: &mut crate::objects::Renderable, spot: bool, cascades: bool) {
+        if r.clusters.is_none() || !r.cast_shadow {
+            return;
+        }
+        let layout = r.geometry.instance_buffers.first().and_then(|cb| cb.vertex_layout());
+        let (device, shared) = (self.device.as_ref().unwrap(), self.shared_layouts.as_ref().unwrap());
+        let targets = [(spot, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS), (cascades, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS)];
+        for (_, format, bias) in targets.into_iter().filter(|t| t.0) {
+            if let Err(problem) = r.material.get_cluster_depth_pipeline(device, shared, layout.as_ref(), format, bias) {
+                log::warn!("{}: no cluster LOD ({problem}); drawn as is", r.material.label);
+                r.clusters = None;
+                return;
+            }
+        }
+    }
+
     /// The lights uniform (group 1, binding 2 of every camera).
     pub(crate) fn light_buffer(&self) -> &wgpu::Buffer {
         self.light_buf.as_ref().expect("renderer initialized")
@@ -1406,6 +1425,7 @@ impl Renderer {
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let cuts = &self.cluster_cuts;
         let sky = self.sky_occlusion.as_mut().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/SkyOcclusion") });
         if let Some([x, y, w, h]) = sky.tile_scissor() {
@@ -1433,12 +1453,17 @@ impl Renderer {
                     1 + r.geometry.instance_buffers.len(),
                     crate::shadows::SkyOcclusion::DEPTH_BIAS,
                 );
+                let offset = mesh_offset(scene_idx, self.matrix_alignment);
+                // its cut for this view, on the cluster path
+                if let Some((cut, pipeline)) = cluster_cut(cuts, r, scene_idx, view).zip(r.material.cluster_depth_pipeline(&key)) {
+                    draw_cut(&mut pass, r, cut, pipeline, offset);
+                    continue;
+                }
                 let Some(pipeline) = r.material.depth_pipeline_cache.get(&key) else { continue };
                 pass.set_pipeline(pipeline);
                 if let Some(bg) = r.material.bind_group() {
                     pass.set_bind_group(0, bg, &[]);
                 }
-                let offset = mesh_offset(scene_idx, self.matrix_alignment);
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                 draw_geometry(&mut pass, r, view);
             }
@@ -1455,6 +1480,7 @@ impl Renderer {
         }
         let device = self.device.as_ref().unwrap();
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let cuts = &self.cluster_cuts;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/CascadedShadows") });
         for cascade in 0..csm.slots.len() {
             let view = self.cascade_view(cascade);
@@ -1479,12 +1505,17 @@ impl Renderer {
                     1 + r.geometry.instance_buffers.len(),
                     crate::shadows::CascadedShadowMap::DEPTH_BIAS,
                 );
+                let offset = mesh_offset(scene_idx, self.matrix_alignment);
+                // its cut for this view, on the cluster path
+                if let Some((cut, pipeline)) = cluster_cut(cuts, r, scene_idx, view).zip(r.material.cluster_depth_pipeline(&key)) {
+                    draw_cut(&mut pass, r, cut, pipeline, offset);
+                    continue;
+                }
                 let Some(pipeline) = r.material.depth_pipeline_cache.get(&key) else { continue };
                 pass.set_pipeline(pipeline);
                 if let Some(bg) = r.material.bind_group() {
                     pass.set_bind_group(0, bg, &[]);
                 }
-                let offset = mesh_offset(scene_idx, self.matrix_alignment);
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                 draw_geometry(&mut pass, r, view);
             }
@@ -1671,6 +1702,7 @@ impl Renderer {
         let device = self.device.as_ref().unwrap();
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
         let alignment = self.matrix_alignment;
+        let cuts = &self.cluster_cuts;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/SpotShadows") });
         for slot in &self.spot_lights.shadows {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1694,12 +1726,17 @@ impl Renderer {
                     1 + r.geometry.instance_buffers.len(),
                     crate::shadows::SpotShadowAtlas::DEPTH_BIAS,
                 );
+                let offset = mesh_offset(scene_idx, alignment);
+                // its cut for this view, on the cluster path
+                if let Some((cut, pipeline)) = cluster_cut(cuts, r, scene_idx, spot_view(slot.layer)).zip(r.material.cluster_depth_pipeline(&key)) {
+                    draw_cut(&mut pass, r, cut, pipeline, offset);
+                    continue;
+                }
                 let Some(pipeline) = r.material.depth_pipeline_cache.get(&key) else { continue };
                 pass.set_pipeline(pipeline);
                 if let Some(bg) = r.material.bind_group() {
                     pass.set_bind_group(0, bg, &[]);
                 }
-                let offset = mesh_offset(scene_idx, alignment);
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                 // culled against this light's frustum, not the camera's
                 draw_geometry(&mut pass, r, spot_view(slot.layer));
@@ -1976,12 +2013,6 @@ impl Renderer {
             views.push(sky.cull_view().map(|view_proj| cluster_view(view_proj, c.projection_matrix.to_glam(), c.view_matrix.to_glam(), sky.options.resolution, threshold * sky.options.lod_error_scale)));
         }
         views
-    }
-
-    /// Renderable `index`'s cluster cut for cull view `view` this frame, if it has one.
-    fn cluster_cut<'a>(&self, r: &'a crate::objects::Renderable, index: usize, view: usize) -> Option<&'a crate::clusters::Cut> {
-        self.cluster_cuts.binary_search(&(index, view)).ok()?;
-        r.clusters.as_ref()?.gpu.as_ref()?.cut(view as u32)
     }
 
     /// Occlusion's second phase, once the first phase's opaque depth is in `gbuffer`: build the
@@ -2278,6 +2309,7 @@ impl Renderer {
                 if (cascades || sky_occlusion) && r.cast_shadow {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
                 }
+                self.prepare_cluster_depth_pipelines(r, spot_shadows, cascades || sky_occlusion);
                 if reflections {
                     r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
                 }
@@ -2592,6 +2624,7 @@ impl Renderer {
             if (cascades || sky_occlusion) && r.cast_shadow {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
             }
+            self.prepare_cluster_depth_pipelines(r, spot_shadows, cascades || sky_occlusion);
             if r.material.options.outputs_velocity {
                 r.material.get_velocity_pipeline(device, &layouts);
             }
@@ -3238,6 +3271,25 @@ impl<'a> CameraClusterDraw<'a> {
             enc.draw_indirect(self.args, 0);
         }
     }
+}
+
+/// Renderable `r`'s (scene index `index`) cluster cut for cull view `view` this frame, if `cuts`
+/// (the frame's, sorted) holds it.
+fn cluster_cut<'a>(cuts: &[(usize, usize)], r: &'a crate::objects::Renderable, index: usize, view: usize) -> Option<&'a crate::clusters::Cut> {
+    cuts.binary_search(&(index, view)).ok()?;
+    r.clusters.as_ref()?.gpu.as_ref()?.cut(view as u32)
+}
+
+/// Draw `r`'s cluster cut `cut` with `pipeline`: its material's group 0, the cut's group 2 at
+/// the renderable's matrix offset, and the indirect draw the cull wrote.
+fn draw_cut<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, cut: &'a crate::clusters::Cut, pipeline: &'a wgpu::RenderPipeline, offset: u32) {
+    let Some(group) = cut.draw_bind_group() else { return };
+    enc.set_pipeline(pipeline);
+    if let Some(bg) = r.material.bind_group() {
+        enc.set_bind_group(0, Some(bg), &[]);
+    }
+    enc.set_bind_group(2, Some(group), &[offset, offset]);
+    enc.draw_indirect(cut.args(), 0);
 }
 
 /// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
