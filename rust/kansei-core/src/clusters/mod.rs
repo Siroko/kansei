@@ -79,6 +79,10 @@ pub struct ClusterOptions {
     pub card_flatness: f32,
     /// Scales pruned levels' error: below 1, crowns thin out nearer (see `ClusterMesh::build`).
     pub card_error_scale: f32,
+    /// The most a pruned card is scaled up to cover the cards it stands for (4: at most a
+    /// sixteenth of the cards are left). Past that the cards stop being pruned: a crown of a few
+    /// giant cards is an impostor's job.
+    pub card_max_scale: f32,
 }
 
 impl Default for ClusterOptions {
@@ -96,6 +100,7 @@ impl Default for ClusterOptions {
             card_max_triangles: 64,
             card_flatness: 0.5,
             card_error_scale: 1.0,
+            card_max_scale: 4.0,
         }
     }
 }
@@ -125,6 +130,8 @@ pub struct Cluster {
     pub parent_error: f32,
     pub parent_bounds: Sphere,
     pub level: u32,
+    /// One of pruned cards (foliage, `ClusterOptions::cards`), not of simplified triangles.
+    pub card: bool,
 }
 
 impl Cluster {

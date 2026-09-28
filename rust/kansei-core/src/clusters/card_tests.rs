@@ -1,5 +1,5 @@
 use super::cards::*;
-use super::tests::rock;
+use super::tests::{bad_edges_keyed, eyes, position_keys, rock, view};
 use super::*;
 use crate::geometries::Geometry;
 /// A quad (two triangles, its own four vertices) centred at `c`, in the plane of `u` and `v`
@@ -85,4 +85,115 @@ fn small_open_flat_components_are_cards() {
     let (positions, ids) = welded(&g);
     let (cards, _) = find_cards(&g.indices, &positions, &ids, &ClusterOptions { cards: true, ..Default::default() });
     assert_eq!(cards.len(), 3);
+}
+
+/// The drawn cards' area (their triangles', scaled copies included) per cell of a `cells`³ grid
+/// over `bounds` (lo, hi), and in all.
+fn area_per_cell(mesh: &ClusterMesh, cut: &[usize], (lo, hi): (Vec3, Vec3), cells: usize) -> (Vec<f32>, f32) {
+    let mut per = vec![0.0f32; cells * cells * cells];
+    let mut total = 0.0;
+    for &c in cut {
+        for [a, b, d] in mesh.triangles(c) {
+            let p = |v: u32| Vec3::from_slice(&mesh.vertices[v as usize].position[..3]);
+            let area = 0.5 * (p(b) - p(a)).cross(p(d) - p(a)).length();
+            let centre = (p(a) + p(b) + p(d)) / 3.0;
+            let cell = ((centre - lo) / (hi - lo) * cells as f32).clamp(Vec3::ZERO, Vec3::splat(cells as f32 - 1.0)).as_uvec3();
+            per[(cell.z as usize * cells + cell.y as usize) * cells + cell.x as usize] += area;
+            total += area;
+        }
+    }
+    (per, total)
+}
+
+fn card_options() -> ClusterOptions {
+    ClusterOptions { cards: true, ..Default::default() }
+}
+
+#[test]
+fn pruned_levels_hold_the_cards_area() {
+    let mesh = ClusterMesh::build(&crown(800), &card_options());
+    assert!(mesh.clusters.iter().all(|c| c.card));
+    let levels = mesh.levels();
+    assert!(levels.len() >= 4, "{} levels", levels.len());
+    let bounds = (Vec3::new(-3.5, -0.5, -3.5), Vec3::new(3.5, 10.5, 3.5));
+    let level0: Vec<usize> = (0..mesh.clusters.len()).filter(|&i| mesh.clusters[i].level == 0).collect();
+    let (cells0, total0) = area_per_cell(&mesh, &level0, bounds, 3);
+    let mut seed = 5;
+    let mut triangles = Vec::new();
+    for eye in eyes(30, 5.0, 3000.0, &mut seed).into_iter().chain([Vec3::new(0.0, 5.0, 40.0), Vec3::new(0.0, 5.0, 4000.0)]) {
+        for threshold in [0.5, 1.0, 4.0] {
+            let cut = mesh.select(&view(eye, threshold));
+            let (cells, total) = area_per_cell(&mesh, &cut, bounds, 3);
+            assert!((total / total0 - 1.0).abs() < 0.1, "eye {eye}, {threshold} px: {total} of {total0}");
+            // (a cell is held to it where it keeps enough cards for the share to mean something:
+            // eight at the cut's reduction)
+            let kept = cut.iter().map(|&c| mesh.clusters[c].triangle_count).sum::<u32>() as f32 / 1600.0;
+            for (k, (&a, &a0)) in cells.iter().zip(&cells0).enumerate() {
+                if a0 / 0.35 * kept >= 8.0 {
+                    assert!((a / a0 - 1.0).abs() < 0.35, "eye {eye}, {threshold} px: cell {k} holds {a} of {a0}");
+                }
+            }
+            triangles.push(cut.iter().map(|&c| mesh.clusters[c].triangle_count).sum::<u32>());
+        }
+    }
+    // from 4 km at 1 px, a small share of the cards
+    let far = triangles[triangles.len() - 2];
+    assert!(far * 8 < 1600, "{far} triangles from 4 km");
+    // and there each part of the crown keeps about its area: a kept card is paired with its
+    // nearest and drawn at the centre of the area it stands for
+    let cut = mesh.select(&view(Vec3::new(0.0, 5.0, 4000.0), 1.0));
+    let (cells, _) = area_per_cell(&mesh, &cut, bounds, 3);
+    for (k, (&a, &a0)) in cells.iter().zip(&cells0).enumerate() {
+        if a0 > 0.05 * total0 {
+            assert!((a / a0 - 1.0).abs() <= 0.2, "from 4 km, cell {k} holds {a} of {a0}");
+        }
+    }
+}
+
+#[test]
+fn levels_of_cards_nest_like_simplified_levels() {
+    let mesh = ClusterMesh::build(&crown(800), &card_options());
+    for c in &mesh.clusters {
+        if c.parent_error.is_finite() {
+            assert!(c.parent_error >= c.error, "{} < {}", c.parent_error, c.error);
+            assert!(c.parent_bounds.contains(&c.lod_bounds));
+        }
+    }
+    let roots = mesh.clusters.iter().filter(|c| !c.parent_error.is_finite()).count();
+    assert!(roots <= 4, "{roots} roots");
+}
+
+#[test]
+fn a_mixed_mesh_prunes_its_cards_and_simplifies_the_rest() {
+    // a rock under a crown of cards, as one mesh
+    let mut g = crown(400);
+    let rock = rock(4, false);
+    let base = g.vertices.len() as u32;
+    g.vertices.extend(rock.vertices.iter().map(|v| Vertex { position: [v.position[0], v.position[1] - 2.0, v.position[2], 1.0], ..*v }));
+    g.indices.extend(rock.indices.iter().map(|i| i + base));
+    let mesh = ClusterMesh::build(&g, &card_options());
+    assert!(mesh.clusters.iter().any(|c| c.card) && mesh.clusters.iter().any(|c| !c.card));
+    let keys = position_keys(&mesh, 1e-5);
+    let mut seed = 9;
+    for eye in eyes(20, 4.0, 1000.0, &mut seed) {
+        for threshold in [0.5, 2.0] {
+            let cut = mesh.select(&view(eye, threshold));
+            let solid: Vec<usize> = cut.iter().copied().filter(|&c| !mesh.clusters[c].card).collect();
+            assert_eq!(bad_edges_keyed(&mesh, &keys, &solid), 0, "eye {eye}: the rock's cut is open");
+        }
+    }
+    // without `cards`, the same mesh is all solid
+    let plain = ClusterMesh::build(&g, &ClusterOptions::default());
+    assert!(plain.clusters.iter().all(|c| !c.card));
+}
+
+#[test]
+fn the_card_error_scale_moves_the_switch_nearer() {
+    let eye = Vec3::new(0.0, 5.0, 150.0);
+    let triangles = |scale: f32| {
+        let mesh = ClusterMesh::build(&crown(800), &ClusterOptions { card_error_scale: scale, ..card_options() });
+        mesh.select(&view(eye, 1.0)).iter().map(|&c| mesh.clusters[c].triangle_count).sum::<u32>()
+    };
+    let (full, quarter) = (triangles(1.0), triangles(0.25));
+    assert!(quarter < full, "{quarter} with a quarter of the error, {full} with all of it");
 }

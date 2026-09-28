@@ -80,3 +80,181 @@ pub(super) fn find_cards(indices: &[u32], positions: &[f32], position_ids: &[u32
     }
     (cards, rest)
 }
+
+use super::{ClusterMesh, Sphere};
+use crate::geometries::Vertex;
+
+/// A card at some level: which card, where its vertices are (u32::MAX: the card's own; else the
+/// first of its scaled copy's, in the card's vertex order), how many level-0 cards it stands for,
+/// the area it covers, and where (their area-weighted centre, where it is drawn).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Placed {
+    pub card: u32,
+    pub first_vertex: u32,
+    pub represents: u32,
+    pub area: f32,
+    pub center: Vec3,
+}
+
+impl Placed {
+    fn vertex(&self, card: &Card, j: usize) -> u32 {
+        if self.first_vertex == u32::MAX { card.vertices[j] } else { self.first_vertex + j as u32 }
+    }
+}
+
+/// A 30-bit Morton code of `p` in `(lo, hi)`.
+pub(super) fn morton(p: Vec3, lo: Vec3, hi: Vec3) -> u32 {
+    let q = ((p - lo) / (hi - lo).max(Vec3::splat(1e-9)) * 1023.0).clamp(Vec3::ZERO, Vec3::splat(1023.0)).as_uvec3();
+    let spread = |mut x: u32| {
+        x = (x | (x << 16)) & 0x0300_00ff;
+        x = (x | (x << 8)) & 0x0300_f00f;
+        x = (x | (x << 4)) & 0x030c_30c3;
+        (x | (x << 2)) & 0x0924_9249
+    };
+    spread(q.x) | spread(q.y) << 1 | spread(q.z) << 2
+}
+
+fn hash(a: u32, b: u32) -> u32 {
+    let x = a.wrapping_mul(0x9E37_79B1) ^ b.wrapping_mul(0x85EB_CA77);
+    (x ^ (x >> 15)).wrapping_mul(0x2C1B_3C6D)
+}
+
+/// Whole cards packed into clusters, in the order given (neighbours: Morton order), each up to
+/// the options' vertex and triangle limits, with `error`, `lod_bounds` (their own when None) and
+/// `level`; per new cluster, its index and its cards.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pack(mesh: &mut ClusterMesh, cards: &[Card], placed: &[Placed], positions: &[f32], error: f32, lod_bounds: Option<Sphere>, level: u32, options: &super::ClusterOptions) -> Vec<(usize, Vec<Placed>)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < placed.len() {
+        let (mut v, mut t, mut end) = (0, 0, start);
+        while end < placed.len() {
+            let card = &cards[placed[end].card as usize];
+            if end > start && (v + card.vertices.len() > options.max_vertices || t + card.triangles.len() > options.max_triangles) {
+                break;
+            }
+            v += card.vertices.len();
+            t += card.triangles.len();
+            end += 1;
+        }
+        let (mut vertices, mut triangles) = (Vec::with_capacity(v), Vec::with_capacity(t * 3));
+        for p in &placed[start..end] {
+            let card = &cards[p.card as usize];
+            let base = vertices.len() as u8;
+            vertices.extend((0..card.vertices.len()).map(|j| p.vertex(card, j)));
+            triangles.extend(card.triangles.iter().flat_map(|t| t.map(|j| base + j as u8)));
+        }
+        let index = mesh.push_cluster(&vertices, &triangles, positions, error, lod_bounds, level, true);
+        out.push((index, placed[start..end].to_vec()));
+        start = end;
+    }
+    out
+}
+
+/// One round over the card clusters still without a parent (`pending`): grouped in Morton order,
+/// each group's cards pruned to one of each neighbouring pair (the kept one scaled to cover its
+/// pair's area: new vertices, appended to the mesh and to `positions`), the children given their
+/// parent's error and sphere, and the kept cards packed into this level's clusters. Returns the
+/// next pending set and whether any group was pruned.
+pub(super) fn prune_round(mesh: &mut ClusterMesh, cards: &[Card], pending: Vec<(usize, Vec<Placed>)>, positions: &mut Vec<f32>, level: u32, options: &super::ClusterOptions) -> (Vec<(usize, Vec<Placed>)>, bool) {
+    let (lo, hi) = bounds_of(positions);
+    let mut pending = pending;
+    pending.sort_by_key(|(c, _)| morton(mesh.clusters[*c].bounds.center, lo, hi));
+    let mut next = Vec::new();
+    let mut progress = false;
+    for group in pending.chunks(options.group_size.max(2)) {
+        let mut placed: Vec<Placed> = group.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+        if placed.len() < 2 {
+            next.extend(group.iter().cloned());
+            continue;
+        }
+        placed.sort_by_key(|p| morton(p.center, lo, hi));
+        let (area, n0) = placed.iter().fold((0.0, 0), |(a, n), p| (a + p.area, n + p.represents));
+        let mut kept = Vec::with_capacity(placed.len().div_ceil(2));
+        for (a, b) in pairs(&placed) {
+            let Some(b) = b else {
+                kept.push(a);
+                continue;
+            };
+            // the one kept: either, by a hash (deterministic, uncorrelated with place)
+            let (a, b) = if hash(a.card, level) <= hash(b.card, level) { (a, b) } else { (b, a) };
+            let card = &cards[a.card as usize];
+            let (represents, covered) = (a.represents + b.represents, a.area + b.area);
+            let scale = (covered / card.area).sqrt();
+            if scale > options.card_max_scale {
+                // as far as this card goes: both stay
+                kept.extend([a, b]);
+                continue;
+            }
+            // drawn at the centre of the area it stands for, scaled to cover it
+            let center = (a.center * a.area + b.center * b.area) / covered;
+            let first_vertex = mesh.vertices.len() as u32;
+            for &v in &card.vertices {
+                let mut vertex: Vertex = mesh.vertices[v as usize];
+                let p = center + (Vec3::from_slice(&vertex.position[..3]) - card.centroid) * scale;
+                vertex.position[..3].copy_from_slice(&p.to_array());
+                mesh.vertices.push(vertex);
+                positions.extend_from_slice(&p.to_array());
+            }
+            kept.push(Placed { card: a.card, first_vertex, represents, area: covered, center });
+        }
+        if kept.len() == placed.len() {
+            // nothing came off: next round, grouped with other neighbours
+            next.extend(group.iter().cloned());
+            continue;
+        }
+        progress = true;
+        let k = kept.len() as f32;
+        let own = options.card_error_scale * ((area / k).sqrt() - (area / n0 as f32).sqrt());
+        let error = group.iter().map(|(c, _)| mesh.clusters[*c].error).fold(own.max(0.0), f32::max);
+        let bounds = Sphere::enclosing(group.iter().map(|(c, _)| mesh.clusters[*c].lod_bounds));
+        for (c, _) in group {
+            mesh.clusters[*c].parent_error = error;
+            mesh.clusters[*c].parent_bounds = bounds;
+        }
+        next.extend(pack(mesh, cards, &kept, positions, error, Some(bounds), level, options));
+    }
+    (next, progress)
+}
+
+/// Neighbouring pairs of `placed` (in Morton order): each card with the nearest still free among
+/// the next few; an odd one alone.
+fn pairs(placed: &[Placed]) -> Vec<(Placed, Option<Placed>)> {
+    const WINDOW: usize = 8;
+    let mut taken = vec![false; placed.len()];
+    let mut out = Vec::with_capacity(placed.len().div_ceil(2));
+    for i in 0..placed.len() {
+        if taken[i] {
+            continue;
+        }
+        taken[i] = true;
+        let nearest = (i + 1..placed.len().min(i + 1 + WINDOW)).filter(|&j| !taken[j]).min_by(|&j, &k| {
+            placed[i].center.distance_squared(placed[j].center).total_cmp(&placed[i].center.distance_squared(placed[k].center))
+        });
+        match nearest {
+            Some(j) => {
+                taken[j] = true;
+                out.push((placed[i], Some(placed[j])));
+            }
+            None => out.push((placed[i], None)),
+        }
+    }
+    out
+}
+
+fn bounds_of(positions: &[f32]) -> (Vec3, Vec3) {
+    positions.chunks(3).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(Vec3::from_slice(p)), hi.max(Vec3::from_slice(p))))
+}
+
+/// The cards at level 0: each on its own, in Morton order of their centroids, packed into
+/// clusters.
+pub(super) fn level_zero(mesh: &mut ClusterMesh, cards: &[Card], positions: &[f32], options: &super::ClusterOptions) -> Vec<(usize, Vec<Placed>)> {
+    if cards.is_empty() {
+        return Vec::new();
+    }
+    let (lo, hi) = bounds_of(positions);
+    let mut order: Vec<u32> = (0..cards.len() as u32).collect();
+    order.sort_by_key(|&c| morton(cards[c as usize].centroid, lo, hi));
+    let placed: Vec<Placed> = order.iter().map(|&c| Placed { card: c, first_vertex: u32::MAX, represents: 1, area: cards[c as usize].area, center: cards[c as usize].centroid }).collect();
+    pack(mesh, cards, &placed, positions, 0.0, None, 0, options)
+}
