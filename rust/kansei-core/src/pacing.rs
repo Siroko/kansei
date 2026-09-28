@@ -5,8 +5,11 @@
 //! the next may not be, and the cadence alternates between one refresh and two: an uneven picture,
 //! though the average frame rate looks fine. `FramePacer` renders on every k-th refresh instead
 //! (every other one on a 120 Hz display is a steady 60 fps), k the fewest that keep up:
-//! - it renders on fewer (k + 1) as soon as refreshes are being missed: the browser calls a
-//!   refresh late while the frames before it are still on the GPU;
+//! - it renders on fewer (k + 1) when refreshes are being missed (the browser calls a refresh
+//!   late while the frames before it are still on the GPU): over two windows running, or many
+//!   over one. A burst of slow frames (a cut, a rebuild) is a few hitches, not a slower cadence;
+//! - it renders when k refresh intervals have passed since the last rendered frame, by the
+//!   refreshes' timestamps: a late refresh does not push the next frame a refresh further;
 //! - it tries more (k - 1) once k has held without a miss for `settle_ms`, and keeps them if
 //!   nothing is missed; if something is, it goes back and waits twice as long before trying again
 //!   (up to `max_backoff_ms`);
@@ -45,8 +48,10 @@ pub struct FramePacerOptions {
     pub max_divisor: u32,
     /// A refresh is missed when it comes this many refresh intervals after the one before.
     pub late_factor: f64,
-    /// The share of the refreshes over the last `window_ms` that may be missed.
+    /// The share of the refreshes that may be missed over each of two `window_ms` running.
     pub late_share: f64,
+    /// Missing this share of the refreshes over one `window_ms` slows down at once.
+    pub late_share_at_once: f64,
     pub window_ms: f64,
     /// How long a cadence must hold without a miss before a faster one is tried, ms.
     pub settle_ms: f64,
@@ -61,7 +66,7 @@ pub struct FramePacerOptions {
 
 impl Default for FramePacerOptions {
     fn default() -> Self {
-        Self { max_fps: None, max_divisor: 4, late_factor: 1.5, late_share: 0.05, window_ms: 1000.0, settle_ms: 2000.0, max_backoff_ms: 16000.0, warmup_ms: 1000.0, try_below: 0.85 }
+        Self { max_fps: None, max_divisor: 4, late_factor: 1.5, late_share: 0.05, late_share_at_once: 0.2, window_ms: 1000.0, settle_ms: 2000.0, max_backoff_ms: 16000.0, warmup_ms: 1000.0, try_below: 0.85 }
     }
 }
 
@@ -76,7 +81,7 @@ pub(crate) struct Cadence {
     refresh_ms: f64,
     /// When an interval about as short as `refresh_ms` was last seen
     last_short: f64,
-    /// The last `window_ms` of refreshes: when, and whether missed
+    /// The last two `window_ms` of refreshes: when, and whether missed
     recent: VecDeque<(f64, bool)>,
     /// Recent rendered frames' GPU time, ms, and what it was when the last try failed
     gpu: VecDeque<f64>,
@@ -87,7 +92,8 @@ pub(crate) struct Cadence {
     changed_at: f64,
     trying: bool,
     backoff_ms: f64,
-    tick: u32,
+    /// When the last frame was rendered
+    last_render: Option<f64>,
 }
 
 impl Cadence {
@@ -108,7 +114,7 @@ impl Cadence {
             changed_at: 0.0,
             trying: false,
             backoff_ms: options.settle_ms,
-            tick: 0,
+            last_render: None,
         }
     }
 
@@ -156,13 +162,18 @@ impl Cadence {
             }
         } else {
             self.recent.push_back((now_ms, late));
-            while self.recent.front().is_some_and(|&(t, _)| now_ms - t > self.options.window_ms) {
+            while self.recent.front().is_some_and(|&(t, _)| now_ms - t > 2.0 * self.options.window_ms) {
                 self.recent.pop_front();
             }
             self.decide(now_ms);
         }
-        self.tick = (self.tick + 1) % self.divisor;
-        self.tick == 0
+        // render once `divisor` refresh intervals have passed since the last frame (half a
+        // refresh early, for the timestamps' jitter)
+        let due = self.last_render.is_none_or(|last| now_ms - last >= (self.divisor as f64 - 0.5) * self.refresh_ms());
+        if due {
+            self.last_render = Some(now_ms);
+        }
+        due
     }
 
     /// A rendered frame's GPU time, ms.
@@ -178,7 +189,6 @@ impl Cadence {
     fn set_divisor(&mut self, divisor: u32, now_ms: f64) {
         self.divisor = divisor;
         self.changed_at = now_ms;
-        self.tick = 0;
         self.recent.clear();
         self.gpu.clear();
     }
@@ -191,10 +201,18 @@ impl Cadence {
             return;
         }
         let since = now_ms - self.changed_at;
-        let missed = self.recent.iter().filter(|(_, late)| *late).count() as f64;
-        let share = missed / self.recent.len().max(1) as f64;
-        // missing refreshes over a whole window: render on fewer (a failed try: wait longer)
-        if since >= o.window_ms && share > o.late_share {
+        // the refreshes missed over the last window, and their share there and over the one before
+        let share = |from: f64, to: f64| {
+            let (missed, count) = self.recent.iter().filter(|&&(t, _)| t > from && t <= to).fold((0, 0), |(m, n), &(_, late)| (m + late as u32, n + 1));
+            (missed as f64, missed as f64 / count.max(1) as f64)
+        };
+        let (missed, last) = share(now_ms - o.window_ms, now_ms);
+        let (_, before) = share(now_ms - 2.0 * o.window_ms, now_ms - o.window_ms);
+        // missing refreshes over two windows running, or many over one: render on fewer; a try
+        // at a faster cadence fails on one (and waits longer before the next)
+        let slower = since >= o.window_ms && (last > o.late_share_at_once || (self.trying && last > o.late_share))
+            || since >= 2.0 * o.window_ms && last > o.late_share && before > o.late_share;
+        if slower {
             if self.trying {
                 self.backoff_ms = (self.backoff_ms * 2.0).min(o.max_backoff_ms);
                 self.failed_gpu = self.gpu_p90().unwrap_or(f64::INFINITY);
@@ -474,6 +492,11 @@ mod tests {
     /// each rendered frame costs `gpu(t)` ms of GPU time, one after another. Runs the cadence for
     /// `seconds` from `start`; the divisor at the end and the rendered frames' times.
     fn simulate(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64) -> (u32, Vec<f64>) {
+        simulate_seeing(cadence, start, refresh, seconds, gpu, |_, _| {})
+    }
+
+    /// `simulate`, calling `seen` with each refresh's time and the divisor after it.
+    fn simulate_seeing(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> (u32, Vec<f64>) {
         let mut in_flight: VecDeque<f64> = VecDeque::new(); // when each frame on the GPU is done
         let mut gpu_free = start;
         let mut rendered = Vec::new();
@@ -494,6 +517,7 @@ mod tests {
                 in_flight.push_back(gpu_free);
                 cadence.on_gpu_time(gpu(t));
             }
+            seen(t, cadence.divisor());
             t += refresh;
         }
         (cadence.divisor(), rendered)
@@ -585,6 +609,74 @@ mod tests {
         // slow first frames (the first half second), then light ones
         let (k, _) = simulate(&mut cadence, 0.0, refresh, 10.0, |t| if t < 500.0 { 100.0 } else { 8.0 });
         assert_eq!(k, 1);
+    }
+
+    /// The divisor changes of a `simulate`: when, and to what.
+    fn divisors(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64) -> Vec<(f64, u32)> {
+        let mut changes = Vec::new();
+        let mut last = cadence.divisor();
+        simulate_seeing(cadence, start, refresh, seconds, gpu, |t, k| {
+            if k != last {
+                changes.push((t, k));
+                last = k;
+            }
+        });
+        changes
+    }
+
+    #[test]
+    fn a_burst_of_slow_frames_is_not_a_slower_cadence() {
+        // 12 ms frames every other refresh at 120 Hz, then a cut: 40 ms frames for a fifth of a
+        // second, a few hitches
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        assert_eq!(simulate(&mut cadence, 0.0, refresh, 10.0, |_| 12.0).0, 2);
+        let cut = 10000.0;
+        let changes = divisors(&mut cadence, cut, refresh, 10.0, |t| if (cut..cut + 200.0).contains(&t) { 40.0 } else { 12.0 });
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    #[test]
+    fn misses_over_two_windows_slow_it_and_many_over_one_at_once() {
+        // at 60 Hz, 18 ms frames miss about one refresh in twelve: after two windows of it,
+        // every other refresh
+        let refresh = 1000.0 / 60.0;
+        let onset = 5000.0;
+        let mut cadence = Cadence::new(FramePacerOptions::default());
+        assert_eq!(simulate(&mut cadence, 0.0, refresh, 5.0, |_| 12.0).0, 1);
+        let changes = divisors(&mut cadence, onset, refresh, 4.0, |_| 18.0);
+        assert!(changes.first().is_some_and(|&(t, k)| k == 2 && (1500.0..2600.0).contains(&(t - onset))), "{changes:?}");
+        // 24 ms frames miss nearly half: within a window
+        let mut cadence = Cadence::new(FramePacerOptions::default());
+        simulate(&mut cadence, 0.0, refresh, 5.0, |_| 12.0);
+        let changes = divisors(&mut cadence, onset, refresh, 2.0, |_| 24.0);
+        assert!(changes.first().is_some_and(|&(t, k)| k == 2 && t - onset < 1200.0), "{changes:?}");
+    }
+
+    #[test]
+    fn a_late_refresh_does_not_delay_the_next_frame() {
+        // every other refresh at 120 Hz; the browser skips a refresh now and then (light frames:
+        // not the GPU), and the frame due on it is rendered on the next one, not a refresh later
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        let mut last = None;
+        for i in 0..2400u32 {
+            if i % 37 == 36 {
+                continue;
+            }
+            let t = i as f64 * refresh;
+            let render = cadence.on_refresh(t);
+            cadence.on_gpu_time(4.0);
+            if t > 2000.0 {
+                // the first refresh two intervals or more after the last frame renders
+                let due = last.is_some_and(|l: f64| t - l > 1.5 * refresh);
+                assert_eq!(render, due, "refresh {i}: {:.1} refreshes after the last frame", (t - last.unwrap_or(t)) / refresh);
+            }
+            if render {
+                last = Some(t);
+            }
+        }
+        assert_eq!(cadence.divisor(), 2);
     }
 
     /// On a real GPU, frames of work are measured (a ring of readbacks); on wgpu's native Metal
