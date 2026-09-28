@@ -76,11 +76,13 @@ pub(crate) struct CullParamsGpu {
     _pad: u32,
 }
 
-/// A view the renderer culls for: its view-projection, and whether it only draws shadow casters.
+/// A view the renderer culls for: its view-projection, whether it only draws shadow casters, and
+/// how it scales the LOD distances (below 1 a view picks finer LODs than the camera would).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CullView {
     pub view_proj: glam::Mat4,
     pub casters_only: bool,
+    pub lod_distance_scale: f32,
 }
 
 impl InstanceCulling {
@@ -154,8 +156,9 @@ impl InstanceCulling {
             planes: frustum_planes(view.view_proj).map(|p| p.to_array()),
             world: world.to_cols_array(),
             lod_origin: lod_origin.to_array(),
-            lod_near: self.lod_range.0,
-            lod_far: self.lod_range.1.min(f32::MAX),
+            // a band [near, far) at distance x scale is the band [near, far) / scale at x
+            lod_near: self.lod_range.0 / view.lod_distance_scale.max(1e-3),
+            lod_far: (self.lod_range.1 / view.lod_distance_scale.max(1e-3)).min(f32::MAX),
             radius: self.radius,
             max_scale: scale.max_element(),
             count: self.count.min(self.capacity),
@@ -280,6 +283,7 @@ mod tests {
         let views = [0.0f32, 40.0].map(|x| CullView {
             view_proj: proj * glam::Mat4::look_at_rh(glam::Vec3::new(x, 0.0, 20.0), glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::Y),
             casters_only: false,
+            lod_distance_scale: 1.0,
         });
         let mut encoder = device.create_command_encoder(&Default::default());
         {

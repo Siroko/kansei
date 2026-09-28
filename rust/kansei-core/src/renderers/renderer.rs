@@ -1478,11 +1478,11 @@ impl Renderer {
     /// for every layer of the spot shadow atlas (`None` when no light uses it this frame), then
     /// `reflection_view(r)` for every planar reflection, then `cascade_view(c)` for every cascade.
     fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
-        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false })];
+        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, lod_distance_scale: 1.0 })];
         if let Some(atlas) = &self.spot_shadow_atlas {
             views.resize(1 + atlas.layers as usize, None);
             for slot in &self.spot_lights.shadows {
-                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true });
+                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, lod_distance_scale: 1.0 });
             }
         }
         // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
@@ -1490,11 +1490,12 @@ impl Renderer {
             r.is_active().then(|| crate::culling::CullView {
                 view_proj: r.camera().projection_matrix.to_glam() * r.camera().view_matrix.to_glam(),
                 casters_only: false,
+                lod_distance_scale: r.lod_distance_scale,
             })
         }));
         // then the cascades (`cascade_view`)
         if let Some(csm) = &self.cascaded_shadows {
-            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true })));
+            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, lod_distance_scale: 1.0 })));
         }
         views
     }
