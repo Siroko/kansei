@@ -26,7 +26,8 @@ struct ClusterCull {
     stretch: f32,
     // which of `views` the cut is for
     view: u32,
-    pad1: u32,
+    // the triangles `indices` holds
+    triangle_capacity: u32,
 }
 
 struct ClusterView {
@@ -40,17 +41,21 @@ struct ClusterView {
     pad: f32,
 }
 
-// DrawIndirect's four words, then the visible instances, the clusters claimed and the triangles
-// drawn
+// DrawIndexedIndirect's five words, then the visible instances, the clusters claimed and listed
+// (drawn), the triangles claimed and listed, and pads (clusters::DRAW_ARGS_BYTES)
 struct ClusterDraw {
-    vertex_count: u32,
+    index_count: u32,
     instance_count: u32,
-    first_vertex: u32,
+    first_index: u32,
+    base_vertex: u32,
     first_instance: u32,
     visible: u32,
     claimed: atomic<u32>,
+    listed: atomic<u32>,
+    triangles_claimed: atomic<u32>,
     triangles: atomic<u32>,
-    pad: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -66,6 +71,9 @@ const WINDOW_SLACK: f32 = 1e-3;
 @group(0) @binding(2) var<storage, read> records: array<u32>;
 @group(0) @binding(3) var<storage, read_write> draws: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> draw: ClusterDraw;
+// the cut's triangles: 3 indices each, `entry << 8 | local vertex` (a cluster's shared vertices
+// share an index, for the vertex cache)
+@group(0) @binding(5) var<storage, read_write> indices: array<u32>;
 @group(1) @binding(0) var<storage, read> views: array<ClusterView>;
 // `views[params.view]`, read once by `cull`
 var<private> view: ClusterView;
@@ -73,7 +81,7 @@ var<private> view: ClusterView;
 // prepare and finish
 @group(0) @binding(10) var<uniform> prepare_params: ClusterCull;
 @group(0) @binding(11) var<storage, read> instance_args: array<u32>;
-@group(0) @binding(12) var<storage, read_write> prepare_draw: array<u32, 8>;
+@group(0) @binding(12) var<storage, read_write> prepare_draw: array<u32, 12>;
 @group(0) @binding(13) var<storage, read_write> dispatch: array<u32, 4>;
 
 @compute @workgroup_size(1)
@@ -82,14 +90,15 @@ fn prepare() {
     if (prepare_params.count_word != NONE) {
         visible = instance_args[prepare_params.count_word];
     }
-    prepare_draw = array<u32, 8>(prepare_params.vertex_count, 0u, 0u, 0u, visible, 0u, 0u, 0u);
+    prepare_draw = array<u32, 12>(0u, 1u, 0u, 0u, 0u, visible, 0u, 0u, 0u, 0u, 0u, 0u);
     let x = min(visible, MAX_GROUPS);
     dispatch = array<u32, 4>(x, select(0u, (visible + x - 1u) / x, x > 0u), 1u, 0u);
 }
 
 @compute @workgroup_size(1)
 fn finish() {
-    prepare_draw[1] = min(prepare_draw[5], prepare_params.capacity);
+    // every index up to here is written: listed clusters' or degenerate triangles
+    prepare_draw[0] = 3u * min(prepare_draw[8], prepare_params.triangle_capacity);
 }
 
 fn record_f32(record: u32, word: u32) -> f32 {
@@ -211,6 +220,39 @@ fn cluster_drawn(c: u32, model: mat4x4<f32>, scale: f32, eye_mesh: vec3<f32>, co
     return true;
 }
 
+// Claim a draw-list entry for cluster `c` and, when it has one, room for its triangles; list it,
+// and write its indices, when they fit. Otherwise its room within the index buffer is written as
+// degenerate triangles, so the whole range the draw reads is written.
+fn list(record: u32, c: u32) {
+    let at = atomicAdd(&draw.claimed, 1u);
+    if (at >= params.capacity) {
+        return;
+    }
+    // (only clusters with an entry take room for their triangles)
+    let count = kansei_cluster_word(c, 2u);
+    let base = atomicAdd(&draw.triangles_claimed, count);
+    let fits = base + count <= params.triangle_capacity;
+    draws[at] = select(vec2<u32>(NONE, NONE), vec2<u32>(record, c), fits);
+    if (fits) {
+        atomicAdd(&draw.listed, 1u);
+        atomicAdd(&draw.triangles, count);
+        let first = kansei_cluster_mesh[2] + kansei_cluster_word(c, 1u);
+        for (var t = 0u; t < count; t++) {
+            let packed = kansei_cluster_mesh[first + t];
+            let i = (base + t) * 3u;
+            indices[i] = (at << 8u) | (packed & 0xffu);
+            indices[i + 1u] = (at << 8u) | ((packed >> 8u) & 0xffu);
+            indices[i + 2u] = (at << 8u) | ((packed >> 16u) & 0xffu);
+        }
+    } else {
+        for (var t = base; t < min(base + count, params.triangle_capacity); t++) {
+            indices[t * 3u] = 0u;
+            indices[t * 3u + 1u] = 0u;
+            indices[t * 3u + 2u] = 0u;
+        }
+    }
+}
+
 @compute @workgroup_size(64)
 fn cull(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     let slot = group.y * groups.x + group.x;
@@ -246,11 +288,7 @@ fn cull(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups
         for (var i = lane; i < count; i += 64u) {
             let c = first + i;
             if (cluster_drawn(c, model, scale, eye_mesh, cone)) {
-                let at = atomicAdd(&draw.claimed, 1u);
-                if (at < params.capacity) {
-                    draws[at] = vec2<u32>(record, c);
-                    atomicAdd(&draw.triangles, kansei_cluster_word(c, 2u));
-                }
+                list(record, c);
             }
         }
     }
