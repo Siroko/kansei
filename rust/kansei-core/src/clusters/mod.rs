@@ -174,6 +174,9 @@ pub struct LodView {
     pub near: f32,
     /// The error budget, pixels.
     pub threshold: f32,
+    /// An orthographic view (a shadow cascade, a top-down view): `pixels_per_radian` is pixels
+    /// per metre, and an error projects to the same pixels at any distance.
+    pub orthographic: bool,
 }
 
 /// `error` (metres) seen from the view as pixels: over the distance to the nearest point of
@@ -183,13 +186,17 @@ pub fn projected_error(error: f32, sphere: Sphere, view: &LodView) -> f32 {
     projected_error_at(error, sphere.center.distance(view.eye) - sphere.radius, view)
 }
 
-/// `error` seen from `distance` away (clamped to the view's `near`), in pixels.
+/// `error` seen from `distance` away (clamped to the view's `near`), in pixels; at any distance
+/// in an orthographic view.
 pub fn projected_error_at(error: f32, distance: f32, view: &LodView) -> f32 {
     if error == 0.0 {
         return 0.0;
     }
     if !error.is_finite() {
         return f32::INFINITY;
+    }
+    if view.orthographic {
+        return error * view.pixels_per_radian;
     }
     error / distance.max(view.near) * view.pixels_per_radian
 }
