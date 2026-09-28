@@ -4,6 +4,13 @@
 // (the main camera) is inside the renderable's LOD band; survivors are copied, word by word, into
 // the view's region of the compacted instances, and counted into its indirect draw.
 //
+// Crossfades (`crossfade` > 0, InstanceCulling::with_crossfade): each band's edges widen by half
+// the crossfade width, and a survivor's record is followed by one more word, its fade: 1 inside
+// the band, in (0, 1) where it fades out past its far edge (the share of its pixels it keeps), in
+// (-1, 0) where it fades in before its near edge (it keeps the complementary pixels). Two LODs
+// meeting at a distance with the same width fade by complementary shares there, so a material
+// that drops pixels by the fade (culling::LOD_FADE_WGSL) draws each pixel from one of them.
+//
 // Two-phase occlusion culling (the views that ask for it, FLAG_OCCLUSION: the camera, planar
 // reflections; for renderables that opt in, FLAG_TWO_PHASE):
 // - `early`: of the survivors, keep those that were visible last frame (`visibility`).
@@ -37,7 +44,7 @@ struct CullInstances {
     shadowLod    : vec2f,             // the LOD band in shadow maps (FLAG_CASTERS_ONLY views)
     reflectionLod: vec2f,             // the LOD band in planar reflections (FLAG_REFLECTION views)
     occlusionView: u32,               // `early` and `late`: the view culled in two phases
-    _pad0        : u32,
+    crossfade    : f32,               // the width of the bands' crossfades (LOD distance); 0: none
     _pad1        : u32,
     _pad2        : u32,
 }
@@ -119,18 +126,45 @@ fn bounds(i : u32) -> Bounds {
     return b;
 }
 
+// The view's kind's LOD band: a shadow map's, a reflection's, or the camera's.
+fn lodBand(v : u32) -> vec2f {
+    if ((views[v].flags & FLAG_CASTERS_ONLY) != 0u) {
+        return ci.shadowLod;
+    } else if ((views[v].flags & FLAG_REFLECTION) != 0u) {
+        return ci.reflectionLod;
+    }
+    return vec2f(ci.lodNear, ci.lodFar);
+}
+
+fn lodDistance(b : Bounds, v : u32) -> f32 {
+    return distance(b.center, views[v].lodOrigin) * views[v].lodScale;
+}
+
+// The fade of a survivor in view v (see the header): 1 inside its band; past the far edge the
+// share it keeps as it fades out, before the near edge minus the share it keeps as it fades in.
+// A band from 0 does not fade in, nor one to infinity (f32 max) out.
+fn lodFade(b : Bounds, v : u32) -> f32 {
+    if (ci.crossfade <= 0.0) { return 1.0; }
+    let d = lodDistance(b, v);
+    let band = lodBand(v);
+    let h = 0.5 * ci.crossfade;
+    if (band.x > 0.0 && d < band.x + h) {
+        return -saturate((d - (band.x - h)) / ci.crossfade);
+    }
+    if (band.y < 3.0e38 && d > band.y - h) {
+        return saturate(((band.y + h) - d) / ci.crossfade);
+    }
+    return 1.0;
+}
+
 // KEPT, LOD_CULLED or FRUSTUM_CULLED
 // (view v)
 fn cull(b : Bounds, v : u32) -> u32 {
-    let d = distance(b.center, views[v].lodOrigin) * views[v].lodScale;
-    // the view's kind's band: a shadow map's, a reflection's, or the camera's
-    var band = vec2f(ci.lodNear, ci.lodFar);
-    if ((views[v].flags & FLAG_CASTERS_ONLY) != 0u) {
-        band = ci.shadowLod;
-    } else if ((views[v].flags & FLAG_REFLECTION) != 0u) {
-        band = ci.reflectionLod;
-    }
-    if (d < band.x || d >= band.y) { return LOD_CULLED; }
+    let d = lodDistance(b, v);
+    // the view's kind's band, its edges widened by half the crossfade
+    let band = lodBand(v);
+    let h = 0.5 * max(ci.crossfade, 0.0);
+    if (d < select(band.x, band.x - h, band.x > 0.0) || d >= band.y + h) { return LOD_CULLED; }
     let isBox = (ci.flags & FLAG_BOX) != 0u;
     for (var k = 0u; k < 6u; k++) {
         let plane = views[v].planes[k];
@@ -203,13 +237,19 @@ fn begin(i : u32, draw : u32) {
     if (i == 0u) { args[draw].indexCount = ci.indexCount; }
 }
 
-// Copy instance i into region `region` of `dst`, counted into draw `draw`.
-fn emit(i : u32, region : u32, draw : u32) {
+// Copy instance i into region `region` of `dst`, counted into draw `draw`; with crossfades its
+// fade after it.
+fn emit(i : u32, region : u32, draw : u32, fade : f32) {
     let slot = atomicAdd(&args[draw].instanceCount, 1u);
     let base = i * ci.strideWords;
-    let out = (region * ci.capacity + slot) * ci.strideWords;
+    let fading = ci.crossfade > 0.0;
+    let outStride = ci.strideWords + select(0u, 1u, fading);
+    let out = (region * ci.capacity + slot) * outStride;
     for (var w = 0u; w < ci.strideWords; w++) {
         dst[out + w] = src[base + w];
+    }
+    if (fading) {
+        dst[out + ci.strideWords] = bitcast<u32>(fade);
     }
 }
 
@@ -248,8 +288,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u, @builtin(workgroup_id) wg : 
     begin(gid.x, v);
     var outcome = UNCOUNTED;
     if (gid.x < ci.count) {
-        outcome = cull(bounds(gid.x), v);
-        if (outcome == KEPT) { emit(gid.x, wg.y, v); }
+        let b = bounds(gid.x);
+        outcome = cull(b, v);
+        if (outcome == KEPT) { emit(gid.x, wg.y, v, lodFade(b, v)); }
     }
     tally(outcome, lid, v, views[v].flags);
 }
@@ -262,10 +303,11 @@ fn early(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_i
     begin(i, v);
     var outcome = UNCOUNTED;
     if (i < ci.count) {
-        outcome = cull(bounds(i), v);
+        let b = bounds(i);
+        outcome = cull(b, v);
         if (outcome == KEPT) {
             if (visibility[i] != 0u) {
-                emit(i, v - ci.firstView, v);
+                emit(i, v - ci.firstView, v, lodFade(b, v));
             } else {
                 outcome = UNCOUNTED;   // left to `late`
             }
@@ -288,7 +330,7 @@ fn late(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_in
         let visible = inView && !occluded(b, v);
         if (inView && visibility[i] == 0u) {
             if (visible) {
-                emit(i, 0u, ci.lateSlot);
+                emit(i, 0u, ci.lateSlot, lodFade(b, v));
             } else {
                 outcome = OCCLUDED;
             }
