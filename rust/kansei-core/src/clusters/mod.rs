@@ -142,14 +142,76 @@ pub struct LodView {
 /// `sphere`. A parent's sphere contains its children's and its error is at least theirs, so its
 /// projected error is at least theirs from any eye.
 pub fn projected_error(error: f32, sphere: Sphere, view: &LodView) -> f32 {
+    projected_error_at(error, sphere.center.distance(view.eye) - sphere.radius, view)
+}
+
+/// `error` seen from `distance` away (clamped to the view's `near`), in pixels.
+pub fn projected_error_at(error: f32, distance: f32, view: &LodView) -> f32 {
     if error == 0.0 {
         return 0.0;
     }
     if !error.is_finite() {
         return f32::INFINITY;
     }
-    let distance = (sphere.center.distance(view.eye) - sphere.radius).max(view.near);
-    error / distance * view.pixels_per_radian
+    error / distance.max(view.near) * view.pixels_per_radian
+}
+
+/// A relative margin `LevelBounds::may_draw` gives the budget, so rounding (on the GPU, with
+/// transformed spheres) never skips a level the cut rule would draw from.
+pub const WINDOW_SLACK: f32 = 1e-3;
+
+/// What one build round's clusters (`Cluster::level`) span, to skip a whole level: `may_draw`
+/// is false only when none of them can pass the cut rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelBounds {
+    /// Its clusters: `first..first + count` of `ClusterMesh::clusters`.
+    pub first: u32,
+    pub count: u32,
+    /// The smallest of its clusters' errors.
+    pub min_error: f32,
+    /// The largest of their parents' errors (∞ when one has none).
+    pub max_parent_error: f32,
+    /// The farthest a cluster's LOD sphere's nearest point lies from the mesh's origin, beyond
+    /// the eye's own distance: the largest `|lod_bounds.center| - lod_bounds.radius`.
+    pub near_reach: f32,
+    /// The farthest a parent's sphere reaches from the origin: the largest
+    /// `|parent_bounds.center| + parent_bounds.radius` (of the finite parents).
+    pub far_reach: f32,
+}
+
+impl LevelBounds {
+    /// Whether some cluster of the level may pass the cut rule for `view`. With `d` the eye's
+    /// distance to the mesh's origin, each cluster's own sphere is at most `d + near_reach` away
+    /// (so its error projects to at least `min_error` from there) and each parent's at least
+    /// `d - far_reach` (so its error projects to at most `max_parent_error` from there).
+    pub fn may_draw(&self, view: &LodView) -> bool {
+        let d = view.eye.length();
+        let fine_enough = projected_error_at(self.min_error, d + self.near_reach, view) <= view.threshold * (1.0 + WINDOW_SLACK);
+        let parent_over = !self.max_parent_error.is_finite() || projected_error_at(self.max_parent_error, d - self.far_reach, view) > view.threshold * (1.0 - WINDOW_SLACK);
+        fine_enough && parent_over
+    }
+}
+
+impl ClusterMesh {
+    /// Each build round's clusters and what they span (clusters are stored by round).
+    pub fn levels(&self) -> Vec<LevelBounds> {
+        let mut levels: Vec<LevelBounds> = Vec::new();
+        for (i, c) in self.clusters.iter().enumerate() {
+            while levels.len() <= c.level as usize {
+                levels.push(LevelBounds { first: i as u32, count: 0, min_error: f32::INFINITY, max_parent_error: 0.0, near_reach: f32::NEG_INFINITY, far_reach: f32::NEG_INFINITY });
+            }
+            let level = &mut levels[c.level as usize];
+            debug_assert_eq!(level.first + level.count, i as u32, "clusters are stored by level");
+            level.count += 1;
+            level.min_error = level.min_error.min(c.error);
+            level.max_parent_error = level.max_parent_error.max(c.parent_error);
+            level.near_reach = level.near_reach.max(c.lod_bounds.center.length() - c.lod_bounds.radius);
+            if c.parent_error.is_finite() {
+                level.far_reach = level.far_reach.max(c.parent_bounds.center.length() + c.parent_bounds.radius);
+            }
+        }
+        levels
+    }
 }
 
 impl ClusterMesh {
