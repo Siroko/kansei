@@ -16,6 +16,7 @@ pub mod profiling;
 pub mod pacing;
 pub mod reflections;
 pub mod impostors;
+pub mod clusters;
 pub mod simulations;
 pub mod pathtracer;
 pub mod loaders;
