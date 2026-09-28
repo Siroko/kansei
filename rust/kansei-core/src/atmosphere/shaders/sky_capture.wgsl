@@ -12,7 +12,7 @@ struct SkyCapture {
     lowerMode     : u32,     // 0: the ground (under the fog, if any); 1: lowerColor
     captureHeight : f32,     // world height the sky is captured from (m)
     maxOpacity    : f32,
-    _pad0         : f32,
+    skyAmbientScale : f32,   // how much of the sky's distant light the fog adds to its colour
     _pad1         : f32,
 }
 
@@ -31,13 +31,14 @@ fn captureCoversGround() -> bool {
 }
 
 // The radiance the capture sees from world direction d, given `sky`, the sky's (and the clouds')
-// radiance there without the fog.
-fn capturedSky(d: vec3f, sky: vec3f) -> vec3f {
+// radiance there without the fog, and `distant`, the sky's distant light, which the fog adds to
+// its colour as Unreal's does.
+fn capturedSky(d: vec3f, sky: vec3f, distant: vec3f) -> vec3f {
     var lum = sky;
     if (capture.fogOn != 0u) {
         let tau = captureLayerDepth(capture.layer0, capture.captureHeight, d.y) + captureLayerDepth(capture.layer1, capture.captureHeight, d.y);
         let t = max(exp(-min(tau, 80.0)), 1.0 - capture.maxOpacity);
-        lum = lum * t + capture.inscattering * (1.0 - t);
+        lum = lum * t + (capture.inscattering + capture.skyAmbientScale * distant) * (1.0 - t);
     }
     if (capture.lowerMode == 1u && d.y < 0.0) {
         lum = capture.lowerColor;

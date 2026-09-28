@@ -267,6 +267,7 @@ pub(crate) struct SkyLightingGpu {
     pub moon_illuminance: [f32; 4],
     pub moon_direction: [f32; 4],
     pub clear_sky_up: [f32; 4],
+    pub distant_sky_light: [f32; 4],
 }
 
 #[cfg(test)]

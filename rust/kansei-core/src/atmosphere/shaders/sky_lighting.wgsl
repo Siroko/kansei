@@ -15,6 +15,7 @@ struct SkyLighting {
     moonIlluminance : vec4f,
     moonDirection   : vec4f,
     clearSkyUp      : vec4f,             // irradiance on an upward surface from the sky without its clouds
+    distantSkyLight : vec4f,             // the sky's mean radiance from 6 km up (Unreal's distant sky light)
 }
 
 fn skyShBasis(d: vec3f) -> array<f32, 9> {
