@@ -22,6 +22,7 @@ exclude = [
     "kansei-wasm/examples/cascaded-shadows",
     "kansei-wasm/examples/depth-of-field",
     "kansei-wasm/examples/gi-box",
+    "kansei-wasm/examples/occlusion-culling",
 ]
 
 [workspace.dependencies]

@@ -12,11 +12,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - `cargo test -p kansei-core` validates every WGSL module with naga and checks each `#[repr(C)]` uniform struct against its WGSL size (see the `shaders_validate_*` tests); keep that pattern for new shaders.
 - `rust/kansei-core/tests/*_gpu.rs` run shaders on a real adapter and read results back; they pass without running when no adapter exists.
 - Headless browser checks: run `chrome-devtools-axi` with its own `CHROME_DEVTOOLS_AXI_SESSION` and `CHROME_DEVTOOLS_AXI_CHROME_ARGS="--enable-unsafe-webgpu --enable-gpu --ignore-gpu-blocklist"`, and serve examples on a port nobody else uses.
-- GPU cost in the browser: wgpu 24's WebGPU backend does not implement `queue.on_submitted_work_done`. Add `--disable-gpu-vsync --disable-frame-rate-limit` to the Chrome args and time the interval between frames.
+- GPU cost in the browser: wgpu 24's WebGPU backend does not implement `queue.on_submitted_work_done`. Add `--disable-gpu-vsync --disable-frame-rate-limit` to the Chrome args and time the interval between frames. Other sessions share this Mac's GPU, so separate runs differ by tens of percent: alternate A and B inside one page (the occlusion-culling example's `bench=1`). On Apple GPUs consecutive passes overlap, so time a span across passes rather than each pass's own timestamps. Leave no animating WebGPU page open between captures (load `about:blank`).
 
 ## Sharp edges
 
-- `queue.write_buffer` lands before the next submit: several writes to one buffer inside a submit leave only the last one for every pass. Give per-dispatch parameters their own buffers.
+- `queue.write_buffer` lands before the next submit: several writes to one buffer inside a submit leave only the last one for every pass. Give per-dispatch parameters their own slots (or buffers).
+- Each `queue.write_buffer` costs tens of microseconds in Chrome: upload a frame's data in one write, not one per dispatch or object (`culling::InstanceCulling` writes its views once a frame and picks them by dynamic offset).
 - Depth is `[0, 1]` (`glam::Mat4::perspective_rh`), cleared to 1.0, so a depth of 1.0 means sky. Front faces are counter-clockwise and materials cull back faces by default.
 - The GBuffer's four MRT targets fill WebGPU's default 32 bytes per sample (rgba8unorm counts 8), and wgpu 24's web backend cannot request more: another per-pixel output needs its own pass, as the velocity pass does.
 - Shadow, reflection and velocity passes redraw each material through its own `vertex_main`, with the light or mirror as the camera (see `Material::get_depth_pipeline`). Vertex shaders must not read group 3. Mark `@builtin(position) @invariant` where a second pass depth-tests against the GBuffer.
