@@ -60,6 +60,16 @@ impl Default for RendererConfig {
     }
 }
 
+/// A pass's cached render bundles: the visible static renderables (`is_bundled`), opaque then
+/// transparent, so the dynamic ones can be drawn live between them. `None` where there was
+/// nothing to record.
+struct SceneBundles {
+    opaque: Option<wgpu::RenderBundle>,
+    transparent: Option<wgpu::RenderBundle>,
+    /// The renderables recorded (`bundle_key`); the bundles are re-recorded when it changes.
+    key: Vec<usize>,
+}
+
 /// The main GPU renderer.
 pub struct Renderer {
     pub config: RendererConfig,
@@ -120,11 +130,9 @@ pub struct Renderer {
     cull_pipeline: Option<crate::culling::CullPipeline>,
     // Planar reflections, drawn after the shadow maps and before the main pass
     planar_reflections: Vec<crate::reflections::PlanarReflection>,
-    // Render bundle caching
-    render_bundle: Option<wgpu::RenderBundle>,
-    last_bundle_object_count: usize,
-    gbuffer_bundle: Option<wgpu::RenderBundle>,
-    gbuffer_last_object_count: usize,
+    // Render bundle caching (the static renderables; dynamic ones are drawn live)
+    render_bundle: Option<SceneBundles>,
+    gbuffer_bundle: Option<SceneBundles>,
     gbuffer_last_sample_count: u32,
     // Depth-copy pass (resolve MSAA depth for compute shaders)
     depth_copy_pipeline: Option<wgpu::RenderPipeline>,
@@ -182,9 +190,7 @@ impl Renderer {
             cull_pipeline: None,
             planar_reflections: Vec::new(),
             render_bundle: None,
-            last_bundle_object_count: 0,
             gbuffer_bundle: None,
-            gbuffer_last_object_count: 0,
             gbuffer_last_sample_count: 0,
             depth_copy_pipeline: None,
             depth_copy_bgl: None,
@@ -757,7 +763,22 @@ impl Renderer {
         self.gbuffer_bundle = None;
     }
 
-    /// Pre-record draw commands into a reusable `RenderBundle`.
+    /// Record the scene's static renderables for a pass into its opaque and transparent bundles.
+    fn build_scene_bundles(
+        &self,
+        scene: &Scene,
+        camera: &Camera,
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+        key: Vec<usize>,
+    ) -> SceneBundles {
+        let bundle = |transparent| self.build_render_bundle(scene, camera, color_formats, depth_format, sample_count, transparent);
+        SceneBundles { opaque: bundle(false), transparent: bundle(true), key }
+    }
+
+    /// Pre-record the draws of the visible static renderables (`is_bundled`), the opaque or the
+    /// transparent ones, into a reusable `RenderBundle`; `None` when none of them is drawn.
     fn build_render_bundle(
         &self,
         scene: &Scene,
@@ -765,7 +786,8 @@ impl Renderer {
         color_formats: &[wgpu::TextureFormat],
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
-    ) -> wgpu::RenderBundle {
+        transparent: bool,
+    ) -> Option<wgpu::RenderBundle> {
         let device = self.device.as_ref().unwrap();
         let alignment = self.matrix_alignment;
 
@@ -795,13 +817,14 @@ impl Renderer {
         // State tracking for dedup
         let mut current_pipeline_ptr: usize = 0;
         let mut current_material_bg_ptr: usize = 0;
+        let mut draws = 0;
 
-        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+        for scene_idx in scene.ordered_indices() {
             let r = match scene.get_renderable(scene_idx) {
                 Some(r) => r,
                 None => continue,
             };
-            if !r.visible || !r.geometry.initialized || r.geometry.is_indirect() {
+            if !r.visible || !r.geometry.initialized || !is_bundled(r) || r.is_transparent() != transparent {
                 continue;
             }
 
@@ -836,14 +859,83 @@ impl Renderer {
             }
 
             // Set mesh bind group (group 2) with dynamic offsets
-            let offset = (draw_idx as u32) * alignment;
+            let offset = mesh_offset(scene_idx, alignment);
             encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
             // Vertex/index buffers and the draw (the camera's culled instances, if culled)
             draw_geometry(&mut encoder, r, MAIN_VIEW);
+            draws += 1;
         }
 
-        encoder.finish(&Default::default())
+        (draws > 0).then(|| encoder.finish(&Default::default()))
+    }
+
+    /// Draw the visible dynamic renderables (`Renderable::dynamic`), the opaque or the
+    /// transparent ones, directly in a live render pass, after the bundle of the same kind.
+    /// They are never recorded into a bundle, so each frame's draw reads the matrices uploaded
+    /// for that frame.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_dynamic_renderables<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        scene: &'a Scene,
+        camera: &'a Camera,
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+        transparent: bool,
+    ) {
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        // executing a bundle clears the pass's state: bind the shared groups again
+        let mut shared_bound = false;
+        for scene_idx in scene.ordered_indices() {
+            let Some(r) = scene.get_renderable(scene_idx) else { continue };
+            if !r.visible || !r.dynamic || !r.geometry.initialized || r.geometry.is_indirect() || r.is_transparent() != transparent {
+                continue;
+            }
+            let key = crate::materials::PipelineKey {
+                color_formats: color_formats.to_vec(),
+                depth_format,
+                sample_count,
+                num_vertex_buffers: 1 + r.geometry.instance_buffers.len(),
+            };
+            let Some(pipeline) = r.material.pipeline_cache.get(&key) else { continue };
+            if !shared_bound {
+                pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
+                if let Some(bg) = &self.shadow_bind_group {
+                    pass.set_bind_group(3, bg, &[]);
+                }
+                shared_bound = true;
+            }
+            pass.set_pipeline(pipeline);
+            if let Some(bg) = r.material.bind_group() {
+                pass.set_bind_group(0, bg, &[]);
+            }
+            let offset = mesh_offset(scene_idx, self.matrix_alignment);
+            pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+            draw_geometry(pass, r, MAIN_VIEW);
+        }
+    }
+
+    /// Draw a pass's scene renderables (all but the indirect ones): its cached bundles with the
+    /// dynamic renderables drawn live after each, opaque then transparent.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene_renderables<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        bundles: &'a SceneBundles,
+        scene: &'a Scene,
+        camera: &'a Camera,
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) {
+        for (bundle, transparent) in [(&bundles.opaque, false), (&bundles.transparent, true)] {
+            if let Some(bundle) = bundle {
+                pass.execute_bundles(std::iter::once(bundle));
+            }
+            self.draw_dynamic_renderables(pass, scene, camera, color_formats, depth_format, sample_count, transparent);
+        }
     }
 
     /// Draw indirect renderables (GPU-driven geometry like marching cubes)
@@ -864,7 +956,7 @@ impl Renderer {
             pass.set_bind_group(3, bg, &[]);
         }
 
-        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+        for scene_idx in scene.ordered_indices() {
             let r = match scene.get_renderable(scene_idx) {
                 Some(r) => r,
                 None => continue,
@@ -895,7 +987,7 @@ impl Renderer {
                 pass.set_bind_group(0, bg, &[]);
             }
 
-            let offset = (draw_idx as u32) * alignment;
+            let offset = mesh_offset(scene_idx, alignment);
             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
             pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
             pass.set_index_buffer(
@@ -928,28 +1020,16 @@ impl Renderer {
             queue.write_buffer(buf, 0, self.spot_lights.as_bytes());
         }
 
-        // Upload per-object matrices
-        let count = scene.len();
+        // Upload per-object matrices: a slot per scene child, at its scene index (`mesh_offset`)
+        let count = scene.children_len();
         self._ensure_matrix_buffers(count);
 
         let alignment = self.matrix_alignment as usize;
-        let floats_per_slot = alignment / 4;
         debug_assert!(alignment >= 128, "mesh slots hold two matrices");
-
-        for (i, idx) in scene.ordered_indices().enumerate() {
-            if let Some(renderable) = scene.get_renderable(idx) {
-                let offset = i * floats_per_slot;
-                let world = renderable.world_matrix;
-                let previous = renderable.previous_world_matrix.replace(Some(world)).unwrap_or(world);
-                self.world_matrices_staging[offset..offset + 16].copy_from_slice(world.as_slice());
-                self.world_matrices_staging[offset + 16..offset + 32].copy_from_slice(previous.as_slice());
-                self.normal_matrices_staging[offset..offset + 16]
-                    .copy_from_slice(renderable.normal_matrix.as_slice());
-            }
-        }
+        write_mesh_slots(scene, &mut self.world_matrices_staging, &mut self.normal_matrices_staging, alignment / 4);
 
         let queue = self.queue.as_ref().unwrap();
-        if count > 0 {
+        if !scene.is_empty() {
             if let Some(ref buf) = self.world_matrices_buf {
                 queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.world_matrices_staging));
             }
@@ -1140,7 +1220,7 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_bind_group(1, csm.camera(cascade).bind_group().unwrap(), &[]);
-            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+            for scene_idx in scene.ordered_indices() {
                 let Some(r) = scene.get_renderable(scene_idx) else { continue };
                 if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                     continue;
@@ -1155,7 +1235,7 @@ impl Renderer {
                 if let Some(bg) = r.material.bind_group() {
                     pass.set_bind_group(0, bg, &[]);
                 }
-                let offset = draw_idx as u32 * self.matrix_alignment;
+                let offset = mesh_offset(scene_idx, self.matrix_alignment);
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                 draw_geometry(&mut pass, r, view);
             }
@@ -1270,7 +1350,7 @@ impl Renderer {
                 if let Some(bg) = &self.shadow_bind_group {
                     pass.set_bind_group(3, bg, &[]);
                 }
-                for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                for scene_idx in scene.ordered_indices() {
                     let Some(r) = scene.get_renderable(scene_idx) else { continue };
                     if !r.visible || !r.geometry.initialized || r.layers & reflection.layer_mask == 0 {
                         continue;
@@ -1286,7 +1366,7 @@ impl Renderer {
                     if let Some(bg) = r.material.bind_group() {
                         pass.set_bind_group(0, bg, &[]);
                     }
-                    let offset = draw_idx as u32 * alignment;
+                    let offset = mesh_offset(scene_idx, alignment);
                     pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                     // culled against the mirrored view, whose near plane is the water
                     draw_geometry(&mut pass, r, view);
@@ -1326,7 +1406,7 @@ impl Renderer {
             pass.set_bind_group(3, bg, &[]);
         }
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
-        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+        for scene_idx in scene.ordered_indices() {
             let Some(r) = scene.get_renderable(scene_idx) else { continue };
             if !r.visible || !r.geometry.initialized || !r.material.options.outputs_velocity || r.is_transparent() {
                 continue;
@@ -1336,7 +1416,7 @@ impl Renderer {
             if let Some(bg) = r.material.bind_group() {
                 pass.set_bind_group(0, bg, &[]);
             }
-            let offset = draw_idx as u32 * self.matrix_alignment;
+            let offset = mesh_offset(scene_idx, self.matrix_alignment);
             pass.set_bind_group(2, mesh_bg, &[offset, offset]);
             draw_geometry(&mut pass, r, MAIN_VIEW);
         }
@@ -1370,7 +1450,7 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_bind_group(1, atlas.camera(slot.layer).bind_group().unwrap(), &[]);
-            for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+            for scene_idx in scene.ordered_indices() {
                 let Some(r) = scene.get_renderable(scene_idx) else { continue };
                 if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                     continue;
@@ -1385,7 +1465,7 @@ impl Renderer {
                 if let Some(bg) = r.material.bind_group() {
                     pass.set_bind_group(0, bg, &[]);
                 }
-                let offset = draw_idx as u32 * alignment;
+                let offset = mesh_offset(scene_idx, alignment);
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                 // culled against this light's frustum, not the camera's
                 draw_geometry(&mut pass, r, spot_view(slot.layer));
@@ -1496,20 +1576,20 @@ impl Renderer {
         // Upload face uniforms for first shadow-casting point light
         csm.upload_face_uniforms(queue, 0, &light_pos, first_light_radius);
 
-        // Ensure mesh buffers sized for scene
-        let renderable_count = scene.ordered_indices().count();
-        csm.ensure_mesh_buffers(device, renderable_count);
+        // Ensure mesh buffers hold a slot per scene child (slots follow the scene index, as in
+        // the renderer's own matrix buffers)
+        csm.ensure_mesh_buffers(device, scene.children_len());
 
         // Upload mesh matrices to cubemap shadow's own buffers
         let csm_alignment = csm.matrix_alignment();
         let floats_per_slot = csm_alignment as usize / 4;
 
-        for (i, idx) in scene.ordered_indices().enumerate() {
+        for idx in scene.ordered_indices() {
             if let Some(r) = scene.get_renderable(idx) {
-                let offset = i * floats_per_slot;
+                let offset = idx * floats_per_slot;
                 if offset + 16 <= csm.world_staging_len() {
-                    csm.write_world_matrix(i, r.world_matrix.as_slice());
-                    csm.write_normal_matrix(i, r.normal_matrix.as_slice());
+                    csm.write_world_matrix(idx, r.world_matrix.as_slice());
+                    csm.write_normal_matrix(idx, r.normal_matrix.as_slice());
                 }
             }
         }
@@ -1555,14 +1635,14 @@ impl Renderer {
                 let light_offset = face * csm_uniform_alignment;
                 pass.set_bind_group(0, csm.light_uniform_bg(), &[light_offset]);
 
-                for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                for scene_idx in scene.ordered_indices() {
                     if let Some(r) = scene.get_renderable(scene_idx) {
                         if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                             continue;
                         }
 
-                        let mesh_offset = (draw_idx as u32) * csm_alignment;
-                        pass.set_bind_group(1, csm.mesh_bg(), &[mesh_offset, mesh_offset]);
+                        let offset = mesh_offset(scene_idx, csm_alignment);
+                        pass.set_bind_group(1, csm.mesh_bg(), &[offset, offset]);
                         pass.set_vertex_buffer(
                             0,
                             r.geometry.active_vertex_buffer().unwrap().slice(..),
@@ -1725,13 +1805,13 @@ impl Renderer {
                         pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
 
                         let alignment = self.matrix_alignment;
-                        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                        for scene_idx in scene.ordered_indices() {
                             let r = scene.get_renderable(scene_idx).unwrap();
                             if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                                 continue;
                             }
 
-                            let offset = (draw_idx as u32) * alignment;
+                            let offset = mesh_offset(scene_idx, alignment);
                             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
                             pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
@@ -1789,16 +1869,16 @@ impl Renderer {
         let format = self.presentation_format;
         let sample_count = self.config.sample_count;
         let depth_format = wgpu::TextureFormat::Depth24Plus;
-        let object_count = scene.ordered_indices().count();
-        if self.render_bundle.is_none() || self.last_bundle_object_count != object_count {
-            self.render_bundle = Some(self.build_render_bundle(
+        let key = bundle_key(scene);
+        if self.render_bundle.as_ref().is_none_or(|b| b.key != key) {
+            self.render_bundle = Some(self.build_scene_bundles(
                 scene,
                 camera,
                 &[format],
                 depth_format,
                 sample_count,
+                key,
             ));
-            self.last_bundle_object_count = object_count;
         }
 
         // Clear material_dirty flags
@@ -1852,7 +1932,11 @@ impl Renderer {
                 ..Default::default()
             });
 
-            pass.execute_bundles(std::iter::once(self.render_bundle.as_ref().unwrap()));
+            // Static renderables from the bundles, dynamic ones drawn live
+            self.draw_scene_renderables(
+                &mut pass, self.render_bundle.as_ref().unwrap(), scene, camera,
+                &[format], depth_format, sample_count,
+            );
 
             // Draw GPU-driven indirect renderables in the same pass
             let fmt = self.presentation_format;
@@ -2019,13 +2103,13 @@ impl Renderer {
                         pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
 
                         let alignment = self.matrix_alignment;
-                        for (draw_idx, scene_idx) in scene.ordered_indices().enumerate() {
+                        for scene_idx in scene.ordered_indices() {
                             let r = scene.get_renderable(scene_idx).unwrap();
                             if !r.visible || !r.cast_shadow || !r.geometry.initialized {
                                 continue;
                             }
 
-                            let offset = (draw_idx as u32) * alignment;
+                            let offset = mesh_offset(scene_idx, alignment);
                             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
                             pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
                             pass.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
@@ -2077,19 +2161,18 @@ impl Renderer {
         }
 
         // Build GBuffer render bundle if needed
-        let gbuffer_object_count = scene.ordered_indices().count();
-        if self.gbuffer_bundle.is_none()
-            || self.gbuffer_last_object_count != gbuffer_object_count
+        let key = bundle_key(scene);
+        if self.gbuffer_bundle.as_ref().is_none_or(|b| b.key != key)
             || self.gbuffer_last_sample_count != gbuffer.sample_count
         {
-            self.gbuffer_bundle = Some(self.build_render_bundle(
+            self.gbuffer_bundle = Some(self.build_scene_bundles(
                 scene,
                 camera,
                 &GBuffer::MRT_FORMATS,
                 GBuffer::DEPTH_FORMAT,
                 gbuffer.sample_count,
+                key,
             ));
-            self.gbuffer_last_object_count = gbuffer_object_count;
             self.gbuffer_last_sample_count = gbuffer.sample_count;
         }
 
@@ -2139,7 +2222,11 @@ impl Renderer {
                 }),
                 ..Default::default()
             });
-            pass.execute_bundles(std::iter::once(self.gbuffer_bundle.as_ref().unwrap()));
+            // Static renderables from the bundles, dynamic ones drawn live
+            self.draw_scene_renderables(
+                &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
+                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count,
+            );
         }
 
         // Copy opaque color → background texture (for refractive objects to sample)
@@ -2404,6 +2491,46 @@ fn spot_view(layer: u32) -> usize {
     1 + layer as usize
 }
 
+/// Byte offset of scene child `scene_idx`'s slot in the per-object matrix buffers (group 2's
+/// dynamic offsets). Slots follow the scene index, not the draw order, so a renderable keeps its
+/// slot, and a recorded render bundle its data, whatever else is shown or hidden.
+fn mesh_offset(scene_idx: usize, alignment: u32) -> u32 {
+    scene_idx as u32 * alignment
+}
+
+/// Write every visible renderable's world matrix, last frame's world matrix (which it then
+/// replaces) and normal matrix into its slot of the staging arrays, which hold `floats_per_slot`
+/// floats per scene child; slot `i` is scene child `i` (`mesh_offset`).
+fn write_mesh_slots(scene: &Scene, world_staging: &mut [f32], normal_staging: &mut [f32], floats_per_slot: usize) {
+    for idx in scene.ordered_indices() {
+        if let Some(renderable) = scene.get_renderable(idx) {
+            let offset = idx * floats_per_slot;
+            let world = renderable.world_matrix;
+            let previous = renderable.previous_world_matrix.replace(Some(world)).unwrap_or(world);
+            world_staging[offset..offset + 16].copy_from_slice(world.as_slice());
+            world_staging[offset + 16..offset + 32].copy_from_slice(previous.as_slice());
+            normal_staging[offset..offset + 16].copy_from_slice(renderable.normal_matrix.as_slice());
+        }
+    }
+}
+
+/// Whether the cached render bundles record `r` when it is visible. Dynamic renderables are
+/// drawn live after them, indirect ones in `draw_indirect_renderables`.
+fn is_bundled(r: &crate::objects::Renderable) -> bool {
+    !r.dynamic && !r.geometry.is_indirect()
+}
+
+/// The renderables a pass's bundles hold: the scene indices of the visible bundled ones, sorted.
+/// Showing, hiding, adding or un-marking one changes it, and the bundles are re-recorded.
+fn bundle_key(scene: &Scene) -> Vec<usize> {
+    let mut key: Vec<usize> = scene
+        .ordered_indices()
+        .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && is_bundled(r)))
+        .collect();
+    key.sort_unstable();
+    key
+}
+
 /// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
 /// compacted instances (indirect) when it has `InstanceCulling`, otherwise its geometry as is.
 fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
@@ -2471,5 +2598,64 @@ mod tests {
         assert_eq!(super::scaled_size(1, 1, 0.25), (1, 1));
         assert_eq!(super::jitter_phases(1.0), 8);
         assert_eq!(super::jitter_phases(0.5), 32);
+    }
+
+    use crate::geometries::BoxGeometry;
+    use crate::materials::{Material, MaterialOptions};
+    use crate::math::Vec3;
+    use crate::objects::{Object3D, Renderable, Scene, SceneNode};
+
+    /// A scene of a transform node, then three boxes at x = 1, 2, 3 (the second one dynamic).
+    fn three_boxes() -> Scene {
+        let mut scene = Scene::new();
+        scene.add(SceneNode::Transform(Object3D::new()));
+        for x in 1..=3 {
+            let material = Material::new("Box", "", vec![], MaterialOptions::default());
+            let mut r = Renderable::new(BoxGeometry::new(1.0, 1.0, 1.0), material);
+            r.set_position(x as f32, 0.0, 0.0);
+            r.dynamic = x == 2;
+            scene.add(SceneNode::Renderable(r));
+        }
+        scene.prepare(&Vec3::ZERO);
+        scene
+    }
+
+    /// The x translation written into each of the scene's slots (0 where nothing was written).
+    fn slot_translations(scene: &Scene) -> Vec<f32> {
+        const FLOATS_PER_SLOT: usize = 64; // 256-byte slots
+        let mut world = vec![0.0; scene.children_len() * FLOATS_PER_SLOT];
+        let mut normal = world.clone();
+        super::write_mesh_slots(scene, &mut world, &mut normal, FLOATS_PER_SLOT);
+        world.chunks(FLOATS_PER_SLOT).map(|slot| slot[12]).collect()
+    }
+
+    #[test]
+    fn mesh_slots_follow_the_scene_index_whatever_is_hidden() {
+        let mut scene = three_boxes();
+        assert_eq!(slot_translations(&scene), [0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(super::mesh_offset(3, 256), 768);
+
+        // hiding the first box leaves every other box in its slot
+        scene.get_renderable_mut(1).unwrap().visible = false;
+        scene.prepare(&Vec3::ZERO);
+        assert_eq!(slot_translations(&scene), [0.0, 0.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn bundles_hold_the_visible_static_renderables() {
+        let mut scene = three_boxes();
+        assert_eq!(super::bundle_key(&scene), [1, 3]);
+
+        // showing or hiding a dynamic renderable keeps the bundles
+        scene.get_renderable_mut(2).unwrap().visible = false;
+        scene.prepare(&Vec3::ZERO);
+        assert_eq!(super::bundle_key(&scene), [1, 3]);
+
+        // hiding a static one, or making it dynamic, re-records them
+        scene.get_renderable_mut(1).unwrap().visible = false;
+        scene.prepare(&Vec3::ZERO);
+        assert_eq!(super::bundle_key(&scene), [3]);
+        scene.get_renderable_mut(3).unwrap().dynamic = true;
+        assert!(super::bundle_key(&scene).is_empty());
     }
 }
