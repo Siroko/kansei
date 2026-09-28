@@ -10,7 +10,7 @@
 // screen did not see reads as sky (SKY_DISTANCE), which materials fill from their environment.
 
 struct Params {
-    prevInvViewProj : mat4x4f,   // last frame's camera: its pixels -> world
+    prevInvViewProj : mat4x4f,   // last frame's camera as it drew (jitter included): its pixels -> world
     viewProj        : mat4x4f,   // this frame's camera
     plane           : vec4f,     // n, d with n·p + d = 0, n toward the reflected side
     cameraPos       : vec3f,     // this frame's
