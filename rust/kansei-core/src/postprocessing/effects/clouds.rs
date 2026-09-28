@@ -91,6 +91,34 @@ impl Default for VolumetricCloudsOptions {
     }
 }
 
+/// Presets of the clouds' cost (`VolumetricCloudsEffect::set_quality`), from the march's resolution
+/// and steps and how much of the cloud map for the sky lighting is rewritten each frame. Costs
+/// per frame at 1440x602 under an overcast (M4 Pro, the minimum of `time_cloud_quality`):
+/// about 0.3 ms low, 0.8-0.9 ms medium, 2 ms high. `VolumetricCloudsEffect::enabled = false`
+/// costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloudQuality {
+    /// A quarter of the resolution each way, 32 steps (4 toward the sun); the cloud map 16 steps,
+    /// a quarter of its rows a frame.
+    Low,
+    /// Half resolution, 64 steps (6); the cloud map 24 steps, half its rows a frame.
+    #[default]
+    Medium,
+    /// Three quarters of the resolution, 96 steps (8); the cloud map 32 steps, all of it.
+    High,
+}
+
+impl CloudQuality {
+    /// (resolution scale, steps, light steps, cloud-map steps, cloud-map interleave)
+    fn settings(self) -> (f32, u32, u32, u32, u32) {
+        match self {
+            CloudQuality::Low => (0.25, 32, 4, 16, 4),
+            CloudQuality::Medium => (0.5, 64, 6, 24, 2),
+            CloudQuality::High => (0.75, 96, 8, 32, 1),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CloudParamsGpu {
@@ -112,7 +140,8 @@ struct CloudParamsGpu {
     steps: u32,
     light_steps: u32,
     blend: f32,
-    _pad: [f32; 2],
+    map_steps: u32,
+    map_interleave: u32,
 }
 
 struct Targets {
@@ -167,6 +196,9 @@ struct Gpu {
 /// lit by the clear sky above them. `lights_sky = false` leaves the sky lighting clear, as does
 /// taking the effect out of the chain.
 pub struct VolumetricCloudsEffect {
+    /// Draw the clouds (default true). Off, the post-processing volume skips them at no cost, and
+    /// the sky lighting and the shadows are clear from the next frame.
+    pub enabled: bool,
     pub layer: CloudLayer,
     /// Whether the clouds occlude and tint the sky lighting and the environment (default true).
     pub lights_sky: bool,
@@ -176,6 +208,12 @@ pub struct VolumetricCloudsEffect {
     /// The side of the shadow map (m), centred under the camera; beyond it there are no cloud
     /// shadows. 256 texels, so 16 km gives 62.5 m per texel.
     pub shadow_size_m: f32,
+    /// Steps along each ray of the cloud map for the sky lighting (its light steps are at most 3):
+    /// it only feeds low-frequency light, so it takes fewer than the view.
+    pub sky_map_steps: u32,
+    /// The cloud map rewrites one row in this many each frame (1: all of it), for the clouds that
+    /// only drift.
+    pub sky_map_interleave: u32,
     /// Seconds, drives the wind.
     pub time: f32,
     pub resolution_scale: f32,
@@ -185,6 +223,7 @@ pub struct VolumetricCloudsEffect {
     pub temporal_blend: f32,
     sky: SkyAtmosphereBindings,
     prev_view_proj: Option<glam::Mat4>,
+    last_camera_frame: Option<u32>,
     frame: u32,
     gpu: Option<Gpu>,
 }
@@ -193,9 +232,12 @@ impl VolumetricCloudsEffect {
     pub fn new(sky: &SkyAtmosphere, options: VolumetricCloudsOptions) -> Self {
         Self {
             layer: options.layer,
+            enabled: true,
             lights_sky: true,
             casts_shadows: true,
             shadow_size_m: 16_000.0,
+            sky_map_steps: 32,
+            sky_map_interleave: 1,
             time: 0.0,
             resolution_scale: options.resolution_scale,
             steps: options.steps,
@@ -204,6 +246,7 @@ impl VolumetricCloudsEffect {
             temporal_blend: options.temporal_blend,
             sky: sky.bindings().clone(),
             prev_view_proj: None,
+            last_camera_frame: None,
             frame: 0,
             gpu: None,
         }
@@ -212,6 +255,16 @@ impl VolumetricCloudsEffect {
     /// Drop the accumulated frames; call on camera cuts.
     pub fn reset_history(&mut self) {
         self.prev_view_proj = None;
+    }
+
+    /// Set the march's resolution and steps and the cloud map's work to a preset.
+    pub fn set_quality(&mut self, quality: CloudQuality) {
+        let (scale, steps, light_steps, map_steps, interleave) = quality.settings();
+        self.resolution_scale = scale;
+        self.steps = steps;
+        self.light_steps = light_steps;
+        self.sky_map_steps = map_steps;
+        self.sky_map_interleave = interleave;
     }
 
     #[cfg(test)]
@@ -461,6 +514,10 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
         }
     }
 
+    fn is_active(&self) -> bool {
+        self.enabled
+    }
+
     fn render(
         &mut self,
         device: &wgpu::Device,
@@ -478,6 +535,12 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
             self.init_gpu(device);
         }
         self.ensure_targets(device, width, height);
+        // a gap in the camera's frames (the clouds were off, or a cut) invalidates the history
+        let camera_frame = camera.frame();
+        if self.last_camera_frame.is_some_and(|f| camera_frame != f && camera_frame != f.wrapping_add(1)) {
+            self.prev_view_proj = None;
+        }
+        self.last_camera_frame = Some(camera_frame);
         let gpu = self.gpu.as_mut().unwrap();
         if !gpu.noise_ready {
             let (shape, detail, weather, bg) = &gpu.noise;
@@ -515,7 +578,8 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
             steps: self.steps.max(1),
             light_steps: self.light_steps.max(1),
             blend: self.temporal_blend.clamp(0.01, 1.0),
-            _pad: [0.0; 2],
+            map_steps: self.sky_map_steps.max(1),
+            map_interleave: self.sky_map_interleave.max(1),
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let current = (self.frame % 2) as usize;
@@ -1004,5 +1068,116 @@ mod tests {
         device.poll(wgpu::Maintain::Wait);
         let gone = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&buf.slice(..).get_mapped_range());
         assert!(gone.enabled < 0.5, "clouds no longer drawn still cast shadows");
+    }
+
+    /// The cheap presets rewrite part of the cloud map each frame with fewer steps: once all its
+    /// rows are written, the sky lighting under an overcast is within a few percent of the full
+    /// map's; after one frame at Low, only a quarter of it is there.
+    #[test]
+    fn a_cheap_cloud_map_lights_the_sky_as_the_full_one() {
+        let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+        let (w, h) = (64u32, 32u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output = texture(GBuffer::COLOR_FORMAT, wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let mut camera = Camera::new(60.0, 0.1, 5000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 2.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 100.0, -1.0));
+        camera.update_view_matrix();
+        // the SH's irradiance on an upward surface after `frames` frames of an overcast
+        let up_after = |quality: CloudQuality, frames: u32| -> glam::Vec3 {
+            let mut sky = crate::atmosphere::SkyAtmosphere::new(&device, Default::default());
+            sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(30.0, 180.0);
+            sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0);
+            let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer: CloudLayer { coverage: 1.0, ..Default::default() }, ..Default::default() });
+            fx.set_quality(quality);
+            for _ in 0..frames {
+                let mut e = device.create_command_encoder(&Default::default());
+                sky.encode(&queue, &mut e, &camera);
+                fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+                queue.submit([e.finish()]);
+            }
+            let size = std::mem::size_of::<crate::atmosphere::params::SkyLightingGpu>() as u64;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut e = device.create_command_encoder(&Default::default());
+            sky.encode(&queue, &mut e, &camera);
+            e.copy_buffer_to_buffer(&sky.bindings().sky_lighting, 0, &buf, 0, size);
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let l: Vec<f32> = bytemuck::cast_slice(&buf.slice(..).get_mapped_range()).to_vec();
+            let e = |k: usize| l[k] * 0.282095 * 3.141593 + l[4 + k] * 0.488603 * 2.094395 - l[24 + k] * 0.315392 * 0.785398 - l[32 + k] * 0.546274 * 0.785398;
+            glam::Vec3::new(e(0), e(1), e(2))
+        };
+        let (clear, high, low, low_first) = (up_after(CloudQuality::High, 0), up_after(CloudQuality::High, 8), up_after(CloudQuality::Low, 8), up_after(CloudQuality::Low, 1));
+        eprintln!("irradiance up: clear {clear:?}, overcast high {high:?}, low {low:?}, low after one frame {low_first:?}");
+        let off = ((low - high) / high).abs().max_element();
+        assert!(off < 0.08, "the low map lights the sky {off} off the high one");
+        // after one frame most of the low map is still empty (clear sky), so less is occluded
+        assert!((low_first - high).length() > 0.5 * (clear - high).length(), "one low frame already wrote most of the map");
+    }
+
+    /// The clouds' cost per quality at midsommar-web's render size (1440x602: 1920x803 at 0.75),
+    /// looking at the horizon under an overcast: ten frames per submit, waited for, less an empty
+    /// submit's time. Other GPU work on the machine inflates it, so read the minimum. Run by
+    /// hand: `cargo test -p kansei-core --lib time_cloud_quality -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_cloud_quality() {
+        let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+        let (w, h) = (1440u32, 602u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output = texture(GBuffer::COLOR_FORMAT, wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+        let depth_tex = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = depth_tex.create_view(&Default::default());
+        {
+            let mut e = device.create_command_encoder(&Default::default());
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            queue.submit([e.finish()]);
+        }
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let mut camera = Camera::new(30.0, 0.1, 5000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 2.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 60.0, -1000.0));
+        camera.update_view_matrix();
+        let mut sky = crate::atmosphere::SkyAtmosphere::new(&device, Default::default());
+        sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(20.0, 180.0);
+        let wall = |f: &mut dyn FnMut(&mut wgpu::CommandEncoder)| -> f64 {
+            let mut e = device.create_command_encoder(&Default::default());
+            f(&mut e);
+            let t = std::time::Instant::now();
+            queue.submit([e.finish()]);
+            device.poll(wgpu::Maintain::Wait);
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        // the sky's LUTs, frame and lighting, once
+        let _ = wall(&mut |e| sky.encode(&queue, e, &camera));
+        let mut empty: Vec<f64> = (0..60).map(|_| wall(&mut |_| {})).collect();
+        empty.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // CloudQuality's presets, and the same march with the cloud map as it was (the view's
+        // steps, all of it every frame)
+        let presets = [CloudQuality::Low, CloudQuality::Medium, CloudQuality::High];
+        for (name, quality, old_map) in presets.iter().flat_map(|&q| [(format!("{q:?}"), q, false), (format!("{q:?}, cloud map as before"), q, true)]) {
+            let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions {
+                layer: CloudLayer { bottom_m: 1200.0, top_m: 5200.0, coverage: 0.9, cloud_type: 0.5, ..Default::default() },
+                max_distance_m: 50_000.0,
+                ..Default::default()
+            });
+            fx.set_quality(quality);
+            if old_map {
+                fx.sky_map_steps = fx.steps;
+                fx.sky_map_interleave = 1;
+            }
+            // ten frames per submit, so the work stands well above the submit's own latency
+            let mut times: Vec<f64> = (0..30)
+                .map(|_| (wall(&mut |e| for _ in 0..10 { fx.render(&device, &queue, e, &gbuffer, &input, &depth, &output, &camera, w, h) }) - empty[0]) / 10.0)
+                .skip(5)
+                .collect();
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("{name}: {:.2} ms min, {:.2} ms median per frame ({w}x{h})", times[0], times[times.len() / 2]);
+        }
     }
 }
