@@ -1,8 +1,8 @@
-// Per-view GPU instance culling: one thread per instance of a renderable's full instance list.
-// An instance survives when its bounds (a sphere, or a box) are inside the view's frustum and its
-// distance from the LOD origin (the main camera) is inside the renderable's LOD band; survivors
-// are copied, word by word, into the view's compacted instance buffer, and counted into its
-// indirect draw.
+// Per-view GPU instance culling: one thread per instance of a renderable's full instance list, and
+// one dispatch for all the views it is drawn in (y: the view). An instance survives when its
+// bounds (a sphere, or a box) are inside the view's frustum and its distance from the LOD origin
+// (the main camera) is inside the renderable's LOD band; survivors are copied, word by word, into
+// the view's region of the compacted instances, and counted into its indirect draw.
 //
 // Two-phase occlusion culling (the main camera, for renderables that opt in):
 // - `early`: of the survivors, keep those that were visible last frame (`visibility`).
@@ -26,17 +26,21 @@ struct CullInstances {
     strideWords  : u32,
     centerWord   : u32,               // word offset of the instance centre (3 x f32)
     scaleWord    : u32,               // word offset of an f32 the bounds scale by, or NO_WORD
-    flags        : u32,               // FLAG_BOX
+    flags        : u32,               // FLAG_BOX, FLAG_CASTS_SHADOW, FLAG_TWO_PHASE
     indexCount   : u32,               // the indirect draw's (its args are cleared every frame)
+    firstView    : u32,               // `main`: the view of the dispatch's first row (y = 0)
+    capacity     : u32,               // instances per view region in `dst`
+    lateSlot     : u32,               // `late`: its draw in `args`
+    _pad         : u32,
 }
 
-// A view: every view's in one buffer, written once a frame; each dispatch picks its own.
+// A view: all of them in one buffer, written once a frame.
 struct CullView {
     planes       : array<vec4f, 6>,   // world-space frustum planes, normalized, inside >= 0
     view         : mat4x4f,           // occlusion: the camera's view
     proj         : mat4x4f,           // occlusion: the camera's projection, jittered as rasterized
     lodOrigin    : vec3f,             // the main camera, for every view
-    flags        : u32,               // FLAG_STATS, FLAG_REVERSE_Z
+    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_STATS, FLAG_REVERSE_Z
     depthSize    : vec2f,             // occlusion: the depth buffer's size in pixels
     lodScale     : f32,               // the view's LOD distance scale (reflections pick finer LODs)
     _pad         : f32,
@@ -53,11 +57,13 @@ struct DrawArgs {
 
 @group(0) @binding(0) var<uniform> ci : CullInstances;
 @group(0) @binding(1) var<storage, read> src : array<u32>;
+// a region of `capacity` instances per view, from view `firstView` (`late`: its own buffer)
 @group(0) @binding(2) var<storage, read_write> dst : array<u32>;
-@group(0) @binding(3) var<storage, read_write> args : DrawArgs;
+// every view's draw, then the second phase's (`lateSlot`)
+@group(0) @binding(3) var<storage, read_write> args : array<DrawArgs>;
 // `early` and `late`: 1 where the instance was visible to the camera last frame
 @group(0) @binding(4) var<storage, read_write> visibility : array<u32>;
-@group(1) @binding(0) var<uniform> cv : CullView;
+@group(1) @binding(0) var<storage, read> views : array<CullView>;
 // `late`: the depth pyramid (farthest depth per texel, see culling::DepthPyramid)
 @group(2) @binding(0) var pyramid : texture_2d<f32>;
 
@@ -65,6 +71,12 @@ const NO_WORD : u32 = 0xffffffffu;
 const FLAG_STATS : u32 = 1u;
 const FLAG_BOX : u32 = 2u;
 const FLAG_REVERSE_Z : u32 = 4u;
+const FLAG_CASTS_SHADOW : u32 = 8u;
+const FLAG_TWO_PHASE : u32 = 16u;
+const FLAG_VIEW : u32 = 32u;
+const FLAG_CASTERS_ONLY : u32 = 64u;
+// the camera's view
+const MAIN_VIEW : u32 = 0u;
 
 // what became of an instance
 const KEPT : u32 = 0u;
@@ -98,18 +110,20 @@ fn bounds(i : u32) -> Bounds {
 }
 
 // KEPT, LOD_CULLED or FRUSTUM_CULLED
-fn cull(b : Bounds) -> u32 {
-    let d = distance(b.center, cv.lodOrigin) * cv.lodScale;
+// (view v)
+fn cull(b : Bounds, v : u32) -> u32 {
+    let d = distance(b.center, views[v].lodOrigin) * views[v].lodScale;
     if (d < ci.lodNear || d >= ci.lodFar) { return LOD_CULLED; }
     let isBox = (ci.flags & FLAG_BOX) != 0u;
     for (var k = 0u; k < 6u; k++) {
-        let n = cv.planes[k].xyz;
+        let plane = views[v].planes[k];
+        let n = plane.xyz;
         var r = b.radius;
         if (isBox) {
             // the box's reach along the normal: its axes are the world matrix's columns
             r = dot(abs(vec3f(dot(n, ci.world[0].xyz), dot(n, ci.world[1].xyz), dot(n, ci.world[2].xyz))), b.half);
         }
-        if (dot(n, b.center) + cv.planes[k].w < -r) { return FRUSTUM_CULLED; }
+        if (dot(n, b.center) + plane.w < -r) { return FRUSTUM_CULLED; }
     }
     return KEPT;
 }
@@ -117,9 +131,9 @@ fn cull(b : Bounds) -> u32 {
 // Whether the bounds are hidden: the rectangle they cover on screen, from their nearest depth,
 // is behind the farthest depth under it in the pyramid.
 fn occluded(b : Bounds) -> bool {
-    let reverse = (cv.flags & FLAG_REVERSE_Z) != 0u;
+    let reverse = (views[MAIN_VIEW].flags & FLAG_REVERSE_Z) != 0u;
     let isBox = (ci.flags & FLAG_BOX) != 0u;
-    let modelView = cv.view * ci.world;
+    let modelView = views[MAIN_VIEW].view * ci.world;
     let centerView = (modelView * vec4f(b.local, 1.0)).xyz;
     var lo = vec2f(1e30);
     var hi = vec2f(-1e30);
@@ -131,7 +145,7 @@ fn occluded(b : Bounds) -> bool {
         if (isBox) {
             v = modelView * vec4f(b.local + corner * b.half, 1.0);
         }
-        let clip = cv.proj * v;
+        let clip = views[MAIN_VIEW].proj * v;
         if (clip.w <= 0.0) { return false; }   // reaching behind the eye
         let ndc = clip.xyz / clip.w;
         lo = min(lo, ndc.xy);
@@ -141,9 +155,9 @@ fn occluded(b : Bounds) -> bool {
     // reaching in front of the near plane
     if ((!reverse && nearest < 0.0) || (reverse && nearest > 1.0)) { return false; }
     // the rectangle in depth pixels (y down), clamped to the buffer
-    let last = cv.depthSize - 1.0;
-    let q0 = vec2u(clamp((vec2f(lo.x, -hi.y) * 0.5 + 0.5) * cv.depthSize, vec2f(0.0), last));
-    let q1 = vec2u(clamp((vec2f(hi.x, -lo.y) * 0.5 + 0.5) * cv.depthSize, vec2f(0.0), last));
+    let last = views[MAIN_VIEW].depthSize - 1.0;
+    let q0 = vec2u(clamp((vec2f(lo.x, -hi.y) * 0.5 + 0.5) * views[MAIN_VIEW].depthSize, vec2f(0.0), last));
+    let q1 = vec2u(clamp((vec2f(hi.x, -lo.y) * 0.5 + 0.5) * views[MAIN_VIEW].depthSize, vec2f(0.0), last));
     // the finest mip where it spans at most 2 x 2 texels: texel t of mip L covers the pixels
     // [t, t + 1) * 2^(L + 1)
     let span = max(q1.x - q0.x, q1.y - q0.y);
@@ -159,15 +173,16 @@ fn occluded(b : Bounds) -> bool {
     return nearest > max(max(d.x, d.y), max(d.z, d.w));
 }
 
-// The draw's index count, from the dispatch's first invocation (the renderer clears the args).
-fn begin(i : u32) {
-    if (i == 0u) { args.indexCount = ci.indexCount; }
+// The draw's index count, from its first invocation (the renderer clears the args).
+fn begin(i : u32, draw : u32) {
+    if (i == 0u) { args[draw].indexCount = ci.indexCount; }
 }
 
-fn emit(i : u32) {
-    let slot = atomicAdd(&args.instanceCount, 1u);
+// Copy instance i into region `region` of `dst`, counted into draw `draw`.
+fn emit(i : u32, region : u32, draw : u32) {
+    let slot = atomicAdd(&args[draw].instanceCount, 1u);
     let base = i * ci.strideWords;
-    let out = slot * ci.strideWords;
+    let out = (region * ci.capacity + slot) * ci.strideWords;
     for (var w = 0u; w < ci.strideWords; w++) {
         dst[out + w] = src[base + w];
     }
@@ -175,49 +190,60 @@ fn emit(i : u32) {
 
 var<workgroup> tallies : array<atomic<u32>, 3>;
 
-// FLAG_STATS: add the workgroup's culled instances to `args.culled`, one atomic per kind. Every
-// invocation calls it, from uniform control flow.
-fn tally(outcome : u32, lid : u32) {
-    if ((cv.flags & FLAG_STATS) == 0u) { return; }
+// FLAG_STATS: add the workgroup's culled instances to draw `draw`'s `culled`, one atomic per kind.
+// Every invocation calls it, from uniform control flow.
+fn tally(outcome : u32, lid : u32, draw : u32, viewFlags : u32) {
+    if ((viewFlags & FLAG_STATS) == 0u) { return; }
     if (outcome >= LOD_CULLED && outcome <= OCCLUDED) {
         atomicAdd(&tallies[outcome - 1u], 1u);
     }
     workgroupBarrier();
     if (lid < 3u) {
         let n = atomicLoad(&tallies[lid]);
-        if (n > 0u) { atomicAdd(&args.culled[lid], n); }
+        if (n > 0u) { atomicAdd(&args[draw].culled[lid], n); }
     }
 }
 
-// Frustum and LOD culling.
+// Whether the renderable is drawn in view `v`: the view is in use (a shadowed light's), the
+// renderable casts shadows if only casters draw there, and the camera's is not culled in phases.
+fn drawnIn(v : u32) -> bool {
+    let flags = views[v].flags;
+    return (flags & FLAG_VIEW) != 0u
+        && ((flags & FLAG_CASTERS_ONLY) == 0u || (ci.flags & FLAG_CASTS_SHADOW) != 0u)
+        && !(v == MAIN_VIEW && (ci.flags & FLAG_TWO_PHASE) != 0u);
+}
+
+// Frustum and LOD culling, a row of workgroups per view.
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_index) lid : u32) {
-    begin(gid.x);
+fn main(@builtin(global_invocation_id) gid : vec3u, @builtin(workgroup_id) wg : vec3u, @builtin(local_invocation_index) lid : u32) {
+    let v = ci.firstView + wg.y;
+    if (!drawnIn(v)) { return; }
+    begin(gid.x, v);
     var outcome = UNCOUNTED;
     if (gid.x < ci.count) {
-        outcome = cull(bounds(gid.x));
-        if (outcome == KEPT) { emit(gid.x); }
+        outcome = cull(bounds(gid.x), v);
+        if (outcome == KEPT) { emit(gid.x, wg.y, v); }
     }
-    tally(outcome, lid);
+    tally(outcome, lid, v, views[v].flags);
 }
 
 // Occlusion, first phase: the instances in view that were visible last frame.
 @compute @workgroup_size(64)
 fn early(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_index) lid : u32) {
     let i = gid.x;
-    begin(i);
+    begin(i, MAIN_VIEW);
     var outcome = UNCOUNTED;
     if (i < ci.count) {
-        outcome = cull(bounds(i));
+        outcome = cull(bounds(i), MAIN_VIEW);
         if (outcome == KEPT) {
             if (visibility[i] != 0u) {
-                emit(i);
+                emit(i, MAIN_VIEW, MAIN_VIEW);
             } else {
                 outcome = UNCOUNTED;   // left to `late`
             }
         }
     }
-    tally(outcome, lid);
+    tally(outcome, lid, MAIN_VIEW, views[MAIN_VIEW].flags);
 }
 
 // Occlusion, second phase: the instances in view and not hidden in the pyramid of the first
@@ -225,20 +251,20 @@ fn early(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_i
 @compute @workgroup_size(64)
 fn late(@builtin(global_invocation_id) gid : vec3u, @builtin(local_invocation_index) lid : u32) {
     let i = gid.x;
-    begin(i);
+    begin(i, ci.lateSlot);
     var outcome = UNCOUNTED;
     if (i < ci.count) {
         let b = bounds(i);
-        let inView = cull(b) == KEPT;
+        let inView = cull(b, MAIN_VIEW) == KEPT;
         let visible = inView && !occluded(b);
         if (inView && visibility[i] == 0u) {
             if (visible) {
-                emit(i);
+                emit(i, 0u, ci.lateSlot);
             } else {
                 outcome = OCCLUDED;
             }
         }
         visibility[i] = select(0u, 1u, visible);
     }
-    tally(outcome, lid);
+    tally(outcome, lid, ci.lateSlot, views[MAIN_VIEW].flags);
 }
