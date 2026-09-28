@@ -1,8 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::atmosphere::sky_atmosphere::{
-    compute_pipeline, sampler_entry, texture_3d_entry, texture_entry, uniform_entry, AERIAL_PERSPECTIVE_LOOKUP_WGSL, COMMON_WGSL,
-    FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LIGHTING_WGSL,
+    compute_pipeline, sampler_entry, texture_3d_entry, texture_entry, uniform_entry, AERIAL_PERSPECTIVE_LOOKUP_WGSL, CLOUD_MAP_SIZE,
+    CLOUD_MAP_WGSL, COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LIGHTING_WGSL, SKY_LOOKUP_WGSL,
 };
 use crate::atmosphere::{SkyAtmosphere, SkyAtmosphereBindings};
 use crate::cameras::Camera;
@@ -20,7 +20,7 @@ const DETAIL_SIZE: u32 = 32;
 const WEATHER_SIZE: u32 = 256;
 
 fn march_source() -> String {
-    [COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, AERIAL_PERSPECTIVE_LOOKUP_WGSL, SKY_LIGHTING_WGSL, MARCH_WGSL].concat()
+    [COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, AERIAL_PERSPECTIVE_LOOKUP_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, MARCH_WGSL].concat()
 }
 
 fn composite_source() -> String {
@@ -125,6 +125,9 @@ struct Gpu {
     params: wgpu::Buffer,
     march: wgpu::ComputePipeline,
     march_bgl: wgpu::BindGroupLayout,
+    // the cloud map for the sky lighting (SkyAtmosphereBindings::cloud_map)
+    sky_map: wgpu::ComputePipeline,
+    sky_map_bgl: wgpu::BindGroupLayout,
     composite: wgpu::ComputePipeline,
     composite_bgl: wgpu::BindGroupLayout,
     shape: wgpu::TextureView,
@@ -149,8 +152,17 @@ struct Gpu {
 /// the wind. `layer` can change every frame (coverage for the weather of a shot). The clouds are
 /// part of the sky: `AtmosphereParams::sky_luminance_factor` scales the light they send like the
 /// sky's.
+///
+/// They also light the scene: each frame they march a small map of themselves all around the
+/// camera (`SkyAtmosphereBindings::cloud_map`), and the next frame's sky lighting (the SH the
+/// materials and fogs take their ambient light from) and environment cubemap see the sky through
+/// it, so the ambient light is occluded and tinted by the cloud layer. The clouds themselves stay
+/// lit by the clear sky above them. `lights_sky = false` leaves the sky lighting clear, as does
+/// taking the effect out of the chain.
 pub struct VolumetricCloudsEffect {
     pub layer: CloudLayer,
+    /// Whether the clouds occlude and tint the sky lighting and the environment (default true).
+    pub lights_sky: bool,
     /// Seconds, drives the wind.
     pub time: f32,
     pub resolution_scale: f32,
@@ -168,6 +180,7 @@ impl VolumetricCloudsEffect {
     pub fn new(sky: &SkyAtmosphere, options: VolumetricCloudsOptions) -> Self {
         Self {
             layer: options.layer,
+            lights_sky: true,
             time: 0.0,
             resolution_scale: options.resolution_scale,
             steps: options.steps,
@@ -287,6 +300,36 @@ impl VolumetricCloudsEffect {
                 uniform_entry(15),
             ],
         );
+        let sky_map_bgl = bgl(
+            "Clouds/SkyMapBGL",
+            &[
+                uniform_entry(0),
+                uniform_entry(1),
+                texture_entry(2),
+                sampler_entry(3),
+                uniform_entry(6),
+                texture_3d_entry(8),
+                texture_3d_entry(9),
+                texture_entry(10),
+                sampler_entry(11),
+                uniform_entry(15),
+                texture_entry(16),
+                sampler_entry(17),
+                storage(18, wgpu::TextureFormat::Rgba16Float, wgpu::TextureViewDimension::D2),
+            ],
+        );
+        let sky_map = {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Clouds/SkyMap"), source: wgpu::ShaderSource::Wgsl(march_source().into()) });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/SkyMap"), bind_group_layouts: &[&sky_map_bgl], push_constant_ranges: &[] });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Clouds/SkyMap"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("skyMap"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
         let composite_bgl = bgl(
             "Clouds/CompositeBGL",
             &[
@@ -307,6 +350,8 @@ impl VolumetricCloudsEffect {
             }),
             march: compute_pipeline(device, "Clouds/March", &march_source(), &march_bgl),
             march_bgl,
+            sky_map,
+            sky_map_bgl,
             composite: compute_pipeline(device, "Clouds/Composite", &composite_source(), &composite_bgl),
             composite_bgl,
             shape,
@@ -447,6 +492,26 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
             let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Clouds/MarchBG"), layout: &gpu.march_bgl, entries: &entries })
         };
+        let sky_map_bg = {
+            let sampler = wgpu::BindingResource::Sampler;
+            let entries = [
+                (0, s.atmosphere.as_entire_binding()),
+                (1, s.frame.as_entire_binding()),
+                (2, tex(&s.transmittance)),
+                (3, sampler(&s.lut_sampler)),
+                (6, s.sky_lighting.as_entire_binding()),
+                (8, tex(&gpu.shape)),
+                (9, tex(&gpu.detail)),
+                (10, tex(&gpu.weather)),
+                (11, sampler(&gpu.noise_sampler)),
+                (15, gpu.params.as_entire_binding()),
+                (16, tex(&s.sky_view)),
+                (17, sampler(&s.sky_view_sampler)),
+                (18, tex(&s.cloud_map)),
+            ]
+            .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource });
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Clouds/SkyMapBG"), layout: &gpu.sky_map_bgl, entries: &entries })
+        };
         let composite_bg = {
             let resources = [self.sky.frame.as_entire_binding(), tex(input), tex(depth), tex(&t.color[current]), tex(&t.depth), tex(output)];
             let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
@@ -456,6 +521,13 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
         pass.set_pipeline(&gpu.march);
         pass.set_bind_group(0, &march_bg, &[]);
         pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        // the clouds all around, for the sky lighting and the environment of the next frame
+        if self.lights_sky {
+            pass.set_pipeline(&gpu.sky_map);
+            pass.set_bind_group(0, &sky_map_bg, &[]);
+            pass.dispatch_workgroups(CLOUD_MAP_SIZE.0.div_ceil(8), CLOUD_MAP_SIZE.1.div_ceil(8), 1);
+            self.sky.cloud_map_frame.store(camera.frame().wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
         pass.set_pipeline(&gpu.composite);
         pass.set_bind_group(0, &composite_bg, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
@@ -624,10 +696,58 @@ mod tests {
                 [half(o), half(o + 2), half(o + 4), half(o + 6)]
             }).collect()
         };
+        // the sky lighting after one more update, which reads the cloud map the clouds left
+        let lighting_at = |sky: &mut crate::atmosphere::SkyAtmosphere, camera: &Camera| -> Vec<f32> {
+            let size = std::mem::size_of::<crate::atmosphere::params::SkyLightingGpu>() as u64;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut e = device.create_command_encoder(&Default::default());
+            sky.encode(&queue, &mut e, camera);
+            e.copy_buffer_to_buffer(&sky.bindings().sky_lighting, 0, &buf, 0, size);
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let v = bytemuck::cast_slice::<u8, f32>(&buf.slice(..).get_mapped_range()).to_vec();
+            v
+        };
+        let lighting = |sky: &mut crate::atmosphere::SkyAtmosphere| lighting_at(sky, &camera);
+        // irradiance on an upward surface from the SH (skyIrradiance at +Y), and the clear sky's
+        let up = |l: &[f32]| -> glam::Vec3 {
+            let c = |i: usize, k: usize| l[i * 4 + k];
+            let e = |k: usize| c(0, k) * 0.282095 * 3.141593 + c(1, k) * 0.488603 * 2.094395 - c(6, k) * 0.315392 * 0.785398 - c(8, k) * 0.546274 * 0.785398;
+            glam::Vec3::new(e(0), e(1), e(2))
+        };
+        let clear_up = |l: &[f32]| glam::Vec3::new(l[13 * 4], l[13 * 4 + 1], l[13 * 4 + 2]);
+        let none = lighting(&mut sky);
+
         let clear = run(&mut sky, 0.0);
         let worst = clear.iter().map(|c| (c[0] - 1000.0).abs().max((c[2] - 1000.0).abs())).fold(0.0, f32::max);
         assert!(worst < 1.0, "a clear sky changed by {worst}");
+        // no clouds leave the sky lighting as it was
+        let lit_clear = lighting(&mut sky);
+        let drift = none.iter().zip(&lit_clear).map(|(a, b)| (a - b).abs() / a.abs().max(1.0)).fold(0.0, f32::max);
+        assert!(drift < 1e-3, "a clear layer changed the sky lighting by {drift}");
         let overcast = run(&mut sky, 1.0);
+        // a closed deck takes the blue sky out of the ambient light and puts its grey base in (under
+        // a high sun about as bright as the clear sky's diffuse light, as a medium overcast is);
+        // the clouds themselves stay lit by the clear sky above them
+        let lit_overcast = lighting(&mut sky);
+        let (e_clear, e_overcast) = (up(&none), up(&lit_overcast));
+        let ratio = e_overcast / e_clear;
+        eprintln!("irradiance up: clear sky {e_clear:?}, overcast {e_overcast:?}, ratio {ratio:?}");
+        assert!(ratio.y > 0.3 && ratio.y < 1.5, "overcast / clear up-irradiance {ratio:?}");
+        let blue = |e: glam::Vec3| e.z / e.x;
+        assert!(blue(e_overcast) < 0.7 * blue(e_clear), "the overcast ambient is about as blue as the clear sky's: {ratio:?}");
+        let kept = (clear_up(&lit_overcast) - clear_up(&none)).abs().max_element() / clear_up(&none).max_element();
+        assert!(kept < 1e-3, "the clear sky's irradiance changed by {kept}");
+        // frames later with no clouds drawn (the effect out of the chain), the sky lighting is clear
+        let mut later = Camera::new(60.0, 0.1, 5000.0, w as f32 / h as f32);
+        later.set_position(0.0, 2.0, 0.0);
+        later.look_at(&Vec3::new(0.0, 100.0, -1.0));
+        later.update_view_matrix();
+        for _ in 0..3 { later.end_frame(); }
+        let gone = lighting_at(&mut sky, &later);
+        let drift = none.iter().zip(&gone).map(|(a, b)| (a - b).abs() / a.abs().max(1.0)).fold(0.0, f32::max);
+        assert!(drift < 1e-3, "clouds no longer drawn still change the sky lighting by {drift}");
         assert!(overcast.iter().all(|c| c.iter().all(|v| v.is_finite())), "non-finite cloud light");
         let mean: f32 = overcast.iter().map(|c| c[1]).sum::<f32>() / overcast.len() as f32;
         // the background barely shows through a closed deck
@@ -640,5 +760,75 @@ mod tests {
         let scaled_mean: f32 = scaled.iter().map(|c| c[1]).sum::<f32>() / scaled.len() as f32;
         let ratio = scaled_mean / mean;
         assert!((ratio - 0.25).abs() < 0.03, "with the sky scaled by 0.25 the clouds scale by {ratio}");
+    }
+
+    /// By hand: how much an overcast darkens the sky lighting at twilight, by default with
+    /// midsommar-web's settings (sun 2.5 degrees below the horizon, haze 1.7, a layer from 1.2 to
+    /// 5.2 km at coverage 0.9 and density 1.2; SUN=, COV=, DEN= change them). Prints the SH's
+    /// irradiance and radiance with and without the clouds.
+    /// `cargo test -p kansei-core --lib twilight_overcast -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn twilight_overcast_sky_lighting() {
+        let Some((device, queue)) = gpu() else { return };
+        let (w, h) = (64u32, 32u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output = texture(GBuffer::COLOR_FORMAT, wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+        let depth_tex = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = depth_tex.create_view(&Default::default());
+        {
+            let mut e = device.create_command_encoder(&Default::default());
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            queue.submit([e.finish()]);
+        }
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let mut camera = Camera::new(60.0, 0.1, 5000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 2.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 100.0, -1.0));
+        camera.update_view_matrix();
+        let env = |k: &str, d: f32| std::env::var(k).map(|v| v.parse().unwrap()).unwrap_or(d);
+        let mut sky = crate::atmosphere::SkyAtmosphere::new(&device, Default::default());
+        sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(env("SUN", -2.5), 140.0);
+        sky.sun.illuminance = Vec3::new(100_000.0, 73_000.0, 55_200.0);
+        sky.params.mie_scattering_scale = 0.003996 * 1.7;
+        let lighting = |sky: &mut crate::atmosphere::SkyAtmosphere| -> Vec<f32> {
+            let size = std::mem::size_of::<crate::atmosphere::params::SkyLightingGpu>() as u64;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut e = device.create_command_encoder(&Default::default());
+            sky.encode(&queue, &mut e, &camera);
+            e.copy_buffer_to_buffer(&sky.bindings().sky_lighting, 0, &buf, 0, size);
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let v = bytemuck::cast_slice::<u8, f32>(&buf.slice(..).get_mapped_range()).to_vec();
+            v
+        };
+        let eval = |l: &[f32], d: glam::Vec3, band: [f32; 3]| -> glam::Vec3 {
+            let c = |i: usize| glam::Vec3::new(l[i * 4], l[i * 4 + 1], l[i * 4 + 2]);
+            c(0) * (0.282095 * band[0]) + (c(1) * d.y + c(2) * d.z + c(3) * d.x) * (0.488603 * band[1])
+                + (c(4) * (1.092548 * d.x * d.y) + c(5) * (1.092548 * d.y * d.z) + c(6) * (0.315392 * (3.0 * d.z * d.z - 1.0)) + c(7) * (1.092548 * d.x * d.z) + c(8) * (0.546274 * (d.x * d.x - d.y * d.y))) * band[2]
+        };
+        let none = lighting(&mut sky);
+        let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions {
+            layer: CloudLayer { bottom_m: 1200.0, top_m: 5200.0, coverage: env("COV", 0.9), cloud_type: 0.5, extinction: CloudLayer::default().extinction * env("DEN", 1.2), ..Default::default() },
+            max_distance_m: 50_000.0,
+            ..Default::default()
+        });
+        for _ in 0..30 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            sky.encode(&queue, &mut encoder, &camera);
+            fx.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+            queue.submit([encoder.finish()]);
+        }
+        let over = lighting(&mut sky);
+        let up = glam::Vec3::Y;
+        let horizon = glam::Vec3::new(0.0, 0.17, 0.98).normalize();
+        let irr = [3.141593, 2.094395, 0.785398];
+        eprintln!("sun {} deg, coverage {}, density {}", env("SUN", -2.5), env("COV", 0.9), env("DEN", 1.2));
+        eprintln!("irradiance up: clear {:?} overcast {:?} ratio {:?}", eval(&none, up, irr), eval(&over, up, irr), eval(&over, up, irr) / eval(&none, up, irr));
+        eprintln!("radiance zenith (low-pass): clear {:?} overcast {:?} ratio {:?}", eval(&none, up, [1.0; 3]), eval(&over, up, [1.0; 3]), eval(&over, up, [1.0; 3]) / eval(&none, up, [1.0; 3]));
+        eprintln!("radiance 10 deg up: clear {:?} overcast {:?}", eval(&none, horizon, [1.0; 3]), eval(&over, horizon, [1.0; 3]));
+        eprintln!("clear sky up (clouds' ambient) {:?}; sun at camera {:?}", &over[13 * 4..13 * 4 + 3], &over[9 * 4..9 * 4 + 4]);
     }
 }
