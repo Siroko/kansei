@@ -23,9 +23,9 @@ pub(crate) const ARGS_BYTES: u64 = 32;
 /// frustum, so things outside the picture still cast into it. An instance is kept when its
 /// bounding sphere (centre at `center_offset`, `radius` times the f32 at
 /// `radius_scale_offset` if set, both in the renderable's object space) is inside the view, and
-/// its distance from the main camera is within `lod_range`. The survivors are compacted into a
-/// buffer per view and drawn indirectly; the geometry's own instance buffer only lends its
-/// vertex layout.
+/// its distance from the main camera is within `lod_range`. The survivors are compacted, a
+/// region per view, and drawn indirectly; the geometry's own instance buffer only lends its
+/// vertex layout. One dispatch culls all of a renderable's views.
 ///
 /// LOD: one renderable per LOD mesh, all sharing `source`, each with its distance band. Bands
 /// are measured from the main camera in every view, so shadows match what is on screen.
@@ -80,42 +80,50 @@ pub struct InstanceCulling {
     /// Occlusion culling for the main camera, in two phases (off by default).
     pub occlusion: bool,
     capacity: u32,
-    views: Vec<ViewSlot>,
     shared: Option<Shared>,
     occlusion_slots: Option<OcclusionSlots>,
     two_phase: bool,
 }
 
-/// A view's compacted instances, and its bind group.
-struct ViewSlot {
+/// Consecutive views culled by one dispatch: their compacted instances, a region of `capacity`
+/// instances each in one buffer, and the bind group (with the chunk's parameters).
+struct Chunk {
+    first_view: usize,
+    views: usize,
     instances: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
-/// What every slot (each view's, then the second occlusion phase's, `late_slot`) shares: the
-/// instances' culling parameters, written only when they change, and the indirect draws, a
-/// stride apart in one buffer that a frame resets with one clear.
+/// The renderable's culling state for every view: the instances' parameters (a copy per chunk,
+/// `params_stride` apart), written only when they change; the indirect draws, `ARGS_BYTES` apart
+/// in one buffer that a frame resets with one clear (each view's, then the second occlusion
+/// phase's, `late_slot`); and the views' compacted instances, in chunks as large as a storage
+/// binding allows (one, but for very many instances and views).
 struct Shared {
     params: wgpu::Buffer,
+    params_stride: u64,
     written: Option<CullInstancesGpu>,
     args: wgpu::Buffer,
-    args_stride: u64,
+    views: usize,
+    chunks: Vec<Chunk>,
 }
 
 /// Occlusion culling's per-renderable state: which instances the camera saw last frame, the
-/// first phase's bind group (the main view's buffers, and `visibility`), and the second phase's
-/// own draw.
+/// first phase's bind group (the main view's region, and `visibility`), and the second phase's
+/// own instances and bind group.
 struct OcclusionSlots {
     visibility: wgpu::Buffer,
     early: wgpu::BindGroup,
-    late: ViewSlot,
+    late_instances: wgpu::Buffer,
+    late: wgpu::BindGroup,
 }
 
-/// A culled draw: the compacted instances (for the geometry's instance buffer) and the indirect
-/// draw, at `offset` in `args`.
+/// A culled draw: the compacted instances (for the geometry's instance buffer, from
+/// `instances_offset`) and the indirect draw, at `offset` in `args`.
 #[derive(Clone, Copy)]
 pub(crate) struct CulledDraw<'a> {
     pub instances: &'a wgpu::Buffer,
+    pub instances_offset: u64,
     pub args: &'a wgpu::Buffer,
     pub offset: u64,
 }
@@ -137,6 +145,10 @@ pub(crate) struct CullInstancesGpu {
     scale_word: u32,
     flags: u32,
     index_count: u32,
+    first_view: u32,
+    capacity: u32,
+    late_slot: u32,
+    _pad: u32,
 }
 
 /// `CullView` in instance_cull.wgsl: a view, shared by every renderable culled for it.
@@ -156,6 +168,10 @@ pub(crate) struct CullViewGpu {
 const FLAG_STATS: u32 = 1;
 const FLAG_BOX: u32 = 2;
 const FLAG_REVERSE_Z: u32 = 4;
+const FLAG_CASTS_SHADOW: u32 = 8;
+const FLAG_TWO_PHASE: u32 = 16;
+const FLAG_VIEW: u32 = 32;
+const FLAG_CASTERS_ONLY: u32 = 64;
 
 /// A view the renderer culls for: its view-projection, whether it only draws shadow casters, and
 /// how it scales the LOD distances (below 1 a view picks finer LODs than the camera would).
@@ -180,7 +196,10 @@ impl CullView {
     /// The view for the GPU: its frustum, the LOD origin, and for the camera what occlusion
     /// culling projects with.
     pub(crate) fn gpu(&self, lod_origin: glam::Vec3, occlusion: Option<&OcclusionView>, stats: bool) -> CullViewGpu {
-        let mut flags = 0;
+        let mut flags = FLAG_VIEW;
+        if self.casters_only {
+            flags |= FLAG_CASTERS_ONLY;
+        }
         if stats {
             flags |= FLAG_STATS;
         }
@@ -220,7 +239,6 @@ impl InstanceCulling {
             bounds_box: None,
             occlusion: false,
             capacity: count,
-            views: Vec::new(),
             shared: None,
             occlusion_slots: None,
             two_phase: false,
@@ -260,17 +278,25 @@ impl InstanceCulling {
     /// with occlusion, the first phase's.
     pub(crate) fn view(&self, view: usize) -> Option<CulledDraw<'_>> {
         let shared = self.shared.as_ref()?;
-        self.views.get(view).map(|v| CulledDraw { instances: &v.instances, args: &shared.args, offset: view as u64 * shared.args_stride })
+        let chunk = shared.chunks.iter().find(|c| (c.first_view..c.first_view + c.views).contains(&view))?;
+        Some(CulledDraw {
+            instances: &chunk.instances,
+            instances_offset: ((view - chunk.first_view) as u64) * self.region_bytes(),
+            args: &shared.args,
+            offset: view as u64 * ARGS_BYTES,
+        })
     }
 
     /// The second phase's compacted instances and indirect draw, when this frame culls the main
     /// view in two phases.
     pub(crate) fn late(&self) -> Option<CulledDraw<'_>> {
         let shared = self.shared.as_ref()?;
-        self.occlusion_slots
-            .as_ref()
-            .filter(|_| self.two_phase)
-            .map(|o| CulledDraw { instances: &o.late.instances, args: &shared.args, offset: self.late_slot() as u64 * shared.args_stride })
+        self.occlusion_slots.as_ref().filter(|_| self.two_phase).map(|o| CulledDraw {
+            instances: &o.late_instances,
+            instances_offset: 0,
+            args: &shared.args,
+            offset: shared.views as u64 * ARGS_BYTES,
+        })
     }
 
     /// Whether this frame culls the main view in two phases (set by the renderer).
@@ -287,33 +313,31 @@ impl InstanceCulling {
         self.count.min(self.capacity)
     }
 
-    /// The second occlusion phase's slot, after the views'.
-    fn late_slot(&self) -> usize {
-        self.views.len()
+    /// Bytes of a view's region of compacted instances.
+    fn region_bytes(&self) -> u64 {
+        self.capacity.max(1) as u64 * self.stride as u64
     }
 
-    fn create_slot(&self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, slot: usize, visibility: Option<&wgpu::Buffer>) -> ViewSlot {
+    fn instances_buffer(&self, device: &wgpu::Device, views: usize) -> wgpu::Buffer {
         // (COPY_SRC: readable for debugging and tests)
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+        device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("InstanceCulling/Instances"),
-            size: (self.capacity.max(1) * self.stride) as u64,
+            size: views as u64 * self.region_bytes(),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
-        });
-        let bind_group = self.bind_group(device, bgl, slot, &instances, visibility);
-        ViewSlot { instances, bind_group }
+        })
     }
 
-    /// Slot `slot`'s bind group: the instances' parameters, the source, its compacted instances
-    /// `instances`, its indirect draw, and with occlusion the visibility.
-    fn bind_group(&self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, slot: usize, instances: &wgpu::Buffer, visibility: Option<&wgpu::Buffer>) -> wgpu::BindGroup {
+    /// A bind group: chunk `chunk`'s parameters, the source, compacted instances `instances`,
+    /// every draw, and with occlusion the visibility.
+    fn bind_group(&self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, chunk: usize, instances: &wgpu::Buffer, visibility: Option<&wgpu::Buffer>) -> wgpu::BindGroup {
         let shared = self.shared.as_ref().expect("shared buffers first");
-        let args = wgpu::BufferBinding { buffer: &shared.args, offset: slot as u64 * shared.args_stride, size: std::num::NonZeroU64::new(ARGS_BYTES) };
+        let params = wgpu::BufferBinding { buffer: &shared.params, offset: chunk as u64 * shared.params_stride, size: std::num::NonZeroU64::new(std::mem::size_of::<CullInstancesGpu>() as u64) };
         let mut entries = vec![
-            wgpu::BindGroupEntry { binding: 0, resource: shared.params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(params) },
             wgpu::BindGroupEntry { binding: 1, resource: self.source.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: instances.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Buffer(args) },
+            wgpu::BindGroupEntry { binding: 3, resource: shared.args.as_entire_binding() },
         ];
         if let Some(visibility) = visibility {
             entries.push(wgpu::BindGroupEntry { binding: 4, resource: visibility.as_entire_binding() });
@@ -324,36 +348,51 @@ impl InstanceCulling {
     /// Make sure there are GPU slots for `count` views; true if buffers were (re)created (render
     /// bundles that recorded the old ones are stale).
     pub(crate) fn ensure_views(&mut self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, count: usize) -> bool {
-        if self.count <= self.capacity && self.views.len() >= count && self.shared.is_some() {
+        let limits = device.limits();
+        let max_chunk_bytes = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        self.ensure_views_within(device, bgl, count, max_chunk_bytes)
+    }
+
+    /// `ensure_views`, with at most `max_chunk_bytes` of compacted instances per chunk.
+    fn ensure_views_within(&mut self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, count: usize, max_chunk_bytes: u64) -> bool {
+        if self.count <= self.capacity && self.shared.as_ref().is_some_and(|s| s.views >= count) {
             return false;
         }
         // recreate everything: the draws hold a slot per view and the second phase's
         self.capacity = self.capacity.max(self.count);
-        let count = count.max(self.views.len());
-        self.views.clear();
+        let count = count.max(self.shared.as_ref().map_or(0, |s| s.views)).max(1);
         self.occlusion_slots = None;
         self.two_phase = false;
-        let args_stride = ARGS_BYTES.div_ceil(device.limits().min_storage_buffer_offset_alignment as u64) * device.limits().min_storage_buffer_offset_alignment as u64;
+        let per_chunk = (max_chunk_bytes / self.region_bytes()).clamp(1, count as u64) as usize;
+        let chunks = count.div_ceil(per_chunk);
+        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let params_stride = (std::mem::size_of::<CullInstancesGpu>() as u64).div_ceil(align) * align;
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         self.shared = Some(Shared {
-            params: buffer("InstanceCulling/Params", std::mem::size_of::<CullInstancesGpu>() as u64, wgpu::BufferUsages::UNIFORM),
+            params: buffer("InstanceCulling/Params", chunks as u64 * params_stride, wgpu::BufferUsages::UNIFORM),
+            params_stride,
             written: None,
             // (COPY_SRC: the stats read them back)
-            args: buffer("InstanceCulling/Args", (count as u64 + 1) * args_stride, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
-            args_stride,
+            args: buffer("InstanceCulling/Args", (count as u64 + 1) * ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            views: count,
+            chunks: Vec::new(),
         });
-        for slot in 0..count {
-            let view = self.create_slot(device, bgl, slot, None);
-            self.views.push(view);
-        }
+        let chunks: Vec<Chunk> = (0..chunks)
+            .map(|k| {
+                let first_view = k * per_chunk;
+                let views = per_chunk.min(count - first_view);
+                let instances = self.instances_buffer(device, views);
+                let bind_group = self.bind_group(device, bgl, k, &instances, None);
+                Chunk { first_view, views, instances, bind_group }
+            })
+            .collect();
+        self.shared.as_mut().unwrap().chunks = chunks;
         true
     }
 
     /// Make sure the occlusion state exists (after `ensure_views`); true if it was created.
     pub(crate) fn ensure_occlusion(&mut self, device: &wgpu::Device, pipeline: &CullPipeline) -> bool {
-        if self.occlusion_slots.is_some() || self.views.is_empty() {
-            return false;
-        }
+        let Some(shared) = self.shared.as_ref().filter(|_| self.occlusion_slots.is_none()) else { return false };
         // one word per instance, zero (nothing seen yet)
         let visibility = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("InstanceCulling/Visibility"),
@@ -361,9 +400,11 @@ impl InstanceCulling {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let early = self.bind_group(device, &pipeline.occlusion_bgl, 0, &self.views[0].instances, Some(&visibility));
-        let late = self.create_slot(device, &pipeline.occlusion_bgl, self.late_slot(), Some(&visibility));
-        self.occlusion_slots = Some(OcclusionSlots { visibility, early, late });
+        // the first phase fills the camera's region (the first chunk's first), the second its own
+        let early = self.bind_group(device, &pipeline.occlusion_bgl, 0, &shared.chunks[0].instances, Some(&visibility));
+        let late_instances = self.instances_buffer(device, 1);
+        let late = self.bind_group(device, &pipeline.occlusion_bgl, 0, &late_instances, Some(&visibility));
+        self.occlusion_slots = Some(OcclusionSlots { visibility, early, late_instances, late });
         true
     }
 
@@ -375,11 +416,18 @@ impl InstanceCulling {
         }
     }
 
-    /// Start a frame, before its cull pass (after `ensure_views`): write the instances' parameters
-    /// for a renderable with `world` matrix and `index_count` indices if they changed, and clear
-    /// every slot's draw (the cull sets the index count of those it culls into).
-    pub(crate) fn begin_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, world: glam::Mat4, index_count: u32) {
+    /// Start a frame, before its cull pass (after `ensure_views` and `set_two_phase`): write the
+    /// instances' parameters for a renderable with `world` matrix and `index_count` indices,
+    /// drawn in shadow maps if `casts_shadow`, if they changed, and clear every slot's draw (the
+    /// cull sets the index count of those it culls into).
+    pub(crate) fn begin_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, world: glam::Mat4, index_count: u32, casts_shadow: bool) {
         let scale = glam::Vec3::new(world.x_axis.truncate().length(), world.y_axis.truncate().length(), world.z_axis.truncate().length());
+        let mut flags = 0;
+        for (on, flag) in [(self.bounds_box.is_some(), FLAG_BOX), (casts_shadow, FLAG_CASTS_SHADOW), (self.two_phase, FLAG_TWO_PHASE)] {
+            if on {
+                flags |= flag;
+            }
+        }
         let params = CullInstancesGpu {
             world: world.to_cols_array(),
             shift: self.bounds_shift.to_array(),
@@ -392,12 +440,22 @@ impl InstanceCulling {
             stride_words: self.stride / 4,
             center_word: self.center_offset / 4,
             scale_word: self.radius_scale_offset.map_or(NO_WORD, |o| o / 4),
-            flags: if self.bounds_box.is_some() { FLAG_BOX } else { 0 },
+            flags,
             index_count,
+            first_view: 0,
+            capacity: self.capacity,
+            late_slot: self.shared.as_ref().expect("ensure_views first").views as u32,
+            _pad: 0,
         };
-        let shared = self.shared.as_mut().expect("ensure_views first");
+        let shared = self.shared.as_mut().unwrap();
         if shared.written != Some(params) {
-            queue.write_buffer(&shared.params, 0, bytemuck::bytes_of(&params));
+            // a copy per chunk, each with its first view
+            let mut bytes = vec![0u8; shared.chunks.len() * shared.params_stride as usize];
+            for (k, chunk) in shared.chunks.iter().enumerate() {
+                let params = CullInstancesGpu { first_view: chunk.first_view as u32, ..params };
+                bytes[k * shared.params_stride as usize..][..std::mem::size_of::<CullInstancesGpu>()].copy_from_slice(bytemuck::bytes_of(&params));
+            }
+            queue.write_buffer(&shared.params, 0, &bytes);
             shared.written = Some(params);
         }
         encoder.clear_buffer(&shared.args, 0, None);
@@ -407,13 +465,17 @@ impl InstanceCulling {
         self.tested().div_ceil(64).max(1)
     }
 
-    /// Cull into view `slot` (with the frustum-only pipeline and the view's group 1 set).
-    pub(crate) fn dispatch(&self, pass: &mut wgpu::ComputePass, slot: usize) {
-        pass.set_bind_group(0, &self.views[slot].bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups(), 1, 1);
+    /// Cull into every view the renderable is drawn in, a dispatch per chunk (with the
+    /// frustum-only pipeline and the views' group 1 set). With two phases this frame, the camera
+    /// is left to `dispatch_early` and `dispatch_late`.
+    pub(crate) fn dispatch(&self, pass: &mut wgpu::ComputePass) {
+        for chunk in &self.shared.as_ref().expect("ensure_views first").chunks {
+            pass.set_bind_group(0, &chunk.bind_group, &[]);
+            pass.dispatch_workgroups(self.workgroups(), chunk.views as u32, 1);
+        }
     }
 
-    /// Occlusion's first phase for the main view (with the `early` pipeline and the main view's
+    /// Occlusion's first phase for the main view (with the `early` pipeline and the views'
     /// group 1 set).
     pub(crate) fn dispatch_early(&self, pass: &mut wgpu::ComputePass) {
         let o = self.occlusion_slots.as_ref().expect("ensure_occlusion first");
@@ -421,18 +483,17 @@ impl InstanceCulling {
         pass.dispatch_workgroups(self.workgroups(), 1, 1);
     }
 
-    /// Occlusion's second phase (with the `late` pipeline, the main view's group 1 and the
-    /// pyramid's group 2 set).
+    /// Occlusion's second phase (with the `late` pipeline, the views' group 1 and the pyramid's
+    /// group 2 set).
     pub(crate) fn dispatch_late(&self, pass: &mut wgpu::ComputePass) {
         let o = self.occlusion_slots.as_ref().expect("ensure_occlusion first");
-        pass.set_bind_group(0, &o.late.bind_group, &[]);
+        pass.set_bind_group(0, &o.late, &[]);
         pass.dispatch_workgroups(self.workgroups(), 1, 1);
     }
 }
 
 /// The cull compute pipelines, shared by every renderable: frustum and LOD only (`pipeline`), and
-/// occlusion's two phases; and the frame's views, in one buffer every dispatch picks its view
-/// from (`set_views`, `view_bind_group`, `view_offset`).
+/// occlusion's two phases; and the frame's views, in one buffer (`set_views`, `view_bind_group`).
 pub(crate) struct CullPipeline {
     pub pipeline: wgpu::ComputePipeline,
     pub early: wgpu::ComputePipeline,
@@ -441,12 +502,11 @@ pub(crate) struct CullPipeline {
     pub bgl: wgpu::BindGroupLayout,
     /// the same, and the visibility
     pub occlusion_bgl: wgpu::BindGroupLayout,
-    /// group 1: a view (dynamic offset)
+    /// group 1: the views
     view_bgl: wgpu::BindGroupLayout,
     /// group 2 of `late`: the depth pyramid
     pub pyramid_bgl: wgpu::BindGroupLayout,
     views: Option<(wgpu::Buffer, wgpu::BindGroup, usize)>,
-    view_stride: u64,
 }
 
 impl CullPipeline {
@@ -462,11 +522,7 @@ impl CullPipeline {
         ];
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("InstanceCulling/BGL"), entries: &entries[..4] });
         let occlusion_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("InstanceCulling/OcclusionBGL"), entries: &entries });
-        let view_size = std::num::NonZeroU64::new(std::mem::size_of::<CullViewGpu>() as u64);
-        let view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("InstanceCulling/ViewBGL"),
-            entries: &[entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: view_size })],
-        });
+        let view_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("InstanceCulling/ViewBGL"), entries: &[entry(0, storage(true))] });
         let pyramid_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("InstanceCulling/PyramidBGL"),
             entries: &[entry(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false })],
@@ -483,7 +539,6 @@ impl CullPipeline {
                 cache: None,
             })
         };
-        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
         Self {
             pipeline: pipeline("main", &[&bgl, &view_bgl]),
             early: pipeline("early", &[&occlusion_bgl, &view_bgl]),
@@ -493,44 +548,32 @@ impl CullPipeline {
             view_bgl,
             pyramid_bgl,
             views: None,
-            view_stride: (std::mem::size_of::<CullViewGpu>() as u64).div_ceil(align) * align,
         }
     }
 
-    /// Upload the frame's views (one write), for `view_bind_group` at `view_offset(i)`.
+    /// Upload the frame's views (one write), for `view_bind_group`.
     pub fn set_views(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, views: &[CullViewGpu]) {
         if self.views.as_ref().is_none_or(|(_, _, capacity)| *capacity < views.len()) {
             let capacity = views.len().next_power_of_two().max(8);
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("InstanceCulling/Views"),
-                size: capacity as u64 * self.view_stride,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                size: (capacity * std::mem::size_of::<CullViewGpu>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("InstanceCulling/Views"),
                 layout: &self.view_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &buffer, offset: 0, size: std::num::NonZeroU64::new(std::mem::size_of::<CullViewGpu>() as u64) }),
-                }],
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
             });
             self.views = Some((buffer, bind_group, capacity));
         }
-        let mut bytes = vec![0u8; views.len() * self.view_stride as usize];
-        for (i, view) in views.iter().enumerate() {
-            bytes[i * self.view_stride as usize..][..std::mem::size_of::<CullViewGpu>()].copy_from_slice(bytemuck::bytes_of(view));
-        }
-        queue.write_buffer(&self.views.as_ref().unwrap().0, 0, &bytes);
+        queue.write_buffer(&self.views.as_ref().unwrap().0, 0, bytemuck::cast_slice(views));
     }
 
-    /// Group 1 of every cull pipeline, with `view_offset(i)` for view `i` (after `set_views`).
+    /// Group 1 of every cull pipeline (after `set_views`).
     pub fn view_bind_group(&self) -> &wgpu::BindGroup {
         &self.views.as_ref().expect("set_views first").1
-    }
-
-    pub fn view_offset(&self, view: usize) -> u32 {
-        (view as u64 * self.view_stride) as u32
     }
 
     /// The `late` pipeline's group 2 for a depth pyramid.
@@ -588,7 +631,9 @@ mod tests {
     }
 
     /// On a real GPU: of a row of instances along x, a view keeps exactly those in its frustum
-    /// and LOD band, copies their whole records, and counts them into the indirect draw.
+    /// and LOD band, copies their whole records, and counts them into the indirect draw; views
+    /// the renderable is not drawn in (an unused one, a shadow it does not cast) draw nothing;
+    /// all of it with every view in one dispatch, and split into chunks.
     #[test]
     fn gpu_culls_and_compacts_per_view() {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -609,61 +654,151 @@ mod tests {
             usage: wgpu::BufferUsages::STORAGE,
         });
         let mut pipeline = CullPipeline::new(&device);
-        let mut culling = InstanceCulling::new(source, 100, 32, 0, 0.5).with_radius_scale(12).with_lod_range(0.0, 30.0);
-        culling.ensure_views(&device, &pipeline.bgl, 3);
         // view 0: looking down -z from z = 20, 90 degrees wide: sees |x| < 20 at z = 0
         // view 1: the same from x = 40, sees 20 < x < 60 but the LOD band (from the origin) stops at 30
         // view 2: view 1 with a LOD distance scale of 0.5, so the band reaches 60
+        // view 3: unused (no light this frame)
+        // view 4: view 0 for shadow casters only, which this renderable is not
         let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
-        let views = [(0.0f32, 1.0), (40.0, 1.0), (40.0, 0.5)].map(|(x, lod_distance_scale)| CullView {
+        let view = |x: f32, lod_distance_scale: f32, casters_only: bool| CullView {
             view_proj: proj * glam::Mat4::look_at_rh(glam::Vec3::new(x, 0.0, 20.0), glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::Y),
-            casters_only: false,
+            casters_only,
             lod_distance_scale,
-        });
-        pipeline.set_views(&device, &queue, &views.map(|v| v.gpu(glam::Vec3::ZERO, None, false)));
-        let mut encoder = device.create_command_encoder(&Default::default());
-        culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline.pipeline);
-            for slot in 0..views.len() {
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(slot)]);
-                culling.dispatch(&mut pass, slot);
-            }
-        }
-        let readback = |buf: &wgpu::Buffer, encoder: &mut wgpu::CommandEncoder| {
-            let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: buf.size(), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, buf.size());
-            staging
         };
-        let staged: Vec<_> = (0..3)
-            .flat_map(|v| {
+        let views = [Some(view(0.0, 1.0, false)), Some(view(40.0, 1.0, false)), Some(view(40.0, 0.5, false)), None, Some(view(0.0, 1.0, true))];
+        pipeline.set_views(&device, &queue, &views.map(|v| v.map_or(bytemuck::Zeroable::zeroed(), |v| v.gpu(glam::Vec3::ZERO, None, false))));
+        // every view in one chunk, then 2 and 1 per chunk
+        for per_chunk in [u64::MAX, 2, 1] {
+            let mut culling = InstanceCulling::new(source.clone(), 100, 32, 0, 0.5).with_radius_scale(12).with_lod_range(0.0, 30.0);
+            culling.ensure_views_within(&device, &pipeline.bgl, views.len(), per_chunk.saturating_mul(100 * 32));
+            let chunks = culling.shared.as_ref().unwrap().chunks.len();
+            assert_eq!(chunks, [1, 3, 5][[u64::MAX, 2, 1].iter().position(|&p| p == per_chunk).unwrap()]);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false);
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                culling.dispatch(&mut pass);
+            }
+            queue.submit(Some(encoder.finish()));
+            // each view's draw, ARGS_BYTES apart in the args, and its region of the instances
+            let args = read_words(&device, &queue, culling.view(0).unwrap().args);
+            let ids = |v: usize| -> (u32, Vec<i32>) {
                 let draw = culling.view(v).unwrap();
-                [readback(draw.args, &mut encoder), readback(draw.instances, &mut encoder)]
+                let a = &args[draw.offset as usize / 4..][..8];
+                let inst = &read_words(&device, &queue, draw.instances)[draw.instances_offset as usize / 4..];
+                let mut ids: Vec<i32> = (0..a[1] as usize).map(|k| f32::from_bits(inst[k * 8 + 4]) as i32 - 50).collect();
+                ids.sort();
+                (a[0], ids)
+            };
+            let label = format!("{per_chunk} views per chunk");
+            // |x| <= 20 (spheres of 0.5 straddle the planes at +-20.x)
+            assert_eq!(ids(0), (36, (-20..=20).collect::<Vec<_>>()), "{label}: view 0");
+            // 20 <= x < 30: in view 1's frustum and within 30 of the LOD origin
+            assert_eq!(ids(1), (36, (20..=29).collect::<Vec<_>>()), "{label}: view 1");
+            // and with the LOD distances halved, all of them to the last instance (49)
+            assert_eq!(ids(2), (36, (20..=49).collect::<Vec<_>>()), "{label}: view 2");
+            // not drawn in: untouched (cleared) draws
+            assert_eq!(ids(3), (0, vec![]), "{label}: unused view");
+            assert_eq!(ids(4), (0, vec![]), "{label}: casters only");
+        }
+    }
+
+    /// The GPU time of the cull pass (timestamps) for a forest the size of the midsommar film's:
+    /// 48 renderables (24 sets of 4700 instances, two LOD bands each) in 4 views, each
+    /// renderable's views in one dispatch against one dispatch per view (1-view chunks). Other
+    /// GPU work on the machine inflates it, so the median is the figure to read. Run by hand:
+    /// `cargo test --release -p kansei-core --lib time_cull_pass -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_cull_pass() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return eprintln!("no timestamp queries: skipping");
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: wgpu::Features::TIMESTAMP_QUERY, ..Default::default() }, None)).unwrap();
+        use wgpu::util::DeviceExt;
+        let mut seed = 1u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let sources: Vec<wgpu::Buffer> = (0..24)
+            .map(|_| {
+                let data: Vec<f32> = (0..4700).flat_map(|_| [rnd() * 600.0 - 300.0, 0.0, rnd() * 600.0 - 300.0, 0.5 + rnd(), 0.0, 0.0, 0.0, 0.0]).collect();
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::STORAGE })
             })
             .collect();
-        queue.submit(Some(encoder.finish()));
-        for s in &staged {
-            s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        }
-        device.poll(wgpu::Maintain::Wait);
-        let words = |b: &wgpu::Buffer| -> Vec<u32> { bytemuck::cast_slice(&b.slice(..).get_mapped_range()).to_vec() };
-        let ids = |args: &[u32], inst: &[u32]| -> Vec<i32> {
-            let mut v: Vec<i32> = (0..args[1] as usize).map(|k| f32::from_bits(inst[k * 8 + 4]) as i32 - 50).collect();
-            v.sort();
-            v
+        let mut pipeline = CullPipeline::new(&device);
+        let look = |eye: glam::Vec3, at: glam::Vec3, fov: f32, far: f32| CullView {
+            view_proj: glam::Mat4::perspective_rh(fov.to_radians(), 16.0 / 9.0, 0.1, far) * glam::Mat4::look_at_rh(eye, at, glam::Vec3::Y),
+            casters_only: false,
+            lod_distance_scale: 1.0,
         };
-        // each view's draw, a slot apart in the shared args
-        let args_at = |b: &wgpu::Buffer, v: usize| words(b)[culling.view(v).unwrap().offset as usize / 4..].to_vec();
-        let (a0, i0, a1, i1) = (args_at(&staged[0], 0), words(&staged[1]), args_at(&staged[2], 1), words(&staged[3]));
-        let (a2, i2) = (args_at(&staged[4], 2), words(&staged[5]));
-        assert_eq!(a0[0], 36, "index count");
-        // |x| <= 20 (spheres of 0.5 straddle the planes at +-20.x)
-        assert_eq!(ids(&a0, &i0), (-20..=20).collect::<Vec<_>>());
-        // 20 <= x < 30: in view 1's frustum and within 30 of the LOD origin
-        assert_eq!(ids(&a1, &i1), (20..=29).collect::<Vec<_>>());
-        // and with the LOD distances halved, all of them to the last instance (49)
-        assert_eq!(ids(&a2, &i2), (20..=49).collect::<Vec<_>>());
+        let views = [
+            look(glam::Vec3::new(0.0, 2.0, 0.0), glam::Vec3::new(0.0, 1.5, -10.0), 60.0, 1000.0),
+            look(glam::Vec3::new(-0.8, 1.0, -2.0), glam::Vec3::new(-0.8, 0.0, -30.0), 40.0, 60.0),
+            look(glam::Vec3::new(0.8, 1.0, -2.0), glam::Vec3::new(0.8, 0.0, -30.0), 40.0, 60.0),
+            look(glam::Vec3::new(0.0, -2.0, 0.0), glam::Vec3::new(0.0, -1.5, -10.0), 60.0, 1000.0),
+        ];
+        pipeline.set_views(&device, &queue, &views.map(|v| v.gpu(glam::Vec3::new(0.0, 2.0, 0.0), None, false)));
+        let make = |per_view: bool| -> Vec<InstanceCulling> {
+            sources
+                .iter()
+                .flat_map(|source| [(0.0, 30.0), (30.0, 200.0)].map(|(near, far)| {
+                    let mut c = InstanceCulling::new(source.clone(), 4700, 32, 0, 1.0).with_radius_scale(12).with_lod_range(near, far);
+                    c.ensure_views_within(&device, &pipeline.bgl, views.len(), if per_view { 4700 * 32 } else { u64::MAX });
+                    c
+                }))
+                .collect()
+        };
+        const FRAMES: u32 = 200;
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 * FRAMES });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16 * FRAMES as u64, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16 * FRAMES as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let run = |cullings: &mut [InstanceCulling]| -> (f64, f64) {
+            for frame in 0..FRAMES {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                for c in cullings.iter_mut() {
+                    c.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true);
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites { query_set: &query_set, beginning_of_pass_write_index: Some(2 * frame), end_of_pass_write_index: Some(2 * frame + 1) }),
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                    for c in cullings.iter() {
+                        c.dispatch(&mut pass);
+                    }
+                }
+                queue.submit(Some(encoder.finish()));
+            }
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.resolve_query_set(&query_set, 0..2 * FRAMES, &resolve, 0);
+            encoder.copy_buffer_to_buffer(&resolve, 0, &staging, 0, resolve.size());
+            queue.submit(Some(encoder.finish()));
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let stamps: Vec<u64> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+            staging.unmap();
+            let period = queue.get_timestamp_period() as f64;
+            // (after a warm-up; a pass whose stamps did not resolve reads 0)
+            let mut ms: Vec<f64> = stamps.chunks(2).skip(20).filter(|t| t[0] > 0 && t[1] > t[0]).map(|t| (t[1] - t[0]) as f64 * period / 1e6).collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (ms[0], ms[ms.len() / 2])
+        };
+        let (mut merged, mut per_view) = (make(false), make(true));
+        for round in 0..3 {
+            let (a_min, a_med) = run(&mut merged);
+            let (b_min, b_med) = run(&mut per_view);
+            eprintln!("round {round}: a dispatch per renderable {a_min:.3} ms min, {a_med:.3} ms median; a dispatch per view {b_min:.3} ms min, {b_med:.3} ms median");
+        }
     }
 
     fn read_words(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<u32> {
@@ -799,34 +934,37 @@ mod tests {
             if reset {
                 culling.reset_visibility(&mut encoder);
             }
-            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36);
+            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false);
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
+                // as the renderer: every view, which leaves the camera's to the two phases
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                culling.dispatch(&mut pass);
                 pass.set_pipeline(&pipeline.early);
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[0]);
+                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
                 culling.dispatch_early(&mut pass);
             }
             pyramid.build(&device, &mut encoder, &depth.create_view(&Default::default()));
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&pipeline.late);
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[0]);
+                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
                 pass.set_bind_group(2, &bind_group, &[]);
                 culling.dispatch_late(&mut pass);
             }
             queue.submit(Some(encoder.finish()));
             let (early, late) = (culling.view(0).unwrap(), culling.late().unwrap());
-            let ids = |instances: &wgpu::Buffer, args: &[u32]| -> Vec<u32> {
-                let words = read_words(&device, &queue, instances);
+            let ids = |draw: CulledDraw, args: &[u32]| -> Vec<u32> {
+                let words = &read_words(&device, &queue, draw.instances)[draw.instances_offset as usize / 4..];
                 let mut ids: Vec<u32> = (0..args[1] as usize).map(|k| f32::from_bits(words[k * 8 + 4]) as u32).collect();
                 ids.sort();
                 ids
             };
             let args = |draw: CulledDraw| read_words(&device, &queue, draw.args)[draw.offset as usize / 4..][..8].to_vec();
             let (a0, a1) = (args(early), args(late));
-            let (early_instances, late_instances) = (early.instances, late.instances);
             assert_eq!((a0[0], a1[0]), (36, 36), "index counts");
-            (ids(early_instances, &a0), ids(late_instances, &a1), [a0[5] + a1[5], a0[6] + a1[6], a0[7] + a1[7]])
+            (ids(early, &a0), ids(late, &a1), [a0[5] + a1[5], a0[6] + a1[6], a0[7] + a1[7]])
         };
 
         for culling in [&mut sphere, &mut boxed] {
