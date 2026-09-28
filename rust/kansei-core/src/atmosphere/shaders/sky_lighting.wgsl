@@ -1,5 +1,6 @@
 // Sky lighting for materials and participating media: the sky's radiance around the camera as
-// order-2 spherical harmonics, and the sun and the moon after the atmosphere. Written every frame
+// order-2 spherical harmonics (the clouds in front of it included), and the sun and the moon
+// after the atmosphere. Written every frame
 // by SkyAtmosphere::update; bind it as a uniform (SkyAtmosphereBindings::sky_lighting).
 //
 // The SH basis is the real, orthonormal one in world coordinates:
@@ -13,6 +14,7 @@ struct SkyLighting {
     sunDirection    : vec4f,             // xyz toward the sun
     moonIlluminance : vec4f,
     moonDirection   : vec4f,
+    clearSkyUp      : vec4f,             // irradiance on an upward surface from the sky without its clouds
 }
 
 fn skyShBasis(d: vec3f) -> array<f32, 9> {

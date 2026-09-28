@@ -1,7 +1,8 @@
 // Sky environment cubemap, one mip per dispatch: the sky's radiance around the camera (the
-// sky-view LUT above the horizon, the air and a Lambertian ground below it; no sun disk, whose
-// highlight belongs to the directional light), GGX-prefiltered for the mip's roughness
-// (Karis 2013's split sum, N = V = R). Mip 0 is the mirror; mip m has roughness m / (mips - 1).
+// sky-view LUT with the clouds in front of it above the horizon, the air and a Lambertian ground
+// below it; no sun disk, whose highlight belongs to the directional light), GGX-prefiltered for
+// the mip's roughness (Karis 2013's split sum, N = V = R). Mip 0 is the mirror; mip m has
+// roughness m / (mips - 1).
 
 struct EnvPass {
     roughness : f32,
@@ -17,6 +18,13 @@ struct EnvPass {
 @group(0) @binding(4) var<uniform> skyLighting : SkyLighting;
 @group(0) @binding(5) var envOut : texture_storage_2d_array<rgba16float, write>;
 @group(0) @binding(6) var<uniform> envPass : EnvPass;
+@group(0) @binding(7) var cloudMap : texture_2d<f32>;
+
+// The sky with the clouds in front of it (cloud_map.wgsl)
+fn skyWithClouds(d: vec3f) -> vec3f {
+    let c = textureSampleLevel(cloudMap, skyViewSampler, cloudMapUv(d), 0.0);
+    return skyViewLuminance(d) * (1.0 - c.a) + c.rgb;
+}
 
 // Direction through texel uv of a cube face, in the WebGPU (D3D/Vulkan) face layout:
 // +X, -X, +Y, -Y, +Z, -Z, with t running down each face.
@@ -36,7 +44,7 @@ fn cubeDirection(face: u32, uv: vec2f) -> vec3f {
 // Radiance arriving from d: the sky, or below the horizon the air in front of a ground lit by the
 // sky and the sun (as the sky lighting's lower hemisphere).
 fn environmentRadiance(d: vec3f) -> vec3f {
-    var lum = skyViewLuminance(d);
+    var lum = skyWithClouds(d);
     let up = normalize(frame.cameraPos);
     if (dot(d, up) < horizonCos(length(frame.cameraPos))) {
         let e = skyIrradiance(skyLighting, up) + skyLighting.sunIlluminance.rgb * max(dot(up, skyLighting.sunDirection.xyz), 0.0)

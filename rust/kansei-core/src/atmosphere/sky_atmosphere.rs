@@ -16,6 +16,9 @@ const MULTI_SCATTERING_WGSL: &str = include_str!("shaders/multi_scattering_lut.w
 const SKY_VIEW_WGSL: &str = include_str!("shaders/sky_view_lut.wgsl");
 const AERIAL_PERSPECTIVE_WGSL: &str = include_str!("shaders/aerial_perspective_lut.wgsl");
 pub(crate) const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
+pub(crate) const CLOUD_MAP_WGSL: &str = include_str!("shaders/cloud_map.wgsl");
+/// The cloud map's size (cloud_map.wgsl): azimuth by zenith angle.
+pub(crate) const CLOUD_MAP_SIZE: (u32, u32) = (128, 64);
 const SKY_LIGHTING_PASS_WGSL: &str = include_str!("shaders/sky_lighting_pass.wgsl");
 const ENVIRONMENT_PASS_WGSL: &str = include_str!("shaders/sky_environment_pass.wgsl");
 
@@ -47,11 +50,11 @@ pub(crate) fn sky_view_source() -> String {
 }
 
 pub(crate) fn sky_lighting_source() -> String {
-    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, SKY_LIGHTING_PASS_WGSL])
+    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, SKY_LIGHTING_PASS_WGSL])
 }
 
 pub(crate) fn environment_source() -> String {
-    shader(&[COMMON_WGSL, FRAME_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, ENVIRONMENT_PASS_WGSL])
+    shader(&[COMMON_WGSL, FRAME_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, ENVIRONMENT_PASS_WGSL])
 }
 
 pub(crate) fn aerial_perspective_source() -> String {
@@ -111,6 +114,13 @@ pub struct SkyAtmosphereBindings {
     pub lut_sampler: wgpu::Sampler,
     /// Linear, repeating in u (the azimuth): for the sky-view LUT.
     pub sky_view_sampler: wgpu::Sampler,
+    /// The clouds around the camera (rgba16float, azimuth by zenith angle; rgb their light, a
+    /// their opacity), written by `VolumetricCloudsEffect` and read by the sky lighting and the
+    /// environment cubemap. Empty (a clear sky) without clouds.
+    pub cloud_map: wgpu::TextureView,
+    /// The camera frame (plus one; 0 never) the clouds last wrote `cloud_map` in. The sky lighting
+    /// reads the map only while it is that fresh, so clouds taken out of the chain leave no trace.
+    pub(crate) cloud_map_frame: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 struct Pipelines {
@@ -123,10 +133,11 @@ struct Pipelines {
     aerial_perspective: wgpu::ComputePipeline,
     aerial_perspective_bg: wgpu::BindGroup,
     sky_lighting: wgpu::ComputePipeline,
-    sky_lighting_bg: wgpu::BindGroup,
+    // with the cloud map, and without it (no clouds wrote it last frame)
+    sky_lighting_bgs: [wgpu::BindGroup; 2],
     environment: wgpu::ComputePipeline,
     /// One per mip, each with its own storage view and parameters.
-    environment_bgs: Vec<wgpu::BindGroup>,
+    environment_bgs: Vec<[wgpu::BindGroup; 2]>,
 }
 
 /// A physically based sky and atmosphere after Hillaire 2020, as the LUTs the sky, the aerial
@@ -361,7 +372,12 @@ impl SkyAtmosphere {
             }),
             lut_sampler: sampler("SkyAtmosphere/LutSampler", wgpu::AddressMode::ClampToEdge),
             sky_view_sampler: sampler("SkyAtmosphere/SkyViewSampler", wgpu::AddressMode::Repeat),
+            // zero-initialised: no clouds until the clouds write it
+            cloud_map: view(&lut_2d(device, "SkyAtmosphere/CloudMap", CLOUD_MAP_SIZE)),
+            cloud_map_frame: Default::default(),
         };
+        // bound in place of the cloud map while no clouds write it
+        let no_clouds = view(&lut_2d(device, "SkyAtmosphere/NoClouds", (1, 1)));
 
         let b = &bindings;
         let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
@@ -407,6 +423,7 @@ impl SkyAtmosphere {
                     },
                     count: None,
                 },
+                texture_entry(7),
             ],
         );
         let environment_bgl = bgl(
@@ -419,6 +436,7 @@ impl SkyAtmosphere {
                 uniform_entry(4),
                 storage_entry_dim(5, wgpu::TextureViewDimension::D2Array),
                 uniform_entry(6),
+                texture_entry(7),
             ],
         );
         let environment_bgs = (0..env_mips)
@@ -446,20 +464,23 @@ impl SkyAtmosphere {
                     0,
                 ]));
                 params.unmap();
-                bind_group(
-                    device,
-                    "SkyAtmosphere/EnvironmentBG",
-                    &environment_bgl,
-                    &[
-                        b.atmosphere.as_entire_binding(),
-                        b.frame.as_entire_binding(),
-                        wgpu::BindingResource::TextureView(&b.sky_view),
-                        wgpu::BindingResource::Sampler(&b.sky_view_sampler),
-                        b.sky_lighting.as_entire_binding(),
-                        wgpu::BindingResource::TextureView(&target),
-                        params.as_entire_binding(),
-                    ],
-                )
+                [&b.cloud_map, &no_clouds].map(|clouds| {
+                    bind_group(
+                        device,
+                        "SkyAtmosphere/EnvironmentBG",
+                        &environment_bgl,
+                        &[
+                            b.atmosphere.as_entire_binding(),
+                            b.frame.as_entire_binding(),
+                            wgpu::BindingResource::TextureView(&b.sky_view),
+                            wgpu::BindingResource::Sampler(&b.sky_view_sampler),
+                            b.sky_lighting.as_entire_binding(),
+                            wgpu::BindingResource::TextureView(&target),
+                            params.as_entire_binding(),
+                            wgpu::BindingResource::TextureView(clouds),
+                        ],
+                    )
+                })
             })
             .collect();
         let tex = wgpu::BindingResource::TextureView;
@@ -513,20 +534,23 @@ impl SkyAtmosphere {
                 ],
             ),
             sky_lighting: compute_pipeline(device, "SkyAtmosphere/SkyLighting", &sky_lighting_source(), &sky_lighting_bgl),
-            sky_lighting_bg: bind_group(
-                device,
-                "SkyAtmosphere/SkyLightingBG",
-                &sky_lighting_bgl,
-                &[
-                    b.atmosphere.as_entire_binding(),
-                    b.frame.as_entire_binding(),
-                    tex(&b.transmittance),
-                    tex(&b.sky_view),
-                    wgpu::BindingResource::Sampler(&b.lut_sampler),
-                    wgpu::BindingResource::Sampler(&b.sky_view_sampler),
-                    b.sky_lighting.as_entire_binding(),
-                ],
-            ),
+            sky_lighting_bgs: [&b.cloud_map, &no_clouds].map(|clouds| {
+                bind_group(
+                    device,
+                    "SkyAtmosphere/SkyLightingBG",
+                    &sky_lighting_bgl,
+                    &[
+                        b.atmosphere.as_entire_binding(),
+                        b.frame.as_entire_binding(),
+                        tex(&b.transmittance),
+                        tex(&b.sky_view),
+                        wgpu::BindingResource::Sampler(&b.lut_sampler),
+                        wgpu::BindingResource::Sampler(&b.sky_view_sampler),
+                        b.sky_lighting.as_entire_binding(),
+                        tex(clouds),
+                    ],
+                )
+            }),
             environment: compute_pipeline(device, "SkyAtmosphere/Environment", &environment_source(), &environment_bgl),
             environment_bgs,
         };
@@ -626,6 +650,9 @@ impl SkyAtmosphere {
     /// atmosphere changed, then the sky-view LUT for the camera. Uses the camera's current view
     /// and projection matrices, so place the camera first.
     pub fn encode(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, camera: &Camera) {
+        // the cloud map (0) if the clouds wrote it this frame or the last, else none (1)
+        let written = self.bindings.cloud_map_frame.load(std::sync::atomic::Ordering::Relaxed);
+        let clouds = if written != 0 && camera.frame().wrapping_sub(written - 1) <= 1 { 0 } else { 1 };
         let atmosphere = self.params.gpu_layout();
         let b = &self.bindings;
         let p = &self.pipelines;
@@ -651,10 +678,10 @@ impl SkyAtmosphere {
         pass.set_bind_group(0, &p.aerial_perspective_bg, &[]);
         pass.dispatch_workgroups(self.ap_size.0.div_ceil(8), self.ap_size.1.div_ceil(8), 1);
         pass.set_pipeline(&p.sky_lighting);
-        pass.set_bind_group(0, &p.sky_lighting_bg, &[]);
+        pass.set_bind_group(0, &p.sky_lighting_bgs[clouds], &[]);
         pass.dispatch_workgroups(1, 1, 1);
         pass.set_pipeline(&p.environment);
-        for (mip, bg) in p.environment_bgs.iter().enumerate() {
+        for (mip, bg) in p.environment_bgs.iter().map(|bgs| &bgs[clouds]).enumerate() {
             let size = (self.environment.width() >> mip).max(1);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 6);
