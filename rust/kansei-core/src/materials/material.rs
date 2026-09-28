@@ -85,6 +85,10 @@ impl DepthPipelineKey {
     }
 }
 
+/// A cluster vertex stage: the instance layout it was generated for (stride and attributes, None
+/// without instances) and its module, or why there is none.
+type ClusterStage = (Option<(u64, Vec<wgpu::VertexAttribute>)>, Result<wgpu::ShaderModule, String>);
+
 /// A render material — shader + pipeline cache + bind group.
 pub struct Material {
     pub label: String,
@@ -105,7 +109,7 @@ pub struct Material {
     /// Cluster pipelines (`get_cluster_pipeline`), keyed with no vertex buffers.
     pub(crate) cluster_pipeline_cache: HashMap<PipelineKey, wgpu::RenderPipeline>,
     /// The cluster stage's module for the instance layout it was made for, or why there is none.
-    cluster_module: Option<(Option<(u64, Vec<wgpu::VertexAttribute>)>, Result<wgpu::ShaderModule, String>)>,
+    cluster_module: Option<ClusterStage>,
     cluster_pipeline_layout: Option<wgpu::PipelineLayout>,
     bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
