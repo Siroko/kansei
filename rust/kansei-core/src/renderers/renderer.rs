@@ -177,6 +177,9 @@ pub struct Renderer {
     // Cluster LOD: the cull's pipelines and view, and the error budget in pixels
     cluster_culling: Option<crate::clusters::ClusterCulling>,
     cluster_threshold: f32,
+    shadow_cluster_error_scale: f32,
+    /// This frame's cluster cuts: (scene index, cull view), sorted.
+    cluster_cuts: Vec<(usize, usize)>,
     // the renderables the last frame drew on the cluster path (the bundles recorded them so)
     clustered: Vec<usize>,
     // Planar reflections, drawn after the shadow maps and before the main pass
@@ -247,6 +250,8 @@ impl Renderer {
             cull_stats: crate::culling::StatsReadback::new(),
             cluster_culling: None,
             cluster_threshold: 1.0,
+            shadow_cluster_error_scale: 1.0,
+            cluster_cuts: Vec::new(),
             clustered: Vec::new(),
             planar_reflections: Vec::new(),
             render_bundle: None,
@@ -580,6 +585,16 @@ impl Renderer {
 
     pub fn cluster_error_threshold(&self) -> f32 {
         self.cluster_threshold
+    }
+
+    /// How much coarser than the camera's the shadow maps' cluster cuts are (spot lights and
+    /// cascades): their budget is the error threshold times this (1 by default).
+    pub fn set_shadow_cluster_error_scale(&mut self, scale: f32) {
+        self.shadow_cluster_error_scale = scale.max(0.0);
+    }
+
+    pub fn shadow_cluster_error_scale(&self) -> f32 {
+        self.shadow_cluster_error_scale
     }
 
     /// Make `r`'s cluster pipeline for a pass's targets, or drop its cluster LOD with a warning
@@ -1832,7 +1847,7 @@ impl Renderer {
                         continue;
                     }
                     let draw = culling.view(slot).unwrap();
-                    self.cull_stats.record(slot, culling.tested(), draw.args, draw.offset);
+                    self.cull_stats.record(slot, culling.tested(), draw.args, draw.offset, r.clusters.is_some());
                 }
             }
             // occlusion's first phase, in each view culled in two phases
@@ -1850,7 +1865,7 @@ impl Renderer {
                         // (tested once, by the first phase)
                         for (draw, tested) in [(culling.view(view), culling.tested()), (culling.late(view), 0)] {
                             let draw = draw.unwrap();
-                            self.cull_stats.record(view, tested, draw.args, draw.offset);
+                            self.cull_stats.record(view, tested, draw.args, draw.offset, false);
                         }
                     }
                 }
@@ -1864,12 +1879,14 @@ impl Renderer {
         self.run_cluster_culling(scene, camera, &main, target_height);
     }
 
-    /// Cluster LOD for the camera, once the instances are culled. Each visible renderable with
-    /// `clusters` gets its mesh's cut for the main view (`main`: the live or frozen camera,
-    /// `target_height` pixels high), which `CameraClusterDraw` draws.
+    /// Cluster LOD in every view, once the instances are culled. Each visible renderable with
+    /// `clusters` gets its mesh's cut for each view it is drawn in (`cull_views`: the camera,
+    /// with `main` the live or frozen one `target_height` pixels high, the shadow maps, the
+    /// reflections and the sky's top-down view), which those views' passes draw.
     fn run_cluster_culling(&mut self, scene: &mut Scene, camera: &Camera, main: &crate::culling::MainView, target_height: u32) {
         let indices: Vec<usize> = scene.ordered_indices().filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && r.clusters.is_some() && r.geometry.initialized)).collect();
         if indices.is_empty() {
+            self.cluster_cuts.clear();
             // renderables that left the cluster path are drawn as meshes again
             if !self.clustered.is_empty() {
                 self.clustered.clear();
@@ -1877,44 +1894,94 @@ impl Renderer {
             }
             return;
         }
+        let mut views = self.cull_views(camera);
+        views[MAIN_VIEW] = Some(main.cull);
+        let lods = self.cluster_views(camera, main, target_height);
+        debug_assert_eq!(views.len(), lods.len(), "cluster views in cull_views order");
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let culling = self.cluster_culling.get_or_insert_with(|| crate::clusters::ClusterCulling::new(device));
-        let pixels_per_radian = target_height as f32 / (2.0 * (camera.fov.to_radians() * 0.5).tan());
-        culling.set_views(queue, &[crate::clusters::ClusterViewGpu::new(main.cull.view_proj, main.lod_origin, pixels_per_radian, camera.near, self.cluster_threshold, false)]);
+        culling.set_views(queue, &lods.iter().map(|v| v.unwrap_or_else(bytemuck::Zeroable::zeroed)).collect::<Vec<_>>());
         let layout = &self.shared_layouts.as_ref().unwrap().cluster_mesh_bgl;
         let matrices = (self.normal_matrices_buf.as_ref().unwrap(), self.world_matrices_buf.as_ref().unwrap());
         let mut stale = false;
-        let mut prepared = Vec::new();
+        let mut cuts = Vec::new();
         for &idx in &indices {
             let r = scene.get_renderable_mut(idx).unwrap();
             let world = r.world_matrix.to_glam();
             let first = r.geometry.instance_buffers.first();
             let stride = first.and_then(|cb| cb.vertex_layout()).map_or(0, |l| l.stride as u32);
-            let source = match (first, r.instance_culling.as_ref()) {
-                (None, _) => crate::clusters::InstanceSource::None,
-                (Some(_), Some(c)) => {
-                    let Some(draw) = c.view(MAIN_VIEW) else { continue };
-                    crate::clusters::InstanceSource::Culled { records: draw.instances, first_record: (draw.instances_offset / c.culled_stride() as u64) as u32, capacity: c.count, args: draw.args, count_word: (draw.offset / 4) as u32 + 1 }
-                }
-                (Some(cb), None) => match cb.gpu_buffer() {
-                    Some(records) => crate::clusters::InstanceSource::All { records, count: r.geometry.instance_count },
-                    None => continue,
-                },
-            };
             let back_faces_culled = !r.is_transparent() && r.material.options.cull_mode == crate::materials::CullMode::Back;
-            stale |= r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, MAIN_VIEW as u32, source, stride, world, back_faces_culled);
-            prepared.push(idx);
+            for (slot, view) in views.iter().enumerate() {
+                let (Some(view), Some(_)) = (view, lods[slot]) else { continue };
+                if !view.draws(r.cast_shadow, r.layers) {
+                    continue;
+                }
+                let source = match (first, r.instance_culling.as_ref()) {
+                    (None, _) => crate::clusters::InstanceSource::None,
+                    (Some(_), Some(c)) => {
+                        let Some(draw) = c.view(slot) else { continue };
+                        crate::clusters::InstanceSource::Culled { records: draw.instances, first_record: (draw.instances_offset / c.culled_stride() as u64) as u32, capacity: c.count, args: draw.args, count_word: (draw.offset / 4) as u32 + 1 }
+                    }
+                    (Some(cb), None) => match cb.gpu_buffer() {
+                        Some(records) => crate::clusters::InstanceSource::All { records, count: r.geometry.instance_count },
+                        None => continue,
+                    },
+                };
+                let changed = r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, slot as u32, source, stride, world, back_faces_culled);
+                // (only the camera's passes record bundles)
+                stale |= changed && slot == MAIN_VIEW;
+                cuts.push((idx, slot));
+            }
         }
-        let gpus: Vec<(&crate::clusters::ClusterGpu, u32)> = prepared.iter().filter_map(|&i| Some((scene.get_renderable(i)?.clusters.as_ref()?.gpu.as_ref()?, MAIN_VIEW as u32))).collect();
+        let gpus: Vec<(&crate::clusters::ClusterGpu, u32)> = cuts.iter().filter_map(|&(i, slot)| Some((scene.get_renderable(i)?.clusters.as_ref()?.gpu.as_ref()?, slot as u32))).collect();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/ClusterCulling") });
         culling.encode(&mut encoder, &gpus);
         queue.submit(Some(encoder.finish()));
-        // renderables joining or leaving the cluster path are drawn the other way
+        for (gpu, slot) in &gpus {
+            self.cull_stats.record_clusters(*slot as usize, gpu.cut(*slot).unwrap().args());
+        }
+        // renderables joining or leaving the camera's cluster path are drawn the other way
+        let prepared: Vec<usize> = cuts.iter().filter(|(_, slot)| *slot == MAIN_VIEW).map(|(i, _)| *i).collect();
         if stale || prepared != self.clustered {
             self.invalidate_bundle();
         }
         self.clustered = prepared;
+        self.cluster_cuts = cuts;
+    }
+
+    /// Each cull view's cluster view (`cull_views` order, `None` where that has none): its
+    /// frustum, the eye, its pixels per radian (per metre in the orthographic cascades and sky
+    /// view), and its budget, the error threshold times the view's scale.
+    fn cluster_views(&self, camera: &Camera, main: &crate::culling::MainView, target_height: u32) -> Vec<Option<crate::clusters::ClusterViewGpu>> {
+        let threshold = self.cluster_threshold;
+        let shadow = threshold * self.shadow_cluster_error_scale;
+        let pixels_per_radian = target_height as f32 / (2.0 * (camera.fov.to_radians() * 0.5).tan());
+        let mut views = vec![Some(crate::clusters::ClusterViewGpu::new(main.cull.view_proj, main.lod_origin, pixels_per_radian, camera.near, threshold, false))];
+        if let Some(atlas) = &self.spot_shadow_atlas {
+            views.resize(1 + atlas.layers as usize, None);
+            for slot in &self.spot_lights.shadows {
+                views[spot_view(slot.layer)] = Some(cluster_view(slot.projection * slot.view, slot.projection, slot.view, atlas.resolution, shadow));
+            }
+        }
+        views.extend(self.planar_reflections.iter().map(|r| {
+            let c = r.camera();
+            (r.is_active() && !r.screen_space).then(|| cluster_view(r.cull_view_proj(), c.projection_matrix.to_glam(), c.view_matrix.to_glam(), r.height(), threshold * r.lod_error_scale))
+        }));
+        if let Some(csm) = &self.cascaded_shadows {
+            views.extend(csm.slots.iter().map(|s| Some(cluster_view(s.projection * s.view, s.projection, s.view, csm.options.resolution, shadow))));
+        }
+        if let Some(sky) = &self.sky_occlusion {
+            let c = sky.camera();
+            views.push(sky.cull_view().map(|view_proj| cluster_view(view_proj, c.projection_matrix.to_glam(), c.view_matrix.to_glam(), sky.options.resolution, threshold * sky.options.lod_error_scale)));
+        }
+        views
+    }
+
+    /// Renderable `index`'s cluster cut for cull view `view` this frame, if it has one.
+    fn cluster_cut<'a>(&self, r: &'a crate::objects::Renderable, index: usize, view: usize) -> Option<&'a crate::clusters::Cut> {
+        self.cluster_cuts.binary_search(&(index, view)).ok()?;
+        r.clusters.as_ref()?.gpu.as_ref()?.cut(view as u32)
     }
 
     /// Occlusion's second phase, once the first phase's opaque depth is in `gbuffer`: build the
@@ -3206,6 +3273,19 @@ fn bind_and_draw<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
     } else {
         enc.draw_indexed(0..r.geometry.index_count(), 0, 0..r.geometry.instance_count);
     }
+}
+
+/// A cluster view from a view's frustum (`view_proj`), its projection and view matrices, and its
+/// target's height in pixels, `threshold` pixels of error: orthographic when the projection is.
+fn cluster_view(view_proj: glam::Mat4, projection: glam::Mat4, view: glam::Mat4, height: u32, threshold: f32) -> crate::clusters::ClusterViewGpu {
+    // a perspective projection's w is the view depth (±1 in z's column); an orthographic one's is 1
+    let orthographic = projection.z_axis.w == 0.0;
+    // pixels per radian at the centre, or per metre: half the height times y's scale
+    let pixels = height as f32 * 0.5 * projection.y_axis.y.abs();
+    // the near plane's distance (errors of nearer spheres are clamped to it)
+    let near = (projection.w_axis.z / projection.z_axis.z).abs();
+    let near = if near.is_finite() && near > 0.0 { near } else { 0.01 };
+    crate::clusters::ClusterViewGpu::new(view_proj, view.inverse().w_axis.truncate(), pixels, near, threshold, orthographic)
 }
 
 /// `width` x `height` times `scale`, rounded, at least 1 x 1.
