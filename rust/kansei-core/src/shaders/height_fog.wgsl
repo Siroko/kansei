@@ -1,6 +1,6 @@
 // Analytic exponential height fog: the line integral of one or two exponential density layers
 // from the camera to each pixel (to `skyDistance` for the sky), coloured by a constant
-// inscattering luminance, the sky's ambient light (SkyLighting, when bound) and a directional
+// inscattering luminance, the sky's distant light (SkyLighting, when bound) and a directional
 // lobe toward the sun. Unreal's ExponentialHeightFog model, for the distance beyond the
 // volumetric fog's froxels: start it where they end and put it before them in the chain.
 // Prefixed with SKY_LIGHTING_WGSL.
@@ -82,7 +82,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     var lightDir = fog.lightDirection;
     var lightVisibility = 1.0;
     if (fog.hasSkyLighting != 0u) {
-        fogColor += skyInscatter(skyLighting, dir, 0.0) * fog.skyAmbientScale;
+        // the sky's distant light, as Unreal's height fog adds it (the SH would hold the fog
+        // itself once the sky lighting captures it)
+        fogColor += skyLighting.distantSkyLight.rgb * fog.skyAmbientScale;
         lightDir = skyLighting.sunDirection.xyz;
         lightVisibility = skyLighting.sunIlluminance.w;
     }

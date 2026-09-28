@@ -48,7 +48,7 @@ impl HeightFogLayer {
 /// Analytic exponential height fog, after Unreal's `ExponentialHeightFog`: per pixel, the line
 /// integral of one or two exponential layers from the camera (from `start_distance`) to the
 /// surface, or to `sky_distance` for the sky, fading the scene toward a fog colour. The colour is
-/// `inscattering` plus the sky's average light when a sky is bound (`set_sky_lighting`, times
+/// `inscattering` plus the sky's distant light when a sky is bound (`set_sky_lighting`, times
 /// `sky_ambient_scale`), with a lobe of `directional_inscattering` toward the sun.
 ///
 /// It is the far fog of a scene: start it where the volumetric fog's froxels end (their `far`)
@@ -130,7 +130,8 @@ impl HeightFogEffect {
         }
     }
 
-    /// Colour the fog with a sky (`SkyAtmosphere::bindings().sky_lighting`): its average light,
+    /// Colour the fog with a sky (`SkyAtmosphere::bindings().sky_lighting`): its distant light (the
+    /// mean radiance all round from 6 km up, `SkyLighting.distantSkyLight`, as Unreal's fog adds),
     /// and its sun for the directional lobe (off while the sun is below the horizon).
     pub fn set_sky_lighting(&mut self, sky_lighting: Option<&wgpu::Buffer>) {
         self.sky_lighting = sky_lighting.cloned();

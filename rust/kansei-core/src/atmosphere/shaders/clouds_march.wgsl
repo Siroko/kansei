@@ -7,7 +7,7 @@
 // - Light: the sun after the atmosphere (the transmittance LUT at each sample) and through the
 //   cloud toward it (a short march), with a dual-lobe phase and Wrenninge's approximation of
 //   multiple scattering, which a diffusion term takes over from deep inside thick cloud; plus
-//   the clear sky's light from above, dimmer toward the base.
+//   the sky's distant light (Unreal's, which lights its clouds), dimmer toward the base.
 // - The atmosphere in front of the cloud: the aerial-perspective LUT at the cloud's depth.
 // - Like the sky they cover, the clouds follow the atmosphere's sky luminance factor: the sun
 //   they scatter and the air in front of them are scaled by it (their sky light is the sky
@@ -206,9 +206,9 @@ fn marchClouds(ro: vec3f, rd: vec3f, maxKm: f32, jitter: f32, stepCount: u32, li
                 // cloud transmits about 1 / (1 + 0.75 (1 - g) tau) of the sun (g about 0.85), so
                 // overcast bases stay grey rather than black
                 ms = max(ms, 1.0 / (4.0 * PI) / (1.0 + 0.11 * od));
-                // the clear sky's light from above (the sky lighting's SH holds the clouds too, as
-                // seen from below), dimmer toward the base
-                let ambient = sky.clearSkyUp.rgb / PI * mix(0.35, 1.0, h);
+                // the sky's distant light, as Unreal lights its clouds (the sky lighting's SH holds
+                // the clouds themselves, as seen from below), dimmer toward the base
+                let ambient = sky.distantSkyLight.rgb * mix(0.35, 1.0, h);
                 let source = (sunIn * ms + ambient) * cp.albedo * sigma;
                 let stepT = exp(-sigma * dt);
                 // energy-conserving integration over the step (Hillaire 2016)

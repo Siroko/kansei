@@ -21,6 +21,7 @@ const AERIAL_PERSPECTIVE_WGSL: &str = include_str!("shaders/aerial_perspective_l
 pub(crate) const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
 pub(crate) const CLOUD_MAP_WGSL: &str = include_str!("shaders/cloud_map.wgsl");
 const SKY_CAPTURE_WGSL: &str = include_str!("shaders/sky_capture.wgsl");
+const DISTANT_SKY_LIGHT_WGSL: &str = include_str!("shaders/distant_sky_light.wgsl");
 /// The cloud map's size (cloud_map.wgsl): azimuth by zenith angle.
 pub(crate) const CLOUD_MAP_SIZE: (u32, u32) = (128, 64);
 pub(crate) use super::CLOUD_SHADOW_WGSL;
@@ -58,6 +59,10 @@ pub(crate) fn sky_view_source() -> String {
 
 pub(crate) fn sky_lighting_source() -> String {
     shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, SKY_CAPTURE_WGSL, SKY_LIGHTING_PASS_WGSL])
+}
+
+pub(crate) fn distant_sky_light_source() -> String {
+    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, LOOKUP_MULTI_SCATTERING_WGSL, DISTANT_SKY_LIGHT_WGSL])
 }
 
 pub(crate) fn environment_source() -> String {
@@ -112,13 +117,17 @@ pub struct SkyCaptureFog {
     pub max_opacity: f32,
     /// World height of the point the sky is captured from, metres (Unreal: its SkyLight actor).
     pub capture_height_m: f32,
+    /// How much of the sky's distant light (`SkyLighting.distantSkyLight`) the fog adds to its
+    /// colour, as `HeightFogEffect::sky_ambient_scale` (Unreal's sky atmosphere ambient
+    /// contribution colour scale).
+    pub sky_ambient_scale: f32,
 }
 
 impl SkyCaptureFog {
     /// The fog a `HeightFogEffect` draws (its layers, colour and opacity), captured from
     /// `capture_height_m`.
     pub fn from_height_fog(fog: &HeightFogEffect, capture_height_m: f32) -> Self {
-        Self { layers: fog.layers, inscattering: fog.inscattering, max_opacity: fog.max_opacity, capture_height_m }
+        Self { layers: fog.layers, inscattering: fog.inscattering, max_opacity: fog.max_opacity, capture_height_m, sky_ambient_scale: fog.sky_ambient_scale }
     }
 }
 
@@ -147,7 +156,8 @@ pub(crate) struct SkyCaptureGpu {
     lower_mode: u32,
     capture_height: f32,
     max_opacity: f32,
-    _pad: [f32; 2],
+    sky_ambient_scale: f32,
+    _pad: f32,
 }
 
 #[derive(Clone)]
@@ -203,6 +213,8 @@ struct Pipelines {
     sky_view_bg: wgpu::BindGroup,
     aerial_perspective: wgpu::ComputePipeline,
     aerial_perspective_bg: wgpu::BindGroup,
+    distant: wgpu::ComputePipeline,
+    distant_bg: wgpu::BindGroup,
     sky_lighting: wgpu::ComputePipeline,
     // with the cloud map, and without it (no clouds wrote it last frame)
     sky_lighting_bgs: [wgpu::BindGroup; 2],
@@ -525,8 +537,32 @@ impl SkyAtmosphere {
                 },
                 texture_entry(7),
                 uniform_entry(8),
+                uniform_entry(9),
             ],
         );
+        // the sky's distant light, before the sky lighting that reads it and passes it on
+        let distant_bgl = bgl(
+            "SkyAtmosphere/DistantSkyLightBGL",
+            &[
+                uniform_entry(0),
+                uniform_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                sampler_entry(4),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        );
+        let distant = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("SkyAtmosphere/DistantSkyLight"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
         let environment_bgl = bgl(
             "SkyAtmosphere/EnvironmentBGL",
             &[
@@ -636,6 +672,20 @@ impl SkyAtmosphere {
                     tex(&b.ap_transmittance),
                 ],
             ),
+            distant: compute_pipeline(device, "SkyAtmosphere/DistantSkyLight", &distant_sky_light_source(), &distant_bgl),
+            distant_bg: bind_group(
+                device,
+                "SkyAtmosphere/DistantSkyLightBG",
+                &distant_bgl,
+                &[
+                    b.atmosphere.as_entire_binding(),
+                    b.frame.as_entire_binding(),
+                    tex(&b.transmittance),
+                    tex(&b.multi_scattering),
+                    wgpu::BindingResource::Sampler(&b.lut_sampler),
+                    distant.as_entire_binding(),
+                ],
+            ),
             sky_lighting: compute_pipeline(device, "SkyAtmosphere/SkyLighting", &sky_lighting_source(), &sky_lighting_bgl),
             sky_lighting_bgs: [&b.cloud_map, &no_clouds].map(|clouds| {
                 bind_group(
@@ -652,6 +702,7 @@ impl SkyAtmosphere {
                         b.sky_lighting.as_entire_binding(),
                         tex(clouds),
                         capture.as_entire_binding(),
+                        distant.as_entire_binding(),
                     ],
                 )
             }),
@@ -796,6 +847,9 @@ impl SkyAtmosphere {
         pass.set_pipeline(&p.aerial_perspective);
         pass.set_bind_group(0, &p.aerial_perspective_bg, &[]);
         pass.dispatch_workgroups(self.ap_size.0.div_ceil(8), self.ap_size.1.div_ceil(8), 1);
+        pass.set_pipeline(&p.distant);
+        pass.set_bind_group(0, &p.distant_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
         pass.set_pipeline(&p.sky_lighting);
         pass.set_bind_group(0, &p.sky_lighting_bgs[clouds], &[]);
         pass.dispatch_workgroups(1, 1, 1);
@@ -848,7 +902,8 @@ impl SkyAtmosphere {
                 lower_mode,
                 capture_height: fog.capture_height_m,
                 max_opacity: fog.max_opacity.clamp(0.0, 1.0),
-                _pad: [0.0; 2],
+                sky_ambient_scale: fog.sky_ambient_scale.max(0.0),
+                _pad: 0.0,
             },
             None => SkyCaptureGpu { lower_color, lower_mode, ..Zeroable::zeroed() },
         }

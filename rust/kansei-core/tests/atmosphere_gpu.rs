@@ -317,7 +317,7 @@ fn sky_lighting_captures_the_height_fog() {
     let c = Vec3::new(0.02, 0.03, 0.05);
     let pi_c = c.to_glam() * std::f32::consts::PI;
     let dense = HeightFogLayer { density: 1.0, height_falloff: 1e-4, height: 0.0 };
-    let fog = |max_opacity: f32| SkyCaptureFog { layers: [dense, HeightFogLayer::default()], inscattering: c, max_opacity, capture_height_m: 6.0 };
+    let fog = |max_opacity: f32| SkyCaptureFog { layers: [dense, HeightFogLayer::default()], inscattering: c, max_opacity, capture_height_m: 6.0, sky_ambient_scale: 0.0 };
 
     sky.capture_fog = Some(fog(1.0));
     let opaque = irradiance(&mut sky);
@@ -348,6 +348,58 @@ fn sky_lighting_captures_the_height_fog() {
     assert!(((down - want) / want).abs().max_element() < 0.1, "down {down} with the lower hemisphere {want}");
     assert!(((up - clear[0]) / clear[0]).abs().max_element() < 0.1, "up {up} vs {}", clear[0]);
     eprintln!("clear {clear:?}; opaque fog {opaque:?} (pi C {pi_c}); half {half:?}; lower colour: up {up} down {down}");
+}
+
+/// The sky's distant light (Unreal's: the mean radiance all round from 6 km above the ground) is
+/// the sphere mean of the sky-view LUT seen from 6 km up, at noon and at twilight, whatever the
+/// camera's height.
+#[test]
+fn distant_sky_light_is_the_sky_s_mean_radiance_from_6_km() {
+    let Some((device, queue)) = gpu() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let options = SkyAtmosphereOptions::default();
+    let mut sky = SkyAtmosphere::new(&device, options);
+    sky.sun.illuminance = Vec3::new(1.0, 1.0, 1.0);
+    let bottom = sky.params.bottom_radius_km;
+    for elevation in [40.0f32, -2.5] {
+        sky.sun.direction = direction_from_elevation_bearing(elevation, 320.0);
+        // the distant light, from a camera on the ground
+        let mut camera = Camera::new(60.0, 0.1, 1000.0, 1.0);
+        camera.set_position(0.0, 2.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 2.0, -10.0));
+        sky.update(&device, &queue, &mut camera);
+        let sh = read_floats(&device, &queue, &sky.bindings().sky_lighting);
+        let d = glam::Vec3::new(sh[56], sh[57], sh[58]);
+        // the sky-view LUT from 6 km up, averaged over the sphere with its texels' solid angles
+        camera.set_position(0.0, 6000.0, 0.0);
+        sky.update(&device, &queue, &mut camera);
+        let lut = read(&device, &queue, &sky.lut_textures()[2]);
+        let r = bottom + 6.0;
+        let theta_h = (-((r - bottom) * (r + bottom)).sqrt() / r).acos();
+        let zenith = |v: f32| {
+            if v < 0.5 {
+                let c = 1.0 - 2.0 * v;
+                theta_h * (1.0 - c * c)
+            } else {
+                let c = 2.0 * v - 1.0;
+                theta_h + (std::f32::consts::PI - theta_h) * c * c
+            }
+        };
+        let (w, h) = options.sky_view_size;
+        let mut sum = glam::Vec3::ZERO;
+        for j in 0..h {
+            let (t0, t1) = (zenith(j as f32 / h as f32), zenith((j + 1) as f32 / h as f32));
+            let t = zenith((j as f32 + 0.5) / h as f32);
+            for i in 0..w {
+                sum += lut.at(i, j) * (t.sin() * (t1 - t0) * (std::f32::consts::TAU / w as f32));
+            }
+        }
+        let mean = sum / (4.0 * std::f32::consts::PI);
+        eprintln!("sun {elevation}: distant sky light {d}, sky-view mean from 6 km {mean}");
+        assert!(((d - mean) / mean).abs().max_element() < 0.1, "sun {elevation}: {d} vs {mean}");
+    }
 }
 
 #[test]

@@ -12,6 +12,7 @@
 @group(0) @binding(6) var<storage, read_write> skyLightingOut : SkyLighting;
 @group(0) @binding(7) var cloudMap : texture_2d<f32>;
 @group(0) @binding(8) var<uniform> capture : SkyCapture;
+@group(0) @binding(9) var<uniform> distantSkyLight : vec4f;   // distant_sky_light.wgsl
 
 // The sky with the clouds in front of it (cloud_map.wgsl)
 fn skyWithClouds(d: vec3f) -> vec3f {
@@ -41,7 +42,7 @@ fn main(@builtin(local_invocation_index) li : u32) {
         let cosT = 1.0 - 2.0 * (f32(cell / N_PHI) + 0.5) / f32(N_COS);
         let sinT = sqrt(max(1.0 - cosT * cosT, 0.0));
         let d = vec3f(sinT * cos(phi), cosT, sinT * sin(phi));
-        let lum = capturedSky(d, skyWithClouds(d)) * cellSolidAngle;
+        let lum = capturedSky(d, skyWithClouds(d), distantSkyLight.rgb) * cellSolidAngle;
         var y = skyShBasis(d);
         for (var i = 0u; i < 9u; i++) { sh[i] += lum * y[i]; }
         up += lum * max(cosT, 0.0);
@@ -85,5 +86,6 @@ fn main(@builtin(local_invocation_index) li : u32) {
     out.moonIlluminance = vec4f(moon, moonVis);
     out.moonDirection = vec4f(frame.moonDirection, 0.0);
     out.clearSkyUp = vec4f(sharedClearUp[0], 0.0);
+    out.distantSkyLight = distantSkyLight;
     skyLightingOut = out;
 }
