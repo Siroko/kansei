@@ -17,7 +17,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 ## Sharp edges
 
 - `queue.write_buffer` lands before the next submit: several writes to one buffer inside a submit leave only the last one for every pass. Give per-dispatch parameters their own slots (or buffers).
-- Each `queue.write_buffer` costs tens of microseconds in Chrome: upload a frame's data in one write, not one per dispatch or object (`culling::InstanceCulling` writes its views once a frame and picks them by dynamic offset).
+- Each `queue.write_buffer` costs tens of microseconds in Chrome: upload a frame's data in one write, not one per dispatch or object (`culling::InstanceCulling` writes all its views once a frame, into one buffer its dispatches index).
 - Depth is `[0, 1]` (`glam::Mat4::perspective_rh`), cleared to 1.0, so a depth of 1.0 means sky. Front faces are counter-clockwise and materials cull back faces by default.
 - The GBuffer's four MRT targets fill WebGPU's default 32 bytes per sample (rgba8unorm counts 8), and wgpu 24's web backend cannot request more: another per-pixel output needs its own pass, as the velocity pass does.
 - Shadow, reflection and velocity passes redraw each material through its own `vertex_main`, with the light or mirror as the camera (see `Material::get_depth_pipeline`). Vertex shaders must not read group 3. Mark `@builtin(position) @invariant` where a second pass depth-tests against the GBuffer.
