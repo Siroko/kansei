@@ -28,7 +28,10 @@ pub(crate) const ARGS_BYTES: u64 = 32;
 /// vertex layout. One dispatch culls all of a renderable's views.
 ///
 /// LOD: one renderable per LOD mesh, all sharing `source`, each with its distance band. Bands
-/// are measured from the main camera in every view, so shadows match what is on screen.
+/// are measured from the main camera in every view, so shadows match what is on screen. Shadow
+/// maps and planar reflections can have bands of their own (`with_shadow_lod_range`,
+/// `with_reflection_lod_range`): a far LOD (an impostor) nearer there than on screen, say. Keep
+/// each kind of view's bands of a mesh's LODs adjoining, as the camera's.
 ///
 /// Tighter bounds (`with_bounds_shift`, `with_bounds_box`) cull more, in every view, and matter
 /// most for occlusion: a tree's sphere round its base reaches a tree's height below the ground
@@ -69,6 +72,11 @@ pub struct InstanceCulling {
     pub radius_scale_offset: Option<u32>,
     /// Distances from the main camera at which the instances draw here: [near, far).
     pub lod_range: (f32, f32),
+    /// The band in shadow maps (spot lights, cascades), if not `lod_range`.
+    pub shadow_lod_range: Option<(f32, f32)>,
+    /// The band in planar reflections, if not `lod_range` (their `lod_distance_scale` applies to
+    /// it as to `lod_range`).
+    pub reflection_lod_range: Option<(f32, f32)>,
     /// Object-space offset of the bounds' centre from the instance's centre, times the per-instance
     /// scale: where the sphere (or box) sits. It moves the centre the LOD distance is measured
     /// from too. Instances' own rotations are not applied: use it along an axis they turn about.
@@ -149,6 +157,8 @@ pub(crate) struct CullInstancesGpu {
     capacity: u32,
     late_slot: u32,
     layers: u32,
+    shadow_lod: [f32; 2],
+    reflection_lod: [f32; 2],
 }
 
 /// `CullView` in instance_cull.wgsl: a view, shared by every renderable culled for it.
@@ -173,14 +183,17 @@ const FLAG_TWO_PHASE: u32 = 16;
 const FLAG_VIEW: u32 = 32;
 const FLAG_CASTERS_ONLY: u32 = 64;
 const FLAG_LAYERED: u32 = 128;
+const FLAG_REFLECTION: u32 = 256;
 
-/// A view the renderer culls for: its view-projection, whether it only draws shadow casters, the
-/// layers it draws if not all (a planar reflection's `layer_mask`), and how it scales the LOD
-/// distances (below 1 a view picks finer LODs than the camera would).
+/// A view the renderer culls for: its view-projection, whether it only draws shadow casters (a
+/// shadow map, with `shadow_lod_range`), whether it is a planar reflection (with
+/// `reflection_lod_range`), the layers it draws if not all (a reflection's `layer_mask`), and how
+/// it scales the LOD distances (below 1 a view picks finer LODs than the camera would).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CullView {
     pub view_proj: glam::Mat4,
     pub casters_only: bool,
+    pub reflection: bool,
     pub layer_mask: Option<u32>,
     pub lod_distance_scale: f32,
 }
@@ -211,6 +224,9 @@ impl CullView {
         }
         if self.layer_mask.is_some() {
             flags |= FLAG_LAYERED;
+        }
+        if self.reflection {
+            flags |= FLAG_REFLECTION;
         }
         if stats {
             flags |= FLAG_STATS;
@@ -247,6 +263,8 @@ impl InstanceCulling {
             radius,
             radius_scale_offset: None,
             lod_range: (0.0, f32::INFINITY),
+            shadow_lod_range: None,
+            reflection_lod_range: None,
             bounds_shift: glam::Vec3::ZERO,
             bounds_box: None,
             occlusion: false,
@@ -265,6 +283,18 @@ impl InstanceCulling {
 
     pub fn with_lod_range(mut self, near: f32, far: f32) -> Self {
         self.lod_range = (near, far);
+        self
+    }
+
+    /// See `shadow_lod_range`.
+    pub fn with_shadow_lod_range(mut self, near: f32, far: f32) -> Self {
+        self.shadow_lod_range = Some((near, far));
+        self
+    }
+
+    /// See `reflection_lod_range`.
+    pub fn with_reflection_lod_range(mut self, near: f32, far: f32) -> Self {
+        self.reflection_lod_range = Some((near, far));
         self
     }
 
@@ -434,6 +464,7 @@ impl InstanceCulling {
     /// slot's draw (the cull sets the index count of those it culls into).
     pub(crate) fn begin_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, world: glam::Mat4, index_count: u32, casts_shadow: bool, layers: u32) {
         let scale = glam::Vec3::new(world.x_axis.truncate().length(), world.y_axis.truncate().length(), world.z_axis.truncate().length());
+        let band = |(near, far): (f32, f32)| [near, far.min(f32::MAX)];
         let mut flags = 0;
         for (on, flag) in [(self.bounds_box.is_some(), FLAG_BOX), (casts_shadow, FLAG_CASTS_SHADOW), (self.two_phase, FLAG_TWO_PHASE)] {
             if on {
@@ -458,6 +489,8 @@ impl InstanceCulling {
             capacity: self.capacity,
             late_slot: self.shared.as_ref().expect("ensure_views first").views as u32,
             layers,
+            shadow_lod: band(self.shadow_lod_range.unwrap_or(self.lod_range)),
+            reflection_lod: band(self.reflection_lod_range.unwrap_or(self.lod_range)),
         };
         let shared = self.shared.as_mut().unwrap();
         if shared.written != Some(params) {
@@ -675,6 +708,7 @@ mod tests {
         let view = |x: f32, lod_distance_scale: f32, casters_only: bool, layer_mask: Option<u32>| CullView {
             view_proj: proj * glam::Mat4::look_at_rh(glam::Vec3::new(x, 0.0, 20.0), glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::Y),
             casters_only,
+            reflection: false,
             layer_mask,
             lod_distance_scale,
         };
@@ -733,6 +767,55 @@ mod tests {
         }
     }
 
+    /// On a real GPU: each kind of view culls by its own LOD band, the camera by `lod_range`, a
+    /// shadow map by `shadow_lod_range` and a reflection by `reflection_lod_range`.
+    #[test]
+    fn gpu_lod_bands_per_kind_of_view() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        // a row of instances along x, |x| metres from the LOD origin; ids from x
+        let data: Vec<f32> = (0..100).flat_map(|i| [i as f32 - 50.0, 0.0, 0.0, 1.0, i as f32, 0.0, 0.0, 0.0]).collect();
+        use wgpu::util::DeviceExt;
+        let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::STORAGE });
+        let mut pipeline = CullPipeline::new(&device);
+        // three views seeing the whole row: the camera, a shadow map and a reflection
+        let view_proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(glam::Vec3::new(0.0, 0.0, 200.0), glam::Vec3::ZERO, glam::Vec3::Y);
+        let view = |casters_only, reflection| CullView { view_proj, casters_only, reflection, layer_mask: None, lod_distance_scale: 1.0 };
+        let views = [view(false, false), view(true, false), view(false, true)];
+        pipeline.set_views(&device, &queue, &views.map(|v| v.gpu(glam::Vec3::ZERO, None, false)));
+        let mut culling = InstanceCulling::new(source, 100, 32, 0, 0.1)
+            .with_radius_scale(12)
+            .with_lod_range(0.0, 10.0)
+            .with_shadow_lod_range(0.0, 5.0)
+            .with_reflection_lod_range(20.0, 30.0);
+        culling.ensure_views(&device, &pipeline.bgl, views.len());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+            culling.dispatch(&mut pass);
+        }
+        queue.submit(Some(encoder.finish()));
+        let args = read_words(&device, &queue, culling.view(0).unwrap().args);
+        let ids = |v: usize| -> Vec<i32> {
+            let draw = culling.view(v).unwrap();
+            let count = args[draw.offset as usize / 4 + 1] as usize;
+            let inst = &read_words(&device, &queue, draw.instances)[draw.instances_offset as usize / 4..];
+            let mut ids: Vec<i32> = (0..count).map(|k| f32::from_bits(inst[k * 8 + 4]) as i32 - 50).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(0), (-9..=9).collect::<Vec<_>>(), "the camera's band");
+        assert_eq!(ids(1), (-4..=4).collect::<Vec<_>>(), "the shadow map's band");
+        assert_eq!(ids(2), (-29..=-20).chain(20..=29).collect::<Vec<_>>(), "the reflection's band");
+    }
+
     /// The GPU time of the cull pass (timestamps) for a forest the size of the midsommar film's:
     /// 48 renderables (24 sets of 4700 instances, two LOD bands each) in 4 views, each
     /// renderable's views in one dispatch against one dispatch per view (1-view chunks). Other
@@ -765,6 +848,7 @@ mod tests {
         let look = |eye: glam::Vec3, at: glam::Vec3, fov: f32, far: f32| CullView {
             view_proj: glam::Mat4::perspective_rh(fov.to_radians(), 16.0 / 9.0, 0.1, far) * glam::Mat4::look_at_rh(eye, at, glam::Vec3::Y),
             casters_only: false,
+            reflection: false,
             layer_mask: None,
             lod_distance_scale: 1.0,
         };
@@ -949,7 +1033,7 @@ mod tests {
             assert!(culling.ensure_occlusion(&device, &pipeline));
             culling.set_two_phase(true);
         }
-        let cull_view = CullView { view_proj: proj * view, casters_only: false, layer_mask: None, lod_distance_scale: 1.0 };
+        let cull_view = CullView { view_proj: proj * view, casters_only: false, reflection: false, layer_mask: None, lod_distance_scale: 1.0 };
         let occlusion = OcclusionView { view, proj, depth_size: (64, 64), reverse_z: false };
         pipeline.set_views(&device, &queue, &[cull_view.gpu(glam::Vec3::ZERO, Some(&occlusion), true)]);
         let mut pyramid = super::super::DepthPyramid::new(&device, 64, 64, super::super::DepthReduction::Max);
