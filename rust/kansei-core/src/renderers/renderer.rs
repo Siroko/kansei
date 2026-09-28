@@ -1895,7 +1895,7 @@ impl Renderer {
                 (None, _) => crate::clusters::InstanceSource::None,
                 (Some(_), Some(c)) => {
                     let Some(draw) = c.view(MAIN_VIEW) else { continue };
-                    crate::clusters::InstanceSource::Culled { records: draw.instances, first_record: (draw.instances_offset / c.stride as u64) as u32, capacity: c.count, args: draw.args, count_word: (draw.offset / 4) as u32 + 1 }
+                    crate::clusters::InstanceSource::Culled { records: draw.instances, first_record: (draw.instances_offset / c.culled_stride() as u64) as u32, capacity: c.count, args: draw.args, count_word: (draw.offset / 4) as u32 + 1 }
                 }
                 (Some(cb), None) => match cb.gpu_buffer() {
                     Some(records) => crate::clusters::InstanceSource::All { records, count: r.geometry.instance_count },
