@@ -1,6 +1,9 @@
 use glam::Vec3;
 use optimesh::clusterizer::{build_meshlets, build_meshlets_bound, Meshlet, MeshletBuffers, Positions};
 use optimesh::meshletutils::compute_cluster_bounds;
+use optimesh::partition::partition_clusters;
+use optimesh::simplifier::{simplify_with_attributes, Attributes, SimplifyTarget, VertexData, SIMPLIFY_ERROR_ABSOLUTE, SIMPLIFY_SPARSE, SIMPLIFY_VERTEX_LOCK};
+use std::collections::HashMap;
 
 use super::{Cluster, ClusterMesh, ClusterOptions, Sphere};
 use crate::geometries::Geometry;
@@ -9,8 +12,52 @@ impl ClusterMesh {
     /// Split `geometry` into clusters and build the graph of coarser versions over them.
     pub fn build(geometry: &Geometry, options: &ClusterOptions) -> ClusterMesh {
         let positions: Vec<f32> = geometry.vertices.iter().flat_map(|v| [v.position[0], v.position[1], v.position[2]]).collect();
+        let attributes: Vec<f32> = geometry.vertices.iter().flat_map(|v| [v.normal[0], v.normal[1], v.normal[2], v.uv[0], v.uv[1]]).collect();
+        let weights = [options.normal_weight, options.normal_weight, options.normal_weight, options.uv_weight, options.uv_weight];
+        let position_ids = position_ids(&positions);
         let mut mesh = ClusterMesh { vertices: geometry.vertices.clone(), clusters: Vec::new(), cluster_vertices: Vec::new(), cluster_triangles: Vec::new() };
-        mesh.split(&geometry.indices, &positions, 0.0, None, 0, options);
+        // the clusters still without a parent, with their triangles
+        let mut pending = mesh.split(&geometry.indices, &positions, 0.0, None, 0, options);
+        let mut level = 0;
+        while pending.len() > 1 {
+            level += 1;
+            let groups = partition(&pending, &positions, options.group_size);
+            let lock = shared_vertex_locks(&groups, &pending, &position_ids);
+            let mut next = Vec::new();
+            let mut progress = false;
+            for group in &groups {
+                let merged: Vec<u32> = group.iter().flat_map(|&i| pending[i].1.iter().copied()).collect();
+                let target = ((merged.len() as f32 * options.simplify_ratio) as usize / 3) * 3;
+                let mut simplified = vec![0u32; merged.len()];
+                let (count, error) = simplify_with_attributes(
+                    &mut simplified,
+                    &merged,
+                    &VertexData { positions: &positions, count: positions.len() / 3, stride: 12 },
+                    &Attributes { data: &attributes, stride: 20, weights: &weights, count: 5 },
+                    Some(&lock),
+                    &SimplifyTarget { target_index_count: target, target_error: f32::MAX, options: SIMPLIFY_SPARSE | SIMPLIFY_ERROR_ABSOLUTE },
+                );
+                if count as f32 > merged.len() as f32 * options.stall_ratio {
+                    // too little came off: next round, grouped with other neighbours
+                    next.extend(group.iter().map(|&i| pending[i].clone()));
+                    continue;
+                }
+                progress = true;
+                // never less than a child's error, from a sphere round all of theirs
+                let error = group.iter().map(|&i| mesh.clusters[pending[i].0].error).fold(error, f32::max);
+                let bounds = Sphere::enclosing(group.iter().map(|&i| mesh.clusters[pending[i].0].lod_bounds));
+                for &i in group {
+                    let child = &mut mesh.clusters[pending[i].0];
+                    child.parent_error = error;
+                    child.parent_bounds = bounds;
+                }
+                next.extend(mesh.split(&simplified[..count], &positions, error, Some(bounds), level, options));
+            }
+            if !progress {
+                break;
+            }
+            pending = next;
+        }
         mesh
     }
 
@@ -62,4 +109,50 @@ impl ClusterMesh {
         }
         out
     }
+}
+
+/// One id per distinct position (seams split vertices, not positions).
+fn position_ids(positions: &[f32]) -> Vec<u32> {
+    let mut ids = HashMap::new();
+    positions
+        .chunks(3)
+        .map(|p| {
+            let next = ids.len() as u32;
+            *ids.entry([p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).or_insert(next)
+        })
+        .collect()
+}
+
+/// Groups of about `size` neighbouring clusters (indices into `pending`).
+fn partition(pending: &[(usize, Vec<u32>)], positions: &[f32], size: usize) -> Vec<Vec<usize>> {
+    let indices: Vec<u32> = pending.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+    let counts: Vec<u32> = pending.iter().map(|(_, t)| t.len() as u32).collect();
+    let mut destination = vec![0u32; pending.len()];
+    let groups = partition_clusters(&mut destination, &indices, &counts, Some(positions), positions.len() / 3, 12, size);
+    let mut out = vec![Vec::new(); groups];
+    for (i, &g) in destination.iter().enumerate() {
+        out[g as usize].push(i);
+    }
+    out
+}
+
+/// `SIMPLIFY_VERTEX_LOCK` on every vertex whose position more than one group uses: groups meet
+/// at the same vertices whatever level each is drawn at.
+fn shared_vertex_locks(groups: &[Vec<usize>], pending: &[(usize, Vec<u32>)], position_ids: &[u32]) -> Vec<u8> {
+    const NONE: u32 = u32::MAX;
+    const SHARED: u32 = u32::MAX - 1;
+    let mut owner = vec![NONE; position_ids.len()];
+    for (g, group) in groups.iter().enumerate() {
+        for &i in group {
+            for &v in &pending[i].1 {
+                let p = position_ids[v as usize] as usize;
+                owner[p] = match owner[p] {
+                    NONE => g as u32,
+                    o if o == g as u32 => o,
+                    _ => SHARED,
+                };
+            }
+        }
+    }
+    position_ids.iter().map(|&p| if owner[p as usize] == SHARED { SIMPLIFY_VERTEX_LOCK } else { 0 }).collect()
 }
