@@ -67,8 +67,12 @@ pub struct HeightFogEffect {
     pub directional_start_distance: f32,
     /// Toward the light, for the lobe when no sky is bound (the sky's sun otherwise).
     pub light_direction: Vec3,
-    /// Metres before which there is no fog.
+    /// Metres before which there is no fog, along each ray (Unreal's StartDistance).
     pub start_distance: f32,
+    /// Where the volumetric fog's froxels end, as a depth along the view (its grid's `far`; 0: no
+    /// volumetric fog): the fog starts on that plane, as Unreal's analytic fog starts where its
+    /// volumetric fog ends, so the two neither overlap nor leave a gap off the view's axis.
+    pub volumetric_fog_distance: f32,
     /// Nothing farther than this gets fog (0: no cutoff).
     pub cutoff_distance: f32,
     pub max_opacity: f32,
@@ -103,6 +107,8 @@ struct HeightFogParamsGpu {
     sky_ambient_scale: f32,
     sky_distance: f32,
     has_sky_lighting: u32,
+    view_forward: [f32; 3],
+    volumetric_fog_distance: f32,
 }
 
 impl Default for HeightFogEffect {
@@ -122,6 +128,7 @@ impl HeightFogEffect {
             directional_start_distance: 0.0,
             light_direction: Vec3::UP,
             start_distance: 0.0,
+            volumetric_fog_distance: 0.0,
             cutoff_distance: 0.0,
             max_opacity: 1.0,
             sky_distance: 100_000.0,
@@ -137,7 +144,8 @@ impl HeightFogEffect {
         self.sky_lighting = sky_lighting.cloned();
     }
 
-    /// Transmittance of the fog between `origin` and `point` (world space), as the shader.
+    /// Transmittance of the fog between `origin` and `point` (world space), as the shader
+    /// (without `volumetric_fog_distance`, which depends on the view).
     pub fn transmittance(&self, origin: Vec3, point: Vec3) -> f32 {
         let (o, p) = (origin.to_glam(), point.to_glam());
         let dist = o.distance(p);
@@ -251,6 +259,8 @@ impl PostProcessingEffect for HeightFogEffect {
             sky_ambient_scale: self.sky_ambient_scale,
             sky_distance: self.sky_distance.max(0.0),
             has_sky_lighting: self.sky_lighting.is_some() as u32,
+            view_forward: (-camera.inverse_view_matrix.to_glam().z_axis.truncate()).normalize().to_array(),
+            volumetric_fog_distance: self.volumetric_fog_distance.max(0.0),
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.no_sky);
@@ -352,6 +362,65 @@ mod tests {
                 .sum();
             let analytic = layer.optical_depth(origin, dir, t0, t1) as f64;
             assert!((analytic - numeric).abs() <= 1e-3 * numeric.max(1e-6), "{dir}: {analytic} vs {numeric}");
+        }
+    }
+
+    /// With `volumetric_fog_distance` the fog starts on that plane in view depth: in a uniform
+    /// fog over the sky, the picture's centre is fogged from D on, a column at angle a off the
+    /// axis from D / cos(a) on, as Unreal's analytic fog hands over from its volumetric fog.
+    #[test]
+    fn fog_starts_where_the_volumetric_fog_ends() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (65u32, 9u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        let output = output_tex.create_view(&Default::default());
+        // all sky
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let mut e = device.create_command_encoder(&Default::default());
+        e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+        queue.submit([e.finish()]);
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        // 90 degrees across, level
+        let mut camera = Camera::new(2.0 * (9.0f32 / 65.0).atan().to_degrees(), 0.1, 5000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 2.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 2.0, -1.0));
+        camera.update_view_matrix();
+        // uniform fog of white light, the sky fogged as 1000 m off
+        let sigma = 0.002f32;
+        let mut fog = HeightFogEffect::new(HeightFogLayer { density: sigma, height_falloff: 0.0, height: 0.0 });
+        fog.inscattering = Vec3::new(1.0, 1.0, 1.0);
+        fog.sky_distance = 1000.0;
+        fog.volumetric_fog_distance = 300.0;
+        let mut e = device.create_command_encoder(&Default::default());
+        fog.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+        let row = (w * 8).div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        e.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &output_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit([e.finish()]);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = buf.slice(..).get_mapped_range();
+        let half = |b: u16| -> f32 {
+            let (s, e, m) = ((b >> 15) as i32, ((b >> 10) & 0x1f) as i32, (b & 0x3ff) as f32);
+            (if s == 1 { -1.0 } else { 1.0 }) * if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
+        };
+        let at = |x: u32| half(bytemuck::cast_slice::<u8, u16>(&data[(4 * row) as usize..])[(x * 4) as usize]);
+        for x in [32u32, 48, 60] {
+            // the pixel's angle off the axis, along its row (tan spans 1 across half the width)
+            let tan = ((x as f32 + 0.5) / w as f32 * 2.0 - 1.0) * 1.0;
+            let cos = 1.0 / (1.0 + tan * tan).sqrt();
+            let want = 1.0 - (-sigma * (1000.0 - 300.0 / cos)).exp();
+            let got = at(x);
+            eprintln!("column {x}: {got:.4} (want {want:.4}, off the axis {:.1} degrees)", cos.acos().to_degrees());
+            assert!((got - want).abs() < 0.01, "column {x}: {got} vs {want}");
         }
     }
 
