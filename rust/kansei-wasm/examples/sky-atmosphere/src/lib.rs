@@ -26,7 +26,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::postprocessing::effects::{
-    AtmosphereEffect, CloudLayer, GiQuality, HeightFogEffect, HeightFogLayer, LocalFogVolume, ScreenSpaceGIEffect, ScreenSpaceGIOptions,
+    AtmosphereEffect, CloudLayer, CloudQuality, GiQuality, HeightFogEffect, HeightFogLayer, LocalFogVolume, ScreenSpaceGIEffect, ScreenSpaceGIOptions,
     VolumetricCloudsEffect, VolumetricCloudsOptions, VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::PostProcessingVolume;
@@ -456,7 +456,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     effects.push(Box::new(AtmosphereEffect::new(&sky)));
     // clouds=<coverage 0..1> (clouds=0 none), cloudtype=<0 stratus .. 1 cumulus>, cloudbase=<m>,
-    // cloudshadows=0 (no cloud shadows on the scene)
+    // cloudshadows=0 (no cloud shadows on the scene), cloudquality=low|medium|high
     let clouds = q.get("clouds").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.45);
     if clouds > 0.0 {
         let num = |k: &str, d: f32| q.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
@@ -465,6 +465,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer, ..Default::default() });
         // cloudshadows=0: the clouds cast no shadows on the scene
         fx.casts_shadows = q.get("cloudshadows").as_deref() != Some("0");
+        // cloudquality=low|medium|high
+        match q.get("cloudquality").as_deref() {
+            Some("low") => fx.set_quality(CloudQuality::Low),
+            Some("medium") => fx.set_quality(CloudQuality::Medium),
+            Some("high") => fx.set_quality(CloudQuality::High),
+            _ => {}
+        }
         effects.push(Box::new(fx));
     }
     let midsommar = q.get("preset").as_deref() == Some("midsommar");
