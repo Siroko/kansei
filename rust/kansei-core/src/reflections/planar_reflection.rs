@@ -40,6 +40,60 @@ pub(crate) fn mirrored_view(view: glam::Mat4, n: glam::Vec3, d: f32) -> glam::Ma
     view * reflection_matrix(n, d)
 }
 
+/// Where a box is on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScreenRect {
+    /// Wholly outside the view.
+    Offscreen,
+    /// Within this rectangle, in screen uv (x0, y0, x1, y1; y down).
+    Rect([f32; 4]),
+    /// Unknown (it reaches behind the eye): the whole screen.
+    Unbounded,
+}
+
+/// The screen rectangle of the box `lo`..`hi` seen through `view_proj`, widened by `margin` (uv)
+/// and clamped to the screen.
+pub(crate) fn screen_rect(view_proj: glam::Mat4, lo: glam::Vec3, hi: glam::Vec3, margin: f32) -> ScreenRect {
+    let (mut min, mut max) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
+    let mut behind = 0;
+    for k in 0..8 {
+        let corner = glam::Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+        let clip = view_proj * corner.extend(1.0);
+        if clip.w <= 1e-4 {
+            behind += 1;
+            continue;
+        }
+        let ndc = clip.truncate().truncate() / clip.w;
+        min = min.min(ndc);
+        max = max.max(ndc);
+    }
+    if behind == 8 {
+        return ScreenRect::Offscreen;
+    }
+    if behind > 0 {
+        return ScreenRect::Unbounded;
+    }
+    // ndc -> uv (y down), widened, clamped
+    let (u0, u1) = (min.x * 0.5 + 0.5 - margin, max.x * 0.5 + 0.5 + margin);
+    let (v0, v1) = (0.5 - max.y * 0.5 - margin, 0.5 - min.y * 0.5 + margin);
+    if u1 <= 0.0 || u0 >= 1.0 || v1 <= 0.0 || v0 >= 1.0 {
+        return ScreenRect::Offscreen;
+    }
+    ScreenRect::Rect([u0.max(0.0), v0.max(0.0), u1.min(1.0), v1.min(1.0)])
+}
+
+/// Clip-space crop mapping the ndc rectangle x in [x0, x1], y in [y0, y1] to the whole of it:
+/// frustum planes of `crop * view_proj` bound that part of the view.
+pub(crate) fn crop(x0: f32, x1: f32, y0: f32, y1: f32) -> glam::Mat4 {
+    let (sx, sy) = (2.0 / (x1 - x0).max(1e-6), 2.0 / (y1 - y0).max(1e-6));
+    glam::Mat4::from_cols(
+        glam::Vec4::new(sx, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, sy, 0.0, 0.0),
+        glam::Vec4::Z,
+        glam::Vec4::new(-(x0 + x1) * sx * 0.5, -(y0 + y1) * sy * 0.5, 0.0, 1.0),
+    )
+}
+
 pub(crate) fn flip_x() -> glam::Mat4 {
     glam::Mat4::from_scale(glam::Vec3::new(-1.0, 1.0, 1.0))
 }
@@ -128,9 +182,20 @@ pub struct PlanarReflection {
     /// from below, where coarse LODs built to read from the side (flat cards, dropped detail)
     /// show; 1 (the default) picks the camera's.
     pub lod_distance_scale: f32,
+    /// World-space bounds of the reflecting surface (its min and max corners), if known. Materials
+    /// sample the reflection by screen position, so it is then drawn only where the surface is
+    /// on screen: its pass is scissored to the surface's rectangle (plus `screen_margin`), its
+    /// instances are culled to that part of the view, and while the surface is off screen it is
+    /// not drawn at all.
+    pub surface_bounds: Option<(Vec3, Vec3)>,
+    /// Margin round the surface's screen rectangle, in screen uv: room for lookups displaced by
+    /// ripples and widened by roughness (0.05 by default).
+    pub screen_margin: f32,
     width: u32,
     height: u32,
     active: bool,
+    // this frame's screen rectangle of the surface, in uv (x0, y0, x1, y1; y down), when bounded
+    screen_rect: Option<[f32; 4]>,
     camera: Camera,
     // MRT targets matching the GBuffer, so the materials' GBuffer pipelines draw into them
     color_view: wgpu::TextureView,
@@ -357,6 +422,9 @@ impl PlanarReflection {
             clip_bias: options.clip_bias,
             enabled: true,
             lod_distance_scale: 1.0,
+            surface_bounds: None,
+            screen_margin: 0.05,
+            screen_rect: None,
             width,
             height,
             active: false,
@@ -433,6 +501,18 @@ impl PlanarReflection {
         let view = main.view_matrix.to_glam();
         let cam_pos = view.inverse().w_axis.truncate();
         self.active = self.enabled && n.dot(cam_pos) + d > 0.0;
+        // only the surface's part of the screen, and nothing while it is off screen
+        self.screen_rect = None;
+        if self.active {
+            if let Some((lo, hi)) = self.surface_bounds {
+                let view_proj = main.projection_matrix.to_glam() * view;
+                match screen_rect(view_proj, lo.to_glam(), hi.to_glam(), self.screen_margin) {
+                    ScreenRect::Offscreen => self.active = false,
+                    ScreenRect::Rect(rect) => self.screen_rect = Some(rect),
+                    ScreenRect::Unbounded => {}
+                }
+            }
+        }
         if let Some(drawn) = &self.fog_drawn {
             drawn.store(self.active, std::sync::atomic::Ordering::Relaxed);
         }
@@ -456,6 +536,29 @@ impl PlanarReflection {
 
     pub(crate) fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    /// The view-projection to cull this frame's instances with: the mirrored camera's, cropped
+    /// to the surface's part of the screen.
+    pub(crate) fn cull_view_proj(&self) -> glam::Mat4 {
+        let view_proj = self.camera.projection_matrix.to_glam() * self.camera.view_matrix.to_glam();
+        match self.screen_rect {
+            // screen uv -> the mirrored view's ndc: x flipped (see `flip_x`), y up
+            Some([u0, v0, u1, v1]) => crop(-(2.0 * u1 - 1.0), -(2.0 * u0 - 1.0), 1.0 - 2.0 * v1, 1.0 - 2.0 * v0) * view_proj,
+            None => view_proj,
+        }
+    }
+
+    /// This frame's scissor rectangle in the render target (x, y, width, height), when bounded.
+    pub(crate) fn scissor(&self) -> Option<[u32; 4]> {
+        let [u0, v0, u1, v1] = self.screen_rect?;
+        let (w, h) = (self.width as f32, self.height as f32);
+        // the target is mirrored left-right
+        let x0 = ((1.0 - u1) * w).floor().clamp(0.0, w - 1.0) as u32;
+        let x1 = ((1.0 - u0) * w).ceil().clamp(x0 as f32 + 1.0, w) as u32;
+        let y0 = (v0 * h).floor().clamp(0.0, h - 1.0) as u32;
+        let y1 = (v1 * h).ceil().clamp(y0 as f32 + 1.0, h) as u32;
+        Some([x0, y0, x1 - x0, y1 - y0])
     }
 
     pub(crate) fn color_attachments(&self) -> [&wgpu::TextureView; 4] {
@@ -499,6 +602,55 @@ impl PlanarReflection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mirrored view cropped to a lake's screen rectangle keeps what the lake reflects, and
+    /// culls what is reflected beside it.
+    #[test]
+    fn cropped_mirror_keeps_what_the_surface_reflects() {
+        let camera_pos = glam::Vec3::new(0.0, 4.0, 20.0);
+        let view = glam::Mat4::look_at_rh(camera_pos, glam::Vec3::new(0.0, 0.0, -10.0), glam::Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(0.8, 1.5, 0.1, 500.0);
+        // a lake at y = 0 from x -5..5, z -20..0, seen from above its near shore
+        let rect = match screen_rect(proj * view, glam::Vec3::new(-5.0, 0.0, -20.0), glam::Vec3::new(5.0, 0.0, 0.0), 0.0) {
+            ScreenRect::Rect(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let [u0, v0, u1, v1] = rect;
+        // the mirror as update_camera builds it, cropped as cull_view_proj does
+        let mirrored = view * reflection_matrix(glam::Vec3::Y, 0.0);
+        let refl = flip_x() * proj * mirrored;
+        let planes = crate::culling::frustum_planes(crop(-(2.0 * u1 - 1.0), -(2.0 * u0 - 1.0), 1.0 - 2.0 * v1, 1.0 - 2.0 * v0) * refl);
+        let kept = |p: glam::Vec3| planes.iter().all(|pl| pl.truncate().dot(p) + pl.w >= 0.0);
+        // the lake itself, and a tree top on the far shore whose reflection falls on the lake
+        assert!(kept(glam::Vec3::new(0.0, 0.0, -10.0)));
+        assert!(kept(glam::Vec3::new(2.0, 3.0, -24.0)));
+        // a tree well off to the side, whose reflection falls beside the lake
+        assert!(!kept(glam::Vec3::new(40.0, 3.0, -10.0)));
+    }
+
+    /// A box's screen rectangle: on screen, beside the view, behind the eye, straddling it; and
+    /// the crop of that rectangle bounds exactly its part of the view.
+    #[test]
+    fn surface_rectangle_and_crop() {
+        // looking down -z, 90 degrees: at z = -10 the view spans x, y in [-10, 10]
+        let view_proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0) * glam::Mat4::look_at_rh(glam::Vec3::ZERO, glam::Vec3::NEG_Z, glam::Vec3::Y);
+        let rect = |lo: [f32; 3], hi: [f32; 3]| screen_rect(view_proj, lo.into(), hi.into(), 0.0);
+        let ScreenRect::Rect([u0, v0, u1, v1]) = rect([1.0, -1.0, -10.0], [3.0, 1.0, -10.0]) else { panic!() };
+        for (got, want) in [(u0, 0.55), (u1, 0.65), (v0, 0.45), (v1, 0.55)] {
+            assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+        }
+        assert_eq!(rect([20.0, -1.0, -10.0], [30.0, 1.0, -10.0]), ScreenRect::Offscreen, "beside the view");
+        assert_eq!(rect([-1.0, -1.0, 5.0], [1.0, 1.0, 10.0]), ScreenRect::Offscreen, "behind the eye");
+        assert_eq!(rect([-1.0, -1.0, -10.0], [1.0, 1.0, 10.0]), ScreenRect::Unbounded, "round the eye");
+        // the crop of ndc x in [0.1, 0.3], y in [-0.1, 0.1] keeps the box's part of the view only
+        let planes = crate::culling::frustum_planes(crop(0.1, 0.3, -0.1, 0.1) * view_proj);
+        let inside = |p: glam::Vec3| planes.iter().all(|pl| pl.truncate().dot(p) + pl.w >= 0.0);
+        assert!(inside(glam::Vec3::new(2.0, 0.0, -10.0)));
+        assert!(inside(glam::Vec3::new(4.0, 0.0, -20.0)), "farther along the same rays");
+        assert!(!inside(glam::Vec3::new(0.0, 0.0, -10.0)));
+        assert!(!inside(glam::Vec3::new(4.0, 0.0, -10.0)));
+        assert!(!inside(glam::Vec3::new(2.0, 2.0, -10.0)));
+    }
 
     #[test]
     fn reflection_matrix_mirrors_across_the_plane() {
