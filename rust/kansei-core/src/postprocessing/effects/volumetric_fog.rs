@@ -71,6 +71,9 @@ pub struct VolumetricFogOptions {
     pub anisotropy: f32,
     /// View distance before which there is no fog (UE's fog start distance).
     pub start_distance: f32,
+    /// View depth past which the froxels hold no fog (Unreal's `VolumetricFogDistance`), at most
+    /// the grid's `far`; 0: the grid's `far`. See `VolumetricFogEffect::max_distance`.
+    pub max_distance: f32,
     /// Density field drift, in metres per second of `time`.
     pub wind_direction: Vec3,
     /// Radiance of a uniform sky around the fog (scatters as density * ambient). Zero matches the
@@ -96,6 +99,7 @@ impl Default for VolumetricFogOptions {
             extinction_coeff: 1.0,
             anisotropy: 0.6,
             start_distance: 0.0,
+            max_distance: 0.0,
             wind_direction: Vec3::ZERO,
             ambient: Vec3::ZERO,
             albedo: Vec3::new(1.0, 1.0, 1.0),
@@ -134,6 +138,8 @@ struct FogParamsGpu {
     jitter_frame: u32,
     skip_spots: u32,
     clip_plane: [f32; 4],
+    max_distance: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -417,6 +423,11 @@ pub struct VolumetricFogEffect {
     pub extinction_coeff: f32,
     pub anisotropy: f32,
     pub start_distance: f32,
+    /// View depth past which the froxels hold no fog (Unreal's `VolumetricFogDistance`, which its
+    /// shots change): at most the grid's `far`, 0 for the grid's `far`. Change it any frame; the
+    /// grid stays. Start a `HeightFogEffect` there (`volumetric_fog_distance = reach()`), as
+    /// Unreal's analytic fog takes over where its volumetric fog ends.
+    pub max_distance: f32,
     pub wind_direction: Vec3,
     pub ambient: Vec3,
     pub albedo: Vec3,
@@ -455,6 +466,7 @@ impl VolumetricFogEffect {
             extinction_coeff: options.extinction_coeff,
             anisotropy: options.anisotropy,
             start_distance: options.start_distance,
+            max_distance: options.max_distance,
             wind_direction: options.wind_direction,
             ambient: options.ambient,
             albedo: options.albedo,
@@ -480,6 +492,12 @@ impl VolumetricFogEffect {
     }
 
     /// The froxel grid (available after the effect's first frame).
+    /// The view depth the froxels hold fog to: `max_distance`, or the grid's `far` when it is 0 or
+    /// beyond it. For `HeightFogEffect::volumetric_fog_distance`.
+    pub fn reach(&self) -> f32 {
+        if self.max_distance > 0.0 { self.max_distance.min(self.grid_options.far) } else { self.grid_options.far }
+    }
+
     pub fn froxel_grid(&self) -> Option<&FroxelGrid> {
         self.gpu.as_ref().map(|g| &g.grid)
     }
@@ -1193,6 +1211,9 @@ impl PostProcessingEffect for VolumetricFogEffect {
             jitter_frame: if grid.is_temporal() { self.frame } else { 0 },
             skip_spots: raymarch_steps.is_some() as u32,
             clip_plane: [0.0, 0.0, 0.0, 1.0],
+            // the fog's reach (`reach`)
+            max_distance: if self.max_distance > 0.0 { self.max_distance.min(grid.far()) } else { grid.far() },
+            _pad: [0.0; 3],
         };
         self.frame = self.frame % 1024 + 1;
         queue.write_buffer(&gpu.fog_params, 0, bytemuck::bytes_of(&params));
@@ -1503,6 +1524,66 @@ mod tests {
             }
         }
         out
+    }
+
+    /// In a uniform fog every slice's transmittance is exp(-sigma (depth - near)), the thick far
+    /// ones too; with `max_distance` the froxels hold fog only to that depth: the far slices'
+    /// transmittance is the reach's, not the grid's, and the slices past it add nothing more.
+    #[test]
+    fn the_fog_ends_at_its_reach() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (64u32, 32u32);
+        let tex = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
+                .create_view(&Default::default())
+        };
+        let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+        let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
+        let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let mut camera = Camera::new(60.0, 0.5, 1000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 5.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 5.0, -10.0));
+        camera.update_view_matrix();
+        let sigma = 0.01f32;
+        let volume = |max_distance: f32| {
+            let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+                grid: FroxelGridOptions { grid_w: 16, grid_h: 16, grid_d: 32, near: 0.5, far: 200.0, temporal: false, blend_factor: 1.0 },
+                base_density: sigma,
+                height_falloff: 0.0,
+                fog_height: 100.0,
+                ambient: Vec3::new(1.0, 1.0, 1.0),
+                max_distance,
+                ..Default::default()
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            fog.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+            queue.submit(std::iter::once(encoder.finish()));
+            (read_volume(&device, &queue, fog.froxel_grid().unwrap()), fog.reach())
+        };
+        // the centre column's transmittance at slice z
+        let t = |v: &[[f32; 4]], z: u32| v[((z * 16 + 8) * 16 + 8) as usize][3];
+        let (all, reach_all) = volume(0.0);
+        // the whole grid holds the fog, its thick far slices too (the clip plane's fade once
+        // thinned them when no plane was set)
+        for z in [16u32, 24, 28] {
+            let d1 = 0.5 * 400f32.powf((z + 1) as f32 / 32.0);
+            assert!((t(&all, z) - (-sigma * (d1 - 0.5)).exp()).abs() < 2e-3, "slice {z}: {}", t(&all, z));
+        }
+        let (short, reach) = volume(60.0);
+        assert_eq!((reach_all, reach), (200.0, 60.0));
+        assert_eq!(volume(500.0).1, 200.0, "the reach is at most the grid's far");
+        let (want_all, want) = ((-sigma * 199.5).exp(), (-sigma * 59.5).exp());
+        eprintln!("far transmittance: grid {:.4} (want {want_all:.4}), reach 60 m {:.4} (want {want:.4})", t(&all, 31), t(&short, 31));
+        assert!((t(&all, 31) - want_all).abs() < 0.02, "grid: {}", t(&all, 31));
+        assert!((t(&short, 31) - want).abs() < 0.02, "reach: {}", t(&short, 31));
+        // past the reach nothing more (60 m is slice 32 ln(120) / ln(400) = 25.6): slices 27 and 31
+        // agree; before it the two volumes agree
+        assert!((t(&short, 27) - t(&short, 31)).abs() < 1e-3, "past the reach: {} vs {}", t(&short, 27), t(&short, 31));
+        assert!((t(&short, 20) - t(&all, 20)).abs() < 1e-3, "before the reach: {} vs {}", t(&short, 20), t(&all, 20));
     }
 
     /// The reflection's volume, built from the camera mirrored in the water, holds only the fog

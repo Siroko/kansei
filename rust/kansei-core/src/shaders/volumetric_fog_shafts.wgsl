@@ -100,7 +100,8 @@ fn shafts(@builtin(global_invocation_id) gid : vec3u) {
     for (var i = 0u; i < spotLights.count; i++) {
         let light = spotLights.lights[i];
         if (light.volumetricScale <= 0.0) { continue; }
-        let seg = shaftConeSegment(light, sp.cameraPos, rd, tScene);
+        // no farther than the fog's reach
+        let seg = shaftConeSegment(light, sp.cameraPos, rd, min(tScene, params.maxDistance / cosView));
         if (seg.x >= seg.y) { continue; }
         let dt = (seg.y - seg.x) / f32(steps);
         // no closer to the lamp than its emitter, so the inverse square stays finite
