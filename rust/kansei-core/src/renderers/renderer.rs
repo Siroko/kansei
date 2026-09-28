@@ -1611,7 +1611,7 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
         for &idx in &culled {
             let r = scene.get_renderable_mut(idx).unwrap();
-            let (visible, world, index_count) = (r.visible, r.world_matrix.to_glam(), r.geometry.index_count());
+            let (visible, world, index_count, casts_shadow) = (r.visible, r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow);
             let culling = r.instance_culling.as_mut().unwrap();
             stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
             let two_phase = occlusion.is_some() && culling.occlusion && visible;
@@ -1625,21 +1625,22 @@ impl Renderer {
                 }
                 self.two_phase.push(idx);
             }
-            culling.begin_frame(queue, &mut encoder, world, index_count);
+            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/InstanceCulling").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+            // a renderable's views in one dispatch; the shader skips those it is not drawn in
             for &idx in &culled {
                 let r = scene.get_renderable(idx).unwrap();
                 let culling = r.instance_culling.as_ref().unwrap();
+                culling.dispatch(&mut pass);
                 for (slot, view) in views.iter().enumerate() {
                     let Some(view) = view else { continue };
                     if view.casters_only && !r.cast_shadow || slot == MAIN_VIEW && culling.two_phase() {
                         continue;
                     }
-                    pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(slot)]);
-                    culling.dispatch(&mut pass, slot);
                     let draw = culling.view(slot).unwrap();
                     self.cull_stats.record(slot, culling.tested(), draw.args, draw.offset);
                 }
@@ -1647,7 +1648,7 @@ impl Renderer {
             // occlusion's first phase
             if !self.two_phase.is_empty() {
                 pass.set_pipeline(&pipeline.early);
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(MAIN_VIEW)]);
+                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
                 for &idx in &self.two_phase {
                     let culling = scene.get_renderable(idx).unwrap().instance_culling.as_ref().unwrap();
                     culling.dispatch_early(&mut pass);
@@ -1678,7 +1679,7 @@ impl Renderer {
         pyramid.build(device, encoder, &gbuffer.depth_view);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/OcclusionCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/OcclusionCulling").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&pipeline.late);
-        pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(MAIN_VIEW)]);
+        pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
         pass.set_bind_group(2, pyramid_bind_group, &[]);
         for &idx in &self.two_phase {
             if let Some(culling) = scene.get_renderable(idx).and_then(|r| r.instance_culling.as_ref()) {
@@ -2832,11 +2833,11 @@ fn bind_and_draw<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
     enc.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
     for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
         let buffer = match culled {
-            Some(draw) if i == 0 => Some(draw.instances),
-            _ => cb.gpu_buffer(),
+            Some(draw) if i == 0 => Some((draw.instances, draw.instances_offset)),
+            _ => cb.gpu_buffer().map(|b| (b, 0)),
         };
-        if let Some(buffer) = buffer {
-            enc.set_vertex_buffer(i as u32 + 1, buffer.slice(..));
+        if let Some((buffer, offset)) = buffer {
+            enc.set_vertex_buffer(i as u32 + 1, buffer.slice(offset..));
         }
     }
     enc.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
