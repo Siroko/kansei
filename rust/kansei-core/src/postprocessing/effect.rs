@@ -41,6 +41,11 @@ pub trait PostProcessingEffect {
         false
     }
     fn destroy(&mut self);
+    /// A short name for profiling (the type's name by default).
+    fn name(&self) -> &'static str {
+        let path = std::any::type_name::<Self>();
+        path.rsplit("::").next().unwrap_or(path)
+    }
     /// Downcast support for runtime access to concrete effect types.
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;

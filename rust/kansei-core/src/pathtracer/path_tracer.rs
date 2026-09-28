@@ -473,7 +473,7 @@ impl PathTracer {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("PathTracer/Trace"),
-            timestamp_writes: None,
+            timestamp_writes: crate::profiling::gpu_pass("PathTracer/Trace").as_ref().map(crate::profiling::PassStamp::compute),
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);

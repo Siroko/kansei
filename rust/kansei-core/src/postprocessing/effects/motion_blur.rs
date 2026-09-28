@@ -296,7 +296,7 @@ impl PostProcessingEffect for MotionBlurEffect {
         let gather = group(&gpu.gather_bgl, vec![view(input), view(&t.motion), view(&t.neighbours), view(output), params_res()]);
         let (tw, th) = (width.div_ceil(TILE), height.div_ceil(TILE));
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("MotionBlur"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("MotionBlur"), timestamp_writes: crate::profiling::gpu_pass("MotionBlur").as_ref().map(crate::profiling::PassStamp::compute) });
         if enabled {
             let prepare = group(&gpu.prepare_bgl, vec![view(depth), view(&gbuffer.velocity_view), view(&t.motion), view(&t.tiles), params_res()]);
             let neighbours = group(&gpu.neighbours_bgl, vec![view(&t.tiles), view(&t.neighbours), params_res()]);

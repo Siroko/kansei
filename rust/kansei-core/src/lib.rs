@@ -12,6 +12,7 @@ pub mod postprocessing;
 pub mod froxels;
 pub mod atmosphere;
 pub mod culling;
+pub mod profiling;
 pub mod reflections;
 pub mod simulations;
 pub mod pathtracer;

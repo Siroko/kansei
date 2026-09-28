@@ -105,7 +105,7 @@ impl LightClusters {
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Self::params_for(camera, width, height)));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("LightClusters") });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("LightClusters/Build"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("LightClusters/Build"), timestamp_writes: crate::profiling::gpu_pass("LightClusters/Build").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(CLUSTER_GRID.iter().product::<u32>().div_ceil(64), 1, 1);

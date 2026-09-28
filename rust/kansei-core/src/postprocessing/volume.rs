@@ -207,6 +207,7 @@ impl PostProcessingVolume {
         width: u32,
         height: u32,
     ) {
+        let _post = crate::profiling::cpu_scope("post");
         if self.gbuffer.is_none() {
             self.ensure_gbuffer(width, height);
         }
@@ -254,6 +255,7 @@ impl PostProcessingVolume {
                 };
                 let (w, h) = if at_display { display_size } else { render_size };
 
+                let _effect = crate::profiling::cpu_scope(effect.name());
                 effect.render(
                     &self.device,
                     &self.queue,
@@ -310,7 +312,7 @@ impl PostProcessingVolume {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("Blit RenderPass").as_ref().map(crate::profiling::PassStamp::render),
                 occlusion_query_set: None,
             });
 

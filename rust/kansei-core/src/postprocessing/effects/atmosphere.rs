@@ -138,7 +138,7 @@ impl PostProcessingEffect for AtmosphereEffect {
             .map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource })
             .collect();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Atmosphere/CompositeBG"), layout: bgl, entries: &entries });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Atmosphere/Composite"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Atmosphere/Composite"), timestamp_writes: crate::profiling::gpu_pass("Atmosphere/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
