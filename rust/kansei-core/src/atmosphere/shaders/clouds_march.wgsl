@@ -37,7 +37,8 @@ struct CloudParams {
     steps         : u32,
     lightSteps    : u32,
     blend         : f32,       // weight of the new frame in the history
-    _pad          : vec2f,
+    mapSteps      : u32,       // the cloud map's steps (its light steps are at most 3)
+    mapInterleave : u32,       // the cloud map rewrites one row in this many each frame
 }
 
 @group(0) @binding(0) var<uniform> atm : Atmosphere;
@@ -109,12 +110,12 @@ fn cloudDensity(p: vec3f, h: f32, detailed: bool) -> f32 {
 }
 
 // Optical depth (per unit extinction) toward the sun from p, through the rest of the layer.
-fn sunOpticalDepth(p: vec3f, sunDir: vec3f, rBottom: f32, rTop: f32) -> f32 {
+fn sunOpticalDepth(p: vec3f, sunDir: vec3f, rBottom: f32, rTop: f32, lightSteps: u32) -> f32 {
     let exitTop = raySphere(p, sunDir, rTop).y;
     let span = min(max(exitTop, 0.0), (rTop - rBottom) * 3.0);
     var depth = 0.0;
     var t = 0.0;
-    let n = max(cp.lightSteps, 1u);
+    let n = max(lightSteps, 1u);
     for (var i = 0u; i < n; i++) {
         // steps growing toward the sun: fine detail near the sample, the bulk further out
         let dt = span * (f32(2u * i + 1u) / f32(n * n));
@@ -143,9 +144,9 @@ struct CloudMarch {
     hit           : bool,
 }
 
-// The cloud layer along a ray from ro (planet frame, km), at most maxKm; jitter in [0, 1) offsets
-// the first step.
-fn marchClouds(ro: vec3f, rd: vec3f, maxKm: f32, jitter: f32) -> CloudMarch {
+// The cloud layer along a ray from ro (planet frame, km), at most maxKm, in `stepCount` steps (and
+// `lightSteps` toward the sun); jitter in [0, 1) offsets the first step.
+fn marchClouds(ro: vec3f, rd: vec3f, maxKm: f32, jitter: f32, stepCount: u32, lightSteps: u32) -> CloudMarch {
     let rBottom = atm.bottomRadius + cp.bottomKm;
     let rTop = atm.bottomRadius + cp.topKm;
     let r0 = length(ro);
@@ -171,7 +172,7 @@ fn marchClouds(ro: vec3f, rd: vec3f, maxKm: f32, jitter: f32) -> CloudMarch {
     var depthSum = 0.0;
     var depthWeight = 0.0;
     if (tEnd > tStart) {
-        let steps = max(cp.steps, 1u);
+        let steps = max(stepCount, 1u);
         let dt = max((tEnd - tStart) / f32(steps), 0.01);
         let sunDir = frame.sunDirection;
         let cosSun = dot(rd, sunDir);
@@ -191,7 +192,7 @@ fn marchClouds(ro: vec3f, rd: vec3f, maxKm: f32, jitter: f32) -> CloudMarch {
                 // comes from the sky lighting, which already does)
                 let sunIn = frame.sunIlluminance * frame.skyLuminanceFactor * transmittanceToTop(r, dot(up, sunDir))
                           * horizonVisibility(r, dot(up, sunDir), frame.sunAngularRadius);
-                let od = sunOpticalDepth(p, sunDir, rBottom, rTop) * cp.extinction;
+                let od = sunOpticalDepth(p, sunDir, rBottom, rTop, lightSteps) * cp.extinction;
                 // multiple scattering (Wrenninge 2013): octaves of weaker extinction, flatter phase
                 var ms = 0.0;
                 var a = 1.0;
@@ -245,7 +246,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     var sceneKm = FAR_KM;
     if (depth < 1.0) { sceneKm = length(unproject(uv, depth) - frame.cameraWorld) * 0.001; }
 
-    let march = marchClouds(frame.cameraPos, rd, sceneKm, fract(ign(vec2f(gid.xy)) + f32(cp.frame) * 0.618034));
+    let march = marchClouds(frame.cameraPos, rd, sceneKm, fract(ign(vec2f(gid.xy)) + f32(cp.frame) * 0.618034), cp.steps, cp.lightSteps);
     var light = march.light;
     let transmittance = march.transmittance;
     let cloudKm = march.depth;
@@ -276,14 +277,15 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
 @group(0) @binding(18) var cloudMapOut : texture_storage_2d<rgba16float, write>;
 
 // The cloud map (cloud_map.wgsl) for the sky lighting: the layer around the camera in every
-// direction. The air in front of each cloud is taken as the sky's own light along the ray times
+// direction, with fewer steps than the view (it only feeds low-frequency lighting), one row in
+// `mapInterleave` rewritten each frame. The air in front of each cloud is taken as the sky's own light along the ray times
 // the air's opacity up to the cloud, which is close for the low-frequency lighting it feeds.
 @compute @workgroup_size(8, 8)
 fn skyMap(@builtin(global_invocation_id) gid : vec3u) {
     let size = textureDimensions(cloudMapOut);
-    if (any(gid.xy >= size)) { return; }
+    if (any(gid.xy >= size) || (gid.y + cp.frame) % max(cp.mapInterleave, 1u) != 0u) { return; }
     let d = cloudMapDirection((vec2f(gid.xy) + 0.5) / vec2f(size));
-    let march = marchClouds(frame.cameraPos, d, FAR_KM, 0.5);
+    let march = marchClouds(frame.cameraPos, d, FAR_KM, 0.5, cp.mapSteps, min(cp.lightSteps, 3u));
     var light = march.light;
     if (march.hit) {
         let air = transmittanceBetween(frame.cameraPos, d, march.depth);
