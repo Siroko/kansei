@@ -176,6 +176,12 @@ fn weld(positions: &mut [f32], tolerance: f32) {
 }
 
 /// One id per distinct position (seams split vertices, not positions).
+/// `position_ids`, for the card tests.
+#[cfg(test)]
+pub(super) fn position_ids_for_tests(positions: &[f32]) -> Vec<u32> {
+    position_ids(positions)
+}
+
 fn position_ids(positions: &[f32]) -> Vec<u32> {
     let mut ids = HashMap::new();
     positions

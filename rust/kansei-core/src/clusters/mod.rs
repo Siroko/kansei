@@ -42,6 +42,7 @@ impl Sphere {
 use crate::geometries::Vertex;
 
 mod build;
+mod cards;
 mod gpu;
 mod vertex_stage;
 pub(crate) use vertex_stage::{cluster_vertex_stage, CLUSTER_VERTEX_ENTRY};
@@ -67,11 +68,35 @@ pub struct ClusterOptions {
     /// Weights of the normals and uvs in the simplifier's error.
     pub normal_weight: f32,
     pub uv_weight: f32,
+    /// Treat small, open, flat-ish components as cards (foliage: sprays, leaves, ribbons), whose
+    /// coarser levels are pruned rather than simplified (off by default: a solid mesh built of
+    /// separate flat panels would lose them at a distance).
+    pub cards: bool,
+    /// The most triangles a card has.
+    pub card_max_triangles: usize,
+    /// The share of a card's area its area-weighted normal keeps (1: flat; a tube or a closed
+    /// shape: about 0).
+    pub card_flatness: f32,
+    /// Scales pruned levels' error: below 1, crowns thin out nearer (see `ClusterMesh::build`).
+    pub card_error_scale: f32,
 }
 
 impl Default for ClusterOptions {
     fn default() -> Self {
-        Self { max_vertices: 128, max_triangles: 124, group_size: 8, simplify_ratio: 0.5, stall_ratio: 0.85, cone_weight: 0.25, normal_weight: 0.5, uv_weight: 0.1 }
+        Self {
+            max_vertices: 128,
+            max_triangles: 124,
+            group_size: 8,
+            simplify_ratio: 0.5,
+            stall_ratio: 0.85,
+            cone_weight: 0.25,
+            normal_weight: 0.5,
+            uv_weight: 0.1,
+            cards: false,
+            card_max_triangles: 64,
+            card_flatness: 0.5,
+            card_error_scale: 1.0,
+        }
     }
 }
 
@@ -237,3 +262,5 @@ impl ClusterMesh {
 mod tests;
 #[cfg(test)]
 mod gpu_tests;
+#[cfg(test)]
+mod card_tests;
