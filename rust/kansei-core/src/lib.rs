@@ -14,6 +14,7 @@ pub mod atmosphere;
 pub mod culling;
 pub mod profiling;
 pub mod reflections;
+pub mod impostors;
 pub mod simulations;
 pub mod pathtracer;
 pub mod loaders;

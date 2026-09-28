@@ -298,29 +298,7 @@ impl Renderer {
     /// creation automatically.
     #[doc(hidden)]
     pub async fn initialize(&mut self, surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) {
-        // Optional features: requested only where the adapter offers them, so devices without
-        // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs).
-        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Kansei Device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
-                required_limits: self.config.required_limits.resolve(&adapter.limits()),
-                memory_hints: wgpu::MemoryHints::default(),
-            }, None)
-            .await
-            .expect("Failed to create device");
-        let limits = device.limits();
-        log::info!(
-            "device limits: {} sampled textures, {} samplers, {} storage buffers per shader stage; textures up to {}",
-            limits.max_sampled_textures_per_shader_stage,
-            limits.max_samplers_per_shader_stage,
-            limits.max_storage_buffers_per_shader_stage,
-            limits.max_texture_dimension_2d
-        );
-
-        self.matrix_alignment = device.limits().min_uniform_buffer_offset_alignment;
-
+        let (device, queue) = self.request_device(adapter).await;
         let surface_caps = surface.get_capabilities(adapter);
         let format = surface_caps.formats.iter()
             .find(|f| f.is_srgb())
@@ -352,6 +330,47 @@ impl Renderer {
         surface.configure(&device, &surface_config);
 
         self.presentation_format = format;
+        self.initialize_resources(device, queue);
+        self.surface = Some(surface);
+        self.surface_config = Some(surface_config);
+    }
+
+    /// Initialize without a surface, for offscreen work: `render_to_gbuffer`, impostor bakes,
+    /// tests. `render` and `render_with_postprocessing` need a surface.
+    #[doc(hidden)]
+    pub async fn initialize_headless(&mut self, adapter: &wgpu::Adapter) {
+        let (device, queue) = self.request_device(adapter).await;
+        self.presentation_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        self.initialize_resources(device, queue);
+    }
+
+    async fn request_device(&self, adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
+        // Optional features: requested only where the adapter offers them, so devices without
+        // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs).
+        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Kansei Device"),
+                required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
+                required_limits: self.config.required_limits.resolve(&adapter.limits()),
+                memory_hints: wgpu::MemoryHints::default(),
+            }, None)
+            .await
+            .expect("Failed to create device");
+        let limits = device.limits();
+        log::info!(
+            "device limits: {} sampled textures, {} samplers, {} storage buffers per shader stage; textures up to {}",
+            limits.max_sampled_textures_per_shader_stage,
+            limits.max_samplers_per_shader_stage,
+            limits.max_storage_buffers_per_shader_stage,
+            limits.max_texture_dimension_2d
+        );
+        (device, queue)
+    }
+
+    /// The renderer's own GPU resources on a new device.
+    fn initialize_resources(&mut self, device: wgpu::Device, queue: wgpu::Queue) {
+        self.matrix_alignment = device.limits().min_uniform_buffer_offset_alignment;
         self._create_depth_texture(&device);
 
         // Create shared bind group layouts
@@ -467,8 +486,6 @@ impl Renderer {
 
         self.device = Some(device);
         self.queue = Some(queue);
-        self.surface = Some(surface);
-        self.surface_config = Some(surface_config);
         self.rebuild_shadow_bind_group();
     }
 
@@ -521,6 +538,34 @@ impl Renderer {
             ],
         }));
         self.invalidate_bundle();
+    }
+
+    /// Make a renderable drawable into the GBuffer's targets: its geometry and instance buffers
+    /// uploaded, its material's bind group and GBuffer pipeline (`sample_count`) made.
+    pub(crate) fn prepare_for_gbuffer(&self, r: &mut crate::objects::Renderable, sample_count: u32) {
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        if !r.geometry.initialized {
+            r.geometry.initialize(device);
+        }
+        for cb in &mut r.geometry.instance_buffers {
+            cb.ensure_ready(device, queue);
+        }
+        r.material.ensure_bindables_initialized(self);
+        r.material.initialize(device, self.shared_layouts.as_ref().unwrap());
+        let instance_layouts: Vec<_> = r.geometry.instance_buffers.iter().filter_map(|cb| cb.vertex_layout()).collect();
+        let layouts: Vec<_> = std::iter::once(Vertex::LAYOUT).chain(instance_layouts.iter().map(|il| il.as_layout())).collect();
+        r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count);
+    }
+
+    /// The lights uniform (group 1, binding 2 of every camera).
+    pub(crate) fn light_buffer(&self) -> &wgpu::Buffer {
+        self.light_buf.as_ref().expect("renderer initialized")
+    }
+
+    /// The shadows and lights bind group (group 3).
+    pub(crate) fn shadow_bind_group(&self) -> &wgpu::BindGroup {
+        self.shadow_bind_group.as_ref().expect("renderer initialized")
     }
 
     /// Returns a reference to the underlying wgpu device.
@@ -2336,9 +2381,6 @@ impl Renderer {
 
         // Initialize geometries + pre-warm pipelines for GBuffer formats
         let device = self.device.as_ref().unwrap();
-        let queue = self.queue.as_ref().unwrap();
-        let shared = self.shared_layouts.as_ref().unwrap();
-        let depth_format = GBuffer::DEPTH_FORMAT;
         let sample_count = gbuffer.sample_count;
         let spot_shadows = self.spot_shadow_atlas.is_some();
             let cascades = self.cascaded_shadows.is_some();
@@ -2347,15 +2389,7 @@ impl Renderer {
         let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
         for idx in ordered_indices {
             let r = scene.get_renderable_mut(idx).expect("ordered scene index should exist");
-            if !r.geometry.initialized {
-                r.geometry.initialize(device);
-            }
-            for cb in &mut r.geometry.instance_buffers {
-                cb.ensure_ready(device, queue);
-            }
-            r.material.ensure_bindables_initialized(self);
-            r.material.initialize(device, shared);
-
+            self.prepare_for_gbuffer(r, sample_count);
             let instance_layouts: Vec<_> = r.geometry.instance_buffers.iter()
                 .filter_map(|cb| cb.vertex_layout())
                 .collect();
@@ -2363,11 +2397,6 @@ impl Renderer {
             for il in &instance_layouts {
                 layouts.push(il.as_layout());
             }
-
-            r.material.get_pipeline(
-                device, &layouts,
-                &GBuffer::MRT_FORMATS, depth_format, sample_count,
-            );
             if spot_shadows && r.cast_shadow {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
             }
