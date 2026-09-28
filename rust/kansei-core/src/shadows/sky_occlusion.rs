@@ -111,10 +111,11 @@ pub struct SkyOcclusion {
     camera: Camera,
     pyramid: wgpu::Texture,
     pyramid_views: Vec<wgpu::TextureView>,
-    build_params: Vec<wgpu::Buffer>,
-    /// Layers of the volume built per frame, and each slab's parameters
+    /// The build's parameters, a slot per pyramid level then one per slab of the volume, written
+    /// at once when a rebuild starts
+    build_params: wgpu::Buffer,
+    /// Layers of the volume built per frame
     slab: u32,
-    slab_params: Vec<wgpu::Buffer>,
     sampler: wgpu::Sampler,
     top_pipeline: wgpu::ComputePipeline,
     top_bgl: wgpu::BindGroupLayout,
@@ -134,6 +135,8 @@ impl SkyOcclusion {
     pub(crate) const FORMAT: wgpu::TextureFormat = crate::shadows::CascadedShadowMap::FORMAT;
     pub(crate) const DEPTH_BIAS: wgpu::DepthBiasState = crate::shadows::CascadedShadowMap::DEPTH_BIAS;
     const NEAR: f32 = 1.0;
+    /// Bytes per slot of `build_params` (WebGPU's uniform offset alignment).
+    const SLOT: u64 = 256;
 
     pub(crate) fn new(device: &wgpu::Device, camera_bgl: &wgpu::BindGroupLayout, light_buf: &wgpu::Buffer, options: SkyOcclusionOptions) -> Self {
         let res = options.resolution.clamp(16, 8192).next_power_of_two();
@@ -177,11 +180,11 @@ impl SkyOcclusion {
         let uniform = |label: &str, size: usize| {
             device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false })
         };
-        // one parameter buffer per pyramid level: a shared one rewritten per dispatch would hold
-        // only the last write when the passes run
-        let build_params = (0..levels).map(|_| uniform("SkyOcclusion/Build", std::mem::size_of::<OcclusionBuildGpu>())).collect();
+        // a slot per dispatch's parameters: one rewritten per dispatch would hold only the last
+        // write when the passes run
         let slab = height.div_ceil(options.frames.clamp(1, height));
-        let slab_params = (0..height.div_ceil(slab)).map(|_| uniform("SkyOcclusion/Slab", std::mem::size_of::<OcclusionBuildGpu>())).collect();
+        let slots = (levels + height.div_ceil(slab)) as usize;
+        let build_params = uniform("SkyOcclusion/Build", slots * Self::SLOT as usize);
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let uniform_entry = entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None });
         let texture_entry = |binding, sample_type, dim| entry(binding, wgpu::BindingType::Texture { sample_type, view_dimension: dim, multisampled: false });
@@ -228,7 +231,6 @@ impl SkyOcclusion {
             pyramid_views,
             build_params,
             slab,
-            slab_params,
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("SkyOcclusion/Sampler"),
                 mag_filter: wgpu::FilterMode::Linear,
@@ -327,24 +329,34 @@ impl SkyOcclusion {
         let (side, height) = (self.back.width(), self.back.height());
         let first_layer = if self.pending { 0 } else { self.next_layer.unwrap_or(0) };
         let slab = self.slab;
-        let slab_params = &self.slab_params[(first_layer / slab) as usize];
-        // the pyramid's parameters on the top-down pass's frame, and this slab's
-        let buffers = self.build_params.iter().enumerate().filter(|_| self.pending).chain(std::iter::once((0, slab_params)));
-        for (level, buf) in buffers {
-            let data = OcclusionBuildGpu {
-                center: center.to_array(),
-                extent: o.extent_m,
-                min_y: o.min_height_m,
-                max_y: o.max_height_m,
-                eye_y: self.eye_y(),
-                near: Self::NEAR,
-                far: self.far(),
-                extinction: o.canopy_extinction.max(0.0),
-                levels,
-                level: level as u32,
-                first_layer,
-            };
-            queue.write_buffer(buf, 0, bytemuck::bytes_of(&data));
+        let slot = |k: u32| wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &self.build_params,
+            offset: k as u64 * Self::SLOT,
+            size: std::num::NonZeroU64::new(std::mem::size_of::<OcclusionBuildGpu>() as u64),
+        });
+        // when a rebuild starts, every dispatch's parameters in one write: the pyramid's levels,
+        // then the volume's slabs
+        if self.pending {
+            let slabs = height.div_ceil(slab);
+            let mut data = vec![0u8; ((levels + slabs) as u64 * Self::SLOT) as usize];
+            for k in 0..levels + slabs {
+                let gpu = OcclusionBuildGpu {
+                    center: center.to_array(),
+                    extent: o.extent_m,
+                    min_y: o.min_height_m,
+                    max_y: o.max_height_m,
+                    eye_y: self.eye_y(),
+                    near: Self::NEAR,
+                    far: self.far(),
+                    extinction: o.canopy_extinction.max(0.0),
+                    levels,
+                    level: k.min(levels),
+                    first_layer: k.saturating_sub(levels) * slab,
+                };
+                let at = (k as u64 * Self::SLOT) as usize;
+                data[at..at + std::mem::size_of::<OcclusionBuildGpu>()].copy_from_slice(bytemuck::bytes_of(&gpu));
+            }
+            queue.write_buffer(&self.build_params, 0, &data);
         }
         let group = |layout: &wgpu::BindGroupLayout, entries: &[(u32, wgpu::BindingResource)]| {
             let entries: Vec<_> = entries.iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding: *binding, resource: resource.clone() }).collect();
@@ -355,12 +367,12 @@ impl SkyOcclusion {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyOcclusion/Build"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
         if self.pending {
             let res = self.pyramid.width();
-            let top = group(&self.top_bgl, &[(0, self.build_params[0].as_entire_binding()), (1, tex(&self.depth)), (3, tex(&self.pyramid_views[0]))]);
+            let top = group(&self.top_bgl, &[(0, slot(0)), (1, tex(&self.depth)), (3, tex(&self.pyramid_views[0]))]);
             pass.set_pipeline(&self.top_pipeline);
             pass.set_bind_group(0, &top, &[]);
             pass.dispatch_workgroups(res.div_ceil(8), res.div_ceil(8), 1);
             for level in 1..levels as usize {
-                let bg = group(&self.down_bgl, &[(0, self.build_params[level].as_entire_binding()), (2, tex(&self.pyramid_views[level - 1])), (3, tex(&self.pyramid_views[level]))]);
+                let bg = group(&self.down_bgl, &[(0, slot(level as u32)), (2, tex(&self.pyramid_views[level - 1])), (3, tex(&self.pyramid_views[level]))]);
                 let size = (res >> level).max(1);
                 pass.set_pipeline(&self.down_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
@@ -370,7 +382,7 @@ impl SkyOcclusion {
         let all = self.pyramid.create_view(&Default::default());
         let volume = group(
             &self.volume_bgl,
-            &[(0, slab_params.as_entire_binding()), (4, tex(&all)), (5, wgpu::BindingResource::Sampler(&self.sampler)), (6, tex(&self.back_view))],
+            &[(0, slot(levels + first_layer / slab)), (4, tex(&all)), (5, wgpu::BindingResource::Sampler(&self.sampler)), (6, tex(&self.back_view))],
         );
         pass.set_pipeline(&self.volume_pipeline);
         pass.set_bind_group(0, &volume, &[]);
