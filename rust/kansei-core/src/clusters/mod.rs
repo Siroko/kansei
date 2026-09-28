@@ -44,6 +44,9 @@ use crate::geometries::Vertex;
 mod build;
 mod gpu;
 
+pub use gpu::InstanceTransform;
+pub(crate) use gpu::{ClusterCulling, ClusterGpu, ClusterViewGpu, InstanceSource};
+
 /// How `ClusterMesh::build` splits and simplifies.
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterOptions {

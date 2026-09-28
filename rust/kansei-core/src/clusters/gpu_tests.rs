@@ -122,3 +122,213 @@ fn the_gpu_fetches_every_clusters_vertices() {
         }
     }
 }
+
+use std::collections::BTreeSet;
+
+#[test]
+fn the_cull_shader_validates_and_its_uniforms_match() {
+    let module = validate("cluster_cull", &format!("{CLUSTER_CULL_WGSL}\n{CLUSTER_MESH_WGSL}"));
+    assert_eq!(struct_size(&module, "ClusterCull"), std::mem::size_of::<ClusterCullGpu>());
+    assert_eq!(struct_size(&module, "ClusterView"), std::mem::size_of::<ClusterViewGpu>());
+    assert_eq!(struct_size(&module, "ClusterDraw") as u64, DRAW_ARGS_BYTES);
+}
+
+/// A view for the cull tests: a camera at `eye` looking at `target` (60°, square), 512 pixels
+/// high, and the budget.
+struct TestView {
+    view_proj: glam::Mat4,
+    eye: glam::Vec3,
+    ppr: f32,
+    near: f32,
+    threshold: f32,
+}
+
+impl TestView {
+    fn looking(eye: glam::Vec3, target: glam::Vec3, threshold: f32) -> Self {
+        let fov = 60f32.to_radians();
+        let view_proj = glam::Mat4::perspective_rh(fov, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(eye, target, glam::Vec3::Y);
+        Self { view_proj, eye, ppr: 512.0 / (2.0 * (fov / 2.0).tan()), near: 0.1, threshold }
+    }
+
+    fn gpu(&self) -> ClusterViewGpu {
+        ClusterViewGpu::new(self.view_proj, self.eye, self.ppr, self.near, self.threshold)
+    }
+}
+
+/// What the cull should draw of `mesh` placed by `model` (a uniform scale, maybe mirrored):
+/// M1's `select` in the mesh's space, less the clusters outside the frustum and (with `cone`)
+/// those facing away. Also returns the clusters within rounding of any of those decisions.
+fn expected(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool) -> (BTreeSet<u32>, BTreeSet<u32>) {
+    let m = glam::Mat3::from_mat4(model);
+    let scale = m.x_axis.length().max(m.y_axis.length()).max(m.z_axis.length());
+    let eye = model.inverse().transform_point3(v.eye);
+    let lod = LodView { eye, pixels_per_radian: v.ppr, near: v.near / scale, threshold: v.threshold };
+    let cone = cone && m.determinant() > 0.0;
+    let planes = crate::culling::frustum_planes(v.view_proj);
+    let selected: BTreeSet<usize> = mesh.select(&lod).into_iter().collect();
+    let close = |p: f32| (p - v.threshold).abs() <= 2e-3 * v.threshold.max(1e-3);
+    let (mut drawn, mut ambiguous) = (BTreeSet::new(), BTreeSet::new());
+    for (i, c) in mesh.clusters.iter().enumerate() {
+        let center = model.transform_point3(c.bounds.center);
+        let radius = c.bounds.radius * scale;
+        let outside: Vec<f32> = planes.iter().map(|p| p.truncate().dot(center) + p.w + radius).collect();
+        let facing = (c.cone_apex - eye).normalize_or_zero().dot(c.cone_axis) - c.cone_cutoff;
+        if close(projected_error(c.error, c.lod_bounds, &lod))
+            || close(projected_error(c.parent_error, c.parent_bounds, &lod))
+            || outside.iter().any(|d| d.abs() < 1e-4 * radius.max(1.0))
+            || (cone && facing.abs() < 1e-4)
+        {
+            ambiguous.insert(i as u32);
+        } else if selected.contains(&i) && outside.iter().all(|&d| d >= 0.0) && !(cone && facing >= 0.0) {
+            drawn.insert(i as u32);
+        }
+    }
+    (drawn, ambiguous)
+}
+
+/// Cull once and read back the draw's words and the drawn (record, cluster) pairs.
+fn cull(device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, gpu: &mut ClusterGpu, source: InstanceSource, params: ClusterCullGpu, view: &TestView) -> (Vec<u32>, Vec<(u32, u32)>) {
+    gpu.bind(device, queue, culling, source, params);
+    culling.set_view(queue, &view.gpu());
+    let mut encoder = device.create_command_encoder(&Default::default());
+    culling.encode(&mut encoder, &[gpu]);
+    queue.submit(Some(encoder.finish()));
+    let args = read_words(device, queue, gpu.args());
+    let list = read_words(device, queue, gpu.draws());
+    let pairs = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
+    (args, pairs)
+}
+
+/// Asserts the GPU drew, of record `record`, the expected clusters (give or take the ambiguous).
+fn assert_cut(label: &str, pairs: &[(u32, u32)], record: u32, (drawn, ambiguous): &(BTreeSet<u32>, BTreeSet<u32>)) {
+    let gpu: BTreeSet<u32> = pairs.iter().filter(|p| p.0 == record).map(|p| p.1).collect();
+    assert_eq!(gpu.len(), pairs.iter().filter(|p| p.0 == record).count(), "{label}: a cluster drawn twice");
+    let missing: Vec<_> = drawn.difference(&gpu).collect();
+    let extra: Vec<_> = gpu.difference(drawn).filter(|c| !ambiguous.contains(c)).collect();
+    assert!(missing.is_empty() && extra.is_empty(), "{label}: missing {missing:?}, extra {extra:?} ({} expected)", drawn.len());
+}
+
+fn buffer(device: &wgpu::Device, words: &[u32]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(words), usage: wgpu::BufferUsages::STORAGE })
+}
+
+/// Records of 12 floats: position, scale, yaw, pad, rotation (x y z w), pad.
+const PLACEMENT: InstanceTransform = InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: Some(24) };
+
+fn placement_record(position: glam::Vec3, scale: f32, yaw: f32, rotation: glam::Quat) -> [f32; 12] {
+    [position.x, position.y, position.z, scale, yaw, 0.0, rotation.x, rotation.y, rotation.z, rotation.w, 0.0, 0.0]
+}
+
+fn placement_matrix(r: &[f32; 12]) -> glam::Mat4 {
+    glam::Mat4::from_translation(glam::Vec3::new(r[0], r[1], r[2])) * glam::Mat4::from_rotation_y(r[4]) * glam::Mat4::from_quat(glam::Quat::from_xyzw(r[6], r[7], r[8], r[9])) * glam::Mat4::from_scale(glam::Vec3::splat(r[3]))
+}
+
+#[test]
+fn the_gpu_cut_of_placed_instances_is_the_cpu_cut() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = [
+        placement_record(glam::Vec3::ZERO, 1.0, 0.0, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(6.0, 0.0, -4.0), 2.5, 1.2, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(-5.0, 1.5, -9.0), 0.5, -2.0, glam::Quat::from_rotation_x(0.7)),
+        placement_record(glam::Vec3::new(30.0, 0.0, -60.0), 3.0, 0.3, glam::Quat::IDENTITY),
+    ];
+    let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(1.5), glam::Quat::from_rotation_z(0.2), glam::Vec3::new(1.0, 0.0, 0.0));
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let params = ClusterCullGpu::new(world, Some(PLACEMENT), 48, &source, 4 * mesh.clusters.len() as u32, gpu.vertex_count(), true);
+    let mut totals = Vec::new();
+    for (eye, target) in [(glam::Vec3::new(0.0, 2.0, 8.0), glam::Vec3::ZERO), (glam::Vec3::new(3.0, 0.5, 1.5), glam::Vec3::new(1.0, 0.0, 0.0)), (glam::Vec3::new(-20.0, 10.0, 30.0), glam::Vec3::new(10.0, 0.0, -30.0))] {
+        for threshold in [0.0, 0.5, 1.0, 4.0] {
+            let view = TestView::looking(eye, target, threshold);
+            let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+            assert_eq!((args[0], args[4]), (gpu.vertex_count(), records.len() as u32));
+            for (k, r) in records.iter().enumerate() {
+                let label = format!("eye {eye}, {threshold} px, instance {k}");
+                assert_cut(&label, &pairs, k as u32, &expected(&mesh, world * placement_matrix(r), &view, true));
+            }
+            let triangles: u32 = pairs.iter().map(|p| mesh.clusters[p.1 as usize].triangle_count).sum();
+            assert_eq!(args[6], triangles, "the triangles drawn");
+            totals.push(triangles);
+        }
+    }
+    // a coarser budget draws fewer triangles
+    assert!(totals[3] < totals[0] && totals[0] > 0, "{totals:?}");
+}
+
+#[test]
+fn matrix_culled_and_single_instances_cut_as_the_cpu_does() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let culling = ClusterCulling::new(&device);
+    let view = TestView::looking(glam::Vec3::new(1.0, 1.5, 6.0), glam::Vec3::new(0.0, 0.0, -2.0), 1.0);
+    let world = glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.5, 0.0));
+
+    // matrices, one of them mirrored (no cone test there: its winding is turned over), behind
+    // two records the culled view doesn't count, with its count in word 5 of the instance draws
+    let matrices = [
+        glam::Mat4::IDENTITY,
+        glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(2.0), glam::Quat::from_rotation_y(0.4), glam::Vec3::new(3.0, 0.0, -4.0)),
+        glam::Mat4::from_translation(glam::Vec3::new(-3.0, 0.0, -2.0)) * glam::Mat4::from_scale(glam::Vec3::new(-1.2, 1.2, 1.2)),
+    ];
+    let mut words: Vec<f32> = vec![9.0; 32];
+    for m in &matrices {
+        words.extend(m.to_cols_array());
+    }
+    let records = buffer(&device, bytemuck::cast_slice(&words));
+    let instance_args = buffer(&device, &[0, 0, 0, 0, 0, 3, 0, 0]);
+    let source = InstanceSource::Culled { records: &records, first_record: 2, capacity: 3, args: &instance_args, count_word: 5 };
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let params = ClusterCullGpu::new(world, Some(InstanceTransform::Matrix { offset: 0 }), 64, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true);
+    let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+    assert_eq!(args[4], 3);
+    assert!(pairs.iter().all(|p| (2..5).contains(&p.0)), "records from the view's first");
+    for (k, m) in matrices.iter().enumerate() {
+        assert_cut(&format!("matrix {k}"), &pairs, 2 + k as u32, &expected(&mesh, world * *m, &view, true));
+    }
+
+    // no instances: the mesh once, where the renderable is
+    let mut single = ClusterGpu::new(&device, &mesh);
+    let params = ClusterCullGpu::new(world, None, 0, &InstanceSource::None, mesh.clusters.len() as u32, single.vertex_count(), true);
+    let (args, pairs) = cull(&device, &queue, &culling, &mut single, InstanceSource::None, params, &view);
+    assert_eq!(args[4], 1);
+    assert_cut("single", &pairs, 0, &expected(&mesh, world, &view, true));
+}
+
+#[test]
+fn nothing_visible_draws_nothing_and_the_capacity_holds() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let culling = ClusterCulling::new(&device);
+    let view = TestView::looking(glam::Vec3::new(0.0, 0.0, 1.5), glam::Vec3::ZERO, 0.0);
+    let records = buffer(&device, bytemuck::cast_slice(&placement_record(glam::Vec3::ZERO, 1.0, 0.0, glam::Quat::IDENTITY)));
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let counted = |count: u32| buffer(&device, &[0, count, 0, 0, 0, 0, 0, 0]);
+
+    // a full list: only the capacity drawn, the rest counted
+    let one = counted(1);
+    let source = InstanceSource::Culled { records: &records, first_record: 0, capacity: 1, args: &one, count_word: 1 };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 5, gpu.vertex_count(), true);
+    let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+    assert_eq!(args[1], 5, "drawn: the capacity");
+    assert!(args[5] > 5, "claimed: {}", args[5]);
+    assert!(pairs.iter().all(|p| p.0 == 0 && (p.1 as usize) < mesh.clusters.len()));
+
+    // then no instance visible: nothing drawn, nothing left from before
+    let none = counted(0);
+    let source = InstanceSource::Culled { records: &records, first_record: 0, capacity: 1, args: &none, count_word: 1 };
+    let (args, _) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+    assert_eq!((args[1], args[4], args[5], args[6]), (0, 0, 0, 0));
+}
