@@ -236,6 +236,63 @@ impl ClusterCulling {
     }
 }
 
+/// Cluster LOD for a renderable (`Renderable::clusters`). Each frame, the camera draws the cut of
+/// `mesh` its view needs (`Renderer::set_cluster_error_threshold`) instead of the geometry,
+/// through a vertex stage generated around the material's `vertex_main`. The geometry, which
+/// must be the mesh `mesh` was built from, is still what the other views draw (shadow maps,
+/// reflections, velocity, impostor bakes) until they move to clusters too.
+///
+/// The instances are the geometry's one instance buffer (if any), culled by the renderable's
+/// `InstanceCulling` when it has one (without occlusion phases) and placed as `transform` says.
+/// Set it before the renderable is first drawn, or call `Renderer::invalidate_bundle` after.
+pub struct ClusterLod {
+    pub mesh: std::sync::Arc<ClusterMesh>,
+    /// How an instance record places the mesh. None: the instances are drawn where the renderable
+    /// is (or there are none).
+    pub transform: Option<InstanceTransform>,
+    /// Skip clusters whose every triangle faces away (on by default). Turn it off when the
+    /// material turns instances in a way `transform` doesn't describe.
+    pub cone_culling: bool,
+    /// Clusters drawn per frame, at most. By default every cluster of every instance, up to
+    /// 4 194 304. Clusters past it aren't drawn.
+    pub capacity: Option<u32>,
+    pub(crate) gpu: Option<ClusterGpu>,
+}
+
+impl ClusterLod {
+    pub fn new(mesh: impl Into<std::sync::Arc<ClusterMesh>>) -> Self {
+        Self { mesh: mesh.into(), transform: None, cone_culling: true, capacity: None, gpu: None }
+    }
+
+    pub fn with_transform(mut self, transform: InstanceTransform) -> Self {
+        self.transform = Some(transform);
+        self
+    }
+
+    pub fn with_cone_culling(mut self, on: bool) -> Self {
+        self.cone_culling = on;
+        self
+    }
+
+    pub fn with_capacity(mut self, clusters: u32) -> Self {
+        self.capacity = Some(clusters);
+        self
+    }
+
+    /// Ready this frame's cut: the GPU state made once, the cull bound to `source` (records of
+    /// `stride` bytes) with the parameters, and the vertex stage's group 2 (`layout`) over the
+    /// renderer's normal and world matrices. True when what bundles recorded changed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, layout: &wgpu::BindGroupLayout, matrices: (&wgpu::Buffer, &wgpu::Buffer), source: InstanceSource, stride: u32, world: glam::Mat4) -> bool {
+        let gpu = self.gpu.get_or_insert_with(|| ClusterGpu::new(device, &self.mesh));
+        let every = (source.capacity() as u64 * gpu.cluster_count as u64).min(DEFAULT_MAX_DRAWN as u64) as u32;
+        let capacity = self.capacity.unwrap_or(every).max(1);
+        let params = ClusterCullGpu::new(world, self.transform, stride, &source, capacity, gpu.vertex_count, self.cone_culling);
+        let grown = gpu.bind(device, queue, culling, source, params);
+        gpu.bind_draw(device, layout, matrices.0, matrices.1) || grown
+    }
+}
+
 /// A renderable's cluster mesh on the GPU, and a view's cut of it. It holds the packed mesh,
 /// the parameters, the draw list and its indirect draw, and the cull's indirect dispatch.
 pub(crate) struct ClusterGpu {
@@ -251,7 +308,13 @@ pub(crate) struct ClusterGpu {
     /// bound in place of a missing instance buffer or count
     empty: wgpu::Buffer,
     bound: Option<Bound>,
+    /// the vertex stage's group 2, and the buffers it was made with
+    draw: Option<(DrawKey, wgpu::BindGroup)>,
 }
+
+/// The buffers the vertex stage's group 2 holds: the normal and world matrices, the draw list and
+/// the records.
+type DrawKey = (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, Option<wgpu::Buffer>);
 
 /// The cull's bind groups, and the instance buffers they were made with.
 struct Bound {
@@ -278,6 +341,7 @@ impl ClusterGpu {
             dispatch: buffer("Clusters/Dispatch", 16, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE),
             empty: buffer("Clusters/Empty", 32, wgpu::BufferUsages::STORAGE),
             bound: None,
+            draw: None,
         }
     }
 
@@ -316,27 +380,51 @@ impl ClusterGpu {
         grown
     }
 
+    /// The vertex stage's group 2 (`SharedLayouts::cluster_mesh_bgl`): the renderer's normal and
+    /// world matrices, the mesh, the draw list and the bound records. Remade when any of them
+    /// changed; true then (bundles recorded the old one).
+    pub(crate) fn bind_draw(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, normal: &wgpu::Buffer, world: &wgpu::Buffer) -> bool {
+        let key = (normal.clone(), world.clone(), self.draws.clone(), self.bound.as_ref().and_then(|b| b.records.clone()));
+        if self.draw.as_ref().is_some_and(|(k, _)| *k == key) {
+            return false;
+        }
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Clusters/Draw"),
+            layout,
+            entries: &[matrix(0, normal, 64), matrix(1, world, 128), entry(2, &self.mesh), entry(3, &self.draws), entry(4, key.3.as_ref().unwrap_or(&self.empty))],
+        });
+        self.draw = Some((key, group));
+        true
+    }
+
+    pub(crate) fn draw_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.draw.as_ref().map(|(_, group)| group)
+    }
+
     /// The indirect draw (`DRAW_ARGS_BYTES`, see `DRAW_ARGS_BYTES` for its words).
     pub(crate) fn args(&self) -> &wgpu::Buffer {
         &self.args
     }
 
     /// The draw list: (record, cluster) per drawn cluster.
+    #[cfg(test)]
     pub(crate) fn draws(&self) -> &wgpu::Buffer {
         &self.draws
     }
 
     /// Vertices a cluster is drawn as.
+    #[cfg(test)]
     pub(crate) fn vertex_count(&self) -> u32 {
         self.vertex_count
-    }
-
-    pub(crate) fn cluster_count(&self) -> u32 {
-        self.cluster_count
     }
 }
 
 /// A bind group entry for the whole of `buffer`.
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
+}
+
+/// A bind group entry for a mesh matrix: `size` bytes of `buffer` at a dynamic offset.
+fn matrix(binding: u32, buffer: &wgpu::Buffer, size: u64) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: 0, size: std::num::NonZeroU64::new(size) }) }
 }

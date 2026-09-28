@@ -422,3 +422,213 @@ fn inputs_the_cluster_path_cannot_feed_are_errors() {
     assert!(error("@vertex fn vertex_main(@location(3) q: vec4<u32>) -> @builtin(position) vec4<f32> { return vec4<f32>(q); }", Some(&floats)).contains("location(3)"));
     assert!(error("@fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }", None).contains("vertex_main"));
 }
+
+use crate::buffers::{BufferType, ComputeBuffer, InstanceAttribute, VertexFormat};
+use crate::cameras::Camera;
+use crate::culling::InstanceCulling;
+use crate::geometries::InstancedGeometry;
+use crate::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use crate::objects::{Renderable, Scene, SceneNode};
+use crate::renderers::{GBuffer, Renderer, RendererConfig};
+
+/// Rocks placed by records of position + scale, then yaw (8 floats), coloured by their normals
+/// in every GBuffer target.
+const ROCKS_WGSL: &str = r#"
+struct Tint { color: vec4<f32> };
+@group(0) @binding(0) var<uniform> tint: Tint;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(3) place: vec4<f32>, @location(4) yaw: f32 };
+struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32> };
+struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
+fn turn(v: vec3<f32>, a: f32) -> vec3<f32> {
+    return vec3<f32>(cos(a) * v.x + sin(a) * v.z, v.y, -sin(a) * v.x + cos(a) * v.z);
+}
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    var out: VOut;
+    let local = turn(v.position.xyz * v.place.w, v.yaw) + v.place.xyz;
+    out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(local, 1.0);
+    out.normal = (world_matrix * vec4<f32>(turn(v.normal, v.yaw), 0.0)).xyz;
+    return out;
+}
+@fragment
+fn fragment_main(in: VOut) -> FOut {
+    let n = vec4<f32>(normalize(in.normal) * 0.5 + 0.5, 1.0) * tint.color;
+    return FOut(n, vec4<f32>(0.0), n, n);
+}
+"#;
+
+const SIZE: u32 = 192;
+
+fn headless() -> Option<Renderer> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+    let mut renderer = Renderer::new(RendererConfig { width: SIZE, height: SIZE, clear_color: crate::math::Vec4::new(0.0, 0.0, 0.0, 0.0), ..Default::default() });
+    pollster::block_on(renderer.initialize_headless(&adapter));
+    Some(renderer)
+}
+
+/// A scene of rocks at `placements` (x, y, z, scale, yaw), culled per instance (the first
+/// `visible` records counted), with cluster LOD or without, and a camera looking at them.
+fn rocks(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: bool) -> (Scene, Camera, usize) {
+    use wgpu::util::DeviceExt;
+    let data: Vec<f32> = placements.iter().flat_map(|p| [p[0], p[1], p[2], p[3], p[4], 0.0, 0.0, 0.0]).collect();
+    let source = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE });
+    let instances = ComputeBuffer::from_external("Rocks", source.clone(), BufferType::Storage).with_vertex_layout(
+        32,
+        vec![InstanceAttribute { shader_location: 3, offset: 0, format: VertexFormat::Float32x4 }, InstanceAttribute { shader_location: 4, offset: 16, format: VertexFormat::Float32 }],
+    );
+    let mut material = Material::new("Rocks", ROCKS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
+    material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    let mut r = Renderable::new(InstancedGeometry::new(rock(4, false), visible, vec![instances]), material);
+    r.instance_culling = Some(InstanceCulling::new(source, visible, 32, 0, 1.2).with_radius_scale(12));
+    if clusters {
+        let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+        r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: None }));
+    }
+    let mut scene = Scene::new();
+    let index = scene.add(SceneNode::Renderable(r));
+    let mut camera = Camera::new(50.0, 0.1, 200.0, 1.0);
+    camera.set_position(0.5, 1.5, 6.0);
+    camera.look_at(&crate::math::Vec3::new(0.0, 0.0, -1.5));
+    camera.update_projection_matrix();
+    (scene, camera, index)
+}
+
+/// A half float's value.
+fn half(bits: u16) -> f32 {
+    let (sign, exponent, mantissa) = ((bits >> 15) as u32, ((bits >> 10) & 0x1f) as i32, (bits & 0x3ff) as f32);
+    let magnitude = match exponent {
+        0 => mantissa * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        e => (1.0 + mantissa / 1024.0) * 2f32.powi(e - 15),
+    };
+    if sign == 1 { -magnitude } else { magnitude }
+}
+
+/// Draw the scene into a GBuffer and read its colour target back (rgba16float; the test
+/// material writes its normal-coded colour there, as into the albedo).
+fn draw(renderer: &mut Renderer, scene: &mut Scene, camera: &mut Camera) -> Vec<[f32; 4]> {
+    let gbuffer = GBuffer::new(renderer.device(), SIZE, SIZE, 1);
+    renderer.render_scene_to_gbuffer(scene, camera, &gbuffer);
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let row = (SIZE * 8).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * SIZE) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        gbuffer.color_texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+    );
+    queue.submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let bytes = buffer.slice(..).get_mapped_range();
+    (0..SIZE * SIZE)
+        .map(|i| {
+            let at = ((i / SIZE) * row + (i % SIZE) * 8) as usize;
+            [0, 1, 2, 3].map(|c| half(u16::from_le_bytes([bytes[at + 2 * c], bytes[at + 2 * c + 1]])))
+        })
+        .collect()
+}
+
+/// (texels covered, texels differing by more than 1/255 in a channel).
+fn compare(a: &[[f32; 4]], b: &[[f32; 4]]) -> (usize, usize) {
+    let covered = a.iter().filter(|t| t[3] > 0.5).count();
+    let differing = a.iter().zip(b).filter(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| (p - q).abs() > 1.0 / 255.0)).count();
+    (covered, differing)
+}
+
+/// The cluster draw's words, read back.
+fn cluster_args(renderer: &Renderer, scene: &Scene, index: usize) -> Vec<u32> {
+    let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().expect("still on the cluster path").gpu.as_ref().unwrap();
+    read_words(renderer.device(), renderer.queue(), gpu.args())
+}
+
+const PLACEMENTS: [[f32; 5]; 4] = [[0.0, 0.0, 0.0, 1.0, 0.0], [2.6, 0.3, -1.5, 0.8, 1.1], [-2.4, -0.2, -2.0, 1.2, -0.6], [0.5, 1.8, -4.0, 1.5, 2.2]];
+
+#[test]
+fn at_zero_error_the_clusters_draw_what_the_mesh_does() {
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    renderer.set_cluster_error_threshold(0.0);
+    let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, false);
+    let mesh = draw(&mut renderer, &mut scene, &mut camera);
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, true);
+    let clusters = draw(&mut renderer, &mut scene, &mut camera);
+    let args = cluster_args(&renderer, &scene, index);
+    assert!(args[1] > 0 && args[4] == 4, "clusters drawn: {args:?}");
+    let (covered, differing) = compare(&mesh, &clusters);
+    assert!(covered > (SIZE * SIZE / 10) as usize, "the rocks cover {covered} texels");
+    assert!(differing * 200 < covered, "{differing} of {covered} texels differ");
+}
+
+#[test]
+fn a_pixel_of_error_draws_far_fewer_triangles_and_nearly_the_same_image() {
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let far: Vec<[f32; 5]> = (0..12).map(|k| [(k % 4) as f32 * 3.0 - 4.5, 0.0, -10.0 - (k / 4) as f32 * 6.0, 1.3, k as f32]).collect();
+    let mut runs = Vec::new();
+    for threshold in [0.0, 1.0] {
+        renderer.set_cluster_error_threshold(threshold);
+        let (mut scene, mut camera, index) = rocks(&renderer, &far, far.len() as u32, true);
+        let image = draw(&mut renderer, &mut scene, &mut camera);
+        runs.push((image, cluster_args(&renderer, &scene, index)[6]));
+    }
+    assert!(runs[1].1 * 3 < runs[0].1, "triangles at 0 and 1 px: {} and {}", runs[0].1, runs[1].1);
+    // the same silhouettes to a pixel, and the shading of coarser triangles' interpolated normals
+    let covered = |t: &[f32; 4]| t[3] > 0.5;
+    let both: Vec<f32> = runs[0].0.iter().zip(&runs[1].0).filter(|(a, b)| covered(a) && covered(b)).map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f32::max)).collect();
+    let silhouette = runs[0].0.iter().zip(&runs[1].0).filter(|(a, b)| covered(a) != covered(b)).count();
+    let mean = both.iter().sum::<f32>() / both.len().max(1) as f32;
+    assert!(both.len() > 500 && silhouette * 25 < both.len(), "{silhouette} silhouette texels differ, of {}", both.len());
+    assert!(mean < 0.02, "shading differs by {mean} on average");
+}
+
+#[test]
+fn grown_instances_rebind_the_clusters() {
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    renderer.set_cluster_error_threshold(0.0);
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 2, true);
+    draw(&mut renderer, &mut scene, &mut camera);
+    // the other two records join: instance culling remakes its buffers, the clusters rebind
+    let r = scene.get_renderable_mut(index).unwrap();
+    r.instance_culling.as_mut().unwrap().count = 4;
+    r.geometry.instance_count = 4;
+    let clusters = draw(&mut renderer, &mut scene, &mut camera);
+    assert_eq!(cluster_args(&renderer, &scene, index)[4], 4);
+    let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, false);
+    let mesh = draw(&mut renderer, &mut scene, &mut camera);
+    let (covered, differing) = compare(&mesh, &clusters);
+    assert!(differing * 200 < covered, "{differing} of {covered} texels differ");
+}
+
+#[test]
+fn a_material_the_cluster_path_cannot_feed_keeps_the_mesh() {
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, true);
+    // reads the instance index: no cluster stage, drawn as before
+    let r = scene.get_renderable_mut(index).unwrap();
+    r.material = Material::new(
+        "Rocks",
+        &ROCKS_WGSL.replace("@location(4) yaw: f32", "@location(4) yaw: f32, @builtin(instance_index) instance: u32"),
+        vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
+        MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
+    );
+    r.material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    let image = draw(&mut renderer, &mut scene, &mut camera);
+    assert!(scene.get_renderable(index).unwrap().clusters.is_none(), "cluster LOD dropped");
+    assert!(image.iter().filter(|t| t[3] > 0.5).count() > (SIZE * SIZE / 10) as usize, "still drawn");
+}
