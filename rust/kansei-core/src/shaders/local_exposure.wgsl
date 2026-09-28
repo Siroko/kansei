@@ -6,7 +6,7 @@
 //                  texels' log2 luminance and their count, split between the two nearest bins;
 //                  both divided by the cell's texel count;
 //   logLuminance:  log2 of the luminance of the picture at 1/32 of its size (each texel the mean
-//                  colour of 32 x 32 pixels);
+//                  colour of 32 x 32 pixels, a workgroup's sum);
 //   blurX, blurY:  that blurred by Unreal's Gaussian, exp(-16.7 (x/r)^2), mirrored at the edges.
 // Luminance is the mean of r, g and b (r.AutoExposure.LuminanceMethod 0), floored.
 
@@ -63,21 +63,31 @@ fn grid(@builtin(workgroup_id) cell : vec3u, @builtin(local_invocation_id) lid :
     }
 }
 
+var<workgroup> partial : array<vec4f, 64>;
+
+// A workgroup per texel: each invocation 2 x 2 bilinear taps (of 2 x 2 pixels), then their sum
 @compute @workgroup_size(8, 8)
-fn logLuminance(@builtin(global_invocation_id) gid : vec3u) {
-    let dims = textureDimensions(logOut);
-    if (any(gid.xy >= dims)) { return; }
+fn logLuminance(@builtin(workgroup_id) texel : vec3u, @builtin(local_invocation_id) lid : vec3u, @builtin(local_invocation_index) li : u32) {
     let size = vec2u(p.width, p.height);
-    // the mean colour of this texel's 32 x 32 pixels: 16 x 16 bilinear taps of 2 x 2
-    var sum = vec3f(0.0);
-    var n = 0.0;
-    for (var k = 0u; k < 256u; k++) {
-        let px = gid.xy * 32u + vec2u(k & 15u, k >> 4u) * 2u;
-        if (any(px >= size)) { continue; }
-        sum += textureSampleLevel(inputTex, linearSampler, (vec2f(px) + 1.0) / vec2f(size), 0.0).rgb;
-        n += 1.0;
+    var sum = vec4f(0.0);
+    for (var k = 0u; k < 4u; k++) {
+        let px = texel.xy * 32u + (lid.xy * 2u + vec2u(k & 1u, k >> 1u)) * 2u;
+        if (all(px < size)) {
+            sum += vec4f(textureSampleLevel(inputTex, linearSampler, (vec2f(px) + 1.0) / vec2f(size), 0.0).rgb, 1.0);
+        }
     }
-    textureStore(logOut, gid.xy, vec4f(sceneLogLuminance(sum / max(n, 1.0)), 0.0, 0.0, 1.0));
+    partial[li] = sum;
+    workgroupBarrier();
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+        if (li < stride) {
+            partial[li] += partial[li + stride];
+        }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        let total = partial[0];
+        textureStore(logOut, texel.xy, vec4f(sceneLogLuminance(total.rgb / max(total.a, 1.0)), 0.0, 0.0, 1.0));
+    }
 }
 
 // Mirrored addressing, as Unreal's AM_Mirror: -1 is 0, size is size - 1.
