@@ -1613,11 +1613,11 @@ impl Renderer {
     /// for every layer of the spot shadow atlas (`None` when no light uses it this frame), then
     /// `reflection_view(r)` for every planar reflection, then `cascade_view(c)` for every cascade.
     fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
-        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, lod_distance_scale: 1.0 })];
+        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, layer_mask: None, lod_distance_scale: 1.0 })];
         if let Some(atlas) = &self.spot_shadow_atlas {
             views.resize(1 + atlas.layers as usize, None);
             for slot in &self.spot_lights.shadows {
-                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, lod_distance_scale: 1.0 });
+                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, layer_mask: None, lod_distance_scale: 1.0 });
             }
         }
         // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
@@ -1625,12 +1625,13 @@ impl Renderer {
             r.is_active().then(|| crate::culling::CullView {
                 view_proj: r.cull_view_proj(),
                 casters_only: false,
+                layer_mask: Some(r.layer_mask),
                 lod_distance_scale: r.lod_distance_scale,
             })
         }));
         // then the cascades (`cascade_view`)
         if let Some(csm) = &self.cascaded_shadows {
-            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, lod_distance_scale: 1.0 })));
+            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, layer_mask: None, lod_distance_scale: 1.0 })));
         }
         // then the sky occlusion's top-down view (`sky_occlusion_view`), while it is being rebuilt
         if let Some(sky) = &self.sky_occlusion {
@@ -1657,8 +1658,8 @@ impl Renderer {
         kinds
     }
 
-    /// Cull every renderable with `instance_culling` for every view (after the frame's uploads,
-    /// before its shadow and main passes). With `depth_size` (the GBuffer's, when the frame can
+    /// Cull every visible renderable with `instance_culling` for every view that draws it (after
+    /// the frame's uploads, before its shadow and main passes). With `depth_size` (the GBuffer's, when the frame can
     /// build a depth pyramid), renderables with `occlusion` get the camera's first phase here and
     /// their second in `run_late_culling`.
     fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera, depth_size: Option<(u32, u32)>) {
@@ -1667,7 +1668,7 @@ impl Renderer {
         self.two_phase.clear();
         let culled: Vec<usize> = scene
             .ordered_indices()
-            .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.instance_culling.is_some() && r.geometry.initialized))
+            .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && r.instance_culling.is_some() && r.geometry.initialized))
             .collect();
         if culled.is_empty() {
             return;
@@ -1696,10 +1697,10 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
         for &idx in &culled {
             let r = scene.get_renderable_mut(idx).unwrap();
-            let (visible, world, index_count, casts_shadow) = (r.visible, r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow);
+            let (world, index_count, casts_shadow, layers) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers);
             let culling = r.instance_culling.as_mut().unwrap();
             stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
-            let two_phase = occlusion.is_some() && culling.occlusion && visible;
+            let two_phase = occlusion.is_some() && culling.occlusion;
             if two_phase {
                 stale_bundles |= culling.ensure_occlusion(device, pipeline);
             }
@@ -1710,7 +1711,7 @@ impl Renderer {
                 }
                 self.two_phase.push(idx);
             }
-            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow);
+            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow, layers);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/InstanceCulling").as_ref().map(crate::profiling::PassStamp::compute) });
@@ -1723,7 +1724,7 @@ impl Renderer {
                 culling.dispatch(&mut pass);
                 for (slot, view) in views.iter().enumerate() {
                     let Some(view) = view else { continue };
-                    if view.casters_only && !r.cast_shadow || slot == MAIN_VIEW && culling.two_phase() {
+                    if !view.draws(r.cast_shadow, r.layers) || slot == MAIN_VIEW && culling.two_phase() {
                         continue;
                     }
                     let draw = culling.view(slot).unwrap();

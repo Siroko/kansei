@@ -44,7 +44,7 @@ impl Occlusion {
     /// The camera's view, or while frozen the one it had when frozen.
     pub fn main_view(&mut self, camera: &Camera) -> MainView {
         let live = MainView {
-            cull: CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, lod_distance_scale: 1.0 },
+            cull: CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, layer_mask: None, lod_distance_scale: 1.0 },
             lod_origin: camera.inverse_view_matrix.to_glam().w_axis.truncate(),
             view: camera.view_matrix.to_glam(),
             proj: camera.jittered_projection().to_glam(),
