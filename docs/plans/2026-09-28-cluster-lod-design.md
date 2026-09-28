@@ -84,6 +84,14 @@ A cluster renderable keeps `InstanceCulling` for its instances (non-instanced re
 
 Instances need a transform the cull shader can read, to move cluster spheres and cones. `InstanceCulling` gains an `InstanceTransform` description of the record: position offset, optional uniform-scale field, optional yaw field (radians, about +y), optional quaternion. That covers the film's `X, Y, Z, height, bearing, …` records and the usual layouts. A missing rotation disables cone culling for that renderable, which stays correct.
 
+**As built (M2).** The camera's pass only; the other views follow in M3.
+- **No prefix sum.** Each visible instance is one workgroup. It walks only the levels its cut can reach and strides over their clusters. `LevelBounds::may_draw` decides this conservatively from the instance's distance, the level's smallest error and largest parent error, and how far its spheres reach from the mesh's origin.
+- **One indirect dispatch per renderable.** A one-thread `prepare` pass sizes it from the visible-instance count.
+- **One buffer for the mesh.** Vertices, cluster vertices, triangles, and cluster and level records share one storage buffer.
+- **Backface culling is a switch** (`ClusterLod::cone_culling`, on by default), skipped for mirroring transforms.
+- **The draw list has a capacity.** Clusters past it are counted and not drawn.
+- **`CullStats`** comes with M3; the draw's arguments already count the triangles drawn.
+
 ## 3. Drawing: vertex pulling around the material's own `vertex_main`
 
 Materials stay as they are. For a cluster renderable the engine generates the vertex stage from the material's WGSL:
@@ -118,7 +126,11 @@ Per-instance occlusion didn't pay in the film (#37): a tree is rarely wholly hid
 
 ## Risks
 
-- **Vertex pulling cost.** Fetching from storage instead of the vertex-input hardware, plus the padding, costs more per vertex. It pays only where selection removes more than it adds. Milestone 2 measures this A/B on a dense mesh field before anything builds on it.
+- **Vertex pulling cost.** Fetching from storage instead of the vertex-input hardware, plus the padding, costs more per vertex. It pays only where selection removes more than it adds. Measured in M2 (example `cluster-lod`, in-page A/B, 1280 x 720, rocks of 81,920 triangles at a 1-pixel budget):
+  - Against the full mesh, clusters are 4.5x faster at 4,096 rocks (2.47 vs 11.08 ms a frame) and 3x at 576.
+  - Against four discrete LODs cut from the same graph at the same budget, they are about 15% slower (1.14-1.24 vs 1.01-1.04 ms a frame).
+  - The cull costs 0.09 ms at 4,096 rocks. The rest is the draw: a non-indexed draw shades 3 vertices a triangle, where an indexed mesh reuses about 0.6, and every cluster is drawn as 124 triangles.
+  - Small rocks are discrete LODs' best case: a whole rock is near or far. A compacted index buffer, with the cull writing each drawn cluster's triangles for one indexed indirect draw, would recover vertex reuse and drop the padding.
 - **Rewriting material WGSL.** It's a text transformation over two known forms. It's covered by naga validation of every material in the repository, and it fails loudly (the renderable keeps the ordinary path) rather than drawing wrong.
 - **Build time in wasm.** Natively, 327,680 triangles build into 5,513 clusters in 0.53 s (release, `clusters::tests::build_time`). The film builds ~30 tree meshes of 1-3K triangles, which is milliseconds even at wasm's speed. A mesh of millions of triangles would take seconds, which is the case for an offline build (the same code, run natively, serialised).
 - **Foliage quality.** Stochastic pruning is proven for foliage, but the film's crowns are ribbons, not free cards. Milestone 4 compares stills against today's LODs before the film adopts it.

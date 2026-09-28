@@ -23,6 +23,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Shadow, reflection and velocity passes redraw each material through its own `vertex_main`, with the light or mirror as the camera (see `Material::get_depth_pipeline`). Vertex shaders must not read group 3. Mark `@builtin(position) @invariant` where a second pass depth-tests against the GBuffer.
 - Group 3 (shadows and lights) only grows by additive bindings; `renderers/shared_layouts.rs` lists them.
 - Instances culled on the CPU for the camera also drop out of shadow maps and reflections. Use `culling::InstanceCulling`, which culls per view on the GPU.
+- Cluster LOD (`Renderable::clusters`) draws only the camera's pass until M3: other views draw the renderable's geometry, which must be the mesh its graph was built from.
 
 ## Maintaining this file
 
