@@ -186,6 +186,6 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         totalScatter += density * spotInScatter(worldPos, viewDir, max(sliceThickness, 0.25));
     }
 
-    totalScatter = (totalScatter + density * skyAmbient(viewDir)) * media.albedo;
+    totalScatter = (totalScatter + density * skyAmbient(viewDir, worldPos)) * media.albedo;
     textureStore(scatterExtTex, gid, vec4f(totalScatter, extinction));
 }
