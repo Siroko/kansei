@@ -65,6 +65,12 @@ const KIND_MATRIX: u32 = 2;
 const FLAG_CONE: u32 = 1;
 /// Entries of a draw list by default, at most (32 MB).
 pub(crate) const DEFAULT_MAX_DRAWN: u32 = 1 << 22;
+/// Entries a draw list starts with, until the cull says what its cut needs (512 KB).
+pub(crate) const INITIAL_DRAWN: u32 = 1 << 16;
+/// Entries a draw list keeps at least (8 KB).
+pub(crate) const MIN_DRAWN: u32 = 1 << 10;
+/// Readbacks in a row a cut must need at most a quarter of its list before the list shrinks.
+pub(crate) const SHRINK_AFTER: u32 = 64;
 /// Bytes of a cluster draw: `DrawIndirect`'s four words, then the visible instances, the
 /// clusters claimed (drawn up to the capacity), the triangles drawn, and a pad.
 pub(crate) const DRAW_ARGS_BYTES: u64 = 32;
@@ -203,6 +209,7 @@ pub(crate) struct ClusterCulling {
     finish: wgpu::ComputePipeline,
     view: wgpu::Buffer,
     view_bind_group: wgpu::BindGroup,
+    feedback: Feedback,
 }
 
 impl ClusterCulling {
@@ -221,7 +228,7 @@ impl ClusterCulling {
         };
         let view = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ClusterCulling/Views"), size: (MAX_VIEWS * std::mem::size_of::<ClusterViewGpu>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let view_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("ClusterCulling/View"), layout: &view_bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: view.as_entire_binding() }] });
-        Self { prepare: pipeline("prepare", &[&prepare_bgl]), cull: pipeline("cull", &[&cull_bgl, &view_bgl]), finish: pipeline("finish", &[&prepare_bgl]), cull_bgl, prepare_bgl, view, view_bind_group }
+        Self { prepare: pipeline("prepare", &[&prepare_bgl]), cull: pipeline("cull", &[&cull_bgl, &view_bgl]), finish: pipeline("finish", &[&prepare_bgl]), cull_bgl, prepare_bgl, view, view_bind_group, feedback: Feedback::default() }
     }
 
     /// The frame's views, by index (`ClusterGpu::bind`'s `view`), in one write: a write per view
@@ -229,6 +236,18 @@ impl ClusterCulling {
     pub(crate) fn set_views(&self, queue: &wgpu::Queue, views: &[ClusterViewGpu]) {
         assert!(views.len() <= MAX_VIEWS, "{} cluster views, at most {MAX_VIEWS}", views.len());
         queue.write_buffer(&self.view, 0, bytemuck::cast_slice(views));
+    }
+
+    /// Start a frame's cull: collect the counts a finished readback holds (each read once, by
+    /// the next `ClusterGpu::bind` of its cut).
+    pub(crate) fn begin_frame(&mut self, device: &wgpu::Device) {
+        self.feedback.begin_frame(device);
+    }
+
+    /// After the frame's cuts `(clusters, view)` are submitted: read back how many clusters each
+    /// claimed (drawn or not), unless a readback is still in flight.
+    pub(crate) fn read_back(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cuts: &[(&ClusterGpu, u32)]) {
+        self.feedback.read_back(device, queue, cuts);
     }
 
     /// Run the cuts `(clusters, view)` (each bound with `ClusterGpu::bind`) in one compute pass:
@@ -280,9 +299,12 @@ pub struct ClusterLod {
     /// back faces and isn't transparent. Turn it off when the material turns instances in a way
     /// `transform` doesn't describe.
     pub cone_culling: bool,
-    /// Clusters drawn per frame in each view, at most (each view's cut has a draw list this
-    /// long: 8 bytes an entry). By default every cluster of every instance, up to 4 194 304.
-    /// Clusters past it aren't drawn.
+    /// Clusters drawn per frame in each view, at most. By default every cluster of every
+    /// instance, up to 4 194 304. Each view's cut keeps a draw list (8 bytes an entry) sized to
+    /// what it needs, as the cull reads back: 65 536 entries at first, then half again its need,
+    /// growing at once and shrinking only after 64 readbacks at a quarter or less. A cut that
+    /// suddenly needs more than its list holds (at load, or past half again its recent need)
+    /// leaves the clusters past it undrawn until the readback lands, 2-3 frames later.
     pub capacity: Option<u32>,
     /// How much further than `transform` the material may stretch or sway an instance about its
     /// origin (1 by default): no point moves more than `stretch - 1` times its distance from the
@@ -336,6 +358,8 @@ impl ClusterLod {
 
 /// A renderable's cluster mesh on the GPU, and its cuts: one per view that draws it.
 pub(crate) struct ClusterGpu {
+    /// Names its cuts' readbacks (`Feedback`), whatever the scene does with the renderable.
+    id: u64,
     mesh: wgpu::Buffer,
     vertex_count: u32,
     cluster_count: u32,
@@ -351,7 +375,10 @@ pub(crate) struct Cut {
     params: wgpu::Buffer,
     written: Option<ClusterCullGpu>,
     draws: wgpu::Buffer,
+    /// `draws`' length in entries (0 before the first bind)
     capacity: u32,
+    /// readbacks in a row that needed at most a quarter of `capacity`
+    low: u32,
     args: wgpu::Buffer,
     dispatch: wgpu::Buffer,
     bound: Option<Bound>,
@@ -379,12 +406,40 @@ impl Cut {
             written: None,
             draws: buffer("Clusters/Draws", 8, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             capacity: 0,
-            // (COPY_SRC: read back by the stats and the tests)
+            low: 0,
+            // (COPY_SRC: read back by the stats, the feedback and the tests)
             args: buffer("Clusters/Args", DRAW_ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             dispatch: buffer("Clusters/Dispatch", 16, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE),
             bound: None,
             draw: None,
         }
+    }
+
+    /// The draw list's length for a cut that may draw `max` clusters, given what the cull last
+    /// read back it `needed` (if a reading arrived): `INITIAL_DRAWN` at first; then half again
+    /// the need, to a power of two, at once when that is longer; and that when it has been at
+    /// most a quarter of the length for `SHRINK_AFTER` readings in a row. Never past `max`.
+    fn sized(&mut self, max: u32, needed: Option<u32>) -> u32 {
+        if self.capacity == 0 {
+            return INITIAL_DRAWN.min(max);
+        }
+        let mut capacity = self.capacity.min(max);
+        if let Some(needed) = needed {
+            let target = (needed as u64 * 3 / 2).max(1).next_power_of_two().min(max as u64).max(MIN_DRAWN.min(max) as u64) as u32;
+            if target > capacity {
+                capacity = target;
+                self.low = 0;
+            } else if target as u64 * 4 <= capacity as u64 {
+                self.low += 1;
+                if self.low >= SHRINK_AFTER {
+                    capacity = target;
+                    self.low = 0;
+                }
+            } else {
+                self.low = 0;
+            }
+        }
+        capacity
     }
 
     /// The indirect draw (`DRAW_ARGS_BYTES`, see `DRAW_ARGS_BYTES` for its words).
@@ -401,7 +456,9 @@ impl Cut {
 impl ClusterGpu {
     pub(crate) fn new(device: &wgpu::Device, mesh: &ClusterMesh) -> Self {
         use wgpu::util::DeviceExt;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             mesh: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Clusters/Mesh"), contents: bytemuck::cast_slice(&mesh.gpu_words()), usage: wgpu::BufferUsages::STORAGE }),
             vertex_count: 3 * mesh.max_triangles(),
             cluster_count: mesh.clusters.len() as u32,
@@ -415,9 +472,10 @@ impl ClusterGpu {
         self.cuts.get(view as usize)?.as_ref()
     }
 
-    /// Bind view `view`'s cut to `source`, with a draw list of at least `params.capacity` entries
-    /// (it grows, never shrinks), and write the parameters if they changed. True when the draw
-    /// list was remade: draws recorded with the old one are stale.
+    /// Bind view `view`'s cut to `source`, with a draw list of at most `params.capacity` entries
+    /// sized to what the cut needs (`Cut::sized`, from `culling`'s readbacks), and write the
+    /// parameters if they changed. True when the draw list was remade: draws recorded with the
+    /// old one are stale.
     pub(crate) fn bind(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, view: u32, source: InstanceSource, mut params: ClusterCullGpu) -> bool {
         params.view = view;
         if self.cuts.len() <= view as usize {
@@ -425,7 +483,8 @@ impl ClusterGpu {
         }
         let (mesh, empty) = (&self.mesh, &self.empty);
         let cut = self.cuts[view as usize].get_or_insert_with(|| Cut::new(device));
-        let grown = params.capacity > cut.capacity;
+        params.capacity = cut.sized(params.capacity.max(1), culling.feedback.needed(self.id, view));
+        let grown = params.capacity != cut.capacity;
         if grown {
             cut.capacity = params.capacity;
             cut.draws = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Draws"), size: cut.capacity as u64 * 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
@@ -487,10 +546,85 @@ impl ClusterGpu {
         &self.cut(view).expect("the cut is bound").draws
     }
 
+    /// View `view`'s draw list's length, in entries.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self, view: u32) -> u32 {
+        self.cut(view).expect("the cut is bound").capacity
+    }
+
     /// Vertices a cluster is drawn as.
     #[cfg(test)]
     pub(crate) fn vertex_count(&self) -> u32 {
         self.vertex_count
+    }
+}
+
+/// The cull's counts read back: how many clusters each cut claimed, drawn or not (word 5 of its
+/// draw), copied into one buffer a frame while none is in flight and read when mapped, a few
+/// frames later, so the frame never waits.
+#[derive(Default)]
+struct Feedback {
+    staging: Option<wgpu::Buffer>,
+    /// the cuts (`ClusterGpu` id, view) of the copy in flight, and its state
+    pending: Option<(Vec<(u64, u32)>, std::sync::Arc<std::sync::atomic::AtomicU8>)>,
+    /// the last readback's counts, until the next frame's
+    needed: std::collections::HashMap<(u64, u32), u32>,
+}
+
+const MAPPING: u8 = 0;
+const MAPPED: u8 = 1;
+const FAILED: u8 = 2;
+
+impl Feedback {
+    fn needed(&self, id: u64, view: u32) -> Option<u32> {
+        self.needed.get(&(id, view)).copied()
+    }
+
+    fn begin_frame(&mut self, device: &wgpu::Device) {
+        use std::sync::atomic::Ordering;
+        self.needed.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.pending.is_some() {
+            device.poll(wgpu::Maintain::Poll);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = device;
+        let Some((cuts, state)) = self.pending.take_if(|(_, s)| s.load(Ordering::Acquire) != MAPPING) else { return };
+        if state.load(Ordering::Acquire) == FAILED {
+            return;
+        }
+        let staging = self.staging.as_ref().unwrap();
+        {
+            let bytes = staging.slice(..).get_mapped_range();
+            let words: &[u32] = bytemuck::cast_slice(&bytes);
+            self.needed.extend(cuts.into_iter().zip(words.iter().copied()));
+        }
+        staging.unmap();
+    }
+
+    fn read_back(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cuts: &[(&ClusterGpu, u32)]) {
+        if self.pending.is_some() {
+            return;
+        }
+        let read: Vec<(&Cut, (u64, u32))> = cuts.iter().filter_map(|&(c, view)| Some((c.cut(view)?, (c.id, view)))).collect();
+        if read.is_empty() {
+            return;
+        }
+        let size = read.len() as u64 * 4;
+        if self.staging.as_ref().is_none_or(|s| s.size() < size) {
+            self.staging = Some(device.create_buffer(&wgpu::BufferDescriptor { label: Some("ClusterCulling/Feedback"), size: size.next_power_of_two().max(16), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+        }
+        let staging = self.staging.as_ref().unwrap();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ClusterCulling/Feedback") });
+        for (k, (cut, _)) in read.iter().enumerate() {
+            // (word 5: the clusters claimed)
+            encoder.copy_buffer_to_buffer(&cut.args, 20, staging, k as u64 * 4, 4);
+        }
+        queue.submit(Some(encoder.finish()));
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(MAPPING));
+        let done = state.clone();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| done.store(if result.is_ok() { MAPPED } else { FAILED }, std::sync::atomic::Ordering::Release));
+        self.pending = Some((read.into_iter().map(|(_, key)| key).collect(), state));
     }
 }
 
