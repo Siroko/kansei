@@ -113,7 +113,7 @@ fn rock(subdivisions: u32) -> Geometry {
 /// The cut of `mesh` seen from `distance` away at `tau` pixels (`ppr` pixels per radian), as a
 /// mesh: a discrete LOD for a band starting there (for the largest rock, `scale`).
 fn lod_mesh(mesh: &ClusterMesh, distance: f32, scale: f32, ppr: f32, tau: f32) -> Geometry {
-    let view = LodView { eye: glam::Vec3::new(0.0, 0.0, distance / scale), pixels_per_radian: ppr, near: 0.1 / scale, threshold: tau };
+    let view = LodView { eye: glam::Vec3::new(0.0, 0.0, distance / scale), pixels_per_radian: ppr, near: 0.1 / scale, threshold: tau, orthographic: false };
     let indices: Vec<u32> = mesh.select(&view).into_iter().flat_map(|c| mesh.triangles(c).flatten().collect::<Vec<_>>()).collect();
     Geometry::new("Rock/LOD", mesh.vertices.clone(), indices)
 }

@@ -92,6 +92,25 @@ Instances need a transform the cull shader can read, to move cluster spheres and
 - **The draw list has a capacity.** Clusters past it are counted and not drawn.
 - **`CullStats`** comes with M3; the draw's arguments already count the triangles drawn.
 
+**As built (M3).** Every view that draws the scene:
+- **Views.** The camera and its velocity pass, the spot shadow layers, rendered planar reflections, the cascades and the sky occlusion's top-down view.
+- **One cull pass for all of them.** `ClusterCulling` holds an array of up to 64 views, written once a frame. Each per-view write would otherwise leave every cut with the last view, since `queue.write_buffer` lands before the frame's work.
+- **A cut per view.** Each renderable keeps a *cut* for every view it is drawn in (by `CullView::draws`: casters in shadow views, the layer mask). A cut is its own parameters (with the view's index), draw list, indirect draw and dispatch. A view that doesn't draw a renderable gets no cut and no buffers. Each view's draw list is `ClusterLod::capacity` long, so memory grows with the views.
+- **Orthographic views.** The cascades and the sky's view see an error at their pixels per metre, whatever the distance (`LodView::orthographic`), and skip the backface cone, since they have no eye. Pixels per radian and pixels per metre both come from the view's projection: height / 2 × |P₁₁|.
+- **Per-view budgets.** Each view's budget is the error threshold times its scale:
+  - `Renderer::set_shadow_cluster_error_scale` (spot shadows and cascades);
+  - `PlanarReflection::lod_error_scale`;
+  - `SkyOcclusionOptions::lod_error_scale`.
+
+  All are 1 by default; the camera's is always 1.
+- **Pipelines.**
+  - Shadow and sky passes draw with a cluster *depth* pipeline, `Material::get_cluster_depth_pipeline`.
+  - The velocity pass uses a cluster *velocity* pipeline and draws the camera's cut, as the GBuffer did. Drawing the mesh there would leave holes where the GBuffer drew a coarser cut.
+  - Reflections draw with the camera's cluster pipeline, at one sample. They are single-phase, as on the camera.
+- **Not moved to clusters:**
+  - The impostor bake keeps the full mesh. It is made once, at a small size, and then seen at many sizes, so a cut at the bake's resolution would bake coarse levels into it.
+  - Point-light cubemap shadows are a legacy path outside the cull views.
+
 ## 3. Drawing: vertex pulling around the material's own `vertex_main`
 
 Materials stay as they are. For a cluster renderable the engine generates the vertex stage from the material's WGSL:
@@ -151,7 +170,7 @@ Per-instance occlusion didn't pay in the film (#37): a tree is rarely wholly hid
 
 ## 6. Stats and debugging
 
-- `CullStats` gains clusters and triangles per view.
+- `CullStats` gains clusters and triangles per view. **As built (M3):** `CullStats::clusters` counts the clusters drawn. A clustered renderable's `triangles` are its cuts' (counted by the cull as it lists them), not its instance draw's, which it no longer issues.
 - A debug view colours clusters by id or by graph level.
 - `ClusterMesh` reports its level count, triangles per level, and build time.
 

@@ -73,7 +73,8 @@ impl GBuffer {
         let (normal_texture, normal_view) = mk("GBuffer/Normal", Self::COLOR_FORMAT, tex_usage, 1);
         let (albedo_texture, albedo_view) = mk("GBuffer/Albedo", Self::ALBEDO_FORMAT, tex_usage, 1);
         let (depth_texture, depth_view) = mk("GBuffer/Depth", Self::DEPTH_FORMAT, tex_usage, 1);
-        let (velocity_texture, velocity_view) = mk("GBuffer/Velocity", Self::VELOCITY_FORMAT, tex_usage, 1);
+        // (COPY_SRC: read back by the tests)
+        let (velocity_texture, velocity_view) = mk("GBuffer/Velocity", Self::VELOCITY_FORMAT, tex_usage | wgpu::TextureUsages::COPY_SRC, 1);
         let (output_texture, output_view) = mk("GBuffer/Output", Self::COLOR_FORMAT, storage_usage, 1);
         let (ping_pong_texture, ping_pong_view) = mk("GBuffer/PingPong", Self::COLOR_FORMAT, storage_usage, 1);
 

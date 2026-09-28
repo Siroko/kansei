@@ -141,17 +141,26 @@ struct TestView {
     ppr: f32,
     near: f32,
     threshold: f32,
+    orthographic: bool,
 }
 
 impl TestView {
     fn looking(eye: glam::Vec3, target: glam::Vec3, threshold: f32) -> Self {
         let fov = 60f32.to_radians();
         let view_proj = glam::Mat4::perspective_rh(fov, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(eye, target, glam::Vec3::Y);
-        Self { view_proj, eye, ppr: 512.0 / (2.0 * (fov / 2.0).tan()), near: 0.1, threshold }
+        Self { view_proj, eye, ppr: 512.0 / (2.0 * (fov / 2.0).tan()), near: 0.1, threshold, orthographic: false }
+    }
+
+    /// Straight down from `eye` onto a square `width` metres across, 512 pixels (a shadow
+    /// cascade's or the sky occlusion's kind of view).
+    fn top_down(eye: glam::Vec3, width: f32, threshold: f32) -> Self {
+        let h = width / 2.0;
+        let view_proj = glam::Mat4::orthographic_rh(-h, h, -h, h, 0.1, 1000.0) * glam::Mat4::look_at_rh(eye, eye - glam::Vec3::Y, glam::Vec3::NEG_Z);
+        Self { view_proj, eye, ppr: 512.0 / width, near: 0.1, threshold, orthographic: true }
     }
 
     fn gpu(&self) -> ClusterViewGpu {
-        ClusterViewGpu::new(self.view_proj, self.eye, self.ppr, self.near, self.threshold)
+        ClusterViewGpu::new(self.view_proj, self.eye, self.ppr, self.near, self.threshold, self.orthographic)
     }
 }
 
@@ -162,8 +171,8 @@ fn expected(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool) -> 
     let m = glam::Mat3::from_mat4(model);
     let scale = m.x_axis.length().max(m.y_axis.length()).max(m.z_axis.length());
     let eye = model.inverse().transform_point3(v.eye);
-    let lod = LodView { eye, pixels_per_radian: v.ppr, near: v.near / scale, threshold: v.threshold };
-    let cone = cone && m.determinant() > 0.0;
+    let lod = LodView { eye, pixels_per_radian: v.ppr, near: v.near / scale, threshold: v.threshold, orthographic: v.orthographic };
+    let cone = cone && m.determinant() > 0.0 && !v.orthographic;
     let planes = crate::culling::frustum_planes(v.view_proj);
     let selected: BTreeSet<usize> = mesh.select(&lod).into_iter().collect();
     let close = |p: f32| (p - v.threshold).abs() <= 2e-3 * v.threshold.max(1e-3);
@@ -188,13 +197,13 @@ fn expected(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool) -> 
 
 /// Cull once and read back the draw's words and the drawn (record, cluster) pairs.
 fn cull(device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, gpu: &mut ClusterGpu, source: InstanceSource, params: ClusterCullGpu, view: &TestView) -> (Vec<u32>, Vec<(u32, u32)>) {
-    gpu.bind(device, queue, culling, source, params);
-    culling.set_view(queue, &view.gpu());
+    gpu.bind(device, queue, culling, 0, source, params);
+    culling.set_views(queue, &[view.gpu()]);
     let mut encoder = device.create_command_encoder(&Default::default());
-    culling.encode(&mut encoder, &[gpu]);
+    culling.encode(&mut encoder, &[(&*gpu, 0)]);
     queue.submit(Some(encoder.finish()));
-    let args = read_words(device, queue, gpu.args());
-    let list = read_words(device, queue, gpu.draws());
+    let args = read_words(device, queue, gpu.args(0));
+    let list = read_words(device, queue, gpu.draws(0));
     let pairs = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
     (args, pairs)
 }
@@ -473,6 +482,17 @@ fn headless() -> Option<Renderer> {
 /// A scene of rocks at `placements` (x, y, z, scale, yaw), culled per instance (the first
 /// `visible` records counted), with cluster LOD or without, and a camera looking at them.
 fn rocks(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: bool) -> (Scene, Camera, usize) {
+    let mut scene = Scene::new();
+    let index = scene.add(SceneNode::Renderable(rock_renderable(renderer, placements, visible, clusters)));
+    let mut camera = Camera::new(50.0, 0.1, 200.0, 1.0);
+    camera.set_position(0.5, 1.5, 6.0);
+    camera.look_at(&crate::math::Vec3::new(0.0, 0.0, -1.5));
+    camera.update_projection_matrix();
+    (scene, camera, index)
+}
+
+/// `rocks`' renderable.
+fn rock_renderable(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: bool) -> Renderable {
     use wgpu::util::DeviceExt;
     let data: Vec<f32> = placements.iter().flat_map(|p| [p[0], p[1], p[2], p[3], p[4], 0.0, 0.0, 0.0]).collect();
     let source = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE });
@@ -488,13 +508,7 @@ fn rocks(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: b
         let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
         r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: None }));
     }
-    let mut scene = Scene::new();
-    let index = scene.add(SceneNode::Renderable(r));
-    let mut camera = Camera::new(50.0, 0.1, 200.0, 1.0);
-    camera.set_position(0.5, 1.5, 6.0);
-    camera.look_at(&crate::math::Vec3::new(0.0, 0.0, -1.5));
-    camera.update_projection_matrix();
-    (scene, camera, index)
+    r
 }
 
 /// A half float's value.
@@ -544,7 +558,7 @@ fn compare(a: &[[f32; 4]], b: &[[f32; 4]]) -> (usize, usize) {
 /// The cluster draw's words, read back.
 fn cluster_args(renderer: &Renderer, scene: &Scene, index: usize) -> Vec<u32> {
     let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().expect("still on the cluster path").gpu.as_ref().unwrap();
-    read_words(renderer.device(), renderer.queue(), gpu.args())
+    read_words(renderer.device(), renderer.queue(), gpu.args(0))
 }
 
 const PLACEMENTS: [[f32; 5]; 4] = [[0.0, 0.0, 0.0, 1.0, 0.0], [2.6, 0.3, -1.5, 0.8, 1.1], [-2.4, -0.2, -2.0, 1.2, -0.6], [0.5, 1.8, -4.0, 1.5, 2.2]];
@@ -698,7 +712,7 @@ fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: boo
     let m = glam::Mat3::from_mat4(model);
     let scale = scale_bound(m) * stretch;
     let eye = model.inverse().transform_point3(v.eye);
-    let cone = cone && m.determinant() > 0.0;
+    let cone = cone && m.determinant() > 0.0 && !v.orthographic;
     let planes = crate::culling::frustum_planes(v.view_proj);
     // a stretch about the mesh's origin also moves a sphere's centre (cluster_cull.wgsl)
     let placed = |s: Sphere| (s.radius + (1.0 - 1.0 / stretch) * s.center.length()) * scale;
@@ -707,6 +721,8 @@ fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: boo
             0.0
         } else if !error.is_finite() {
             f32::INFINITY
+        } else if v.orthographic {
+            error * scale * v.ppr
         } else {
             error * scale / (v.eye.distance(model.transform_point3(s.center)) - placed(s)).max(v.near) * v.ppr
         }
@@ -950,4 +966,420 @@ fn spokes() -> crate::geometries::Geometry {
         }
     }
     crate::geometries::Geometry::new("spokes", vertices, indices)
+}
+
+#[test]
+fn every_view_gets_its_own_cut_in_one_pass() {
+    // a frame's views (the camera, a spot light, a cascade) cut in one pass: each cut is its own
+    // view's, not the last view written
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = [
+        placement_record(glam::Vec3::new(0.0, 0.0, -3.0), 1.5, 0.9, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(4.0, 0.0, -6.0), 2.0, -2.2, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(-4.0, 0.0, -8.0), 1.0, 2.8, glam::Quat::IDENTITY),
+    ];
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let views = [
+        TestView::looking(glam::Vec3::new(0.0, 1.0, 2.0), glam::Vec3::new(0.0, 0.0, -5.0), 0.5),
+        TestView::looking(glam::Vec3::new(30.0, 10.0, 40.0), glam::Vec3::new(0.0, 0.0, -5.0), 2.0),
+        TestView::top_down(glam::Vec3::new(0.0, 50.0, -5.0), 8.0, 1.0),
+    ];
+    for view in 0..views.len() as u32 {
+        let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
+        gpu.bind(&device, &queue, &culling, view, source, params);
+    }
+    culling.set_views(&queue, &views.iter().map(TestView::gpu).collect::<Vec<_>>());
+    let mut encoder = device.create_command_encoder(&Default::default());
+    culling.encode(&mut encoder, &[(&gpu, 0), (&gpu, 1), (&gpu, 2)]);
+    queue.submit(Some(encoder.finish()));
+    let mut sizes = Vec::new();
+    for (index, view) in views.iter().enumerate() {
+        let args = read_words(&device, &queue, gpu.args(index as u32));
+        let list = read_words(&device, &queue, gpu.draws(index as u32));
+        let pairs: Vec<(u32, u32)> = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
+        for (k, r) in records.iter().enumerate() {
+            assert_cut(&format!("view {index}, instance {k}"), &pairs, k as u32, &expected_world(&mesh, placement_matrix(r), view, true, 1.0));
+        }
+        sizes.push(pairs.len());
+    }
+    // the views differ enough that sharing one view's data can't pass
+    assert!(sizes[0] != sizes[1] && sizes[1] != sizes[2], "{sizes:?}");
+}
+
+/// `rocks` lit by a shadowed spot light 4 m above them and a shadowed sun (two cascades), with
+/// the renderer's culling stats on.
+fn lit_rocks(renderer: &mut Renderer, clusters: bool) -> (Scene, Camera, usize) {
+    use crate::lights::{DirectionalLight, Light, SpotLight};
+    use crate::math::Vec3;
+    renderer.enable_spot_shadows(256, 1);
+    renderer.enable_cascaded_shadows(crate::shadows::CascadedShadowOptions { cascades: 2, resolution: 256, max_distance: 30.0, caster_distance: 30.0, ..Default::default() });
+    renderer.set_culling_stats(true);
+    let (mut scene, camera, index) = rocks(renderer, &PLACEMENTS, 4, clusters);
+    scene.get_renderable_mut(index).unwrap().cast_shadow = true;
+    let mut spot = SpotLight::new(Vec3::new(0.5, 4.0, -1.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 10.0, 20.0, 0.6, 0.8);
+    spot.cast_shadow = true;
+    scene.add(SceneNode::Light(Light::Spot(spot)));
+    let mut sun = DirectionalLight::new(Vec3::new(-0.3, -1.0, -0.2), Vec3::new(1.0, 1.0, 1.0), 1.0);
+    sun.cast_shadow = true;
+    scene.add(SceneNode::Light(Light::Directional(sun)));
+    (scene, camera, index)
+}
+
+/// Draw a few frames, until the stats of one are read back.
+fn stats_after_frames(renderer: &mut Renderer, scene: &mut Scene, camera: &mut Camera) -> crate::culling::CullingStats {
+    for _ in 0..6 {
+        draw(renderer, scene, camera);
+    }
+    renderer.culling_stats().cloned().expect("stats read back")
+}
+
+#[test]
+fn shadow_views_cut_clustered_casters() {
+    use crate::culling::CullViewKind;
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, index) = lit_rocks(&mut renderer, true);
+    let stats = stats_after_frames(&mut renderer, &mut scene, &mut camera);
+    for kind in [CullViewKind::Camera, CullViewKind::SpotShadow(0), CullViewKind::Cascade(0)] {
+        let s = stats.view(kind).unwrap_or_default();
+        assert!(s.clusters > 0 && s.triangles > 0, "{kind:?}: {s:?}");
+    }
+    // every view with a cut of its own
+    let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().unwrap().gpu.as_ref().unwrap();
+    assert!(gpu.cut(0).is_some() && gpu.cut(1).is_some(), "the camera's and the spot light's cuts");
+}
+
+#[test]
+fn shadow_triangles_fall_with_the_scale() {
+    use crate::culling::CullViewKind;
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, _) = lit_rocks(&mut renderer, true);
+    let mut seen = Vec::new();
+    for scale in [1.0, 8.0] {
+        renderer.set_shadow_cluster_error_scale(scale);
+        let stats = stats_after_frames(&mut renderer, &mut scene, &mut camera);
+        seen.push([CullViewKind::Camera, CullViewKind::SpotShadow(0), CullViewKind::Cascade(0)].map(|k| stats.view(k).unwrap_or_default().triangles));
+    }
+    let ([camera0, spot0, cascade0], [camera1, spot1, cascade1]) = (seen[0], seen[1]);
+    assert!(spot1 < spot0 && cascade1 < cascade0, "shadow triangles at scales 1 and 8: {seen:?}");
+    assert_eq!(camera0, camera1, "the camera's cut moved with the shadows' scale: {seen:?}");
+}
+
+#[test]
+fn renderables_off_a_view_get_no_cut_there() {
+    use crate::culling::CullViewKind;
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, index) = lit_rocks(&mut renderer, true);
+    scene.get_renderable_mut(index).unwrap().cast_shadow = false;
+    let stats = stats_after_frames(&mut renderer, &mut scene, &mut camera);
+    let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().unwrap().gpu.as_ref().unwrap();
+    // view 1: the spot shadow atlas's layer 0
+    assert!(gpu.cut(1).is_none(), "a cut for a view the renderable isn't drawn in");
+    assert_eq!(stats.view(CullViewKind::SpotShadow(0)).unwrap_or_default().clusters, 0);
+    assert!(stats.camera().clusters > 0);
+}
+
+/// Layer `layer` of a Depth32Float array texture, read back.
+fn read_depth(renderer: &Renderer, texture: &wgpu::Texture, layer: u32) -> Vec<f32> {
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let (w, h) = (texture.width(), texture.height());
+    let row = (w * 4).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::DepthOnly },
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let bytes = buffer.slice(..).get_mapped_range();
+    (0..w * h).map(|i| f32::from_le_bytes(bytes[((i / w) * row + (i % w) * 4) as usize..][..4].try_into().unwrap())).collect()
+}
+
+/// (texels either map covers, texels whose depths differ by more than 1e-4).
+fn compare_depths(a: &[f32], b: &[f32]) -> (usize, usize) {
+    let covered = a.iter().zip(b).filter(|(x, y)| **x < 1.0 || **y < 1.0).count();
+    let differing = a.iter().zip(b).filter(|(x, y)| (**x - **y).abs() > 1e-4).count();
+    (covered, differing)
+}
+
+/// The shadow maps a frame of `lit_rocks` leaves (the spot light's layer, then the two
+/// cascades), with cluster LOD or without, at `threshold` pixels and the shadows' `scale`.
+fn shadow_maps(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<Vec<f32>>> {
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    renderer.set_shadow_cluster_error_scale(scale);
+    let (mut scene, mut camera, _) = lit_rocks(&mut renderer, clusters);
+    for _ in 0..2 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    let spot = &renderer.spot_shadow_atlas().unwrap().texture;
+    let cascades = &renderer.cascaded_shadow_map().unwrap().texture;
+    Some(vec![read_depth(&renderer, spot, 0), read_depth(&renderer, cascades, 0), read_depth(&renderer, cascades, 1)])
+}
+
+#[test]
+fn shadow_maps_draw_the_shadow_cut() {
+    // at no error the cut is the mesh, so the maps match; at a coarse shadow budget they are
+    // the coarse cut's, not the mesh's
+    let Some(mesh) = shadow_maps(false, 0.0, 1.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let exact = shadow_maps(true, 0.0, 1.0).unwrap();
+    let coarse = shadow_maps(true, 1.0, 1e4).unwrap();
+    for (k, name) in ["spot", "cascade 0", "cascade 1"].iter().enumerate() {
+        let (covered, differing) = compare_depths(&mesh[k], &exact[k]);
+        assert!(covered > 100 && differing * 200 < covered, "{name} at no error: {differing} of {covered} texels differ");
+        let (covered, differing) = compare_depths(&mesh[k], &coarse[k]);
+        assert!(differing * 20 > covered, "{name} at a coarse shadow budget: only {differing} of {covered} texels differ from the mesh's");
+    }
+}
+
+/// The sky occlusion's visibility volume once built over `rocks`, with cluster LOD or without,
+/// at `threshold` pixels and the top-down view's `scale`.
+fn sky_volume(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<u8>> {
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let options = crate::shadows::SkyOcclusionOptions { extent_m: 16.0, resolution: 256, volume_size: (32, 8), min_height_m: -4.0, max_height_m: 8.0, frames: 1, depth_tiles: 1, lod_error_scale: scale, ..Default::default() };
+    renderer.enable_sky_occlusion(options);
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    scene.get_renderable_mut(index).unwrap().cast_shadow = true;
+    for _ in 0..12 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    let sky = renderer.sky_occlusion().unwrap();
+    let texture = sky.volume_texture();
+    let (side, levels) = (texture.width(), texture.height());
+    let row = (side * 4).div_ceil(256) * 256;
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * levels * side) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &read, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(levels) } },
+        wgpu::Extent3d { width: side, height: levels, depth_or_array_layers: texture.depth_or_array_layers() },
+    );
+    queue.submit(Some(encoder.finish()));
+    read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let data = read.slice(..).get_mapped_range().to_vec();
+    Some(data)
+}
+
+#[test]
+fn sky_occlusion_draws_the_top_down_cut() {
+    let Some(mesh) = sky_volume(false, 0.0, 1.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let exact = sky_volume(true, 0.0, 1.0).unwrap();
+    let coarse = sky_volume(true, 1.0, 1e4).unwrap();
+    let occluded = mesh.chunks(4).filter(|v| v[0] < 250).count();
+    let differing = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x[0].abs_diff(y[0]) > 1).count();
+    assert!(occluded > 20, "the rocks occlude only {occluded} voxels");
+    assert!(differing(&mesh, &exact) * 50 < occluded, "at no error: {} voxels differ", differing(&mesh, &exact));
+    assert!(differing(&mesh, &coarse) > 0, "at a coarse budget the volume is still the mesh's");
+}
+
+/// The rocks' material, writing motion vectors (`outputs_velocity`) from last frame's world
+/// matrix and view.
+const VELOCITY_ROCKS_WGSL: &str = r#"
+struct Tint { color: vec4<f32> };
+@group(0) @binding(0) var<uniform> tint: Tint;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+struct Temporal { view_proj: mat4x4<f32>, prev_view_proj: mat4x4<f32>, jitter: vec2<f32>, prev_jitter: vec2<f32>, frame: u32, pad0: u32, pad1: u32, pad2: u32 };
+@group(1) @binding(3) var<uniform> temporal: Temporal;
+struct Transforms { world: mat4x4<f32>, prev_world: mat4x4<f32> };
+@group(2) @binding(1) var<uniform> mesh: Transforms;
+struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(3) place: vec4<f32>, @location(4) yaw: f32 };
+struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) curr: vec4<f32>, @location(2) prev: vec4<f32> };
+struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32>, @location(4) velocity: vec2<f32> };
+fn turn(v: vec3<f32>, a: f32) -> vec3<f32> {
+    return vec3<f32>(cos(a) * v.x + sin(a) * v.z, v.y, -sin(a) * v.x + cos(a) * v.z);
+}
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    var out: VOut;
+    let local = vec4<f32>(turn(v.position.xyz * v.place.w, v.yaw) + v.place.xyz, 1.0);
+    out.clip = projection_matrix * view_matrix * mesh.world * local;
+    out.normal = (mesh.world * vec4<f32>(turn(v.normal, v.yaw), 0.0)).xyz;
+    out.curr = temporal.view_proj * mesh.world * local;
+    out.prev = temporal.prev_view_proj * mesh.prev_world * local;
+    return out;
+}
+@fragment
+fn fragment_main(in: VOut) -> FOut {
+    let n = vec4<f32>(normalize(in.normal) * 0.5 + 0.5, 1.0) * tint.color;
+    let velocity = (in.curr.xy / in.curr.w - in.prev.xy / in.prev.w) * vec2<f32>(0.5, -0.5);
+    return FOut(n, vec4<f32>(0.0), n, n, velocity);
+}
+"#;
+
+/// Channels `channels` of a 16-bit float texture, read back.
+fn read_half(renderer: &Renderer, texture: &wgpu::Texture, channels: u32) -> Vec<Vec<f32>> {
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let (w, h) = (texture.width(), texture.height());
+    let row = (w * 2 * channels).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let bytes = buffer.slice(..).get_mapped_range();
+    (0..w * h)
+        .map(|i| {
+            let at = ((i / w) * row + (i % w) * 2 * channels) as usize;
+            (0..channels as usize).map(|c| half(u16::from_le_bytes([bytes[at + 2 * c], bytes[at + 2 * c + 1]]))).collect()
+        })
+        .collect()
+}
+
+/// A frame of `rocks` with the velocity material, after one where the rocks stood 0.3 m to the
+/// left: the GBuffer's colour (alpha: covered) and velocity.
+fn velocity_frame(clusters: bool, threshold: f32) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    let r = scene.get_renderable_mut(index).unwrap();
+    r.material = Material::new("Rocks", VELOCITY_ROCKS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), outputs_velocity: true, ..Default::default() });
+    r.material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    r.object.set_position(-0.3, 0.0, 0.0);
+    draw(&mut renderer, &mut scene, &mut camera);
+    scene.get_renderable_mut(index).unwrap().object.set_position(0.0, 0.0, 0.0);
+    let gbuffer = GBuffer::new(renderer.device(), SIZE, SIZE, 1);
+    renderer.render_scene_to_gbuffer(&mut scene, &mut camera, &gbuffer);
+    Some((read_half(&renderer, &gbuffer.color_texture, 4), read_half(&renderer, &gbuffer.velocity_texture, 2)))
+}
+
+#[test]
+fn velocity_follows_the_cut_the_gbuffer_drew() {
+    // the velocity pass depth-tests against the GBuffer: drawing the mesh where the GBuffer drew
+    // a coarser cut leaves holes; drawing the camera's cut fills every texel it covers
+    let Some((color, mesh)) = velocity_frame(false, 0.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let covered: Vec<usize> = (0..color.len()).filter(|&i| color[i][3] > 0.5).collect();
+    let moving = covered.iter().filter(|&&i| mesh[i][0].abs() > 1e-3 && mesh[i][0] < GBuffer::NO_VELOCITY / 2.0).count();
+    assert!(moving * 2 > covered.len() && covered.len() > 500, "the rocks' velocity: {moving} of {} texels", covered.len());
+    let (_, exact) = velocity_frame(true, 0.0).unwrap();
+    let differing = covered.iter().filter(|&&i| (0..2).any(|c| (mesh[i][c] - exact[i][c]).abs() > 1e-3)).count();
+    assert!(differing * 200 < covered.len(), "at no error: {differing} of {} texels' velocities differ", covered.len());
+    let (color, coarse) = velocity_frame(true, 4.0).unwrap();
+    let covered: Vec<usize> = (0..color.len()).filter(|&i| color[i][3] > 0.5).collect();
+    let holes = covered.iter().filter(|&&i| coarse[i][0] >= GBuffer::NO_VELOCITY / 2.0).count();
+    assert!(holes * 50 < covered.len(), "at a 4-pixel budget: {holes} of {} covered texels have no velocity", covered.len());
+}
+
+/// A rendered planar reflection of `rocks` in the plane y = -1.5, with cluster LOD or without, at
+/// `threshold` pixels and the reflection's `scale`: its texture.
+fn reflection_image(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<Vec<f32>>> {
+    use crate::reflections::{PlanarReflection, PlanarReflectionOptions};
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    let mut reflection = PlanarReflection::new(&renderer, crate::math::Vec3::new(0.0, -1.5, 0.0), crate::math::Vec3::new(0.0, 1.0, 0.0), PlanarReflectionOptions { width: 160, height: 160, mip_levels: 1, ..Default::default() });
+    reflection.lod_error_scale = scale;
+    renderer.add_planar_reflection(reflection);
+    for _ in 0..2 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    Some(read_half(&renderer, renderer.planar_reflection(0).unwrap().texture(), 4))
+}
+
+#[test]
+fn planar_reflections_draw_their_cut() {
+    let Some(mesh) = reflection_image(false, 0.0, 1.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let lit = |t: &Vec<f32>| t[..3].iter().any(|c| *c > 0.02);
+    let covered = mesh.iter().filter(|t| lit(t)).count();
+    let differing = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).filter(|(x, y)| (0..3).any(|c| (x[c] - y[c]).abs() > 2.0 / 255.0)).count();
+    let exact = reflection_image(true, 0.0, 1.0).unwrap();
+    assert!(covered > 200, "the reflection shows {covered} texels of rock");
+    assert!(differing(&mesh, &exact) * 200 < covered, "at no error: {} of {covered} texels differ", differing(&mesh, &exact));
+    let coarse = reflection_image(true, 1.0, 1e4).unwrap();
+    assert!(differing(&mesh, &coarse) * 20 > covered, "at a coarse budget only {} of {covered} texels differ from the mesh's", differing(&mesh, &coarse));
+}
+
+#[test]
+fn every_clustered_renderable_finds_its_cuts_whatever_the_draw_order() {
+    // transparent renderables come after the opaque ones, back to front: the passes still find
+    // each renderable's cut for each view
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, glass) = lit_rocks(&mut renderer, true);
+    {
+        let r = scene.get_renderable_mut(glass).unwrap();
+        r.material = Material::new("Glass", ROCKS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), transparent: true, ..Default::default() });
+        r.material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    }
+    let solid = scene.add(SceneNode::Renderable(rock_renderable(&renderer, &PLACEMENTS, 4, true)));
+    scene.get_renderable_mut(solid).unwrap().cast_shadow = true;
+    assert!(glass < solid);
+    draw(&mut renderer, &mut scene, &mut camera);
+    for index in [glass, solid] {
+        for view in [0, 1] {
+            assert!(renderer.has_cluster_cut(&scene, index, view), "renderable {index}: no cut found for view {view}");
+        }
+    }
+}
+
+/// `reflection_image`'s, seen from 2 m above the water, looking 1° down at the rocks: the usual
+/// water shot.
+fn level_reflection_image(clusters: bool, threshold: f32) -> Option<Vec<Vec<f32>>> {
+    use crate::reflections::{PlanarReflection, PlanarReflectionOptions};
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    camera.set_position(0.0, 0.5, 8.0);
+    camera.look_at(&crate::math::Vec3::new(0.0, 0.5 - 100.0 * 1f32.to_radians().tan(), -92.0));
+    renderer.add_planar_reflection(PlanarReflection::new(&renderer, crate::math::Vec3::new(0.0, -1.5, 0.0), crate::math::Vec3::new(0.0, 1.0, 0.0), PlanarReflectionOptions { width: 192, height: 192, mip_levels: 1, ..Default::default() }));
+    for _ in 0..2 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    Some(read_half(&renderer, renderer.planar_reflection(0).unwrap().texture(), 4))
+}
+
+#[test]
+fn a_level_reflection_keeps_the_budget_near_the_water() {
+    // the mirrored view's projection has its near plane on the water, far out along a level
+    // view: errors must still be measured from the camera's near, or the reflection's cut is
+    // far coarser than a pixel
+    let Some(mesh) = level_reflection_image(false, 0.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let clusters = level_reflection_image(true, 1.0).unwrap();
+    let covered = mesh.iter().filter(|t| t[..3].iter().any(|c| *c > 0.02)).count();
+    let differing = mesh.iter().zip(&clusters).filter(|(x, y)| (0..3).any(|c| (x[c] - y[c]).abs() > 0.1)).count();
+    assert!(covered > 200, "the reflection shows {covered} texels of rock");
+    assert!(differing * 20 < covered, "at a 1-pixel budget {differing} of {covered} texels differ clearly from the mesh's");
 }
