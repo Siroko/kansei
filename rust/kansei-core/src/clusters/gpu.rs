@@ -418,12 +418,13 @@ impl Cut {
     /// The draw list's length for a cut that may draw `max` clusters, given what the cull last
     /// read back it `needed` (if a reading arrived): `INITIAL_DRAWN` at first; then half again
     /// the need, to a power of two, at once when that is longer; and that when it has been at
-    /// most a quarter of the length for `SHRINK_AFTER` readings in a row. Never past `max`.
+    /// most a quarter of the length for `SHRINK_AFTER` readings in a row. It grows no longer
+    /// than `max`, but a smaller `max` alone doesn't shrink it (the draw is capped instead).
     fn sized(&mut self, max: u32, needed: Option<u32>) -> u32 {
         if self.capacity == 0 {
             return INITIAL_DRAWN.min(max);
         }
-        let mut capacity = self.capacity.min(max);
+        let mut capacity = self.capacity;
         if let Some(needed) = needed {
             let target = (needed as u64 * 3 / 2).max(1).next_power_of_two().min(max as u64).max(MIN_DRAWN.min(max) as u64) as u32;
             if target > capacity {
@@ -483,10 +484,13 @@ impl ClusterGpu {
         }
         let (mesh, empty) = (&self.mesh, &self.empty);
         let cut = self.cuts[view as usize].get_or_insert_with(|| Cut::new(device));
-        params.capacity = cut.sized(params.capacity.max(1), culling.feedback.needed(self.id, view));
-        let grown = params.capacity != cut.capacity;
+        let max = params.capacity.max(1);
+        let length = cut.sized(max, culling.feedback.needed(self.id, view));
+        // (the shader draws no more than the list holds, nor than `max`)
+        params.capacity = length.min(max);
+        let grown = length != cut.capacity;
         if grown {
-            cut.capacity = params.capacity;
+            cut.capacity = length;
             cut.draws = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Draws"), size: cut.capacity as u64 * 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
             cut.bound = None;
         }
