@@ -25,4 +25,4 @@ pub use taa::{TemporalAAEffect, TemporalAAOptions};
 pub use tonemap::{
     ev100_from_camera, exposure_from_ev100, white_balance_matrix, ColorGrade, ToneMapEffect, ToneMapOptions, ToneMapper,
 };
-pub use volumetric_fog::{LocalFogShape, LocalFogVolume, VolumetricFogEffect, VolumetricFogOptions};
+pub use volumetric_fog::{LocalFogShape, LocalFogVolume, SpotScattering, VolumetricFogEffect, VolumetricFogOptions};
