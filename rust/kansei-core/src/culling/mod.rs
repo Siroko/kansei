@@ -11,5 +11,5 @@ pub use depth_pyramid::{DepthPyramid, DepthReduction};
 pub use instance_culling::{frustum_planes, InstanceCulling};
 pub use stats::{CullStats, CullViewKind, CullingStats};
 pub(crate) use instance_culling::{CullPipeline, CulledDraw, CullView, OcclusionView};
-pub(crate) use occlusion::Occlusion;
+pub(crate) use occlusion::{MainView, Occlusion};
 pub(crate) use stats::StatsReadback;

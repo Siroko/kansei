@@ -17,6 +17,9 @@ pub struct SharedLayouts {
     pub camera_bgl: wgpu::BindGroupLayout,
     pub mesh_bgl: wgpu::BindGroupLayout,
     pub shadow_bgl: wgpu::BindGroupLayout,
+    /// Group 2 of cluster pipelines (`clusters::ClusterLod`): `mesh_bgl`'s matrices, then the
+    /// packed cluster mesh, the view's draw list and the instance records (vertex-stage storage).
+    pub cluster_mesh_bgl: wgpu::BindGroupLayout,
 }
 
 impl SharedLayouts {
@@ -230,6 +233,15 @@ impl SharedLayouts {
             ],
         });
 
-        Self { camera_bgl, mesh_bgl, shadow_bgl }
+        // Group 2 of cluster pipelines (clusters::cluster_vertex_stage): the mesh matrices as in
+        // `mesh_bgl`, then the packed cluster mesh, the view's draw list and the instance records
+        let matrix = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None }, count: None };
+        let storage = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let cluster_mesh_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shared/ClusterMeshBGL"),
+            entries: &[matrix(0), matrix(1), storage(2), storage(3), storage(4)],
+        });
+
+        Self { camera_bgl, mesh_bgl, shadow_bgl, cluster_mesh_bgl }
     }
 }

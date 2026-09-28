@@ -24,6 +24,7 @@ exclude = [
     "kansei-wasm/examples/gi-box",
     "kansei-wasm/examples/occlusion-culling",
     "kansei-wasm/examples/impostors",
+    "kansei-wasm/examples/cluster-lod",
 ]
 
 [workspace.dependencies]

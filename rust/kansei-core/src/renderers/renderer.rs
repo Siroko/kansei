@@ -174,6 +174,11 @@ pub struct Renderer {
     two_phase_any: Vec<usize>,
     two_phase: Vec<usize>,
     cull_stats: crate::culling::StatsReadback,
+    // Cluster LOD: the cull's pipelines and view, and the error budget in pixels
+    cluster_culling: Option<crate::clusters::ClusterCulling>,
+    cluster_threshold: f32,
+    // the renderables the last frame drew on the cluster path (the bundles recorded them so)
+    clustered: Vec<usize>,
     // Planar reflections, drawn after the shadow maps and before the main pass
     planar_reflections: Vec<crate::reflections::PlanarReflection>,
     // Render bundle caching (the static renderables; dynamic ones are drawn live)
@@ -240,6 +245,9 @@ impl Renderer {
             two_phase_any: Vec::new(),
             two_phase: Vec::new(),
             cull_stats: crate::culling::StatsReadback::new(),
+            cluster_culling: None,
+            cluster_threshold: 1.0,
+            clustered: Vec::new(),
             planar_reflections: Vec::new(),
             render_bundle: None,
             gbuffer_bundle: None,
@@ -561,6 +569,40 @@ impl Renderer {
         let instance_layouts: Vec<_> = r.geometry.instance_buffers.iter().filter_map(|cb| cb.vertex_layout()).collect();
         let layouts: Vec<_> = std::iter::once(Vertex::LAYOUT).chain(instance_layouts.iter().map(|il| il.as_layout())).collect();
         r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count);
+    }
+
+    /// Cluster LOD's error budget (`Renderable::clusters`), in pixels at the render size: each
+    /// cluster drawn is the coarsest whose simplification error the camera sees under it. 1 by
+    /// default; 0 draws the full mesh.
+    pub fn set_cluster_error_threshold(&mut self, pixels: f32) {
+        self.cluster_threshold = pixels.max(0.0);
+    }
+
+    pub fn cluster_error_threshold(&self) -> f32 {
+        self.cluster_threshold
+    }
+
+    /// Make `r`'s cluster pipeline for a pass's targets, or drop its cluster LOD with a warning
+    /// when the cluster path can't draw it: it keeps the ordinary path.
+    fn prepare_cluster_pipeline(&self, r: &mut crate::objects::Renderable, color_formats: &[wgpu::TextureFormat], depth_format: wgpu::TextureFormat, sample_count: u32) {
+        if r.clusters.is_none() {
+            return;
+        }
+        let first = r.geometry.instance_buffers.first();
+        let problem = if r.geometry.instance_buffers.len() > 1 {
+            Some("more than one instance buffer".to_string())
+        } else if first.is_some_and(|cb| cb.vertex_layout().is_none_or(|l| l.stride % 4 != 0)) {
+            Some("an instance buffer without a vertex layout of whole words".to_string())
+        } else if r.instance_culling.is_none() && first.is_some_and(|cb| cb.gpu_buffer().is_some_and(|b| !b.usage().contains(wgpu::BufferUsages::STORAGE))) {
+            Some("an instance buffer without STORAGE usage (and no InstanceCulling)".to_string())
+        } else {
+            let layout = first.and_then(|cb| cb.vertex_layout());
+            r.material.get_cluster_pipeline(self.device.as_ref().unwrap(), self.shared_layouts.as_ref().unwrap(), layout.as_ref(), color_formats, depth_format, sample_count).err()
+        };
+        if let Some(problem) = problem {
+            log::warn!("{}: no cluster LOD ({problem}); drawn as is", r.material.label);
+            r.clusters = None;
+        }
     }
 
     /// The lights uniform (group 1, binding 2 of every camera).
@@ -935,10 +977,9 @@ impl Renderer {
                 sample_count,
                 num_vertex_buffers: num_vb,
             };
-            let pipeline = match r.material.pipeline_cache.get(&key) {
-                Some(p) => p,
-                None => continue,
-            };
+            // the camera's cluster draw where the renderable has one, else its geometry's
+            let cluster = CameraClusterDraw::of(r, &key);
+            let Some(pipeline) = cluster.map(|c| c.pipeline).or_else(|| r.material.pipeline_cache.get(&key)) else { continue };
 
             // Set pipeline (skip if same)
             let pipeline_ptr = pipeline as *const _ as usize;
@@ -957,12 +998,16 @@ impl Renderer {
                 }
             }
 
-            // Set mesh bind group (group 2) with dynamic offsets
+            // Set mesh bind group (group 2) with dynamic offsets, then the vertex/index buffers and
+            // the draw (the camera's culled instances, if culled; the cut, with cluster LOD)
             let offset = mesh_offset(scene_idx, alignment);
-            encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
-
-            // Vertex/index buffers and the draw (the camera's culled instances, if culled)
-            set.draw(&mut encoder, r);
+            match cluster {
+                Some(cluster) => cluster.draw(&mut encoder, set, offset),
+                None => {
+                    encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
+                    set.draw(&mut encoder, r);
+                }
+            }
             draws += 1;
         }
 
@@ -998,7 +1043,8 @@ impl Renderer {
                 sample_count,
                 num_vertex_buffers: 1 + r.geometry.instance_buffers.len(),
             };
-            let Some(pipeline) = r.material.pipeline_cache.get(&key) else { continue };
+            let cluster = CameraClusterDraw::of(r, &key);
+            let Some(pipeline) = cluster.map(|c| c.pipeline).or_else(|| r.material.pipeline_cache.get(&key)) else { continue };
             if !shared_bound {
                 pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
                 if let Some(bg) = &self.shadow_bind_group {
@@ -1011,8 +1057,13 @@ impl Renderer {
                 pass.set_bind_group(0, bg, &[]);
             }
             let offset = mesh_offset(scene_idx, self.matrix_alignment);
-            pass.set_bind_group(2, mesh_bg, &[offset, offset]);
-            set.draw(pass, r);
+            match cluster {
+                Some(cluster) => cluster.draw(pass, set, offset),
+                None => {
+                    pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+                    set.draw(pass, r);
+                }
+            }
         }
     }
 
@@ -1700,7 +1751,7 @@ impl Renderer {
     /// (the GBuffer's, when the frame can build a depth pyramid), and the active reflections with
     /// `occlusion_culling`; their second phase is in `run_late_culling` and
     /// `render_planar_reflections`.
-    fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera, depth_size: Option<(u32, u32)>) {
+    fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera, depth_size: Option<(u32, u32)>, target_height: u32) {
         let kinds = self.cull_view_kinds();
         self.cull_stats.begin_frame(self.device.as_ref().unwrap(), kinds);
         self.two_phase.clear();
@@ -1711,6 +1762,8 @@ impl Renderer {
             .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && r.instance_culling.is_some() && r.geometry.initialized))
             .collect();
         if culled.is_empty() {
+            let main = self.occlusion.main_view(camera);
+            self.run_cluster_culling(scene, camera, &main, target_height);
             return;
         }
         let mut views = self.cull_views(camera);
@@ -1746,9 +1799,11 @@ impl Renderer {
         for &idx in &culled {
             let r = scene.get_renderable_mut(idx).unwrap();
             let (world, index_count, casts_shadow, layers) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers);
+            // cluster LOD has no occlusion phases yet
+            let clustered = r.clusters.is_some();
             let culling = r.instance_culling.as_mut().unwrap();
             stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
-            let two_phase_views: &[usize] = if culling.occlusion { &occlusion_views } else { &[] };
+            let two_phase_views: &[usize] = if culling.occlusion && !clustered { &occlusion_views } else { &[] };
             stale_bundles |= culling.ensure_occlusion(device, pipeline, two_phase_views);
             culling.set_two_phase(two_phase_views);
             if two_phase_views.iter().any(|&v| culling.two_phase_in(v)) {
@@ -1806,6 +1861,60 @@ impl Renderer {
         if stale_bundles {
             self.invalidate_bundle();
         }
+        self.run_cluster_culling(scene, camera, &main, target_height);
+    }
+
+    /// Cluster LOD for the camera, once the instances are culled. Each visible renderable with
+    /// `clusters` gets its mesh's cut for the main view (`main`: the live or frozen camera,
+    /// `target_height` pixels high), which `CameraClusterDraw` draws.
+    fn run_cluster_culling(&mut self, scene: &mut Scene, camera: &Camera, main: &crate::culling::MainView, target_height: u32) {
+        let indices: Vec<usize> = scene.ordered_indices().filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && r.clusters.is_some() && r.geometry.initialized)).collect();
+        if indices.is_empty() {
+            // renderables that left the cluster path are drawn as meshes again
+            if !self.clustered.is_empty() {
+                self.clustered.clear();
+                self.invalidate_bundle();
+            }
+            return;
+        }
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let culling = self.cluster_culling.get_or_insert_with(|| crate::clusters::ClusterCulling::new(device));
+        let pixels_per_radian = target_height as f32 / (2.0 * (camera.fov.to_radians() * 0.5).tan());
+        culling.set_view(queue, &crate::clusters::ClusterViewGpu::new(main.cull.view_proj, main.lod_origin, pixels_per_radian, camera.near, self.cluster_threshold));
+        let layout = &self.shared_layouts.as_ref().unwrap().cluster_mesh_bgl;
+        let matrices = (self.normal_matrices_buf.as_ref().unwrap(), self.world_matrices_buf.as_ref().unwrap());
+        let mut stale = false;
+        let mut prepared = Vec::new();
+        for &idx in &indices {
+            let r = scene.get_renderable_mut(idx).unwrap();
+            let world = r.world_matrix.to_glam();
+            let first = r.geometry.instance_buffers.first();
+            let stride = first.and_then(|cb| cb.vertex_layout()).map_or(0, |l| l.stride as u32);
+            let source = match (first, r.instance_culling.as_ref()) {
+                (None, _) => crate::clusters::InstanceSource::None,
+                (Some(_), Some(c)) => {
+                    let Some(draw) = c.view(MAIN_VIEW) else { continue };
+                    crate::clusters::InstanceSource::Culled { records: draw.instances, first_record: (draw.instances_offset / c.stride as u64) as u32, capacity: c.count, args: draw.args, count_word: (draw.offset / 4) as u32 + 1 }
+                }
+                (Some(cb), None) => match cb.gpu_buffer() {
+                    Some(records) => crate::clusters::InstanceSource::All { records, count: r.geometry.instance_count },
+                    None => continue,
+                },
+            };
+            let back_faces_culled = !r.is_transparent() && r.material.options.cull_mode == crate::materials::CullMode::Back;
+            stale |= r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, source, stride, world, back_faces_culled);
+            prepared.push(idx);
+        }
+        let gpus: Vec<&crate::clusters::ClusterGpu> = prepared.iter().filter_map(|&i| scene.get_renderable(i)?.clusters.as_ref()?.gpu.as_ref()).collect();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/ClusterCulling") });
+        culling.encode(&mut encoder, &gpus);
+        queue.submit(Some(encoder.finish()));
+        // renderables joining or leaving the cluster path are drawn the other way
+        if stale || prepared != self.clustered {
+            self.invalidate_bundle();
+        }
+        self.clustered = prepared;
     }
 
     /// Occlusion's second phase, once the first phase's opaque depth is in `gbuffer`: build the
@@ -2095,6 +2204,7 @@ impl Renderer {
                     device, &layouts,
                     &[format], depth_format, sample_count,
                 );
+                self.prepare_cluster_pipeline(r, &[format], depth_format, sample_count);
                 if spot_shadows && r.cast_shadow {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
                 }
@@ -2123,7 +2233,7 @@ impl Renderer {
         if let Some(sky) = self.sky_occlusion.as_mut() {
             sky.update(self.queue.as_ref().unwrap(), camera);
         }
-        self.run_instance_culling(scene, camera, None);
+        self.run_instance_culling(scene, camera, None, self.config.height);
         self.cull_stats.end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera.frame());
 
         // Shadow pass
@@ -2371,8 +2481,8 @@ impl Renderer {
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
 
-    /// Private: draw scene into GBuffer MRT (non-MSAA, sample_count=1).
-    fn render_scene_to_gbuffer(
+    /// Draw the scene into the GBuffer's targets.
+    pub(crate) fn render_scene_to_gbuffer(
         &mut self,
         scene: &mut Scene,
         camera: &mut Camera,
@@ -2401,6 +2511,7 @@ impl Renderer {
         for idx in ordered_indices {
             let r = scene.get_renderable_mut(idx).expect("ordered scene index should exist");
             self.prepare_for_gbuffer(r, sample_count);
+            self.prepare_cluster_pipeline(r, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count);
             let instance_layouts: Vec<_> = r.geometry.instance_buffers.iter()
                 .filter_map(|cb| cb.vertex_layout())
                 .collect();
@@ -2434,7 +2545,7 @@ impl Renderer {
         }
         // occlusion needs the GBuffer's single-sampled depth
         let depth_size = (gbuffer.sample_count == 1).then_some((gbuffer.width, gbuffer.height));
-        self.run_instance_culling(scene, camera, depth_size);
+        self.run_instance_culling(scene, camera, depth_size, gbuffer.height);
         drop(t);
         let t = crate::profiling::cpu_scope("scene/shadows");
 
@@ -3033,6 +3144,31 @@ fn draw_reflection(
             draw_late_geometry(&mut pass, r, view);
         } else {
             draw_geometry(&mut pass, r, view);
+        }
+    }
+}
+
+/// A renderable's camera draw on the cluster path: its material's cluster pipeline for the pass,
+/// the vertex stage's group 2, and the indirect draw the cluster cull wrote.
+#[derive(Clone, Copy)]
+struct CameraClusterDraw<'a> {
+    pipeline: &'a wgpu::RenderPipeline,
+    group: &'a wgpu::BindGroup,
+    args: &'a wgpu::Buffer,
+}
+
+impl<'a> CameraClusterDraw<'a> {
+    /// `r`'s, when it has cluster LOD ready and a cluster pipeline for a pass of `key`.
+    fn of(r: &'a crate::objects::Renderable, key: &crate::materials::PipelineKey) -> Option<Self> {
+        let gpu = r.clusters.as_ref()?.gpu.as_ref()?;
+        Some(Self { pipeline: r.material.cluster_pipeline(key)?, group: gpu.draw_bind_group()?, args: gpu.args() })
+    }
+
+    /// Draw it in `set` (nothing in the late set: clusters have no occlusion phases yet).
+    fn draw(self, enc: &mut impl wgpu::util::RenderEncoder<'a>, set: DrawSet, offset: u32) {
+        if set != DrawSet::Late {
+            enc.set_bind_group(2, Some(self.group), &[offset, offset]);
+            enc.draw_indirect(self.args, 0);
         }
     }
 }
