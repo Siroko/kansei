@@ -86,7 +86,8 @@ use crate::geometries::Vertex;
 
 /// A card at some level: which card, where its vertices are (u32::MAX: the card's own; else the
 /// first of its scaled copy's, in the card's vertex order), how many level-0 cards it stands for,
-/// the area it covers, and where (their area-weighted centre, where it is drawn).
+/// the area it covers, and where (their area-weighted centre, where it is drawn), and the box
+/// round those level-0 cards (the outline grown cards should keep within).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Placed {
     pub card: u32,
@@ -94,6 +95,7 @@ pub(super) struct Placed {
     pub represents: u32,
     pub area: f32,
     pub center: Vec3,
+    pub region: CardBox,
 }
 
 impl Placed {
@@ -171,6 +173,8 @@ pub(super) fn prune_round(mesh: &mut ClusterMesh, cards: &[Card], pending: Vec<(
         placed.sort_by_key(|p| morton(p.center, lo, hi));
         let (area, n0) = placed.iter().fold((0.0, 0), |(a, n), p| (a + p.area, n + p.represents));
         let mut kept = Vec::with_capacity(placed.len().div_ceil(2));
+        // how far the grown cards reach past the level-0 cards they stand for
+        let mut protrusion = 0.0f32;
         for (a, b) in pairs(&placed) {
             let Some(b) = b else {
                 kept.push(a);
@@ -188,15 +192,17 @@ pub(super) fn prune_round(mesh: &mut ClusterMesh, cards: &[Card], pending: Vec<(
             }
             // drawn at the centre of the area it stands for, scaled to cover it
             let center = (a.center * a.area + b.center * b.area) / covered;
+            let region = a.region.union(&b.region);
             let first_vertex = mesh.vertices.len() as u32;
             for &v in &card.vertices {
                 let mut vertex: Vertex = mesh.vertices[v as usize];
                 let p = center + (Vec3::from_slice(&vertex.position[..3]) - card.centroid) * scale;
+                protrusion = protrusion.max(region.distance(p));
                 vertex.position[..3].copy_from_slice(&p.to_array());
                 mesh.vertices.push(vertex);
                 positions.extend_from_slice(&p.to_array());
             }
-            kept.push(Placed { card: a.card, first_vertex, represents, area: covered, center });
+            kept.push(Placed { card: a.card, first_vertex, represents, area: covered, center, region });
         }
         if kept.len() == placed.len() {
             // nothing came off: next round, grouped with other neighbours
@@ -205,8 +211,11 @@ pub(super) fn prune_round(mesh: &mut ClusterMesh, cards: &[Card], pending: Vec<(
         }
         progress = true;
         let k = kept.len() as f32;
-        let own = options.card_error_scale * ((area / k).sqrt() - (area / n0 as f32).sqrt());
-        let error = group.iter().map(|(c, _)| mesh.clusters[*c].error).fold(own.max(0.0), f32::max);
+        // the crown thinned (scaled: how soon a crown may thin is a choice), or its outline moved
+        // (in full: a spire rounded off is seen as it is)
+        let thinned = options.card_error_scale * ((area / k).sqrt() - (area / n0 as f32).sqrt());
+        let own = thinned.max(protrusion).max(0.0);
+        let error = group.iter().map(|(c, _)| mesh.clusters[*c].error).fold(own, f32::max);
         let bounds = Sphere::enclosing(group.iter().map(|(c, _)| mesh.clusters[*c].lod_bounds));
         for (c, _) in group {
             mesh.clusters[*c].parent_error = error;
@@ -242,6 +251,29 @@ fn pairs(placed: &[Placed]) -> Vec<(Placed, Option<Placed>)> {
     out
 }
 
+/// An axis-aligned box round cards.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CardBox {
+    lo: Vec3,
+    hi: Vec3,
+}
+
+impl CardBox {
+    fn of(points: impl Iterator<Item = Vec3>) -> Self {
+        let (lo, hi) = points.fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(p), hi.max(p)));
+        Self { lo, hi }
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        Self { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi) }
+    }
+
+    /// How far `p` lies outside it (0 inside).
+    fn distance(&self, p: Vec3) -> f32 {
+        (self.lo - p).max(p - self.hi).max(Vec3::ZERO).length()
+    }
+}
+
 fn bounds_of(positions: &[f32]) -> (Vec3, Vec3) {
     positions.chunks(3).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(Vec3::from_slice(p)), hi.max(Vec3::from_slice(p))))
 }
@@ -255,6 +287,6 @@ pub(super) fn level_zero(mesh: &mut ClusterMesh, cards: &[Card], positions: &[f3
     let (lo, hi) = bounds_of(positions);
     let mut order: Vec<u32> = (0..cards.len() as u32).collect();
     order.sort_by_key(|&c| morton(cards[c as usize].centroid, lo, hi));
-    let placed: Vec<Placed> = order.iter().map(|&c| Placed { card: c, first_vertex: u32::MAX, represents: 1, area: cards[c as usize].area, center: cards[c as usize].centroid }).collect();
+    let placed: Vec<Placed> = order.iter().map(|&c| Placed { card: c, first_vertex: u32::MAX, represents: 1, area: cards[c as usize].area, center: cards[c as usize].centroid, region: CardBox::of(cards[c as usize].vertices.iter().map(|&v| Vec3::from_slice(&positions[v as usize * 3..v as usize * 3 + 3]))) }).collect();
     pack(mesh, cards, &placed, positions, 0.0, None, 0, options)
 }
