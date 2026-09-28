@@ -6,11 +6,13 @@
 //! `TIMESTAMP_QUERY` feature). Sections time themselves: `let _t = profiling::cpu_scope("upload");`
 //! (nested sections count in each). Both cost a thread-local check while profiling is off.
 //!
-//! GPU passes overlap on tile-based GPUs, so each pass is charged its *exclusive* time: from its
-//! start to the next pass's start (or its own end, whichever is first), along the frame's GPU
-//! timeline. Those sum to the time the GPU spent on the frame's passes; `busy` is each pass's own
-//! start to end, overlaps included. Readbacks are asynchronous: `Renderer::profile` averages the
-//! frames that have arrived.
+//! GPU passes overlap on tile-based GPUs (a render pass starts its vertex work while the passes
+//! before it are still shading), so each pass is charged its *exclusive* time: how far it pushes
+//! the frame's GPU timeline past the end of every pass submitted before it. A pass hidden behind
+//! earlier work costs nothing, the overlap goes to the pass still running, and the exclusive
+//! times sum to the time the GPU spent on the frame's passes (idle gaps aside); `busy` is each
+//! pass's own start to end, overlaps included. Readbacks are asynchronous: `Renderer::take_profile`
+//! averages the frames that have arrived.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -82,7 +84,8 @@ pub fn cpu_scope(label: &'static str) -> Option<CpuScope> {
 #[derive(Clone, Debug)]
 pub struct PassTime {
     pub label: &'static str,
-    /// Its share of the frame's GPU timeline (see the module docs), ms.
+    /// How far it pushes the frame's GPU timeline past the passes submitted before it (see the
+    /// module docs), ms.
     pub exclusive_ms: f64,
     /// Its own start to end, overlaps included, ms.
     pub busy_ms: f64,
@@ -251,15 +254,17 @@ fn gpu_profile(frames: &[FramePasses]) -> FrameProfile {
     let mut profile = FrameProfile::default();
     {
         for passes in frames {
-            // the passes that ran (Metal resolves an empty pass's timestamps to 0), by start
-            let mut ran: Vec<_> = passes.iter().filter(|(_, b, e)| *b > 0 && e >= b).collect();
-            ran.sort_by_key(|(_, b, _)| *b);
-            let Some(first) = ran.first() else { continue };
+            // the passes that ran (Metal resolves an empty pass's timestamps to 0), in submission
+            // order, which is the GPU's
+            let ran: Vec<_> = passes.iter().filter(|(_, b, e)| *b > 0 && e >= b).collect();
+            let Some(first) = ran.iter().map(|(_, b, _)| *b).min() else { continue };
             profile.gpu_frames += 1;
-            profile.gpu_span_ms += (ran.iter().map(|(_, _, e)| *e).max().unwrap() - first.1) as f64 / 1e6;
-            for (k, &&(label, begin, end)) in ran.iter().enumerate() {
-                let next = ran.get(k + 1).map_or(end, |n| n.1);
-                let exclusive = (end.min(next).max(begin) - begin) as f64 / 1e6;
+            profile.gpu_span_ms += (ran.iter().map(|(_, _, e)| *e).max().unwrap() - first) as f64 / 1e6;
+            // the end of everything submitted so far
+            let mut frontier = 0u64;
+            for &&(label, begin, end) in &ran {
+                let exclusive = end.saturating_sub(begin.max(frontier)) as f64 / 1e6;
+                frontier = frontier.max(end);
                 let busy = (end - begin) as f64 / 1e6;
                 profile.gpu_ms += exclusive;
                 match profile.gpu.iter_mut().find(|t| t.label == label) {
@@ -288,8 +293,9 @@ fn gpu_profile(frames: &[FramePasses]) -> FrameProfile {
 mod tests {
     use super::*;
 
-    /// Exclusive times partition the GPU timeline: an overlapped stretch goes to the later pass,
-    /// idle gaps to none, passes that did not run (zero stamps) are skipped; same labels add up.
+    /// Exclusive times partition the GPU timeline: an overlapped stretch goes to the pass still
+    /// running (the earlier one), a pass hidden behind earlier work costs nothing, idle gaps go to
+    /// none, passes that did not run (zero stamps) are skipped; same labels add up.
     #[test]
     fn exclusive_times_partition_the_timeline() {
         const MS: u64 = 1_000_000;
@@ -298,6 +304,8 @@ mod tests {
             ("shadow", T, T + 2 * MS),
             // starts before the shadow pass ends (tile-based overlap)
             ("gbuffer", T + MS, T + 5 * MS),
+            // starts and ends while the GBuffer pass is still running
+            ("hidden", T + 3 * MS, T + 4 * MS),
             // an idle millisecond, then two passes with the same label
             ("post", T + 6 * MS, T + 7 * MS),
             ("post", T + 7 * MS, T + 9 * MS),
@@ -307,8 +315,9 @@ mod tests {
         let p = gpu_profile(&[frame.clone(), frame]);
         assert_eq!(p.gpu_frames, 2);
         let get = |label| p.gpu.iter().find(|t| t.label == label).unwrap();
-        assert_eq!((get("shadow").exclusive_ms, get("shadow").busy_ms), (1.0, 2.0));
-        assert_eq!(get("gbuffer").exclusive_ms, 4.0);
+        assert_eq!((get("shadow").exclusive_ms, get("shadow").busy_ms), (2.0, 2.0));
+        assert_eq!((get("gbuffer").exclusive_ms, get("gbuffer").busy_ms), (3.0, 4.0));
+        assert_eq!((get("hidden").exclusive_ms, get("hidden").busy_ms), (0.0, 1.0));
         assert_eq!((get("post").exclusive_ms, get("post").count), (3.0, 2.0));
         assert!(p.gpu.iter().all(|t| t.label != "empty"));
         assert_eq!((p.gpu_ms, p.gpu_span_ms), (8.0, 9.0));
