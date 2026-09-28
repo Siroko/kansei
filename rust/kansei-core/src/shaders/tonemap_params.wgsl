@@ -22,7 +22,7 @@ struct ToneMapParams {
     frame               : u32,
     tonemapper          : u32,
     flags               : u32,
-    _pad0               : u32,
+    frameAspect         : f32,     // the frame the picture is the centre crop of (0: the picture)
     film                : vec4f,   // Unreal's film curve: slope, toe, shoulder, black clip
     film2               : vec4f,   // its white clip, blue correction, gamut expansion, highlights max
     // Unreal's local exposure (FLAG_LOCAL_EXPOSURE): highlight and shadow contrast, detail
