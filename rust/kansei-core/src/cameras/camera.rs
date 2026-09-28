@@ -183,6 +183,13 @@ impl Camera {
         self.prev_view_proj
     }
 
+    /// Last frame's view-projection as it drew, jitter included: what reconstructs world positions
+    /// from last frame's depth (its pixels were rendered jittered).
+    pub fn previous_jittered_view_projection(&self) -> Option<Mat4> {
+        let jitter = glam::Mat4::from_translation(glam::Vec3::new(self.prev_jitter[0], self.prev_jitter[1], 0.0));
+        self.prev_view_proj.map(|vp| Mat4::from(jitter * vp.to_glam()))
+    }
+
     /// Frames rendered since creation (wraps).
     pub fn frame(&self) -> u32 {
         self.frame
@@ -225,5 +232,27 @@ impl std::ops::Deref for Camera {
 impl std::ops::DerefMut for Camera {
     fn deref_mut(&mut self) -> &mut Object3D {
         &mut self.object
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_frames_jittered_view_is_what_its_gbuffer_was_drawn_with() {
+        let mut camera = Camera::new(60.0, 0.1, 100.0, 1.5);
+        camera.update_projection_matrix();
+        camera.set_position(1.0, 2.0, 3.0);
+        camera.update_view_matrix();
+        assert!(camera.previous_jittered_view_projection().is_none());
+        camera.jitter = [0.002, -0.003];
+        let drawn = camera.jittered_projection().to_glam() * camera.view_matrix.to_glam();
+        camera.end_frame();
+        // the next frame's jitter
+        camera.jitter = [-0.001, 0.004];
+        let previous = camera.previous_jittered_view_projection().unwrap().to_glam();
+        assert!(previous.abs_diff_eq(drawn, 1e-6), "{previous} vs {drawn}");
+        assert!(!previous.abs_diff_eq(camera.previous_view_projection().unwrap().to_glam(), 1e-6));
     }
 }
