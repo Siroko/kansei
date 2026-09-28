@@ -3,7 +3,7 @@
 mod planar_reflection;
 
 pub use planar_reflection::{oblique_near_plane, reflection_matrix, PlanarReflection, PlanarReflectionOptions, ReflectionFog};
-pub(crate) use planar_reflection::{flip_x, mirrored_view, ReflectionFogParamsGpu};
+pub(crate) use planar_reflection::{crop, flip_x, mirrored_view, ReflectionFogParamsGpu};
 
 /// WGSL for sampling a [`PlanarReflection`] in a material: `kansei_screen_uv`,
 /// `kansei_reflection_offset` (ripples) and `kansei_planar_reflection` (roughness picks the mip).
