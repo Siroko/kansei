@@ -77,7 +77,9 @@ pub struct ClusterOptions {
     /// The share of a card's area its area-weighted normal keeps (1: flat; a tube or a closed
     /// shape: about 0).
     pub card_flatness: f32,
-    /// Scales pruned levels' error: below 1, crowns thin out nearer (see `ClusterMesh::build`).
+    /// Scales the part of pruned levels' error that is a crown thinning out: below 1, crowns thin
+    /// out nearer (see `ClusterMesh::build`). How far grown cards reach past the cards they stand
+    /// for (a crown's outline moving, a spire rounded off) always counts in full.
     pub card_error_scale: f32,
     /// The most a pruned card is scaled up to cover the cards it stands for (4: at most a
     /// sixteenth of the cards are left). Past that the cards stop being pruned: a crown of a few

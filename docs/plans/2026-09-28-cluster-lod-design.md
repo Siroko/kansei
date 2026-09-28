@@ -162,6 +162,20 @@ Card clusters draw with the material's alpha test in every pass (`shadow_fragmen
   Not measured: a reference with LOD0 forced everywhere, so whether today's LODs thin the crowns is an inference; and the triangles drawn per shot, so how deep the cut pruned at each shot is unknown. The test crown's pruning stops at 126 of 1,600 triangles (about 1/13), not the cap's 1/16.
 
   So cards are not ready for the film's far trees as they are. Worth trying next: a lower `card_max_scale` (2), keeping kept cards near their own positions at a crown's silhouette, or handing distant crowns to impostors.
+
+  **The spire loss, measured and fixed.** On the test crown at a 1-pixel budget:
+  - At the default `card_error_scale` of 1, cuts moved the crown's outline by at most 0.5 px at every distance.
+  - At 0.25, the scale the stills used, they moved it by up to 2 px. The scale made the whole error four times laxer than the budget, including the part that moves the outline.
+
+  So a pruned group's error is now the larger of two things:
+  - the crown thinning, scaled by `card_error_scale`;
+  - how far its grown cards reach past the box round the level-0 cards they stand for, in full.
+
+  Effects:
+  - Every scale now keeps the outline within the budget. Checked at 1, 0.25 and 0.1, from 30 m to 4 km.
+  - The default's cuts are unchanged.
+  - At 0.25 the crown prunes later: 800 of 1,600 triangles at 500 m instead of 200, and fully pruned from 2 km instead of 1 km.
+  - A `card_max_scale` of 2 would have left 5.5% of the coarsest cut's area outside the crown, and stopped pruning at 456 triangles instead of 126.
 - **Cost is not measured yet.** The whole film is GPU-bound on the shared Mac (35–72 ms a frame headless), and the runs were stopped for the machine's load. What to expect:
   - The cap would leave about 150 of 2,400 foliage triangles, roughly today's LOD2 (146); the test crown stops a little above it (1/13).
   - M2 measured vertex pulling about 15% slower than discrete LODs.
