@@ -5,7 +5,7 @@ use optimesh::partition::partition_clusters;
 use optimesh::simplifier::{simplify_with_attributes, Attributes, SimplifyTarget, VertexData, SIMPLIFY_ERROR_ABSOLUTE, SIMPLIFY_SPARSE, SIMPLIFY_VERTEX_LOCK};
 use std::collections::HashMap;
 
-use super::{Cluster, ClusterMesh, ClusterOptions, Sphere};
+use super::{cards, Cluster, ClusterMesh, ClusterOptions, Sphere};
 use crate::geometries::Geometry;
 
 impl ClusterMesh {
@@ -34,15 +34,32 @@ impl ClusterMesh {
             v.position[..3].copy_from_slice(p);
         }
         let mut mesh = ClusterMesh { vertices, clusters: Vec::new(), cluster_vertices: Vec::new(), cluster_triangles: Vec::new() };
-        // the clusters still without a parent, with their triangles
-        let mut pending = mesh.split(&geometry.indices, &positions, 0.0, None, 0, options);
+        // cards (with `options.cards`) are pruned level by level, the rest simplified; the card
+        // rounds append their scaled copies to the vertices (and `positions`), which the
+        // simplifier never sees
+        let original = geometry.vertices.len();
+        let (card_list, solid) = if options.cards { cards::find_cards(&geometry.indices, &positions, &position_ids, options) } else { (Vec::new(), geometry.indices.clone()) };
+        // the clusters still without a parent, with their triangles (or cards)
+        let mut pending = mesh.split(&solid, &positions, 0.0, None, 0, options);
+        let mut pending_cards = cards::level_zero(&mut mesh, &card_list, &positions, options);
         let mut level = 0;
-        while pending.len() > 1 {
+        while pending.len() > 1 || pending_cards.len() > 1 {
             level += 1;
+            let mut progress = false;
+            if pending_cards.len() > 1 {
+                let (next, pruned) = cards::prune_round(&mut mesh, &card_list, std::mem::take(&mut pending_cards), &mut positions, level, options);
+                pending_cards = next;
+                progress |= pruned;
+            }
+            if pending.len() <= 1 {
+                if !progress {
+                    break;
+                }
+                continue;
+            }
             let groups = partition(&pending, &positions, &canonical, options.group_size);
             let lock = shared_vertex_locks(&groups, &pending, &position_ids);
             let mut next = Vec::new();
-            let mut progress = false;
             for group in &groups {
                 let merged: Vec<u32> = group.iter().flat_map(|&i| pending[i].1.iter().copied()).collect();
                 let target = ((merged.len() as f32 * options.simplify_ratio) as usize / 3) * 3;
@@ -50,7 +67,7 @@ impl ClusterMesh {
                 let (count, error) = simplify_with_attributes(
                     &mut simplified,
                     &merged,
-                    &VertexData { positions: &positions, count: positions.len() / 3, stride: 12 },
+                    &VertexData { positions: &positions[..original * 3], count: original, stride: 12 },
                     &Attributes { data: &attributes, stride: 20, weights: &weights, count: 5 },
                     Some(&lock),
                     &SimplifyTarget { target_index_count: target, target_error: f32::MAX, options: SIMPLIFY_SPARSE | SIMPLIFY_ERROR_ABSOLUTE },
@@ -71,10 +88,10 @@ impl ClusterMesh {
                 }
                 next.extend(mesh.split(&simplified[..count], &positions, error, Some(bounds), level, options));
             }
+            pending = next;
             if !progress {
                 break;
             }
-            pending = next;
         }
         mesh
     }
@@ -104,29 +121,40 @@ impl ClusterMesh {
             // (meshlet triangle offsets count indices, 3 per triangle)
             let local_triangles = &triangles[m.triangle_offset as usize..(m.triangle_offset + m.triangle_count * 3) as usize];
             let global: Vec<u32> = local_triangles.iter().map(|&t| local_vertices[t as usize]).collect();
-            let b = compute_cluster_bounds(&global, positions, positions.len() / 3, 12);
-            let bounds = Sphere { center: Vec3::from(b.center), radius: b.radius };
-            let lod_bounds = lod_bounds.unwrap_or(bounds);
-            out.push((self.clusters.len(), global));
-            self.clusters.push(Cluster {
-                vertex_offset: self.cluster_vertices.len() as u32,
-                vertex_count: m.vertex_count,
-                triangle_offset: (self.cluster_triangles.len() / 3) as u32,
-                triangle_count: m.triangle_count,
-                bounds,
-                cone_apex: Vec3::from(b.cone_apex),
-                cone_axis: Vec3::from(b.cone_axis),
-                cone_cutoff: b.cone_cutoff,
-                error,
-                lod_bounds,
-                parent_error: f32::INFINITY,
-                parent_bounds: lod_bounds,
-                level,
-            });
-            self.cluster_vertices.extend_from_slice(local_vertices);
-            self.cluster_triangles.extend_from_slice(local_triangles);
+            let index = self.push_cluster(local_vertices, local_triangles, positions, error, lod_bounds, level, false);
+            out.push((index, global));
         }
         out
+    }
+
+    /// A cluster of `vertices` (into the mesh's) and `triangles` (3 indices into those each),
+    /// with its bounds and cone from `positions`, carrying `error` and `lod_bounds` (its own
+    /// bounds when `None`); its index.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn push_cluster(&mut self, vertices: &[u32], triangles: &[u8], positions: &[f32], error: f32, lod_bounds: Option<Sphere>, level: u32, card: bool) -> usize {
+        let global: Vec<u32> = triangles.iter().map(|&t| vertices[t as usize]).collect();
+        let b = compute_cluster_bounds(&global, positions, positions.len() / 3, 12);
+        let bounds = Sphere { center: Vec3::from(b.center), radius: b.radius };
+        let lod_bounds = lod_bounds.unwrap_or(bounds);
+        self.clusters.push(Cluster {
+            vertex_offset: self.cluster_vertices.len() as u32,
+            vertex_count: vertices.len() as u32,
+            triangle_offset: (self.cluster_triangles.len() / 3) as u32,
+            triangle_count: (triangles.len() / 3) as u32,
+            bounds,
+            cone_apex: Vec3::from(b.cone_apex),
+            cone_axis: Vec3::from(b.cone_axis),
+            cone_cutoff: b.cone_cutoff,
+            error,
+            lod_bounds,
+            parent_error: f32::INFINITY,
+            parent_bounds: lod_bounds,
+            level,
+            card,
+        });
+        self.cluster_vertices.extend_from_slice(vertices);
+        self.cluster_triangles.extend_from_slice(triangles);
+        self.clusters.len() - 1
     }
 }
 

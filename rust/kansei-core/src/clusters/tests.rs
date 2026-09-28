@@ -172,7 +172,7 @@ fn flat_shaded_meshes_keep_one_level() {
 
 /// One id per point of `mesh.vertices`: positions within `tolerance` of each other share one (a
 /// seam's copies that differ by rounding or by the sign of zero are one point to a viewer).
-fn position_keys(mesh: &ClusterMesh, tolerance: f32) -> Vec<u32> {
+pub(super) fn position_keys(mesh: &ClusterMesh, tolerance: f32) -> Vec<u32> {
     let mut cells: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
     let mut points: Vec<Vec3> = Vec::new();
     mesh.vertices
@@ -210,7 +210,7 @@ fn bad_edges(mesh: &ClusterMesh, clusters: &[usize]) -> usize {
 }
 
 /// `bad_edges` with the mesh's `position_keys` at hand.
-fn bad_edges_keyed(mesh: &ClusterMesh, keys: &[u32], clusters: &[usize]) -> usize {
+pub(super) fn bad_edges_keyed(mesh: &ClusterMesh, keys: &[u32], clusters: &[usize]) -> usize {
     let mut uses: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for &c in clusters {
         for t in mesh.triangles(c) {
