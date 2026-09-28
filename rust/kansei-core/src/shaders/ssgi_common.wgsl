@@ -20,7 +20,7 @@ struct SsgiParams {
     maxRadiusPx  : f32,
     blend        : f32,       // weight of the new frame in the history
     hasSky       : u32,
-    _pad         : f32,
+    debug        : u32,       // 1: output only the light the bounce adds
 }
 
 const SSGI_PI : f32 = 3.14159265358979;

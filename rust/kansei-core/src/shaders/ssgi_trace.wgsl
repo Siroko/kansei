@@ -5,8 +5,9 @@
 //
 // Around each point, a few slices through the view vector are searched on both sides. Every
 // depth sample hides the part of the slice's hemisphere between its front and back; the
-// hemisphere is cut into 32 sectors of equal cosine-weighted area, and a sector the first time
-// it is hidden takes the sample's colour (its outgoing radiance, the lit scene). The sectors
+// hemisphere is cut into 32 sectors of equal weight (the cosine to the normal times the slices'
+// Jacobian, as in GTAO), and a sector the first time it is hidden takes the sample's colour (its
+// outgoing radiance, the lit scene). The sectors
 // left open are the sky the point sees. Output: rgb the irradiance the bounce brings (as E, so
 // a diffuse surface adds albedo / pi times it), a the share of the hemisphere left open.
 
@@ -26,15 +27,27 @@ fn sectors(lo: f32, hi: f32) -> u32 {
     return select((1u << width) - 1u, 0xffffffffu, width >= 32u) << a;
 }
 
-// Share of the cosine-weighted hemisphere below an angle a from the normal. Angles within a few
-// degrees of the horizon count as the horizon itself: depth-rebuilt normals are that far off, and
-// a surface's own neighbours would otherwise hide the edge sectors (which span 14 degrees each,
-// the cosine weighting being flat there) while carrying almost none of the light.
+// A slice holds the directions at angle h from the view vector (signed toward the slice's
+// direction on screen). Over all slices, a direction's solid angle is |sin h| dh dphi, so the
+// irradiance weighs it by cos(h - g) |sin h|, g being the normal's angle in the slice (Jimenez et
+// al. 2016, GTAO); without |sin h| the directions toward the camera would count too much and a
+// wall beside the point too little. This is the integral of that weight up to h.
+fn sliceWeightIntegral(h: f32, g: f32) -> f32 {
+    let f = -0.25 * cos(2.0 * h - g) + 0.5 * h * sin(g);
+    return select(-f - 0.5 * cos(g), f, h >= 0.0);
+}
+
+// Share of the slice's hemisphere (around the normal at angle g) below angle g + a. The angles
+// are stretched away from the normal so the last few degrees before the horizon count as the
+// horizon itself: depth-rebuilt normals are that far off, and a surface's own neighbours would
+// otherwise hide the edge sectors (which span wide angles, the weight being flat there) while
+// carrying almost none of the light. Stretching rather than shifting leaves the angles near the
+// normal, which carry the most light, almost where they are.
 const HORIZON_BIAS : f32 = 0.09;
-fn hemisphereShare(a: f32) -> f32 {
+fn hemisphereShare(a: f32, g: f32, start: f32, total: f32) -> f32 {
     let c = clamp(a, -0.5 * SSGI_PI, 0.5 * SSGI_PI);
-    let biased = sign(c) * min(abs(c) + HORIZON_BIAS, 0.5 * SSGI_PI);
-    return (sin(biased) + 1.0) * 0.5;
+    let stretched = clamp(c * (0.5 * SSGI_PI) / (0.5 * SSGI_PI - HORIZON_BIAS), -0.5 * SSGI_PI, 0.5 * SSGI_PI);
+    return saturate((sliceWeightIntegral(g + stretched, g) - start) / total);
 }
 
 fn ign(c: vec2f) -> f32 {
@@ -96,7 +109,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         let projLen = length(projN);
         if (projLen < 1e-4) { continue; }
         let cosN = clamp(dot(projN, v) / projLen, -1.0, 1.0);
-        let nAngle = sign(dot(ortho, projN)) * acos(cosN);
+        // the normal faces the camera, so within a quarter turn of the view vector
+        let nAngle = clamp(sign(dot(ortho, projN)) * acos(cosN), -0.5 * SSGI_PI, 0.5 * SSGI_PI);
+        // the slice's whole weight (its share of the irradiance), and where its hemisphere starts
+        let sliceWeight = projLen * (cos(nAngle) + nAngle * sin(nAngle));
+        let start = sliceWeightIntegral(nAngle - 0.5 * SSGI_PI, nAngle);
+        let total = cos(nAngle) + nAngle * sin(nAngle);
         var hidden = 0u;
         for (var side = 0u; side < 2u; side++) {
             let sgn = select(-1.0, 1.0, side == 1u);
@@ -123,8 +141,8 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
                 // then as shares of the cosine-weighted hemisphere around the normal
                 let hf = sgn * acos(clamp(dot(front / dist, v), -1.0, 1.0));
                 let hb = sgn * acos(clamp(dot(normalize(back), v), -1.0, 1.0));
-                let tf = hemisphereShare(hf - nAngle);
-                let tb = hemisphereShare(hb - nAngle);
+                let tf = hemisphereShare(hf - nAngle, nAngle, start, total);
+                let tb = hemisphereShare(hb - nAngle, nAngle, start, total);
                 let bits = sectors(min(tf, tb), max(tf, tb));
                 let fresh = bits & ~hidden;
                 if (fresh != 0u) {
@@ -135,16 +153,16 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
                         facing = saturate(dot(normalize((sp.view * vec4f(sn.xyz, 0.0)).xyz), -front / dist) * 4.0);
                     }
                     let radiance = textureLoad(colorTex, spx, 0).rgb;
-                    light += radiance * (facing * f32(countOneBits(fresh)) / 32.0 * projLen);
+                    light += radiance * (facing * f32(countOneBits(fresh)) / 32.0 * sliceWeight);
                 }
                 hidden |= bits;
             }
         }
-        open += (1.0 - f32(countOneBits(hidden)) / 32.0) * projLen;
-        weight += projLen;
+        open += (1.0 - f32(countOneBits(hidden)) / 32.0) * sliceWeight;
+        weight += sliceWeight;
     }
-    // each slice's sectors average the radiance over the cosine-weighted hemisphere: pi times it
-    // is the irradiance
+    // the slices' sectors average the radiance over the cosine-weighted hemisphere: pi times it is
+    // the irradiance
     let e = light * (SSGI_PI / max(weight, 1e-4));
     textureStore(outTex, gid.xy, vec4f(min(e, vec3f(60000.0)), open / max(weight, 1e-4)));
 }

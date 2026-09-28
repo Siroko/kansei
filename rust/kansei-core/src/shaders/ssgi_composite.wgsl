@@ -2,7 +2,8 @@
 // traced texels whose surface matches this pixel's), then added to the scene as albedo / pi
 // times its irradiance. With the sky's lighting bound, the part of the sky the point cannot see
 // is taken out of the ambient light it would otherwise get (albedo / pi times the sky's
-// irradiance around its normal), so the bounce replaces the sky light it blocks.
+// irradiance around its normal), so the bounce replaces the sky light it blocks. The debug view
+// shows the bounce alone.
 
 @group(0) @binding(0) var<uniform> sp : SsgiParams;
 @group(0) @binding(1) var colorTex  : texture_2d<f32>;
@@ -21,7 +22,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let depth = ssgiDepth(px);
     let albedo = textureLoad(albedoTex, px, 0).rgb;
     if (depth >= 1.0 || all(albedo <= vec3f(0.0))) {
-        textureStore(outTex, gid.xy, color);
+        textureStore(outTex, gid.xy, select(color, vec4f(0.0, 0.0, 0.0, color.a), sp.debug != 0u));
         return;
     }
     let uv = (vec2f(gid.xy) + 0.5) / sp.fullSize;
@@ -43,7 +44,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         weight += w;
     }
     gi /= max(weight, 1e-6);
-    var result = color.rgb + albedo * gi.rgb * (sp.intensity / SSGI_PI);
+    let bounce = albedo * gi.rgb * (sp.intensity / SSGI_PI);
+    if (sp.debug != 0u) {
+        textureStore(outTex, gid.xy, vec4f(bounce, color.a));
+        return;
+    }
+    var result = color.rgb + bounce;
     let n = ssgiWorldNormal(px);
     if (sp.hasSky != 0u && sp.aoStrength > 0.0 && n.w > 0.0) {
         let ambient = albedo * skyIrradiance(sky, n.xyz) / SSGI_PI;
