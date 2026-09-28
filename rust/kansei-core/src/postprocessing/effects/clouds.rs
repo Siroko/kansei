@@ -2,8 +2,10 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::atmosphere::sky_atmosphere::{
     compute_pipeline, sampler_entry, texture_3d_entry, texture_entry, uniform_entry, AERIAL_PERSPECTIVE_LOOKUP_WGSL, CLOUD_MAP_SIZE,
-    CLOUD_MAP_WGSL, COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LIGHTING_WGSL, SKY_LOOKUP_WGSL,
+    CLOUD_MAP_WGSL, CLOUD_SHADOW_SIZE, CLOUD_SHADOW_WGSL, COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LIGHTING_WGSL,
+    SKY_LOOKUP_WGSL,
 };
+use crate::atmosphere::params::CloudShadowParamsGpu;
 use crate::atmosphere::{SkyAtmosphere, SkyAtmosphereBindings};
 use crate::cameras::Camera;
 use crate::math::Vec3;
@@ -20,7 +22,7 @@ const DETAIL_SIZE: u32 = 32;
 const WEATHER_SIZE: u32 = 256;
 
 fn march_source() -> String {
-    [COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, AERIAL_PERSPECTIVE_LOOKUP_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, MARCH_WGSL].concat()
+    [COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, AERIAL_PERSPECTIVE_LOOKUP_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, CLOUD_SHADOW_WGSL, MARCH_WGSL].concat()
 }
 
 fn composite_source() -> String {
@@ -128,6 +130,11 @@ struct Gpu {
     // the cloud map for the sky lighting (SkyAtmosphereBindings::cloud_map)
     sky_map: wgpu::ComputePipeline,
     sky_map_bgl: wgpu::BindGroupLayout,
+    // the shadow map (SkyAtmosphereBindings::cloud_shadow), and its parameters staged for it and
+    // copied to the bindings after it is written
+    shadow_map: wgpu::ComputePipeline,
+    shadow_map_bgl: wgpu::BindGroupLayout,
+    shadow_staging: wgpu::Buffer,
     composite: wgpu::ComputePipeline,
     composite_bgl: wgpu::BindGroupLayout,
     shape: wgpu::TextureView,
@@ -163,6 +170,12 @@ pub struct VolumetricCloudsEffect {
     pub layer: CloudLayer,
     /// Whether the clouds occlude and tint the sky lighting and the environment (default true).
     pub lights_sky: bool,
+    /// Whether the clouds shadow the scene from the sun (`SkyAtmosphereBindings::cloud_shadow`,
+    /// default true).
+    pub casts_shadows: bool,
+    /// The side of the shadow map (m), centred under the camera; beyond it there are no cloud
+    /// shadows. 256 texels, so 16 km gives 62.5 m per texel.
+    pub shadow_size_m: f32,
     /// Seconds, drives the wind.
     pub time: f32,
     pub resolution_scale: f32,
@@ -181,6 +194,8 @@ impl VolumetricCloudsEffect {
         Self {
             layer: options.layer,
             lights_sky: true,
+            casts_shadows: true,
+            shadow_size_m: 16_000.0,
             time: 0.0,
             resolution_scale: options.resolution_scale,
             steps: options.steps,
@@ -201,7 +216,12 @@ impl VolumetricCloudsEffect {
 
     #[cfg(test)]
     pub(crate) fn shader_sources() -> Vec<(&'static str, String)> {
-        vec![("clouds_noise", NOISE_WGSL.to_string()), ("clouds_march", march_source()), ("clouds_composite", composite_source())]
+        vec![
+            ("clouds_noise", NOISE_WGSL.to_string()),
+            ("clouds_march", march_source()),
+            ("clouds_composite", composite_source()),
+            ("cloud_shadow", CLOUD_SHADOW_WGSL.to_string()),
+        ]
     }
 
     fn init_gpu(&mut self, device: &wgpu::Device) {
@@ -330,6 +350,32 @@ impl VolumetricCloudsEffect {
                 cache: None,
             })
         };
+        let shadow_map_bgl = bgl(
+            "Clouds/ShadowMapBGL",
+            &[
+                uniform_entry(0),
+                uniform_entry(1),
+                texture_3d_entry(8),
+                texture_3d_entry(9),
+                texture_entry(10),
+                sampler_entry(11),
+                uniform_entry(15),
+                storage(19, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureViewDimension::D2),
+                uniform_entry(20),
+            ],
+        );
+        let shadow_map = {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Clouds/ShadowMap"), source: wgpu::ShaderSource::Wgsl(march_source().into()) });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/ShadowMap"), bind_group_layouts: &[&shadow_map_bgl], push_constant_ranges: &[] });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Clouds/ShadowMap"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("shadowMap"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
         let composite_bgl = bgl(
             "Clouds/CompositeBGL",
             &[
@@ -352,6 +398,14 @@ impl VolumetricCloudsEffect {
             march_bgl,
             sky_map,
             sky_map_bgl,
+            shadow_map,
+            shadow_map_bgl,
+            shadow_staging: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Clouds/ShadowParamsStaging"),
+                size: std::mem::size_of::<CloudShadowParamsGpu>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
             composite: compute_pipeline(device, "Clouds/Composite", &composite_source(), &composite_bgl),
             composite_bgl,
             shape,
@@ -517,6 +571,31 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
             let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Clouds/CompositeBG"), layout: &gpu.composite_bgl, entries: &entries })
         };
+        let shadow_bg = if self.casts_shadows {
+            let sun = self.sky.sun_direction.lock().map(|s| *s).unwrap_or(glam::Vec3::Y);
+            let eye = camera.inverse_view_matrix.to_glam().w_axis;
+            let size = self.shadow_size_m.max(100.0);
+            // centred under the camera, snapped to whole texels so the shadows don't crawl
+            let texel = size / CLOUD_SHADOW_SIZE as f32;
+            let center = [(eye.x / texel).round() * texel, (eye.z / texel).round() * texel];
+            let shadow = CloudShadowParamsGpu { center, inv_size: 1.0 / size, plane_y: eye.y, sun_dir: sun.to_array(), enabled: (sun.y > 0.01) as u32 as f32 };
+            queue.write_buffer(&gpu.shadow_staging, 0, bytemuck::bytes_of(&shadow));
+            let entries = [
+                (0, s.atmosphere.as_entire_binding()),
+                (1, s.frame.as_entire_binding()),
+                (8, tex(&gpu.shape)),
+                (9, tex(&gpu.detail)),
+                (10, tex(&gpu.weather)),
+                (11, wgpu::BindingResource::Sampler(&gpu.noise_sampler)),
+                (15, gpu.params.as_entire_binding()),
+                (19, tex(&s.cloud_shadow)),
+                (20, gpu.shadow_staging.as_entire_binding()),
+            ]
+            .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource });
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Clouds/ShadowMapBG"), layout: &gpu.shadow_map_bgl, entries: &entries }))
+        } else {
+            None
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Clouds"), ..Default::default() });
         pass.set_pipeline(&gpu.march);
         pass.set_bind_group(0, &march_bg, &[]);
@@ -528,9 +607,23 @@ impl PostProcessingEffect for VolumetricCloudsEffect {
             pass.dispatch_workgroups(CLOUD_MAP_SIZE.0.div_ceil(8), CLOUD_MAP_SIZE.1.div_ceil(8), 1);
             self.sky.cloud_map_frame.store(camera.frame().wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
         }
+        // the shadow on the scene from the sun, for the next frame's materials
+        let sun = self.sky.sun_direction.lock().map(|s| *s).unwrap_or(glam::Vec3::Y);
+        let shadows = self.casts_shadows && sun.y > 0.01;
+        if shadows {
+            pass.set_pipeline(&gpu.shadow_map);
+            pass.set_bind_group(0, shadow_bg.as_ref().unwrap(), &[]);
+            pass.dispatch_workgroups(CLOUD_SHADOW_SIZE.div_ceil(8), CLOUD_SHADOW_SIZE.div_ceil(8), 1);
+        }
         pass.set_pipeline(&gpu.composite);
         pass.set_bind_group(0, &composite_bg, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        drop(pass);
+        if self.casts_shadows {
+            // the parameters of the map just written (or its shadows off, with the sun down)
+            encoder.copy_buffer_to_buffer(&gpu.shadow_staging, 0, &self.sky.cloud_shadow_params, 0, std::mem::size_of::<CloudShadowParamsGpu>() as u64);
+            self.sky.cloud_shadow_frame.store(camera.frame().wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {}
@@ -563,6 +656,7 @@ mod tests {
             }
         }
         assert_eq!(sizes["CloudParams"], std::mem::size_of::<CloudParamsGpu>());
+        assert_eq!(sizes["CloudShadowParams"], std::mem::size_of::<CloudShadowParamsGpu>());
     }
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -830,5 +924,85 @@ mod tests {
         eprintln!("radiance zenith (low-pass): clear {:?} overcast {:?} ratio {:?}", eval(&none, up, [1.0; 3]), eval(&over, up, [1.0; 3]), eval(&over, up, [1.0; 3]) / eval(&none, up, [1.0; 3]));
         eprintln!("radiance 10 deg up: clear {:?} overcast {:?}", eval(&none, horizon, [1.0; 3]), eval(&over, horizon, [1.0; 3]));
         eprintln!("clear sky up (clouds' ambient) {:?}; sun at camera {:?}", &over[13 * 4..13 * 4 + 3], &over[9 * 4..9 * 4 + 4]);
+    }
+
+    /// The clouds' shadow map: a clear sky casts none, an overcast one a deep shadow, broken cloud
+    /// patches of both; it lies under the camera, and is off with the sun down or the clouds gone.
+    #[test]
+    fn the_clouds_shadow_the_scene_from_the_sun() {
+        let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+        let (w, h) = (64u32, 32u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output = texture(GBuffer::COLOR_FORMAT, wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let mut camera = Camera::new(60.0, 0.1, 5000.0, w as f32 / h as f32);
+        camera.set_position(300.0, 2.0, -700.0);
+        camera.look_at(&Vec3::new(300.0, 2.0, -800.0));
+        camera.update_view_matrix();
+        let mut sky = crate::atmosphere::SkyAtmosphere::new(&device, Default::default());
+        sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(50.0, 180.0);
+        sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0);
+        // the map (transmittance per texel) and its parameters after a few frames at a coverage
+        let run = |sky: &mut crate::atmosphere::SkyAtmosphere, coverage: f32| -> (Vec<f32>, CloudShadowParamsGpu) {
+            let mut fx = VolumetricCloudsEffect::new(sky, VolumetricCloudsOptions { layer: CloudLayer { coverage, ..Default::default() }, ..Default::default() });
+            for _ in 0..3 {
+                let mut e = device.create_command_encoder(&Default::default());
+                sky.encode(&queue, &mut e, &camera);
+                fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+                queue.submit([e.finish()]);
+            }
+            let n = CLOUD_SHADOW_SIZE;
+            let size = std::mem::size_of::<CloudShadowParamsGpu>() as u64;
+            let map_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * n * 4) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let params_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut e = device.create_command_encoder(&Default::default());
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: sky.cloud_shadow_texture(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &map_buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) } },
+                wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            );
+            e.copy_buffer_to_buffer(&sky.bindings().cloud_shadow_params, 0, &params_buf, 0, size);
+            queue.submit([e.finish()]);
+            map_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            params_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let map = map_buf.slice(..).get_mapped_range().chunks_exact(4).map(|t| t[0] as f32 / 255.0).collect();
+            let params = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&params_buf.slice(..).get_mapped_range());
+            (map, params)
+        };
+        let mean = |m: &[f32]| m.iter().sum::<f32>() / m.len() as f32;
+        let (clear, params) = run(&mut sky, 0.0);
+        assert!(clear.iter().all(|&t| t > 0.99), "a clear sky casts a shadow: min {}", clear.iter().cloned().fold(1.0, f32::min));
+        assert!(params.enabled > 0.5, "shadows off with the sun up");
+        let texel = params.inv_size.recip() / CLOUD_SHADOW_SIZE as f32;
+        assert!((params.center[0] - 300.0).abs() <= texel && (params.center[1] + 700.0).abs() <= texel && (params.plane_y - 2.0).abs() < 1e-3, "{:?} {}", params.center, params.plane_y);
+        let (overcast, _) = run(&mut sky, 1.0);
+        let (broken, _) = run(&mut sky, 0.5);
+        let (lo, hi) = (broken.iter().cloned().fold(1.0, f32::min), broken.iter().cloned().fold(0.0, f32::max));
+        eprintln!("sun transmitted: overcast {:.3} mean; broken {:.3} mean, {lo:.3}..{hi:.3}", mean(&overcast), mean(&broken));
+        assert!(mean(&overcast) < 0.1, "an overcast lets {} of the sun through", mean(&overcast));
+        assert!(lo < 0.3 && hi > 0.9, "broken cloud casts no patches: {lo}..{hi}");
+
+        // the sun down: the shadows are off
+        sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(-3.0, 180.0);
+        let (_, down) = run(&mut sky, 1.0);
+        assert!(down.enabled < 0.5, "shadows on with the sun down");
+        // frames later with no clouds drawn: off
+        sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(50.0, 180.0);
+        let _ = run(&mut sky, 1.0);
+        let mut later = Camera::new(60.0, 0.1, 5000.0, w as f32 / h as f32);
+        for _ in 0..3 { later.end_frame(); }
+        let mut e = device.create_command_encoder(&Default::default());
+        sky.encode(&queue, &mut e, &later);
+        let size = std::mem::size_of::<CloudShadowParamsGpu>() as u64;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        e.copy_buffer_to_buffer(&sky.bindings().cloud_shadow_params, 0, &buf, 0, size);
+        queue.submit([e.finish()]);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let gone = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&buf.slice(..).get_mapped_range());
+        assert!(gone.enabled < 0.5, "clouds no longer drawn still cast shadows");
     }
 }

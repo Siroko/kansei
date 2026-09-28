@@ -291,3 +291,35 @@ fn skyMap(@builtin(global_invocation_id) gid : vec3u) {
     }
     textureStore(cloudMapOut, gid.xy, vec4f(light, 1.0 - march.transmittance));
 }
+
+@group(0) @binding(19) var cloudShadowOut : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(20) var<uniform> shadowParams : CloudShadowParams;
+const SHADOW_STEPS : u32 = 16u;
+
+// The cloud shadow map (cloud_shadow.wgsl): from each texel's point on the plane, the layer's
+// transmittance along the sun's ray, from the layer's base to its top (the base shapes only: at
+// the map's tens of metres per texel the eroded detail would only alias).
+@compute @workgroup_size(8, 8)
+fn shadowMap(@builtin(global_invocation_id) gid : vec3u) {
+    let size = textureDimensions(cloudShadowOut);
+    if (any(gid.xy >= size)) { return; }
+    let sunDir = shadowParams.sunDir;
+    let uv = (vec2f(gid.xy) + 0.5) / vec2f(size);
+    let xz = shadowParams.center + (uv - 0.5) / shadowParams.invSize;
+    let ro = frame.cameraPos + (vec3f(xz.x, shadowParams.planeY, xz.y) - frame.cameraWorld) * 0.001;
+    let rBottom = atm.bottomRadius + cp.bottomKm;
+    let rTop = atm.bottomRadius + cp.topKm;
+    let t0 = max(raySphere(ro, sunDir, rBottom).y, 0.0);
+    let t1 = raySphere(ro, sunDir, rTop).y;
+    var od = 0.0;
+    if (t1 > t0) {
+        // a low sun crosses a long stretch of the layer: the part that counts is near its base
+        let dt = min(t1 - t0, (rTop - rBottom) * 4.0) / f32(SHADOW_STEPS);
+        for (var i = 0u; i < SHADOW_STEPS; i++) {
+            let q = ro + sunDir * (t0 + (f32(i) + 0.5) * dt);
+            let h = saturate((length(q) - rBottom) / (rTop - rBottom));
+            od += cloudDensity(q, h, false) * dt;
+        }
+    }
+    textureStore(cloudShadowOut, gid.xy, vec4f(exp(-od * cp.extinction), 0.0, 0.0, 1.0));
+}

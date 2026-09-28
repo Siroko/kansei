@@ -19,6 +19,9 @@ pub(crate) const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wg
 pub(crate) const CLOUD_MAP_WGSL: &str = include_str!("shaders/cloud_map.wgsl");
 /// The cloud map's size (cloud_map.wgsl): azimuth by zenith angle.
 pub(crate) const CLOUD_MAP_SIZE: (u32, u32) = (128, 64);
+pub(crate) use super::CLOUD_SHADOW_WGSL;
+/// The cloud shadow map's texels per side.
+pub(crate) const CLOUD_SHADOW_SIZE: u32 = 256;
 const SKY_LIGHTING_PASS_WGSL: &str = include_str!("shaders/sky_lighting_pass.wgsl");
 const ENVIRONMENT_PASS_WGSL: &str = include_str!("shaders/sky_environment_pass.wgsl");
 
@@ -121,6 +124,17 @@ pub struct SkyAtmosphereBindings {
     /// The camera frame (plus one; 0 never) the clouds last wrote `cloud_map` in. The sky lighting
     /// reads the map only while it is that fresh, so clouds taken out of the chain leave no trace.
     pub(crate) cloud_map_frame: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The clouds' shadow on the scene (rgba8unorm, r the cloud layer's transmittance toward the
+    /// sun), written by `VolumetricCloudsEffect`: bind it with `lut_sampler` and
+    /// `cloud_shadow_params` and multiply the sun's light by `CLOUD_SHADOW_WGSL`'s
+    /// `cloudShadow`. Off (1 everywhere) without clouds.
+    pub cloud_shadow: wgpu::TextureView,
+    /// The shadow map's placement (WGSL `CloudShadowParams`), from the same frame as the map.
+    pub cloud_shadow_params: wgpu::Buffer,
+    /// As `cloud_map_frame`, for the shadow map.
+    pub(crate) cloud_shadow_frame: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The sun's direction at the last update, for the clouds' shadow map.
+    pub(crate) sun_direction: std::sync::Arc<std::sync::Mutex<glam::Vec3>>,
 }
 
 struct Pipelines {
@@ -184,6 +198,7 @@ pub struct SkyAtmosphere {
     /// Aerial-perspective scattering and transmittance volumes.
     ap_volumes: [wgpu::Texture; 2],
     environment: wgpu::Texture,
+    cloud_shadow: wgpu::Texture,
     pipelines: Pipelines,
     transmittance_size: (u32, u32),
     multi_scattering_size: u32,
@@ -344,6 +359,16 @@ impl SkyAtmosphere {
             view_formats: &[],
         });
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let cloud_shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SkyAtmosphere/CloudShadow"),
+            size: wgpu::Extent3d { width: CLOUD_SHADOW_SIZE, height: CLOUD_SHADOW_SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
         let bindings = SkyAtmosphereBindings {
             atmosphere: uniform("SkyAtmosphere/Atmosphere", std::mem::size_of::<AtmosphereGpu>()),
             frame: uniform("SkyAtmosphere/Frame", std::mem::size_of::<SkyFrameGpu>()),
@@ -375,6 +400,16 @@ impl SkyAtmosphere {
             // zero-initialised: no clouds until the clouds write it
             cloud_map: view(&lut_2d(device, "SkyAtmosphere/CloudMap", CLOUD_MAP_SIZE)),
             cloud_map_frame: Default::default(),
+            cloud_shadow: cloud_shadow_texture.create_view(&Default::default()),
+            // zero: shadows off until the clouds write them
+            cloud_shadow_params: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("SkyAtmosphere/CloudShadowParams"),
+                size: std::mem::size_of::<crate::atmosphere::params::CloudShadowParamsGpu>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            cloud_shadow_frame: Default::default(),
+            sun_direction: Default::default(),
         };
         // bound in place of the cloud map while no clouds write it
         let no_clouds = view(&lut_2d(device, "SkyAtmosphere/NoClouds", (1, 1)));
@@ -565,6 +600,7 @@ impl SkyAtmosphere {
             luts,
             ap_volumes,
             environment,
+            cloud_shadow: cloud_shadow_texture,
             pipelines,
             transmittance_size: options.transmittance_size,
             multi_scattering_size: ms,
@@ -651,8 +687,18 @@ impl SkyAtmosphere {
     /// and projection matrices, so place the camera first.
     pub fn encode(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, camera: &Camera) {
         // the cloud map (0) if the clouds wrote it this frame or the last, else none (1)
-        let written = self.bindings.cloud_map_frame.load(std::sync::atomic::Ordering::Relaxed);
-        let clouds = if written != 0 && camera.frame().wrapping_sub(written - 1) <= 1 { 0 } else { 1 };
+        let fresh = |stamp: &std::sync::atomic::AtomicU32| {
+            let written = stamp.load(std::sync::atomic::Ordering::Relaxed);
+            written != 0 && camera.frame().wrapping_sub(written - 1) <= 1
+        };
+        let clouds = if fresh(&self.bindings.cloud_map_frame) { 0 } else { 1 };
+        if let Ok(mut sun) = self.bindings.sun_direction.lock() {
+            *sun = self.sun.direction.to_glam().normalize_or(glam::Vec3::Y);
+        }
+        // no clouds drawn lately: their shadows are off (the clouds copy the parameters in when drawn)
+        if !fresh(&self.bindings.cloud_shadow_frame) {
+            queue.write_buffer(&self.bindings.cloud_shadow_params, 0, bytemuck::bytes_of(&<crate::atmosphere::params::CloudShadowParamsGpu as bytemuck::Zeroable>::zeroed()));
+        }
         let atmosphere = self.params.gpu_layout();
         let b = &self.bindings;
         let p = &self.pipelines;
@@ -710,6 +756,11 @@ impl SkyAtmosphere {
     /// The sky environment cubemap texture (6 layers, GGX-prefiltered mips).
     pub fn environment_texture(&self) -> &wgpu::Texture {
         &self.environment
+    }
+
+    /// The clouds' shadow map (`SkyAtmosphereBindings::cloud_shadow`), for binding it in a material.
+    pub fn cloud_shadow_texture(&self) -> &wgpu::Texture {
+        &self.cloud_shadow
     }
 
     /// Force the transmittance and multiple-scattering LUTs to be rebuilt on the next update.

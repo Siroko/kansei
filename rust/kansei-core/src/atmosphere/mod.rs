@@ -24,3 +24,10 @@ pub const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
 /// with `Texture::from_view`) and `environment_sampler`; and `skyEnvironmentBrdf(f0, roughness,
 /// n_dot_v)`, the split sum's analytic environment BRDF to scale it by.
 pub const SKY_ENVIRONMENT_WGSL: &str = include_str!("shaders/sky_environment.wgsl");
+
+/// `cloudShadow(map, mapSampler, params, worldPos)`: the cloud layer's transmittance toward the sun
+/// at a point below the clouds, to multiply the sun's direct light by. Bind
+/// `SkyAtmosphereBindings::cloud_shadow` (`texture_2d<f32>`, e.g. `Texture::from_view` with
+/// `SkyAtmosphere::cloud_shadow_texture`), a linear clamping sampler and `cloud_shadow_params`
+/// (uniform `CloudShadowParams`). `VolumetricCloudsEffect` writes them; it is 1 without clouds.
+pub const CLOUD_SHADOW_WGSL: &str = include_str!("shaders/cloud_shadow.wgsl");
