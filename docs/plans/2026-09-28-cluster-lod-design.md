@@ -119,7 +119,7 @@ Per-instance occlusion didn't pay in the film (#37): a tree is rarely wholly hid
 
 - **Vertex pulling cost.** Fetching from storage instead of the vertex-input hardware, plus the padding, costs more per vertex. It pays only where selection removes more than it adds. Milestone 2 measures this A/B on a dense mesh field before anything builds on it.
 - **Rewriting material WGSL.** It's a text transformation over two known forms. It's covered by naga validation of every material in the repository, and it fails loudly (the renderable keeps the ordinary path) rather than drawing wrong.
-- **Build time in wasm.** Natively, 327K triangles take 0.46 s. The film builds ~30 tree meshes of 1-3K triangles, which is milliseconds even at wasm's speed. A mesh of millions of triangles would take seconds, which is the case for an offline build (the same code, run natively, serialised).
+- **Build time in wasm.** Natively, 327,680 triangles build into 7,578 clusters in 0.42 s (release, `clusters::tests::build_time`). The film builds ~30 tree meshes of 1-3K triangles, which is milliseconds even at wasm's speed. A mesh of millions of triangles would take seconds, which is the case for an offline build (the same code, run natively, serialised).
 - **Foliage quality.** Stochastic pruning is proven for foliage, but the film's crowns are ribbons, not free cards. Milestone 4 compares stills against today's LODs before the film adopts it.
 
 ## Milestones
