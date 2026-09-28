@@ -1007,3 +1007,84 @@ fn every_view_gets_its_own_cut_in_one_pass() {
     // the views differ enough that sharing one view's data can't pass
     assert!(sizes[0] != sizes[1] && sizes[1] != sizes[2], "{sizes:?}");
 }
+
+/// `rocks` lit by a shadowed spot light 4 m above them and a shadowed sun (two cascades), with
+/// the renderer's culling stats on.
+fn lit_rocks(renderer: &mut Renderer, clusters: bool) -> (Scene, Camera, usize) {
+    use crate::lights::{DirectionalLight, Light, SpotLight};
+    use crate::math::Vec3;
+    renderer.enable_spot_shadows(256, 1);
+    renderer.enable_cascaded_shadows(crate::shadows::CascadedShadowOptions { cascades: 2, resolution: 256, max_distance: 30.0, caster_distance: 30.0, ..Default::default() });
+    renderer.set_culling_stats(true);
+    let (mut scene, camera, index) = rocks(renderer, &PLACEMENTS, 4, clusters);
+    scene.get_renderable_mut(index).unwrap().cast_shadow = true;
+    let mut spot = SpotLight::new(Vec3::new(0.5, 4.0, -1.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 10.0, 20.0, 0.6, 0.8);
+    spot.cast_shadow = true;
+    scene.add(SceneNode::Light(Light::Spot(spot)));
+    let mut sun = DirectionalLight::new(Vec3::new(-0.3, -1.0, -0.2), Vec3::new(1.0, 1.0, 1.0), 1.0);
+    sun.cast_shadow = true;
+    scene.add(SceneNode::Light(Light::Directional(sun)));
+    (scene, camera, index)
+}
+
+/// Draw a few frames, until the stats of one are read back.
+fn stats_after_frames(renderer: &mut Renderer, scene: &mut Scene, camera: &mut Camera) -> crate::culling::CullingStats {
+    for _ in 0..6 {
+        draw(renderer, scene, camera);
+    }
+    renderer.culling_stats().cloned().expect("stats read back")
+}
+
+#[test]
+fn shadow_views_cut_clustered_casters() {
+    use crate::culling::CullViewKind;
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, index) = lit_rocks(&mut renderer, true);
+    let stats = stats_after_frames(&mut renderer, &mut scene, &mut camera);
+    for kind in [CullViewKind::Camera, CullViewKind::SpotShadow(0), CullViewKind::Cascade(0)] {
+        let s = stats.view(kind).unwrap_or_default();
+        assert!(s.clusters > 0 && s.triangles > 0, "{kind:?}: {s:?}");
+    }
+    // every view with a cut of its own
+    let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().unwrap().gpu.as_ref().unwrap();
+    assert!(gpu.cut(0).is_some() && gpu.cut(1).is_some(), "the camera's and the spot light's cuts");
+}
+
+#[test]
+fn shadow_triangles_fall_with_the_scale() {
+    use crate::culling::CullViewKind;
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, _) = lit_rocks(&mut renderer, true);
+    let mut seen = Vec::new();
+    for scale in [1.0, 8.0] {
+        renderer.set_shadow_cluster_error_scale(scale);
+        let stats = stats_after_frames(&mut renderer, &mut scene, &mut camera);
+        seen.push([CullViewKind::Camera, CullViewKind::SpotShadow(0), CullViewKind::Cascade(0)].map(|k| stats.view(k).unwrap_or_default().triangles));
+    }
+    let ([camera0, spot0, cascade0], [camera1, spot1, cascade1]) = (seen[0], seen[1]);
+    assert!(spot1 < spot0 && cascade1 < cascade0, "shadow triangles at scales 1 and 8: {seen:?}");
+    assert_eq!(camera0, camera1, "the camera's cut moved with the shadows' scale: {seen:?}");
+}
+
+#[test]
+fn renderables_off_a_view_get_no_cut_there() {
+    use crate::culling::CullViewKind;
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, index) = lit_rocks(&mut renderer, true);
+    scene.get_renderable_mut(index).unwrap().cast_shadow = false;
+    let stats = stats_after_frames(&mut renderer, &mut scene, &mut camera);
+    let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().unwrap().gpu.as_ref().unwrap();
+    // view 1: the spot shadow atlas's layer 0
+    assert!(gpu.cut(1).is_none(), "a cut for a view the renderable isn't drawn in");
+    assert_eq!(stats.view(CullViewKind::SpotShadow(0)).unwrap_or_default().clusters, 0);
+    assert!(stats.camera().clusters > 0);
+}

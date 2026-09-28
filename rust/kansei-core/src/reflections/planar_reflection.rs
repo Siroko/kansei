@@ -183,6 +183,9 @@ pub struct PlanarReflection {
     /// from below, where coarse LODs built to read from the side (flat cards, dropped detail)
     /// show; 1 (the default) picks the camera's.
     pub lod_distance_scale: f32,
+    /// Scales the cluster LOD budget (`Renderable::clusters`) in the mirrored view: above 1 the
+    /// reflection draws coarser cuts than the camera. 1 by default.
+    pub lod_error_scale: f32,
     /// Occlusion culling in the mirrored view (off by default): instanced renderables with
     /// `InstanceCulling::with_occlusion` also skip the instances hidden behind the rest of what
     /// the mirror draws, in two phases as for the camera, against a depth pyramid of the mirror's
@@ -440,6 +443,7 @@ impl PlanarReflection {
             clip_bias: options.clip_bias,
             enabled: true,
             lod_distance_scale: 1.0,
+            lod_error_scale: 1.0,
             occlusion_culling: false,
             surface_bounds: None,
             screen_margin: 0.05,

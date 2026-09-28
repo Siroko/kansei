@@ -32,6 +32,9 @@ pub struct SkyOcclusionOptions {
     /// above 1 it draws coarser LODs, whose detail the map's texels rarely resolve, but it also
     /// drops instances beyond a last LOD band that ends at a finite distance sooner.
     pub lod_distance_scale: f32,
+    /// Scales the cluster LOD budget (`Renderable::clusters`) of the top-down view: above 1 it
+    /// draws coarser cuts than the camera. 1 by default.
+    pub lod_error_scale: f32,
     /// The layers (`Renderable::layers`) whose shadow casters occlude the sky; all by default.
     /// Leave solid ground out (put the vegetation on a layer of its own): the volume counts what
     /// is under a top as inside it, so where it is interpolated across the ground the voxels
@@ -52,6 +55,7 @@ impl Default for SkyOcclusionOptions {
             frames: 4,
             depth_tiles: 2,
             lod_distance_scale: 1.0,
+            lod_error_scale: 1.0,
             layer_mask: u32::MAX,
         }
     }
