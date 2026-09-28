@@ -991,6 +991,8 @@ mod tests {
             let ln2 = std::f32::consts::LN_2;
             let layer = crate::postprocessing::effects::HeightFogLayer { density: 0.03 * 0.1 * ln2 * ln2, height_falloff: 0.1 * 0.1 * ln2, height: 0.0 };
             sky.capture_fog = Some(crate::atmosphere::SkyCaptureFog { layers: [layer, Default::default()], inscattering: Vec3::new(c[0], c[1], c[2]), max_opacity: 1.0, capture_height_m: 6.0, sky_ambient_scale: 1.0 });
+            // Unreal's capture itself, the fog below the horizon too
+            sky.lighting_sees_ground = false;
             for _ in 0..3 {
                 let mut encoder = device.create_command_encoder(&Default::default());
                 sky.encode(&queue, &mut encoder, &camera);
