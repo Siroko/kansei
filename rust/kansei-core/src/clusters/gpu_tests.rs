@@ -762,3 +762,96 @@ fn sheared_transforms_keep_every_level_the_cut_needs() {
     }
     assert!(checked > 1000, "{checked}");
 }
+
+/// Cards (quads with a disc in their uv) placed like the rocks, alpha-tested and drawn from both
+/// sides.
+const CARDS_WGSL: &str = r#"
+struct Tint { color: vec4<f32> };
+@group(0) @binding(0) var<uniform> tint: Tint;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) place: vec4<f32>, @location(4) yaw: f32 };
+struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) uv: vec2<f32> };
+struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
+fn turn(v: vec3<f32>, a: f32) -> vec3<f32> {
+    return vec3<f32>(cos(a) * v.x + sin(a) * v.z, v.y, -sin(a) * v.x + cos(a) * v.z);
+}
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    var out: VOut;
+    let local = turn(v.position.xyz * v.place.w, v.yaw) + v.place.xyz;
+    out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(local, 1.0);
+    out.normal = (world_matrix * vec4<f32>(turn(v.normal, v.yaw), 0.0)).xyz;
+    out.uv = v.uv;
+    return out;
+}
+@fragment
+fn fragment_main(in: VOut) -> FOut {
+    if (length(in.uv - vec2<f32>(0.5)) > 0.5) {
+        discard;
+    }
+    let n = vec4<f32>(normalize(in.normal) * 0.5 + 0.5, 1.0) * tint.color;
+    return FOut(n, vec4<f32>(0.0), n, n);
+}
+"#;
+
+/// Three crowns of cards at `placements` (x, y, z, scale, yaw), with card clusters or without,
+/// and a camera at `eye` looking at `target`.
+fn crowns(renderer: &Renderer, placements: &[[f32; 5]], clusters: bool, eye: crate::math::Vec3, target: crate::math::Vec3) -> (Scene, Camera, usize) {
+    use wgpu::util::DeviceExt;
+    let geometry = super::card_tests::crown(800);
+    let data: Vec<f32> = placements.iter().flat_map(|p| [p[0], p[1], p[2], p[3], p[4], 0.0, 0.0, 0.0]).collect();
+    let source = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE });
+    let instances = ComputeBuffer::from_external("Crowns", source.clone(), BufferType::Storage).with_vertex_layout(
+        32,
+        vec![InstanceAttribute { shader_location: 3, offset: 0, format: VertexFormat::Float32x4 }, InstanceAttribute { shader_location: 4, offset: 16, format: VertexFormat::Float32 }],
+    );
+    let mut material = Material::new("Cards", CARDS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), cull_mode: crate::materials::CullMode::None, ..Default::default() });
+    material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    let count = placements.len() as u32;
+    let mut r = Renderable::new(InstancedGeometry::new(geometry, count, vec![instances]), material);
+    r.instance_culling = Some(InstanceCulling::new(source, count, 32, 0, 12.0).with_radius_scale(12));
+    if clusters {
+        let mesh = ClusterMesh::build(&super::card_tests::crown(800), &ClusterOptions { cards: true, ..Default::default() });
+        r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: None }));
+    }
+    let mut scene = Scene::new();
+    let index = scene.add(SceneNode::Renderable(r));
+    let mut camera = Camera::new(50.0, 0.1, 500.0, 1.0);
+    camera.set_position(eye.x, eye.y, eye.z);
+    camera.look_at(&target);
+    camera.update_projection_matrix();
+    (scene, camera, index)
+}
+
+#[test]
+fn card_clusters_draw_through_the_camera_path() {
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let placements = [[-4.0, 0.0, 0.0, 1.0, 0.3], [4.0, 0.0, -2.0, 0.9, 2.0], [0.0, 0.0, -6.0, 1.1, -1.0]];
+    let near = (crate::math::Vec3::new(0.0, 6.0, 16.0), crate::math::Vec3::new(0.0, 5.0, -2.0));
+    // at zero error, what the mesh draws, both faces of every card
+    renderer.set_cluster_error_threshold(0.0);
+    let (mut scene, mut camera, _) = crowns(&renderer, &placements, false, near.0, near.1);
+    let mesh = draw(&mut renderer, &mut scene, &mut camera);
+    let (mut scene, mut camera, index) = crowns(&renderer, &placements, true, near.0, near.1);
+    let clusters = draw(&mut renderer, &mut scene, &mut camera);
+    assert!(cluster_args(&renderer, &scene, index)[1] > 0);
+    let (covered, differing) = compare(&mesh, &clusters);
+    assert!(covered > (SIZE * SIZE / 10) as usize && differing * 200 < covered, "{differing} of {covered} texels differ");
+    // from 60 m at 2 px: far fewer triangles, about as many texels covered
+    renderer.set_cluster_error_threshold(2.0);
+    let far = (crate::math::Vec3::new(0.0, 6.0, 60.0), crate::math::Vec3::new(0.0, 5.0, -2.0));
+    let (mut scene, mut camera, _) = crowns(&renderer, &placements, false, far.0, far.1);
+    let mesh = draw(&mut renderer, &mut scene, &mut camera);
+    let (mut scene, mut camera, index) = crowns(&renderer, &placements, true, far.0, far.1);
+    let pruned = draw(&mut renderer, &mut scene, &mut camera);
+    let triangles = cluster_args(&renderer, &scene, index)[6];
+    assert!(triangles * 2 <= 3 * 1600, "{triangles} triangles for three crowns of 1600");
+    let coverage = |image: &[[f32; 4]]| image.iter().filter(|t| t[3] > 0.5).count() as f32;
+    let (full, kept) = (coverage(&mesh), coverage(&pruned));
+    assert!(full > 200.0 && (kept / full - 1.0).abs() < 0.15, "coverage {kept} of {full}");
+}
