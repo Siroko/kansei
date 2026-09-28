@@ -482,6 +482,17 @@ fn headless() -> Option<Renderer> {
 /// A scene of rocks at `placements` (x, y, z, scale, yaw), culled per instance (the first
 /// `visible` records counted), with cluster LOD or without, and a camera looking at them.
 fn rocks(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: bool) -> (Scene, Camera, usize) {
+    let mut scene = Scene::new();
+    let index = scene.add(SceneNode::Renderable(rock_renderable(renderer, placements, visible, clusters)));
+    let mut camera = Camera::new(50.0, 0.1, 200.0, 1.0);
+    camera.set_position(0.5, 1.5, 6.0);
+    camera.look_at(&crate::math::Vec3::new(0.0, 0.0, -1.5));
+    camera.update_projection_matrix();
+    (scene, camera, index)
+}
+
+/// `rocks`' renderable.
+fn rock_renderable(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: bool) -> Renderable {
     use wgpu::util::DeviceExt;
     let data: Vec<f32> = placements.iter().flat_map(|p| [p[0], p[1], p[2], p[3], p[4], 0.0, 0.0, 0.0]).collect();
     let source = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE });
@@ -497,13 +508,7 @@ fn rocks(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: b
         let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
         r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: None }));
     }
-    let mut scene = Scene::new();
-    let index = scene.add(SceneNode::Renderable(r));
-    let mut camera = Camera::new(50.0, 0.1, 200.0, 1.0);
-    camera.set_position(0.5, 1.5, 6.0);
-    camera.look_at(&crate::math::Vec3::new(0.0, 0.0, -1.5));
-    camera.update_projection_matrix();
-    (scene, camera, index)
+    r
 }
 
 /// A half float's value.
@@ -1320,4 +1325,61 @@ fn planar_reflections_draw_their_cut() {
     assert!(differing(&mesh, &exact) * 200 < covered, "at no error: {} of {covered} texels differ", differing(&mesh, &exact));
     let coarse = reflection_image(true, 1.0, 1e4).unwrap();
     assert!(differing(&mesh, &coarse) * 20 > covered, "at a coarse budget only {} of {covered} texels differ from the mesh's", differing(&mesh, &coarse));
+}
+
+#[test]
+fn every_clustered_renderable_finds_its_cuts_whatever_the_draw_order() {
+    // transparent renderables come after the opaque ones, back to front: the passes still find
+    // each renderable's cut for each view
+    let Some(mut renderer) = headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (mut scene, mut camera, glass) = lit_rocks(&mut renderer, true);
+    {
+        let r = scene.get_renderable_mut(glass).unwrap();
+        r.material = Material::new("Glass", ROCKS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), transparent: true, ..Default::default() });
+        r.material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    }
+    let solid = scene.add(SceneNode::Renderable(rock_renderable(&renderer, &PLACEMENTS, 4, true)));
+    scene.get_renderable_mut(solid).unwrap().cast_shadow = true;
+    assert!(glass < solid);
+    draw(&mut renderer, &mut scene, &mut camera);
+    for index in [glass, solid] {
+        for view in [0, 1] {
+            assert!(renderer.has_cluster_cut(&scene, index, view), "renderable {index}: no cut found for view {view}");
+        }
+    }
+}
+
+/// `reflection_image`'s, seen from 2 m above the water, looking 1° down at the rocks: the usual
+/// water shot.
+fn level_reflection_image(clusters: bool, threshold: f32) -> Option<Vec<Vec<f32>>> {
+    use crate::reflections::{PlanarReflection, PlanarReflectionOptions};
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    camera.set_position(0.0, 0.5, 8.0);
+    camera.look_at(&crate::math::Vec3::new(0.0, 0.5 - 100.0 * 1f32.to_radians().tan(), -92.0));
+    renderer.add_planar_reflection(PlanarReflection::new(&renderer, crate::math::Vec3::new(0.0, -1.5, 0.0), crate::math::Vec3::new(0.0, 1.0, 0.0), PlanarReflectionOptions { width: 192, height: 192, mip_levels: 1, ..Default::default() }));
+    for _ in 0..2 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    Some(read_half(&renderer, renderer.planar_reflection(0).unwrap().texture(), 4))
+}
+
+#[test]
+fn a_level_reflection_keeps_the_budget_near_the_water() {
+    // the mirrored view's projection has its near plane on the water, far out along a level
+    // view: errors must still be measured from the camera's near, or the reflection's cut is
+    // far coarser than a pixel
+    let Some(mesh) = level_reflection_image(false, 0.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let clusters = level_reflection_image(true, 1.0).unwrap();
+    let covered = mesh.iter().filter(|t| t[..3].iter().any(|c| *c > 0.02)).count();
+    let differing = mesh.iter().zip(&clusters).filter(|(x, y)| (0..3).any(|c| (x[c] - y[c]).abs() > 0.1)).count();
+    assert!(covered > 200, "the reflection shows {covered} texels of rock");
+    assert!(differing * 20 < covered, "at a 1-pixel budget {differing} of {covered} texels differ clearly from the mesh's");
 }

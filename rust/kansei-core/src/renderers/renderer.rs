@@ -639,6 +639,12 @@ impl Renderer {
         }
     }
 
+    /// Whether the passes find renderable `index`'s cluster cut for cull view `view` this frame.
+    #[cfg(test)]
+    pub(crate) fn has_cluster_cut(&self, scene: &Scene, index: usize, view: usize) -> bool {
+        scene.get_renderable(index).is_some_and(|r| cluster_cut(&self.cluster_cuts, r, index, view).is_some())
+    }
+
     /// Make `r`'s cluster velocity pipeline when its material writes motion vectors, or drop its
     /// cluster LOD with a warning when the cluster path can't draw it.
     fn prepare_cluster_velocity_pipeline(&self, r: &mut crate::objects::Renderable) {
@@ -2003,6 +2009,8 @@ impl Renderer {
             self.invalidate_bundle();
         }
         self.clustered = prepared;
+        // (in draw order until now: transparent renderables last, back to front)
+        cuts.sort_unstable();
         self.cluster_cuts = cuts;
     }
 
@@ -2017,19 +2025,21 @@ impl Renderer {
         if let Some(atlas) = &self.spot_shadow_atlas {
             views.resize(1 + atlas.layers as usize, None);
             for slot in &self.spot_lights.shadows {
-                views[spot_view(slot.layer)] = Some(cluster_view(slot.projection * slot.view, slot.projection, slot.view, atlas.resolution, shadow));
+                views[spot_view(slot.layer)] = Some(cluster_view(slot.projection * slot.view, slot.projection, slot.view, atlas.resolution, projection_near(slot.projection), shadow));
             }
         }
         views.extend(self.planar_reflections.iter().map(|r| {
             let c = r.camera();
-            (r.is_active() && !r.screen_space).then(|| cluster_view(r.cull_view_proj(), c.projection_matrix.to_glam(), c.view_matrix.to_glam(), r.height(), threshold * r.lod_error_scale))
+            // (the camera's near: the mirrored projection's near plane is the water, which a level
+            // view meets far out)
+            (r.is_active() && !r.screen_space).then(|| cluster_view(r.cull_view_proj(), c.projection_matrix.to_glam(), c.view_matrix.to_glam(), r.height(), camera.near, threshold * r.lod_error_scale))
         }));
         if let Some(csm) = &self.cascaded_shadows {
-            views.extend(csm.slots.iter().map(|s| Some(cluster_view(s.projection * s.view, s.projection, s.view, csm.options.resolution, shadow))));
+            views.extend(csm.slots.iter().map(|s| Some(cluster_view(s.projection * s.view, s.projection, s.view, csm.options.resolution, projection_near(s.projection), shadow))));
         }
         if let Some(sky) = &self.sky_occlusion {
             let c = sky.camera();
-            views.push(sky.cull_view().map(|view_proj| cluster_view(view_proj, c.projection_matrix.to_glam(), c.view_matrix.to_glam(), sky.options.resolution, threshold * sky.options.lod_error_scale)));
+            views.push(sky.cull_view().map(|view_proj| cluster_view(view_proj, c.projection_matrix.to_glam(), c.view_matrix.to_glam(), sky.options.resolution, projection_near(c.projection_matrix.to_glam()), threshold * sky.options.lod_error_scale)));
         }
         views
     }
@@ -3358,17 +3368,21 @@ fn bind_and_draw<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
     }
 }
 
-/// A cluster view from a view's frustum (`view_proj`), its projection and view matrices, and its
-/// target's height in pixels, `threshold` pixels of error: orthographic when the projection is.
-fn cluster_view(view_proj: glam::Mat4, projection: glam::Mat4, view: glam::Mat4, height: u32, threshold: f32) -> crate::clusters::ClusterViewGpu {
+/// A cluster view from a view's frustum (`view_proj`), its projection and view matrices, its
+/// target's height in pixels and its `near` distance (errors of nearer spheres are clamped to
+/// it), `threshold` pixels of error: orthographic when the projection is.
+fn cluster_view(view_proj: glam::Mat4, projection: glam::Mat4, view: glam::Mat4, height: u32, near: f32, threshold: f32) -> crate::clusters::ClusterViewGpu {
     // a perspective projection's w is the view depth (±1 in z's column); an orthographic one's is 1
     let orthographic = projection.z_axis.w == 0.0;
     // pixels per radian at the centre, or per metre: half the height times y's scale
     let pixels = height as f32 * 0.5 * projection.y_axis.y.abs();
-    // the near plane's distance (errors of nearer spheres are clamped to it)
-    let near = (projection.w_axis.z / projection.z_axis.z).abs();
-    let near = if near.is_finite() && near > 0.0 { near } else { 0.01 };
     crate::clusters::ClusterViewGpu::new(view_proj, view.inverse().w_axis.truncate(), pixels, near, threshold, orthographic)
+}
+
+/// A perspective projection's near distance (0.01 when it has none to read).
+fn projection_near(projection: glam::Mat4) -> f32 {
+    let near = (projection.w_axis.z / projection.z_axis.z).abs();
+    if near.is_finite() && near > 0.0 { near } else { 0.01 }
 }
 
 /// `width` x `height` times `scale`, rounded, at least 1 x 1.
