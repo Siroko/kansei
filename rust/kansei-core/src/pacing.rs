@@ -7,23 +7,33 @@
 //! (every other one on a 120 Hz display is a steady 60 fps), k the fewest that keep up:
 //! - it renders on fewer (k + 1) when refreshes are being missed (the browser calls a refresh
 //!   late while the frames before it are still on the GPU): over two windows running, or many
-//!   over one, and only while the frames' median GPU time does not fit k refreshes. A burst of
-//!   slow frames (a cut, a rebuild), or misses while the typical frame fits, are hitches, not a
-//!   slower cadence;
+//!   over one, and only while the frames' median GPU time does not fit k refreshes;
+//! - and when frames keep spilling past k refreshes (one in ten or more, on nearly every refresh
+//!   over two windows running), missed refreshes or not: the browser keeps a frame or two in
+//!   flight, so the screen shows uneven intervals before any refresh is missed. Only where the
+//!   slower cadence keeps `spill_floor_fps` (on a 120 Hz display, 60 fps goes to 40; on a 60 Hz
+//!   one, 30 would be worse than the spills);
+//! - a burst of slow frames (a cut, a rebuild), or frames one step slower would not hold either,
+//!   is a hitch, not a slower cadence;
 //! - it renders when k refresh intervals have passed since the last rendered frame, by the
 //!   refreshes' timestamps: a late refresh does not push the next frame a refresh further;
-//! - it tries more (k - 1) once k has held without a miss for `settle_ms`, and keeps them if
-//!   nothing is missed; if something is, it goes back and waits twice as long before trying again
-//!   (up to `max_backoff_ms`);
+//! - after slowing down from a cadence it held, it comes back to it as soon as the latest frames
+//!   fit it with room (`fit_share`), whatever the wait, a step or several at a time;
+//! - otherwise it tries more (k - 1) blind once k has held without a miss for `settle_ms` (8 s:
+//!   a try that fails shows as a couple of seconds of uneven frames), and keeps them once they
+//!   have held for `probation_ms` with frames that rarely spill; if they don't, it goes back and
+//!   waits twice as long before trying that cadence again (up to `max_backoff_ms`), each cadence
+//!   its own wait;
 //! - `max_fps` caps it (60 on a 120 Hz display, where a steady 60 is the aim).
 //!
-//! The frames' GPU time (`FrameTimer`) is measured too, but it only gates and hints: a GPU with
-//! fewer frames to draw lowers its clocks (Apple's do), so each frame takes longer at a slower
-//! cadence, and a pacer slowing down by GPU time slows down further and further. Misses slow it
-//! down only while the median frame (over the last second or so) does not fit the cadence; when
-//! the median fits a faster cadence with room (`fit_share`) even at the slower one's clocks, and
-//! is below what it was when that cadence last failed, the pacer tries it at once, whatever the
+//! The frames' GPU time (`FrameTimer`) is measured too. A GPU with fewer frames to draw lowers its
+//! clocks (Apple's do), so each frame takes longer at a slower cadence. When the latest frames fit
+//! a faster cadence with room even at the slower one's clocks, and their median is below what this
+//! cadence cost just before that faster one last failed, the pacer tries it at once, whatever the
 //! wait (the cost fell: a lighter shot after a heavier one).
+//!
+//! `FramePacer::take_report` says what it saw and did (the refresh and frame intervals, the GPU
+//! time, each change and why): log it on a display where the pacing misbehaves.
 //!
 //! ```ignore
 //! let mut pacer = FramePacer::new(renderer.device(), renderer.queue(), FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
@@ -56,23 +66,32 @@ pub struct FramePacerOptions {
     /// Missing this share of the refreshes over one `window_ms` slows down at once.
     pub late_share_at_once: f64,
     pub window_ms: f64,
-    /// How long a cadence must hold without a miss before a faster one is tried, ms.
+    /// How long a cadence must hold without a miss before a faster one is tried, ms. Each try
+    /// that fails shows as a second or so of uneven frames, so tries come rarely.
     pub settle_ms: f64,
     /// The longest wait before trying a faster cadence that failed again, ms.
     pub max_backoff_ms: f64,
+    /// How long a faster cadence must hold before it is kept, ms: slowing down within it, or
+    /// frames that don't fit it at its end, is a failed try (the next waits twice as long).
+    pub probation_ms: f64,
+    /// Frames that keep spilling past the cadence slow it down only while the slower cadence
+    /// renders at least this many frames per second (40: on a 120 Hz display, 60 fps goes to 40
+    /// rather than showing uneven intervals; on a 60 Hz display the next step down is 30, and
+    /// spills stay hitches).
+    pub spill_floor_fps: f64,
     /// How long after the first refresh misses are not counted (loading, warming up), ms.
     pub warmup_ms: f64,
-    /// Missed refreshes slow a cadence only while recent frames' median GPU time (the last
-    /// `GPU_FRAMES`) is over its frame time; while it fits, they are hitches (a burst of slow
-    /// frames, a stall elsewhere) that a slower cadence would not remove. A faster cadence is
-    /// tried at once when the median is below this share of its frame time (and well below what
-    /// it was when that cadence last failed).
+    /// Missed refreshes slow a cadence only while recent frames' GPU time (nine in ten of the
+    /// last `GPU_FRAMES`) is over its frame time; while it fits, they are hitches (a burst of
+    /// slow frames, a stall elsewhere) that a slower cadence would not remove. A faster cadence
+    /// is tried at once when the latest frames (nine in ten) are below this share of its frame
+    /// time (and their median well below what it was when that cadence last failed).
     pub fit_share: f64,
 }
 
 impl Default for FramePacerOptions {
     fn default() -> Self {
-        Self { max_fps: None, max_divisor: 4, late_factor: 1.5, late_share: 0.05, late_share_at_once: 0.2, window_ms: 1000.0, settle_ms: 1000.0, max_backoff_ms: 16000.0, warmup_ms: 1000.0, fit_share: 0.9 }
+        Self { max_fps: None, max_divisor: 4, late_factor: 1.5, late_share: 0.05, late_share_at_once: 0.2, window_ms: 1000.0, settle_ms: 8000.0, max_backoff_ms: 120000.0, probation_ms: 10000.0, spill_floor_fps: 40.0, warmup_ms: 1000.0, fit_share: 0.9 }
     }
 }
 
@@ -89,23 +108,115 @@ pub(crate) struct Cadence {
     last_short: f64,
     /// The last two `window_ms` of refreshes: when, and whether missed
     recent: VecDeque<(f64, bool)>,
-    /// Recent rendered frames' GPU time, ms, and what it was when the last try failed
+    /// Recent rendered frames' GPU time, ms
     gpu: VecDeque<f64>,
-    failed_gpu: f64,
+    /// The last two `window_ms` of refreshes: when, and whether frames were spilling then
+    spills: VecDeque<(f64, bool)>,
     divisor: u32,
-    /// When the divisor last changed, whether that was a try at a faster cadence, and the wait
-    /// before the next try
+    /// When the divisor last changed, and the try at a faster cadence still on probation
     changed_at: f64,
-    trying: bool,
-    backoff_ms: f64,
+    trying: Option<Try>,
+    /// Per divisor: the wait before trying it (after it failed), and the slower cadence's median
+    /// GPU time when a try at it last failed (∞: none failed since it was last kept)
+    backoff_ms: Vec<f64>,
+    failed_base: Vec<f64>,
+    /// The divisor the pacer held before it last slowed down from a held cadence (not a failed
+    /// try): it comes back to it as soon as frames fit it
+    home: Option<u32>,
     /// When the last frame was rendered
     last_render: Option<f64>,
+    /// What `take_report` reports: since when, the refresh and frame intervals (in refreshes:
+    /// 1, 2, 3, 4, 5 or more), the refreshes missed and the divisor's changes
+    report_start: Option<f64>,
+    report_refreshes: [u32; 5],
+    report_frames: [u32; 5],
+    report_missed: u32,
+    report_stalls: u32,
+    report_changes: Vec<PacerChange>,
+}
+
+/// A faster cadence on probation: the slower cadence's median GPU time just before it, whether
+/// it was blind (no sign the frames would fit), and on how many of its refreshes frames spilled.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Try {
+    base: f64,
+    blind: bool,
+    over: u32,
+    refreshes: u32,
+}
+
+/// A change of `FramePacer`'s divisor: when (ms, the refreshes' clock), to what, and why:
+/// "floor" (`max_fps`), "misses" (refreshes missed while frames don't fit), "spilling" (one frame
+/// in ten or more over the cadence), "try failed", "try" (held long enough), "lighter" (the
+/// latest frames fit a faster cadence).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PacerChange {
+    pub at_ms: f64,
+    pub divisor: u32,
+    pub reason: &'static str,
+}
+
+/// What `FramePacer` saw and did since the last report (`FramePacer::take_report`), to log on a
+/// display the pacing misbehaves on: `Display` prints it on a line.
+#[derive(Debug, Clone)]
+pub struct PacerReport {
+    pub seconds: f64,
+    /// The display's refresh interval as measured, the divisor now, and the one it holds (the
+    /// same but during a blind try at a faster cadence).
+    pub refresh_ms: f64,
+    pub divisor: u32,
+    pub holding: u32,
+    /// The intervals between refreshes (requestAnimationFrame), and between rendered frames, in
+    /// refreshes: 1, 2, 3, 4, 5 or more.
+    pub refresh_intervals: [u32; 5],
+    pub frame_intervals: [u32; 5],
+    pub missed: u32,
+    /// Gaps between refreshes of a quarter second or more (a stall, a hidden tab), not counted
+    /// as intervals.
+    pub stalls: u32,
+    /// Recent frames' GPU time, ms (NaN before any).
+    pub gpu_p50: f64,
+    pub gpu_p90: f64,
+    pub changes: Vec<PacerChange>,
+}
+
+impl std::fmt::Display for PacerReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let counts = |c: &[u32; 5]| c.iter().enumerate().map(|(i, n)| format!("{}{}:{n}", i + 1, if i == 4 { "+" } else { "" })).collect::<Vec<_>>().join(" ");
+        write!(
+            f,
+            "pacer: {:.1} s of {:.2} ms refreshes, every {}{} · refreshes {} · frames {} · missed {} · stalls {} · GPU p50 {:.1} p90 {:.1} ms",
+            self.seconds,
+            self.refresh_ms,
+            self.divisor,
+            if self.holding != self.divisor { format!(" (a try; holds {})", self.holding) } else { String::new() },
+            counts(&self.refresh_intervals),
+            counts(&self.frame_intervals),
+            self.missed,
+            self.stalls,
+            self.gpu_p50,
+            self.gpu_p90
+        )?;
+        for c in &self.changes {
+            write!(f, " · {:.1} s → {} ({})", c.at_ms / 1000.0, c.divisor, c.reason)?;
+        }
+        Ok(())
+    }
 }
 
 impl Cadence {
     const RELEARN_MS: f64 = 30000.0;
     /// Rendered frames whose GPU time the median is taken over (a second at 60 fps).
     const GPU_FRAMES: usize = 60;
+    /// The latest frames a lighter scene is judged by (a quarter second at 60 fps): coming back
+    /// to a faster cadence should not wait for the heavier frames to leave `GPU_FRAMES`.
+    const RECENT_FRAMES: usize = 15;
+    /// Frames spill over a cadence when they do on this share of the refreshes over two windows.
+    const SPILLING: f64 = 0.8;
+    /// A try is kept when frames spilled on less than this share of its probation's refreshes.
+    const KEEP: f64 = 0.2;
+    /// Changes a report keeps while nobody takes it.
+    const MAX_CHANGES: usize = 64;
     /// How much lighter than when a faster cadence last failed the median must be for it to be
     /// tried at once: frames at a slower cadence measure lighter by themselves (less of a shared
     /// GPU's work falls inside them), which is not the scene getting lighter.
@@ -121,13 +232,50 @@ impl Cadence {
             last_short: 0.0,
             recent: VecDeque::new(),
             gpu: VecDeque::new(),
-            failed_gpu: f64::INFINITY,
+            spills: VecDeque::new(),
             divisor: 1,
             changed_at: 0.0,
-            trying: false,
-            backoff_ms: options.settle_ms,
+            trying: None,
+            backoff_ms: vec![options.settle_ms; options.max_divisor.max(1) as usize + 1],
+            failed_base: vec![f64::INFINITY; options.max_divisor.max(1) as usize + 1],
+            home: None,
             last_render: None,
+            report_start: None,
+            report_refreshes: [0; 5],
+            report_frames: [0; 5],
+            report_missed: 0,
+            report_stalls: 0,
+            report_changes: Vec::new(),
         }
+    }
+
+    /// An interval's bucket in refreshes: 1, 2, 3, 4, 5 or more.
+    fn bucket(&self, interval: f64) -> usize {
+        ((interval / self.refresh_ms()).round().max(1.0) as usize).min(5) - 1
+    }
+
+    /// What it saw and did since the last report.
+    pub(crate) fn take_report(&mut self) -> PacerReport {
+        let now = self.last_refresh.unwrap_or(0.0);
+        let report = PacerReport {
+            seconds: self.report_start.map_or(0.0, |start| (now - start) / 1000.0),
+            refresh_ms: self.refresh_ms(),
+            divisor: self.divisor,
+            holding: self.held(),
+            refresh_intervals: self.report_refreshes,
+            frame_intervals: self.report_frames,
+            missed: self.report_missed,
+            stalls: self.report_stalls,
+            gpu_p50: self.gpu_p50().unwrap_or(f64::NAN),
+            gpu_p90: self.gpu_p90().unwrap_or(f64::NAN),
+            changes: std::mem::take(&mut self.report_changes),
+        };
+        self.report_start = self.last_refresh;
+        self.report_refreshes = [0; 5];
+        self.report_frames = [0; 5];
+        self.report_missed = 0;
+        self.report_stalls = 0;
+        report
     }
 
     /// The fewest refreshes per frame `max_fps` allows.
@@ -142,10 +290,14 @@ impl Cadence {
     /// A refresh at `now_ms`: whether to render on it.
     pub(crate) fn on_refresh(&mut self, now_ms: f64) -> bool {
         let first = *self.first_refresh.get_or_insert(now_ms);
+        self.report_start.get_or_insert(now_ms);
         let mut late = false;
         if let Some(last) = self.last_refresh {
             let interval = now_ms - last;
             // (a hidden tab or a stall is not a refresh interval)
+            if interval >= 250.0 {
+                self.report_stalls += 1;
+            }
             if interval > 0.0 && interval < 250.0 {
                 self.intervals.push_back(interval);
                 if self.intervals.len() > 240 {
@@ -164,6 +316,9 @@ impl Cadence {
                     self.last_short = now_ms;
                 }
                 late = interval > self.refresh_ms * self.options.late_factor;
+                let bucket = self.bucket(interval);
+                self.report_refreshes[bucket] += 1;
+                self.report_missed += late as u32;
             }
         }
         self.last_refresh = Some(now_ms);
@@ -183,6 +338,10 @@ impl Cadence {
         // refresh early, for the timestamps' jitter)
         let due = self.last_render.is_none_or(|last| now_ms - last >= (self.divisor as f64 - 0.5) * self.refresh_ms());
         if due {
+            if let Some(last) = self.last_render {
+                let bucket = self.bucket(now_ms - last);
+                self.report_frames[bucket] += 1;
+            }
             self.last_render = Some(now_ms);
         }
         due
@@ -198,20 +357,27 @@ impl Cadence {
         }
     }
 
-    fn set_divisor(&mut self, divisor: u32, now_ms: f64) {
+    fn set_divisor(&mut self, divisor: u32, now_ms: f64, reason: &'static str) {
+        // (kept for a report nobody takes: the latest)
+        if self.report_changes.len() >= Self::MAX_CHANGES {
+            self.report_changes.remove(0);
+        }
+        self.report_changes.push(PacerChange { at_ms: now_ms, divisor, reason });
         self.divisor = divisor;
         self.changed_at = now_ms;
         self.recent.clear();
         self.gpu.clear();
+        self.spills.clear();
     }
 
     fn decide(&mut self, now_ms: f64) {
         let o = self.options;
         let floor = self.min_divisor();
         if self.divisor < floor {
-            self.set_divisor(floor, now_ms);
+            self.set_divisor(floor, now_ms, "floor");
             return;
         }
+        let k = self.divisor;
         let since = now_ms - self.changed_at;
         // the refreshes missed over the last window, and their share there and over the one before
         let share = |from: f64, to: f64| {
@@ -221,39 +387,90 @@ impl Cadence {
         let (missed, last) = share(now_ms - o.window_ms, now_ms);
         let (_, before) = share(now_ms - 2.0 * o.window_ms, now_ms - o.window_ms);
         // missing refreshes over two windows running, or many over one, while the median frame
-        // does not fit: render on fewer; a try at a faster cadence fails on one window's misses
-        // (and waits longer before the next)
-        let fits = self.fits(self.divisor, 1.0);
-        let slower = !fits
-            && (since >= o.window_ms && (last > o.late_share_at_once || (self.trying && last > o.late_share))
+        // does not fit: render on fewer; a try fails on one window's misses
+        let misses = !self.median_fits(k)
+            && (since >= o.window_ms && (last > o.late_share_at_once || (self.trying.is_some() && last > o.late_share))
                 || since >= 2.0 * o.window_ms && last > o.late_share && before > o.late_share);
-        if slower {
-            if self.trying {
-                self.backoff_ms = (self.backoff_ms * 2.0).min(o.max_backoff_ms);
-                self.failed_gpu = self.gpu_p50().unwrap_or(f64::INFINITY);
+        // frames spilling past the cadence (one in ten or more) on nearly every refresh over two
+        // windows: the screen shows uneven intervals whether or not refreshes are missed (the
+        // browser keeps a frame or two in flight). Frames that one step slower would not hold
+        // either (a cut, a rebuild) are hitches, left out; and only while the slower cadence keeps
+        // `spill_floor_fps`
+        let over = self.spill_p90(k).is_some_and(|gpu| gpu > k as f64 * self.refresh_ms());
+        self.spills.push_back((now_ms, over));
+        while self.spills.front().is_some_and(|&(t, _)| now_ms - t > 2.0 * o.window_ms) {
+            self.spills.pop_front();
+        }
+        let over_share = self.spills.iter().filter(|&&(_, over)| over).count() as f64 / self.spills.len().max(1) as f64;
+        if let Some(t) = self.trying.as_mut() {
+            t.over += over as u32;
+            t.refreshes += 1;
+        }
+        let steps_down = 1000.0 / ((k + 1) as f64 * self.refresh_ms()) >= o.spill_floor_fps - 0.5;
+        let spilling = steps_down && since >= 2.0 * o.window_ms && over_share >= Self::SPILLING;
+        if misses || spilling {
+            let reason = if self.trying.is_some() { "try failed" } else if spilling { "spilling" } else { "misses" };
+            match self.trying.take() {
+                Some(t) => self.failed(k, t),
+                // a held cadence: come back to it as soon as frames fit it
+                None => self.home = Some(k),
             }
-            self.trying = false;
-            if self.divisor < o.max_divisor.max(floor) {
-                self.set_divisor(self.divisor + 1, now_ms);
+            if k < o.max_divisor.max(floor) {
+                self.set_divisor(k + 1, now_ms, reason);
             }
             return;
         }
-        // a try that held over a window: keep it
-        if self.trying && since >= o.window_ms {
-            self.trying = false;
-            self.backoff_ms = o.settle_ms;
-            self.failed_gpu = f64::INFINITY;
+        // a try that held through its probation, frames spilling on few of its refreshes: keep
+        // it; otherwise it failed (near the threshold, the percentile dips under it now and then)
+        if let Some(t) = self.trying.filter(|_| since >= o.probation_ms) {
+            if (t.over as f64) < Self::KEEP * t.refreshes.max(1) as f64 {
+                self.trying = None;
+                self.backoff_ms[k as usize] = o.settle_ms;
+                self.failed_base[k as usize] = f64::INFINITY;
+                self.home = None;
+            } else if k < o.max_divisor.max(floor) {
+                self.trying = None;
+                self.failed(k, t);
+                self.set_divisor(k + 1, now_ms, "try failed");
+                return;
+            }
         }
-        // held without a miss for long enough, or the GPU time well within a faster cadence: try it
-        if !self.trying && self.divisor > floor && missed == 0.0 {
-            let lighter = self.fits(self.divisor - 1, self.options.fit_share) && self.gpu_p50().is_some_and(|gpu| gpu < self.failed_gpu * Self::LIGHTER);
-            if lighter {
-                self.backoff_ms = o.settle_ms;
-            }
-            if lighter || since >= self.backoff_ms {
-                self.set_divisor(self.divisor - 1, now_ms);
-                self.trying = true;
-            }
+        if k <= floor || missed > 0.0 {
+            return;
+        }
+        // the latest frames well within a faster cadence: try it at once (and on, a step at a
+        // time, while they keep fitting): back home on that alone; elsewhere when they are also
+        // well below what this cadence cost when a try at the faster one last failed
+        let faster = k - 1;
+        let lighter = self.gpu_recent().is_some_and(|(p50, p90)| {
+            p90 < faster as f64 * self.refresh_ms() * o.fit_share && (self.home == Some(faster) || p50 < self.failed_base[faster as usize] * Self::LIGHTER)
+        });
+        // or, held without a miss for long enough: a blind try (the clocks may be what's slow)
+        let blind = self.trying.is_none() && since >= self.backoff_ms[faster as usize];
+        if lighter || blind {
+            let base = self.gpu_p50().unwrap_or(f64::INFINITY);
+            // (a lighter step during a probation keeps the lower base)
+            let base = self.trying.map_or(base, |t| t.base.min(base));
+            self.set_divisor(faster, now_ms, if lighter { "lighter" } else { "try" });
+            self.trying = Some(Try { base, blind: !lighter, over: 0, refreshes: 0 });
+        }
+    }
+
+    /// A try at divisor `k` failed: wait longer before the next, remember what the slower cadence
+    /// cost just before it, and it is no longer a home to come back to on fit alone.
+    fn failed(&mut self, k: u32, t: Try) {
+        self.backoff_ms[k as usize] = (self.backoff_ms[k as usize] * 2.0).min(self.options.max_backoff_ms);
+        self.failed_base[k as usize] = t.base;
+        if self.home == Some(k) {
+            self.home = None;
+        }
+    }
+
+    /// The divisor it holds: a blind try still on probation doesn't count.
+    pub(crate) fn held(&self) -> u32 {
+        match self.trying {
+            Some(t) if t.blind => self.divisor + 1,
+            _ => self.divisor,
         }
     }
 
@@ -261,9 +478,29 @@ impl Cadence {
         (self.gpu.len() >= 10).then(|| percentile(&self.gpu, 0.5))
     }
 
-    /// Whether recent frames' median GPU time is below `share` of `divisor` refreshes.
-    fn fits(&self, divisor: u32, share: f64) -> bool {
-        self.gpu_p50().is_some_and(|gpu| gpu < divisor as f64 * self.refresh_ms() * share)
+    /// The median and 90th percentile of the latest `RECENT_FRAMES` frames' GPU time.
+    fn gpu_recent(&self) -> Option<(f64, f64)> {
+        (self.gpu.len() >= Self::RECENT_FRAMES).then(|| {
+            let recent: VecDeque<f64> = self.gpu.iter().rev().take(Self::RECENT_FRAMES).copied().collect();
+            (percentile(&recent, 0.5), percentile(&recent, 0.9))
+        })
+    }
+
+    /// Recent frames' 90th percentile GPU time at divisor `k`, leaving out the frames that one
+    /// step slower would not hold either (hitches: a cut, a rebuild).
+    fn spill_p90(&self, k: u32) -> Option<f64> {
+        let limit = (k + 1) as f64 * self.refresh_ms();
+        let held: VecDeque<f64> = self.gpu.iter().copied().filter(|&ms| ms <= limit).collect();
+        (held.len() >= 10).then(|| percentile(&held, 0.9))
+    }
+
+    fn gpu_p90(&self) -> Option<f64> {
+        (self.gpu.len() >= 10).then(|| percentile(&self.gpu, 0.9))
+    }
+
+    /// Whether recent frames' median GPU time fits `divisor` refreshes.
+    fn median_fits(&self, divisor: u32) -> bool {
+        self.gpu_p50().is_some_and(|gpu| gpu < divisor as f64 * self.refresh_ms())
     }
 
     pub(crate) fn divisor(&self) -> u32 {
@@ -323,6 +560,12 @@ impl FramePacer {
     /// The last measured frame's GPU time, ms (NaN until one arrives).
     pub fn gpu_ms(&self) -> f64 {
         self.timer.last_ms()
+    }
+
+    /// What it saw and did since the last report: log it every few seconds on a display where
+    /// the pacing misbehaves (`to_string` prints it on a line).
+    pub fn take_report(&mut self) -> PacerReport {
+        self.cadence.take_report()
     }
 }
 
@@ -520,14 +763,27 @@ mod tests {
     /// each rendered frame costs `gpu(t)` ms of GPU time, one after another. Runs the cadence for
     /// `seconds` from `start`; the divisor at the end and the rendered frames' times.
     fn simulate(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64) -> (u32, Vec<f64>) {
-        simulate_seeing(cadence, start, refresh, seconds, gpu, |_, _| {})
+        let run = run(cadence, start, refresh, seconds, gpu, |_, _| {});
+        (cadence.held(), run.rendered)
     }
 
     /// `simulate`, calling `seen` with each refresh's time and the divisor after it.
-    fn simulate_seeing(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> (u32, Vec<f64>) {
+    fn simulate_seeing(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, seen: impl FnMut(f64, u32)) -> (u32, Vec<f64>) {
+        let run = run(cadence, start, refresh, seconds, gpu, seen);
+        (cadence.held(), run.rendered)
+    }
+
+    /// A simulation's frames: when they were rendered, and when the screen showed
+    /// them (each at the first refresh after its GPU work is done, one a refresh, in order).
+    struct Run {
+        rendered: Vec<f64>,
+        shown: Vec<f64>,
+    }
+
+    fn run(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> Run {
         let mut in_flight: VecDeque<f64> = VecDeque::new(); // when each frame on the GPU is done
         let mut gpu_free = start;
-        let mut rendered = Vec::new();
+        let (mut rendered, mut shown) = (Vec::new(), Vec::<f64>::new());
         let mut t = start;
         while t < start + seconds * 1000.0 {
             while in_flight.front().is_some_and(|&done| done <= t) {
@@ -540,15 +796,114 @@ mod tests {
                 continue;
             }
             if cadence.on_refresh(t) {
+                let ms = gpu(t);
                 rendered.push(t);
-                gpu_free = gpu_free.max(t) + gpu(t);
+                gpu_free = gpu_free.max(t) + ms;
                 in_flight.push_back(gpu_free);
-                cadence.on_gpu_time(gpu(t));
+                cadence.on_gpu_time(ms);
+                let at = start + ((gpu_free - start) / refresh).ceil() * refresh;
+                shown.push(shown.last().map_or(at, |&last| at.max(last + refresh)));
             }
             seen(t, cadence.divisor());
             t += refresh;
         }
-        (cadence.divisor(), rendered)
+        Run { rendered, shown }
+    }
+
+    /// The seconds (from `from` ms) whose shown frames came at more than one interval, but for
+    /// those with a divisor change in them or just before (in `changes`).
+    fn uneven_seconds(shown: &[f64], refresh: f64, from: f64, changes: &[(f64, u32)]) -> Vec<u32> {
+        let mut per_second: std::collections::BTreeMap<u32, std::collections::BTreeSet<i64>> = Default::default();
+        for w in shown.windows(2).filter(|w| w[0] >= from) {
+            per_second.entry((w[1] / 1000.0) as u32).or_default().insert(((w[1] - w[0]) / refresh).round() as i64);
+        }
+        per_second
+            .into_iter()
+            .filter(|(s, intervals)| intervals.len() > 1 && !changes.iter().any(|&(t, _)| ((t / 1000.0) as u32).abs_diff(*s) <= 1))
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    /// A deterministic noise in [-1, 1) for frame `i`.
+    fn noise(i: u64) -> f64 {
+        let x = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i >> 7).wrapping_mul(0xBF58_476D_1CE4_E5B9)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (x >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    }
+
+    /// Frame costs of `base` ms, ±`spread` (a share), a new draw each frame.
+    fn near_the_budget(base: f64, spread: f64) -> impl Fn(f64) -> f64 {
+        let i = std::cell::Cell::new(0u64);
+        move |_| {
+            let k = i.get();
+            i.set(k + 1);
+            base * (1.0 + spread * noise(k))
+        }
+    }
+
+    #[test]
+    fn a_scene_near_the_budget_does_not_flip_between_cadences() {
+        // 16.9 ms frames (±4%) at 120 Hz capped at 60: every third refresh (40 fps) keeps up and
+        // every other doesn't quite. Tries at every other refresh are what the screen shows as
+        // jumps between 60 and 40: they come rarely, not every second or two
+        let refresh = 1000.0 / 120.0;
+        for (base, spread) in [(16.9, 0.04), (17.5, 0.03), (18.0, 0.1)] {
+            let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+            let mut changes = Vec::new();
+            let mut last = cadence.divisor();
+            let run = run(&mut cadence, 0.0, refresh, 120.0, near_the_budget(base, spread), |t, k| {
+                if k != last {
+                    changes.push((t, k));
+                    last = k;
+                }
+            });
+            let after_start: Vec<&(f64, u32)> = changes.iter().filter(|(t, _)| *t > 3000.0).collect();
+            assert!(after_start.len() <= 8, "{base} ms ±{spread}: {} changes in 2 minutes: {changes:?}", changes.len());
+            let tries: Vec<f64> = after_start.iter().filter(|(_, k)| *k == 2).map(|(t, _)| *t).collect();
+            assert!(tries.windows(2).all(|w| w[1] - w[0] >= 8000.0), "{base} ms ±{spread}: tries {tries:?}");
+            // frames that don't straddle two refreshes at every third are shown evenly every
+            // second but around the changes
+            if base == 17.5 {
+                let uneven = uneven_seconds(&run.shown, refresh, 3000.0, &changes);
+                assert!(uneven.is_empty(), "{base} ms ±{spread}: uneven seconds {uneven:?}, changes {changes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn frames_that_keep_spilling_over_the_budget_slow_it_down() {
+        // 15.5 ms frames ±12% at 120 Hz capped at 60: the median fits every other refresh, but
+        // nearly one frame in five spills past it, and the screen shows 1-, 2- and 3-refresh
+        // intervals every second. Every third refresh (40 fps) is steady: it goes there and stays
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        let changes = divisors(&mut cadence, 0.0, refresh, 30.0, near_the_budget(15.5, 0.12));
+        assert!(changes.iter().any(|&(t, k)| k == 3 && t < 5000.0), "{changes:?}");
+        assert_eq!(cadence.held(), 3, "{changes:?}");
+        // a steady 15.5 ms (the same median) keeps every other refresh
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        assert!(divisors(&mut cadence, 0.0, refresh, 30.0, near_the_budget(15.5, 0.02)).iter().all(|&(_, k)| k == 2));
+    }
+
+    #[test]
+    fn the_report_says_what_it_saw_and_why_it_changed() {
+        // 15.5 ms frames ±12% at 120 Hz capped at 60: it slows to every third refresh, spilling
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        simulate(&mut cadence, 0.0, refresh, 6.0, near_the_budget(15.5, 0.12));
+        let report = cadence.take_report();
+        assert!((report.seconds - 6.0).abs() < 0.1, "{report}");
+        assert_eq!((report.divisor, report.holding), (3, 3), "{report}");
+        assert!(report.changes.iter().any(|c| c.divisor == 3 && c.reason == "spilling"), "{report}");
+        // every refresh came on time; frames were 2 then 3 refreshes apart
+        assert!(report.refresh_intervals[0] > 600 && report.refresh_intervals[1..].iter().all(|&n| n == 0), "{report}");
+        assert!(report.frame_intervals[1] > 0 && report.frame_intervals[2] > 0, "{report}");
+        assert!(report.gpu_p90 > 16.7 && report.gpu_p50 < report.gpu_p90, "{report}");
+        let text = report.to_string();
+        assert!(text.contains("spilling") && text.contains("→ 3"), "{text}");
+        // a report covers what came after the last
+        simulate(&mut cadence, 6000.0, refresh, 2.0, near_the_budget(15.5, 0.12));
+        let next = cadence.take_report();
+        assert!((next.seconds - 2.0).abs() < 0.1 && next.changes.is_empty(), "{next}");
     }
 
     fn steady(frames: &[f64], interval: f64) -> bool {
@@ -561,11 +916,12 @@ mod tests {
         for (refresh, gpu, divisor) in [(r60, 12.0, 1), (r60, 20.0, 2), (r120, 12.0, 2), (r120, 15.0, 2), (r120, 20.0, 3), (r120, 6.0, 1), (r120, 30.0, 4)] {
             let mut cadence = Cadence::new(FramePacerOptions::default());
             // (light frames at first, as while loading: the refresh is seen)
-            let (k, frames) = simulate(&mut cadence, 0.0, refresh, 30.0, |t| if t < 500.0 { 2.0 } else { gpu });
+            let (k, frames) = simulate(&mut cadence, 0.0, refresh, 45.0, |t| if t < 500.0 { 2.0 } else { gpu });
             assert_eq!(k, divisor, "{gpu} ms frames at {:.0} Hz", 1000.0 / refresh);
             assert!((cadence.refresh_ms() - refresh).abs() < 0.01);
-            // and the last seconds are evenly spaced
-            let tail: Vec<f64> = frames.into_iter().filter(|&t| t > 27000.0).collect();
+            // and the last seconds are evenly spaced (between the ever rarer tries at a faster
+            // cadence)
+            let tail: Vec<f64> = frames.into_iter().filter(|&t| t > 42000.0).collect();
             assert!(steady(&tail, divisor as f64 * refresh), "{gpu} ms frames at {:.0} Hz: {tail:?}", 1000.0 / refresh);
         }
     }
@@ -603,18 +959,9 @@ mod tests {
         // refresh fail, and come further and further apart
         let refresh = 1000.0 / 120.0;
         let mut cadence = Cadence::new(FramePacerOptions::default());
-        let mut t = 0.0;
-        let mut tries = Vec::new();
-        let mut last = 0;
-        while t < 90000.0 {
-            let (k, _) = simulate(&mut cadence, t, refresh, 0.1, |_| 15.0);
-            if k == 1 && last != 1 {
-                tries.push(t);
-            }
-            last = k;
-            t += 100.0;
-        }
-        assert!(tries.len() >= 3, "{tries:?}");
+        let changes = divisors(&mut cadence, 0.0, refresh, 90.0, |_| 15.0);
+        let tries: Vec<f64> = changes.iter().filter(|&&(_, k)| k == 1).map(|&(t, _)| t).collect();
+        assert!(tries.len() >= 3, "{changes:?}");
         let gaps: Vec<f64> = tries.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(gaps.windows(2).all(|g| g[1] >= g[0] - 150.0), "the gaps grow: {gaps:?}");
         assert!(gaps.last().unwrap() > &10000.0, "{gaps:?}");
@@ -697,6 +1044,99 @@ mod tests {
         // with the typical frame over a refresh (18 ms), the misses slow it down
         let heavy = run(&|_| 18.0);
         assert!(heavy.first().is_some_and(|&(_, k)| k == 2), "{heavy:?}");
+    }
+
+    #[test]
+    fn on_a_60_hz_display_spills_stay_hitches() {
+        // one step down from 60 is 30 there (under `spill_floor_fps`): 15.5 ms ±10% frames (one
+        // in eight over a refresh) stay at every refresh
+        let refresh = 1000.0 / 60.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        let changes = divisors(&mut cadence, 0.0, refresh, 60.0, near_the_budget(15.5, 0.1));
+        assert!(changes.iter().all(|&(_, k)| k == 1), "{changes:?}");
+    }
+
+    /// Milliseconds spent at a divisor above `k` over `changes`, until `end`.
+    fn time_above(changes: &[(f64, u32)], start: (f64, u32), k: u32, end: f64) -> f64 {
+        let mut time = 0.0;
+        let (mut at, mut current) = start;
+        for &(t, d) in changes.iter().chain(std::iter::once(&(end, 0))) {
+            if current > k {
+                time += t - at;
+            }
+            (at, current) = (t, d);
+        }
+        time
+    }
+
+    #[test]
+    fn rebuilds_of_half_a_second_or_a_second_are_hitches() {
+        // 120 Hz capped at 60, 12 ms frames (every other refresh), or 19 ms (every third): a
+        // stretch of 40-45 ms frames (a rebuild) doesn't fit one step slower either: a hitch
+        let refresh = 1000.0 / 120.0;
+        for (base, k, slow) in [(12.0, 2, 40.0), (19.0, 3, 45.0)] {
+            for length in [500.0, 1000.0] {
+                let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+                assert_eq!(simulate(&mut cadence, 0.0, refresh, 10.0, |_| base).0, k);
+                let at = 10000.0;
+                let changes = divisors(&mut cadence, at, refresh, 20.0, move |t| if (at..at + length).contains(&t) { slow } else { base });
+                let off = time_above(&changes, (at, k), k, at + 20000.0);
+                assert!(off <= 1000.0, "{base} ms at every {k}, {length} ms of {slow} ms: {off} ms slower: {changes:?}");
+            }
+        }
+        // two of them five seconds apart
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        simulate(&mut cadence, 0.0, refresh, 10.0, |_| 12.0);
+        let bursts = |t: f64| (10000.0..10500.0).contains(&t) || (15000.0..15500.0).contains(&t);
+        let changes = divisors(&mut cadence, 10000.0, refresh, 20.0, move |t| if bursts(t) { 40.0 } else { 12.0 });
+        assert!(time_above(&changes, (10000.0, 2), 2, 30000.0) <= 1000.0, "{changes:?}");
+    }
+
+    #[test]
+    fn a_cut_after_failed_tries_does_not_pin_a_slower_cadence() {
+        // 120 Hz capped at 60: 19 ms frames settle at every third refresh after failed tries at
+        // every other (long waits between them); a heavy half second (a cut) then must not hold
+        // every fourth for longer than the cut
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        assert_eq!(simulate(&mut cadence, 0.0, refresh, 150.0, |_| 19.0).0, 3);
+        let at = 150000.0;
+        let changes = divisors(&mut cadence, at, refresh, 30.0, move |t| if (at..at + 500.0).contains(&t) { 28.0 } else { 19.0 });
+        assert!(time_above(&changes, (at, 3), 3, at + 30000.0) <= 2500.0, "{changes:?}");
+        // on a 60 Hz display, steady 30 fps (22 ms frames) and a burst of 60 ms frames
+        let refresh = 1000.0 / 60.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        assert_eq!(simulate(&mut cadence, 0.0, refresh, 150.0, |_| 22.0).0, 2);
+        let changes = divisors(&mut cadence, at, refresh, 30.0, move |t| if (at..at + 500.0).contains(&t) { 60.0 } else { 22.0 });
+        assert!(time_above(&changes, (at, 2), 2, at + 30000.0) <= 2500.0, "{changes:?}");
+    }
+
+    #[test]
+    fn it_comes_back_several_steps_at_once() {
+        // 120 Hz uncapped: 5 ms frames (every refresh), 3 s of 30 ms (every fourth), then 5 ms:
+        // back to every refresh within a few seconds, not a probation per step
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions::default());
+        assert_eq!(simulate(&mut cadence, 0.0, refresh, 10.0, |_| 5.0).0, 1);
+        assert_eq!(simulate(&mut cadence, 10000.0, refresh, 3.0, |_| 30.0).0, 4);
+        let changes = divisors(&mut cadence, 13000.0, refresh, 10.0, |_| 5.0);
+        assert!(changes.iter().any(|&(t, k)| k == 1 && t < 16000.0), "{changes:?}");
+        assert_eq!(cadence.divisor(), 1, "{changes:?}");
+    }
+
+    #[test]
+    fn near_the_spill_threshold_it_settles() {
+        // 120 Hz capped at 60: about one frame in ten over 16.7 ms (15.2 ms ±12%): whatever it
+        // settles on, it doesn't keep switching
+        let refresh = 1000.0 / 120.0;
+        let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+        let changes = divisors(&mut cadence, 0.0, refresh, 300.0, near_the_budget(15.2, 0.12));
+        // tries at every other refresh come further and further apart, whether they fail on
+        // spills or at the end of their probation
+        let tries: Vec<f64> = changes.iter().filter(|&&(t, k)| k == 2 && t > 3000.0).map(|&(t, _)| t).collect();
+        let gaps: Vec<f64> = tries.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.iter().all(|&g| g >= 8000.0) && gaps.windows(2).all(|g| g[1] >= g[0]), "tries {tries:?}: {changes:?}");
+        assert!(changes.iter().filter(|(t, _)| *t > 180000.0).count() <= 2, "{changes:?}");
     }
 
     #[test]
