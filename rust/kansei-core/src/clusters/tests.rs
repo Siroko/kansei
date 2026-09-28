@@ -242,3 +242,13 @@ fn degenerate_triangles_never_break_a_cut() {
         assert!(!mesh.select(&view(Vec3::new(0.0, 0.0, 30.0), threshold)).is_empty());
     }
 }
+
+/// `cargo test -p kansei-core --release --lib build_time -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn build_time() {
+    let rock = rock(7, false);
+    let start = std::time::Instant::now();
+    let mesh = ClusterMesh::build(&rock, &ClusterOptions::default());
+    println!("{} triangles -> {} clusters in {:?}", rock.indices.len() / 3, mesh.clusters.len(), start.elapsed());
+}
