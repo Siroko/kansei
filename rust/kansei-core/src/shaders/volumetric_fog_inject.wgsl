@@ -28,7 +28,7 @@ struct FogParams {
     anisotropy      : f32,
     startDistance   : f32,
     jitterFrame     : u32,   // 0: sample froxel centres; n > 0: the n-th temporal jitter
-    _pad2           : f32,
+    skipSpots       : u32,   // 1: the spot lights are raymarched instead (volumetric_fog_shafts.wgsl)
     // world plane (n, d): the fog lies only where n.p + d >= 0 (a planar reflection's view sees
     // the fog above its mirror); (0, 0, 0, 1) keeps all of it
     clipPlane       : vec4f,
@@ -181,8 +181,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         totalScatter += density * pl.color * smoothFalloff(dist, pl.radius) * visibility * phase;
     }
 
-    // spot lights: cones with shadows (volumetric_fog_spot.wgsl)
-    totalScatter += density * spotInScatter(worldPos, viewDir, max(sliceThickness, 0.25));
+    // spot lights: cones with shadows (volumetric_fog_spot.wgsl), unless raymarched per pixel
+    if (params.skipSpots == 0u) {
+        totalScatter += density * spotInScatter(worldPos, viewDir, max(sliceThickness, 0.25));
+    }
 
     totalScatter = (totalScatter + density * skyAmbient(viewDir)) * media.albedo;
     textureStore(scatterExtTex, gid, vec4f(totalScatter, extinction));
