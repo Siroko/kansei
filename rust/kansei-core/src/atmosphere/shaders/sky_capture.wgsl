@@ -13,7 +13,7 @@ struct SkyCapture {
     captureHeight : f32,     // world height the sky is captured from (m)
     maxOpacity    : f32,
     skyAmbientScale : f32,   // how much of the sky's distant light the fog adds to its colour
-    _pad1         : f32,
+    lightingSeesGround : u32, // the sky lighting sees the lit ground below the horizon under the fog
 }
 
 // Optical depth of one exponential layer from height z to infinity along a direction whose up
@@ -28,6 +28,12 @@ fn captureLayerDepth(layer: vec4f, z: f32, mu: f32) -> f32 {
 // Whether the capture replaces the lit ground below the horizon (the fog, or a set colour).
 fn captureCoversGround() -> bool {
     return capture.fogOn != 0u || capture.lowerMode == 1u;
+}
+
+// Whether the sky lighting sees the lit ground below the horizon although the capture's fog
+// covers it there (SkyAtmosphere::lighting_sees_ground).
+fn lightingSeesGround() -> bool {
+    return capture.fogOn != 0u && capture.lightingSeesGround != 0u && capture.lowerMode == 0u;
 }
 
 // The radiance the capture sees from world direction d, given `sky`, the sky's (and the clouds')
