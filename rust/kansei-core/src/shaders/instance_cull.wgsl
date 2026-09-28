@@ -31,7 +31,7 @@ struct CullInstances {
     firstView    : u32,               // `main`: the view of the dispatch's first row (y = 0)
     capacity     : u32,               // instances per view region in `dst`
     lateSlot     : u32,               // `late`: its draw in `args`
-    _pad         : u32,
+    layers       : u32,               // the renderable's (`Renderable::layers`)
 }
 
 // A view: all of them in one buffer, written once a frame.
@@ -40,10 +40,10 @@ struct CullView {
     view         : mat4x4f,           // occlusion: the camera's view
     proj         : mat4x4f,           // occlusion: the camera's projection, jittered as rasterized
     lodOrigin    : vec3f,             // the main camera, for every view
-    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_STATS, FLAG_REVERSE_Z
+    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_LAYERED, FLAG_STATS, FLAG_REVERSE_Z
     depthSize    : vec2f,             // occlusion: the depth buffer's size in pixels
     lodScale     : f32,               // the view's LOD distance scale (reflections pick finer LODs)
-    _pad         : f32,
+    layerMask    : u32,               // FLAG_LAYERED: the layers it draws (a reflection's)
 }
 
 struct DrawArgs {
@@ -75,6 +75,7 @@ const FLAG_CASTS_SHADOW : u32 = 8u;
 const FLAG_TWO_PHASE : u32 = 16u;
 const FLAG_VIEW : u32 = 32u;
 const FLAG_CASTERS_ONLY : u32 = 64u;
+const FLAG_LAYERED : u32 = 128u;
 // the camera's view
 const MAIN_VIEW : u32 = 0u;
 
@@ -205,11 +206,13 @@ fn tally(outcome : u32, lid : u32, draw : u32, viewFlags : u32) {
 }
 
 // Whether the renderable is drawn in view `v`: the view is in use (a shadowed light's), the
-// renderable casts shadows if only casters draw there, and the camera's is not culled in phases.
+// renderable casts shadows if only casters draw there and is on a layer the view draws, and the
+// camera's is not culled in phases (as `CullView::draws`).
 fn drawnIn(v : u32) -> bool {
     let flags = views[v].flags;
     return (flags & FLAG_VIEW) != 0u
         && ((flags & FLAG_CASTERS_ONLY) == 0u || (ci.flags & FLAG_CASTS_SHADOW) != 0u)
+        && ((flags & FLAG_LAYERED) == 0u || (views[v].layerMask & ci.layers) != 0u)
         && !(v == MAIN_VIEW && (ci.flags & FLAG_TWO_PHASE) != 0u);
 }
 
