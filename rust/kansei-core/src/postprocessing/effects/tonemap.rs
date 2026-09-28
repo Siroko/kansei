@@ -195,8 +195,9 @@ pub struct ToneMapOptions {
     /// Stops on top of `exposure` (per-shot trims).
     pub exposure_compensation: f32,
     pub grade: ColorGrade,
-    /// Natural (cos⁴) vignetting, 0 = off. UE's VignetteIntensity scale; 0.5 darkens the
-    /// corners to about 0.64.
+    /// Natural (cos⁴) vignetting, 0 = off: Unreal's `VignetteIntensity` and its formula, the
+    /// tangent off the axis growing with the intensity to sqrt(2) times it at the frame's
+    /// corners, so 0.5 darkens the corners to 0.44.
     pub vignette: f32,
     /// Lateral chromatic aberration, 0 = off; at 1 red and blue differ in magnification by 1 %.
     pub chromatic_aberration: f32,
@@ -211,6 +212,11 @@ pub struct ToneMapOptions {
     pub dither: bool,
     /// Unreal's local exposure; off when `None`.
     pub local_exposure: Option<LocalExposure>,
+    /// The aspect (width / height) of the frame the picture is the centre crop of, when it is
+    /// letterboxed: the vignette is the frame's, as Unreal's is its view's when a widget draws
+    /// the letterbox over it (the Midsommar intro renders 16:9 behind a 2.39:1 one). `None`: the
+    /// picture's own.
+    pub frame_aspect: Option<f32>,
 }
 
 impl Default for ToneMapOptions {
@@ -228,6 +234,7 @@ impl Default for ToneMapOptions {
             encode_srgb: true,
             dither: true,
             local_exposure: None,
+            frame_aspect: None,
         }
     }
 }
@@ -403,7 +410,7 @@ struct ToneMapParamsGpu {
     frame: u32,
     tonemapper: u32,
     flags: u32,
-    _pad: u32,
+    frame_aspect: f32,
     film: [f32; 4],
     film2: [f32; 4],
     local_exposure: [f32; 4],
@@ -510,7 +517,7 @@ impl ToneMapEffect {
             frame: self.frame,
             tonemapper: o.tonemapper.gpu_id(),
             flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 } | if o.local_exposure.is_some() { FLAG_LOCAL_EXPOSURE } else { 0 },
-            _pad: 0,
+            frame_aspect: o.frame_aspect.unwrap_or(0.0).max(0.0),
             film: [f.slope, f.toe, f.shoulder, f.black_clip],
             film2: [f.white_clip, f.blue_correction.clamp(0.0, 1.0), f.expand_gamut.max(0.0), 1.0],
             ..self.local_params(width, height)
@@ -965,6 +972,66 @@ mod tests {
         assert!(green.y > on.y && magenta.y < on.y, "{green:?} {on:?} {magenta:?}");
         let duv = (xy_to_uv(green) - xy_to_uv(on)).length();
         assert!((duv - 0.02).abs() < 1e-4);
+    }
+
+    /// The vignette is Unreal's (PostProcessCommon.ush's VignetteSpace and ComputeVignetteMask,
+    /// transcribed): a 16:9 frame's corners fall to 0.44 at intensity 0.5, and a 2.39:1 picture
+    /// cropped from that frame shows the frame's vignette.
+    #[test]
+    fn vignette_is_unreal_s() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        // Unreal: the frame's viewport position in [-1, 1], height / width a
+        let unreal = |x: f32, y: f32, a: f32, intensity: f32| {
+            let scale = 2f32.sqrt() / (1.0 + a * a).sqrt();
+            let (px, py) = (x * scale * intensity, y * a * scale * intensity);
+            (1.0 / (px * px + py * py + 1.0)).powi(2)
+        };
+        let camera = Camera::new(60.0, 0.1, 100.0, 1.0);
+        for (w, h, frame) in [(160u32, 90u32, None), (239, 100, Some(16.0f32 / 9.0))] {
+            let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+            let input_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING);
+            let halves: Vec<u16> = (0..w * h).flat_map(|_| [f32_to_f16(0.5), f32_to_f16(0.5), f32_to_f16(0.5), f32_to_f16(1.0)]).collect();
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &input_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&halves),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            let input = input_tex.create_view(&Default::default());
+            let output_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
+            let output = output_tex.create_view(&Default::default());
+            let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+            let gbuffer = GBuffer::new(&device, w, h, 1);
+            let mut fx = ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::None, vignette: 0.5, encode_srgb: false, dither: false, frame_aspect: frame, ..Default::default() });
+            let mut e = device.create_command_encoder(&Default::default());
+            fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+            let row = (w * 8).div_ceil(256) * 256;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &output_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let data = buf.slice(..).get_mapped_range();
+            let px: &[u16] = bytemuck::cast_slice(&data);
+            let frame_aspect = frame.unwrap_or(w as f32 / h as f32);
+            let band = frame_aspect / (w as f32 / h as f32);
+            for (x, y) in [(w / 2, h / 2), (w - 1, h / 2), (w - 1, 0), (0, h - 1), (w / 4, h / 4)] {
+                let got = f16_to_f32(px[((y * row / 2) + x * 4) as usize]) / 0.5;
+                let (nx, ny) = (((x as f32 + 0.5) / w as f32) * 2.0 - 1.0, (((y as f32 + 0.5) / h as f32) * 2.0 - 1.0) * band);
+                let want = unreal(nx, ny, 1.0 / frame_aspect, 0.5);
+                assert!((got - want).abs() < 2e-3, "{w}x{h}, frame {frame:?}, pixel ({x}, {y}): {got} vs Unreal's {want}");
+            }
+            if frame.is_none() {
+                // the frame's corner itself
+                assert!((unreal(1.0, 1.0, h as f32 / w as f32, 0.5) - 0.4444).abs() < 1e-3);
+            }
+        }
     }
 
     #[test]
