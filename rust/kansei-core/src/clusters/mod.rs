@@ -113,5 +113,44 @@ impl ClusterMesh {
     }
 }
 
+/// Where a view sees a mesh from, in the mesh's own space, and how much error it tolerates.
+#[derive(Clone, Copy, Debug)]
+pub struct LodView {
+    pub eye: Vec3,
+    /// Pixels per radian at the view's centre: the viewport's height / (2 tan(fov_y / 2)).
+    pub pixels_per_radian: f32,
+    /// Distances are clamped to this (an eye inside a sphere).
+    pub near: f32,
+    /// The error budget, pixels.
+    pub threshold: f32,
+}
+
+/// `error` (metres) seen from the view as pixels: over the distance to the nearest point of
+/// `sphere`. A parent's sphere contains its children's and its error is at least theirs, so its
+/// projected error is at least theirs from any eye.
+pub fn projected_error(error: f32, sphere: Sphere, view: &LodView) -> f32 {
+    if error == 0.0 {
+        return 0.0;
+    }
+    if !error.is_finite() {
+        return f32::INFINITY;
+    }
+    let distance = (sphere.center.distance(view.eye) - sphere.radius).max(view.near);
+    error / distance * view.pixels_per_radian
+}
+
+impl ClusterMesh {
+    /// The clusters `view` draws: each whose error is within the budget and whose parent's is
+    /// over it. Every point of the mesh is in exactly one (no holes, no overlaps).
+    pub fn select(&self, view: &LodView) -> Vec<usize> {
+        (0..self.clusters.len())
+            .filter(|&i| {
+                let c = &self.clusters[i];
+                projected_error(c.error, c.lod_bounds, view) <= view.threshold && projected_error(c.parent_error, c.parent_bounds, view) > view.threshold
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -168,3 +168,77 @@ fn flat_shaded_meshes_keep_one_level() {
     let mesh = ClusterMesh::build(&Geometry::new("flat", vertices, indices), &ClusterOptions::default());
     assert!(mesh.clusters.iter().all(|c| c.level == 0 && c.parent_error.is_infinite()));
 }
+
+fn key(v: &Vertex) -> [u32; 3] {
+    [v.position[0].to_bits(), v.position[1].to_bits(), v.position[2].to_bits()]
+}
+
+/// Edges (by position) of `clusters`' triangles that betray a hole or an overlap: used an odd
+/// number of times (a hole's rim), or shared by other than exactly two clusters once each (an
+/// overlap). A fold the simplifier left inside one cluster (an edge used 4 times, all in that
+/// cluster) is neither.
+fn bad_edges(mesh: &ClusterMesh, clusters: &[usize]) -> usize {
+    let mut uses: HashMap<([u32; 3], [u32; 3]), Vec<usize>> = HashMap::new();
+    for &c in clusters {
+        for t in mesh.triangles(c) {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (a, b) = (key(&mesh.vertices[a as usize]), key(&mesh.vertices[b as usize]));
+                uses.entry((a.min(b), a.max(b))).or_default().push(c);
+            }
+        }
+    }
+    uses.values()
+        .filter(|u| {
+            let crossing = u.iter().any(|&c| c != u[0]);
+            u.len() % 2 == 1 || (crossing && u.len() != 2)
+        })
+        .count()
+}
+
+fn view(eye: Vec3, threshold: f32) -> LodView {
+    LodView { eye, pixels_per_radian: 1080.0 / 0.8, near: 0.1, threshold }
+}
+
+#[test]
+fn every_cut_is_closed() {
+    for seam in [false, true] {
+        let mesh = ClusterMesh::build(&rock(5, seam), &ClusterOptions::default());
+        let mut cuts = Vec::new();
+        for eye in [Vec3::new(0.0, 0.0, 3.0), Vec3::new(2.0, 1.0, 1.5), Vec3::new(0.0, 0.0, 40.0), Vec3::new(-300.0, 20.0, 0.0)] {
+            for threshold in [0.0, 0.5, 1.0, 4.0, 1e9] {
+                let cut = mesh.select(&view(eye, threshold));
+                let bad = bad_edges(&mesh, &cut);
+                assert_eq!(bad, 0, "seam {seam}, eye {eye}, budget {threshold}: {bad} edges open or overlapping in a cut of {} clusters", cut.len());
+                cuts.push(cut.iter().map(|&i| mesh.clusters[i].triangle_count).sum::<u32>());
+            }
+        }
+        // at a pixel's budget, the cut from 300 m is far coarser than the one from 3 m
+        assert!(cuts[17] * 20 < cuts[2], "seam {seam}: {cuts:?}");
+    }
+}
+
+#[test]
+fn an_eye_inside_the_mesh_gets_the_finest_cut() {
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let cut = mesh.select(&view(Vec3::ZERO, 1.0));
+    assert!(cut.iter().all(|&i| mesh.clusters[i].level == 0));
+    assert_eq!(bad_edges(&mesh, &cut), 0);
+}
+
+#[test]
+fn degenerate_triangles_never_break_a_cut() {
+    let mut g = rock(4, false);
+    // zero-area triangles: repeated vertices, and three vertices on one line
+    g.indices.extend([0, 0, 1, 5, 5, 5]);
+    let a = g.vertices.len() as u32;
+    for k in 0..3 {
+        let mut q = g.vertices[0];
+        q.position[0] += 0.001 * k as f32;
+        g.vertices.push(q);
+    }
+    g.indices.extend([a, a + 1, a + 2]);
+    let mesh = ClusterMesh::build(&g, &ClusterOptions::default());
+    for threshold in [0.0, 1.0, 1e9] {
+        assert!(!mesh.select(&view(Vec3::new(0.0, 0.0, 30.0), threshold)).is_empty());
+    }
+}
