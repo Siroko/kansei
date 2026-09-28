@@ -1329,8 +1329,9 @@ impl Renderer {
         self.sky_occlusion.as_mut()
     }
 
-    /// While the sky occlusion is being rebuilt: on its first frame the shadow casters on its
-    /// layers seen from above, culled to that view, and its pyramid; then a slab of its volume.
+    /// While the sky occlusion is being rebuilt: a tile of the top-down pass a frame (the shadow
+    /// casters on its layers seen from above, culled to that tile), then its pyramid and its
+    /// volume's slabs (`SkyOcclusion::build`).
     fn run_sky_occlusion_pass(&mut self, scene: &Scene) {
         if !self.sky_occlusion.as_ref().is_some_and(|s| s.building()) {
             return;
@@ -1341,18 +1342,20 @@ impl Renderer {
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
         let sky = self.sky_occlusion.as_mut().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/SkyOcclusion") });
-        if sky.pending() {
+        if let Some([x, y, w, h]) = sky.tile_scissor() {
+            let load = if sky.first_tile() { wgpu::LoadOp::Clear(1.0) } else { wgpu::LoadOp::Load };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/SkyOcclusionPass"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: sky.depth_view(),
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations { load, store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: crate::profiling::gpu_pass("Renderer/SkyOcclusionPass").as_ref().map(crate::profiling::PassStamp::render),
                 ..Default::default()
             });
+            pass.set_scissor_rect(x, y, w, h);
             pass.set_bind_group(1, sky.camera().bind_group().unwrap(), &[]);
             for scene_idx in scene.ordered_indices() {
                 let Some(r) = scene.get_renderable(scene_idx) else { continue };

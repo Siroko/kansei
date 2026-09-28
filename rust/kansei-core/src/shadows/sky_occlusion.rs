@@ -20,9 +20,14 @@ pub struct SkyOcclusionOptions {
     pub recenter: f32,
     /// How much a ray is dimmed per metre through canopy that covers its whole footprint.
     pub canopy_extinction: f32,
-    /// Frames a rebuild is spread over: the top-down pass and a share of the volume on the first,
-    /// the rest of the volume on the others. Materials read the previous volume until it is done.
+    /// Frames the volume's build is spread over, after the top-down pass (a share of it on each).
+    /// Materials read the previous volume until the new one is done.
     pub frames: u32,
+    /// Tiles per side the top-down pass is split into, one drawn per frame, each culled to its
+    /// part of the view (1: the whole map in one frame). A rebuild then takes `depth_tiles`
+    /// squared frames of the top-down pass, one for the pyramid and `frames` for the volume, and
+    /// no frame carries the whole top-down pass.
+    pub depth_tiles: u32,
     /// Scales the camera distance `InstanceCulling` picks LOD bands by, for the top-down view:
     /// above 1 it draws coarser LODs, whose detail the map's texels rarely resolve, but it also
     /// drops instances beyond a last LOD band that ends at a finite distance sooner.
@@ -45,6 +50,7 @@ impl Default for SkyOcclusionOptions {
             recenter: 0.125,
             canopy_extinction: 0.3,
             frames: 4,
+            depth_tiles: 2,
             lod_distance_scale: 1.0,
             layer_mask: u32::MAX,
         }
@@ -88,9 +94,10 @@ pub(crate) struct OcclusionBuildGpu {
 /// above, culled on the GPU like a shadow cascade. From it the build makes a pyramid of the
 /// canopy's cover and height, then a low-resolution volume of sky visibility: from each voxel, 24
 /// cosine-weighted directions cone-traced through the canopy. It rebuilds only when the camera has
-/// moved far enough (`SkyOcclusionOptions::recenter`), or on `refresh`, over a few frames
-/// (`SkyOcclusionOptions::frames`); the scene is taken to stand still in between. Materials read
-/// it with `SKY_OCCLUSION_WGSL`'s `skyVisibility` and dim their sky ambient light by it.
+/// moved far enough (`SkyOcclusionOptions::recenter`), or on `refresh`, spread over frames: the
+/// top-down pass a tile a frame (`depth_tiles`), the pyramid, the volume a slab a frame
+/// (`frames`); the scene is taken to stand still in between. Materials read it with
+/// `SKY_OCCLUSION_WGSL`'s `skyVisibility` and dim their sky ambient light by it.
 ///
 /// The canopy is seen as a height field: its top, and how much of each area it covers. What is
 /// under a crown is taken to be inside it, so rays that would slip beneath a neighbouring crown
@@ -123,10 +130,12 @@ pub struct SkyOcclusion {
     down_bgl: wgpu::BindGroupLayout,
     volume_pipeline: wgpu::ComputePipeline,
     volume_bgl: wgpu::BindGroupLayout,
-    /// Where the map was last built, whether the top-down pass is due this frame, and the next
-    /// layer of the volume to build while one is being built.
+    /// Where the map was last built; while it is being rebuilt, the tile of the top-down pass due
+    /// this frame, whether the pyramid (and the volume's first slab) is, and the volume's next
+    /// layer.
     center: Option<glam::Vec2>,
-    pending: bool,
+    tile: Option<u32>,
+    pyramid_due: bool,
     next_layer: Option<u32>,
 }
 
@@ -245,7 +254,8 @@ impl SkyOcclusion {
             volume_pipeline: pipeline("SkyOcclusion/Volume", "volume", &volume_bgl),
             volume_bgl,
             center: None,
-            pending: false,
+            tile: None,
+            pyramid_due: false,
             next_layer: None,
         }
     }
@@ -274,10 +284,11 @@ impl SkyOcclusion {
         let eye = camera.inverse_view_matrix.to_glam().w_axis;
         let here = glam::Vec2::new(eye.x, eye.z);
         let o = self.options;
-        self.pending = self.center.is_none_or(|c| (here - c).abs().max_element() > o.extent_m * o.recenter);
-        if !self.pending {
+        if !self.center.is_none_or(|c| (here - c).abs().max_element() > o.extent_m * o.recenter) {
             return;
         }
+        self.tile = Some(0);
+        self.pyramid_due = false;
         self.next_layer = None;
         let texel = o.extent_m / self.pyramid.width() as f32;
         let center = (here / texel).round() * texel;
@@ -292,19 +303,51 @@ impl SkyOcclusion {
         self.camera.upload(queue);
     }
 
-    /// The top-down view to cull for, while a rebuild is pending.
+    fn tiles(&self) -> u32 {
+        self.options.depth_tiles.clamp(1, self.pyramid.width())
+    }
+
+    /// Tile `tile`'s texels of the depth map: x from, x to, y from, y to (rows go down the map).
+    fn tile_texels(&self, tile: u32) -> [u32; 4] {
+        let (n, res) = (self.tiles(), self.pyramid.width());
+        let (x, y) = (tile % n, tile / n);
+        [x * res / n, (x + 1) * res / n, y * res / n, (y + 1) * res / n]
+    }
+
+    /// Tile `tile`'s part of the view in normalized device coordinates: x from, x to, y from, y
+    /// to (y up), along its texels' edges.
+    fn tile_ndc(&self, tile: u32) -> [f32; 4] {
+        let res = self.pyramid.width() as f32;
+        let [x0, x1, y0, y1] = self.tile_texels(tile).map(|t| t as f32 / res * 2.0 - 1.0);
+        [x0, x1, -y1, -y0]
+    }
+
+    /// The top-down view to cull for this frame, while a tile of it is due: that tile's part.
     pub(crate) fn cull_view(&self) -> Option<glam::Mat4> {
-        self.pending.then(|| self.camera.projection_matrix.to_glam() * self.camera.view_matrix.to_glam())
+        let [x0, x1, y0, y1] = self.tile_ndc(self.tile?);
+        Some(crate::reflections::crop(x0, x1, y0, y1) * self.camera.projection_matrix.to_glam() * self.camera.view_matrix.to_glam())
     }
 
-    /// Whether the top-down pass is due this frame.
+    /// Whether a tile of the top-down pass is due this frame.
     pub(crate) fn pending(&self) -> bool {
-        self.pending
+        self.tile.is_some()
     }
 
-    /// Whether `build` has work this frame: the top-down pass is due, or a volume is being built.
+    /// Whether this frame's tile is the first of a rebuild (its pass clears the map).
+    pub(crate) fn first_tile(&self) -> bool {
+        self.tile == Some(0)
+    }
+
+    /// This frame's tile of the depth map (x, y, width, height in texels), while one is due.
+    pub(crate) fn tile_scissor(&self) -> Option<[u32; 4]> {
+        let [x0, x1, y0, y1] = self.tile_texels(self.tile?);
+        Some([x0, y0, x1 - x0, y1 - y0])
+    }
+
+    /// Whether `build` has work this frame: a tile of the top-down pass, the pyramid, or a slab
+    /// of the volume.
     pub(crate) fn building(&self) -> bool {
-        self.pending || self.next_layer.is_some()
+        self.tile.is_some() || self.pyramid_due || self.next_layer.is_some()
     }
 
     pub(crate) fn depth_view(&self) -> &wgpu::TextureView {
@@ -315,28 +358,35 @@ impl SkyOcclusion {
         &self.camera
     }
 
-    /// After the top-down depth pass, the pyramid and the volume's first slab; on the frames
-    /// after it, the volume's next slabs. Once the volume is complete, it replaces the one
-    /// materials read, with the parameters that place it (written before this frame's
-    /// submission, so its materials read the new volume).
+    /// After a tile of the top-down pass, on to the next (nothing else that frame); on the frame
+    /// after the last, the pyramid and the volume's first slab; on the frames after it, the
+    /// volume's next slabs. Once the volume is complete, it replaces the one materials read, with
+    /// the parameters that place it (written before this frame's submission, so its materials
+    /// read the new volume).
     pub(crate) fn build(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
         let Some(center) = self.center else { return };
+        if let Some(tile) = self.tile {
+            let last = self.tiles() * self.tiles() - 1;
+            self.tile = (tile < last).then_some(tile + 1);
+            self.pyramid_due = tile >= last;
+            return;
+        }
         if !self.building() {
             return;
         }
         let o = self.options;
         let levels = self.pyramid_views.len() as u32;
         let (side, height) = (self.back.width(), self.back.height());
-        let first_layer = if self.pending { 0 } else { self.next_layer.unwrap_or(0) };
+        let first_layer = if self.pyramid_due { 0 } else { self.next_layer.unwrap_or(0) };
         let slab = self.slab;
         let slot = |k: u32| wgpu::BindingResource::Buffer(wgpu::BufferBinding {
             buffer: &self.build_params,
             offset: k as u64 * Self::SLOT,
             size: std::num::NonZeroU64::new(std::mem::size_of::<OcclusionBuildGpu>() as u64),
         });
-        // when a rebuild starts, every dispatch's parameters in one write: the pyramid's levels,
-        // then the volume's slabs
-        if self.pending {
+        // with the pyramid, every dispatch's parameters in one write: the pyramid's levels, then
+        // the volume's slabs
+        if self.pyramid_due {
             let slabs = height.div_ceil(slab);
             let mut data = vec![0u8; ((levels + slabs) as u64 * Self::SLOT) as usize];
             for k in 0..levels + slabs {
@@ -365,7 +415,7 @@ impl SkyOcclusion {
         let tex = wgpu::BindingResource::TextureView;
         let stamp = crate::profiling::gpu_pass("SkyOcclusion/Build");
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyOcclusion/Build"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
-        if self.pending {
+        if self.pyramid_due {
             let res = self.pyramid.width();
             let top = group(&self.top_bgl, &[(0, slot(0)), (1, tex(&self.depth)), (3, tex(&self.pyramid_views[0]))]);
             pass.set_pipeline(&self.top_pipeline);
@@ -388,7 +438,7 @@ impl SkyOcclusion {
         pass.set_bind_group(0, &volume, &[]);
         pass.dispatch_workgroups(side.div_ceil(4), slab.min(height - first_layer).div_ceil(4), side.div_ceil(4));
         drop(pass);
-        self.pending = false;
+        self.pyramid_due = false;
         let next = first_layer + slab;
         if next < height {
             self.next_layer = Some(next);
@@ -433,6 +483,66 @@ mod tests {
         }
         assert_eq!(sizes["OcclusionBuild"], std::mem::size_of::<OcclusionBuildGpu>());
         assert_eq!(sizes["SkyOcclusionParams"], std::mem::size_of::<SkyOcclusionParamsGpu>());
+    }
+
+    /// A rebuild draws the top-down pass a tile a frame, the tiles covering the map once and each
+    /// culled to its own part of the view, then the pyramid, then the volume a slab a frame.
+    #[test]
+    fn a_rebuild_is_spread_over_tiles_then_slabs() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let shared = crate::renderers::SharedLayouts::new(&device);
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4096, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
+        let options = SkyOcclusionOptions { extent_m: 64.0, resolution: 256, volume_size: (32, 16), frames: 4, depth_tiles: 3, ..Default::default() };
+        let mut sky = SkyOcclusion::new(&device, &shared.camera_bgl, &light_buf, options);
+        let mut camera = Camera::new(60.0, 0.1, 100.0, 1.0);
+        camera.set_position(5.0, 2.0, -3.0);
+        camera.look_at(&crate::math::Vec3::new(5.0, 2.0, -4.0));
+        camera.update_view_matrix();
+        sky.update(&queue, &camera);
+        let full = sky.camera().projection_matrix.to_glam() * sky.camera().view_matrix.to_glam();
+        let center = sky.center.unwrap();
+        let mut covered = vec![0u8; 256 * 256];
+        let mut stages = Vec::new();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        while sky.building() {
+            if let Some([x, y, w, h]) = sky.tile_scissor() {
+                assert_eq!(sky.first_tile(), stages.is_empty(), "the first tile clears the map");
+                for py in y..y + h {
+                    for px in x..x + w {
+                        covered[(py * 256 + px) as usize] += 1;
+                    }
+                }
+                // the tile's cull view frames exactly its part of the map: the world point at a
+                // texel's centre is inside it for the tile's texels and outside for the others
+                let cull = sky.cull_view().unwrap();
+                for (tx, ty) in [(x, y), (x + w - 1, y + h - 1), (x + w, y), (x.wrapping_sub(1), y + h - 1)] {
+                    if tx >= 256 || ty >= 256 {
+                        continue;
+                    }
+                    let world = glam::Vec3::new(
+                        center.x + ((tx as f32 + 0.5) / 256.0 - 0.5) * 64.0,
+                        0.0,
+                        center.y + ((ty as f32 + 0.5) / 256.0 - 0.5) * 64.0,
+                    );
+                    let ndc = cull.project_point3(world);
+                    let inside = ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0;
+                    assert_eq!(inside, tx >= x && tx < x + w && ty >= y && ty < y + h, "texel ({tx}, {ty}) and tile at ({x}, {y})");
+                    // and the full view puts that texel where the map has it
+                    let full_ndc = full.project_point3(world);
+                    let texel = ((full_ndc.x * 0.5 + 0.5) * 256.0, (0.5 - full_ndc.y * 0.5) * 256.0);
+                    assert!((texel.0 - (tx as f32 + 0.5)).abs() < 1e-2 && (texel.1 - (ty as f32 + 0.5)).abs() < 1e-2, "texel ({tx}, {ty}) seen at {texel:?}");
+                }
+                stages.push("tile");
+            } else {
+                stages.push(if sky.pyramid_due { "pyramid" } else { "slab" });
+            }
+            sky.build(&device, &queue, &mut encoder);
+        }
+        queue.submit([encoder.finish()]);
+        assert!(covered.iter().all(|&c| c == 1), "the tiles cover the map once");
+        assert_eq!(stages, [vec!["tile"; 9], vec!["pyramid"], vec!["slab"; 3]].concat(), "the frames of a rebuild");
     }
 
     /// A crown of full cover, a disc 5 m across its radius with its top at 10 m, over flat ground:
