@@ -5,7 +5,8 @@ use crate::math::Vec3;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
-const WGSL: &str = include_str!("../../shaders/tonemap.wgsl");
+const WGSL: &str = concat!(include_str!("../../shaders/tonemap_params.wgsl"), include_str!("../../shaders/tonemap.wgsl"));
+const LOCAL_EXPOSURE_WGSL: &str = concat!(include_str!("../../shaders/tonemap_params.wgsl"), include_str!("../../shaders/local_exposure.wgsl"));
 
 /// The lens attenuation q of Unreal Engine 5 (`r.EyeAdaptation.LensAttenuation`), with which
 /// 1 cd/m² exposes to 1.0 at EV100 0: the ISO 12232 saturation constant 0.78 over q.
@@ -134,6 +135,57 @@ impl Default for UnrealFilm {
     }
 }
 
+/// Unreal Engine 5's local exposure, its bilateral method (post-process settings
+/// `LocalExposure*`): a factor on each pixel's light that scales the contrast of its
+/// surroundings' luminance about middle grey, while keeping its detail against them. Bright
+/// surroundings (a sky) come down and dark ones come up, as a photographer dodges and burns.
+///
+/// Each frame it builds Unreal's inputs from the picture: a bilateral grid of log luminance (cells
+/// of 128 x 128 pixels, 32 bins of luminance), so the surroundings are the nearby pixels about as
+/// bright as the pixel; and the log luminance at 1/32 of the picture's size, blurred. Middle grey
+/// is 0.18 of exposed light, as with Unreal's manual metering. The defaults are Unreal's, which
+/// change nothing; `unreal(highlight, shadow)` sets the two contrasts, as a project's
+/// `r.DefaultFeature.LocalExposure.*ContrastScale` do.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalExposure {
+    /// Contrast of the surroundings brighter than middle grey (1 keeps it, 0 flattens it).
+    pub highlight_contrast: f32,
+    /// Contrast of the surroundings darker than middle grey.
+    pub shadow_contrast: f32,
+    /// How much of a pixel's detail against its surroundings is kept.
+    pub detail_strength: f32,
+    /// How much the surroundings are the blurred luminance rather than the bilateral grid's.
+    pub blurred_luminance_blend: f32,
+    /// The blurred luminance's kernel, as a share of the picture's width (%).
+    pub blurred_luminance_kernel_percent: f32,
+    /// Stops on middle grey.
+    pub middle_grey_bias: f32,
+    /// The log2 scene luminance the grid's bins span (Unreal's histogram range, -10 to 20 with its
+    /// extended luminance range).
+    pub log_luminance_range: (f32, f32),
+}
+
+impl Default for LocalExposure {
+    fn default() -> Self {
+        Self {
+            highlight_contrast: 1.0,
+            shadow_contrast: 1.0,
+            detail_strength: 1.0,
+            blurred_luminance_blend: 0.6,
+            blurred_luminance_kernel_percent: 50.0,
+            middle_grey_bias: 0.0,
+            log_luminance_range: (-10.0, 20.0),
+        }
+    }
+}
+
+impl LocalExposure {
+    /// Unreal's defaults with these highlight and shadow contrasts.
+    pub fn unreal(highlight_contrast: f32, shadow_contrast: f32) -> Self {
+        Self { highlight_contrast, shadow_contrast, ..Default::default() }
+    }
+}
+
 pub struct ToneMapOptions {
     pub tonemapper: ToneMapper,
     /// The curve of `ToneMapper::UnrealFilmic`.
@@ -157,6 +209,8 @@ pub struct ToneMapOptions {
     pub encode_srgb: bool,
     /// Triangular dither of one 8-bit step against banding.
     pub dither: bool,
+    /// Unreal's local exposure; off when `None`.
+    pub local_exposure: Option<LocalExposure>,
 }
 
 impl Default for ToneMapOptions {
@@ -173,6 +227,7 @@ impl Default for ToneMapOptions {
             grain_size: 1.6,
             encode_srgb: true,
             dither: true,
+            local_exposure: None,
         }
     }
 }
@@ -351,16 +406,44 @@ struct ToneMapParamsGpu {
     _pad: u32,
     film: [f32; 4],
     film2: [f32; 4],
+    local_exposure: [f32; 4],
+    local_exposure2: [f32; 4],
+    local_exposure3: [f32; 4],
 }
 
 const FLAG_ENCODE_SRGB: u32 = 1;
 const FLAG_DITHER: u32 = 2;
+const FLAG_LOCAL_EXPOSURE: u32 = 4;
+/// Half-resolution texels per side of a bilateral grid cell (local_exposure.wgsl's LOCAL_CELL).
+const LOCAL_CELL: u32 = 64;
+/// Bins of the grid.
+const LOCAL_BINS: u32 = 32;
 
 struct Gpu {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
     sampler: wgpu::Sampler,
+    local: LocalGpu,
+}
+
+/// Local exposure's pipelines, and its textures for a picture size (a 1-texel stand-in until it
+/// is on).
+struct LocalGpu {
+    grid: wgpu::ComputePipeline,
+    log_luminance: wgpu::ComputePipeline,
+    blur_x: wgpu::ComputePipeline,
+    blur_y: wgpu::ComputePipeline,
+    size: (u32, u32),
+    grid_view: wgpu::TextureView,
+    /// The log luminance, and the blur's intermediate
+    log: [wgpu::TextureView; 2],
+}
+
+/// The bilateral grid's cells and the blurred luminance's texels for a picture size.
+fn local_sizes(width: u32, height: u32) -> ((u32, u32), (u32, u32)) {
+    let half = (width.div_ceil(2), height.div_ceil(2));
+    ((half.0.div_ceil(LOCAL_CELL), half.1.div_ceil(LOCAL_CELL)), (width.div_ceil(32), height.div_ceil(32)))
 }
 
 /// The display transform (K2): physical exposure, lens (chromatic aberration, vignette), a
@@ -426,10 +509,36 @@ impl ToneMapEffect {
             height,
             frame: self.frame,
             tonemapper: o.tonemapper.gpu_id(),
-            flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 },
+            flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 } | if o.local_exposure.is_some() { FLAG_LOCAL_EXPOSURE } else { 0 },
             _pad: 0,
             film: [f.slope, f.toe, f.shoulder, f.black_clip],
             film2: [f.white_clip, f.blue_correction.clamp(0.0, 1.0), f.expand_gamut.max(0.0), 1.0],
+            ..self.local_params(width, height)
+        }
+    }
+
+    /// Local exposure's parameters (and its flag) for a picture size; zeros when it is off.
+    fn local_params(&self, width: u32, height: u32) -> ToneMapParamsGpu {
+        let Some(le) = self.options.local_exposure else { return ToneMapParamsGpu::zeroed() };
+        let (log_min, log_max) = le.log_luminance_range;
+        let scale = 1.0 / (log_max - log_min).max(1e-3);
+        let half = (width.div_ceil(2) as f32, height.div_ceil(2) as f32);
+        let (cells, blurred) = local_sizes(width, height);
+        // Unreal's Gaussian (PostProcessWeightedSampleSum): a radius of half the kernel's share of
+        // the blurred texture's width, at most 31 texels
+        let radius = blurred.0 as f32 * le.blurred_luminance_kernel_percent * 0.01 * 0.5;
+        let radius = radius.clamp(1e-3, 31.0);
+        ToneMapParamsGpu {
+            flags: FLAG_LOCAL_EXPOSURE,
+            local_exposure: [le.highlight_contrast, le.shadow_contrast, le.detail_strength, le.blurred_luminance_blend.clamp(0.0, 1.0)],
+            local_exposure2: [(0.18f32).log2() + le.middle_grey_bias, scale, -log_min * scale, log_min],
+            local_exposure3: [
+                half.0 / LOCAL_CELL as f32 / cells.0 as f32,
+                half.1 / LOCAL_CELL as f32 / cells.1 as f32,
+                radius,
+                radius.ceil().min(31.0),
+            ],
+            ..ToneMapParamsGpu::zeroed()
         }
     }
 
@@ -450,6 +559,16 @@ impl ToneMapEffect {
                 }),
                 entry(2, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
                 entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(4, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                }),
+                entry(5, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                }),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -483,12 +602,93 @@ impl ToneMapEffect {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        self.gpu = Some(Gpu { pipeline, bgl, params, sampler });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ToneMap/LocalExposure"), source: wgpu::ShaderSource::Wgsl(LOCAL_EXPOSURE_WGSL.into()) });
+        let local_pipeline = |entry_point: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("ToneMap/LocalExposure"),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let (grid_view, log) = Self::local_textures(device, (1, 1, 1), (1, 1));
+        let local = LocalGpu {
+            grid: local_pipeline("grid"),
+            log_luminance: local_pipeline("logLuminance"),
+            blur_x: local_pipeline("blurX"),
+            blur_y: local_pipeline("blurY"),
+            size: (0, 0),
+            grid_view,
+            log,
+        };
+        self.gpu = Some(Gpu { pipeline, bgl, params, sampler, local });
+    }
+
+    /// Local exposure's grid (`cells` and its bins) and the blurred luminance's two textures.
+    fn local_textures(device: &wgpu::Device, grid: (u32, u32, u32), blurred: (u32, u32)) -> (wgpu::TextureView, [wgpu::TextureView; 2]) {
+        let texture = |label: &str, size: wgpu::Extent3d, dimension| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let flat = wgpu::Extent3d { width: blurred.0, height: blurred.1, depth_or_array_layers: 1 };
+        (
+            texture("ToneMap/LocalExposureGrid", wgpu::Extent3d { width: grid.0, height: grid.1, depth_or_array_layers: grid.2 }, wgpu::TextureDimension::D3),
+            [texture("ToneMap/LocalExposureLog", flat, wgpu::TextureDimension::D2), texture("ToneMap/LocalExposureBlur", flat, wgpu::TextureDimension::D2)],
+        )
+    }
+
+    /// Local exposure's grid and blurred luminance for this frame's input (`params` already
+    /// written): the grid, the log luminance at 1/32, and its blur across then down.
+    fn encode_local_exposure(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, input: &wgpu::TextureView, width: u32, height: u32) {
+        let gpu = self.gpu.as_mut().unwrap();
+        let (cells, blurred) = local_sizes(width, height);
+        if gpu.local.size != (width, height) {
+            (gpu.local.grid_view, gpu.local.log) = Self::local_textures(device, (cells.0, cells.1, LOCAL_BINS), blurred);
+            gpu.local.size = (width, height);
+        }
+        let local = &gpu.local;
+        let group = |pipeline: &wgpu::ComputePipeline, entries: &[(u32, wgpu::BindingResource)]| {
+            let entries: Vec<_> = entries.iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding: *binding, resource: resource.clone() }).collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("ToneMap/LocalExposureBG"), layout: &pipeline.get_bind_group_layout(0), entries: &entries })
+        };
+        let tex = wgpu::BindingResource::TextureView;
+        let params = gpu.params.as_entire_binding();
+        let sampler = wgpu::BindingResource::Sampler(&gpu.sampler);
+        let passes = [
+            (&local.grid, group(&local.grid, &[(0, tex(input)), (1, params.clone()), (2, sampler.clone()), (3, tex(&local.grid_view))]), cells),
+            (&local.log_luminance, group(&local.log_luminance, &[(0, tex(input)), (1, params.clone()), (2, sampler), (4, tex(&local.log[0]))]), blurred),
+            (&local.blur_x, group(&local.blur_x, &[(1, params.clone()), (5, tex(&local.log[0])), (4, tex(&local.log[1]))]), (blurred.0.div_ceil(8), blurred.1.div_ceil(8))),
+            (&local.blur_y, group(&local.blur_y, &[(1, params), (5, tex(&local.log[1])), (4, tex(&local.log[0]))]), (blurred.0.div_ceil(8), blurred.1.div_ceil(8))),
+        ];
+        let stamp = crate::profiling::gpu_pass("ToneMap/LocalExposure");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ToneMap/LocalExposure"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
+        for (pipeline, bind_group, (x, y)) in &passes {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(*x, *y, 1);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn shader_source() -> &'static str {
         WGSL
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_exposure_source() -> &'static str {
+        LOCAL_EXPOSURE_WGSL
     }
 }
 
@@ -517,8 +717,11 @@ impl PostProcessingEffect for ToneMapEffect {
         }
         let params = self.params(width, height);
         self.frame = self.frame.wrapping_add(1);
+        queue.write_buffer(&self.gpu.as_ref().unwrap().params, 0, bytemuck::bytes_of(&params));
+        if self.options.local_exposure.is_some() {
+            self.encode_local_exposure(device, encoder, input, width, height);
+        }
         let gpu = self.gpu.as_ref().unwrap();
-        queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ToneMap/BG"),
@@ -528,6 +731,8 @@ impl PostProcessingEffect for ToneMapEffect {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(output) },
                 wgpu::BindGroupEntry { binding: 2, resource: gpu.params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&gpu.local.grid_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&gpu.local.log[0]) },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ToneMap"), timestamp_writes: crate::profiling::gpu_pass("ToneMap").as_ref().map(crate::profiling::PassStamp::compute) });
@@ -566,6 +771,158 @@ mod tests {
             })
             .unwrap();
         assert_eq!(span, std::mem::size_of::<ToneMapParamsGpu>());
+        let code = ToneMapEffect::local_exposure_source();
+        let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("local_exposure: {}", e.emit_to_string(code)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("local_exposure: {e:?}"));
+    }
+
+    /// Local exposure's GPU cost at 1920 x 1080, by wall clock (ten frames per submit, the two
+    /// alternated): `cargo test -p kansei-core --lib time_local_exposure -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_local_exposure() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (1920u32, 1080u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let camera = Camera::new(60.0, 0.1, 100.0, 1.0);
+        let mut effects = [None, Some(LocalExposure::unreal(0.8, 0.8))].map(|local| ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::UnrealFilmic, local_exposure: local, ..Default::default() }));
+        let wall = |fx: &mut ToneMapEffect| {
+            let mut e = device.create_command_encoder(&Default::default());
+            for _ in 0..10 {
+                fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+            }
+            let t = std::time::Instant::now();
+            queue.submit([e.finish()]);
+            device.poll(wgpu::Maintain::Wait);
+            t.elapsed().as_secs_f64() * 1e3 / 10.0
+        };
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..40 {
+            for (k, fx) in effects.iter_mut().enumerate() {
+                let ms = wall(fx);
+                if round >= 5 {
+                    times[k].push(ms);
+                }
+            }
+        }
+        for t in &mut times {
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        eprintln!("tonemap {:.3} ms, with local exposure {:.3} ms (medians per frame, {w}x{h})", times[0][times[0].len() / 2], times[1][times[1].len() / 2]);
+    }
+
+    /// Unreal's local exposure on a sky 2 stops over middle grey beside ground 4 stops under it.
+    /// With the bilateral grid alone each side's surroundings are itself, up to their shared edge,
+    /// so each is scaled by 2^((contrast - 1) x its stops from middle grey). With the blurred
+    /// luminance blended in, as Unreal's defaults do, the surroundings follow a fine reference of
+    /// the blur.
+    #[test]
+    fn local_exposure_follows_unreal_s() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (256u32, 128u32);
+        // exposure 1: exposed light is scene light; the inputs as the half floats they are stored as
+        let (sky, ground) = (f16_to_f32(f32_to_f16(0.18 * 4.0)), f16_to_f32(f32_to_f16(0.18 / 16.0)));
+        let value = |x: u32| if x < w / 2 { sky } else { ground };
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING);
+        let halves: Vec<u16> = (0..w * h).flat_map(|i| { let v = f32_to_f16(value(i % w)); [v, v, v, f32_to_f16(1.0)] }).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &input_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let input = input_tex.create_view(&Default::default());
+        let output_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        let output = output_tex.create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let camera = Camera::new(60.0, 0.1, 100.0, 1.0);
+        let run = |local: LocalExposure| -> Vec<f32> {
+            let mut fx = ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::None, encode_srgb: false, dither: false, local_exposure: Some(local), ..Default::default() });
+            let mut e = device.create_command_encoder(&Default::default());
+            fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (w * h * 8) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &output_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let data = buf.slice(..).get_mapped_range();
+            // the green channel of each pixel
+            bytemuck::cast_slice::<u8, u16>(&data).chunks(4).map(|px| f16_to_f32(px[1])).collect()
+        };
+        let middle_grey = 0.18f32.log2();
+        let factor = |y: f32, base: f32, contrast: f32| (middle_grey + (base - middle_grey) * contrast + (y - base) - y).exp2();
+        let columns = [4u32, 100, 126, 127, 128, 129, 160, 250];
+
+        // the bilateral grid alone
+        let out = run(LocalExposure { blurred_luminance_blend: 0.0, ..LocalExposure::unreal(0.8, 0.6) });
+        for x in columns {
+            let (v, contrast) = if x < w / 2 { (sky, 0.8) } else { (ground, 0.6) };
+            let want = v * factor(v.log2(), v.log2(), contrast);
+            let got = out[(64 * w + x) as usize];
+            assert!((got / want - 1.0).abs() < 0.01, "grid alone, column {x}: {got} vs {want}");
+        }
+
+        // Unreal's blend of the blurred luminance: its reference, the log luminance at 1/32 (8 x 4
+        // texels, each a side's own), blurred across then down with Unreal's Gaussian (radius 2
+        // texels, 2 taps), mirrored, then sampled bilinearly at each pixel
+        let (bw, bh) = (w / 32, h / 32);
+        let mut log: Vec<f32> = (0..bw * bh).map(|i| value((i % bw) * 32).log2()).collect();
+        let radius = bw as f32 * 50.0 * 0.01 * 0.5;
+        let mirror = |c: i32, n: i32| (if c < 0 { -c - 1 } else if c >= n { 2 * n - c - 1 } else { c }).clamp(0, n - 1);
+        for axis in [(1i32, 0i32), (0, 1)] {
+            log = (0..bw * bh)
+                .map(|i| {
+                    let (x, y) = ((i % bw) as i32, (i / bw) as i32);
+                    let (mut sum, mut weights) = (0.0, 0.0);
+                    for k in -2i32..=2 {
+                        let wk = (-16.7 * (k as f32 / radius).powi(2)).exp();
+                        let (sx, sy) = (mirror(x + axis.0 * k, bw as i32), mirror(y + axis.1 * k, bh as i32));
+                        sum += wk * log[(sy as u32 * bw + sx as u32) as usize];
+                        weights += wk;
+                    }
+                    sum / weights
+                })
+                .collect();
+        }
+        let blurred_at = |x: u32, y: u32| {
+            let (u, v) = ((x as f32 + 0.5) / w as f32 * bw as f32 - 0.5, (y as f32 + 0.5) / h as f32 * bh as f32 - 0.5);
+            let at = |i: i32, j: i32| log[(j.clamp(0, bh as i32 - 1) as u32 * bw + i.clamp(0, bw as i32 - 1) as u32) as usize];
+            let (i, j) = (u.floor() as i32, v.floor() as i32);
+            let (fu, fv) = (u - u.floor(), v - v.floor());
+            (at(i, j) * (1.0 - fu) + at(i + 1, j) * fu) * (1.0 - fv) + (at(i, j + 1) * (1.0 - fu) + at(i + 1, j + 1) * fu) * fv
+        };
+        let out = run(LocalExposure::unreal(0.8, 0.6));
+        for x in columns {
+            let v = value(x);
+            let base = v.log2() + (blurred_at(x, 64) - v.log2()) * 0.6;
+            let contrast = if base > middle_grey { 0.8 } else { 0.6 };
+            let want = v * factor(v.log2(), base, contrast);
+            let got = out[(64 * w + x) as usize];
+            eprintln!("column {x}: {got:.5} (reference {want:.5}, input {v:.5})");
+            assert!((got / want - 1.0).abs() < 0.015, "blended, column {x}: {got} vs {want}");
+        }
+
+        // Unreal's defaults change nothing
+        let out = run(LocalExposure::default());
+        for x in columns {
+            assert!((out[(64 * w + x) as usize] / value(x) - 1.0).abs() < 2e-3, "defaults, column {x}");
+        }
     }
 
     #[test]

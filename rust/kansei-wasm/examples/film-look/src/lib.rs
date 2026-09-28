@@ -3,7 +3,8 @@
 //! grade, vignette, grain, chromatic aberration, sRGB encoding and dither).
 //!
 //! URL parameters: `tm=aces|agx|punchy|neutral|unreal|none` (curve), `ev=<EV100>` (exposure),
-//! `film=0` (no vignette/grain/CA), `bloom=0`, `t=<seconds>` (freeze the camera).
+//! `film=0` (no vignette/grain/CA), `bloom=0`, `t=<seconds>` (freeze the camera), `le=<contrast>`
+//! (Unreal's local exposure at this highlight and shadow contrast, e.g. 0.8).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -19,7 +20,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingVolume,
-    effects::{exposure_from_ev100, BloomEffect, BloomOptions, ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions},
+    effects::{exposure_from_ev100, BloomEffect, BloomOptions, LocalExposure, ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 
@@ -198,6 +199,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         options.grain = 0.22;
         options.chromatic_aberration = 0.25;
     }
+    options.local_exposure = query_param("le").and_then(|v| v.parse().ok()).map(|c: f32| LocalExposure::unreal(c, c));
     let tonemap = ToneMapEffect::new(options);
 
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(fog)];
