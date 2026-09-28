@@ -1,6 +1,7 @@
 // Display transform, the last effect of the HDR chain. Per pixel, in order:
-//   lens:    lateral chromatic aberration (spectral taps), then physical exposure and a cos^4
-//            vignette, all on scene-linear light;
+//   lens:    lateral chromatic aberration (spectral taps), then physical exposure, Unreal's local
+//            exposure (optional, from local_exposure.wgsl's grid) and a cos^4 vignette, all on
+//            scene-linear light;
 //   grade:   white balance, contrast about middle grey, and saturation/gain per tonal zone,
 //            on exposed scene-linear light (UE applies its colour grading at this point too);
 //   curve:   a filmic tone curve to display-linear [0, 1] (or, for UnrealFilmic, Unreal's own
@@ -8,36 +9,14 @@
 //   film:    monochrome grain and a triangular dither, in the sRGB-encoded signal;
 //   output:  sRGB-encoded for non-sRGB targets, decoded back to linear for sRGB ones.
 
-struct ToneMapParams {
-    whiteBalance        : mat3x3f,
-    gain                : vec3f,
-    exposure            : f32,
-    shadowGain          : vec3f,
-    contrast            : f32,
-    highlightGain       : vec3f,
-    shadowsMax          : f32,
-    saturation          : vec3f,   // per channel, as UE's ColorSaturation
-    highlightsMin       : f32,
-    shadowSaturation    : vec3f,
-    vignette            : f32,
-    highlightSaturation : vec3f,
-    chromaticAberration : f32,
-    grain               : f32,
-    grainSize           : f32,
-    width               : u32,
-    height              : u32,
-    frame               : u32,
-    tonemapper          : u32,
-    flags               : u32,
-    _pad0               : u32,
-    film                : vec4f,   // Unreal's film curve: slope, toe, shoulder, black clip
-    film2               : vec4f,   // its white clip, blue correction, gamut expansion, highlights max
-}
-
 @group(0) @binding(0) var inputTex      : texture_2d<f32>;
 @group(0) @binding(1) var outputTex     : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> p    : ToneMapParams;
 @group(0) @binding(3) var linearSampler : sampler;
+// Unreal's local exposure (local_exposure.wgsl): the bilateral grid of log luminance, and the
+// blurred log luminance
+@group(0) @binding(4) var localGrid     : texture_3d<f32>;
+@group(0) @binding(5) var localBlurred  : texture_2d<f32>;
 
 const TONEMAP_NONE           : u32 = 0u;
 const TONEMAP_ACES_FITTED    : u32 = 1u;
@@ -116,6 +95,27 @@ fn sampleLens(coord: vec2u, uv: vec2f) -> vec3f {
 
 // Natural vignetting, the cos^4 law of an ideal lens: tan^2 of the field angle grows with the
 // squared image radius (1 at the corners), scaled by the vignette intensity.
+// Unreal's local exposure (its bilateral method, PostProcessHistogramCommon.ush's
+// CalculateBaseLogLuminance and CalculateLocalExposure): the factor on this pixel's scene light
+// that scales the contrast of its surroundings' luminance about middle grey (the highlight or
+// shadow contrast) while keeping its detail against them (the detail strength). Its
+// surroundings are the bilateral grid's mean log luminance of nearby pixels as bright as it,
+// mixed with the blurred log luminance.
+fn localExposure(scene: vec3f, uv: vec2f) -> f32 {
+    let logL = log2(max(dot(scene, vec3f(1.0 / 3.0)), exp2(p.localExposure2.w)));
+    let bin = logL * p.localExposure2.y + p.localExposure2.z;
+    let g = textureSampleLevel(localGrid, linearSampler, vec3f(uv * p.localExposure3.xy, (bin * 31.0 + 0.5) / 32.0), 0.0).xy;
+    let blurred = textureSampleLevel(localBlurred, linearSampler, uv, 0.0).r;
+    // a grid cell with no pixels this bright falls back to the blurred luminance
+    let bilateral = select(g.x / g.y, blurred, g.y * LOCAL_CELL_TEXELS < 0.001);
+    let logExposure = log2(p.exposure);
+    let base = mix(bilateral, blurred, p.localExposure.w) + logExposure;
+    let y = logL + logExposure;
+    let middleGrey = p.localExposure2.x;
+    let contrast = select(p.localExposure.y, p.localExposure.x, base > middleGrey);
+    return exp2(middleGrey + (base - middleGrey) * contrast + (y - base) * p.localExposure.z - y);
+}
+
 fn vignetteMask(uv: vec2f) -> f32 {
     let aspect = f32(p.width) / f32(p.height);
     let d = (uv - 0.5) * vec2f(aspect, 1.0);
@@ -388,7 +388,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let pix = vec2f(gid.xy) + 0.5;
     let uv = pix / vec2f(f32(p.width), f32(p.height));
 
-    let scene = sampleLens(gid.xy, uv) * (p.exposure * vignetteMask(uv));
+    let lens = sampleLens(gid.xy, uv);
+    var local = 1.0;
+    if ((p.flags & FLAG_LOCAL_EXPOSURE) != 0u) {
+        local = localExposure(lens, uv);
+    }
+    let scene = lens * (p.exposure * vignetteMask(uv) * local);
     var display : vec3f;
     if (p.tonemapper == TONEMAP_UNREAL_FILMIC) {
         display = unrealDisplay(max(p.whiteBalance * scene, vec3f(0.0)));
