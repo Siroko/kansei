@@ -42,6 +42,7 @@ impl Sphere {
 use crate::geometries::Vertex;
 
 mod build;
+mod gpu;
 
 /// How `ClusterMesh::build` splits and simplifies.
 #[derive(Clone, Copy, Debug)]
@@ -229,3 +230,5 @@ impl ClusterMesh {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod gpu_tests;
