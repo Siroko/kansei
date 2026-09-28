@@ -1493,20 +1493,27 @@ impl Renderer {
 
     /// Draw every planar reflection: the scene from the mirrored camera (only renderables on the
     /// reflection's layer mask) with the materials' GBuffer pipelines, then its resolve and mips.
-    fn render_planar_reflections(&mut self, scene: &Scene) {
+    /// Those with `screen_space` project `screen`'s GBuffer instead (still last frame's, before
+    /// this frame's pass; without one they are not updated).
+    fn render_planar_reflections(&mut self, scene: &Scene, screen: Option<(&Camera, &GBuffer)>) {
         if self.planar_reflections.is_empty() {
             return;
         }
         let queue = self.queue.as_ref().unwrap();
         let device = self.device.as_ref().unwrap();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/PlanarReflections") });
+        if let Some((camera, gbuffer)) = screen.filter(|(_, gbuffer)| gbuffer.sample_count == 1) {
+            for reflection in self.planar_reflections.iter_mut().filter(|r| r.is_active() && r.screen_space) {
+                reflection.project_screen_space(device, queue, &mut encoder, camera, gbuffer);
+            }
+        }
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
         let shadow_bg = self.shadow_bind_group.as_ref();
         let alignment = self.matrix_alignment;
         let cc = &self.config.clear_color;
         let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/PlanarReflections") });
         let reflection_views: Vec<usize> = (0..self.planar_reflections.len()).map(|index| self.reflection_view(index)).collect();
-        for (reflection, &view) in self.planar_reflections.iter().zip(&reflection_views).filter(|(r, _)| r.is_active()) {
+        for (reflection, &view) in self.planar_reflections.iter().zip(&reflection_views).filter(|(r, _)| r.is_active() && !r.screen_space) {
             let two_phase = self.occlusion_views.contains(&view) && !self.two_phase_any.is_empty();
             let draw = |encoder: &mut wgpu::CommandEncoder, phase: ReflectionPhase| draw_reflection(encoder, scene, reflection, view, phase, clear, mesh_bg, shadow_bg, alignment);
             if !two_phase {
@@ -1647,8 +1654,9 @@ impl Renderer {
             }
         }
         // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
+        // (none for those reflecting the screen)
         views.extend(self.planar_reflections.iter().map(|r| {
-            r.is_active().then(|| crate::culling::CullView {
+            (r.is_active() && !r.screen_space).then(|| crate::culling::CullView {
                 view_proj: r.cull_view_proj(),
                 casters_only: false,
                 reflection: true,
@@ -1712,7 +1720,7 @@ impl Renderer {
         // the views culled in two phases, with what their occlusion test projects with
         let mut occlusion: Vec<(usize, crate::culling::OcclusionView)> = depth_size.filter(|_| self.occlusion.enabled).map(|size| (MAIN_VIEW, main.occlusion(size))).into_iter().collect();
         for (index, reflection) in self.planar_reflections.iter().enumerate() {
-            if reflection.is_active() && reflection.occlusion_culling {
+            if reflection.is_active() && reflection.occlusion_culling && !reflection.screen_space {
                 occlusion.push((self.reflection_view(index), reflection.occlusion_view()));
             }
         }
@@ -2211,7 +2219,7 @@ impl Renderer {
         if !self.planar_reflections.is_empty() {
             self.light_clusters.as_ref().unwrap().disable(self.queue.as_ref().unwrap());
         }
-        self.render_planar_reflections(scene);
+        self.render_planar_reflections(scene, None);
         let clusters = self.light_clusters.as_ref().unwrap();
         if self.clustered_lights {
             clusters.build(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera, self.config.width, self.config.height);
@@ -2513,7 +2521,7 @@ impl Renderer {
         }
         drop(t);
         let t = crate::profiling::cpu_scope("scene/reflections");
-        self.render_planar_reflections(scene);
+        self.render_planar_reflections(scene, Some((camera, gbuffer)));
         drop(t);
         let t = crate::profiling::cpu_scope("scene/clusters");
         let clusters = self.light_clusters.as_ref().unwrap();
