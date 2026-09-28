@@ -295,8 +295,9 @@ fn sky_lighting_sh_matches_the_sky_it_projects() {
 
 /// With a capture fog the sky lighting sees the sky through it (Unreal's real-time capture): an
 /// opaque fog is its colour all round, one capped at half opacity is half the sky and half the fog
-/// from every side (the projection is linear), and the environment cubemap agrees. A lower
-/// hemisphere colour replaces what is below the horizon.
+/// from every side (the projection is linear), and the environment cubemap agrees. By default the
+/// lighting sees the lit ground below the horizon instead, as Unreal's Lumen does, while the
+/// environment keeps the fog there. A lower hemisphere colour replaces what is below the horizon.
 #[test]
 fn sky_lighting_captures_the_height_fog() {
     let Some((device, queue)) = gpu() else {
@@ -319,6 +320,8 @@ fn sky_lighting_captures_the_height_fog() {
     let dense = HeightFogLayer { density: 1.0, height_falloff: 1e-4, height: 0.0 };
     let fog = |max_opacity: f32| SkyCaptureFog { layers: [dense, HeightFogLayer::default()], inscattering: c, max_opacity, capture_height_m: 6.0, sky_ambient_scale: 0.0 };
 
+    // the capture itself: the fog below the horizon too
+    sky.lighting_sees_ground = false;
     sky.capture_fog = Some(fog(1.0));
     let opaque = irradiance(&mut sky);
     for e in opaque {
@@ -338,6 +341,24 @@ fn sky_lighting_captures_the_height_fog() {
         let want = 0.5 * e_clear + 0.5 * pi_c;
         assert!(((*e - want) / want).abs().max_element() < 0.01, "half the fog gives {e}, not {want}");
     }
+
+    // by default, the lit ground below the horizon (a Lambertian of albedo 0.3 under the fog's pi
+    // C and the sun, which the capture's fog does not dim), the fog above it; the environment
+    // still sees the fog below
+    sky.lighting_sees_ground = true;
+    sky.sky_light_ground_albedo = Some(Vec3::new(0.3, 0.3, 0.3));
+    sky.capture_fog = Some(fog(1.0));
+    let [up, down, _] = irradiance(&mut sky);
+    let sh = read_floats(&device, &queue, &sky.bindings().sky_lighting);
+    let sun = glam::Vec3::new(sh[36], sh[37], sh[38]) * sky.sun.direction.to_glam().y.max(0.0);
+    let ground = 0.3 * (pi_c + sun);
+    assert!(((up - pi_c) / pi_c).abs().max_element() < 0.1, "up {up} under the fog vs {pi_c}");
+    assert!(((down - ground) / ground).abs().max_element() < 0.1, "down {down} from the ground vs {ground}");
+    let env = read(&device, &queue, sky.environment_texture());
+    let l = env.at3(centre, centre, 3);
+    assert!(((l - c.to_glam()) / c.to_glam()).abs().max_element() < 0.01, "environment below {l} under the fog {c:?}");
+    eprintln!("the ground under the fog: up {up} down {down}");
+    sky.sky_light_ground_albedo = Some(Vec3::ZERO);
 
     // Unreal's lower-hemisphere colour, without fog: the ground is gone, the colour is below
     sky.capture_fog = None;
