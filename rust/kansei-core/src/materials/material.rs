@@ -111,6 +111,12 @@ pub struct Material {
     /// The cluster stage's module for the instance layout it was made for, or why there is none.
     cluster_module: Option<ClusterStage>,
     cluster_pipeline_layout: Option<wgpu::PipelineLayout>,
+    /// Shadow passes' cluster pipelines (`get_cluster_depth_pipeline`), keyed with no vertex
+    /// buffers, and their layout (groups 0-2, group 2 the cluster mesh group).
+    pub(crate) cluster_depth_pipeline_cache: HashMap<DepthPipelineKey, wgpu::RenderPipeline>,
+    cluster_depth_pipeline_layout: Option<wgpu::PipelineLayout>,
+    /// The velocity pass's cluster pipeline (`get_cluster_velocity_pipeline`).
+    pub(crate) cluster_velocity_pipeline: Option<wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
 }
@@ -134,6 +140,9 @@ impl Material {
             cluster_pipeline_cache: HashMap::new(),
             cluster_module: None,
             cluster_pipeline_layout: None,
+            cluster_depth_pipeline_cache: HashMap::new(),
+            cluster_depth_pipeline_layout: None,
+            cluster_velocity_pipeline: None,
             bind_group: None,
             initialized: false,
         }
@@ -311,17 +320,19 @@ impl Material {
         sample_count: u32,
     ) -> Result<&wgpu::RenderPipeline, String> {
         assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
-        let layout_key = instances.map(|l| (l.stride, l.attributes.clone()));
-        if self.cluster_module.as_ref().is_none_or(|(k, _)| *k != layout_key) {
-            let module = crate::clusters::cluster_vertex_stage(&self.processed_code(), instances).map(|code| {
-                device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{}/ClusterShader", self.label)), source: wgpu::ShaderSource::Wgsl(code.into()) })
-            });
-            self.cluster_module = Some((layout_key, module));
-            self.cluster_pipeline_cache.clear();
+        let module = self.cluster_stage(device, instances)?;
+        let layout = self.cluster_layout(device, shared);
+        let key = PipelineKey { color_formats: color_formats.to_vec(), depth_format, sample_count, num_vertex_buffers: 0 };
+        if !self.cluster_pipeline_cache.contains_key(&key) {
+            let pipeline = self.create_pipeline(device, &layout, &module, crate::clusters::CLUSTER_VERTEX_ENTRY, &[], color_formats, depth_format, sample_count, "ClusterPipeline");
+            self.cluster_pipeline_cache.insert(key.clone(), pipeline);
         }
-        let module = self.cluster_module.as_ref().unwrap().1.clone()?;
-        let layout = self
-            .cluster_pipeline_layout
+        Ok(&self.cluster_pipeline_cache[&key])
+    }
+
+    /// The cluster pipelines' layout: the material's groups with the cluster mesh group as group 2.
+    fn cluster_layout(&mut self, device: &wgpu::Device, shared: &SharedLayouts) -> wgpu::PipelineLayout {
+        self.cluster_pipeline_layout
             .get_or_insert_with(|| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some(&format!("{}/ClusterPipelineLayout", self.label)),
@@ -329,13 +340,51 @@ impl Material {
                     push_constant_ranges: &[],
                 })
             })
-            .clone();
-        let key = PipelineKey { color_formats: color_formats.to_vec(), depth_format, sample_count, num_vertex_buffers: 0 };
-        if !self.cluster_pipeline_cache.contains_key(&key) {
-            let pipeline = self.create_pipeline(device, &layout, &module, crate::clusters::CLUSTER_VERTEX_ENTRY, &[], color_formats, depth_format, sample_count, "ClusterPipeline");
-            self.cluster_pipeline_cache.insert(key.clone(), pipeline);
+            .clone()
+    }
+
+    /// The generated cluster vertex stage's module for `instances`' records (remade, with every
+    /// cluster pipeline, when the layout changes), or why it can't be generated.
+    fn cluster_stage(&mut self, device: &wgpu::Device, instances: Option<&crate::buffers::InstanceBufferLayout>) -> Result<wgpu::ShaderModule, String> {
+        let layout_key = instances.map(|l| (l.stride, l.attributes.clone()));
+        if self.cluster_module.as_ref().is_none_or(|(k, _)| *k != layout_key) {
+            let module = crate::clusters::cluster_vertex_stage(&self.processed_code(), instances).map(|code| {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{}/ClusterShader", self.label)), source: wgpu::ShaderSource::Wgsl(code.into()) })
+            });
+            self.cluster_module = Some((layout_key, module));
+            self.cluster_pipeline_cache.clear();
+            self.cluster_depth_pipeline_cache.clear();
+            self.cluster_velocity_pipeline = None;
         }
-        Ok(&self.cluster_pipeline_cache[&key])
+        self.cluster_module.as_ref().unwrap().1.clone()
+    }
+
+    /// Get or create the shadow passes' pipeline over a cluster draw (a shadow view's cut of
+    /// `Renderable::clusters`): `get_depth_pipeline`'s, with the generated vertex stage.
+    pub(crate) fn get_cluster_depth_pipeline(&mut self, device: &wgpu::Device, shared: &SharedLayouts, instances: Option<&crate::buffers::InstanceBufferLayout>, depth_format: wgpu::TextureFormat, bias: wgpu::DepthBiasState) -> Result<&wgpu::RenderPipeline, String> {
+        assert!(self.depth_pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        let module = self.cluster_stage(device, instances)?;
+        let layout = self
+            .cluster_depth_pipeline_layout
+            .get_or_insert_with(|| {
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(&format!("{}/ClusterDepthPipelineLayout", self.label)),
+                    bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.cluster_mesh_bgl],
+                    push_constant_ranges: &[],
+                })
+            })
+            .clone();
+        let key = DepthPipelineKey::new(depth_format, 0, bias);
+        if !self.cluster_depth_pipeline_cache.contains_key(&key) {
+            let pipeline = self.create_depth_pipeline(device, &layout, &module, crate::clusters::CLUSTER_VERTEX_ENTRY, &[], depth_format, bias, "ClusterDepthPipeline");
+            self.cluster_depth_pipeline_cache.insert(key.clone(), pipeline);
+        }
+        Ok(&self.cluster_depth_pipeline_cache[&key])
+    }
+
+    /// The cluster depth pipeline made for a pass with `key` (whatever its vertex buffers), if any.
+    pub(crate) fn cluster_depth_pipeline(&self, key: &DepthPipelineKey) -> Option<&wgpu::RenderPipeline> {
+        self.cluster_depth_pipeline_cache.get(&DepthPipelineKey { num_vertex_buffers: 0, ..key.clone() })
     }
 
     /// The cluster pipeline made for a pass with `key` (whatever its vertex buffers), if any.
@@ -364,42 +413,49 @@ impl Material {
         assert!(self.depth_pipeline_layout.is_some(), "Material not initialized — call initialize() first");
         let key = DepthPipelineKey::new(depth_format, vertex_layouts.len(), bias);
         if !self.depth_pipeline_cache.contains_key(&key) {
-            let module = self.shader_module.as_ref().unwrap();
-            let fragment = self.options.shadow_fragment_entry.map(|entry| wgpu::FragmentState {
-                module,
-                entry_point: Some(entry),
-                targets: &[],
-                compilation_options: Default::default(),
-            });
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(&format!("{}/DepthPipeline", self.label)),
-                layout: self.depth_pipeline_layout.as_ref(),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some("vertex_main"),
-                    buffers: vertex_layouts,
-                    compilation_options: Default::default(),
-                },
-                fragment,
-                primitive: wgpu::PrimitiveState {
-                    topology: self.options.topology,
-                    cull_mode: self.options.cull_mode.to_wgpu(),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: depth_format,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: Default::default(),
-                    bias,
-                }),
-                multisample: Default::default(),
-                multiview: None,
-                cache: None,
-            });
+            let (layout, module) = (self.depth_pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap());
+            let pipeline = self.create_depth_pipeline(device, layout, module, "vertex_main", vertex_layouts, depth_format, bias, "DepthPipeline");
             self.depth_pipeline_cache.insert(key.clone(), pipeline);
         }
         self.depth_pipeline_cache.get(&key).unwrap()
+    }
+
+    /// A depth-only pipeline of this material for the shadow passes: `vertex_entry` of `module`
+    /// over `vertex_layouts`, plus `shadow_fragment_entry` if set.
+    #[allow(clippy::too_many_arguments)]
+    fn create_depth_pipeline(&self, device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, vertex_entry: &str, vertex_layouts: &[wgpu::VertexBufferLayout], depth_format: wgpu::TextureFormat, bias: wgpu::DepthBiasState, label: &str) -> wgpu::RenderPipeline {
+        let fragment = self.options.shadow_fragment_entry.map(|entry| wgpu::FragmentState {
+            module,
+            entry_point: Some(entry),
+            targets: &[],
+            compilation_options: Default::default(),
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("{}/{label}", self.label)),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some(vertex_entry),
+                buffers: vertex_layouts,
+                compilation_options: Default::default(),
+            },
+            fragment,
+            primitive: wgpu::PrimitiveState {
+                topology: self.options.topology,
+                cull_mode: self.options.cull_mode.to_wgpu(),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias,
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        })
     }
 
     /// Get or create the pipeline of the renderer's velocity pass: this material's shader with
@@ -407,52 +463,70 @@ impl Material {
     /// depth-tested against the GBuffer without writing depth.
     pub(crate) fn get_velocity_pipeline(&mut self, device: &wgpu::Device, vertex_layouts: &[wgpu::VertexBufferLayout]) -> &wgpu::RenderPipeline {
         assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
-        use crate::renderers::GBuffer;
         let key = vertex_layouts.len();
         if !self.velocity_pipeline_cache.contains_key(&key) {
-            let module = self.shader_module.as_ref().unwrap();
-            let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![None; GBuffer::VELOCITY_TARGET];
-            targets.push(Some(wgpu::ColorTargetState {
-                format: GBuffer::VELOCITY_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            }));
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(&format!("{}/VelocityPipeline", self.label)),
-                layout: self.pipeline_layout.as_ref(),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some("vertex_main"),
-                    buffers: vertex_layouts,
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some("fragment_main"),
-                    targets: &targets,
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: self.options.topology,
-                    cull_mode: self.options.cull_mode.to_wgpu(),
-                    ..Default::default()
-                },
-                // the GBuffer pass and this one must produce the same depths: mark the position
-                // output @invariant; the small bias toward the camera covers compilers that differ
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: GBuffer::DEPTH_FORMAT,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: Default::default(),
-                    bias: wgpu::DepthBiasState { constant: -4, slope_scale: -1.0, clamp: 0.0 },
-                }),
-                multisample: Default::default(),
-                multiview: None,
-                cache: None,
-            });
+            let (layout, module) = (self.pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap());
+            let pipeline = self.create_velocity_pipeline(device, layout, module, "vertex_main", vertex_layouts, "VelocityPipeline");
             self.velocity_pipeline_cache.insert(key, pipeline);
         }
         self.velocity_pipeline_cache.get(&key).unwrap()
+    }
+
+    /// Get or create the velocity pass's pipeline over a cluster draw (the camera's cut of
+    /// `Renderable::clusters`): `get_velocity_pipeline`'s, with the generated vertex stage.
+    pub(crate) fn get_cluster_velocity_pipeline(&mut self, device: &wgpu::Device, shared: &SharedLayouts, instances: Option<&crate::buffers::InstanceBufferLayout>) -> Result<&wgpu::RenderPipeline, String> {
+        assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        let module = self.cluster_stage(device, instances)?;
+        let layout = self.cluster_layout(device, shared);
+        if self.cluster_velocity_pipeline.is_none() {
+            self.cluster_velocity_pipeline = Some(self.create_velocity_pipeline(device, &layout, &module, crate::clusters::CLUSTER_VERTEX_ENTRY, &[], "ClusterVelocityPipeline"));
+        }
+        Ok(self.cluster_velocity_pipeline.as_ref().unwrap())
+    }
+
+    /// A velocity-pass pipeline of this material: `vertex_entry` of `module` over
+    /// `vertex_layouts`, its `fragment_main` into the velocity target only.
+    fn create_velocity_pipeline(&self, device: &wgpu::Device, layout: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, vertex_entry: &str, vertex_layouts: &[wgpu::VertexBufferLayout], label: &str) -> wgpu::RenderPipeline {
+        use crate::renderers::GBuffer;
+        let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![None; GBuffer::VELOCITY_TARGET];
+        targets.push(Some(wgpu::ColorTargetState {
+            format: GBuffer::VELOCITY_FORMAT,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        }));
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("{}/{label}", self.label)),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some(vertex_entry),
+                buffers: vertex_layouts,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some("fragment_main"),
+                targets: &targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: self.options.topology,
+                cull_mode: self.options.cull_mode.to_wgpu(),
+                ..Default::default()
+            },
+            // the GBuffer pass and this one must produce the same depths: mark the position
+            // output @invariant; the small bias toward the camera covers compilers that differ
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: GBuffer::DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState { constant: -4, slope_scale: -1.0, clamp: 0.0 },
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        })
     }
 
     /// Create (or recreate) the material bind group from the given resources.

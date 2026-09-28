@@ -273,7 +273,7 @@ fn assert_cuts_closed(name: &str, mesh: &ClusterMesh, eyes: &[Vec3], budgets: &[
 }
 
 pub(super) fn view(eye: Vec3, threshold: f32) -> LodView {
-    LodView { eye, pixels_per_radian: 1080.0 / 0.8, near: 0.1, threshold }
+    LodView { eye, pixels_per_radian: 1080.0 / 0.8, near: 0.1, threshold, orthographic: false }
 }
 
 #[test]
@@ -482,4 +482,29 @@ fn the_level_window_skips_the_levels_a_view_cannot_reach() {
     // at the surface with a tight budget, the coarsest level is over it
     let near = view(Vec3::new(0.0, 0.0, 1.02), 0.25);
     assert!(!skipped(&near)[0] && *skipped(&near).last().unwrap(), "near: {:?}", skipped(&near));
+}
+
+#[test]
+fn orthographic_cuts_are_closed_and_ignore_distance() {
+    // a shadow cascade or a top-down view: an error is seen at the view's pixels per metre,
+    // however far the eye is
+    let mesh = ClusterMesh::build(&rock(5, false), &ClusterOptions::default());
+    let level0: Vec<usize> = (0..mesh.clusters.len()).filter(|&i| mesh.clusters[i].level == 0).collect();
+    let whole = area(&mesh, &level0);
+    let keys = position_keys(&mesh, 1e-5);
+    let ortho = |eye: Vec3, pixels_per_metre: f32, threshold: f32| LodView { eye, pixels_per_radian: pixels_per_metre, near: 0.1, threshold, orthographic: true };
+    let mut triangles = Vec::new();
+    for pixels_per_metre in [2.0, 20.0, 200.0] {
+        for threshold in [0.5, 1.0, 4.0] {
+            let near = mesh.select(&ortho(Vec3::new(0.0, 10.0, 0.0), pixels_per_metre, threshold));
+            let far = mesh.select(&ortho(Vec3::new(0.0, 100.0, 0.0), pixels_per_metre, threshold));
+            assert_eq!(near, far, "{pixels_per_metre} px/m, budget {threshold}: the eye's distance changed the cut");
+            let covered = area(&mesh, &near) / whole;
+            assert!((0.8..1.2).contains(&covered), "{pixels_per_metre} px/m, budget {threshold}: the cut covers {covered}");
+            assert_eq!(bad_edges_keyed(&mesh, &keys, &near), 0, "{pixels_per_metre} px/m, budget {threshold}: an open cut");
+            triangles.push(near.iter().map(|&i| mesh.clusters[i].triangle_count).sum::<u32>());
+        }
+    }
+    // coarser at fewer pixels per metre
+    assert!(triangles[1] < triangles[4] && triangles[4] < triangles[7], "{triangles:?}");
 }

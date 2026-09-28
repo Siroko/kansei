@@ -17,8 +17,11 @@ pub struct CullStats {
     pub occlusion_culled: u32,
     /// Drawn (in either phase, with occlusion culling).
     pub drawn: u32,
-    /// Triangles drawn: each draw's instances times its mesh's.
+    /// Triangles drawn: each draw's instances times its mesh's, and each cluster cut's
+    /// (`Renderable::clusters`) triangles.
     pub triangles: u64,
+    /// Clusters drawn by the renderables with cluster LOD.
+    pub clusters: u32,
 }
 
 impl std::ops::AddAssign for CullStats {
@@ -29,6 +32,7 @@ impl std::ops::AddAssign for CullStats {
         self.occlusion_culled += o.occlusion_culled;
         self.drawn += o.drawn;
         self.triangles += o.triangles;
+        self.clusters += o.clusters;
     }
 }
 
@@ -82,13 +86,26 @@ struct Entry {
     tested: u32,
     args: wgpu::Buffer,
     offset: u64,
+    kind: EntryKind,
 }
+
+/// What an entry's 32 bytes are.
+#[derive(Clone, Copy, PartialEq)]
+enum EntryKind {
+    /// An instance draw (`ARGS_BYTES`); `clustered` when its renderable draws cluster cuts
+    /// instead, whose triangles count for it.
+    Instances { clustered: bool },
+    /// A cluster cut's draw (`clusters::DRAW_ARGS_BYTES`).
+    Clusters,
+}
+
+const _: () = assert!(ARGS_BYTES == crate::clusters::DRAW_ARGS_BYTES);
 
 struct Pending {
     frame: u32,
     kinds: Vec<CullViewKind>,
-    // (view, tested) per ARGS_BYTES in the staging buffer
-    entries: Vec<(usize, u32)>,
+    // (view, tested, kind) per ARGS_BYTES in the staging buffer
+    entries: Vec<(usize, u32, EntryKind)>,
     // MAPPING, then MAPPED or FAILED
     state: Arc<AtomicU8>,
 }
@@ -125,12 +142,18 @@ impl StatsReadback {
             let bytes = staging.slice(..).get_mapped_range();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
             let mut views: Vec<(CullViewKind, CullStats)> = Vec::new();
-            for (k, &(view, tested)) in pending.entries.iter().enumerate() {
+            for (k, &(view, tested, entry)) in pending.entries.iter().enumerate() {
                 let a = &words[k * ARGS_BYTES as usize / 4..][..8];
                 let kind = pending.kinds[view];
-                // (the draw's index count, then its instance count)
-                let triangles = a[0] as u64 / 3 * a[1] as u64;
-                let stats = CullStats { tested, drawn: a[1], lod_culled: a[5], frustum_culled: a[6], occlusion_culled: a[7], triangles };
+                let stats = match entry {
+                    // (the draw's index count, then its instance count)
+                    EntryKind::Instances { clustered } => {
+                        let triangles = if clustered { 0 } else { a[0] as u64 / 3 * a[1] as u64 };
+                        CullStats { tested, drawn: a[1], lod_culled: a[5], frustum_culled: a[6], occlusion_culled: a[7], triangles, clusters: 0 }
+                    }
+                    // (the clusters drawn, then the triangles counted as they were listed)
+                    EntryKind::Clusters => CullStats { clusters: a[1], triangles: a[6] as u64, ..Default::default() },
+                };
                 match views.iter_mut().find(|(k, _)| *k == kind) {
                     Some((_, s)) => *s += stats,
                     None => views.push((kind, stats)),
@@ -143,10 +166,17 @@ impl StatsReadback {
     }
 
     /// A draw culled this frame for view `view`: `tested` instances, counted into `args` at
-    /// `offset`.
-    pub fn record(&mut self, view: usize, tested: u32, args: &wgpu::Buffer, offset: u64) {
+    /// `offset`. `clustered`: the renderable draws cluster cuts instead (`record_clusters`).
+    pub fn record(&mut self, view: usize, tested: u32, args: &wgpu::Buffer, offset: u64, clustered: bool) {
         if self.enabled {
-            self.entries.push(Entry { view, tested, args: args.clone(), offset });
+            self.entries.push(Entry { view, tested, args: args.clone(), offset, kind: EntryKind::Instances { clustered } });
+        }
+    }
+
+    /// A cluster cut made this frame for view `view`, its draw in `args`.
+    pub fn record_clusters(&mut self, view: usize, args: &wgpu::Buffer) {
+        if self.enabled {
+            self.entries.push(Entry { view, tested: 0, args: args.clone(), offset: 0, kind: EntryKind::Clusters });
         }
     }
 
@@ -174,7 +204,7 @@ impl StatsReadback {
         let state = Arc::new(AtomicU8::new(MAPPING));
         let done = state.clone();
         staging.slice(..).map_async(wgpu::MapMode::Read, move |result| done.store(if result.is_ok() { MAPPED } else { FAILED }, Ordering::Release));
-        let entries = self.entries.drain(..).map(|e| (e.view, e.tested)).collect();
+        let entries = self.entries.drain(..).map(|e| (e.view, e.tested, e.kind)).collect();
         self.pending = Some(Pending { frame, kinds: std::mem::take(&mut self.kinds), entries, state });
     }
 }

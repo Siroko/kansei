@@ -123,7 +123,9 @@ pub(crate) struct ClusterCullGpu {
     flags: u32,
     yaw_scale: f32,
     stretch: f32,
-    _pad: [u32; 2],
+    /// the cut's view, in `ClusterCulling::set_views` (set by `ClusterGpu::bind`)
+    view: u32,
+    _pad: u32,
 }
 
 impl ClusterCullGpu {
@@ -160,7 +162,8 @@ impl ClusterCullGpu {
             flags: if cone_culling && stretch <= 1.0 { FLAG_CONE } else { 0 },
             yaw_scale,
             stretch: stretch.max(1.0),
-            _pad: [0; 2],
+            view: 0,
+            _pad: 0,
         }
     }
 }
@@ -174,18 +177,24 @@ pub(crate) struct ClusterViewGpu {
     pixels_per_radian: f32,
     near: f32,
     threshold: f32,
-    _pad: [f32; 2],
+    orthographic: u32,
+    _pad: f32,
 }
 
 impl ClusterViewGpu {
     /// A view: its view-projection's frustum, the eye errors are measured from, pixels per
-    /// radian, the distance errors are clamped to, and the budget in pixels.
-    pub(crate) fn new(view_proj: glam::Mat4, eye: glam::Vec3, pixels_per_radian: f32, near: f32, threshold: f32) -> Self {
-        Self { planes: crate::culling::frustum_planes(view_proj).map(|p| p.to_array()), eye: eye.to_array(), pixels_per_radian, near, threshold, _pad: [0.0; 2] }
+    /// radian (per metre when `orthographic`), the distance errors are clamped to, and the budget
+    /// in pixels.
+    pub(crate) fn new(view_proj: glam::Mat4, eye: glam::Vec3, pixels_per_unit: f32, near: f32, threshold: f32, orthographic: bool) -> Self {
+        Self { planes: crate::culling::frustum_planes(view_proj).map(|p| p.to_array()), eye: eye.to_array(), pixels_per_radian: pixels_per_unit, near, threshold, orthographic: orthographic as u32, _pad: 0.0 }
     }
 }
 
-/// The cluster cull's pipelines and its view (one per renderer).
+/// Views a frame's cull holds at most (the camera, the spot shadow layers, the reflections, the
+/// cascades and the sky: far fewer).
+pub(crate) const MAX_VIEWS: usize = 64;
+
+/// The cluster cull's pipelines and the frame's views (one per renderer).
 pub(crate) struct ClusterCulling {
     cull_bgl: wgpu::BindGroupLayout,
     prepare_bgl: wgpu::BindGroupLayout,
@@ -203,28 +212,33 @@ impl ClusterCulling {
         let storage = |binding, read_only| buffer_entry(binding, wgpu::BufferBindingType::Storage { read_only });
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
         let cull_bgl = layout("ClusterCulling/Cull", &[uniform(0), storage(1, true), storage(2, true), storage(3, false), storage(4, false)]);
-        let view_bgl = layout("ClusterCulling/View", &[uniform(0)]);
+        let view_bgl = layout("ClusterCulling/View", &[storage(0, true)]);
         let prepare_bgl = layout("ClusterCulling/Prepare", &[uniform(10), storage(11, true), storage(12, false), storage(13, false)]);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ClusterCulling"), source: wgpu::ShaderSource::Wgsl(format!("{CLUSTER_CULL_WGSL}\n{CLUSTER_MESH_WGSL}").into()) });
         let pipeline = |entry: &str, layouts: &[&wgpu::BindGroupLayout]| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ClusterCulling"), bind_group_layouts: layouts, push_constant_ranges: &[] });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(&format!("ClusterCulling/{entry}")), layout: Some(&layout), module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
         };
-        let view = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ClusterCulling/View"), size: std::mem::size_of::<ClusterViewGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let view = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ClusterCulling/Views"), size: (MAX_VIEWS * std::mem::size_of::<ClusterViewGpu>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let view_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("ClusterCulling/View"), layout: &view_bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: view.as_entire_binding() }] });
         Self { prepare: pipeline("prepare", &[&prepare_bgl]), cull: pipeline("cull", &[&cull_bgl, &view_bgl]), finish: pipeline("finish", &[&prepare_bgl]), cull_bgl, prepare_bgl, view, view_bind_group }
     }
 
-    /// The frame's view, shared by every renderable (one write).
-    pub(crate) fn set_view(&self, queue: &wgpu::Queue, view: &ClusterViewGpu) {
-        queue.write_buffer(&self.view, 0, bytemuck::bytes_of(view));
+    /// The frame's views, by index (`ClusterGpu::bind`'s `view`), in one write: a write per view
+    /// would leave every cut with the last (`queue.write_buffer` lands before the frame's work).
+    pub(crate) fn set_views(&self, queue: &wgpu::Queue, views: &[ClusterViewGpu]) {
+        assert!(views.len() <= MAX_VIEWS, "{} cluster views, at most {MAX_VIEWS}", views.len());
+        queue.write_buffer(&self.view, 0, bytemuck::cast_slice(views));
     }
 
-    /// Cut each of `clusters` (bound with `ClusterGpu::bind`) for the view in one compute pass:
+    /// Run the cuts `(clusters, view)` (each bound with `ClusterGpu::bind`) in one compute pass:
     /// every prepare, then every cull (dispatched indirectly, a workgroup per visible instance),
     /// then every finish. A cull's dispatch buffer is never bound while it is dispatched.
-    pub(crate) fn encode(&self, encoder: &mut wgpu::CommandEncoder, clusters: &[&ClusterGpu]) {
-        let bound: Vec<(&ClusterGpu, &Bound)> = clusters.iter().filter_map(|c| Some((*c, c.bound.as_ref()?))).collect();
+    pub(crate) fn encode(&self, encoder: &mut wgpu::CommandEncoder, cuts: &[(&ClusterGpu, u32)]) {
+        let bound: Vec<(&Cut, &Bound)> = cuts.iter().filter_map(|&(c, view)| {
+            let cut = c.cut(view)?;
+            Some((cut, cut.bound.as_ref()?))
+        }).collect();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/ClusterCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/ClusterCulling").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&self.prepare);
         for (_, b) in &bound {
@@ -245,11 +259,14 @@ impl ClusterCulling {
     }
 }
 
-/// Cluster LOD for a renderable (`Renderable::clusters`). Each frame, the camera draws the cut of
-/// `mesh` its view needs (`Renderer::set_cluster_error_threshold`) instead of the geometry,
-/// through a vertex stage generated around the material's `vertex_main`. The geometry, which
-/// must be the mesh `mesh` was built from, is still what the other views draw (shadow maps,
-/// reflections, velocity, impostor bakes) until they move to clusters too.
+/// Cluster LOD for a renderable (`Renderable::clusters`). Each frame, every view that draws it
+/// (the camera and its velocity pass, the spot and cascaded shadow maps, rendered planar
+/// reflections and the sky occlusion's top-down view) draws the cut of `mesh` that view needs
+/// (`Renderer::set_cluster_error_threshold`, times the view's scale:
+/// `Renderer::set_shadow_cluster_error_scale`, `PlanarReflection::lod_error_scale`,
+/// `SkyOcclusionOptions::lod_error_scale`) instead of the geometry, through a vertex stage
+/// generated around the material's `vertex_main`. The geometry, which must be the mesh `mesh`
+/// was built from, is still what impostor bakes and point-light (cubemap) shadows draw.
 ///
 /// The instances are the geometry's one instance buffer (if any), culled by the renderable's
 /// `InstanceCulling` when it has one (without occlusion phases) and placed as `transform` says.
@@ -263,8 +280,9 @@ pub struct ClusterLod {
     /// back faces and isn't transparent. Turn it off when the material turns instances in a way
     /// `transform` doesn't describe.
     pub cone_culling: bool,
-    /// Clusters drawn per frame, at most. By default every cluster of every instance, up to
-    /// 4 194 304. Clusters past it aren't drawn.
+    /// Clusters drawn per frame in each view, at most (each view's cut has a draw list this
+    /// long: 8 bytes an entry). By default every cluster of every instance, up to 4 194 304.
+    /// Clusters past it aren't drawn.
     pub capacity: Option<u32>,
     /// How much further than `transform` the material may stretch or sway an instance about its
     /// origin (1 by default): no point moves more than `stretch - 1` times its distance from the
@@ -300,35 +318,42 @@ impl ClusterLod {
         self
     }
 
-    /// Ready this frame's cut: the GPU state made once, the cull bound to `source` (records of
-    /// `stride` bytes) with the parameters, and the vertex stage's group 2 (`layout`) over the
-    /// renderer's normal and world matrices. `back_faces_culled`: the material culls back faces
-    /// (the cone test only removes what it would). True when what bundles recorded changed.
+    /// Ready this frame's cut for view `view`: the GPU state made once, the cut bound to `source`
+    /// (records of `stride` bytes) with the parameters, and its vertex stage group 2 (`layout`)
+    /// over the renderer's normal and world matrices. `back_faces_culled`: the material culls
+    /// back faces (the cone test only removes what it would). True when what bundles recorded
+    /// changed.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, layout: &wgpu::BindGroupLayout, matrices: (&wgpu::Buffer, &wgpu::Buffer), source: InstanceSource, stride: u32, world: glam::Mat4, back_faces_culled: bool) -> bool {
+    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, layout: &wgpu::BindGroupLayout, matrices: (&wgpu::Buffer, &wgpu::Buffer), view: u32, source: InstanceSource, stride: u32, world: glam::Mat4, back_faces_culled: bool) -> bool {
         let gpu = self.gpu.get_or_insert_with(|| ClusterGpu::new(device, &self.mesh));
         let every = (source.capacity() as u64 * gpu.cluster_count as u64).min(DEFAULT_MAX_DRAWN as u64) as u32;
         let capacity = self.capacity.unwrap_or(every).max(1);
         let params = ClusterCullGpu::new(world, self.transform, stride, &source, capacity, gpu.vertex_count, self.cone_culling && back_faces_culled, self.stretch);
-        let grown = gpu.bind(device, queue, culling, source, params);
-        gpu.bind_draw(device, layout, matrices.0, matrices.1) || grown
+        let grown = gpu.bind(device, queue, culling, view, source, params);
+        gpu.bind_draw(device, layout, view, matrices.0, matrices.1) || grown
     }
 }
 
-/// A renderable's cluster mesh on the GPU, and a view's cut of it. It holds the packed mesh,
-/// the parameters, the draw list and its indirect draw, and the cull's indirect dispatch.
+/// A renderable's cluster mesh on the GPU, and its cuts: one per view that draws it.
 pub(crate) struct ClusterGpu {
     mesh: wgpu::Buffer,
     vertex_count: u32,
     cluster_count: u32,
+    /// bound in place of a missing instance buffer or count
+    empty: wgpu::Buffer,
+    /// by view (`ClusterCulling::set_views`); none for views that never drew it
+    cuts: Vec<Option<Cut>>,
+}
+
+/// A view's cut of a renderable: its parameters, the draw list and its indirect draw, and the
+/// cull's indirect dispatch.
+pub(crate) struct Cut {
     params: wgpu::Buffer,
     written: Option<ClusterCullGpu>,
     draws: wgpu::Buffer,
     capacity: u32,
     args: wgpu::Buffer,
     dispatch: wgpu::Buffer,
-    /// bound in place of a missing instance buffer or count
-    empty: wgpu::Buffer,
     bound: Option<Bound>,
     /// the vertex stage's group 2, and the buffers it was made with
     draw: Option<(DrawKey, wgpu::BindGroup)>,
@@ -346,81 +371,20 @@ struct Bound {
     prepare_bind_group: wgpu::BindGroup,
 }
 
-impl ClusterGpu {
-    pub(crate) fn new(device: &wgpu::Device, mesh: &ClusterMesh) -> Self {
-        use wgpu::util::DeviceExt;
+impl Cut {
+    fn new(device: &wgpu::Device) -> Self {
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         Self {
-            mesh: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Clusters/Mesh"), contents: bytemuck::cast_slice(&mesh.gpu_words()), usage: wgpu::BufferUsages::STORAGE }),
-            vertex_count: 3 * mesh.max_triangles(),
-            cluster_count: mesh.clusters.len() as u32,
             params: buffer("Clusters/Params", std::mem::size_of::<ClusterCullGpu>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             written: None,
             draws: buffer("Clusters/Draws", 8, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             capacity: 0,
-            // (COPY_SRC: read back by the tests)
+            // (COPY_SRC: read back by the stats and the tests)
             args: buffer("Clusters/Args", DRAW_ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             dispatch: buffer("Clusters/Dispatch", 16, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE),
-            empty: buffer("Clusters/Empty", 32, wgpu::BufferUsages::STORAGE),
             bound: None,
             draw: None,
         }
-    }
-
-    /// Bind the cull to `source`, with a draw list of at least `params.capacity` entries (it grows,
-    /// never shrinks), and write the parameters if they changed. True when the draw list was
-    /// remade: draws recorded with the old one are stale.
-    pub(crate) fn bind(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, source: InstanceSource, params: ClusterCullGpu) -> bool {
-        let grown = params.capacity > self.capacity;
-        if grown {
-            self.capacity = params.capacity;
-            self.draws = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Draws"), size: self.capacity as u64 * 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-            self.bound = None;
-        }
-        let (records, count) = match source {
-            InstanceSource::None => (None, None),
-            InstanceSource::All { records, .. } => (Some(records.clone()), None),
-            InstanceSource::Culled { records, args, .. } => (Some(records.clone()), Some(args.clone())),
-        };
-        if self.bound.as_ref().is_none_or(|b| b.records != records || b.count != count) {
-            let cull_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Clusters/Cull"),
-                layout: &culling.cull_bgl,
-                entries: &[entry(0, &self.params), entry(1, &self.mesh), entry(2, records.as_ref().unwrap_or(&self.empty)), entry(3, &self.draws), entry(4, &self.args)],
-            });
-            let prepare_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Clusters/Prepare"),
-                layout: &culling.prepare_bgl,
-                entries: &[entry(10, &self.params), entry(11, count.as_ref().unwrap_or(&self.empty)), entry(12, &self.args), entry(13, &self.dispatch)],
-            });
-            self.bound = Some(Bound { records, count, cull_bind_group, prepare_bind_group });
-        }
-        if self.written != Some(params) {
-            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-            self.written = Some(params);
-        }
-        grown
-    }
-
-    /// The vertex stage's group 2 (`SharedLayouts::cluster_mesh_bgl`): the renderer's normal and
-    /// world matrices, the mesh, the draw list and the bound records. Remade when any of them
-    /// changed; true then (bundles recorded the old one).
-    pub(crate) fn bind_draw(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, normal: &wgpu::Buffer, world: &wgpu::Buffer) -> bool {
-        let key = (normal.clone(), world.clone(), self.draws.clone(), self.bound.as_ref().and_then(|b| b.records.clone()));
-        if self.draw.as_ref().is_some_and(|(k, _)| *k == key) {
-            return false;
-        }
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Clusters/Draw"),
-            layout,
-            entries: &[matrix(0, normal, 64), matrix(1, world, 128), entry(2, &self.mesh), entry(3, &self.draws), entry(4, key.3.as_ref().unwrap_or(&self.empty))],
-        });
-        self.draw = Some((key, group));
-        true
-    }
-
-    pub(crate) fn draw_bind_group(&self) -> Option<&wgpu::BindGroup> {
-        self.draw.as_ref().map(|(_, group)| group)
     }
 
     /// The indirect draw (`DRAW_ARGS_BYTES`, see `DRAW_ARGS_BYTES` for its words).
@@ -428,10 +392,99 @@ impl ClusterGpu {
         &self.args
     }
 
-    /// The draw list: (record, cluster) per drawn cluster.
+    /// The vertex stage's group 2 for this cut, once `ClusterGpu::bind_draw` made it.
+    pub(crate) fn draw_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.draw.as_ref().map(|(_, group)| group)
+    }
+}
+
+impl ClusterGpu {
+    pub(crate) fn new(device: &wgpu::Device, mesh: &ClusterMesh) -> Self {
+        use wgpu::util::DeviceExt;
+        Self {
+            mesh: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Clusters/Mesh"), contents: bytemuck::cast_slice(&mesh.gpu_words()), usage: wgpu::BufferUsages::STORAGE }),
+            vertex_count: 3 * mesh.max_triangles(),
+            cluster_count: mesh.clusters.len() as u32,
+            empty: device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Empty"), size: 32, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false }),
+            cuts: Vec::new(),
+        }
+    }
+
+    /// View `view`'s cut, if it was ever bound.
+    pub(crate) fn cut(&self, view: u32) -> Option<&Cut> {
+        self.cuts.get(view as usize)?.as_ref()
+    }
+
+    /// Bind view `view`'s cut to `source`, with a draw list of at least `params.capacity` entries
+    /// (it grows, never shrinks), and write the parameters if they changed. True when the draw
+    /// list was remade: draws recorded with the old one are stale.
+    pub(crate) fn bind(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, view: u32, source: InstanceSource, mut params: ClusterCullGpu) -> bool {
+        params.view = view;
+        if self.cuts.len() <= view as usize {
+            self.cuts.resize_with(view as usize + 1, || None);
+        }
+        let (mesh, empty) = (&self.mesh, &self.empty);
+        let cut = self.cuts[view as usize].get_or_insert_with(|| Cut::new(device));
+        let grown = params.capacity > cut.capacity;
+        if grown {
+            cut.capacity = params.capacity;
+            cut.draws = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Draws"), size: cut.capacity as u64 * 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            cut.bound = None;
+        }
+        let (records, count) = match source {
+            InstanceSource::None => (None, None),
+            InstanceSource::All { records, .. } => (Some(records.clone()), None),
+            InstanceSource::Culled { records, args, .. } => (Some(records.clone()), Some(args.clone())),
+        };
+        if cut.bound.as_ref().is_none_or(|b| b.records != records || b.count != count) {
+            let cull_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Clusters/Cull"),
+                layout: &culling.cull_bgl,
+                entries: &[entry(0, &cut.params), entry(1, mesh), entry(2, records.as_ref().unwrap_or(empty)), entry(3, &cut.draws), entry(4, &cut.args)],
+            });
+            let prepare_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Clusters/Prepare"),
+                layout: &culling.prepare_bgl,
+                entries: &[entry(10, &cut.params), entry(11, count.as_ref().unwrap_or(empty)), entry(12, &cut.args), entry(13, &cut.dispatch)],
+            });
+            cut.bound = Some(Bound { records, count, cull_bind_group, prepare_bind_group });
+        }
+        if cut.written != Some(params) {
+            queue.write_buffer(&cut.params, 0, bytemuck::bytes_of(&params));
+            cut.written = Some(params);
+        }
+        grown
+    }
+
+    /// View `view`'s vertex stage group 2 (`SharedLayouts::cluster_mesh_bgl`): the renderer's
+    /// normal and world matrices, the mesh, the cut's draw list and its bound records. Remade when
+    /// any of them changed; true then (bundles recorded the old one). The cut must be bound.
+    pub(crate) fn bind_draw(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: u32, normal: &wgpu::Buffer, world: &wgpu::Buffer) -> bool {
+        let (mesh, empty) = (&self.mesh, &self.empty);
+        let cut = self.cuts[view as usize].as_mut().expect("the cut is bound");
+        let key = (normal.clone(), world.clone(), cut.draws.clone(), cut.bound.as_ref().and_then(|b| b.records.clone()));
+        if cut.draw.as_ref().is_some_and(|(k, _)| *k == key) {
+            return false;
+        }
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Clusters/Draw"),
+            layout,
+            entries: &[matrix(0, normal, 64), matrix(1, world, 128), entry(2, mesh), entry(3, &cut.draws), entry(4, key.3.as_ref().unwrap_or(empty))],
+        });
+        cut.draw = Some((key, group));
+        true
+    }
+
+    /// View `view`'s indirect draw (the cut must be bound).
     #[cfg(test)]
-    pub(crate) fn draws(&self) -> &wgpu::Buffer {
-        &self.draws
+    pub(crate) fn args(&self, view: u32) -> &wgpu::Buffer {
+        &self.cut(view).expect("the cut is bound").args
+    }
+
+    /// View `view`'s draw list: (record, cluster) per drawn cluster.
+    #[cfg(test)]
+    pub(crate) fn draws(&self, view: u32) -> &wgpu::Buffer {
+        &self.cut(view).expect("the cut is bound").draws
     }
 
     /// Vertices a cluster is drawn as.
