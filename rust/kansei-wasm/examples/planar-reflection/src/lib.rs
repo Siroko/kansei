@@ -9,7 +9,8 @@
 //! URL parameters: `ripples=<strength>` (0 = mirror), `rough=<0..1>`, `t=<seconds>` (freeze),
 //! `fogrefl=0` (no fog in the reflection: the water fogs the reflected path with a flat colour),
 //! `occlusion=1` (the treeline occlusion-culled, for the camera and in the mirror
-//! (`PlanarReflection::occlusion_culling`); the culling stats logged every 2 s).
+//! (`PlanarReflection::occlusion_culling`); the culling stats logged every 2 s), `screen=1` (the
+//! reflection from the screen, `PlanarReflection::screen_space`, instead of the mirrored view).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -296,6 +297,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         PlanarReflectionOptions { width: width / 2, height: height / 2, layer_mask: !WATER_LAYER, ..Default::default() },
     );
     reflection.occlusion_culling = occlusion;
+    reflection.screen_space = query_param("screen").as_deref() == Some("1");
     renderer.set_culling_stats(occlusion);
     let ripples: f32 = query_param("ripples").and_then(|v| v.parse().ok()).unwrap_or(0.03);
     let roughness: f32 = query_param("rough").and_then(|v| v.parse().ok()).unwrap_or(0.05);

@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::buffers::Texture;
 use crate::cameras::Camera;
 use crate::math::Vec3;
+use super::screen_space::{ScreenSpaceParamsGpu, ScreenSpaceProjection};
 use crate::renderers::{GBuffer, Renderer};
 
 const RESOLVE_WGSL: &str = concat!(include_str!("../shaders/froxel_common.wgsl"), include_str!("../shaders/planar_reflection_resolve.wgsl"));
@@ -197,6 +198,14 @@ pub struct PlanarReflection {
     /// Margin round the surface's screen rectangle, in screen uv: room for lookups displaced by
     /// ripples and widened by roughness (0.05 by default).
     pub screen_margin: f32,
+    /// Reflect what the camera saw instead of drawing the mirrored view (off by default): last
+    /// frame's GBuffer, each pixel above the plane mirrored across it into this frame's view
+    /// (pixel-projected reflections), in one compute pass whatever the scene's geometry. What
+    /// the screen did not see (above its top edge, behind the camera, hidden from it) reads as
+    /// sky, which materials fill from their environment; after a camera cut
+    /// (`Camera::reset_motion`) the whole reflection does, for a frame. It needs the GBuffer:
+    /// `render_with_postprocessing` or `render_to_gbuffer`, single-sampled.
+    pub screen_space: bool,
     width: u32,
     height: u32,
     active: bool,
@@ -223,6 +232,9 @@ pub struct PlanarReflection {
     fog_drawn: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     downsample_pipeline: wgpu::ComputePipeline,
     downsample_bgs: Vec<wgpu::BindGroup>,
+    // the attached fog (the screen-space path binds it itself)
+    fog: Option<ReflectionFog>,
+    screen_space_projection: Option<ScreenSpaceProjection>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -451,6 +463,9 @@ impl PlanarReflection {
             fog_drawn: None,
             downsample_pipeline: pipeline("PlanarReflection/Downsample", DOWNSAMPLE_WGSL, &downsample_bgl),
             downsample_bgs,
+            screen_space: false,
+            fog: None,
+            screen_space_projection: None,
         }
     }
 
@@ -458,6 +473,7 @@ impl PlanarReflection {
     /// none. Materials then fog only what lies beyond the fog's volume along the reflected path.
     pub fn set_fog(&mut self, renderer: &Renderer, fog: Option<&ReflectionFog>) {
         self.fog_drawn = fog.map(|f| f.drawn.clone());
+        self.fog = fog.cloned();
         let fog = fog.unwrap_or(&self.no_fog);
         self.resolve_bg = resolve_bind_group(
             renderer.device(),
@@ -606,12 +622,45 @@ impl PlanarReflection {
         pass.set_pipeline(&self.resolve_pipeline);
         pass.set_bind_group(0, &self.resolve_bg, &[]);
         pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        self.build_mips(&mut pass);
+    }
+
+    fn build_mips(&self, pass: &mut wgpu::ComputePass) {
         pass.set_pipeline(&self.downsample_pipeline);
         for (level, bg) in self.downsample_bgs.iter().enumerate() {
             let (w, h) = ((self.width >> (level + 1)).max(1), (self.height >> (level + 1)).max(1));
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
+    }
+
+    /// The screen-space path (`screen_space`): project `gbuffer`'s colour and depth, still last
+    /// frame's (`camera`'s previous view), into mip 0, then build the mips.
+    pub(crate) fn project_screen_space(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, camera: &Camera, gbuffer: &GBuffer) {
+        let (width, height) = (self.width, self.height);
+        let (n, d) = self.plane();
+        let view_proj = camera.view_projection().to_glam();
+        let camera_pos = camera.view_matrix.to_glam().inverse().w_axis.truncate();
+        // no last frame to project (a camera cut, the first frame): an empty rectangle, all sky
+        let (prev, rect) = match camera.previous_view_projection() {
+            Some(prev) => (prev.to_glam(), self.screen_rect.unwrap_or([0.0, 0.0, 1.0, 1.0])),
+            None => (view_proj, [1.0, 1.0, 0.0, 0.0]),
+        };
+        let params = ScreenSpaceParamsGpu {
+            prev_inv_view_proj: prev.inverse().to_cols_array(),
+            view_proj: view_proj.to_cols_array(),
+            plane: [n.x, n.y, n.z, d],
+            camera_pos: camera_pos.to_array(),
+            min_height: self.clip_bias.max(0.0),
+            src_size: [gbuffer.width, gbuffer.height],
+            dst_size: [width, height],
+            rect,
+        };
+        let projection = self.screen_space_projection.get_or_insert_with(|| ScreenSpaceProjection::new(device, width, height));
+        let fog = self.fog.as_ref().unwrap_or(&self.no_fog);
+        projection.run(device, queue, encoder, &gbuffer.color_view, &gbuffer.depth_view, &self.mip0_view, fog, &self.fog_sampler, &params);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("PlanarReflection/Mips"), timestamp_writes: None });
+        self.build_mips(&mut pass);
     }
 
     #[cfg(test)]

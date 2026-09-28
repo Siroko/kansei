@@ -1,6 +1,7 @@
 //! Reflections: planar mirror views of the scene for materials to sample (K9).
 
 mod planar_reflection;
+mod screen_space;
 
 pub use planar_reflection::{oblique_near_plane, reflection_matrix, PlanarReflection, PlanarReflectionOptions, ReflectionFog};
 pub(crate) use planar_reflection::{crop, flip_x, mirrored_view, ReflectionFogParamsGpu};
