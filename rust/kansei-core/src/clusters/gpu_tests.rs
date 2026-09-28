@@ -73,12 +73,12 @@ const FETCH_WGSL: &str = r#"
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let per_cluster = 3u * kansei_cluster_mesh[7];
-    if (id.x >= per_cluster || id.y >= kansei_cluster_mesh[5]) {
+    // (every local vertex a cluster may have: its triangles index them)
+    if (id.x >= 256u || id.y >= kansei_cluster_mesh[5]) {
         return;
     }
-    let vertex = kansei_cluster_vertex(id.y, id.x);
-    fetched[id.y * per_cluster + id.x] = vec2<u32>(vertex, bitcast<u32>(kansei_vertex_f32(vertex, 1u)));
+    let vertex = kansei_cluster_local_vertex(id.y, id.x);
+    fetched[id.y * 256u + id.x] = vec2<u32>(vertex, bitcast<u32>(kansei_vertex_f32(vertex, 1u)));
 }
 "#;
 
@@ -92,7 +92,7 @@ fn the_gpu_fetches_every_clusters_vertices() {
     };
     use wgpu::util::DeviceExt;
     let mesh = ClusterMesh::build(&rock(3, true), &ClusterOptions::default());
-    let per_cluster = 3 * mesh.max_triangles() as usize;
+    let per_cluster = 256;
     let words = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&mesh.gpu_words()), usage: wgpu::BufferUsages::STORAGE });
     let fetched = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (mesh.clusters.len() * per_cluster * 8) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
@@ -112,10 +112,8 @@ fn the_gpu_fetches_every_clusters_vertices() {
     queue.submit(Some(encoder.finish()));
     let fetched = read_words(&device, &queue, &fetched);
     for (i, c) in mesh.clusters.iter().enumerate() {
-        let triangles: Vec<[u32; 3]> = mesh.triangles(i).collect();
-        for k in 0..per_cluster {
-            // past its triangles, the first corner: triangles of no area
-            let expected = if k / 3 < c.triangle_count as usize { triangles[k / 3][k % 3] } else { triangles[0][0] };
+        for k in 0..c.vertex_count as usize {
+            let expected = mesh.cluster_vertices[c.vertex_offset as usize + k];
             let at = 2 * (i * per_cluster + k);
             assert_eq!(fetched[at], expected, "cluster {i}, vertex {k}");
             assert_eq!(f32::from_bits(fetched[at + 1]), mesh.vertices[expected as usize].position[1]);
@@ -204,7 +202,7 @@ fn cull(device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, gp
     queue.submit(Some(encoder.finish()));
     let args = read_words(device, queue, gpu.args(0));
     let list = read_words(device, queue, gpu.draws(0));
-    let pairs = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
+    let pairs = list.chunks(2).take(args[W_CLAIMED] as usize).filter(|p| p[0] != NO_WORD).map(|p| (p[0], p[1])).collect();
     (args, pairs)
 }
 
@@ -257,13 +255,13 @@ fn the_gpu_cut_of_placed_instances_is_the_cpu_cut() {
         for threshold in [0.0, 0.5, 1.0, 4.0] {
             let view = TestView::looking(eye, target, threshold);
             let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
-            assert_eq!((args[0], args[4]), (gpu.vertex_count(), records.len() as u32));
+            assert_eq!((args[W_INDICES], args[W_VISIBLE]), (3 * args[W_TRIANGLES], records.len() as u32));
             for (k, r) in records.iter().enumerate() {
                 let label = format!("eye {eye}, {threshold} px, instance {k}");
                 assert_cut(&label, &pairs, k as u32, &expected(&mesh, world * placement_matrix(r), &view, true));
             }
             let triangles: u32 = pairs.iter().map(|p| mesh.clusters[p.1 as usize].triangle_count).sum();
-            assert_eq!(args[6], triangles, "the triangles drawn");
+            assert_eq!(args[W_TRIANGLES], triangles, "the triangles drawn");
             totals.push(triangles);
         }
     }
@@ -299,7 +297,7 @@ fn matrix_culled_and_single_instances_cut_as_the_cpu_does() {
     let mut gpu = ClusterGpu::new(&device, &mesh);
     let params = ClusterCullGpu::new(world, Some(InstanceTransform::Matrix { offset: 0 }), 64, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
     let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
-    assert_eq!(args[4], 3);
+    assert_eq!(args[W_VISIBLE], 3);
     assert!(pairs.iter().all(|p| (2..5).contains(&p.0)), "records from the view's first");
     for (k, m) in matrices.iter().enumerate() {
         assert_cut(&format!("matrix {k}"), &pairs, 2 + k as u32, &expected(&mesh, world * *m, &view, true));
@@ -309,7 +307,7 @@ fn matrix_culled_and_single_instances_cut_as_the_cpu_does() {
     let mut single = ClusterGpu::new(&device, &mesh);
     let params = ClusterCullGpu::new(world, None, 0, &InstanceSource::None, mesh.clusters.len() as u32, single.vertex_count(), true, 1.0);
     let (args, pairs) = cull(&device, &queue, &culling, &mut single, InstanceSource::None, params, &view);
-    assert_eq!(args[4], 1);
+    assert_eq!(args[W_VISIBLE], 1);
     assert_cut("single", &pairs, 0, &expected(&mesh, world, &view, true));
 }
 
@@ -331,15 +329,15 @@ fn nothing_visible_draws_nothing_and_the_capacity_holds() {
     let source = InstanceSource::Culled { records: &records, first_record: 0, capacity: 1, args: &one, count_word: 1 };
     let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 5, gpu.vertex_count(), true, 1.0);
     let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
-    assert_eq!(args[1], 5, "drawn: the capacity");
-    assert!(args[5] > 5, "claimed: {}", args[5]);
+    assert_eq!(args[W_LISTED], 5, "drawn: the capacity");
+    assert!(args[W_CLAIMED] > 5, "claimed: {}", args[W_CLAIMED]);
     assert!(pairs.iter().all(|p| p.0 == 0 && (p.1 as usize) < mesh.clusters.len()));
 
     // then no instance visible: nothing drawn, nothing left from before
     let none = counted(0);
     let source = InstanceSource::Culled { records: &records, first_record: 0, capacity: 1, args: &none, count_word: 1 };
     let (args, _) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
-    assert_eq!((args[1], args[4], args[5], args[6]), (0, 0, 0, 0));
+    assert_eq!((args[W_INDICES], args[W_VISIBLE], args[W_CLAIMED], args[W_TRIANGLES]), (0, 0, 0, 0));
 }
 
 use crate::buffers::InstanceBufferLayout;
@@ -575,7 +573,7 @@ fn at_zero_error_the_clusters_draw_what_the_mesh_does() {
     let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, true);
     let clusters = draw(&mut renderer, &mut scene, &mut camera);
     let args = cluster_args(&renderer, &scene, index);
-    assert!(args[1] > 0 && args[4] == 4, "clusters drawn: {args:?}");
+    assert!(args[W_LISTED] > 0 && args[W_VISIBLE] == 4, "clusters drawn: {args:?}");
     let (covered, differing) = compare(&mesh, &clusters);
     assert!(covered > (SIZE * SIZE / 10) as usize, "the rocks cover {covered} texels");
     assert!(differing * 200 < covered, "{differing} of {covered} texels differ");
@@ -619,7 +617,7 @@ fn grown_instances_rebind_the_clusters() {
     r.instance_culling.as_mut().unwrap().count = 4;
     r.geometry.instance_count = 4;
     let clusters = draw(&mut renderer, &mut scene, &mut camera);
-    assert_eq!(cluster_args(&renderer, &scene, index)[4], 4);
+    assert_eq!(cluster_args(&renderer, &scene, index)[W_VISIBLE], 4);
     let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, false);
     let mesh = draw(&mut renderer, &mut scene, &mut camera);
     let (covered, differing) = compare(&mesh, &clusters);
@@ -1003,7 +1001,7 @@ fn every_view_gets_its_own_cut_in_one_pass() {
     for (index, view) in views.iter().enumerate() {
         let args = read_words(&device, &queue, gpu.args(index as u32));
         let list = read_words(&device, &queue, gpu.draws(index as u32));
-        let pairs: Vec<(u32, u32)> = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
+        let pairs: Vec<(u32, u32)> = list.chunks(2).take(args[W_CLAIMED] as usize).filter(|p| p[0] != NO_WORD).map(|p| (p[0], p[1])).collect();
         for (k, r) in records.iter().enumerate() {
             assert_cut(&format!("view {index}, instance {k}"), &pairs, k as u32, &expected_world(&mesh, placement_matrix(r), view, true, 1.0));
         }
@@ -1408,7 +1406,7 @@ fn cull_frame(device: &wgpu::Device, queue: &wgpu::Queue, culling: &mut ClusterC
     // (the frame's readback lands before the next: in a renderer, a few frames later)
     device.poll(wgpu::Maintain::Wait);
     let args = read_words(device, queue, gpu.args(0));
-    (args[1], args[5], gpu.capacity(0))
+    (args[W_LISTED], args[W_CLAIMED], gpu.capacity(0))
 }
 
 #[test]
@@ -1418,7 +1416,7 @@ fn draw_lists_grow_and_shrink_to_what_the_cut_needs() {
         return;
     };
     let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
-    let records = rock_field(50);
+    let records = rock_field(25);
     let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
     let mut culling = ClusterCulling::new(&device);
     let mut gpu = ClusterGpu::new(&device, &mesh);
@@ -1428,7 +1426,7 @@ fn draw_lists_grow_and_shrink_to_what_the_cut_needs() {
     // every level-0 cluster of the field: more than the list starts with
     let near = TestView::looking(glam::Vec3::new(0.0, 60.0, 40.0), glam::Vec3::new(0.0, 0.0, -37.0), 0.0);
     let (drawn, claimed, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, source, params, &near);
-    assert!(claimed > capacity && drawn == capacity && capacity < every, "the first frame: {drawn} drawn of {claimed} claimed, {capacity} long (every: {every})");
+    assert!(claimed > capacity && drawn < claimed && capacity < every, "the first frame: {drawn} drawn of {claimed} claimed, {capacity} long (every: {every})");
     let mut frames = 1;
     let (mut drawn, mut claimed, mut capacity) = (drawn, claimed, capacity);
     while drawn < claimed {
@@ -1437,6 +1435,9 @@ fn draw_lists_grow_and_shrink_to_what_the_cut_needs() {
         assert!(frames <= 8, "still {drawn} drawn of {claimed} after {frames} frames");
     }
     assert!(capacity <= (claimed + claimed / 2).next_power_of_two(), "grown to {capacity} for {claimed}");
+    // and the index buffer holds every triangle the cut claims
+    let args = read_words(&device, &queue, gpu.args(0));
+    assert!(args[W_TRIANGLES] == args[W_TRIANGLES_CLAIMED] && args[W_INDICES] == 3 * args[W_TRIANGLES], "{} of {} triangles drawn", args[W_TRIANGLES], args[W_TRIANGLES_CLAIMED]);
     let grown = capacity;
     // far away and coarse: a cluster or so a rock; the list keeps its size a while, then shrinks
     let far = TestView::looking(glam::Vec3::new(0.0, 400.0, 400.0), glam::Vec3::new(0.0, 0.0, -37.0), 8.0);
@@ -1495,4 +1496,110 @@ fn fewer_instances_cap_the_draw_but_keep_the_list() {
     assert!(!gpu.bind(&device, &queue, &culling, 0, few, params), "the list was remade for fewer instances");
     let (drawn, _, after) = cull_frame(&device, &queue, &mut culling, &mut gpu, few, params, &view);
     assert!(after == capacity && drawn <= max, "{drawn} drawn (at most {max}), the list {after} long (was {capacity})");
+}
+
+/// Words of a cut's draw (`DRAW_ARGS_BYTES`): the index count, the instance count, the visible
+/// instances, the clusters claimed and listed, the triangles claimed and listed.
+const W_INDICES: usize = 0;
+const W_INSTANCES: usize = 1;
+const W_VISIBLE: usize = 5;
+const W_CLAIMED: usize = 6;
+const W_LISTED: usize = 7;
+const W_TRIANGLES_CLAIMED: usize = 8;
+const W_TRIANGLES: usize = 9;
+
+/// A cut's listed draw-list entries: (entry, record, cluster).
+fn listed(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &ClusterGpu, view: u32) -> Vec<(u32, u32, u32)> {
+    let args = read_words(device, queue, gpu.args(view));
+    let list = read_words(device, queue, gpu.draws(view));
+    list.chunks(2).take(args[W_CLAIMED] as usize).enumerate().filter(|(_, p)| p[0] != NO_WORD).map(|(e, p)| (e as u32, p[0], p[1])).collect()
+}
+
+/// A cut's drawn triangles, decoded from its indices, per draw-list entry: (degenerate triangles,
+/// triangles of each entry as mesh vertices).
+fn decoded(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &ClusterMesh, gpu: &ClusterGpu, view: u32) -> (usize, std::collections::BTreeMap<u32, Vec<[u32; 3]>>) {
+    let args = read_words(device, queue, gpu.args(view));
+    let entries: std::collections::HashMap<u32, u32> = listed(device, queue, gpu, view).into_iter().map(|(e, _, c)| (e, c)).collect();
+    let indices = read_words(device, queue, gpu.indices(view));
+    let (mut degenerate, mut per) = (0, std::collections::BTreeMap::<u32, Vec<[u32; 3]>>::new());
+    for t in indices[..args[W_INDICES] as usize].chunks(3) {
+        if t[0] == t[1] && t[1] == t[2] {
+            degenerate += 1;
+            continue;
+        }
+        let entry = t[0] >> 8;
+        assert!(t.iter().all(|i| i >> 8 == entry), "a triangle across entries: {t:?}");
+        let cluster = *entries.get(&entry).unwrap_or_else(|| panic!("index {t:?}: entry {entry} isn't listed"));
+        let c = &mesh.clusters[cluster as usize];
+        let vertex = |i: u32| {
+            assert!(i & 255 < c.vertex_count, "local vertex {} of a cluster of {}", i & 255, c.vertex_count);
+            mesh.cluster_vertices[(c.vertex_offset + (i & 255)) as usize]
+        };
+        per.entry(entry).or_default().push([vertex(t[0]), vertex(t[1]), vertex(t[2])]);
+    }
+    (degenerate, per)
+}
+
+#[test]
+fn cluster_draws_are_indexed_without_padding() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = rock_field(6);
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, records.len() as u32 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
+    let view = TestView::looking(glam::Vec3::new(0.0, 8.0, -20.0), glam::Vec3::new(0.0, 0.0, -37.0), 1.0);
+    let (args, _) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+    let entries = listed(&device, &queue, &gpu, 0);
+    let triangles: u32 = entries.iter().map(|&(_, _, c)| mesh.clusters[c as usize].triangle_count).sum();
+    assert!(entries.len() > 20 && entries.len() as u32 == args[W_LISTED], "{} entries listed, {} counted", entries.len(), args[W_LISTED]);
+    assert_eq!((args[W_INDICES], args[W_INSTANCES], args[W_TRIANGLES]), (3 * triangles, 1, triangles), "the draw: no padding");
+    let (degenerate, per) = decoded(&device, &queue, &mesh, &gpu, 0);
+    assert_eq!(degenerate, 0);
+    for (entry, _, cluster) in entries {
+        let mut drawn = per.get(&entry).cloned().unwrap_or_default();
+        let mut own: Vec<[u32; 3]> = mesh.triangles(cluster as usize).collect();
+        drawn.sort();
+        own.sort();
+        assert_eq!(drawn, own, "entry {entry}: cluster {cluster}'s triangles");
+    }
+}
+
+#[test]
+fn an_overflowing_cut_draws_only_whole_written_triangles() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = rock_field(6);
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    // room for far fewer triangles than the cut claims
+    gpu.limit_triangles(1000);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, records.len() as u32 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
+    // (a second view over the first's indices: none of them may survive into the drawn range)
+    // (the second's coarser clusters end elsewhere than the first's)
+    for (eye, threshold) in [(glam::Vec3::new(0.0, 8.0, -20.0), 0.0), (glam::Vec3::new(12.0, 3.0, -30.0), 8.0)] {
+        let view = TestView::looking(eye, glam::Vec3::new(0.0, 0.0, -37.0), threshold);
+        let (args, _) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+        assert!(args[W_TRIANGLES_CLAIMED] > 1000 && args[W_INDICES] == 3 * 1000, "{args:?}");
+        let entries = listed(&device, &queue, &gpu, 0);
+        let (degenerate, per) = decoded(&device, &queue, &mesh, &gpu, 0);
+        // every listed cluster is whole, the rest of the range degenerate
+        let whole: u32 = entries.iter().map(|&(_, _, c)| mesh.clusters[c as usize].triangle_count).sum();
+        for (entry, _, cluster) in &entries {
+            assert_eq!(per.get(entry).map_or(0, Vec::len) as u32, mesh.clusters[*cluster as usize].triangle_count, "eye {eye}: entry {entry} drawn whole");
+        }
+        assert_eq!(per.values().map(Vec::len).sum::<usize>() as u32, whole);
+        assert_eq!(whole + degenerate as u32, 1000);
+        assert_eq!(args[W_TRIANGLES], whole);
+    }
 }

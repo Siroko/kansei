@@ -65,15 +65,25 @@ const KIND_MATRIX: u32 = 2;
 const FLAG_CONE: u32 = 1;
 /// Entries of a draw list by default, at most (32 MB).
 pub(crate) const DEFAULT_MAX_DRAWN: u32 = 1 << 22;
-/// Entries a draw list starts with, until the cull says what its cut needs (512 KB).
-pub(crate) const INITIAL_DRAWN: u32 = 1 << 16;
+/// Entries a draw list starts with, until the cull says what its cut needs (128 KB; each entry
+/// stands for a cluster's triangles in the index buffer, ~1.5 KB).
+pub(crate) const INITIAL_DRAWN: u32 = 1 << 14;
 /// Entries a draw list keeps at least (8 KB).
 pub(crate) const MIN_DRAWN: u32 = 1 << 10;
 /// Readbacks in a row a cut must need at most a quarter of its list before the list shrinks.
 pub(crate) const SHRINK_AFTER: u32 = 64;
-/// Bytes of a cluster draw: `DrawIndirect`'s four words, then the visible instances, the
-/// clusters claimed (drawn up to the capacity), the triangles drawn, and a pad.
-pub(crate) const DRAW_ARGS_BYTES: u64 = 32;
+/// Triangles an index buffer starts with, until the cull says what its cut needs (3 MB).
+pub(crate) const INITIAL_TRIANGLES: u32 = 1 << 18;
+/// Triangles an index buffer keeps room for at least (48 KB).
+pub(crate) const MIN_TRIANGLES: u32 = 1 << 12;
+/// Bytes of a cluster draw: `DrawIndexedIndirect`'s five words (the index count, one instance,
+/// zeros), then the visible instances, the clusters claimed and listed (drawn), the triangles
+/// claimed and listed, and two pads.
+pub(crate) const DRAW_ARGS_BYTES: u64 = 48;
+/// Word of the draw: the clusters claimed, drawn or not.
+pub(crate) const CLAIMED_WORD: u64 = 6;
+/// Word of the draw: the triangles claimed, drawn or not.
+pub(crate) const TRIANGLES_CLAIMED_WORD: u64 = 8;
 
 /// Where an instance record places the mesh, as far as the cluster test needs it: spheres,
 /// errors and cones follow the instance. It should say what the material's vertex stage does
@@ -131,7 +141,8 @@ pub(crate) struct ClusterCullGpu {
     stretch: f32,
     /// the cut's view, in `ClusterCulling::set_views` (set by `ClusterGpu::bind`)
     view: u32,
-    _pad: u32,
+    /// the triangles its index buffer holds (set by `ClusterGpu::bind`)
+    triangle_capacity: u32,
 }
 
 impl ClusterCullGpu {
@@ -169,7 +180,7 @@ impl ClusterCullGpu {
             yaw_scale,
             stretch: stretch.max(1.0),
             view: 0,
-            _pad: 0,
+            triangle_capacity: 0,
         }
     }
 }
@@ -218,7 +229,7 @@ impl ClusterCulling {
         let uniform = |binding| buffer_entry(binding, wgpu::BufferBindingType::Uniform);
         let storage = |binding, read_only| buffer_entry(binding, wgpu::BufferBindingType::Storage { read_only });
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
-        let cull_bgl = layout("ClusterCulling/Cull", &[uniform(0), storage(1, true), storage(2, true), storage(3, false), storage(4, false)]);
+        let cull_bgl = layout("ClusterCulling/Cull", &[uniform(0), storage(1, true), storage(2, true), storage(3, false), storage(4, false), storage(5, false)]);
         let view_bgl = layout("ClusterCulling/View", &[storage(0, true)]);
         let prepare_bgl = layout("ClusterCulling/Prepare", &[uniform(10), storage(11, true), storage(12, false), storage(13, false)]);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ClusterCulling"), source: wgpu::ShaderSource::Wgsl(format!("{CLUSTER_CULL_WGSL}\n{CLUSTER_MESH_WGSL}").into()) });
@@ -300,11 +311,13 @@ pub struct ClusterLod {
     /// `transform` doesn't describe.
     pub cone_culling: bool,
     /// Clusters drawn per frame in each view, at most. By default every cluster of every
-    /// instance, up to 4 194 304. Each view's cut keeps a draw list (8 bytes an entry) sized to
-    /// what it needs, as the cull reads back: 65 536 entries at first, then half again its need,
-    /// growing at once and shrinking only after 64 readbacks at a quarter or less. A cut that
-    /// suddenly needs more than its list holds (at load, or past half again its recent need)
-    /// leaves the clusters past it undrawn until the readback lands, 2-3 frames later.
+    /// instance, up to 4 194 304. Each view's cut keeps a draw list (8 bytes an entry) and an
+    /// index buffer of its clusters' triangles (12 bytes each), drawn as one indexed draw, both
+    /// sized to what it needs as the cull reads back: 16 384 entries and 262 144 triangles at
+    /// first, then half again the need, growing at once and shrinking only after 64 readbacks at
+    /// a quarter or less. A cut that suddenly needs more than they hold (at load, or past half
+    /// again its recent need) leaves the clusters past them undrawn until the readback lands,
+    /// 2-3 frames later.
     pub capacity: Option<u32>,
     /// How much further than `transform` the material may stretch or sway an instance about its
     /// origin (1 by default): no point moves more than `stretch - 1` times its distance from the
@@ -367,6 +380,8 @@ pub(crate) struct ClusterGpu {
     empty: wgpu::Buffer,
     /// by view (`ClusterCulling::set_views`); none for views that never drew it
     cuts: Vec<Option<Cut>>,
+    /// the most triangles an index buffer holds (tests make it small)
+    triangle_limit: u32,
 }
 
 /// A view's cut of a renderable: its parameters, the draw list and its indirect draw, and the
@@ -377,8 +392,12 @@ pub(crate) struct Cut {
     draws: wgpu::Buffer,
     /// `draws`' length in entries (0 before the first bind)
     capacity: u32,
-    /// readbacks in a row that needed at most a quarter of `capacity`
-    low: u32,
+    list: Sizer,
+    /// the cut's triangles, 3 indices each (`entry << 8 | local vertex`)
+    indices: wgpu::Buffer,
+    /// `indices`' room in triangles (0 before the first bind)
+    triangle_capacity: u32,
+    triangles: Sizer,
     args: wgpu::Buffer,
     dispatch: wgpu::Buffer,
     bound: Option<Bound>,
@@ -406,7 +425,10 @@ impl Cut {
             written: None,
             draws: buffer("Clusters/Draws", 8, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             capacity: 0,
-            low: 0,
+            list: Sizer::default(),
+            indices: buffer("Clusters/Indices", 12, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            triangle_capacity: 0,
+            triangles: Sizer::default(),
             // (COPY_SRC: read back by the stats, the feedback and the tests)
             args: buffer("Clusters/Args", DRAW_ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             dispatch: buffer("Clusters/Dispatch", 16, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE),
@@ -415,37 +437,14 @@ impl Cut {
         }
     }
 
-    /// The draw list's length for a cut that may draw `max` clusters, given what the cull last
-    /// read back it `needed` (if a reading arrived): `INITIAL_DRAWN` at first; then half again
-    /// the need, to a power of two, at once when that is longer; and that when it has been at
-    /// most a quarter of the length for `SHRINK_AFTER` readings in a row. It grows no longer
-    /// than `max`, but a smaller `max` alone doesn't shrink it (the draw is capped instead).
-    fn sized(&mut self, max: u32, needed: Option<u32>) -> u32 {
-        if self.capacity == 0 {
-            return INITIAL_DRAWN.min(max);
-        }
-        let mut capacity = self.capacity;
-        if let Some(needed) = needed {
-            let target = (needed as u64 * 3 / 2).max(1).next_power_of_two().min(max as u64).max(MIN_DRAWN.min(max) as u64) as u32;
-            if target > capacity {
-                capacity = target;
-                self.low = 0;
-            } else if target as u64 * 4 <= capacity as u64 {
-                self.low += 1;
-                if self.low >= SHRINK_AFTER {
-                    capacity = target;
-                    self.low = 0;
-                }
-            } else {
-                self.low = 0;
-            }
-        }
-        capacity
-    }
-
     /// The indirect draw (`DRAW_ARGS_BYTES`, see `DRAW_ARGS_BYTES` for its words).
     pub(crate) fn args(&self) -> &wgpu::Buffer {
         &self.args
+    }
+
+    /// Its index buffer (`DRAW_ARGS_BYTES`'s index count of it is drawn).
+    pub(crate) fn indices(&self) -> &wgpu::Buffer {
+        &self.indices
     }
 
     /// The vertex stage's group 2 for this cut, once `ClusterGpu::bind_draw` made it.
@@ -465,6 +464,7 @@ impl ClusterGpu {
             cluster_count: mesh.clusters.len() as u32,
             empty: device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Empty"), size: 32, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false }),
             cuts: Vec::new(),
+            triangle_limit: u32::MAX,
         }
     }
 
@@ -485,14 +485,26 @@ impl ClusterGpu {
         let (mesh, empty) = (&self.mesh, &self.empty);
         let cut = self.cuts[view as usize].get_or_insert_with(|| Cut::new(device));
         let max = params.capacity.max(1);
-        let length = cut.sized(max, culling.feedback.needed(self.id, view));
-        // (the shader draws no more than the list holds, nor than `max`)
+        let (needed, triangles_needed) = culling.feedback.needed(self.id, view).unzip();
+        let length = cut.list.sized(cut.capacity, INITIAL_DRAWN, MIN_DRAWN, max, needed);
+        // (the shader lists no more than the list holds, nor than `max`)
         params.capacity = length.min(max);
-        let grown = length != cut.capacity;
+        let mut grown = length != cut.capacity;
         if grown {
             cut.capacity = length;
             cut.draws = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Draws"), size: cut.capacity as u64 * 8, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
             cut.bound = None;
+        }
+        // every cluster it may list at its largest, within what a binding holds
+        let binding = (device.limits().max_storage_buffer_binding_size as u64).min(device.limits().max_buffer_size) / 12;
+        let most = (max as u64 * (self.vertex_count / 3) as u64).min(binding).min(self.triangle_limit as u64).max(1) as u32;
+        let triangles = cut.triangles.sized(cut.triangle_capacity, INITIAL_TRIANGLES, MIN_TRIANGLES, most, triangles_needed);
+        params.triangle_capacity = triangles.min(most);
+        if triangles != cut.triangle_capacity {
+            cut.triangle_capacity = triangles;
+            cut.indices = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Clusters/Indices"), size: triangles as u64 * 12, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            cut.bound = None;
+            grown = true;
         }
         let (records, count) = match source {
             InstanceSource::None => (None, None),
@@ -503,7 +515,7 @@ impl ClusterGpu {
             let cull_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Clusters/Cull"),
                 layout: &culling.cull_bgl,
-                entries: &[entry(0, &cut.params), entry(1, mesh), entry(2, records.as_ref().unwrap_or(empty)), entry(3, &cut.draws), entry(4, &cut.args)],
+                entries: &[entry(0, &cut.params), entry(1, mesh), entry(2, records.as_ref().unwrap_or(empty)), entry(3, &cut.draws), entry(4, &cut.args), entry(5, &cut.indices)],
             });
             let prepare_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Clusters/Prepare"),
@@ -544,6 +556,18 @@ impl ClusterGpu {
         &self.cut(view).expect("the cut is bound").args
     }
 
+    /// View `view`'s index buffer.
+    #[cfg(test)]
+    pub(crate) fn indices(&self, view: u32) -> &wgpu::Buffer {
+        &self.cut(view).expect("the cut is bound").indices
+    }
+
+    /// Room for at most `triangles` in every cut's index buffer.
+    #[cfg(test)]
+    pub(crate) fn limit_triangles(&mut self, triangles: u32) {
+        self.triangle_limit = triangles;
+    }
+
     /// View `view`'s draw list: (record, cluster) per drawn cluster.
     #[cfg(test)]
     pub(crate) fn draws(&self, view: u32) -> &wgpu::Buffer {
@@ -571,8 +595,8 @@ struct Feedback {
     staging: Option<wgpu::Buffer>,
     /// the cuts (`ClusterGpu` id, view) of the copy in flight, and its state
     pending: Option<(Vec<(u64, u32)>, std::sync::Arc<std::sync::atomic::AtomicU8>)>,
-    /// the last readback's counts, until the next frame's
-    needed: std::collections::HashMap<(u64, u32), u32>,
+    /// the last readback's counts (clusters, triangles), until the next frame's
+    needed: std::collections::HashMap<(u64, u32), (u32, u32)>,
 }
 
 const MAPPING: u8 = 0;
@@ -580,7 +604,8 @@ const MAPPED: u8 = 1;
 const FAILED: u8 = 2;
 
 impl Feedback {
-    fn needed(&self, id: u64, view: u32) -> Option<u32> {
+    /// The clusters and triangles cut (`id`, `view`) last claimed, if a reading arrived.
+    fn needed(&self, id: u64, view: u32) -> Option<(u32, u32)> {
         self.needed.get(&(id, view)).copied()
     }
 
@@ -601,7 +626,7 @@ impl Feedback {
         {
             let bytes = staging.slice(..).get_mapped_range();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
-            self.needed.extend(cuts.into_iter().zip(words.iter().copied()));
+            self.needed.extend(cuts.into_iter().zip(words.chunks(2).map(|w| (w[0], w[1]))));
         }
         staging.unmap();
     }
@@ -614,21 +639,62 @@ impl Feedback {
         if read.is_empty() {
             return;
         }
-        let size = read.len() as u64 * 4;
+        let size = read.len() as u64 * 8;
         if self.staging.as_ref().is_none_or(|s| s.size() < size) {
             self.staging = Some(device.create_buffer(&wgpu::BufferDescriptor { label: Some("ClusterCulling/Feedback"), size: size.next_power_of_two().max(16), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
         }
         let staging = self.staging.as_ref().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ClusterCulling/Feedback") });
         for (k, (cut, _)) in read.iter().enumerate() {
-            // (word 5: the clusters claimed)
-            encoder.copy_buffer_to_buffer(&cut.args, 20, staging, k as u64 * 4, 4);
+            encoder.copy_buffer_to_buffer(&cut.args, CLAIMED_WORD * 4, staging, k as u64 * 8, 4);
+            encoder.copy_buffer_to_buffer(&cut.args, TRIANGLES_CLAIMED_WORD * 4, staging, k as u64 * 8 + 4, 4);
         }
         queue.submit(Some(encoder.finish()));
         let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(MAPPING));
         let done = state.clone();
         staging.slice(..).map_async(wgpu::MapMode::Read, move |result| done.store(if result.is_ok() { MAPPED } else { FAILED }, std::sync::atomic::Ordering::Release));
         self.pending = Some((read.into_iter().map(|(_, key)| key).collect(), state));
+    }
+}
+
+/// A buffer's length (a draw list's entries, an index buffer's triangles) sized to what its cut
+/// needs, from the cull's readbacks.
+#[derive(Default)]
+struct Sizer {
+    /// readbacks in a row that needed at most a quarter of the length
+    low: u32,
+}
+
+impl Sizer {
+    /// The length for `current` (0: none yet) given a reading of what the cut `needed` (if one
+    /// arrived): `initial` at first; then half again the need, rounded up to an eighth of its
+    /// power of two (at least `min`), at once when that is longer; and that when it has been at most a quarter of the
+    /// length for `SHRINK_AFTER` readings in a row. It grows no longer than `max`, but a smaller
+    /// `max` alone doesn't shrink it (the draw is capped instead).
+    fn sized(&mut self, current: u32, initial: u32, min: u32, max: u32, needed: Option<u32>) -> u32 {
+        if current == 0 {
+            return initial.min(max);
+        }
+        let mut length = current;
+        if let Some(needed) = needed {
+            // (rounded up to an eighth of its power of two: steps small next to the length)
+            let want = (needed as u64 * 3 / 2).max(1);
+            let step = (want.next_power_of_two() / 8).max(1);
+            let target = want.div_ceil(step).saturating_mul(step).min(max as u64).max(min.min(max) as u64) as u32;
+            if target > length {
+                length = target;
+                self.low = 0;
+            } else if target as u64 * 4 <= length as u64 {
+                self.low += 1;
+                if self.low >= SHRINK_AFTER {
+                    length = target;
+                    self.low = 0;
+                }
+            } else {
+                self.low = 0;
+            }
+        }
+        length
     }
 }
 
