@@ -1,5 +1,6 @@
 //! The vertex stage of a material's cluster pipeline, generated from its WGSL. `vertex_main`
-//! becomes a plain function. `kansei_cluster_vertex_main` finds its draw-list entry, reads the
+//! becomes a plain function. `kansei_cluster_vertex_main` finds its draw-list entry (from the
+//! cut's index: `entry << 8 | the vertex's index in the cluster`), reads the
 //! mesh's vertex and the instance record's attributes (from the instance buffer's layout),
 //! fills `vertex_main`'s inputs, and calls it.
 
@@ -98,8 +99,9 @@ pub(crate) fn cluster_vertex_stage(code: &str, instances: Option<&InstanceBuffer
     out += &code[body..];
     out += &format!("\nconst KANSEI_RECORD_WORDS: u32 = {record_words}u;\n{PRELUDE}\n{CLUSTER_MESH_WGSL}\n");
     out += &format!("@vertex\nfn {CLUSTER_VERTEX_ENTRY}(@builtin(vertex_index) kansei_vertex_index: u32, @builtin(instance_index) kansei_instance_index: u32) -> {returns} {{\n");
-    out += "    let kansei_draw = kansei_cluster_draws[kansei_instance_index];\n";
-    out += "    let kansei_vertex = kansei_cluster_vertex(kansei_draw.y, kansei_vertex_index);\n";
+    // (the cut's index: its draw-list entry, and the vertex's index in the entry's cluster)
+    out += "    let kansei_draw = kansei_cluster_draws[kansei_vertex_index >> 8u];\n";
+    out += "    let kansei_vertex = kansei_cluster_local_vertex(kansei_draw.y, kansei_vertex_index & 0xffu);\n";
     out += "    let kansei_record = kansei_draw.x;\n";
     out += &fill;
     out += &format!("    return vertex_main({args});\n}}\n");

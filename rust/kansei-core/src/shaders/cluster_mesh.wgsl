@@ -19,17 +19,8 @@ fn kansei_cluster_vec4(cluster: u32, word: u32) -> vec4<f32> {
     return vec4<f32>(kansei_cluster_f32(cluster, word), kansei_cluster_f32(cluster, word + 1u), kansei_cluster_f32(cluster, word + 2u), kansei_cluster_f32(cluster, word + 3u));
 }
 
-// The mesh vertex drawn as vertex `vertex` of `cluster` (3 per triangle). Past its triangles,
-// the first triangle's first corner: the padding up to the draw's size has no area.
-fn kansei_cluster_vertex(cluster: u32, vertex: u32) -> u32 {
-    var triangle = vertex / 3u;
-    var corner = vertex % 3u;
-    if (triangle >= kansei_cluster_word(cluster, 2u)) {
-        triangle = 0u;
-        corner = 0u;
-    }
-    let packed = kansei_cluster_mesh[kansei_cluster_mesh[2] + kansei_cluster_word(cluster, 1u) + triangle];
-    let local = (packed >> (corner * 8u)) & 0xffu;
+// The mesh vertex that is vertex `local` of `cluster` (an index of its triangles).
+fn kansei_cluster_local_vertex(cluster: u32, local: u32) -> u32 {
     return kansei_cluster_mesh[kansei_cluster_mesh[1] + kansei_cluster_word(cluster, 0u) + local];
 }
 
