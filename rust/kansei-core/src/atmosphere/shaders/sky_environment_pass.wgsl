@@ -1,6 +1,7 @@
 // Sky environment cubemap, one mip per dispatch: the sky's radiance around the camera (the
 // sky-view LUT with the clouds in front of it above the horizon, the air and a Lambertian ground
-// below it; no sun disk, whose highlight belongs to the directional light), GGX-prefiltered for
+// below it, and the capture fog in front of all of it; no sun disk, whose highlight belongs to the
+// directional light), GGX-prefiltered for
 // the mip's roughness (Karis 2013's split sum, N = V = R). Mip 0 is the mirror; mip m has
 // roughness m / (mips - 1).
 
@@ -19,6 +20,7 @@ struct EnvPass {
 @group(0) @binding(5) var envOut : texture_storage_2d_array<rgba16float, write>;
 @group(0) @binding(6) var<uniform> envPass : EnvPass;
 @group(0) @binding(7) var cloudMap : texture_2d<f32>;
+@group(0) @binding(8) var<uniform> capture : SkyCapture;
 
 // The sky with the clouds in front of it (cloud_map.wgsl)
 fn skyWithClouds(d: vec3f) -> vec3f {
@@ -42,16 +44,16 @@ fn cubeDirection(face: u32, uv: vec2f) -> vec3f {
 }
 
 // Radiance arriving from d: the sky, or below the horizon the air in front of a ground lit by the
-// sky and the sun (as the sky lighting's lower hemisphere).
+// sky and the sun (as the sky lighting's lower hemisphere), then what the capture adds.
 fn environmentRadiance(d: vec3f) -> vec3f {
     var lum = skyWithClouds(d);
     let up = normalize(frame.cameraPos);
-    if (dot(d, up) < horizonCos(length(frame.cameraPos))) {
+    if (!captureCoversGround() && dot(d, up) < horizonCos(length(frame.cameraPos))) {
         let e = skyIrradiance(skyLighting, up) + skyLighting.sunIlluminance.rgb * max(dot(up, skyLighting.sunDirection.xyz), 0.0)
               + skyLighting.moonIlluminance.rgb * max(dot(up, skyLighting.moonDirection.xyz), 0.0);
         lum += frame.skyLightGroundAlbedo / PI * e;
     }
-    return lum;
+    return capturedSky(d, lum);
 }
 
 fn radicalInverse(i: u32) -> f32 {

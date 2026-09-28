@@ -177,5 +177,6 @@ mod tests {
         assert_eq!(sizes["Atmosphere"], std::mem::size_of::<AtmosphereGpu>());
         assert_eq!(sizes["SkyFrame"], std::mem::size_of::<SkyFrameGpu>());
         assert_eq!(sizes["SkyLighting"], std::mem::size_of::<SkyLightingGpu>());
+        assert_eq!(sizes["SkyCapture"], std::mem::size_of::<crate::atmosphere::sky_atmosphere::SkyCaptureGpu>());
     }
 }

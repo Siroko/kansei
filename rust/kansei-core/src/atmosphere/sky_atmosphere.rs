@@ -1,5 +1,8 @@
+use bytemuck::{Pod, Zeroable};
+
 use crate::cameras::Camera;
 use crate::math::Vec3;
+use crate::postprocessing::effects::{HeightFogEffect, HeightFogLayer};
 
 use super::params::{AtmosphereGpu, AtmosphereParams, CelestialLight, SkyFrameGpu, SkyLightingGpu};
 
@@ -17,6 +20,7 @@ const SKY_VIEW_WGSL: &str = include_str!("shaders/sky_view_lut.wgsl");
 const AERIAL_PERSPECTIVE_WGSL: &str = include_str!("shaders/aerial_perspective_lut.wgsl");
 pub(crate) const SKY_LIGHTING_WGSL: &str = include_str!("shaders/sky_lighting.wgsl");
 pub(crate) const CLOUD_MAP_WGSL: &str = include_str!("shaders/cloud_map.wgsl");
+const SKY_CAPTURE_WGSL: &str = include_str!("shaders/sky_capture.wgsl");
 /// The cloud map's size (cloud_map.wgsl): azimuth by zenith angle.
 pub(crate) const CLOUD_MAP_SIZE: (u32, u32) = (128, 64);
 pub(crate) use super::CLOUD_SHADOW_WGSL;
@@ -53,11 +57,11 @@ pub(crate) fn sky_view_source() -> String {
 }
 
 pub(crate) fn sky_lighting_source() -> String {
-    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, SKY_LIGHTING_PASS_WGSL])
+    shader(&[COMMON_WGSL, FRAME_WGSL, LOOKUP_TRANSMITTANCE_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, SKY_CAPTURE_WGSL, SKY_LIGHTING_PASS_WGSL])
 }
 
 pub(crate) fn environment_source() -> String {
-    shader(&[COMMON_WGSL, FRAME_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, ENVIRONMENT_PASS_WGSL])
+    shader(&[COMMON_WGSL, FRAME_WGSL, SKY_LOOKUP_WGSL, SKY_LIGHTING_WGSL, CLOUD_MAP_WGSL, SKY_CAPTURE_WGSL, ENVIRONMENT_PASS_WGSL])
 }
 
 pub(crate) fn aerial_perspective_source() -> String {
@@ -93,6 +97,59 @@ impl Default for SkyAtmosphereOptions {
 }
 
 /// The GPU handles an effect or a material needs to read the atmosphere. Cheap to clone.
+/// The scene's exponential height fog as the sky lighting and the environment cubemap capture it
+/// (`SkyAtmosphere::capture_fog`): composited at infinite distance over the sky and the clouds, as
+/// seen from `capture_height_m`, as Unreal's real-time sky-light capture does with its
+/// ExponentialHeightFog. Seen from low down it covers the horizon and, opaque below it, replaces
+/// the ground, so the ambient light and the reflections take the fog's colour where the fog is.
+#[derive(Debug, Clone, Copy)]
+pub struct SkyCaptureFog {
+    /// The fog's layers (as `HeightFogEffect::layers`); the second is off while its density is 0.
+    pub layers: [HeightFogLayer; 2],
+    /// Its colour at full opacity, cd/m^2 (as `HeightFogEffect::inscattering`).
+    pub inscattering: Vec3,
+    /// At most this opaque (as `HeightFogEffect::max_opacity`).
+    pub max_opacity: f32,
+    /// World height of the point the sky is captured from, metres (Unreal: its SkyLight actor).
+    pub capture_height_m: f32,
+}
+
+impl SkyCaptureFog {
+    /// The fog a `HeightFogEffect` draws (its layers, colour and opacity), captured from
+    /// `capture_height_m`.
+    pub fn from_height_fog(fog: &HeightFogEffect, capture_height_m: f32) -> Self {
+        Self { layers: fog.layers, inscattering: fog.inscattering, max_opacity: fog.max_opacity, capture_height_m }
+    }
+}
+
+/// What the sky lighting and the environment cubemap see below the horizon.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SkyLowerHemisphere {
+    /// A Lambertian ground of `sky_light_ground_albedo` lit by the sky and the lights, behind the
+    /// air; under a capture fog, the fog, which is opaque below the horizon (Unreal's capture with
+    /// `bLowerHemisphereIsBlack` off).
+    #[default]
+    Ground,
+    /// This radiance, whatever the fog (Unreal's `bLowerHemisphereIsBlack` with its
+    /// `LowerHemisphereColor`; black is `Color(Vec3::ZERO)`).
+    Color(Vec3),
+}
+
+/// The WGSL `SkyCapture` struct (sky_capture.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct SkyCaptureGpu {
+    layer0: [f32; 4],
+    layer1: [f32; 4],
+    inscattering: [f32; 3],
+    fog_on: u32,
+    lower_color: [f32; 3],
+    lower_mode: u32,
+    capture_height: f32,
+    max_opacity: f32,
+    _pad: [f32; 2],
+}
+
 #[derive(Clone)]
 pub struct SkyAtmosphereBindings {
     /// `Atmosphere` uniform (the WGSL struct in `ATMOSPHERE_WGSL`).
@@ -184,6 +241,11 @@ struct Pipelines {
 /// renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
 /// ```
 pub struct SkyAtmosphere {
+    /// The scene's height fog as the sky lighting and the environment capture it, in front of the
+    /// sky and the clouds (Unreal's real-time sky-light capture); `None` captures the sky alone.
+    pub capture_fog: Option<SkyCaptureFog>,
+    /// What the sky lighting and the environment see below the horizon.
+    pub lower_hemisphere: SkyLowerHemisphere,
     pub params: AtmosphereParams,
     pub sun: CelestialLight,
     pub moon: CelestialLight,
@@ -193,6 +255,8 @@ pub struct SkyAtmosphere {
     /// `None` uses `params.ground_albedo`, zero leaves the lower hemisphere black.
     pub sky_light_ground_albedo: Option<Vec3>,
     bindings: SkyAtmosphereBindings,
+    /// The capture's fog and lower hemisphere (WGSL `SkyCapture`), written every update.
+    capture: wgpu::Buffer,
     /// Transmittance, multiple-scattering and sky-view LUT textures (the views are in `bindings`).
     luts: [wgpu::Texture; 3],
     /// Aerial-perspective scattering and transmittance volumes.
@@ -413,6 +477,7 @@ impl SkyAtmosphere {
         };
         // bound in place of the cloud map while no clouds write it
         let no_clouds = view(&lut_2d(device, "SkyAtmosphere/NoClouds", (1, 1)));
+        let capture = uniform("SkyAtmosphere/Capture", std::mem::size_of::<SkyCaptureGpu>());
 
         let b = &bindings;
         let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
@@ -459,6 +524,7 @@ impl SkyAtmosphere {
                     count: None,
                 },
                 texture_entry(7),
+                uniform_entry(8),
             ],
         );
         let environment_bgl = bgl(
@@ -472,6 +538,7 @@ impl SkyAtmosphere {
                 storage_entry_dim(5, wgpu::TextureViewDimension::D2Array),
                 uniform_entry(6),
                 texture_entry(7),
+                uniform_entry(8),
             ],
         );
         let environment_bgs = (0..env_mips)
@@ -513,6 +580,7 @@ impl SkyAtmosphere {
                             wgpu::BindingResource::TextureView(&target),
                             params.as_entire_binding(),
                             wgpu::BindingResource::TextureView(clouds),
+                            capture.as_entire_binding(),
                         ],
                     )
                 })
@@ -583,6 +651,7 @@ impl SkyAtmosphere {
                         wgpu::BindingResource::Sampler(&b.sky_view_sampler),
                         b.sky_lighting.as_entire_binding(),
                         tex(clouds),
+                        capture.as_entire_binding(),
                     ],
                 )
             }),
@@ -596,7 +665,10 @@ impl SkyAtmosphere {
             moon: CelestialLight::moon(),
             origin_altitude_m: 0.0,
             sky_light_ground_albedo: None,
+            capture_fog: None,
+            lower_hemisphere: SkyLowerHemisphere::Ground,
             bindings,
+            capture,
             luts,
             ap_volumes,
             environment,
@@ -716,6 +788,7 @@ impl SkyAtmosphere {
         }
 
         queue.write_buffer(&b.frame, 0, bytemuck::bytes_of(&self.frame(camera)));
+        queue.write_buffer(&self.capture, 0, bytemuck::bytes_of(&self.capture_gpu()));
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/SkyView"), ..Default::default() });
         pass.set_pipeline(&p.sky_view);
         pass.set_bind_group(0, &p.sky_view_bg, &[]);
@@ -756,6 +829,29 @@ impl SkyAtmosphere {
     /// The sky environment cubemap texture (6 layers, GGX-prefiltered mips).
     pub fn environment_texture(&self) -> &wgpu::Texture {
         &self.environment
+    }
+
+    fn capture_gpu(&self) -> SkyCaptureGpu {
+        let layer = |l: &HeightFogLayer| [l.density.max(0.0), l.height_falloff, l.height, 0.0];
+        let rgb = |v: Vec3| [v.x, v.y, v.z];
+        let (lower_color, lower_mode) = match self.lower_hemisphere {
+            SkyLowerHemisphere::Ground => ([0.0; 3], 0),
+            SkyLowerHemisphere::Color(c) => (rgb(c), 1),
+        };
+        match &self.capture_fog {
+            Some(fog) => SkyCaptureGpu {
+                layer0: layer(&fog.layers[0]),
+                layer1: layer(&fog.layers[1]),
+                inscattering: rgb(fog.inscattering),
+                fog_on: 1,
+                lower_color,
+                lower_mode,
+                capture_height: fog.capture_height_m,
+                max_opacity: fog.max_opacity.clamp(0.0, 1.0),
+                _pad: [0.0; 2],
+            },
+            None => SkyCaptureGpu { lower_color, lower_mode, ..Zeroable::zeroed() },
+        }
     }
 
     /// The clouds' shadow map (`SkyAtmosphereBindings::cloud_shadow`), for binding it in a material.
