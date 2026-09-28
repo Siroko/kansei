@@ -1660,7 +1660,8 @@ impl Renderer {
         // then the sky occlusion's top-down view (`sky_occlusion_view`), while it is being rebuilt
         if let Some(sky) = &self.sky_occlusion {
             let lod_distance_scale = sky.options.lod_distance_scale;
-            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, lod_distance_scale }));
+            let layer_mask = Some(sky.options.layer_mask);
+            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, reflection: false, layer_mask, lod_distance_scale }));
         }
         views
     }
