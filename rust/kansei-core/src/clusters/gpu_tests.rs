@@ -1088,3 +1088,108 @@ fn renderables_off_a_view_get_no_cut_there() {
     assert_eq!(stats.view(CullViewKind::SpotShadow(0)).unwrap_or_default().clusters, 0);
     assert!(stats.camera().clusters > 0);
 }
+
+/// Layer `layer` of a Depth32Float array texture, read back.
+fn read_depth(renderer: &Renderer, texture: &wgpu::Texture, layer: u32) -> Vec<f32> {
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let (w, h) = (texture.width(), texture.height());
+    let row = (w * 4).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::DepthOnly },
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let bytes = buffer.slice(..).get_mapped_range();
+    (0..w * h).map(|i| f32::from_le_bytes(bytes[((i / w) * row + (i % w) * 4) as usize..][..4].try_into().unwrap())).collect()
+}
+
+/// (texels either map covers, texels whose depths differ by more than 1e-4).
+fn compare_depths(a: &[f32], b: &[f32]) -> (usize, usize) {
+    let covered = a.iter().zip(b).filter(|(x, y)| **x < 1.0 || **y < 1.0).count();
+    let differing = a.iter().zip(b).filter(|(x, y)| (**x - **y).abs() > 1e-4).count();
+    (covered, differing)
+}
+
+/// The shadow maps a frame of `lit_rocks` leaves (the spot light's layer, then the two
+/// cascades), with cluster LOD or without, at `threshold` pixels and the shadows' `scale`.
+fn shadow_maps(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<Vec<f32>>> {
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    renderer.set_shadow_cluster_error_scale(scale);
+    let (mut scene, mut camera, _) = lit_rocks(&mut renderer, clusters);
+    for _ in 0..2 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    let spot = &renderer.spot_shadow_atlas().unwrap().texture;
+    let cascades = &renderer.cascaded_shadow_map().unwrap().texture;
+    Some(vec![read_depth(&renderer, spot, 0), read_depth(&renderer, cascades, 0), read_depth(&renderer, cascades, 1)])
+}
+
+#[test]
+fn shadow_maps_draw_the_shadow_cut() {
+    // at no error the cut is the mesh, so the maps match; at a coarse shadow budget they are
+    // the coarse cut's, not the mesh's
+    let Some(mesh) = shadow_maps(false, 0.0, 1.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let exact = shadow_maps(true, 0.0, 1.0).unwrap();
+    let coarse = shadow_maps(true, 1.0, 1e4).unwrap();
+    for (k, name) in ["spot", "cascade 0", "cascade 1"].iter().enumerate() {
+        let (covered, differing) = compare_depths(&mesh[k], &exact[k]);
+        assert!(covered > 100 && differing * 200 < covered, "{name} at no error: {differing} of {covered} texels differ");
+        let (covered, differing) = compare_depths(&mesh[k], &coarse[k]);
+        assert!(differing * 20 > covered, "{name} at a coarse shadow budget: only {differing} of {covered} texels differ from the mesh's");
+    }
+}
+
+/// The sky occlusion's visibility volume once built over `rocks`, with cluster LOD or without,
+/// at `threshold` pixels and the top-down view's `scale`.
+fn sky_volume(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<u8>> {
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let options = crate::shadows::SkyOcclusionOptions { extent_m: 16.0, resolution: 256, volume_size: (32, 8), min_height_m: -4.0, max_height_m: 8.0, frames: 1, depth_tiles: 1, lod_error_scale: scale, ..Default::default() };
+    renderer.enable_sky_occlusion(options);
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    scene.get_renderable_mut(index).unwrap().cast_shadow = true;
+    for _ in 0..12 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    let sky = renderer.sky_occlusion().unwrap();
+    let texture = sky.volume_texture();
+    let (side, levels) = (texture.width(), texture.height());
+    let row = (side * 4).div_ceil(256) * 256;
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * levels * side) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &read, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(levels) } },
+        wgpu::Extent3d { width: side, height: levels, depth_or_array_layers: texture.depth_or_array_layers() },
+    );
+    queue.submit(Some(encoder.finish()));
+    read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let data = read.slice(..).get_mapped_range().to_vec();
+    Some(data)
+}
+
+#[test]
+fn sky_occlusion_draws_the_top_down_cut() {
+    let Some(mesh) = sky_volume(false, 0.0, 1.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let exact = sky_volume(true, 0.0, 1.0).unwrap();
+    let coarse = sky_volume(true, 1.0, 1e4).unwrap();
+    let occluded = mesh.chunks(4).filter(|v| v[0] < 250).count();
+    let differing = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x[0].abs_diff(y[0]) > 1).count();
+    assert!(occluded > 20, "the rocks occlude only {occluded} voxels");
+    assert!(differing(&mesh, &exact) * 50 < occluded, "at no error: {} voxels differ", differing(&mesh, &exact));
+    assert!(differing(&mesh, &coarse) > 0, "at a coarse budget the volume is still the mesh's");
+}
