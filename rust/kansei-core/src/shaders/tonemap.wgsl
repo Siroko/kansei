@@ -3,7 +3,8 @@
 //            vignette, all on scene-linear light;
 //   grade:   white balance, contrast about middle grey, and saturation/gain per tonal zone,
 //            on exposed scene-linear light (UE applies its colour grading at this point too);
-//   curve:   a filmic tone curve to display-linear [0, 1];
+//   curve:   a filmic tone curve to display-linear [0, 1] (or, for UnrealFilmic, Unreal's own
+//            grade and filmic curve in AP1, unrealDisplay);
 //   film:    monochrome grain and a triangular dither, in the sRGB-encoded signal;
 //   output:  sRGB-encoded for non-sRGB targets, decoded back to linear for sRGB ones.
 
@@ -29,6 +30,8 @@ struct ToneMapParams {
     tonemapper          : u32,
     flags               : u32,
     _pad0               : u32,
+    film                : vec4f,   // Unreal's film curve: slope, toe, shoulder, black clip
+    film2               : vec4f,   // its white clip, blue correction, gamut expansion, highlights max
 }
 
 @group(0) @binding(0) var inputTex      : texture_2d<f32>;
@@ -41,6 +44,7 @@ const TONEMAP_ACES_FITTED    : u32 = 1u;
 const TONEMAP_AGX            : u32 = 2u;
 const TONEMAP_AGX_PUNCHY     : u32 = 3u;
 const TONEMAP_KHRONOS_NEUTRAL: u32 = 4u;
+const TONEMAP_UNREAL_FILMIC  : u32 = 5u;
 
 const FLAG_ENCODE_SRGB : u32 = 1u;
 const FLAG_DITHER      : u32 = 2u;
@@ -226,6 +230,148 @@ fn toneCurve(c: vec3f) -> vec3f {
     }
 }
 
+// ── Unreal's display transform (PostProcessCombineLUTs.usf, TonemapCommon.ush, ACESCommon.ush) ──
+// Its matrices are written row by row, so they are applied as `v * M`.
+
+const AP1_Y = vec3f(0.2722287168, 0.6740817658, 0.0536895174);
+const INV_LN10 : f32 = 0.4342944819;
+
+fn srgbToAp1(c: vec3f) -> vec3f {
+    return c * mat3x3f(vec3f(0.6130974024, 0.3395231461, 0.0473794514), vec3f(0.0701937225, 0.9163538791, 0.0134523986), vec3f(0.0206155929, 0.1095697729, 0.8698146341));
+}
+fn ap1ToSrgb(c: vec3f) -> vec3f {
+    return c * mat3x3f(vec3f(1.7050509926, -0.6217921205, -0.0832588722), vec3f(-0.1302564175, 1.1408047365, -0.0105483190), vec3f(-0.0240033568, -0.1289689761, 1.1529723328));
+}
+fn ap1ToAp0(c: vec3f) -> vec3f {
+    return c * mat3x3f(vec3f(0.6954522414, 0.1406786965, 0.1638690622), vec3f(0.0447945634, 0.8596711185, 0.0955343182), vec3f(-0.0055258826, 0.0040252103, 1.0015006723));
+}
+fn ap0ToAp1(c: vec3f) -> vec3f {
+    return c * mat3x3f(vec3f(1.4514393161, -0.2365107469, -0.2149285693), vec3f(-0.0765537734, 1.1762296998, -0.0996759264), vec3f(0.0083161484, -0.0060324498, 0.9977163014));
+}
+
+// Nuke-style ColorCorrect in AP1: saturation about AP1 luma, contrast about middle grey, gain.
+fn unrealColorCorrect(c: vec3f, saturation: vec3f, gain: vec3f) -> vec3f {
+    let luma = dot(c, AP1_Y);
+    var x = max(vec3f(0.0), luma + (c - luma) * saturation);
+    x = pow(x / MIDDLE_GREY, vec3f(p.contrast)) * MIDDLE_GREY;
+    return x * gain;
+}
+
+// ColorCorrectAll: the shadow, midtone and highlight grades blended by AP1 luma.
+fn unrealColorCorrectAll(c: vec3f) -> vec3f {
+    let luma = dot(c, AP1_Y);
+    let shadows = unrealColorCorrect(c, p.shadowSaturation * p.saturation, p.shadowGain * p.gain);
+    let wShadows = 1.0 - smoothstep(0.0, p.shadowsMax, luma);
+    let highlights = unrealColorCorrect(c, p.highlightSaturation * p.saturation, p.highlightGain * p.gain);
+    let wHighlights = smoothstep(p.highlightsMin, p.film2.w, luma);
+    let midtones = unrealColorCorrect(c, p.saturation, p.gain);
+    return shadows * wShadows + midtones * (1.0 - wShadows - wHighlights) + highlights * wHighlights;
+}
+
+fn rgbToSaturation(c: vec3f) -> f32 {
+    let mn = min(c.r, min(c.g, c.b));
+    let mx = max(c.r, max(c.g, c.b));
+    return (max(mx, 1e-10) - max(mn, 1e-10)) / max(mx, 1e-2);
+}
+
+fn rgbToYc(c: vec3f) -> f32 {
+    let chroma = sqrt(max(c.b * (c.b - c.g) + c.g * (c.g - c.r) + c.r * (c.r - c.b), 0.0));
+    return (c.b + c.g + c.r + 1.75 * chroma) / 3.0;
+}
+
+fn sigmoidShaper(x: f32) -> f32 {
+    let t = max(1.0 - abs(0.5 * x), 0.0);
+    return 0.5 * (1.0 + sign(x) * (1.0 - t * t));
+}
+
+fn glowFwd(yc: f32, gain: f32, mid: f32) -> f32 {
+    if (yc <= 2.0 / 3.0 * mid) { return gain; }
+    if (yc >= 2.0 * mid) { return 0.0; }
+    return gain * (mid / yc - 0.5);
+}
+
+fn rgbToHue(c: vec3f) -> f32 {
+    var h = 0.0;
+    if (!(c.r == c.g && c.g == c.b)) {
+        h = degrees(atan2(sqrt(3.0) * (c.g - c.b), 2.0 * c.r - c.g - c.b));
+    }
+    if (h < 0.0) { h += 360.0; }
+    return clamp(h, 0.0, 360.0);
+}
+
+fn centerHue(h: f32, center: f32) -> f32 {
+    var x = h - center;
+    if (x < -180.0) { x += 360.0; } else if (x > 180.0) { x -= 360.0; }
+    return x;
+}
+
+// Unreal's FilmToneMap on AP1: ACES's glow and red modifier in AP0, a desaturation, the filmic
+// curve per channel in log10 with a toe, a straight part and a shoulder, and a last desaturation.
+fn unrealFilmToneMap(ap1: vec3f) -> vec3f {
+    let slope = p.film.x;
+    let toe = p.film.y;
+    let shoulder = p.film.z;
+    let blackClip = p.film.w;
+    let whiteClip = p.film2.x;
+
+    var ap0 = ap1ToAp0(ap1);
+    let sat = rgbToSaturation(ap0);
+    let s = sigmoidShaper((sat - 0.4) / 0.2);
+    ap0 *= 1.0 + glowFwd(rgbToYc(ap0), 0.05 * s, 0.08);
+    let hw = pow(smoothstep(0.0, 1.0, 1.0 - abs(2.0 * centerHue(rgbToHue(ap0), 0.0) / 135.0)), 2.0);
+    ap0.r += hw * sat * (0.03 - ap0.r) * (1.0 - 0.82);
+
+    var w = max(ap0ToAp1(ap0), vec3f(0.0));
+    w = mix(vec3f(dot(w, AP1_Y)), w, 0.96);
+
+    let toeScale = 1.0 + blackClip - toe;
+    let shoulderScale = 1.0 + whiteClip - shoulder;
+    let inMatch = 0.18;
+    let outMatch = 0.18;
+    var toeMatch : f32;
+    if (toe > 0.8) {
+        toeMatch = (1.0 - toe - outMatch) / slope + log(inMatch) * INV_LN10;
+    } else {
+        let bt = (outMatch + blackClip) / toeScale - 1.0;
+        toeMatch = log(inMatch) * INV_LN10 - 0.5 * log((1.0 + bt) / (1.0 - bt)) * (toeScale / slope);
+    }
+    let straightMatch = (1.0 - toe) / slope - toeMatch;
+    let shoulderMatch = shoulder / slope - straightMatch;
+
+    let logColor = log(max(w, vec3f(1e-30))) * INV_LN10;
+    let straight = slope * (logColor + straightMatch);
+    var toeColor = -blackClip + 2.0 * toeScale / (1.0 + exp(-2.0 * slope / toeScale * (logColor - toeMatch)));
+    var shoulderColor = 1.0 + whiteClip - 2.0 * shoulderScale / (1.0 + exp(2.0 * slope / shoulderScale * (logColor - shoulderMatch)));
+    toeColor = select(straight, toeColor, logColor < vec3f(toeMatch));
+    shoulderColor = select(straight, shoulderColor, logColor > vec3f(shoulderMatch));
+    var t = saturate((logColor - toeMatch) / (shoulderMatch - toeMatch));
+    if (shoulderMatch < toeMatch) { t = 1.0 - t; }
+    t = (3.0 - 2.0 * t) * t * t;
+    var tone = mix(toeColor, shoulderColor, t);
+    tone = mix(vec3f(dot(tone, AP1_Y)), tone, 0.93);
+    return max(tone, vec3f(0.0));
+}
+
+// Exposed scene-linear sRGB to display-linear sRGB, as Unreal's tonemapper LUT for an sRGB
+// display (the white balance is applied by the caller, as `p.whiteBalance`).
+fn unrealDisplay(balanced: vec3f) -> vec3f {
+    var ap1 = srgbToAp1(balanced);
+    // bright saturated colours pushed out toward a wider gamut
+    let luma = dot(ap1, AP1_Y);
+    let chroma = ap1 / max(luma, 1e-12);
+    let chromaDist2 = dot(chroma - 1.0, chroma - 1.0);
+    let expandAmount = (1.0 - exp2(-4.0 * chromaDist2)) * (1.0 - exp2(-4.0 * p.film2.z * luma * luma));
+    let expanded = ap1 * mat3x3f(vec3f(1.3704123718, -0.3292921877, -0.0636831194), vec3f(-0.0834334917, 1.0970927480, -0.0108613795), vec3f(-0.0257933209, -0.0986257988, 1.2036949526));
+    ap1 = mix(ap1, expanded, expandAmount);
+    ap1 = unrealColorCorrectAll(ap1);
+    let blueCorrect = mat3x3f(vec3f(0.9386393778, 0.0, 0.0613606221), vec3f(0.0, 0.8307941330, 0.1692058671), vec3f(0.0, 0.0, 1.0));
+    let blueUncorrect = mat3x3f(vec3f(1.0653748755, 0.0000014467, -0.0653710053), vec3f(-0.0000003456, 1.2036635245, -0.2036677199), vec3f(0.0000000198, 0.0000000212, 0.9999996001));
+    ap1 = mix(ap1, ap1 * blueCorrect, p.film2.y);
+    ap1 = unrealFilmToneMap(ap1);
+    ap1 = mix(ap1, ap1 * blueUncorrect, p.film2.y);
+    return saturate(max(ap1ToSrgb(ap1), vec3f(0.0)));
+}
+
 // ── Encoding ──
 
 fn srgbEncode(c: vec3f) -> vec3f {
@@ -243,7 +389,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let uv = pix / vec2f(f32(p.width), f32(p.height));
 
     let scene = sampleLens(gid.xy, uv) * (p.exposure * vignetteMask(uv));
-    let display = toneCurve(grade(scene));
+    var display : vec3f;
+    if (p.tonemapper == TONEMAP_UNREAL_FILMIC) {
+        display = unrealDisplay(max(p.whiteBalance * scene, vec3f(0.0)));
+    } else {
+        display = toneCurve(grade(scene));
+    }
 
     // film grain, strongest in the midtones of the encoded signal (where film shows it)
     var encoded = srgbEncode(display);
