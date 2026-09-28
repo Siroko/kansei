@@ -39,6 +39,8 @@ pub enum CullViewKind {
     Reflection(u32),
     /// A cascade of the sun's shadows.
     Cascade(u32),
+    /// The top-down view of the sky occlusion (`Renderer::enable_sky_occlusion`).
+    SkyOcclusion,
 }
 
 /// Instance culling statistics of a recent frame, per view.
