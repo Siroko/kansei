@@ -250,8 +250,9 @@ pub struct ClusterLod {
     /// How an instance record places the mesh. None: the instances are drawn where the renderable
     /// is (or there are none).
     pub transform: Option<InstanceTransform>,
-    /// Skip clusters whose every triangle faces away (on by default). Turn it off when the
-    /// material turns instances in a way `transform` doesn't describe.
+    /// Skip clusters whose every triangle faces away (on by default), where the material culls
+    /// back faces and isn't transparent. Turn it off when the material turns instances in a way
+    /// `transform` doesn't describe.
     pub cone_culling: bool,
     /// Clusters drawn per frame, at most. By default every cluster of every instance, up to
     /// 4 194 304. Clusters past it aren't drawn.
@@ -281,13 +282,14 @@ impl ClusterLod {
 
     /// Ready this frame's cut: the GPU state made once, the cull bound to `source` (records of
     /// `stride` bytes) with the parameters, and the vertex stage's group 2 (`layout`) over the
-    /// renderer's normal and world matrices. True when what bundles recorded changed.
+    /// renderer's normal and world matrices. `back_faces_culled`: the material culls back faces
+    /// (the cone test only removes what it would). True when what bundles recorded changed.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, layout: &wgpu::BindGroupLayout, matrices: (&wgpu::Buffer, &wgpu::Buffer), source: InstanceSource, stride: u32, world: glam::Mat4) -> bool {
+    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, layout: &wgpu::BindGroupLayout, matrices: (&wgpu::Buffer, &wgpu::Buffer), source: InstanceSource, stride: u32, world: glam::Mat4, back_faces_culled: bool) -> bool {
         let gpu = self.gpu.get_or_insert_with(|| ClusterGpu::new(device, &self.mesh));
         let every = (source.capacity() as u64 * gpu.cluster_count as u64).min(DEFAULT_MAX_DRAWN as u64) as u32;
         let capacity = self.capacity.unwrap_or(every).max(1);
-        let params = ClusterCullGpu::new(world, self.transform, stride, &source, capacity, gpu.vertex_count, self.cone_culling);
+        let params = ClusterCullGpu::new(world, self.transform, stride, &source, capacity, gpu.vertex_count, self.cone_culling && back_faces_culled);
         let grown = gpu.bind(device, queue, culling, source, params);
         gpu.bind_draw(device, layout, matrices.0, matrices.1) || grown
     }

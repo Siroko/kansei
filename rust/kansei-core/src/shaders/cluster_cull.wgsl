@@ -142,7 +142,7 @@ fn projected_at(error: f32, distance: f32) -> f32 {
     return error / max(distance, view.near) * view.pixels_per_radian;
 }
 
-// the error of a mesh sphere (xyz, radius) placed by `model`, whose largest scale is `scale`
+// the error of a mesh sphere (xyz, radius) placed by `model`, `scale` a bound on its largest scale
 fn projected(error: f32, sphere: vec4<f32>, model: mat4x4<f32>, scale: f32) -> f32 {
     let center = (model * vec4<f32>(sphere.xyz, 1.0)).xyz;
     return projected_at(error * scale, distance(view.eye, center) - sphere.w * scale);
@@ -195,7 +195,11 @@ fn cull(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups
     let record = params.first_record + slot;
     let model = params.world * placement(record);
     let m = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz);
-    let scale = max(length(m[0]), max(length(m[1]), length(m[2])));
+    // a bound on the largest scale in any direction: the square root of the largest absolute
+    // row sum of mᵀm (the columns' lengths when they are orthogonal; more under shear, where the
+    // columns' lengths fall short and the level window would skip levels the cut needs)
+    let g = transpose(m) * m;
+    let scale = sqrt(max(dot(abs(g[0]), vec3<f32>(1.0)), max(dot(abs(g[1]), vec3<f32>(1.0)), dot(abs(g[2]), vec3<f32>(1.0)))));
     let det = determinant(m);
     // a mirroring transform turns the winding over: no cone test
     let cone = (params.flags & FLAG_CONE) != 0u && det > 0.0;

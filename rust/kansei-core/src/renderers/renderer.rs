@@ -177,6 +177,8 @@ pub struct Renderer {
     // Cluster LOD: the cull's pipelines and view, and the error budget in pixels
     cluster_culling: Option<crate::clusters::ClusterCulling>,
     cluster_threshold: f32,
+    // the renderables the last frame drew on the cluster path (the bundles recorded them so)
+    clustered: Vec<usize>,
     // Planar reflections, drawn after the shadow maps and before the main pass
     planar_reflections: Vec<crate::reflections::PlanarReflection>,
     // Render bundle caching (the static renderables; dynamic ones are drawn live)
@@ -245,6 +247,7 @@ impl Renderer {
             cull_stats: crate::culling::StatsReadback::new(),
             cluster_culling: None,
             cluster_threshold: 1.0,
+            clustered: Vec::new(),
             planar_reflections: Vec::new(),
             render_bundle: None,
             gbuffer_bundle: None,
@@ -1867,6 +1870,11 @@ impl Renderer {
     fn run_cluster_culling(&mut self, scene: &mut Scene, camera: &Camera, main: &crate::culling::MainView, target_height: u32) {
         let indices: Vec<usize> = scene.ordered_indices().filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && r.clusters.is_some() && r.geometry.initialized)).collect();
         if indices.is_empty() {
+            // renderables that left the cluster path are drawn as meshes again
+            if !self.clustered.is_empty() {
+                self.clustered.clear();
+                self.invalidate_bundle();
+            }
             return;
         }
         let device = self.device.as_ref().unwrap();
@@ -1894,16 +1902,19 @@ impl Renderer {
                     None => continue,
                 },
             };
-            stale |= r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, source, stride, world);
+            let back_faces_culled = !r.is_transparent() && r.material.options.cull_mode == crate::materials::CullMode::Back;
+            stale |= r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, source, stride, world, back_faces_culled);
             prepared.push(idx);
         }
         let gpus: Vec<&crate::clusters::ClusterGpu> = prepared.iter().filter_map(|&i| scene.get_renderable(i)?.clusters.as_ref()?.gpu.as_ref()).collect();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/ClusterCulling") });
         culling.encode(&mut encoder, &gpus);
         queue.submit(Some(encoder.finish()));
-        if stale {
+        // renderables joining or leaving the cluster path are drawn the other way
+        if stale || prepared != self.clustered {
             self.invalidate_bundle();
         }
+        self.clustered = prepared;
     }
 
     /// Occlusion's second phase, once the first phase's opaque depth is in `gbuffer`: build the
