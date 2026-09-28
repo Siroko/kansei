@@ -53,7 +53,7 @@ fn environmentRadiance(d: vec3f) -> vec3f {
               + skyLighting.moonIlluminance.rgb * max(dot(up, skyLighting.moonDirection.xyz), 0.0);
         lum += frame.skyLightGroundAlbedo / PI * e;
     }
-    return capturedSky(d, lum);
+    return capturedSky(d, lum, skyLighting.distantSkyLight.rgb);
 }
 
 fn radicalInverse(i: u32) -> f32 {

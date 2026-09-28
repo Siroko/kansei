@@ -984,12 +984,13 @@ mod tests {
         }
         let over = lighting(&mut sky);
         // FOG=r,g,b: the film's height fog (Unreal's 0.03 density, 0.1 falloff, as Unreal integrates
-        // it) captured from 6 m with that colour, as Unreal's sky-light capture sees it
+        // it) captured from 6 m with that colour plus the sky's distant light, as Unreal's sky-light
+        // capture sees it
         if let Ok(colour) = std::env::var("FOG") {
             let c: Vec<f32> = colour.split(',').map(|v| v.parse().unwrap()).collect();
             let ln2 = std::f32::consts::LN_2;
             let layer = crate::postprocessing::effects::HeightFogLayer { density: 0.03 * 0.1 * ln2 * ln2, height_falloff: 0.1 * 0.1 * ln2, height: 0.0 };
-            sky.capture_fog = Some(crate::atmosphere::SkyCaptureFog { layers: [layer, Default::default()], inscattering: Vec3::new(c[0], c[1], c[2]), max_opacity: 1.0, capture_height_m: 6.0 });
+            sky.capture_fog = Some(crate::atmosphere::SkyCaptureFog { layers: [layer, Default::default()], inscattering: Vec3::new(c[0], c[1], c[2]), max_opacity: 1.0, capture_height_m: 6.0, sky_ambient_scale: 1.0 });
             for _ in 0..3 {
                 let mut encoder = device.create_command_encoder(&Default::default());
                 sky.encode(&queue, &mut encoder, &camera);
@@ -998,7 +999,7 @@ mod tests {
             }
             let fogged = lighting(&mut sky);
             let irr = [3.141593, 2.094395, 0.785398];
-            eprintln!("captured through the fog: irradiance up {:?}, east {:?}, down {:?}", eval(&fogged, glam::Vec3::Y, irr), eval(&fogged, glam::Vec3::X, irr), eval(&fogged, -glam::Vec3::Y, irr));
+            eprintln!("captured through the fog: irradiance up {:?}, east {:?}, down {:?}; distant sky light {:?}", eval(&fogged, glam::Vec3::Y, irr), eval(&fogged, glam::Vec3::X, irr), eval(&fogged, -glam::Vec3::Y, irr), &fogged[14 * 4..14 * 4 + 3]);
         }
         let up = glam::Vec3::Y;
         let horizon = glam::Vec3::new(0.0, 0.17, 0.98).normalize();
