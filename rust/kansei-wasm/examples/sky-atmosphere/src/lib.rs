@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use kansei_core::atmosphere::{
-    direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SKY_ENVIRONMENT_WGSL, SKY_LIGHTING_WGSL,
+    direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, CLOUD_SHADOW_WGSL, SKY_ENVIRONMENT_WGSL, SKY_LIGHTING_WGSL,
 };
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
@@ -41,6 +41,9 @@ const SURFACE_WGSL: &str = r#"
 struct MaterialUniforms { albedo: vec4<f32> };
 @group(0) @binding(0) var<uniform> material: MaterialUniforms;
 @group(0) @binding(1) var<uniform> sky: SkyLighting;
+@group(0) @binding(2) var cloud_shadow_map: texture_2d<f32>;
+@group(0) @binding(3) var cloud_shadow_sampler: sampler;
+@group(0) @binding(4) var<uniform> cloud_shadow_params: CloudShadowParams;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -104,7 +107,9 @@ fn fragment_main(input: VertexOutput) -> GBufferOut {
     var e = vec3<f32>(0.0);
     for (var i = 0u; i < lights.num_directional; i++) {
         let l = lights.directional[i];
-        e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
+        // the sun (light 0) through its shadow map and the clouds
+        let clouds = cloudShadow(cloud_shadow_map, cloud_shadow_sampler, cloud_shadow_params, input.world_position);
+        e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow * clouds, i == 0u);
     }
     var out: GBufferOut;
     out.color = vec4<f32>(material.albedo.rgb / 3.14159265 * (e + skyIrradiance(sky, n)), 1.0);
@@ -123,6 +128,9 @@ struct Surface { albedo: vec4<f32>, f0_roughness: vec4<f32> };
 @group(0) @binding(1) var<uniform> sky: SkyLighting;
 @group(0) @binding(2) var env: texture_cube<f32>;
 @group(0) @binding(3) var env_sampler: sampler;
+@group(0) @binding(4) var cloud_shadow_map: texture_2d<f32>;
+@group(0) @binding(5) var cloud_shadow_sampler: sampler;
+@group(0) @binding(6) var<uniform> cloud_shadow_params: CloudShadowParams;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -181,7 +189,8 @@ fn fragment_main(input: VertexOutput) -> GBufferOut {
         let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0);
         let k = roughness * roughness * 0.5;
         let vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
-        color += lights.directional[i].color * nl * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
+        let clouds = select(1.0, cloudShadow(cloud_shadow_map, cloud_shadow_sampler, cloud_shadow_params, input.world_position), i == 0u);
+        color += lights.directional[i].color * (nl * clouds) * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
     }
     var out: GBufferOut;
     out.color = vec4<f32>(color, 1.0);
@@ -195,12 +204,15 @@ fn fragment_main(input: VertexOutput) -> GBufferOut {
 fn reflective(label: &str, albedo: [f32; 3], f0: [f32; 3], roughness: f32, sky: &SkyAtmosphere) -> Material {
     let mut m = Material::new(
         label,
-        &format!("{SKY_LIGHTING_WGSL}\n{SKY_ENVIRONMENT_WGSL}\n{REFLECTIVE_WGSL}"),
+        &format!("{SKY_LIGHTING_WGSL}\n{SKY_ENVIRONMENT_WGSL}\n{CLOUD_SHADOW_WGSL}\n{REFLECTIVE_WGSL}"),
         vec![
             Binding::uniform(0, ShaderStages::FRAGMENT),
             Binding::uniform(1, ShaderStages::FRAGMENT),
             Binding::texture_cube(2, ShaderStages::FRAGMENT),
             Binding::sampler(3, ShaderStages::FRAGMENT),
+            Binding::texture_2d(4, ShaderStages::FRAGMENT),
+            Binding::sampler(5, ShaderStages::FRAGMENT),
+            Binding::uniform(6, ShaderStages::FRAGMENT),
         ],
         MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
     );
@@ -208,18 +220,34 @@ fn reflective(label: &str, albedo: [f32; 3], f0: [f32; 3], roughness: f32, sky: 
     m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
     m.set_bindable(2, Texture::from_view("SkyEnvironment", sky.environment_texture().clone(), sky.bindings().environment.clone()));
     m.set_bindable(3, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
+    bind_cloud_shadow(&mut m, 4, sky);
     m
+}
+
+/// The clouds' shadow (CLOUD_SHADOW_WGSL) at bindings `first` (map), +1 (sampler), +2 (params).
+fn bind_cloud_shadow(m: &mut Material, first: u32, sky: &SkyAtmosphere) {
+    let b = sky.bindings();
+    m.set_bindable(first, Texture::from_view("CloudShadow", sky.cloud_shadow_texture().clone(), b.cloud_shadow.clone()));
+    m.set_bindable(first + 1, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
+    m.set_bindable(first + 2, ComputeBuffer::from_external("CloudShadowParams", b.cloud_shadow_params.clone(), BufferType::Uniform));
 }
 
 fn surface(label: &str, albedo: [f32; 3], sky: &SkyAtmosphere) -> Material {
     let mut m = Material::new(
         label,
-        &format!("{SKY_LIGHTING_WGSL}\n{SURFACE_WGSL}"),
-        vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::uniform(1, ShaderStages::FRAGMENT)],
+        &format!("{SKY_LIGHTING_WGSL}\n{CLOUD_SHADOW_WGSL}\n{SURFACE_WGSL}"),
+        vec![
+            Binding::uniform(0, ShaderStages::FRAGMENT),
+            Binding::uniform(1, ShaderStages::FRAGMENT),
+            Binding::texture_2d(2, ShaderStages::FRAGMENT),
+            Binding::sampler(3, ShaderStages::FRAGMENT),
+            Binding::uniform(4, ShaderStages::FRAGMENT),
+        ],
         MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[albedo[0], albedo[1], albedo[2], 1.0]);
     m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
+    bind_cloud_shadow(&mut m, 2, sky);
     m
 }
 
@@ -427,13 +455,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         effects.push(Box::new(gi));
     }
     effects.push(Box::new(AtmosphereEffect::new(&sky)));
-    // clouds=<coverage 0..1> (clouds=0 none), cloudtype=<0 stratus .. 1 cumulus>, cloudbase=<m>
+    // clouds=<coverage 0..1> (clouds=0 none), cloudtype=<0 stratus .. 1 cumulus>, cloudbase=<m>,
+    // cloudshadows=0 (no cloud shadows on the scene)
     let clouds = q.get("clouds").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.45);
     if clouds > 0.0 {
         let num = |k: &str, d: f32| q.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
         let base = num("cloudbase", 1500.0);
         let layer = CloudLayer { coverage: clouds, cloud_type: num("cloudtype", 0.7), bottom_m: base, top_m: base + num("cloudthick", 2500.0), ..Default::default() };
-        effects.push(Box::new(VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer, ..Default::default() })));
+        let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer, ..Default::default() });
+        // cloudshadows=0: the clouds cast no shadows on the scene
+        fx.casts_shadows = q.get("cloudshadows").as_deref() != Some("0");
+        effects.push(Box::new(fx));
     }
     let midsommar = q.get("preset").as_deref() == Some("midsommar");
     if midsommar {
