@@ -13,6 +13,7 @@ const INJECT_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
     include_str!("../../shaders/volumetric_fog_inject.wgsl"),
     include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("../../shaders/sky_occlusion.wgsl"),
     include_str!("../../shaders/volumetric_fog_media.wgsl"),
     include_str!("../../shaders/spot_light_types.wgsl"),
     include_str!("../../shaders/volumetric_fog_spot.wgsl"),
@@ -26,6 +27,7 @@ const SHAFTS_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
     include_str!("../../shaders/volumetric_fog_inject.wgsl"),
     include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("../../shaders/sky_occlusion.wgsl"),
     include_str!("../../shaders/volumetric_fog_media.wgsl"),
     include_str!("../../shaders/spot_light_types.wgsl"),
     include_str!("../../shaders/volumetric_fog_spot.wgsl"),
@@ -352,6 +354,9 @@ struct Gpu {
     media_params: wgpu::Buffer,
     volumes: wgpu::Buffer,
     dummy_sky_lighting: wgpu::Buffer,
+    /// Stand-ins for the sky occlusion: a 1-texel volume, and its parameters off
+    dummy_occlusion_volume: wgpu::TextureView,
+    dummy_occlusion_params: wgpu::Buffer,
     dummy_spot_lights: wgpu::Buffer,
     dummy_spot_atlas: wgpu::TextureView,
     spot_sampler: wgpu::Sampler,
@@ -430,6 +435,8 @@ pub struct VolumetricFogEffect {
     shadow_map: Option<(wgpu::TextureView, wgpu::Buffer)>,
     point_shadows: Option<wgpu::TextureView>,
     sky_lighting: Option<wgpu::Buffer>,
+    /// The sky occlusion's volume and parameters (`set_sky_occlusion`)
+    sky_occlusion: Option<(wgpu::TextureView, wgpu::Buffer)>,
     spot_lights: Option<wgpu::Buffer>,
     spot_shadows: Option<wgpu::TextureView>,
     /// The mirror plane (unit normal, d) of the reflection fog, if any.
@@ -462,6 +469,7 @@ impl VolumetricFogEffect {
             shadow_map: None,
             point_shadows: None,
             sky_lighting: None,
+            sky_occlusion: None,
             spot_lights: None,
             spot_shadows: None,
             reflection_plane: None,
@@ -572,6 +580,15 @@ impl VolumetricFogEffect {
     /// the sky and its aerial perspective.
     pub fn set_sky_lighting(&mut self, sky_lighting: Option<&wgpu::Buffer>) {
         self.sky_lighting = sky_lighting.cloned();
+        self.bindings_dirty = true;
+    }
+
+    /// Dim the sky's light on the fog by how much of the sky each froxel sees
+    /// (`Renderer::sky_occlusion`, `shadows::SKY_OCCLUSION_WGSL`'s `skyVisibility`), as Unreal's
+    /// Lumen occludes the sky light its volumetric fog receives: under the canopy, and where the
+    /// trees round a clearing hide the horizon. The fog's other lights are not affected.
+    pub fn set_sky_occlusion(&mut self, sky_occlusion: Option<&crate::shadows::SkyOcclusion>) {
+        self.sky_occlusion = sky_occlusion.map(|s| (s.volume.clone(), s.params.clone()));
         self.bindings_dirty = true;
     }
 
@@ -784,6 +801,15 @@ impl VolumetricFogEffect {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                // the sky occlusion (volumetric_fog_media.wgsl)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 19, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                uniform(20),
             ],
         });
         let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -925,6 +951,20 @@ impl VolumetricFogEffect {
 
         let volumes = buffer("VolumetricFog/LocalVolumes", std::mem::size_of::<LocalFogVolumeGpu>(), wgpu::BufferUsages::STORAGE);
         let dummy_sky_lighting = buffer("VolumetricFog/NoSkyLighting", SKY_LIGHTING_BYTES as usize, wgpu::BufferUsages::UNIFORM);
+        // no sky occlusion: its parameters zero (off, so skyVisibility is 1) and a 1-texel volume
+        let dummy_occlusion_params = buffer("VolumetricFog/NoSkyOcclusion", 32, wgpu::BufferUsages::UNIFORM);
+        let dummy_occlusion_volume = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("VolumetricFog/NoSkyOcclusionVolume"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
         let media_params = buffer("VolumetricFog/MediaParams", std::mem::size_of::<FogMediaParamsGpu>(), wgpu::BufferUsages::UNIFORM);
 
         self.gpu = Some(Gpu {
@@ -950,6 +990,8 @@ impl VolumetricFogEffect {
             media_params,
             volumes,
             dummy_sky_lighting,
+            dummy_occlusion_volume,
+            dummy_occlusion_params,
             dummy_spot_lights,
             dummy_spot_atlas,
             spot_sampler,
@@ -1038,6 +1080,10 @@ impl VolumetricFogEffect {
         let sky_lighting = self.sky_lighting.as_ref().unwrap_or(&gpu.dummy_sky_lighting);
         let spot_lights = self.spot_lights.as_ref().unwrap_or(&gpu.dummy_spot_lights);
         let spot_atlas = self.spot_shadows.as_ref().unwrap_or(&gpu.dummy_spot_atlas);
+        let (occlusion_volume, occlusion_params) = match &self.sky_occlusion {
+            Some((volume, params)) => (volume, params),
+            None => (&gpu.dummy_occlusion_volume, &gpu.dummy_occlusion_params),
+        };
         let group = |label: &str, output: &wgpu::TextureView, params: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -1056,6 +1102,9 @@ impl VolumetricFogEffect {
                     wgpu::BindGroupEntry { binding: 7, resource: spot_lights.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(spot_atlas) },
                     wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&gpu.spot_sampler) },
+                    wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(occlusion_volume) },
+                    wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::Sampler(&gpu.accum_sampler) },
+                    wgpu::BindGroupEntry { binding: 20, resource: occlusion_params.as_entire_binding() },
                 ],
             })
         };
@@ -1509,6 +1558,76 @@ mod tests {
         let near = at(&mirrored, 8, 15, 10);
         assert!(near[3] > 0.99 && near[1] < 1e-3, "mirrored view before the water: {near:?}");
         eprintln!("main {m:?}, mirrored below {below:?}, rising {rising:?}, before the water {near:?}");
+    }
+
+    /// With a sky occlusion bound, each froxel's sky light is dimmed by the sky it sees: a fog lit
+    /// only by a uniform sky, half of it seen over the world's left (x < 0) and all of it over the
+    /// right, scatters half as much light down the picture's left columns and as much down its
+    /// right ones.
+    #[test]
+    fn the_sky_light_on_the_fog_follows_the_sky_occlusion() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (64u32, 32u32);
+        let tex = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
+                .create_view(&Default::default())
+        };
+        let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+        let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
+        let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        // a uniform sky of radiance 1: its SH is band 0 only
+        let sky = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: SKY_LIGHTING_BYTES, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let band0 = 0.282095 * 4.0 * std::f32::consts::PI;
+        queue.write_buffer(&sky, 0, bytemuck::cast_slice(&[band0, band0, band0, 0.0f32]));
+        // the sky occlusion's volume by hand: half the sky seen over x < 0, all of it beyond
+        let shared = crate::renderers::SharedLayouts::new(&device);
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4096, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
+        let options = crate::shadows::SkyOcclusionOptions { extent_m: 400.0, volume_size: (32, 8), min_height_m: -10.0, max_height_m: 30.0, ..Default::default() };
+        let occlusion = crate::shadows::SkyOcclusion::new(&device, &shared.camera_bgl, &light_buf, options);
+        let (side, layers) = options.volume_size;
+        let texels: Vec<u8> = (0..side * layers * side).flat_map(|i| [if i % side < side / 2 { 128 } else { 255 }, 0, 0, 255]).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: occlusion.volume_texture(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &texels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(side * 4), rows_per_image: Some(layers) },
+            wgpu::Extent3d { width: side, height: layers, depth_or_array_layers: side },
+        );
+        // SkyOcclusionParams: centre (0, 0), 1 / extent, min height, 1 / height span, on
+        let params = [0.0f32, 0.0, 1.0 / options.extent_m, options.min_height_m, 1.0 / (options.max_height_m - options.min_height_m), 1.0, 0.0, 0.0];
+        queue.write_buffer(&occlusion.params, 0, bytemuck::cast_slice(&params));
+        let mut camera = Camera::new(60.0, 0.5, 1000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 5.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 5.0, -10.0));
+        camera.update_view_matrix();
+        let scatter = |occluded: bool| {
+            let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+                grid: FroxelGridOptions { grid_w: 16, grid_h: 16, grid_d: 32, near: 0.5, far: 100.0, temporal: false, blend_factor: 1.0 },
+                base_density: 0.02,
+                height_falloff: 0.0,
+                fog_height: 100.0,
+                ambient: Vec3::new(0.0, 0.0, 0.0),
+                ..Default::default()
+            });
+            fog.set_sky_lighting(Some(&sky));
+            fog.set_sky_occlusion(occluded.then_some(&occlusion));
+            let mut encoder = device.create_command_encoder(&Default::default());
+            fog.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+            queue.submit(std::iter::once(encoder.finish()));
+            read_volume(&device, &queue, fog.froxel_grid().unwrap())
+        };
+        let (open, occluded) = (scatter(false), scatter(true));
+        let at = |v: &[[f32; 4]], x: u32| v[((31 * 16 + 8) * 16 + x) as usize][1];
+        let (left, right) = (at(&occluded, 2) / at(&open, 2), at(&occluded, 13) / at(&open, 13));
+        eprintln!("the fog's sky light with the occlusion: left {left:.3}, right {right:.3} of without");
+        assert!(at(&open, 2) > 0.01, "no sky light on the fog: {:?}", at(&open, 2));
+        // each column's first metres lie within a voxel (12.5 m) of x = 0, where the volume blends
+        // the two halves
+        assert!((left - 128.0 / 255.0).abs() < 0.04, "left: {left}");
+        assert!((right - 1.0).abs() < 0.03, "right: {right}");
     }
 
     /// While the reflection is not drawn (disabled, or the camera under its plane) the fog builds

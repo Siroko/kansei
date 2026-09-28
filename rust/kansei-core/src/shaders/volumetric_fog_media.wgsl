@@ -38,6 +38,10 @@ struct LocalFogVolume {
 @group(0) @binding(10) var<uniform> mediaParams : FogMediaParams;
 @group(0) @binding(11) var<storage, read> fogVolumes : array<LocalFogVolume>;
 @group(0) @binding(12) var<uniform> skyLighting : SkyLighting;
+// how much of the sky each point sees (SkyOcclusion; off, it is 1 everywhere)
+@group(0) @binding(18) var skyOcclusionVolume : texture_3d<f32>;
+@group(0) @binding(19) var skyOcclusionSampler : sampler;
+@group(0) @binding(20) var<uniform> skyOcclusion : SkyOcclusionParams;
 
 struct FogMedia {
     density    : f32,     // what the light terms are scaled by
@@ -82,8 +86,10 @@ fn fogMedia(worldPos: vec3f, heightFog: f32) -> FogMedia {
     return m;
 }
 
-// Sky light scattered toward the camera per unit scattering coefficient, with the fog's phase.
-fn skyAmbient(viewDir: vec3f) -> vec3f {
+// Sky light scattered toward the camera per unit scattering coefficient, with the fog's phase,
+// at worldPos: dimmed by how much of the sky it sees.
+fn skyAmbient(viewDir: vec3f, worldPos: vec3f) -> vec3f {
     if (mediaParams.hasSkyLighting == 0u) { return vec3f(0.0); }
-    return skyInscatter(skyLighting, viewDir, params.anisotropy) * mediaParams.skyAmbientScale;
+    let visibility = skyVisibility(skyOcclusionVolume, skyOcclusionSampler, skyOcclusion, worldPos);
+    return skyInscatter(skyLighting, viewDir, params.anisotropy) * (mediaParams.skyAmbientScale * visibility);
 }
