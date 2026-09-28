@@ -23,6 +23,7 @@ pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
 pub use ssgi::{GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions};
 pub use taa::{TemporalAAEffect, TemporalAAOptions};
 pub use tonemap::{
-    ev100_from_camera, exposure_from_ev100, white_balance_matrix, ColorGrade, ToneMapEffect, ToneMapOptions, ToneMapper,
+    ev100_from_camera, exposure_from_ev100, exposure_from_ev100_lens, unreal_white_balance_matrix, white_balance_matrix, ColorGrade, ToneMapEffect,
+    ToneMapOptions, ToneMapper, UnrealFilm, LENS_ATTENUATION_UE4, LENS_ATTENUATION_UE5,
 };
 pub use volumetric_fog::{LocalFogShape, LocalFogVolume, SpotScattering, VolumetricFogEffect, VolumetricFogOptions};
