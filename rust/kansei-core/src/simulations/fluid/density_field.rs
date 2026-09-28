@@ -181,17 +181,17 @@ impl FluidDensityField {
 
         // Clear
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Clear").as_ref().map(crate::profiling::PassStamp::compute) });
             self.clear.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
         // Splat
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Splat").as_ref().map(crate::profiling::PassStamp::compute) });
             self.splat.dispatch(&mut pass, (particle_count + 63) / 64, 1, 1);
         }
         // Copy
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Copy").as_ref().map(crate::profiling::PassStamp::compute) });
             self.copy.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
     }
@@ -210,15 +210,15 @@ impl FluidDensityField {
         let queue = &self.queue;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("DensityField/Update") });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Clear").as_ref().map(crate::profiling::PassStamp::compute) });
             self.clear.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Splat").as_ref().map(crate::profiling::PassStamp::compute) });
             self.splat.dispatch(&mut pass, (particle_count + 63) / 64, 1, 1);
         }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Copy").as_ref().map(crate::profiling::PassStamp::compute) });
             self.copy.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
         queue.submit(std::iter::once(encoder.finish()));

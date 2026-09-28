@@ -596,32 +596,32 @@ impl PostProcessingEffect for DepthOfFieldEffect {
         let wg_half = ((hw + 7) / 8, (hh + 7) / 8);
 
         // Pass 1: CoC
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/CoC"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/CoC"), timestamp_writes: crate::profiling::gpu_pass("DoF/CoC").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.coc_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.coc_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
         // Pass 2a: Dilate H
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateH"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateH"), timestamp_writes: crate::profiling::gpu_pass("DoF/DilateH").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.dilate_h_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.dilate_h_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
         // Pass 2b: Dilate V
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateV"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateV"), timestamp_writes: crate::profiling::gpu_pass("DoF/DilateV").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.dilate_v_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.dilate_v_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
         // Pass 3: Downsample + near/far separation
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Downsample"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Downsample"), timestamp_writes: crate::profiling::gpu_pass("DoF/Downsample").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.downsample_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.downsample_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_half.0, wg_half.1, 1); }
         // Pass 4: Vogel disk blur
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Blur"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Blur"), timestamp_writes: crate::profiling::gpu_pass("DoF/Blur").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.blur_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.blur_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_half.0, wg_half.1, 1); }
         // Pass 5: Composite
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Composite"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Composite"), timestamp_writes: crate::profiling::gpu_pass("DoF/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.composite_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.composite_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }

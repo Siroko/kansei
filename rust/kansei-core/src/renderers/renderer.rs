@@ -1270,7 +1270,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/CascadePass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             pass.set_bind_group(1, csm.camera(cascade).bind_group().unwrap(), &[]);
             for scene_idx in scene.ordered_indices() {
@@ -1397,7 +1397,7 @@ impl Renderer {
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                         stencil_ops: None,
                     }),
-                    ..Default::default()
+                    timestamp_writes: crate::profiling::gpu_pass("Renderer/PlanarReflectionPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
                 });
                 pass.set_bind_group(1, reflection.camera().bind_group().unwrap(), &[]);
                 if let Some(bg) = &self.shadow_bind_group {
@@ -1452,7 +1452,7 @@ impl Renderer {
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
                 stencil_ops: None,
             }),
-            ..Default::default()
+            timestamp_writes: crate::profiling::gpu_pass("Renderer/VelocityPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
         });
         pass.set_bind_group(1, camera.bind_group().unwrap(), &[]);
         if let Some(bg) = &self.shadow_bind_group {
@@ -1501,7 +1501,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/SpotShadowPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             pass.set_bind_group(1, atlas.camera(slot.layer).bind_group().unwrap(), &[]);
             for scene_idx in scene.ordered_indices() {
@@ -1624,7 +1624,7 @@ impl Renderer {
             culling.begin_frame(queue, &mut encoder, world, index_count);
         }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/InstanceCulling").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&pipeline.pipeline);
             for &idx in &culled {
                 let r = scene.get_renderable(idx).unwrap();
@@ -1672,7 +1672,7 @@ impl Renderer {
         let pipeline = self.cull_pipeline.as_ref().unwrap();
         let (pyramid, pyramid_bind_group) = self.occlusion.pyramid_for(device, (gbuffer.width, gbuffer.height), pipeline);
         pyramid.build(device, encoder, &gbuffer.depth_view);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/OcclusionCulling"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/OcclusionCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/OcclusionCulling").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&pipeline.late);
         pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(MAIN_VIEW)]);
         pass.set_bind_group(2, pyramid_bind_group, &[]);
@@ -1725,6 +1725,19 @@ impl Renderer {
     /// that visibility), wherever the camera moves: fly round to see what is culled.
     pub fn set_freeze_culling(&mut self, frozen: bool) {
         self.occlusion.freeze = frozen;
+    }
+
+    /// Profile frames (see `profiling`): each labelled pass's GPU time, from timestamp queries
+    /// (where the adapter offers `timestamp-query`), and each labelled section's CPU time. Off by
+    /// default; costs a thread-local check per pass and section while off.
+    pub fn set_profiling(&mut self, enabled: bool) {
+        crate::profiling::set_enabled(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), enabled);
+    }
+
+    /// The frames profiled since the last call, averaged per frame (the GPU's arrive a few frames
+    /// late); `FrameProfile::report` formats them.
+    pub fn take_profile(&self) -> crate::profiling::FrameProfile {
+        crate::profiling::take(self.device.as_ref().unwrap())
     }
 
     /// Count what instance culling does per view (a few atomics per workgroup of 64 instances), for
@@ -1834,7 +1847,7 @@ impl Renderer {
                         }),
                         stencil_ops: None,
                     }),
-                    ..Default::default()
+                    timestamp_writes: crate::profiling::gpu_pass("CubemapShadow").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
                 });
 
                 pass.set_pipeline(csm.pipeline());
@@ -2004,7 +2017,7 @@ impl Renderer {
                                 }),
                                 stencil_ops: None,
                             }),
-                            ..Default::default()
+                            timestamp_writes: crate::profiling::gpu_pass("Renderer/ShadowPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
                         });
 
                         pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
@@ -2136,7 +2149,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/MainPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
 
             // Static renderables from the bundles, dynamic ones drawn live
@@ -2157,6 +2170,7 @@ impl Renderer {
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
         output.present();
         camera.end_frame();
+        crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
 
     /// Render scene with post-processing effects.
@@ -2166,6 +2180,7 @@ impl Renderer {
         camera: &mut Camera,
         volume: &mut crate::postprocessing::PostProcessingVolume,
     ) {
+        let _frame = crate::profiling::cpu_scope("frame");
         let width = self.config.width;
         let height = self.config.height;
         let (render_width, render_height) = self.render_size();
@@ -2188,15 +2203,20 @@ impl Renderer {
         }
 
         // Get surface texture for blit
+        let t = crate::profiling::cpu_scope("frame/surface");
         let surface = self.surface.as_ref().unwrap();
         let output = surface.get_current_texture().expect("Surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
+        drop(t);
 
         // Run post-processing chain + blit
         volume.render(camera, &canvas_view, width, height);
 
+        let t = crate::profiling::cpu_scope("frame/present");
         output.present();
+        drop(t);
         camera.end_frame();
+        crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
 
     /// Private: draw scene into GBuffer MRT (non-MSAA, sample_count=1).
@@ -2206,6 +2226,8 @@ impl Renderer {
         camera: &mut Camera,
         gbuffer: &GBuffer,
     ) {
+        let _scene = crate::profiling::cpu_scope("scene");
+        let t = crate::profiling::cpu_scope("scene/prepare");
         camera.update_view_matrix();
         scene.prepare(camera.position());
 
@@ -2261,14 +2283,20 @@ impl Renderer {
         }
 
         // Upload camera + per-object matrices
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/upload");
         self.upload_all(scene, camera);
 
         // GPU instance culling for every view (camera, spot shadows, reflections, cascades)
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/culling");
         self.update_planar_reflection_cameras(camera);
         self.update_cascaded_shadows(scene, camera);
         // occlusion needs the GBuffer's single-sampled depth
         let depth_size = (gbuffer.sample_count == 1).then_some((gbuffer.width, gbuffer.height));
         self.run_instance_culling(scene, camera, depth_size);
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/shadows");
 
         // Shadow pass (if enabled)
         if self.shadows_enabled && self.cascaded_shadows.is_none() {
@@ -2304,7 +2332,7 @@ impl Renderer {
                                 }),
                                 stencil_ops: None,
                             }),
-                            ..Default::default()
+                            timestamp_writes: crate::profiling::gpu_pass("Shadow/GBufferPath").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
                         });
 
                         pass.set_pipeline(self.shadow_pipeline.as_ref().unwrap());
@@ -2350,7 +2378,11 @@ impl Renderer {
         if !self.planar_reflections.is_empty() {
             self.light_clusters.as_ref().unwrap().disable(self.queue.as_ref().unwrap());
         }
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/reflections");
         self.render_planar_reflections(scene);
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/clusters");
         let clusters = self.light_clusters.as_ref().unwrap();
         if self.clustered_lights {
             // tiles of the GBuffer's pixels (the render size)
@@ -2359,6 +2391,8 @@ impl Renderer {
             clusters.disable(self.queue.as_ref().unwrap());
         }
 
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/bundles");
         // Check material dirty flags → invalidate gbuffer bundle
         for idx in scene.ordered_indices() {
             if let Some(r) = scene.get_renderable(idx) {
@@ -2394,6 +2428,8 @@ impl Renderer {
         }
 
         // GBuffer MRT render pass
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/gbuffer");
         let device = self.device.as_ref().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Renderer/GBufferDraw"),
@@ -2429,7 +2465,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferOpaquePass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             // Static renderables from the bundles, dynamic ones drawn live; with occlusion culling,
             // only the opaque ones (the first phase)
@@ -2459,7 +2495,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferLatePass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             self.draw_scene_renderables(
                 &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
@@ -2504,7 +2540,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferIndirectPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             self.draw_indirect_renderables(
                 &mut pass, scene, camera,
@@ -2516,7 +2552,10 @@ impl Renderer {
         // the rest of the velocity texture keeps NO_VELOCITY
         self.draw_velocity(&mut encoder, scene, camera, gbuffer);
 
+        drop(t);
+        let t = crate::profiling::cpu_scope("scene/submit");
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
+        drop(t);
         self.cull_stats.end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera.frame());
     }
 
@@ -2566,7 +2605,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
         } else {
             // Non-MSAA path — clear only for now (GBuffer draw loop comes in Plan 2)
@@ -2599,7 +2638,7 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
         }
 
@@ -2707,7 +2746,7 @@ impl Renderer {
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                 stencil_ops: None,
             }),
-            ..Default::default()
+            timestamp_writes: crate::profiling::gpu_pass("DepthCopy").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
         });
         pass.set_pipeline(self.depth_copy_pipeline.as_ref().unwrap());
         pass.set_bind_group(0, &bg, &[]);

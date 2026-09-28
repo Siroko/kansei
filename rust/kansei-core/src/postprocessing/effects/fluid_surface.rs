@@ -326,7 +326,7 @@ impl PostProcessingEffect for FluidSurfaceEffect {
 
         // 4. Composite pass
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("FluidSurface/Composite"), timestamp_writes: None,
+            label: Some("FluidSurface/Composite"), timestamp_writes: crate::profiling::gpu_pass("FluidSurface/Composite").as_ref().map(crate::profiling::PassStamp::compute),
         });
         pass.set_pipeline(self.composite_pipeline.as_ref().unwrap());
         pass.set_bind_group(0, self.composite_bg.as_ref().unwrap(), &[]);

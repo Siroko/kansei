@@ -368,7 +368,7 @@ impl PostProcessingEffect for ScreenSpaceGIEffect {
             &gpu.composite_bgl,
             vec![p(), tex(input), tex(depth), tex(&t.history[current]), tex(&gbuffer.albedo_view), tex(&gbuffer.normal_view), sky.as_entire_binding(), tex(output)],
         );
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SSGI"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SSGI"), timestamp_writes: crate::profiling::gpu_pass("SSGI").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&gpu.trace);
         pass.set_bind_group(0, &trace, &[]);
         pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
