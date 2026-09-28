@@ -642,8 +642,8 @@ impl PlanarReflection {
         let view_proj = camera.view_projection().to_glam();
         let camera_pos = camera.view_matrix.to_glam().inverse().w_axis.truncate();
         // no last frame to project (a camera cut, the first frame): an empty rectangle, all sky
-        let (prev, rect) = match camera.previous_view_projection() {
-            Some(prev) => (prev.to_glam(), self.screen_rect.unwrap_or([0.0, 0.0, 1.0, 1.0])),
+        let (prev, rect) = match screen_space_source(camera) {
+            Some(prev) => (prev, self.screen_rect.unwrap_or([0.0, 0.0, 1.0, 1.0])),
             None => (view_proj, [1.0, 1.0, 0.0, 0.0]),
         };
         let params = ScreenSpaceParamsGpu {
@@ -669,9 +669,31 @@ impl PlanarReflection {
     }
 }
 
+/// The view last frame's GBuffer was drawn with (jittered, with TAA), which the screen-space path
+/// reconstructs its pixels' world positions with; None without a last frame.
+fn screen_space_source(camera: &Camera) -> Option<glam::Mat4> {
+    camera.previous_jittered_view_projection().map(|vp| vp.to_glam())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Last frame's GBuffer was drawn jittered (TAA): its pixels are projected with that jittered
+    /// view, or the whole reflection slides by the jitter from frame to frame (a flicker TAA
+    /// can't settle).
+    #[test]
+    fn the_screen_is_projected_with_the_view_it_was_drawn_with() {
+        let mut camera = Camera::new(60.0, 0.1, 100.0, 1.5);
+        camera.update_projection_matrix();
+        camera.update_view_matrix();
+        assert!(screen_space_source(&camera).is_none(), "no last frame");
+        camera.jitter = [0.002, -0.003];
+        let drawn = camera.jittered_projection().to_glam() * camera.view_matrix.to_glam();
+        camera.end_frame();
+        camera.jitter = [-0.001, 0.004];
+        assert!(screen_space_source(&camera).unwrap().abs_diff_eq(drawn, 1e-6));
+    }
 
     /// The mirrored view cropped to a lake's screen rectangle keeps what the lake reflects, and
     /// culls what is reflected beside it.
