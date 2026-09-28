@@ -65,6 +65,28 @@ fn radicalInverse(i: u32) -> f32 {
     return f32(b) * 2.3283064365386963e-10;
 }
 
+// GGX sample i of envPass.samples around n (tangent frame tx, ty): the radiance it brings,
+// weighted by N.L, and that weight (zero below the surface).
+fn ggxSample(n: vec3f, tx: vec3f, ty: vec3f, i: u32) -> vec4f {
+    let a = envPass.roughness * envPass.roughness;
+    let xi = vec2f((f32(i) + 0.5) / f32(envPass.samples), radicalInverse(i));
+    let phi = 2.0 * PI * xi.x;
+    let cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    let sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    let h = tx * (sinTheta * cos(phi)) + ty * (sinTheta * sin(phi)) + n * cosTheta;
+    let l = 2.0 * dot(n, h) * h - n;
+    let nl = dot(n, l);
+    if (nl <= 0.0) { return vec4f(0.0); }
+    return vec4f(environmentRadiance(l) * nl, nl);
+}
+
+fn tangentFrame(n: vec3f) -> mat2x3f {
+    // +z as up, but where n is +-z (the 1x1 mip's texel centres), +x
+    let tx = normalize(cross(select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(n.z) < 0.999), n));
+    return mat2x3f(tx, cross(n, tx));
+}
+
+// One invocation per texel: the mirror mip (and any mip, sampling alone).
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid : vec3u) {
     let size = textureDimensions(envOut);
@@ -77,23 +99,39 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     }
 
     // GGX importance sampling around n, weighted by N.L
-    let a = envPass.roughness * envPass.roughness;
-    let tangentX = normalize(cross(select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(n.y) < 0.999), n));
-    let tangentY = cross(n, tangentX);
-    var sum = vec3f(0.0);
-    var weight = 0.0;
+    let t = tangentFrame(n);
+    var sum = vec4f(0.0);
     for (var i = 0u; i < envPass.samples; i++) {
-        let xi = vec2f((f32(i) + 0.5) / f32(envPass.samples), radicalInverse(i));
-        let phi = 2.0 * PI * xi.x;
-        let cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
-        let sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
-        let h = tangentX * (sinTheta * cos(phi)) + tangentY * (sinTheta * sin(phi)) + n * cosTheta;
-        let l = 2.0 * dot(n, h) * h - n;
-        let nl = dot(n, l);
-        if (nl > 0.0) {
-            sum += environmentRadiance(l) * nl;
-            weight += nl;
-        }
+        sum += ggxSample(n, t[0], t[1], i);
     }
-    textureStore(envOut, gid.xy, gid.z, vec4f(sum / max(weight, 1e-6), 1.0));
+    textureStore(envOut, gid.xy, gid.z, vec4f(sum.rgb / max(sum.a, 1e-6), 1.0));
+}
+
+const ROUGH_GROUP : u32 = 32u;
+var<workgroup> partial : array<vec4f, ROUGH_GROUP>;
+
+// The rough mips: one workgroup per texel (xy: texel, z: face), its invocations sharing the GGX
+// samples. The small mips have too few texels to fill the GPU at one invocation each, so each
+// texel's whole sample loop would run in turn; shared, the loops are ROUGH_GROUP times shorter.
+@compute @workgroup_size(32, 1, 1)
+fn rough(@builtin(workgroup_id) wg : vec3u, @builtin(local_invocation_index) lid : u32) {
+    let size = textureDimensions(envOut);
+    let texel = wg.xy;
+    let n = cubeDirection(wg.z, (vec2f(texel) + 0.5) / vec2f(size));
+    let t = tangentFrame(n);
+    var sum = vec4f(0.0);
+    for (var i = lid; i < envPass.samples; i += ROUGH_GROUP) {
+        sum += ggxSample(n, t[0], t[1], i);
+    }
+    partial[lid] = sum;
+    workgroupBarrier();
+    for (var stride = ROUGH_GROUP / 2u; stride > 0u; stride /= 2u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        textureStore(envOut, texel, wg.z, vec4f(partial[0].rgb / max(partial[0].a, 1e-6), 1.0));
+    }
 }
