@@ -20,6 +20,12 @@ struct ClusterCull {
     capacity: u32,
     vertex_count: u32,
     flags: u32,
+    // the record's yaw times this (radians); how much further the material may stretch an
+    // instance (spheres and errors grow by it)
+    yaw_scale: f32,
+    stretch: f32,
+    pad0: u32,
+    pad1: u32,
 }
 
 struct ClusterView {
@@ -128,7 +134,7 @@ fn placement(record: u32) -> mat4x4<f32> {
         m = rotation(record_vec4(record, params.rotation_word));
     }
     if (params.yaw_word != NONE) {
-        let a = record_f32(record, params.yaw_word);
+        let a = record_f32(record, params.yaw_word) * params.yaw_scale;
         m = mat3x3<f32>(vec3<f32>(cos(a), 0.0, -sin(a)), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(sin(a), 0.0, cos(a))) * m;
     }
     if (params.scale_word != NONE) {
@@ -199,7 +205,7 @@ fn cull(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups
     // row sum of mᵀm (the columns' lengths when they are orthogonal; more under shear, where the
     // columns' lengths fall short and the level window would skip levels the cut needs)
     let g = transpose(m) * m;
-    let scale = sqrt(max(dot(abs(g[0]), vec3<f32>(1.0)), max(dot(abs(g[1]), vec3<f32>(1.0)), dot(abs(g[2]), vec3<f32>(1.0)))));
+    let scale = sqrt(max(dot(abs(g[0]), vec3<f32>(1.0)), max(dot(abs(g[1]), vec3<f32>(1.0)), dot(abs(g[2]), vec3<f32>(1.0))))) * params.stretch;
     let det = determinant(m);
     // a mirroring transform turns the winding over: no cone test
     let cone = (params.flags & FLAG_CONE) != 0u && det > 0.0;

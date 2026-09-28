@@ -76,10 +76,11 @@ pub(crate) const DRAW_ARGS_BYTES: u64 = 32;
 pub enum InstanceTransform {
     /// A column-major 4x4 matrix of f32.
     Matrix { offset: u32 },
-    /// A position (3 x f32), then optionally a uniform scale (f32), a turn about +y in radians
-    /// (f32, as `glam::Mat3::from_rotation_y`) and a rotation (a unit quaternion, x y z w):
+    /// A position (3 x f32), then optionally a uniform scale (f32), a turn about +y (f32 times
+    /// `yaw_scale` radians, as `glam::Mat3::from_rotation_y`: -1 for a bearing that turns a mesh
+    /// by minus itself) and a rotation (a unit quaternion, x y z w):
     /// `position + yaw * rotation * (scale * p)`.
-    Placement { position: u32, scale: Option<u32>, yaw: Option<u32>, rotation: Option<u32> },
+    Placement { position: u32, scale: Option<u32>, yaw: Option<u32>, yaw_scale: f32, rotation: Option<u32> },
 }
 
 /// Where the cull reads a renderable's instances: none (the mesh once, where the renderable
@@ -120,18 +121,23 @@ pub(crate) struct ClusterCullGpu {
     capacity: u32,
     vertex_count: u32,
     flags: u32,
+    yaw_scale: f32,
+    stretch: f32,
+    _pad: [u32; 2],
 }
 
 impl ClusterCullGpu {
     /// A renderable's parameters. Its world matrix; how its records (`stride` bytes each) place
     /// the mesh, and where they come from; the draw list's capacity; the draw's vertices
-    /// (3 x the mesh's max triangles); and whether to test the cones.
-    pub(crate) fn new(world: glam::Mat4, transform: Option<InstanceTransform>, stride: u32, source: &InstanceSource, capacity: u32, vertex_count: u32, cone_culling: bool) -> Self {
+    /// (3 x the mesh's max triangles); whether to test the cones; and how much further the
+    /// material may stretch an instance (`ClusterLod::stretch`: no cone test past 1).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(world: glam::Mat4, transform: Option<InstanceTransform>, stride: u32, source: &InstanceSource, capacity: u32, vertex_count: u32, cone_culling: bool, stretch: f32) -> Self {
         let word = |offset: u32| offset / 4;
-        let (kind, position_word, scale_word, yaw_word, rotation_word) = match (source, transform) {
-            (InstanceSource::None, _) | (_, None) => (KIND_NONE, 0, NO_WORD, NO_WORD, NO_WORD),
-            (_, Some(InstanceTransform::Matrix { offset })) => (KIND_MATRIX, word(offset), NO_WORD, NO_WORD, NO_WORD),
-            (_, Some(InstanceTransform::Placement { position, scale, yaw, rotation })) => (KIND_PLACEMENT, word(position), scale.map_or(NO_WORD, word), yaw.map_or(NO_WORD, word), rotation.map_or(NO_WORD, word)),
+        let (kind, position_word, scale_word, yaw_word, yaw_scale, rotation_word) = match (source, transform) {
+            (InstanceSource::None, _) | (_, None) => (KIND_NONE, 0, NO_WORD, NO_WORD, 1.0, NO_WORD),
+            (_, Some(InstanceTransform::Matrix { offset })) => (KIND_MATRIX, word(offset), NO_WORD, NO_WORD, 1.0, NO_WORD),
+            (_, Some(InstanceTransform::Placement { position, scale, yaw, yaw_scale, rotation })) => (KIND_PLACEMENT, word(position), scale.map_or(NO_WORD, word), yaw.map_or(NO_WORD, word), yaw_scale, rotation.map_or(NO_WORD, word)),
         };
         let (first_record, instance_count, count_word) = match *source {
             InstanceSource::None => (0, 1, NO_WORD),
@@ -151,7 +157,10 @@ impl ClusterCullGpu {
             count_word,
             capacity,
             vertex_count,
-            flags: if cone_culling { FLAG_CONE } else { 0 },
+            flags: if cone_culling && stretch <= 1.0 { FLAG_CONE } else { 0 },
+            yaw_scale,
+            stretch: stretch.max(1.0),
+            _pad: [0; 2],
         }
     }
 }
@@ -257,12 +266,16 @@ pub struct ClusterLod {
     /// Clusters drawn per frame, at most. By default every cluster of every instance, up to
     /// 4 194 304. Clusters past it aren't drawn.
     pub capacity: Option<u32>,
+    /// How much further than `transform` the material may stretch or sway an instance (1 by
+    /// default): the cull's spheres and errors grow by it (and its cones are off past 1). The
+    /// film's trees: widths up to 1.1x their height, and a sway.
+    pub stretch: f32,
     pub(crate) gpu: Option<ClusterGpu>,
 }
 
 impl ClusterLod {
     pub fn new(mesh: impl Into<std::sync::Arc<ClusterMesh>>) -> Self {
-        Self { mesh: mesh.into(), transform: None, cone_culling: true, capacity: None, gpu: None }
+        Self { mesh: mesh.into(), transform: None, cone_culling: true, capacity: None, stretch: 1.0, gpu: None }
     }
 
     pub fn with_transform(mut self, transform: InstanceTransform) -> Self {
@@ -272,6 +285,11 @@ impl ClusterLod {
 
     pub fn with_cone_culling(mut self, on: bool) -> Self {
         self.cone_culling = on;
+        self
+    }
+
+    pub fn with_stretch(mut self, stretch: f32) -> Self {
+        self.stretch = stretch;
         self
     }
 
@@ -289,7 +307,7 @@ impl ClusterLod {
         let gpu = self.gpu.get_or_insert_with(|| ClusterGpu::new(device, &self.mesh));
         let every = (source.capacity() as u64 * gpu.cluster_count as u64).min(DEFAULT_MAX_DRAWN as u64) as u32;
         let capacity = self.capacity.unwrap_or(every).max(1);
-        let params = ClusterCullGpu::new(world, self.transform, stride, &source, capacity, gpu.vertex_count, self.cone_culling && back_faces_culled);
+        let params = ClusterCullGpu::new(world, self.transform, stride, &source, capacity, gpu.vertex_count, self.cone_culling && back_faces_culled, self.stretch);
         let grown = gpu.bind(device, queue, culling, source, params);
         gpu.bind_draw(device, layout, matrices.0, matrices.1) || grown
     }
