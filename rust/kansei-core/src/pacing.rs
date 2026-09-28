@@ -20,10 +20,10 @@
 //! The frames' GPU time (`FrameTimer`) is measured too, but it only gates and hints: a GPU with
 //! fewer frames to draw lowers its clocks (Apple's do), so each frame takes longer at a slower
 //! cadence, and a pacer slowing down by GPU time slows down further and further. Misses slow it
-//! down only while the median frame does not fit the cadence (`fit_share`); when the median fits
-//! a faster cadence even at the slower one's clocks, and is below what it was when that cadence
-//! last failed, the pacer tries it at once, whatever the wait (the cost fell: a lighter shot after
-//! a heavier one).
+//! down only while the median frame (over the last second or so) does not fit the cadence; when
+//! the median fits a faster cadence with room (`fit_share`) even at the slower one's clocks, and
+//! is below what it was when that cadence last failed, the pacer tries it at once, whatever the
+//! wait (the cost fell: a lighter shot after a heavier one).
 //!
 //! ```ignore
 //! let mut pacer = FramePacer::new(renderer.device(), renderer.queue(), FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
@@ -62,10 +62,11 @@ pub struct FramePacerOptions {
     pub max_backoff_ms: f64,
     /// How long after the first refresh misses are not counted (loading, warming up), ms.
     pub warmup_ms: f64,
-    /// A cadence fits while recent frames' median GPU time is below this share of its frame
-    /// time. Missed refreshes do not slow a cadence that fits (they are hitches: a burst of slow
-    /// frames, a stall elsewhere, which a slower cadence would not remove), and a faster one that
-    /// fits is tried at once (while the median is below what it was when that cadence last failed).
+    /// Missed refreshes slow a cadence only while recent frames' median GPU time (the last
+    /// `GPU_FRAMES`) is over its frame time; while it fits, they are hitches (a burst of slow
+    /// frames, a stall elsewhere) that a slower cadence would not remove. A faster cadence is
+    /// tried at once when the median is below this share of its frame time (and below what it was
+    /// when that cadence last failed).
     pub fit_share: f64,
 }
 
@@ -103,6 +104,8 @@ pub(crate) struct Cadence {
 
 impl Cadence {
     const RELEARN_MS: f64 = 30000.0;
+    /// Rendered frames whose GPU time the median is taken over (a second at 60 fps).
+    const GPU_FRAMES: usize = 60;
 
     pub(crate) fn new(options: FramePacerOptions) -> Self {
         Self {
@@ -185,7 +188,7 @@ impl Cadence {
     pub(crate) fn on_gpu_time(&mut self, ms: f64) {
         if ms.is_finite() && ms > 0.0 {
             self.gpu.push_back(ms);
-            if self.gpu.len() > 30 {
+            if self.gpu.len() > Self::GPU_FRAMES {
                 self.gpu.pop_front();
             }
         }
@@ -216,7 +219,7 @@ impl Cadence {
         // missing refreshes over two windows running, or many over one, while the median frame
         // does not fit: render on fewer; a try at a faster cadence fails on one window's misses
         // (and waits longer before the next)
-        let fits = self.fits(self.divisor);
+        let fits = self.fits(self.divisor, 1.0);
         let slower = !fits
             && (since >= o.window_ms && (last > o.late_share_at_once || (self.trying && last > o.late_share))
                 || since >= 2.0 * o.window_ms && last > o.late_share && before > o.late_share);
@@ -239,7 +242,7 @@ impl Cadence {
         }
         // held without a miss for long enough, or the GPU time well within a faster cadence: try it
         if !self.trying && self.divisor > floor && missed == 0.0 {
-            let lighter = self.fits(self.divisor - 1) && self.gpu_p50().is_some_and(|gpu| gpu < self.failed_gpu * 0.9);
+            let lighter = self.fits(self.divisor - 1, self.options.fit_share) && self.gpu_p50().is_some_and(|gpu| gpu < self.failed_gpu * 0.9);
             if lighter {
                 self.backoff_ms = o.settle_ms;
             }
@@ -254,9 +257,9 @@ impl Cadence {
         (self.gpu.len() >= 10).then(|| percentile(&self.gpu, 0.5))
     }
 
-    /// Whether recent frames' median GPU time fits `divisor` refreshes (`fit_share`).
-    fn fits(&self, divisor: u32) -> bool {
-        self.gpu_p50().is_some_and(|gpu| gpu < divisor as f64 * self.refresh_ms() * self.options.fit_share)
+    /// Whether recent frames' median GPU time is below `share` of `divisor` refreshes.
+    fn fits(&self, divisor: u32, share: f64) -> bool {
+        self.gpu_p50().is_some_and(|gpu| gpu < divisor as f64 * self.refresh_ms() * share)
     }
 
     pub(crate) fn divisor(&self) -> u32 {
@@ -680,15 +683,16 @@ mod tests {
         // but the typical frame fits: it stays at 60
         let refresh = 1000.0 / 60.0;
         let gpu = |t: f64| if ((t / refresh) as u64).is_multiple_of(3) { 26.0 } else { 12.0 };
-        let run = |options: FramePacerOptions| {
-            let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..options });
+        let run = |gpu: &dyn Fn(f64) -> f64| {
+            let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
             simulate(&mut cadence, 0.0, refresh, 2.0, |_| 12.0);
             divisors(&mut cadence, 2000.0, refresh, 20.0, gpu)
         };
-        let changes = run(FramePacerOptions::default());
+        let changes = run(&gpu);
         assert!(changes.is_empty(), "{changes:?}");
-        // (without the median's say, those misses would slow it)
-        assert!(!run(FramePacerOptions { fit_share: 0.0, ..Default::default() }).is_empty());
+        // with the typical frame over a refresh (18 ms), the misses slow it down
+        let heavy = run(&|_| 18.0);
+        assert!(heavy.first().is_some_and(|&(_, k)| k == 2), "{heavy:?}");
     }
 
     #[test]
