@@ -141,17 +141,26 @@ struct TestView {
     ppr: f32,
     near: f32,
     threshold: f32,
+    orthographic: bool,
 }
 
 impl TestView {
     fn looking(eye: glam::Vec3, target: glam::Vec3, threshold: f32) -> Self {
         let fov = 60f32.to_radians();
         let view_proj = glam::Mat4::perspective_rh(fov, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(eye, target, glam::Vec3::Y);
-        Self { view_proj, eye, ppr: 512.0 / (2.0 * (fov / 2.0).tan()), near: 0.1, threshold }
+        Self { view_proj, eye, ppr: 512.0 / (2.0 * (fov / 2.0).tan()), near: 0.1, threshold, orthographic: false }
+    }
+
+    /// Straight down from `eye` onto a square `width` metres across, 512 pixels (a shadow
+    /// cascade's or the sky occlusion's kind of view).
+    fn top_down(eye: glam::Vec3, width: f32, threshold: f32) -> Self {
+        let h = width / 2.0;
+        let view_proj = glam::Mat4::orthographic_rh(-h, h, -h, h, 0.1, 1000.0) * glam::Mat4::look_at_rh(eye, eye - glam::Vec3::Y, glam::Vec3::NEG_Z);
+        Self { view_proj, eye, ppr: 512.0 / width, near: 0.1, threshold, orthographic: true }
     }
 
     fn gpu(&self) -> ClusterViewGpu {
-        ClusterViewGpu::new(self.view_proj, self.eye, self.ppr, self.near, self.threshold)
+        ClusterViewGpu::new(self.view_proj, self.eye, self.ppr, self.near, self.threshold, self.orthographic)
     }
 }
 
@@ -162,8 +171,8 @@ fn expected(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool) -> 
     let m = glam::Mat3::from_mat4(model);
     let scale = m.x_axis.length().max(m.y_axis.length()).max(m.z_axis.length());
     let eye = model.inverse().transform_point3(v.eye);
-    let lod = LodView { eye, pixels_per_radian: v.ppr, near: v.near / scale, threshold: v.threshold };
-    let cone = cone && m.determinant() > 0.0;
+    let lod = LodView { eye, pixels_per_radian: v.ppr, near: v.near / scale, threshold: v.threshold, orthographic: v.orthographic };
+    let cone = cone && m.determinant() > 0.0 && !v.orthographic;
     let planes = crate::culling::frustum_planes(v.view_proj);
     let selected: BTreeSet<usize> = mesh.select(&lod).into_iter().collect();
     let close = |p: f32| (p - v.threshold).abs() <= 2e-3 * v.threshold.max(1e-3);
@@ -188,13 +197,13 @@ fn expected(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool) -> 
 
 /// Cull once and read back the draw's words and the drawn (record, cluster) pairs.
 fn cull(device: &wgpu::Device, queue: &wgpu::Queue, culling: &ClusterCulling, gpu: &mut ClusterGpu, source: InstanceSource, params: ClusterCullGpu, view: &TestView) -> (Vec<u32>, Vec<(u32, u32)>) {
-    gpu.bind(device, queue, culling, source, params);
-    culling.set_view(queue, &view.gpu());
+    gpu.bind(device, queue, culling, 0, source, params);
+    culling.set_views(queue, &[view.gpu()]);
     let mut encoder = device.create_command_encoder(&Default::default());
-    culling.encode(&mut encoder, &[gpu]);
+    culling.encode(&mut encoder, &[(&*gpu, 0)]);
     queue.submit(Some(encoder.finish()));
-    let args = read_words(device, queue, gpu.args());
-    let list = read_words(device, queue, gpu.draws());
+    let args = read_words(device, queue, gpu.args(0));
+    let list = read_words(device, queue, gpu.draws(0));
     let pairs = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
     (args, pairs)
 }
@@ -544,7 +553,7 @@ fn compare(a: &[[f32; 4]], b: &[[f32; 4]]) -> (usize, usize) {
 /// The cluster draw's words, read back.
 fn cluster_args(renderer: &Renderer, scene: &Scene, index: usize) -> Vec<u32> {
     let gpu = scene.get_renderable(index).unwrap().clusters.as_ref().expect("still on the cluster path").gpu.as_ref().unwrap();
-    read_words(renderer.device(), renderer.queue(), gpu.args())
+    read_words(renderer.device(), renderer.queue(), gpu.args(0))
 }
 
 const PLACEMENTS: [[f32; 5]; 4] = [[0.0, 0.0, 0.0, 1.0, 0.0], [2.6, 0.3, -1.5, 0.8, 1.1], [-2.4, -0.2, -2.0, 1.2, -0.6], [0.5, 1.8, -4.0, 1.5, 2.2]];
@@ -698,7 +707,7 @@ fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: boo
     let m = glam::Mat3::from_mat4(model);
     let scale = scale_bound(m) * stretch;
     let eye = model.inverse().transform_point3(v.eye);
-    let cone = cone && m.determinant() > 0.0;
+    let cone = cone && m.determinant() > 0.0 && !v.orthographic;
     let planes = crate::culling::frustum_planes(v.view_proj);
     // a stretch about the mesh's origin also moves a sphere's centre (cluster_cull.wgsl)
     let placed = |s: Sphere| (s.radius + (1.0 - 1.0 / stretch) * s.center.length()) * scale;
@@ -707,6 +716,8 @@ fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: boo
             0.0
         } else if !error.is_finite() {
             f32::INFINITY
+        } else if v.orthographic {
+            error * scale * v.ppr
         } else {
             error * scale / (v.eye.distance(model.transform_point3(s.center)) - placed(s)).max(v.near) * v.ppr
         }
@@ -950,4 +961,49 @@ fn spokes() -> crate::geometries::Geometry {
         }
     }
     crate::geometries::Geometry::new("spokes", vertices, indices)
+}
+
+#[test]
+fn every_view_gets_its_own_cut_in_one_pass() {
+    // a frame's views (the camera, a spot light, a cascade) cut in one pass: each cut is its own
+    // view's, not the last view written
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = [
+        placement_record(glam::Vec3::new(0.0, 0.0, -3.0), 1.5, 0.9, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(4.0, 0.0, -6.0), 2.0, -2.2, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(-4.0, 0.0, -8.0), 1.0, 2.8, glam::Quat::IDENTITY),
+    ];
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let views = [
+        TestView::looking(glam::Vec3::new(0.0, 1.0, 2.0), glam::Vec3::new(0.0, 0.0, -5.0), 0.5),
+        TestView::looking(glam::Vec3::new(30.0, 10.0, 40.0), glam::Vec3::new(0.0, 0.0, -5.0), 2.0),
+        TestView::top_down(glam::Vec3::new(0.0, 50.0, -5.0), 8.0, 1.0),
+    ];
+    for view in 0..views.len() as u32 {
+        let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
+        gpu.bind(&device, &queue, &culling, view, source, params);
+    }
+    culling.set_views(&queue, &views.iter().map(TestView::gpu).collect::<Vec<_>>());
+    let mut encoder = device.create_command_encoder(&Default::default());
+    culling.encode(&mut encoder, &[(&gpu, 0), (&gpu, 1), (&gpu, 2)]);
+    queue.submit(Some(encoder.finish()));
+    let mut sizes = Vec::new();
+    for (index, view) in views.iter().enumerate() {
+        let args = read_words(&device, &queue, gpu.args(index as u32));
+        let list = read_words(&device, &queue, gpu.draws(index as u32));
+        let pairs: Vec<(u32, u32)> = list.chunks(2).take(args[1] as usize).map(|p| (p[0], p[1])).collect();
+        for (k, r) in records.iter().enumerate() {
+            assert_cut(&format!("view {index}, instance {k}"), &pairs, k as u32, &expected_world(&mesh, placement_matrix(r), view, true, 1.0));
+        }
+        sizes.push(pairs.len());
+    }
+    // the views differ enough that sharing one view's data can't pass
+    assert!(sizes[0] != sizes[1] && sizes[1] != sizes[2], "{sizes:?}");
 }

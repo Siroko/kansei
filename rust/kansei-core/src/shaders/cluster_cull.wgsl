@@ -24,7 +24,8 @@ struct ClusterCull {
     // instance (spheres and errors grow by it)
     yaw_scale: f32,
     stretch: f32,
-    pad0: u32,
+    // which of `views` the cut is for
+    view: u32,
     pad1: u32,
 }
 
@@ -34,7 +35,9 @@ struct ClusterView {
     pixels_per_radian: f32,
     near: f32,
     threshold: f32,
-    pad: vec2<f32>,
+    // 1: `pixels_per_radian` is pixels per metre, at any distance (a cascade, a top-down view)
+    orthographic: u32,
+    pad: f32,
 }
 
 // DrawIndirect's four words, then the visible instances, the clusters claimed and the triangles
@@ -63,7 +66,9 @@ const WINDOW_SLACK: f32 = 1e-3;
 @group(0) @binding(2) var<storage, read> records: array<u32>;
 @group(0) @binding(3) var<storage, read_write> draws: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> draw: ClusterDraw;
-@group(1) @binding(0) var<uniform> view: ClusterView;
+@group(1) @binding(0) var<storage, read> views: array<ClusterView>;
+// `views[params.view]`, read once by `cull`
+var<private> view: ClusterView;
 
 // prepare and finish
 @group(0) @binding(10) var<uniform> prepare_params: ClusterCull;
@@ -145,6 +150,9 @@ fn placement(record: u32) -> mat4x4<f32> {
 
 // clusters::projected_error_at: `error` (world units) seen `distance` away, in pixels
 fn projected_at(error: f32, distance: f32) -> f32 {
+    if (view.orthographic != 0u) {
+        return error * view.pixels_per_radian;
+    }
     return error / max(distance, view.near) * view.pixels_per_radian;
 }
 
@@ -209,6 +217,7 @@ fn cull(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups
     if (slot >= draw.visible) {
         return;
     }
+    view = views[params.view];
     let record = params.first_record + slot;
     let model = params.world * placement(record);
     let m = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz);
@@ -218,8 +227,9 @@ fn cull(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups
     let g = transpose(m) * m;
     let scale = sqrt(max(dot(abs(g[0]), vec3<f32>(1.0)), max(dot(abs(g[1]), vec3<f32>(1.0)), dot(abs(g[2]), vec3<f32>(1.0))))) * params.stretch;
     let det = determinant(m);
-    // a mirroring transform turns the winding over: no cone test
-    let cone = (params.flags & FLAG_CONE) != 0u && det > 0.0;
+    // a mirroring transform turns the winding over, and an orthographic view has no eye: no
+    // cone test
+    let cone = (params.flags & FLAG_CONE) != 0u && det > 0.0 && view.orthographic == 0u;
     var eye_mesh = vec3<f32>(0.0);
     if (cone) {
         let inverse = transpose(mat3x3<f32>(cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1]))) * (1.0 / det);

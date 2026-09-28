@@ -1881,7 +1881,7 @@ impl Renderer {
         let queue = self.queue.as_ref().unwrap();
         let culling = self.cluster_culling.get_or_insert_with(|| crate::clusters::ClusterCulling::new(device));
         let pixels_per_radian = target_height as f32 / (2.0 * (camera.fov.to_radians() * 0.5).tan());
-        culling.set_view(queue, &crate::clusters::ClusterViewGpu::new(main.cull.view_proj, main.lod_origin, pixels_per_radian, camera.near, self.cluster_threshold));
+        culling.set_views(queue, &[crate::clusters::ClusterViewGpu::new(main.cull.view_proj, main.lod_origin, pixels_per_radian, camera.near, self.cluster_threshold, false)]);
         let layout = &self.shared_layouts.as_ref().unwrap().cluster_mesh_bgl;
         let matrices = (self.normal_matrices_buf.as_ref().unwrap(), self.world_matrices_buf.as_ref().unwrap());
         let mut stale = false;
@@ -1903,10 +1903,10 @@ impl Renderer {
                 },
             };
             let back_faces_culled = !r.is_transparent() && r.material.options.cull_mode == crate::materials::CullMode::Back;
-            stale |= r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, source, stride, world, back_faces_culled);
+            stale |= r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, MAIN_VIEW as u32, source, stride, world, back_faces_culled);
             prepared.push(idx);
         }
-        let gpus: Vec<&crate::clusters::ClusterGpu> = prepared.iter().filter_map(|&i| scene.get_renderable(i)?.clusters.as_ref()?.gpu.as_ref()).collect();
+        let gpus: Vec<(&crate::clusters::ClusterGpu, u32)> = prepared.iter().filter_map(|&i| Some((scene.get_renderable(i)?.clusters.as_ref()?.gpu.as_ref()?, MAIN_VIEW as u32))).collect();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/ClusterCulling") });
         culling.encode(&mut encoder, &gpus);
         queue.submit(Some(encoder.finish()));
@@ -3160,8 +3160,8 @@ struct CameraClusterDraw<'a> {
 impl<'a> CameraClusterDraw<'a> {
     /// `r`'s, when it has cluster LOD ready and a cluster pipeline for a pass of `key`.
     fn of(r: &'a crate::objects::Renderable, key: &crate::materials::PipelineKey) -> Option<Self> {
-        let gpu = r.clusters.as_ref()?.gpu.as_ref()?;
-        Some(Self { pipeline: r.material.cluster_pipeline(key)?, group: gpu.draw_bind_group()?, args: gpu.args() })
+        let cut = r.clusters.as_ref()?.gpu.as_ref()?.cut(MAIN_VIEW as u32)?;
+        Some(Self { pipeline: r.material.cluster_pipeline(key)?, group: cut.draw_bind_group()?, args: cut.args() })
     }
 
     /// Draw it in `set` (nothing in the late set: clusters have no occlusion phases yet).
