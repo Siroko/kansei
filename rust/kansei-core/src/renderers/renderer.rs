@@ -639,6 +639,19 @@ impl Renderer {
         }
     }
 
+    /// Make `r`'s cluster velocity pipeline when its material writes motion vectors, or drop its
+    /// cluster LOD with a warning when the cluster path can't draw it.
+    fn prepare_cluster_velocity_pipeline(&self, r: &mut crate::objects::Renderable) {
+        if r.clusters.is_none() || !r.material.options.outputs_velocity {
+            return;
+        }
+        let layout = r.geometry.instance_buffers.first().and_then(|cb| cb.vertex_layout());
+        if let Err(problem) = r.material.get_cluster_velocity_pipeline(self.device.as_ref().unwrap(), self.shared_layouts.as_ref().unwrap(), layout.as_ref()) {
+            log::warn!("{}: no cluster LOD ({problem}); drawn as is", r.material.label);
+            r.clusters = None;
+        }
+    }
+
     /// The lights uniform (group 1, binding 2 of every camera).
     pub(crate) fn light_buffer(&self) -> &wgpu::Buffer {
         self.light_buf.as_ref().expect("renderer initialized")
@@ -1610,9 +1623,10 @@ impl Renderer {
         let cc = &self.config.clear_color;
         let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
         let reflection_views: Vec<usize> = (0..self.planar_reflections.len()).map(|index| self.reflection_view(index)).collect();
+        let cuts = &self.cluster_cuts;
         for (reflection, &view) in self.planar_reflections.iter().zip(&reflection_views).filter(|(r, _)| r.is_active() && !r.screen_space) {
             let two_phase = self.occlusion_views.contains(&view) && !self.two_phase_any.is_empty();
-            let draw = |encoder: &mut wgpu::CommandEncoder, phase: ReflectionPhase| draw_reflection(encoder, scene, reflection, view, phase, clear, mesh_bg, shadow_bg, alignment);
+            let draw = |encoder: &mut wgpu::CommandEncoder, phase: ReflectionPhase| draw_reflection(encoder, scene, cuts, reflection, view, phase, clear, mesh_bg, shadow_bg, alignment);
             if !two_phase {
                 draw(&mut encoder, ReflectionPhase::All);
             } else {
@@ -1675,12 +1689,17 @@ impl Renderer {
             if !r.visible || !r.geometry.initialized || !r.material.options.outputs_velocity || r.is_transparent() {
                 continue;
             }
+            let offset = mesh_offset(scene_idx, self.matrix_alignment);
+            // the camera's cut, as the GBuffer drew it
+            if let Some((cut, pipeline)) = cluster_cut(&self.cluster_cuts, r, scene_idx, MAIN_VIEW).zip(r.material.cluster_velocity_pipeline.as_ref()) {
+                draw_cut(&mut pass, r, cut, pipeline, offset);
+                continue;
+            }
             let Some(pipeline) = r.material.velocity_pipeline_cache.get(&(1 + r.geometry.instance_buffers.len())) else { continue };
             pass.set_pipeline(pipeline);
             if let Some(bg) = r.material.bind_group() {
                 pass.set_bind_group(0, bg, &[]);
             }
-            let offset = mesh_offset(scene_idx, self.matrix_alignment);
             pass.set_bind_group(2, mesh_bg, &[offset, offset]);
             draw_geometry(&mut pass, r, MAIN_VIEW);
             draw_late_geometry(&mut pass, r, MAIN_VIEW);
@@ -2312,6 +2331,7 @@ impl Renderer {
                 self.prepare_cluster_depth_pipelines(r, spot_shadows, cascades || sky_occlusion);
                 if reflections {
                     r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
+                    self.prepare_cluster_pipeline(r, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
                 }
             }
         }
@@ -2627,6 +2647,11 @@ impl Renderer {
             self.prepare_cluster_depth_pipelines(r, spot_shadows, cascades || sky_occlusion);
             if r.material.options.outputs_velocity {
                 r.material.get_velocity_pipeline(device, &layouts);
+            }
+            self.prepare_cluster_velocity_pipeline(r);
+            // the rendered reflections' targets are single-sampled
+            if sample_count != 1 && !self.planar_reflections.is_empty() {
+                self.prepare_cluster_pipeline(r, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
             }
         }
 
@@ -3179,6 +3204,7 @@ enum ReflectionPhase {
 fn draw_reflection(
     encoder: &mut wgpu::CommandEncoder,
     scene: &Scene,
+    cuts: &[(usize, usize)],
     reflection: &crate::reflections::PlanarReflection,
     view: usize,
     phase: ReflectionPhase,
@@ -3232,12 +3258,17 @@ fn draw_reflection(
             sample_count: 1,
             num_vertex_buffers: 1 + r.geometry.instance_buffers.len(),
         };
+        let offset = mesh_offset(scene_idx, alignment);
+        // its cut for the mirrored view, on the cluster path (single-phase: never late when opaque)
+        if let Some((cut, pipeline)) = cluster_cut(cuts, r, scene_idx, view).zip(r.material.cluster_pipeline(&key)) {
+            draw_cut(&mut pass, r, cut, pipeline, offset);
+            continue;
+        }
         let Some(pipeline) = r.material.pipeline_cache.get(&key) else { continue };
         pass.set_pipeline(pipeline);
         if let Some(bg) = r.material.bind_group() {
             pass.set_bind_group(0, bg, &[]);
         }
-        let offset = mesh_offset(scene_idx, alignment);
         pass.set_bind_group(2, mesh_bg, &[offset, offset]);
         // culled against the mirrored view, whose near plane is the water
         if late && !r.is_transparent() {

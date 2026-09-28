@@ -303,7 +303,8 @@ impl PlanarReflection {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            // (COPY_SRC: read back by the tests)
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let texture_view = texture.create_view(&Default::default());
@@ -600,6 +601,12 @@ impl PlanarReflection {
         let y0 = (v0 * h).floor().clamp(0.0, h - 1.0) as u32;
         let y1 = (v1 * h).ceil().clamp(y0 as f32 + 1.0, h) as u32;
         Some([x0, y0, x1 - x0, y1 - y0])
+    }
+
+    /// The resolved reflection (what `material_texture` binds).
+    #[cfg(test)]
+    pub(crate) fn texture(&self) -> &wgpu::Texture {
+        &self.texture
     }
 
     pub(crate) fn color_attachments(&self) -> [&wgpu::TextureView; 4] {
