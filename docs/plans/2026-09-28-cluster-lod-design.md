@@ -110,6 +110,33 @@ Cards (quads and ribbons, alpha-tested, `CullMode::None`) are detected per conne
 
 Card clusters draw with the material's alpha test in every pass (`shadow_fragment_entry` as today). The impostor stays as the far band where even the root cut is too many triangles for its pixels. The handover is by projected size, as `InstanceCulling`'s bands work today.
 
+**As built (M4).**
+- **Opt-in.** Cards are opt-in (`ClusterOptions::cards`): a solid mesh made of separate flat panels would otherwise lose them at a distance.
+- **Detection.** A card is a connected component (by welded position) with at most `card_max_triangles` (64) triangles and at most `max_vertices`, open, keeping `card_flatness` (0.5) of its area in its area-weighted normal. A tube or a closed shape cancels out. The rest of the mesh takes M1's path, and each build round runs both.
+- **Level 0.** Whole cards are packed into clusters in Morton order.
+- **Each round.**
+  - Card clusters are grouped by Morton order.
+  - In a group, each card is paired with its nearest free neighbour, and one of each pair is kept (by a hash).
+  - The kept card stands for both. It is scaled about its centroid to cover their area and drawn at the area-weighted centre of what it stands for, as new vertices.
+  - A group's error is `card_error_scale` × the growth of its typical card size, √(A/k) − √(A/n₀), and never less than a child's.
+- **The cap.** Pruning stops at `card_max_scale` (4: at most a sixteenth of the cards). Below that, a few giant cards would carry the crown's area away from where it was; the impostor takes over there.
+- **Tests.** A crown of 800 cards keeps its drawn area within 10% at every cut. From 4 km, each part of the crown stays within 20% of its own area (pairing along Morton order alone: 41%). A mixed mesh keeps its solid part crack-free.
+- **The film's trees.** They needed `InstanceTransform::Placement::yaw_scale` (−1: a bearing turns the mesh by minus itself) and `ClusterLod::stretch` (1.15: widths up to 1.1× the height, and the sway). A stretch turns cones off.
+
+**Evaluation on the film's spruce** (a scratch clone: LOD0 foliage on card clusters against today's three LODs; bark, shadows and the mirror unchanged):
+- **Build.** The graphs build in 6–8 ms each in wasm: 68–71 clusters over 9–11 levels from ~2,400 foliage triangles.
+- **Coverage is held.** Coverage is the share of the frame's upper half darker than half the sky's brightness. From today's LODs to cards:
+  - at 6 s, +3.7% (`card_error_scale` 1 down to 0.25);
+  - at 30 s, +2.5–3.4%;
+  - at 39, 48 and 59 s, within ±0.2%.
+
+  Cards keep LOD0's coverage, while today's LOD1 and LOD2 thin the crowns. Stills: `docs/plans/cluster-lod-m4/`.
+- **Cost is not measured yet.** The whole film is GPU-bound on the shared Mac (35–72 ms a frame headless), and the runs were stopped for the machine's load. What to expect:
+  - The cap leaves about 150 of 2,400 foliage triangles, roughly today's LOD2 (146).
+  - M2 measured vertex pulling about 15% slower than discrete LODs.
+
+  So cards buy coverage and no LOD pops rather than triangles. M2's proposed compacted index buffer is what would change that.
+
 ## 5. Occlusion (milestone 5)
 
 Two phases per cluster, with the existing depth pyramids (`DepthPyramid`, linear pyramids for oblique views):
