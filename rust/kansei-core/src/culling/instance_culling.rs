@@ -88,6 +88,9 @@ pub struct InstanceCulling {
     pub bounds_box: Option<glam::Vec3>,
     /// Occlusion culling for the main camera, in two phases (off by default).
     pub occlusion: bool,
+    /// Width of the crossfades at the LOD bands' edges, in LOD distance (0: none); see
+    /// `with_crossfade`. Turning them on or off changes the compacted instances' layout.
+    pub crossfade: f32,
     capacity: u32,
     shared: Option<Shared>,
     occlusion_slots: Vec<OcclusionSlot>,
@@ -117,6 +120,8 @@ struct Shared {
     args: wgpu::Buffer,
     views: usize,
     chunks: Vec<Chunk>,
+    /// bytes per compacted instance the buffers were made for
+    out_stride: u32,
 }
 
 /// Occlusion culling's per-renderable state for a view culled in two phases: which instances it
@@ -164,7 +169,8 @@ pub(crate) struct CullInstancesGpu {
     shadow_lod: [f32; 2],
     reflection_lod: [f32; 2],
     occlusion_view: u32,
-    _pad: [u32; 3],
+    crossfade: f32,
+    _pad: [u32; 2],
 }
 
 /// `CullView` in instance_cull.wgsl: a view, shared by every renderable culled for it.
@@ -284,6 +290,7 @@ impl InstanceCulling {
             bounds_shift: glam::Vec3::ZERO,
             bounds_box: None,
             occlusion: false,
+            crossfade: 0.0,
             capacity: count,
             shared: None,
             occlusion_slots: Vec::new(),
@@ -332,6 +339,34 @@ impl InstanceCulling {
         self
     }
 
+    /// Dithered crossfades between LODs, over `width` of LOD distance (metres, times the view's
+    /// LOD distance scale): each band's edges widen by `width / 2`, and there the instances draw
+    /// in both LODs, each keeping a complementary share of the pixels, so an instance moving
+    /// across a band's edge dissolves from one LOD into the other instead of snapping, in every
+    /// view (the camera, shadow maps, reflections), by that view's band. A band from 0 has no
+    /// near crossfade, and one to infinity no far one: an impostor LOD fades in from the meshes.
+    /// Give every LOD of a set the same width, narrower than its bands.
+    ///
+    /// Each compacted instance is then followed by its fade, an f32: declare the instance
+    /// buffer's vertex layout `stride + 4` bytes wide with the fade as an attribute at offset
+    /// `stride`, pass it to the fragment shader, and drop pixels with
+    /// `culling::LOD_FADE_WGSL`'s `kansei_lod_fade_discard` (in the shadow fragment too, for the
+    /// shadows to dissolve). An impostor baked from such a LOD draws it with that layout too: end
+    /// `ImpostorOptions::instance` with a fade of 1.
+    ///
+    /// The fade depends only on the distance, so there is no switch to flip back and forth: an
+    /// instance moving to and fro across a band's edge dissolves to and fro by as much as it
+    /// moves, one held there stays part dissolved, and temporal antialiasing blends the dither.
+    pub fn with_crossfade(mut self, width: f32) -> Self {
+        self.crossfade = width.max(0.0);
+        self
+    }
+
+    /// Bytes of a compacted instance: the source's, and with crossfades its fade.
+    pub fn culled_stride(&self) -> u32 {
+        self.stride + if self.crossfade > 0.0 { 4 } else { 0 }
+    }
+
     /// The compacted instances and indirect draw of `view` (0 is the main camera), once culled;
     /// with occlusion, the first phase's.
     pub(crate) fn view(&self, view: usize) -> Option<CulledDraw<'_>> {
@@ -370,7 +405,7 @@ impl InstanceCulling {
 
     /// Bytes of a view's region of compacted instances.
     fn region_bytes(&self) -> u64 {
-        self.capacity.max(1) as u64 * self.stride as u64
+        self.capacity.max(1) as u64 * self.culled_stride() as u64
     }
 
     fn instances_buffer(&self, device: &wgpu::Device, views: usize) -> wgpu::Buffer {
@@ -410,7 +445,7 @@ impl InstanceCulling {
 
     /// `ensure_views`, with at most `max_chunk_bytes` of compacted instances per chunk.
     fn ensure_views_within(&mut self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, count: usize, max_chunk_bytes: u64) -> bool {
-        if self.count <= self.capacity && self.shared.as_ref().is_some_and(|s| s.views >= count) {
+        if self.count <= self.capacity && self.shared.as_ref().is_some_and(|s| s.views >= count && s.out_stride == self.culled_stride()) {
             return false;
         }
         // recreate everything: the draws hold a slot per view and the second phase's
@@ -431,6 +466,7 @@ impl InstanceCulling {
             args: buffer("InstanceCulling/Args", 2 * count as u64 * ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             views: count,
             chunks: Vec::new(),
+            out_stride: self.culled_stride(),
         });
         let chunks: Vec<Chunk> = (0..chunks)
             .map(|k| {
@@ -520,7 +556,8 @@ impl InstanceCulling {
             shadow_lod: band(self.shadow_lod_range.unwrap_or(self.lod_range)),
             reflection_lod: band(self.reflection_lod_range.unwrap_or(self.lod_range)),
             occlusion_view: 0,
-            _pad: [0; 3],
+            crossfade: self.crossfade,
+            _pad: [0; 2],
         };
         let shared = self.shared.as_mut().expect("ensure_views first");
         if shared.written != Some(params) {
@@ -948,6 +985,130 @@ mod tests {
             let (a_min, a_med) = run(&mut merged);
             let (b_min, b_med) = run(&mut per_view);
             eprintln!("round {round}: a dispatch per renderable {a_min:.3} ms min, {a_med:.3} ms median; a dispatch per view {b_min:.3} ms min, {b_med:.3} ms median");
+        }
+    }
+
+    /// On a real GPU: two LODs meeting at 50 m with a 10 m crossfade both draw the instances from
+    /// 45 to 55 m, with fades that add up to 1 (the nearer LOD's share falling, the farther's
+    /// rising), and nothing else changes; a shadow map fades at its own band's edge (30 m), a
+    /// reflection at the camera's band scaled by its LOD distance scale.
+    #[test]
+    fn gpu_crossfades_between_lods() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        // a row of instances along x, x metres from the LOD origin (0 to 99); ids from x
+        let data: Vec<f32> = (0..100).flat_map(|i| [i as f32, 0.0, 0.0, 1.0, i as f32, 0.0, 0.0, 0.0]).collect();
+        use wgpu::util::DeviceExt;
+        let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::STORAGE });
+        let mut pipeline = CullPipeline::new(&device);
+        // the camera, a shadow map and a reflection (LOD distances x 2), all seeing the whole row
+        let view_proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(glam::Vec3::new(50.0, 0.0, 200.0), glam::Vec3::new(50.0, 0.0, 0.0), glam::Vec3::Y);
+        let view = |casters_only, reflection, lod_distance_scale| CullView { view_proj, casters_only, reflection, layer_mask: None, lod_distance_scale };
+        let views = [view(false, false, 1.0), view(true, false, 1.0), view(false, true, 2.0)];
+        pipeline.set_views(&device, &queue, &views.map(|v| v.gpu(glam::Vec3::ZERO, None, false)));
+        let lod = |near: f32, far: f32, shadow: (f32, f32)| InstanceCulling::new(source.clone(), 100, 32, 0, 0.1).with_lod_range(near, far).with_shadow_lod_range(shadow.0, shadow.1).with_crossfade(10.0);
+        let mut lods = [lod(0.0, 50.0, (0.0, 30.0)), lod(50.0, f32::INFINITY, (30.0, f32::INFINITY))];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for culling in &mut lods {
+            assert_eq!(culling.culled_stride(), 36);
+            culling.ensure_views(&device, &pipeline.bgl, views.len());
+            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+            for culling in &lods {
+                culling.dispatch(&mut pass);
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+        // each LOD's (id, fade) in view v, by id
+        let culled = |culling: &InstanceCulling, v: usize| -> Vec<(u32, f32)> {
+            let draw = culling.view(v).unwrap();
+            let count = read_words(&device, &queue, draw.args)[draw.offset as usize / 4 + 1] as usize;
+            let words = &read_words(&device, &queue, draw.instances)[draw.instances_offset as usize / 4..];
+            let mut out: Vec<(u32, f32)> = (0..count).map(|k| (f32::from_bits(words[k * 9 + 4]) as u32, f32::from_bits(words[k * 9 + 8]))).collect();
+            out.sort_by_key(|&(id, _)| id);
+            out
+        };
+        // (view, its band's edge in LOD distance, its LOD distance scale)
+        for (v, edge, scale, what) in [(0usize, 50.0f32, 1.0f32, "camera"), (1, 30.0, 1.0, "shadow"), (2, 50.0, 2.0, "reflection")] {
+            let (near, far) = (culled(&lods[0], v), culled(&lods[1], v));
+            let ids = |c: &[(u32, f32)]| c.iter().map(|&(id, _)| id).collect::<Vec<_>>();
+            // the nearer LOD to edge + 5 (exclusive), the farther from edge - 5, in LOD distance
+            let (lo, hi) = (((edge - 5.0) / scale).ceil() as u32, ((edge + 5.0) / scale).ceil() as u32);
+            assert_eq!(ids(&near), (0..hi).collect::<Vec<_>>(), "{what}: the nearer LOD");
+            assert_eq!(ids(&far), (lo..100).collect::<Vec<_>>(), "{what}: the farther LOD");
+            for &(id, fade) in &near {
+                let d = id as f32 * scale;
+                let want = if d <= edge - 5.0 { 1.0 } else { (edge + 5.0 - d) / 10.0 };
+                assert!((fade - want).abs() < 1e-5, "{what}: nearer LOD, instance {id}: fade {fade}, want {want}");
+            }
+            for &(id, fade) in &far {
+                let d = id as f32 * scale;
+                if d >= edge + 5.0 {
+                    assert_eq!(fade, 1.0, "{what}: farther LOD, instance {id}");
+                } else {
+                    // fading in, and the two shares add up to 1
+                    let other = near.iter().find(|&&(n, _)| n == id).map(|&(_, f)| f).unwrap();
+                    assert!(fade <= 0.0 && (other - fade - 1.0).abs() < 1e-5, "{what}: instance {id}: fades {other} and {fade}");
+                }
+            }
+        }
+    }
+
+    /// The material side (LOD_FADE_WGSL): of 64 x 64 pixels, a LOD fading out with a share f and
+    /// its partner fading in with 1 - f keep complementary pixels (every pixel exactly once), the
+    /// first about f of them, on every frame.
+    #[test]
+    fn lod_fade_dither_is_complementary() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let code = format!(
+            "{}\n@group(0) @binding(0) var<storage, read_write> out : array<u32>;\n\
+             @group(0) @binding(1) var<uniform> job : vec4f;\n\
+             @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g : vec3u) {{\n\
+                 let p = vec2f(g.xy) + 0.5;\n\
+                 let keepOut = !kansei_lod_fade_discard(job.x, p, u32(job.z));\n\
+                 let keepIn = !kansei_lod_fade_discard(job.y, p, u32(job.z));\n\
+                 out[g.y * 64u + g.x] = select(0u, 1u, keepOut) | select(0u, 2u, keepIn);\n\
+             }}",
+            crate::culling::LOD_FADE_WGSL
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        use wgpu::util::DeviceExt;
+        let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 64 * 64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        for f in [0.1f32, 0.35, 0.5, 0.8] {
+            for frame in [0u32, 1, 17] {
+                let job = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&[f, -(1.0 - f), frame as f32, 0.0]), usage: wgpu::BufferUsages::UNIFORM });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: out.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: job.as_entire_binding() }],
+                });
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups(8, 8, 1);
+                }
+                queue.submit(Some(encoder.finish()));
+                let words = read_words(&device, &queue, &out);
+                assert!(words.iter().all(|&w| w == 1 || w == 2), "f {f}, frame {frame}: a pixel kept by neither or both");
+                let share = words.iter().filter(|&&w| w == 1).count() as f32 / words.len() as f32;
+                assert!((share - f).abs() < 0.03, "f {f}, frame {frame}: the fading-out LOD keeps {share}");
+            }
         }
     }
 

@@ -7,6 +7,11 @@ mod instance_culling;
 mod occlusion;
 mod stats;
 
+/// WGSL for materials of renderables culled with crossfades (`InstanceCulling::with_crossfade`):
+/// `kansei_lod_fade_discard(fade, pixel, frame)`, whether to drop a pixel of an instance fading
+/// between LODs.
+pub const LOD_FADE_WGSL: &str = include_str!("../shaders/lod_fade.wgsl");
+
 pub use depth_pyramid::{DepthPyramid, DepthReduction};
 pub use instance_culling::{frustum_planes, InstanceCulling};
 pub use stats::{CullStats, CullViewKind, CullingStats};
