@@ -243,7 +243,7 @@ impl PostProcessingEffect for TemporalAAEffect {
             ],
         });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("TAA/Resolve"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("TAA/Resolve"), timestamp_writes: crate::profiling::gpu_pass("TAA/Resolve").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);

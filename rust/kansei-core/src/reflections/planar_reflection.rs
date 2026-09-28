@@ -478,7 +478,7 @@ impl PlanarReflection {
             _pad1: [0; 2],
         };
         queue.write_buffer(&self.resolve_params, 0, bytemuck::bytes_of(&params));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("PlanarReflection/Resolve"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("PlanarReflection/Resolve"), timestamp_writes: crate::profiling::gpu_pass("PlanarReflection/Resolve").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&self.resolve_pipeline);
         pass.set_bind_group(0, &self.resolve_bg, &[]);
         pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);

@@ -339,7 +339,7 @@ impl FroxelGrid {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FroxelGrid/TemporalBlend"),
-                ..Default::default()
+                timestamp_writes: crate::profiling::gpu_pass("FroxelGrid/TemporalBlend").as_ref().map(crate::profiling::PassStamp::compute)
             });
             pass.set_pipeline(&t.pipeline);
             pass.set_bind_group(0, &t.blend_bg[t.read_idx], &[]);
@@ -360,7 +360,7 @@ impl FroxelGrid {
         };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("FroxelGrid/Accumulate"),
-            ..Default::default()
+            timestamp_writes: crate::profiling::gpu_pass("FroxelGrid/Accumulate").as_ref().map(crate::profiling::PassStamp::compute)
         });
         pass.set_pipeline(&self.accum_pipeline);
         pass.set_bind_group(0, bind_group, &[]);

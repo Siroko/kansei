@@ -543,7 +543,7 @@ impl MarchingCubesSimulation {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FluidMarchingCubes/Reset"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("FluidMarchingCubes/Reset").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.reset_pipeline);
             pass.set_bind_group(0, &self.reset_bg, &[]);
@@ -558,7 +558,7 @@ impl MarchingCubesSimulation {
             };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FluidMarchingCubes/Extract"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("FluidMarchingCubes/Extract").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, extract_bind_group, &[]);
@@ -572,7 +572,7 @@ impl MarchingCubesSimulation {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FluidMarchingCubes/Finalize"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("FluidMarchingCubes/Finalize").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.finalize_pipeline);
             pass.set_bind_group(0, &self.finalize_bg, &[]);

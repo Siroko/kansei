@@ -18,7 +18,7 @@ impl ComputeBatch {
         for (pass, wx, wy, wz) in passes {
             let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ComputeBatch/Pass"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("ComputeBatch/Pass").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.dispatch(&mut compute, *wx, *wy, *wz);
         }
@@ -34,7 +34,7 @@ impl ComputeBatch {
         for (pass, wx, wy, wz) in passes {
             let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ComputeBatch/Pass"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("ComputeBatch/Pass").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.dispatch(&mut compute, *wx, *wy, *wz);
         }

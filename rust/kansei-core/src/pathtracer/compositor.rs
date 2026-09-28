@@ -248,7 +248,7 @@ impl Compositor {
 
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Compositor"),
-            timestamp_writes: None,
+            timestamp_writes: crate::profiling::gpu_pass("Compositor").as_ref().map(crate::profiling::PassStamp::compute),
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);

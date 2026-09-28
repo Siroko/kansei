@@ -116,7 +116,7 @@ impl PostProcessingEffect for ColorGradingEffect {
             ],
         });
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ColorGrading"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ColorGrading"), timestamp_writes: crate::profiling::gpu_pass("ColorGrading").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);

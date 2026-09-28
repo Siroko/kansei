@@ -265,7 +265,7 @@ impl PostProcessingEffect for HeightFogEffect {
                 wgpu::BindGroupEntry { binding: 4, resource: sky.as_entire_binding() },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("HeightFog"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("HeightFog"), timestamp_writes: crate::profiling::gpu_pass("HeightFog").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&gpu.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);

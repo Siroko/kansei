@@ -827,7 +827,7 @@ impl SkyAtmosphere {
         let p = &self.pipelines;
         if self.built_for != Some(atmosphere) {
             queue.write_buffer(&b.atmosphere, 0, bytemuck::bytes_of(&atmosphere));
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/StaticLUTs"), ..Default::default() });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/StaticLUTs"), timestamp_writes: crate::profiling::gpu_pass("SkyAtmosphere/StaticLUTs").as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&p.transmittance);
             pass.set_bind_group(0, &p.transmittance_bg, &[]);
             pass.dispatch_workgroups(self.transmittance_size.0.div_ceil(8), self.transmittance_size.1.div_ceil(8), 1);
@@ -840,7 +840,7 @@ impl SkyAtmosphere {
 
         queue.write_buffer(&b.frame, 0, bytemuck::bytes_of(&self.frame(camera)));
         queue.write_buffer(&self.capture, 0, bytemuck::bytes_of(&self.capture_gpu()));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/SkyView"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SkyAtmosphere/SkyView"), timestamp_writes: crate::profiling::gpu_pass("SkyAtmosphere/SkyView").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&p.sky_view);
         pass.set_bind_group(0, &p.sky_view_bg, &[]);
         pass.dispatch_workgroups(self.sky_view_size.0.div_ceil(8), self.sky_view_size.1.div_ceil(8), 1);

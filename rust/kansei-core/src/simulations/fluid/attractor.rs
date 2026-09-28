@@ -754,7 +754,7 @@ impl GlyphAttractor {
         });
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("GlyphAttractor/Pass"),
-            timestamp_writes: None,
+            timestamp_writes: crate::profiling::gpu_pass("GlyphAttractor/Pass").as_ref().map(crate::profiling::PassStamp::compute),
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
@@ -802,7 +802,7 @@ impl GlyphAttractor {
         });
         let pwg = (self.particle_count + 63) / 64;
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("GlyphAttractor/Tagging"), timestamp_writes: None,
+            label: Some("GlyphAttractor/Tagging"), timestamp_writes: crate::profiling::gpu_pass("GlyphAttractor/Tagging").as_ref().map(crate::profiling::PassStamp::compute),
         });
         cp.set_bind_group(0, &bg, &[]);
         // Deliberately ONE compute pass for all four dispatches: wgpu inserts the

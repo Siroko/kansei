@@ -148,7 +148,7 @@ impl FluidSurfaceRenderer {
         self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&data));
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("FluidSurface/March"), timestamp_writes: None,
+            label: Some("FluidSurface/March"), timestamp_writes: crate::profiling::gpu_pass("FluidSurface/March").as_ref().map(crate::profiling::PassStamp::compute),
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);

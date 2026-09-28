@@ -543,7 +543,7 @@ impl ProbeGrid {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ProbeGrid/Trace"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("ProbeGrid/Trace").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.trace_pipeline);
             pass.set_bind_group(0, &trace_bg, &[]);
@@ -591,7 +591,7 @@ impl ProbeGrid {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ProbeGrid/Update"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("ProbeGrid/Update").as_ref().map(crate::profiling::PassStamp::compute),
             });
             pass.set_pipeline(&self.update_pipeline);
             pass.set_bind_group(0, &update_bg, &[]);
