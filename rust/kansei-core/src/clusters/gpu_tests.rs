@@ -1603,3 +1603,15 @@ fn an_overflowing_cut_draws_only_whole_written_triangles() {
         assert_eq!(args[W_TRIANGLES], whole);
     }
 }
+
+#[test]
+fn a_full_draw_list_scales_the_triangles_it_saw() {
+    // clusters past a full list take no room for their triangles: the reading of what the index
+    // buffer needs is scaled by the clusters claimed over those with an entry, so both buffers
+    // grow on the same readback
+    assert_eq!(triangles_needed(30_000, 16_384, 1_600_000), 2_929_687);
+    // (a list that held every cluster: the reading as it is)
+    assert_eq!(triangles_needed(12_000, 16_384, 1_200_000), 1_200_000);
+    // (nothing claimed)
+    assert_eq!(triangles_needed(0, 16_384, 0), 0);
+}

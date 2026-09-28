@@ -485,7 +485,9 @@ impl ClusterGpu {
         let (mesh, empty) = (&self.mesh, &self.empty);
         let cut = self.cuts[view as usize].get_or_insert_with(|| Cut::new(device));
         let max = params.capacity.max(1);
-        let (needed, triangles_needed) = culling.feedback.needed(self.id, view).unzip();
+        let reading = culling.feedback.needed(self.id, view);
+        let needed = reading.map(|(clusters, _)| clusters);
+        let triangles_seen = reading.map(|(clusters, triangles)| triangles_needed(clusters, cut.capacity, triangles));
         let length = cut.list.sized(cut.capacity, INITIAL_DRAWN, MIN_DRAWN, max, needed);
         // (the shader lists no more than the list holds, nor than `max`)
         params.capacity = length.min(max);
@@ -498,7 +500,7 @@ impl ClusterGpu {
         // every cluster it may list at its largest, within what a binding holds
         let binding = (device.limits().max_storage_buffer_binding_size as u64).min(device.limits().max_buffer_size) / 12;
         let most = (max as u64 * (self.vertex_count / 3) as u64).min(binding).min(self.triangle_limit as u64).max(1) as u32;
-        let triangles = cut.triangles.sized(cut.triangle_capacity, INITIAL_TRIANGLES, MIN_TRIANGLES, most, triangles_needed);
+        let triangles = cut.triangles.sized(cut.triangle_capacity, INITIAL_TRIANGLES, MIN_TRIANGLES, most, triangles_seen);
         params.triangle_capacity = triangles.min(most);
         if triangles != cut.triangle_capacity {
             cut.triangle_capacity = triangles;
@@ -655,6 +657,17 @@ impl Feedback {
         staging.slice(..).map_async(wgpu::MapMode::Read, move |result| done.store(if result.is_ok() { MAPPED } else { FAILED }, std::sync::atomic::Ordering::Release));
         self.pending = Some((read.into_iter().map(|(_, key)| key).collect(), state));
     }
+}
+
+/// The triangles a cut needs, from a reading of the clusters it `claimed` and the triangles it
+/// claimed room for: only clusters with an entry in its draw list (`list` of them) take room, so
+/// past a full list the triangles are scaled by the clusters claimed over those with an entry
+/// (both buffers then grow on the same readback).
+pub(crate) fn triangles_needed(claimed: u32, list: u32, triangles: u32) -> u32 {
+    if claimed <= list || list == 0 {
+        return triangles;
+    }
+    (triangles as u64 * claimed as u64 / list as u64).min(u32::MAX as u64) as u32
 }
 
 /// A buffer's length (a draw list's entries, an index buffer's triangles) sized to what its cut
