@@ -21,6 +21,8 @@ struct HeightFogParams {
     skyAmbientScale       : f32,
     skyDistance           : f32,
     hasSkyLighting        : u32,
+    viewForward           : vec3f,   // the camera's forward axis
+    volumetricFogDistance : f32,     // the volumetric fog's end as a view depth (0: none)
 }
 
 @group(0) @binding(0) var inputTex  : texture_2d<f32>;
@@ -72,12 +74,14 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         dir = normalize(unproject(uv, 1.0) - unproject(uv, 0.0));
         dist = fog.skyDistance;
     }
-    if ((fog.cutoffDistance > 0.0 && dist > fog.cutoffDistance) || dist <= fog.startDistance) {
+    // the fog starts past startDistance along the ray and past the volumetric fog's end plane
+    let start = max(fog.startDistance, fog.volumetricFogDistance / max(dot(dir, fog.viewForward), 1e-4));
+    if ((fog.cutoffDistance > 0.0 && dist > fog.cutoffDistance) || dist <= start) {
         textureStore(outputTex, gid.xy, color);
         return;
     }
 
-    let opacity = min(1.0 - exp(-opticalDepth(fog.cameraPos, dir, fog.startDistance, dist)), fog.maxOpacity);
+    let opacity = min(1.0 - exp(-opticalDepth(fog.cameraPos, dir, start, dist)), fog.maxOpacity);
     var fogColor = fog.inscattering;
     var lightDir = fog.lightDirection;
     var lightVisibility = 1.0;
@@ -92,7 +96,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
 
     // the lobe toward the light, only past its own start distance
     if (any(fog.directional > vec3f(0.0))) {
-        let t0 = max(fog.startDistance, fog.directionalStart);
+        let t0 = max(start, fog.directionalStart);
         let dirOpacity = min(1.0 - exp(-opticalDepth(fog.cameraPos, dir, t0, dist)), fog.maxOpacity);
         let lobe = pow(saturate(dot(dir, normalize(lightDir))), fog.directionalExponent);
         result += fog.directional * lobe * lightVisibility * dirOpacity;
