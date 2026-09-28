@@ -332,3 +332,93 @@ fn nothing_visible_draws_nothing_and_the_capacity_holds() {
     let (args, _) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
     assert_eq!((args[1], args[4], args[5], args[6]), (0, 0, 0, 0));
 }
+
+use crate::buffers::InstanceBufferLayout;
+use wgpu::VertexFormat::*;
+
+fn layout(stride: u64, attributes: &[(u32, u64, wgpu::VertexFormat)]) -> InstanceBufferLayout {
+    InstanceBufferLayout { stride, attributes: attributes.iter().map(|&(shader_location, offset, format)| wgpu::VertexAttribute { format, offset, shader_location }).collect() }
+}
+
+fn validate_stage(name: &str, code: &str, instances: Option<&InstanceBufferLayout>) -> naga::Module {
+    let stage = cluster_vertex_stage(code, instances).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let module = validate(name, &stage);
+    assert!(module.entry_points.iter().any(|e| e.name == CLUSTER_VERTEX_ENTRY && e.stage == naga::ShaderStage::Vertex), "{name}: no cluster entry point");
+    assert!(!module.entry_points.iter().any(|e| e.name == "vertex_main"), "{name}: vertex_main is still an entry point");
+    module
+}
+
+#[test]
+fn the_engine_materials_get_a_cluster_stage() {
+    validate_stage("basic", include_str!("../shaders/basic.wgsl"), None);
+    validate_stage("basic_lit", include_str!("../shaders/basic_lit.wgsl"), None);
+    let mat4 = layout(64, &[(3, 0, Float32x4), (4, 16, Float32x4), (5, 32, Float32x4), (6, 48, Float32x4)]);
+    validate_stage("basic_instanced", include_str!("../shaders/basic_instanced.wgsl"), Some(&mat4));
+    validate_stage("particle_billboard", include_str!("../shaders/particle_billboard.wgsl"), Some(&layout(16, &[(3, 0, Float32x4)])));
+}
+
+/// The forms the repository's materials take (the examples, the film): located parameters with
+/// comments and a trailing comma, one returning a builtin; and a struct of located members with
+/// instance attributes of each kind.
+#[test]
+fn located_and_struct_forms_get_a_cluster_stage() {
+    let located = r#"
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) n: vec3<f32> };
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+@vertex
+fn vertex_main(
+    // per vertex
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>, /* unused */
+) -> VOut {
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world_matrix * position;
+    out.n = normal + vec3<f32>(uv, 0.0);
+    return out;
+}
+@fragment fn fragment_main(in: VOut) -> @location(0) vec4<f32> { return vec4<f32>(in.n, 1.0); }
+"#;
+    validate_stage("located", located, None);
+    let builtin_out = r#"
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@vertex fn vertex_main(@location(0) position: vec4<f32>) -> @builtin(position) vec4<f32> { return view_matrix * position; }
+@fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }
+"#;
+    validate_stage("builtin return", builtin_out, None);
+    let instanced = r#"
+struct VIn {
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(3) place: vec4<f32>,
+    @location(4) yaw: f32,
+    @location(5) ids: vec2<u32>,
+    @location(6) offset: vec3i,
+};
+struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) @interpolate(flat) id: u32 };
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    var out: VOut;
+    out.clip = view_matrix * vec4<f32>(v.position.xyz * v.place.w + v.place.xyz + vec3<f32>(v.offset) + v.normal * v.yaw, 1.0);
+    out.id = v.ids.x + v.ids.y;
+    return out;
+}
+@fragment fn fragment_main(in: VOut) -> @location(0) vec4<f32> { return vec4<f32>(f32(in.id)); }
+"#;
+    let records = layout(48, &[(3, 0, Float32x4), (4, 16, Float32), (5, 20, Uint32x2), (6, 28, Sint32x3)]);
+    validate_stage("instanced struct", instanced, Some(&records));
+}
+
+#[test]
+fn inputs_the_cluster_path_cannot_feed_are_errors() {
+    let error = |code: &str, instances: Option<&InstanceBufferLayout>| cluster_vertex_stage(code, instances).expect_err(code);
+    assert!(error("@vertex fn vertex_main(@location(0) p: vec4<f32>, @builtin(instance_index) i: u32) -> @builtin(position) vec4<f32> { return p; }", None).contains("instance_index"));
+    assert!(error("struct VIn { @location(0) p: vec4<f32>, @builtin(vertex_index) i: u32 };\n@vertex fn vertex_main(v: VIn) -> @builtin(position) vec4<f32> { return v.p; }", None).contains("vertex_index"));
+    assert!(error("@vertex fn vertex_main(@location(3) q: vec4<f32>) -> @builtin(position) vec4<f32> { return q; }", None).contains("location(3)"));
+    let floats = layout(16, &[(3, 0, Float32x4)]);
+    assert!(error("@vertex fn vertex_main(@location(3) q: vec4<u32>) -> @builtin(position) vec4<f32> { return vec4<f32>(q); }", Some(&floats)).contains("location(3)"));
+    assert!(error("@fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }", None).contains("vertex_main"));
+}
