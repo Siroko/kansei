@@ -444,8 +444,8 @@ fn set_text(id: &str, text: &str) {
     }
 }
 
-fn thousands(n: u32) -> String {
-    let s = n.to_string();
+fn thousands(n: impl Into<u64>) -> String {
+    let s = n.into().to_string();
     let mut out = String::new();
     for (k, c) in s.chars().enumerate() {
         if k > 0 && (s.len() - k).is_multiple_of(3) {
@@ -469,12 +469,13 @@ fn hud(st: &State) -> String {
     if let Some(stats) = st.renderer.culling_stats() {
         let c: CullStats = stats.camera();
         text += &format!(
-            "camera: {} tested · {} outside their LOD band · {} outside the frustum · {} occluded · {} drawn\n",
+            "camera: {} tested · {} outside their LOD band · {} outside the frustum · {} occluded · {} drawn ({} triangles)\n",
             thousands(c.tested),
             thousands(c.lod_culled),
             thousands(c.frustum_culled),
             thousands(c.occlusion_culled),
-            thousands(c.drawn)
+            thousands(c.drawn),
+            thousands(c.triangles)
         );
     }
     let (w, h) = st.renderer.render_size();
