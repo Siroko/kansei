@@ -9,12 +9,15 @@
 //! browser without vsync). Keys: O toggles occlusion culling, F freezes the camera's culling (then
 //! move on to see what it culled), C cycles the camera.
 //!
-//! URL parameters: `cam=valley|forest|ridge|high|fly|sky` (sky: nothing in view, so occlusion's
+//! URL parameters: `cam=valley|forest|ridge|high|fly|sky|edge` (sky: nothing in view, so occlusion's
 //! overhead alone), `occlusion=0`, `freeze=1`, `trees=<n>`, `bounds=sphere` (the spheres round
 //! the trees' bases, as before tighter bounds, instead of boxes), `scale=<render scale>`, `taa=0`,
 //! `t=<seconds>` (the fly path's time, frozen),
 //! `size=<w>x<h>` (canvas pixels), `bench=1` (alternate occlusion on and off every 3 s, 8 times,
-//! and report the mean GPU time and frame interval of each).
+//! and report the mean GPU time and frame interval of each), `skyocc=1` (the trees occlude the
+//! sky's light, `Renderer::enable_sky_occlusion`: the sky ambient is dimmed under the canopy;
+//! `skyocc=show` shows the sky visibility, `skyocc=rebuild` starts a rebuild every frame, to time
+//! a rebuild's first frame: the top-down pass, the pyramid and a quarter of the volume).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,7 +26,7 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, VertexFormat};
+use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, Sampler, Texture, VertexFormat};
 use kansei_core::cameras::{Camera, MOTION_VECTORS_WGSL};
 use kansei_core::culling::{CullStats, InstanceCulling};
 use kansei_core::geometries::{Geometry, InstancedGeometry, SphereGeometry, Vertex};
@@ -35,12 +38,15 @@ use kansei_core::postprocessing::{
     effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::shadows::{SkyOcclusion, SkyOcclusionOptions, SKY_OCCLUSION_WGSL};
 
 /// A diffuse surface in sunlight and haze, writing motion vectors. TREE_* (string replaced) place
-/// a unit tree: instance vec4 (xyz base, w height), vec4 (yaw, tint, -, -).
+/// a unit tree: instance vec4 (xyz base, w height), vec4 (yaw, tint, -, -). SKY_* bind the sky
+/// occlusion and dim the sky's light by it.
 const SURFACE_WGSL: &str = r#"
 struct Surface { base_color: vec4<f32>, params: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
+SKY_BINDINGS
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -78,9 +84,11 @@ fn vertex_main(v: VIn) -> VOut {
 fn fragment_main(in: VOut) -> FOut {
     let n = normalize(in.normal);
     let sun = normalize(vec3<f32>(-0.4, 0.55, -0.7));
-    let sky = mix(vec3<f32>(60.0, 55.0, 45.0), vec3<f32>(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5);
+    let visibility = SKY_VISIBILITY;
+    let sky = mix(vec3<f32>(60.0, 55.0, 45.0), vec3<f32>(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5) * visibility;
     let base = surface.base_color.rgb * (0.7 + 0.6 * in.tint);
-    let lit = base * (sky + vec3<f32>(9000.0, 7600.0, 6000.0) * max(dot(n, sun), 0.0));
+    var lit = base * (sky + vec3<f32>(9000.0, 7600.0, 6000.0) * max(dot(n, sun), 0.0));
+    SKY_SHOW
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let eye = -(transpose(view3) * view_matrix[3].xyz);
     let haze = 1.0 - exp(-distance(in.world, eye) * 0.0025);
@@ -108,7 +116,19 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-fn surface_material(label: &str, base: [f32; 3], tree: bool) -> Material {
+/// `skyocc=`: off, on, or showing the sky visibility.
+#[derive(Clone, Copy, PartialEq)]
+enum SkyOcc {
+    Off,
+    On,
+    Show,
+}
+
+/// The layer the trees are on (as well as the default one), the only one occluding the sky: the
+/// terrain is solid ground, not canopy.
+const TREE_LAYER: u32 = 1 << 1;
+
+fn surface_material(label: &str, base: [f32; 3], tree: bool, sky: Option<(&SkyOcclusion, SkyOcc)>) -> Material {
     let (input, place) = if tree {
         (
             "@location(3) inst: vec4<f32>, @location(4) extra: vec4<f32>,",
@@ -120,14 +140,34 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool) -> Material {
     } else {
         ("", "")
     };
-    let shader = SURFACE_WGSL.replace("TREE_INPUT", input).replace("TREE_PLACE", place);
+    let mut shader = SURFACE_WGSL.replace("TREE_INPUT", input).replace("TREE_PLACE", place);
+    let mut bindings = vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)];
+    if let Some((_, mode)) = sky {
+        shader = format!("{SKY_OCCLUSION_WGSL}\n{shader}")
+            .replace(
+                "SKY_BINDINGS",
+                "@group(0) @binding(1) var sky_volume: texture_3d<f32>;\n\
+                 @group(0) @binding(2) var sky_sampler: sampler;\n\
+                 @group(0) @binding(3) var<uniform> sky_occlusion: SkyOcclusionParams;",
+            )
+            .replace("SKY_VISIBILITY", "skyVisibility(sky_volume, sky_sampler, sky_occlusion, in.world)")
+            .replace("SKY_SHOW", if mode == SkyOcc::Show { "lit = vec3<f32>(visibility * 2000.0);" } else { "" });
+        bindings.extend([Binding::texture_3d(1, ShaderStages::FRAGMENT), Binding::sampler(2, ShaderStages::FRAGMENT), Binding::uniform(3, ShaderStages::FRAGMENT)]);
+    } else {
+        shader = shader.replace("SKY_BINDINGS", "").replace("SKY_VISIBILITY", "1.0").replace("SKY_SHOW", "");
+    }
     let mut m = Material::new(
         label,
         &format!("{MOTION_VECTORS_WGSL}\n{shader}"),
-        vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
+        bindings,
         MaterialOptions { outputs_velocity: true, ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[base[0], base[1], base[2], 1.0, 0.0, 0.0, 0.0, 0.0f32]);
+    if let Some((sky, _)) = sky {
+        m.set_bindable(1, Texture::from_view("SkyOcclusion", sky.volume_texture().clone(), sky.volume.clone()));
+        m.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
+        m.set_bindable(3, ComputeBuffer::from_external("SkyOcclusionParams", sky.params.clone(), BufferType::Uniform));
+    }
     m
 }
 
@@ -220,7 +260,7 @@ fn spruce(segments: u32, rings: u32, cones: u32, label: &str) -> Geometry {
 }
 
 /// Camera presets: position and target.
-const CAMS: [&str; 6] = ["valley", "forest", "ridge", "high", "fly", "sky"];
+const CAMS: [&str; 7] = ["valley", "forest", "ridge", "high", "fly", "sky", "edge"];
 
 fn eye(x: f32, z: f32, up: f32) -> glam::Vec3 {
     glam::Vec3::new(x, ground(x, z) + up, z)
@@ -235,6 +275,8 @@ fn place_camera(camera: &mut Camera, cam: &str, t: f32) {
         // on the ridge, looking over the far forest: little is hidden
         "ridge" => (eye(-40.0, -130.0, 6.0), eye(-40.0, -300.0, 0.0)),
         "sky" => (eye(0.0, 100.0, 1.7), eye(0.0, 100.0, 1.7) + glam::Vec3::new(0.001, 100.0, 0.0)),
+        // at the meadow's eastern rim, the forest's edge close by
+        "edge" => (eye(52.0, 70.0, 1.7), eye(90.0, 40.0, 8.0)),
         // high above: nothing is hidden, occlusion only costs
         "high" => (glam::Vec3::new(-260.0, 220.0, 260.0), glam::Vec3::new(0.0, 0.0, -60.0)),
         // a loop through the valley and over the ridge
@@ -416,6 +458,8 @@ struct State {
     gpu_ms: f64,
     cpu_ms: f64,
     keys: Rc<RefCell<Vec<String>>>,
+    /// `skyocc=rebuild`: start a rebuild of the sky occlusion every frame
+    rebuild_sky: bool,
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -506,13 +550,32 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     renderer.set_culling_stats(true);
     renderer.set_occlusion_culling(query_param("occlusion").as_deref() != Some("0"));
+    let sky_occ = match query_param("skyocc").as_deref() {
+        Some("1") | Some("rebuild") => SkyOcc::On,
+        Some("show") => SkyOcc::Show,
+        _ => SkyOcc::Off,
+    };
+    let rebuild_sky = query_param("skyocc").as_deref() == Some("rebuild");
+    if sky_occ != SkyOcc::Off {
+        // the ground and the trees' tops (up to 26 m over the hill's 57 m) lie in the volume; the
+        // top-down view draws coarser LODs (the last one reaches any distance)
+        renderer.enable_sky_occlusion(SkyOcclusionOptions {
+            min_height_m: -10.0,
+            max_height_m: 90.0,
+            volume_size: (128, 32),
+            lod_distance_scale: 4.0,
+            layer_mask: TREE_LAYER,
+            ..Default::default()
+        });
+    }
 
     let mut scene = Scene::new();
     let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
     sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
     scene.add(SceneNode::Renderable(Renderable::new(SphereGeometry::new(1500.0, 32, 16), sky)));
     // the terrain: an ordinary mesh, and the main occluder
-    scene.add(SceneNode::Renderable(Renderable::new(terrain(240), surface_material("Terrain", [0.09, 0.1, 0.05], false))));
+    let sky = renderer.sky_occlusion().map(|s| (s, sky_occ));
+    scene.add(SceneNode::Renderable(Renderable::new(terrain(240), surface_material("Terrain", [0.09, 0.1, 0.05], false, sky))));
 
     // the forest: base xyz and height, then yaw and tint, 32 bytes a tree; everywhere but the
     // valley's meadow and clearings where the cameras stand
@@ -550,7 +613,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             ],
         );
         let label = geometry.label.clone();
-        let mut r = Renderable::new(InstancedGeometry::new(geometry, trees, vec![instances]), surface_material(&label, [0.05, 0.09, 0.05], true));
+        let mut r = Renderable::new(InstancedGeometry::new(geometry, trees, vec![instances]), surface_material(&label, [0.05, 0.09, 0.05], true, sky));
+        r.layers |= TREE_LAYER;
         // a sphere round the base reaching the top (x height), or a box from the ground to the
         // top, as wide as the lowest cone
         let mut culling = InstanceCulling::new(source.clone(), trees, 32, 0, 1.0).with_radius_scale(12).with_lod_range(near, far).with_occlusion(true);
@@ -598,7 +662,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, timer, bench, cam, start: now_ms(), frozen_t, trees, frame: 0, last_frame: now_ms(), interval_ms: 0.0, gpu_ms: 0.0, cpu_ms: 0.0, keys }));
+    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, timer, bench, cam, start: now_ms(), frozen_t, trees, frame: 0, last_frame: now_ms(), interval_ms: 0.0, gpu_ms: 0.0, cpu_ms: 0.0, keys, rebuild_sky }));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
@@ -631,6 +695,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
             if let Some(timer) = st.timer.as_mut() {
                 timer.begin(st.renderer.device(), st.renderer.queue());
+            }
+            if st.rebuild_sky {
+                if let Some(sky) = st.renderer.sky_occlusion_mut() {
+                    sky.refresh();
+                }
             }
             let before = now_ms();
             st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
