@@ -188,3 +188,25 @@ pub(crate) fn frame_direction(frames: u32, layout: ImpostorLayout, column: u32, 
 
 #[cfg(test)]
 mod tests;
+
+/// Test helpers other modules' GPU tests share.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// Read an rgba8 texture back, row by row.
+    pub(crate) fn read_texels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<[u8; 4]> {
+        let (w, h) = (texture.width(), texture.height());
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let bytes = buffer.slice(..).get_mapped_range();
+        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| bytes[(y * row + x * 4) as usize..][..4].try_into().unwrap()).collect()
+    }
+}

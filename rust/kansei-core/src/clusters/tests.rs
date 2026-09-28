@@ -25,7 +25,7 @@ use std::collections::HashMap;
 /// A noisy icosphere (a rock) with `subdivisions`. With `seam`, the triangles on the x < 0 side
 /// get their own vertices with other uvs, so a uv seam runs round the rock (split vertices at
 /// one position).
-fn rock(subdivisions: u32, seam: bool) -> Geometry {
+pub(super) fn rock(subdivisions: u32, seam: bool) -> Geometry {
     let t = (1.0 + 5f32.sqrt()) / 2.0;
     let mut p: Vec<Vec3> = [[-1.0, t, 0.0], [1.0, t, 0.0], [-1.0, -t, 0.0], [1.0, -t, 0.0], [0.0, -1.0, t], [0.0, 1.0, t], [0.0, -1.0, -t], [0.0, 1.0, -t], [t, 0.0, -1.0], [t, 0.0, 1.0], [-t, 0.0, -1.0], [-t, 0.0, 1.0]]
         .iter()
@@ -244,7 +244,7 @@ fn random(seed: &mut u32) -> f32 {
 }
 
 /// `count` eyes round the origin, in random directions, from `near` to `far` (log-uniform).
-fn eyes(count: usize, near: f32, far: f32, seed: &mut u32) -> Vec<Vec3> {
+pub(super) fn eyes(count: usize, near: f32, far: f32, seed: &mut u32) -> Vec<Vec3> {
     (0..count)
         .map(|_| {
             let (z, a) = (random(seed) * 2.0 - 1.0, random(seed) * std::f32::consts::TAU);
@@ -272,7 +272,7 @@ fn assert_cuts_closed(name: &str, mesh: &ClusterMesh, eyes: &[Vec3], budgets: &[
     }
 }
 
-fn view(eye: Vec3, threshold: f32) -> LodView {
+pub(super) fn view(eye: Vec3, threshold: f32) -> LodView {
     LodView { eye, pixels_per_radian: 1080.0 / 0.8, near: 0.1, threshold }
 }
 
@@ -430,3 +430,56 @@ fn clusters_are_well_filled() {
     assert!(fill >= 0.9, "clusters {fill:.2} full");
 }
 
+
+#[test]
+fn levels_partition_the_clusters_in_order() {
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let levels = mesh.levels();
+    assert!(levels.len() > 3, "{} levels", levels.len());
+    let mut next = 0;
+    for (l, level) in levels.iter().enumerate() {
+        assert_eq!(level.first, next, "level {l} starts where the one before ends");
+        assert!(level.count > 0, "level {l} is empty");
+        for c in &mesh.clusters[level.first as usize..(level.first + level.count) as usize] {
+            assert_eq!(c.level as usize, l);
+            assert!(c.error >= level.min_error);
+            assert!(!c.parent_error.is_finite() || c.parent_error <= level.max_parent_error);
+            assert!(c.lod_bounds.center.length() - c.lod_bounds.radius <= level.near_reach);
+        }
+        next += level.count;
+    }
+    assert_eq!(next as usize, mesh.clusters.len());
+    assert!(!levels.last().unwrap().max_parent_error.is_finite(), "the root level has no parent");
+}
+
+#[test]
+fn the_level_window_keeps_every_drawn_cluster() {
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let levels = mesh.levels();
+    let mut seed = 7;
+    let mut checked = 0;
+    for eye in eyes(40, 0.5, 600.0, &mut seed).into_iter().chain([Vec3::ZERO, Vec3::new(0.0, 0.0, 1.02)]) {
+        for threshold in [0.0, 0.25, 1.0, 4.0, 32.0] {
+            let v = view(eye, threshold);
+            for i in mesh.select(&v) {
+                let c = &mesh.clusters[i];
+                assert!(levels[c.level as usize].may_draw(&v), "cluster {i} (level {}) drawn from {eye} at {threshold} px, its level skipped", c.level);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+}
+
+#[test]
+fn the_level_window_skips_the_levels_a_view_cannot_reach() {
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let levels = mesh.levels();
+    let skipped = |v: &LodView| levels.iter().map(|l| !l.may_draw(v)).collect::<Vec<_>>();
+    // far away, the fine levels' parents are all under the budget
+    let far = view(Vec3::new(0.0, 0.0, 400.0), 1.0);
+    assert!(skipped(&far)[0] && skipped(&far)[1], "far: {:?}", skipped(&far));
+    // at the surface with a tight budget, the coarsest level is over it
+    let near = view(Vec3::new(0.0, 0.0, 1.02), 0.25);
+    assert!(!skipped(&near)[0] && *skipped(&near).last().unwrap(), "near: {:?}", skipped(&near));
+}

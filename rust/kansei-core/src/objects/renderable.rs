@@ -17,6 +17,8 @@ pub struct Renderable {
     /// Cull the instances on the GPU per view (camera, each shadow map) instead of drawing the
     /// geometry's instance buffer as is; see `InstanceCulling`.
     pub instance_culling: Option<crate::culling::InstanceCulling>,
+    /// Draw the camera's cut of a cluster graph instead of the geometry: see `ClusterLod`.
+    pub clusters: Option<crate::clusters::ClusterLod>,
     /// Bitmask of the layers this renderable is on (bit 0 by default). Secondary views such
     /// as planar reflections draw only renderables whose layers intersect their mask.
     pub layers: u32,
@@ -44,6 +46,7 @@ impl Renderable {
             visible: true,
             material_dirty: true,
             instance_culling: None,
+            clusters: None,
             layers: Self::DEFAULT_LAYERS,
             dynamic: false,
             previous_world_matrix: std::cell::Cell::new(None),
