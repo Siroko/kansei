@@ -26,8 +26,8 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::postprocessing::effects::{
-    AtmosphereEffect, CloudLayer, HeightFogEffect, HeightFogLayer, LocalFogVolume, VolumetricCloudsEffect, VolumetricCloudsOptions,
-    VolumetricFogEffect, VolumetricFogOptions,
+    AtmosphereEffect, CloudLayer, GiQuality, HeightFogEffect, HeightFogLayer, LocalFogVolume, ScreenSpaceGIEffect, ScreenSpaceGIOptions,
+    VolumetricCloudsEffect, VolumetricCloudsOptions, VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -89,8 +89,16 @@ fn sun_shadow(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
     return mix(1.0, s / 9.0, inside);
 }
 
+// the lit colour, and the normal and albedo the screen-space GI reads (GBuffer targets 2 and 3)
+struct GBufferOut {
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec4<f32>,
+    @location(2) normal: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
+};
+
 @fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput) -> GBufferOut {
     let n = normalize(input.world_normal);
     let shadow = sun_shadow(input.world_position, n);
     var e = vec3<f32>(0.0);
@@ -98,7 +106,12 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let l = lights.directional[i];
         e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
     }
-    return vec4<f32>(material.albedo.rgb / 3.14159265 * (e + skyIrradiance(sky, n)), 1.0);
+    var out: GBufferOut;
+    out.color = vec4<f32>(material.albedo.rgb / 3.14159265 * (e + skyIrradiance(sky, n)), 1.0);
+    out.emissive = vec4<f32>(0.0);
+    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
+    out.albedo = vec4<f32>(material.albedo.rgb, 1.0);
+    return out;
 }
 "#;
 
@@ -135,8 +148,15 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
+struct GBufferOut {
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec4<f32>,
+    @location(2) normal: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
+};
+
 @fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput) -> GBufferOut {
     let n = normalize(input.world_normal);
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
@@ -163,7 +183,12 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
         color += lights.directional[i].color * nl * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
     }
-    return vec4<f32>(color, 1.0);
+    var out: GBufferOut;
+    out.color = vec4<f32>(color, 1.0);
+    out.emissive = vec4<f32>(0.0);
+    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
+    out.albedo = vec4<f32>(material.albedo.rgb * (1.0 - spec_brdf), 1.0);
+    return out;
 }
 "#;
 
@@ -177,7 +202,7 @@ fn reflective(label: &str, albedo: [f32; 3], f0: [f32; 3], roughness: f32, sky: 
             Binding::texture_cube(2, ShaderStages::FRAGMENT),
             Binding::sampler(3, ShaderStages::FRAGMENT),
         ],
-        MaterialOptions::default(),
+        MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[albedo[0], albedo[1], albedo[2], 1.0, f0[0], f0[1], f0[2], roughness]);
     m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
@@ -191,7 +216,7 @@ fn surface(label: &str, albedo: [f32; 3], sky: &SkyAtmosphere) -> Material {
         label,
         &format!("{SKY_LIGHTING_WGSL}\n{SURFACE_WGSL}"),
         vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::uniform(1, ShaderStages::FRAGMENT)],
-        MaterialOptions::default(),
+        MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[albedo[0], albedo[1], albedo[2], 1.0]);
     m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
@@ -386,7 +411,22 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let sun_light = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // the chain: the sky and its aerial perspective, the fog in front of them, the display transform
-    let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(AtmosphereEffect::new(&sky))];
+    // gi=low|medium|high|ultra: screen-space global illumination (off by default), first in the
+    // chain so the bounce lies on the surfaces under the aerial perspective
+    let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = Vec::new();
+    let quality = match q.get("gi").as_deref() {
+        Some("low") => Some(GiQuality::Low),
+        Some("medium") | Some("1") => Some(GiQuality::Medium),
+        Some("high") => Some(GiQuality::High),
+        Some("ultra") => Some(GiQuality::Ultra),
+        _ => None,
+    };
+    if let Some(quality) = quality {
+        let mut gi = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality, ..Default::default() });
+        gi.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        effects.push(Box::new(gi));
+    }
+    effects.push(Box::new(AtmosphereEffect::new(&sky)));
     // clouds=<coverage 0..1> (clouds=0 none), cloudtype=<0 stratus .. 1 cumulus>, cloudbase=<m>
     let clouds = q.get("clouds").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.45);
     if clouds > 0.0 {
