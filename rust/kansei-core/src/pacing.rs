@@ -65,8 +65,8 @@ pub struct FramePacerOptions {
     /// Missed refreshes slow a cadence only while recent frames' median GPU time (the last
     /// `GPU_FRAMES`) is over its frame time; while it fits, they are hitches (a burst of slow
     /// frames, a stall elsewhere) that a slower cadence would not remove. A faster cadence is
-    /// tried at once when the median is below this share of its frame time (and below what it was
-    /// when that cadence last failed).
+    /// tried at once when the median is below this share of its frame time (and well below what
+    /// it was when that cadence last failed).
     pub fit_share: f64,
 }
 
@@ -106,6 +106,10 @@ impl Cadence {
     const RELEARN_MS: f64 = 30000.0;
     /// Rendered frames whose GPU time the median is taken over (a second at 60 fps).
     const GPU_FRAMES: usize = 60;
+    /// How much lighter than when a faster cadence last failed the median must be for it to be
+    /// tried at once: frames at a slower cadence measure lighter by themselves (less of a shared
+    /// GPU's work falls inside them), which is not the scene getting lighter.
+    const LIGHTER: f64 = 0.75;
 
     pub(crate) fn new(options: FramePacerOptions) -> Self {
         Self {
@@ -242,7 +246,7 @@ impl Cadence {
         }
         // held without a miss for long enough, or the GPU time well within a faster cadence: try it
         if !self.trying && self.divisor > floor && missed == 0.0 {
-            let lighter = self.fits(self.divisor - 1, self.options.fit_share) && self.gpu_p50().is_some_and(|gpu| gpu < self.failed_gpu * 0.9);
+            let lighter = self.fits(self.divisor - 1, self.options.fit_share) && self.gpu_p50().is_some_and(|gpu| gpu < self.failed_gpu * Self::LIGHTER);
             if lighter {
                 self.backoff_ms = o.settle_ms;
             }
@@ -693,6 +697,28 @@ mod tests {
         // with the typical frame over a refresh (18 ms), the misses slow it down
         let heavy = run(&|_| 18.0);
         assert!(heavy.first().is_some_and(|&(_, k)| k == 2), "{heavy:?}");
+    }
+
+    #[test]
+    fn a_frame_time_that_depends_on_the_cadence_does_not_make_it_thrash() {
+        // frames that take 19 ms at every refresh but 14.5 at every other (a shared GPU, clocks):
+        // the tries at every refresh fail, and come further apart, not every second or two
+        let refresh = 1000.0 / 60.0;
+        let last = std::cell::Cell::new((0.0f64, 0.0f64));
+        let gpu = |t: f64| {
+            let (prev, ms) = last.get();
+            if t == prev {
+                return ms;
+            }
+            let ms = if t - prev > 1.5 * refresh { 14.5 } else { 19.0 };
+            last.set((t, ms));
+            ms
+        };
+        let mut cadence = Cadence::new(FramePacerOptions::default());
+        simulate(&mut cadence, 0.0, refresh, 2.0, |_| 12.0);
+        let changes = divisors(&mut cadence, 2000.0, refresh, 30.0, gpu);
+        let tries = changes.iter().filter(|&&(_, k)| k == 1).count();
+        assert!(tries <= 5, "{tries} tries in 30 s: {changes:?}");
     }
 
     #[test]
