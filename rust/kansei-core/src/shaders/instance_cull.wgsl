@@ -32,6 +32,8 @@ struct CullInstances {
     capacity     : u32,               // instances per view region in `dst`
     lateSlot     : u32,               // `late`: its draw in `args`
     layers       : u32,               // the renderable's (`Renderable::layers`)
+    shadowLod    : vec2f,             // the LOD band in shadow maps (FLAG_CASTERS_ONLY views)
+    reflectionLod: vec2f,             // the LOD band in planar reflections (FLAG_REFLECTION views)
 }
 
 // A view: all of them in one buffer, written once a frame.
@@ -40,7 +42,7 @@ struct CullView {
     view         : mat4x4f,           // occlusion: the camera's view
     proj         : mat4x4f,           // occlusion: the camera's projection, jittered as rasterized
     lodOrigin    : vec3f,             // the main camera, for every view
-    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_LAYERED, FLAG_STATS, FLAG_REVERSE_Z
+    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_REFLECTION, FLAG_LAYERED, FLAG_STATS, FLAG_REVERSE_Z
     depthSize    : vec2f,             // occlusion: the depth buffer's size in pixels
     lodScale     : f32,               // the view's LOD distance scale (reflections pick finer LODs)
     layerMask    : u32,               // FLAG_LAYERED: the layers it draws (a reflection's)
@@ -76,6 +78,7 @@ const FLAG_TWO_PHASE : u32 = 16u;
 const FLAG_VIEW : u32 = 32u;
 const FLAG_CASTERS_ONLY : u32 = 64u;
 const FLAG_LAYERED : u32 = 128u;
+const FLAG_REFLECTION : u32 = 256u;
 // the camera's view
 const MAIN_VIEW : u32 = 0u;
 
@@ -114,7 +117,14 @@ fn bounds(i : u32) -> Bounds {
 // (view v)
 fn cull(b : Bounds, v : u32) -> u32 {
     let d = distance(b.center, views[v].lodOrigin) * views[v].lodScale;
-    if (d < ci.lodNear || d >= ci.lodFar) { return LOD_CULLED; }
+    // the view's kind's band: a shadow map's, a reflection's, or the camera's
+    var band = vec2f(ci.lodNear, ci.lodFar);
+    if ((views[v].flags & FLAG_CASTERS_ONLY) != 0u) {
+        band = ci.shadowLod;
+    } else if ((views[v].flags & FLAG_REFLECTION) != 0u) {
+        band = ci.reflectionLod;
+    }
+    if (d < band.x || d >= band.y) { return LOD_CULLED; }
     let isBox = (ci.flags & FLAG_BOX) != 0u;
     for (var k = 0u; k < 6u; k++) {
         let plane = views[v].planes[k];
