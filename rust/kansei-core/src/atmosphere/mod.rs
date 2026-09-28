@@ -6,7 +6,7 @@ pub(crate) mod params;
 pub(crate) mod sky_atmosphere;
 
 pub use params::{direction_from_elevation_bearing, AtmosphereParams, CelestialLight};
-pub use sky_atmosphere::{SkyAtmosphere, SkyAtmosphereBindings, SkyAtmosphereOptions};
+pub use sky_atmosphere::{SkyAtmosphere, SkyAtmosphereBindings, SkyAtmosphereOptions, SkyCaptureFog, SkyLowerHemisphere};
 
 /// The WGSL `Atmosphere` and `SkyFrame` structs and the atmosphere helpers (medium, phase
 /// functions, ray-sphere tests, LUT parameterisations), for shaders that read the atmosphere.
