@@ -668,7 +668,7 @@ impl ToneMapEffect {
         let sampler = wgpu::BindingResource::Sampler(&gpu.sampler);
         let passes = [
             (&local.grid, group(&local.grid, &[(0, tex(input)), (1, params.clone()), (2, sampler.clone()), (3, tex(&local.grid_view))]), cells),
-            (&local.log_luminance, group(&local.log_luminance, &[(0, tex(input)), (1, params.clone()), (2, sampler), (4, tex(&local.log[0]))]), (blurred.0.div_ceil(8), blurred.1.div_ceil(8))),
+            (&local.log_luminance, group(&local.log_luminance, &[(0, tex(input)), (1, params.clone()), (2, sampler), (4, tex(&local.log[0]))]), blurred),
             (&local.blur_x, group(&local.blur_x, &[(1, params.clone()), (5, tex(&local.log[0])), (4, tex(&local.log[1]))]), (blurred.0.div_ceil(8), blurred.1.div_ceil(8))),
             (&local.blur_y, group(&local.blur_y, &[(1, params), (5, tex(&local.log[1])), (4, tex(&local.log[0]))]), (blurred.0.div_ceil(8), blurred.1.div_ceil(8))),
         ];
@@ -776,6 +776,47 @@ mod tests {
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
             .unwrap_or_else(|e| panic!("local_exposure: {e:?}"));
+    }
+
+    /// Local exposure's GPU cost at 1920 x 1080, by wall clock (ten frames per submit, the two
+    /// alternated): `cargo test -p kansei-core --lib time_local_exposure -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_local_exposure() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (1920u32, 1080u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let camera = Camera::new(60.0, 0.1, 100.0, 1.0);
+        let mut effects = [None, Some(LocalExposure::unreal(0.8, 0.8))].map(|local| ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::UnrealFilmic, local_exposure: local, ..Default::default() }));
+        let wall = |fx: &mut ToneMapEffect| {
+            let mut e = device.create_command_encoder(&Default::default());
+            for _ in 0..10 {
+                fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+            }
+            let t = std::time::Instant::now();
+            queue.submit([e.finish()]);
+            device.poll(wgpu::Maintain::Wait);
+            t.elapsed().as_secs_f64() * 1e3 / 10.0
+        };
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..40 {
+            for (k, fx) in effects.iter_mut().enumerate() {
+                let ms = wall(fx);
+                if round >= 5 {
+                    times[k].push(ms);
+                }
+            }
+        }
+        for t in &mut times {
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        eprintln!("tonemap {:.3} ms, with local exposure {:.3} ms (medians per frame, {w}x{h})", times[0][times[0].len() / 2], times[1][times[1].len() / 2]);
     }
 
     /// Unreal's local exposure on a sky 2 stops over middle grey beside ground 4 stops under it.
