@@ -1193,3 +1193,131 @@ fn sky_occlusion_draws_the_top_down_cut() {
     assert!(differing(&mesh, &exact) * 50 < occluded, "at no error: {} voxels differ", differing(&mesh, &exact));
     assert!(differing(&mesh, &coarse) > 0, "at a coarse budget the volume is still the mesh's");
 }
+
+/// The rocks' material, writing motion vectors (`outputs_velocity`) from last frame's world
+/// matrix and view.
+const VELOCITY_ROCKS_WGSL: &str = r#"
+struct Tint { color: vec4<f32> };
+@group(0) @binding(0) var<uniform> tint: Tint;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+struct Temporal { view_proj: mat4x4<f32>, prev_view_proj: mat4x4<f32>, jitter: vec2<f32>, prev_jitter: vec2<f32>, frame: u32, pad0: u32, pad1: u32, pad2: u32 };
+@group(1) @binding(3) var<uniform> temporal: Temporal;
+struct Transforms { world: mat4x4<f32>, prev_world: mat4x4<f32> };
+@group(2) @binding(1) var<uniform> mesh: Transforms;
+struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(3) place: vec4<f32>, @location(4) yaw: f32 };
+struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) curr: vec4<f32>, @location(2) prev: vec4<f32> };
+struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32>, @location(4) velocity: vec2<f32> };
+fn turn(v: vec3<f32>, a: f32) -> vec3<f32> {
+    return vec3<f32>(cos(a) * v.x + sin(a) * v.z, v.y, -sin(a) * v.x + cos(a) * v.z);
+}
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    var out: VOut;
+    let local = vec4<f32>(turn(v.position.xyz * v.place.w, v.yaw) + v.place.xyz, 1.0);
+    out.clip = projection_matrix * view_matrix * mesh.world * local;
+    out.normal = (mesh.world * vec4<f32>(turn(v.normal, v.yaw), 0.0)).xyz;
+    out.curr = temporal.view_proj * mesh.world * local;
+    out.prev = temporal.prev_view_proj * mesh.prev_world * local;
+    return out;
+}
+@fragment
+fn fragment_main(in: VOut) -> FOut {
+    let n = vec4<f32>(normalize(in.normal) * 0.5 + 0.5, 1.0) * tint.color;
+    let velocity = (in.curr.xy / in.curr.w - in.prev.xy / in.prev.w) * vec2<f32>(0.5, -0.5);
+    return FOut(n, vec4<f32>(0.0), n, n, velocity);
+}
+"#;
+
+/// Channels `channels` of a 16-bit float texture, read back.
+fn read_half(renderer: &Renderer, texture: &wgpu::Texture, channels: u32) -> Vec<Vec<f32>> {
+    let (device, queue) = (renderer.device(), renderer.queue());
+    let (w, h) = (texture.width(), texture.height());
+    let row = (w * 2 * channels).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let bytes = buffer.slice(..).get_mapped_range();
+    (0..w * h)
+        .map(|i| {
+            let at = ((i / w) * row + (i % w) * 2 * channels) as usize;
+            (0..channels as usize).map(|c| half(u16::from_le_bytes([bytes[at + 2 * c], bytes[at + 2 * c + 1]]))).collect()
+        })
+        .collect()
+}
+
+/// A frame of `rocks` with the velocity material, after one where the rocks stood 0.3 m to the
+/// left: the GBuffer's colour (alpha: covered) and velocity.
+fn velocity_frame(clusters: bool, threshold: f32) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let (mut scene, mut camera, index) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    let r = scene.get_renderable_mut(index).unwrap();
+    r.material = Material::new("Rocks", VELOCITY_ROCKS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), outputs_velocity: true, ..Default::default() });
+    r.material.set_uniform_bindable(0, "Tint", &[[1.0f32; 4]]);
+    r.object.set_position(-0.3, 0.0, 0.0);
+    draw(&mut renderer, &mut scene, &mut camera);
+    scene.get_renderable_mut(index).unwrap().object.set_position(0.0, 0.0, 0.0);
+    let gbuffer = GBuffer::new(renderer.device(), SIZE, SIZE, 1);
+    renderer.render_scene_to_gbuffer(&mut scene, &mut camera, &gbuffer);
+    Some((read_half(&renderer, &gbuffer.color_texture, 4), read_half(&renderer, &gbuffer.velocity_texture, 2)))
+}
+
+#[test]
+fn velocity_follows_the_cut_the_gbuffer_drew() {
+    // the velocity pass depth-tests against the GBuffer: drawing the mesh where the GBuffer drew
+    // a coarser cut leaves holes; drawing the camera's cut fills every texel it covers
+    let Some((color, mesh)) = velocity_frame(false, 0.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let covered: Vec<usize> = (0..color.len()).filter(|&i| color[i][3] > 0.5).collect();
+    let moving = covered.iter().filter(|&&i| mesh[i][0].abs() > 1e-3 && mesh[i][0] < GBuffer::NO_VELOCITY / 2.0).count();
+    assert!(moving * 2 > covered.len() && covered.len() > 500, "the rocks' velocity: {moving} of {} texels", covered.len());
+    let (_, exact) = velocity_frame(true, 0.0).unwrap();
+    let differing = covered.iter().filter(|&&i| (0..2).any(|c| (mesh[i][c] - exact[i][c]).abs() > 1e-3)).count();
+    assert!(differing * 200 < covered.len(), "at no error: {differing} of {} texels' velocities differ", covered.len());
+    let (color, coarse) = velocity_frame(true, 4.0).unwrap();
+    let covered: Vec<usize> = (0..color.len()).filter(|&i| color[i][3] > 0.5).collect();
+    let holes = covered.iter().filter(|&&i| coarse[i][0] >= GBuffer::NO_VELOCITY / 2.0).count();
+    assert!(holes * 50 < covered.len(), "at a 4-pixel budget: {holes} of {} covered texels have no velocity", covered.len());
+}
+
+/// A rendered planar reflection of `rocks` in the plane y = -1.5, with cluster LOD or without, at
+/// `threshold` pixels and the reflection's `scale`: its texture.
+fn reflection_image(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<Vec<f32>>> {
+    use crate::reflections::{PlanarReflection, PlanarReflectionOptions};
+    let mut renderer = headless()?;
+    renderer.set_cluster_error_threshold(threshold);
+    let (mut scene, mut camera, _) = rocks(&renderer, &PLACEMENTS, 4, clusters);
+    let mut reflection = PlanarReflection::new(&renderer, crate::math::Vec3::new(0.0, -1.5, 0.0), crate::math::Vec3::new(0.0, 1.0, 0.0), PlanarReflectionOptions { width: 160, height: 160, mip_levels: 1, ..Default::default() });
+    reflection.lod_error_scale = scale;
+    renderer.add_planar_reflection(reflection);
+    for _ in 0..2 {
+        draw(&mut renderer, &mut scene, &mut camera);
+    }
+    Some(read_half(&renderer, renderer.planar_reflection(0).unwrap().texture(), 4))
+}
+
+#[test]
+fn planar_reflections_draw_their_cut() {
+    let Some(mesh) = reflection_image(false, 0.0, 1.0) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let lit = |t: &Vec<f32>| t[..3].iter().any(|c| *c > 0.02);
+    let covered = mesh.iter().filter(|t| lit(t)).count();
+    let differing = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).filter(|(x, y)| (0..3).any(|c| (x[c] - y[c]).abs() > 2.0 / 255.0)).count();
+    let exact = reflection_image(true, 0.0, 1.0).unwrap();
+    assert!(covered > 200, "the reflection shows {covered} texels of rock");
+    assert!(differing(&mesh, &exact) * 200 < covered, "at no error: {} of {covered} texels differ", differing(&mesh, &exact));
+    let coarse = reflection_image(true, 1.0, 1e4).unwrap();
+    assert!(differing(&mesh, &coarse) * 20 > covered, "at a coarse budget only {} of {covered} texels differ from the mesh's", differing(&mesh, &coarse));
+}

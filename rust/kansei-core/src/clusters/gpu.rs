@@ -259,11 +259,14 @@ impl ClusterCulling {
     }
 }
 
-/// Cluster LOD for a renderable (`Renderable::clusters`). Each frame, the camera draws the cut of
-/// `mesh` its view needs (`Renderer::set_cluster_error_threshold`) instead of the geometry,
-/// through a vertex stage generated around the material's `vertex_main`. The geometry, which
-/// must be the mesh `mesh` was built from, is still what the other views draw (shadow maps,
-/// reflections, velocity, impostor bakes) until they move to clusters too.
+/// Cluster LOD for a renderable (`Renderable::clusters`). Each frame, every view that draws it
+/// (the camera and its velocity pass, the spot and cascaded shadow maps, rendered planar
+/// reflections and the sky occlusion's top-down view) draws the cut of `mesh` that view needs
+/// (`Renderer::set_cluster_error_threshold`, times the view's scale:
+/// `Renderer::set_shadow_cluster_error_scale`, `PlanarReflection::lod_error_scale`,
+/// `SkyOcclusionOptions::lod_error_scale`) instead of the geometry, through a vertex stage
+/// generated around the material's `vertex_main`. The geometry, which must be the mesh `mesh`
+/// was built from, is still what impostor bakes and point-light (cubemap) shadows draw.
 ///
 /// The instances are the geometry's one instance buffer (if any), culled by the renderable's
 /// `InstanceCulling` when it has one (without occlusion phases) and placed as `transform` says.
@@ -277,8 +280,9 @@ pub struct ClusterLod {
     /// back faces and isn't transparent. Turn it off when the material turns instances in a way
     /// `transform` doesn't describe.
     pub cone_culling: bool,
-    /// Clusters drawn per frame, at most. By default every cluster of every instance, up to
-    /// 4 194 304. Clusters past it aren't drawn.
+    /// Clusters drawn per frame in each view, at most (each view's cut has a draw list this
+    /// long: 8 bytes an entry). By default every cluster of every instance, up to 4 194 304.
+    /// Clusters past it aren't drawn.
     pub capacity: Option<u32>,
     /// How much further than `transform` the material may stretch or sway an instance about its
     /// origin (1 by default): no point moves more than `stretch - 1` times its distance from the
