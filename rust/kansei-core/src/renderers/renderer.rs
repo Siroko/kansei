@@ -3298,6 +3298,7 @@ fn draw_reflection(
 struct CameraClusterDraw<'a> {
     pipeline: &'a wgpu::RenderPipeline,
     group: &'a wgpu::BindGroup,
+    indices: &'a wgpu::Buffer,
     args: &'a wgpu::Buffer,
 }
 
@@ -3305,14 +3306,15 @@ impl<'a> CameraClusterDraw<'a> {
     /// `r`'s, when it has cluster LOD ready and a cluster pipeline for a pass of `key`.
     fn of(r: &'a crate::objects::Renderable, key: &crate::materials::PipelineKey) -> Option<Self> {
         let cut = r.clusters.as_ref()?.gpu.as_ref()?.cut(MAIN_VIEW as u32)?;
-        Some(Self { pipeline: r.material.cluster_pipeline(key)?, group: cut.draw_bind_group()?, args: cut.args() })
+        Some(Self { pipeline: r.material.cluster_pipeline(key)?, group: cut.draw_bind_group()?, indices: cut.indices(), args: cut.args() })
     }
 
     /// Draw it in `set` (nothing in the late set: clusters have no occlusion phases yet).
     fn draw(self, enc: &mut impl wgpu::util::RenderEncoder<'a>, set: DrawSet, offset: u32) {
         if set != DrawSet::Late {
             enc.set_bind_group(2, Some(self.group), &[offset, offset]);
-            enc.draw_indirect(self.args, 0);
+            enc.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            enc.draw_indexed_indirect(self.args, 0);
         }
     }
 }
@@ -3333,7 +3335,8 @@ fn draw_cut<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::obje
         enc.set_bind_group(0, Some(bg), &[]);
     }
     enc.set_bind_group(2, Some(group), &[offset, offset]);
-    enc.draw_indirect(cut.args(), 0);
+    enc.set_index_buffer(cut.indices().slice(..), wgpu::IndexFormat::Uint32);
+    enc.draw_indexed_indirect(cut.args(), 0);
 }
 
 /// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,

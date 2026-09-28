@@ -99,12 +99,20 @@ enum EntryKind {
     Clusters,
 }
 
-const _: () = assert!(ARGS_BYTES == crate::clusters::DRAW_ARGS_BYTES);
+impl EntryKind {
+    /// Its bytes in the readback.
+    fn bytes(self) -> u64 {
+        match self {
+            Self::Instances { .. } => ARGS_BYTES,
+            Self::Clusters => crate::clusters::DRAW_ARGS_BYTES,
+        }
+    }
+}
 
 struct Pending {
     frame: u32,
     kinds: Vec<CullViewKind>,
-    // (view, tested, kind) per ARGS_BYTES in the staging buffer
+    // (view, tested, kind) one after another in the staging buffer (`EntryKind::bytes` each)
     entries: Vec<(usize, u32, EntryKind)>,
     // MAPPING, then MAPPED or FAILED
     state: Arc<AtomicU8>,
@@ -142,8 +150,10 @@ impl StatsReadback {
             let bytes = staging.slice(..).get_mapped_range();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
             let mut views: Vec<(CullViewKind, CullStats)> = Vec::new();
-            for (k, &(view, tested, entry)) in pending.entries.iter().enumerate() {
-                let a = &words[k * ARGS_BYTES as usize / 4..][..8];
+            let mut at = 0;
+            for &(view, tested, entry) in &pending.entries {
+                let a = &words[at..][..entry.bytes() as usize / 4];
+                at += entry.bytes() as usize / 4;
                 let kind = pending.kinds[view];
                 let stats = match entry {
                     // (the draw's index count, then its instance count)
@@ -151,8 +161,8 @@ impl StatsReadback {
                         let triangles = if clustered { 0 } else { a[0] as u64 / 3 * a[1] as u64 };
                         CullStats { tested, drawn: a[1], lod_culled: a[5], frustum_culled: a[6], occlusion_culled: a[7], triangles, clusters: 0 }
                     }
-                    // (the clusters drawn, then the triangles counted as they were listed)
-                    EntryKind::Clusters => CullStats { clusters: a[1], triangles: a[6] as u64, ..Default::default() },
+                    // (the clusters listed, then their triangles)
+                    EntryKind::Clusters => CullStats { clusters: a[7], triangles: a[9] as u64, ..Default::default() },
                 };
                 match views.iter_mut().find(|(k, _)| *k == kind) {
                     Some((_, s)) => *s += stats,
@@ -186,7 +196,7 @@ impl StatsReadback {
         if !self.enabled || self.pending.is_some() || self.entries.is_empty() {
             return;
         }
-        let size = self.entries.len() as u64 * ARGS_BYTES;
+        let size: u64 = self.entries.iter().map(|e| e.kind.bytes()).sum();
         if self.staging.as_ref().is_none_or(|s| s.size() < size) {
             self.staging = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("InstanceCulling/StatsReadback"),
@@ -197,8 +207,10 @@ impl StatsReadback {
         }
         let staging = self.staging.as_ref().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("InstanceCulling/Stats") });
-        for (k, entry) in self.entries.iter().enumerate() {
-            encoder.copy_buffer_to_buffer(&entry.args, entry.offset, staging, k as u64 * ARGS_BYTES, ARGS_BYTES);
+        let mut at = 0;
+        for entry in &self.entries {
+            encoder.copy_buffer_to_buffer(&entry.args, entry.offset, staging, at, entry.kind.bytes());
+            at += entry.kind.bytes();
         }
         queue.submit(Some(encoder.finish()));
         let state = Arc::new(AtomicU8::new(MAPPING));
