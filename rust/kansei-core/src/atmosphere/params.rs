@@ -246,6 +246,17 @@ pub(crate) struct SkyFrameGpu {
     pub _pad1: f32,
 }
 
+/// The WGSL `CloudShadowParams` struct (cloud_shadow.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct CloudShadowParamsGpu {
+    pub center: [f32; 2],
+    pub inv_size: f32,
+    pub plane_y: f32,
+    pub sun_dir: [f32; 3],
+    pub enabled: f32,
+}
+
 /// The WGSL `SkyLighting` struct: sky radiance SH and the lights at the camera.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
