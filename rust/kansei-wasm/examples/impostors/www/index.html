@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kansei — Impostors</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #eee; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #panel { position: fixed; left: 12px; top: 12px; padding: 8px 10px; background: rgba(0, 0, 0, 0.6); border-radius: 4px; }
+        #hud, #bench { margin: 0; white-space: pre-wrap; }
+        label { margin-right: 14px; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <div id="panel">
+        <label><input type="checkbox" id="impostors" checked> impostors (I)</label>
+        <pre id="hud"></pre>
+        <pre id="bench"></pre>
+    </div>
+    <script type="module">
+        import init, { start } from '../pkg/kansei_wasm_impostors.js';
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>
