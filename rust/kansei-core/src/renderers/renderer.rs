@@ -1399,6 +1399,10 @@ impl Renderer {
                     }),
                     timestamp_writes: crate::profiling::gpu_pass("Renderer/PlanarReflectionPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
                 });
+                // only the surface's part of the screen, when its bounds are known
+                if let Some([x, y, w, h]) = reflection.scissor() {
+                    pass.set_scissor_rect(x, y, w, h);
+                }
                 pass.set_bind_group(1, reflection.camera().bind_group().unwrap(), &[]);
                 if let Some(bg) = &self.shadow_bind_group {
                     pass.set_bind_group(3, bg, &[]);
@@ -1542,7 +1546,7 @@ impl Renderer {
         // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
         views.extend(self.planar_reflections.iter().map(|r| {
             r.is_active().then(|| crate::culling::CullView {
-                view_proj: r.camera().projection_matrix.to_glam() * r.camera().view_matrix.to_glam(),
+                view_proj: r.cull_view_proj(),
                 casters_only: false,
                 lod_distance_scale: r.lod_distance_scale,
             })
