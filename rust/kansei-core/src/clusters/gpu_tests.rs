@@ -214,7 +214,7 @@ fn buffer(device: &wgpu::Device, words: &[u32]) -> wgpu::Buffer {
 }
 
 /// Records of 12 floats: position, scale, yaw, pad, rotation (x y z w), pad.
-const PLACEMENT: InstanceTransform = InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: Some(24) };
+const PLACEMENT: InstanceTransform = InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: Some(24) };
 
 fn placement_record(position: glam::Vec3, scale: f32, yaw: f32, rotation: glam::Quat) -> [f32; 12] {
     [position.x, position.y, position.z, scale, yaw, 0.0, rotation.x, rotation.y, rotation.z, rotation.w, 0.0, 0.0]
@@ -242,7 +242,7 @@ fn the_gpu_cut_of_placed_instances_is_the_cpu_cut() {
     let culling = ClusterCulling::new(&device);
     let mut gpu = ClusterGpu::new(&device, &mesh);
     let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
-    let params = ClusterCullGpu::new(world, Some(PLACEMENT), 48, &source, 4 * mesh.clusters.len() as u32, gpu.vertex_count(), true);
+    let params = ClusterCullGpu::new(world, Some(PLACEMENT), 48, &source, 4 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
     let mut totals = Vec::new();
     for (eye, target) in [(glam::Vec3::new(0.0, 2.0, 8.0), glam::Vec3::ZERO), (glam::Vec3::new(3.0, 0.5, 1.5), glam::Vec3::new(1.0, 0.0, 0.0)), (glam::Vec3::new(-20.0, 10.0, 30.0), glam::Vec3::new(10.0, 0.0, -30.0))] {
         for threshold in [0.0, 0.5, 1.0, 4.0] {
@@ -288,7 +288,7 @@ fn matrix_culled_and_single_instances_cut_as_the_cpu_does() {
     let instance_args = buffer(&device, &[0, 0, 0, 0, 0, 3, 0, 0]);
     let source = InstanceSource::Culled { records: &records, first_record: 2, capacity: 3, args: &instance_args, count_word: 5 };
     let mut gpu = ClusterGpu::new(&device, &mesh);
-    let params = ClusterCullGpu::new(world, Some(InstanceTransform::Matrix { offset: 0 }), 64, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true);
+    let params = ClusterCullGpu::new(world, Some(InstanceTransform::Matrix { offset: 0 }), 64, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
     let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
     assert_eq!(args[4], 3);
     assert!(pairs.iter().all(|p| (2..5).contains(&p.0)), "records from the view's first");
@@ -298,7 +298,7 @@ fn matrix_culled_and_single_instances_cut_as_the_cpu_does() {
 
     // no instances: the mesh once, where the renderable is
     let mut single = ClusterGpu::new(&device, &mesh);
-    let params = ClusterCullGpu::new(world, None, 0, &InstanceSource::None, mesh.clusters.len() as u32, single.vertex_count(), true);
+    let params = ClusterCullGpu::new(world, None, 0, &InstanceSource::None, mesh.clusters.len() as u32, single.vertex_count(), true, 1.0);
     let (args, pairs) = cull(&device, &queue, &culling, &mut single, InstanceSource::None, params, &view);
     assert_eq!(args[4], 1);
     assert_cut("single", &pairs, 0, &expected(&mesh, world, &view, true));
@@ -320,7 +320,7 @@ fn nothing_visible_draws_nothing_and_the_capacity_holds() {
     // a full list: only the capacity drawn, the rest counted
     let one = counted(1);
     let source = InstanceSource::Culled { records: &records, first_record: 0, capacity: 1, args: &one, count_word: 1 };
-    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 5, gpu.vertex_count(), true);
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 5, gpu.vertex_count(), true, 1.0);
     let (args, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
     assert_eq!(args[1], 5, "drawn: the capacity");
     assert!(args[5] > 5, "claimed: {}", args[5]);
@@ -486,7 +486,7 @@ fn rocks(renderer: &Renderer, placements: &[[f32; 5]], visible: u32, clusters: b
     r.instance_culling = Some(InstanceCulling::new(source, visible, 32, 0, 1.2).with_radius_scale(12));
     if clusters {
         let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
-        r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: None }));
+        r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: None }));
     }
     let mut scene = Scene::new();
     let index = scene.add(SceneNode::Renderable(r));
@@ -694,9 +694,9 @@ fn scale_bound(m: glam::Mat3) -> f32 {
 /// What the cull should draw of `mesh` placed by any `model` (shear included): the cut rule in
 /// world space with `scale_bound`, the frustum, and (with `cone`, unmirrored) the cone in the
 /// mesh's space. Also returns the clusters within rounding of a decision.
-fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool) -> (BTreeSet<u32>, BTreeSet<u32>) {
+fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: bool, stretch: f32) -> (BTreeSet<u32>, BTreeSet<u32>) {
     let m = glam::Mat3::from_mat4(model);
-    let scale = scale_bound(m);
+    let scale = scale_bound(m) * stretch;
     let eye = model.inverse().transform_point3(v.eye);
     let cone = cone && m.determinant() > 0.0;
     let planes = crate::culling::frustum_planes(v.view_proj);
@@ -743,7 +743,7 @@ fn sheared_transforms_keep_every_level_the_cut_needs() {
     let culling = ClusterCulling::new(&device);
     let mut gpu = ClusterGpu::new(&device, &mesh);
     let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
-    let params = ClusterCullGpu::new(world, Some(PLACEMENT), 48, &source, 2 * mesh.clusters.len() as u32, gpu.vertex_count(), true);
+    let params = ClusterCullGpu::new(world, Some(PLACEMENT), 48, &source, 2 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.0);
     let mut checked = 0;
     for distance in [5.0f32, 8.0, 12.0, 20.0] {
         for k in 0..6 {
@@ -754,7 +754,7 @@ fn sheared_transforms_keep_every_level_the_cut_needs() {
                 let (_, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
                 for (i, r) in records.iter().enumerate() {
                     let label = format!("eye {eye}, {threshold} px, instance {i}");
-                    assert_cut(&label, &pairs, i as u32, &expected_world(&mesh, world * placement_matrix(r), &view, true));
+                    assert_cut(&label, &pairs, i as u32, &expected_world(&mesh, world * placement_matrix(r), &view, true, 1.0));
                 }
                 checked += pairs.len();
             }
@@ -814,7 +814,7 @@ fn crowns(renderer: &Renderer, placements: &[[f32; 5]], clusters: bool, eye: cra
     r.instance_culling = Some(InstanceCulling::new(source, count, 32, 0, 12.0).with_radius_scale(12));
     if clusters {
         let mesh = ClusterMesh::build(&super::card_tests::crown(800), &ClusterOptions { cards: true, ..Default::default() });
-        r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: None }));
+        r.clusters = Some(ClusterLod::new(mesh).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: None }));
     }
     let mut scene = Scene::new();
     let index = scene.add(SceneNode::Renderable(r));
@@ -854,4 +854,35 @@ fn card_clusters_draw_through_the_camera_path() {
     let coverage = |image: &[[f32; 4]]| image.iter().filter(|t| t[3] > 0.5).count() as f32;
     let (full, kept) = (coverage(&mesh), coverage(&pruned));
     assert!(full > 200.0 && (kept / full - 1.0).abs() < 0.15, "coverage {kept} of {full}");
+}
+
+#[test]
+fn a_negated_yaw_and_a_stretch_bound_the_film_s_trees() {
+    // records of the film's trees: a bearing b turns the mesh by -b; the material stretches a
+    // tree's width up to 1.1x its height and sways it: a 1.2 margin
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = [
+        placement_record(glam::Vec3::new(0.0, 0.0, -3.0), 1.5, 0.9, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(4.0, 0.0, -6.0), 2.0, -2.2, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(-4.0, 0.0, -8.0), 1.0, 2.8, glam::Quat::IDENTITY),
+    ];
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let transform = InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: -1.0, rotation: None };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(transform), 48, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.2);
+    let turned = |r: &[f32; 12]| glam::Mat4::from_translation(glam::Vec3::new(r[0], r[1], r[2])) * glam::Mat4::from_rotation_y(-r[4]) * glam::Mat4::from_scale(glam::Vec3::splat(r[3]));
+    for (eye, threshold) in [(glam::Vec3::new(0.0, 2.0, 6.0), 0.5), (glam::Vec3::new(6.0, 1.0, 2.0), 1.0), (glam::Vec3::new(-8.0, 4.0, 10.0), 2.0)] {
+        let view = TestView::looking(eye, glam::Vec3::new(0.0, 0.0, -5.0), threshold);
+        let (_, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+        // (the stretch loosens bounds and errors; cones are off where a material stretches)
+        for (k, r) in records.iter().enumerate() {
+            assert_cut(&format!("eye {eye}, instance {k}"), &pairs, k as u32, &expected_world(&mesh, turned(r), &view, false, 1.2));
+        }
+    }
 }

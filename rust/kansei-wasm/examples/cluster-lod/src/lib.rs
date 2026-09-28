@@ -307,7 +307,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // clusters
     let mut r = Renderable::new(InstancedGeometry::new(Geometry::new("Rock", geometry.vertices.clone(), geometry.indices.clone()), rocks, vec![instances()]), material());
     r.instance_culling = Some(culling(0.0, f32::INFINITY));
-    r.clusters = Some(ClusterLod::new(mesh.clone()).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), rotation: None }));
+    r.clusters = Some(ClusterLod::new(mesh.clone()).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: None }));
     modes[0].push(scene.add(SceneNode::Renderable(r)));
     // discrete LODs cut from the graph at the same budget, for the largest rock (1.3)
     let ppr = height as f32 / (2.0 * (45f32.to_radians() / 2.0).tan());
