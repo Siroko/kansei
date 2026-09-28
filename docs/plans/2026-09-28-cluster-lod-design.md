@@ -48,8 +48,9 @@ This keeps the renderer's structure: every pass still issues one indirect draw p
 
 `clusters::ClusterMesh::build(&Geometry, &ClusterOptions)`, on the CPU. The film generates its trees in wasm at load, so the builder runs in the browser. It uses **`optimesh`**, a pure-Rust port of meshoptimizer 1.1: bit-exact against the C++ (differential-tested), no `unsafe` by default, builds for `wasm32-unknown-unknown`, no dependencies. From it we use `build_meshlets`, `partition_clusters`, `simplify_with_attributes` and `compute_cluster_bounds`. The graph itself follows meshoptimizer's cluster-LOD demo (`clusterlod.h`) and Nanite:
 
-1. **Level 0.** Split the mesh into clusters of at most 124 triangles and 64 vertices (`build_meshlets`, cone weight 0.25 so clusters face one way and backface culling works). Each gets its bounding sphere, its normal cone, and error 0.
-2. **Group.** Partition the current clusters into groups of about 8 neighbours (`partition_clusters`, spatial).
+0. **Weld.** Positions within a millionth of the mesh's size are made bit-identical (and `-0.0` becomes `0.0`). The simplifier and the locks match positions exactly, so a seam whose copies differ by rounding (the engine's own UV sphere's last column) or by the sign of zero would otherwise open cracks at coarser levels.
+1. **Level 0.** Split the mesh into clusters of at most 124 triangles and 128 vertices (`build_meshlets`, cone weight 0.25 so clusters face one way and backface culling works). At 128 vertices clusters fill to ~96% of their triangles; at 64 they reach only ~70%, and every cluster is drawn as 124 triangles. Each gets its bounding sphere, its normal cone (apex, axis, cutoff; `Cluster::backfacing` is the reference test), and error 0.
+2. **Group.** Partition the current clusters into groups of about 8 neighbours (`partition_clusters`, spatial). It is given one vertex per position, so clusters on either side of a uv seam are neighbours; by vertex index a rock in 16 uv islands was cut from 40 m with 3,870 triangles against 632 in one piece.
 3. **Simplify each group** to half its triangles (`simplify_with_attributes`, weighted on normals and uvs, absolute error). Vertices the group shares with clusters outside it are locked (`SIMPLIFY_VERTEX_LOCK` in the per-vertex lock array, found by position so uv seams don't count as boundaries). A neighbouring group's clusters therefore meet this one's at the same vertices, whatever level each is drawn at: no cracks. The mesh's own open borders are *not* locked by default (unlike `SIMPLIFY_LOCK_BORDER`), so open meshes still reduce.
 4. **Error and bounds.**
    - The group's error is the simplifier's error plus nothing less than its children's: `max(simplify_error, max(child.error))`.
@@ -60,7 +61,7 @@ This keeps the renderer's structure: every pass still issues one indirect draw p
 
 The vertex buffer is the geometry's own. Simplification only drops and reuses vertices (no new positions), so every level shares one buffer. The graph adds only indices: the coarser levels together hold about as many triangles again as the mesh (each halves the one below). Clusters store 8-bit local indices and a list of global vertex indices.
 
-A prototype of this build, the exact code of the M1 plan, was run against `optimesh` 1.1. On a noisy icosphere of 20,480 triangles it gave 9 levels (20,480 → 10,216 → 5,098 → … → 78). Every cut, over 4 viewpoints × 5 budgets, with and without a uv seam, was free of holes and overlaps. 327,680 triangles built in 0.46 s (release, native), and it compiles for wasm32. Two behaviours to know:
+A prototype of this build, the exact code of the M1 plan, was run against `optimesh` 1.1. On a noisy icosphere of 20,480 triangles it gave 9 levels (20,480 → 10,216 → 5,098 → … → 78). Every cut, over 4 viewpoints × 5 budgets, with and without a uv seam, was free of holes and overlaps, and it compiles for wasm32. The M1 build (after its review: welding, grouping by position, 128 vertices) turns 327,680 triangles into 5,513 clusters, 96% full, in 0.53 s (release, native). Two behaviours to know:
 - **Meshes whose every edge is an attribute seam** (flat-shaded, a normal per face) don't reduce. The attribute-preserving simplifier moves no seam vertex, so they keep one level. Welding normals before the build fixes that, if such content appears.
 - **At extreme reductions the simplifier can fold an edge inside one coarse cluster** (four triangles on one edge). That's a local artifact, not a crack. The closure test tells the two apart.
 
@@ -79,7 +80,7 @@ A cluster renderable keeps `InstanceCulling` for its instances (non-instanced re
    - later, Hi-Z occlusion (milestone 5).
 
    Survivors append `(instance slot, cluster)` to the view's draw list and count their triangles into `CullStats`.
-4. **Draw args.** `draw_indirect` with `vertex_count = 3 × max_triangles` and `instance_count = drawn clusters`. Triangles past a cluster's own count come out degenerate (all three corners at one vertex), so the rasterizer drops them. The clusters are filled to about 95% by the builder, so the padding is a few percent of vertex work. Compacting a triangle list instead is a later option if the measurements ask for it.
+4. **Draw args.** `draw_indirect` with `vertex_count = 3 × max_triangles` and `instance_count = drawn clusters`. Triangles past a cluster's own count come out degenerate (all three corners at one vertex), so the rasterizer drops them. The clusters are filled to about 96% by the builder (at 128 vertices per cluster), so the padding is a few percent of vertex work. Compacting a triangle list instead is a later option if the measurements ask for it.
 
 Instances need a transform the cull shader can read, to move cluster spheres and cones. `InstanceCulling` gains an `InstanceTransform` description of the record: position offset, optional uniform-scale field, optional yaw field (radians, about +y), optional quaternion. That covers the film's `X, Y, Z, height, bearing, …` records and the usual layouts. A missing rotation disables cone culling for that renderable, which stays correct.
 
@@ -119,7 +120,7 @@ Per-instance occlusion didn't pay in the film (#37): a tree is rarely wholly hid
 
 - **Vertex pulling cost.** Fetching from storage instead of the vertex-input hardware, plus the padding, costs more per vertex. It pays only where selection removes more than it adds. Milestone 2 measures this A/B on a dense mesh field before anything builds on it.
 - **Rewriting material WGSL.** It's a text transformation over two known forms. It's covered by naga validation of every material in the repository, and it fails loudly (the renderable keeps the ordinary path) rather than drawing wrong.
-- **Build time in wasm.** Natively, 327K triangles take 0.46 s. The film builds ~30 tree meshes of 1-3K triangles, which is milliseconds even at wasm's speed. A mesh of millions of triangles would take seconds, which is the case for an offline build (the same code, run natively, serialised).
+- **Build time in wasm.** Natively, 327,680 triangles build into 5,513 clusters in 0.53 s (release, `clusters::tests::build_time`). The film builds ~30 tree meshes of 1-3K triangles, which is milliseconds even at wasm's speed. A mesh of millions of triangles would take seconds, which is the case for an offline build (the same code, run natively, serialised).
 - **Foliage quality.** Stochastic pruning is proven for foliage, but the film's crowns are ribbons, not free cards. Milestone 4 compares stills against today's LODs before the film adopts it.
 
 ## Milestones

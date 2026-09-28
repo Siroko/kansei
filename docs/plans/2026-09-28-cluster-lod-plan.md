@@ -17,7 +17,7 @@
 
 - Everything runs in wasm (`cargo check -p kansei-core --target wasm32-unknown-unknown`): no threads, no filesystem, no C dependencies.
 - Kansei's one vertex layout: `Vertex { position: [f32; 4], normal: [f32; 3], uv: [f32; 2] }` (`geometries/geometry.rs`); indices are `u32`.
-- Cluster limits: at most 124 triangles and 64 vertices (`ClusterOptions::default()`).
+- Cluster limits: at most 124 triangles and 128 vertices (`ClusterOptions::default()`; 64 at first, raised after review: at 64 clusters were only ~70% full).
 - The graph shares the geometry's vertex buffer: simplification only drops and reuses vertices.
 - Errors are absolute (object-space metres), and a cluster's parent error and parent sphere contain its own.
 - PRs go against `development`. Commit messages follow the repo's style (`feat(clusters): ...`) with no AI attribution.
