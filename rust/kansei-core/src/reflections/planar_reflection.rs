@@ -123,6 +123,11 @@ pub struct PlanarReflection {
     pub clip_bias: f32,
     /// Skip rendering (the texture keeps its last contents).
     pub enabled: bool,
+    /// Scales the distances by which instanced renderables (`InstanceCulling`) choose their LOD
+    /// in the mirrored view: below 1 it picks finer LODs than the camera. A mirror sees objects
+    /// from below, where coarse LODs built to read from the side (flat cards, dropped detail)
+    /// show; 1 (the default) picks the camera's.
+    pub lod_distance_scale: f32,
     width: u32,
     height: u32,
     active: bool,
@@ -351,6 +356,7 @@ impl PlanarReflection {
             layer_mask: options.layer_mask,
             clip_bias: options.clip_bias,
             enabled: true,
+            lod_distance_scale: 1.0,
             width,
             height,
             active: false,
