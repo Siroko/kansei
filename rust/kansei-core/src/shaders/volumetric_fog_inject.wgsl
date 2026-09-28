@@ -32,6 +32,7 @@ struct FogParams {
     // world plane (n, d): the fog lies only where n.p + d >= 0 (a planar reflection's view sees
     // the fog above its mirror); (0, 0, 0, 1) keeps all of it
     clipPlane       : vec4f,
+    maxDistance     : f32,   // the view depth the fog ends at (its reach)
 }
 
 struct DirLightData {
@@ -150,10 +151,16 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     // the height fog plus local fog volumes (volumetric_fog_media.wgsl): the lights below scale
     // with the total density, and the media's albedo colours what they scatter
     let media = fogMedia(worldPos, heightFog);
-    // faded in over a slice across the clip plane
-    let above = saturate((dot(params.clipPlane.xyz, worldPos) + params.clipPlane.w) / max(sliceThickness, 1e-3) + 0.5);
-    let density = media.density * above;
-    let extinction = media.extinction * above;
+    // faded in over a slice across the clip plane, when there is one (a reflection's): the
+    // default (0, 0, 0, 1) keeps all the fog, whatever the slices' thickness
+    let clipped = any(params.clipPlane.xyz != vec3f(0.0));
+    let above = select(1.0, saturate((dot(params.clipPlane.xyz, worldPos) + params.clipPlane.w) / max(sliceThickness, 1e-3) + 0.5), clipped);
+    // none past the fog's reach: the slice across it keeps the share of its depth before it
+    let d0 = sliceDepth(f32(gid.z), params.gridNear, params.gridFar, gridSize.z);
+    let d1 = sliceDepth(f32(gid.z) + 1.0, params.gridNear, params.gridFar, gridSize.z);
+    let reach = saturate((params.maxDistance - d0) / max(d1 - d0, 1e-3));
+    let density = media.density * above * reach;
+    let extinction = media.extinction * above * reach;
 
     let viewDir = normalize(worldPos - params.cameraPos);
     var totalScatter = density * params.ambient;
