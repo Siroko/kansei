@@ -189,7 +189,8 @@ fn a_mixed_mesh_prunes_its_cards_and_simplifies_the_rest() {
 
 #[test]
 fn the_card_error_scale_moves_the_switch_nearer() {
-    let eye = Vec3::new(0.0, 5.0, 150.0);
+    // (as near as the crown's outline allows: `the_silhouette_stays_within_the_budget_at_any_error_scale`)
+    let eye = Vec3::new(0.0, 5.0, 250.0);
     let triangles = |scale: f32| {
         let mesh = ClusterMesh::build(&crown(800), &ClusterOptions { card_error_scale: scale, ..card_options() });
         mesh.select(&view(eye, 1.0)).iter().map(|&c| mesh.clusters[c].triangle_count).sum::<u32>()
@@ -197,3 +198,43 @@ fn the_card_error_scale_moves_the_switch_nearer() {
     let (full, quarter) = (triangles(1.0), triangles(0.25));
     assert!(quarter < full, "{quarter} with a quarter of the error, {full} with all of it");
 }
+
+
+
+/// How far past the crown (its cone widened by `margin`) the area `cut` draws reaches, at most.
+fn reach_past_the_crown(mesh: &ClusterMesh, cut: &[usize], margin: f32) -> f32 {
+    let mut worst = 0.0f32;
+    for &c in cut {
+        for [a, b, d] in mesh.triangles(c) {
+            for v in [a, b, d] {
+                let q = Vec3::from_slice(&mesh.vertices[v as usize].position[..3]);
+                let radius = 3.0 * (1.0 - q.y / 10.0).max(0.0) + margin;
+                worst = worst.max(glam::Vec2::new(q.x, q.z).length() - radius).max(q.y - 10.0 - margin);
+            }
+        }
+    }
+    worst
+}
+
+#[test]
+fn the_silhouette_stays_within_the_budget_at_any_error_scale() {
+    // `card_error_scale` trades how thin a crown gets for triangles; how far grown cards reach
+    // past the cards they stand for (a spruce's spire rounded off) counts in full whatever it is
+    for ces in [1.0, 0.25, 0.1] {
+        let mesh = ClusterMesh::build(&crown(800), &ClusterOptions { card_error_scale: ces, ..card_options() });
+        for d in [30.0, 60.0, 120.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0] {
+            let v = view(Vec3::new(d, 5.0, 0.0), 1.0);
+            let cut = mesh.select(&v);
+            // (level 0's cards reach 0.45 m past the cone their centres fill)
+            let pixels = reach_past_the_crown(&mesh, &cut, 0.45) / (d - 3.0) * v.pixels_per_radian;
+            assert!(pixels <= 1.0, "card_error_scale {ces}, {d} m away: the crown reaches {pixels:.2} px past its own");
+        }
+    }
+    // and a small scale still thins crowns nearer than the default
+    let triangles = |ces: f32| {
+        let mesh = ClusterMesh::build(&crown(800), &ClusterOptions { card_error_scale: ces, ..card_options() });
+        mesh.select(&view(Vec3::new(250.0, 5.0, 0.0), 1.0)).iter().map(|&i| mesh.clusters[i].triangle_count).sum::<u32>()
+    };
+    assert!(triangles(0.25) < triangles(1.0), "at 250 m: {} triangles at 0.25, {} at 1", triangles(0.25), triangles(1.0));
+}
+
