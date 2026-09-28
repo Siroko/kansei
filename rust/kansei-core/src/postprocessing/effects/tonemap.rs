@@ -7,14 +7,24 @@ use crate::renderers::GBuffer;
 
 const WGSL: &str = include_str!("../../shaders/tonemap.wgsl");
 
-/// Lagarde & de Rousiers' calibration constant (Moving Frostbite to PBR, 2014), as UE uses:
-/// the luminance that saturates the sensor at EV100 0 is 1.2 cd/m².
-const SATURATION_LUMINANCE_AT_EV0: f32 = 1.2;
+/// The lens attenuation q of Unreal Engine 5 (`r.EyeAdaptation.LensAttenuation`), with which
+/// 1 cd/m² exposes to 1.0 at EV100 0: the ISO 12232 saturation constant 0.78 over q.
+pub const LENS_ATTENUATION_UE5: f32 = 0.78;
+/// Unreal Engine 4's (and Lagarde & de Rousiers', Moving Frostbite to PBR, 2014): 1 cd/m²
+/// exposes to 1/1.2 at EV100 0.
+pub const LENS_ATTENUATION_UE4: f32 = 0.65;
 
-/// The linear exposure for a manual EV100: `1 / (1.2 * 2^ev100)`. Physical light values (cd/m²)
-/// times this land in the tone curve's range; EV100 3.9 (dusk) gives 0.0558.
+/// The linear exposure for a manual EV100, as Unreal Engine 5 exposes: `1 / 2^ev100`. Physical
+/// light values (cd/m²) times this land in the tone curve's range; EV100 3.9 (dusk) gives 0.067.
 pub fn exposure_from_ev100(ev100: f32) -> f32 {
-    1.0 / (SATURATION_LUMINANCE_AT_EV0 * 2f32.powf(ev100))
+    exposure_from_ev100_lens(ev100, LENS_ATTENUATION_UE5)
+}
+
+/// The linear exposure for a manual EV100 through a lens of attenuation q: `q / 0.78 / 2^ev100`
+/// (Unreal's `LuminanceMaxFromLensAttenuation`). `LENS_ATTENUATION_UE4` gives the older
+/// `1 / (1.2 * 2^ev100)`.
+pub fn exposure_from_ev100_lens(ev100: f32, lens_attenuation: f32) -> f32 {
+    lens_attenuation.max(0.01) / 0.78 / 2f32.powf(ev100)
 }
 
 /// EV100 of a physical camera: `log2(N² / t * 100 / ISO)`, for an f-number, a shutter time in
@@ -36,6 +46,12 @@ pub enum ToneMapper {
     AgXPunchy,
     /// Khronos PBR Neutral: keeps base colours as authored up to 0.76, then a soft shoulder.
     KhronosNeutral,
+    /// Unreal Engine's filmic display transform, as its tonemapper LUT computes it for an sRGB
+    /// display (PostProcessCombineLUTs.usf, TonemapCommon.ush): Unreal's white balance, the
+    /// colour into AP1 with its gamut expansion, the grade as Unreal's ColorCorrectAll in AP1 (with
+    /// AP1 luma and its shadow, midtone and highlight weights), blue correction, `FilmToneMap`
+    /// with `ToneMapOptions::unreal_film`'s curve, and back to sRGB. For scenes matched to Unreal.
+    UnrealFilmic,
 }
 
 impl ToneMapper {
@@ -46,6 +62,7 @@ impl ToneMapper {
             ToneMapper::AgX => 2,
             ToneMapper::AgXPunchy => 3,
             ToneMapper::KhronosNeutral => 4,
+            ToneMapper::UnrealFilmic => 5,
         }
     }
 }
@@ -95,8 +112,32 @@ impl Default for ColorGrade {
     }
 }
 
+/// Unreal's filmic curve and what surrounds it (its post-process settings `FilmSlope`, `FilmToe`,
+/// `FilmShoulder`, `FilmBlackClip`, `FilmWhiteClip`, `BlueCorrection`, `ExpandGamut`), for
+/// `ToneMapper::UnrealFilmic`. The defaults are Unreal's.
+#[derive(Debug, Clone, Copy)]
+pub struct UnrealFilm {
+    pub slope: f32,
+    pub toe: f32,
+    pub shoulder: f32,
+    pub black_clip: f32,
+    pub white_clip: f32,
+    /// How much of the blue correction for bright blue lights (0..1).
+    pub blue_correction: f32,
+    /// How far bright saturated colours are pushed out of the sRGB gamut toward AP1 (0..1).
+    pub expand_gamut: f32,
+}
+
+impl Default for UnrealFilm {
+    fn default() -> Self {
+        Self { slope: 0.88, toe: 0.55, shoulder: 0.26, black_clip: 0.0, white_clip: 0.04, blue_correction: 0.6, expand_gamut: 1.0 }
+    }
+}
+
 pub struct ToneMapOptions {
     pub tonemapper: ToneMapper,
+    /// The curve of `ToneMapper::UnrealFilmic`.
+    pub unreal_film: UnrealFilm,
     /// Linear multiplier on scene light; see [`exposure_from_ev100`].
     pub exposure: f32,
     /// Stops on top of `exposure` (per-shot trims).
@@ -122,6 +163,7 @@ impl Default for ToneMapOptions {
     fn default() -> Self {
         Self {
             tonemapper: ToneMapper::AcesFitted,
+            unreal_film: UnrealFilm::default(),
             exposure: 1.0,
             exposure_compensation: 0.0,
             grade: ColorGrade::default(),
@@ -212,6 +254,75 @@ pub fn white_balance_matrix(kelvin: f32, tint: f32) -> glam::Mat3 {
     srgb_to_xyz.inverse() * bradford.inverse() * scale * bradford * srgb_to_xyz
 }
 
+// ── Unreal's white balance (TonemapCommon.ush) ──
+
+fn unreal_d_illuminant_xy(t: f64) -> glam::DVec2 {
+    let t = t * 1.4388 / 1.438;
+    let o = 1.0 / t;
+    let x = if t <= 7000.0 {
+        0.244063 + (0.09911e3 + (2.9678e6 - 4.6070e9 * o) * o) * o
+    } else {
+        0.237040 + (0.24748e3 + (1.9018e6 - 2.0064e9 * o) * o) * o
+    };
+    glam::DVec2::new(x, -3.0 * x * x + 2.87 * x - 0.275)
+}
+
+fn unreal_planckian_uv(t: f64) -> glam::DVec2 {
+    let u = (0.860117757 + 1.54118254e-4 * t + 1.28641212e-7 * t * t) / (1.0 + 8.42420235e-4 * t + 7.08145163e-7 * t * t);
+    let v = (0.317398726 + 4.22806245e-5 * t + 4.20481691e-8 * t * t) / (1.0 - 2.89741816e-5 * t + 1.61456053e-7 * t * t);
+    glam::DVec2::new(u, v)
+}
+
+fn unreal_uv_to_xy(uv: glam::DVec2) -> glam::DVec2 {
+    let d = 2.0 * uv.x - 8.0 * uv.y + 4.0;
+    glam::DVec2::new(3.0 * uv.x / d, 2.0 * uv.y / d)
+}
+
+/// The Planckian locus at `t`, moved `tint * 0.05` along its isotherm (Unreal's
+/// `PlanckianIsothermal`).
+fn unreal_planckian_isothermal_xy(t: f64, tint: f64) -> glam::DVec2 {
+    let uv = unreal_planckian_uv(t);
+    let ud = (-1.13758118e9 - 1.91615621e6 * t - 1.53177 * t * t) / (1.41213984e6 + 1189.62 * t + t * t).powi(2);
+    let vd = (1.97471536e9 - 705674.0 * t - 308.607 * t * t) / (6.19363586e6 - 179.456 * t + t * t).powi(2);
+    let n = glam::DVec2::new(ud, vd).normalize();
+    unreal_uv_to_xy(uv + glam::DVec2::new(n.y, -n.x) * (tint * 0.05))
+}
+
+/// Linear-sRGB matrix of Unreal's temperature white balance (`WhiteBalance`): the white of
+/// `kelvin` (a daylight illuminant from 4000 K, the Planckian locus below), moved along its
+/// isotherm by `tint`, adapted to D65 with the Bradford transform. Its tint runs the same way as
+/// `white_balance_matrix`'s (negative: the picture turns green), 0.05 in CIE 1960 uv per unit
+/// rather than 0.02.
+pub fn unreal_white_balance_matrix(kelvin: f32, tint: f32) -> glam::Mat3 {
+    let (t, tint) = (kelvin as f64, tint as f64);
+    let locus = unreal_uv_to_xy(unreal_planckian_uv(t));
+    let src = if t < 4000.0 { locus } else { unreal_d_illuminant_xy(t) } + (unreal_planckian_isothermal_xy(t, tint) - locus);
+    let xyz = |xy: glam::DVec2| glam::DVec3::new(xy.x / xy.y, 1.0, (1.0 - xy.x - xy.y) / xy.y);
+    let bradford = glam::DMat3::from_cols(
+        glam::DVec3::new(0.8951, -0.7502, 0.0389),
+        glam::DVec3::new(0.2664, 1.7135, -0.0685),
+        glam::DVec3::new(-0.1614, 0.0367, 1.0296),
+    );
+    let bradford_inv = glam::DMat3::from_cols(
+        glam::DVec3::new(0.9869929, 0.4323053, -0.0085287),
+        glam::DVec3::new(-0.1470543, 0.5183603, 0.0400428),
+        glam::DVec3::new(0.1599627, 0.0492912, 0.9684867),
+    );
+    let (s, d) = (bradford * xyz(src), bradford * xyz(glam::DVec2::new(0.31270, 0.32900)));
+    let cat = bradford_inv * glam::DMat3::from_diagonal(d / s) * bradford;
+    let srgb_to_xyz = glam::DMat3::from_cols(
+        glam::DVec3::new(0.4123907993, 0.2126390059, 0.0193308187),
+        glam::DVec3::new(0.3575843394, 0.7151686788, 0.1191947798),
+        glam::DVec3::new(0.1804807884, 0.0721923154, 0.9505321522),
+    );
+    let xyz_to_srgb = glam::DMat3::from_cols(
+        glam::DVec3::new(3.2409699419, -0.9692436363, 0.0556300797),
+        glam::DVec3::new(-1.5373831776, 1.8759675015, -0.2039769589),
+        glam::DVec3::new(-0.4986107603, 0.0415550574, 1.0569715142),
+    );
+    (xyz_to_srgb * cat * srgb_to_xyz).as_mat3()
+}
+
 // ── GPU layout (must match ToneMapParams in tonemap.wgsl) ──
 
 #[repr(C)]
@@ -238,6 +349,8 @@ struct ToneMapParamsGpu {
     tonemapper: u32,
     flags: u32,
     _pad: u32,
+    film: [f32; 4],
+    film2: [f32; 4],
 }
 
 const FLAG_ENCODE_SRGB: u32 = 1;
@@ -285,7 +398,12 @@ impl ToneMapEffect {
     fn params(&self, width: u32, height: u32) -> ToneMapParamsGpu {
         let o = &self.options;
         let g = &o.grade;
-        let wb = white_balance_matrix(g.white_temperature, g.white_tint);
+        let wb = if o.tonemapper == ToneMapper::UnrealFilmic {
+            unreal_white_balance_matrix(g.white_temperature, g.white_tint)
+        } else {
+            white_balance_matrix(g.white_temperature, g.white_tint)
+        };
+        let f = &o.unreal_film;
         let col = |v: glam::Vec3| [v.x, v.y, v.z, 0.0];
         let v3 = |v: Vec3| [v.x, v.y, v.z];
         ToneMapParamsGpu {
@@ -310,6 +428,8 @@ impl ToneMapEffect {
             tonemapper: o.tonemapper.gpu_id(),
             flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 },
             _pad: 0,
+            film: [f.slope, f.toe, f.shoulder, f.black_clip],
+            film2: [f.white_clip, f.blue_correction.clamp(0.0, 1.0), f.expand_gamut.max(0.0), 1.0],
         }
     }
 
@@ -450,9 +570,11 @@ mod tests {
 
     #[test]
     fn exposure_matches_ue_calibration() {
-        // UE manual exposure at EV100 3.9 (the Midsommar intro): 1 / (1.2 * 2^3.9)
-        assert!((exposure_from_ev100(3.9) - 0.05583).abs() < 1e-4);
-        assert!((exposure_from_ev100(0.0) - 1.0 / 1.2).abs() < 1e-6);
+        // UE 5's manual exposure at EV100 3.9 (the Midsommar intro): 1 / 2^3.9; 1 cd/m^2 is 1.0 at 0
+        assert!((exposure_from_ev100(3.9) - 0.066986).abs() < 1e-5);
+        assert!((exposure_from_ev100(0.0) - 1.0).abs() < 1e-6);
+        // UE 4's lens: 1 / (1.2 * 2^3.9)
+        assert!((exposure_from_ev100_lens(3.9, LENS_ATTENUATION_UE4) - 0.05583).abs() < 1e-4);
         // f/1.4, 1/60 s, ISO 100 is EV100 ~6.9
         assert!((ev100_from_camera(1.4, 1.0 / 60.0, 100.0) - 6.878).abs() < 0.001);
         // doubling ISO opens one stop
@@ -498,5 +620,139 @@ mod tests {
         fx.options.encode_srgb = true;
         fx.options.dither = false;
         assert_eq!(fx.params(640, 360).flags, FLAG_ENCODE_SRGB);
+    }
+
+    /// Unreal's white balance matrix, against a transcription of TonemapCommon.ush's
+    /// `WhiteBalance` (the midsommar-twilight-sky scout's ue_display.py).
+    #[test]
+    fn unreal_white_balance_matches_unreal_s() {
+        let cases: [(f32, f32, [[f32; 3]; 3]); 2] = [
+            (6500.0, -0.18, [[0.963995, -0.08145, -0.00001], [0.004105, 1.039241, 0.002786], [-0.001346, -0.008964, 0.918815]]),
+            (5000.0, 0.3, [[0.986126, 0.015607, -0.027377], [-0.001241, 0.968687, -0.015809], [0.015463, 0.064156, 1.692414]]),
+        ];
+        for (kelvin, tint, rows) in cases {
+            let m = unreal_white_balance_matrix(kelvin, tint);
+            for (i, row) in rows.iter().enumerate() {
+                for (j, want) in row.iter().enumerate() {
+                    let got = m.col(j)[i];
+                    assert!((got - want).abs() < 2e-5, "{kelvin} K, tint {tint}: [{i}][{j}] {got} vs {want}");
+                }
+            }
+        }
+        assert!((unreal_white_balance_matrix(6500.0, 0.0) - glam::Mat3::IDENTITY).abs_diff_eq(glam::Mat3::ZERO, 2e-3));
+        // a negative tint turns the picture green, as white_balance_matrix's does, more strongly
+        let (unreal, kansei) = (unreal_white_balance_matrix(6500.0, -0.18) * glam::Vec3::ONE, white_balance_matrix(6500.0, -0.18) * glam::Vec3::ONE);
+        assert!(unreal.y > unreal.x && unreal.y > unreal.z && kansei.y > kansei.x && kansei.y > kansei.z);
+        assert!(unreal.y - unreal.x > kansei.y - kansei.x, "{unreal} {kansei}");
+    }
+
+    /// `ToneMapper::UnrealFilmic` displays scene colours as Unreal's tonemapper LUT does, neutral
+    /// and with the Midsommar intro's grade, against a transcription of PostProcessCombineLUTs.usf
+    /// and TonemapCommon.ush (the midsommar-twilight-sky scout's ue_display.py).
+    #[test]
+    fn unreal_filmic_matches_unreal_s_lut() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let inputs: [[f32; 3]; 10] = [
+            [0.005; 3], [0.02; 3], [0.1; 3], [0.18; 3], [1.0; 3], [4.0; 3],
+            [0.0, 0.0, 0.3], [0.3, 0.05, 0.02], [0.05, 0.2, 0.08], [2.0, 1.0, 0.3],
+        ];
+        let neutral: [[f32; 3]; 10] = [
+            [0.000511, 0.000511, 0.000511], [0.005355, 0.005355, 0.005355], [0.075913, 0.075912, 0.075913], [0.180001, 0.179999, 0.18],
+            [0.723365, 0.723357, 0.723359], [0.944162, 0.944152, 0.944155], [0.0, 0.0, 0.300718], [0.267275, 0.027444, 0.008443],
+            [0.02144, 0.200903, 0.060531], [0.915832, 0.742783, 0.408637],
+        ];
+        let intro: [[f32; 3]; 10] = [
+            [0.000141, 0.000384, 0.000325], [0.001811, 0.004662, 0.003921], [0.044192, 0.076682, 0.062223], [0.117805, 0.190485, 0.158558],
+            [0.680856, 0.75487, 0.736746], [0.937129, 0.961538, 0.955643], [0.0, 0.0, 0.208206], [0.169866, 0.040124, 0.015121],
+            [0.013544, 0.198433, 0.065892], [0.777586, 0.783623, 0.719583],
+        ];
+        // the intro's grade (create_intro_scene.py): Unreal's vec4s as their rgb times their w
+        let intro_grade = ColorGrade {
+            white_temperature: 6500.0,
+            white_tint: -0.18,
+            contrast: 1.06,
+            saturation: Vec3::new(0.9 * 0.78, 0.95 * 0.78, 0.78),
+            gain: Vec3::new(0.88, 1.0, 0.98),
+            shadow_gain: Vec3::new(0.9, 1.0, 1.04),
+            shadow_saturation: Vec3::new(1.0, 1.0, 1.0),
+            highlight_gain: Vec3::new(0.97, 1.0, 1.0),
+            highlight_saturation: Vec3::new(0.4, 0.4, 0.4),
+            shadows_max: 0.09,
+            highlights_min: 0.5,
+        };
+        let (w, h) = (inputs.len() as u32, 1u32);
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let texels: Vec<f32> = inputs.iter().flat_map(|c| [c[0], c[1], c[2], 1.0]).collect();
+        // the effect's input is filterable: half floats
+        let half_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let halves: Vec<u16> = texels.iter().map(|&v| f32_to_f16(v)).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &half_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&halves),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let input = half_tex.create_view(&Default::default());
+        let output_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        let output = output_tex.create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let camera = Camera::new(60.0, 0.1, 100.0, 1.0);
+        for (name, grade, want) in [("neutral", ColorGrade::default(), neutral), ("intro", intro_grade, intro)] {
+            let mut fx = ToneMapEffect::new(ToneMapOptions {
+                tonemapper: ToneMapper::UnrealFilmic,
+                grade,
+                encode_srgb: false,
+                dither: false,
+                ..Default::default()
+            });
+            let mut e = device.create_command_encoder(&Default::default());
+            fx.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &output_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let data = buf.slice(..).get_mapped_range();
+            let px: Vec<u16> = bytemuck::cast_slice(&data[..(w * 8) as usize]).to_vec();
+            for (i, (input, want)) in inputs.iter().zip(want).enumerate() {
+                let got = [f16_to_f32(px[i * 4]), f16_to_f32(px[i * 4 + 1]), f16_to_f32(px[i * 4 + 2])];
+                for c in 0..3 {
+                    // the half-float input and output, and the display's 8-bit-ish tolerance
+                    assert!((got[c] - want[c]).abs() < 2e-3 + 0.01 * want[c], "{name} {input:?}: {got:?} vs Unreal {want:?}");
+                }
+            }
+        }
+    }
+
+    fn f32_to_f16(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        let mant = bits & 0x7f_ffff;
+        if exp <= 0 {
+            if exp < -10 { return sign; }
+            let m = (mant | 0x80_0000) >> (1 - exp);
+            return sign | ((m + 0x1000) >> 13) as u16;
+        }
+        if exp >= 31 { return sign | 0x7c00; }
+        sign | ((exp as u16) << 10) | (((mant + 0x1000) >> 13) as u16)
+    }
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let frac = (h & 0x3ff) as f32;
+        sign * match exp {
+            0 => frac * 2f32.powi(-24),
+            31 => f32::INFINITY,
+            _ => (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+        }
     }
 }

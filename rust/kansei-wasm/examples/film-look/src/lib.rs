@@ -2,7 +2,7 @@
 //! fog, physically based bloom, then ToneMapEffect (EV100 exposure, filmic curve, scene-linear
 //! grade, vignette, grain, chromatic aberration, sRGB encoding and dither).
 //!
-//! URL parameters: `tm=aces|agx|punchy|neutral|none` (curve), `ev=<EV100>` (exposure),
+//! URL parameters: `tm=aces|agx|punchy|neutral|unreal|none` (curve), `ev=<EV100>` (exposure),
 //! `film=0` (no vignette/grain/CA), `bloom=0`, `t=<seconds>` (freeze the camera).
 
 use wasm_bindgen::prelude::*;
@@ -183,6 +183,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         Some("agx") => ToneMapper::AgX,
         Some("punchy") => ToneMapper::AgXPunchy,
         Some("neutral") => ToneMapper::KhronosNeutral,
+        Some("unreal") => ToneMapper::UnrealFilmic,
         Some("none") => ToneMapper::None,
         _ => ToneMapper::AcesFitted,
     };
