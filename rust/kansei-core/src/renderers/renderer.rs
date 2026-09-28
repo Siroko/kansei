@@ -61,13 +61,50 @@ impl Default for RendererConfig {
 }
 
 /// A pass's cached render bundles: the visible static renderables (`is_bundled`), opaque then
-/// transparent, so the dynamic ones can be drawn live between them. `None` where there was
-/// nothing to record.
+/// transparent, so the dynamic ones can be drawn live between them; with occlusion culling, also
+/// the second phase of the opaque ones culled in two phases (`DrawSet::Late`). `None` where there
+/// was nothing to record.
 struct SceneBundles {
     opaque: Option<wgpu::RenderBundle>,
     transparent: Option<wgpu::RenderBundle>,
-    /// The renderables recorded (`bundle_key`); the bundles are re-recorded when it changes.
-    key: Vec<usize>,
+    late: Option<wgpu::RenderBundle>,
+    /// The renderables recorded (`bundle_key`), and those culled in two phases; the bundles are
+    /// re-recorded when either changes.
+    key: (Vec<usize>, Vec<usize>),
+}
+
+/// Which of a pass's scene renderables a bundle, or the live draws of the dynamic ones, draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawSet {
+    /// The opaque renderables: with occlusion culling, the first phase, whose depth the pyramid is
+    /// built from.
+    Opaque,
+    /// The transparent renderables (both phases' instances); they do not occlude.
+    Transparent,
+    /// Occlusion's second phase: the instances it found visible of the opaque renderables culled
+    /// in two phases.
+    Late,
+}
+
+impl DrawSet {
+    fn includes(self, r: &crate::objects::Renderable) -> bool {
+        match self {
+            DrawSet::Opaque => !r.is_transparent(),
+            DrawSet::Transparent => r.is_transparent(),
+            DrawSet::Late => !r.is_transparent() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase()),
+        }
+    }
+
+    /// Draw `r` for the camera: its culled instances (the first phase's with occlusion), and
+    /// for the transparent and late sets the second phase's.
+    fn draw<'a>(self, enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable) {
+        if self != DrawSet::Late {
+            draw_geometry(enc, r, MAIN_VIEW);
+        }
+        if self != DrawSet::Opaque {
+            draw_late_geometry(enc, r);
+        }
+    }
 }
 
 /// The main GPU renderer.
@@ -128,6 +165,11 @@ pub struct Renderer {
     clustered_lights: bool,
     // GPU instance culling (renderables with `instance_culling`)
     cull_pipeline: Option<crate::culling::CullPipeline>,
+    // occlusion culling of the camera's instances; the renderables it culls in two phases this
+    // frame (scene indices); and the culling statistics
+    occlusion: crate::culling::Occlusion,
+    two_phase: Vec<usize>,
+    cull_stats: crate::culling::StatsReadback,
     // Planar reflections, drawn after the shadow maps and before the main pass
     planar_reflections: Vec<crate::reflections::PlanarReflection>,
     // Render bundle caching (the static renderables; dynamic ones are drawn live)
@@ -188,6 +230,9 @@ impl Renderer {
             light_clusters: None,
             clustered_lights: true,
             cull_pipeline: None,
+            occlusion: crate::culling::Occlusion::new(),
+            two_phase: Vec::new(),
+            cull_stats: crate::culling::StatsReadback::new(),
             planar_reflections: Vec::new(),
             render_bundle: None,
             gbuffer_bundle: None,
@@ -763,7 +808,8 @@ impl Renderer {
         self.gbuffer_bundle = None;
     }
 
-    /// Record the scene's static renderables for a pass into its opaque and transparent bundles.
+    /// Record the scene's static renderables for a pass into its opaque and transparent bundles,
+    /// and the second occlusion phase's when `key.1` (the two-phase renderables) is not empty.
     fn build_scene_bundles(
         &self,
         scene: &Scene,
@@ -771,14 +817,15 @@ impl Renderer {
         color_formats: &[wgpu::TextureFormat],
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
-        key: Vec<usize>,
+        key: (Vec<usize>, Vec<usize>),
     ) -> SceneBundles {
-        let bundle = |transparent| self.build_render_bundle(scene, camera, color_formats, depth_format, sample_count, transparent);
-        SceneBundles { opaque: bundle(false), transparent: bundle(true), key }
+        let bundle = |set| self.build_render_bundle(scene, camera, color_formats, depth_format, sample_count, set);
+        let late = if key.1.is_empty() { None } else { bundle(DrawSet::Late) };
+        SceneBundles { opaque: bundle(DrawSet::Opaque), transparent: bundle(DrawSet::Transparent), late, key }
     }
 
-    /// Pre-record the draws of the visible static renderables (`is_bundled`), the opaque or the
-    /// transparent ones, into a reusable `RenderBundle`; `None` when none of them is drawn.
+    /// Pre-record the draws of the visible static renderables (`is_bundled`) of `set` into a
+    /// reusable `RenderBundle`; `None` when none of them is drawn.
     fn build_render_bundle(
         &self,
         scene: &Scene,
@@ -786,7 +833,7 @@ impl Renderer {
         color_formats: &[wgpu::TextureFormat],
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
-        transparent: bool,
+        set: DrawSet,
     ) -> Option<wgpu::RenderBundle> {
         let device = self.device.as_ref().unwrap();
         let alignment = self.matrix_alignment;
@@ -824,7 +871,7 @@ impl Renderer {
                 Some(r) => r,
                 None => continue,
             };
-            if !r.visible || !r.geometry.initialized || !is_bundled(r) || r.is_transparent() != transparent {
+            if !r.visible || !r.geometry.initialized || !is_bundled(r) || !set.includes(r) {
                 continue;
             }
 
@@ -863,15 +910,15 @@ impl Renderer {
             encoder.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
             // Vertex/index buffers and the draw (the camera's culled instances, if culled)
-            draw_geometry(&mut encoder, r, MAIN_VIEW);
+            set.draw(&mut encoder, r);
             draws += 1;
         }
 
         (draws > 0).then(|| encoder.finish(&Default::default()))
     }
 
-    /// Draw the visible dynamic renderables (`Renderable::dynamic`), the opaque or the
-    /// transparent ones, directly in a live render pass, after the bundle of the same kind.
+    /// Draw the visible dynamic renderables (`Renderable::dynamic`) of `set` directly in a live
+    /// render pass, after the bundle of the same set.
     /// They are never recorded into a bundle, so each frame's draw reads the matrices uploaded
     /// for that frame.
     #[allow(clippy::too_many_arguments)]
@@ -883,14 +930,14 @@ impl Renderer {
         color_formats: &[wgpu::TextureFormat],
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
-        transparent: bool,
+        set: DrawSet,
     ) {
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
         // executing a bundle clears the pass's state: bind the shared groups again
         let mut shared_bound = false;
         for scene_idx in scene.ordered_indices() {
             let Some(r) = scene.get_renderable(scene_idx) else { continue };
-            if !r.visible || !r.dynamic || !r.geometry.initialized || r.geometry.is_indirect() || r.is_transparent() != transparent {
+            if !r.visible || !r.dynamic || !r.geometry.initialized || r.geometry.is_indirect() || !set.includes(r) {
                 continue;
             }
             let key = crate::materials::PipelineKey {
@@ -913,12 +960,12 @@ impl Renderer {
             }
             let offset = mesh_offset(scene_idx, self.matrix_alignment);
             pass.set_bind_group(2, mesh_bg, &[offset, offset]);
-            draw_geometry(pass, r, MAIN_VIEW);
+            set.draw(pass, r);
         }
     }
 
-    /// Draw a pass's scene renderables (all but the indirect ones): its cached bundles with the
-    /// dynamic renderables drawn live after each, opaque then transparent.
+    /// Draw `sets` of a pass's scene renderables (all but the indirect ones): for each, its cached
+    /// bundle and then its dynamic renderables, drawn live.
     #[allow(clippy::too_many_arguments)]
     fn draw_scene_renderables<'a>(
         &'a self,
@@ -929,12 +976,18 @@ impl Renderer {
         color_formats: &[wgpu::TextureFormat],
         depth_format: wgpu::TextureFormat,
         sample_count: u32,
+        sets: &[DrawSet],
     ) {
-        for (bundle, transparent) in [(&bundles.opaque, false), (&bundles.transparent, true)] {
+        for &set in sets {
+            let bundle = match set {
+                DrawSet::Opaque => &bundles.opaque,
+                DrawSet::Transparent => &bundles.transparent,
+                DrawSet::Late => &bundles.late,
+            };
             if let Some(bundle) = bundle {
                 pass.execute_bundles(std::iter::once(bundle));
             }
-            self.draw_dynamic_renderables(pass, scene, camera, color_formats, depth_format, sample_count, transparent);
+            self.draw_dynamic_renderables(pass, scene, camera, color_formats, depth_format, sample_count, set);
         }
     }
 
@@ -1419,6 +1472,7 @@ impl Renderer {
             let offset = mesh_offset(scene_idx, self.matrix_alignment);
             pass.set_bind_group(2, mesh_bg, &[offset, offset]);
             draw_geometry(&mut pass, r, MAIN_VIEW);
+            draw_late_geometry(&mut pass, r);
         }
     }
 
@@ -1500,9 +1554,28 @@ impl Renderer {
         views
     }
 
+    /// What each cull view is, in `cull_views` order (for the stats).
+    fn cull_view_kinds(&self) -> Vec<crate::culling::CullViewKind> {
+        use crate::culling::CullViewKind;
+        let mut kinds = vec![CullViewKind::Camera];
+        if let Some(atlas) = &self.spot_shadow_atlas {
+            kinds.extend((0..atlas.layers).map(CullViewKind::SpotShadow));
+        }
+        kinds.extend((0..self.planar_reflections.len() as u32).map(CullViewKind::Reflection));
+        if let Some(csm) = &self.cascaded_shadows {
+            kinds.extend((0..csm.slots.len() as u32).map(CullViewKind::Cascade));
+        }
+        kinds
+    }
+
     /// Cull every renderable with `instance_culling` for every view (after the frame's uploads,
-    /// before its shadow and main passes).
-    fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera) {
+    /// before its shadow and main passes). With `depth_size` (the GBuffer's, when the frame can
+    /// build a depth pyramid), renderables with `occlusion` get the camera's first phase here and
+    /// their second in `run_late_culling`.
+    fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera, depth_size: Option<(u32, u32)>) {
+        let kinds = self.cull_view_kinds();
+        self.cull_stats.begin_frame(self.device.as_ref().unwrap(), kinds);
+        self.two_phase.clear();
         let culled: Vec<usize> = scene
             .ordered_indices()
             .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.instance_culling.is_some() && r.geometry.initialized))
@@ -1510,28 +1583,75 @@ impl Renderer {
         if culled.is_empty() {
             return;
         }
-        let views = self.cull_views(camera);
+        let mut views = self.cull_views(camera);
+        // the camera's view, or the frozen one
+        let main = self.occlusion.main_view(camera);
+        views[MAIN_VIEW] = Some(main.cull);
+        let occlusion = depth_size.filter(|_| self.occlusion.enabled).map(|size| main.occlusion(size));
+        let reset = self.occlusion.take_reset(camera.previous_view_projection().is_none());
+        let stats = self.cull_stats.enabled;
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let pipeline = self.cull_pipeline.get_or_insert_with(|| crate::culling::CullPipeline::new(device));
-        let lod_origin = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        // the frame's views, in one write (the camera's with what occlusion projects with)
+        let gpu_views: Vec<_> = views
+            .iter()
+            .enumerate()
+            .map(|(slot, view)| match view {
+                Some(view) => view.gpu(main.lod_origin, occlusion.as_ref().filter(|_| slot == MAIN_VIEW), stats),
+                None => bytemuck::Zeroable::zeroed(),
+            })
+            .collect();
+        pipeline.set_views(device, queue, &gpu_views);
         let mut stale_bundles = false;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
+        for &idx in &culled {
+            let r = scene.get_renderable_mut(idx).unwrap();
+            let (visible, world, index_count) = (r.visible, r.world_matrix.to_glam(), r.geometry.index_count());
+            let culling = r.instance_culling.as_mut().unwrap();
+            stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
+            let two_phase = occlusion.is_some() && culling.occlusion && visible;
+            if two_phase {
+                stale_bundles |= culling.ensure_occlusion(device, pipeline);
+            }
+            culling.set_two_phase(two_phase);
+            if culling.two_phase() {
+                if reset {
+                    culling.reset_visibility(&mut encoder);
+                }
+                self.two_phase.push(idx);
+            }
+            culling.begin_frame(queue, &mut encoder, world, index_count);
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), ..Default::default() });
             pass.set_pipeline(&pipeline.pipeline);
-            for idx in culled {
-                let r = scene.get_renderable_mut(idx).unwrap();
-                let (world, index_count, casts) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow);
-                let culling = r.instance_culling.as_mut().unwrap();
-                stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
+            for &idx in &culled {
+                let r = scene.get_renderable(idx).unwrap();
+                let culling = r.instance_culling.as_ref().unwrap();
                 for (slot, view) in views.iter().enumerate() {
                     let Some(view) = view else { continue };
-                    if view.casters_only && !casts {
+                    if view.casters_only && !r.cast_shadow || slot == MAIN_VIEW && culling.two_phase() {
                         continue;
                     }
-                    let params = culling.params(view, world, lod_origin);
-                    culling.dispatch(queue, &mut pass, slot, &params, index_count);
+                    pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(slot)]);
+                    culling.dispatch(&mut pass, slot);
+                    let draw = culling.view(slot).unwrap();
+                    self.cull_stats.record(slot, culling.tested(), draw.args, draw.offset);
+                }
+            }
+            // occlusion's first phase
+            if !self.two_phase.is_empty() {
+                pass.set_pipeline(&pipeline.early);
+                pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(MAIN_VIEW)]);
+                for &idx in &self.two_phase {
+                    let culling = scene.get_renderable(idx).unwrap().instance_culling.as_ref().unwrap();
+                    culling.dispatch_early(&mut pass);
+                    // (tested once, by the first phase)
+                    for (draw, tested) in [(culling.view(MAIN_VIEW), culling.tested()), (culling.late(), 0)] {
+                        let draw = draw.unwrap();
+                        self.cull_stats.record(MAIN_VIEW, tested, draw.args, draw.offset);
+                    }
                 }
             }
         }
@@ -1539,6 +1659,91 @@ impl Renderer {
         if stale_bundles {
             self.invalidate_bundle();
         }
+    }
+
+    /// Occlusion's second phase, once the first phase's opaque depth is in `gbuffer`: build the
+    /// depth pyramid from it and cull the two-phase renderables against it (not while frozen,
+    /// when the second phase draws nothing).
+    fn run_late_culling(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene, gbuffer: &GBuffer) {
+        if self.two_phase.is_empty() || self.occlusion.frozen() {
+            return;
+        }
+        let device = self.device.as_ref().unwrap();
+        let pipeline = self.cull_pipeline.as_ref().unwrap();
+        let (pyramid, pyramid_bind_group) = self.occlusion.pyramid_for(device, (gbuffer.width, gbuffer.height), pipeline);
+        pyramid.build(device, encoder, &gbuffer.depth_view);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/OcclusionCulling"), ..Default::default() });
+        pass.set_pipeline(&pipeline.late);
+        pass.set_bind_group(1, pipeline.view_bind_group(), &[pipeline.view_offset(MAIN_VIEW)]);
+        pass.set_bind_group(2, pyramid_bind_group, &[]);
+        for &idx in &self.two_phase {
+            if let Some(culling) = scene.get_renderable(idx).and_then(|r| r.instance_culling.as_ref()) {
+                culling.dispatch_late(&mut pass);
+            }
+        }
+    }
+
+    /// Occlusion culling for renderables whose `InstanceCulling` has `occlusion` (on by default;
+    /// those renderables opt in). It applies to the camera in `render_with_postprocessing` with a
+    /// single-sampled GBuffer; `render` and the other views (shadow maps, reflections) cull by
+    /// frustum and LOD only.
+    ///
+    /// Each frame runs in two phases. The first draws, with the rest of the opaque scene, the
+    /// instances in view that the camera saw last frame; a depth pyramid is built from that depth;
+    /// the second tests every instance in view against it and draws the visible ones the first
+    /// left out (disoccluded, or new in view) in a second GBuffer pass, followed by the
+    /// transparent renderables (which do not occlude). Everything visible is drawn the frame it
+    /// appears, whatever the camera does; the history only decides which phase draws it. The
+    /// occluders are everything opaque drawn in the first phase: renderables without culling
+    /// (terrain, large meshes), frustum-culled instances, and the instances seen last frame.
+    ///
+    /// It pays where much instanced geometry is hidden and costly to draw. The second phase
+    /// costs a pyramid build, a second cull and a second GBuffer pass that loads and stores every
+    /// target: about 1 ms at 1440 x 810 on an Apple GPU, whose tile-based rendering already
+    /// drops hidden pixels cheaply. Measure a scene before enabling it (`set_culling_stats`, and
+    /// the occlusion-culling example's `bench=1`).
+    pub fn set_occlusion_culling(&mut self, enabled: bool) {
+        if enabled != self.occlusion.enabled {
+            self.occlusion.request_reset();
+        }
+        self.occlusion.enabled = enabled;
+    }
+
+    pub fn occlusion_culling(&self) -> bool {
+        self.occlusion.enabled
+    }
+
+    /// Forget which instances the camera saw (the renderer does on a camera cut, when the camera's
+    /// `reset_motion` was called): the next frame's first phase draws none of them, and the second
+    /// tests them all against the depth of the rest of the scene.
+    pub fn reset_occlusion_history(&mut self) {
+        self.occlusion.request_reset();
+    }
+
+    /// Debugging: freeze the camera's culling where it is. Until unfrozen, the camera's view draws
+    /// the instances it drew when frozen (culled by that frustum, LOD origin and, with occlusion,
+    /// that visibility), wherever the camera moves: fly round to see what is culled.
+    pub fn set_freeze_culling(&mut self, frozen: bool) {
+        self.occlusion.freeze = frozen;
+    }
+
+    /// Count what instance culling does per view (a few atomics per workgroup of 64 instances), for
+    /// `culling_stats`.
+    pub fn set_culling_stats(&mut self, enabled: bool) {
+        self.cull_stats.enabled = enabled;
+    }
+
+    /// The latest culling statistics read back from the GPU, once `set_culling_stats(true)`. The
+    /// readback is asynchronous: a few frames old, and under heavy GPU load up to seconds (check
+    /// `CullingStats::frame`).
+    pub fn culling_stats(&self) -> Option<&crate::culling::CullingStats> {
+        self.cull_stats.latest()
+    }
+
+    /// The depth pyramid occlusion culling built this frame, from the depth of its first phase
+    /// (GBuffer size, `DepthReduction::Max`), once built.
+    pub fn depth_pyramid(&self) -> Option<&crate::culling::DepthPyramid> {
+        self.occlusion.pyramid()
     }
 
     /// Run the cubemap shadow pass for point lights.
@@ -1754,7 +1959,8 @@ impl Renderer {
         // GPU instance culling for every view (camera, spot shadows, reflections, cascades)
         self.update_planar_reflection_cameras(camera);
         self.update_cascaded_shadows(scene, camera);
-        self.run_instance_culling(scene, camera);
+        self.run_instance_culling(scene, camera, None);
+        self.cull_stats.end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera.frame());
 
         // Shadow pass
         if self.shadows_enabled && self.cascaded_shadows.is_none() {
@@ -1870,7 +2076,7 @@ impl Renderer {
         let format = self.presentation_format;
         let sample_count = self.config.sample_count;
         let depth_format = wgpu::TextureFormat::Depth24Plus;
-        let key = bundle_key(scene);
+        let key = (bundle_key(scene), Vec::new());
         if self.render_bundle.as_ref().is_none_or(|b| b.key != key) {
             self.render_bundle = Some(self.build_scene_bundles(
                 scene,
@@ -1936,7 +2142,7 @@ impl Renderer {
             // Static renderables from the bundles, dynamic ones drawn live
             self.draw_scene_renderables(
                 &mut pass, self.render_bundle.as_ref().unwrap(), scene, camera,
-                &[format], depth_format, sample_count,
+                &[format], depth_format, sample_count, &[DrawSet::Opaque, DrawSet::Transparent],
             );
 
             // Draw GPU-driven indirect renderables in the same pass
@@ -2060,7 +2266,9 @@ impl Renderer {
         // GPU instance culling for every view (camera, spot shadows, reflections, cascades)
         self.update_planar_reflection_cameras(camera);
         self.update_cascaded_shadows(scene, camera);
-        self.run_instance_culling(scene, camera);
+        // occlusion needs the GBuffer's single-sampled depth
+        let depth_size = (gbuffer.sample_count == 1).then_some((gbuffer.width, gbuffer.height));
+        self.run_instance_culling(scene, camera, depth_size);
 
         // Shadow pass (if enabled)
         if self.shadows_enabled && self.cascaded_shadows.is_none() {
@@ -2161,8 +2369,8 @@ impl Renderer {
             }
         }
 
-        // Build GBuffer render bundle if needed
-        let key = bundle_key(scene);
+        // Build GBuffer render bundle if needed (with the second occlusion phase's)
+        let key = (bundle_key(scene), self.two_phase.clone());
         if self.gbuffer_bundle.as_ref().is_none_or(|b| b.key != key)
             || self.gbuffer_last_sample_count != gbuffer.sample_count
         {
@@ -2223,10 +2431,39 @@ impl Renderer {
                 }),
                 ..Default::default()
             });
-            // Static renderables from the bundles, dynamic ones drawn live
+            // Static renderables from the bundles, dynamic ones drawn live; with occlusion culling,
+            // only the opaque ones (the first phase)
+            let sets: &[DrawSet] = if self.two_phase.is_empty() { &[DrawSet::Opaque, DrawSet::Transparent] } else { &[DrawSet::Opaque] };
             self.draw_scene_renderables(
                 &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
-                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count,
+                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, sets,
+            );
+        }
+
+        // Occlusion's second phase: cull against the pyramid of the first phase's depth, then draw
+        // what it found visible, and the transparent renderables
+        if !self.two_phase.is_empty() {
+            self.run_late_culling(&mut encoder, scene, gbuffer);
+            let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
+            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: load });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderer/GBufferLatePass"),
+                color_attachments: &[
+                    attachment(&gbuffer.color_view),
+                    attachment(&gbuffer.emissive_view),
+                    attachment(&gbuffer.normal_view),
+                    attachment(&gbuffer.albedo_view),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &gbuffer.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            self.draw_scene_renderables(
+                &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
+                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, &[DrawSet::Late, DrawSet::Transparent],
             );
         }
 
@@ -2237,8 +2474,10 @@ impl Renderer {
             wgpu::Extent3d { width: gbuffer.width, height: gbuffer.height, depth_or_array_layers: 1 },
         );
 
-        // Pass 2: Indirect/refractive objects (Load existing MRT + depth)
-        {
+        // Pass 2: Indirect/refractive objects (Load existing MRT + depth), when there are any (an
+        // empty pass would still load and store every target)
+        let indirect = scene.ordered_indices().filter_map(|i| scene.get_renderable(i)).any(|r| r.visible && r.geometry.initialized && r.geometry.is_indirect());
+        if indirect {
             let load = wgpu::LoadOp::Load;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/GBufferIndirectPass"),
@@ -2278,6 +2517,7 @@ impl Renderer {
         self.draw_velocity(&mut encoder, scene, camera, gbuffer);
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
+        self.cull_stats.end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera.frame());
     }
 
     /// Render scene into a GBuffer for post-processing.
@@ -2535,11 +2775,21 @@ fn bundle_key(scene: &Scene) -> Vec<usize> {
 /// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
 /// compacted instances (indirect) when it has `InstanceCulling`, otherwise its geometry as is.
 fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
-    let culled = r.instance_culling.as_ref().and_then(|c| c.view(view));
+    bind_and_draw(enc, r, r.instance_culling.as_ref().and_then(|c| c.view(view)));
+}
+
+/// Draw the second phase of a renderable culled in two phases this frame (nothing otherwise).
+fn draw_late_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable) {
+    if let Some(late) = r.instance_culling.as_ref().and_then(|c| c.late()) {
+        bind_and_draw(enc, r, Some(late));
+    }
+}
+
+fn bind_and_draw<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, culled: Option<crate::culling::CulledDraw<'a>>) {
     enc.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
     for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
         let buffer = match culled {
-            Some((instances, _)) if i == 0 => Some(instances),
+            Some(draw) if i == 0 => Some(draw.instances),
             _ => cb.gpu_buffer(),
         };
         if let Some(buffer) = buffer {
@@ -2547,8 +2797,8 @@ fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
         }
     }
     enc.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
-    if let Some((_, args)) = culled {
-        enc.draw_indexed_indirect(args, 0);
+    if let Some(draw) = culled {
+        enc.draw_indexed_indirect(draw.args, draw.offset);
     } else if r.geometry.is_indirect() {
         enc.draw_indexed_indirect(r.geometry.active_indirect_buffer().unwrap(), 0);
     } else {
