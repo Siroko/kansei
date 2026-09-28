@@ -20,6 +20,11 @@ pub struct Renderable {
     /// Bitmask of the layers this renderable is on (bit 0 by default). Secondary views such
     /// as planar reflections draw only renderables whose layers intersect their mask.
     pub layers: u32,
+    /// Its transform changes every frame, so it is drawn directly in the pass each frame rather
+    /// than recorded into the cached render bundle (false by default). Mark anything the app
+    /// moves while it is on screen: the bundle is re-recorded only when the set of renderables
+    /// it holds changes.
+    pub dynamic: bool,
     /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
     pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
@@ -40,6 +45,7 @@ impl Renderable {
             material_dirty: true,
             instance_culling: None,
             layers: Self::DEFAULT_LAYERS,
+            dynamic: false,
             previous_world_matrix: std::cell::Cell::new(None),
         }
     }
