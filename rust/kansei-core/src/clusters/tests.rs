@@ -102,3 +102,69 @@ fn tiny_and_empty_meshes() {
     assert_eq!(one.clusters.len(), 1);
     assert_eq!(one.triangles(0).collect::<Vec<_>>(), vec![[0, 1, 2]]);
 }
+
+#[test]
+fn levels_shrink_to_a_root_and_errors_and_bounds_nest() {
+    let mesh = ClusterMesh::build(&rock(5, false), &ClusterOptions::default());
+    let levels = mesh.clusters.iter().map(|c| c.level).max().unwrap();
+    let per_level: Vec<u32> = (0..=levels).map(|l| mesh.clusters.iter().filter(|c| c.level == l).map(|c| c.triangle_count).sum()).collect();
+    assert!(levels >= 4, "{per_level:?}");
+    assert!(per_level.windows(2).all(|w| w[1] < w[0]), "{per_level:?}");
+    let root_triangles: u32 = mesh.clusters.iter().filter(|c| c.parent_error.is_infinite()).map(|c| c.triangle_count).sum();
+    assert!(root_triangles <= 4 * 124, "{root_triangles} root triangles");
+    for c in &mesh.clusters {
+        assert!(c.parent_error >= c.error);
+        assert!(c.parent_bounds.contains(&c.lod_bounds));
+    }
+}
+
+#[test]
+fn open_and_disjoint_meshes_terminate() {
+    // a field of disjoint quads (cards): nothing to collapse, and the build still ends
+    let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+    for i in 0..2000u32 {
+        let (x, z) = ((i % 50) as f32, (i / 50) as f32);
+        let base = vertices.len() as u32;
+        for (dx, dy) in [(0.0, 0.0), (0.8, 0.0), (0.8, 0.8), (0.0, 0.8)] {
+            vertices.push(Vertex { position: [x + dx, dy, z, 1.0], normal: [0.0, 0.0, 1.0], uv: [dx, dy] });
+        }
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    let cards = ClusterMesh::build(&Geometry::new("cards", vertices, indices), &ClusterOptions::default());
+    assert!(!cards.clusters.is_empty());
+    // an open grid reduces: its outline isn't locked
+    let n = 120u32;
+    let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+    for z in 0..=n {
+        for x in 0..=n {
+            let (fx, fz) = (x as f32 / n as f32, z as f32 / n as f32);
+            vertices.push(Vertex { position: [fx, 0.05 * (fx * 9.0).sin() * (fz * 7.0).cos(), fz, 1.0], normal: [0.0, 1.0, 0.0], uv: [fx, fz] });
+        }
+    }
+    for z in 0..n {
+        for x in 0..n {
+            let i = z * (n + 1) + x;
+            indices.extend([i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+        }
+    }
+    let grid = ClusterMesh::build(&Geometry::new("grid", vertices, indices), &ClusterOptions::default());
+    assert!(grid.clusters.iter().any(|c| c.level >= 3));
+}
+
+#[test]
+fn flat_shaded_meshes_keep_one_level() {
+    // every triangle its own vertices with its face normal: every edge is a seam, and the
+    // attribute-preserving simplifier moves none of them
+    let smooth = rock(3, false);
+    let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+    for t in smooth.indices.chunks(3) {
+        let p: Vec<Vec3> = t.iter().map(|&i| Vec3::from_slice(&smooth.vertices[i as usize].position[..3])).collect();
+        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize();
+        for q in p {
+            indices.push(vertices.len() as u32);
+            vertices.push(Vertex { position: [q.x, q.y, q.z, 1.0], normal: n.to_array(), uv: [0.0, 0.0] });
+        }
+    }
+    let mesh = ClusterMesh::build(&Geometry::new("flat", vertices, indices), &ClusterOptions::default());
+    assert!(mesh.clusters.iter().all(|c| c.level == 0 && c.parent_error.is_infinite()));
+}
