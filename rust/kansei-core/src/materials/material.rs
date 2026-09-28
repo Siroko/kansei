@@ -102,6 +102,11 @@ pub struct Material {
     pub(crate) depth_pipeline_cache: HashMap<DepthPipelineKey, wgpu::RenderPipeline>,
     /// Velocity-pass pipelines by vertex-buffer count.
     pub(crate) velocity_pipeline_cache: HashMap<usize, wgpu::RenderPipeline>,
+    /// Cluster pipelines (`get_cluster_pipeline`), keyed with no vertex buffers.
+    pub(crate) cluster_pipeline_cache: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    /// The cluster stage's module for the instance layout it was made for, or why there is none.
+    cluster_module: Option<(Option<(u64, Vec<wgpu::VertexAttribute>)>, Result<wgpu::ShaderModule, String>)>,
+    cluster_pipeline_layout: Option<wgpu::PipelineLayout>,
     bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
 }
@@ -122,6 +127,9 @@ impl Material {
             pipeline_cache: HashMap::new(),
             depth_pipeline_cache: HashMap::new(),
             velocity_pipeline_cache: HashMap::new(),
+            cluster_pipeline_cache: HashMap::new(),
+            cluster_module: None,
+            cluster_pipeline_layout: None,
             bind_group: None,
             initialized: false,
         }
@@ -133,11 +141,7 @@ impl Material {
             return;
         }
 
-        let processed_code = if let Some(ref chunks) = self.shader_chunks {
-            crate::materials::parse_includes(&self.shader_code, chunks)
-        } else {
-            self.shader_code.clone()
-        };
+        let processed_code = self.processed_code();
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("{}/Shader", self.label)),
@@ -194,82 +198,153 @@ impl Material {
         };
 
         if !self.pipeline_cache.contains_key(&key) {
-            // Number of fragment shader outputs: @location(0) always,
-            // @location(1) only if the shader outputs emissive.
-            let shader_output_count = self.options.mrt_output_count.unwrap_or_else(||
-                if self.options.outputs_emissive { 2 } else { 1 });
-
-            let targets: Vec<Option<wgpu::ColorTargetState>> = color_formats.iter().enumerate().map(|(i, fmt)| {
-                let mut state = wgpu::ColorTargetState {
-                    format: *fmt,
-                    blend: None,
-                    // Targets beyond what the shader outputs must have empty write mask,
-                    // otherwise WebGPU validation fails ("no corresponding fragment stage output").
-                    write_mask: if i < shader_output_count {
-                        wgpu::ColorWrites::ALL
-                    } else {
-                        wgpu::ColorWrites::empty()
-                    },
-                };
-                if i == 0 && self.options.transparent {
-                    state.blend = Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            operation: wgpu::BlendOperation::Add,
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            operation: wgpu::BlendOperation::Add,
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        },
-                    });
-                }
-                Some(state)
-            }).collect();
-
-            let depth_write = self.options.depth_write.unwrap_or(!self.options.transparent);
-            let cull_mode = if self.options.transparent { None } else { self.options.cull_mode.to_wgpu() };
-
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(&format!("{}/Pipeline", self.label)),
-                layout: self.pipeline_layout.as_ref(),
-                vertex: wgpu::VertexState {
-                    module: self.shader_module.as_ref().unwrap(),
-                    entry_point: Some("vertex_main"),
-                    buffers: vertex_layouts,
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: self.shader_module.as_ref().unwrap(),
-                    entry_point: Some("fragment_main"),
-                    targets: &targets,
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: self.options.topology,
-                    cull_mode,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: depth_format,
-                    depth_write_enabled: depth_write,
-                    depth_compare: self.options.depth_compare,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    ..Default::default()
-                },
-                multiview: None,
-                cache: None,
-            });
-
+            let pipeline = self.create_pipeline(device, self.pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap(), "vertex_main", vertex_layouts, color_formats, depth_format, sample_count, "Pipeline");
             self.pipeline_cache.insert(key.clone(), pipeline);
         }
 
         self.pipeline_cache.get(&key).unwrap()
+    }
+
+    /// A render pipeline of this material: `vertex_entry` of `module` over `vertex_layouts`, its
+    /// `fragment_main`, into the given targets.
+    #[allow(clippy::too_many_arguments)]
+    fn create_pipeline(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        module: &wgpu::ShaderModule,
+        vertex_entry: &str,
+        vertex_layouts: &[wgpu::VertexBufferLayout],
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+        label: &str,
+    ) -> wgpu::RenderPipeline {
+        // Number of fragment shader outputs: @location(0) always,
+        // @location(1) only if the shader outputs emissive.
+        let shader_output_count = self.options.mrt_output_count.unwrap_or_else(||
+            if self.options.outputs_emissive { 2 } else { 1 });
+
+        let targets: Vec<Option<wgpu::ColorTargetState>> = color_formats.iter().enumerate().map(|(i, fmt)| {
+            let mut state = wgpu::ColorTargetState {
+                format: *fmt,
+                blend: None,
+                // Targets beyond what the shader outputs must have empty write mask,
+                // otherwise WebGPU validation fails ("no corresponding fragment stage output").
+                write_mask: if i < shader_output_count {
+                    wgpu::ColorWrites::ALL
+                } else {
+                    wgpu::ColorWrites::empty()
+                },
+            };
+            if i == 0 && self.options.transparent {
+                state.blend = Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        operation: wgpu::BlendOperation::Add,
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        operation: wgpu::BlendOperation::Add,
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    },
+                });
+            }
+            Some(state)
+        }).collect();
+
+        let depth_write = self.options.depth_write.unwrap_or(!self.options.transparent);
+        let cull_mode = if self.options.transparent { None } else { self.options.cull_mode.to_wgpu() };
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("{}/{label}", self.label)),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some(vertex_entry),
+                buffers: vertex_layouts,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some("fragment_main"),
+                targets: &targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: self.options.topology,
+                cull_mode,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: depth_write,
+                depth_compare: self.options.depth_compare,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            multiview: None,
+            cache: None,
+        })
+    }
+
+    /// Get or create the pipeline that draws this material over a cluster draw (the camera's cut
+    /// of `Renderable::clusters`): its WGSL with the generated vertex stage for `instances`'
+    /// records. The Err says why the stage can't be generated; the renderable then keeps the
+    /// ordinary path.
+    pub(crate) fn get_cluster_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        shared: &SharedLayouts,
+        instances: Option<&crate::buffers::InstanceBufferLayout>,
+        color_formats: &[wgpu::TextureFormat],
+        depth_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> Result<&wgpu::RenderPipeline, String> {
+        assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        let layout_key = instances.map(|l| (l.stride, l.attributes.clone()));
+        if self.cluster_module.as_ref().is_none_or(|(k, _)| *k != layout_key) {
+            let module = crate::clusters::cluster_vertex_stage(&self.processed_code(), instances).map(|code| {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&format!("{}/ClusterShader", self.label)), source: wgpu::ShaderSource::Wgsl(code.into()) })
+            });
+            self.cluster_module = Some((layout_key, module));
+            self.cluster_pipeline_cache.clear();
+        }
+        let module = self.cluster_module.as_ref().unwrap().1.clone()?;
+        let layout = self
+            .cluster_pipeline_layout
+            .get_or_insert_with(|| {
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(&format!("{}/ClusterPipelineLayout", self.label)),
+                    bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.cluster_mesh_bgl, &shared.shadow_bgl],
+                    push_constant_ranges: &[],
+                })
+            })
+            .clone();
+        let key = PipelineKey { color_formats: color_formats.to_vec(), depth_format, sample_count, num_vertex_buffers: 0 };
+        if !self.cluster_pipeline_cache.contains_key(&key) {
+            let pipeline = self.create_pipeline(device, &layout, &module, crate::clusters::CLUSTER_VERTEX_ENTRY, &[], color_formats, depth_format, sample_count, "ClusterPipeline");
+            self.cluster_pipeline_cache.insert(key.clone(), pipeline);
+        }
+        Ok(&self.cluster_pipeline_cache[&key])
+    }
+
+    /// The cluster pipeline made for a pass with `key` (whatever its vertex buffers), if any.
+    pub(crate) fn cluster_pipeline(&self, key: &PipelineKey) -> Option<&wgpu::RenderPipeline> {
+        self.cluster_pipeline_cache.get(&PipelineKey { num_vertex_buffers: 0, ..key.clone() })
+    }
+
+    /// The WGSL with its includes resolved.
+    fn processed_code(&self) -> String {
+        match &self.shader_chunks {
+            Some(chunks) => crate::materials::parse_includes(&self.shader_code, chunks),
+            None => self.shader_code.clone(),
+        }
     }
 
     /// Get or create the depth-only pipeline shadow passes draw this material with: its own

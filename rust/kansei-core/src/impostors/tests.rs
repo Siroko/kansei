@@ -1,4 +1,5 @@
 use super::*;
+use super::tests_support::read_texels;
 
 fn validate(name: &str, code: &str) -> naga::Module {
     let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
@@ -131,23 +132,6 @@ fn baked_sphere(renderer: &mut crate::renderers::Renderer, frames: u32, frame_si
     material.set_uniform_bindable(0, "Tint", &[[0.2f32, 0.4, 0.6, 1.0]]);
     let sphere = scene.add(crate::objects::SceneNode::Renderable(crate::objects::Renderable::new(crate::geometries::SphereGeometry::new(1.0, 64, 32), material)));
     renderer.bake_impostor(&mut scene, &[sphere], &ImpostorOptions { frames, frame_size, supersample: 2, ..Default::default() })
-}
-
-fn read_texels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<[u8; 4]> {
-    let (w, h) = (texture.width(), texture.height());
-    let row = (w * 4).div_ceil(256) * 256;
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-    );
-    queue.submit(Some(encoder.finish()));
-    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
-    (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| bytes[(y * row + x * 4) as usize..][..4].try_into().unwrap()).collect()
 }
 
 /// Every frame of a sphere's impostor sees a disc: covered inside, empty in the corners, the
