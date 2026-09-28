@@ -46,6 +46,8 @@ mod build;
 /// How `ClusterMesh::build` splits and simplifies.
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterOptions {
+    /// Vertices a cluster may reference (at most 256: its triangles' indices are bytes). 128
+    /// lets clusters fill up to `max_triangles` (a cluster is drawn as `max_triangles`).
     pub max_vertices: usize,
     pub max_triangles: usize,
     /// Clusters per group simplified together (about).
@@ -63,7 +65,7 @@ pub struct ClusterOptions {
 
 impl Default for ClusterOptions {
     fn default() -> Self {
-        Self { max_vertices: 64, max_triangles: 124, group_size: 8, simplify_ratio: 0.5, stall_ratio: 0.85, cone_weight: 0.25, normal_weight: 0.5, uv_weight: 0.1 }
+        Self { max_vertices: 128, max_triangles: 124, group_size: 8, simplify_ratio: 0.5, stall_ratio: 0.85, cone_weight: 0.25, normal_weight: 0.5, uv_weight: 0.1 }
     }
 }
 
@@ -78,7 +80,10 @@ pub struct Cluster {
     pub triangle_count: u32,
     /// Of its triangles, for culling.
     pub bounds: Sphere,
-    /// Its triangles' normal cone (backface culling): axis, and cos of the half-angle (1 = none).
+    /// Its triangles' normal cone, for backface culling (`backfacing`), as meshoptimizer gives
+    /// it: the apex, the axis, and the sine of the cone's half-angle (its cutoff widened by 90°).
+    /// A cone too wide to cull (over ~168°) has a zero axis and a cutoff of 1, and culls nothing.
+    pub cone_apex: Vec3,
     pub cone_axis: Vec3,
     pub cone_cutoff: f32,
     /// The error of the simplification that made it (0 at level 0), measured from `lod_bounds`.
@@ -89,6 +94,14 @@ pub struct Cluster {
     pub parent_error: f32,
     pub parent_bounds: Sphere,
     pub level: u32,
+}
+
+impl Cluster {
+    /// Whether every one of its triangles faces away from `eye` (the mesh's own space), so a
+    /// view there can skip it: `dot(normalize(cone_apex - eye), cone_axis) >= cone_cutoff`.
+    pub fn backfacing(&self, eye: Vec3) -> bool {
+        (self.cone_apex - eye).normalize_or_zero().dot(self.cone_axis) >= self.cone_cutoff
+    }
 }
 
 /// A mesh as a graph of clusters over its own vertices.

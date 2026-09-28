@@ -82,7 +82,8 @@ fn level_zero_is_the_mesh_in_clusters() {
     assert_eq!(triangles, rock.indices.len() / 3);
     for &i in &level0 {
         let c = &mesh.clusters[i];
-        assert!(c.triangle_count <= 124 && c.vertex_count <= 64);
+        let options = ClusterOptions::default();
+        assert!(c.triangle_count <= options.max_triangles as u32 && c.vertex_count <= options.max_vertices as u32);
         assert_eq!(c.error, 0.0);
         for t in mesh.triangles(i) {
             for v in t {
@@ -169,20 +170,55 @@ fn flat_shaded_meshes_keep_one_level() {
     assert!(mesh.clusters.iter().all(|c| c.level == 0 && c.parent_error.is_infinite()));
 }
 
-fn key(v: &Vertex) -> [u32; 3] {
-    [v.position[0].to_bits(), v.position[1].to_bits(), v.position[2].to_bits()]
+/// One id per point of `mesh.vertices`: positions within `tolerance` of each other share one (a
+/// seam's copies that differ by rounding or by the sign of zero are one point to a viewer).
+fn position_keys(mesh: &ClusterMesh, tolerance: f32) -> Vec<u32> {
+    let mut cells: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+    let mut points: Vec<Vec3> = Vec::new();
+    mesh.vertices
+        .iter()
+        .map(|v| {
+            let p = Vec3::from_slice(&v.position[..3]);
+            let c = (p / tolerance).floor();
+            let c = [c.x as i64, c.y as i64, c.z as i64];
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(near) = cells.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) {
+                            if let Some(&k) = near.iter().find(|&&k| points[k as usize].distance(p) <= tolerance) {
+                                return k;
+                            }
+                        }
+                    }
+                }
+            }
+            points.push(p);
+            let k = points.len() as u32 - 1;
+            cells.entry(c).or_default().push(k);
+            k
+        })
+        .collect()
 }
 
-/// Edges (by position) of `clusters`' triangles that betray a hole or an overlap: used an odd
-/// number of times (a hole's rim), or shared by other than exactly two clusters once each (an
-/// overlap). A fold the simplifier left inside one cluster (an edge used 4 times, all in that
-/// cluster) is neither.
+/// Edges of `clusters`' triangles that betray a hole or an overlap: used an odd number of times
+/// (a hole's rim), or shared by other than exactly two clusters once each (an overlap). Points
+/// are compared within 1e-5 (`position_keys`), and triangles with two corners at one point
+/// (zero area, as a UV sphere has at its poles) cover nothing and are skipped. A fold the
+/// simplifier left inside one cluster (an edge used 4 times, all in that cluster) is neither.
 fn bad_edges(mesh: &ClusterMesh, clusters: &[usize]) -> usize {
-    let mut uses: HashMap<([u32; 3], [u32; 3]), Vec<usize>> = HashMap::new();
+    bad_edges_keyed(mesh, &position_keys(mesh, 1e-5), clusters)
+}
+
+/// `bad_edges` with the mesh's `position_keys` at hand.
+fn bad_edges_keyed(mesh: &ClusterMesh, keys: &[u32], clusters: &[usize]) -> usize {
+    let mut uses: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for &c in clusters {
         for t in mesh.triangles(c) {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                let (a, b) = (key(&mesh.vertices[a as usize]), key(&mesh.vertices[b as usize]));
+            let k = t.map(|v| keys[v as usize]);
+            if k[0] == k[1] || k[1] == k[2] || k[2] == k[0] {
+                continue;
+            }
+            for (a, b) in [(k[0], k[1]), (k[1], k[2]), (k[2], k[0])] {
                 uses.entry((a.min(b), a.max(b))).or_default().push(c);
             }
         }
@@ -193,6 +229,47 @@ fn bad_edges(mesh: &ClusterMesh, clusters: &[usize]) -> usize {
             u.len() % 2 == 1 || (crossing && u.len() != 2)
         })
         .count()
+}
+
+/// The total area of `clusters`' triangles.
+fn area(mesh: &ClusterMesh, clusters: &[usize]) -> f32 {
+    let p = |v: u32| Vec3::from_slice(&mesh.vertices[v as usize].position[..3]);
+    clusters.iter().flat_map(|&c| mesh.triangles(c)).map(|t| (p(t[1]) - p(t[0])).cross(p(t[2]) - p(t[0])).length() * 0.5).sum()
+}
+
+/// A seeded sequence in [0, 1).
+fn random(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+    (*seed >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// `count` eyes round the origin, in random directions, from `near` to `far` (log-uniform).
+fn eyes(count: usize, near: f32, far: f32, seed: &mut u32) -> Vec<Vec3> {
+    (0..count)
+        .map(|_| {
+            let (z, a) = (random(seed) * 2.0 - 1.0, random(seed) * std::f32::consts::TAU);
+            let r = (1.0 - z * z).sqrt();
+            Vec3::new(r * a.cos(), z, r * a.sin()) * near * (far / near).powf(random(seed))
+        })
+        .collect()
+}
+
+/// Asserts every cut of `mesh` seen from `eyes` at `budgets` is non-empty, covers about the
+/// mesh's area, and has no hole or overlap.
+fn assert_cuts_closed(name: &str, mesh: &ClusterMesh, eyes: &[Vec3], budgets: &[f32]) {
+    let level0: Vec<usize> = (0..mesh.clusters.len()).filter(|&i| mesh.clusters[i].level == 0).collect();
+    let whole = area(mesh, &level0);
+    let keys = position_keys(mesh, 1e-5);
+    for &eye in eyes {
+        for &threshold in budgets {
+            let cut = mesh.select(&view(eye, threshold));
+            assert!(!cut.is_empty(), "{name}: eye {eye}, budget {threshold}: an empty cut");
+            let covered = area(mesh, &cut) / whole;
+            assert!((0.8..1.2).contains(&covered), "{name}: eye {eye}, budget {threshold}: the cut covers {covered} of the mesh");
+            let bad = bad_edges_keyed(mesh, &keys, &cut);
+            assert_eq!(bad, 0, "{name}: eye {eye}, budget {threshold}: {bad} edges open or overlapping in a cut of {} clusters", cut.len());
+        }
+    }
 }
 
 fn view(eye: Vec3, threshold: f32) -> LodView {
@@ -206,14 +283,16 @@ fn every_cut_is_closed() {
         let mut cuts = Vec::new();
         for eye in [Vec3::new(0.0, 0.0, 3.0), Vec3::new(2.0, 1.0, 1.5), Vec3::new(0.0, 0.0, 40.0), Vec3::new(-300.0, 20.0, 0.0)] {
             for threshold in [0.0, 0.5, 1.0, 4.0, 1e9] {
+                assert_cuts_closed(&format!("seam {seam}"), &mesh, &[eye], &[threshold]);
                 let cut = mesh.select(&view(eye, threshold));
-                let bad = bad_edges(&mesh, &cut);
-                assert_eq!(bad, 0, "seam {seam}, eye {eye}, budget {threshold}: {bad} edges open or overlapping in a cut of {} clusters", cut.len());
                 cuts.push(cut.iter().map(|&i| mesh.clusters[i].triangle_count).sum::<u32>());
             }
         }
         // at a pixel's budget, the cut from 300 m is far coarser than the one from 3 m
-        assert!(cuts[17] * 20 < cuts[2], "seam {seam}: {cuts:?}");
+        assert!(cuts[17] > 0 && cuts[17] * 20 < cuts[2], "seam {seam}: {cuts:?}");
+        // and from anywhere, 1.3 m to 1.1 km
+        let mut seed = 7;
+        assert_cuts_closed(&format!("seam {seam}"), &mesh, &eyes(30, 1.3, 1100.0, &mut seed), &[0.5, 2.0]);
     }
 }
 
@@ -250,5 +329,104 @@ fn build_time() {
     let rock = rock(7, false);
     let start = std::time::Instant::now();
     let mesh = ClusterMesh::build(&rock, &ClusterOptions::default());
-    println!("{} triangles -> {} clusters in {:?}", rock.indices.len() / 3, mesh.clusters.len(), start.elapsed());
+    let elapsed = start.elapsed();
+    let fill = mesh.clusters.iter().map(|c| c.triangle_count as f32).sum::<f32>() / (mesh.clusters.len() * ClusterOptions::default().max_triangles) as f32;
+    println!("{} triangles -> {} clusters ({fill:.2} full) in {elapsed:?}", rock.indices.len() / 3, mesh.clusters.len());
 }
+
+/// The rock cut into `islands` uv islands by longitude: each island's triangles get their own
+/// vertices (uvs a unit over per island), as a textured asset's are.
+fn rock_islands(subdivisions: u32, islands: u32) -> Geometry {
+    let rock = rock(subdivisions, false);
+    let mut copies: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for t in rock.indices.chunks(3) {
+        let centroid: Vec3 = t.iter().map(|&i| Vec3::from_slice(&rock.vertices[i as usize].position[..3])).sum();
+        let longitude = centroid.z.atan2(centroid.x) + std::f32::consts::PI;
+        let island = ((longitude / std::f32::consts::TAU * islands as f32) as u32).min(islands - 1);
+        for &i in t {
+            let v = *copies.entry((i, island)).or_insert_with(|| {
+                let mut v = rock.vertices[i as usize];
+                v.uv[0] += island as f32;
+                vertices.push(v);
+                vertices.len() as u32 - 1
+            });
+            indices.push(v);
+        }
+    }
+    Geometry::new("rock islands", vertices, indices)
+}
+
+#[test]
+fn seams_that_differ_by_rounding_or_the_sign_of_zero_stay_closed() {
+    let mut seed = 11;
+    let eyes = [vec![Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 40.0, 0.0)], eyes(10, 1.5, 500.0, &mut seed)].concat();
+    // the engine's UV sphere: its last column repeats the first, off by rounding (sin(TAU)), and
+    // its poles' copies differ in the sign of zero
+    let sphere = ClusterMesh::build(&crate::geometries::SphereGeometry::new(1.0, 128, 64), &ClusterOptions::default());
+    assert!(sphere.clusters.iter().filter(|c| c.parent_error.is_infinite()).map(|c| c.triangle_count).sum::<u32>() <= 4 * 124);
+    assert_cuts_closed("sphere", &sphere, &eyes, &[0.5, 1.0, 1e9]);
+    // the seamed rock, its seam copies' zeros written as -0.0
+    let mut rock = rock(5, true);
+    let copies = rock.vertices.len() / 2;
+    for v in rock.vertices.iter_mut().skip(copies) {
+        for x in v.position.iter_mut().take(3) {
+            if *x == 0.0 {
+                *x = -0.0;
+            }
+        }
+    }
+    let rock = ClusterMesh::build(&rock, &ClusterOptions::default());
+    assert_cuts_closed("rock with -0.0", &rock, &eyes, &[0.5, 1.0, 1e9]);
+}
+
+#[test]
+fn uv_islands_reduce_like_one_piece() {
+    // the grouping finds neighbours across seams: a rock in 16 uv islands is cut from 40 m about
+    // as coarsely as in one piece. In 64 islands the seams themselves limit it (the simplifier
+    // keeps each seam a polyline): about 1,200 root triangles, against 3,100 grouped by vertex
+    let triangles = |mesh: &ClusterMesh, cut: &[usize]| cut.iter().map(|&i| mesh.clusters[i].triangle_count).sum::<u32>();
+    let far = view(Vec3::new(0.0, 0.0, 40.0), 1.0);
+    let whole = ClusterMesh::build(&rock_islands(5, 1), &ClusterOptions::default());
+    let islands = ClusterMesh::build(&rock_islands(5, 16), &ClusterOptions::default());
+    let (one, sixteen) = (triangles(&whole, &whole.select(&far)), triangles(&islands, &islands.select(&far)));
+    assert!(sixteen <= 2 * one, "from 40 m: {sixteen} triangles in 16 islands, {one} in one piece");
+    let many = ClusterMesh::build(&rock_islands(5, 64), &ClusterOptions::default());
+    let root: u32 = many.clusters.iter().filter(|c| c.parent_error.is_infinite()).map(|c| c.triangle_count).sum();
+    assert!(root <= 1600, "{root} root triangles in 64 islands");
+    let mut seed = 3;
+    assert_cuts_closed("islands", &islands, &eyes(8, 1.5, 500.0, &mut seed), &[1.0]);
+}
+
+#[test]
+fn the_cone_test_never_culls_a_cluster_facing_the_eye() {
+    let mesh = ClusterMesh::build(&rock(5, false), &ClusterOptions::default());
+    let p = |v: u32| Vec3::from_slice(&mesh.vertices[v as usize].position[..3]);
+    let mut seed = 5;
+    let mut culled = 0;
+    for eye in eyes(40, 1.2, 200.0, &mut seed) {
+        for (i, c) in mesh.clusters.iter().enumerate() {
+            if !c.backfacing(eye) {
+                continue;
+            }
+            culled += 1;
+            for t in mesh.triangles(i) {
+                let (a, b, d) = (p(t[0]), p(t[1]), p(t[2]));
+                let n = (b - a).cross(d - a);
+                assert!(n.dot(eye - a) <= 1e-5 * n.length() * (eye - a).length(), "cluster {i} culled from {eye} with a triangle facing it");
+            }
+        }
+    }
+    assert!(culled > 0, "nothing culled");
+}
+
+#[test]
+fn clusters_are_well_filled() {
+    // vertex pulling draws each cluster as max_triangles: what's short of it is wasted work
+    let options = ClusterOptions::default();
+    let mesh = ClusterMesh::build(&rock(5, false), &options);
+    let fill = mesh.clusters.iter().map(|c| c.triangle_count as f32).sum::<f32>() / (mesh.clusters.len() * options.max_triangles) as f32;
+    assert!(fill >= 0.9, "clusters {fill:.2} full");
+}
+
