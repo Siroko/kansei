@@ -1963,6 +1963,7 @@ impl Renderer {
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let culling = self.cluster_culling.get_or_insert_with(|| crate::clusters::ClusterCulling::new(device));
+        culling.begin_frame(device);
         culling.set_views(queue, &lods.iter().map(|v| v.unwrap_or_else(bytemuck::Zeroable::zeroed)).collect::<Vec<_>>());
         let layout = &self.shared_layouts.as_ref().unwrap().cluster_mesh_bgl;
         let matrices = (self.normal_matrices_buf.as_ref().unwrap(), self.world_matrices_buf.as_ref().unwrap());
@@ -2000,6 +2001,8 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/ClusterCulling") });
         culling.encode(&mut encoder, &gpus);
         queue.submit(Some(encoder.finish()));
+        // what each cut claimed, to size its draw list to (a few frames later)
+        culling.read_back(device, queue, &gpus);
         for (gpu, slot) in &gpus {
             self.cull_stats.record_clusters(*slot as usize, gpu.cut(*slot).unwrap().args());
         }

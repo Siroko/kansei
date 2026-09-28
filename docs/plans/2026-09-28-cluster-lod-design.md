@@ -95,7 +95,15 @@ Instances need a transform the cull shader can read, to move cluster spheres and
 **As built (M3).** Every view that draws the scene:
 - **Views.** The camera and its velocity pass, the spot shadow layers, rendered planar reflections, the cascades and the sky occlusion's top-down view.
 - **One cull pass for all of them.** `ClusterCulling` holds an array of up to 64 views, written once a frame. Each per-view write would otherwise leave every cut with the last view, since `queue.write_buffer` lands before the frame's work.
-- **A cut per view.** Each renderable keeps a *cut* for every view it is drawn in (by `CullView::draws`: casters in shadow views, the layer mask). A cut is its own parameters (with the view's index), draw list, indirect draw and dispatch. A view that doesn't draw a renderable gets no cut and no buffers. Each view's draw list is `ClusterLod::capacity` long, so memory grows with the views.
+- **A cut per view.** Each renderable keeps a *cut* for every view it is drawn in (by `CullView::draws`: casters in shadow views, the layer mask). A cut is its own parameters (with the view's index), draw list, indirect draw and dispatch. A view that doesn't draw a renderable gets no cut and no buffers.
+- **Draw lists sized by need.** The cull counts every cluster a cut claims, drawn or not, and reads the counts back asynchronously, at most one copy in flight.
+  - A list starts at 65,536 entries (512 KB).
+  - It grows at once to half again the need, rounded to a power of two.
+  - It shrinks to that only after 64 readbacks in a row at a quarter of its length or less.
+  - `ClusterLod::capacity` stays the hard maximum.
+  - The cost is a jump past the list's headroom (at load, or a shot needing more than half again its recent largest need): clusters past the list go undrawn until the readback lands, 2–3 frames later.
+
+  For the film this replaces worst-case lists (instances × clusters, ~13 MB per view) with what each view draws.
 - **Orthographic views.** The cascades and the sky's view see an error at their pixels per metre, whatever the distance (`LodView::orthographic`), and skip the backface cone, since they have no eye. Pixels per radian and pixels per metre both come from the view's projection: height / 2 × |P₁₁|.
 - **Per-view budgets.** Each view's budget is the error threshold times its scale:
   - `Renderer::set_shadow_cluster_error_scale` (spot shadows and cascades);

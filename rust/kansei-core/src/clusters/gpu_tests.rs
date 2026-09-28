@@ -1383,3 +1383,116 @@ fn a_level_reflection_keeps_the_budget_near_the_water() {
     assert!(covered > 200, "the reflection shows {covered} texels of rock");
     assert!(differing * 20 < covered, "at a 1-pixel budget {differing} of {covered} texels differ clearly from the mesh's");
 }
+
+/// A field of `side`² rocks 1.5 m apart, centred 37 m ahead, as placement records.
+fn rock_field(side: u32) -> Vec<[f32; 12]> {
+    (0..side * side)
+        .map(|i| {
+            let (x, z) = ((i % side) as f32 - side as f32 / 2.0, (i / side) as f32 - side as f32 / 2.0);
+            placement_record(glam::Vec3::new(x * 1.5, 0.0, z * 1.5 - 37.0), 0.5, i as f32, glam::Quat::IDENTITY)
+        })
+        .collect()
+}
+
+/// A frame of the cull with feedback: collect what earlier frames read back, bind (sizing the
+/// draw list), cull, and read this frame's counts back. The drawn and claimed counts, and the
+/// list's capacity.
+fn cull_frame(device: &wgpu::Device, queue: &wgpu::Queue, culling: &mut ClusterCulling, gpu: &mut ClusterGpu, source: InstanceSource, params: ClusterCullGpu, view: &TestView) -> (u32, u32, u32) {
+    culling.begin_frame(device);
+    gpu.bind(device, queue, culling, 0, source, params);
+    culling.set_views(queue, &[view.gpu()]);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    culling.encode(&mut encoder, &[(&*gpu, 0)]);
+    queue.submit(Some(encoder.finish()));
+    culling.read_back(device, queue, &[(&*gpu, 0)]);
+    // (the frame's readback lands before the next: in a renderer, a few frames later)
+    device.poll(wgpu::Maintain::Wait);
+    let args = read_words(device, queue, gpu.args(0));
+    (args[1], args[5], gpu.capacity(0))
+}
+
+#[test]
+fn draw_lists_grow_and_shrink_to_what_the_cut_needs() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = rock_field(50);
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let mut culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let every = records.len() as u32 * mesh.clusters.len() as u32;
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, every, gpu.vertex_count(), false, 1.0);
+    // every level-0 cluster of the field: more than the list starts with
+    let near = TestView::looking(glam::Vec3::new(0.0, 60.0, 40.0), glam::Vec3::new(0.0, 0.0, -37.0), 0.0);
+    let (drawn, claimed, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, source, params, &near);
+    assert!(claimed > capacity && drawn == capacity && capacity < every, "the first frame: {drawn} drawn of {claimed} claimed, {capacity} long (every: {every})");
+    let mut frames = 1;
+    let (mut drawn, mut claimed, mut capacity) = (drawn, claimed, capacity);
+    while drawn < claimed {
+        (drawn, claimed, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, source, params, &near);
+        frames += 1;
+        assert!(frames <= 8, "still {drawn} drawn of {claimed} after {frames} frames");
+    }
+    assert!(capacity <= (claimed + claimed / 2).next_power_of_two(), "grown to {capacity} for {claimed}");
+    let grown = capacity;
+    // far away and coarse: a cluster or so a rock; the list keeps its size a while, then shrinks
+    let far = TestView::looking(glam::Vec3::new(0.0, 400.0, 400.0), glam::Vec3::new(0.0, 0.0, -37.0), 8.0);
+    for frame in 0..80 {
+        let (drawn, claimed, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, source, params, &far);
+        assert_eq!(drawn, claimed, "frame {frame} after moving away: {drawn} drawn of {claimed}");
+        if frame < 32 {
+            assert_eq!(capacity, grown, "shrunk after only {frame} frames");
+        }
+    }
+    let (_, claimed, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, source, params, &far);
+    assert!(capacity < grown / 4 && capacity >= claimed, "far away the list is {capacity} long for {claimed} (it was {grown})");
+}
+
+#[test]
+fn an_explicit_capacity_is_a_hard_maximum() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = rock_field(10);
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let mut culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &source, 5, gpu.vertex_count(), false, 1.0);
+    let view = TestView::looking(glam::Vec3::new(0.0, 20.0, 10.0), glam::Vec3::new(0.0, 0.0, -37.0), 0.0);
+    for _ in 0..6 {
+        let (drawn, claimed, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, source, params, &view);
+        assert!(capacity == 5 && drawn == 5 && claimed > 5, "{drawn} drawn of {claimed}, {capacity} long");
+    }
+}
+
+#[test]
+fn fewer_instances_cap_the_draw_but_keep_the_list() {
+    // a renderable whose instance count falls (so may everything it can draw) keeps its list:
+    // remaking it every time the count moves would thrash the bind groups and the bundles
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&rock(4, false), &ClusterOptions::default());
+    let records = rock_field(20);
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let mut culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let view = TestView::looking(glam::Vec3::new(0.0, 60.0, 40.0), glam::Vec3::new(0.0, 0.0, -37.0), 0.0);
+    let all = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &all, records.len() as u32 * mesh.clusters.len() as u32, gpu.vertex_count(), false, 1.0);
+    let (_, _, capacity) = cull_frame(&device, &queue, &mut culling, &mut gpu, all, params, &view);
+    let few = InstanceSource::All { records: &record_buffer, count: 2 };
+    let max = 2 * mesh.clusters.len() as u32;
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(PLACEMENT), 48, &few, max, gpu.vertex_count(), false, 1.0);
+    culling.begin_frame(&device);
+    assert!(!gpu.bind(&device, &queue, &culling, 0, few, params), "the list was remade for fewer instances");
+    let (drawn, _, after) = cull_frame(&device, &queue, &mut culling, &mut gpu, few, params, &view);
+    assert!(after == capacity && drawn <= max, "{drawn} drawn (at most {max}), the list {after} long (was {capacity})");
+}
