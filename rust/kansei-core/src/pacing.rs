@@ -7,7 +7,9 @@
 //! (every other one on a 120 Hz display is a steady 60 fps), k the fewest that keep up:
 //! - it renders on fewer (k + 1) when refreshes are being missed (the browser calls a refresh
 //!   late while the frames before it are still on the GPU): over two windows running, or many
-//!   over one. A burst of slow frames (a cut, a rebuild) is a few hitches, not a slower cadence;
+//!   over one, and only while the frames' median GPU time does not fit k refreshes. A burst of
+//!   slow frames (a cut, a rebuild), or misses while the typical frame fits, are hitches, not a
+//!   slower cadence;
 //! - it renders when k refresh intervals have passed since the last rendered frame, by the
 //!   refreshes' timestamps: a late refresh does not push the next frame a refresh further;
 //! - it tries more (k - 1) once k has held without a miss for `settle_ms`, and keeps them if
@@ -15,12 +17,13 @@
 //!   (up to `max_backoff_ms`);
 //! - `max_fps` caps it (60 on a 120 Hz display, where a steady 60 is the aim).
 //!
-//! The frames' GPU time (`FrameTimer`) is measured too, but only hints: a GPU with fewer frames to
-//! draw lowers its clocks (Apple's do), so each frame takes longer at a slower cadence, and a pacer
-//! slowing down by GPU time slows down further and further. When recent frames' GPU time is well
-//! within a faster cadence even so (`try_below`), and below what it was when that cadence last
-//! failed, the pacer tries it at once, whatever the wait (the cost fell: a lighter shot after a
-//! heavier one); misses still decide whether it stays.
+//! The frames' GPU time (`FrameTimer`) is measured too, but it only gates and hints: a GPU with
+//! fewer frames to draw lowers its clocks (Apple's do), so each frame takes longer at a slower
+//! cadence, and a pacer slowing down by GPU time slows down further and further. Misses slow it
+//! down only while the median frame (over the last second or so) does not fit the cadence; when
+//! the median fits a faster cadence with room (`fit_share`) even at the slower one's clocks, and
+//! is below what it was when that cadence last failed, the pacer tries it at once, whatever the
+//! wait (the cost fell: a lighter shot after a heavier one).
 //!
 //! ```ignore
 //! let mut pacer = FramePacer::new(renderer.device(), renderer.queue(), FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
@@ -59,14 +62,17 @@ pub struct FramePacerOptions {
     pub max_backoff_ms: f64,
     /// How long after the first refresh misses are not counted (loading, warming up), ms.
     pub warmup_ms: f64,
-    /// A faster cadence is tried at once when recent frames' GPU time (90th percentile) is below
-    /// this share of its frame time.
-    pub try_below: f64,
+    /// Missed refreshes slow a cadence only while recent frames' median GPU time (the last
+    /// `GPU_FRAMES`) is over its frame time; while it fits, they are hitches (a burst of slow
+    /// frames, a stall elsewhere) that a slower cadence would not remove. A faster cadence is
+    /// tried at once when the median is below this share of its frame time (and well below what
+    /// it was when that cadence last failed).
+    pub fit_share: f64,
 }
 
 impl Default for FramePacerOptions {
     fn default() -> Self {
-        Self { max_fps: None, max_divisor: 4, late_factor: 1.5, late_share: 0.05, late_share_at_once: 0.2, window_ms: 1000.0, settle_ms: 2000.0, max_backoff_ms: 16000.0, warmup_ms: 1000.0, try_below: 0.85 }
+        Self { max_fps: None, max_divisor: 4, late_factor: 1.5, late_share: 0.05, late_share_at_once: 0.2, window_ms: 1000.0, settle_ms: 1000.0, max_backoff_ms: 16000.0, warmup_ms: 1000.0, fit_share: 0.9 }
     }
 }
 
@@ -98,6 +104,12 @@ pub(crate) struct Cadence {
 
 impl Cadence {
     const RELEARN_MS: f64 = 30000.0;
+    /// Rendered frames whose GPU time the median is taken over (a second at 60 fps).
+    const GPU_FRAMES: usize = 60;
+    /// How much lighter than when a faster cadence last failed the median must be for it to be
+    /// tried at once: frames at a slower cadence measure lighter by themselves (less of a shared
+    /// GPU's work falls inside them), which is not the scene getting lighter.
+    const LIGHTER: f64 = 0.75;
 
     pub(crate) fn new(options: FramePacerOptions) -> Self {
         Self {
@@ -180,7 +192,7 @@ impl Cadence {
     pub(crate) fn on_gpu_time(&mut self, ms: f64) {
         if ms.is_finite() && ms > 0.0 {
             self.gpu.push_back(ms);
-            if self.gpu.len() > 30 {
+            if self.gpu.len() > Self::GPU_FRAMES {
                 self.gpu.pop_front();
             }
         }
@@ -208,14 +220,17 @@ impl Cadence {
         };
         let (missed, last) = share(now_ms - o.window_ms, now_ms);
         let (_, before) = share(now_ms - 2.0 * o.window_ms, now_ms - o.window_ms);
-        // missing refreshes over two windows running, or many over one: render on fewer; a try
-        // at a faster cadence fails on one (and waits longer before the next)
-        let slower = since >= o.window_ms && (last > o.late_share_at_once || (self.trying && last > o.late_share))
-            || since >= 2.0 * o.window_ms && last > o.late_share && before > o.late_share;
+        // missing refreshes over two windows running, or many over one, while the median frame
+        // does not fit: render on fewer; a try at a faster cadence fails on one window's misses
+        // (and waits longer before the next)
+        let fits = self.fits(self.divisor, 1.0);
+        let slower = !fits
+            && (since >= o.window_ms && (last > o.late_share_at_once || (self.trying && last > o.late_share))
+                || since >= 2.0 * o.window_ms && last > o.late_share && before > o.late_share);
         if slower {
             if self.trying {
                 self.backoff_ms = (self.backoff_ms * 2.0).min(o.max_backoff_ms);
-                self.failed_gpu = self.gpu_p90().unwrap_or(f64::INFINITY);
+                self.failed_gpu = self.gpu_p50().unwrap_or(f64::INFINITY);
             }
             self.trying = false;
             if self.divisor < o.max_divisor.max(floor) {
@@ -231,8 +246,7 @@ impl Cadence {
         }
         // held without a miss for long enough, or the GPU time well within a faster cadence: try it
         if !self.trying && self.divisor > floor && missed == 0.0 {
-            let lighter = since >= o.window_ms
-                && self.gpu_p90().is_some_and(|gpu| gpu < (self.divisor - 1) as f64 * self.refresh_ms * o.try_below && gpu < self.failed_gpu * 0.9);
+            let lighter = self.fits(self.divisor - 1, self.options.fit_share) && self.gpu_p50().is_some_and(|gpu| gpu < self.failed_gpu * Self::LIGHTER);
             if lighter {
                 self.backoff_ms = o.settle_ms;
             }
@@ -243,8 +257,13 @@ impl Cadence {
         }
     }
 
-    fn gpu_p90(&self) -> Option<f64> {
-        (self.gpu.len() >= 10).then(|| percentile(&self.gpu, 0.9))
+    fn gpu_p50(&self) -> Option<f64> {
+        (self.gpu.len() >= 10).then(|| percentile(&self.gpu, 0.5))
+    }
+
+    /// Whether recent frames' median GPU time is below `share` of `divisor` refreshes.
+    fn fits(&self, divisor: u32, share: f64) -> bool {
+        self.gpu_p50().is_some_and(|gpu| gpu < divisor as f64 * self.refresh_ms() * share)
     }
 
     pub(crate) fn divisor(&self) -> u32 {
@@ -311,14 +330,18 @@ impl FramePacer {
 /// frame's work and another after it (on Metal an empty pass resolves its timestamps to zero,
 /// hence the dispatch). Without `TIMESTAMP_QUERY`, the time from the first submit until a buffer
 /// copied after the last becomes mappable: an upper bound, queueing included. A ring of readbacks
-/// measures every frame although results arrive a few frames late. A frame's stamps are resolved
-/// at the next frame's start (or `flush`): wgpu's native Metal backend can resolve them before
-/// they are written when asked right after; a frame whose stamps still read back out of order is
-/// left unmeasured.
+/// measures every frame although results arrive a few frames late; the ring shares one query set
+/// (on Metal each set is a counter sample buffer, of which a browser tab gets few). A frame's
+/// stamps are resolved at the next frame's start (or `flush`): wgpu's native Metal backend can
+/// resolve them before they are written when asked right after; a frame whose stamps still read
+/// back out of order is left unmeasured.
 pub struct FrameTimer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     queries: Option<(wgpu::ComputePipeline, f64)>,
+    /// `STAMPS` timestamps per slot, and where each slot's are resolved (`RESOLVE_STRIDE` apart)
+    set: Option<wgpu::QuerySet>,
+    resolve: wgpu::Buffer,
     slots: Vec<TimerSlot>,
     armed: Option<usize>,
     started_ms: f64,
@@ -329,14 +352,15 @@ pub struct FrameTimer {
 }
 
 struct TimerSlot {
-    set: Option<wgpu::QuerySet>,
-    resolve: wgpu::Buffer,
     readback: wgpu::Buffer,
     busy: Arc<AtomicBool>,
 }
 
 impl FrameTimer {
     const SLOTS: usize = 8;
+    const STAMPS: u32 = 4;
+    /// Query resolves land at multiples of 256 bytes.
+    const RESOLVE_STRIDE: u64 = 256;
 
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
@@ -352,12 +376,12 @@ impl FrameTimer {
             });
             (noop, queue.get_timestamp_period() as f64)
         });
-        let buffer = |usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some("FrameTimer"), size: 32, usage, mapped_at_creation: false });
+        let buffer = |size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some("FrameTimer"), size, usage, mapped_at_creation: false });
+        let set = timestamps.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("FrameTimer"), ty: wgpu::QueryType::Timestamp, count: Self::SLOTS as u32 * Self::STAMPS }));
+        let resolve = buffer(Self::SLOTS as u64 * Self::RESOLVE_STRIDE, wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
         let slots = (0..Self::SLOTS)
             .map(|_| TimerSlot {
-                set: timestamps.then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("FrameTimer"), ty: wgpu::QueryType::Timestamp, count: 4 })),
-                resolve: buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
-                readback: buffer(wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ),
+                readback: buffer(8 * Self::STAMPS as u64, wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ),
                 busy: Arc::new(AtomicBool::new(false)),
             })
             .collect();
@@ -365,6 +389,8 @@ impl FrameTimer {
             device: device.clone(),
             queue: queue.clone(),
             queries,
+            set,
+            resolve,
             slots,
             armed: None,
             started_ms: 0.0,
@@ -375,14 +401,15 @@ impl FrameTimer {
     }
 
     fn stamp(&self, encoder: &mut wgpu::CommandEncoder, slot: usize, end: bool) {
-        let (Some((noop, _)), Some(set)) = (&self.queries, &self.slots[slot].set) else { return };
+        let (Some((noop, _)), Some(set)) = (&self.queries, &self.set) else { return };
+        let first = slot as u32 * Self::STAMPS + if end { 2 } else { 0 };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("FrameTimer"),
             // both stamps of both passes (the end of a pass is not always written on every GPU)
             timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                 query_set: set,
-                beginning_of_pass_write_index: Some(if end { 2 } else { 0 }),
-                end_of_pass_write_index: Some(if end { 3 } else { 1 }),
+                beginning_of_pass_write_index: Some(first),
+                end_of_pass_write_index: Some(first + 1),
             }),
         });
         pass.set_pipeline(noop);
@@ -423,11 +450,12 @@ impl FrameTimer {
         }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FrameTimer/Resolve") });
         for &(k, _) in &self.unresolved {
-            let slot = &self.slots[k];
-            if let Some(set) = &slot.set {
-                encoder.resolve_query_set(set, 0..4, &slot.resolve, 0);
+            let offset = k as u64 * Self::RESOLVE_STRIDE;
+            if let Some(set) = &self.set {
+                let first = k as u32 * Self::STAMPS;
+                encoder.resolve_query_set(set, first..first + Self::STAMPS, &self.resolve, offset);
             }
-            encoder.copy_buffer_to_buffer(&slot.resolve, 0, &slot.readback, 0, 32);
+            encoder.copy_buffer_to_buffer(&self.resolve, offset, &self.slots[k].readback, 0, 8 * Self::STAMPS as u64);
         }
         self.queue.submit(Some(encoder.finish()));
         let period = self.queries.as_ref().map(|(_, period)| *period);
@@ -654,6 +682,61 @@ mod tests {
     }
 
     #[test]
+    fn misses_while_the_median_frame_fits_are_hitches() {
+        // at 60 Hz capped at 60: 12 ms frames with every third at 26 ms miss refreshes all along,
+        // but the typical frame fits: it stays at 60
+        let refresh = 1000.0 / 60.0;
+        let gpu = |t: f64| if ((t / refresh) as u64).is_multiple_of(3) { 26.0 } else { 12.0 };
+        let run = |gpu: &dyn Fn(f64) -> f64| {
+            let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+            simulate(&mut cadence, 0.0, refresh, 2.0, |_| 12.0);
+            divisors(&mut cadence, 2000.0, refresh, 20.0, gpu)
+        };
+        let changes = run(&gpu);
+        assert!(changes.is_empty(), "{changes:?}");
+        // with the typical frame over a refresh (18 ms), the misses slow it down
+        let heavy = run(&|_| 18.0);
+        assert!(heavy.first().is_some_and(|&(_, k)| k == 2), "{heavy:?}");
+    }
+
+    #[test]
+    fn a_frame_time_that_depends_on_the_cadence_does_not_make_it_thrash() {
+        // frames that take 19 ms at every refresh but 14.5 at every other (a shared GPU, clocks):
+        // the tries at every refresh fail, and come further apart, not every second or two
+        let refresh = 1000.0 / 60.0;
+        let last = std::cell::Cell::new((0.0f64, 0.0f64));
+        let gpu = |t: f64| {
+            let (prev, ms) = last.get();
+            if t == prev {
+                return ms;
+            }
+            let ms = if t - prev > 1.5 * refresh { 14.5 } else { 19.0 };
+            last.set((t, ms));
+            ms
+        };
+        let mut cadence = Cadence::new(FramePacerOptions::default());
+        simulate(&mut cadence, 0.0, refresh, 2.0, |_| 12.0);
+        let changes = divisors(&mut cadence, 2000.0, refresh, 30.0, gpu);
+        let tries = changes.iter().filter(|&&(_, k)| k == 1).count();
+        assert!(tries <= 5, "{tries} tries in 30 s: {changes:?}");
+    }
+
+    #[test]
+    fn it_comes_back_within_about_a_second() {
+        let refresh = 1000.0 / 60.0;
+        for (lighter, within) in [(12.0, 800.0), (14.5, 800.0)] {
+            let mut cadence = Cadence::new(FramePacerOptions { max_fps: Some(60.0), ..Default::default() });
+            simulate(&mut cadence, 0.0, refresh, 2.0, |_| 12.0);
+            // a heavy stretch: every other refresh
+            assert_eq!(simulate(&mut cadence, 2000.0, refresh, 3.0, |_| 24.0).0, 2);
+            // lighter again: a median that fits a refresh is tried at once
+            let changes = divisors(&mut cadence, 5000.0, refresh, 5.0, move |_| lighter);
+            assert!(changes.first().is_some_and(|&(t, k)| k == 1 && t - 5000.0 < within), "{lighter} ms frames: {changes:?}");
+            assert_eq!(changes.len(), 1, "{lighter} ms frames: {changes:?}");
+        }
+    }
+
+    #[test]
     fn a_late_refresh_does_not_delay_the_next_frame() {
         // every other refresh at 120 Hz; the browser skips a refresh now and then (light frames:
         // not the GPU), and the frame due on it is rendered on the next one, not a refresh later
@@ -679,14 +762,18 @@ mod tests {
         assert_eq!(cadence.divisor(), 2);
     }
 
-    /// On a real GPU, frames of work are measured (a ring of readbacks); on wgpu's native Metal
-    /// backend some stamps read back stale, and those frames go unmeasured.
+    /// On a real GPU, frames of work are measured (a ring of readbacks), with other timers alive;
+    /// on wgpu's native Metal backend some stamps read back stale, and those frames go unmeasured.
     #[test]
     fn the_frame_timer_measures_each_frame() {
         let instance = wgpu::Instance::default();
         let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
         let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }, None)).unwrap();
+        // many timers alive on one device, as a browser tab's reloads leave them for its garbage
+        // collector: each holds one query set (on Metal a counter sample buffer, of which a
+        // device has few)
+        let _others: Vec<FrameTimer> = (0..15).map(|_| FrameTimer::new(&device, &queue)).collect();
         let mut timer = FrameTimer::new(&device, &queue);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
