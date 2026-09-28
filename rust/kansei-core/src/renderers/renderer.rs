@@ -159,6 +159,7 @@ pub struct Renderer {
     spot_shadow_sampler: Option<wgpu::Sampler>,
     // Cascaded sun/moon shadows (group 3, bindings 10-12), and a count-0 stand-in without them
     cascaded_shadows: Option<crate::shadows::CascadedShadowMap>,
+    sky_occlusion: Option<crate::shadows::SkyOcclusion>,
     cascade_dummy_buf: Option<wgpu::Buffer>,
     // Clustered light lists (group 3, bindings 8-9)
     light_clusters: Option<crate::lights::light_clusters::LightClusters>,
@@ -226,6 +227,7 @@ impl Renderer {
             spot_dummy_atlas_view: None,
             spot_shadow_sampler: None,
             cascaded_shadows: None,
+            sky_occlusion: None,
             cascade_dummy_buf: None,
             light_clusters: None,
             clustered_lights: true,
@@ -1251,6 +1253,81 @@ impl Renderer {
         self.reflection_view(self.planar_reflections.len()) + index
     }
 
+    /// Cull view of the sky occlusion's top-down view, after the cascades.
+    fn sky_occlusion_view(&self) -> usize {
+        self.cascade_view(self.cascaded_shadows.as_ref().map_or(0, |c| c.slots.len()))
+    }
+
+    /// Sky occlusion around the camera: how much of the sky each point sees past the canopy
+    /// (`SkyOcclusion`), for materials to dim their sky ambient light by with
+    /// `shadows::SKY_OCCLUSION_WGSL`. The shadow casters on its layers are drawn from straight
+    /// above when the camera has moved far enough, culled on the GPU; call `SkyOcclusion::refresh` (through
+    /// `sky_occlusion_mut`) after changing the scene under it.
+    pub fn enable_sky_occlusion(&mut self, options: crate::shadows::SkyOcclusionOptions) {
+        let device = self.device.as_ref().unwrap();
+        let shared = self.shared_layouts.as_ref().unwrap();
+        self.sky_occlusion = Some(crate::shadows::SkyOcclusion::new(device, &shared.camera_bgl, self.light_buf.as_ref().unwrap(), options));
+        self.invalidate_bundle();
+    }
+
+    /// The sky occlusion, once `enable_sky_occlusion` has been called.
+    pub fn sky_occlusion(&self) -> Option<&crate::shadows::SkyOcclusion> {
+        self.sky_occlusion.as_ref()
+    }
+
+    pub fn sky_occlusion_mut(&mut self) -> Option<&mut crate::shadows::SkyOcclusion> {
+        self.sky_occlusion.as_mut()
+    }
+
+    /// While the sky occlusion is being rebuilt: on its first frame the shadow casters on its
+    /// layers seen from above, culled to that view, and its pyramid; then a slab of its volume.
+    fn run_sky_occlusion_pass(&mut self, scene: &Scene) {
+        if !self.sky_occlusion.as_ref().is_some_and(|s| s.building()) {
+            return;
+        }
+        let view = self.sky_occlusion_view();
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let sky = self.sky_occlusion.as_mut().unwrap();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/SkyOcclusion") });
+        if sky.pending() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderer/SkyOcclusionPass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: sky.depth_view(),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: crate::profiling::gpu_pass("Renderer/SkyOcclusionPass").as_ref().map(crate::profiling::PassStamp::render),
+                ..Default::default()
+            });
+            pass.set_bind_group(1, sky.camera().bind_group().unwrap(), &[]);
+            for scene_idx in scene.ordered_indices() {
+                let Some(r) = scene.get_renderable(scene_idx) else { continue };
+                if !r.visible || !r.cast_shadow || !r.geometry.initialized || r.layers & sky.options.layer_mask == 0 {
+                    continue;
+                }
+                let key = crate::materials::DepthPipelineKey::new(
+                    crate::shadows::SkyOcclusion::FORMAT,
+                    1 + r.geometry.instance_buffers.len(),
+                    crate::shadows::SkyOcclusion::DEPTH_BIAS,
+                );
+                let Some(pipeline) = r.material.depth_pipeline_cache.get(&key) else { continue };
+                pass.set_pipeline(pipeline);
+                if let Some(bg) = r.material.bind_group() {
+                    pass.set_bind_group(0, bg, &[]);
+                }
+                let offset = mesh_offset(scene_idx, self.matrix_alignment);
+                pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+                draw_geometry(&mut pass, r, view);
+            }
+        }
+        sky.build(device, queue, &mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Render each cascade: every visible shadow caster, culled to the cascade.
     fn run_cascade_shadow_pass(&mut self, scene: &Scene) {
         let Some(csm) = self.cascaded_shadows.as_ref() else { return };
@@ -1555,6 +1632,11 @@ impl Renderer {
         if let Some(csm) = &self.cascaded_shadows {
             views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, lod_distance_scale: 1.0 })));
         }
+        // then the sky occlusion's top-down view (`sky_occlusion_view`), while it is being rebuilt
+        if let Some(sky) = &self.sky_occlusion {
+            let lod_distance_scale = sky.options.lod_distance_scale;
+            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, lod_distance_scale }));
+        }
         views
     }
 
@@ -1568,6 +1650,9 @@ impl Renderer {
         kinds.extend((0..self.planar_reflections.len() as u32).map(CullViewKind::Reflection));
         if let Some(csm) = &self.cascaded_shadows {
             kinds.extend((0..csm.slots.len() as u32).map(CullViewKind::Cascade));
+        }
+        if self.sky_occlusion.is_some() {
+            kinds.push(CullViewKind::SkyOcclusion);
         }
         kinds
     }
@@ -1925,6 +2010,7 @@ impl Renderer {
             let depth_format = wgpu::TextureFormat::Depth24Plus;
             let spot_shadows = self.spot_shadow_atlas.is_some();
             let cascades = self.cascaded_shadows.is_some();
+            let sky_occlusion = self.sky_occlusion.is_some();
             let reflections = !self.planar_reflections.is_empty();
 
             let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
@@ -1954,7 +2040,7 @@ impl Renderer {
                 if spot_shadows && r.cast_shadow {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
                 }
-                if cascades && r.cast_shadow {
+                if (cascades || sky_occlusion) && r.cast_shadow {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
                 }
                 if reflections {
@@ -1976,6 +2062,9 @@ impl Renderer {
         // GPU instance culling for every view (camera, spot shadows, reflections, cascades)
         self.update_planar_reflection_cameras(camera);
         self.update_cascaded_shadows(scene, camera);
+        if let Some(sky) = self.sky_occlusion.as_mut() {
+            sky.update(self.queue.as_ref().unwrap(), camera);
+        }
         self.run_instance_culling(scene, camera, None);
         self.cull_stats.end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera.frame());
 
@@ -2065,6 +2154,7 @@ impl Renderer {
         self.run_spot_shadow_pass(scene);
         // Cascaded sun/moon shadows
         self.run_cascade_shadow_pass(scene);
+        self.run_sky_occlusion_pass(scene);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -2250,6 +2340,7 @@ impl Renderer {
         let sample_count = gbuffer.sample_count;
         let spot_shadows = self.spot_shadow_atlas.is_some();
             let cascades = self.cascaded_shadows.is_some();
+            let sky_occlusion = self.sky_occlusion.is_some();
 
         let ordered_indices: Vec<usize> = scene.ordered_indices().collect();
         for idx in ordered_indices {
@@ -2278,7 +2369,7 @@ impl Renderer {
             if spot_shadows && r.cast_shadow {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::SpotShadowAtlas::FORMAT, crate::shadows::SpotShadowAtlas::DEPTH_BIAS);
             }
-            if cascades && r.cast_shadow {
+            if (cascades || sky_occlusion) && r.cast_shadow {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
             }
             if r.material.options.outputs_velocity {
@@ -2296,6 +2387,9 @@ impl Renderer {
         let t = crate::profiling::cpu_scope("scene/culling");
         self.update_planar_reflection_cameras(camera);
         self.update_cascaded_shadows(scene, camera);
+        if let Some(sky) = self.sky_occlusion.as_mut() {
+            sky.update(self.queue.as_ref().unwrap(), camera);
+        }
         // occlusion needs the GBuffer's single-sampled depth
         let depth_size = (gbuffer.sample_count == 1).then_some((gbuffer.width, gbuffer.height));
         self.run_instance_culling(scene, camera, depth_size);
@@ -2376,6 +2470,7 @@ impl Renderer {
         self.run_spot_shadow_pass(scene);
         // Cascaded sun/moon shadows
         self.run_cascade_shadow_pass(scene);
+        self.run_sky_occlusion_pass(scene);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
