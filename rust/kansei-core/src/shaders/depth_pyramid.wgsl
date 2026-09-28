@@ -6,12 +6,23 @@
 //
 // Substituted by depth_pyramid.rs: MODE_VALUE (0 keeps the maximum, 1 the minimum, 2 both, as
 // r = min and g = max) and FORMAT (its storage format).
+//
+// `from_depth_linear` reduces view distances (-z in view space, unprojected with `linearize`)
+// instead of the depths: for projections whose depth does not grow with distance alike on every
+// pixel (an oblique near plane).
 
 const MODE : u32 = MODE_VALUE;
 
 @group(0) @binding(0) var depth    : texture_depth_2d;
 @group(0) @binding(1) var previous : texture_2d<f32>;
 @group(0) @binding(2) var dst      : texture_storage_2d<FORMAT, write>;
+
+struct Linearize {
+    inverseProjection : mat4x4f,
+    size              : vec2f,   // the depth buffer's, in pixels
+    _pad              : vec2f,
+}
+@group(0) @binding(3) var<uniform> linearize : Linearize;
 
 fn store(p : vec2u, v : vec2f) {
     switch MODE {
@@ -34,6 +45,25 @@ fn from_depth(@builtin(global_invocation_id) gid : vec3u) {
     let b = min(gid.xy * 2u + 1u, last);
     let d = vec4f(textureLoad(depth, a, 0), textureLoad(depth, vec2u(b.x, a.y), 0),
                   textureLoad(depth, vec2u(a.x, b.y), 0), textureLoad(depth, b, 0));
+    store(gid.xy, reduce4(d.xx, d.yy, d.zz, d.ww));
+}
+
+// The view distance at depth pixel p: nothing drawn there (depth 1) is infinitely far.
+fn viewDistance(p : vec2u) -> f32 {
+    let d = textureLoad(depth, p, 0);
+    if (d >= 1.0) { return 3.0e38; }
+    let ndc = (vec2f(p) + 0.5) / linearize.size * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+    let v = linearize.inverseProjection * vec4f(ndc, d, 1.0);
+    return -v.z / v.w;
+}
+
+@compute @workgroup_size(8, 8)
+fn from_depth_linear(@builtin(global_invocation_id) gid : vec3u) {
+    if (any(gid.xy >= textureDimensions(dst))) { return; }
+    let last = textureDimensions(depth) - 1u;
+    let a = min(gid.xy * 2u, last);
+    let b = min(gid.xy * 2u + 1u, last);
+    let d = vec4f(viewDistance(a), viewDistance(vec2u(b.x, a.y)), viewDistance(vec2u(a.x, b.y)), viewDistance(b));
     store(gid.xy, reduce4(d.xx, d.yy, d.zz, d.ww));
 }
 

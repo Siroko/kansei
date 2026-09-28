@@ -91,7 +91,7 @@ impl DrawSet {
         match self {
             DrawSet::Opaque => !r.is_transparent(),
             DrawSet::Transparent => r.is_transparent(),
-            DrawSet::Late => !r.is_transparent() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase()),
+            DrawSet::Late => !r.is_transparent() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase_in(MAIN_VIEW)),
         }
     }
 
@@ -102,7 +102,7 @@ impl DrawSet {
             draw_geometry(enc, r, MAIN_VIEW);
         }
         if self != DrawSet::Opaque {
-            draw_late_geometry(enc, r);
+            draw_late_geometry(enc, r, MAIN_VIEW);
         }
     }
 }
@@ -165,9 +165,12 @@ pub struct Renderer {
     clustered_lights: bool,
     // GPU instance culling (renderables with `instance_culling`)
     cull_pipeline: Option<crate::culling::CullPipeline>,
-    // occlusion culling of the camera's instances; the renderables it culls in two phases this
-    // frame (scene indices); and the culling statistics
+    // occlusion culling; the views culled in two phases this frame (cull view indices: the
+    // camera's, reflections'), the renderables culled in two phases in them, and those culled so
+    // in the camera's (scene indices); and the culling statistics
     occlusion: crate::culling::Occlusion,
+    occlusion_views: Vec<usize>,
+    two_phase_any: Vec<usize>,
     two_phase: Vec<usize>,
     cull_stats: crate::culling::StatsReadback,
     // Planar reflections, drawn after the shadow maps and before the main pass
@@ -231,6 +234,8 @@ impl Renderer {
             clustered_lights: true,
             cull_pipeline: None,
             occlusion: crate::culling::Occlusion::new(),
+            occlusion_views: Vec::new(),
+            two_phase_any: Vec::new(),
             two_phase: Vec::new(),
             cull_stats: crate::culling::StatsReadback::new(),
             planar_reflections: Vec::new(),
@@ -1370,64 +1375,37 @@ impl Renderer {
         let queue = self.queue.as_ref().unwrap();
         let device = self.device.as_ref().unwrap();
         let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let shadow_bg = self.shadow_bind_group.as_ref();
         let alignment = self.matrix_alignment;
         let cc = &self.config.clear_color;
         let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/PlanarReflections") });
-        for (index, reflection) in self.planar_reflections.iter().enumerate().filter(|(_, r)| r.is_active()) {
-            let view = self.reflection_view(index);
-            {
-                let targets = reflection.color_attachments();
-                let attachment = |view, load| Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
-                });
-                let black = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Renderer/PlanarReflectionPass"),
-                    color_attachments: &[
-                        attachment(targets[0], wgpu::LoadOp::Clear(clear)),
-                        attachment(targets[1], black),
-                        attachment(targets[2], black),
-                        attachment(targets[3], black),
-                    ],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: reflection.depth_attachment(),
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: crate::profiling::gpu_pass("Renderer/PlanarReflectionPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
-                });
-                // only the surface's part of the screen, when its bounds are known
-                if let Some([x, y, w, h]) = reflection.scissor() {
-                    pass.set_scissor_rect(x, y, w, h);
-                }
-                pass.set_bind_group(1, reflection.camera().bind_group().unwrap(), &[]);
-                if let Some(bg) = &self.shadow_bind_group {
-                    pass.set_bind_group(3, bg, &[]);
-                }
-                for scene_idx in scene.ordered_indices() {
-                    let Some(r) = scene.get_renderable(scene_idx) else { continue };
-                    if !r.visible || !r.geometry.initialized || r.layers & reflection.layer_mask == 0 {
-                        continue;
+        let reflection_views: Vec<usize> = (0..self.planar_reflections.len()).map(|index| self.reflection_view(index)).collect();
+        for (reflection, &view) in self.planar_reflections.iter().zip(&reflection_views).filter(|(r, _)| r.is_active()) {
+            let two_phase = self.occlusion_views.contains(&view) && !self.two_phase_any.is_empty();
+            let draw = |encoder: &mut wgpu::CommandEncoder, phase: ReflectionPhase| draw_reflection(encoder, scene, reflection, view, phase, clear, mesh_bg, shadow_bg, alignment);
+            if !two_phase {
+                draw(&mut encoder, ReflectionPhase::All);
+            } else {
+                // the opaque renderables with their first phase's instances; a pyramid of the
+                // mirror's depth; the second phase against it; its instances and the transparent
+                draw(&mut encoder, ReflectionPhase::Early);
+                let pipeline = self.cull_pipeline.as_ref().unwrap();
+                let (pyramid, pyramid_bind_group) = self.occlusion.pyramid_for(view, device, (reflection.width(), reflection.height()), pipeline);
+                pyramid.build_linear(device, queue, &mut encoder, reflection.depth_attachment(), reflection.occlusion_view().proj.inverse());
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/ReflectionOcclusionCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/ReflectionOcclusionCulling").as_ref().map(crate::profiling::PassStamp::compute) });
+                    pass.set_pipeline(&pipeline.late);
+                    pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                    pass.set_bind_group(2, pyramid_bind_group, &[]);
+                    for &idx in &self.two_phase_any {
+                        let Some(r) = scene.get_renderable(idx) else { continue };
+                        if let Some(culling) = r.instance_culling.as_ref().filter(|c| c.two_phase_in(view) && r.layers & reflection.layer_mask != 0) {
+                            culling.dispatch_late(&mut pass, view);
+                        }
                     }
-                    let key = crate::materials::PipelineKey {
-                        color_formats: GBuffer::MRT_FORMATS.to_vec(),
-                        depth_format: GBuffer::DEPTH_FORMAT,
-                        sample_count: 1,
-                        num_vertex_buffers: 1 + r.geometry.instance_buffers.len(),
-                    };
-                    let Some(pipeline) = r.material.pipeline_cache.get(&key) else { continue };
-                    pass.set_pipeline(pipeline);
-                    if let Some(bg) = r.material.bind_group() {
-                        pass.set_bind_group(0, bg, &[]);
-                    }
-                    let offset = mesh_offset(scene_idx, alignment);
-                    pass.set_bind_group(2, mesh_bg, &[offset, offset]);
-                    // culled against the mirrored view, whose near plane is the water
-                    draw_geometry(&mut pass, r, view);
                 }
+                draw(&mut encoder, ReflectionPhase::Late);
             }
             reflection.resolve(queue, &mut encoder);
         }
@@ -1476,7 +1454,7 @@ impl Renderer {
             let offset = mesh_offset(scene_idx, self.matrix_alignment);
             pass.set_bind_group(2, mesh_bg, &[offset, offset]);
             draw_geometry(&mut pass, r, MAIN_VIEW);
-            draw_late_geometry(&mut pass, r);
+            draw_late_geometry(&mut pass, r, MAIN_VIEW);
         }
     }
 
@@ -1575,13 +1553,17 @@ impl Renderer {
     }
 
     /// Cull every visible renderable with `instance_culling` for every view that draws it (after
-    /// the frame's uploads, before its shadow and main passes). With `depth_size` (the GBuffer's, when the frame can
-    /// build a depth pyramid), renderables with `occlusion` get the camera's first phase here and
-    /// their second in `run_late_culling`.
+    /// the frame's uploads, before its shadow and main passes). Renderables with `occlusion` get
+    /// the first phase here in the views culled in two phases: the camera's with `depth_size`
+    /// (the GBuffer's, when the frame can build a depth pyramid), and the active reflections with
+    /// `occlusion_culling`; their second phase is in `run_late_culling` and
+    /// `render_planar_reflections`.
     fn run_instance_culling(&mut self, scene: &mut Scene, camera: &Camera, depth_size: Option<(u32, u32)>) {
         let kinds = self.cull_view_kinds();
         self.cull_stats.begin_frame(self.device.as_ref().unwrap(), kinds);
         self.two_phase.clear();
+        self.two_phase_any.clear();
+        self.occlusion_views.clear();
         let culled: Vec<usize> = scene
             .ordered_indices()
             .filter(|&i| scene.get_renderable(i).is_some_and(|r| r.visible && r.instance_culling.is_some() && r.geometry.initialized))
@@ -1593,18 +1575,26 @@ impl Renderer {
         // the camera's view, or the frozen one
         let main = self.occlusion.main_view(camera);
         views[MAIN_VIEW] = Some(main.cull);
-        let occlusion = depth_size.filter(|_| self.occlusion.enabled).map(|size| main.occlusion(size));
+        // the views culled in two phases, with what their occlusion test projects with
+        let mut occlusion: Vec<(usize, crate::culling::OcclusionView)> = depth_size.filter(|_| self.occlusion.enabled).map(|size| (MAIN_VIEW, main.occlusion(size))).into_iter().collect();
+        for (index, reflection) in self.planar_reflections.iter().enumerate() {
+            if reflection.is_active() && reflection.occlusion_culling {
+                occlusion.push((self.reflection_view(index), reflection.occlusion_view()));
+            }
+        }
+        let occlusion_views: Vec<usize> = occlusion.iter().map(|(view, _)| *view).collect();
         let reset = self.occlusion.take_reset(camera.previous_view_projection().is_none());
         let stats = self.cull_stats.enabled;
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let pipeline = self.cull_pipeline.get_or_insert_with(|| crate::culling::CullPipeline::new(device));
-        // the frame's views, in one write (the camera's with what occlusion projects with)
+        // the frame's views, in one write (those culled in two phases with what occlusion projects
+        // with)
         let gpu_views: Vec<_> = views
             .iter()
             .enumerate()
             .map(|(slot, view)| match view {
-                Some(view) => view.gpu(main.lod_origin, occlusion.as_ref().filter(|_| slot == MAIN_VIEW), stats),
+                Some(view) => view.gpu(main.lod_origin, occlusion.iter().find(|(v, _)| *v == slot).map(|(_, o)| o), stats),
                 None => bytemuck::Zeroable::zeroed(),
             })
             .collect();
@@ -1616,15 +1606,16 @@ impl Renderer {
             let (world, index_count, casts_shadow, layers) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers);
             let culling = r.instance_culling.as_mut().unwrap();
             stale_bundles |= culling.ensure_views(device, &pipeline.bgl, views.len());
-            let two_phase = occlusion.is_some() && culling.occlusion;
-            if two_phase {
-                stale_bundles |= culling.ensure_occlusion(device, pipeline);
-            }
-            culling.set_two_phase(two_phase);
-            if culling.two_phase() {
+            let two_phase_views: &[usize] = if culling.occlusion { &occlusion_views } else { &[] };
+            stale_bundles |= culling.ensure_occlusion(device, pipeline, two_phase_views);
+            culling.set_two_phase(two_phase_views);
+            if two_phase_views.iter().any(|&v| culling.two_phase_in(v)) {
                 if reset {
                     culling.reset_visibility(&mut encoder);
                 }
+                self.two_phase_any.push(idx);
+            }
+            if culling.two_phase_in(MAIN_VIEW) {
                 self.two_phase.push(idx);
             }
             culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow, layers);
@@ -1640,29 +1631,36 @@ impl Renderer {
                 culling.dispatch(&mut pass);
                 for (slot, view) in views.iter().enumerate() {
                     let Some(view) = view else { continue };
-                    if !view.draws(r.cast_shadow, r.layers) || slot == MAIN_VIEW && culling.two_phase() {
+                    if !view.draws(r.cast_shadow, r.layers) || culling.two_phase_in(slot) {
                         continue;
                     }
                     let draw = culling.view(slot).unwrap();
                     self.cull_stats.record(slot, culling.tested(), draw.args, draw.offset);
                 }
             }
-            // occlusion's first phase
-            if !self.two_phase.is_empty() {
+            // occlusion's first phase, in each view culled in two phases
+            if !self.two_phase_any.is_empty() {
                 pass.set_pipeline(&pipeline.early);
                 pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
-                for &idx in &self.two_phase {
-                    let culling = scene.get_renderable(idx).unwrap().instance_culling.as_ref().unwrap();
-                    culling.dispatch_early(&mut pass);
-                    // (tested once, by the first phase)
-                    for (draw, tested) in [(culling.view(MAIN_VIEW), culling.tested()), (culling.late(), 0)] {
-                        let draw = draw.unwrap();
-                        self.cull_stats.record(MAIN_VIEW, tested, draw.args, draw.offset);
+                for &view in &occlusion_views {
+                    for &idx in &self.two_phase_any {
+                        let r = scene.get_renderable(idx).unwrap();
+                        let culling = r.instance_culling.as_ref().unwrap();
+                        if !culling.two_phase_in(view) || !views[view].is_some_and(|v| v.draws(r.cast_shadow, r.layers)) {
+                            continue;
+                        }
+                        culling.dispatch_early(&mut pass, view);
+                        // (tested once, by the first phase)
+                        for (draw, tested) in [(culling.view(view), culling.tested()), (culling.late(view), 0)] {
+                            let draw = draw.unwrap();
+                            self.cull_stats.record(view, tested, draw.args, draw.offset);
+                        }
                     }
                 }
             }
         }
         queue.submit(std::iter::once(encoder.finish()));
+        self.occlusion_views = occlusion_views;
         if stale_bundles {
             self.invalidate_bundle();
         }
@@ -1677,7 +1675,7 @@ impl Renderer {
         }
         let device = self.device.as_ref().unwrap();
         let pipeline = self.cull_pipeline.as_ref().unwrap();
-        let (pyramid, pyramid_bind_group) = self.occlusion.pyramid_for(device, (gbuffer.width, gbuffer.height), pipeline);
+        let (pyramid, pyramid_bind_group) = self.occlusion.pyramid_for(MAIN_VIEW, device, (gbuffer.width, gbuffer.height), pipeline);
         pyramid.build(device, encoder, &gbuffer.depth_view);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/OcclusionCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/OcclusionCulling").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&pipeline.late);
@@ -1685,15 +1683,15 @@ impl Renderer {
         pass.set_bind_group(2, pyramid_bind_group, &[]);
         for &idx in &self.two_phase {
             if let Some(culling) = scene.get_renderable(idx).and_then(|r| r.instance_culling.as_ref()) {
-                culling.dispatch_late(&mut pass);
+                culling.dispatch_late(&mut pass, MAIN_VIEW);
             }
         }
     }
 
     /// Occlusion culling for renderables whose `InstanceCulling` has `occlusion` (on by default;
     /// those renderables opt in). It applies to the camera in `render_with_postprocessing` with a
-    /// single-sampled GBuffer; `render` and the other views (shadow maps, reflections) cull by
-    /// frustum and LOD only.
+    /// single-sampled GBuffer; `render` and shadow maps cull by frustum and LOD only, and planar
+    /// reflections have their own switch (`PlanarReflection::occlusion_culling`).
     ///
     /// Each frame runs in two phases. The first draws, with the rest of the opaque scene, the
     /// instances in view that the camera saw last frame; a depth pyramid is built from that depth;
@@ -1763,7 +1761,7 @@ impl Renderer {
     /// The depth pyramid occlusion culling built this frame, from the depth of its first phase
     /// (GBuffer size, `DepthReduction::Max`), once built.
     pub fn depth_pyramid(&self) -> Option<&crate::culling::DepthPyramid> {
-        self.occlusion.pyramid()
+        self.occlusion.pyramid(MAIN_VIEW)
     }
 
     /// Run the cubemap shadow pass for point lights.
@@ -2818,15 +2816,101 @@ fn bundle_key(scene: &Scene) -> Vec<usize> {
     key
 }
 
+/// Which of a planar reflection's passes to draw: the only one, or with occlusion culling the
+/// first (opaque renderables, first-phase instances) or the second (second-phase instances, then
+/// the transparent renderables, over the first's targets).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReflectionPhase {
+    All,
+    Early,
+    Late,
+}
+
+/// A planar reflection's pass `phase`: the scene's visible renderables on its layers, drawn from
+/// the mirrored camera and culled for its cull view `view`.
+#[allow(clippy::too_many_arguments)]
+fn draw_reflection(
+    encoder: &mut wgpu::CommandEncoder,
+    scene: &Scene,
+    reflection: &crate::reflections::PlanarReflection,
+    view: usize,
+    phase: ReflectionPhase,
+    clear: wgpu::Color,
+    mesh_bg: &wgpu::BindGroup,
+    shadow_bg: Option<&wgpu::BindGroup>,
+    alignment: u32,
+) {
+    let late = phase == ReflectionPhase::Late;
+    let targets = reflection.color_attachments();
+    let load = |cleared| if late { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(cleared) };
+    let attachment = |view, cleared| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: load(cleared), store: wgpu::StoreOp::Store } });
+    let black = wgpu::Color::TRANSPARENT;
+    let label = if late { "Renderer/PlanarReflectionLatePass" } else { "Renderer/PlanarReflectionPass" };
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[attachment(targets[0], clear), attachment(targets[1], black), attachment(targets[2], black), attachment(targets[3], black)],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: reflection.depth_attachment(),
+            depth_ops: Some(wgpu::Operations { load: if late { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(1.0) }, store: wgpu::StoreOp::Store }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: crate::profiling::gpu_pass(label).as_ref().map(crate::profiling::PassStamp::render),
+        ..Default::default()
+    });
+    // only the surface's part of the screen, when its bounds are known
+    if let Some([x, y, w, h]) = reflection.scissor() {
+        pass.set_scissor_rect(x, y, w, h);
+    }
+    pass.set_bind_group(1, reflection.camera().bind_group().unwrap(), &[]);
+    if let Some(bg) = shadow_bg {
+        pass.set_bind_group(3, bg, &[]);
+    }
+    for scene_idx in scene.ordered_indices() {
+        let Some(r) = scene.get_renderable(scene_idx) else { continue };
+        if !r.visible || !r.geometry.initialized || r.layers & reflection.layer_mask == 0 {
+            continue;
+        }
+        let two_phase = r.instance_culling.as_ref().is_some_and(|c| c.two_phase_in(view));
+        let drawn = match phase {
+            ReflectionPhase::All => true,
+            ReflectionPhase::Early => !r.is_transparent(),
+            ReflectionPhase::Late => r.is_transparent() || two_phase,
+        };
+        if !drawn {
+            continue;
+        }
+        let key = crate::materials::PipelineKey {
+            color_formats: GBuffer::MRT_FORMATS.to_vec(),
+            depth_format: GBuffer::DEPTH_FORMAT,
+            sample_count: 1,
+            num_vertex_buffers: 1 + r.geometry.instance_buffers.len(),
+        };
+        let Some(pipeline) = r.material.pipeline_cache.get(&key) else { continue };
+        pass.set_pipeline(pipeline);
+        if let Some(bg) = r.material.bind_group() {
+            pass.set_bind_group(0, bg, &[]);
+        }
+        let offset = mesh_offset(scene_idx, alignment);
+        pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+        // culled against the mirrored view, whose near plane is the water
+        if late && !r.is_transparent() {
+            draw_late_geometry(&mut pass, r, view);
+        } else {
+            draw_geometry(&mut pass, r, view);
+        }
+    }
+}
+
 /// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
 /// compacted instances (indirect) when it has `InstanceCulling`, otherwise its geometry as is.
 fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
     bind_and_draw(enc, r, r.instance_culling.as_ref().and_then(|c| c.view(view)));
 }
 
-/// Draw the second phase of a renderable culled in two phases this frame (nothing otherwise).
-fn draw_late_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable) {
-    if let Some(late) = r.instance_culling.as_ref().and_then(|c| c.late()) {
+/// Draw the second phase of a renderable culled in two phases in cull view `view` this frame
+/// (nothing otherwise).
+fn draw_late_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
+    if let Some(late) = r.instance_culling.as_ref().and_then(|c| c.late(view)) {
         bind_and_draw(enc, r, Some(late));
     }
 }
