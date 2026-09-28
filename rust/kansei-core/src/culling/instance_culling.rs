@@ -37,10 +37,11 @@ pub(crate) const ARGS_BYTES: u64 = 32;
 /// most for occlusion: a tree's sphere round its base reaches a tree's height below the ground
 /// and to each side.
 ///
-/// Occlusion (`with_occlusion(true)`): the main camera's view also skips instances hidden behind
-/// the depth of the rest of the scene, in two phases per frame (see `Renderer::set_occlusion_culling`).
-/// Shadow maps and reflections stay frustum-only (an instance hidden from the camera may still
-/// cast a shadow into the picture).
+/// Occlusion (`with_occlusion(true)`): the camera's view, and planar reflections that ask for it
+/// (`PlanarReflection::occlusion_culling`), also skip instances hidden behind the depth of the
+/// rest of what they draw, in two phases per frame (see `Renderer::set_occlusion_culling`).
+/// Shadow maps stay frustum-only (an instance hidden from the camera may still cast a shadow
+/// into the picture).
 ///
 /// ```ignore
 /// // 32-byte instances: position xyz + height, then yaw, ...; spheres of 0.6 x height
@@ -89,8 +90,9 @@ pub struct InstanceCulling {
     pub occlusion: bool,
     capacity: u32,
     shared: Option<Shared>,
-    occlusion_slots: Option<OcclusionSlots>,
-    two_phase: bool,
+    occlusion_slots: Vec<OcclusionSlot>,
+    /// the views culled in two phases this frame
+    two_phase: Vec<usize>,
 }
 
 /// Consecutive views culled by one dispatch: their compacted instances, a region of `capacity`
@@ -103,10 +105,11 @@ struct Chunk {
 }
 
 /// The renderable's culling state for every view: the instances' parameters (a copy per chunk,
-/// `params_stride` apart), written only when they change; the indirect draws, `ARGS_BYTES` apart
-/// in one buffer that a frame resets with one clear (each view's, then the second occlusion
-/// phase's, `late_slot`); and the views' compacted instances, in chunks as large as a storage
-/// binding allows (one, but for very many instances and views).
+/// then one per view for its occlusion phases, `params_stride` apart), written only when they
+/// change; the indirect draws, `ARGS_BYTES` apart in one buffer that a frame resets with one
+/// clear (each view's, then each view's second occlusion phase's); and the views' compacted
+/// instances, in chunks as large as a storage binding allows (one, but for very many instances
+/// and views).
 struct Shared {
     params: wgpu::Buffer,
     params_stride: u64,
@@ -116,10 +119,11 @@ struct Shared {
     chunks: Vec<Chunk>,
 }
 
-/// Occlusion culling's per-renderable state: which instances the camera saw last frame, the
-/// first phase's bind group (the main view's region, and `visibility`), and the second phase's
-/// own instances and bind group.
-struct OcclusionSlots {
+/// Occlusion culling's per-renderable state for a view culled in two phases: which instances it
+/// saw last frame, the first phase's bind group (the view's region, and `visibility`), and the
+/// second phase's own instances and bind group.
+struct OcclusionSlot {
+    view: usize,
     visibility: wgpu::Buffer,
     early: wgpu::BindGroup,
     late_instances: wgpu::Buffer,
@@ -159,6 +163,8 @@ pub(crate) struct CullInstancesGpu {
     layers: u32,
     shadow_lod: [f32; 2],
     reflection_lod: [f32; 2],
+    occlusion_view: u32,
+    _pad: [u32; 3],
 }
 
 /// `CullView` in instance_cull.wgsl: a view, shared by every renderable culled for it.
@@ -184,6 +190,8 @@ const FLAG_VIEW: u32 = 32;
 const FLAG_CASTERS_ONLY: u32 = 64;
 const FLAG_LAYERED: u32 = 128;
 const FLAG_REFLECTION: u32 = 256;
+const FLAG_OCCLUSION: u32 = 512;
+const FLAG_LINEAR_DEPTH: u32 = 1024;
 
 /// A view the renderer culls for: its view-projection, whether it only draws shadow casters (a
 /// shadow map, with `shadow_lod_range`), whether it is a planar reflection (with
@@ -198,14 +206,16 @@ pub(crate) struct CullView {
     pub lod_distance_scale: f32,
 }
 
-/// What occlusion culling projects bounds with: the camera's view, its projection as rasterized
-/// (jittered), and the depth buffer's size in pixels.
+/// What occlusion culling projects bounds with: the view, its projection as rasterized
+/// (jittered), and the depth buffer's size in pixels; and whether the depth pyramid holds view
+/// distances (`DepthPyramid::build_linear`) rather than depths.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OcclusionView {
     pub view: glam::Mat4,
     pub proj: glam::Mat4,
     pub depth_size: (u32, u32),
     pub reverse_z: bool,
+    pub linear_depth: bool,
 }
 
 impl CullView {
@@ -215,8 +225,8 @@ impl CullView {
         (!self.casters_only || casts_shadow) && self.layer_mask.is_none_or(|mask| mask & layers != 0)
     }
 
-    /// The view for the GPU: its frustum, the LOD origin, and for the camera what occlusion
-    /// culling projects with.
+    /// The view for the GPU: its frustum, the LOD origin, and for a view culled in two phases
+    /// this frame what occlusion culling projects with.
     pub(crate) fn gpu(&self, lod_origin: glam::Vec3, occlusion: Option<&OcclusionView>, stats: bool) -> CullViewGpu {
         let mut flags = FLAG_VIEW;
         if self.casters_only {
@@ -233,6 +243,12 @@ impl CullView {
         }
         if occlusion.is_some_and(|o| o.reverse_z) {
             flags |= FLAG_REVERSE_Z;
+        }
+        if occlusion.is_some() {
+            flags |= FLAG_OCCLUSION;
+        }
+        if occlusion.is_some_and(|o| o.linear_depth) {
+            flags |= FLAG_LINEAR_DEPTH;
         }
         let (view, proj, depth_size) = match occlusion {
             Some(o) => (o.view, o.proj, [o.depth_size.0 as f32, o.depth_size.1 as f32]),
@@ -270,8 +286,8 @@ impl InstanceCulling {
             occlusion: false,
             capacity: count,
             shared: None,
-            occlusion_slots: None,
-            two_phase: false,
+            occlusion_slots: Vec::new(),
+            two_phase: Vec::new(),
         }
     }
 
@@ -329,25 +345,22 @@ impl InstanceCulling {
         })
     }
 
-    /// The second phase's compacted instances and indirect draw, when this frame culls the main
-    /// view in two phases.
-    pub(crate) fn late(&self) -> Option<CulledDraw<'_>> {
+    /// The second phase's compacted instances and indirect draw in `view`, when this frame culls
+    /// it in two phases.
+    pub(crate) fn late(&self, view: usize) -> Option<CulledDraw<'_>> {
         let shared = self.shared.as_ref()?;
-        self.occlusion_slots.as_ref().filter(|_| self.two_phase).map(|o| CulledDraw {
-            instances: &o.late_instances,
-            instances_offset: 0,
-            args: &shared.args,
-            offset: shared.views as u64 * ARGS_BYTES,
-        })
+        let slot = self.occlusion_slots.iter().find(|o| o.view == view).filter(|_| self.two_phase.contains(&view))?;
+        Some(CulledDraw { instances: &slot.late_instances, instances_offset: 0, args: &shared.args, offset: (shared.views + view) as u64 * ARGS_BYTES })
     }
 
-    /// Whether this frame culls the main view in two phases (set by the renderer).
-    pub(crate) fn two_phase(&self) -> bool {
-        self.two_phase
+    /// Whether this frame culls `view` in two phases (set by the renderer).
+    pub(crate) fn two_phase_in(&self, view: usize) -> bool {
+        self.two_phase.contains(&view)
     }
 
-    pub(crate) fn set_two_phase(&mut self, two_phase: bool) {
-        self.two_phase = two_phase && self.occlusion_slots.is_some();
+    /// Cull `views` in two phases this frame (those with occlusion state), the others by frustum.
+    pub(crate) fn set_two_phase(&mut self, views: &[usize]) {
+        self.two_phase = views.iter().copied().filter(|v| self.occlusion_slots.iter().any(|o| o.view == *v)).collect();
     }
 
     /// The instances a dispatch tests.
@@ -403,19 +416,19 @@ impl InstanceCulling {
         // recreate everything: the draws hold a slot per view and the second phase's
         self.capacity = self.capacity.max(self.count);
         let count = count.max(self.shared.as_ref().map_or(0, |s| s.views)).max(1);
-        self.occlusion_slots = None;
-        self.two_phase = false;
+        self.occlusion_slots.clear();
+        self.two_phase.clear();
         let per_chunk = (max_chunk_bytes / self.region_bytes()).clamp(1, count as u64) as usize;
         let chunks = count.div_ceil(per_chunk);
         let align = device.limits().min_uniform_buffer_offset_alignment as u64;
         let params_stride = (std::mem::size_of::<CullInstancesGpu>() as u64).div_ceil(align) * align;
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         self.shared = Some(Shared {
-            params: buffer("InstanceCulling/Params", chunks as u64 * params_stride, wgpu::BufferUsages::UNIFORM),
+            params: buffer("InstanceCulling/Params", (chunks + count) as u64 * params_stride, wgpu::BufferUsages::UNIFORM),
             params_stride,
             written: None,
             // (COPY_SRC: the stats read them back)
-            args: buffer("InstanceCulling/Args", (count as u64 + 1) * ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            args: buffer("InstanceCulling/Args", 2 * count as u64 * ARGS_BYTES, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
             views: count,
             chunks: Vec::new(),
         });
@@ -432,28 +445,43 @@ impl InstanceCulling {
         true
     }
 
-    /// Make sure the occlusion state exists (after `ensure_views`); true if it was created.
-    pub(crate) fn ensure_occlusion(&mut self, device: &wgpu::Device, pipeline: &CullPipeline) -> bool {
-        let Some(shared) = self.shared.as_ref().filter(|_| self.occlusion_slots.is_none()) else { return false };
-        // one word per instance, zero (nothing seen yet)
-        let visibility = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("InstanceCulling/Visibility"),
-            size: self.capacity.max(1) as u64 * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        // the first phase fills the camera's region (the first chunk's first), the second its own
-        let early = self.bind_group(device, &pipeline.occlusion_bgl, 0, &shared.chunks[0].instances, Some(&visibility));
-        let late_instances = self.instances_buffer(device, 1);
-        let late = self.bind_group(device, &pipeline.occlusion_bgl, 0, &late_instances, Some(&visibility));
-        self.occlusion_slots = Some(OcclusionSlots { visibility, early, late_instances, late });
-        true
+    /// Make sure there is occlusion state for each of `views` (after `ensure_views`); true if
+    /// any was created.
+    pub(crate) fn ensure_occlusion(&mut self, device: &wgpu::Device, pipeline: &CullPipeline, views: &[usize]) -> bool {
+        let Some(shared) = self.shared.as_ref() else { return false };
+        let chunk_count = shared.chunks.len();
+        let mut created = false;
+        for &view in views {
+            if view >= shared.views || self.occlusion_slots.iter().any(|o| o.view == view) {
+                continue;
+            }
+            // one word per instance, zero (nothing seen yet)
+            let visibility = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("InstanceCulling/Visibility"),
+                size: self.capacity.max(1) as u64 * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            // the first phase fills the view's region (in its chunk), the second its own buffer;
+            // both read the view's copy of the parameters
+            let chunk = shared.chunks.iter().find(|c| (c.first_view..c.first_view + c.views).contains(&view)).unwrap();
+            let early = self.bind_group(device, &pipeline.occlusion_bgl, chunk_count + view, &chunk.instances, Some(&visibility));
+            let late_instances = self.instances_buffer(device, 1);
+            let late = self.bind_group(device, &pipeline.occlusion_bgl, chunk_count + view, &late_instances, Some(&visibility));
+            self.occlusion_slots.push(OcclusionSlot { view, visibility, early, late_instances, late });
+            created = true;
+        }
+        if created {
+            // the new views' copies of the parameters
+            self.shared.as_mut().unwrap().written = None;
+        }
+        created
     }
 
     /// Forget which instances were visible (a camera cut): the next first phase draws none of
     /// them, and the second tests them all.
     pub(crate) fn reset_visibility(&self, encoder: &mut wgpu::CommandEncoder) {
-        if let Some(o) = &self.occlusion_slots {
+        for o in &self.occlusion_slots {
             encoder.clear_buffer(&o.visibility, 0, None);
         }
     }
@@ -466,7 +494,7 @@ impl InstanceCulling {
         let scale = glam::Vec3::new(world.x_axis.truncate().length(), world.y_axis.truncate().length(), world.z_axis.truncate().length());
         let band = |(near, far): (f32, f32)| [near, far.min(f32::MAX)];
         let mut flags = 0;
-        for (on, flag) in [(self.bounds_box.is_some(), FLAG_BOX), (casts_shadow, FLAG_CASTS_SHADOW), (self.two_phase, FLAG_TWO_PHASE)] {
+        for (on, flag) in [(self.bounds_box.is_some(), FLAG_BOX), (casts_shadow, FLAG_CASTS_SHADOW), (!self.two_phase.is_empty(), FLAG_TWO_PHASE)] {
             if on {
                 flags |= flag;
             }
@@ -487,18 +515,26 @@ impl InstanceCulling {
             index_count,
             first_view: 0,
             capacity: self.capacity,
-            late_slot: self.shared.as_ref().expect("ensure_views first").views as u32,
+            late_slot: 0,
             layers,
             shadow_lod: band(self.shadow_lod_range.unwrap_or(self.lod_range)),
             reflection_lod: band(self.reflection_lod_range.unwrap_or(self.lod_range)),
+            occlusion_view: 0,
+            _pad: [0; 3],
         };
-        let shared = self.shared.as_mut().unwrap();
+        let shared = self.shared.as_mut().expect("ensure_views first");
         if shared.written != Some(params) {
-            // a copy per chunk, each with its first view
-            let mut bytes = vec![0u8; shared.chunks.len() * shared.params_stride as usize];
+            // a copy per chunk, each with its first view; then one per view culled in two phases,
+            // with the view, its chunk's first view and its second phase's draw
+            let stride = shared.params_stride as usize;
+            let mut bytes = vec![0u8; (shared.chunks.len() + shared.views) * stride];
+            let mut put = |k: usize, params: CullInstancesGpu| bytes[k * stride..][..std::mem::size_of::<CullInstancesGpu>()].copy_from_slice(bytemuck::bytes_of(&params));
             for (k, chunk) in shared.chunks.iter().enumerate() {
-                let params = CullInstancesGpu { first_view: chunk.first_view as u32, ..params };
-                bytes[k * shared.params_stride as usize..][..std::mem::size_of::<CullInstancesGpu>()].copy_from_slice(bytemuck::bytes_of(&params));
+                put(k, CullInstancesGpu { first_view: chunk.first_view as u32, ..params });
+            }
+            for o in &self.occlusion_slots {
+                let first_view = shared.chunks.iter().find(|c| (c.first_view..c.first_view + c.views).contains(&o.view)).unwrap().first_view;
+                put(shared.chunks.len() + o.view, CullInstancesGpu { first_view: first_view as u32, occlusion_view: o.view as u32, late_slot: (shared.views + o.view) as u32, ..params });
             }
             queue.write_buffer(&shared.params, 0, &bytes);
             shared.written = Some(params);
@@ -511,8 +547,8 @@ impl InstanceCulling {
     }
 
     /// Cull into every view the renderable is drawn in, a dispatch per chunk (with the
-    /// frustum-only pipeline and the views' group 1 set). With two phases this frame, the camera
-    /// is left to `dispatch_early` and `dispatch_late`.
+    /// frustum-only pipeline and the views' group 1 set). The views culled in two phases this
+    /// frame are left to `dispatch_early` and `dispatch_late`.
     pub(crate) fn dispatch(&self, pass: &mut wgpu::ComputePass) {
         for chunk in &self.shared.as_ref().expect("ensure_views first").chunks {
             pass.set_bind_group(0, &chunk.bind_group, &[]);
@@ -520,19 +556,20 @@ impl InstanceCulling {
         }
     }
 
-    /// Occlusion's first phase for the main view (with the `early` pipeline and the views'
-    /// group 1 set).
-    pub(crate) fn dispatch_early(&self, pass: &mut wgpu::ComputePass) {
-        let o = self.occlusion_slots.as_ref().expect("ensure_occlusion first");
-        pass.set_bind_group(0, &o.early, &[]);
+    fn slot(&self, view: usize) -> &OcclusionSlot {
+        self.occlusion_slots.iter().find(|o| o.view == view).expect("ensure_occlusion for the view first")
+    }
+
+    /// Occlusion's first phase in `view` (with the `early` pipeline and the views' group 1 set).
+    pub(crate) fn dispatch_early(&self, pass: &mut wgpu::ComputePass, view: usize) {
+        pass.set_bind_group(0, &self.slot(view).early, &[]);
         pass.dispatch_workgroups(self.workgroups(), 1, 1);
     }
 
-    /// Occlusion's second phase (with the `late` pipeline, the views' group 1 and the pyramid's
-    /// group 2 set).
-    pub(crate) fn dispatch_late(&self, pass: &mut wgpu::ComputePass) {
-        let o = self.occlusion_slots.as_ref().expect("ensure_occlusion first");
-        pass.set_bind_group(0, &o.late, &[]);
+    /// Occlusion's second phase in `view` (with the `late` pipeline, the views' group 1 and the
+    /// view's pyramid's group 2 set).
+    pub(crate) fn dispatch_late(&self, pass: &mut wgpu::ComputePass, view: usize) {
+        pass.set_bind_group(0, &self.slot(view).late, &[]);
         pass.dispatch_workgroups(self.workgroups(), 1, 1);
     }
 }
@@ -1019,90 +1056,110 @@ mod tests {
         }
         use wgpu::util::DeviceExt;
         let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::STORAGE });
-        let mut pipeline = CullPipeline::new(&device);
-        let mut sphere = InstanceCulling::new(source.clone(), 5, 32, 0, 0.5).with_radius_scale(12).with_occlusion(true);
-        // all ten records as boxes: the first five then reach from their centre up, the second
-        // five are centred where the spheres are; either way each id is hidden, beside, ...
-        let mut boxed = InstanceCulling::new(source, 10, 32, 0, 0.5)
-            .with_radius_scale(12)
-            .with_bounds_shift(glam::Vec3::Y)
-            .with_bounds_box(glam::Vec3::new(0.5, 1.0, 0.5))
-            .with_occlusion(true);
-        for culling in [&mut sphere, &mut boxed] {
-            culling.ensure_views(&device, &pipeline.bgl, 1);
-            assert!(culling.ensure_occlusion(&device, &pipeline));
-            culling.set_two_phase(true);
-        }
-        let cull_view = CullView { view_proj: proj * view, casters_only: false, reflection: false, layer_mask: None, lod_distance_scale: 1.0 };
-        let occlusion = OcclusionView { view, proj, depth_size: (64, 64), reverse_z: false };
-        pipeline.set_views(&device, &queue, &[cull_view.gpu(glam::Vec3::ZERO, Some(&occlusion), true)]);
-        let mut pyramid = super::super::DepthPyramid::new(&device, 64, 64, super::super::DepthReduction::Max);
+        // culled in two phases in view 0 alone, then in view 1 while view 0 (the same camera)
+        // stays frustum-only: the renderer's camera, and a reflection with occlusion culling;
+        // then with a pyramid of view distances (as reflections have), to the same effect
+        for (occluded, linear) in [(0usize, false), (1, false), (1, true)] {
+            let mut pipeline = CullPipeline::new(&device);
+            let mut sphere = InstanceCulling::new(source.clone(), 5, 32, 0, 0.5).with_radius_scale(12).with_occlusion(true);
+            // all ten records as boxes: the first five then reach from their centre up, the second
+            // five are centred where the spheres are; either way each id is hidden, beside, ...
+            let mut boxed = InstanceCulling::new(source.clone(), 10, 32, 0, 0.5)
+                .with_radius_scale(12)
+                .with_bounds_shift(glam::Vec3::Y)
+                .with_bounds_box(glam::Vec3::new(0.5, 1.0, 0.5))
+                .with_occlusion(true);
+            for culling in [&mut sphere, &mut boxed] {
+                culling.ensure_views(&device, &pipeline.bgl, occluded + 1);
+                assert!(culling.ensure_occlusion(&device, &pipeline, &[occluded]));
+                culling.set_two_phase(&[occluded]);
+            }
+            let cull_view = CullView { view_proj: proj * view, casters_only: false, reflection: false, layer_mask: None, lod_distance_scale: 1.0 };
+            let occlusion = OcclusionView { view, proj, depth_size: (64, 64), reverse_z: false, linear_depth: linear };
+            let views: Vec<_> = (0..=occluded).map(|v| cull_view.gpu(glam::Vec3::ZERO, (v == occluded).then_some(&occlusion), true)).collect();
+            pipeline.set_views(&device, &queue, &views);
+            let mut pyramid = super::super::DepthPyramid::new(&device, 64, 64, super::super::DepthReduction::Max);
 
-        // one frame of both phases; the ids each drew, and (lod, frustum, occluded) culled
-        let mut frame = |culling: &mut InstanceCulling, wall_at: Option<f32>, reset: bool| -> (Vec<u32>, Vec<u32>, [u32; 3]) {
-            let depth = wall_depth(&device, &queue, wall_at);
-            pyramid.resize(&device, 64, 64);
-            let bind_group = pipeline.pyramid_bind_group(&device, &pyramid);
-            let mut encoder = device.create_command_encoder(&Default::default());
-            if reset {
-                culling.reset_visibility(&mut encoder);
-            }
-            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false, 1);
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                // as the renderer: every view, which leaves the camera's to the two phases
-                pass.set_pipeline(&pipeline.pipeline);
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
-                culling.dispatch(&mut pass);
-                pass.set_pipeline(&pipeline.early);
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
-                culling.dispatch_early(&mut pass);
-            }
-            pyramid.build(&device, &mut encoder, &depth.create_view(&Default::default()));
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&pipeline.late);
-                pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
-                pass.set_bind_group(2, &bind_group, &[]);
-                culling.dispatch_late(&mut pass);
-            }
-            queue.submit(Some(encoder.finish()));
-            let (early, late) = (culling.view(0).unwrap(), culling.late().unwrap());
-            let ids = |draw: CulledDraw, args: &[u32]| -> Vec<u32> {
-                let words = &read_words(&device, &queue, draw.instances)[draw.instances_offset as usize / 4..];
-                let mut ids: Vec<u32> = (0..args[1] as usize).map(|k| f32::from_bits(words[k * 8 + 4]) as u32).collect();
-                ids.sort();
-                ids
+            // one frame of both phases; the ids each drew, (lod, frustum, occluded) culled, and
+            // the ids the frustum-only view drew (if any)
+            let mut frame = |culling: &mut InstanceCulling, wall_at: Option<f32>, reset: bool| -> (Vec<u32>, Vec<u32>, [u32; 3], Vec<u32>) {
+                let depth = wall_depth(&device, &queue, wall_at);
+                pyramid.resize(&device, 64, 64);
+                let bind_group = pipeline.pyramid_bind_group(&device, &pyramid);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                if reset {
+                    culling.reset_visibility(&mut encoder);
+                }
+                culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false, 1);
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    // as the renderer: every view, which leaves the one culled in two phases to them
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                    culling.dispatch(&mut pass);
+                    pass.set_pipeline(&pipeline.early);
+                    pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                    culling.dispatch_early(&mut pass, occluded);
+                }
+                if linear {
+                    pyramid.build_linear(&device, &queue, &mut encoder, &depth.create_view(&Default::default()), proj.inverse());
+                } else {
+                    pyramid.build(&device, &mut encoder, &depth.create_view(&Default::default()));
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&pipeline.late);
+                    pass.set_bind_group(1, pipeline.view_bind_group(), &[]);
+                    pass.set_bind_group(2, &bind_group, &[]);
+                    culling.dispatch_late(&mut pass, occluded);
+                }
+                queue.submit(Some(encoder.finish()));
+                let (early, late) = (culling.view(occluded).unwrap(), culling.late(occluded).unwrap());
+                let ids = |draw: CulledDraw, args: &[u32]| -> Vec<u32> {
+                    let words = &read_words(&device, &queue, draw.instances)[draw.instances_offset as usize / 4..];
+                    let mut ids: Vec<u32> = (0..args[1] as usize).map(|k| f32::from_bits(words[k * 8 + 4]) as u32).collect();
+                    ids.sort();
+                    ids
+                };
+                let args = |draw: CulledDraw| read_words(&device, &queue, draw.args)[draw.offset as usize / 4..][..8].to_vec();
+                let (a0, a1) = (args(early), args(late));
+                assert_eq!((a0[0], a1[0]), (36, 36), "index counts");
+                let frustum_only = if occluded > 0 {
+                    let draw = culling.view(0).unwrap();
+                    ids(draw, &args(draw))
+                } else {
+                    Vec::new()
+                };
+                (ids(early, &a0), ids(late, &a1), [a0[5] + a1[5], a0[6] + a1[6], a0[7] + a1[7]], frustum_only)
             };
-            let args = |draw: CulledDraw| read_words(&device, &queue, draw.args)[draw.offset as usize / 4..][..8].to_vec();
-            let (a0, a1) = (args(early), args(late));
-            assert_eq!((a0[0], a1[0]), (36, 36), "index counts");
-            (ids(early, &a0), ids(late, &a1), [a0[5] + a1[5], a0[6] + a1[6], a0[7] + a1[7]])
-        };
 
-        for culling in [&mut sphere, &mut boxed] {
-            let label = if culling.bounds_box.is_some() { "box" } else { "sphere" };
-            // frame 1: nothing seen yet; the second phase draws the visible ones
-            let (early, late, culled) = frame(&mut *culling, Some(wall), true);
-            if culling.count == 5 {
-                assert_eq!(early, Vec::<u32>::new(), "{label}: frame 1 early");
-                assert_eq!(late, vec![RIGHT, FRONT, EDGE], "{label}: frame 1 late");
-                assert_eq!(culled, [0, 1, 1], "{label}: frame 1 (lod, frustum, occluded)");
-                // frame 2: the first phase draws them; the hidden one stays culled
-                let (early, late, culled) = frame(&mut *culling, Some(wall), false);
-                assert_eq!((early, late, culled), (vec![RIGHT, FRONT, EDGE], vec![], [0, 1, 1]), "{label}: frame 2");
-                // frame 3: the wall is gone; the second phase draws the uncovered one
-                let (early, late, culled) = frame(&mut *culling, None, false);
-                assert_eq!((early, late, culled), (vec![RIGHT, FRONT, EDGE], vec![HIDDEN], [0, 1, 0]), "{label}: frame 3");
-                // frame 4: all four seen; a reset forgets them
-                let (early, _, _) = frame(&mut *culling, None, false);
-                assert_eq!(early, vec![HIDDEN, RIGHT, FRONT, EDGE], "{label}: frame 4");
-                let (early, late, _) = frame(&mut *culling, Some(wall), true);
-                assert_eq!((early, late), (vec![], vec![RIGHT, FRONT, EDGE]), "{label}: after a reset");
-            } else {
-                assert_eq!(early, Vec::<u32>::new(), "{label}: frame 1 early");
-                assert_eq!(late, vec![RIGHT, RIGHT, FRONT, FRONT, EDGE, EDGE], "{label}: frame 1 late");
-                assert_eq!(culled, [0, 2, 2], "{label}: frame 1 (lod, frustum, occluded)");
+            for culling in [&mut sphere, &mut boxed] {
+                let label = format!("{} in view {occluded}{}", if culling.bounds_box.is_some() { "box" } else { "sphere" }, if linear { ", view distances" } else { "" });
+                // frame 1: nothing seen yet; the second phase draws the visible ones
+                let (early, late, culled, frustum_only) = frame(&mut *culling, Some(wall), true);
+                if culling.count == 5 {
+                    assert_eq!(early, Vec::<u32>::new(), "{label}: frame 1 early");
+                    assert_eq!(late, vec![RIGHT, FRONT, EDGE], "{label}: frame 1 late");
+                    assert_eq!(culled, [0, 1, 1], "{label}: frame 1 (lod, frustum, occluded)");
+                    if occluded > 0 {
+                        assert_eq!(frustum_only, vec![HIDDEN, RIGHT, FRONT, EDGE], "{label}: the frustum-only view");
+                    }
+                    // frame 2: the first phase draws them; the hidden one stays culled
+                    let (early, late, culled, _) = frame(&mut *culling, Some(wall), false);
+                    assert_eq!((early, late, culled), (vec![RIGHT, FRONT, EDGE], vec![], [0, 1, 1]), "{label}: frame 2");
+                    // frame 3: the wall is gone; the second phase draws the uncovered one
+                    let (early, late, culled, _) = frame(&mut *culling, None, false);
+                    assert_eq!((early, late, culled), (vec![RIGHT, FRONT, EDGE], vec![HIDDEN], [0, 1, 0]), "{label}: frame 3");
+                    // frame 4: all four seen; a reset forgets them
+                    let (early, _, _, _) = frame(&mut *culling, None, false);
+                    assert_eq!(early, vec![HIDDEN, RIGHT, FRONT, EDGE], "{label}: frame 4");
+                    let (early, late, _, _) = frame(&mut *culling, Some(wall), true);
+                    assert_eq!((early, late), (vec![], vec![RIGHT, FRONT, EDGE]), "{label}: after a reset");
+                } else {
+                    assert_eq!(early, Vec::<u32>::new(), "{label}: frame 1 early");
+                    assert_eq!(late, vec![RIGHT, RIGHT, FRONT, FRONT, EDGE, EDGE], "{label}: frame 1 late");
+                    assert_eq!(culled, [0, 2, 2], "{label}: frame 1 (lod, frustum, occluded)");
+                }
             }
         }
     }
