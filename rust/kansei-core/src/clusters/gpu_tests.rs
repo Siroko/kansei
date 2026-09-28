@@ -700,13 +700,15 @@ fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: boo
     let eye = model.inverse().transform_point3(v.eye);
     let cone = cone && m.determinant() > 0.0;
     let planes = crate::culling::frustum_planes(v.view_proj);
+    // a stretch about the mesh's origin also moves a sphere's centre (cluster_cull.wgsl)
+    let placed = |s: Sphere| (s.radius + (1.0 - 1.0 / stretch) * s.center.length()) * scale;
     let projected = |error: f32, s: Sphere| {
         if error == 0.0 {
             0.0
         } else if !error.is_finite() {
             f32::INFINITY
         } else {
-            error * scale / (v.eye.distance(model.transform_point3(s.center)) - s.radius * scale).max(v.near) * v.ppr
+            error * scale / (v.eye.distance(model.transform_point3(s.center)) - placed(s)).max(v.near) * v.ppr
         }
     };
     let close = |p: f32| (p - v.threshold).abs() <= 2e-3 * v.threshold.max(1e-3);
@@ -714,7 +716,7 @@ fn expected_world(mesh: &ClusterMesh, model: glam::Mat4, v: &TestView, cone: boo
     for (i, c) in mesh.clusters.iter().enumerate() {
         let (own, parent) = (projected(c.error, c.lod_bounds), projected(c.parent_error, c.parent_bounds));
         let center = model.transform_point3(c.bounds.center);
-        let radius = c.bounds.radius * scale;
+        let radius = placed(c.bounds);
         let outside: Vec<f32> = planes.iter().map(|p| p.truncate().dot(center) + p.w + radius).collect();
         let facing = (c.cone_apex - eye).normalize_or_zero().dot(c.cone_axis) - c.cone_cutoff;
         if close(own) || close(parent) || outside.iter().any(|d| d.abs() < 1e-4 * radius.max(1.0)) || (cone && facing.abs() < 1e-4) {
@@ -885,4 +887,67 @@ fn a_negated_yaw_and_a_stretch_bound_the_film_s_trees() {
             assert_cut(&format!("eye {eye}, instance {k}"), &pairs, k as u32, &expected_world(&mesh, turned(r), &view, false, 1.2));
         }
     }
+}
+
+#[test]
+fn a_stretch_covers_an_instance_widened_about_its_origin() {
+    // a material widening the film's trees 1.1x about their origin moves an off-axis cluster
+    // outwards as well as growing it: every level-0 cluster with a widened vertex inside the
+    // frustum must still be drawn, wherever the frustum's edges cut the instances
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let mesh = ClusterMesh::build(&spokes(), &ClusterOptions::default());
+    let records = [
+        placement_record(glam::Vec3::new(0.0, 0.0, -3.0), 1.5, 0.9, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(4.0, 0.0, -6.0), 2.0, -2.2, glam::Quat::IDENTITY),
+        placement_record(glam::Vec3::new(-4.0, 0.0, -8.0), 1.0, 2.8, glam::Quat::IDENTITY),
+    ];
+    let record_buffer = buffer(&device, bytemuck::cast_slice(&records.concat()));
+    let culling = ClusterCulling::new(&device);
+    let mut gpu = ClusterGpu::new(&device, &mesh);
+    let source = InstanceSource::All { records: &record_buffer, count: records.len() as u32 };
+    let transform = InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: -1.0, rotation: None };
+    let params = ClusterCullGpu::new(glam::Mat4::IDENTITY, Some(transform), 48, &source, 3 * mesh.clusters.len() as u32, gpu.vertex_count(), true, 1.1);
+    let widened = |r: &[f32; 12]| {
+        glam::Mat4::from_translation(glam::Vec3::new(r[0], r[1], r[2])) * glam::Mat4::from_rotation_y(-r[4]) * glam::Mat4::from_scale(glam::Vec3::new(1.1 * r[3], r[3], 1.1 * r[3]))
+    };
+    let mut checked = 0;
+    for step in 0..96 {
+        // swing the view across the instances so its edges sweep through them
+        let a = step as f32 * std::f32::consts::TAU / 96.0;
+        let eye = glam::Vec3::new(0.0, 1.0, 4.0);
+        let view = TestView::looking(eye, eye + glam::Vec3::new(a.sin(), -0.1, -a.cos()), 0.0);
+        let planes = crate::culling::frustum_planes(view.view_proj);
+        let (_, pairs) = cull(&device, &queue, &culling, &mut gpu, source, params, &view);
+        for (k, r) in records.iter().enumerate() {
+            let model = widened(r);
+            for (i, c) in mesh.clusters.iter().enumerate().filter(|(_, c)| c.level == 0) {
+                let inside = mesh.triangles(i).flatten().any(|v| {
+                    let p = model.transform_point3(glam::Vec4::from(mesh.vertices[v as usize].position).truncate());
+                    planes.iter().all(|q| q.truncate().dot(p) + q.w > 1e-3)
+                });
+                if inside {
+                    checked += 1;
+                    assert!(pairs.contains(&(k as u32, i as u32)), "view {step}, instance {k}: cluster {i} (level {}) has widened geometry in view but was culled", c.level);
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "only {checked} clusters in view");
+}
+
+/// Branches: 8 thin plates reaching from 1 m to 5 m out from the origin, so a cluster reaches
+/// along the direction a widening moves it.
+fn spokes() -> crate::geometries::Geometry {
+    let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+    for k in 0..8 {
+        let a = k as f32 / 8.0 * std::f32::consts::TAU;
+        let out = glam::Vec3::new(a.cos(), 0.0, a.sin());
+        for j in 0..40 {
+            super::card_tests::quad(&mut vertices, &mut indices, out * (1.05 + j as f32 * 0.1), out * 0.05, glam::Vec3::Y * 0.05);
+        }
+    }
+    crate::geometries::Geometry::new("spokes", vertices, indices)
 }

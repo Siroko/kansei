@@ -266,9 +266,11 @@ pub struct ClusterLod {
     /// Clusters drawn per frame, at most. By default every cluster of every instance, up to
     /// 4 194 304. Clusters past it aren't drawn.
     pub capacity: Option<u32>,
-    /// How much further than `transform` the material may stretch or sway an instance (1 by
-    /// default): the cull's spheres and errors grow by it (and its cones are off past 1). The
-    /// film's trees: widths up to 1.1x their height, and a sway.
+    /// How much further than `transform` the material may stretch or sway an instance about its
+    /// origin (1 by default): no point moves more than `stretch - 1` times its distance from the
+    /// origin. The cull's errors grow by it, its spheres by it and by how far their centres may
+    /// move, and its cones are off past 1. The film's trees: widths up to 1.1x their height, and
+    /// a sway.
     pub stretch: f32,
     pub(crate) gpu: Option<ClusterGpu>,
 }

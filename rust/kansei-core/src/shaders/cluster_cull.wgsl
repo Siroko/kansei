@@ -148,13 +148,23 @@ fn projected_at(error: f32, distance: f32) -> f32 {
     return error / max(distance, view.near) * view.pixels_per_radian;
 }
 
-// the error of a mesh sphere (xyz, radius) placed by `model`, `scale` a bound on its largest scale
-fn projected(error: f32, sphere: vec4<f32>, model: mat4x4<f32>, scale: f32) -> f32 {
-    let center = (model * vec4<f32>(sphere.xyz, 1.0)).xyz;
-    return projected_at(error * scale, distance(view.eye, center) - sphere.w * scale);
+// the radius a mesh sphere (xyz, radius) needs once placed, `scale` a bound on the placement's
+// largest scale times the stretch: a material stretching an instance up to `stretch` about its
+// origin moves a point up to (stretch - 1) times its distance from there, so the sphere grows by
+// the stretch and by how far its centre may move
+fn placed_radius(sphere: vec4<f32>, scale: f32) -> f32 {
+    return (sphere.w + (1.0 - 1.0 / params.stretch) * length(sphere.xyz)) * scale;
 }
 
-// clusters::LevelBounds::may_draw, from the eye's distance to the mesh's origin
+// the error of a mesh sphere (xyz, radius) placed by `model`, `scale` as in `placed_radius`
+fn projected(error: f32, sphere: vec4<f32>, model: mat4x4<f32>, scale: f32) -> f32 {
+    let center = (model * vec4<f32>(sphere.xyz, 1.0)).xyz;
+    return projected_at(error * scale, distance(view.eye, center) - placed_radius(sphere, scale));
+}
+
+// clusters::LevelBounds::may_draw, from the eye's distance to the mesh's origin (a stretch's
+// `placed_radius` keeps within it: a sphere's nearest point comes no nearer the origin than
+// `near_reach * scale` allows for, and its farthest reaches `far_reach * scale` at most)
 fn level_may_draw(level: u32, origin_distance: f32, scale: f32) -> bool {
     let min_error = bitcast<f32>(kansei_level_word(level, 2u));
     let max_parent_error = bitcast<f32>(kansei_level_word(level, 3u));
@@ -177,8 +187,9 @@ fn cluster_drawn(c: u32, model: mat4x4<f32>, scale: f32, eye_mesh: vec3<f32>, co
     // the frustum
     let bounds = kansei_cluster_vec4(c, 4u);
     let center = (model * vec4<f32>(bounds.xyz, 1.0)).xyz;
+    let radius = placed_radius(bounds, scale);
     for (var p = 0u; p < 6u; p++) {
-        if (dot(view.planes[p].xyz, center) + view.planes[p].w < -bounds.w * scale) {
+        if (dot(view.planes[p].xyz, center) + view.planes[p].w < -radius) {
             return false;
         }
     }
