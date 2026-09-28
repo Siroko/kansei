@@ -17,6 +17,8 @@ pub struct CullStats {
     pub occlusion_culled: u32,
     /// Drawn (in either phase, with occlusion culling).
     pub drawn: u32,
+    /// Triangles drawn: each draw's instances times its mesh's.
+    pub triangles: u64,
 }
 
 impl std::ops::AddAssign for CullStats {
@@ -26,6 +28,7 @@ impl std::ops::AddAssign for CullStats {
         self.frustum_culled += o.frustum_culled;
         self.occlusion_culled += o.occlusion_culled;
         self.drawn += o.drawn;
+        self.triangles += o.triangles;
     }
 }
 
@@ -123,7 +126,9 @@ impl StatsReadback {
             for (k, &(view, tested)) in pending.entries.iter().enumerate() {
                 let a = &words[k * ARGS_BYTES as usize / 4..][..8];
                 let kind = pending.kinds[view];
-                let stats = CullStats { tested, drawn: a[1], lod_culled: a[5], frustum_culled: a[6], occlusion_culled: a[7] };
+                // (the draw's index count, then its instance count)
+                let triangles = a[0] as u64 / 3 * a[1] as u64;
+                let stats = CullStats { tested, drawn: a[1], lod_culled: a[5], frustum_culled: a[6], occlusion_culled: a[7], triangles };
                 match views.iter_mut().find(|(k, _)| *k == kind) {
                     Some((_, s)) => *s += stats,
                     None => views.push((kind, stats)),
