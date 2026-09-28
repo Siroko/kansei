@@ -11,6 +11,7 @@ bytemuck = { workspace = true }
 log = { workspace = true }
 image = { workspace = true }
 gltf = { workspace = true }
+optimesh = { workspace = true }
 egui = { version = "0.31", optional = true }
 egui-wgpu = { version = "0.31", optional = true }
 
