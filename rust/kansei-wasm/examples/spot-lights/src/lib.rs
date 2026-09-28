@@ -7,7 +7,9 @@
 //! only, the bug GPU per-view culling avoids), `drive=1`, `t=<seconds>` (freeze), `shadows=0`,
 //! `fog=0`, `stats=1` (log the CPU time of the render call and the frame interval, which is the
 //! GPU time when the browser runs without vsync), `casters=<n>` (n more
-//! renderables), `lamps=<n>` (n small downlights), `clusters=0` (every light at every pixel).
+//! renderables), `lamps=<n>` (n small downlights), `clusters=0` (every light at every pixel),
+//! `shafts=<steps>` (the beams raymarched per pixel with that many samples per light, instead of
+//! in the fog's froxels).
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -25,7 +27,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
-    effects::{exposure_from_ev100, BloomEffect, BloomOptions, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions},
+    effects::{exposure_from_ev100, BloomEffect, BloomOptions, SpotScattering, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 
@@ -329,6 +331,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             height_falloff: 0.05,
             anisotropy: 0.3,
             ambient: Vec3::new(0.25, 0.32, 0.45),
+            spot_scattering: match query_param("shafts").and_then(|v| v.parse().ok()) {
+                Some(steps) if steps > 0 => SpotScattering::Raymarched { steps },
+                _ => SpotScattering::Froxels,
+            },
             ..Default::default()
         });
         fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());

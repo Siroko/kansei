@@ -21,6 +21,36 @@ const COMPOSITE_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
     include_str!("../../shaders/volumetric_fog_composite.wgsl"),
 );
+/// The injection's shader with the shafts' entry point (`shafts`) appended.
+const SHAFTS_WGSL: &str = concat!(
+    include_str!("../../shaders/froxel_common.wgsl"),
+    include_str!("../../shaders/volumetric_fog_inject.wgsl"),
+    include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("../../shaders/volumetric_fog_media.wgsl"),
+    include_str!("../../shaders/spot_light_types.wgsl"),
+    include_str!("../../shaders/volumetric_fog_spot.wgsl"),
+    include_str!("../../shaders/volumetric_fog_shafts_common.wgsl"),
+    include_str!("../../shaders/volumetric_fog_shafts.wgsl"),
+);
+const SHAFTS_TEMPORAL_WGSL: &str = concat!(
+    include_str!("../../shaders/volumetric_fog_shafts_common.wgsl"),
+    include_str!("../../shaders/volumetric_fog_shafts_temporal.wgsl"),
+);
+
+/// How the fog scatters the spot lights' light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpotScattering {
+    /// In the froxel grid with the fog's other light (the default). Cheap, but the grid's slices
+    /// are metres deep where the beams are, so a shadow thinner than that (a trunk or grass
+    /// shadowing a beam that crosses the view) fades into the lit fog around it.
+    #[default]
+    Froxels,
+    /// Raymarched along each view ray at half resolution, `steps` samples per light over the part
+    /// of the ray inside its cone, each through the light's shadow map; filtered over frames and
+    /// upsampled by depth. The shadows of thin things stay sharp in the beams. The froxels keep the
+    /// medium and the other lights (and a planar reflection's fog keeps the spots in its grid).
+    Raymarched { steps: u32 },
+}
 
 const NO_SHADOW: u32 = u32::MAX;
 
@@ -50,6 +80,8 @@ pub struct VolumetricFogOptions {
     pub albedo: Vec3,
     /// Scales the sky's light on the fog once a sky is bound (`set_sky_lighting`); 1 is physical.
     pub sky_ambient_scale: f32,
+    /// How the spot lights scatter: in the froxels, or raymarched per pixel for sharp shafts.
+    pub spot_scattering: SpotScattering,
 }
 
 impl Default for VolumetricFogOptions {
@@ -66,6 +98,7 @@ impl Default for VolumetricFogOptions {
             ambient: Vec3::ZERO,
             albedo: Vec3::new(1.0, 1.0, 1.0),
             sky_ambient_scale: 1.0,
+            spot_scattering: SpotScattering::Froxels,
         }
     }
 }
@@ -97,7 +130,7 @@ struct FogParamsGpu {
     anisotropy: f32,
     start_distance: f32,
     jitter_frame: u32,
-    _pad: f32,
+    skip_spots: u32,
     clip_plane: [f32; 4],
 }
 
@@ -129,6 +162,27 @@ struct CompositeParamsGpu {
     grid_d: f32,
     screen_width: f32,
     screen_height: f32,
+    shafts: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShaftParamsGpu {
+    inv_view_proj: [f32; 16],
+    prev_view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    frame: u32,
+    view_forward: [f32; 3],
+    steps: u32,
+    size: [u32; 2],
+    full_size: [u32; 2],
+    grid_near: f32,
+    grid_far: f32,
+    grid_d: f32,
+    blend: f32,
+    camera_near: f32,
+    camera_far: f32,
+    history_valid: u32,
     _pad: f32,
 }
 
@@ -261,6 +315,22 @@ struct FogMediaParamsGpu {
     _pad: [u32; 2],
 }
 
+/// A half-resolution shafts target (rgb light, a linear depth).
+fn shafts_target(device: &wgpu::Device, label: &str, width: u32, height: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
 /// Size of the WGSL `SkyLighting` struct (atmosphere::SKY_LIGHTING_WGSL).
 const SKY_LIGHTING_BYTES: u64 = std::mem::size_of::<crate::atmosphere::params::SkyLightingGpu>() as u64;
 
@@ -286,6 +356,23 @@ struct Gpu {
     dummy_spot_atlas: wgpu::TextureView,
     spot_sampler: wgpu::Sampler,
     reflection: Option<ReflectionGpu>,
+    shafts: ShaftsGpu,
+}
+
+/// The raymarched spot-light shafts (SpotScattering::Raymarched).
+struct ShaftsGpu {
+    trace: wgpu::ComputePipeline,
+    trace_bgl: wgpu::BindGroupLayout,
+    temporal: wgpu::ComputePipeline,
+    temporal_bgl: wgpu::BindGroupLayout,
+    params: wgpu::Buffer,
+    /// Bound in the composite while the shafts are off.
+    none: wgpu::TextureView,
+    /// (width, height, trace, history A and B), at half the image's resolution.
+    targets: Option<(u32, u32, wgpu::TextureView, [wgpu::TextureView; 2])>,
+    frame: u32,
+    prev_view_proj: Option<glam::Mat4>,
+    last_camera_frame: Option<u32>,
 }
 
 /// The fog as a planar reflection sees it: a second froxel grid, built from the mirrored camera
@@ -314,7 +401,10 @@ struct ReflectionGpu {
 /// ```
 ///
 /// With a temporal grid, the injection samples a different point of each froxel every frame, so
-/// the history resolves shadow detail (shafts, the shadows of trunks in beams) finer than the grid.
+/// the history resolves shadow detail (shafts, the shadows of trunks in beams) finer than the grid,
+/// across the view. Along the view a froxel is a few metres deep at a few tens of metres, too deep
+/// for the shadow of a trunk or of grass in a beam: `spot_scattering:
+/// SpotScattering::Raymarched` marches the spot lights' beams per pixel instead.
 pub struct VolumetricFogEffect {
     pub base_density: f32,
     pub height_falloff: f32,
@@ -330,6 +420,8 @@ pub struct VolumetricFogEffect {
     pub local_volumes: Vec<LocalFogVolume>,
     /// Seconds, drives the wind offset. The effect has no clock of its own; set it per frame.
     pub time: f32,
+    /// How the spot lights scatter: in the froxels, or raymarched per pixel for sharp shafts.
+    pub spot_scattering: SpotScattering,
     /// Temporal jitter index of the injection (1..=1024), advanced every frame.
     frame: u32,
     grid_options: FroxelGridOptions,
@@ -362,6 +454,7 @@ impl VolumetricFogEffect {
             sky_ambient_scale: options.sky_ambient_scale,
             local_volumes: Vec::new(),
             time: 0.0,
+            spot_scattering: options.spot_scattering,
             frame: 1,
             grid_options: options.grid,
             dir_data: Vec::new(),
@@ -387,6 +480,7 @@ impl VolumetricFogEffect {
     pub fn reset_history(&mut self) {
         if let Some(g) = &mut self.gpu {
             g.grid.reset_history();
+            g.shafts.prev_view_proj = None;
             if let Some(r) = &mut g.reflection {
                 r.grid.reset_history();
             }
@@ -563,6 +657,76 @@ impl VolumetricFogEffect {
             },
             count: None,
         };
+        let texture_2d = |binding, filterable| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: compute,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let storage_2d = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: compute,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format: wgpu::TextureFormat::Rgba16Float,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        };
+        let spot_atlas_entry = wgpu::BindGroupLayoutEntry {
+            binding: 8,
+            visibility: compute,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let spot_sampler_entry = wgpu::BindGroupLayoutEntry { binding: 9, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None };
+        // the shafts: the injection's medium, lights and parameters, the scene's depth, the
+        // accumulated grid (for the transmittance), their target and parameters
+        let shafts_trace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VolumetricFog/ShaftsBGL"),
+            entries: &[
+                uniform(2),
+                storage(7),
+                spot_atlas_entry,
+                spot_sampler_entry,
+                uniform(10),
+                storage(11),
+                uniform(12),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 15, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                storage_2d(16),
+                uniform(17),
+            ],
+        });
+        let shafts_temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VolumetricFog/ShaftsTemporalBGL"),
+            entries: &[
+                uniform(0),
+                texture_2d(1, false),
+                texture_2d(2, true),
+                storage_2d(3),
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
         let inject_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("VolumetricFog/InjectBGL"),
             entries: &[
@@ -672,10 +836,11 @@ impl VolumetricFogEffect {
                     count: None,
                 },
                 uniform(5),
+                texture_2d(6, false),
             ],
         });
 
-        let pipeline = |label: &str, code: &str, bgl: &wgpu::BindGroupLayout| {
+        let entry_pipeline = |label: &str, code: &str, entry: &str, bgl: &wgpu::BindGroupLayout| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(code.into()),
@@ -689,11 +854,12 @@ impl VolumetricFogEffect {
                 label: Some(label),
                 layout: Some(&layout),
                 module: &module,
-                entry_point: Some("main"),
+                entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
+        let pipeline = |label: &str, code: &str, bgl: &wgpu::BindGroupLayout| entry_pipeline(label, code, "main", bgl);
         let buffer = |label: &str, size: usize, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -788,6 +954,18 @@ impl VolumetricFogEffect {
             dummy_spot_atlas,
             spot_sampler,
             reflection: None,
+            shafts: ShaftsGpu {
+                trace: entry_pipeline("VolumetricFog/Shafts", SHAFTS_WGSL, "shafts", &shafts_trace_bgl),
+                trace_bgl: shafts_trace_bgl,
+                temporal: pipeline("VolumetricFog/ShaftsTemporal", SHAFTS_TEMPORAL_WGSL, &shafts_temporal_bgl),
+                temporal_bgl: shafts_temporal_bgl,
+                params: buffer("VolumetricFog/ShaftParams", std::mem::size_of::<ShaftParamsGpu>(), wgpu::BufferUsages::UNIFORM),
+                none: shafts_target(device, "VolumetricFog/NoShafts", 1, 1),
+                targets: None,
+                frame: 0,
+                prev_view_proj: None,
+                last_camera_frame: None,
+            },
         });
         self.lights_dirty = true;
         self.bindings_dirty = true;
@@ -891,8 +1069,13 @@ impl VolumetricFogEffect {
     }
 
     #[cfg(test)]
-    pub(crate) fn shader_sources() -> [(&'static str, &'static str); 2] {
-        [("volumetric_fog_inject", INJECT_WGSL), ("volumetric_fog_composite", COMPOSITE_WGSL)]
+    pub(crate) fn shader_sources() -> [(&'static str, &'static str); 4] {
+        [
+            ("volumetric_fog_inject", INJECT_WGSL),
+            ("volumetric_fog_composite", COMPOSITE_WGSL),
+            ("volumetric_fog_shafts", SHAFTS_WGSL),
+            ("volumetric_fog_shafts_temporal", SHAFTS_TEMPORAL_WGSL),
+        ]
     }
 }
 
@@ -924,6 +1107,11 @@ impl PostProcessingEffect for VolumetricFogEffect {
         if self.bindings_dirty {
             self.rebuild_inject_bind_group(device);
         }
+        // the spots raymarched per pixel instead of in the froxels (only with spot lights bound)
+        let raymarch_steps = match self.spot_scattering {
+            SpotScattering::Raymarched { steps } if self.spot_lights.is_some() => Some(steps.max(1)),
+            _ => None,
+        };
         let gpu = self.gpu.as_mut().unwrap();
 
         let vp = camera.projection_matrix.to_glam() * camera.view_matrix.to_glam();
@@ -954,7 +1142,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
             anisotropy: self.anisotropy,
             start_distance: self.start_distance,
             jitter_frame: if grid.is_temporal() { self.frame } else { 0 },
-            _pad: 0.0,
+            skip_spots: raymarch_steps.is_some() as u32,
             clip_plane: [0.0, 0.0, 0.0, 1.0],
         };
         self.frame = self.frame % 1024 + 1;
@@ -967,7 +1155,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
             grid_d: grid.grid_d() as f32,
             screen_width: width as f32,
             screen_height: height as f32,
-            _pad: 0.0,
+            shafts: if raymarch_steps.is_some() { 1.0 } else { 0.0 },
         };
         queue.write_buffer(&gpu.composite_params, 0, bytemuck::bytes_of(&composite));
 
@@ -996,6 +1184,8 @@ impl PostProcessingEffect for VolumetricFogEffect {
             mirrored.inv_view_proj = m_inv.to_cols_array();
             mirrored.camera_pos = [m_cam.x, m_cam.y, m_cam.z];
             mirrored.clip_plane = [n.x, n.y, n.z, d];
+            // the reflection keeps the spots in its grid
+            mirrored.skip_spots = 0;
             queue.write_buffer(&r.fog_params, 0, bytemuck::bytes_of(&mirrored));
             if above {
                 let (gw, gh, gd) = (r.grid.grid_w(), r.grid.grid_h(), r.grid.grid_d());
@@ -1018,7 +1208,95 @@ impl PostProcessingEffect for VolumetricFogEffect {
             encoder.copy_buffer_to_buffer(&r.staging, 0, &r.shared.params, 0, std::mem::size_of::<ReflectionFogParamsGpu>() as u64);
         }
 
-        // 4. composite over the scene
+        // 4. the spot lights' shafts, raymarched per pixel at half resolution
+        let mut shafts_view = None;
+        if let Some(steps) = raymarch_steps {
+            let (sw, sh) = (width.div_ceil(2), height.div_ceil(2));
+            let sg = &mut gpu.shafts;
+            if sg.targets.as_ref().is_none_or(|t| t.0 != sw || t.1 != sh) {
+                let history = [shafts_target(device, "VolumetricFog/ShaftsHistoryA", sw, sh), shafts_target(device, "VolumetricFog/ShaftsHistoryB", sw, sh)];
+                sg.targets = Some((sw, sh, shafts_target(device, "VolumetricFog/ShaftsTrace", sw, sh), history));
+                sg.prev_view_proj = None;
+            }
+            // a gap in the camera's frames (a cut, or the shafts were off) invalidates the history
+            let camera_frame = camera.frame();
+            if sg.last_camera_frame.is_some_and(|f| camera_frame != f && camera_frame != f.wrapping_add(1)) {
+                sg.prev_view_proj = None;
+            }
+            sg.last_camera_frame = Some(camera_frame);
+            let forward = -camera.inverse_view_matrix.to_glam().z_axis.truncate().normalize();
+            let shaft_params = ShaftParamsGpu {
+                inv_view_proj: inv_vp.to_cols_array(),
+                prev_view_proj: sg.prev_view_proj.unwrap_or(vp).to_cols_array(),
+                camera_pos: [cam.x, cam.y, cam.z],
+                frame: sg.frame,
+                view_forward: forward.to_array(),
+                steps,
+                size: [sw, sh],
+                full_size: [width, height],
+                grid_near: composite.grid_near,
+                grid_far: composite.grid_far,
+                grid_d: composite.grid_d,
+                blend: self.grid_options.blend_factor.clamp(0.05, 1.0),
+                camera_near: camera.near,
+                camera_far: camera.far,
+                history_valid: sg.prev_view_proj.is_some() as u32,
+                _pad: 0.0,
+            };
+            queue.write_buffer(&sg.params, 0, bytemuck::bytes_of(&shaft_params));
+            let current = (sg.frame % 2) as usize;
+            sg.frame = sg.frame.wrapping_add(1);
+            sg.prev_view_proj = Some(vp);
+            let (_, _, trace, history) = sg.targets.as_ref().unwrap();
+            let tex = wgpu::BindingResource::TextureView;
+            let spot_lights = self.spot_lights.as_ref().unwrap_or(&gpu.dummy_spot_lights);
+            let spot_atlas = self.spot_shadows.as_ref().unwrap_or(&gpu.dummy_spot_atlas);
+            let sky_lighting = self.sky_lighting.as_ref().unwrap_or(&gpu.dummy_sky_lighting);
+            let group = |label: &str, layout: &wgpu::BindGroupLayout, entries: &[(u32, wgpu::BindingResource)]| {
+                let entries: Vec<_> = entries.iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding: *binding, resource: resource.clone() }).collect();
+                device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
+            };
+            let trace_bg = group(
+                "VolumetricFog/ShaftsBG",
+                &sg.trace_bgl,
+                &[
+                    (2, gpu.fog_params.as_entire_binding()),
+                    (7, spot_lights.as_entire_binding()),
+                    (8, tex(spot_atlas)),
+                    (9, wgpu::BindingResource::Sampler(&gpu.spot_sampler)),
+                    (10, gpu.media_params.as_entire_binding()),
+                    (11, gpu.volumes.as_entire_binding()),
+                    (12, sky_lighting.as_entire_binding()),
+                    (13, tex(depth)),
+                    (14, tex(gpu.grid.accum_view())),
+                    (15, wgpu::BindingResource::Sampler(&gpu.accum_sampler)),
+                    (16, tex(trace)),
+                    (17, sg.params.as_entire_binding()),
+                ],
+            );
+            let temporal_bg = group(
+                "VolumetricFog/ShaftsTemporalBG",
+                &sg.temporal_bgl,
+                &[
+                    (0, sg.params.as_entire_binding()),
+                    (1, tex(trace)),
+                    (2, tex(&history[1 - current])),
+                    (3, tex(&history[current])),
+                    (4, wgpu::BindingResource::Sampler(&gpu.accum_sampler)),
+                ],
+            );
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Shafts"), ..Default::default() });
+            pass.set_pipeline(&sg.trace);
+            pass.set_bind_group(0, &trace_bg, &[]);
+            pass.dispatch_workgroups(sw.div_ceil(8), sh.div_ceil(8), 1);
+            pass.set_pipeline(&sg.temporal);
+            pass.set_bind_group(0, &temporal_bg, &[]);
+            pass.dispatch_workgroups(sw.div_ceil(8), sh.div_ceil(8), 1);
+            drop(pass);
+            shafts_view = Some(history[current].clone());
+        }
+
+        // 5. composite over the scene
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("VolumetricFog/CompositeBG"),
             layout: &gpu.composite_bgl,
@@ -1029,6 +1307,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(gpu.grid.accum_view()) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&gpu.accum_sampler) },
                 wgpu::BindGroupEntry { binding: 5, resource: gpu.composite_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(shafts_view.as_ref().unwrap_or(&gpu.shafts.none)) },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Composite"), ..Default::default() });
@@ -1079,6 +1358,7 @@ mod tests {
         assert_eq!(sizes["FogMediaParams"], std::mem::size_of::<FogMediaParamsGpu>());
         assert_eq!(sizes["LocalFogVolume"], std::mem::size_of::<LocalFogVolumeGpu>());
         assert_eq!(sizes["SkyLighting"] as u64, SKY_LIGHTING_BYTES);
+        assert_eq!(sizes["ShaftParams"], std::mem::size_of::<ShaftParamsGpu>());
     }
 
     #[test]
@@ -1268,6 +1548,276 @@ mod tests {
         // never written: the zero-initialised texture
         let mirrored = read_volume(&device, &queue, fog.reflection_froxel_grid().unwrap());
         assert!(mirrored.iter().all(|v| *v == [0.0; 4]), "a volume was built for a reflection that was not drawn");
+    }
+
+    /// A fog scene for the spot-light tests: spot lights packed as the renderer packs them, a
+    /// shadow atlas where the first light's layer holds a thin vertical card (the plane
+    /// z = card.0, card.1 < x < card.2), nothing but fog before a black background, and the camera
+    /// at (0, 1, 0) looking down -z.
+    struct SpotFogScene {
+        light_buf: wgpu::Buffer,
+        atlas: wgpu::TextureView,
+        input: wgpu::TextureView,
+        output_tex: wgpu::Texture,
+        output: wgpu::TextureView,
+        depth: wgpu::TextureView,
+        gbuffer: GBuffer,
+        camera: Camera,
+    }
+
+    fn spot_fog_scene(device: &wgpu::Device, queue: &wgpu::Queue, (w, h): (u32, u32), lights: &[Light], card: (f32, f32, f32), res: u32) -> SpotFogScene {
+        use glam::Vec3 as V;
+        let mut packed = crate::lights::spot_lights_gpu::SpotLightsGpu::new();
+        packed.pack(lights.iter(), lights.len() as u32, res);
+        let light_buf = { use wgpu::util::DeviceExt; device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: packed.as_bytes(), usage: wgpu::BufferUsages::STORAGE }) };
+        let layers = lights.len() as u32;
+        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: layers },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SpotShadowAtlas::FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let atlas = atlas_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        for (layer, light) in packed.lights.iter().enumerate() {
+            // the card's depth wherever it covers a texel of the first light's map
+            let light_vp = glam::Mat4::from_cols_array(&light.view_proj);
+            let inv = light_vp.inverse();
+            let lamp = V::from(light.position);
+            let mut depths = vec![1.0f32; (res * res) as usize];
+            if layer == 0 {
+                for y in 0..res {
+                    for x in 0..res {
+                        let ndc = glam::Vec2::new((x as f32 + 0.5) / res as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / res as f32 * 2.0);
+                        let dir = (inv.project_point3(V::new(ndc.x, ndc.y, 1.0)) - lamp).normalize();
+                        let t = (card.0 - lamp.z) / dir.z;
+                        let hit = lamp + dir * t;
+                        if t > 0.0 && hit.x > card.1 && hit.x < card.2 {
+                            depths[(y * res + x) as usize] = light_vp.project_point3(hit).z;
+                        }
+                    }
+                }
+            }
+            let layer_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer as u32, array_layer_count: Some(1), ..Default::default() });
+            let depth_buf = { use wgpu::util::DeviceExt; device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&depths), usage: wgpu::BufferUsages::STORAGE }) };
+            let code = format!("@group(0) @binding(0) var<storage, read> d : array<f32>;\n\
+                @vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {{ let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)); return vec4f(p * 2.0 - 1.0, 0.0, 1.0); }}\n\
+                @fragment fn fs(@builtin(position) pos : vec4f) -> @builtin(frag_depth) f32 {{ return d[u32(pos.y) * {res}u + u32(pos.x)]; }}");
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: None,
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[], compilation_options: Default::default() }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState { format: SpotShadowAtlas::FORMAT, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: depth_buf.as_entire_binding() }] });
+            let mut e = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &layer_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            queue.submit([e.finish()]);
+        }
+        let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let output_tex = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        let output = output_tex.create_view(&Default::default());
+        let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        {
+            let mut e = device.create_command_encoder(&Default::default());
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            queue.submit([e.finish()]);
+        }
+        let gbuffer = GBuffer::new(device, w, h, 1);
+        let mut camera = Camera::new(60.0, 0.1, 100.0, w as f32 / h as f32);
+        camera.set_position(0.0, 1.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 1.0, -1.0));
+        camera.update_view_matrix();
+        SpotFogScene { light_buf, atlas, input, output_tex, output, depth, gbuffer, camera }
+    }
+
+    /// A headlamp shines through fog toward the camera past a thin card just in front of it, whose
+    /// shadow wedge reaches the camera (the film's beams through grass and trunks). Along the
+    /// lamp's row, the raymarched shafts follow a CPU raymarch of the same fog, light and card
+    /// (the card's shadow takes about 30 % of the light there); the froxels, at the film's 12
+    /// pixels per froxel, stray much further. The columns next to the lamp are left out: its glow
+    /// changes too fast there for the half-resolution march.
+    #[test]
+    fn raymarched_spot_shafts_keep_thin_shadows() {
+        use glam::Vec3 as V;
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (256u32, 128u32);
+        const DENSITY: f32 = 0.05;
+        const G: f32 = 0.3;
+        let lamp = V::new(0.0, 1.0, -20.0);
+        let mut spot = crate::lights::SpotLight::new(Vec3::new(lamp.x, lamp.y, lamp.z), Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0), 5000.0, 40.0, 10f32.to_radians(), 20f32.to_radians());
+        spot.cast_shadow = true;
+        spot.volumetric_scale = 1.0;
+        spot.source_radius = 0.05;
+        // the card: the plane z = -18.5, 0.2 < x < 0.35 (1.5 m in front of the lamp, beside its axis)
+        let (card_z, card_x0, card_x1) = (-18.5f32, 0.2f32, 0.35f32);
+        let blocked = |p: V| -> bool {
+            let d = lamp - p;
+            if d.z.abs() < 1e-6 { return false; }
+            let t = (card_z - p.z) / d.z;
+            if !(0.0..=1.0).contains(&t) { return false; }
+            let x = p.x + d.x * t;
+            x > card_x0 && x < card_x1
+        };
+        let scene = spot_fog_scene(&device, &queue, (w, h), &[Light::Spot(spot)], (card_z, card_x0, card_x1), 512);
+        let SpotFogScene { light_buf, atlas: atlas_array, input, output_tex, output, depth, gbuffer, camera } = &scene;
+        let run = |scattering: SpotScattering| -> Vec<[f32; 4]> {
+            let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+                grid: FroxelGridOptions { grid_w: 22, grid_h: 11, grid_d: 48, near: 0.5, far: 40.0, temporal: true, blend_factor: 0.1 },
+                base_density: DENSITY,
+                height_falloff: 0.0,
+                anisotropy: G,
+                spot_scattering: scattering,
+                ..Default::default()
+            });
+            fog.spot_lights = Some(light_buf.clone());
+            fog.spot_shadows = Some(atlas_array.clone());
+            for _ in 0..48 {
+                let mut e = device.create_command_encoder(&Default::default());
+                fog.render(&device, &queue, &mut e, gbuffer, input, depth, output, camera, w, h);
+                queue.submit([e.finish()]);
+            }
+            let row = (w * 8).div_ceil(256) * 256;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut e = device.create_command_encoder(&Default::default());
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: output_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit([e.finish()]);
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let data = buf.slice(..).get_mapped_range();
+            (0..w * h)
+                .map(|i| {
+                    let o = ((i / w) * row + (i % w) * 8) as usize;
+                    let c = |k: usize| f16_to_f32(u16::from_le_bytes([data[o + 2 * k], data[o + 2 * k + 1]]));
+                    [c(0), c(1), c(2), c(3)]
+                })
+                .collect()
+        };
+        let froxels = run(SpotScattering::Froxels);
+        let raymarched = run(SpotScattering::Raymarched { steps: 32 });
+
+        // the reference: the same fog (uniform, albedo 1), light and card, marched finely on the CPU
+        let inv_vp = (camera.projection_matrix.to_glam() * camera.view_matrix.to_glam()).inverse();
+        let eye = V::new(0.0, 1.0, 0.0);
+        let (cos_outer, cos_inner) = (20f32.to_radians().cos(), 10f32.to_radians().cos());
+        let truth = |x: u32, y: u32, shadowed: bool| -> f32 {
+            let ndc = glam::Vec2::new((x as f32 + 0.5) / w as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / h as f32 * 2.0);
+            let rd = (inv_vp.project_point3(V::new(ndc.x, ndc.y, 1.0)) - eye).normalize();
+            let (n, t_max) = (8000, 40.0f32);
+            let dt = t_max / n as f32;
+            let mut sum = 0.0;
+            for k in 0..n {
+                let t = (k as f32 + 0.5) * dt;
+                let p = eye + rd * t;
+                let d = lamp - p;
+                let dist2 = d.length_squared().max(0.05 * 0.05);
+                let l = d / d.length();
+                let r = d.length_squared() / (40.0 * 40.0);
+                let window = (1.0 - r * r).clamp(0.0, 1.0);
+                let cone = ((-l.z - cos_outer) / (cos_inner - cos_outer)).clamp(0.0, 1.0);
+                if window * cone <= 0.0 || (shadowed && blocked(p)) { continue; }
+                let hg = (1.0 - G * G) / (4.0 * std::f32::consts::PI * (1.0 + G * G - 2.0 * G * rd.dot(l)).powf(1.5));
+                sum += DENSITY * 5000.0 * window * window * cone * cone / dist2 * hg * (-DENSITY * t).exp() * dt;
+            }
+            sum
+        };
+        // along the lamp's row, right of it: where the card's shadow darkens the truth
+        let y = h / 2;
+        let (mut worst_ray, mut worst_frox, mut streak) = (0.0f32, 0.0f32, 0);
+        for x in (w / 2 + 6..w).step_by(2) {
+            let lit = truth(x, y, false);
+            let want = truth(x, y, true);
+            if lit < 0.02 * truth(w / 2 + 2, y, false) { continue; }
+            let i = (y * w + x) as usize;
+            let (ray, frox) = (raymarched[i][0], froxels[i][0]);
+            let in_streak = want < 0.8 * lit;
+            if in_streak { streak += 1; }
+            worst_ray = worst_ray.max((ray / want - 1.0).abs());
+            worst_frox = worst_frox.max((frox / want - 1.0).abs());
+        }
+        eprintln!("worst relative error: raymarched {worst_ray:.3}, froxels {worst_frox:.3}; {streak} shadowed columns");
+        assert!(streak >= 10, "the card's shadow did not cross the row");
+        assert!(worst_ray < 0.1, "raymarched shafts off the reference by {worst_ray}");
+        assert!(worst_frox > 2.0 * worst_ray, "the froxels were as close ({worst_frox} vs {worst_ray})");
+    }
+
+    /// The GPU time of the fog at the film's resolution and grid with its two headlamps shining at
+    /// the camera (every pixel's ray crosses both cones: the worst case), froxels against
+    /// raymarched shafts: each frame submitted and waited for, less an empty submit's time.
+    /// Other GPU work on the machine inflates it, so the minimum is the figure to read. Run by
+    /// hand: `cargo test -p kansei-core --lib time_spot_shafts -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_spot_shafts() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (w, h) = (1920u32, 803u32);
+        let lamps: Vec<Light> = [-0.62f32, 0.62]
+            .iter()
+            .map(|&x| {
+                let mut s = crate::lights::SpotLight::new(Vec3::new(x, 0.7, -25.0), Vec3::new(0.0, -0.02, 1.0), Vec3::new(1.0, 0.95, 0.85), 22000.0, 70.0, 10f32.to_radians(), 30f32.to_radians());
+                s.cast_shadow = true;
+                s.volumetric_scale = 1.0;
+                s.source_radius = 0.08;
+                Light::Spot(s)
+            })
+            .collect();
+        let scene = spot_fog_scene(&device, &queue, (w, h), &lamps, (-23.5, -0.3, -0.1), 1024);
+        let wall = |encode: &mut dyn FnMut(&mut wgpu::CommandEncoder)| -> f64 {
+            let mut e = device.create_command_encoder(&Default::default());
+            encode(&mut e);
+            let t = std::time::Instant::now();
+            queue.submit([e.finish()]);
+            device.poll(wgpu::Maintain::Wait);
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let mut empty: Vec<f64> = (0..100).map(|_| wall(&mut |_| {})).collect();
+        empty.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for scattering in [SpotScattering::Froxels, SpotScattering::Raymarched { steps: 8 }, SpotScattering::Raymarched { steps: 16 }, SpotScattering::Raymarched { steps: 24 }] {
+            let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+                grid: FroxelGridOptions { grid_w: 160, grid_h: 67, grid_d: 48, near: 0.5, far: 260.0, temporal: true, blend_factor: 0.1 },
+                base_density: 0.02,
+                height_falloff: 0.05,
+                spot_scattering: scattering,
+                ..Default::default()
+            });
+            fog.spot_lights = Some(scene.light_buf.clone());
+            fog.spot_shadows = Some(scene.atlas.clone());
+            let mut times: Vec<f64> = (0..120)
+                .map(|_| wall(&mut |e| fog.render(&device, &queue, e, &scene.gbuffer, &scene.input, &scene.depth, &scene.output, &scene.camera, w, h)))
+                .skip(20)
+                .collect();
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("{scattering:?}: fog {:.2} ms min, {:.2} ms median ({w}x{h}, an empty submit {:.2} ms taken off)", times[0] - empty[0], times[times.len() / 2] - empty[0], empty[0]);
+        }
     }
 }
 
