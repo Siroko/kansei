@@ -65,11 +65,15 @@ fn mantle_standing_up_at(name: &str, up: f32) -> Clip {
 
 /// Running at 5 m/s over a 1 m hurdle: the root up from frame 17 to 21, on top to 24, down by 28.
 fn hurdle() -> Clip {
+    hurdle_named("hurdle")
+}
+
+fn hurdle_named(name: &str) -> Clip {
     let y = |f: usize| {
         let f = f as f32;
         smooth((f - 17.0) / 4.0) - smooth((f - 24.0) / 4.0)
     };
-    clip("hurdle", 61, move |f| Vec3::new(0.0, y(f), -3.6 + f as f32 / 6.0), |_| 1.0, |_| None, 0.4)
+    clip(name, 61, move |f| Vec3::new(0.0, y(f), -3.6 + f as f32 / 6.0), |_| 1.0, |_| None, 0.4)
 }
 
 /// Dropping 3 m (landing at frame 15), then walking.
@@ -505,4 +509,206 @@ fn space_jumps_unless_there_is_something_to_traverse() {
     run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 0.3);
     assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Ok(ActionKind::Jump));
     assert_eq!(c.last_obstacle.map(|o| o.half_width < 0.3), Some(true));
+}
+
+/// A hurdle, a vault, a mantle and a climb (the synthetic hurdle and mantle, lifted by the warp),
+/// the fall loop, a landing and a jump: every clip's run-up starts well back from its ledge (the
+/// mantle 2 m, reaching 0.67 m by its `last_entry`), like captured ones.
+fn contact_database() -> (Database, Vec<ActionClip>) {
+    database_with(vec![
+        (hurdle(), ActionKind::Hurdle),
+        (hurdle_named("vault"), ActionKind::Vault),
+        (mantle(), ActionKind::Mantle),
+        (mantle_standing_up_at("climb", 32.0), ActionKind::Climb),
+        (fall(), ActionKind::Fall),
+        (land(), ActionKind::Land),
+        (jump_clip("jump_walk", 1.5), ActionKind::Jump),
+    ])
+}
+
+/// A box 20 m wide whose front face is at z = 0, `height` high and `depth` deep, on the floor.
+fn block(height: f32, depth: f32) -> CollisionWorld {
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-10.0, 0.0, 0.0), Vec3::new(10.0, height, depth)));
+    w
+}
+
+/// The boxes each kind of traversal is for.
+const BLOCKS: [(ActionKind, f32, f32); 4] = [(ActionKind::Hurdle, 0.8, 0.3), (ActionKind::Vault, 1.0, 0.9), (ActionKind::Mantle, 1.3, 3.0), (ActionKind::Climb, 2.4, 3.0)];
+
+/// Moves `c` under `input` until `stop` says so (or `seconds` run out); true if it stopped.
+fn step_until(c: &mut CharacterController, db: &Database, w: &CollisionWorld, velocity: Vec3, seconds: f32, mut stop: impl FnMut(&CharacterController) -> bool) -> bool {
+    for _ in 0..(seconds * 60.0) as usize {
+        c.update(db, w, &MotionInput { velocity, facing: None }, 1.0 / 60.0);
+        if stop(c) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Plays out a traversal started just now, the input still pushing along `velocity`: the most
+/// it slid backward (away from the face at z = 0) in a frame, and where it was once back on its
+/// feet.
+fn play_out(c: &mut CharacterController, db: &Database, w: &CollisionWorld, velocity: Vec3) -> (f32, Vec3) {
+    let mut last = c.matcher.character().translation;
+    let mut back: f32 = 0.0;
+    step_until(c, db, w, velocity, 4.0, |c| {
+        let p = c.matcher.character().translation;
+        back = back.max(last.z - p.z);
+        last = p;
+        c.state() == CharacterState::Grounded
+    });
+    (back, last)
+}
+
+#[test]
+fn pressed_against_an_obstacle_of_any_height_it_traverses() {
+    let (db, table) = contact_database();
+    for (kind, height, depth) in BLOCKS {
+        let w = block(height, depth);
+        let mut c = controller(&db, table.clone(), Vec3::new(0.0, 0.0, -3.0));
+        // walked into it and still pushing
+        let forward = Vec3::new(0.0, 0.0, 1.5);
+        run(&mut c, &db, &w, forward, 3.0);
+        let z = c.matcher.character().translation.z;
+        assert!(z > -0.35 && z < -0.25, "{kind:?}: against it at {z}");
+        assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Ok(kind), "{kind:?}: {:?}", c.last_obstacle);
+        let (back, end) = play_out(&mut c, &db, &w, forward);
+        // the clip starts late rather than sliding the character back to its run-up
+        assert!(back < 0.01, "{kind:?}: slid back {back} m in a frame");
+        if kind.crosses() {
+            assert!(end.z > depth && end.y.abs() < 0.02, "{kind:?}: over it, on the floor: {end}");
+        } else {
+            assert!(end.z > 0.1 && (end.y - height).abs() < 0.02, "{kind:?}: on top: {end}");
+        }
+    }
+}
+
+#[test]
+fn running_into_an_obstacle_it_traverses_the_moment_it_meets_it() {
+    let (db, table) = contact_database();
+    for (kind, height, depth) in BLOCKS {
+        let w = block(height, depth);
+        let mut c = controller(&db, table.clone(), Vec3::new(0.0, 0.0, -6.0));
+        let forward = Vec3::new(0.0, 0.0, 4.0);
+        // Space as it meets the face
+        assert!(step_until(&mut c, &db, &w, forward, 3.0, |c| c.matcher.character().translation.z > -0.36), "{kind:?}: never reached it");
+        let result = c.request_traverse_or_jump(&db, &w, 1.0);
+        let started = result == Ok(kind) || step_until(&mut c, &db, &w, forward, 0.2, |c| c.state() == CharacterState::Traversing(kind));
+        assert!(started, "{kind:?}: {result:?}, {:?}", c.last_result);
+    }
+}
+
+#[test]
+fn pushed_along_an_obstacle_at_an_angle_it_traverses_rather_than_jumps() {
+    let (db, table) = contact_database();
+    for (kind, height, depth) in BLOCKS {
+        for degrees in [30.0f32, 50.0] {
+            let w = block(height, depth);
+            let mut c = controller(&db, table.clone(), Vec3::new(0.0, 0.0, -3.0));
+            let a = degrees.to_radians();
+            let heading = Vec3::new(a.sin(), 0.0, a.cos()) * 1.5;
+            assert!(step_until(&mut c, &db, &w, heading, 4.0, |c| c.matcher.character().translation.z > -0.36));
+            run(&mut c, &db, &w, heading, 0.5);
+            // sliding along the face: the wall leaves it no speed into it
+            let v = c.matcher.simulation().velocity;
+            assert!(v.z.abs() < 0.2 && v.x > 0.2, "{kind:?} at {degrees}: sliding along it {v}");
+            assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Ok(kind), "{kind:?} at {degrees}: {:?}", c.last_obstacle);
+            // squared up to it
+            step_until(&mut c, &db, &w, heading, 0.4, |_| false);
+            let yaw = yaw_of(c.matcher.character().rotation);
+            assert!(yaw.abs() < 0.05, "{kind:?} at {degrees}: facing into it, {yaw}");
+        }
+    }
+}
+
+#[test]
+fn space_pressed_as_a_landing_ends_runs_once_it_is_back_on_its_feet() {
+    let (db, table) = contact_database();
+    let w = floor();
+    let forward = Vec3::new(0.0, 0.0, 1.5);
+    let jumping = || {
+        let mut c = controller(&db, table.clone(), Vec3::ZERO);
+        run(&mut c, &db, &w, forward, 0.5);
+        assert_eq!(c.jump(&db), Ok(ActionKind::Jump));
+        c
+    };
+    // the frame (after the jump) the landing ends
+    let mut states = Vec::new();
+    step_until(&mut jumping(), &db, &w, forward, 4.0, |c| {
+        states.push(c.state());
+        false
+    });
+    let end = states.iter().rposition(|s| *s == CharacterState::Landing).unwrap();
+    // whether a Space pressed this many frames before then jumps again once it has landed
+    let jump_again = |early: usize| -> bool {
+        let mut c = jumping();
+        for _ in 0..=end - early {
+            c.update(&db, &w, &MotionInput { velocity: forward, facing: None }, 1.0 / 60.0);
+        }
+        assert_eq!(c.state(), CharacterState::Landing);
+        assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Err(Refusal::Busy));
+        step_until(&mut c, &db, &w, forward, 0.5, |c| c.state() == CharacterState::Jumping)
+    };
+    assert!(jump_again(6), "pressed 0.1 s before the landing ends: jumps as it ends");
+    assert!(!jump_again(24), "pressed 0.4 s before: dropped");
+}
+
+#[test]
+fn from_right_against_an_obstacle_a_clip_starts_late_and_lands_its_ledge_just_past_the_edge() {
+    let (db, table) = contact_database();
+    let w = block(1.3, 3.0);
+    let rules = TraversalRules::default();
+    let mantle = *table.iter().find(|a| a.kind == ActionKind::Mantle).unwrap();
+    let plan = |feet: Vec3| {
+        let obstacle = detect_obstacle(&w, feet, Vec3::Z, 5.0, &DetectionSettings::default()).unwrap();
+        let action = plan_traversal(&db, &[mantle], ActionKind::Mantle, &obstacle, feet, 0.0, 0.0, db.clips[0].start, &rules, |_| true).unwrap();
+        let RootPath::Warp(warp) = &action.path else { panic!() };
+        let placed = warp.to.apply(Vec3::new(mantle.ledge.x, 0.0, mantle.ledge.z));
+        (action.start, placed.z - obstacle.ledge.z)
+    };
+    // from its run-up: within it, the ledge on the edge
+    let (start, past) = plan(Vec3::new(0.0, 0.0, -1.5));
+    assert!(start <= mantle.last_entry && past.abs() < 1e-3, "{start} {past}");
+    // against it (0.3 m, closer than the run-up comes before the hands reach the ledge): after
+    // `last_entry`, no later than the hands reach it, the ledge at most `ledge_tolerance` past
+    let (start, past) = plan(Vec3::new(0.0, 0.0, -0.3));
+    assert!(start > mantle.last_entry && start <= mantle.latest_entry(), "{start} ({} to {})", mantle.last_entry, mantle.latest_entry());
+    assert!((-1e-3..=rules.ledge_tolerance + 1e-3).contains(&past), "{past}");
+}
+
+#[test]
+fn pushed_into_a_wall_at_an_angle_it_slides_along_it() {
+    let (db, table) = contact_database();
+    let w = block(2.4, 3.0);
+    let mut c = controller(&db, table, Vec3::new(0.0, 0.0, -3.0));
+    let a = 30f32.to_radians();
+    let heading = Vec3::new(a.sin(), 0.0, a.cos()) * 1.5;
+    assert!(step_until(&mut c, &db, &w, heading, 4.0, |c| c.matcher.character().translation.z > -0.36));
+    run(&mut c, &db, &w, heading, 0.5);
+    let x = c.matcher.simulation().position.x;
+    run(&mut c, &db, &w, heading, 1.0);
+    // the input's pace along the wall (0.75 m/s), none into it
+    let v = c.matcher.simulation().velocity;
+    assert!((v.x - 0.75).abs() < 0.05 && v.z.abs() < 0.05, "{v}");
+    let moved = c.matcher.simulation().position.x - x;
+    assert!(moved > 0.65 && moved < 0.8, "{moved} m along the wall in a second");
+}
+
+#[test]
+fn against_a_face_the_ledge_is_in_front_of_the_feet() {
+    // a box 2 m wide; the feet against its face 0.35 m from one end, probing at 45 degrees toward
+    // that end (where the probe meets the face only 0.1 m from the corner)
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.9)));
+    let s = DetectionSettings::default();
+    let feet = Vec3::new(-0.65, 0.0, -0.3);
+    let o = detect_obstacle(&w, feet, Vec3::new(-1.0, 0.0, 1.0), 2.0, &s).unwrap();
+    assert!(o.ledge.abs_diff_eq(Vec3::new(-0.65, 1.0, 0.0), 0.01), "{}", o.ledge);
+    assert!(o.half_width >= 0.3, "{}", o.half_width);
+    assert_eq!(traversal_kind(&w, &o, feet, &TraversalRules::default(), u32::MAX), Ok(ActionKind::Vault));
+    // from farther away, where the probe meets it
+    let o = detect_obstacle(&w, Vec3::new(0.5, 0.0, -1.5), Vec3::new(-1.0, 0.0, 1.0), 3.0, &s).unwrap();
+    assert!(o.ledge.abs_diff_eq(Vec3::new(-0.88, 1.0, 0.0), 0.05), "{}", o.ledge);
 }
