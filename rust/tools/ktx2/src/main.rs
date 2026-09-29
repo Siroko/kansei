@@ -19,7 +19,8 @@ options:
                        data    linear data (ORM, roughness, masks): UASTC + RDO + zstd, linear
                        rg      two-channel XY normal maps: R and G kept as BC5/EAC RG11
                        hdr     HDR (EXR/HDR input): UASTC HDR 4x4
-  --out <file>       output file (one input only; default: next to the input)
+  --out <file>       output file (one input only, or the array; default: next to the input)
+  --array            all inputs (equal sizes) as the layers of one 2D array texture; needs --out
   --out-dir <dir>    output directory
   --no-mips          base level only (default: a full mip chain)
   --clamp            clamp instead of wrap at the borders when filtering mips (atlases)
@@ -93,6 +94,7 @@ struct Options {
     out_dir: Option<PathBuf>,
     mips: bool,
     clamp: bool,
+    array: bool,
     etc1s_q: u32,
     lambda: Option<f32>,
     basisu: String,
@@ -101,7 +103,7 @@ struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { kind: None, out: None, out_dir: None, mips: true, clamp: false, etc1s_q: 192, lambda: None, basisu: "basisu".into(), extra: vec![] }
+        Self { kind: None, out: None, out_dir: None, mips: true, clamp: false, array: false, etc1s_q: 192, lambda: None, basisu: "basisu".into(), extra: vec![] }
     }
 }
 
@@ -123,6 +125,9 @@ fn basisu_args(kind: Kind, o: &Options) -> Vec<String> {
         Kind::Rg => [uastc(0.5), vec!["-linear".into(), "-normal_map".into(), "-separate_rg_to_color_alpha".into()]].concat(),
         Kind::Hdr => vec!["-hdr".into()],
     };
+    if o.array {
+        args.push("-tex_array".into());
+    }
     if o.mips {
         args.push("-mipmap".into());
         if o.clamp {
@@ -146,6 +151,7 @@ fn memory_report(bytes: &[u8], channels: Option<Channels>) -> Result<String, Str
     let info = ktx2::inspect(bytes).map_err(|e| e.to_string())?;
     let channels = channels.unwrap_or(info.default_channels());
     let (w, h, levels) = (info.header.width, info.header.height, info.header.levels);
+    let layers = info.header.layers.max(1) as u64;
     let hdr = matches!(info.codec, BasisCodec::UastcHdr | BasisCodec::OtherHdr);
     let devices = [
         ("desktop (BC)", CompressionSupport { bc: true, ..CompressionSupport::NONE }),
@@ -157,15 +163,15 @@ fn memory_report(bytes: &[u8], channels: Option<Channels>) -> Result<String, Str
     for (device, support) in devices {
         let options = ktx2::Ktx2Options { srgb: None, channels: Some(channels) };
         let target = ktx2::choose_target(bytes, &options, support).map_err(|e| e.to_string())?;
-        parts.push(format!("{device} {} {}", target.name(), mb(target.chain_bytes(w, h, levels))));
+        parts.push(format!("{device} {} {}", target.name(), mb(layers * target.chain_bytes(w, h, levels))));
     }
     let uncompressed = if hdr { GpuTarget::Rgba16Float } else { GpuTarget::Rgba8 };
     Ok(format!(
         "GPU memory: {}; uncompressed {} {} with these mips, {} without",
         parts.join(" · "),
         uncompressed.name(),
-        mb(uncompressed.chain_bytes(w, h, levels)),
-        mb(uncompressed.level_bytes(w, h)),
+        mb(layers * uncompressed.chain_bytes(w, h, levels)),
+        mb(layers * uncompressed.level_bytes(w, h)),
     ))
 }
 
@@ -174,11 +180,12 @@ fn describe(path: &Path) -> Result<(), String> {
     let info = ktx2::inspect(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let h = &info.header;
     println!(
-        "{}: {} {}x{}, {} mips, {}{}, {:?} supercompression, {}",
+        "{}: {} {}x{}{}, {} mips, {}{}, {:?} supercompression, {}",
         path.display(),
         info.codec_name,
         h.width,
         h.height,
+        if h.layers > 0 { format!("x{} layers", h.layers) } else { String::new() },
         h.levels,
         if h.srgb { "sRGB" } else { "linear" },
         if info.has_alpha { " with alpha" } else { "" },
@@ -202,7 +209,9 @@ fn readable_input(input: &Path, out: &Path) -> Result<(PathBuf, bool), String> {
     Ok((png, true))
 }
 
-fn encode(input: &Path, o: &Options) -> Result<(), String> {
+/// Encode `inputs` (one image, or the layers of an array) to one KTX2 file.
+fn encode(inputs: &[PathBuf], o: &Options) -> Result<(), String> {
+    let input = inputs[0].as_path();
     let kind = o.kind.unwrap_or_else(|| Kind::guess(input));
     let out = match (&o.out, &o.out_dir) {
         (Some(out), _) => out.clone(),
@@ -212,18 +221,24 @@ fn encode(input: &Path, o: &Options) -> Result<(), String> {
     if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let (source, temporary) = readable_input(input, &out)?;
+    let mut sources = vec![];
+    for (i, input) in inputs.iter().enumerate() {
+        let scratch = out.with_extension(format!("{i}.ktx2"));
+        sources.push(readable_input(input, &scratch)?);
+    }
     let args = basisu_args(kind, o);
     let status = Command::new(&o.basisu)
         .arg("-quiet")
         .args(&args)
         .arg("-output_file")
         .arg(&out)
-        .arg(&source)
+        .args(sources.iter().map(|(source, _)| source))
         .stdout(std::process::Stdio::null())
         .status();
-    if temporary {
-        let _ = std::fs::remove_file(&source);
+    for (source, temporary) in &sources {
+        if *temporary {
+            let _ = std::fs::remove_file(source);
+        }
     }
     match status {
         Ok(s) if s.success() => {}
@@ -232,16 +247,18 @@ fn encode(input: &Path, o: &Options) -> Result<(), String> {
     }
     let bytes = std::fs::read(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let info = ktx2::inspect(&bytes).map_err(|e| format!("{}: {e}", out.display()))?;
-    let input_bytes = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+    let input_bytes: u64 = inputs.iter().map(|i| std::fs::metadata(i).map(|m| m.len()).unwrap_or(0)).sum();
+    let names: Vec<String> = inputs.iter().map(|i| i.display().to_string()).collect();
     println!(
-        "{} ({}) -> {} [{}: {} {}, {} mips] {}",
-        input.display(),
+        "{} ({}) -> {} [{}: {} {}, {} mips{}] {}",
+        names.join(" + "),
         kb(input_bytes),
         out.display(),
         kind.name(),
         info.codec_name,
         if info.header.srgb { "sRGB" } else { "linear" },
         info.header.levels,
+        if info.header.layers > 0 { format!(", {} layers", info.header.layers) } else { String::new() },
         kb(bytes.len() as u64),
     );
     println!("  {}", memory_report(&bytes, kind.channels())?);
@@ -260,6 +277,7 @@ fn parse(args: &[String]) -> Result<(Options, bool, Vec<PathBuf>), String> {
             "--out-dir" => o.out_dir = Some(value("--out-dir")?.into()),
             "--no-mips" => o.mips = false,
             "--clamp" => o.clamp = true,
+            "--array" => o.array = true,
             "--q" => o.etc1s_q = value("--q")?.parse().map_err(|_| "--q takes 1-255")?,
             "--lambda" => o.lambda = Some(value("--lambda")?.parse().map_err(|_| "--lambda takes a number")?),
             "--basisu" => o.basisu = value("--basisu")?,
@@ -275,8 +293,11 @@ fn parse(args: &[String]) -> Result<(Options, bool, Vec<PathBuf>), String> {
     if inputs.is_empty() {
         return Err(String::new());
     }
-    if o.out.is_some() && inputs.len() > 1 {
-        return Err("--out takes one input; use --out-dir for several".into());
+    if o.array && o.out.is_none() {
+        return Err("--array needs --out".into());
+    }
+    if o.out.is_some() && inputs.len() > 1 && !o.array {
+        return Err("--out takes one input (or --array); use --out-dir for several".into());
     }
     Ok((o, info, inputs))
 }
@@ -294,8 +315,9 @@ fn main() -> ExitCode {
         }
     };
     let mut failed = false;
-    for input in &inputs {
-        let result = if info { describe(input) } else { encode(input, &options) };
+    let jobs: Vec<Vec<PathBuf>> = if options.array { vec![inputs.clone()] } else { inputs.iter().map(|i| vec![i.clone()]).collect() };
+    for job in &jobs {
+        let result = if info { job.iter().try_for_each(|i| describe(i)) } else { encode(job, &options) };
         if let Err(e) = result {
             eprintln!("{e}");
             failed = true;
@@ -345,6 +367,10 @@ mod tests {
         assert!(parse(&a("--out x.ktx2 a.png b.png")).is_err());
         assert!(parse(&a("--kind shiny a.png")).is_err());
         assert!(parse(&a("--info t.ktx2")).unwrap().1);
+        assert!(parse(&a("--array a.png b.png")).is_err());
+        assert!(parse(&a("--array --out t.ktx2 a.png b.png")).unwrap().0.array);
+        let o = Options { array: true, ..Options::default() };
+        assert!(basisu_args(Kind::Color, &o).join(" ").contains("-tex_array -mipmap"));
     }
 
     #[test]

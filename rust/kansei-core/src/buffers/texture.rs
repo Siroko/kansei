@@ -108,6 +108,16 @@ impl Texture {
         texture
     }
 
+    /// A 2D array of `layers` layers with its whole mip chain given, level 0 first, each level
+    /// holding every layer in turn (as `ktx2::transcode` produces for an array KTX2), bound as
+    /// `texture_2d_array`. Uploaded on first use like `from_rgba`.
+    pub fn from_array_levels(label: &str, format: wgpu::TextureFormat, width: u32, height: u32, layers: u32, levels: Vec<Vec<u8>>) -> Self {
+        let mut texture = Self::new_2d_array(label, width, height, layers, format, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        texture.mip_levels = levels.len().max(1) as u32;
+        texture.initial_data = Some(levels);
+        texture
+    }
+
     /// Wrap a texture created elsewhere (a render target, a LUT, a cubemap) with the view to bind,
     /// so it can be attached to a material like any other Texture.
     pub fn from_view(label: &str, texture: wgpu::Texture, view: wgpu::TextureView) -> Self {

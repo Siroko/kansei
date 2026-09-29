@@ -60,6 +60,7 @@ cargo run --release -p kansei-ktx2-tool -- --info out/basecolor.ktx2
 | `rg` | two-channel XY normals (BC5/EAC RG11) | as `normal`, plus `-separate_rg_to_color_alpha` |
 | `hdr` | EXR/HDR input | `-hdr` |
 
+`--array --out <file>` encodes all inputs (of equal size) as the layers of one 2D array texture.
 `auto` (the default) guesses the kind from the file name (`*normal*`, `*_n.*`, `*orm*`,
 `*rough*`, …, `.exr`). Every preset writes a full mip chain (`--no-mips` to skip; `--clamp` for
 atlases). `--q` and `--lambda` tune ETC1S quality and UASTC RDO strength, and arguments after `--`
@@ -88,10 +89,13 @@ material.set_bindable(1, texture.into_texture());
   `.rg` in every format, including the RG8 fallback.
 - **Sizes**: WebGPU requires a block-compressed texture's base size to be a multiple of 4. Other
   sizes load as uncompressed texels. Smaller mips are uploaded as whole blocks.
-- `ktx2::inspect` reads a file's codec, levels and supercompression without transcoding;
-  `ktx2::choose_target` gives the target without transcoding; `ktx2::transcode_levels` forces a
-  target.
-- Not yet supported: cubemaps, texture arrays and Basis video (the loader returns
+- **2D arrays**: a KTX2 with layers becomes a `texture_2d_array` (`TranscodedTexture::layers`;
+  each level holds every layer in turn).
+- `ktx2::inspect` reads a file's codec, levels, layers and supercompression without
+  transcoding. `ktx2::choose_target` gives the target without transcoding.
+  `ktx2::transcode_levels` forces a target. `ktx2::transcode_level` transcodes one level, for
+  example a small level as RGBA8 for a texture's mean colour.
+- Not yet supported: cubemaps, 3D textures and Basis video (the loader returns
   `Ktx2Error::Unsupported`).
 
 ### glTF (`KHR_texture_basisu`)
@@ -116,7 +120,8 @@ The crate is young (0.1, July 2026), so its output is checked against the offici
 rather than trusted:
 
 - `tests/fixtures/ktx2/generate.py` encodes tiny fixtures (20x12 with mips down to 1x1; ETC1S,
-  UASTC with alpha, a UASTC normal map, UASTC HDR) with the official `basisu`. It records
+  UASTC with alpha, a UASTC normal map, UASTC HDR, and two-layer ETC1S and UASTC arrays) with
+  the official `basisu`. It records
   `basisu -unpack`'s output, and the output of the official transcoder built at the same tag with
   strict IEEE float, for every target the engine uses.
 - `tests/ktx2_transcode.rs` asserts that every target matches the official transcoder byte for

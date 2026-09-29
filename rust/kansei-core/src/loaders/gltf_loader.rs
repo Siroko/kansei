@@ -96,6 +96,7 @@ impl GLTFResult {
             format: GpuTarget::Rgba8.format(texture.srgb),
             width,
             height,
+            layers: None,
             levels: vec![rgba.into_raw()],
             file_bytes: bytes.len(),
         })

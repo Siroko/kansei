@@ -118,18 +118,37 @@ fn target_for(header: &Ktx2Header, file: &BasisFile, options: &Ktx2Options, supp
     select_target(file.codec(), channels, (header.width, header.height), support, |t| file.can_transcode(t))
 }
 
-/// Every mip of image 0 transcoded to `target`, whatever the device supports (for tools, tests
-/// and forcing a fallback). Compressed levels are rounded up to whole blocks.
+/// Every mip transcoded to `target`, whatever the device supports (for tools, tests and forcing
+/// a fallback): per level, each array layer's data in turn. Compressed levels are rounded up to
+/// whole blocks.
 pub fn transcode_levels(bytes: &[u8], target: GpuTarget) -> Result<Vec<Vec<u8>>, Ktx2Error> {
+    let header = Ktx2Header::parse(bytes)?;
+    (0..header.levels).map(|level| transcode_level(bytes, level, target)).collect()
+}
+
+/// One mip `level` transcoded to `target`, each array layer's data in turn (a small level
+/// as `Rgba8` gives a texture's mean colour cheaply, say).
+pub fn transcode_level(bytes: &[u8], level: u32, target: GpuTarget) -> Result<Vec<u8>, Ktx2Error> {
     let header = Ktx2Header::parse(bytes)?;
     let file = BasisFile::open(bytes).map_err(|e| not_basis(&header, e))?;
     if !file.can_transcode(target) {
         return Err(Ktx2Error::Unsupported(format!("{} cannot become {}", file.codec_name(), target.name())));
     }
-    (0..header.levels).map(|l| file.transcode(l, target)).collect()
+    if level >= header.levels {
+        return Err(Ktx2Error::Unsupported(format!("level {level} of {}", header.levels)));
+    }
+    level_data(&file, level, header.layers.max(1), target)
 }
 
-/// Transcode every mip of a 2D Basis KTX2 texture for a device with `support`.
+fn level_data(file: &BasisFile, level: u32, layers: u32, target: GpuTarget) -> Result<Vec<u8>, Ktx2Error> {
+    let mut data = Vec::new();
+    for layer in 0..layers {
+        data.extend(file.transcode(level, layer, target)?);
+    }
+    Ok(data)
+}
+
+/// Transcode every mip of a 2D (or 2D array) Basis KTX2 texture for a device with `support`.
 pub fn transcode(
     label: &str,
     bytes: &[u8],
@@ -137,10 +156,10 @@ pub fn transcode(
     support: CompressionSupport,
 ) -> Result<TranscodedTexture, Ktx2Error> {
     let header = Ktx2Header::parse(bytes)?;
-    if header.layers > 1 || header.faces > 1 || header.depth > 1 {
+    if header.faces > 1 || header.depth > 1 {
         return Err(Ktx2Error::Unsupported(format!(
-            "{label}: {} layers, {} faces, depth {} (only 2D textures load so far)",
-            header.layers, header.faces, header.depth
+            "{label}: {} faces, depth {} (2D textures and 2D arrays load so far)",
+            header.faces, header.depth
         )));
     }
     let file = BasisFile::open(bytes).map_err(|e| not_basis(&header, e))?;
@@ -157,7 +176,8 @@ pub fn transcode(
         );
     }
     let target = target_for(&header, &file, options, support);
-    let levels = (0..header.levels).map(|l| file.transcode(l, target)).collect::<Result<Vec<_>, _>>()?;
+    let layers = header.layers.max(1);
+    let levels = (0..header.levels).map(|l| level_data(&file, l, layers, target)).collect::<Result<Vec<_>, _>>()?;
     Ok(TranscodedTexture {
         label: label.to_string(),
         codec: file.codec_name(),
@@ -165,6 +185,7 @@ pub fn transcode(
         format: target.format(srgb),
         width: header.width,
         height: header.height,
+        layers: (header.layers > 0).then_some(header.layers),
         levels,
         file_bytes: bytes.len(),
     })
@@ -180,7 +201,11 @@ pub struct TranscodedTexture {
     pub format: wgpu::TextureFormat,
     pub width: u32,
     pub height: u32,
-    /// Each mip level's blocks (or texels), tightly packed, level 0 first.
+    /// The layer count of a 2D array texture (bound as `texture_2d_array`); `None` for a 2D
+    /// texture.
+    pub layers: Option<u32>,
+    /// Each mip level's blocks (or texels), tightly packed, level 0 first; within a level, each
+    /// array layer in turn.
     pub levels: Vec<Vec<u8>>,
     /// Size of the KTX2 file.
     pub file_bytes: usize,
@@ -196,18 +221,19 @@ impl TranscodedTexture {
     pub fn uncompressed_bytes(&self) -> u64 {
         let hdr = matches!(self.target, GpuTarget::Bc6h | GpuTarget::AstcHdr4x4 | GpuTarget::Rgba16Float);
         let base = if hdr { GpuTarget::Rgba16Float } else { GpuTarget::Rgba8 };
-        base.chain_bytes(self.width, self.height, self.levels.len() as u32)
+        base.chain_bytes(self.width, self.height, self.levels.len() as u32) * self.layers.unwrap_or(1) as u64
     }
 
     /// One line for logs and HUDs.
     pub fn summary(&self) -> String {
         let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
         format!(
-            "{}: {} {}x{} ({} mips, {:.2} MB file) -> {:?}, {:.2} MB on the GPU (uncompressed {:.2} MB)",
+            "{}: {} {}x{}{} ({} mips, {:.2} MB file) -> {:?}, {:.2} MB on the GPU (uncompressed {:.2} MB)",
             self.label,
             self.codec,
             self.width,
             self.height,
+            self.layers.map(|l| format!("x{l} layers")).unwrap_or_default(),
             self.levels.len(),
             mb(self.file_bytes as u64),
             self.format,
@@ -216,8 +242,11 @@ impl TranscodedTexture {
         )
     }
 
-    /// A `Texture` with every mip, uploaded when first bound.
+    /// A `Texture` with every mip (and layer), uploaded when first bound.
     pub fn into_texture(self) -> Texture {
-        Texture::from_levels(&self.label, self.format, self.width, self.height, self.levels)
+        match self.layers {
+            Some(layers) => Texture::from_array_levels(&self.label, self.format, self.width, self.height, layers, self.levels),
+            None => Texture::from_levels(&self.label, self.format, self.width, self.height, self.levels),
+        }
     }
 }

@@ -55,12 +55,12 @@ impl<'a> BasisFile<'a> {
         self.inner.supports(transcoder_format(target))
     }
 
-    /// Mip `level` of image 0 (layer 0, face 0) as `target`'s texels or blocks, tightly packed.
-    pub fn transcode(&self, level: u32, target: GpuTarget) -> Result<Vec<u8>, Ktx2Error> {
+    /// Mip `level` of array layer `layer` (face 0) as `target`'s texels or blocks, tightly packed.
+    pub fn transcode(&self, level: u32, layer: u32, target: GpuTarget) -> Result<Vec<u8>, Ktx2Error> {
         let raw = self
             .inner
-            .transcode(level, transcoder_format(target), basisu::DecodeFlags::NONE)
-            .map_err(|e| Ktx2Error::Transcoder(format!("level {level} to {}: {e:?}", target.name())))?;
+            .transcode_image(level, layer, 0, transcoder_format(target), basisu::DecodeFlags::NONE)
+            .map_err(|e| Ktx2Error::Transcoder(format!("level {level} layer {layer} to {}: {e:?}", target.name())))?;
         Ok(match target {
             // cut from RGBA: R in red; the Basis two-channel layout has G in alpha
             GpuTarget::R8 => raw.chunks_exact(4).map(|p| p[0]).collect(),
