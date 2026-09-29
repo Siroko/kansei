@@ -14,7 +14,8 @@
 //!   ledge. `plan_traversal` picks the clip from the character's speed, the frame to start at from
 //!   the distance to the ledge and the pose, and skips clips that would end inside something; it
 //!   warps the clip so its ledge lands on the real one, lifted to the real height and stretched to
-//!   the real depth.
+//!   the real depth. A character already at the obstacle (closer than any clip's run-up) starts a
+//!   clip late, up to its take-off, and the clip's ledge may land a little past the real edge.
 //! - `CharacterController` keeps a `MotionMatcher` out of the world's colliders, on its ground,
 //!   falling off edges and landing, and traverses or jumps on request. A jump plays a jump clip
 //!   (`plan_jump`: the pace and pose that fit) up to its take-off, then flies ballistic under
@@ -256,6 +257,12 @@ impl ActionClip {
         (self.ledge - db.root_at(self.clip, frame).0).dot(self.forward)
     }
 
+    /// Latest frame a traversal can start at from right against the obstacle: its take-off, or
+    /// the hands reaching the ledge if that comes first (never earlier than `last_entry`).
+    pub fn latest_entry(&self) -> f32 {
+        self.rise.min(self.anchor).max(self.last_entry)
+    }
+
     /// The clip root's speed (m/s) at `frame`.
     pub fn speed_at(&self, db: &Database, frame: f32) -> f32 {
         let a = db.root_at(self.clip, frame).0;
@@ -294,12 +301,15 @@ pub struct DetectionSettings {
     /// How far along the top depth is measured, and the step.
     pub max_depth: f32,
     pub step: f32,
+    /// Feet this close to the face (m) are against it: the ledge is straight in front of them,
+    /// not where a probe at an angle meets the face farther along.
+    pub contact: f32,
     pub layers: u32,
 }
 
 impl Default for DetectionSettings {
     fn default() -> Self {
-        Self { heights: [0.35, 0.65, 1.0, 1.45, 1.95, 2.45], radius: 0.12, max_height: 3.0, max_depth: 2.0, step: 0.1, layers: u32::MAX }
+        Self { heights: [0.35, 0.65, 1.0, 1.45, 1.95, 2.45], radius: 0.12, max_height: 3.0, max_depth: 2.0, step: 0.1, contact: 0.5, layers: u32::MAX }
     }
 }
 
@@ -321,6 +331,14 @@ pub fn detect_obstacle(world: &CollisionWorld, feet: Vec3, direction: Vec3, reac
         return None;
     }
     let face = hit.point - normal * settings.radius;
+    // against the face: straight in front of the feet, if the face goes on there
+    let gap = (feet - face).dot(normal);
+    let face = if gap <= settings.contact {
+        let from = Vec3::new(feet.x, face.y, feet.z);
+        world.raycast(from, -normal, gap.max(0.0) + 0.05, settings.layers).filter(|h| h.normal.dot(normal) > 0.95).map_or(face, |h| h.point)
+    } else {
+        face
+    };
     // its top, just behind the face
     let down = |p: Vec3| world.raycast(Vec3::new(p.x, feet.y + settings.max_height + 0.3, p.z), Vec3::NEG_Y, settings.max_height + 0.3 - 0.05, settings.layers);
     let top_hit = down(face - normal * 0.08)?;
@@ -408,6 +426,17 @@ pub struct TraversalRules {
     /// before the ledge is reached (m/s).
     pub max_distance_error: f32,
     pub max_warp_speed: f32,
+    /// Shortest time a warp eases the clip onto the obstacle (s): a traversal started late, from
+    /// right against it, turns and slides the character over at least this long.
+    pub min_warp_time: f32,
+    /// Most of a clip's own travel over the warp that a character closer than captured may cut
+    /// (a fraction): its steps shorten, and it never slides backward.
+    pub max_shortening: f32,
+    /// How far past the real edge a clip's ledge may land when the character is closer than the
+    /// warp can slide it back from (m; at most half the top's depth).
+    pub ledge_tolerance: f32,
+    /// Cost per second a clip starts past its `last_entry`, skipping the start of its run-up.
+    pub late_weight: f32,
 }
 
 impl Default for TraversalRules {
@@ -426,6 +455,10 @@ impl Default for TraversalRules {
             pose_weight: 0.05,
             max_distance_error: 1.2,
             max_warp_speed: 1.5,
+            min_warp_time: 0.2,
+            max_shortening: 0.5,
+            ledge_tolerance: 0.12,
+            late_weight: 1.0,
         }
     }
 }
@@ -471,35 +504,50 @@ pub fn traversal_kind(world: &CollisionWorld, obstacle: &Obstacle, feet: Vec3, r
     Err(Refusal::TooHigh)
 }
 
-/// The best clip of `kind` and frame to start it at for a character at `feet` with this speed,
-/// playing database frame `current`, and the action that warps it onto the obstacle. A clip
-/// that ends on the top must leave the character where `stands` (feet position) allows: a
-/// mantle that walks on before handing over needs more room than one that stands up by the edge.
+/// The best clip of `kind` and frame to start it at for a character at `feet` with this speed
+/// toward the obstacle, playing database frame `current`, and the action that warps it onto the
+/// obstacle. A clip that ends on the top must leave the character where `stands` (feet position)
+/// allows: a mantle that walks on before handing over needs more room than one that stands up by
+/// the edge.
+///
+/// A clip starts where its distance to the ledge is the character's, give or take what the warp
+/// can slide before the ledge is reached. Right against the obstacle that is often nowhere in its
+/// run-up (captured from half a metre or more): it may then start later, up to its take-off, and
+/// land its ledge up to `ledge_tolerance` past the real edge rather than slide the character back.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_traversal(db: &Database, table: &[ActionClip], kind: ActionKind, obstacle: &Obstacle, feet: Vec3, heading: f32, speed: f32, current: usize, rules: &TraversalRules, stands: impl Fn(Vec3) -> bool) -> Result<Action, Refusal> {
     let here = db.features(current);
-    // each clip's best entry frame, cheapest first
-    let mut candidates: Vec<(f32, &ActionClip, f32)> = Vec::new();
+    let tolerance = rules.ledge_tolerance.min(obstacle.depth.map_or(f32::MAX, |d| d * 0.5)).max(0.0);
+    // each clip's best entry frame and how far past the edge it lands, cheapest first
+    let mut candidates: Vec<(f32, &ActionClip, f32, f32)> = Vec::new();
     for c in table.iter().filter(|c| c.kind == kind) {
-        let mut best: Option<(f32, f32)> = None;
+        let mut best: Option<(f32, f32, f32)> = None;
         let mut f = 0.0;
-        while f <= c.last_entry {
+        while f <= c.latest_entry() {
             let d = c.distance_at(db, f);
+            // positive: the clip expects the ledge farther than it is
             let error = d - obstacle.distance;
-            let window = (c.anchor - f).max(1.0) / db.sample_rate;
-            if error.abs() <= rules.max_distance_error.min(rules.max_warp_speed * window) {
+            let frames = warp_frames(c, f, db, rules);
+            let slide = rules.max_distance_error.min(rules.max_warp_speed * frames / db.sample_rate);
+            // closer than captured: the clip's approach over the warp shortened, not reversed
+            let travel = (d - c.distance_at(db, f + frames)).max(0.0);
+            let back = slide.min(rules.max_shortening * travel);
+            if (error <= 0.0 && -error <= slide) || (error > 0.0 && error <= back + tolerance) {
+                let past = (error - back).max(0.0);
                 let s = c.speed_at(db, f) - speed;
                 let frame = db.clips[c.clip].start + f as usize;
                 let pose = pose_distance(db.features(frame), here);
-                let cost = rules.distance_weight * error * error + rules.speed_weight * s * s + rules.pose_weight * pose;
-                if best.is_none_or(|(b, _)| cost < b) {
-                    best = Some((cost, f));
+                let late = ((f - c.last_entry) / db.sample_rate).max(0.0);
+                let error = error - past;
+                let cost = rules.distance_weight * (error * error + past * past) + rules.speed_weight * s * s + rules.pose_weight * pose + rules.late_weight * late;
+                if best.is_none_or(|(b, _, _)| cost < b) {
+                    best = Some((cost, f, past));
                 }
             }
             f += 1.0;
         }
-        if let Some((cost, f)) = best {
-            candidates.push((cost, c, f));
+        if let Some((cost, f, past)) = best {
+            candidates.push((cost, c, f, past));
         }
     }
     if candidates.is_empty() {
@@ -508,7 +556,7 @@ pub fn plan_traversal(db: &Database, table: &[ActionClip], kind: ActionKind, obs
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
     candidates
         .into_iter()
-        .map(|(_, c, start)| (c, start, warp_onto(db, c, start, obstacle, feet, heading)))
+        .map(|(_, c, start, past)| (c, start, warp_onto(db, c, start, obstacle, past, feet, heading, rules)))
         .find(|(c, _, warp)| c.kind.crosses() || stands(warp.root(c.exit, db.root_at(c.clip, c.exit)).0))
         .map(|(c, start, warp)| Action { clip: c.clip, start, exit: Some(c.exit), path: RootPath::Warp(warp), collides: false, tag: kind as u32 })
         .ok_or(Refusal::NoRoom)
@@ -540,15 +588,24 @@ pub fn plan_jump<'a>(db: &Database, table: &'a [ActionClip], speed: f32, current
     best.map(|(_, c, f)| (c, f))
 }
 
-/// `c`'s root motion from `start`, warped from the character at `feet` onto the obstacle.
-fn warp_onto(db: &Database, c: &ActionClip, start: f32, obstacle: &Obstacle, feet: Vec3, heading: f32) -> RootWarp {
+/// Frames a warp from clip frame `start` has to ease onto the obstacle: until the ledge is
+/// reached, and never less than `min_warp_time`.
+fn warp_frames(c: &ActionClip, start: f32, db: &Database, rules: &TraversalRules) -> f32 {
+    (c.anchor - start).max(rules.min_warp_time * db.sample_rate).max(1.0)
+}
+
+/// `c`'s root motion from `start`, warped from the character at `feet` onto the obstacle, its
+/// ledge `past` metres beyond the real edge.
+#[allow(clippy::too_many_arguments)]
+fn warp_onto(db: &Database, c: &ActionClip, start: f32, obstacle: &Obstacle, past: f32, feet: Vec3, heading: f32, rules: &TraversalRules) -> RootWarp {
     let clip_start = db.root_at(c.clip, start);
     let mut warp = RootWarp::identity(clip_start, (feet, heading));
     // the clip's ledge onto the real one, facing into it
     let clip_heading = c.forward.x.atan2(c.forward.z);
     let into = -obstacle.normal;
-    warp.to = Placement::between((Vec3::new(c.ledge.x, 0.0, c.ledge.z), clip_heading), (Vec3::new(obstacle.ledge.x, 0.0, obstacle.ledge.z), into.x.atan2(into.z)));
-    warp.window = Ramp::new(start, c.anchor.max(start + 1.0), 0.0, 1.0);
+    let target = obstacle.ledge + into * past;
+    warp.to = Placement::between((Vec3::new(c.ledge.x, 0.0, c.ledge.z), clip_heading), (Vec3::new(target.x, 0.0, target.z), into.x.atan2(into.z)));
+    warp.window = Ramp::new(start, start + warp_frames(c, start, db, rules), 0.0, 1.0);
     // up by what the real obstacle has more than the captured one, by the time the ledge is
     // reached; over one, down again to the floor behind
     let clip_ground = clip_start.0.y;
@@ -558,7 +615,7 @@ fn warp_onto(db: &Database, c: &ActionClip, start: f32, obstacle: &Obstacle, fee
     if c.kind.crosses() {
         let floor = obstacle.back_floor.unwrap_or(feet.y) - feet.y;
         warp.lift.push(Ramp::new(c.off_top, c.down.max(c.off_top + 1.0), 0.0, floor - lift));
-        let extra = (obstacle.depth.unwrap_or(c.span) - c.span).clamp(-0.3, 1.0);
+        let extra = (obstacle.depth.unwrap_or(c.span) - past - c.span).clamp(-0.3, 1.0);
         warp.stretch.push(Ramp::new(c.on_top, c.off_top.max(c.on_top + 1.0), 0.0, extra));
         warp.stretch_direction = into;
     }
@@ -596,6 +653,9 @@ pub struct CharacterController {
     pub max_jump_delay: f32,
     /// A fall from higher than this (m) lands with the harder landings.
     pub heavy_fall: f32,
+    /// How long a `request_traverse_or_jump` made while busy (landing, mid-traversal) waits to
+    /// run once the character is back on its feet (s).
+    pub request_buffer: f32,
     state: CharacterState,
     /// The last obstacle probed and what came of it (for debug views).
     pub last_obstacle: Option<Obstacle>,
@@ -604,6 +664,11 @@ pub struct CharacterController {
     pending: f32,
     /// Whether the last obstacle probed has a kind of traversal (a clip may fit once closer).
     traversable: bool,
+    /// Where the input last asked to go (m/s): traversals look that way, even while a wall the
+    /// character slides along turns its velocity away.
+    intent: Vec3,
+    /// A request made while busy: seconds it still waits, and its patience.
+    buffered: Option<(f32, f32)>,
     /// The jump running up to its take-off, and the highest point of this time in the air.
     jump: Option<ActionClip>,
     air_top: f32,
@@ -624,11 +689,14 @@ impl CharacterController {
             jump_height: None,
             max_jump_delay: 0.4,
             heavy_fall: 2.0,
+            request_buffer: 0.2,
             state: CharacterState::Grounded,
             last_obstacle: None,
             last_result: None,
             pending: 0.0,
             traversable: false,
+            intent: Vec3::ZERO,
+            buffered: None,
             jump: None,
             air_top: 0.0,
         }
@@ -652,9 +720,12 @@ impl CharacterController {
     }
 
     /// Traverse the obstacle ahead as `request_traverse` does, or jump when there is nothing to
-    /// traverse: no obstacle, one too high or too narrow, no room on it, no clip for it.
+    /// traverse: no obstacle, one too high or too narrow, no room on it, no clip for it. Asked while
+    /// busy (landing, traversing), it runs once the character is back on its feet, if that is
+    /// within `request_buffer`.
     pub fn request_traverse_or_jump(&mut self, db: &Database, world: &CollisionWorld, patience: f32) -> Result<ActionKind, Refusal> {
         let result = self.request_traverse(db, world, patience);
+        self.buffered = (result == Err(Refusal::Busy)).then_some((self.request_buffer, patience));
         let nothing_to_traverse = match result {
             Err(Refusal::NoObstacle | Refusal::TooHigh | Refusal::TooNarrow | Refusal::NoClip) => true,
             Err(Refusal::NoRoom) => !self.traversable,
@@ -691,6 +762,19 @@ impl CharacterController {
 
     /// Advance by `dt` under `input`.
     pub fn update(&mut self, db: &Database, world: &CollisionWorld, input: &MotionInput, dt: f32) {
+        self.intent = Vec3::new(input.velocity.x, 0.0, input.velocity.z);
+        self.advance(db, world, input, dt);
+        if let Some((left, patience)) = self.buffered {
+            self.buffered = None;
+            if self.state == CharacterState::Grounded {
+                let _ = self.request_traverse_or_jump(db, world, patience);
+            } else if left > dt {
+                self.buffered = Some((left - dt, patience));
+            }
+        }
+    }
+
+    fn advance(&mut self, db: &Database, world: &CollisionWorld, input: &MotionInput, dt: f32) {
         if self.pending > 0.0 {
             self.pending -= dt;
             if self.state == CharacterState::Grounded && self.traverse(db, world).is_ok() {
@@ -851,8 +935,8 @@ impl CharacterController {
         }
     }
 
-    /// Look for an obstacle ahead (along the character's movement, else its facing) and
-    /// traverse it if it can.
+    /// Look for an obstacle ahead (where the input heads, else along the character's movement,
+    /// else its facing) and traverse it if it can.
     pub fn traverse(&mut self, db: &Database, world: &CollisionWorld) -> Result<ActionKind, Refusal> {
         let result = self.try_traverse(db, world);
         self.last_result = Some(result);
@@ -865,9 +949,20 @@ impl CharacterController {
         }
         let character = self.matcher.character();
         let velocity = self.matcher.simulation().velocity;
-        let speed = Vec3::new(velocity.x, 0.0, velocity.z).length();
+        let moving = Vec3::new(velocity.x, 0.0, velocity.z);
         let facing = character.rotation * FORWARD;
-        let direction = if speed > 0.5 { velocity } else { facing };
+        // where the player heads: a wall the character is pushed against leaves it no speed into
+        // the wall, only along it
+        let direction = if self.intent.length() > 0.1 {
+            self.intent
+        } else if moving.length() > 0.5 {
+            moving
+        } else {
+            facing
+        };
+        let direction = Vec3::new(direction.x, 0.0, direction.z).normalize_or(FORWARD);
+        // the pace toward the obstacle picks the clip, not a slide along it
+        let speed = moving.dot(direction).max(0.0);
         let reach = 1.5 + speed * 1.1;
         let obstacle = detect_obstacle(world, character.translation, direction, reach, &self.detection);
         self.last_obstacle = obstacle;
