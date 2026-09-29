@@ -20,15 +20,19 @@ mod ktx2_fixtures;
 use ktx2_fixtures::{fixture, golden, target};
 
 /// Every texel of every level of `texture`, level 0 first, as the shader reads it.
+/// For an array texture, each level holds every layer in turn.
 fn read_texels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &mut Texture) -> Vec<[f32; 4]> {
     texture.ensure_ready(device, queue);
     let size = texture.size();
     let levels = texture.gpu_texture().unwrap().mip_level_count();
-    let texels: u64 = (0..levels).map(|l| ((size.width >> l).max(1) * (size.height >> l).max(1)) as u64).sum();
+    let layers = size.depth_or_array_layers;
+    let array = layers > 1;
+    let texels: u64 = (0..levels).map(|l| ((size.width >> l).max(1) * (size.height >> l).max(1) * layers) as u64).sum();
     let bytes = texels * 16;
     let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let bindings = [Binding::texture_2d(0, wgpu::ShaderStages::COMPUTE), Binding::storage(1, wgpu::ShaderStages::COMPUTE, false)];
+    let texture_binding = if array { Binding::texture_2d_array(0, wgpu::ShaderStages::COMPUTE) } else { Binding::texture_2d(0, wgpu::ShaderStages::COMPUTE) };
+    let bindings = [texture_binding, Binding::storage(1, wgpu::ShaderStages::COMPUTE, false)];
     let layout = BindGroupBuilder::create_layout(device, "Ktx2Read", &bindings);
     let group = BindGroupBuilder::create_bind_group(
         device,
@@ -39,22 +43,32 @@ fn read_texels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &mut Texture
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(
-            r#"
-            @group(0) @binding(0) var tex : texture_2d<f32>;
+            format!(
+                r#"
+            @group(0) @binding(0) var tex : {ty};
             @group(0) @binding(1) var<storage, read_write> out : array<vec4f>;
-            @compute @workgroup_size(1) fn main() {
+            @compute @workgroup_size(1) fn main() {{
                 var i = 0u;
-                for (var level = 0u; level < textureNumLevels(tex); level++) {
+                for (var level = 0u; level < textureNumLevels(tex); level++) {{
                     let size = textureDimensions(tex, level);
-                    for (var y = 0u; y < size.y; y++) {
-                        for (var x = 0u; x < size.x; x++) {
-                            out[i] = textureLoad(tex, vec2i(i32(x), i32(y)), i32(level));
-                            i++;
-                        }
-                    }
-                }
-            }
-            "#
+                    for (var layer = 0u; layer < {layers}u; layer++) {{
+                        for (var y = 0u; y < size.y; y++) {{
+                            for (var x = 0u; x < size.x; x++) {{
+                                out[i] = {load};
+                                i++;
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+            "#,
+                ty = if array { "texture_2d_array<f32>" } else { "texture_2d<f32>" },
+                load = if array {
+                    "textureLoad(tex, vec2i(i32(x), i32(y)), i32(layer), i32(level))"
+                } else {
+                    "textureLoad(tex, vec2i(i32(x), i32(y)), i32(level))"
+                },
+            )
             .into(),
         ),
     });
@@ -107,7 +121,7 @@ fn every_supported_target_uploads_its_mips_and_reads_back() {
     let support = CompressionSupport::of_device(&device);
     eprintln!("{support:?}");
     let mut skipped = vec![];
-    for name in ["etc1s_rgb", "etc1s_rgba", "uastc_rgba", "uastc_normal"] {
+    for name in ["etc1s_rgb", "etc1s_rgba", "uastc_rgba", "uastc_normal", "etc1s_array", "uastc_array"] {
         let bytes = fixture(&format!("{name}.ktx2"));
         let info = ktx2::inspect(&bytes).unwrap();
         let (w, h) = (info.header.width, info.header.height);
@@ -124,7 +138,10 @@ fn every_supported_target_uploads_its_mips_and_reads_back() {
                 continue;
             }
             let levels = ktx2::transcode_levels(&bytes, target).unwrap();
-            let mut texture = Texture::from_levels(name, target.format(false), w, h, levels);
+            let mut texture = match info.header.layers {
+                0 => Texture::from_levels(name, target.format(false), w, h, levels),
+                layers => Texture::from_array_levels(name, target.format(false), w, h, layers, levels),
+            };
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             let texels = read_texels(&device, &queue, &mut texture);
             assert!(pollster::block_on(device.pop_error_scope()).is_none(), "{name} {}: validation error", target.name());

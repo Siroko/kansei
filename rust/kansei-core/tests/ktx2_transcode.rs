@@ -10,7 +10,7 @@ use kansei_core::loaders::ktx2::{
 mod ktx2_fixtures;
 use ktx2_fixtures::{fixture, golden, target};
 
-const FIXTURES: [&str; 5] = ["etc1s_rgb", "etc1s_rgba", "uastc_rgba", "uastc_normal", "uastc_hdr"];
+const FIXTURES: [&str; 7] = ["etc1s_rgb", "etc1s_rgba", "uastc_rgba", "uastc_normal", "uastc_hdr", "etc1s_array", "uastc_array"];
 
 fn differing_blocks(a: &[Vec<u8>], b: &[Vec<u8>]) -> usize {
     a.iter().zip(b).map(|(x, y)| x.chunks(16).zip(y.chunks(16)).filter(|(p, q)| p != q).count()).sum()
@@ -45,7 +45,7 @@ fn every_target_matches_the_official_transcoder_byte_for_byte() {
         }
     }
     eprintln!("{checked} (fixture, target) pairs identical to basisu -unpack");
-    assert!(checked >= 40);
+    assert!(checked >= 60);
 }
 
 #[test]
@@ -73,6 +73,8 @@ fn inspect_reads_codec_levels_supercompression_and_colour_space() {
         ("uastc_normal", BasisCodec::UastcLdr, Supercompression::Zstandard, false, false, (8, 8), 4),
         ("uastc_hdr", BasisCodec::UastcHdr, Supercompression::Zstandard, false, false, (20, 12), 5),
     ];
+    let array = ktx2::inspect(&fixture("etc1s_array.ktx2")).unwrap();
+    assert_eq!((array.header.layers, array.header.levels, array.has_alpha), (2, 5, true));
     for (name, codec, sc, alpha, srgb, (w, h), levels) in cases {
         let info = ktx2::inspect(&fixture(&format!("{name}.ktx2"))).unwrap();
         assert_eq!(info.codec, codec, "{name}");
@@ -110,6 +112,24 @@ fn transcode_picks_the_target_and_colour_space_for_the_device() {
     // HDR
     assert_eq!(t("uastc_hdr", Ktx2Options::default(), all).format, F::Bc6hRgbUfloat);
     assert_eq!(t("uastc_hdr", Ktx2Options::default(), CompressionSupport::NONE).format, F::Rgba16Float);
+}
+
+#[test]
+fn arrays_hold_every_layer_of_every_level() {
+    let bytes = fixture("uastc_array.ktx2");
+    let bc = CompressionSupport { bc: true, ..CompressionSupport::NONE };
+    let t = ktx2::transcode("Array", &bytes, &Ktx2Options::color(), bc).unwrap();
+    assert_eq!((t.target, t.layers, t.levels.len()), (GpuTarget::Bc7, Some(2), 5));
+    assert_eq!(t.gpu_bytes(), 2 * 25 * 16);
+    assert_eq!(t.uncompressed_bytes(), 2 * 4 * (20 * 12 + 10 * 6 + 5 * 3 + 2 + 1));
+    assert!(t.summary().contains("20x12x2 layers"), "{}", t.summary());
+    // layer 1 is rgb.png: opaque, unlike layer 0
+    let level0 = ktx2::transcode_level(&bytes, 0, GpuTarget::Rgba8).unwrap();
+    let (layer0, layer1) = level0.split_at(20 * 12 * 4);
+    assert!(layer0.chunks(4).any(|p| p[3] < 200));
+    assert!(layer1.chunks(4).all(|p| p[3] == 255));
+    // a single level, all layers
+    assert_eq!(ktx2::transcode_level(&bytes, 4, GpuTarget::Rgba8).unwrap().len(), 2 * 4);
 }
 
 #[test]
