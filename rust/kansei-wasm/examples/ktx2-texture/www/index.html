@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kansei — KTX2 textures</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font: 13px/1.5 ui-monospace, Menlo, monospace; color: #ddd; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #report { position: fixed; left: 12px; top: 10px; margin: 0; padding: 8px 10px; background: rgba(0, 0, 0, 0.6); white-space: pre-wrap; max-width: calc(100vw - 44px); }
+        #report a { color: #9cf; margin-right: 10px; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <pre id="report">loading…</pre>
+    <script type="module">
+        import init, { start } from '../pkg/kansei_wasm_ktx2_texture.js';
+        const report = document.getElementById('report');
+        const links = ['all', 'bc', 'astc', 'etc2', 'none'].map(s => `<a href="?support=${s}">${s}</a>`).join('');
+        try {
+            await init();
+            report.textContent = await start('kansei');
+            report.insertAdjacentHTML('beforeend', `\nformats: ${links}`);
+        } catch (e) {
+            report.textContent = `failed: ${e}`;
+        }
+    </script>
+</body>
+</html>

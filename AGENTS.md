@@ -6,6 +6,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Active development is the Rust engine in `rust/` (workspace: `kansei-core`, `kansei-wasm`, `kansei-native`); the TypeScript library in `src/` is the older port. Open PRs against `development`, not `main`.
 - `rust/kansei-wasm/examples/*` are standalone crates, each with its own `[workspace]` and listed under `exclude` in `rust/Cargo.toml`. Build one with `wasm-pack build --target web --release` in its directory, serve that directory, and open `www/`.
+- Textures ship as KTX2 (Basis Universal), transcoded per device by `loaders::ktx2`; encode with `rust/tools/ktx2` (needs `basisu`). See `docs/ktx2.md`. The transcoder crate is vendored and trimmed in `rust/vendor/basisu` (`PATCHES.md`): a new target needs its dispatch arm back.
 
 ## Verifying
 
@@ -23,6 +24,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Shadow, reflection and velocity passes redraw each material through its own `vertex_main`, with the light or mirror as the camera (see `Material::get_depth_pipeline`). Vertex shaders must not read group 3. Mark `@builtin(position) @invariant` where a second pass depth-tests against the GBuffer.
 - Group 3 (shadows and lights) only grows by additive bindings; `renderers/shared_layouts.rs` lists them.
 - Instances culled on the CPU for the camera also drop out of shadow maps and reflections. Use `culling::InstanceCulling`, which culls per view on the GPU.
+- The `target/` directories of a few older examples (spinning-box, lit-scene, shadow-scene, ...) are committed: building those examples modifies tracked files, so restore them with `git checkout -- <example>/target` before committing.
 - Cluster LOD (`Renderable::clusters`) draws only the camera's pass until M3: other views draw the renderable's geometry, which must be the mesh its graph was built from.
 - Skinned materials (`animation::SKINNING_WGSL`) skin in their own `vertex_main`, but the single directional shadow map (`enable_shadows`) draws casters with a shared depth shader: a skinned mesh casts its bind pose there, so use cascaded shadows.
 - Never commit animation data, character meshes or anything derived from them (glTF exports, `.kmm` packs) unless their licence allows a public MIT repo: third-party sets such as Epic's GASP stay in a private folder, and the motion-matching example loads packs from a local path (`rust/kansei-anim-bake/README.md`).

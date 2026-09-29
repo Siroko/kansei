@@ -1,0 +1,13 @@
+[package]
+name = "kansei-ktx2-tool"
+version = "0.1.0"
+edition = "2021"
+description = "Encode PNG/JPEG/WebP images to Basis Universal KTX2 textures for Kansei (wraps the official basisu CLI)"
+
+[[bin]]
+name = "kansei-ktx2"
+path = "src/main.rs"
+
+[dependencies]
+kansei-core = { path = "../../kansei-core" }
+image = { workspace = true }
