@@ -86,6 +86,10 @@ impl Default for ContactThresholds {
     }
 }
 
+/// Tag bit (in `ClipInfo::tags`) of clips only played on command (traversals, falls, landings):
+/// searches leave them out unless their filter asks for this bit.
+pub const ACTION_TAG: u32 = 1 << 31;
+
 /// One clip's frames in the database.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipInfo {
@@ -479,8 +483,13 @@ impl Database {
         }
     }
 
-    /// The character root at fractional frame `f` of clip `clip` (0 = its first frame).
-    fn root_at(&self, clip: &ClipInfo, f: f32) -> (Vec3, f32) {
+    /// The character root (position and heading) at fractional frame `frame` of clip `clip`, in
+    /// the clip's space.
+    pub fn root_at(&self, clip: usize, frame: f32) -> (Vec3, f32) {
+        self.root_in(&self.clips[clip], frame)
+    }
+
+    fn root_in(&self, clip: &ClipInfo, f: f32) -> (Vec3, f32) {
         let a = (f.floor() as usize).min(clip.frames - 1);
         let b = (a + 1).min(clip.frames - 1);
         let t = f - a as f32;
@@ -502,8 +511,8 @@ impl Database {
             return (d0 + yaw_rotation(y0) * d1, y0 + y1);
         }
         let to = to.min((info.frames - 1) as f32);
-        let (pa, ya) = self.root_at(info, from);
-        let (pb, yb) = self.root_at(info, to);
+        let (pa, ya) = self.root_in(info, from);
+        let (pb, yb) = self.root_in(info, to);
         (yaw_rotation(-ya) * (pb - pa), wrap_angle(yb - ya))
     }
 
