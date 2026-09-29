@@ -1,10 +1,12 @@
-//! `.kmm`: a motion-matching database and its skinned meshes in one little-endian binary file.
+//! `.kmm`: a motion-matching database and its skinned meshes in one little-endian binary file;
+//! or, as a `CharacterPack`, a character to show that animation on (skeleton, meshes, images).
 //!
 //! `KMMP`, a u32 version, then sections: a 4-byte tag, a u64 length and the payload. Readers skip
 //! tags they don't know. Sections: `SKEL` skeleton, `ROLE` joint roles, rate and feature weights,
 //! `CLIP` clips, `ROTS` quantized rotations, `TRAN`/`SCAL` translation and scale tracks, `ROOT`
 //! character root per frame, `CONT` foot contacts, `FEAT` feature normalization and rows, `MESH`
-//! (repeated) skinned meshes with a colour, `META` key/value strings (source, licence).
+//! (repeated) skinned meshes with a colour, `IMAG` (repeated) named images (encoded bytes, e.g.
+//! WebP), `META` key/value strings (source, licence).
 
 use glam::{Mat4, Quat, Vec3};
 
@@ -48,14 +50,7 @@ impl MotionPack {
                 w.str(v);
             }
         });
-        section(&mut out, b"SKEL", |w| {
-            w.u32(db.skeleton.len() as u32);
-            for j in 0..db.skeleton.len() {
-                w.str(&db.skeleton.names[j]);
-                w.i32(db.skeleton.parents[j].map_or(-1, |p| p as i32));
-                w.transform(&db.skeleton.rest[j]);
-            }
-        });
+        section(&mut out, b"SKEL", |w| w.skeleton(&db.skeleton));
         section(&mut out, b"ROLE", |w| {
             for j in [db.roles.root, db.roles.hips, db.roles.feet[0], db.roles.feet[1]] {
                 w.u32(j as u32);
@@ -147,20 +142,7 @@ impl MotionPack {
                         meta.push((r.str()?, r.str()?));
                     }
                 }
-                b"SKEL" => {
-                    let n = r.u32()? as usize;
-                    let (mut names, mut parents, mut rest) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
-                    for i in 0..n {
-                        names.push(r.str()?);
-                        let p = r.i32()?;
-                        if p >= i as i32 {
-                            return Err(format!("joint {i} comes before its parent {p}"));
-                        }
-                        parents.push((p >= 0).then_some(p as usize));
-                        rest.push(r.transform()?);
-                    }
-                    skeleton = Some(Skeleton::new(names, parents, rest));
-                }
+                b"SKEL" => skeleton = Some(r.skeleton()?),
                 b"ROLE" => {
                     let j = [r.u32()?, r.u32()?, r.u32()?, r.u32()?].map(|x| x as usize);
                     let rate = r.f32()?;
@@ -234,6 +216,106 @@ impl MotionPack {
     }
 }
 
+/// A named image, encoded (PNG, JPEG, WebP...): a character's textures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackImage {
+    pub name: String,
+    /// Its media type, e.g. `image/webp`.
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A character to show a motion pack's animation on: its skeleton (the same joint names and axes
+/// as the motion pack's, its own proportions: see `animation::retarget`), skinned meshes and
+/// images.
+#[derive(Debug, Clone)]
+pub struct CharacterPack {
+    pub skeleton: Skeleton,
+    pub meshes: Vec<PackMesh>,
+    pub images: Vec<PackImage>,
+    pub meta: Vec<(String, String)>,
+}
+
+impl CharacterPack {
+    pub fn meta(&self, key: &str) -> Option<&str> {
+        self.meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    pub fn image(&self, name: &str) -> Option<&PackImage> {
+        self.images.iter().find(|i| i.name == name)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        section(&mut out, b"META", |w| {
+            w.u32(self.meta.len() as u32);
+            for (k, v) in &self.meta {
+                w.str(k);
+                w.str(v);
+            }
+        });
+        section(&mut out, b"SKEL", |w| w.skeleton(&self.skeleton));
+        for m in &self.meshes {
+            section(&mut out, b"MESH", |w| w.mesh(m));
+        }
+        for image in &self.images {
+            section(&mut out, b"IMAG", |w| {
+                w.str(&image.name);
+                w.str(&image.mime);
+                w.u32(image.bytes.len() as u32);
+                w.bytes(&image.bytes);
+            });
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 8 || &bytes[..4] != MAGIC {
+            return Err("not a Kansei pack (.kmm)".into());
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != VERSION {
+            return Err(format!("pack version {version}, this build reads {VERSION}"));
+        }
+        let (mut skeleton, mut meshes, mut images, mut meta) = (None, Vec::new(), Vec::new(), Vec::new());
+        let mut at = 8;
+        while at < bytes.len() {
+            let mut header = Reader { bytes, at };
+            let tag: [u8; 4] = header.take(4)?.try_into().unwrap();
+            let length = header.u64()? as usize;
+            let start = header.at;
+            let payload = bytes.get(start..start + length).ok_or("truncated pack")?;
+            let mut r = Reader { bytes: payload, at: 0 };
+            match &tag {
+                b"META" => {
+                    for _ in 0..r.u32()? {
+                        meta.push((r.str()?, r.str()?));
+                    }
+                }
+                b"SKEL" => skeleton = Some(r.skeleton()?),
+                b"MESH" => meshes.push(r.mesh()?),
+                b"IMAG" => {
+                    let (name, mime) = (r.str()?, r.str()?);
+                    let n = r.u32()? as usize;
+                    images.push(PackImage { name, mime, bytes: r.take(n)?.to_vec() });
+                }
+                _ => {}
+            }
+            at = start + length;
+        }
+        let skeleton = skeleton.ok_or("the pack has no skeleton")?;
+        if meshes.is_empty() {
+            return Err("the pack has no mesh".into());
+        }
+        if meshes.iter().any(|m| m.mesh.skin_joints.iter().any(|&j| j >= skeleton.len())) {
+            return Err("a mesh is skinned to joints the skeleton lacks".into());
+        }
+        Ok(Self { skeleton, meshes, images, meta })
+    }
+}
+
 fn section(out: &mut Vec<u8>, tag: &[u8; 4], write: impl FnOnce(&mut Writer)) {
     let mut w = Writer(Vec::new());
     write(&mut w);
@@ -274,6 +356,14 @@ impl Writer {
         self.vec3(t.translation);
         self.quat(t.rotation);
         self.vec3(t.scale);
+    }
+    fn skeleton(&mut self, skeleton: &Skeleton) {
+        self.u32(skeleton.len() as u32);
+        for j in 0..skeleton.len() {
+            self.str(&skeleton.names[j]);
+            self.i32(skeleton.parents[j].map_or(-1, |p| p as i32));
+            self.transform(&skeleton.rest[j]);
+        }
     }
     fn tracks(&mut self, t: &Vec3Tracks) {
         self.u32(t.constant.len() as u32);
@@ -363,6 +453,20 @@ impl Reader<'_> {
     }
     fn transform(&mut self) -> Result<Transform, String> {
         Ok(Transform::new(self.vec3()?, self.quat()?, self.vec3()?))
+    }
+    fn skeleton(&mut self) -> Result<Skeleton, String> {
+        let n = self.u32()? as usize;
+        let (mut names, mut parents, mut rest) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for i in 0..n {
+            names.push(self.str()?);
+            let p = self.i32()?;
+            if p >= i as i32 {
+                return Err(format!("joint {i} comes before its parent {p}"));
+            }
+            parents.push((p >= 0).then_some(p as usize));
+            rest.push(self.transform()?);
+        }
+        Ok(Skeleton::new(names, parents, rest))
     }
     fn tracks(&mut self) -> Result<Vec3Tracks, String> {
         let joints = self.u32()? as usize;
