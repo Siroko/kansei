@@ -77,6 +77,22 @@ fn land() -> Clip {
     clip("land", 50, |f| Vec3::new(0.0, (3.0 - f as f32 * 0.2).max(0.0), f as f32 * 0.05), |_| 1.0, |_| None, 0.2)
 }
 
+/// Dropping `drop` metres (landing at frame `drop / 0.2`), then walking.
+fn land_from(name: &str, drop: f32) -> Clip {
+    clip(name, (drop / 0.2) as usize + 35, move |f| Vec3::new(0.0, (drop - f as f32 * 0.2).max(0.0), f as f32 * 0.05), |_| 1.0, |_| None, 0.2)
+}
+
+/// A run-up at `speed` m/s, the take-off at frame 10, a 1 m apex, then falling on past the
+/// take-off height.
+fn jump_clip(name: &str, speed: f32) -> Clip {
+    let up = (2.0f32 * 9.81).sqrt();
+    let y = move |f: usize| {
+        let t = (f as f32 - 10.0) / RATE;
+        if t <= 0.0 { 0.0 } else { up * t - 0.5 * 9.81 * t * t }
+    };
+    clip(name, 61, move |f| Vec3::new(0.0, y(f), (f as f32 - 10.0) * speed / RATE), |f| if f < 10 { 0.9 } else { 1.0 }, |_| None, 0.1 + 0.2 * speed.min(1.0))
+}
+
 fn fall() -> Clip {
     clip("fall", 31, |_| Vec3::ZERO, |_| 1.0, |_| None, 0.6)
 }
@@ -335,4 +351,158 @@ fn pushing_the_character_out_of_a_wall_gives_it_no_speed() {
     let z = c.matcher.character().translation.z;
     assert!(z < -0.29 && z > -0.45, "out of the wall, and no farther: {z}");
     assert!(c.matcher.simulation().velocity.length() < 0.1, "{}", c.matcher.simulation().velocity);
+}
+
+/// Standing and walking jumps (and a running one if `run`), light and heavy landings, the fall
+/// loop and a hurdle.
+fn jump_database(run: bool) -> (Database, Vec<ActionClip>) {
+    let mut actions = vec![
+        (jump_clip("jump_stand", 0.0), ActionKind::Jump),
+        (jump_clip("jump_walk", 1.5), ActionKind::Jump),
+        (land(), ActionKind::Land),
+        (land_from("land_heavy", 6.0), ActionKind::Land),
+        (fall(), ActionKind::Fall),
+        (hurdle(), ActionKind::Hurdle),
+    ];
+    if run {
+        actions.push((jump_clip("jump_run", 4.0), ActionKind::Jump));
+    }
+    database_with(actions)
+}
+
+fn floor() -> CollisionWorld {
+    let mut w = CollisionWorld::new();
+    w.add_box(Obb::from_min_max(Vec3::new(-100.0, -1.0, -100.0), Vec3::new(100.0, 0.0, 100.0)));
+    w
+}
+
+/// Runs `c` for `seconds`, walking along +Z, and returns each state and clip it went through (an
+/// entry whenever either changes), and the highest point it reached.
+fn fly(c: &mut CharacterController, db: &Database, w: &CollisionWorld, seconds: f32) -> (Vec<(CharacterState, String)>, f32) {
+    let mut seen: Vec<(CharacterState, String)> = Vec::new();
+    let mut highest = f32::MIN;
+    for _ in 0..(seconds * 60.0) as usize {
+        c.update(db, w, &MotionInput { velocity: Vec3::new(0.0, 0.0, 1.5), facing: None }, 1.0 / 60.0);
+        highest = highest.max(c.matcher.character().translation.y);
+        let state = match c.state() {
+            CharacterState::Falling(_) => CharacterState::Falling(0.0),
+            s => s,
+        };
+        let clip = db.clips[c.matcher.playing().0].name.clone();
+        if seen.last().is_none_or(|(s, n)| *s != state || *n != clip) {
+            seen.push((state, clip));
+        }
+    }
+    (seen, highest)
+}
+
+#[test]
+fn analysis_reads_the_take_off_and_apex_of_a_jump() {
+    let (db, table) = jump_database(false);
+    let walk = table.iter().find(|a| db.clips[a.clip].name == "jump_walk").unwrap();
+    assert_eq!(walk.kind, ActionKind::Jump);
+    assert_eq!(walk.rise, 10.0);
+    assert!((walk.anchor - 23.5).abs() <= 0.5, "apex at {}", walk.anchor);
+    assert!((walk.height - 1.0).abs() < 0.01, "{}", walk.height);
+    assert!((walk.speed_at(&db, 5.0) - 1.5).abs() < 0.01);
+}
+
+#[test]
+fn a_jump_takes_off_flies_as_high_as_asked_and_lands_light() {
+    let (db, table) = jump_database(false);
+    let w = floor();
+    let mut c = controller(&db, table, Vec3::ZERO);
+    c.jump_height = Some(0.8);
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 1.0);
+    assert_eq!(c.jump(&db), Ok(ActionKind::Jump));
+    // the run-up that goes with walking
+    assert_eq!(db.clips[c.matcher.action().unwrap().clip].name, "jump_walk");
+    let (seen, highest) = fly(&mut c, &db, &w, 3.0);
+    assert!((highest - 0.8).abs() < 0.03, "as high as asked: {highest}");
+    let mut states: Vec<_> = seen.iter().map(|(s, _)| *s).collect();
+    states.dedup();
+    assert_eq!(states, [CharacterState::Jumping, CharacterState::Falling(0.0), CharacterState::Landing, CharacterState::Grounded]);
+    assert!(seen.contains(&(CharacterState::Landing, "land".into())), "a light landing for a 0.8 m fall: {seen:?}");
+    let p = c.matcher.character().translation;
+    assert!(p.y.abs() < 0.02 && p.z > 1.5, "down and on: {p}");
+}
+
+#[test]
+fn a_running_jump_lands_on_top_of_a_box() {
+    let (db, mut table) = jump_database(true);
+    table.retain(|a| a.kind != ActionKind::Jump || db.clips[a.clip].name == "jump_run");
+    // 0.5 m high (more than a step), its front 2.8 m ahead
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-2.0, 0.0, 2.8), Vec3::new(2.0, 0.5, 20.0)));
+    let mut c = controller(&db, table, Vec3::ZERO);
+    assert_eq!(c.jump(&db), Ok(ActionKind::Jump));
+    let (seen, _) = fly(&mut c, &db, &w, 3.0);
+    assert!(seen.iter().any(|(s, _)| *s == CharacterState::Landing), "{seen:?}");
+    let p = c.matcher.character().translation;
+    assert_eq!(c.state(), CharacterState::Grounded);
+    assert!((p.y - 0.5).abs() < 0.02 && p.z > 2.8, "on the box: {p}");
+}
+
+#[test]
+fn a_wall_stops_a_jump() {
+    let (db, table) = jump_database(false);
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-2.0, 0.0, 1.0), Vec3::new(2.0, 3.0, 2.0)));
+    let mut c = controller(&db, table, Vec3::ZERO);
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 0.2);
+    assert_eq!(c.jump(&db), Ok(ActionKind::Jump));
+    for _ in 0..180 {
+        c.update(&db, &w, &MotionInput { velocity: Vec3::new(0.0, 0.0, 1.5), facing: None }, 1.0 / 60.0);
+        let z = c.matcher.character().translation.z;
+        assert!(z < 0.72, "kept out of the wall: {z}");
+    }
+    assert_eq!(c.state(), CharacterState::Grounded);
+    assert!(c.matcher.character().translation.y.abs() < 0.02);
+}
+
+#[test]
+fn a_jump_off_a_high_platform_goes_on_with_the_fall_loop_and_lands_heavy() {
+    let (db, table) = jump_database(false);
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 10.0, 0.0)));
+    let mut c = controller(&db, table, Vec3::new(0.0, 10.0, -2.6));
+    c.matcher.set_ground(10.0);
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 1.0);
+    assert_eq!(c.jump(&db), Ok(ActionKind::Jump));
+    let (seen, _) = fly(&mut c, &db, &w, 4.0);
+    // off the edge in the air; the jump clip runs out before the ground, the fall loop goes on
+    let expected: Vec<(CharacterState, String)> = [
+        (CharacterState::Jumping, "jump_walk"),
+        (CharacterState::Falling(0.0), "jump_walk"),
+        (CharacterState::Falling(0.0), "fall"),
+        (CharacterState::Landing, "land_heavy"),
+    ]
+    .map(|(s, n)| (s, n.to_string()))
+    .to_vec();
+    assert_eq!(seen[..4], expected[..], "{seen:?}");
+    assert_eq!(c.state(), CharacterState::Grounded);
+    assert!(c.matcher.character().translation.y.abs() < 0.02);
+}
+
+#[test]
+fn space_jumps_unless_there_is_something_to_traverse() {
+    let (db, table) = jump_database(false);
+    // open floor: a jump
+    let w = floor();
+    let mut c = controller(&db, table.clone(), Vec3::ZERO);
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 0.5);
+    assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Ok(ActionKind::Jump));
+    // a thin box ahead: a hurdle
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 0.7, 0.3)));
+    let mut c = controller(&db, table.clone(), Vec3::new(0.0, 0.0, -2.4));
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 0.5);
+    assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Ok(ActionKind::Hurdle));
+    // the end of a beam: too narrow to traverse, so a jump
+    let mut w = floor();
+    w.add_box(Obb::from_min_max(Vec3::new(-0.175, 0.0, 1.0), Vec3::new(0.175, 0.6, 8.0)));
+    let mut c = controller(&db, table, Vec3::new(0.0, 0.0, -0.8));
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 0.3);
+    assert_eq!(c.request_traverse_or_jump(&db, &w, 1.0), Ok(ActionKind::Jump));
+    assert_eq!(c.last_obstacle.map(|o| o.half_width < 0.3), Some(true));
 }
