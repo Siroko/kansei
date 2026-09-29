@@ -2,6 +2,7 @@ use crate::geometries::{Geometry, Vertex};
 use crate::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
 use crate::math::Vec3;
 use crate::objects::Renderable;
+use super::ktx2::{self, CompressionSupport, GpuTarget, Ktx2Options, TranscodedTexture};
 
 const BASIC_LIT_WGSL: &str = include_str!("../shaders/basic_lit.wgsl");
 
@@ -12,6 +13,44 @@ pub struct GLTFMaterialInfo {
     pub metallic: f32,
     pub roughness: f32,
     pub double_sided: bool,
+    /// sRGB colour (x base colour factor).
+    pub base_color_texture: Option<GLTFTextureRef>,
+    /// Linear: roughness in G, metalness in B.
+    pub metallic_roughness_texture: Option<GLTFTextureRef>,
+    /// Linear tangent-space normals.
+    pub normal_texture: Option<GLTFTextureRef>,
+    /// Linear: occlusion in R.
+    pub occlusion_texture: Option<GLTFTextureRef>,
+    /// sRGB colour.
+    pub emissive_texture: Option<GLTFTextureRef>,
+}
+
+/// A material's texture: which image to load and how its texels are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GLTFTextureRef {
+    /// The glTF texture index.
+    pub texture: usize,
+    /// The image to load: the `KHR_texture_basisu` KTX2 image when the texture has one,
+    /// otherwise the texture's own source.
+    pub image: usize,
+    /// The texture's PNG/JPEG source when a KTX2 image is preferred over it.
+    pub fallback_image: Option<usize>,
+    /// Which UV set it reads.
+    pub tex_coord: u32,
+    /// Colour (base colour, emissive) rather than linear data.
+    pub srgb: bool,
+}
+
+/// An image of the glTF file, its encoded bytes resolved where the file holds them.
+pub struct GLTFImage {
+    pub name: Option<String>,
+    /// "image/ktx2", "image/png", "image/jpeg" (from the file, or guessed from the bytes).
+    pub mime_type: Option<String>,
+    /// The URI of an image stored outside the file.
+    pub uri: Option<String>,
+    /// The encoded image; `None` for an external image not read yet (see
+    /// `GLTFResult::set_image_data`).
+    pub data: Option<Vec<u8>>,
 }
 
 /// A loaded renderable with its transform.
@@ -27,9 +66,41 @@ pub struct GLTFRenderable {
 pub struct GLTFResult {
     pub renderables: Vec<GLTFRenderable>,
     pub materials: Vec<GLTFMaterialInfo>,
+    pub images: Vec<GLTFImage>,
 }
 
 impl GLTFResult {
+    /// Provide the bytes of an external image (for WASM, where `.gltf` files' image URIs are
+    /// fetched separately).
+    pub fn set_image_data(&mut self, image: usize, bytes: Vec<u8>) {
+        self.images[image].data = Some(bytes);
+    }
+
+    /// Decode or transcode a material texture for a device with `support`: KTX2 images (from
+    /// `KHR_texture_basisu`) become the best block-compressed format it samples, PNG/JPEG images
+    /// RGBA8 (one mip). Colour textures load as sRGB, the rest as linear.
+    pub fn load_texture(&self, texture: &GLTFTextureRef, support: CompressionSupport) -> Result<TranscodedTexture, String> {
+        let image = &self.images[texture.image];
+        let label = image.name.clone().unwrap_or_else(|| format!("GLTF/Image{}", texture.image));
+        let bytes = image.data.as_deref().ok_or_else(|| format!("{label}: image data not loaded ({:?})", image.uri))?;
+        if ktx2::is_ktx2(bytes) {
+            let options = if texture.srgb { Ktx2Options::color() } else { Ktx2Options::linear() };
+            return ktx2::transcode(&label, bytes, &options, support).map_err(|e| format!("{label}: {e}"));
+        }
+        let rgba = image::load_from_memory(bytes).map_err(|e| format!("{label}: {e}"))?.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Ok(TranscodedTexture {
+            label,
+            codec: image.mime_type.clone().unwrap_or_else(|| "image".into()),
+            target: GpuTarget::Rgba8,
+            format: GpuTarget::Rgba8.format(texture.srgb),
+            width,
+            height,
+            levels: vec![rgba.into_raw()],
+            file_bytes: bytes.len(),
+        })
+    }
+
     /// Convert into engine `Renderable`s with basic lit materials derived from glTF PBR data.
     /// Applies position, rotation, scale, and an optional extra uniform scale multiplier.
     pub fn into_renderables(self, scale_multiplier: f32) -> Vec<Renderable> {
@@ -80,32 +151,27 @@ impl GLTFResult {
 pub struct GLTFLoader;
 
 impl GLTFLoader {
-    /// Load a glTF or glb file from disk.
+    /// Load a glTF or glb file from disk, with its external buffers and images.
     pub fn load(path: &str) -> Result<GLTFResult, String> {
-        let (document, buffers, _images) =
-            gltf::import(path).map_err(|e| format!("Failed to load glTF '{}': {}", path, e))?;
-        let materials = Self::parse_materials(&document);
-        let renderables = Self::parse_scene(&document, &buffers);
-        Ok(GLTFResult {
-            renderables,
-            materials,
-        })
+        let gltf = gltf::Gltf::open(path).map_err(|e| format!("Failed to load glTF '{}': {}", path, e))?;
+        let base = std::path::Path::new(path).parent();
+        let buffers = gltf::import_buffers(&gltf.document, base, gltf.blob.clone())
+            .map_err(|e| format!("Failed to load glTF '{}' buffers: {}", path, e))?;
+        Ok(Self::from_document(&gltf.document, &buffers, base))
     }
 
     /// Load from in-memory glb bytes.
     pub fn load_glb(bytes: &[u8]) -> Result<GLTFResult, String> {
-        let (document, buffers, _images) =
-            gltf::import_slice(bytes).map_err(|e| format!("Failed to parse glb: {}", e))?;
-        let materials = Self::parse_materials(&document);
-        let renderables = Self::parse_scene(&document, &buffers);
-        Ok(GLTFResult {
-            renderables,
-            materials,
-        })
+        let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| format!("Failed to parse glb: {}", e))?;
+        let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone())
+            .map_err(|e| format!("Failed to parse glb buffers: {}", e))?;
+        Ok(Self::from_document(&gltf.document, &buffers, None))
     }
 
     /// Load from in-memory glTF JSON + external binary buffer(s).
-    /// Use this for WASM where .gltf + .bin are fetched separately via HTTP.
+    /// Use this for WASM where .gltf + .bin are fetched separately via HTTP; images stored in
+    /// the buffers or as data URIs are resolved, external ones are left for
+    /// `GLTFResult::set_image_data`.
     pub fn load_gltf_with_buffers(
         gltf_json: &[u8],
         external_buffers: Vec<Vec<u8>>,
@@ -119,11 +185,57 @@ impl GLTFLoader {
             .map(gltf::buffer::Data)
             .collect();
 
-        let materials = Self::parse_materials(&gltf.document);
-        let renderables = Self::parse_scene(&gltf.document, &buffers);
-        Ok(GLTFResult {
-            renderables,
-            materials,
+        Ok(Self::from_document(&gltf.document, &buffers, None))
+    }
+
+    fn from_document(doc: &gltf::Document, buffers: &[gltf::buffer::Data], base: Option<&std::path::Path>) -> GLTFResult {
+        GLTFResult {
+            renderables: Self::parse_scene(doc, buffers),
+            materials: Self::parse_materials(doc),
+            images: Self::parse_images(doc, buffers, base),
+        }
+    }
+
+    /// Each image's encoded bytes, read from its buffer view, its data URI, or (native, given a
+    /// base directory) its file. `gltf::import` would also decode them, which fails for KTX2.
+    fn parse_images(doc: &gltf::Document, buffers: &[gltf::buffer::Data], base: Option<&std::path::Path>) -> Vec<GLTFImage> {
+        doc.images()
+            .map(|img| {
+                let (uri, mime, data) = match img.source() {
+                    gltf::image::Source::View { view, mime_type } => {
+                        let data = buffers.get(view.buffer().index()).and_then(|b| b.get(view.offset()..view.offset() + view.length())).map(|d| d.to_vec());
+                        (None, Some(mime_type.to_string()), data)
+                    }
+                    gltf::image::Source::Uri { uri, mime_type } => {
+                        let data = if let Some(rest) = uri.strip_prefix("data:") {
+                            rest.split_once(";base64,").and_then(|(_, b64)| decode_base64(b64))
+                        } else {
+                            base.and_then(|dir| std::fs::read(dir.join(percent_decode(uri))).ok())
+                        };
+                        let mime = mime_type.map(str::to_string).or_else(|| uri.strip_prefix("data:").and_then(|r| r.split(';').next()).map(str::to_string));
+                        (Some(uri.to_string()).filter(|u| !u.starts_with("data:")), mime, data)
+                    }
+                };
+                let mime = mime.or_else(|| data.as_deref().filter(|d| ktx2::is_ktx2(d)).map(|_| "image/ktx2".to_string()));
+                GLTFImage { name: img.name().map(str::to_string), mime_type: mime, uri, data }
+            })
+            .collect()
+    }
+
+    fn texture_ref(texture: gltf::Texture, tex_coord: u32, srgb: bool) -> Option<GLTFTextureRef> {
+        let basisu = texture
+            .extension_value("KHR_texture_basisu")
+            .and_then(|ext| ext.get("source"))
+            .and_then(|s| s.as_u64())
+            .map(|s| s as usize);
+        let source = texture.source().map(|img| img.index());
+        let image = basisu.or(source)?;
+        Some(GLTFTextureRef {
+            texture: texture.index(),
+            image,
+            fallback_image: source.filter(|&s| s != image),
+            tex_coord,
+            srgb,
         })
     }
 
@@ -137,6 +249,11 @@ impl GLTFLoader {
                     metallic: pbr.metallic_factor(),
                     roughness: pbr.roughness_factor(),
                     double_sided: mat.double_sided(),
+                    base_color_texture: pbr.base_color_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), true)),
+                    metallic_roughness_texture: pbr.metallic_roughness_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), false)),
+                    normal_texture: mat.normal_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), false)),
+                    occlusion_texture: mat.occlusion_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), false)),
+                    emissive_texture: mat.emissive_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), true)),
                 }
             })
             .collect()
@@ -221,4 +338,47 @@ impl GLTFLoader {
 
         Some(Geometry::new("GLTF/Primitive", vertices, indices))
     }
+}
+
+/// Standard base64 (data URIs), ignoring whitespace; `None` on anything else.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in text.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
+        acc = (acc << 6) | value(c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// `%XX` escapes in a relative URI.
+fn percent_decode(uri: &str) -> String {
+    let b = uri.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
