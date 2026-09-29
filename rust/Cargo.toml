@@ -4,6 +4,7 @@ members = [
     "kansei-core",
     "kansei-wasm",
     "kansei-native",
+    "kansei-anim-bake",
 ]
 exclude = [
     "kansei-wasm/examples/spinning-box",
