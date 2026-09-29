@@ -5,7 +5,8 @@ use super::search::{Match, SearchFilter};
 use crate::animation::ik::{two_joint_ik, FootLock};
 use crate::animation::inertialization::Inertializer;
 use crate::animation::springs::{damper_exact, negexp, spring_character_update, spring_damper_exact_quat};
-use crate::animation::{quat_abs, quat_from_scaled_angle_axis, quat_to_scaled_angle_axis, Pose, Transform};
+use crate::animation::retarget::Retarget;
+use crate::animation::{quat_abs, quat_from_scaled_angle_axis, quat_to_scaled_angle_axis, Pose, Skeleton, Transform};
 
 /// Tuning of a `MotionMatcher`. The defaults follow Holden's reference controller at 30 Hz data.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +94,21 @@ pub struct SearchInfo {
     pub cost: f32,
 }
 
+/// A character with its own proportions shown instead of the database's skeleton (see
+/// `MotionMatcher::set_display`).
+#[derive(Debug, Clone)]
+struct Display {
+    skeleton: Skeleton,
+    retarget: Retarget,
+    legs: [[usize; 3]; 2],
+}
+
+/// The (upper, middle, foot) joints of the leg ending at `foot`.
+fn leg(skeleton: &Skeleton, foot: usize) -> [usize; 3] {
+    let middle = skeleton.parents[foot].unwrap_or(foot);
+    [skeleton.parents[middle].unwrap_or(middle), middle, foot]
+}
+
 /// A character driven by motion matching: every few frames it searches the database for the
 /// frame whose pose and future trajectory best match its current pose and the trajectory the
 /// input predicts, switches there with inertialization, and plays on, moved by the clips' root
@@ -102,10 +118,13 @@ pub struct MotionMatcher {
     clip: usize,
     /// Playhead in frames of `clip`.
     frame: f32,
-    /// The database's pose at the playhead, and the output (inertialized, feet locked).
+    /// The database's pose at the playhead, the pose shown (inertialized, on the database's
+    /// skeleton), and the output: that pose on the display skeleton if any, feet locked.
     sampled: Pose,
+    matched: Pose,
     pose: Pose,
     model: Vec<Transform>,
+    display: Option<Display>,
     /// The character root in the world: position and heading.
     character: Transform,
     simulation: Simulation,
@@ -129,18 +148,16 @@ impl MotionMatcher {
     pub fn new(db: &Database, settings: MotionMatchingSettings, position: Vec3, yaw: f32) -> Self {
         let mut sampled = Pose { local: Vec::new() };
         db.pose(0, 0, 0.0, &mut sampled);
-        let leg = |foot: usize| {
-            let middle = db.skeleton.parents[foot].unwrap_or(foot);
-            [db.skeleton.parents[middle].unwrap_or(middle), middle, foot]
-        };
         let character = Transform::from_translation_rotation(position, yaw_rotation(yaw));
         let mut matcher = Self {
             settings,
             clip: 0,
             frame: 0.0,
             pose: sampled.clone(),
+            matched: sampled.clone(),
             sampled,
             model: Vec::new(),
+            display: None,
             character,
             simulation: Simulation { position, velocity: Vec3::ZERO, acceleration: Vec3::ZERO, rotation: character.rotation, angular_velocity: Vec3::ZERO },
             desired_yaw: yaw,
@@ -149,7 +166,7 @@ impl MotionMatcher {
             search_timer: 0.0,
             searched_input: None,
             feet: Default::default(),
-            legs: [leg(db.roles.feet[0]), leg(db.roles.feet[1])],
+            legs: [leg(&db.skeleton, db.roles.feet[0]), leg(&db.skeleton, db.roles.feet[1])],
             last_search: SearchInfo::default(),
             root_speed: (0.0, 0.0),
             scratch: (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Pose { local: Vec::new() }),
@@ -158,12 +175,30 @@ impl MotionMatcher {
         matcher
     }
 
-    /// The output pose (local; the root joint relative to `character`).
+    /// Show the animation on another skeleton with the same joint names and axes but its own
+    /// proportions (`retarget` from the database's skeleton to `skeleton`); `None` shows the
+    /// database's. Foot locking then works on that skeleton's legs.
+    pub fn set_display(&mut self, db: &Database, display: Option<(Skeleton, Retarget)>) {
+        self.display = display.map(|(skeleton, retarget)| {
+            let foot = |j: usize| skeleton.find(&db.skeleton.names[j]).unwrap_or(0);
+            let legs = [leg(&skeleton, foot(db.roles.feet[0])), leg(&skeleton, foot(db.roles.feet[1]))];
+            Display { skeleton, retarget, legs }
+        });
+        self.feet.iter_mut().for_each(FootLock::reset);
+        self.output(db);
+    }
+
+    /// The skeleton the output pose is on.
+    pub fn output_skeleton<'a>(&'a self, db: &'a Database) -> &'a Skeleton {
+        self.display.as_ref().map_or(&db.skeleton, |d| &d.skeleton)
+    }
+
+    /// The output pose (local, on `output_skeleton`; the root joint relative to `character`).
     pub fn pose(&self) -> &Pose {
         &self.pose
     }
 
-    /// The output pose in model space (relative to `character`).
+    /// The output pose in model space (relative to `character`, on `output_skeleton`).
     pub fn model(&self) -> &[Transform] {
         &self.model
     }
@@ -217,11 +252,25 @@ impl MotionMatcher {
         self.simulate(input, dt);
         self.search_if_due(db, input, dt);
         self.play(db, dt);
-        self.inertializer.update(&mut self.pose, self.settings.inertialization_halflife, dt);
+        self.inertializer.update(&mut self.matched, self.settings.inertialization_halflife, dt);
         self.synchronize(dt);
-        self.pose.to_model(&db.skeleton, &mut self.model);
+        self.output(db);
         if self.settings.foot_lock {
             self.lock_feet(db, dt);
+        }
+    }
+
+    /// The output pose from the matched one: retargeted onto the display skeleton if any.
+    fn output(&mut self, db: &Database) {
+        match &self.display {
+            Some(d) => {
+                d.retarget.apply(&self.matched, &mut self.pose);
+                self.pose.to_model(&d.skeleton, &mut self.model);
+            }
+            None => {
+                self.pose.local.clone_from(&self.matched.local);
+                self.pose.to_model(&db.skeleton, &mut self.model);
+            }
         }
     }
 
@@ -313,7 +362,7 @@ impl MotionMatcher {
         let a = self.frame.floor() as usize;
         let b = (a + 1).min(info.frames - 1);
         db.pose(info.start + a, info.start + b, self.frame - a as f32, &mut self.sampled);
-        self.pose.local.clone_from(&self.sampled.local);
+        self.matched.local.clone_from(&self.sampled.local);
         self.root_speed = (moved.length() / dt, turned.abs() / dt);
     }
 
@@ -350,8 +399,10 @@ impl MotionMatcher {
         let contacts = db.contacts(self.current_frame(db));
         let s = &self.settings;
         let mut moved = false;
+        let skeleton = self.display.as_ref().map_or(&db.skeleton, |d| &d.skeleton);
+        let legs = self.display.as_ref().map_or(self.legs, |d| d.legs);
         for side in 0..2 {
-            let [upper, middle, foot] = self.legs[side];
+            let [upper, middle, foot] = legs[side];
             if upper == middle || middle == foot {
                 continue;
             }
@@ -359,13 +410,13 @@ impl MotionMatcher {
             let target = self.feet[side].update(animated, contacts[side], s.foot_unlock_radius, s.foot_lock_halflife, dt);
             if target.distance(animated) > 1e-5 {
                 let local = self.character.inverse().transform_point(target);
-                two_joint_ik(&db.skeleton, &mut self.pose, &mut self.model, upper, middle, foot, local);
+                two_joint_ik(skeleton, &mut self.pose, &mut self.model, upper, middle, foot, local);
                 moved = true;
             }
         }
         if moved {
             // the joints below the feet follow them
-            self.pose.to_model(&db.skeleton, &mut self.model);
+            self.pose.to_model(skeleton, &mut self.model);
         }
     }
 }

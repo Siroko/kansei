@@ -19,7 +19,16 @@ The config (JSON) names what to export and where:
     }
 
 `include` and `exclude` are fnmatch patterns over each AnimSequence's path relative to
-`animation_root`. Writes `mesh.glb` (the skinned mesh and skeleton), one `clips/<path>.glb` per
+`animation_root`. Optional `"import"` brings in other meshes rigged to the same skeleton, as
+FBX, before exporting them too (to `<name>.glb`):
+
+    "import": [{"fbx": "/abs/path/hero.fbx", "name": "hero",
+                "skeleton": "/Game/Characters/Hero/Meshes/SK_Hero_Skeleton",
+                "folder": "/Game/KanseiImport"}]
+
+They go through the FBX importer onto that skeleton asset (its normals as authored, no
+animation, no materials), so their bones have the skeleton's axes, as its animations expect.
+This does write the imported assets into the project: use a copy. Writes `mesh.glb` (the skinned mesh and skeleton), one `clips/<path>.glb` per
 sequence (skeleton and animation, no mesh) and `manifest.json` listing them with their frame
 count, length and loop flag, for `kansei-anim-bake`.
 
@@ -75,6 +84,43 @@ def messages(result):
     return out
 
 
+def import_fbx(item):
+    """An FBX rigged to an existing skeleton, as a skeletal mesh of that skeleton."""
+    skeleton = unreal.load_asset(item["skeleton"])
+    if skeleton is None:
+        raise RuntimeError("no skeleton at %s" % item["skeleton"])
+    options = unreal.FbxImportUI()
+    options.set_editor_property("import_mesh", True)
+    options.set_editor_property("import_as_skeletal", True)
+    options.set_editor_property("mesh_type_to_import", unreal.FBXImportType.FBXIT_SKELETAL_MESH)
+    options.set_editor_property("skeleton", skeleton)
+    options.set_editor_property("import_animations", False)
+    options.set_editor_property("import_materials", False)
+    options.set_editor_property("import_textures", False)
+    options.set_editor_property("create_physics_asset", False)
+    data = options.get_editor_property("skeletal_mesh_import_data")
+    data.set_editor_property("import_morph_targets", False)
+    data.set_editor_property("update_skeleton_reference_pose", False)
+    data.set_editor_property("use_t0_as_ref_pose", False)
+    data.set_editor_property("convert_scene", True)
+    data.set_editor_property("import_meshes_in_bone_hierarchy", True)
+    data.set_editor_property("normal_import_method", unreal.FBXNormalImportMethod.FBXNIM_IMPORT_NORMALS)
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", item["fbx"])
+    task.set_editor_property("destination_path", item.get("folder", "/Game/KanseiImport"))
+    task.set_editor_property("destination_name", item["name"])
+    task.set_editor_property("automated", True)
+    task.set_editor_property("replace_existing", True)
+    task.set_editor_property("save", False)
+    task.set_editor_property("options", options)
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    path = "%s/%s" % (item.get("folder", "/Game/KanseiImport"), item["name"])
+    asset = unreal.load_asset(path)
+    if asset is None:
+        raise RuntimeError("importing %s made no asset at %s" % (item["fbx"], path))
+    return asset
+
+
 def main():
     config = load_config()
     out_dir = config["output"]
@@ -92,6 +138,13 @@ def main():
         issues = messages(unreal.GLTFExporter.export_to_gltf(mesh, target, export_options(True), set()))
         manifest["mesh"] = {"file": "mesh.glb", "asset": mesh_path, "issues": issues}
         unreal.log("kansei export: mesh %s -> %s" % (mesh_path, target))
+
+    for item in config.get("import", []):
+        asset = import_fbx(item)
+        target = os.path.join(out_dir, item["name"] + ".glb")
+        issues = messages(unreal.GLTFExporter.export_to_gltf(asset, target, export_options(True), set()))
+        manifest.setdefault("imported", []).append({"file": item["name"] + ".glb", "fbx": item["fbx"], "issues": issues})
+        unreal.log("kansei export: imported %s -> %s" % (item["fbx"], target))
 
     root = config["animation_root"].rstrip("/")
     include = config.get("include", ["*"])
