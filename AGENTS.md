@@ -6,7 +6,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Active development is the Rust engine in `rust/` (workspace: `kansei-core`, `kansei-wasm`, `kansei-native`); the TypeScript library in `src/` is the older port. Open PRs against `development`, not `main`.
 - `rust/kansei-wasm/examples/*` are standalone crates, each with its own `[workspace]` and listed under `exclude` in `rust/Cargo.toml`. Build one with `wasm-pack build --target web --release` in its directory, serve that directory, and open `www/`.
-- Textures ship as KTX2 (Basis Universal), transcoded per device by `loaders::ktx2`; encode with `rust/tools/ktx2` (needs `basisu`). See `docs/ktx2.md`.
+- Textures ship as KTX2 (Basis Universal), transcoded per device by `loaders::ktx2`; encode with `rust/tools/ktx2` (needs `basisu`). See `docs/ktx2.md`. The transcoder crate is vendored and trimmed in `rust/vendor/basisu` (`PATCHES.md`): a new target needs its dispatch arm back.
 
 ## Verifying
 
