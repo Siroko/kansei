@@ -134,3 +134,17 @@ fn external_images_wait_for_their_bytes() {
     result.set_image_data(2, fixture("uastc_normal.ktx2"));
     assert_eq!(result.load_texture(&normal, CompressionSupport::NONE).unwrap().format, wgpu::TextureFormat::Rgba8Unorm);
 }
+
+/// The skinned-glTF importer reads the same materials and images, so a character's
+/// `KHR_texture_basisu` textures load too (and `gltf::import`'s image decoding, which rejects
+/// KTX2, is not in the way).
+#[test]
+fn skinned_import_resolves_ktx2_images() {
+    let (json, bin) = scene();
+    let skinned = kansei_core::animation::SkinnedGltf::from_slice(&glb(&json, &bin), None).unwrap();
+    let color = skinned.materials[0].base_color_texture.expect("base colour texture");
+    assert_eq!((color.image, color.fallback_image), (0, Some(1)));
+    assert_eq!(skinned.images.len(), 3);
+    let bc = CompressionSupport { bc: true, ..CompressionSupport::NONE };
+    assert_eq!(skinned.load_texture(&color, bc).unwrap().format, wgpu::TextureFormat::Bc7RgbaUnormSrgb);
+}

@@ -6,7 +6,8 @@ use glam::{Mat4, Quat, Vec3};
 
 use super::{strongest_influences, Clip, Pose, Skeleton, SkinnedMesh, Transform};
 use crate::geometries::Vertex;
-use crate::loaders::GLTFMaterialInfo;
+use crate::loaders::ktx2::{CompressionSupport, TranscodedTexture};
+use crate::loaders::{GLTFImage, GLTFLoader, GLTFMaterialInfo, GLTFTextureRef};
 
 /// A glTF file's skeleton, skinned meshes and animations.
 ///
@@ -19,24 +20,37 @@ pub struct SkinnedGltf {
     pub skeleton: Skeleton,
     pub meshes: Vec<SkinnedMesh>,
     pub clips: Vec<Clip>,
+    /// With their texture references (`KHR_texture_basisu` KTX2 images included), as
+    /// `GLTFLoader` reads them.
     pub materials: Vec<GLTFMaterialInfo>,
+    pub images: Vec<GLTFImage>,
 }
 
 impl SkinnedGltf {
     /// Load a .gltf or .glb file from disk. `sample_rate` resamples the animations (frames per
     /// second); `None` uses the rate of their keys.
     pub fn load(path: &str, sample_rate: Option<f32>) -> Result<Self, String> {
-        let (document, buffers, _) = gltf::import(path).map_err(|e| format!("failed to load glTF '{path}': {e}"))?;
-        Self::from_document(&document, &buffers, sample_rate)
+        let (document, buffers, base) = crate::loaders::gltf_loader::open(path)?;
+        Self::from_parts(&document, &buffers, base.as_deref(), sample_rate)
     }
 
     /// Load from in-memory .glb bytes (or .gltf with embedded buffers).
     pub fn from_slice(bytes: &[u8], sample_rate: Option<f32>) -> Result<Self, String> {
-        let (document, buffers, _) = gltf::import_slice(bytes).map_err(|e| format!("failed to parse glTF: {e}"))?;
+        let (document, buffers) = crate::loaders::gltf_loader::open_slice(bytes)?;
         Self::from_document(&document, &buffers, sample_rate)
     }
 
+    /// Decode or transcode a material texture, as `GLTFResult::load_texture`.
+    pub fn load_texture(&self, texture: &GLTFTextureRef, support: CompressionSupport) -> Result<TranscodedTexture, String> {
+        crate::loaders::gltf_loader::load_texture(&self.images, texture, support)
+    }
+
+    /// Images stored outside the file stay unresolved (`GLTFImage::data` is `None`).
     pub fn from_document(document: &gltf::Document, buffers: &[gltf::buffer::Data], sample_rate: Option<f32>) -> Result<Self, String> {
+        Self::from_parts(document, buffers, None, sample_rate)
+    }
+
+    fn from_parts(document: &gltf::Document, buffers: &[gltf::buffer::Data], base: Option<&std::path::Path>, sample_rate: Option<f32>) -> Result<Self, String> {
         let (skeleton, joint_nodes) = skeleton(document);
         if skeleton.is_empty() {
             return Err("the glTF has no nodes to animate".into());
@@ -56,20 +70,9 @@ impl SkinnedGltf {
             }
         }
         let clips = document.animations().enumerate().map(|(i, a)| clip(&a, i, buffers, &joint_nodes, sample_rate)).collect::<Result<_, _>>()?;
-        let materials = document
-            .materials()
-            .map(|m| {
-                let pbr = m.pbr_metallic_roughness();
-                GLTFMaterialInfo {
-                    name: m.name().unwrap_or("Unnamed").to_string(),
-                    base_color: pbr.base_color_factor(),
-                    metallic: pbr.metallic_factor(),
-                    roughness: pbr.roughness_factor(),
-                    double_sided: m.double_sided(),
-                }
-            })
-            .collect();
-        Ok(Self { skeleton, meshes, clips, materials })
+        let materials = GLTFLoader::parse_materials(document);
+        let images = GLTFLoader::parse_images(document, buffers, base);
+        Ok(Self { skeleton, meshes, clips, materials, images })
     }
 }
 

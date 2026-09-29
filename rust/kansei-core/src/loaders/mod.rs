@@ -1,5 +1,5 @@
 mod texture_loader;
-mod gltf_loader;
+pub(crate) mod gltf_loader;
 pub mod ktx2;
 
 pub use texture_loader::{TextureLoader, LoadedTexture};
