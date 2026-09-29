@@ -391,7 +391,7 @@ fn run(config_path: &Path) -> Result<(), String> {
     let meshes = model.meshes.into_iter().map(|mesh| PackMesh { mesh, color: config.color }).collect();
     let mut meta: Vec<(String, String)> = config.meta.into_iter().collect();
     meta.push(("tags".into(), tag_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
-    let pack = MotionPack { database, meshes, meta };
+    let pack = MotionPack { database, meshes, actions: Vec::new(), meta };
     let bytes = pack.to_bytes();
     if let Some(dir) = output.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
