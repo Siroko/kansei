@@ -11,6 +11,8 @@ bytemuck = { workspace = true }
 log = { workspace = true }
 image = { workspace = true }
 gltf = { workspace = true }
+# Basis Universal transcoder (pure Rust, Apache-2.0); only loaders/ktx2/basis.rs uses it
+basisu = { workspace = true }
 optimesh = { workspace = true }
 egui = { version = "0.31", optional = true }
 egui-wgpu = { version = "0.31", optional = true }

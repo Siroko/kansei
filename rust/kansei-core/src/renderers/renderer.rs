@@ -364,8 +364,10 @@ impl Renderer {
 
     async fn request_device(&self, adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
         // Optional features: requested only where the adapter offers them, so devices without
-        // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs).
-        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs); the
+        // texture compression features let KTX2 textures stay block-compressed on the GPU.
+        let optional_features =
+            adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | crate::loaders::ktx2::CompressionSupport::FEATURES);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Kansei Device"),
@@ -375,6 +377,7 @@ impl Renderer {
             }, None)
             .await
             .expect("Failed to create device");
+        log::info!("texture compression: {:?}", crate::loaders::ktx2::CompressionSupport::of_device(&device));
         let limits = device.limits();
         log::info!(
             "device limits: {} sampled textures, {} samplers, {} storage buffers per shader stage; textures up to {}",
@@ -686,6 +689,12 @@ impl Renderer {
     /// The limits the device was created with (see `RendererConfig::required_limits`).
     pub fn limits(&self) -> wgpu::Limits {
         self.device().limits()
+    }
+
+    /// The block-compressed texture formats the device can sample, which decide what KTX2
+    /// textures transcode to (`loaders::ktx2::transcode`).
+    pub fn compression_support(&self) -> crate::loaders::ktx2::CompressionSupport {
+        crate::loaders::ktx2::CompressionSupport::of_device(self.device())
     }
 
     pub fn queue(&self) -> &wgpu::Queue {

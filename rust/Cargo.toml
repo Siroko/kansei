@@ -5,8 +5,10 @@ members = [
     "kansei-wasm",
     "kansei-native",
     "kansei-anim-bake",
+    "tools/ktx2",
 ]
 exclude = [
+    "vendor/basisu",
     "kansei-wasm/examples/spinning-box",
     "kansei-wasm/examples/instanced-cubes",
     "kansei-wasm/examples/lit-scene",
@@ -27,6 +29,7 @@ exclude = [
     "kansei-wasm/examples/impostors",
     "kansei-wasm/examples/cluster-lod",
     "kansei-wasm/examples/motion-matching",
+    "kansei-wasm/examples/ktx2-texture",
 ]
 
 [workspace.dependencies]
@@ -37,5 +40,7 @@ log = "0.4"
 env_logger = "0.11"
 pollster = "0.4"
 image = "0.25"
-gltf = { version = "1", features = ["utils"] }
+gltf = { version = "1", features = ["utils", "extensions", "allow_empty_texture"] }
+# vendored with the targets Kansei never requests removed (vendor/basisu/PATCHES.md)
+basisu = { path = "vendor/basisu" }
 optimesh = "1.1"
