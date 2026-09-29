@@ -22,6 +22,7 @@ mod gltf;
 pub mod ik;
 pub mod inertialization;
 pub mod motion_matching;
+pub mod retarget;
 mod pose;
 mod skeleton;
 mod skin;
