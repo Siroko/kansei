@@ -80,26 +80,7 @@ impl GLTFResult {
     /// `KHR_texture_basisu`) become the best block-compressed format it samples, PNG/JPEG images
     /// RGBA8 (one mip). Colour textures load as sRGB, the rest as linear.
     pub fn load_texture(&self, texture: &GLTFTextureRef, support: CompressionSupport) -> Result<TranscodedTexture, String> {
-        let image = &self.images[texture.image];
-        let label = image.name.clone().unwrap_or_else(|| format!("GLTF/Image{}", texture.image));
-        let bytes = image.data.as_deref().ok_or_else(|| format!("{label}: image data not loaded ({:?})", image.uri))?;
-        if ktx2::is_ktx2(bytes) {
-            let options = if texture.srgb { Ktx2Options::color() } else { Ktx2Options::linear() };
-            return ktx2::transcode(&label, bytes, &options, support).map_err(|e| format!("{label}: {e}"));
-        }
-        let rgba = image::load_from_memory(bytes).map_err(|e| format!("{label}: {e}"))?.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        Ok(TranscodedTexture {
-            label,
-            codec: image.mime_type.clone().unwrap_or_else(|| "image".into()),
-            target: GpuTarget::Rgba8,
-            format: GpuTarget::Rgba8.format(texture.srgb),
-            width,
-            height,
-            layers: None,
-            levels: vec![rgba.into_raw()],
-            file_bytes: bytes.len(),
-        })
+        load_texture(&self.images, texture, support)
     }
 
     /// Convert into engine `Renderable`s with basic lit materials derived from glTF PBR data.
@@ -154,19 +135,14 @@ pub struct GLTFLoader;
 impl GLTFLoader {
     /// Load a glTF or glb file from disk, with its external buffers and images.
     pub fn load(path: &str) -> Result<GLTFResult, String> {
-        let gltf = gltf::Gltf::open(path).map_err(|e| format!("Failed to load glTF '{}': {}", path, e))?;
-        let base = std::path::Path::new(path).parent();
-        let buffers = gltf::import_buffers(&gltf.document, base, gltf.blob.clone())
-            .map_err(|e| format!("Failed to load glTF '{}' buffers: {}", path, e))?;
-        Ok(Self::from_document(&gltf.document, &buffers, base))
+        let (document, buffers, base) = open(path)?;
+        Ok(Self::from_document(&document, &buffers, base.as_deref()))
     }
 
     /// Load from in-memory glb bytes.
     pub fn load_glb(bytes: &[u8]) -> Result<GLTFResult, String> {
-        let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| format!("Failed to parse glb: {}", e))?;
-        let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone())
-            .map_err(|e| format!("Failed to parse glb buffers: {}", e))?;
-        Ok(Self::from_document(&gltf.document, &buffers, None))
+        let (document, buffers) = open_slice(bytes)?;
+        Ok(Self::from_document(&document, &buffers, None))
     }
 
     /// Load from in-memory glTF JSON + external binary buffer(s).
@@ -199,7 +175,7 @@ impl GLTFLoader {
 
     /// Each image's encoded bytes, read from its buffer view, its data URI, or (native, given a
     /// base directory) its file. `gltf::import` would also decode them, which fails for KTX2.
-    fn parse_images(doc: &gltf::Document, buffers: &[gltf::buffer::Data], base: Option<&std::path::Path>) -> Vec<GLTFImage> {
+    pub(crate) fn parse_images(doc: &gltf::Document, buffers: &[gltf::buffer::Data], base: Option<&std::path::Path>) -> Vec<GLTFImage> {
         doc.images()
             .map(|img| {
                 let (uri, mime, data) = match img.source() {
@@ -240,7 +216,7 @@ impl GLTFLoader {
         })
     }
 
-    fn parse_materials(doc: &gltf::Document) -> Vec<GLTFMaterialInfo> {
+    pub(crate) fn parse_materials(doc: &gltf::Document) -> Vec<GLTFMaterialInfo> {
         doc.materials()
             .map(|mat| {
                 let pbr = mat.pbr_metallic_roughness();
@@ -339,6 +315,49 @@ impl GLTFLoader {
 
         Some(Geometry::new("GLTF/Primitive", vertices, indices))
     }
+}
+
+/// `texture`'s image from `images`, transcoded (KTX2) or decoded (PNG/JPEG, one RGBA8 mip) in its
+/// colour space (`GLTFResult::load_texture`, `SkinnedGltf::load_texture`).
+pub(crate) fn load_texture(images: &[GLTFImage], texture: &GLTFTextureRef, support: CompressionSupport) -> Result<TranscodedTexture, String> {
+    let image = images.get(texture.image).ok_or_else(|| format!("no image {}", texture.image))?;
+    let label = image.name.clone().unwrap_or_else(|| format!("GLTF/Image{}", texture.image));
+    let bytes = image.data.as_deref().ok_or_else(|| format!("{label}: image data not loaded ({:?})", image.uri))?;
+    if ktx2::is_ktx2(bytes) {
+        let options = if texture.srgb { Ktx2Options::color() } else { Ktx2Options::linear() };
+        return ktx2::transcode(&label, bytes, &options, support).map_err(|e| format!("{label}: {e}"));
+    }
+    let rgba = image::load_from_memory(bytes).map_err(|e| format!("{label}: {e}"))?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok(TranscodedTexture {
+        label,
+        codec: image.mime_type.clone().unwrap_or_else(|| "image".into()),
+        target: GpuTarget::Rgba8,
+        format: GpuTarget::Rgba8.format(texture.srgb),
+        width,
+        height,
+        layers: None,
+        levels: vec![rgba.into_raw()],
+        file_bytes: bytes.len(),
+    })
+}
+
+/// A glTF or glb file from disk with its buffers (external ones read from beside it), without
+/// decoding images as `gltf::import` does (it rejects KTX2), and the directory external images
+/// are read from.
+pub(crate) fn open(path: &str) -> Result<(gltf::Document, Vec<gltf::buffer::Data>, Option<std::path::PathBuf>), String> {
+    let gltf = gltf::Gltf::open(path).map_err(|e| format!("Failed to load glTF '{}': {}", path, e))?;
+    let base = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+    let buffers = gltf::import_buffers(&gltf.document, base.as_deref(), gltf.blob.clone())
+        .map_err(|e| format!("Failed to load glTF '{}' buffers: {}", path, e))?;
+    Ok((gltf.document, buffers, base))
+}
+
+/// In-memory glb bytes (or a .gltf with embedded buffers), as `open`.
+pub(crate) fn open_slice(bytes: &[u8]) -> Result<(gltf::Document, Vec<gltf::buffer::Data>), String> {
+    let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| format!("Failed to parse glb: {}", e))?;
+    let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone()).map_err(|e| format!("Failed to parse glb buffers: {}", e))?;
+    Ok((gltf.document, buffers))
 }
 
 /// Standard base64 (data URIs), ignoring whitespace; `None` on anything else.
