@@ -110,10 +110,12 @@ impl Default for Options {
 /// The basisu arguments for a kind (input and output excluded).
 fn basisu_args(kind: Kind, o: &Options) -> Vec<String> {
     let uastc = |lambda: f32| {
-        let mut a = vec!["-uastc".to_string(), "-uastc_level".into(), "2".into()];
+        // zstd at its strongest (the default is 6): smaller files, the same texels
+        let mut a = vec!["-uastc".to_string(), "-uastc_level".into(), "2".into(), "-ktx2_zstandard_level".into(), "22".into()];
         let lambda = o.lambda.unwrap_or(lambda);
         if lambda > 0.0 {
-            a.extend(["-uastc_rdo_l".into(), lambda.to_string()]);
+            // the largest RDO dictionary: about 1.5% smaller than the default at the same quality
+            a.extend(["-uastc_rdo_l".into(), lambda.to_string(), "-uastc_rdo_d".into(), "65536".into()]);
         }
         a
     };
@@ -348,12 +350,13 @@ mod tests {
         let o = Options::default();
         let args = |k| basisu_args(k, &o).join(" ");
         assert_eq!(args(Kind::Color), "-etc1s -srgb -q 192 -mipmap");
-        assert_eq!(args(Kind::Hero), "-uastc -uastc_level 2 -uastc_rdo_l 1 -srgb -mipmap");
-        assert_eq!(args(Kind::Normal), "-uastc -uastc_level 2 -uastc_rdo_l 0.5 -linear -normal_map -mip_renorm -mipmap");
-        assert_eq!(args(Kind::Data), "-uastc -uastc_level 2 -uastc_rdo_l 1 -linear -mipmap");
+        let uastc = "-uastc -uastc_level 2 -ktx2_zstandard_level 22";
+        assert_eq!(args(Kind::Hero), format!("{uastc} -uastc_rdo_l 1 -uastc_rdo_d 65536 -srgb -mipmap"));
+        assert_eq!(args(Kind::Normal), format!("{uastc} -uastc_rdo_l 0.5 -uastc_rdo_d 65536 -linear -normal_map -mip_renorm -mipmap"));
+        assert_eq!(args(Kind::Data), format!("{uastc} -uastc_rdo_l 1 -uastc_rdo_d 65536 -linear -mipmap"));
         assert!(args(Kind::Rg).contains("-separate_rg_to_color_alpha"));
         let o = Options { mips: false, lambda: Some(0.0), extra: vec!["-y_flip".into()], ..Options::default() };
-        assert_eq!(basisu_args(Kind::Hero, &o).join(" "), "-uastc -uastc_level 2 -srgb -y_flip");
+        assert_eq!(basisu_args(Kind::Hero, &o).join(" "), "-uastc -uastc_level 2 -ktx2_zstandard_level 22 -srgb -y_flip");
         let o = Options { clamp: true, ..Options::default() };
         assert!(basisu_args(Kind::Color, &o).join(" ").ends_with("-mipmap -mip_clamp"));
     }

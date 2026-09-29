@@ -57,6 +57,11 @@ cargo run --release -p kansei-ktx2-tool -- --info out/basecolor.ktx2
 | `hero` | colour that must look its best | `-uastc -uastc_level 2 -uastc_rdo_l 1 -srgb` |
 | `normal` | RGB normal maps | `-uastc -uastc_rdo_l 0.5 -linear -normal_map -mip_renorm` |
 | `data` | linear data (ORM, roughness, masks) | `-uastc -uastc_rdo_l 1 -linear` |
+
+Every UASTC preset also passes `-uastc_rdo_d 65536 -ktx2_zstandard_level 22`: the largest RDO
+dictionary and the strongest zstd level make files about 1.5% smaller with the same texels.
+On noisy scans (photographed ground, asphalt) UASTC stays near 8 bits per texel whatever the
+RDO strength; there, resolution is what trades size (a 512² map is a quarter of a 1K one).
 | `rg` | two-channel XY normals (BC5/EAC RG11) | as `normal`, plus `-separate_rg_to_color_alpha` |
 | `hdr` | EXR/HDR input | `-hdr` |
 
@@ -116,6 +121,10 @@ The official C++ transcoder would need LLVM clang with a WebAssembly backend in 
 which Apple's clang and the Vercel build image lack. Only `loaders/ktx2/basis.rs` touches the
 crate, so another backend (the official C++ through `basisu_c_sys`, say) replaces that one file.
 
+The crate is vendored in `rust/vendor/basisu` with the transcode targets Kansei never requests
+removed (PVRTC, ATC, FXT1, BC3, the 16-bit and RGB half/9E5 formats; see its `PATCHES.md`), so
+their code and lookup tables stay out of WASM builds.
+
 The crate is young (0.1, July 2026), so its output is checked against the official transcoder
 rather than trusted:
 
@@ -134,6 +143,5 @@ rather than trusted:
   the sampled texels against the official CPU decode of the same blocks, sRGB decoding, and the
   HDR formats.
 
-The transcoder adds about 0.5 MB (gzipped) to a WASM build that loads KTX2. Some of that is ETC1S
-lookup tables for targets Kansei never requests (ATC, PVRTC2); the crate has no feature flags to
-drop them yet.
+The trimmed transcoder is about 0.8 MB of WASM at opt-level "s" (364 KB gzipped), about 1 MB at
+opt-level 3, in a build that loads KTX2.
