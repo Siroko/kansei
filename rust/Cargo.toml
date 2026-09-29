@@ -28,6 +28,7 @@ exclude = [
     "kansei-wasm/examples/impostors",
     "kansei-wasm/examples/cluster-lod",
     "kansei-wasm/examples/motion-matching",
+    "kansei-wasm/examples/ktx2-texture",
 ]
 
 [workspace.dependencies]
