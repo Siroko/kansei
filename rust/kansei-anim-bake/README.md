@@ -52,6 +52,19 @@ mesh it was baked from, and carries their licence.
 
 3. **Play it**: `rust/kansei-wasm/examples/motion-matching` loads a pack from a local path.
 
+## Characters
+
+A character pack (`CharacterPack`) is another body for a motion pack's animation: a mesh rigged to
+the same skeleton (same joint names and axes) with its own proportions, and its textures. Make one
+with a config that has a `character` section (see `src/main.rs`).
+
+- Textures are resized and encoded as lossy WebP. A DirectX-style normal map is flipped into
+  glTF's convention (`normal_directx`).
+- To keep the bone axes the animations expect, export the mesh through the same path as the
+  clips. `export_gltf.py`'s `import` step brings an FBX onto the skeleton asset with Unreal's FBX
+  importer, then exports it with the rest.
+- At runtime `animation::retarget` maps the database's poses onto it.
+
 ## What is baked
 
 At the clips' rate (30 fps by default), per frame:

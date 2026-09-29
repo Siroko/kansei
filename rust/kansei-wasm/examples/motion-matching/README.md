@@ -31,6 +31,19 @@ The clips should cover:
 Tag them `idle`, `walk` and `run` for the gait filter (see the bake config). The walk and run
 paces default to 2 and 5 m/s; set `walk=` and `run=` in the URL to match your data.
 
+## A second body
+
+A character pack (`www/pack/hero.kmm`, or `?hero=<url>`) is optional. It holds a mesh rigged to the
+same skeleton as the motion pack, with its own proportions and textures. `kansei-anim-bake` makes
+one from a glTF mesh and its textures (`character` config).
+
+- Loaded, it is shown by default. C switches between it and the motion pack's own mesh, and
+  `?char=hero` or `?char=mannequin` picks one.
+- The pose is retargeted onto its skeleton (`animation::retarget`: rotations as they are,
+  translations oriented and scaled to its bones), and foot locking works on its legs.
+- Its colour, normal (tangent space, +Y up) and occlusion/roughness/metallic textures are
+  decoded from the pack and mipmapped on load.
+
 ## Build and run
 
 ```sh
@@ -51,6 +64,7 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 | orbit, zoom | drag, wheel | right stick |
 | overlay (trajectory, feet, HUD) | B | |
 | skeleton, mesh, foot locking | K, M, L | |
+| character (with a character pack) | C | |
 
 In the overlay:
 - blue boxes are the simulated character now and at ⅓, ⅔ and 1 s ahead;

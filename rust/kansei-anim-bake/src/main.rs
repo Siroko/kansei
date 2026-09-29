@@ -20,6 +20,25 @@
 //! }
 //! ```
 //!
+//! A config with a `character` instead bakes a `CharacterPack`: a mesh to show a motion pack's
+//! animation on (rigged to the same skeleton, with its own proportions) and its textures, each
+//! resized to at most `texture_size` and encoded as lossy WebP (`quality`, 0-100):
+//!
+//! ```json
+//! {
+//!   "character": {
+//!     "mesh": "export/hero.glb",
+//!     "textures": {"base_color": "hero_BaseColor.png", "normal": "hero_Normal.png", "orm": "hero_ORM.png"},
+//!     "texture_size": 2048, "quality": 85, "normal_directx": true
+//!   },
+//!   "output": "pack/hero.kmm",
+//!   "meta": {"source": "...", "license": "..."}
+//! }
+//! ```
+//!
+//! `normal_directx` flips the normal map's green channel into glTF's convention (+Y up). Joints
+//! nothing is weighted to are left out, as for a motion pack.
+//!
 //! Clips come from `export/manifest.json` when there is one (written by `unreal/export_gltf.py`,
 //! with each clip's loop flag), else from every `.glb`/`.gltf` under `export`. A clip is named by
 //! its path under `export/clips` (or `export`) without the extension; `include`, `exclude`,
@@ -41,6 +60,7 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default = "here")]
     export: PathBuf,
     #[serde(default = "default_mesh")]
     mesh: PathBuf,
@@ -63,6 +83,36 @@ struct Config {
     color: [f32; 4],
     #[serde(default)]
     meta: BTreeMap<String, String>,
+    character: Option<CharacterConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CharacterConfig {
+    mesh: PathBuf,
+    #[serde(default)]
+    textures: BTreeMap<String, PathBuf>,
+    #[serde(default = "default_texture_size")]
+    texture_size: u32,
+    #[serde(default = "default_quality")]
+    quality: f32,
+    #[serde(default)]
+    normal_directx: bool,
+    #[serde(default = "white")]
+    color: [f32; 4],
+}
+
+fn here() -> PathBuf {
+    ".".into()
+}
+fn default_texture_size() -> u32 {
+    2048
+}
+fn default_quality() -> f32 {
+    85.0
+}
+fn white() -> [f32; 4] {
+    [1.0; 4]
 }
 
 #[derive(Deserialize)]
@@ -206,10 +256,62 @@ fn sources(export: &Path, mesh: &Path) -> Result<Vec<Source>, String> {
     Ok(files.into_iter().filter(|f| f != mesh).map(|f| Source { name: clip_name(&f, export), file: f, looping: false }).collect())
 }
 
+/// A texture resized to fit `size` and encoded as lossy WebP; a normal map's green flipped when
+/// asked.
+fn encode_texture(path: &Path, size: u32, quality: f32, flip_green: bool) -> Result<Vec<u8>, String> {
+    let image = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image = if image.width() > size || image.height() > size { image.resize(size, size, image::imageops::FilterType::Lanczos3) } else { image };
+    let mut rgb = image.to_rgb8();
+    if flip_green {
+        for p in rgb.pixels_mut() {
+            p[1] = 255 - p[1];
+        }
+    }
+    let encoder = webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height());
+    Ok(encoder.encode(quality).to_vec())
+}
+
+fn bake_character(base: &Path, character: &CharacterConfig, output: &Path, meta: &BTreeMap<String, String>, keep_unskinned: bool) -> Result<(), String> {
+    use kansei_core::animation::motion_matching::pack::{CharacterPack, PackImage};
+    let mesh_path = base.join(&character.mesh);
+    let mut model = SkinnedGltf::load(&mesh_path.to_string_lossy(), None)?;
+    if model.meshes.is_empty() {
+        return Err(format!("{} has no skinned mesh", mesh_path.display()));
+    }
+    let root = model.skeleton.parents.iter().position(|p| p.is_none()).unwrap_or(0);
+    let skeleton = if keep_unskinned { model.skeleton.clone() } else { prune(&model.skeleton, &mut model.meshes, &[root]) };
+    println!(
+        "character: {} joints ({} left out), {} vertices, {} triangles",
+        skeleton.len(),
+        model.skeleton.len() - skeleton.len(),
+        model.meshes.iter().map(|m| m.vertices.len()).sum::<usize>(),
+        model.meshes.iter().map(|m| m.indices.len() / 3).sum::<usize>()
+    );
+    let mut images = Vec::new();
+    for (name, path) in &character.textures {
+        let bytes = encode_texture(&base.join(path), character.texture_size, character.quality, name == "normal" && character.normal_directx)?;
+        println!("texture {name}: {:.1} MB", bytes.len() as f64 / 1e6);
+        images.push(PackImage { name: name.clone(), mime: "image/webp".into(), bytes });
+    }
+    let meshes = model.meshes.into_iter().map(|mesh| PackMesh { mesh, color: character.color }).collect();
+    let pack = CharacterPack { skeleton, meshes, images, meta: meta.clone().into_iter().collect() };
+    let bytes = pack.to_bytes();
+    if let Some(dir) = output.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+    CharacterPack::from_bytes(&bytes)?;
+    println!("wrote {} ({:.1} MB)", output.display(), bytes.len() as f64 / 1e6);
+    Ok(())
+}
+
 fn run(config_path: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(config_path).map_err(|e| format!("{}: {e}", config_path.display()))?;
     let config: Config = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", config_path.display()))?;
     let base = config_path.parent().unwrap_or(Path::new("."));
+    if let Some(character) = &config.character {
+        return bake_character(base, character, &base.join(&config.output), &config.meta, config.keep_unskinned);
+    }
     let export = base.join(&config.export);
     let mesh_path = export.join(&config.mesh);
     let output = base.join(&config.output);

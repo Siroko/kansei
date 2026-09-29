@@ -7,10 +7,16 @@
 //! ships with Kansei: the page loads `pack/locomotion.kmm` next to `index.html` (or `pack=<url>`)
 //! and says how to make one when it is missing. See this example's README.
 //!
+//! A character pack (`pack/hero.kmm`, or `hero=<url>`), when there is one, is a second body for
+//! the same animation: a mesh rigged to the same skeleton with its own proportions and textures,
+//! the pose retargeted onto it (`animation::retarget`). It is shown by default; C switches
+//! between it and the motion pack's own mesh (`char=hero` or `char=mannequin` to choose).
+//!
 //! Controls: WASD or arrows move relative to the camera, Shift runs, Q toggles strafing (face the
 //! camera's direction), mouse drag orbits and the wheel zooms. Gamepad: left stick moves (tilt
 //! sets the pace), right stick orbits, A or the right trigger runs, the left bumper toggles
-//! strafing. B toggles the trajectory overlay and HUD, K the skeleton, M the mesh, L foot locking.
+//! strafing. B toggles the trajectory overlay and HUD, K the skeleton, M the mesh, L foot locking,
+//! C the character.
 //!
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
@@ -24,10 +30,13 @@ use glam::{Mat4, Quat, Vec3 as GVec3};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use kansei_core::animation::motion_matching::pack::MotionPack;
+use kansei_core::animation::motion_matching::pack::{CharacterPack, MotionPack};
+use kansei_core::animation::retarget::Retarget;
 use kansei_core::animation::motion_matching::{yaw_of, Database, MotionInput, MotionMatcher, MotionMatchingSettings};
-use kansei_core::animation::{skinned_lit_material, BonePalette, SkinnedLitParams, SkinnedMesh, PALETTE_BINDING};
-use kansei_core::buffers::{BufferType, ComputeBuffer};
+use kansei_core::animation::{skin_buffer, skinned_lit_material, BonePalette, Skeleton, SkinnedLitParams, SkinnedMesh, PALETTE_BINDING, SKINNING_WGSL, SKIN_BINDING};
+use kansei_core::buffers::{Bindable, BufferType, ComputeBuffer, Sampler};
+use kansei_core::cameras::MOTION_VECTORS_WGSL;
+use kansei_core::materials::BindingResource;
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
@@ -137,6 +146,126 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// The textured character: `SkinnedLitParams` (base_color tints the colour texture), then its
+/// colour (sRGB), normal (tangent space, +Y up) and occlusion/roughness/metallic textures.
+const HERO_WGSL: &str = r#"
+struct Surface { tint: vec4<f32>, sun_direction: vec4<f32>, sun: vec4<f32>, sky: vec4<f32> };
+@group(0) @binding(0) var<uniform> surface: Surface;
+@group(0) @binding(3) var base_color_texture: texture_2d<f32>;
+@group(0) @binding(4) var normal_texture: texture_2d<f32>;
+@group(0) @binding(5) var orm_texture: texture_2d<f32>;
+@group(0) @binding(6) var texture_sampler: sampler;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> mesh: KanseiMeshTransforms;
+
+struct VIn { @builtin(vertex_index) vertex: u32, @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
+struct VOut {
+    @builtin(position) @invariant clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) curr: vec4<f32>,
+    @location(4) prev: vec4<f32>,
+};
+struct FOut { @location(0) color: vec4<f32>, @location(4) velocity: vec2<f32> };
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let s = kansei_skin(v.vertex, v.position.xyz, v.normal);
+    let world = mesh.world * vec4<f32>(s.position, 1.0);
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.normal = (normal_matrix * vec4<f32>(s.normal, 0.0)).xyz;
+    out.uv = v.uv;
+    out.curr = kansei_camera_temporal.viewProj * world;
+    out.prev = kansei_camera_temporal.prevViewProj * (mesh.prevWorld * vec4<f32>(s.prev_position, 1.0));
+    return out;
+}
+
+// The normal map in the frame of the surface's position and uv derivatives (no stored tangents).
+// glTF uv run down the image while the map's +Y is up, hence -B.
+fn mapped_normal(n: vec3<f32>, p: vec3<f32>, uv: vec2<f32>, m: vec3<f32>) -> vec3<f32> {
+    let dp1 = dpdx(p);
+    let dp2 = dpdy(p);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let t = dp2perp * duv1.x + dp1perp * duv2.x;
+    let b = dp2perp * duv1.y + dp1perp * duv2.y;
+    let scale = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+    return normalize(t * scale * m.x - b * scale * m.y + n * m.z);
+}
+
+@fragment
+fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> FOut {
+    var n = normalize(in.normal);
+    if (!front) { n = -n; }
+    let albedo = textureSample(base_color_texture, texture_sampler, in.uv).rgb * surface.tint.rgb;
+    let orm = textureSample(orm_texture, texture_sampler, in.uv).rgb;
+    let m = textureSample(normal_texture, texture_sampler, in.uv).xyz * 2.0 - 1.0;
+    n = mapped_normal(n, in.world, in.uv, m);
+    let l = -normalize(surface.sun_direction.xyz);
+    let shadow = kansei_sun_shadow(in.world, n, in.clip.xy);
+    let view = normalize(-(transpose(mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz)) * view_matrix[3].xyz) - in.world);
+    let h = normalize(l + view);
+    let roughness = clamp(orm.g, 0.08, 1.0);
+    let a2 = roughness * roughness * roughness * roughness;
+    let nh = max(dot(n, h), 0.0);
+    let d = a2 / (3.14159265 * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
+    let nl = max(dot(n, l), 0.0);
+    let specular = mix(vec3<f32>(0.04), albedo, orm.b) * d * 0.25;
+    let sky = mix(surface.sky.rgb * 0.2, surface.sky.rgb, n.y * 0.5 + 0.5);
+    let lit = (albedo * (1.0 - orm.b) / 3.14159265 + specular) * surface.sun.rgb * nl * shadow + albedo * sky * orm.r;
+    return FOut(vec4<f32>(lit, 1.0), kansei_motion_vector(in.curr, in.prev));
+}
+"#;
+
+/// A texture already on the GPU, bound as it is.
+struct GpuTexture {
+    view: wgpu::TextureView,
+}
+
+impl Bindable for GpuTexture {
+    fn ensure_ready(&mut self, _: &wgpu::Device, _: &wgpu::Queue) {}
+    fn binding_resource(&self) -> Option<BindingResource<'_>> {
+        Some(BindingResource::TextureView(&self.view))
+    }
+}
+
+/// An image with its mip chain on the GPU.
+fn upload_texture(renderer: &Renderer, label: &str, image: image::RgbaImage, srgb: bool) -> GpuTexture {
+    let mut levels = vec![image];
+    while levels.last().is_some_and(|l| l.width() > 1 || l.height() > 1) {
+        let l = levels.last().unwrap();
+        let next = image::imageops::resize(l, (l.width() / 2).max(1), (l.height() / 2).max(1), image::imageops::FilterType::Triangle);
+        levels.push(next);
+    }
+    let (width, height) = (levels[0].width(), levels[0].height());
+    let texture = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: levels.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (mip, level) in levels.iter().enumerate() {
+        renderer.queue().write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: mip as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            level.as_raw(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * level.width()), rows_per_image: None },
+            wgpu::Extent3d { width: level.width(), height: level.height(), depth_or_array_layers: 1 },
+        );
+    }
+    GpuTexture { view: texture.create_view(&Default::default()) }
+}
+
 fn surface_params(base: [f32; 3]) -> [f32; 16] {
     let d = SUN_DIR;
     [base[0], base[1], base[2], 0.0, d[0], d[1], d[2], 0.0, SUN[0], SUN[1], SUN[2], 0.0, SKY[0], SKY[1], SKY[2], 0.0]
@@ -238,13 +367,70 @@ fn segment(a: GVec3, b: GVec3, thickness: f32) -> Mat4 {
     Mat4::from_scale_rotation_translation(GVec3::new(thickness, length, thickness), rotation, (a + b) * 0.5)
 }
 
-/// The character: its database, matcher, mesh and palette, and the debug markers.
-struct Character {
-    db: Database,
-    matcher: MotionMatcher,
+/// A mesh the character can be shown as: the motion pack's own, on the database's skeleton, or a
+/// character pack's, the pose retargeted onto its skeleton.
+struct Body {
+    name: &'static str,
     mesh: SkinnedMesh,
     palette: BonePalette,
     index: usize,
+    display: Option<(Skeleton, Retarget)>,
+    source: String,
+}
+
+/// A character pack as a body: its textured mesh, hidden until shown.
+fn hero_body(renderer: &Renderer, scene: &mut Scene, pack: CharacterPack, db: &Database) -> Result<Body, String> {
+    let source = format!("{}\n{}", pack.meta("source").unwrap_or("(no source noted)"), pack.meta("license").unwrap_or("(no licence noted)"));
+    let retarget = Retarget::new(&db.skeleton, &pack.skeleton, &Retarget::UNREAL_KEEP);
+    let texture = |name: &str, srgb: bool, fallback: [u8; 4]| -> Result<GpuTexture, String> {
+        let image = match pack.image(name) {
+            Some(i) => image::load_from_memory(&i.bytes).map_err(|e| format!("texture {name}: {e}"))?.to_rgba8(),
+            None => image::RgbaImage::from_pixel(1, 1, image::Rgba(fallback)),
+        };
+        Ok(upload_texture(renderer, name, image, srgb))
+    };
+    let (base_color, normal, orm) = (texture("base_color", true, [200, 200, 200, 255])?, texture("normal", false, [128, 128, 255, 255])?, texture("orm", false, [255, 160, 0, 255])?);
+    let first = pack.meshes.into_iter().next().ok_or("the character pack has no mesh")?;
+    let mesh = first.mesh;
+    let mut palette = BonePalette::new(mesh.skin_joints.len());
+    palette.update(&mesh, &pack.skeleton.rest_model());
+    let params = SkinnedLitParams { base_color: first.color, sun_direction: [SUN_DIR[0], SUN_DIR[1], SUN_DIR[2], 0.0], sun: [SUN[0], SUN[1], SUN[2], 0.0], sky: [SKY[0], SKY[1], SKY[2], 0.0] };
+    let shader = format!("{SKINNING_WGSL}\n{MOTION_VECTORS_WGSL}\n{CASCADED_SHADOWS_WGSL}\n{HERO_WGSL}");
+    let mut material = Material::new(
+        "Hero",
+        &shader,
+        vec![
+            Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
+            Binding::storage(PALETTE_BINDING, ShaderStages::VERTEX, true),
+            Binding::storage(SKIN_BINDING, ShaderStages::VERTEX, true),
+            Binding::texture_2d(3, ShaderStages::FRAGMENT),
+            Binding::texture_2d(4, ShaderStages::FRAGMENT),
+            Binding::texture_2d(5, ShaderStages::FRAGMENT),
+            Binding::sampler(6, ShaderStages::FRAGMENT),
+        ],
+        MaterialOptions { outputs_velocity: true, ..Default::default() },
+    );
+    material.set_uniform_bindable(0, "Hero/Params", &[params]);
+    material.set_bindable(PALETTE_BINDING, palette.buffer("Hero/Palette"));
+    material.set_bindable(SKIN_BINDING, skin_buffer("Hero/Skin", &mesh));
+    material.set_bindable(3, base_color);
+    material.set_bindable(4, normal);
+    material.set_bindable(5, orm);
+    material.set_bindable(6, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    let mut r = Renderable::new(mesh.geometry(), material);
+    r.dynamic = true;
+    r.visible = false;
+    let index = scene.add(SceneNode::Renderable(r));
+    log::info!("character pack: {} joints, {} vertices, {} triangles", pack.skeleton.len(), mesh.vertices.len(), mesh.indices.len() / 3);
+    Ok(Body { name: "hero", mesh, palette, index, display: Some((pack.skeleton, retarget)), source })
+}
+
+/// The character: its database, matcher, bodies, and the debug markers.
+struct Character {
+    db: Database,
+    matcher: MotionMatcher,
+    bodies: Vec<Body>,
+    showing: usize,
     bones: Markers,
     trajectory: Markers,
     /// Tag bits the search may use while walking and while running (all when the pack has no
@@ -255,7 +441,7 @@ struct Character {
 }
 
 impl Character {
-    fn new(renderer: &Renderer, scene: &mut Scene, pack: MotionPack, gait: bool) -> Result<Self, String> {
+    fn new(renderer: &Renderer, scene: &mut Scene, pack: MotionPack, hero: Option<CharacterPack>, gait: bool) -> Result<Self, String> {
         let tags: Vec<String> = pack.meta("tags").unwrap_or("").split(',').map(str::to_string).collect();
         let source = format!("{}\n{}", pack.meta("source").unwrap_or("(no source noted)"), pack.meta("license").unwrap_or("(no licence noted)"));
         let MotionPack { database: db, meshes, .. } = pack;
@@ -272,7 +458,15 @@ impl Character {
         let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
         r.dynamic = true;
         let index = scene.add(SceneNode::Renderable(r));
-        let bones = Markers::new(renderer, scene, "Bones", db.joint_count(), [30000.0, 20000.0, 4000.0], true);
+        let mut bodies = vec![Body { name: "mannequin", mesh, palette, index, display: None, source: source.clone() }];
+        if let Some(pack) = hero {
+            match hero_body(renderer, scene, pack, &db) {
+                Ok(b) => bodies.push(b),
+                Err(e) => log::warn!("character pack left out: {e}"),
+            }
+        }
+        let joints = bodies.iter().map(|b| b.display.as_ref().map_or(db.joint_count(), |d| d.0.len())).max().unwrap_or(0);
+        let bones = Markers::new(renderer, scene, "Bones", joints, [30000.0, 20000.0, 4000.0], true);
         bones.set_visible(scene, false);
         // the simulation now and its 3 predicted samples, and each foot's target
         let trajectory = Markers::new(renderer, scene, "Trajectory", 6, [300.0, 1600.0, 3000.0], false);
@@ -280,8 +474,26 @@ impl Character {
         let (idle, walk, run) = (bit("idle"), bit("walk"), bit("run"));
         let (walk_tags, run_tags) = if gait && walk != 0 && run != 0 { (idle | walk, idle | run) } else { (u32::MAX, u32::MAX) };
         let matcher = MotionMatcher::new(&db, MotionMatchingSettings::default(), GVec3::ZERO, 0.0);
-        log::info!("motion pack: {} clips, {} frames, {} joints; {} vertices", db.clips.len(), db.frame_count(), db.joint_count(), mesh.vertices.len());
-        Ok(Self { db, matcher, mesh, palette, index, bones, trajectory, walk_tags, run_tags, source })
+        log::info!("motion pack: {} clips, {} frames, {} joints", db.clips.len(), db.frame_count(), db.joint_count());
+        Ok(Self { db, matcher, bodies, showing: 0, bones, trajectory, walk_tags, run_tags, source })
+    }
+
+    /// Show body `which` (its mesh, the pose on its skeleton).
+    fn show(&mut self, scene: &mut Scene, which: usize) {
+        self.showing = which % self.bodies.len();
+        for (i, b) in self.bodies.iter_mut().enumerate() {
+            if let Some(r) = scene.get_renderable_mut(b.index) {
+                r.visible = i == self.showing;
+                r.reset_motion();
+            }
+            b.palette.reset_motion();
+        }
+        self.matcher.set_display(&self.db, self.bodies[self.showing].display.clone());
+    }
+
+    /// The output skeleton's joint named as database joint `j`.
+    fn joint(&self, j: usize) -> usize {
+        self.matcher.output_skeleton(&self.db).find(&self.db.skeleton.names[j]).unwrap_or(0)
     }
 }
 
@@ -368,6 +580,12 @@ impl State {
             match key.as_str() {
                 "q" => self.strafe = !self.strafe,
                 "b" => self.overlay = !self.overlay,
+                "c" => {
+                    if let Some(c) = &mut self.character {
+                        let next = c.showing + 1;
+                        c.show(&mut self.scene, next);
+                    }
+                }
                 "k" | "m" | "l" => {
                     if let Some(c) = &mut self.character {
                         match key.as_str() {
@@ -376,7 +594,7 @@ impl State {
                                 c.bones.set_visible(&mut self.scene, !visible);
                             }
                             "m" => {
-                                if let Some(r) = self.scene.get_renderable_mut(c.index) {
+                                if let Some(r) = self.scene.get_renderable_mut(c.bodies[c.showing].index) {
                                     r.visible = !r.visible;
                                 }
                             }
@@ -407,16 +625,17 @@ impl State {
             self.switches += search.switched as u32;
 
             let character = c.matcher.character();
-            if let Some(r) = self.scene.get_renderable_mut(c.index) {
+            let body = &mut c.bodies[c.showing];
+            if let Some(r) = self.scene.get_renderable_mut(body.index) {
                 r.object.set_position(character.translation.x, character.translation.y, character.translation.z);
                 r.object.rotation.y = yaw_of(character.rotation);
-                c.palette.update(&c.mesh, c.matcher.model());
+                body.palette.update(&body.mesh, c.matcher.model());
                 if let Some(buffer) = r.material.bindable_buffer(PALETTE_BINDING) {
-                    c.palette.upload(self.renderer.queue(), &buffer);
+                    body.palette.upload(self.renderer.queue(), &buffer);
                 }
             }
             // follow the character's hips
-            let hips = character.transform_point(c.matcher.model()[c.db.roles.hips].translation);
+            let hips = character.transform_point(c.matcher.model()[c.joint(c.db.roles.hips)].translation);
             let target = GVec3::new(character.translation.x, hips.y * 0.9, character.translation.z);
             let t = 1.0 - (-dt * 8.0).exp();
             let current = GVec3::new(self.controls.target.x, self.controls.target.y, self.controls.target.z);
@@ -434,7 +653,7 @@ impl State {
                 // each foot's target, raised when not planted
                 let model = c.matcher.model();
                 for (side, locked) in c.matcher.feet_locked().iter().enumerate() {
-                    let p = character.transform_point(model[c.db.roles.feet[side]].translation);
+                    let p = character.transform_point(model[c.joint(c.db.roles.feet[side])].translation);
                     let size = if *locked { 0.09 } else { 0.04 };
                     c.trajectory.matrices[k] = Mat4::from_scale_rotation_translation(GVec3::splat(size), Quat::IDENTITY, GVec3::new(p.x, 0.02, p.z));
                     k += 1;
@@ -445,11 +664,13 @@ impl State {
             c.trajectory.upload(&self.renderer);
             if self.scene.get_renderable(c.bones.index).is_some_and(|r| r.visible) {
                 let model = c.matcher.model();
-                for (j, parent) in c.db.skeleton.parents.iter().enumerate() {
-                    c.bones.matrices[j] = match parent {
-                        Some(p) if *p != c.db.roles.root => segment(character.transform_point(model[*p].translation), character.transform_point(model[j].translation), 0.015),
-                        _ => Mat4::ZERO,
-                    };
+                let root = c.joint(c.db.roles.root);
+                let parents = c.matcher.output_skeleton(&c.db).parents.clone();
+                c.bones.matrices.fill(Mat4::ZERO);
+                for (j, parent) in parents.iter().enumerate() {
+                    if let Some(p) = parent.filter(|p| *p != root) {
+                        c.bones.matrices[j] = segment(character.transform_point(model[p].translation), character.transform_point(model[j].translation), 0.015);
+                    }
                 }
                 c.bones.upload(&self.renderer);
             }
@@ -488,7 +709,7 @@ impl State {
                         if feet[0] { "L planted" } else { "L free" },
                         if feet[1] { "R planted" } else { "R free" },
                         if c.matcher.settings.foot_lock { "on" } else { "off" },
-                        c.source,
+                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.showing > 0 { c.bodies[c.showing].source.as_str() } else { "" }),
                     ));
                 }
                 Some(_) => set_hud(""),
@@ -534,9 +755,29 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let url = query_param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
     set_hud(&format!("Loading motion pack {url} …"));
     let gait = query_param("gait").as_deref() != Some("0");
-    let character = match fetch_bytes(&url).await.and_then(|bytes| MotionPack::from_bytes(&bytes)) {
-        Ok(pack) => match Character::new(&renderer, &mut scene, pack, gait) {
-            Ok(c) => Some(c),
+    let motion = fetch_bytes(&url).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
+    // a second body, optional
+    let hero_url = query_param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
+    let hero = match &motion {
+        Ok(_) => match fetch_bytes(&hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::info!("no character pack: {e}");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let character = match motion {
+        Ok(pack) => match Character::new(&renderer, &mut scene, pack, hero, gait) {
+            Ok(mut c) => {
+                let wanted = match query_param("char").as_deref() {
+                    Some("mannequin") => 0,
+                    _ => c.bodies.len() - 1,
+                };
+                c.show(&mut scene, wanted);
+                Some(c)
+            }
             Err(e) => {
                 set_hud(&format!("The motion pack {url} can't be used: {e}."));
                 None

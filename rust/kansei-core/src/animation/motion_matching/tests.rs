@@ -185,6 +185,19 @@ fn a_pack_round_trips() {
     assert_eq!(a.skin_words(), b.skin_words());
     assert_eq!(back.meshes[0].color, [0.5, 0.4, 0.3, 1.0]);
     assert!(a.vertices.iter().zip(&b.vertices).all(|(x, y)| x.position == y.position && x.normal == y.normal && x.uv == y.uv));
+    // a character pack: skeleton, mesh and images
+    use super::pack::{CharacterPack, PackImage};
+    let character = CharacterPack {
+        skeleton: pack.database.skeleton.clone(),
+        meshes: pack.meshes.clone(),
+        images: vec![PackImage { name: "base_color".into(), mime: "image/webp".into(), bytes: vec![1, 2, 3, 4, 5] }],
+        meta: vec![("source".into(), "synthetic".into())],
+    };
+    let back_character = CharacterPack::from_bytes(&character.to_bytes()).unwrap();
+    assert_eq!(back_character.skeleton, character.skeleton);
+    assert_eq!(back_character.image("base_color").unwrap().bytes, vec![1, 2, 3, 4, 5]);
+    assert_eq!(back_character.meshes[0].mesh.skin_words(), character.meshes[0].mesh.skin_words());
+    assert!(CharacterPack::from_bytes(&character.to_bytes()[..40]).is_err());
     // not a pack, truncated, or corrupt: errors, not panics
     assert!(MotionPack::from_bytes(b"nope").is_err());
     assert!(MotionPack::from_bytes(&bytes[..bytes.len() / 2]).is_err());
@@ -265,4 +278,33 @@ fn searches_run_on_their_interval_and_switch_with_inertialization() {
     for (a, b) in pose_before.local.iter().zip(&matcher.pose().local) {
         assert!(a.rotation.dot(b.rotation).abs() > 0.99, "{a:?} {b:?}");
     }
+}
+
+#[test]
+fn a_display_skeleton_shows_the_pose_with_its_own_proportions() {
+    use crate::animation::retarget::Retarget;
+    let db = database();
+    // the biped with 20% shorter legs and hips 20% lower
+    let mut short = db.skeleton.clone();
+    for (j, name) in short.names.clone().iter().enumerate() {
+        if name.starts_with("calf") || name.starts_with("foot") || name == "hips" {
+            short.rest[j].translation *= 0.8;
+        }
+    }
+    let mut matcher = MotionMatcher::new(&db, MotionMatchingSettings::default(), Vec3::ZERO, 0.0);
+    matcher.set_display(&db, Some((short.clone(), Retarget::new(&db.skeleton, &short, &Retarget::UNREAL_KEEP))));
+    run(&mut matcher, &db, Vec3::ZERO, 1.0);
+    let model = matcher.model();
+    let hips = short.find("hips").unwrap();
+    assert!((model[hips].translation.y - 0.8).abs() < 0.02, "hips at {}", model[hips].translation.y);
+    // standing, both feet of the short legs are planted on the ground they reach
+    assert_eq!(matcher.feet_locked(), [true, true]);
+    let foot = short.find("foot_l").unwrap();
+    assert!((model[foot].translation.y - 0.08).abs() < 0.02, "foot at {}", model[foot].translation.y);
+    run(&mut matcher, &db, Vec3::new(0.0, 0.0, 1.5), 2.0);
+    assert_eq!(matcher.pose().len(), short.len());
+    assert!(matcher.character().translation.z > 1.5);
+    // and back to the database's own skeleton
+    matcher.set_display(&db, None);
+    assert!((matcher.model()[1].translation.y - 1.0).abs() < 0.1);
 }
