@@ -28,6 +28,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Cluster LOD (`Renderable::clusters`) draws only the camera's pass until M3: other views draw the renderable's geometry, which must be the mesh its graph was built from.
 - Skinned materials (`animation::SKINNING_WGSL`) skin in their own `vertex_main`, but the single directional shadow map (`enable_shadows`) draws casters with a shared depth shader: a skinned mesh casts its bind pose there, so use cascaded shadows.
 - Never commit animation data, character meshes or anything derived from them (glTF exports, `.kmm` packs) unless their licence allows a public MIT repo: third-party sets such as Epic's GASP stay in a private folder, and the motion-matching example loads packs from a local path (`rust/kansei-anim-bake/README.md`).
+- Animation code (`animation/`, `collision/`) is clean-room: from papers and permissively licensed code, credited in the module docs. Never port Unreal Engine source (PoseSearch, AnimationWarping…) or GASP Blueprints; read what a clip needs from its tracks, not engine metadata.
 
 ## Maintaining this file
 

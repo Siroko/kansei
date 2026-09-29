@@ -24,9 +24,10 @@ mod controller;
 mod database;
 pub mod pack;
 mod search;
+pub mod traversal;
 
-pub use controller::{MotionInput, MotionMatcher, MotionMatchingSettings, SearchInfo, Simulation};
-pub use database::{wrap_angle, yaw_of, yaw_rotation, ClipInfo, ContactThresholds, Database, DatabaseBuilder, FeatureWeights, JointRoles, BOUND_LARGE, BOUND_SMALL, FEATURES, FORWARD, STRIDE, TRAJECTORY_TIMES};
+pub use controller::{Action, MotionInput, MotionMatcher, MotionMatchingSettings, RootPath, SearchInfo, Simulation};
+pub use database::{wrap_angle, yaw_of, yaw_rotation, ClipInfo, ACTION_TAG, ContactThresholds, Database, DatabaseBuilder, FeatureWeights, JointRoles, BOUND_LARGE, BOUND_SMALL, FEATURES, FORWARD, STRIDE, TRAJECTORY_TIMES};
 pub use search::{Match, SearchFilter};
 
 #[cfg(test)]

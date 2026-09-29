@@ -65,6 +65,20 @@ with a config that has a `character` section (see `src/main.rs`).
   importer, then exports it with the rest.
 - At runtime `animation::retarget` maps the database's poses onto it.
 
+## Actions
+
+Traversals, falls and landings are played on command, not found by the search. Name them in the
+config's `actions`, by kind (`hurdle`, `vault`, `mantle`, `climb`, `fall`, `land`). They get only
+`ACTION_TAG`, so the search skips them, and the pack stores what
+`motion_matching::traversal::ActionClip::analyze` reads from each:
+- the obstacle's height, from the root joint, which rides the surface the character is on;
+- its front ledge, from the hands planted on its top (`joints.left_hand`/`right_hand`);
+- the frames where the character leaves the ground, reaches the ledge, is on the top, leaves it,
+  lands, and can hand back to motion matching.
+
+It reads the animation alone, no engine metadata. The tool prints each clip's analysis. A clip
+it finds nothing in is left out, with a warning.
+
 ## What is baked
 
 At the clips' rate (30 fps by default), per frame:

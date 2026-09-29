@@ -12,7 +12,9 @@
 //!   "exclude": [],
 //!   "loop": ["*_Loop_*"],
 //!   "tags": {"idle": ["Idle/*"], "walk": ["Walk/*"]},
-//!   "joints": {"root": "root", "hips": "pelvis", "left_foot": "foot_l", "right_foot": "foot_r"},
+//!   "actions": {"mantle": ["Traversal/*Mantle*"], "fall": ["Jump/*Loop_Fall"], "land": ["Jump/*Land*"]},
+//!   "joints": {"root": "root", "hips": "pelvis", "left_foot": "foot_l", "right_foot": "foot_r",
+//!              "left_hand": "hand_l", "right_hand": "hand_r"},
 //!   "sample_rate": 30,
 //!   "keep_unskinned": false,
 //!   "color": [0.55, 0.57, 0.6, 1.0],
@@ -46,6 +48,11 @@
 //! overrides the manifest's flag for the clips it matches. Each tag is a bit (in the order
 //! given) the runtime search can filter on.
 //!
+//! `actions` names the clips played on command rather than searched for, by kind (`hurdle`,
+//! `vault`, `mantle`, `climb`, `fall`, `land`): they get `ACTION_TAG` only, and
+//! `ActionClip::analyze` reads their phases into the pack (a clip it finds nothing in is left
+//! out, with a warning). Action clips must also match `include`.
+//!
 //! Joints no vertex is weighted to, that the database doesn't read and that have no such joint
 //! below them (IK targets, virtual bones, prop sockets) are left out, unless `keep_unskinned`.
 
@@ -53,7 +60,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kansei_core::animation::motion_matching::pack::{MotionPack, PackMesh};
-use kansei_core::animation::motion_matching::{DatabaseBuilder, JointRoles, FEATURES};
+use kansei_core::animation::motion_matching::traversal::{ActionClip, ActionKind};
+use kansei_core::animation::motion_matching::{DatabaseBuilder, JointRoles, ACTION_TAG, FEATURES};
 use kansei_core::animation::{Skeleton, SkinnedGltf, SkinnedMesh};
 use serde::Deserialize;
 
@@ -73,6 +81,8 @@ struct Config {
     looping: Option<Vec<String>>,
     #[serde(default)]
     tags: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    actions: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     joints: Joints,
     #[serde(default = "default_rate")]
@@ -122,12 +132,23 @@ struct Joints {
     hips: String,
     left_foot: String,
     right_foot: String,
+    #[serde(default = "left_hand")]
+    left_hand: String,
+    #[serde(default = "right_hand")]
+    right_hand: String,
+}
+
+fn left_hand() -> String {
+    "hand_l".into()
+}
+fn right_hand() -> String {
+    "hand_r".into()
 }
 
 impl Default for Joints {
     /// Unreal's skeleton names.
     fn default() -> Self {
-        Self { root: "root".into(), hips: "pelvis".into(), left_foot: "foot_l".into(), right_foot: "foot_r".into() }
+        Self { root: "root".into(), hips: "pelvis".into(), left_foot: "foot_l".into(), right_foot: "foot_r".into(), left_hand: left_hand(), right_hand: right_hand() }
     }
 }
 
@@ -325,7 +346,8 @@ fn run(config_path: &Path) -> Result<(), String> {
     let skeleton = if config.keep_unskinned {
         model.skeleton.clone()
     } else {
-        prune(&model.skeleton, &mut model.meshes, &[full.root, full.hips, full.feet[0], full.feet[1]])
+        let hands: Vec<usize> = [&j.left_hand, &j.right_hand].iter().filter_map(|n| model.skeleton.find(n)).collect();
+        prune(&model.skeleton, &mut model.meshes, &[[full.root, full.hips, full.feet[0], full.feet[1]].as_slice(), &hands].concat())
     };
     let roles = JointRoles::find(&skeleton, &j.root, &j.hips, &j.left_foot, &j.right_foot)?;
     println!(
@@ -336,22 +358,32 @@ fn run(config_path: &Path) -> Result<(), String> {
         model.meshes.iter().map(|m| m.vertices.len()).sum::<usize>()
     );
 
+    let action_kinds: Vec<(ActionKind, &Vec<String>)> = config
+        .actions
+        .iter()
+        .map(|(name, patterns)| ActionKind::from_name(name).map(|k| (k, patterns)).ok_or_else(|| format!("unknown action kind '{name}' (hurdle, vault, mantle, climb, fall, land)")))
+        .collect::<Result<_, _>>()?;
     let tag_names: Vec<&String> = config.tags.keys().collect();
     if tag_names.len() > 32 {
         return Err("at most 32 tags".into());
     }
     let mut builder = DatabaseBuilder::new(skeleton.clone(), roles, config.sample_rate);
     let mut baked = 0;
+    let mut pending_actions = Vec::new();
     for source in sources(&export, &mesh_path)? {
         if !any_match(&config.include, &source.name) || any_match(&config.exclude, &source.name) {
             continue;
         }
         let looping = config.looping.as_ref().map_or(source.looping, |p| any_match(p, &source.name));
+        let action = action_kinds.iter().find(|(_, p)| any_match(p, &source.name)).map(|(k, _)| *k);
         let mut tags = 0u32;
         for (bit, name) in tag_names.iter().enumerate() {
             if any_match(&config.tags[*name], &source.name) {
                 tags |= 1 << bit;
             }
+        }
+        if action.is_some() {
+            tags = ACTION_TAG;
         }
         let file = SkinnedGltf::load(&source.file.to_string_lossy(), Some(config.sample_rate))?;
         for (k, clip) in file.clips.iter().enumerate() {
@@ -365,6 +397,9 @@ fn run(config_path: &Path) -> Result<(), String> {
                 }
             }
             builder.add_clip(&clip, looping, tags)?;
+            if let Some(kind) = action {
+                pending_actions.push((baked, kind, clip.name.clone()));
+            }
             baked += 1;
         }
     }
@@ -388,10 +423,29 @@ fn run(config_path: &Path) -> Result<(), String> {
         println!("tag {bit} '{name}': {} clips", database.clips.iter().filter(|c| c.tags & (1 << bit) != 0).count());
     }
 
+    let hands = [skeleton.find(&j.left_hand), skeleton.find(&j.right_hand)];
+    let mut actions = Vec::new();
+    if !pending_actions.is_empty() {
+        let [Some(left), Some(right)] = hands else {
+            return Err(format!("actions need the hand joints '{}' and '{}'", j.left_hand, j.right_hand));
+        };
+        for (clip, kind, name) in pending_actions {
+            match ActionClip::analyze(&database, clip, kind, [left, right]) {
+                Some(a) => {
+                    println!(
+                        "action {:6} {name}: height {:.2} m, ledge {:.2?}, frames rise {} anchor {} top {} off {} down {} exit {}, span {:.2} m",
+                        kind.name(), a.height, a.ledge.to_array(), a.rise, a.anchor, a.on_top, a.off_top, a.down, a.exit, a.span
+                    );
+                    actions.push(a);
+                }
+                None => eprintln!("warning: action clip '{name}' shows no {} (left out)", kind.name()),
+            }
+        }
+    }
     let meshes = model.meshes.into_iter().map(|mesh| PackMesh { mesh, color: config.color }).collect();
     let mut meta: Vec<(String, String)> = config.meta.into_iter().collect();
     meta.push(("tags".into(), tag_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
-    let pack = MotionPack { database, meshes, meta };
+    let pack = MotionPack { database, meshes, actions, meta };
     let bytes = pack.to_bytes();
     if let Some(dir) = output.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;

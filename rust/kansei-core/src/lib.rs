@@ -23,3 +23,4 @@ pub mod loaders;
 pub mod systems;
 pub mod sdf;
 pub mod animation;
+pub mod collision;
