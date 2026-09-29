@@ -29,6 +29,7 @@ mod skin;
 mod skinning;
 pub mod springs;
 mod transform;
+pub mod warping;
 
 #[cfg(test)]
 mod tests;

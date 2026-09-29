@@ -6,6 +6,7 @@ use crate::animation::ik::{two_joint_ik, FootLock};
 use crate::animation::inertialization::Inertializer;
 use crate::animation::springs::{damper_exact, negexp, spring_character_update, spring_damper_exact_quat};
 use crate::animation::retarget::Retarget;
+use crate::animation::warping::RootWarp;
 use crate::animation::{quat_abs, quat_from_scaled_angle_axis, quat_to_scaled_angle_axis, Pose, Skeleton, Transform};
 
 /// Tuning of a `MotionMatcher`. The defaults follow Holden's reference controller at 30 Hz data.
@@ -109,6 +110,29 @@ fn leg(skeleton: &Skeleton, foot: usize) -> [usize; 3] {
     [skeleton.parents[middle].unwrap_or(middle), middle, foot]
 }
 
+/// How the character moves while an action plays.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RootPath {
+    /// The clip's root motion placed in the world by a warp (traversal, landing).
+    Warp(RootWarp),
+    /// Momentum and gravity (falling); the clip only animates the pose.
+    Ballistic { velocity: Vec3, gravity: f32 },
+}
+
+/// A clip played on command instead of found by the search: a traversal, a fall, a landing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    /// Database clip, and the clip frame it starts at.
+    pub clip: usize,
+    pub start: f32,
+    /// Clip frame at which motion matching takes over again; `None` plays until
+    /// `MotionMatcher::stop_action` (a looping clip goes round).
+    pub exit: Option<f32>,
+    pub path: RootPath,
+    /// For the caller: what the action is (e.g. a traversal kind).
+    pub tag: u32,
+}
+
 /// A character driven by motion matching: every few frames it searches the database for the
 /// frame whose pose and future trajectory best match its current pose and the trajectory the
 /// input predicts, switches there with inertialization, and plays on, moved by the clips' root
@@ -139,6 +163,10 @@ pub struct MotionMatcher {
     last_search: SearchInfo,
     /// The root motion's speed (m/s) and turn rate (rad/s) this frame.
     root_speed: (f32, f32),
+    /// The clip playing on command, if any, instead of searching.
+    action: Option<Action>,
+    /// Height of the ground the character stands on while matching.
+    ground: f32,
     scratch: (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Pose),
 }
 
@@ -169,6 +197,8 @@ impl MotionMatcher {
             legs: [leg(&db.skeleton, db.roles.feet[0]), leg(&db.skeleton, db.roles.feet[1])],
             last_search: SearchInfo::default(),
             root_speed: (0.0, 0.0),
+            action: None,
+            ground: position.y,
             scratch: (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Pose { local: Vec::new() }),
         };
         matcher.pose.to_model(&db.skeleton, &mut matcher.model);
@@ -236,6 +266,48 @@ impl MotionMatcher {
         [self.feet[0].is_locked(), self.feet[1].is_locked()]
     }
 
+    /// The action playing, if any.
+    pub fn action(&self) -> Option<&Action> {
+        self.action.as_ref()
+    }
+
+    /// Play `action` now instead of searching, inertializing from what shows.
+    pub fn start_action(&mut self, db: &Database, action: Action) {
+        let from = self.current_frame(db);
+        let to = db.clips[action.clip].start + (action.start.round() as usize).min(db.clips[action.clip].frames - 1);
+        self.transition(db, from, to);
+        self.frame = action.start;
+        self.feet.iter_mut().for_each(FootLock::reset);
+        self.action = Some(action);
+    }
+
+    /// End the action: motion matching searches again at the next update.
+    pub fn stop_action(&mut self) {
+        if self.action.take().is_some() {
+            self.searched_input = None;
+            self.simulation.position = self.character.translation;
+            self.simulation.rotation = self.character.rotation;
+            self.simulation.angular_velocity = Vec3::ZERO;
+            self.desired_yaw = yaw_of(self.character.rotation);
+        }
+    }
+
+    /// Put the character here (keeping its pose and what plays), its simulation with it.
+    pub fn place(&mut self, character: Transform) {
+        self.character = character;
+        self.simulation.position = character.translation;
+    }
+
+    /// The height of the ground under the character, which it stands on while matching (an
+    /// action's root path decides its height itself).
+    pub fn set_ground(&mut self, height: f32) {
+        self.ground = height;
+    }
+
+    pub fn ground(&self) -> f32 {
+        self.ground
+    }
+
     /// Move the character (and its simulation) without blending, facing `yaw`.
     pub fn teleport(&mut self, position: Vec3, yaw: f32) {
         self.character = Transform::from_translation_rotation(position, yaw_rotation(yaw));
@@ -244,18 +316,47 @@ impl MotionMatcher {
         self.inertializer.reset();
         self.feet.iter_mut().for_each(FootLock::reset);
         self.searched_input = None;
+        self.action = None;
+        self.ground = position.y;
     }
 
     /// Advance by `dt` seconds under `input`.
     pub fn update(&mut self, db: &Database, input: &MotionInput, dt: f32) {
+        self.update_constrained(db, input, dt, &mut |_, to| to);
+    }
+
+    /// `update`, with `constrain(from, to)` saying where a move from `from` toward `to` may end
+    /// (the world's collision): it shapes the simulated position, its predicted trajectory (so
+    /// the search sees the character stopping at a wall) and the character.
+    pub fn update_constrained(&mut self, db: &Database, input: &MotionInput, dt: f32, constrain: &mut dyn FnMut(Vec3, Vec3) -> Vec3) {
         let dt = dt.max(1e-4);
-        self.simulate(input, dt);
-        self.search_if_due(db, input, dt);
-        self.play(db, dt);
+        self.simulate(input, dt, constrain);
+        if self.action.is_some() {
+            self.play_action(db, dt);
+        } else {
+            self.search_if_due(db, input, dt);
+            self.play(db, dt);
+        }
         self.inertializer.update(&mut self.matched, self.settings.inertialization_halflife, dt);
-        self.synchronize(dt);
+        if self.action.is_some() {
+            // the simulation waits where the action takes the character
+            let s = &mut self.simulation;
+            s.position = self.character.translation;
+            s.rotation = self.character.rotation;
+            s.acceleration = Vec3::ZERO;
+            s.angular_velocity = Vec3::ZERO;
+        } else {
+            let before = self.character.translation;
+            self.synchronize(dt);
+            let moved = constrain(before, self.character.translation);
+            self.character.translation = moved;
+            // stand on the ground
+            let y = &mut self.character.translation.y;
+            *y = if (*y - self.ground).abs() > 0.5 { self.ground } else { *y + (self.ground - *y) * (1.0 - negexp(dt / 0.05)) };
+            self.simulation.position.y = self.ground;
+        }
         self.output(db);
-        if self.settings.foot_lock {
+        if self.settings.foot_lock && self.action.is_none() {
             self.lock_feet(db, dt);
         }
     }
@@ -275,7 +376,7 @@ impl MotionMatcher {
     }
 
     /// The simulated character follows the input with springs; predict its trajectory.
-    fn simulate(&mut self, input: &MotionInput, dt: f32) {
+    fn simulate(&mut self, input: &MotionInput, dt: f32, constrain: &mut dyn FnMut(Vec3, Vec3) -> Vec3) {
         let goal = Vec3::new(input.velocity.x, 0.0, input.velocity.z);
         self.desired_yaw = match input.facing {
             Some(yaw) => yaw,
@@ -284,14 +385,24 @@ impl MotionMatcher {
         };
         let goal_rotation = yaw_rotation(self.desired_yaw);
         let s = &mut self.simulation;
+        let before = s.position;
         spring_character_update(&mut s.position, &mut s.velocity, &mut s.acceleration, goal, self.settings.velocity_halflife, dt);
+        let allowed = constrain(before, s.position);
+        if allowed.distance(s.position) > 1e-5 {
+            // blocked: drop the velocity into what blocked it (pushing out of an overlap is a
+            // correction of the position, not speed)
+            let blocked = Vec3::new(s.position.x - allowed.x, 0.0, s.position.z - allowed.z).normalize_or_zero();
+            s.velocity -= blocked * s.velocity.dot(blocked).max(0.0);
+            s.position = allowed;
+        }
         spring_damper_exact_quat(&mut s.rotation, &mut s.angular_velocity, goal_rotation, self.settings.rotation_halflife, dt);
         for (k, t) in TRAJECTORY_TIMES.iter().enumerate() {
             let (mut p, mut v, mut a) = (s.position, s.velocity, s.acceleration);
             spring_character_update(&mut p, &mut v, &mut a, goal, self.settings.velocity_halflife, *t);
             let (mut r, mut w) = (s.rotation, s.angular_velocity);
             spring_damper_exact_quat(&mut r, &mut w, goal_rotation, self.settings.rotation_halflife, *t);
-            self.trajectory[k] = Transform::from_translation_rotation(p, r);
+            let from = if k == 0 { s.position } else { self.trajectory[k - 1].translation };
+            self.trajectory[k] = Transform::from_translation_rotation(constrain(from, p), r);
         }
     }
 
@@ -364,6 +475,42 @@ impl MotionMatcher {
         db.pose(info.start + a, info.start + b, self.frame - a as f32, &mut self.sampled);
         self.matched.local.clone_from(&self.sampled.local);
         self.root_speed = (moved.length() / dt, turned.abs() / dt);
+    }
+
+    /// Play the action: its clip on, the character moved by its root path; hand back to the
+    /// search at its exit frame.
+    fn play_action(&mut self, db: &Database, dt: f32) {
+        let Some((clip, exit)) = self.action.as_ref().map(|a| (a.clip, a.exit)) else { return };
+        let info = &db.clips[clip];
+        let before = self.character;
+        let mut next = self.frame + dt * db.sample_rate;
+        let exit = exit.map(|e| e.min((info.frames - 1) as f32));
+        if info.looping && exit.is_none() {
+            next = next.rem_euclid(info.playable() as f32);
+        }
+        let done = exit.is_some_and(|e| next >= e);
+        self.frame = next.min((info.frames - 1) as f32);
+        match &mut self.action.as_mut().unwrap().path {
+            RootPath::Warp(warp) => {
+                let (p, yaw) = warp.root(self.frame, db.root_at(clip, self.frame));
+                self.character = Transform::from_translation_rotation(p, yaw_rotation(yaw));
+            }
+            RootPath::Ballistic { velocity, gravity } => {
+                self.character.translation += *velocity * dt - Vec3::Y * (0.5 * *gravity * dt * dt);
+                velocity.y -= *gravity * dt;
+            }
+        }
+        let a = self.frame.floor() as usize;
+        let b = (a + 1).min(info.frames - 1);
+        db.pose(info.start + a, info.start + b, self.frame - a as f32, &mut self.sampled);
+        self.matched.local.clone_from(&self.sampled.local);
+        let moved = self.character.translation - before.translation;
+        self.root_speed = (Vec3::new(moved.x, 0.0, moved.z).length() / dt, wrap_angle(yaw_of(self.character.rotation) - yaw_of(before.rotation)).abs() / dt);
+        self.simulation.velocity = Vec3::new(moved.x, 0.0, moved.z) / dt;
+        if done {
+            self.ground = self.character.translation.y;
+            self.stop_action();
+        }
     }
 
     /// Pull the animated character toward the simulation, then clamp it within reach of it.
