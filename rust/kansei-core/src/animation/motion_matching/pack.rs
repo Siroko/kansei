@@ -6,11 +6,13 @@
 //! `CLIP` clips, `ROTS` quantized rotations, `TRAN`/`SCAL` translation and scale tracks, `ROOT`
 //! character root per frame, `CONT` foot contacts, `FEAT` feature normalization and rows, `MESH`
 //! (repeated) skinned meshes with a colour, `IMAG` (repeated) named images (encoded bytes, e.g.
-//! WebP), `META` key/value strings (source, licence).
+//! WebP), `ACTS` action clips (traversals, falls, landings: what `traversal::ActionClip::analyze`
+//! found), `META` key/value strings (source, licence).
 
 use glam::{Mat4, Quat, Vec3};
 
 use super::database::{ClipInfo, Database, FeatureWeights, JointRoles, Vec3Tracks, FEATURES, STRIDE};
+use super::traversal::{ActionClip, ActionKind};
 use crate::animation::{Skeleton, SkinnedMesh, Transform, MAX_INFLUENCES};
 use crate::geometries::Vertex;
 
@@ -29,6 +31,8 @@ pub struct PackMesh {
 pub struct MotionPack {
     pub database: Database,
     pub meshes: Vec<PackMesh>,
+    /// Clips played on command, with their analysis.
+    pub actions: Vec<ActionClip>,
     /// Free-form (key, value) notes: where the data comes from and under which licence.
     pub meta: Vec<(String, String)>,
 }
@@ -107,6 +111,21 @@ impl MotionPack {
         for m in &self.meshes {
             section(&mut out, b"MESH", |w| w.mesh(m));
         }
+        if !self.actions.is_empty() {
+            section(&mut out, b"ACTS", |w| {
+                w.u32(self.actions.len() as u32);
+                for a in &self.actions {
+                    w.u32(a.clip as u32);
+                    w.u8(a.kind as u8);
+                    w.f32(a.height);
+                    w.vec3(a.ledge);
+                    w.vec3(a.forward);
+                    for x in [a.rise, a.anchor, a.on_top, a.off_top, a.down, a.exit, a.span, a.last_entry] {
+                        w.f32(x);
+                    }
+                }
+            });
+        }
         out
     }
 
@@ -128,6 +147,7 @@ impl MotionPack {
         let mut contacts = Vec::new();
         let mut features = None;
         let mut meshes = Vec::new();
+        let mut actions = Vec::new();
         let mut at = 8;
         while at < bytes.len() {
             let mut header = Reader { bytes, at };
@@ -188,6 +208,16 @@ impl MotionPack {
                     features = Some((offset, scale, rows));
                 }
                 b"MESH" => meshes.push(r.mesh()?),
+                b"ACTS" => {
+                    for _ in 0..r.u32()? {
+                        let clip = r.u32()? as usize;
+                        let kind = ActionKind::from_u8(r.u8()?).ok_or("unknown action kind in the motion pack")?;
+                        let height = r.f32()?;
+                        let (ledge, forward) = (r.vec3()?, r.vec3()?);
+                        let [rise, anchor, on_top, off_top, down, exit, span, last_entry] = r.f32s::<8>()?;
+                        actions.push(ActionClip { clip, kind, height, ledge, forward, rise, anchor, on_top, off_top, down, exit, span, last_entry });
+                    }
+                }
                 _ => {}
             }
             at = start + length;
@@ -205,6 +235,9 @@ impl MotionPack {
         if clips.iter().any(|c| c.start + c.frames > frames) || [roles.root, roles.hips, roles.feet[0], roles.feet[1]].iter().any(|&j| j >= joints) {
             return Err("the motion pack's clips or roles are out of range".into());
         }
+        if actions.iter().any(|a| a.clip >= clips.len()) {
+            return Err("the motion pack's actions name clips it lacks".into());
+        }
         for m in &meshes {
             if m.mesh.skin_joints.iter().any(|&j| j >= joints) {
                 return Err(format!("mesh '{}' is skinned to joints the skeleton lacks", m.mesh.name));
@@ -212,7 +245,7 @@ impl MotionPack {
         }
         let mut database = Database { skeleton, roles, sample_rate, weights, clips, rotations, translations, scales, roots, contacts, feature_offset, feature_scale, features, bounds_small: Vec::new(), bounds_large: Vec::new() };
         database.build_bounds();
-        Ok(Self { database, meshes, meta })
+        Ok(Self { database, meshes, actions, meta })
     }
 }
 

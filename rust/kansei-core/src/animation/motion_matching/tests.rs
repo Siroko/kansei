@@ -175,10 +175,13 @@ fn triangle_mesh() -> SkinnedMesh {
 
 #[test]
 fn a_pack_round_trips() {
-    let pack = MotionPack { database: database(), meshes: vec![PackMesh { mesh: triangle_mesh(), color: [0.5, 0.4, 0.3, 1.0] }], meta: vec![("source".into(), "synthetic".into())] };
+    use super::traversal::{ActionClip, ActionKind};
+    let action = ActionClip { clip: 2, kind: ActionKind::Vault, height: 1.1, ledge: Vec3::new(0.1, 1.1, 0.4), forward: Vec3::Z, rise: 10.0, anchor: 14.0, on_top: 15.0, off_top: 18.0, down: 22.0, exit: 22.0, span: 0.4, last_entry: 4.0 };
+    let pack = MotionPack { database: database(), meshes: vec![PackMesh { mesh: triangle_mesh(), color: [0.5, 0.4, 0.3, 1.0] }], actions: vec![action], meta: vec![("source".into(), "synthetic".into())] };
     let bytes = pack.to_bytes();
     let back = MotionPack::from_bytes(&bytes).unwrap();
     assert_eq!(back.database, pack.database);
+    assert_eq!(back.actions, pack.actions);
     assert_eq!(back.meta("source"), Some("synthetic"));
     let (a, b) = (&back.meshes[0].mesh, &pack.meshes[0].mesh);
     assert_eq!((a.indices.clone(), a.joints.clone(), a.skin_joints.clone(), a.inverse_bind.clone(), a.material), (b.indices.clone(), b.joints.clone(), b.skin_joints.clone(), b.inverse_bind.clone(), b.material));
