@@ -19,10 +19,14 @@
 
 mod clip;
 mod gltf;
+pub mod ik;
+pub mod inertialization;
+pub mod motion_matching;
 mod pose;
 mod skeleton;
 mod skin;
 mod skinning;
+pub mod springs;
 mod transform;
 
 #[cfg(test)]
