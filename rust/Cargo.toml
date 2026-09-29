@@ -8,6 +8,7 @@ members = [
     "tools/ktx2",
 ]
 exclude = [
+    "vendor/basisu",
     "kansei-wasm/examples/spinning-box",
     "kansei-wasm/examples/instanced-cubes",
     "kansei-wasm/examples/lit-scene",
@@ -40,5 +41,6 @@ env_logger = "0.11"
 pollster = "0.4"
 image = "0.25"
 gltf = { version = "1", features = ["utils", "extensions", "allow_empty_texture"] }
-basisu = "0.1"
+# vendored with the targets Kansei never requests removed (vendor/basisu/PATCHES.md)
+basisu = { path = "vendor/basisu" }
 optimesh = "1.1"
