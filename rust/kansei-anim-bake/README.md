@@ -1,0 +1,67 @@
+# kansei-anim-bake
+
+Bakes animation clips and a skinned mesh (glTF) into a **motion-matching pack** (`.kmm`) for
+`kansei_core::animation::motion_matching`: the clips' poses, the character root's motion, foot
+contacts and the search features, with the mesh, in one binary file the runtime loads as is.
+
+## Data stays out of this repository
+
+The tool is code; what it reads and writes is **your data**. A pack is derived from the clips and
+mesh it was baked from, and carries their licence.
+
+- Never commit third-party animation, meshes, their glTF exports or `.kmm` packs to Kansei (a
+  public MIT repository). `*.kmm` is gitignored; keep exports and packs in a private folder
+  outside any public repo.
+- Ship a pack only as the licence of its sources allows. Store licensed store assets (Fab,
+  Marketplace, Mixamo…) only as packed binaries inside a product, and only where their terms
+  allow that.
+- Record where a pack comes from in its `meta` (`source`, `license`): the runtime can show it.
+
+## Pipeline
+
+1. **Export glTF from Unreal Engine, headless** (no editor window). `unreal/export_gltf.py` runs
+   in the editor commandlet with UE's own glTF exporter:
+
+   ```sh
+   UnrealEditor-Cmd /path/Project.uproject -run=pythonscript \
+     -script="$PWD/unreal/export_gltf.py /path/export-config.json" \
+     -EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities \
+     -unattended -nullrhi -nosplash -nosound -nop4 -stdout
+   ```
+
+   The config names the skeletal mesh, a root folder of AnimSequences and include/exclude
+   patterns. The script writes `mesh.glb`, `clips/<path>.glb` (skeleton and animation only) and
+   `manifest.json` (frames, length, loop flag). It keeps each sequence's root motion by clearing
+   "Force Root Lock" on the loaded asset (in memory; nothing is saved). The editor still writes
+   caches (`Saved/`, `DerivedDataCache/`), so run it on a copy of the project; on APFS,
+   `cp -cR` makes one instantly without using disk. Any other glTF source works too: skip this
+   step and point `export` at a folder of `.glb`/`.gltf` clips.
+
+2. **Bake**:
+
+   ```sh
+   cargo run --release -p kansei-anim-bake -- /path/bake-config.json
+   ```
+
+   The config's fields are listed in `src/main.rs`. `include`/`exclude` pick clips by path,
+   `loop` marks loops, `tags` sets bits the search can filter on (e.g. one per gait), and
+   `joints` names the root (a top joint on the ground carrying root motion and facing +Z), hips
+   and feet. The defaults are Unreal's names. Joints nothing is weighted to (IK targets, virtual
+   bones) are left out. The tool prints the database's size and contact coverage, then reads
+   the pack back to check it.
+
+3. **Play it**: `rust/kansei-wasm/examples/motion-matching` loads a pack from a local path.
+
+## What is baked
+
+At the clips' rate (30 fps by default), per frame:
+
+- joint rotations as 16-bit quaternions;
+- translations, stored once per joint when they never change, else 16 bits per axis over the
+  joint's range;
+- the character root (position and heading);
+- foot contacts (a foot low and slow for three frames or more);
+- 27 normalized features: foot positions and velocities, hips velocity, and the root's future
+  positions and facings at ⅓, ⅔ and 1 s.
+
+Loops continue cycle after cycle past their end. Other clips go on at their last velocity.
