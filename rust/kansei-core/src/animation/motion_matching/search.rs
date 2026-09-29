@@ -1,4 +1,4 @@
-use super::database::{box_distance, distance, Database, BOUND_LARGE, BOUND_SMALL, STRIDE};
+use super::database::{box_distance, distance, Database, ACTION_TAG, BOUND_LARGE, BOUND_SMALL, STRIDE};
 
 /// What a search may return.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6,7 +6,7 @@ pub struct SearchFilter {
     /// Frames at the end of a clip that doesn't loop that the search never lands on, so playback
     /// has time to search again before the clip runs out.
     pub ignore_end: usize,
-    /// Only clips with one of these tag bits (every clip when `u32::MAX`).
+    /// Only clips with one of these tag bits (every clip but actions by default: `!ACTION_TAG`).
     pub tags: u32,
     /// The frame playing now: frames of its clip within `ignore_near` of it are skipped (landing
     /// next to the playhead only restarts what is already playing).
@@ -16,7 +16,15 @@ pub struct SearchFilter {
 
 impl Default for SearchFilter {
     fn default() -> Self {
-        Self { ignore_end: 10, tags: u32::MAX, current: None, ignore_near: 3 }
+        Self { ignore_end: 10, tags: !ACTION_TAG, current: None, ignore_near: 3 }
+    }
+}
+
+impl SearchFilter {
+    /// Whether a clip with these tags may be found: one of the filter's bits, and action clips
+    /// only when the filter asks for `ACTION_TAG`.
+    pub fn allows(&self, tags: u32) -> bool {
+        tags & self.tags != 0 && (tags & ACTION_TAG == 0 || self.tags & ACTION_TAG != 0)
     }
 }
 
@@ -36,7 +44,7 @@ impl Database {
         let mut limit = best_cost;
         let current_clip = filter.current.map(|f| self.clip_of(f));
         for (c, clip) in self.clips.iter().enumerate() {
-            if clip.tags & filter.tags == 0 {
+            if !filter.allows(clip.tags) {
                 continue;
             }
             let end = clip.start + if clip.looping { clip.playable() } else { clip.frames.saturating_sub(filter.ignore_end).max(1) };
@@ -83,7 +91,7 @@ impl Database {
         let mut limit = best_cost;
         let current_clip = filter.current.map(|f| self.clip_of(f));
         for (c, clip) in self.clips.iter().enumerate() {
-            if clip.tags & filter.tags == 0 {
+            if !filter.allows(clip.tags) {
                 continue;
             }
             let end = clip.start + if clip.looping { clip.playable() } else { clip.frames.saturating_sub(filter.ignore_end).max(1) };
