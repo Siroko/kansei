@@ -15,14 +15,16 @@
 //! A course of boxes stands around the start: low rails to hurdle, boxes to vault, blocks to mantle
 //! onto, walls to climb, long narrow beams and stacked blocks, some turned. Space in front of one
 //! traverses it (`motion_matching::traversal`): the kind from its shape, the clip from the pace,
-//! the clip's root motion warped onto its ledge. Walking off a top falls and lands. The pack needs
-//! action clips for that (`kansei-anim-bake`'s `actions`); without them Space does nothing.
+//! the clip's root motion warped onto its ledge. With nothing to traverse ahead, Space jumps: a
+//! jump clip for the pace up to its take-off, then a ballistic flight that lands wherever it
+//! comes down, box tops included. Walking off a top falls and lands. The pack needs action clips
+//! for that (`kansei-anim-bake`'s `actions`); without them Space does nothing.
 //!
-//! Controls: WASD or arrows move relative to the camera, Shift runs, Space traverses, Q toggles
-//! strafing (face the camera's direction), mouse drag orbits and the wheel zooms. Gamepad: left
-//! stick moves (tilt sets the pace), right stick orbits, A traverses, B or the right trigger runs,
-//! the left bumper toggles strafing. Keys B, K, M, L and C toggle the trajectory overlay and HUD,
-//! the skeleton, the mesh, foot locking and the character.
+//! Controls: WASD or arrows move relative to the camera, Shift runs, Space jumps or traverses, Q
+//! toggles strafing (face the camera's direction), mouse drag orbits and the wheel zooms. Gamepad:
+//! left stick moves (tilt sets the pace), right stick orbits, A jumps or traverses, B or the right
+//! trigger runs, the left bumper toggles strafing. Keys B, K, M, L and C toggle the trajectory
+//! overlay and HUD, the skeleton, the mesh, foot locking and the character.
 //!
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
@@ -150,7 +152,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
 
 /// The course: (x, base height, z) of a box's bottom centre, its width, height and depth, its
 /// heading (radians) and colour.
-const COURSE: [([f32; 3], [f32; 3], f32, [f32; 3]); 18] = [
+const COURSE: [([f32; 3], [f32; 3], f32, [f32; 3]); 20] = [
     // low rails to hurdle, one long and turned
     ([0.0, 0.0, 5.0], [3.0, 0.5, 0.25], 0.0, [0.55, 0.35, 0.2]),
     ([-6.0, 0.0, 4.0], [4.0, 0.8, 0.25], 0.5, [0.55, 0.35, 0.2]),
@@ -177,6 +179,9 @@ const COURSE: [([f32; 3], [f32; 3], f32, [f32; 3]); 18] = [
     // a low step onto a platform, and a thin wall at an angle
     ([0.0, 0.0, -10.0], [5.0, 0.3, 3.0], 0.0, [0.4, 0.42, 0.45]),
     ([8.0, 0.0, 16.0], [3.0, 1.1, 0.3], 0.9, [0.55, 0.35, 0.2]),
+    // two platforms with a gap to jump across (a running jump; a walking one falls short)
+    ([-14.0, 0.0, 3.0], [3.0, 1.2, 6.0], 0.0, [0.4, 0.5, 0.45]),
+    ([-14.0, 0.0, 9.5], [3.0, 1.2, 4.0], 0.0, [0.4, 0.5, 0.45]),
 ];
 
 /// The course's boxes as colliders and renderables.
@@ -724,8 +729,8 @@ impl State {
             c.controller.matcher.settings.filter.tags = if run { c.run_tags } else { c.walk_tags };
             c.controller.update(&c.db, &self.world, &MotionInput { velocity, facing }, dt);
             if traverse {
-                // pressed a little early, it still goes once in reach
-                let _ = c.controller.request_traverse(&c.db, &self.world, 1.0);
+                // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump
+                let _ = c.controller.request_traverse_or_jump(&c.db, &self.world, 1.0);
             }
             // the obstacle last looked at: its ledge, and a post down to the floor
             c.ledge.matrices.fill(Mat4::ZERO);
@@ -809,7 +814,7 @@ impl State {
                     let feet = c.controller.matcher.feet_locked();
                     let speed = c.controller.matcher.simulation().velocity.length();
                     set_hud(&format!(
-                        "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock",
+                        "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock",
                         self.fps,
                         if run { "run" } else { "walk" },
                         format_args!("{speed:.1} m/s"),
@@ -828,8 +833,9 @@ impl State {
                             "state  {}{}",
                             match c.controller.state() {
                                 CharacterState::Grounded => "on the ground".to_string(),
-                                CharacterState::Traversing(k) => ["hurdling", "vaulting", "mantling", "climbing", "falling", "landing"][k as usize].to_string(),
-                                CharacterState::Falling(t) => format!("falling {t:.1} s"),
+                                CharacterState::Traversing(k) => ["hurdling", "vaulting", "mantling", "climbing", "falling", "landing", "jumping"][k as usize].to_string(),
+                                CharacterState::Jumping => "jumping".to_string(),
+                                CharacterState::Falling(t) => format!("in the air {t:.1} s"),
                                 CharacterState::Landing => "landing".to_string(),
                             },
                             match c.controller.last_result {
@@ -914,7 +920,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 if let Some(at) = query_param("at") {
                     let v: Vec<f32> = at.split(',').filter_map(|x| x.parse().ok()).collect();
                     if v.len() >= 2 {
-                        c.controller.matcher.teleport(GVec3::new(v[0], 0.0, v[1]), v.get(2).copied().unwrap_or(0.0).to_radians());
+                        // on whatever is there (a box top)
+                        let y = world.ground_height(GVec3::new(v[0], 0.0, v[1]), 50.0, 50.0, u32::MAX).unwrap_or(0.0);
+                        c.controller.matcher.teleport(GVec3::new(v[0], y, v[1]), v.get(2).copied().unwrap_or(0.0).to_radians());
                     }
                 }
                 Some(c)
