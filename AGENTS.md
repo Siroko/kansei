@@ -24,6 +24,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Group 3 (shadows and lights) only grows by additive bindings; `renderers/shared_layouts.rs` lists them.
 - Instances culled on the CPU for the camera also drop out of shadow maps and reflections. Use `culling::InstanceCulling`, which culls per view on the GPU.
 - Cluster LOD (`Renderable::clusters`) draws only the camera's pass until M3: other views draw the renderable's geometry, which must be the mesh its graph was built from.
+- Skinned materials (`animation::SKINNING_WGSL`) skin in their own `vertex_main`, but the single directional shadow map (`enable_shadows`) draws casters with a shared depth shader: a skinned mesh casts its bind pose there, so use cascaded shadows.
+- Never commit animation data, character meshes or anything derived from them (glTF exports, `.kmm` packs) unless their licence allows a public MIT repo: third-party sets such as Epic's GASP stay in a private folder, and the motion-matching example loads packs from a local path (`rust/kansei-anim-bake/README.md`).
 
 ## Maintaining this file
 
