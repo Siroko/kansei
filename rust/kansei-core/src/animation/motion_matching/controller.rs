@@ -115,7 +115,7 @@ fn leg(skeleton: &Skeleton, foot: usize) -> [usize; 3] {
 pub enum RootPath {
     /// The clip's root motion placed in the world by a warp (traversal, landing).
     Warp(RootWarp),
-    /// Momentum and gravity (falling); the clip only animates the pose.
+    /// Momentum and gravity (jumping, falling); the clip only animates the pose.
     Ballistic { velocity: Vec3, gravity: f32 },
 }
 
@@ -129,6 +129,9 @@ pub struct Action {
     /// `MotionMatcher::stop_action` (a looping clip goes round).
     pub exit: Option<f32>,
     pub path: RootPath,
+    /// Whether the path is kept out of the world like the simulation (`update_constrained`):
+    /// yes for jumps, falls and landings; not for traversals, which go over what they cross.
+    pub collides: bool,
     /// For the caller: what the action is (e.g. a traversal kind).
     pub tag: u32,
 }
@@ -271,6 +274,11 @@ impl MotionMatcher {
         self.action.as_ref()
     }
 
+    /// The action playing, to change its path or exit as it plays (a jump leaving the ground).
+    pub fn action_mut(&mut self) -> Option<&mut Action> {
+        self.action.as_mut()
+    }
+
     /// Play `action` now instead of searching, inertializing from what shows.
     pub fn start_action(&mut self, db: &Database, action: Action) {
         let from = self.current_frame(db);
@@ -327,12 +335,13 @@ impl MotionMatcher {
 
     /// `update`, with `constrain(from, to)` saying where a move from `from` toward `to` may end
     /// (the world's collision): it shapes the simulated position, its predicted trajectory (so
-    /// the search sees the character stopping at a wall) and the character.
+    /// the search sees the character stopping at a wall), the character, and an action's path
+    /// if it `collides`.
     pub fn update_constrained(&mut self, db: &Database, input: &MotionInput, dt: f32, constrain: &mut dyn FnMut(Vec3, Vec3) -> Vec3) {
         let dt = dt.max(1e-4);
         self.simulate(input, dt, constrain);
         if self.action.is_some() {
-            self.play_action(db, dt);
+            self.play_action(db, dt, constrain);
         } else {
             self.search_if_due(db, input, dt);
             self.play(db, dt);
@@ -479,8 +488,8 @@ impl MotionMatcher {
 
     /// Play the action: its clip on, the character moved by its root path; hand back to the
     /// search at its exit frame.
-    fn play_action(&mut self, db: &Database, dt: f32) {
-        let Some((clip, exit)) = self.action.as_ref().map(|a| (a.clip, a.exit)) else { return };
+    fn play_action(&mut self, db: &Database, dt: f32, constrain: &mut dyn FnMut(Vec3, Vec3) -> Vec3) {
+        let Some((clip, exit, collides)) = self.action.as_ref().map(|a| (a.clip, a.exit, a.collides)) else { return };
         let info = &db.clips[clip];
         let before = self.character;
         let mut next = self.frame + dt * db.sample_rate;
@@ -493,11 +502,18 @@ impl MotionMatcher {
         match &mut self.action.as_mut().unwrap().path {
             RootPath::Warp(warp) => {
                 let (p, yaw) = warp.root(self.frame, db.root_at(clip, self.frame));
+                let p = if collides { constrain(before.translation, p) } else { p };
                 self.character = Transform::from_translation_rotation(p, yaw_rotation(yaw));
             }
             RootPath::Ballistic { velocity, gravity } => {
-                self.character.translation += *velocity * dt - Vec3::Y * (0.5 * *gravity * dt * dt);
+                let from = self.character.translation;
+                let to = from + *velocity * dt - Vec3::Y * (0.5 * *gravity * dt * dt);
+                let allowed = if collides { constrain(from, to) } else { to };
+                // blocked: drop the velocity into what blocked it
+                let blocked = Vec3::new(to.x - allowed.x, 0.0, to.z - allowed.z).normalize_or_zero();
+                *velocity -= blocked * velocity.dot(blocked).max(0.0);
                 velocity.y -= *gravity * dt;
+                self.character.translation = allowed;
             }
         }
         let a = self.frame.floor() as usize;

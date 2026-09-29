@@ -55,7 +55,8 @@ Boxes stand around the start, some turned so you can take them at an angle:
 - blocks (1.2 to 1.5 m) to mantle onto, and walls (2 and 2.4 m) to climb;
 - long narrow beams, too narrow to stand along;
 - two stacks of blocks, one on top of another: mantle onto the first, then onto the second;
-- a 0.3 m step, walked up without a traversal.
+- a 0.3 m step, walked up without a traversal;
+- two 1.2 m platforms 1.5 m apart: a running jump crosses the gap, a walking one falls short.
 
 Space (A) traverses what is ahead, along the way the character moves (else where it faces)
 (`motion_matching::traversal`):
@@ -65,9 +66,17 @@ Space (A) traverses what is ahead, along the way the character moves (else where
   clips that leave room where they end;
 - the clip's root motion is warped so its ledge lands on the real one, at the real height.
 
-Pressed a little early, Space waits up to a second for the obstacle to come in reach. The HUD's
-`state` line shows what the character is doing, and why the last Space was refused ("too high",
-"no room to land"…). Walking off a top falls, then lands.
+Pressed a little early, Space waits up to a second for the obstacle to come in reach. With
+nothing to traverse ahead (nothing there, or something too high, too narrow or with no room on
+it), Space jumps:
+- a jump clip whose pace and pose fit plays up to its take-off;
+- from there the flight is ballistic, with the run-up's momentum and the controller's gravity,
+  kept out of the boxes and landing wherever it comes down, box tops included;
+- the jump clip, then the fall loop, animate it in the air, and the landing is chosen by the
+  height of the fall (light or heavy) and the pace (into a stand, a walk or a run).
+
+Walking off a top falls the same way. The HUD's `state` line shows what the character is doing,
+and why the last Space was refused ("too high", "no room to land"…).
 
 ## Build and run
 
@@ -85,7 +94,7 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 |---|---|---|
 | move (relative to the camera) | WASD, arrows | left stick (tilt sets the pace) |
 | run | Shift | B, right trigger |
-| traverse | Space | A |
+| jump, or traverse what is ahead | Space | A |
 | strafe (face the camera's way) | Q | left bumper |
 | orbit, zoom | drag, wheel | right stick |
 | overlay (trajectory, feet, HUD) | B | |

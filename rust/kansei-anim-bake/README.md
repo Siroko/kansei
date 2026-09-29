@@ -67,14 +67,16 @@ with a config that has a `character` section (see `src/main.rs`).
 
 ## Actions
 
-Traversals, falls and landings are played on command, not found by the search. Name them in the
-config's `actions`, by kind (`hurdle`, `vault`, `mantle`, `climb`, `fall`, `land`). They get only
-`ACTION_TAG`, so the search skips them, and the pack stores what
+Traversals, jumps, falls and landings are played on command, not found by the search. Name them
+in the config's `actions`, by kind (`hurdle`, `vault`, `mantle`, `climb`, `jump`, `fall`,
+`land`). They get only `ACTION_TAG`, so the search skips them, and the pack stores what
 `motion_matching::traversal::ActionClip::analyze` reads from each:
 - the obstacle's height, from the root joint, which rides the surface the character is on;
 - its front ledge, from the hands planted on its top (`joints.left_hand`/`right_hand`);
 - the frames where the character leaves the ground, reaches the ledge, is on the top, leaves it,
-  lands, and can hand back to motion matching.
+  lands, and can hand back to motion matching;
+- for a jump, the take-off and the apex's height; for a landing, the impact and the height it
+  fell from (the controller picks harder landings for longer falls by it).
 
 It reads the animation alone, no engine metadata. The tool prints each clip's analysis. A clip
 it finds nothing in is left out, with a warning.
