@@ -104,6 +104,16 @@ struct Display {
     legs: [[usize; 3]; 2],
 }
 
+/// The horizontal direction a move from `from` toward `wanted` was blocked in, when it ended at
+/// `allowed`: what was taken off the move, less any part of it along the move that was allowed
+/// (a slide along a wall, stopped a hair short of it, loses a little of both).
+fn blocked_direction(from: Vec3, wanted: Vec3, allowed: Vec3) -> Vec3 {
+    let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z);
+    let removed = flat(wanted - allowed);
+    let along = flat(allowed - from).normalize_or_zero();
+    (removed - along * removed.dot(along)).normalize_or(removed.normalize_or_zero())
+}
+
 /// The (upper, middle, foot) joints of the leg ending at `foot`.
 fn leg(skeleton: &Skeleton, foot: usize) -> [usize; 3] {
     let middle = skeleton.parents[foot].unwrap_or(foot);
@@ -400,7 +410,7 @@ impl MotionMatcher {
         if allowed.distance(s.position) > 1e-5 {
             // blocked: drop the velocity into what blocked it (pushing out of an overlap is a
             // correction of the position, not speed)
-            let blocked = Vec3::new(s.position.x - allowed.x, 0.0, s.position.z - allowed.z).normalize_or_zero();
+            let blocked = blocked_direction(before, s.position, allowed);
             s.velocity -= blocked * s.velocity.dot(blocked).max(0.0);
             s.position = allowed;
         }
@@ -510,7 +520,7 @@ impl MotionMatcher {
                 let to = from + *velocity * dt - Vec3::Y * (0.5 * *gravity * dt * dt);
                 let allowed = if collides { constrain(from, to) } else { to };
                 // blocked: drop the velocity into what blocked it
-                let blocked = Vec3::new(to.x - allowed.x, 0.0, to.z - allowed.z).normalize_or_zero();
+                let blocked = if allowed.distance(to) > 1e-5 { blocked_direction(from, to, allowed) } else { Vec3::ZERO };
                 *velocity -= blocked * velocity.dot(blocked).max(0.0);
                 velocity.y -= *gravity * dt;
                 self.character.translation = allowed;
