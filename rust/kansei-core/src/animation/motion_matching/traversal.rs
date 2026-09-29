@@ -16,7 +16,9 @@
 //!   warps the clip so its ledge lands on the real one, lifted to the real height and stretched to
 //!   the real depth.
 //! - `CharacterController` keeps a `MotionMatcher` out of the world's colliders, on its ground,
-//!   falling off edges and landing, and runs traversals on request.
+//!   falling off edges and landing, and traverses or jumps on request. A jump plays a jump clip
+//!   (`plan_jump`: the pace and pose that fit) up to its take-off, then flies ballistic under
+//!   the controller's gravity; landings are chosen by the height of the fall and the pace.
 
 use glam::{Vec2, Vec3};
 
@@ -42,10 +44,12 @@ pub enum ActionKind {
     Fall = 4,
     /// Landing from a fall.
     Land = 5,
+    /// Jumping: the run-up and take-off, then the pose in the air.
+    Jump = 6,
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 6] = [ActionKind::Hurdle, ActionKind::Vault, ActionKind::Mantle, ActionKind::Climb, ActionKind::Fall, ActionKind::Land];
+    pub const ALL: [ActionKind; 7] = [ActionKind::Hurdle, ActionKind::Vault, ActionKind::Mantle, ActionKind::Climb, ActionKind::Fall, ActionKind::Land, ActionKind::Jump];
 
     pub fn from_u8(v: u8) -> Option<Self> {
         Self::ALL.get(v as usize).copied()
@@ -59,6 +63,7 @@ impl ActionKind {
             ActionKind::Climb => "climb",
             ActionKind::Fall => "fall",
             ActionKind::Land => "land",
+            ActionKind::Jump => "jump",
         }
     }
 
@@ -77,21 +82,23 @@ impl ActionKind {
 pub struct ActionClip {
     pub clip: usize,
     pub kind: ActionKind,
-    /// Height of the obstacle above the clip's starting ground (for a landing: the drop).
+    /// Height of the obstacle above the clip's starting ground (for a landing: the drop, for a
+    /// jump: the apex above the take-off).
     pub height: f32,
     /// The obstacle's front ledge (on its top), in the clip's space, and the direction the clip
     /// runs into it (horizontal, unit).
     pub ledge: Vec3,
     pub forward: Vec3,
-    /// The last frame on the starting ground before the lift.
+    /// The last frame on the starting ground before the lift (for a jump: the take-off).
     pub rise: f32,
-    /// When the ledge is reached (hands on it, or the root most of the way up).
+    /// When the ledge is reached (hands on it, or the root most of the way up; for a landing:
+    /// the impact, for a jump: the apex).
     pub anchor: f32,
     /// When the root is up on the top, and (over an obstacle) when it leaves it and is back down.
     pub on_top: f32,
     pub off_top: f32,
     pub down: f32,
-    /// When motion matching can take over (for a landing: the impact).
+    /// When motion matching can take over.
     pub exit: f32,
     /// Distance the root travels on the top (over an obstacle).
     pub span: f32,
@@ -162,6 +169,25 @@ impl ActionClip {
                 }
                 let impact = (0..n).find(|&f| y[f] - end <= 0.02 && (0..f).any(|g| y[g] - end > 0.3))?;
                 return Some(ActionClip { height: top - end, anchor: impact as f32, exit: (impact as f32 + 0.5 * rate).min(last), ..empty });
+            }
+            ActionKind::Jump => {
+                // the take-off: the last frame on the ground before the root rises to its apex
+                let apex = (0..n).max_by(|&a, &b| y[a].total_cmp(&y[b]))?;
+                if y[apex] < 0.2 {
+                    return None;
+                }
+                let rise = (0..apex).rev().find(|&f| y[f] <= 0.02)?;
+                let forward = yaw_rotation(t.root[rise].1) * FORWARD;
+                let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or(FORWARD);
+                return Some(ActionClip {
+                    height: y[apex],
+                    forward,
+                    rise: rise as f32,
+                    anchor: apex as f32,
+                    on_top: apex as f32,
+                    last_entry: (rise as f32 - 2.0).max(0.0),
+                    ..empty
+                });
             }
             _ => {}
         }
@@ -464,7 +490,7 @@ pub fn plan_traversal(db: &Database, table: &[ActionClip], kind: ActionKind, obs
             if error.abs() <= rules.max_distance_error.min(rules.max_warp_speed * window) {
                 let s = c.speed_at(db, f) - speed;
                 let frame = db.clips[c.clip].start + f as usize;
-                let pose: f32 = db.features(frame)[..15].iter().zip(&here[..15]).map(|(a, b)| (a - b) * (a - b)).sum();
+                let pose = pose_distance(db.features(frame), here);
                 let cost = rules.distance_weight * error * error + rules.speed_weight * s * s + rules.pose_weight * pose;
                 if best.is_none_or(|(b, _)| cost < b) {
                     best = Some((cost, f));
@@ -484,8 +510,34 @@ pub fn plan_traversal(db: &Database, table: &[ActionClip], kind: ActionKind, obs
         .into_iter()
         .map(|(_, c, start)| (c, start, warp_onto(db, c, start, obstacle, feet, heading)))
         .find(|(c, _, warp)| c.kind.crosses() || stands(warp.root(c.exit, db.root_at(c.clip, c.exit)).0))
-        .map(|(c, start, warp)| Action { clip: c.clip, start, exit: Some(c.exit), path: RootPath::Warp(warp), tag: kind as u32 })
+        .map(|(c, start, warp)| Action { clip: c.clip, start, exit: Some(c.exit), path: RootPath::Warp(warp), collides: false, tag: kind as u32 })
         .ok_or(Refusal::NoRoom)
+}
+
+/// Squared distance between two frames' pose features (feet and hips, not the trajectory).
+fn pose_distance(a: &[f32], b: &[f32]) -> f32 {
+    a[..15].iter().zip(&b[..15]).map(|(a, b)| (a - b) * (a - b)).sum()
+}
+
+/// The jump clip and frame to start it at for a character at this speed, playing database frame
+/// `current`: the pace nearest the character's and the pose nearest the one showing, taking off
+/// within `max_delay` seconds.
+pub fn plan_jump<'a>(db: &Database, table: &'a [ActionClip], speed: f32, current: usize, rules: &TraversalRules, max_delay: f32) -> Option<(&'a ActionClip, f32)> {
+    let here = db.features(current);
+    let mut best: Option<(f32, &ActionClip, f32)> = None;
+    for c in table.iter().filter(|c| c.kind == ActionKind::Jump) {
+        let mut f = (c.rise - max_delay * db.sample_rate).max(0.0).floor();
+        while f <= c.last_entry {
+            let s = c.speed_at(db, f) - speed;
+            let pose = pose_distance(db.features(db.clips[c.clip].start + f as usize), here);
+            let cost = rules.speed_weight * s * s + rules.pose_weight * pose;
+            if best.is_none_or(|(b, _, _)| cost < b) {
+                best = Some((cost, c, f));
+            }
+            f += 1.0;
+        }
+    }
+    best.map(|(_, c, f)| (c, f))
 }
 
 /// `c`'s root motion from `start`, warped from the character at `feet` onto the obstacle.
@@ -518,13 +570,15 @@ fn warp_onto(db: &Database, c: &ActionClip, start: f32, obstacle: &Obstacle, fee
 pub enum CharacterState {
     Grounded,
     Traversing(ActionKind),
-    /// Seconds in the air.
+    /// Running up to a jump's take-off.
+    Jumping,
+    /// Seconds in the air (after a take-off or off an edge).
     Falling(f32),
     Landing,
 }
 
 /// A motion-matched character in a collision world: kept out of colliders, on its ground,
-/// falling off edges and landing, and traversing obstacles on request.
+/// falling off edges and landing, and traversing obstacles or jumping on request.
 pub struct CharacterController {
     pub matcher: MotionMatcher,
     pub actions: Vec<ActionClip>,
@@ -536,12 +590,23 @@ pub struct CharacterController {
     pub step: f32,
     pub gravity: f32,
     pub layers: u32,
+    /// Jumps: how high they go (m above the take-off; `None`: as high as the clip jumps), and
+    /// how soon after the request they may leave the ground (s).
+    pub jump_height: Option<f32>,
+    pub max_jump_delay: f32,
+    /// A fall from higher than this (m) lands with the harder landings.
+    pub heavy_fall: f32,
     state: CharacterState,
     /// The last obstacle probed and what came of it (for debug views).
     pub last_obstacle: Option<Obstacle>,
     pub last_result: Option<Result<ActionKind, Refusal>>,
     /// Seconds a `request_traverse` keeps trying while the obstacle is still out of reach.
     pending: f32,
+    /// Whether the last obstacle probed has a kind of traversal (a clip may fit once closer).
+    traversable: bool,
+    /// The jump running up to its take-off, and the highest point of this time in the air.
+    jump: Option<ActionClip>,
+    air_top: f32,
 }
 
 impl CharacterController {
@@ -556,10 +621,16 @@ impl CharacterController {
             step: 0.35,
             gravity: 9.81,
             layers: u32::MAX,
+            jump_height: None,
+            max_jump_delay: 0.4,
+            heavy_fall: 2.0,
             state: CharacterState::Grounded,
             last_obstacle: None,
             last_result: None,
             pending: 0.0,
+            traversable: false,
+            jump: None,
+            air_top: 0.0,
         }
     }
 
@@ -578,6 +649,44 @@ impl CharacterController {
         // what may change as it comes closer: the obstacle in reach, a clip that fits
         self.pending = if matches!(result, Err(Refusal::OutOfReach | Refusal::NoObstacle | Refusal::NoRoom)) { patience } else { 0.0 };
         result
+    }
+
+    /// Traverse the obstacle ahead as `request_traverse` does, or jump when there is nothing to
+    /// traverse: no obstacle, one too high or too narrow, no room on it, no clip for it.
+    pub fn request_traverse_or_jump(&mut self, db: &Database, world: &CollisionWorld, patience: f32) -> Result<ActionKind, Refusal> {
+        let result = self.request_traverse(db, world, patience);
+        let nothing_to_traverse = match result {
+            Err(Refusal::NoObstacle | Refusal::TooHigh | Refusal::TooNarrow | Refusal::NoClip) => true,
+            Err(Refusal::NoRoom) => !self.traversable,
+            _ => false,
+        };
+        if !nothing_to_traverse {
+            return result;
+        }
+        self.pending = 0.0;
+        let jumped = self.jump(db);
+        self.last_result = Some(jumped);
+        jumped
+    }
+
+    /// Jump: the jump clip whose pace and pose fit plays its run-up to the take-off; from there
+    /// the character flies ballistic, with the run-up's momentum and up at the speed that reaches
+    /// `jump_height` (else the clip's own apex), the clip and then the fall loop animating it
+    /// until it lands.
+    pub fn jump(&mut self, db: &Database) -> Result<ActionKind, Refusal> {
+        if self.state != CharacterState::Grounded {
+            return Err(Refusal::Busy);
+        }
+        let velocity = self.matcher.simulation().velocity;
+        let speed = Vec3::new(velocity.x, 0.0, velocity.z).length();
+        let (clip, start) = plan_jump(db, &self.actions, speed, self.matcher.current_frame(db), &self.rules, self.max_jump_delay).ok_or(Refusal::NoClip)?;
+        let clip = *clip;
+        let character = self.matcher.character();
+        let warp = RootWarp::identity(db.root_at(clip.clip, start), (character.translation, yaw_of(character.rotation)));
+        self.matcher.start_action(db, Action { clip: clip.clip, start, exit: None, path: RootPath::Warp(warp), collides: true, tag: ActionKind::Jump as u32 });
+        self.jump = Some(clip);
+        self.state = CharacterState::Jumping;
+        Ok(ActionKind::Jump)
     }
 
     /// Advance by `dt` under `input`.
@@ -625,7 +734,7 @@ impl CharacterController {
                     let ground = world.ground_height(c, 0.3, 4.0, layers);
                     if kind == ActionKind::Vault && ground.is_some_and(|g| (g - c.y).abs() < 0.3) {
                         self.matcher.set_ground(ground.unwrap());
-                        self.land(db);
+                        self.land(db, self.last_obstacle.map_or(0.0, |o| o.height));
                     } else if ground.is_some_and(|g| g > c.y - 0.4) {
                         self.matcher.set_ground(ground.unwrap());
                         self.state = CharacterState::Grounded;
@@ -635,17 +744,51 @@ impl CharacterController {
                     }
                 }
             }
+            CharacterState::Jumping => {
+                self.matcher.update_constrained(db, input, dt, &mut constrain);
+                let Some(clip) = self.jump else {
+                    self.matcher.stop_action();
+                    self.state = CharacterState::Grounded;
+                    return;
+                };
+                if self.matcher.playing().1 >= clip.rise {
+                    // leave the ground: the run-up's momentum, and up at the speed that reaches
+                    // the jump's height
+                    let v = self.matcher.simulation().velocity;
+                    let up = (2.0 * self.gravity * self.jump_height.unwrap_or(clip.height)).sqrt();
+                    let gravity = self.gravity;
+                    if let Some(action) = self.matcher.action_mut() {
+                        action.path = RootPath::Ballistic { velocity: Vec3::new(v.x, up, v.z), gravity };
+                    }
+                    self.jump = None;
+                    self.air_top = self.matcher.character().translation.y;
+                    self.state = CharacterState::Falling(0.0);
+                }
+            }
             CharacterState::Falling(time) => {
                 self.matcher.update_constrained(db, input, dt, &mut constrain);
+                // a jump's clip played out: on with the fall loop, at the same momentum
+                let air = self.matcher.action().and_then(|a| match a.path {
+                    RootPath::Ballistic { velocity, .. } => Some((a.clip, velocity)),
+                    RootPath::Warp(_) => None,
+                });
+                if let (Some((clip, velocity)), Some(fall)) = (air, self.first(ActionKind::Fall).copied()) {
+                    if clip != fall.clip && self.matcher.playing().1 >= (db.clips[clip].frames - 1) as f32 {
+                        self.fall_with(db, velocity);
+                    }
+                }
                 let c = self.matcher.character().translation;
+                self.air_top = self.air_top.max(c.y);
+                // lands only on the way down (not on a step it rises past)
+                let rising = air.is_some_and(|(_, v)| v.y > 0.0);
                 let ground = world.ground_height(c, 1.0, 50.0, layers);
-                if let Some(g) = ground.filter(|g| c.y <= *g) {
+                if let Some(g) = ground.filter(|g| !rising && c.y <= *g) {
                     let mut t = self.matcher.character();
                     t.translation.y = g;
                     self.matcher.place(t);
                     self.matcher.set_ground(g);
                     if time > 0.35 {
-                        self.land(db);
+                        self.land(db, self.air_top - g);
                     } else {
                         self.matcher.stop_action();
                         self.state = CharacterState::Grounded;
@@ -663,39 +806,42 @@ impl CharacterController {
         }
     }
 
+    /// Off an edge: falling with the pace it walked at.
     fn start_fall(&mut self, db: &Database) {
         let velocity = self.matcher.simulation().velocity;
-        let velocity = Vec3::new(velocity.x, 0.0, velocity.z);
-        match self.first(ActionKind::Fall).copied() {
-            Some(fall) => {
-                let action = Action { clip: fall.clip, start: 0.0, exit: None, path: RootPath::Ballistic { velocity, gravity: self.gravity }, tag: ActionKind::Fall as u32 };
-                self.matcher.start_action(db, action);
-            }
-            None => {
-                // no fall clip: fall with the pose that plays
-                let (clip, frame) = self.matcher.playing();
-                let action = Action { clip, start: frame, exit: None, path: RootPath::Ballistic { velocity, gravity: self.gravity }, tag: ActionKind::Fall as u32 };
-                self.matcher.start_action(db, action);
-            }
-        }
+        self.fall_with(db, Vec3::new(velocity.x, 0.0, velocity.z));
+        self.air_top = self.matcher.character().translation.y;
         self.state = CharacterState::Falling(0.0);
     }
 
-    fn land(&mut self, db: &Database) {
+    /// Fly on with this momentum, animated by the fall loop (without one, by the pose that plays).
+    fn fall_with(&mut self, db: &Database, velocity: Vec3) {
+        let path = RootPath::Ballistic { velocity, gravity: self.gravity };
+        let (clip, start) = match self.first(ActionKind::Fall) {
+            Some(fall) => (fall.clip, 0.0),
+            None => self.matcher.playing(),
+        };
+        self.matcher.start_action(db, Action { clip, start, exit: None, path, collides: true, tag: ActionKind::Fall as u32 });
+    }
+
+    /// Land from a fall of `drop` metres: among the harder landings (those captured falling
+    /// farther) past `heavy_fall`, else among the lighter ones, the one whose run-out pace is
+    /// nearest.
+    fn land(&mut self, db: &Database, drop: f32) {
         let speed = self.matcher.simulation().velocity.length();
         let character = self.matcher.character();
-        // the landing whose run-out pace is nearest
-        let best = self.actions.iter().filter(|c| c.kind == ActionKind::Land).min_by(|a, b| {
-            let pace = |c: &ActionClip| (c.speed_at(db, (c.anchor + 5.0).min(c.exit)) - speed).abs();
-            pace(a).total_cmp(&pace(b))
-        });
+        let lands = || self.actions.iter().filter(|c| c.kind == ActionKind::Land);
+        let (low, high) = lands().fold((f32::MAX, f32::MIN), |(l, h), c| (l.min(c.height), h.max(c.height)));
+        let heavy = drop > self.heavy_fall;
+        let pace = |c: &ActionClip| (c.speed_at(db, (c.anchor + 5.0).min(c.exit)) - speed).abs();
+        let best = lands().filter(|c| high - low < 0.1 || (c.height > (low + high) * 0.5) == heavy).min_by(|a, b| pace(a).total_cmp(&pace(b)));
         match best.copied() {
             Some(land) => {
                 let clip_root = db.root_at(land.clip, land.anchor);
                 // from the impact on, on the ground (whatever height the fall or vault ended at)
                 let on_ground = Vec3::new(character.translation.x, self.matcher.ground(), character.translation.z);
                 let warp = RootWarp::identity(clip_root, (on_ground, yaw_of(character.rotation)));
-                self.matcher.start_action(db, Action { clip: land.clip, start: land.anchor, exit: Some(land.exit), path: RootPath::Warp(warp), tag: ActionKind::Land as u32 });
+                self.matcher.start_action(db, Action { clip: land.clip, start: land.anchor, exit: Some(land.exit), path: RootPath::Warp(warp), collides: true, tag: ActionKind::Land as u32 });
                 self.state = CharacterState::Landing;
             }
             None => {
@@ -725,8 +871,10 @@ impl CharacterController {
         let reach = 1.5 + speed * 1.1;
         let obstacle = detect_obstacle(world, character.translation, direction, reach, &self.detection);
         self.last_obstacle = obstacle;
+        self.traversable = false;
         let obstacle = obstacle.ok_or(Refusal::NoObstacle)?;
         let kind = traversal_kind(world, &obstacle, character.translation, &self.rules, self.layers)?;
+        self.traversable = true;
         let stands = |feet: Vec3| stands_at(world, feet, &self.rules, self.layers);
         let action = plan_traversal(db, &self.actions, kind, &obstacle, character.translation, yaw_of(character.rotation), speed, self.matcher.current_frame(db), &self.rules, stands)?;
         self.matcher.start_action(db, action);

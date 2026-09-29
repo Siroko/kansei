@@ -49,7 +49,7 @@
 //! given) the runtime search can filter on.
 //!
 //! `actions` names the clips played on command rather than searched for, by kind (`hurdle`,
-//! `vault`, `mantle`, `climb`, `fall`, `land`): they get `ACTION_TAG` only, and
+//! `vault`, `mantle`, `climb`, `fall`, `land`, `jump`): they get `ACTION_TAG` only, and
 //! `ActionClip::analyze` reads their phases into the pack (a clip it finds nothing in is left
 //! out, with a warning). Action clips must also match `include`.
 //!
