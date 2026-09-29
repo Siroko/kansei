@@ -2,7 +2,8 @@
 
 A skinned character driven by motion matching (`kansei_core::animation::motion_matching`):
 walking, running, starting, stopping, turning and strafing under keyboard or gamepad control, on
-a ground plane with cascaded shadows and TAA.
+a ground plane with cascaded shadows and TAA, and over a course of boxes: hurdling, vaulting,
+mantling and climbing on request, falling off edges and landing.
 
 **No animation data ships with Kansei.** The page loads a motion-matching pack (`.kmm`) from
 `www/pack/locomotion.kmm`, or from the URL in `?pack=<url>`. Without one it shows how to make
@@ -26,7 +27,9 @@ that licence allows it.
 The clips should cover:
 - idle;
 - walk and run loops;
-- starts, stops, turns and pivots.
+- starts, stops, turns and pivots;
+- for the course: traversals (hurdles, vaults, mantles, climbs), a fall loop and landings, named
+  as `actions` in the bake config. Without them the course only blocks the way.
 
 Tag them `idle`, `walk` and `run` for the gait filter (see the bake config). The walk and run
 paces default to 2 and 5 m/s; set `walk=` and `run=` in the URL to match your data.
@@ -44,6 +47,28 @@ one from a glTF mesh and its textures (`character` config).
 - Its colour, normal (tangent space, +Y up) and occlusion/roughness/metallic textures are
   decoded from the pack and mipmapped on load.
 
+## The course
+
+Boxes stand around the start, some turned so you can take them at an angle:
+- low rails (0.5 to 1 m) to hurdle, and a thin wall;
+- boxes (about 1 m high, 1 m deep) to vault;
+- blocks (1.2 to 1.5 m) to mantle onto, and walls (2 and 2.4 m) to climb;
+- long narrow beams, too narrow to stand along;
+- two stacks of blocks, one on top of another: mantle onto the first, then onto the second;
+- a 0.3 m step, walked up without a traversal.
+
+Space (A) traverses what is ahead, along the way the character moves (else where it faces)
+(`motion_matching::traversal`):
+- the kind comes from the obstacle's shape: its height, its depth and whether there is room to
+  stand on it or beyond it;
+- the clip and its start frame come from the pace and the distance to the ledge, among the
+  clips that leave room where they end;
+- the clip's root motion is warped so its ledge lands on the real one, at the real height.
+
+Pressed a little early, Space waits up to a second for the obstacle to come in reach. The HUD's
+`state` line shows what the character is doing, and why the last Space was refused ("too high",
+"no room to land"…). Walking off a top falls, then lands.
+
 ## Build and run
 
 ```sh
@@ -59,7 +84,8 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 | | keyboard / mouse | gamepad |
 |---|---|---|
 | move (relative to the camera) | WASD, arrows | left stick (tilt sets the pace) |
-| run | Shift | A, right trigger |
+| run | Shift | B, right trigger |
+| traverse | Space | A |
 | strafe (face the camera's way) | Q | left bumper |
 | orbit, zoom | drag, wheel | right stick |
 | overlay (trajectory, feet, HUD) | B | |
@@ -68,8 +94,11 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 
 In the overlay:
 - blue boxes are the simulated character now and at ⅓, ⅔ and 1 s ahead;
-- the small boxes under the feet grow while a foot is planted and locked.
+- the small boxes under the feet grow while a foot is planted and locked;
+- the red bar and post mark the last ledge found, and its height.
 
 URL parameters:
 - `gait=0` searches every clip, instead of idle + walk or idle + run by tag;
-- `taa=0` turns TAA off.
+- `taa=0` turns TAA off;
+- `course=0` leaves the boxes out;
+- `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
