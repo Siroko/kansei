@@ -108,7 +108,8 @@ impl ParamOffsets {
     pub const GRAVITY_CENTER_Y: usize = 41;
     pub const GRAVITY_CENTER_Z: usize = 42;
     pub const RADIAL_GRAVITY: usize = 43;
-    pub const BUFFER_SIZE: usize = 44;
+    pub const SOLVER: usize = 44;
+    pub const BUFFER_SIZE: usize = 48;
 }
 
 /// Compute SPH kernel factors for 2D.

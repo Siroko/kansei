@@ -585,6 +585,7 @@ impl FluidSimulation {
         f[ParamOffsets::GRAVITY_CENTER_Z] = p.gravity_center[2];
         f[ParamOffsets::RADIAL_GRAVITY] = if p.radial_gravity { 1.0 } else { 0.0 };
         f[ParamOffsets::NEGATIVE_PRESSURE_SCALE] = p.negative_pressure_scale;
+        f[ParamOffsets::SOLVER] = f32::from_ne_bytes(((p.solver == FluidSolver::Pbf) as u32).to_ne_bytes());
     }
 
     pub fn particle_count(&self) -> u32 { self.particle_count }
@@ -713,7 +714,7 @@ impl PbfPasses {
             delta: pass("delta", &[spos, co, &lambdas, &deltas], &[sp, &params]),
             apply: pass("apply", &[spos, &deltas], &[sp]),
             unsort: pass("unsort", &[spos, si, pos], &[sp]),
-            velocity: pass("velocity", &[pos, &previous, vel], &[sp]),
+            velocity: pass("velocity", &[pos, &previous, vel], &[sp, &params]),
             gather: pass("gather", &[pos, vel, si, spos, svel], &[sp]),
             vorticity: pass("vorticity", &[spos, svel, co, &omega], &[sp]),
             xsph: pass("xsph", &[spos, svel, co, &omega, si, vel], &[sp, &params]),

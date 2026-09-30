@@ -29,10 +29,12 @@ pub struct PbfOptions {
     pub xsph: f32,
     /// Vorticity confinement strength.
     pub vorticity: f32,
+    /// A cap on the particles' speed (simulation units per second; 0: none).
+    pub max_speed: f32,
 }
 
 impl PbfOptions {
-    pub const DEFAULT: Self = Self { iterations: 3, rest_density: 6.4, relaxation: 5.0, scorr_k: 0.05, scorr_n: 4.0, scorr_dq: 0.2, xsph: 0.1, vorticity: 0.0 };
+    pub const DEFAULT: Self = Self { iterations: 3, rest_density: 6.4, relaxation: 5.0, scorr_k: 0.05, scorr_n: 4.0, scorr_dq: 0.2, xsph: 0.1, vorticity: 0.0, max_speed: 0.0 };
 }
 
 impl Default for PbfOptions {
@@ -52,7 +54,7 @@ pub(crate) struct GpuPbf {
     scorr_w_dq: f32,
     xsph: f32,
     vorticity: f32,
-    _pad: f32,
+    max_speed: f32,
 }
 
 impl GpuPbf {
@@ -61,7 +63,7 @@ impl GpuPbf {
         let r = o.scorr_dq.clamp(0.0, 1.0) * h;
         let q = h * h - r * r;
         let w_dq = 315.0 / (64.0 * std::f32::consts::PI * h.powi(9)) * q * q * q;
-        Self { rest_density: o.rest_density.max(1e-3), relaxation: o.relaxation.max(1e-6), scorr_k: o.scorr_k, scorr_n: o.scorr_n, scorr_w_dq: w_dq.max(1e-12), xsph: o.xsph, vorticity: o.vorticity, _pad: 0.0 }
+        Self { rest_density: o.rest_density.max(1e-3), relaxation: o.relaxation.max(1e-6), scorr_k: o.scorr_k, scorr_n: o.scorr_n, scorr_w_dq: w_dq.max(1e-12), xsph: o.xsph, vorticity: o.vorticity, max_speed: o.max_speed }
     }
 }
 
@@ -74,7 +76,7 @@ struct PbfParams {
     scorrWdq: f32,
     xsph: f32,
     vorticity: f32,
-    _pad: f32,
+    maxSpeed: f32,
 };
 "#;
 
@@ -245,19 +247,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// 6. The velocity is the move over the step.
+/// 6. The velocity is the move over the step, but a collider's (the particles a collider pushed
+/// out this substep, marked w + 2: their move is the push, not a motion), and capped.
 pub(crate) const VELOCITY_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read_write> positions: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> previous: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> velocities: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> params: SimParams;
+@group(0) @binding(4) var<uniform> pbf: PbfParams;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.particleCount) { return; }
-    let v = (positions[idx].xyz - previous[idx].xyz) / max(params.dt, 1e-6);
-    velocities[idx] = vec4<f32>(v, velocities[idx].w);
+    let v4 = velocities[idx];
+    var v = (positions[idx].xyz - previous[idx].xyz) / max(params.dt, 1e-6);
+    var w = v4.w;
+    if (w >= 1.5) {
+        v = v4.xyz;
+        w -= 2.0;
+    }
+    let speed = length(v);
+    if (pbf.maxSpeed > 0.0 && speed > pbf.maxSpeed) {
+        v *= pbf.maxSpeed / speed;
+    }
+    velocities[idx] = vec4<f32>(v, w);
 }
 "#;
 
