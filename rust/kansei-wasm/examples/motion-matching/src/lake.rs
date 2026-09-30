@@ -21,7 +21,7 @@ use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 use kansei_core::simulations::fluid::{
     DensityFieldOptions, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer,
     FluidContainerOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
-    FluidSubstepPass, MarchingCubesOptions, PlanarContainerShape, DEFAULT_OPTIONS,
+    FluidSolver, FluidSubstepPass, MarchingCubesOptions, PbfOptions, PlanarContainerShape, DEFAULT_OPTIONS,
 };
 
 use crate::{SKY, SUN, SUN_DIR};
@@ -88,6 +88,25 @@ impl SurfaceSettings {
 }
 /// Lattice spacing of the particles at the fluid clock's rest density (simulation units).
 const SPACING: f32 = 0.537;
+
+/// The density poly6 (radius `h`, unit mass) sums to at a particle of a cubic lattice `spacing`
+/// apart, itself included: Position Based Fluids' rest density for water filled that way.
+fn lattice_density(spacing: f32, h: f32) -> f32 {
+    let n = (h / spacing).ceil() as i32;
+    let poly6 = 315.0 / (64.0 * std::f32::consts::PI * h.powi(9));
+    let mut rho = 0.0;
+    for i in -n..=n {
+        for j in -n..=n {
+            for k in -n..=n {
+                let d2 = ((i * i + j * j + k * k) as f32) * spacing * spacing;
+                if d2 < h * h {
+                    rho += poly6 * (h * h - d2).powi(3);
+                }
+            }
+        }
+    }
+    rho
+}
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -356,6 +375,9 @@ impl Lake {
             // minute's splashing stranded 4% of the lake on the shore; at 0.6 and 1 it drains
             // back within 8 s)
             negative_pressure_scale: 0.6,
+            // Position Based Fluids, when chosen (the tweak panel): at rest, the density its kernel
+            // sums to on the fill's lattice, so the water keeps its volume
+            pbf: PbfOptions { rest_density: lattice_density(SPACING, 1.0), ..PbfOptions::DEFAULT },
             ..DEFAULT_OPTIONS
         }, &particles);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
@@ -477,6 +499,17 @@ impl Lake {
             "nearPressure" => p.near_pressure_multiplier = value,
             "restDensity" => p.density_target = value,
             "substeps" => p.substeps = value.round().clamp(1.0, 8.0) as u32,
+            // PBF is stable at twice the substep: half as many
+            "solver" => {
+                p.solver = if value > 0.5 { FluidSolver::Pbf } else { FluidSolver::Sph };
+                p.substeps = if p.solver == FluidSolver::Pbf { 2 } else { 4 };
+            }
+            "pbfIterations" => p.pbf.iterations = value.round().clamp(1.0, 12.0) as u32,
+            "pbfRelaxation" => p.pbf.relaxation = value,
+            "pbfScorrK" => p.pbf.scorr_k = value,
+            "pbfScorrN" => p.pbf.scorr_n = value,
+            "pbfXsph" => p.pbf.xsph = value,
+            "pbfVorticity" => p.pbf.vorticity = value,
             "timeScale" => self.time_scale = value.max(0.1),
             "drag" => self.colliders.options.drag = value,
             "splash" => self.splash_push = value,

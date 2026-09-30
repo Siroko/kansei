@@ -1,4 +1,5 @@
 use super::params::*;
+use super::pbf::{shader_sources as pbf_sources, GpuPbf};
 
 /// Cap on hash-grid cells (3 × u32 per cell → 24 MB at the cap). Large enough that the
 /// cell stays equal to the smoothing radius for the tanks we use; `fit_grid` still
@@ -32,7 +33,7 @@ struct Pass {
 }
 
 impl Pass {
-    fn dispatch<'a>(&'a self, cpass: &mut wgpu::ComputePass<'a>, wx: u32, wy: u32, wz: u32) {
+    fn dispatch(&self, cpass: &mut wgpu::ComputePass<'_>, wx: u32, wy: u32, wz: u32) {
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
         cpass.dispatch_workgroups(wx, wy, wz);
@@ -96,6 +97,8 @@ pub struct FluidSimulation {
     integrate: Option<Pass>,
     // Per-substep param buffers for batched update (avoids writeBuffer overwrite)
     substep_param_buffers: Vec<wgpu::Buffer>,
+    /// Position Based Fluids' buffers and passes, made on its first step.
+    pbf: Option<PbfPasses>,
 }
 
 impl FluidSimulation {
@@ -142,6 +145,7 @@ impl FluidSimulation {
             forces: None,
             integrate: None,
             substep_param_buffers: Vec::new(),
+            pbf: None,
         };
         sim.compute_grid_from_positions(positions);
         sim.create_buffers(positions, device);
@@ -399,12 +403,8 @@ impl FluidSimulation {
     pub fn update_batched_with(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2], extra: &[&dyn FluidSubstepPass]) {
         let device = self.device.clone().expect("FluidSimulation not initialized");
         let queue = self.queue.clone().expect("FluidSimulation not initialized");
-        let n = self.particle_count;
-        let particle_wg = ((n + 63) / 64) as u32;
-        let neighbor_wg = (n + NEIGHBOR_WG - 1) / NEIGHBOR_WG;
-        let grid_wg = ((self.total_cells + 255) / 256) as u32;
-        let prefix_wg = ((self.total_cells + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE).max(1) as u32;
         let substeps = self.params.substeps;
+        self.prepare_solver(&device, &queue);
 
         // Ensure we have per-substep param buffers
         while self.substep_param_buffers.len() < substeps as usize {
@@ -439,26 +439,7 @@ impl FluidSimulation {
 
             let stamp = crate::profiling::gpu_pass("FluidSim/Substep");
             let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("FluidSim/Substep"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
-            macro_rules! dispatch {
-                ($pass:expr, $wx:expr) => {
-                    if let Some(ref p) = $pass {
-                        p.dispatch(&mut cp, $wx, 1, 1);
-                    }
-                };
-            }
-
-            dispatch!(self.grid_clear, grid_wg);
-            dispatch!(self.grid_assign, particle_wg);
-            dispatch!(self.prefix_sum_local, prefix_wg.max(1));
-            dispatch!(self.prefix_sum_top, 1);
-            dispatch!(self.prefix_sum_distribute, prefix_wg.max(1));
-            dispatch!(self.scatter, particle_wg);
-            dispatch!(self.density, neighbor_wg);
-            dispatch!(self.forces, neighbor_wg);
-            dispatch!(self.integrate, particle_wg);
-            for pass in extra {
-                pass.dispatch(&mut cp, n);
-            }
+            self.encode_substep(&mut cp, extra);
             drop(cp);
         }
 
@@ -468,12 +449,7 @@ impl FluidSimulation {
     /// Run a single substep — pack params, dispatch all 10 compute passes, submit.
     fn update_substep(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32,
                           mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2], extra: &[&dyn FluidSubstepPass]) {
-        let n = self.particle_count;
-        let particle_wg = ((n + 63) / 64) as u32;
-        let neighbor_wg = (n + NEIGHBOR_WG - 1) / NEIGHBOR_WG;
-        let grid_wg = ((self.total_cells + 255) / 256) as u32;
-        let prefix_wg = ((self.total_cells + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE).max(1) as u32;
-
+        self.prepare_solver(device, queue);
         self.pack_params(dt, mouse_strength, mouse_pos, mouse_dir);
         if let Some(ref pb) = self.params_buffer {
             queue.write_buffer(pb, 0, bytemuck::cast_slice(&self.params_data));
@@ -481,30 +457,81 @@ impl FluidSimulation {
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FluidSim") });
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-
-        macro_rules! dispatch {
-            ($pass:expr, $wx:expr) => {
-                if let Some(ref p) = $pass {
-                    p.dispatch(&mut cp, $wx, 1, 1);
-                }
-            };
-        }
-
-        dispatch!(self.grid_clear, grid_wg);
-        dispatch!(self.grid_assign, particle_wg);
-        dispatch!(self.prefix_sum_local, prefix_wg.max(1));
-        dispatch!(self.prefix_sum_top, 1);
-        dispatch!(self.prefix_sum_distribute, prefix_wg.max(1));
-        dispatch!(self.scatter, particle_wg);
-        dispatch!(self.density, neighbor_wg);
-        dispatch!(self.forces, neighbor_wg);
-        dispatch!(self.integrate, particle_wg);
-        for pass in extra {
-            pass.dispatch(&mut cp, n);
-        }
+        self.encode_substep(&mut cp, extra);
         drop(cp);
 
         queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// The solver's resources before a step: PBF's buffers and passes on first use, and its
+    /// options.
+    fn prepare_solver(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.params.solver != FluidSolver::Pbf {
+            return;
+        }
+        if self.pbf.is_none() {
+            self.pbf = Some(PbfPasses::new(self, device));
+        }
+        let gpu = GpuPbf::new(&self.params.pbf, self.params.smoothing_radius);
+        queue.write_buffer(&self.pbf.as_ref().unwrap().params, 0, bytemuck::bytes_of(&gpu));
+    }
+
+    /// One substep's passes: the neighbour grid, then SPH (density, forces, integration) or PBF
+    /// (predict, projections, velocities), with `extra` after the integration.
+    fn encode_substep(&self, cp: &mut wgpu::ComputePass<'_>, extra: &[&dyn FluidSubstepPass]) {
+        let n = self.particle_count;
+        let particle_wg = (n + 63) / 64;
+        let neighbor_wg = (n + NEIGHBOR_WG - 1) / NEIGHBOR_WG;
+        let grid_wg = (self.total_cells + 255) / 256;
+        let prefix_wg = ((self.total_cells + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE).max(1);
+        macro_rules! dispatch {
+            ($pass:expr, $wx:expr) => {
+                if let Some(ref p) = $pass {
+                    p.dispatch(cp, $wx, 1, 1);
+                }
+            };
+        }
+        let pbf = self.pbf.as_ref().filter(|_| self.params.solver == FluidSolver::Pbf);
+        if let Some(pbf) = pbf {
+            // predict, and keep the prediction in the container and out of the colliders
+            pbf.predict.dispatch(cp, particle_wg, 1, 1);
+            for pass in extra {
+                pass.dispatch(cp, n);
+            }
+        }
+        dispatch!(self.grid_clear, grid_wg);
+        dispatch!(self.grid_assign, particle_wg);
+        dispatch!(self.prefix_sum_local, prefix_wg);
+        dispatch!(self.prefix_sum_top, 1);
+        dispatch!(self.prefix_sum_distribute, prefix_wg);
+        dispatch!(self.scatter, particle_wg);
+        match pbf {
+            None => {
+                dispatch!(self.density, neighbor_wg);
+                dispatch!(self.forces, neighbor_wg);
+                dispatch!(self.integrate, particle_wg);
+                for pass in extra {
+                    pass.dispatch(cp, n);
+                }
+            }
+            Some(pbf) => {
+                for _ in 0..self.params.pbf.iterations.max(1) {
+                    pbf.lambda.dispatch(cp, neighbor_wg, 1, 1);
+                    pbf.delta.dispatch(cp, neighbor_wg, 1, 1);
+                    pbf.apply.dispatch(cp, particle_wg, 1, 1);
+                }
+                pbf.unsort.dispatch(cp, particle_wg, 1, 1);
+                for pass in extra {
+                    pass.dispatch(cp, n);
+                }
+                pbf.velocity.dispatch(cp, particle_wg, 1, 1);
+                pbf.gather.dispatch(cp, particle_wg, 1, 1);
+                if self.params.pbf.vorticity > 0.0 {
+                    pbf.vorticity.dispatch(cp, neighbor_wg, 1, 1);
+                }
+                pbf.xsph.dispatch(cp, neighbor_wg, 1, 1);
+            }
+        }
     }
 
     fn pack_params(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
@@ -632,7 +659,65 @@ impl FluidSimulation {
         let nb = ((tc + PREFIX_SUM_BLOCK_SIZE as usize - 1) / PREFIX_SUM_BLOCK_SIZE as usize).max(1);
         self.block_sums_buffer = Some(mk("BlockSums", nb));
 
-        // Recreate compute passes with new buffers
+        // Recreate compute passes with new buffers (PBF's too, on its next step)
         self.create_passes(&device);
+        self.pbf = None;
+    }
+}
+
+/// Position Based Fluids' buffers and passes on a simulation's buffers (see `pbf`).
+pub(crate) struct PbfPasses {
+    params: wgpu::Buffer,
+    predict: Pass,
+    lambda: Pass,
+    delta: Pass,
+    apply: Pass,
+    unsort: Pass,
+    velocity: Pass,
+    gather: Pass,
+    vorticity: Pass,
+    xsph: Pass,
+}
+
+impl PbfPasses {
+    fn new(sim: &FluidSimulation, device: &wgpu::Device) -> Self {
+        let n = sim.particle_count.max(1) as u64;
+        let mk = |label: &str, size: u64| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let previous = mk("FluidSim/PBF/Previous", n * 16);
+        let lambdas = mk("FluidSim/PBF/Lambdas", n * 4);
+        let deltas = mk("FluidSim/PBF/Deltas", n * 16);
+        let omega = mk("FluidSim/PBF/Omega", n * 16);
+        let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("FluidSim/PBF/Params"), size: std::mem::size_of::<GpuPbf>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let sources: std::collections::HashMap<&str, String> = pbf_sources(SIM_PARAMS_WGSL, NEIGHBOR_WG).into_iter().collect();
+        let pos = sim.positions_buffer.as_ref().unwrap();
+        let vel = sim.velocities_buffer.as_ref().unwrap();
+        let spos = sim.sorted_positions_buffer.as_ref().unwrap();
+        let svel = sim.sorted_velocities_buffer.as_ref().unwrap();
+        let co = sim.cell_offsets_buffer.as_ref().unwrap();
+        let si = sim.sorted_indices_buffer.as_ref().unwrap();
+        let sp = sim.params_buffer.as_ref().unwrap();
+        // storage buffers (read-write) then uniforms, bound in order
+        let pass = |name: &str, storage: &[&wgpu::Buffer], uniforms: &[&wgpu::Buffer]| -> Pass {
+            let mut entries = Vec::new();
+            let mut bind = Vec::new();
+            for (k, b) in storage.iter().chain(uniforms).enumerate() {
+                let ty = if k < storage.len() { wgpu::BufferBindingType::Storage { read_only: false } } else { wgpu::BufferBindingType::Uniform };
+                entries.push(wgpu::BindGroupLayoutEntry { binding: k as u32, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None });
+                bind.push(wgpu::BindGroupEntry { binding: k as u32, resource: b.as_entire_binding() });
+            }
+            FluidSimulation::make_pass(device, &format!("FluidSim/PBF/{name}"), &sources[name], &entries, bind)
+        };
+        Self {
+            predict: pass("predict", &[pos, vel, &previous], &[sp]),
+            lambda: pass("lambda", &[spos, co, &lambdas], &[sp, &params]),
+            delta: pass("delta", &[spos, co, &lambdas, &deltas], &[sp, &params]),
+            apply: pass("apply", &[spos, &deltas], &[sp]),
+            unsort: pass("unsort", &[spos, si, pos], &[sp]),
+            velocity: pass("velocity", &[pos, &previous, vel], &[sp]),
+            gather: pass("gather", &[pos, vel, si, spos, svel], &[sp]),
+            vorticity: pass("vorticity", &[spos, svel, co, &omega], &[sp]),
+            xsph: pass("xsph", &[spos, svel, co, &omega, si, vel], &[sp, &params]),
+            params,
+        }
     }
 }

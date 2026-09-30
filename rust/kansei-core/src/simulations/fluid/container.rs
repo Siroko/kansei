@@ -229,12 +229,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // floor: up onto it, and off its slope
+    // floor: out along its normal (not straight up: on a slope that would undo every move down
+    // it, and a position-based solver, whose velocity is the move, would never slide), and off
+    // its slope
     let floor_y = sample_field(pos.xz).y + container.margin;
     if (pos.y < floor_y) {
         let g = gradient(pos.xz);
         let n = normalize(vec3<f32>(-g[0].y, 1.0, -g[1].y));
-        pos.y = floor_y;
+        pos += n * ((floor_y - pos.y) * n.y);
+        pos.y = max(pos.y, sample_field(pos.xz).y + container.margin * 0.5);
         vel = collide(vel, n);
     }
 
