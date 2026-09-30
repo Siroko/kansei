@@ -576,7 +576,7 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
     // ── Density field + surface renderer (for raymarch mode) ──
     let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max,
-        DensityFieldOptions { resolution: 128, kernel_scale: tuning.kernel_scale }); // max-axis cells; ~0.55 units/cell on the 70-tall tank (192/256 looked the same)
+        DensityFieldOptions { resolution: 128, kernel_scale: tuning.kernel_scale, ..Default::default() }); // max-axis cells; ~0.55 units/cell on the 70-tall tank (192/256 looked the same)
     let surface_renderer = FluidSurfaceRenderer::new(&renderer);
 
     // ── Marching cubes (compute only — render via standard Renderable) ──

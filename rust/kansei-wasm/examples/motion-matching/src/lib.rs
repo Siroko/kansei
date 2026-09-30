@@ -26,10 +26,15 @@
 //! trigger runs, the left bumper toggles strafing. Keys B, K, M, L and C toggle the trajectory
 //! overlay and HUD, the skeleton, the mesh, foot locking and the character.
 //!
+//! A small lake lies east of the course (`lake`): SPH water in a container shaped like the lake,
+//! which the character wades into, its legs pushing the water (wakes, splashes and ripples).
+//!
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
-//! paces; sideways and backward scale with them), `course=0` (no boxes), `at=<x>,<z>,<heading
-//! in degrees>` (where the character starts).
+//! paces; sideways and backward scale with them), `course=0` (no boxes), `lake=0` (no lake),
+//! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake).
+
+mod lake;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -56,7 +61,7 @@ use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, Shade
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
-    effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, FluidSurfaceEffect, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
     PostProcessingEffect, PostProcessingVolume,
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -472,12 +477,10 @@ struct Body {
     palette: BonePalette,
     index: usize,
     display: Option<(Skeleton, Retarget)>,
-    source: String,
 }
 
 /// A character pack as a body: its textured mesh, hidden until shown.
 fn hero_body(renderer: &Renderer, scene: &mut Scene, pack: CharacterPack, db: &Database) -> Result<Body, String> {
-    let source = format!("{}\n{}", pack.meta("source").unwrap_or("(no source noted)"), pack.meta("license").unwrap_or("(no licence noted)"));
     let retarget = Retarget::new(&db.skeleton, &pack.skeleton, &Retarget::UNREAL_KEEP);
     let texture = |name: &str, srgb: bool, fallback: [u8; 4]| -> Result<GpuTexture, String> {
         let image = match pack.image(name) {
@@ -519,7 +522,7 @@ fn hero_body(renderer: &Renderer, scene: &mut Scene, pack: CharacterPack, db: &D
     r.visible = false;
     let index = scene.add(SceneNode::Renderable(r));
     log::info!("character pack: {} joints, {} vertices, {} triangles", pack.skeleton.len(), mesh.vertices.len(), mesh.indices.len() / 3);
-    Ok(Body { name: "hero", mesh, palette, index, display: Some((pack.skeleton, retarget)), source })
+    Ok(Body { name: "hero", mesh, palette, index, display: Some((pack.skeleton, retarget)) })
 }
 
 /// The character: its database, matcher, bodies, and the debug markers.
@@ -536,13 +539,11 @@ struct Character {
     /// gait tags or `gait=0`).
     walk_tags: u32,
     run_tags: u32,
-    source: String,
 }
 
 impl Character {
     fn new(renderer: &Renderer, scene: &mut Scene, pack: MotionPack, hero: Option<CharacterPack>, gait: bool) -> Result<Self, String> {
         let tags: Vec<String> = pack.meta("tags").unwrap_or("").split(',').map(str::to_string).collect();
-        let source = format!("{}\n{}", pack.meta("source").unwrap_or("(no source noted)"), pack.meta("license").unwrap_or("(no licence noted)"));
         let MotionPack { database: db, meshes, actions, .. } = pack;
         // the pack's own mesh, when it has one (a pack may ship without, for a character pack's body)
         let mut bodies = Vec::new();
@@ -559,7 +560,7 @@ impl Character {
             let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
             r.dynamic = true;
             let index = scene.add(SceneNode::Renderable(r));
-            bodies.push(Body { name: "mannequin", mesh, palette, index, display: None, source: source.clone() });
+            bodies.push(Body { name: "mannequin", mesh, palette, index, display: None });
         }
         if let Some(pack) = hero {
             match hero_body(renderer, scene, pack, &db) {
@@ -583,7 +584,7 @@ impl Character {
         let controller = CharacterController::new(matcher, actions);
         let ledge = Markers::new(renderer, scene, "Ledge", 2, [3000.0, 400.0, 200.0], true);
         log::info!("motion pack: {} clips, {} frames, {} joints", db.clips.len(), db.frame_count(), db.joint_count());
-        Ok(Self { db, controller, bodies, ledge, showing: 0, bones, trajectory, walk_tags, run_tags, source })
+        Ok(Self { db, controller, bodies, ledge, showing: 0, bones, trajectory, walk_tags, run_tags })
     }
 
     /// Show body `which` (its mesh, the pose on its skeleton).
@@ -603,6 +604,25 @@ impl Character {
     fn joint(&self, j: usize) -> usize {
         self.controller.matcher.output_skeleton(&self.db).find(&self.db.skeleton.names[j]).unwrap_or(0)
     }
+
+    /// The legs as capsules (world ends, radius): each thigh, shin and foot (hip to knee to ankle
+    /// to toe, up the foot's parents and down to its first child), and the hips.
+    fn leg_capsules(&self) -> Vec<(GVec3, GVec3, f32)> {
+        let matcher = &self.controller.matcher;
+        let (character, model, skeleton) = (matcher.character(), matcher.model(), matcher.output_skeleton(&self.db));
+        let at = |j: usize| character.transform_point(model[j].translation);
+        let mut legs = Vec::new();
+        for side in 0..2 {
+            let foot = self.joint(self.db.roles.feet[side]);
+            let Some(knee) = skeleton.parents[foot] else { continue };
+            let Some(hip) = skeleton.parents[knee] else { continue };
+            let toe = skeleton.parents.iter().position(|p| *p == Some(foot)).map_or(at(foot) + character.rotation * GVec3::Z * 0.15, at);
+            legs.extend([(at(hip), at(knee), 0.085), (at(knee), at(foot), 0.06), (at(foot), toe, 0.05)]);
+        }
+        let hips = at(self.joint(self.db.roles.hips));
+        legs.push((hips, hips, 0.14));
+        legs
+    }
 }
 
 /// Keys held and pressed since last frame, from the page's key events.
@@ -620,6 +640,7 @@ struct State {
     controls: CameraControls,
     volume: PostProcessingVolume,
     character: Option<Character>,
+    lake: Option<lake::Lake>,
     keys: Rc<RefCell<Keys>>,
     last: f64,
     frame: u32,
@@ -634,6 +655,12 @@ struct State {
     switches: u32,
     counted_since: f64,
     rates: (f32, f32),
+    /// Whether the character was in the air last frame, and the fastest it has fallen since
+    /// (m/s); its height last frame.
+    air: (bool, f32),
+    last_y: f32,
+    /// `profile=1`: when the profile was last logged (0: not profiling).
+    profile_since: f64,
 }
 
 /// Left stick, right stick, and the pressed state of each button of the first connected gamepad.
@@ -781,7 +808,7 @@ impl State {
                 for (side, locked) in c.controller.matcher.feet_locked().iter().enumerate() {
                     let p = character.transform_point(model[c.joint(c.db.roles.feet[side])].translation);
                     let size = if *locked { 0.09 } else { 0.04 };
-                    c.trajectory.matrices[k] = Mat4::from_scale_rotation_translation(GVec3::splat(size), Quat::IDENTITY, GVec3::new(p.x, 0.02, p.z));
+                    c.trajectory.matrices[k] = Mat4::from_scale_rotation_translation(GVec3::splat(size), Quat::IDENTITY, GVec3::new(p.x, character.translation.y + 0.02, p.z));
                     k += 1;
                 }
             } else {
@@ -799,6 +826,27 @@ impl State {
                     }
                 }
                 c.bones.upload(&self.renderer);
+            }
+        }
+        if let Some(lake) = &mut self.lake {
+            let legs = self.character.as_ref().map(Character::leg_capsules).unwrap_or_default();
+            // a landing: back on its feet after being in the air, at the fastest it came down
+            let mut landing = None;
+            if let Some(c) = &self.character {
+                let y = c.controller.matcher.character().translation.y;
+                let airborne = matches!(c.controller.state(), CharacterState::Jumping | CharacterState::Falling(_));
+                let (was, fall) = &mut self.air;
+                if airborne {
+                    *fall = fall.max((self.last_y - y) / dt);
+                } else if *was {
+                    landing = Some((c.controller.matcher.character().translation, *fall));
+                    *fall = 0.0;
+                }
+                *was = airborne;
+                self.last_y = y;
+            }
+            if let Some(surface) = self.volume.effects.get_mut(lake.effect).and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
+                lake.update(surface, &legs, landing, dt);
             }
         }
         self.controls.update(&mut self.camera, dt);
@@ -850,7 +898,11 @@ impl State {
                                 None => String::new(),
                             }
                         ),
-                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.bodies[c.showing].display.is_some() { c.bodies[c.showing].source.as_str() } else { "" }),
+                        format_args!(
+                            "{}character: {} (C to switch)",
+                            self.lake.as_ref().map_or(String::new(), |l| format!("lake   {} particles, east of the course (at=14,-1,90), P tweaks\n", l.particles())),
+                            c.bodies[c.showing].name,
+                        ),
                     ));
                 }
                 Some(_) => set_hud(""),
@@ -859,6 +911,10 @@ impl State {
         }
 
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
+        if self.profile_since > 0.0 && now - self.profile_since > 3.0 {
+            self.profile_since = now;
+            log::info!("profile ({:.1} ms/frame)\n{}", 1000.0 / self.fps, self.renderer.take_profile().report());
+        }
     }
 }
 
@@ -890,7 +946,10 @@ where
     let mut scene = Scene::new();
     // the floor and the course, for collision
     let mut world = CollisionWorld::new();
-    world.add_box(Obb::from_min_max(GVec3::new(-200.0, -1.0, -200.0), GVec3::new(200.0, 0.0, 200.0)));
+    let with_lake = query_param("lake").as_deref() != Some("0");
+    if !with_lake {
+        world.add_box(Obb::from_min_max(GVec3::new(-200.0, -1.0, -200.0), GVec3::new(200.0, 0.0, 200.0)));
+    }
     if query_param("course").as_deref() != Some("0") {
         build_course(&mut scene, &mut world);
     }
@@ -901,10 +960,16 @@ where
     scene.add(SceneNode::Renderable(sky));
     let mut ground_material = Material::new("Ground", &format!("{CASCADED_SHADOWS_WGSL}\n{GROUND_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
     ground_material.set_uniform_bindable(0, "Ground", &surface_params([0.32, 0.32, 0.3]));
-    let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
-    ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
-    ground.cast_shadow = false;
-    scene.add(SceneNode::Renderable(ground));
+    // with the lake, the ground has a hole the lake's terrain fills
+    let lake = if with_lake {
+        Some(lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0))
+    } else {
+        let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
+        ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
+        ground.cast_shadow = false;
+        scene.add(SceneNode::Renderable(ground));
+        None
+    };
     let mut sun = DirectionalLight::new(Vec3::new(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]), Vec3::new(1.0, 0.9, 0.75), 80000.0);
     sun.cast_shadow = true;
     scene.add(SceneNode::Light(Light::Directional(sun)));
@@ -968,11 +1033,19 @@ where
         ToneMapEffect::new(o)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
+    // the water's refraction and reflection come first, on the lit scene (the lake's `effect` 0)
+    let lake = lake.map(|(lake, surface)| {
+        effects.push(Box::new(surface));
+        lake
+    });
     if query_param("taa").as_deref() != Some("0") {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
+    if let Some(surface) = lake.as_ref().and_then(|l| volume.effects[l.effect].as_any().downcast_ref::<FluidSurfaceEffect>()) {
+        lake::Lake::add_surface(&mut scene, surface);
+    }
     let mut camera = Camera::new(45.0, 0.1, 1200.0, width as f32 / height as f32);
     camera.update_projection_matrix();
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
@@ -1020,6 +1093,7 @@ where
         controls,
         volume,
         character,
+        lake,
         keys,
         last: now_secs(),
         frame: 0,
@@ -1032,7 +1106,16 @@ where
         switches: 0,
         counted_since: now_secs(),
         rates: (0.0, 0.0),
+        profile_since: 0.0,
+        air: (false, 0.0),
+        last_y: 0.0,
     }));
+    if query_param("profile").as_deref() == Some("1") {
+        let mut s = state.borrow_mut();
+        s.renderer.set_profiling(true);
+        s.profile_since = now_secs();
+    }
+    STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
@@ -1041,4 +1124,122 @@ where
     }));
     request_animation_frame(g.borrow().as_ref().unwrap());
     Ok(())
+}
+
+thread_local! {
+    /// The page's state, for the exports the tweak panel calls between frames.
+    static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` on the lake, its surface effect and the renderer, when there is a lake.
+fn with_lake<R>(f: impl FnOnce(&mut lake::Lake, &mut FluidSurfaceEffect, &Renderer) -> R) -> Option<R> {
+    STATE.with(|s| {
+        let state = s.borrow().clone()?;
+        let mut state = state.borrow_mut();
+        let State { lake, volume, renderer, .. } = &mut *state;
+        let lake = lake.as_mut()?;
+        let surface = volume.effects.get_mut(lake.effect)?.as_any_mut().downcast_mut::<FluidSurfaceEffect>()?;
+        Some(f(lake, surface, renderer))
+    })
+}
+
+fn surface_js(s: lake::SurfaceSettings) -> JsValue {
+    let o = js_sys::Object::new();
+    let set = |k: &str, v: JsValue| {
+        let _ = js_sys::Reflect::set(&o, &k.into(), &v);
+    };
+    set("surfaceField", s.surface_field.into());
+    set("resolution", s.resolution.into());
+    set("kernel", s.kernel.into());
+    set("particleRadius", s.particle_radius.into());
+    set("iso", s.iso.into());
+    set("interpolate", s.interpolate.into());
+    o.into()
+}
+
+/// The lake's current settings, for the tweak panel: the simulation's and the surface's.
+#[wasm_bindgen]
+pub fn lake_settings() -> JsValue {
+    with_lake(|lake, surface, _| {
+        let p = &surface.sim.params;
+        let o: js_sys::Object = surface_js(lake.surface_settings()).into();
+        for (k, v) in [
+            ("viscosity", p.viscosity),
+            ("negativePressure", p.negative_pressure_scale),
+            ("pressure", p.pressure_multiplier),
+            ("nearPressure", p.near_pressure_multiplier),
+            ("restDensity", p.density_target),
+            ("substeps", p.substeps as f32),
+            ("timeScale", lake.time_scale),
+            ("drag", lake.drag()),
+            ("splash", lake.splash_push),
+            ("friction", lake.friction()),
+        ] {
+            let _ = js_sys::Reflect::set(&o, &k.into(), &v.into());
+        }
+        o.into()
+    })
+    .unwrap_or(JsValue::NULL)
+}
+
+/// Set one of the lake's simulation settings by name (see `lake::Lake::set`).
+#[wasm_bindgen]
+pub fn lake_set(key: &str, value: f32) -> bool {
+    with_lake(|lake, surface, _| lake.set(surface, key, value)).unwrap_or(false)
+}
+
+/// Put the lake's water back as it started.
+#[wasm_bindgen]
+pub fn lake_reset() {
+    with_lake(|lake, surface, _| lake.reset(surface));
+}
+
+/// Extract the lake's surface with these settings.
+#[wasm_bindgen]
+pub fn lake_surface(surface_field: bool, resolution: u32, kernel: f32, particle_radius: f32, iso: f32, interpolate: bool) {
+    let settings = lake::SurfaceSettings { surface_field, resolution: resolution.clamp(32, 384), kernel: kernel.max(0.5), particle_radius, iso, interpolate };
+    with_lake(|lake, surface, renderer| lake.set_surface(renderer, surface, settings));
+}
+
+/// Apply a surface preset ("droplets", "smooth" or "performance") and return its settings.
+#[wasm_bindgen]
+pub fn lake_surface_preset(name: &str) -> JsValue {
+    let settings = match name {
+        "smooth" => lake::SurfaceSettings::SMOOTH,
+        "performance" => lake::SurfaceSettings::PERFORMANCE,
+        _ => lake::SurfaceSettings::DROPLETS,
+    };
+    with_lake(|lake, surface, renderer| lake.set_surface(renderer, surface, settings));
+    surface_js(settings)
+}
+
+/// Debugging the lake: its particles by region, read back from the GPU ("lake n (y) · bank ·
+/// wall band · outside").
+#[wasm_bindgen]
+pub async fn lake_regions() -> JsValue {
+    let Some((buffer, device, queue)) = with_lake(|_, surface, renderer| (surface.sim.positions_buffer().cloned(), renderer.device().clone(), renderer.queue().clone())) else { return JsValue::NULL };
+    let Some(buffer) = buffer else { return JsValue::NULL };
+    let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Lake/Readback"), size: buffer.size(), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(&buffer, 0, &staging, 0, buffer.size());
+    queue.submit(Some(encoder.finish()));
+    let (tx, rx) = (Rc::new(RefCell::new(None::<js_sys::Function>)), ());
+    let _ = rx;
+    let promise = {
+        let tx = tx.clone();
+        js_sys::Promise::new(&mut move |resolve, _| *tx.borrow_mut() = Some(resolve))
+    };
+    staging.slice(..).map_async(wgpu::MapMode::Read, move |_| {
+        if let Some(resolve) = tx.borrow_mut().take() {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    let positions: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    staging.unmap();
+    with_lake(|lake, _, _| {
+        let r = lake.regions(&positions);
+        JsValue::from_str(&format!("lake {} ({:.3}) · bank {} ({:.3}) · wall band {} ({:.3}) · outside {} ({:.3})", r[0].0, r[0].1, r[1].0, r[1].1, r[2].0, r[2].1, r[3].0, r[3].1))
+    })
+    .unwrap_or(JsValue::NULL)
 }

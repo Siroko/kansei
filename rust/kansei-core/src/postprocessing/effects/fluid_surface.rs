@@ -20,6 +20,12 @@ pub struct FluidSurfaceOptions {
     pub light_direction: [f32; 3],
     pub light_intensity: f32,
     pub light_color: [f32; 3],
+    /// Strength of the rim glow at grazing angles, tinted by the key light.
+    pub rim: f32,
+    /// The sky's colour, reflected where the reflected view ray points up (open water under the
+    /// sky), mixed in by `sky_reflection` (0: screen-space reflection only).
+    pub sky_color: [f32; 3],
+    pub sky_reflection: f32,
 }
 
 impl Default for FluidSurfaceOptions {
@@ -31,6 +37,9 @@ impl Default for FluidSurfaceOptions {
             light_direction: [0.3, -1.0, 0.5],
             light_intensity: 2.0,
             light_color: [1.0, 1.0, 1.0],
+            rim: 0.15,
+            sky_color: [1.0, 1.0, 1.0],
+            sky_reflection: 0.0,
         }
     }
 }
@@ -49,7 +58,8 @@ struct CompositeParams {
     screen_width: f32,
     screen_height: f32,
     light_dir: [f32; 4],   // xyz = direction light travels (world), w = intensity
-    light_color: [f32; 4],
+    light_color: [f32; 4], // rgb, w = rim strength
+    sky: [f32; 4],         // rgb, w = sky reflection
 }
 
 const COMPOSITE_SHADER: &str = r#"
@@ -65,7 +75,8 @@ struct Params {
     screen_width: f32,
     screen_height: f32,
     light_dir: vec4<f32>,   // xyz = direction light travels (world), w = intensity
-    light_color: vec4<f32>,
+    light_color: vec4<f32>, // rgb, w = rim strength
+    sky: vec4<f32>,         // rgb, w = sky reflection
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -73,6 +84,15 @@ struct Params {
 @group(0) @binding(2) var background_tex: texture_2d<f32>; // opaque scene before MC
 @group(0) @binding(3) var normal_tex: texture_2d<f32>;     // GBuffer normals
 @group(0) @binding(4) var output_tex: texture_storage_2d<rgba16float, write>;
+
+// A refracted sample, where the fluid covers it: elsewhere the texel shows something in front of
+// the surface (a body standing out of the water), which must not appear through it, and the
+// pixel's own texel stands in.
+fn refracted_texel(uv: vec2<f32>, own: vec2u, dims: vec2<f32>) -> vec3<f32> {
+    let texel = min(vec2u(dims * uv), vec2u(dims) - vec2u(1u));
+    let covered = length(textureLoad(normal_tex, texel, 0).rgb) >= 0.01;
+    return textureLoad(background_tex, select(own, texel, covered), 0).rgb;
+}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -114,9 +134,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let uv_g = clamp(screen_uv + offset, vec2<f32>(0.0), vec2<f32>(1.0));
     let uv_b = clamp(screen_uv + offset * (1.0 - ca), vec2<f32>(0.0), vec2<f32>(1.0));
 
-    let bg_r = textureLoad(background_tex, vec2u(dims_f * uv_r), 0).r;
-    let bg_g = textureLoad(background_tex, vec2u(dims_f * uv_g), 0).g;
-    let bg_b = textureLoad(background_tex, vec2u(dims_f * uv_b), 0).b;
+    let bg_r = refracted_texel(uv_r, coord, dims_f).r;
+    let bg_g = refracted_texel(uv_g, coord, dims_f).g;
+    let bg_b = refracted_texel(uv_b, coord, dims_f).b;
     var refracted = vec3<f32>(bg_r, bg_g, bg_b);
 
     // Tint refracted light by fluid color (absorption)
@@ -132,7 +152,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let reflect_dir = reflect(vec3<f32>(0.0, 0.0, -1.0), N_view);
     let reflect_offset = reflect_dir.xy * 0.3;
     let reflect_uv = clamp(screen_uv + reflect_offset, vec2<f32>(0.0), vec2<f32>(1.0));
-    let reflected = textureLoad(background_tex, vec2u(dims_f * reflect_uv), 0).rgb;
+    var reflected = textureLoad(background_tex, vec2u(dims_f * reflect_uv), 0).rgb;
+    // Open sky where the reflected ray points up in the world (view to world: the transpose)
+    let up = (transpose(view3) * reflect_dir).y;
+    reflected = mix(reflected, params.sky.rgb, params.sky.w * smoothstep(0.0, 0.15, up));
 
     // Key-light GGX specular (view space: V = (0,0,1)).
     let L = normalize(view3 * normalize(-params.light_dir.xyz));
@@ -150,7 +173,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let specular = fresnel * D * G * ndotl * light_rgb * 0.5;
 
     // Rim light for edge glow, tinted by the key light
-    let rim = pow(1.0 - ndotv, 3.0) * 0.15 * params.light_color.rgb * (0.5 + 0.25 * params.light_dir.w);
+    let rim = pow(1.0 - ndotv, 3.0) * params.light_color.w * params.light_color.rgb * (0.5 + 0.25 * params.light_dir.w);
 
     // Final: mix refracted (transmitted) and reflected (environment) via Fresnel, + specular + rim
     let result = mix(refracted, reflected, fresnel) + specular + rim;
@@ -302,7 +325,11 @@ impl PostProcessingEffect for FluidSurfaceEffect {
             ],
             light_color: [
                 self.options.light_color[0], self.options.light_color[1],
-                self.options.light_color[2], 1.0,
+                self.options.light_color[2], self.options.rim,
+            ],
+            sky: [
+                self.options.sky_color[0], self.options.sky_color[1],
+                self.options.sky_color[2], self.options.sky_reflection,
             ],
         };
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(&params));
@@ -345,4 +372,20 @@ impl PostProcessingEffect for FluidSurfaceEffect {
 
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shader_validates_and_the_params_layout_matches() {
+        let module = naga::front::wgsl::parse_str(COMPOSITE_SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(COMPOSITE_SHADER)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
+        let span = module.types.iter().find_map(|(_, t)| match (&t.name, &t.inner) {
+            (Some(n), naga::TypeInner::Struct { span, .. }) if n == "Params" => Some(*span as usize),
+            _ => None,
+        });
+        assert_eq!(span, Some(std::mem::size_of::<CompositeParams>()));
+    }
 }

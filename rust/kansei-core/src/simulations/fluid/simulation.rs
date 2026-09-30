@@ -9,7 +9,7 @@ const PREFIX_SUM_BLOCK_SIZE: u32 = 512;
 /// WGSL as `__NEIGHBOR_WG__` so the dispatch count and the shader cannot disagree.
 const NEIGHBOR_WG: u32 = 64;
 
-const SIM_PARAMS_WGSL: &str = include_str!("shaders/sim-params.wgsl");
+pub(crate) const SIM_PARAMS_WGSL: &str = include_str!("shaders/sim-params.wgsl");
 const GRID_CLEAR_WGSL: &str = include_str!("shaders/grid-clear.wgsl");
 const GRID_ASSIGN_WGSL: &str = include_str!("shaders/grid-assign.wgsl");
 const PREFIX_SUM_LOCAL_WGSL: &str = include_str!("shaders/prefix-sum-local.wgsl");
@@ -37,6 +37,14 @@ impl Pass {
         cpass.set_bind_group(0, &self.bind_group, &[]);
         cpass.dispatch_workgroups(wx, wy, wz);
     }
+}
+
+/// A compute pass run after each substep's integration, in the same compute pass as the solver:
+/// it corrects the particles' positions and velocities (a container's walls, moving colliders).
+/// Implementors bind the simulation's positions, velocities and `SimParams` (which carry the
+/// substep's `dt` and the particle count) with [`FluidSimulation::substep_pipeline`].
+pub trait FluidSubstepPass {
+    fn dispatch(&self, pass: &mut wgpu::ComputePass<'_>, particle_count: u32);
 }
 
 /// SPH fluid simulation — 10 compute passes per substep.
@@ -368,16 +376,27 @@ impl FluidSimulation {
 
     /// Pack params and dispatch all substeps — one submit per substep.
     pub fn update(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+        self.update_with(dt, mouse_strength, mouse_pos, mouse_dir, &[]);
+    }
+
+    /// [`update`](Self::update), running `extra` after each substep's integration, in order.
+    pub fn update_with(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2], extra: &[&dyn FluidSubstepPass]) {
         let device = self.device.clone().expect("FluidSimulation not initialized");
         let queue = self.queue.clone().expect("FluidSimulation not initialized");
         for _s in 0..self.params.substeps {
-            self.update_substep(&device, &queue, dt, mouse_strength, mouse_pos, mouse_dir);
+            self.update_substep(&device, &queue, dt, mouse_strength, mouse_pos, mouse_dir, extra);
         }
     }
 
     /// Pack params and dispatch all substeps in a SINGLE queue.submit().
     /// Uses per-substep param buffers to avoid writeBuffer overwrite (see MEMORY.md).
     pub fn update_batched(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+        self.update_batched_with(dt, mouse_strength, mouse_pos, mouse_dir, &[]);
+    }
+
+    /// [`update_batched`](Self::update_batched), running `extra` after each substep's
+    /// integration, in order.
+    pub fn update_batched_with(&mut self, dt: f32, mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2], extra: &[&dyn FluidSubstepPass]) {
         let device = self.device.clone().expect("FluidSimulation not initialized");
         let queue = self.queue.clone().expect("FluidSimulation not initialized");
         let n = self.particle_count;
@@ -418,7 +437,8 @@ impl FluidSimulation {
                 );
             }
 
-            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            let stamp = crate::profiling::gpu_pass("FluidSim/Substep");
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("FluidSim/Substep"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
             macro_rules! dispatch {
                 ($pass:expr, $wx:expr) => {
                     if let Some(ref p) = $pass {
@@ -436,6 +456,9 @@ impl FluidSimulation {
             dispatch!(self.density, neighbor_wg);
             dispatch!(self.forces, neighbor_wg);
             dispatch!(self.integrate, particle_wg);
+            for pass in extra {
+                pass.dispatch(&mut cp, n);
+            }
             drop(cp);
         }
 
@@ -444,7 +467,7 @@ impl FluidSimulation {
 
     /// Run a single substep — pack params, dispatch all 10 compute passes, submit.
     fn update_substep(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32,
-                          mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2]) {
+                          mouse_strength: f32, mouse_pos: [f32; 2], mouse_dir: [f32; 2], extra: &[&dyn FluidSubstepPass]) {
         let n = self.particle_count;
         let particle_wg = ((n + 63) / 64) as u32;
         let neighbor_wg = (n + NEIGHBOR_WG - 1) / NEIGHBOR_WG;
@@ -476,6 +499,9 @@ impl FluidSimulation {
         dispatch!(self.density, neighbor_wg);
         dispatch!(self.forces, neighbor_wg);
         dispatch!(self.integrate, particle_wg);
+        for pass in extra {
+            pass.dispatch(&mut cp, n);
+        }
         drop(cp);
 
         queue.submit(std::iter::once(encoder.finish()));
@@ -531,9 +557,40 @@ impl FluidSimulation {
         f[ParamOffsets::GRAVITY_CENTER_Y] = p.gravity_center[1];
         f[ParamOffsets::GRAVITY_CENTER_Z] = p.gravity_center[2];
         f[ParamOffsets::RADIAL_GRAVITY] = if p.radial_gravity { 1.0 } else { 0.0 };
+        f[ParamOffsets::NEGATIVE_PRESSURE_SCALE] = p.negative_pressure_scale;
     }
 
     pub fn particle_count(&self) -> u32 { self.particle_count }
+
+    /// The device and queue the simulation runs on.
+    pub fn gpu(&self) -> (&wgpu::Device, &wgpu::Queue) {
+        (self.device.as_ref().expect("FluidSimulation not initialized"), self.queue.as_ref().expect("FluidSimulation not initialized"))
+    }
+
+    /// A compute pipeline for a [`FluidSubstepPass`] (entry point `main`) and its bind group:
+    /// the positions (binding 0), velocities (1) and `SimParams` (2), then `extra` from binding
+    /// 3 on, each a uniform (`false`) or a read-only storage buffer (`true`). `code` must declare
+    /// them and include `SimParams` (the `sim-params.wgsl` source).
+    pub fn substep_pipeline(&self, label: &str, code: &str, extra: &[(&wgpu::Buffer, bool)]) -> (wgpu::ComputePipeline, wgpu::BindGroup) {
+        let device = self.gpu().0;
+        let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let storage = wgpu::BufferBindingType::Storage { read_only: false };
+        let mut entries = vec![entry(0, storage), entry(1, storage), entry(2, wgpu::BufferBindingType::Uniform)];
+        let mut resources: Vec<&wgpu::Buffer> = vec![self.positions_buffer.as_ref().unwrap(), self.velocities_buffer.as_ref().unwrap(), self.params_buffer.as_ref().unwrap()];
+        for (k, (buffer, is_storage)) in extra.iter().enumerate() {
+            let ty = if *is_storage { wgpu::BufferBindingType::Storage { read_only: true } } else { wgpu::BufferBindingType::Uniform };
+            entries.push(entry(3 + k as u32, ty));
+            resources.push(buffer);
+        }
+        let bind_entries: Vec<wgpu::BindGroupEntry> = resources.iter().enumerate().map(|(k, b)| wgpu::BindGroupEntry { binding: k as u32, resource: b.as_entire_binding() }).collect();
+        let pass = Self::make_pass(device, label, code, &entries, bind_entries);
+        (pass.pipeline, pass.bind_group)
+    }
     pub fn grid_dims(&self) -> [u32; 3] { self.grid_dims }
     pub fn positions_buffer(&self) -> Option<&wgpu::Buffer> { self.positions_buffer.as_ref() }
     /// The per-particle velocity buffer (`array<vec4<f32>>`), for external

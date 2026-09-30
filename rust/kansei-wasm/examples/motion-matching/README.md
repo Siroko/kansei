@@ -24,8 +24,8 @@ An app that stores its packs another way (encrypted, say) can depend on this cra
 `start_with_loader(canvas_id, load)` instead of `start`: `load` gets each pack's URL and returns
 its `.kmm` bytes, so it can fetch and decode them itself.
 
-A pack carries the licence of the animation it was baked from. The HUD shows the pack's `source`
-and `license` notes. Don't put a pack built from licensed third-party data at a public URL unless
+A pack carries the licence of the animation it was baked from, in its `source` and `license`
+notes. Don't put a pack built from licensed third-party data at a public URL unless
 that licence allows it.
 
 The clips should cover:
@@ -84,6 +84,38 @@ it), Space jumps:
 Walking off a top falls the same way. The HUD's `state` line shows what the character is doing,
 and why the last Space was refused ("too high", "no room to land"…).
 
+## The lake
+
+East of the course lies a small lake (`lake=0` leaves it out; `at=14,-1,90` starts on its
+shore). The water is the engine's SPH fluid, the one the fluid clock uses (about 128K particles,
+5 cm apart, and less viscous than the clock's).
+It is held by a `FluidContainer` whose walls follow the lake's irregular outline, a strip of shore
+outside it, and whose floor is the lake bed. The character's legs push it through
+`FluidColliders`.
+
+- The character wades: the bed is in the collision world, shelving from the waterline to about
+  0.6 m deep, so it walks down into the water and out again.
+- Its thighs, shins, feet and hips are capsules. Walking pushes a wake and ripples ahead of the
+  legs, running throws the water up, and water pushed onto the shore drains back.
+- The simulation runs at 11 times the world's size and √11 times real time, so waves and splashes
+  move at their real pace.
+- The surface is marching cubes over a surface field (`DensityFieldOptions::particle_radius`):
+  smooth over the bulk, with spray as small droplets. It refracts the bed and reflects the sky
+  (`FluidSurfaceEffect`).
+- Landing in the water (a jump or a fall) throws a crown of spray, scaled by how fast the
+  character came down: a sphere at its feet pushes the water out for a moment
+  (`FluidCapsule::expansion`).
+
+### Tweaking the water
+
+P shows a panel (Tweakpane), hidden at first:
+- **water:** viscosity, the tensile correction (how much of the pull under the rest density
+  acts), stiffness and near stiffness, rest density, substeps, time scale, the bed's friction,
+  the legs' drag, the landing splash, and a reset;
+- **surface:** presets (*Surface field, droplets*, the default; *Density iso, smooth*;
+  *Performance*), and each setting: surface field or density, iso level, kernel radius, particle
+  radius, grid resolution, interpolation.
+
 ## Build and run
 
 ```sh
@@ -116,4 +148,9 @@ URL parameters:
 - `gait=0` searches every clip, instead of idle + walk or idle + run by tag;
 - `taa=0` turns TAA off;
 - `course=0` leaves the boxes out;
+- `lake=0` leaves the lake out;
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
+- `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
+  3 s (`Renderer::set_profiling`).
+- `lake_regions()` (a wasm export, from the console) counts the lake's particles in the lake, on the
+  bank, against the walls and outside them, with their mean height: to check water drains back.
