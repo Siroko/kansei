@@ -78,6 +78,23 @@ it), Space jumps:
 Walking off a top falls the same way. The HUD's `state` line shows what the character is doing,
 and why the last Space was refused ("too high", "no room to land"…).
 
+## The lake
+
+East of the course lies a small lake (`lake=0` leaves it out; `at=14,-1,90` starts on its
+shore). The water is the engine's SPH fluid, the one the fluid clock uses (about 50K particles).
+It is held by a `FluidContainer` whose walls follow the lake's irregular outline, a strip of shore
+outside it, and whose floor is the lake bed. The character's legs push it through
+`FluidColliders`.
+
+- The character wades: the bed is in the collision world, shelving from the waterline to about
+  0.6 m deep, so it walks down into the water and out again.
+- Its thighs, shins, feet and hips are capsules. Walking pushes a wake and ripples ahead of the
+  legs, running throws the water up, and water pushed onto the shore drains back.
+- The simulation runs at 8 times the world's size and √8 times real time, so waves and splashes
+  move at their real pace.
+- The surface is marching cubes over the particles, refracting the bed and reflecting the sky
+  (`FluidSurfaceEffect`).
+
 ## Build and run
 
 ```sh
@@ -110,4 +127,5 @@ URL parameters:
 - `gait=0` searches every clip, instead of idle + walk or idle + run by tag;
 - `taa=0` turns TAA off;
 - `course=0` leaves the boxes out;
+- `lake=0` leaves the lake out;
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
