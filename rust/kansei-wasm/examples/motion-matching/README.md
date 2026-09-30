@@ -93,7 +93,8 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
   legs, running throws the water up, and water pushed onto the shore drains back.
 - The simulation runs at 11 times the world's size and √11 times real time, so waves and splashes
   move at their real pace.
-- The surface is marching cubes over the particles, refracting the bed and reflecting the sky
+- The surface is marching cubes over a surface field (`DensityFieldOptions::particle_radius`):
+  smooth over the bulk, with spray as small droplets. It refracts the bed and reflects the sky
   (`FluidSurfaceEffect`).
 
 ## Build and run

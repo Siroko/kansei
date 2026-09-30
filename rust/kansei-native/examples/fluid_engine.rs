@@ -519,6 +519,7 @@ impl ApplicationHandler for App {
             DensityFieldOptions {
                 resolution: 128,
                 kernel_scale: 3.7,
+                ..Default::default()
             },
         ));
         self.surface_renderer = Some(FluidSurfaceRenderer::new(&renderer));
