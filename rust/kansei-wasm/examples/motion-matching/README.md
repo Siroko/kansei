@@ -103,9 +103,13 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
 ### Tweaking the water
 
 P shows a panel (Tweakpane), hidden at first:
-- **water:** viscosity, the tensile correction (how much of the pull under the rest density
-  acts), stiffness and near stiffness, rest density, substeps, time scale, the bed's friction,
-  the legs' drag, the landing splash, and a reset;
+- **solver:** SPH (the default) or PBF, Position Based Fluids (`FluidSolver::Pbf`: a density
+  constraint projected on the positions, Macklin & Müller 2013), with its iterations, relaxation,
+  tensile correction (`s_corr` k and n), XSPH viscosity and vorticity confinement. PBF steps 2
+  substeps to SPH's 4;
+- **water:** substeps, time scale, the bed's friction, the legs' drag, the landing splash, and a
+  reset; and for SPH its viscosity, tensile correction (how much of the pull under the rest density
+  acts), stiffness and near stiffness, and rest density;
 - **surface:** presets (*Surface field, droplets*, the default; *Density iso, smooth*;
   *Performance*), and each setting: surface field or density, iso level, kernel radius, particle
   radius, grid resolution, interpolation.

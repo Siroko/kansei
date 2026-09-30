@@ -1,3 +1,14 @@
+pub use super::pbf::PbfOptions;
+
+/// The solver a [`FluidSimulation`](super::FluidSimulation) steps with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FluidSolver {
+    /// Smoothed Particle Hydrodynamics: pressure and near pressure from the density, viscosity.
+    Sph,
+    /// Position Based Fluids (see `pbf`): a density constraint projected on the positions.
+    Pbf,
+}
+
 /// Fluid simulation configuration.
 #[derive(Debug, Clone)]
 pub struct FluidSimulationOptions {
@@ -23,6 +34,9 @@ pub struct FluidSimulationOptions {
     /// computed, less to weaken it. The pull is what strings a sparse free surface into
     /// filaments (SPH's tensile instability); `near_pressure` still keeps particles apart.
     pub negative_pressure_scale: f32,
+    /// The solver; `pbf` configures Position Based Fluids.
+    pub solver: FluidSolver,
+    pub pbf: PbfOptions,
 }
 
 pub const DEFAULT_OPTIONS: FluidSimulationOptions = FluidSimulationOptions {
@@ -43,6 +57,8 @@ pub const DEFAULT_OPTIONS: FluidSimulationOptions = FluidSimulationOptions {
     substeps: 3,
     world_bounds_padding: 0.2,
     negative_pressure_scale: 1.0,
+    solver: FluidSolver::Sph,
+    pbf: PbfOptions::DEFAULT,
 };
 
 /// Offsets into the packed params uniform buffer (matches SimParams WGSL struct).

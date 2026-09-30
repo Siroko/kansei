@@ -1157,6 +1157,13 @@ pub fn lake_settings() -> JsValue {
             ("drag", lake.drag()),
             ("splash", lake.splash_push),
             ("friction", lake.friction()),
+            ("solver", if p.solver == kansei_core::simulations::fluid::FluidSolver::Pbf { 1.0 } else { 0.0 }),
+            ("pbfIterations", p.pbf.iterations as f32),
+            ("pbfRelaxation", p.pbf.relaxation),
+            ("pbfScorrK", p.pbf.scorr_k),
+            ("pbfScorrN", p.pbf.scorr_n),
+            ("pbfXsph", p.pbf.xsph),
+            ("pbfVorticity", p.pbf.vorticity),
         ] {
             let _ = js_sys::Reflect::set(&o, &k.into(), &v.into());
         }
