@@ -303,17 +303,18 @@ impl Lake {
             ..DEFAULT_OPTIONS
         }, &particles);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
-        sim.world_bounds_max = [hi[0], 2.0 * SIM_SCALE, hi[1]];
+        sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
         let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.02 });
         let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.35 });
 
-        // its surface: splatted, polygonised, and composited by the effect. The splat is wider
-        // than the particles (1.6 h) and the iso level a third of the inside's density, which
-        // smooths out the layers the particles settle in along the sloping bed; the voxels are
-        // half a unit (4.4 cm).
-        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 320, kernel_scale: 0.6 });
-        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 600_000, iso_level: 0.5 });
+        // its surface: a surface field (the distance to the weighted mean of the particles within
+        // 2 units, less a particle radius of 0.35) polygonised at its iso level of 1. Averaging over
+        // the wide kernel flattens the layers the particles settle in along the sloping bed, while a
+        // lone particle stays a droplet 3 cm across and a jet of them a thin one; the voxels are
+        // under half a unit (4.4 cm).
+        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 320, kernel_scale: 1.0, particle_radius: Some(0.35) });
+        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 600_000, iso_level: 1.0 });
         // interpolated marching cubes (the default extraction draws voxel faces)
         marching_cubes.set_use_classic(true);
         let marching_cubes_bg = marching_cubes.create_bind_group(renderer, &density.density_view);
@@ -333,7 +334,7 @@ impl Lake {
             sky_color: [7000.0, 8000.0, 10000.0],
             sky_reflection: 1.0,
         });
-        surface.splat_radius = Some(1.6);
+        surface.splat_radius = Some(2.0);
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
         (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, near: (bmin, bmax) }, surface)

@@ -289,7 +289,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // ── Density field + surface renderer ──
     let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
-        sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7 });
+        sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 128, kernel_scale: 3.7, ..Default::default() });
     let surface_renderer = FluidSurfaceRenderer::new(&renderer);
     let cornell_box = CornellBox::new(&renderer, format, sim.world_bounds_min, sim.world_bounds_max);
 
@@ -793,7 +793,7 @@ pub fn get_frame_time() -> f64 {
     with_state(|s| {
         s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
             s.sim.world_bounds_min, s.sim.world_bounds_max,
-            DensityFieldOptions { resolution: v, kernel_scale: s.density_field.kernel_scale });
+            DensityFieldOptions { resolution: v, kernel_scale: s.density_field.kernel_scale, ..Default::default() });
         s.surface_bg = s.surface_renderer.create_bind_group(
             &s.color_view, &s.depth_view, &s.output_view, &s.density_field.density_view);
         s.marching_cubes_bg = s
@@ -809,7 +809,7 @@ pub fn get_frame_time() -> f64 {
         // Rebuild density field for new bounds
         s.density_field = FluidDensityField::new(&s.renderer, s.sim.positions_buffer().unwrap(),
             s.sim.world_bounds_min, s.sim.world_bounds_max,
-            DensityFieldOptions { resolution: 128, kernel_scale: s.density_field.kernel_scale });
+            DensityFieldOptions { resolution: 128, kernel_scale: s.density_field.kernel_scale, ..Default::default() });
         s.surface_bg = s.surface_renderer.create_bind_group(
             &s.color_view, &s.depth_view, &s.output_view, &s.density_field.density_view);
         s.marching_cubes_bg = s
