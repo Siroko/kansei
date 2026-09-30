@@ -544,25 +544,31 @@ impl Character {
         let tags: Vec<String> = pack.meta("tags").unwrap_or("").split(',').map(str::to_string).collect();
         let source = format!("{}\n{}", pack.meta("source").unwrap_or("(no source noted)"), pack.meta("license").unwrap_or("(no licence noted)"));
         let MotionPack { database: db, meshes, actions, .. } = pack;
-        let first = meshes.into_iter().next().ok_or("the pack has no mesh")?;
-        let mesh = first.mesh;
-        let mut palette = BonePalette::new(mesh.skin_joints.len());
-        palette.update(&mesh, &db.skeleton.rest_model());
-        let params = SkinnedLitParams {
-            base_color: first.color,
-            sun_direction: [SUN_DIR[0], SUN_DIR[1], SUN_DIR[2], 0.0],
-            sun: [SUN[0], SUN[1], SUN[2], 0.0],
-            sky: [SKY[0], SKY[1], SKY[2], 0.0],
-        };
-        let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
-        r.dynamic = true;
-        let index = scene.add(SceneNode::Renderable(r));
-        let mut bodies = vec![Body { name: "mannequin", mesh, palette, index, display: None, source: source.clone() }];
+        // the pack's own mesh, when it has one (a pack may ship without, for a character pack's body)
+        let mut bodies = Vec::new();
+        if let Some(first) = meshes.into_iter().next() {
+            let mesh = first.mesh;
+            let mut palette = BonePalette::new(mesh.skin_joints.len());
+            palette.update(&mesh, &db.skeleton.rest_model());
+            let params = SkinnedLitParams {
+                base_color: first.color,
+                sun_direction: [SUN_DIR[0], SUN_DIR[1], SUN_DIR[2], 0.0],
+                sun: [SUN[0], SUN[1], SUN[2], 0.0],
+                sky: [SKY[0], SKY[1], SKY[2], 0.0],
+            };
+            let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
+            r.dynamic = true;
+            let index = scene.add(SceneNode::Renderable(r));
+            bodies.push(Body { name: "mannequin", mesh, palette, index, display: None, source: source.clone() });
+        }
         if let Some(pack) = hero {
             match hero_body(renderer, scene, pack, &db) {
                 Ok(b) => bodies.push(b),
                 Err(e) => log::warn!("character pack left out: {e}"),
             }
+        }
+        if bodies.is_empty() {
+            return Err("the pack has no mesh, and there is no character pack to show it on".into());
         }
         let joints = bodies.iter().map(|b| b.display.as_ref().map_or(db.joint_count(), |d| d.0.len())).max().unwrap_or(0);
         let bones = Markers::new(renderer, scene, "Bones", joints, [30000.0, 20000.0, 4000.0], true);
@@ -844,7 +850,7 @@ impl State {
                                 None => String::new(),
                             }
                         ),
-                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.showing > 0 { c.bodies[c.showing].source.as_str() } else { "" }),
+                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.bodies[c.showing].display.is_some() { c.bodies[c.showing].source.as_str() } else { "" }),
                     ));
                 }
                 Some(_) => set_hud(""),

@@ -46,6 +46,8 @@ one from a glTF mesh and its textures (`character` config).
 
 - Loaded, it is shown by default. C switches between it and the motion pack's own mesh, and
   `?char=hero` or `?char=mannequin` picks one.
+- A motion pack may then ship without a mesh of its own (no `MESH` section): the character pack's
+  body is the only one.
 - The pose is retargeted onto its skeleton (`animation::retarget`: rotations as they are,
   translations oriented and scaled to its bones), and foot locking works on its legs.
 - Its colour, normal (tangent space, +Y up) and occlusion/roughness/metallic textures are
