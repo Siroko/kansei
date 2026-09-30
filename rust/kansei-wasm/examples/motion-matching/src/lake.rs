@@ -5,8 +5,8 @@
 //! character's legs through `FluidColliders`. The character wades: the bed is in the collision
 //! world, so it walks down into the shallows and out again, splashing.
 //!
-//! The simulation runs 8 times the world's size (a particle every 7 cm, with the fluid clock's
-//! tuned constants at a smoothing radius of 1) and so √8 times faster than real time, which keeps
+//! The simulation runs 11 times the world's size (a particle every 5 cm, with the fluid clock's
+//! tuned constants at a smoothing radius of 1) and so √11 times faster than real time, which keeps
 //! gravity-driven motion (waves, splashes) at its real pace.
 
 use glam::{Mat4, Vec3 as GVec3};
@@ -27,9 +27,9 @@ use kansei_core::simulations::fluid::{
 use crate::{SKY, SUN, SUN_DIR};
 
 /// Simulation units per metre.
-const SIM_SCALE: f32 = 8.0;
+const SIM_SCALE: f32 = 11.0;
 /// Simulated seconds per real second: √SIM_SCALE, so gravity acts at its real pace.
-const TIME_SCALE: f32 = 2.828_427;
+const TIME_SCALE: f32 = 3.316_625;
 /// Real seconds per simulation step (up to `MAX_STEPS` a frame).
 const STEP: f32 = 1.0 / 60.0;
 const MAX_STEPS: u32 = 2;
@@ -286,7 +286,7 @@ impl Lake {
         let count = (particles.len() / 4) as u32;
         log::info!("lake: {count} particles");
 
-        // the fluid clock's tuning at 80K particles, h = 1 (see its `tuning_for`)
+        // the fluid clock's tuning at 80K particles, h = 1 (see its `tuning_for`), less viscous
         let mut sim = FluidSimulation::new(renderer, FluidSimulationOptions {
             max_particles: count,
             dimensions: 3,
@@ -294,10 +294,12 @@ impl Lake {
             pressure_multiplier: 46.5,
             near_pressure_multiplier: 20.0,
             density_target: 8.6,
-            viscosity: 1.0,
+            // a fifth of the clock's viscosity: the water runs and splashes freely
+            viscosity: 0.15,
             damping: 1.0,
             gravity: [0.0, -9.8, 0.0],
-            substeps: 3,
+            // 4 substeps keep each one near the clock's stable 16 ms at this time scale
+            substeps: 4,
             ..DEFAULT_OPTIONS
         }, &particles);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
@@ -309,9 +311,9 @@ impl Lake {
         // its surface: splatted, polygonised, and composited by the effect. The splat is wider
         // than the particles (1.6 h) and the iso level a third of the inside's density, which
         // smooths out the layers the particles settle in along the sloping bed; the voxels are
-        // half a unit (6 cm).
-        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 224, kernel_scale: 0.6 });
-        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 300_000, iso_level: 0.5 });
+        // half a unit (4.4 cm).
+        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 320, kernel_scale: 0.6 });
+        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 600_000, iso_level: 0.5 });
         // interpolated marching cubes (the default extraction draws voxel faces)
         marching_cubes.set_use_classic(true);
         let marching_cubes_bg = marching_cubes.create_bind_group(renderer, &density.density_view);
