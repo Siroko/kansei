@@ -653,6 +653,12 @@ struct State {
     switches: u32,
     counted_since: f64,
     rates: (f32, f32),
+    /// Whether the character was in the air last frame, and the fastest it has fallen since
+    /// (m/s); its height last frame.
+    air: (bool, f32),
+    last_y: f32,
+    /// `profile=1`: when the profile was last logged (0: not profiling).
+    profile_since: f64,
 }
 
 /// Left stick, right stick, and the pressed state of each button of the first connected gamepad.
@@ -822,8 +828,23 @@ impl State {
         }
         if let Some(lake) = &mut self.lake {
             let legs = self.character.as_ref().map(Character::leg_capsules).unwrap_or_default();
+            // a landing: back on its feet after being in the air, at the fastest it came down
+            let mut landing = None;
+            if let Some(c) = &self.character {
+                let y = c.controller.matcher.character().translation.y;
+                let airborne = matches!(c.controller.state(), CharacterState::Jumping | CharacterState::Falling(_));
+                let (was, fall) = &mut self.air;
+                if airborne {
+                    *fall = fall.max((self.last_y - y) / dt);
+                } else if *was {
+                    landing = Some((c.controller.matcher.character().translation, *fall));
+                    *fall = 0.0;
+                }
+                *was = airborne;
+                self.last_y = y;
+            }
             if let Some(surface) = self.volume.effects.get_mut(lake.effect).and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
-                lake.update(surface, &legs, dt);
+                lake.update(surface, &legs, landing, dt);
             }
         }
         self.controls.update(&mut self.camera, dt);
@@ -890,6 +911,10 @@ impl State {
         }
 
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
+        if self.profile_since > 0.0 && now - self.profile_since > 3.0 {
+            self.profile_since = now;
+            log::info!("profile ({:.1} ms/frame)\n{}", 1000.0 / self.fps, self.renderer.take_profile().report());
+        }
     }
 }
 
@@ -1070,7 +1095,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         switches: 0,
         counted_since: now_secs(),
         rates: (0.0, 0.0),
+        profile_since: 0.0,
+        air: (false, 0.0),
+        last_y: 0.0,
     }));
+    if query_param("profile").as_deref() == Some("1") {
+        let mut s = state.borrow_mut();
+        s.renderer.set_profiling(true);
+        s.profile_since = now_secs();
+    }
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     *g.borrow_mut() = Some(Closure::new(move || {

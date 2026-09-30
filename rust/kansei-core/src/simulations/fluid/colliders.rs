@@ -11,13 +11,15 @@ use super::simulation::{FluidSimulation, FluidSubstepPass, SIM_PARAMS_WGSL};
 
 /// A capsule: the segment `a`-`b` grown by `radius`, and the velocity of each end (per second of
 /// simulation time), in the simulation's space. A sphere is a capsule with `a == b`.
+/// `expansion` is how fast its surface moves out along its normal (a body displacing the fluid
+/// all round, such as a landing's impact), on top of the ends' velocities.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 pub struct FluidCapsule {
     pub a: [f32; 3],
     pub radius: f32,
     pub b: [f32; 3],
-    pub _pad0: f32,
+    pub expansion: f32,
     pub velocity_a: [f32; 3],
     pub _pad1: f32,
     pub velocity_b: [f32; 3],
@@ -32,7 +34,7 @@ impl FluidCapsule {
     /// The same capsule in a space scaled by `s`, with its velocities scaled by `velocity_scale`
     /// (e.g. `s` over the simulation's time scale).
     pub fn scaled(&self, s: f32, velocity_scale: f32) -> Self {
-        Self::new(self.a.map(|v| v * s), self.b.map(|v| v * s), self.radius * s, self.velocity_a.map(|v| v * velocity_scale), self.velocity_b.map(|v| v * velocity_scale))
+        Self { expansion: self.expansion * velocity_scale, ..Self::new(self.a.map(|v| v * s), self.b.map(|v| v * s), self.radius * s, self.velocity_a.map(|v| v * velocity_scale), self.velocity_b.map(|v| v * velocity_scale)) }
     }
 }
 
@@ -73,7 +75,7 @@ struct Capsule {
     a: vec3<f32>,
     radius: f32,
     b: vec3<f32>,
-    _pad0: f32,
+    expansion: f32,
     velocity_a: vec3<f32>,
     _pad1: f32,
     velocity_b: vec3<f32>,
@@ -109,7 +111,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pos = q + n * c.radius;
         // the collider's surface moves with its axis: relative to it, what goes in bounces back
         // and what slides along is dragged
-        let surface = mix(c.velocity_a, c.velocity_b, t);
+        let surface = mix(c.velocity_a, c.velocity_b, t) + n * c.expansion;
         let rel = vel - surface;
         let vn = dot(rel, n);
         let vt = (rel - n * vn) * (1.0 - colliders.drag);

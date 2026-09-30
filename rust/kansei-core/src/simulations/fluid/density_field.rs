@@ -34,7 +34,10 @@ pub struct DensityFieldOptions {
     /// `Some(r)`: it is a surface field instead (Zhu & Bridson), `1 + (r - d) / h` with `d` the
     /// distance to the kernel-weighted mean of the particles within the splat radius `h`: its
     /// iso level is 1, where a lone particle is a droplet of radius `r` and a flat layer of
-    /// particles a flat surface, however they are stacked.
+    /// particles a flat surface, however they are stacked. `kernel_scale` is then 1 over the
+    /// kernel weight the bulk sums to (particles per unit volume × 0.638 h³ for its
+    /// `(1 - d²/h²)³` kernel): a voxel weighing past a third of that is inside, so walls and
+    /// floors under the fluid make no surface.
     pub particle_radius: Option<f32>,
 }
 
