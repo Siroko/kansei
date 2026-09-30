@@ -20,6 +20,10 @@ Keep packs outside the repository and link them in. `*.kmm` is gitignored, and s
 ln -s /path/to/private/packs rust/kansei-wasm/examples/motion-matching/www/pack
 ```
 
+An app that stores its packs another way (encrypted, say) can depend on this crate and call
+`start_with_loader(canvas_id, load)` instead of `start`: `load` gets each pack's URL and returns
+its `.kmm` bytes, so it can fetch and decode them itself.
+
 A pack carries the licence of the animation it was baked from. The HUD shows the pack's `source`
 and `license` notes. Don't put a pack built from licensed third-party data at a public URL unless
 that licence allows it.

@@ -858,6 +858,17 @@ impl State {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
+    start_with_loader(canvas_id, |url: String| async move { fetch_bytes(&url).await }).await
+}
+
+/// `start`, with the packs' bytes from `load` instead of a plain fetch: it gets each pack's URL
+/// (`pack/locomotion.kmm`, `pack/hero.kmm`, or `pack=`/`hero=`) and returns the `.kmm` bytes, or
+/// why there are none. For an app that stores its packs another way, e.g. encrypted.
+pub async fn start_with_loader<L, F>(canvas_id: &str, load: L) -> Result<(), JsValue>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
     let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -896,11 +907,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let url = query_param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
     set_hud(&format!("Loading motion pack {url} …"));
     let gait = query_param("gait").as_deref() != Some("0");
-    let motion = fetch_bytes(&url).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
+    let motion = load(url.clone()).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
     // a second body, optional
     let hero_url = query_param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
     let hero = match &motion {
-        Ok(_) => match fetch_bytes(&hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
+        Ok(_) => match load(hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
             Ok(h) => Some(h),
             Err(e) => {
                 log::info!("no character pack: {e}");
