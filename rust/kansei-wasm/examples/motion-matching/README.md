@@ -81,7 +81,8 @@ and why the last Space was refused ("too high", "no room to land"…).
 ## The lake
 
 East of the course lies a small lake (`lake=0` leaves it out; `at=14,-1,90` starts on its
-shore). The water is the engine's SPH fluid, the one the fluid clock uses (about 50K particles).
+shore). The water is the engine's SPH fluid, the one the fluid clock uses (about 128K particles,
+5 cm apart, and less viscous than the clock's).
 It is held by a `FluidContainer` whose walls follow the lake's irregular outline, a strip of shore
 outside it, and whose floor is the lake bed. The character's legs push it through
 `FluidColliders`.
@@ -90,7 +91,7 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
   0.6 m deep, so it walks down into the water and out again.
 - Its thighs, shins, feet and hips are capsules. Walking pushes a wake and ripples ahead of the
   legs, running throws the water up, and water pushed onto the shore drains back.
-- The simulation runs at 8 times the world's size and √8 times real time, so waves and splashes
+- The simulation runs at 11 times the world's size and √11 times real time, so waves and splashes
   move at their real pace.
 - The surface is marching cubes over the particles, refracting the bed and reflecting the sky
   (`FluidSurfaceEffect`).
