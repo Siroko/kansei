@@ -121,7 +121,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (touched) {
         positions[idx] = vec4<f32>(pos, positions[idx].w);
-        velocities[idx] = vec4<f32>(vel, v4.w);
+        // Position Based Fluids derive the velocity from the move, which would turn the push out of
+        // a collider into a burst: w + 2 marks this velocity (the collider's) as the one to keep
+        let held = select(0.0, 1.0, v4.w - 2.0 * floor(v4.w * 0.5) > 0.5);
+        velocities[idx] = vec4<f32>(vel, held + select(0.0, 2.0, params.solver == 1u));
     }
 }
 "#;
