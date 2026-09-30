@@ -14,8 +14,9 @@ mod attractor;
 mod clock;
 mod container;
 mod colliders;
+mod pbf;
 
-pub use params::{FluidSimulationOptions, DEFAULT_OPTIONS};
+pub use params::{FluidSimulationOptions, FluidSolver, PbfOptions, DEFAULT_OPTIONS};
 pub use simulation::{FluidSimulation, FluidSubstepPass};
 pub use container::{signed_distance, FluidContainer, FluidContainerOptions, PlanarContainerShape};
 pub use colliders::{FluidCapsule, FluidColliders, FluidCollidersOptions};
