@@ -1195,3 +1195,34 @@ pub fn lake_surface_preset(name: &str) -> JsValue {
     with_lake(|lake, surface, renderer| lake.set_surface(renderer, surface, settings));
     surface_js(settings)
 }
+
+/// Debugging the lake: its particles by region, read back from the GPU ("lake n (y) · bank ·
+/// wall band · outside").
+#[wasm_bindgen]
+pub async fn lake_regions() -> JsValue {
+    let Some((buffer, device, queue)) = with_lake(|_, surface, renderer| (surface.sim.positions_buffer().cloned(), renderer.device().clone(), renderer.queue().clone())) else { return JsValue::NULL };
+    let Some(buffer) = buffer else { return JsValue::NULL };
+    let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Lake/Readback"), size: buffer.size(), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(&buffer, 0, &staging, 0, buffer.size());
+    queue.submit(Some(encoder.finish()));
+    let (tx, rx) = (Rc::new(RefCell::new(None::<js_sys::Function>)), ());
+    let _ = rx;
+    let promise = {
+        let tx = tx.clone();
+        js_sys::Promise::new(&mut move |resolve, _| *tx.borrow_mut() = Some(resolve))
+    };
+    staging.slice(..).map_async(wgpu::MapMode::Read, move |_| {
+        if let Some(resolve) = tx.borrow_mut().take() {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    let positions: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    staging.unmap();
+    with_lake(|lake, _, _| {
+        let r = lake.regions(&positions);
+        JsValue::from_str(&format!("lake {} ({:.3}) · bank {} ({:.3}) · wall band {} ({:.3}) · outside {} ({:.3})", r[0].0, r[0].1, r[1].0, r[1].1, r[2].0, r[2].1, r[3].0, r[3].1))
+    })
+    .unwrap_or(JsValue::NULL)
+}
