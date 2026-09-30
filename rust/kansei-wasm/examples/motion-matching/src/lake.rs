@@ -377,7 +377,8 @@ impl Lake {
             negative_pressure_scale: 0.6,
             // Position Based Fluids, when chosen (the tweak panel): at rest, the density its kernel
             // sums to on the fill's lattice, so the water keeps its volume
-            pbf: PbfOptions { rest_density: lattice_density(SPACING, 1.0), ..PbfOptions::DEFAULT },
+            // and no faster than 12 m/s (a running foot's swing, and some)
+            pbf: PbfOptions { rest_density: lattice_density(SPACING, 1.0), max_speed: 12.0 * SIM_SCALE / TIME_SCALE, ..PbfOptions::DEFAULT },
             ..DEFAULT_OPTIONS
         }, &particles);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
@@ -474,7 +475,10 @@ impl Lake {
             if age < SPLASH_TIME {
                 let c = ((at + GVec3::Y * 0.1) * SIM_SCALE).to_array();
                 let up = [0.0, speed * 0.4 * SIM_SCALE / self.time_scale, 0.0];
-                capsules.push(FluidCapsule { expansion: speed * self.splash_push * SIM_SCALE / self.time_scale, ..FluidCapsule::new(c, c, SPLASH_RADIUS * SIM_SCALE, up, up) });
+                // it grows to its radius over the splash rather than appearing whole: a
+                // position-based solver would read a whole sphere's push in one substep as a burst
+                let radius = SPLASH_RADIUS * (age / SPLASH_TIME).clamp(0.2, 1.0);
+                capsules.push(FluidCapsule { expansion: speed * self.splash_push * SIM_SCALE / self.time_scale, ..FluidCapsule::new(c, c, radius * SIM_SCALE, up, up) });
                 self.splash = Some((at, speed, age + dt));
             } else {
                 self.splash = None;
@@ -581,4 +585,14 @@ impl Lake {
         out.map(|(n, y)| (n, if n > 0 { y / n as f32 } else { 0.0 }))
     }
 
+
+    /// World m/s per simulation unit of speed.
+    pub fn world_speed_scale(&self) -> f32 {
+        self.time_scale / SIM_SCALE
+    }
+
+    /// The container floor's height (world) under a point in simulation space.
+    pub fn floor_at(&self, x: f32, z: f32) -> f32 {
+        self.container.shape().floor(x, z) / SIM_SCALE
+    }
 }

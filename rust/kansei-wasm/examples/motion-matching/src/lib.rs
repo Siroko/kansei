@@ -1207,14 +1207,40 @@ pub fn lake_surface_preset(name: &str) -> JsValue {
 /// wall band · outside").
 #[wasm_bindgen]
 pub async fn lake_regions() -> JsValue {
-    let Some((buffer, device, queue)) = with_lake(|_, surface, renderer| (surface.sim.positions_buffer().cloned(), renderer.device().clone(), renderer.queue().clone())) else { return JsValue::NULL };
-    let Some(buffer) = buffer else { return JsValue::NULL };
+    let Some(positions) = read_lake_buffer(false).await else { return JsValue::NULL };
+    with_lake(|lake, _, _| {
+        let r = lake.regions(&positions);
+        JsValue::from_str(&format!("lake {} ({:.3}) · bank {} ({:.3}) · wall band {} ({:.3}) · outside {} ({:.3})", r[0].0, r[0].1, r[1].0, r[1].1, r[2].0, r[2].1, r[3].0, r[3].1))
+    })
+    .unwrap_or(JsValue::NULL)
+}
+
+/// Debugging the lake: its particles' speeds (m/s in the world): [max, 99th percentile, mean, how
+/// many are past 4 m/s].
+#[wasm_bindgen]
+pub async fn lake_speeds() -> JsValue {
+    let Some(velocities) = read_lake_buffer(true).await else { return JsValue::NULL };
+    let scale = with_lake(|lake, _, _| lake.world_speed_scale()).unwrap_or(1.0);
+    let mut speeds: Vec<f32> = velocities.chunks_exact(4).map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() * scale).collect();
+    speeds.sort_by(f32::total_cmp);
+    let n = speeds.len().max(1);
+    let out = js_sys::Array::new();
+    let fast = speeds.iter().filter(|s| **s > 4.0).count() as f32;
+    for v in [speeds.last().copied().unwrap_or(0.0), speeds[(n * 99 / 100).min(n - 1)], speeds.iter().sum::<f32>() / n as f32, fast] {
+        out.push(&v.into());
+    }
+    out.into()
+}
+
+/// The lake's particle positions (or velocities), read back from the GPU.
+async fn read_lake_buffer(velocities: bool) -> Option<Vec<f32>> {
+    let (buffer, device, queue) = with_lake(|_, surface, renderer| (if velocities { surface.sim.velocities_buffer() } else { surface.sim.positions_buffer() }.cloned(), renderer.device().clone(), renderer.queue().clone()))?;
+    let buffer = buffer?;
     let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Lake/Readback"), size: buffer.size(), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
     let mut encoder = device.create_command_encoder(&Default::default());
     encoder.copy_buffer_to_buffer(&buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
-    let (tx, rx) = (Rc::new(RefCell::new(None::<js_sys::Function>)), ());
-    let _ = rx;
+    let tx = Rc::new(RefCell::new(None::<js_sys::Function>));
     let promise = {
         let tx = tx.clone();
         js_sys::Promise::new(&mut move |resolve, _| *tx.borrow_mut() = Some(resolve))
@@ -1225,11 +1251,23 @@ pub async fn lake_regions() -> JsValue {
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-    let positions: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let data: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
     staging.unmap();
-    with_lake(|lake, _, _| {
-        let r = lake.regions(&positions);
-        JsValue::from_str(&format!("lake {} ({:.3}) · bank {} ({:.3}) · wall band {} ({:.3}) · outside {} ({:.3})", r[0].0, r[0].1, r[1].0, r[1].1, r[2].0, r[2].1, r[3].0, r[3].1))
-    })
-    .unwrap_or(JsValue::NULL)
+    Some(data)
+}
+
+/// Debugging the lake: its 12 fastest particles, "x y z (above the floor) speed" in the world.
+#[wasm_bindgen]
+pub async fn lake_fastest() -> JsValue {
+    let (Some(p), Some(v)) = (read_lake_buffer(false).await, read_lake_buffer(true).await) else { return JsValue::NULL };
+    let scale = with_lake(|lake, _, _| lake.world_speed_scale()).unwrap_or(1.0);
+    let mut all: Vec<(f32, usize)> = v.chunks_exact(4).enumerate().map(|(i, v)| ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() * scale, i)).collect();
+    all.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let lines: Vec<String> = all.iter().take(12).map(|(s, i)| {
+        let q = &p[i * 4..i * 4 + 4];
+        let (x, y, z) = (q[0] / 11.0, q[1] / 11.0, q[2] / 11.0);
+        let above = with_lake(|lake, _, _| lake.floor_at(q[0], q[2])).unwrap_or(0.0);
+        format!("{x:.2} {y:.3} {z:.2} (+{:.3}) {s:.2}", y - above)
+    }).collect();
+    JsValue::from_str(&lines.join(" | "))
 }
