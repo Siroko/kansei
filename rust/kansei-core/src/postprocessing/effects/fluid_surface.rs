@@ -85,6 +85,15 @@ struct Params {
 @group(0) @binding(3) var normal_tex: texture_2d<f32>;     // GBuffer normals
 @group(0) @binding(4) var output_tex: texture_storage_2d<rgba16float, write>;
 
+// A refracted sample, where the fluid covers it: elsewhere the texel shows something in front of
+// the surface (a body standing out of the water), which must not appear through it, and the
+// pixel's own texel stands in.
+fn refracted_texel(uv: vec2<f32>, own: vec2u, dims: vec2<f32>) -> vec3<f32> {
+    let texel = min(vec2u(dims * uv), vec2u(dims) - vec2u(1u));
+    let covered = length(textureLoad(normal_tex, texel, 0).rgb) >= 0.01;
+    return textureLoad(background_tex, select(own, texel, covered), 0).rgb;
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let coord = gid.xy;
@@ -125,9 +134,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let uv_g = clamp(screen_uv + offset, vec2<f32>(0.0), vec2<f32>(1.0));
     let uv_b = clamp(screen_uv + offset * (1.0 - ca), vec2<f32>(0.0), vec2<f32>(1.0));
 
-    let bg_r = textureLoad(background_tex, vec2u(dims_f * uv_r), 0).r;
-    let bg_g = textureLoad(background_tex, vec2u(dims_f * uv_g), 0).g;
-    let bg_b = textureLoad(background_tex, vec2u(dims_f * uv_b), 0).b;
+    let bg_r = refracted_texel(uv_r, coord, dims_f).r;
+    let bg_g = refracted_texel(uv_g, coord, dims_f).g;
+    let bg_b = refracted_texel(uv_b, coord, dims_f).b;
     var refracted = vec3<f32>(bg_r, bg_g, bg_b);
 
     // Tint refracted light by fluid color (absorption)

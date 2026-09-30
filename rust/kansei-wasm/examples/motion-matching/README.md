@@ -20,8 +20,8 @@ Keep packs outside the repository and link them in. `*.kmm` is gitignored, and s
 ln -s /path/to/private/packs rust/kansei-wasm/examples/motion-matching/www/pack
 ```
 
-A pack carries the licence of the animation it was baked from. The HUD shows the pack's `source`
-and `license` notes. Don't put a pack built from licensed third-party data at a public URL unless
+A pack carries the licence of the animation it was baked from, in its `source` and `license`
+notes. Don't put a pack built from licensed third-party data at a public URL unless
 that licence allows it.
 
 The clips should cover:
@@ -99,6 +99,16 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
 - Landing in the water (a jump or a fall) throws a crown of spray, scaled by how fast the
   character came down: a sphere at its feet pushes the water out for a moment
   (`FluidCapsule::expansion`).
+
+### Tweaking the water
+
+P shows a panel (Tweakpane), hidden at first:
+- **water:** viscosity, the tensile correction (how much of the pull under the rest density
+  acts), stiffness and near stiffness, rest density, substeps, time scale, the bed's friction,
+  the legs' drag, the landing splash, and a reset;
+- **surface:** presets (*Surface field, droplets*, the default; *Density iso, smooth*;
+  *Performance*), and each setting: surface field or density, iso level, kernel radius, particle
+  radius, grid resolution, interpolation.
 
 ## Build and run
 

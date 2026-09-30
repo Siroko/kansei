@@ -17,9 +17,44 @@
     <canvas id="kansei" tabindex="0"></canvas>
     <pre id="hud"></pre>
     <script type="module">
-        import init, { start } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset } from '../pkg/kansei_wasm_motion_matching.js';
+        import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
         await init();
         await start('kansei');
+
+        // The lake's tweak panel: P shows and hides it.
+        const p = lake_settings();
+        if (p) {
+            const pane = new Pane({ title: 'Lake (P to hide)' });
+            pane.hidden = true;
+            window.addEventListener('keydown', (e) => { if (e.key.toLowerCase() === 'p' && !e.repeat) pane.hidden = !pane.hidden; });
+
+            const water = pane.addFolder({ title: 'water' });
+            const bind = (folder, key, opts) => folder.addBinding(p, key, opts).on('change', (ev) => lake_set(key, ev.value));
+            bind(water, 'viscosity', { min: 0, max: 2, step: 0.01 });
+            bind(water, 'negativePressure', { label: 'tensile (neg. pressure)', min: 0, max: 1, step: 0.01 });
+            bind(water, 'pressure', { label: 'stiffness', min: 5, max: 100, step: 0.5 });
+            bind(water, 'nearPressure', { label: 'near stiffness', min: 0, max: 60, step: 0.5 });
+            bind(water, 'restDensity', { label: 'rest density', min: 4, max: 14, step: 0.1 });
+            bind(water, 'substeps', { min: 1, max: 8, step: 1 });
+            bind(water, 'timeScale', { label: 'time scale', min: 0.5, max: 6, step: 0.05 });
+            bind(water, 'friction', { label: 'bed friction', min: 0, max: 0.2, step: 0.001 });
+            bind(water, 'drag', { label: 'leg drag', min: 0, max: 1, step: 0.01 });
+            bind(water, 'splash', { label: 'landing splash', min: 0, max: 4, step: 0.05 });
+            water.addButton({ title: 'reset water' }).on('click', () => lake_reset());
+
+            const surface = pane.addFolder({ title: 'surface' });
+            const preset = { preset: 'droplets' };
+            const apply = () => lake_surface(p.surfaceField, p.resolution, p.kernel, p.particleRadius, p.iso, p.interpolate);
+            surface.addBinding(preset, 'preset', { options: { 'Surface field, droplets': 'droplets', 'Density iso, smooth': 'smooth', 'Performance': 'performance' } })
+                .on('change', (ev) => { Object.assign(p, lake_surface_preset(ev.value)); pane.refresh(); });
+            surface.addBinding(p, 'surfaceField', { label: 'surface field' }).on('change', apply);
+            surface.addBinding(p, 'iso', { label: 'iso level', min: 0.02, max: 2, step: 0.01 }).on('change', apply);
+            surface.addBinding(p, 'kernel', { label: 'kernel radius', min: 0.8, max: 2.5, step: 0.05 }).on('change', apply);
+            surface.addBinding(p, 'particleRadius', { label: 'particle radius', min: 0.2, max: 1, step: 0.01 }).on('change', apply);
+            surface.addBinding(p, 'resolution', { label: 'grid resolution', min: 96, max: 384, step: 32 }).on('change', apply);
+            surface.addBinding(p, 'interpolate', { label: 'interpolate' }).on('change', apply);
+        }
     </script>
 </body>
 </html>
