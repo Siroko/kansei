@@ -20,6 +20,10 @@ Keep packs outside the repository and link them in. `*.kmm` is gitignored, and s
 ln -s /path/to/private/packs rust/kansei-wasm/examples/motion-matching/www/pack
 ```
 
+An app that stores its packs another way (encrypted, say) can depend on this crate and call
+`start_with_loader(canvas_id, load)` instead of `start`: `load` gets each pack's URL and returns
+its `.kmm` bytes, so it can fetch and decode them itself.
+
 A pack carries the licence of the animation it was baked from, in its `source` and `license`
 notes. Don't put a pack built from licensed third-party data at a public URL unless
 that licence allows it.
@@ -42,6 +46,8 @@ one from a glTF mesh and its textures (`character` config).
 
 - Loaded, it is shown by default. C switches between it and the motion pack's own mesh, and
   `?char=hero` or `?char=mannequin` picks one.
+- A motion pack may then ship without a mesh of its own (no `MESH` section): the character pack's
+  body is the only one.
 - The pose is retargeted onto its skeleton (`animation::retarget`: rotations as they are,
   translations oriented and scaled to its bones), and foot locking works on its legs.
 - Its colour, normal (tangent space, +Y up) and occlusion/roughness/metallic textures are
