@@ -544,25 +544,31 @@ impl Character {
         let tags: Vec<String> = pack.meta("tags").unwrap_or("").split(',').map(str::to_string).collect();
         let source = format!("{}\n{}", pack.meta("source").unwrap_or("(no source noted)"), pack.meta("license").unwrap_or("(no licence noted)"));
         let MotionPack { database: db, meshes, actions, .. } = pack;
-        let first = meshes.into_iter().next().ok_or("the pack has no mesh")?;
-        let mesh = first.mesh;
-        let mut palette = BonePalette::new(mesh.skin_joints.len());
-        palette.update(&mesh, &db.skeleton.rest_model());
-        let params = SkinnedLitParams {
-            base_color: first.color,
-            sun_direction: [SUN_DIR[0], SUN_DIR[1], SUN_DIR[2], 0.0],
-            sun: [SUN[0], SUN[1], SUN[2], 0.0],
-            sky: [SKY[0], SKY[1], SKY[2], 0.0],
-        };
-        let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
-        r.dynamic = true;
-        let index = scene.add(SceneNode::Renderable(r));
-        let mut bodies = vec![Body { name: "mannequin", mesh, palette, index, display: None, source: source.clone() }];
+        // the pack's own mesh, when it has one (a pack may ship without, for a character pack's body)
+        let mut bodies = Vec::new();
+        if let Some(first) = meshes.into_iter().next() {
+            let mesh = first.mesh;
+            let mut palette = BonePalette::new(mesh.skin_joints.len());
+            palette.update(&mesh, &db.skeleton.rest_model());
+            let params = SkinnedLitParams {
+                base_color: first.color,
+                sun_direction: [SUN_DIR[0], SUN_DIR[1], SUN_DIR[2], 0.0],
+                sun: [SUN[0], SUN[1], SUN[2], 0.0],
+                sky: [SKY[0], SKY[1], SKY[2], 0.0],
+            };
+            let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
+            r.dynamic = true;
+            let index = scene.add(SceneNode::Renderable(r));
+            bodies.push(Body { name: "mannequin", mesh, palette, index, display: None, source: source.clone() });
+        }
         if let Some(pack) = hero {
             match hero_body(renderer, scene, pack, &db) {
                 Ok(b) => bodies.push(b),
                 Err(e) => log::warn!("character pack left out: {e}"),
             }
+        }
+        if bodies.is_empty() {
+            return Err("the pack has no mesh, and there is no character pack to show it on".into());
         }
         let joints = bodies.iter().map(|b| b.display.as_ref().map_or(db.joint_count(), |d| d.0.len())).max().unwrap_or(0);
         let bones = Markers::new(renderer, scene, "Bones", joints, [30000.0, 20000.0, 4000.0], true);
@@ -844,7 +850,7 @@ impl State {
                                 None => String::new(),
                             }
                         ),
-                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.showing > 0 { c.bodies[c.showing].source.as_str() } else { "" }),
+                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.bodies[c.showing].display.is_some() { c.bodies[c.showing].source.as_str() } else { "" }),
                     ));
                 }
                 Some(_) => set_hud(""),
@@ -858,6 +864,17 @@ impl State {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
+    start_with_loader(canvas_id, |url: String| async move { fetch_bytes(&url).await }).await
+}
+
+/// `start`, with the packs' bytes from `load` instead of a plain fetch: it gets each pack's URL
+/// (`pack/locomotion.kmm`, `pack/hero.kmm`, or `pack=`/`hero=`) and returns the `.kmm` bytes, or
+/// why there are none. For an app that stores its packs another way, e.g. encrypted.
+pub async fn start_with_loader<L, F>(canvas_id: &str, load: L) -> Result<(), JsValue>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
     let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
@@ -896,11 +913,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let url = query_param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
     set_hud(&format!("Loading motion pack {url} …"));
     let gait = query_param("gait").as_deref() != Some("0");
-    let motion = fetch_bytes(&url).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
+    let motion = load(url.clone()).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
     // a second body, optional
     let hero_url = query_param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
     let hero = match &motion {
-        Ok(_) => match fetch_bytes(&hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
+        Ok(_) => match load(hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
             Ok(h) => Some(h),
             Err(e) => {
                 log::info!("no character pack: {e}");
