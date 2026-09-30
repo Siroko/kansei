@@ -362,7 +362,7 @@ impl Lake {
         sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
         let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.002 });
-        let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.15 });
+        let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.6 });
 
         // its surface: a surface field (the distance to the weighted mean of the particles within
         // 1.5 units, less a particle radius of 0.45) polygonised at its iso level of 1, where the bulk
