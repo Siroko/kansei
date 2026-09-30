@@ -164,6 +164,16 @@ impl FluidDensityField {
 
     pub fn tex_dims(&self) -> [u32; 3] { self.tex_dims }
 
+    /// The surface field's particle radius (a field made with `particle_radius`; ignored for a
+    /// density field).
+    pub fn set_particle_radius(&mut self, radius: f32) {
+        if self.particle_radius.is_some() {
+            self.particle_radius = Some(radius);
+        }
+    }
+
+    pub fn particle_radius(&self) -> Option<f32> { self.particle_radius }
+
     fn upload_params(&mut self, bounds_min: [f32; 3], bounds_max: [f32; 3], particle_count: u32, smoothing_radius: f32) {
         let p = &mut self.params_data;
         let td = self.tex_dims;

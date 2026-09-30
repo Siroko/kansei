@@ -52,8 +52,40 @@ const BANK_OUT: f32 = 1.6;
 const SPLASH_RADIUS: f32 = 0.3;
 const SPLASH_TIME: f32 = 0.12;
 const SPLASH_PUSH: f32 = 1.2;
-/// The surface field's kernel radius (simulation units).
-const SPLAT: f32 = 1.5;
+/// How the water's surface is extracted from the particles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceSettings {
+    /// A surface field (droplets, flat layers) rather than the splatted density.
+    pub surface_field: bool,
+    /// Voxels along the field's longest side.
+    pub resolution: u32,
+    /// The splat's kernel radius (simulation units).
+    pub kernel: f32,
+    /// The surface field's particle radius (simulation units).
+    pub particle_radius: f32,
+    /// The iso level: 1 for a surface field; a density for the density field.
+    pub iso: f32,
+    /// Interpolated marching cubes (else voxel faces).
+    pub interpolate: bool,
+}
+
+impl SurfaceSettings {
+    /// The default: a surface field, spray as droplets 8 cm across, at the density build's cost.
+    pub const DROPLETS: Self = Self { surface_field: true, resolution: 256, kernel: 1.5, particle_radius: 0.45, iso: 1.0, interpolate: true };
+    /// The splatted density at an iso level, wide and smooth: spray is blobby.
+    pub const SMOOTH: Self = Self { surface_field: false, resolution: 256, kernel: 1.6, particle_radius: 0.45, iso: 0.5, interpolate: true };
+    /// A coarser surface field, for slower GPUs.
+    pub const PERFORMANCE: Self = Self { surface_field: true, resolution: 192, kernel: 1.5, particle_radius: 0.55, iso: 1.0, interpolate: true };
+
+    fn density_options(&self) -> DensityFieldOptions {
+        DensityFieldOptions {
+            resolution: self.resolution,
+            // surface field: 1 over the kernel weight of the bulk (particles per unit³ × 0.638 h³)
+            kernel_scale: if self.surface_field { 1.0 / (SPACING.powi(-3) * 0.638 * self.kernel.powi(3)) } else { 0.6 },
+            particle_radius: self.surface_field.then_some(self.particle_radius),
+        }
+    }
+}
 /// Lattice spacing of the particles at the fluid clock's rest density (simulation units).
 const SPACING: f32 = 0.537;
 
@@ -115,7 +147,9 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
     let shadow = kansei_sun_shadow(in.world, n, in.clip.xy);
     let lines = max(grid(in.world.xz, 1.0, 1.0) * 0.35, grid(in.world.xz, 5.0, 1.5) * 0.6);
     let under = in.world.y - surface.base_color.w;
-    let wet = smoothstep(0.03, -0.02, under);
+    // wet up to a damp margin over the still water (the water settles a few cm over the height
+    // it is filled to), so no dry band shows through the shallows
+    let wet = smoothstep(0.08, 0.04, under);
     let silt = mix(vec3<f32>(0.3, 0.26, 0.19), vec3<f32>(0.16, 0.15, 0.11), smoothstep(0.0, -0.5, under));
     let base = mix(surface.base_color.rgb, silt, wet) * (1.0 - lines * mix(1.0, 0.4, wet));
     let l = -normalize(surface.sun_dir.xyz);
@@ -215,6 +249,13 @@ pub struct Lake {
     splash: Option<(GVec3, f32, f32)>,
     /// The waterline's bounds (x, z): legs within 2 m of them push the water.
     near: ([f32; 2], [f32; 2]),
+    /// Simulated seconds per real second.
+    pub time_scale: f32,
+    /// A landing splash's push outward per m/s of the fall.
+    pub splash_push: f32,
+    /// The particles as they started, for a reset.
+    initial: Vec<f32>,
+    surface: SurfaceSettings,
 }
 
 /// Blur the floor of `shape` (a box filter `radius` nodes each way, along x then z, twice): the
@@ -317,20 +358,16 @@ impl Lake {
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
         sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
-        let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.02 });
+        let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.002 });
         let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.15 });
 
         // its surface: a surface field (the distance to the weighted mean of the particles within
-        // SPLAT, less a particle radius of 0.45) polygonised at its iso level of 1, where the bulk
+        // 1.5 units, less a particle radius of 0.45) polygonised at its iso level of 1, where the bulk
         // is inside whatever the mean. Averaging flattens the layers the particles settle in along
         // the sloping bed, while a lone particle stays a droplet 8 cm across and a jet of them a
         // thin one. The voxels are 0.6 units (5.5 cm): the kernel reaches 3 of them each way.
-        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions {
-            resolution: 256,
-            // 1 over the kernel weight of the bulk (particles per unit³ × 0.638 h³)
-            kernel_scale: 1.0 / (SPACING.powi(-3) * 0.638 * SPLAT.powi(3)),
-            particle_radius: Some(0.45),
-        });
+        let settings = SurfaceSettings::DROPLETS;
+        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, settings.density_options());
         let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 600_000, iso_level: 1.0 });
         // interpolated marching cubes (the default extraction draws voxel faces)
         marching_cubes.set_use_classic(true);
@@ -351,10 +388,10 @@ impl Lake {
             sky_color: [7000.0, 8000.0, 10000.0],
             sky_reflection: 1.0,
         });
-        surface.splat_radius = Some(SPLAT);
+        surface.splat_radius = Some(settings.kernel);
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, splash: None, near: (bmin, bmax) }, surface)
+        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings }, surface)
     }
 
     /// The water's surface renderable, drawing the effect's marching-cubes mesh (the effect must
@@ -387,11 +424,12 @@ impl Lake {
         if self.previous.len() != legs.len() {
             self.previous = legs.iter().map(|(a, b, _)| [*a, *b]).collect();
         }
+        let time_scale = self.time_scale;
         let velocity = |now: GVec3, then: GVec3| {
             let v = (now - then) / dt.max(1e-3);
             // a teleport (`at=`, a switch of body) is no kick
             let v = if v.length() > 15.0 { GVec3::ZERO } else { v };
-            (v * SIM_SCALE / TIME_SCALE).to_array()
+            (v * SIM_SCALE / time_scale).to_array()
         };
         let mut capsules: Vec<FluidCapsule> = legs
             .iter()
@@ -410,8 +448,8 @@ impl Lake {
         if let Some((at, speed, age)) = self.splash {
             if age < SPLASH_TIME {
                 let c = ((at + GVec3::Y * 0.1) * SIM_SCALE).to_array();
-                let up = [0.0, speed * 0.4 * SIM_SCALE / TIME_SCALE, 0.0];
-                capsules.push(FluidCapsule { expansion: speed * SPLASH_PUSH * SIM_SCALE / TIME_SCALE, ..FluidCapsule::new(c, c, SPLASH_RADIUS * SIM_SCALE, up, up) });
+                let up = [0.0, speed * 0.4 * SIM_SCALE / self.time_scale, 0.0];
+                capsules.push(FluidCapsule { expansion: speed * self.splash_push * SIM_SCALE / self.time_scale, ..FluidCapsule::new(c, c, SPLASH_RADIUS * SIM_SCALE, up, up) });
                 self.splash = Some((at, speed, age + dt));
             } else {
                 self.splash = None;
@@ -421,8 +459,73 @@ impl Lake {
 
         self.accumulator = (self.accumulator + dt).min(STEP * MAX_STEPS as f32);
         while self.accumulator >= STEP {
-            surface.sim.update_batched_with(STEP * TIME_SCALE, 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
+            surface.sim.update_batched_with(STEP * self.time_scale, 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
             self.accumulator -= STEP;
         }
+    }
+
+    /// Change a setting of the water by name (the page's tweak panel); false for an unknown one.
+    pub fn set(&mut self, surface: &mut FluidSurfaceEffect, key: &str, value: f32) -> bool {
+        let p = &mut surface.sim.params;
+        match key {
+            "viscosity" => p.viscosity = value,
+            "negativePressure" => p.negative_pressure_scale = value,
+            "pressure" => p.pressure_multiplier = value,
+            "nearPressure" => p.near_pressure_multiplier = value,
+            "restDensity" => p.density_target = value,
+            "substeps" => p.substeps = value.round().clamp(1.0, 8.0) as u32,
+            "timeScale" => self.time_scale = value.max(0.1),
+            "drag" => self.colliders.options.drag = value,
+            "splash" => self.splash_push = value,
+            "friction" | "restitution" => {
+                let o = &mut self.container.options;
+                if key == "friction" { o.friction = value } else { o.restitution = value }
+                self.container.upload();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Put the water back as it started, still.
+    pub fn reset(&mut self, surface: &FluidSurfaceEffect) {
+        let queue = surface.sim.gpu().1;
+        if let (Some(positions), Some(velocities)) = (surface.sim.positions_buffer(), surface.sim.velocities_buffer()) {
+            queue.write_buffer(positions, 0, bytemuck::cast_slice(&self.initial));
+            queue.write_buffer(velocities, 0, bytemuck::cast_slice(&vec![0.0f32; self.initial.len()]));
+        }
+        self.splash = None;
+        self.accumulator = 0.0;
+    }
+
+    pub fn surface_settings(&self) -> SurfaceSettings {
+        self.surface
+    }
+
+    /// Extract the surface as `settings` say: a new field when its kind or resolution changes,
+    /// else the kernel, radius, iso level and interpolation in place.
+    pub fn set_surface(&mut self, renderer: &Renderer, surface: &mut FluidSurfaceEffect, settings: SurfaceSettings) {
+        let old = self.surface;
+        if settings.surface_field != old.surface_field || settings.resolution != old.resolution {
+            let sim = &surface.sim;
+            let field = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, settings.density_options());
+            surface.marching_cubes_bg = surface.marching_cubes.create_bind_group(renderer, &field.density_view);
+            surface.density_field = field;
+        } else {
+            surface.density_field.kernel_scale = settings.density_options().kernel_scale;
+            surface.density_field.set_particle_radius(settings.particle_radius);
+        }
+        surface.splat_radius = Some(settings.kernel);
+        surface.marching_cubes.set_iso_level(settings.iso);
+        surface.marching_cubes.set_use_classic(settings.interpolate);
+        self.surface = settings;
+    }
+
+    pub fn drag(&self) -> f32 {
+        self.colliders.options.drag
+    }
+
+    pub fn friction(&self) -> f32 {
+        self.container.options.friction
     }
 }
