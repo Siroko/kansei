@@ -26,10 +26,15 @@
 //! trigger runs, the left bumper toggles strafing. Keys B, K, M, L and C toggle the trajectory
 //! overlay and HUD, the skeleton, the mesh, foot locking and the character.
 //!
+//! A small lake lies east of the course (`lake`): SPH water in a container shaped like the lake,
+//! which the character wades into, its legs pushing the water (wakes, splashes and ripples).
+//!
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
-//! paces; sideways and backward scale with them), `course=0` (no boxes), `at=<x>,<z>,<heading
-//! in degrees>` (where the character starts).
+//! paces; sideways and backward scale with them), `course=0` (no boxes), `lake=0` (no lake),
+//! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake).
+
+mod lake;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -56,7 +61,7 @@ use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, Shade
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
-    effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, FluidSurfaceEffect, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
     PostProcessingEffect, PostProcessingVolume,
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -597,6 +602,25 @@ impl Character {
     fn joint(&self, j: usize) -> usize {
         self.controller.matcher.output_skeleton(&self.db).find(&self.db.skeleton.names[j]).unwrap_or(0)
     }
+
+    /// The legs as capsules (world ends, radius): each thigh, shin and foot (hip to knee to ankle
+    /// to toe, up the foot's parents and down to its first child), and the hips.
+    fn leg_capsules(&self) -> Vec<(GVec3, GVec3, f32)> {
+        let matcher = &self.controller.matcher;
+        let (character, model, skeleton) = (matcher.character(), matcher.model(), matcher.output_skeleton(&self.db));
+        let at = |j: usize| character.transform_point(model[j].translation);
+        let mut legs = Vec::new();
+        for side in 0..2 {
+            let foot = self.joint(self.db.roles.feet[side]);
+            let Some(knee) = skeleton.parents[foot] else { continue };
+            let Some(hip) = skeleton.parents[knee] else { continue };
+            let toe = skeleton.parents.iter().position(|p| *p == Some(foot)).map_or(at(foot) + character.rotation * GVec3::Z * 0.15, at);
+            legs.extend([(at(hip), at(knee), 0.085), (at(knee), at(foot), 0.06), (at(foot), toe, 0.05)]);
+        }
+        let hips = at(self.joint(self.db.roles.hips));
+        legs.push((hips, hips, 0.14));
+        legs
+    }
 }
 
 /// Keys held and pressed since last frame, from the page's key events.
@@ -614,6 +638,7 @@ struct State {
     controls: CameraControls,
     volume: PostProcessingVolume,
     character: Option<Character>,
+    lake: Option<lake::Lake>,
     keys: Rc<RefCell<Keys>>,
     last: f64,
     frame: u32,
@@ -775,7 +800,7 @@ impl State {
                 for (side, locked) in c.controller.matcher.feet_locked().iter().enumerate() {
                     let p = character.transform_point(model[c.joint(c.db.roles.feet[side])].translation);
                     let size = if *locked { 0.09 } else { 0.04 };
-                    c.trajectory.matrices[k] = Mat4::from_scale_rotation_translation(GVec3::splat(size), Quat::IDENTITY, GVec3::new(p.x, 0.02, p.z));
+                    c.trajectory.matrices[k] = Mat4::from_scale_rotation_translation(GVec3::splat(size), Quat::IDENTITY, GVec3::new(p.x, character.translation.y + 0.02, p.z));
                     k += 1;
                 }
             } else {
@@ -793,6 +818,12 @@ impl State {
                     }
                 }
                 c.bones.upload(&self.renderer);
+            }
+        }
+        if let Some(lake) = &mut self.lake {
+            let legs = self.character.as_ref().map(Character::leg_capsules).unwrap_or_default();
+            if let Some(surface) = self.volume.effects.get_mut(lake.effect).and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
+                lake.update(surface, &legs, dt);
             }
         }
         self.controls.update(&mut self.camera, dt);
@@ -844,7 +875,13 @@ impl State {
                                 None => String::new(),
                             }
                         ),
-                        format_args!("character: {} (C to switch)\n{}\n{}", c.bodies[c.showing].name, c.source, if c.showing > 0 { c.bodies[c.showing].source.as_str() } else { "" }),
+                        format_args!(
+                            "{}character: {} (C to switch)\n{}\n{}",
+                            self.lake.as_ref().map_or(String::new(), |l| format!("lake   {} particles, east of the course (at=14,-1,90)\n", l.particles())),
+                            c.bodies[c.showing].name,
+                            c.source,
+                            if c.showing > 0 { c.bodies[c.showing].source.as_str() } else { "" }
+                        ),
                     ));
                 }
                 Some(_) => set_hud(""),
@@ -873,7 +910,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut scene = Scene::new();
     // the floor and the course, for collision
     let mut world = CollisionWorld::new();
-    world.add_box(Obb::from_min_max(GVec3::new(-200.0, -1.0, -200.0), GVec3::new(200.0, 0.0, 200.0)));
+    let with_lake = query_param("lake").as_deref() != Some("0");
+    if !with_lake {
+        world.add_box(Obb::from_min_max(GVec3::new(-200.0, -1.0, -200.0), GVec3::new(200.0, 0.0, 200.0)));
+    }
     if query_param("course").as_deref() != Some("0") {
         build_course(&mut scene, &mut world);
     }
@@ -884,10 +924,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     scene.add(SceneNode::Renderable(sky));
     let mut ground_material = Material::new("Ground", &format!("{CASCADED_SHADOWS_WGSL}\n{GROUND_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
     ground_material.set_uniform_bindable(0, "Ground", &surface_params([0.32, 0.32, 0.3]));
-    let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
-    ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
-    ground.cast_shadow = false;
-    scene.add(SceneNode::Renderable(ground));
+    // with the lake, the ground has a hole the lake's terrain fills
+    let lake = if with_lake {
+        Some(lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0))
+    } else {
+        let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
+        ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
+        ground.cast_shadow = false;
+        scene.add(SceneNode::Renderable(ground));
+        None
+    };
     let mut sun = DirectionalLight::new(Vec3::new(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]), Vec3::new(1.0, 0.9, 0.75), 80000.0);
     sun.cast_shadow = true;
     scene.add(SceneNode::Light(Light::Directional(sun)));
@@ -951,11 +997,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ToneMapEffect::new(o)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
+    // the water's refraction and reflection come first, on the lit scene (the lake's `effect` 0)
+    let lake = lake.map(|(lake, surface)| {
+        effects.push(Box::new(surface));
+        lake
+    });
     if query_param("taa").as_deref() != Some("0") {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
+    if let Some(surface) = lake.as_ref().and_then(|l| volume.effects[l.effect].as_any().downcast_ref::<FluidSurfaceEffect>()) {
+        lake::Lake::add_surface(&mut scene, surface);
+    }
     let mut camera = Camera::new(45.0, 0.1, 1200.0, width as f32 / height as f32);
     camera.update_projection_matrix();
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
@@ -1003,6 +1057,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         controls,
         volume,
         character,
+        lake,
         keys,
         last: now_secs(),
         frame: 0,
