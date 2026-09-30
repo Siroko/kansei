@@ -47,6 +47,13 @@ const SHELF: f32 = 2.6;
 const SHORE: f32 = 1.2;
 const BANK: f32 = 0.1;
 const BANK_OUT: f32 = 1.6;
+/// A landing's splash: the sphere at the feet (m), how long it pushes (s), and its push outward
+/// per m/s of the fall.
+const SPLASH_RADIUS: f32 = 0.3;
+const SPLASH_TIME: f32 = 0.12;
+const SPLASH_PUSH: f32 = 1.2;
+/// The surface field's kernel radius (simulation units).
+const SPLAT: f32 = 1.5;
 /// Lattice spacing of the particles at the fluid clock's rest density (simulation units).
 const SPACING: f32 = 0.537;
 
@@ -204,6 +211,8 @@ pub struct Lake {
     /// Last frame's capsule ends (world), for their velocities.
     previous: Vec<[GVec3; 2]>,
     particles: u32,
+    /// A landing's splash: where (world), how fast it came down, and for how long it has pushed.
+    splash: Option<(GVec3, f32, f32)>,
     /// The waterline's bounds (x, z): legs within 2 m of them push the water.
     near: ([f32; 2], [f32; 2]),
 }
@@ -300,20 +309,28 @@ impl Lake {
             gravity: [0.0, -9.8, 0.0],
             // 4 substeps keep each one near the clock's stable 16 ms at this time scale
             substeps: 4,
+            // a fifth of the pull under the rest density: sparse water breaks into drops
+            // instead of stringing into filaments
+            negative_pressure_scale: 0.2,
             ..DEFAULT_OPTIONS
         }, &particles);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
         sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
         let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.02 });
-        let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.35 });
+        let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.15 });
 
         // its surface: a surface field (the distance to the weighted mean of the particles within
-        // 2 units, less a particle radius of 0.35) polygonised at its iso level of 1. Averaging over
-        // the wide kernel flattens the layers the particles settle in along the sloping bed, while a
-        // lone particle stays a droplet 3 cm across and a jet of them a thin one; the voxels are
-        // under half a unit (4.4 cm).
-        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 320, kernel_scale: 1.0, particle_radius: Some(0.35) });
+        // SPLAT, less a particle radius of 0.45) polygonised at its iso level of 1, where the bulk
+        // is inside whatever the mean. Averaging flattens the layers the particles settle in along
+        // the sloping bed, while a lone particle stays a droplet 8 cm across and a jet of them a
+        // thin one. The voxels are 0.6 units (5.5 cm): the kernel reaches 3 of them each way.
+        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions {
+            resolution: 256,
+            // 1 over the kernel weight of the bulk (particles per unit³ × 0.638 h³)
+            kernel_scale: 1.0 / (SPACING.powi(-3) * 0.638 * SPLAT.powi(3)),
+            particle_radius: Some(0.45),
+        });
         let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 600_000, iso_level: 1.0 });
         // interpolated marching cubes (the default extraction draws voxel faces)
         marching_cubes.set_use_classic(true);
@@ -334,10 +351,10 @@ impl Lake {
             sky_color: [7000.0, 8000.0, 10000.0],
             sky_reflection: 1.0,
         });
-        surface.splat_radius = Some(2.0);
+        surface.splat_radius = Some(SPLAT);
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, near: (bmin, bmax) }, surface)
+        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, splash: None, near: (bmin, bmax) }, surface)
     }
 
     /// The water's surface renderable, drawing the effect's marching-cubes mesh (the effect must
@@ -360,9 +377,9 @@ impl Lake {
         self.particles
     }
 
-    /// Place the character's leg capsules (world ends and radii) and step the water by `dt` real
-    /// seconds.
-    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], dt: f32) {
+    /// Place the character's leg capsules (world ends and radii), and a landing's splash (where
+    /// the feet came down and how fast, m/s), and step the water by `dt` real seconds.
+    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], landing: Option<(GVec3, f32)>, dt: f32) {
         // legs count only near the lake
         let (lo, hi) = self.near;
         let near = legs.first().is_some_and(|(a, _, _)| a.x > lo[0] - 2.0 && a.x < hi[0] + 2.0 && a.z > lo[1] - 2.0 && a.z < hi[1] + 2.0);
@@ -376,12 +393,30 @@ impl Lake {
             let v = if v.length() > 15.0 { GVec3::ZERO } else { v };
             (v * SIM_SCALE / TIME_SCALE).to_array()
         };
-        let capsules: Vec<FluidCapsule> = legs
+        let mut capsules: Vec<FluidCapsule> = legs
             .iter()
             .zip(&self.previous)
             .map(|((a, b, r), [pa, pb])| FluidCapsule::new((*a * SIM_SCALE).to_array(), (*b * SIM_SCALE).to_array(), r * SIM_SCALE, velocity(*a, *pa), velocity(*b, *pb)))
             .collect();
         self.previous = legs.iter().map(|(a, b, _)| [*a, *b]).collect();
+        // a landing in the water: a body-sized sphere at the feet that pushes the water out all
+        // round for a moment, as fast as the fall, throwing a crown of spray
+        if let Some((at, speed)) = landing {
+            let inside = self.container.shape().distance(at.x * SIM_SCALE, at.z * SIM_SCALE) < 0.0;
+            if inside && at.y < WATER + 0.15 && speed > 1.0 {
+                self.splash = Some((at, speed.min(8.0), 0.0));
+            }
+        }
+        if let Some((at, speed, age)) = self.splash {
+            if age < SPLASH_TIME {
+                let c = ((at + GVec3::Y * 0.1) * SIM_SCALE).to_array();
+                let up = [0.0, speed * 0.4 * SIM_SCALE / TIME_SCALE, 0.0];
+                capsules.push(FluidCapsule { expansion: speed * SPLASH_PUSH * SIM_SCALE / TIME_SCALE, ..FluidCapsule::new(c, c, SPLASH_RADIUS * SIM_SCALE, up, up) });
+                self.splash = Some((at, speed, age + dt));
+            } else {
+                self.splash = None;
+            }
+        }
         self.colliders.set(&capsules);
 
         self.accumulator = (self.accumulator + dt).min(STEP * MAX_STEPS as f32);

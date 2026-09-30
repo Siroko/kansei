@@ -437,7 +437,8 @@ impl FluidSimulation {
                 );
             }
 
-            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            let stamp = crate::profiling::gpu_pass("FluidSim/Substep");
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("FluidSim/Substep"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
             macro_rules! dispatch {
                 ($pass:expr, $wx:expr) => {
                     if let Some(ref p) = $pass {
@@ -556,6 +557,7 @@ impl FluidSimulation {
         f[ParamOffsets::GRAVITY_CENTER_Y] = p.gravity_center[1];
         f[ParamOffsets::GRAVITY_CENTER_Z] = p.gravity_center[2];
         f[ParamOffsets::RADIAL_GRAVITY] = if p.radial_gravity { 1.0 } else { 0.0 };
+        f[ParamOffsets::NEGATIVE_PRESSURE_SCALE] = p.negative_pressure_scale;
     }
 
     pub fn particle_count(&self) -> u32 { self.particle_count }

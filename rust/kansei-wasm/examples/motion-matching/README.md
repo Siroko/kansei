@@ -96,6 +96,9 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
 - The surface is marching cubes over a surface field (`DensityFieldOptions::particle_radius`):
   smooth over the bulk, with spray as small droplets. It refracts the bed and reflects the sky
   (`FluidSurfaceEffect`).
+- Landing in the water (a jump or a fall) throws a crown of spray, scaled by how fast the
+  character came down: a sphere at its feet pushes the water out for a moment
+  (`FluidCapsule::expansion`).
 
 ## Build and run
 
@@ -131,3 +134,5 @@ URL parameters:
 - `course=0` leaves the boxes out;
 - `lake=0` leaves the lake out;
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
+- `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
+  3 s (`Renderer::set_profiling`).
