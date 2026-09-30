@@ -15,7 +15,8 @@
 @group(0) @binding(11) var<storage, read_write> velocities: array<vec4<f32>>; // original order (output)
 
 fn pressureFromDensity(density: f32) -> f32 {
-    return (density - params.densityTarget) * params.pressureMultiplier;
+    let p = (density - params.densityTarget) * params.pressureMultiplier;
+    return select(p, p * params.negativePressureScale, p < 0.0);
 }
 
 fn nearPressureFromDensity(nearDensity: f32) -> f32 {

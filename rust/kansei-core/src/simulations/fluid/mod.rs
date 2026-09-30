@@ -12,9 +12,13 @@ mod cornell_box;
 mod fluid_renderables;
 mod attractor;
 mod clock;
+mod container;
+mod colliders;
 
 pub use params::{FluidSimulationOptions, DEFAULT_OPTIONS};
-pub use simulation::FluidSimulation;
+pub use simulation::{FluidSimulation, FluidSubstepPass};
+pub use container::{signed_distance, FluidContainer, FluidContainerOptions, PlanarContainerShape};
+pub use colliders::{FluidCapsule, FluidColliders, FluidCollidersOptions};
 pub use density_field::{FluidDensityField, DensityFieldOptions};
 pub use surface_renderer::FluidSurfaceRenderer;
 pub use particle_renderer::FluidParticleRenderer;

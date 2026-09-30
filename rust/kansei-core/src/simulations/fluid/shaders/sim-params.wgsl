@@ -35,7 +35,7 @@ struct SimParams {
     spikyPow3Factor: f32,
     spikyPow2DerivFactor: f32,
     spikyPow3DerivFactor: f32,
-    _pad: f32,
+    negativePressureScale: f32, // 1 = plain pressure; below 1 weakens the pull of under-dense regions
 
     gravityCenter: vec3<f32>,
     radialGravity: f32, // 0 = directional, 1 = radial toward gravityCenter
