@@ -350,9 +350,12 @@ impl Lake {
             gravity: [0.0, -9.8, 0.0],
             // 4 substeps keep each one near the clock's stable 16 ms at this time scale
             substeps: 4,
-            // a fifth of the pull under the rest density: sparse water breaks into drops
-            // instead of stringing into filaments
-            negative_pressure_scale: 0.2,
+            // 0.6 of the pull under the rest density: fewer filaments than the clock's full
+            // cohesion. Not much less: near pressure always pushes, so sparse water with little
+            // pull spreads like a gas, climbs the bank as a film and stays there (at 0.2 a
+            // minute's splashing stranded 4% of the lake on the shore; at 0.6 and 1 it drains
+            // back within 8 s)
+            negative_pressure_scale: 0.6,
             ..DEFAULT_OPTIONS
         }, &particles);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
@@ -528,4 +531,21 @@ impl Lake {
     pub fn friction(&self) -> f32 {
         self.container.options.friction
     }
+
+    /// Particles by region, from positions read back (simulation space, 4 floats each): in the
+    /// lake (inside the waterline), on the bank (the shore strip's inner part), in the band
+    /// against the walls (the strip's outer 0.3 m), and past the walls; with each region's mean
+    /// height (m).
+    pub fn regions(&self, positions: &[f32]) -> [(u32, f32); 4] {
+        let shape = self.container.shape();
+        let mut out = [(0u32, 0.0f32); 4];
+        for p in positions.chunks_exact(4) {
+            let d = shape.distance(p[0], p[2]) / SIM_SCALE;
+            let k = if d < 0.0 { 0 } else if d < SHORE - 0.3 { 1 } else if d <= SHORE + 0.01 { 2 } else { 3 };
+            out[k].0 += 1;
+            out[k].1 += p[1] / SIM_SCALE;
+        }
+        out.map(|(n, y)| (n, if n > 0 { y / n as f32 } else { 0.0 }))
+    }
+
 }

@@ -146,3 +146,5 @@ URL parameters:
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
 - `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
   3 s (`Renderer::set_profiling`).
+- `lake_regions()` (a wasm export, from the console) counts the lake's particles in the lake, on the
+  bank, against the walls and outside them, with their mean height: to check water drains back.
