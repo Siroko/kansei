@@ -142,8 +142,15 @@
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
     const camera = new Camera(26, 0.1, 1000, window.innerWidth / window.innerHeight);
-    const orbitRadius = window.innerWidth < 768 ? 120 : 90;
+    // Opening view: a low camera skimming the columns, with the focus band (85 units away) across the lower middle
+    // and the foreground and background blurred out. Drag to orbit and scroll to zoom from there.
+    const orbitRadius = window.innerWidth < 768 ? 160 : 130;
     const cameraControls = new CameraControls(camera, scene.position, null, orbitRadius);
+    cameraControls.azimuth = -0.01 * Math.PI * 2;
+    // Elevation has no setter: set the orbit's vertical angle (in turns) and its eased value together, as azimuth does.
+    const ELEVATION_TURNS = 0.075;
+    cameraControls.currentAngles.y = cameraControls.prevAngles.y = ELEVATION_TURNS;
+    cameraControls.finalRadians.y = ELEVATION_TURNS * Math.PI * 2;
 
     // ── Material (no texture — Lambert only) ──────────────────────────────────
     const material = new Material(lambertShader, { bindings: [] });
@@ -187,7 +194,7 @@
       strength: 0.5
     });
     const dofEffect = new DepthOfFieldEffect({
-      focusDistance: 25,
+      focusDistance: 85,
       focusRange: 15,
       maxBlur: 24
     });
