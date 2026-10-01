@@ -60,6 +60,8 @@ struct CompositeParams {
     light_dir: [f32; 4],   // xyz = direction light travels (world), w = intensity
     light_color: [f32; 4], // rgb, w = rim strength
     sky: [f32; 4],         // rgb, w = sky reflection
+    mask: u32,             // 0: any GBuffer normal is fluid; 1: only where emissive alpha >= 0.5
+    _pad: [u32; 3],
 }
 
 const COMPOSITE_SHADER: &str = r#"
@@ -77,6 +79,10 @@ struct Params {
     light_dir: vec4<f32>,   // xyz = direction light travels (world), w = intensity
     light_color: vec4<f32>, // rgb, w = rim strength
     sky: vec4<f32>,         // rgb, w = sky reflection
+    mask: u32,              // 0: any GBuffer normal is fluid; 1: only where emissive alpha >= 0.5
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -84,13 +90,21 @@ struct Params {
 @group(0) @binding(2) var background_tex: texture_2d<f32>; // opaque scene before MC
 @group(0) @binding(3) var normal_tex: texture_2d<f32>;     // GBuffer normals
 @group(0) @binding(4) var output_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var emissive_tex: texture_2d<f32>;   // GBuffer emissive (alpha: the fluid's mask)
+
+// Whether the fluid's surface covers this texel: a GBuffer normal, and with the emissive mask the
+// fluid material's mark (other materials writing normals, for GI, are not the fluid).
+fn is_fluid(texel: vec2u) -> bool {
+    if (length(textureLoad(normal_tex, texel, 0).rgb) < 0.01) { return false; }
+    return params.mask == 0u || textureLoad(emissive_tex, texel, 0).a >= 0.5;
+}
 
 // A refracted sample, where the fluid covers it: elsewhere the texel shows something in front of
 // the surface (a body standing out of the water), which must not appear through it, and the
 // pixel's own texel stands in.
 fn refracted_texel(uv: vec2<f32>, own: vec2u, dims: vec2<f32>) -> vec3<f32> {
     let texel = min(vec2u(dims * uv), vec2u(dims) - vec2u(1u));
-    let covered = length(textureLoad(normal_tex, texel, 0).rgb) >= 0.01;
+    let covered = is_fluid(texel);
     return textureLoad(background_tex, select(own, texel, covered), 0).rgb;
 }
 
@@ -103,10 +117,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     let scene = textureLoad(scene_color, coord, 0);
     let normal_data = textureLoad(normal_tex, coord, 0).rgb;
-    let normal_len = length(normal_data);
 
     // No MC surface here → pass through scene color
-    if (normal_len < 0.01) {
+    if (!is_fluid(coord)) {
         textureStore(output_tex, coord, scene);
         return;
     }
@@ -182,6 +195,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 "#;
 
+/// How [`FluidSurfaceEffect`] finds the fluid's surface in the GBuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FluidMask {
+    /// Any pixel with a normal: for scenes where only the fluid writes the GBuffer's normals.
+    #[default]
+    AnyNormal,
+    /// Pixels with a normal whose emissive alpha is at least 0.5, which the fluid's surface
+    /// material writes (and other materials leave at 0): for scenes whose other materials write
+    /// normals too (for screen-space GI and AO).
+    EmissiveAlpha,
+}
+
 /// Fluid surface post-processing effect.
 ///
 /// Encapsulates: density field update → MC extract → screen-space refraction composite.
@@ -211,6 +236,8 @@ pub struct FluidSurfaceEffect {
     /// Whether the effect runs at all (the default): off, it costs nothing and composites nothing,
     /// for a fluid out of view.
     pub active: bool,
+    /// How the composite finds the fluid's pixels (any normal, by default).
+    pub mask: FluidMask,
 }
 
 impl FluidSurfaceEffect {
@@ -225,7 +252,7 @@ impl FluidSurfaceEffect {
             options, sim, density_field, marching_cubes, marching_cubes_bg,
             composite_pipeline: None, composite_bgl: None, params_buf: None,
             composite_bg: None, cached_input_ptr: 0, initialized: false, splat_radius: None,
-            extract: true, active: true,
+            extract: true, active: true, mask: FluidMask::AnyNormal,
         }
     }
 
@@ -256,6 +283,8 @@ impl PostProcessingEffect for FluidSurfaceEffect {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             ],
         });
 
@@ -341,6 +370,8 @@ impl PostProcessingEffect for FluidSurfaceEffect {
                 self.options.sky_color[0], self.options.sky_color[1],
                 self.options.sky_color[2], self.options.sky_reflection,
             ],
+            mask: (self.mask == FluidMask::EmissiveAlpha) as u32,
+            _pad: [0; 3],
         };
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(&params));
 
@@ -357,6 +388,7 @@ impl PostProcessingEffect for FluidSurfaceEffect {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gbuffer.background_view) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(output) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&gbuffer.emissive_view) },
                 ],
             }));
         }
