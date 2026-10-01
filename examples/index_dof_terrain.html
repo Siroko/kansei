@@ -19,11 +19,15 @@
     import { Renderer } from '../src/renderers/Renderer'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
     import { Renderable } from '../src/objects/Renderable'
     import { Scene } from '../src/objects/Scene'
     import { Camera } from '../src/cameras/Camera'
     import { Vector2 } from '../src/math/Vector2'
     import { Vector3 } from '../src/math/Vector3'
+    import { Float } from '../src/math/Float'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
     import { CameraControls } from '../src/controls/CameraControls'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
@@ -40,14 +44,20 @@
     const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
     const SCROLL_SPEED   = 35;   // world-units per second along Z
 
+    const GRID_HALF      = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
+    const GRID_SPAN      = GRID_SIZE * GRID_SPACING;              // total Z extent
+
     // ── Lambert shader (white base colour, single directional/point light) ───
     // Light sits top-right of the scene: high Y, positive X, slightly back.
-    // Group 0 is intentionally empty — light data is baked as a WGSL constant.
+    // Light data is baked as WGSL constants. The whole field is one instanced draw: each instance is a column
+    // (x, start z, height), and the vertex shader scrolls it along Z by the shared offset, wrapping it to the back.
     const lambertShader = /* wgsl */`
       // World-space light position (top-right of the scene).
       const LIGHT_POS : vec3f = vec3f(80.0, 150.0, -60.0);
       const AMBIENT   : f32   = 0.12;
       const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
+      const MAX_Z     : f32   = ${(GRID_HALF + GRID_SPACING).toFixed(4)};
+      const GRID_SPAN : f32   = ${GRID_SPAN.toFixed(4)};
 
       struct VertexOut {
         @builtin(position) position   : vec4f,
@@ -55,7 +65,8 @@
         @location(1)       worldNormal: vec3f,
       }
 
-      // Group 0 — no material bindings for this shader
+      // Scroll along Z in world units, kept in [0, GRID_SPAN).
+      @group(0) @binding(0) var<uniform> scrollOffset   : f32;
       @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
       @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
       @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
@@ -66,14 +77,19 @@
         @location(0) position : vec4f,
         @location(1) normal   : vec3f,
         @location(2) uv       : vec2f,
+        @location(3) column   : vec4f, // x, start z, height (y scale), unused
       ) -> VertexOut {
-        let worldPos = worldMatrix * position;
+        // A column that scrolls past the front edge wraps to the back of the grid.
+        var z = column.y + scrollOffset;
+        if (z > MAX_Z) { z -= GRID_SPAN; }
+        let local    = vec4f(position.x + column.x, position.y * column.z, position.z + z, 1.0);
+        let worldPos = worldMatrix * local;
         var out : VertexOut;
         out.position    = projectionMatrix * viewMatrix * worldPos;
         out.worldPos    = worldPos.xyz;
-        // normalMatrix is the inverse-transpose model matrix — correct for
-        // non-uniform scales (e.g. the tall, thin noise columns).
-        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        // Inverse-transpose of the column's Y scale (the tall, thin noise columns), then the renderable's normalMatrix.
+        let columnNormal = normal * vec3f(1.0, 1.0 / column.z, 1.0);
+        out.worldNormal = normalize((normalMatrix * vec4f(columnNormal, 0.0)).xyz);
         return out;
       }
 
@@ -147,39 +163,35 @@
     const orbitTarget = new Vector3(0, 0, 0);
     const cameraControls = new CameraControls(camera, orbitTarget, null, 100);
 
-    // ── Material (no texture — Lambert only) ──────────────────────────────────
-    const material = new Material(lambertShader, { bindings: [] });
-    const geometry = new BoxGeometry(1, 1, 1);
-
-    // ── Grid of cubes ─────────────────────────────────────────────────────────
-    const half     = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
-    const gridSpan = GRID_SIZE * GRID_SPACING;              // total Z extent
-
-    // Each cube keeps its original grid Z so the noise coordinate is
-    // (worldX, originalZ - noiseOffset), i.e. we slide a window through the
-    // noise field continuously.  When a cube wraps, originalZ shifts by
-    // -gridSpan so the next sample is seamless.
-    const cubes = [];
-
+    // ── Grid of columns: one instance per column ──────────────────────────────
+    // Each column keeps its height from the noise at its starting grid position; only its Z scrolls.
+    const columns = new Float32Array(GRID_SIZE * GRID_SIZE * 4);
     for (let row = 0; row < GRID_SIZE; row++) {
       for (let col = 0; col < GRID_SIZE; col++) {
-        const worldX = col * GRID_SPACING - half;
-        const worldZ = row * GRID_SPACING - half;
-
-        const renderable = new Renderable(geometry, material);
-        renderable.position.x = worldX;
-        renderable.position.y = 0;
-        renderable.position.z = worldZ;
-
-        const noiseVal = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM);
-        renderable.scale.y = noiseVal * SCALE_Y_STRENGTH + 0.1;
-
-        scene.add(renderable);
-        cubes.push({ obj: renderable, noiseZ: worldZ });
+        const worldX = col * GRID_SPACING - GRID_HALF;
+        const worldZ = row * GRID_SPACING - GRID_HALF;
+        const i = (row * GRID_SIZE + col) * 4;
+        columns[i]     = worldX;
+        columns[i + 1] = worldZ;
+        columns[i + 2] = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM) * SCALE_Y_STRENGTH + 0.1;
       }
     }
+    const columnBuffer = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: columns,
+      shaderLocation: 3,
+      offset: 0,
+      stride: 4 * 4,
+      format: 'float32x4',
+    });
 
-    let noiseOffset = 0;
+    // ── Material (no texture — Lambert only) ──────────────────────────────────
+    const scrollOffset = new Float(0);
+    const material = new Material(lambertShader, {
+      bindings: [{ binding: 0, visibility: GPUShaderStage.VERTEX, value: scrollOffset }],
+    });
+    const geometry = new InstancedGeometry(new BoxGeometry(1, 1, 1), GRID_SIZE * GRID_SIZE, [columnBuffer]);
+    scene.add(new Renderable(geometry, material));
 
     // ── Post-processing volume ────────────────────────────────────────────────
     const ssaoEffect = new SSAOEffect({
@@ -281,26 +293,13 @@
 
     // ── Render loop ───────────────────────────────────────────────────────────
     let lastTime = performance.now();
-    const maxZ = half + GRID_SPACING;
 
     function animate(now) {
       const dt = (now - lastTime) / 1000;
       lastTime = now;
 
-      const dz = SCROLL_SPEED * dt;
-      noiseOffset += dz;
-
-      for (let i = 0; i < cubes.length; i++) {
-        const { obj } = cubes[i];
-        obj.position.z += dz;
-
-        if (obj.position.z > maxZ) {
-          obj.position.z -= gridSpan;
-          // const nz = cubes[i].noiseZ - noiseOffset;
-          // const n  = fbm(obj.position.x * NOISE_ZOOM, nz * NOISE_ZOOM);
-          // obj.scale.y = n * SCALE_Y_STRENGTH + 0.1;
-        }
-      }
+      // Wrapped on the CPU so the offset keeps full float precision on the GPU.
+      scrollOffset.value = (scrollOffset.value + SCROLL_SPEED * dt) % GRID_SPAN;
 
       cameraControls.update();
       volume.render(scene, camera);
