@@ -27,7 +27,10 @@
 //! overlay and HUD, the skeleton, the mesh, foot locking and the character.
 //!
 //! A small lake lies east of the course (`lake`): SPH water in a container shaped like the lake,
-//! which the character wades into, its legs pushing the water (wakes, splashes and ripples).
+//! which the character wades into, its legs pushing the water (wakes, splashes and ripples). A
+//! water cannon on its west bank (`cannon`) pours more water in when the character stands by it
+//! and presses E (X on a gamepad, or a click on its prompt), raising the lake's level; R (Y) by it
+//! drains the lake back. A water mill in the lake (`mill`) turns its paddles through the water.
 //!
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
@@ -35,7 +38,10 @@
 //! `rest=0` (the lake's water never rests: always stepped and drawn),
 //! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake).
 
+mod cannon;
 mod lake;
+mod mill;
+mod props;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -397,6 +403,14 @@ fn query_param(name: &str) -> Option<String> {
 }
 
 /// Show `text` in the page's HUD element.
+/// Show `text` in the page's `#prompt` element (hidden when empty), if it has one.
+fn set_prompt(text: &str) {
+    if let Some(prompt) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("prompt")) {
+        prompt.set_text_content(Some(text));
+        let _ = prompt.set_attribute("data-visible", if text.is_empty() { "0" } else { "1" });
+    }
+}
+
 fn set_hud(text: &str) {
     if let Some(hud) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("hud")) {
         hud.set_text_content(Some(text));
@@ -642,6 +656,14 @@ struct State {
     volume: PostProcessingVolume,
     character: Option<Character>,
     lake: Option<lake::Lake>,
+    /// The props by the lake: the water cannon and the mill (with the lake only).
+    cannon: Option<cannon::Cannon>,
+    mill: Option<mill::Mill>,
+    /// The cannon's trigger from the page (a click on its prompt): pressed since last frame, held.
+    pointer_fire: (bool, bool),
+    /// The prompt shown and the still water's height drawn, as last set.
+    prompt: String,
+    level: f32,
     keys: Rc<RefCell<Keys>>,
     last: f64,
     frame: u32,
@@ -688,12 +710,16 @@ impl State {
 
         // input: keyboard, then the gamepad on top
         let (mut stick, mut run, mut toggles) = ([0.0f32; 2], false, Vec::new());
+        // the cannon's trigger: E, the gamepad's X, or a click on the prompt
+        let (mut fire_pressed, mut fire_held) = self.pointer_fire;
+        self.pointer_fire.0 = false;
         {
             let mut keys = self.keys.borrow_mut();
             let held = |k: &[&str]| k.iter().any(|k| keys.held.contains(*k));
             stick[0] = held(&["d", "arrowright"]) as i32 as f32 - held(&["a", "arrowleft"]) as i32 as f32;
             stick[1] = held(&["w", "arrowup"]) as i32 as f32 - held(&["s", "arrowdown"]) as i32 as f32;
             run = held(&["shift"]);
+            fire_held |= held(&["e"]);
             toggles.append(&mut keys.pressed);
         }
         let length = (stick[0] * stick[0] + stick[1] * stick[1]).sqrt();
@@ -714,12 +740,21 @@ impl State {
             if pressed(4) && !was(4) {
                 toggles.push("q".into());
             }
+            if pressed(2) && !was(2) {
+                toggles.push("e".into());
+            }
+            if pressed(3) && !was(3) {
+                toggles.push("r".into());
+            }
+            fire_held |= pressed(2);
             self.pad_held = buttons.iter().map(|b| b.0).collect();
         }
-        let mut traverse = false;
+        let (mut traverse, mut drain) = (false, false);
         for key in toggles {
             match key.as_str() {
                 " " => traverse = true,
+                "e" => fire_pressed = true,
+                "r" => drain = true,
                 "q" => self.strafe = !self.strafe,
                 "b" => self.overlay = !self.overlay,
                 "c" => {
@@ -848,7 +883,41 @@ impl State {
                 self.last_y = y;
             }
             if let Some(surface) = self.volume.effects.get_mut(lake.effect).and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
-                lake.update(surface, &legs, landing, dt, self.camera.view_projection().to_glam());
+                // the props: the mill turns, the cannon fires when the character stands by it
+                let (bodies, stirring) = match &mut self.mill {
+                    Some(mill) => {
+                        mill.update(dt, &mut self.scene);
+                        (mill.capsules(), mill.turning())
+                    }
+                    None => (Vec::new(), false),
+                };
+                let at = self.character.as_ref().map(|c| c.controller.matcher.character().translation);
+                let stream = match &mut self.cannon {
+                    Some(cannon) => {
+                        if drain && cannon.near {
+                            lake.reset(surface);
+                        }
+                        cannon.update(dt, at, fire_pressed, fire_held, lake, &mut self.scene)
+                    }
+                    None => None,
+                };
+                let poured = lake.update(surface, &legs, landing, &bodies, stirring, stream, dt, self.camera.view_projection().to_glam());
+                if let Some(cannon) = &mut self.cannon {
+                    cannon.poured += poured as u64;
+                }
+            }
+            // the wet line on the bed follows the still water's height
+            let level = lake.level();
+            if (level - self.level).abs() > 0.002 {
+                if let Some(buffer) = self.scene.get_renderable_mut(lake.terrain).and_then(|r| r.material.bindable_buffer(0)) {
+                    self.renderer.queue().write_buffer(&buffer, 0, bytemuck::cast_slice(&lake.terrain_uniform()));
+                    self.level = level;
+                }
+            }
+            let prompt = self.cannon.as_ref().map_or(String::new(), |c| c.prompt(lake));
+            if prompt != self.prompt {
+                set_prompt(&prompt);
+                self.prompt = prompt;
             }
         }
 
@@ -869,7 +938,7 @@ impl State {
                     let feet = c.controller.matcher.feet_locked();
                     let speed = c.controller.matcher.simulation().velocity.length();
                     set_hud(&format!(
-                        "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock",
+                        "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock · E / X fire the cannon (by it)",
                         self.fps,
                         if run { "run" } else { "walk" },
                         format_args!("{speed:.1} m/s"),
@@ -901,7 +970,12 @@ impl State {
                         ),
                         format_args!(
                             "{}character: {} (C to switch)",
-                            self.lake.as_ref().map_or(String::new(), |l| format!("lake   {} particles, east of the course (at=14,-1,90), P tweaks\nwater  {}, fastest {:.2} m/s, {} over {} m/s\n", l.particles(), l.state().name(), l.speed().0, l.speed().1, lake::SETTLE_SPEED)),
+                            self.lake.as_ref().map_or(String::new(), |l| format!(
+                                "lake   {} / {} particles, {:.0}% full (level {:+.3} m), east of the course (at=14,-1,90), P tweaks\nwater  {}, fastest {:.2} m/s, {} over {} m/s{}{}\n",
+                                l.particles(), l.capacity(), l.fill() * 100.0, l.level(), l.state().name(), l.speed().0, l.speed().1, lake::SETTLE_SPEED,
+                                self.cannon.as_ref().map_or(String::new(), |c| format!("\ncannon {}{} poured", if c.firing() { "firing, " } else if c.near { "ready, " } else { "" }, c.poured)),
+                                self.mill.as_ref().map_or(String::new(), |m| format!("\nmill   {}", if m.turning() { format!("{:.0} rpm", m.rpm) } else { "stopped".to_string() })),
+                            )),
                             c.bodies[c.showing].name,
                         ),
                     ));
@@ -962,9 +1036,15 @@ where
     let mut ground_material = Material::new("Ground", &format!("{CASCADED_SHADOWS_WGSL}\n{GROUND_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
     ground_material.set_uniform_bindable(0, "Ground", &surface_params([0.32, 0.32, 0.3]));
     // with the lake, the ground has a hole the lake's terrain fills
+    let (mut cannon, mut mill) = (None, None);
     let lake = if with_lake {
         let (mut lake, surface) = lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0);
         lake.rest = query_param("rest").as_deref() != Some("0");
+        cannon = Some(cannon::Cannon::new(&mut scene, &mut world, &lake));
+        mill = Some(mill::Mill::new(&mut scene, &mut world, &lake));
+        if let Some(m) = &mut mill {
+            m.on = query_param("mill").as_deref() != Some("0");
+        }
         Some((lake, surface))
     } else {
         let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
@@ -1096,7 +1176,12 @@ where
         controls,
         volume,
         character,
+        level: lake.as_ref().map_or(0.0, |l| l.level()),
         lake,
+        cannon,
+        mill,
+        pointer_fire: (false, false),
+        prompt: String::new(),
         keys,
         last: now_secs(),
         frame: 0,
@@ -1132,6 +1217,15 @@ where
 thread_local! {
     /// The page's state, for the exports the tweak panel calls between frames.
     static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` on the page's state, once it has started.
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    STATE.with(|s| {
+        let state = s.borrow().clone()?;
+        let mut state = state.borrow_mut();
+        Some(f(&mut state))
+    })
 }
 
 /// Run `f` on the lake, its surface effect and the renderer, when there is a lake.
@@ -1201,10 +1295,68 @@ pub fn lake_state() -> Option<String> {
     with_lake(|lake, _, _| lake.state().name().to_string())
 }
 
-/// Set one of the lake's simulation settings by name (see `lake::Lake::set`).
+/// Set one of the lake's simulation settings by name (see `lake::Lake::set`), or the mill's
+/// (`mill`: 1 turning, 0 stopped; `millRpm`: its speed in turns a minute).
 #[wasm_bindgen]
 pub fn lake_set(key: &str, value: f32) -> bool {
+    if let Some(done) = with_state(|state| {
+        let mill = state.mill.as_mut()?;
+        match key {
+            "mill" => mill.on = value > 0.5,
+            "millRpm" => mill.rpm = value.clamp(0.0, 60.0),
+            _ => return None,
+        }
+        Some(true)
+    })
+    .flatten()
+    {
+        return done;
+    }
     with_lake(|lake, surface, _| lake.set(surface, key, value)).unwrap_or(false)
+}
+
+/// The mill's settings for the tweak panel ({ mill: 0 or 1, millRpm }), or null without one.
+#[wasm_bindgen]
+pub fn mill_settings() -> JsValue {
+    with_state(|state| {
+        let mill = state.mill.as_ref()?;
+        let o = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&o, &"mill".into(), &(mill.on as u32).into());
+        let _ = js_sys::Reflect::set(&o, &"millRpm".into(), &mill.rpm.into());
+        Some(JsValue::from(o))
+    })
+    .flatten()
+    .unwrap_or(JsValue::NULL)
+}
+
+/// What the page should prompt near the cannon ("E / X — fire water …", or that the lake is
+/// full), or "" when the character is not by it: for a page that shows its own overlay.
+#[wasm_bindgen]
+pub fn cannon_prompt() -> String {
+    with_state(|state| state.prompt.clone()).unwrap_or_default()
+}
+
+/// The cannon's trigger from the page (a click or touch on the prompt): `down` fires (a burst,
+/// and it pours while held), `false` releases it. Only fires with the character by the cannon.
+#[wasm_bindgen]
+pub fn cannon_fire(down: bool) {
+    with_state(|state| state.pointer_fire = (state.pointer_fire.0 || down, down));
+}
+
+/// How full the lake is: { particles, capacity, fill (0 at the start's level, 1 full), level (m) },
+/// or null without a lake.
+#[wasm_bindgen]
+pub fn lake_fill() -> JsValue {
+    with_state(|state| {
+        let lake = state.lake.as_ref()?;
+        let o = js_sys::Object::new();
+        for (k, v) in [("particles", lake.particles() as f32), ("capacity", lake.capacity() as f32), ("fill", lake.fill()), ("level", lake.level())] {
+            let _ = js_sys::Reflect::set(&o, &k.into(), &v.into());
+        }
+        Some(JsValue::from(o))
+    })
+    .flatten()
+    .unwrap_or(JsValue::NULL)
 }
 
 /// Put the lake's water back as it started.
