@@ -178,7 +178,8 @@ h2 {
     linear-gradient(to right, rgba(5, 9, 11, 0.55) 0%, rgba(5, 9, 11, 0) 55%),
     linear-gradient(to top, var(--bg) 0%, rgba(5, 9, 11, 0.6) 34%, rgba(5, 9, 11, 0) 65%);
 }
-/* The still sits a little oversized so the pointer can drift it without showing an edge. */
+/* The loop and the still sit a little oversized so the pointer can drift them without showing an edge. */
+.hero-video,
 .hero-still {
   position: absolute;
   inset: -3%;
@@ -188,7 +189,14 @@ h2 {
   object-position: 60% 50%;
   display: block;
   transform: translate3d(var(--px, 0px), var(--py, 0px), 0);
-  transition: transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1);
+  opacity: 0;
+  transition:
+    transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1),
+    opacity 1.6s ease;
+}
+.hero-video.is-shown,
+.hero-still.is-shown {
+  opacity: 1;
 }
 .hero-live {
   position: absolute;
@@ -522,6 +530,7 @@ h2 {
   html {
     scroll-behavior: auto;
   }
+  .hero-video,
   .hero-still {
     transform: none;
   }

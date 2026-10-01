@@ -56,11 +56,16 @@
     <main id="main">
       <section class="hero" aria-labelledby="hero-title">
         <div class="hero-media" aria-hidden="true">
+          <!--
+            The hero starts black. site.js fades in the live lake (raggare.kansei.graphics/bg/lake/, an iframe) when it
+            can run, else this loop cut from the teaser film, else (reduced motion) the still. Each loads only if used.
+          -->
+          <video class="hero-video" muted loop playsinline preload="metadata" tabindex="-1"></video>
           <picture>
-            <source media="(max-width: 760px) and (orientation: portrait)" srcset="/media/lake-still-portrait.webp" />
-            <img class="hero-still" src="/media/lake-still.webp" alt="" width="2400" height="1000" decoding="async" fetchpriority="high" />
+            <source media="(max-width: 760px) and (orientation: portrait)" data-srcset="/media/lake-still-portrait.webp" />
+            <img class="hero-still" data-src="/media/lake-still.webp" alt="" width="2400" height="1000" decoding="async" />
           </picture>
-          <!-- site.js adds the live lake (raggare.kansei.graphics/bg/lake/) here as an iframe when it can run. -->
+          <noscript><img class="hero-still is-shown" src="/media/lake-still.webp" alt="" width="2400" height="1000" /></noscript>
         </div>
         <div class="hero-copy">
           <p class="eyebrow">Game &amp; graphics studio</p>
