@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kansei — Depth of Field</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #label { position: fixed; left: 12px; bottom: 10px; color: #fff8; font: 12px ui-monospace, monospace; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <div id="label"></div>
+    <script type="module">
+        // URL parameters (all optional):
+        //   focal    focal length in mm on a 23.76 mm filmback (default 50); sets the field of view
+        //   fstop    f-number (default 1.8)
+        //   focus    focus distance in metres (default 8, the subject); rack=1 pulls focus 2 -> 30 m
+        //            and back every 8 s (t= fixes the time, for stills)
+        //   blades   aperture blades (default 0: round bokeh)
+        //   samples  gather samples per half-resolution pixel (default 72); scatter=0 gathers highlights too
+        //   ev       EV100 exposure (default 10.8); dof=0 turns the depth of field off, taa=0 the TAA;
+        //            order=after runs the DoF after the TAA instead of before it
+        //   debug    1 background layer, 2 near layer, 3 near alpha, 4 CoC
+        //   scale    render scale, 0.25 to 1 (default 1): the TAA upscales to the canvas
+        document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
+        import init, { start } from '../pkg/kansei_wasm_depth_of_field.js';
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>

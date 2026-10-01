@@ -1,6 +1,8 @@
 const CLEAR_WGSL: &str = include_str!("shaders/density-field-clear.wgsl");
 const SPLAT_WGSL: &str = include_str!("shaders/density-field-splat.wgsl");
 const COPY_WGSL: &str = include_str!("shaders/density-field-copy.wgsl");
+const SURFACE_SPLAT_WGSL: &str = include_str!("shaders/surface-field-splat.wgsl");
+const SURFACE_COPY_WGSL: &str = include_str!("shaders/surface-field-copy.wgsl");
 use crate::buffers::{BufferType, ComputeBuffer};
 use crate::buffers::Texture;
 use crate::materials::{Binding, BindingResource, Compute};
@@ -11,7 +13,8 @@ pub struct FluidDensityField {
     pub density_view: wgpu::TextureView,
     accum_buffer: ComputeBuffer,
     params_buffer: ComputeBuffer,
-    params_data: [f32; 12],
+    params_data: [f32; 16],
+    particle_radius: Option<f32>,
     tex_dims: [u32; 3],
     pub kernel_scale: f32,
 
@@ -27,11 +30,20 @@ pub struct FluidDensityField {
 pub struct DensityFieldOptions {
     pub resolution: u32,
     pub kernel_scale: f32,
+    /// `None`: the field is the particles' splatted density (`kernel_scale` scales it).
+    /// `Some(r)`: it is a surface field instead (Zhu & Bridson), `1 + (r - d) / h` with `d` the
+    /// distance to the kernel-weighted mean of the particles within the splat radius `h`: its
+    /// iso level is 1, where a lone particle is a droplet of radius `r` and a flat layer of
+    /// particles a flat surface, however they are stacked. `kernel_scale` is then 1 over the
+    /// kernel weight the bulk sums to (particles per unit volume × 0.638 h³ for its
+    /// `(1 - d²/h²)³` kernel): a voxel weighing past a third of that is inside, so walls and
+    /// floors under the fluid make no surface.
+    pub particle_radius: Option<f32>,
 }
 
 impl Default for DensityFieldOptions {
     fn default() -> Self {
-        Self { resolution: 64, kernel_scale: 1.0 }
+        Self { resolution: 64, kernel_scale: 1.0, particle_radius: None }
     }
 }
 
@@ -80,7 +92,7 @@ impl FluidDensityField {
             "DensityField/Accum",
             BufferType::Storage,
             wgpu::BufferUsages::STORAGE,
-            vec![0u8; total_voxels * 4],
+            vec![0u8; total_voxels * if options.particle_radius.is_some() { 16 } else { 4 }],
         );
         accum_buffer.initialize(device);
 
@@ -89,7 +101,7 @@ impl FluidDensityField {
             "DensityField/Params",
             BufferType::Uniform,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            vec![0u8; 48],
+            vec![0u8; 64],
         );
         params_buffer.initialize(device);
 
@@ -106,7 +118,7 @@ impl FluidDensityField {
 
         let mut splat = Compute::new(
             "DensityField/Splat",
-            SPLAT_WGSL,
+            if options.particle_radius.is_some() { SURFACE_SPLAT_WGSL } else { SPLAT_WGSL },
             vec![
                 Binding::storage(0, wgpu::ShaderStages::COMPUTE, false),
                 Binding::storage(1, wgpu::ShaderStages::COMPUTE, false),
@@ -125,7 +137,7 @@ impl FluidDensityField {
 
         let mut copy = Compute::new(
             "DensityField/Copy",
-            COPY_WGSL,
+            if options.particle_radius.is_some() { SURFACE_COPY_WGSL } else { COPY_WGSL },
             vec![
                 Binding::storage(0, wgpu::ShaderStages::COMPUTE, false),
                 Binding::storage_texture_3d(1, wgpu::ShaderStages::COMPUTE, wgpu::TextureFormat::Rgba16Float),
@@ -144,13 +156,23 @@ impl FluidDensityField {
 
         Self {
             density_texture, density_view, accum_buffer, params_buffer,
-            params_data: [0.0; 12], tex_dims, kernel_scale: options.kernel_scale,
+            params_data: [0.0; 16], particle_radius: options.particle_radius, tex_dims, kernel_scale: options.kernel_scale,
             device: device.clone(), queue: queue.clone(),
             clear, splat, copy,
         }
     }
 
     pub fn tex_dims(&self) -> [u32; 3] { self.tex_dims }
+
+    /// The surface field's particle radius (a field made with `particle_radius`; ignored for a
+    /// density field).
+    pub fn set_particle_radius(&mut self, radius: f32) {
+        if self.particle_radius.is_some() {
+            self.particle_radius = Some(radius);
+        }
+    }
+
+    pub fn particle_radius(&self) -> Option<f32> { self.particle_radius }
 
     fn upload_params(&mut self, bounds_min: [f32; 3], bounds_max: [f32; 3], particle_count: u32, smoothing_radius: f32) {
         let p = &mut self.params_data;
@@ -163,6 +185,7 @@ impl FluidDensityField {
         p[7] = smoothing_radius;
         p[8] = bounds_max[0]; p[9] = bounds_max[1]; p[10] = bounds_max[2];
         p[11] = self.kernel_scale;
+        p[12] = self.particle_radius.unwrap_or(0.0);
         self.params_buffer.write(&self.params_data);
         self.params_buffer.update(&self.queue);
     }
@@ -181,17 +204,17 @@ impl FluidDensityField {
 
         // Clear
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Clear").as_ref().map(crate::profiling::PassStamp::compute) });
             self.clear.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
         // Splat
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Splat").as_ref().map(crate::profiling::PassStamp::compute) });
             self.splat.dispatch(&mut pass, (particle_count + 63) / 64, 1, 1);
         }
         // Copy
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Copy").as_ref().map(crate::profiling::PassStamp::compute) });
             self.copy.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
     }
@@ -210,17 +233,36 @@ impl FluidDensityField {
         let queue = &self.queue;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("DensityField/Update") });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Clear"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Clear").as_ref().map(crate::profiling::PassStamp::compute) });
             self.clear.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Splat"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Splat").as_ref().map(crate::profiling::PassStamp::compute) });
             self.splat.dispatch(&mut pass, (particle_count + 63) / 64, 1, 1);
         }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DensityField/Copy"), timestamp_writes: crate::profiling::gpu_pass("DensityField/Copy").as_ref().map(crate::profiling::PassStamp::compute) });
             self.copy.dispatch(&mut pass, (w + 3) / 4, (h + 3) / 4, (d + 3) / 4);
         }
         queue.submit(std::iter::once(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_surface_field_shaders_validate_and_share_the_params_layout() {
+        for (name, code) in [("splat", SURFACE_SPLAT_WGSL), ("copy", SURFACE_COPY_WGSL)] {
+            let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let span = module.types.iter().find_map(|(_, t)| match (&t.name, &t.inner) {
+                (Some(n), naga::TypeInner::Struct { span, .. }) if n == "SurfaceFieldParams" => Some(*span as usize),
+                _ => None,
+            });
+            // the params buffer: 16 floats
+            assert_eq!(span, Some(16 * 4), "{name}");
+        }
     }
 }

@@ -448,7 +448,7 @@ impl TLASBuilder {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("TLASBuilder/MortonCodes"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("TLASBuilder/MortonCodes").as_ref().map(crate::profiling::PassStamp::compute),
             });
             cpass.set_pipeline(&self.morton_pipeline);
             cpass.set_bind_group(0, &morton_bg, &[]);
@@ -524,7 +524,7 @@ impl TLASBuilder {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("TLASBuilder/BuildLeaves"),
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("TLASBuilder/BuildLeaves").as_ref().map(crate::profiling::PassStamp::compute),
             });
             cpass.set_pipeline(&self.leaf_pipeline);
             cpass.set_bind_group(0, &build_bg_leaf, &[]);

@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Motion-matching packs are derived from third-party animation: keep them out of the repo
+*.kmm

@@ -40,17 +40,15 @@ impl Scene {
         // Update transforms
         for node in &mut self.children {
             match node {
+                // `update_model_matrix` also picks up fields written directly (`rotation.x = …`),
+                // which leave `is_dirty` false, and returns early when nothing changed
                 SceneNode::Renderable(r) => {
-                    if r.object.is_dirty() {
-                        r.object.update_model_matrix();
-                    }
+                    r.object.update_model_matrix();
                     r.object.update_world_matrix(None); // all root-level for now
                     r.object.update_normal_matrix();
                 }
                 SceneNode::Transform(o) => {
-                    if o.is_dirty() {
-                        o.update_model_matrix();
-                    }
+                    o.update_model_matrix();
                     o.update_world_matrix(None);
                 }
                 SceneNode::Light(_) => {}
@@ -165,5 +163,24 @@ impl Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rotation written straight into the field, after the first `prepare`, moves the node.
+    #[test]
+    fn prepare_picks_up_direct_field_writes() {
+        let mut scene = Scene::new();
+        let idx = scene.add(SceneNode::Transform(Object3D::new()));
+        scene.prepare(&Vec3::ZERO);
+        let SceneNode::Transform(o) = &mut scene.children[idx] else { unreachable!() };
+        o.rotation.x = std::f32::consts::FRAC_PI_2;
+        scene.prepare(&Vec3::ZERO);
+        let SceneNode::Transform(o) = &scene.children[idx] else { unreachable!() };
+        let y = o.world_matrix.to_glam().transform_vector3(glam::Vec3::Y);
+        assert!((y - glam::Vec3::Z).length() < 1e-5, "{y}");
     }
 }

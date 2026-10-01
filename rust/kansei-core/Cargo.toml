@@ -11,15 +11,24 @@ bytemuck = { workspace = true }
 log = { workspace = true }
 image = { workspace = true }
 gltf = { workspace = true }
+# Basis Universal transcoder (pure Rust, Apache-2.0); only loaders/ktx2/basis.rs uses it
+basisu = { workspace = true }
+optimesh = { workspace = true }
 egui = { version = "0.31", optional = true }
 egui-wgpu = { version = "0.31", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
     "HtmlCanvasElement", "MouseEvent", "WheelEvent", "EventTarget",
-    "TouchEvent", "Touch", "TouchList",
+    "TouchEvent", "Touch", "TouchList", "Window", "Performance",
 ] }
 wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# validates the WGSL modules in unit tests (same naga as wgpu 24)
+naga = { version = "24", features = ["wgsl-in"] }
+# headless GPU tests (skipped when there is no adapter)
+pollster = { workspace = true }
 
 [features]
 default = []

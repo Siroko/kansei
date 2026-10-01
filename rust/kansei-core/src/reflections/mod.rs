@@ -1,0 +1,11 @@
+//! Reflections: planar mirror views of the scene for materials to sample (K9).
+
+mod planar_reflection;
+mod screen_space;
+
+pub use planar_reflection::{oblique_near_plane, reflection_matrix, PlanarReflection, PlanarReflectionOptions, ReflectionFog};
+pub(crate) use planar_reflection::{crop, flip_x, mirrored_view, ReflectionFogParamsGpu};
+
+/// WGSL for sampling a [`PlanarReflection`] in a material: `kansei_screen_uv`,
+/// `kansei_reflection_offset` (ripples) and `kansei_planar_reflection` (roughness picks the mip).
+pub const PLANAR_REFLECTION_WGSL: &str = include_str!("../shaders/planar_reflection_sample.wgsl");
