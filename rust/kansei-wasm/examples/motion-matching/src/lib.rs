@@ -32,6 +32,7 @@
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
 //! paces; sideways and backward scale with them), `course=0` (no boxes), `lake=0` (no lake),
+//! `rest=0` (the lake's water never rests: always stepped and drawn),
 //! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake).
 
 mod lake;
@@ -828,6 +829,7 @@ impl State {
                 c.bones.upload(&self.renderer);
             }
         }
+        self.controls.update(&mut self.camera, dt);
         if let Some(lake) = &mut self.lake {
             let legs = self.character.as_ref().map(Character::leg_capsules).unwrap_or_default();
             // a landing: back on its feet after being in the air, at the fastest it came down
@@ -846,10 +848,9 @@ impl State {
                 self.last_y = y;
             }
             if let Some(surface) = self.volume.effects.get_mut(lake.effect).and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
-                lake.update(surface, &legs, landing, dt);
+                lake.update(surface, &legs, landing, dt, self.camera.view_projection().to_glam());
             }
         }
-        self.controls.update(&mut self.camera, dt);
 
         // HUD, a few times a second
         if now - self.counted_since > 1.0 {
@@ -900,7 +901,7 @@ impl State {
                         ),
                         format_args!(
                             "{}character: {} (C to switch)",
-                            self.lake.as_ref().map_or(String::new(), |l| format!("lake   {} particles, east of the course (at=14,-1,90), P tweaks\n", l.particles())),
+                            self.lake.as_ref().map_or(String::new(), |l| format!("lake   {} particles, east of the course (at=14,-1,90), P tweaks\nwater  {}, fastest {:.2} m/s, {} over {} m/s\n", l.particles(), l.state().name(), l.speed().0, l.speed().1, lake::SETTLE_SPEED)),
                             c.bodies[c.showing].name,
                         ),
                     ));
@@ -962,7 +963,9 @@ where
     ground_material.set_uniform_bindable(0, "Ground", &surface_params([0.32, 0.32, 0.3]));
     // with the lake, the ground has a hole the lake's terrain fills
     let lake = if with_lake {
-        Some(lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0))
+        let (mut lake, surface) = lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0);
+        lake.rest = query_param("rest").as_deref() != Some("0");
+        Some((lake, surface))
     } else {
         let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
         ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
@@ -1174,6 +1177,7 @@ pub fn lake_settings() -> JsValue {
             ("drag", lake.drag()),
             ("splash", lake.splash_push),
             ("friction", lake.friction()),
+            ("rest", lake.rest as u32 as f32),
             ("solver", if p.solver == kansei_core::simulations::fluid::FluidSolver::Pbf { 1.0 } else { 0.0 }),
             ("pbfIterations", p.pbf.iterations as f32),
             ("pbfRelaxation", p.pbf.relaxation),
@@ -1187,6 +1191,14 @@ pub fn lake_settings() -> JsValue {
         o.into()
     })
     .unwrap_or(JsValue::NULL)
+}
+
+/// Whether the lake's water is "running", "culled" (out of view, not stepped or drawn) or
+/// "asleep" (settled with nothing near it: not stepped, its surface drawn as it was); null without
+/// a lake.
+#[wasm_bindgen]
+pub fn lake_state() -> Option<String> {
+    with_lake(|lake, _, _| lake.state().name().to_string())
 }
 
 /// Set one of the lake's simulation settings by name (see `lake::Lake::set`).

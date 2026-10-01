@@ -619,6 +619,12 @@ impl FluidSimulation {
         let pass = Self::make_pass(device, label, code, &entries, bind_entries);
         (pass.pipeline, pass.bind_group)
     }
+    /// The box the particles are kept in (`world_bounds_min`/`max`, the simulation's space) grown
+    /// by `margin` all round: for culling the fluid against a view
+    /// ([`crate::culling::aabb_in_frustum`]), once mapped to the world.
+    pub fn bounds(&self, margin: f32) -> (glam::Vec3, glam::Vec3) {
+        (glam::Vec3::from(self.world_bounds_min) - margin, glam::Vec3::from(self.world_bounds_max) + margin)
+    }
     pub fn grid_dims(&self) -> [u32; 3] { self.grid_dims }
     pub fn positions_buffer(&self) -> Option<&wgpu::Buffer> { self.positions_buffer.as_ref() }
     /// The per-particle velocity buffer (`array<vec4<f32>>`), for external
