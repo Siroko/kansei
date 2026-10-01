@@ -204,6 +204,13 @@ pub struct FluidSurfaceEffect {
     /// radius. Set it explicitly when the sim radius is smaller than a field voxel,
     /// otherwise the field is sparse and the surface shatters into shards.
     pub splat_radius: Option<f32>,
+    /// Whether the surface is extracted from the particles each frame (the default). Off, the
+    /// last surface extracted keeps drawing: for a simulation that is not stepping (see
+    /// `simulations::fluid::FluidSleep`).
+    pub extract: bool,
+    /// Whether the effect runs at all (the default): off, it costs nothing and composites nothing,
+    /// for a fluid out of view.
+    pub active: bool,
 }
 
 impl FluidSurfaceEffect {
@@ -218,6 +225,7 @@ impl FluidSurfaceEffect {
             options, sim, density_field, marching_cubes, marching_cubes_bg,
             composite_pipeline: None, composite_bgl: None, params_buf: None,
             composite_bg: None, cached_input_ptr: 0, initialized: false, splat_radius: None,
+            extract: true, active: true,
         }
     }
 
@@ -290,20 +298,22 @@ impl PostProcessingEffect for FluidSurfaceEffect {
         if !self.initialized { return; }
 
         // 1. Density field + MC extract compute passes
-        self.density_field.update_with_encoder(encoder,
-            self.sim.world_bounds_min, self.sim.world_bounds_max,
-            self.sim.particle_count(), self.splat_radius.unwrap_or(self.sim.params.smoothing_radius));
+        if self.extract {
+            self.density_field.update_with_encoder(encoder,
+                self.sim.world_bounds_min, self.sim.world_bounds_max,
+                self.sim.particle_count(), self.splat_radius.unwrap_or(self.sim.params.smoothing_radius));
 
-        let source = SurfaceExtractionSourceContract {
-            version: SurfaceContractVersion::V1,
-            field_dims: self.density_field.tex_dims(),
-            world_bounds_min: self.sim.world_bounds_min,
-            world_bounds_max: self.sim.world_bounds_max,
-            iso_value: self.marching_cubes.iso_level(),
-        };
-        self.marching_cubes.update_with_encoder_and_queue(
-            encoder, queue, &self.marching_cubes_bg, source,
-        );
+            let source = SurfaceExtractionSourceContract {
+                version: SurfaceContractVersion::V1,
+                field_dims: self.density_field.tex_dims(),
+                world_bounds_min: self.sim.world_bounds_min,
+                world_bounds_max: self.sim.world_bounds_max,
+                iso_value: self.marching_cubes.iso_level(),
+            };
+            self.marching_cubes.update_with_encoder_and_queue(
+                encoder, queue, &self.marching_cubes_bg, source,
+            );
+        }
 
         // 2. Upload composite params
         let mut view_matrix = [0.0f32; 16];
@@ -358,6 +368,10 @@ impl PostProcessingEffect for FluidSurfaceEffect {
         pass.set_pipeline(self.composite_pipeline.as_ref().unwrap());
         pass.set_bind_group(0, self.composite_bg.as_ref().unwrap(), &[]);
         pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
     }
 
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {

@@ -11,6 +11,17 @@ pub fn frustum_planes(view_proj: glam::Mat4) -> [glam::Vec4; 6] {
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| p / p.truncate().length().max(1e-12))
 }
 
+/// Whether the box `[min, max]` is at least partly inside the frustum `planes`
+/// ([`frustum_planes`]): false only when it lies wholly outside one plane, so a box near a corner
+/// of the frustum may be kept though nothing of it shows (conservative, as culling must be).
+pub fn aabb_in_frustum(planes: &[glam::Vec4; 6], min: glam::Vec3, max: glam::Vec3) -> bool {
+    planes.iter().all(|p| {
+        // the box's corner furthest along the plane's normal
+        let far = glam::Vec3::select(p.truncate().cmpge(glam::Vec3::ZERO), max, min);
+        p.truncate().dot(far) + p.w >= 0.0
+    })
+}
+
 /// Bytes of a view's indirect draw: `DrawIndexedIndirect`'s five words, then the instances culled
 /// by the LOD band, the frustum and occlusion (counted when the renderer's culling stats are on).
 pub(crate) const ARGS_BYTES: u64 = 32;
@@ -727,6 +738,24 @@ mod tests {
         for p in planes {
             assert!((p.truncate().length() - 1.0).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn aabb_in_frustum_keeps_boxes_that_touch_the_view() {
+        let view = glam::Mat4::look_at_rh(glam::Vec3::new(0.0, 0.0, 10.0), glam::Vec3::ZERO, glam::Vec3::Y);
+        let planes = frustum_planes(glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0) * view);
+        let in_view = |c: glam::Vec3, h: f32| aabb_in_frustum(&planes, c - glam::Vec3::splat(h), c + glam::Vec3::splat(h));
+        assert!(in_view(glam::Vec3::ZERO, 1.0));
+        assert!(!in_view(glam::Vec3::new(0.0, 0.0, 20.0), 1.0), "behind the camera");
+        assert!(!in_view(glam::Vec3::new(30.0, 0.0, 0.0), 1.0), "off to the side");
+        assert!(!in_view(glam::Vec3::new(0.0, 0.0, -200.0), 1.0), "beyond the far plane");
+        // straddling the left plane: kept; a little further out: culled
+        let edge_x = 10.0 * 0.5f32.tan();
+        assert!(in_view(glam::Vec3::new(-edge_x - 0.5, 0.0, 0.0), 1.0));
+        assert!(!in_view(glam::Vec3::new(-edge_x - 2.0, 0.0, 0.0), 1.0));
+        // a box around the camera, and one far bigger than the view, are kept
+        assert!(in_view(glam::Vec3::new(0.0, 0.0, 10.0), 1.0));
+        assert!(in_view(glam::Vec3::ZERO, 1000.0));
     }
 
     #[test]

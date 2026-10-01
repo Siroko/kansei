@@ -8,6 +8,11 @@
 //! The simulation runs 11 times the world's size (a particle every 5 cm, with the fluid clock's
 //! tuned constants at a smoothing radius of 1) and so √11 times faster than real time, which keeps
 //! gravity-driven motion (waves, splashes) at its real pace.
+//!
+//! The water rests when it can (`simulations::fluid::FluidSleep`): out of view for a moment it is
+//! culled (neither stepped nor drawn), and in view, once settled with nothing near it, it sleeps
+//! (not stepped, its last surface drawn). Legs or a splash near it, a setting changed, or a reset
+//! wake it.
 
 use glam::{Mat4, Vec3 as GVec3};
 
@@ -21,7 +26,8 @@ use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 use kansei_core::simulations::fluid::{
     DensityFieldOptions, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer,
     FluidContainerOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
-    FluidSolver, FluidSubstepPass, MarchingCubesOptions, PbfOptions, PlanarContainerShape, DEFAULT_OPTIONS,
+    FluidActivity, FluidSleep, FluidSleepOptions, FluidSolver, FluidSpeedProbe, FluidSubstepPass, MarchingCubesOptions,
+    PbfOptions, PlanarContainerShape, DEFAULT_OPTIONS,
 };
 
 use crate::{SKY, SUN, SUN_DIR};
@@ -52,6 +58,13 @@ const BANK_OUT: f32 = 1.6;
 const SPLASH_RADIUS: f32 = 0.3;
 const SPLASH_TIME: f32 = 0.12;
 const SPLASH_PUSH: f32 = 1.2;
+/// Resting: legs this far (m) outside the waterline's bounds wake the water; it is culled after
+/// this long out of view (s), the last waves dying out meanwhile; and it sleeps once no particle
+/// has moved faster than this (m/s) for this long (s).
+const WAKE_DISTANCE: f32 = 2.0;
+const CULL_AFTER: f32 = 1.5;
+pub const SETTLE_SPEED: f32 = 0.05;
+const SETTLE_AFTER: f32 = 1.0;
 /// How the water's surface is extracted from the particles.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceSettings {
@@ -275,6 +288,14 @@ pub struct Lake {
     /// The particles as they started, for a reset.
     initial: Vec<f32>,
     surface: SurfaceSettings,
+    /// Whether the water steps: culled out of view, asleep when settled.
+    sleep: FluidSleep,
+    probe: FluidSpeedProbe,
+    /// The last speed read (m/s): the fastest particle, and how many moved faster than
+    /// `SETTLE_SPEED`.
+    speed: (f32, u32),
+    /// Whether the water may rest at all (else it always runs, as before resting).
+    pub rest: bool,
 }
 
 /// Blur the floor of `shape` (a box filter `radius` nodes each way, along x then z, twice): the
@@ -415,9 +436,11 @@ impl Lake {
             sky_reflection: 1.0,
         });
         surface.splat_radius = Some(settings.kernel);
+        let probe = FluidSpeedProbe::new(&surface.sim, SETTLE_SPEED * SIM_SCALE / TIME_SCALE);
+        let sleep = FluidSleep::new(FluidSleepOptions { cull_after: CULL_AFTER, settle_speed: SETTLE_SPEED, settle_after: SETTLE_AFTER });
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings }, surface)
+        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
     }
 
     /// The water's surface renderable, drawing the effect's marching-cubes mesh (the effect must
@@ -441,11 +464,17 @@ impl Lake {
     }
 
     /// Place the character's leg capsules (world ends and radii), and a landing's splash (where
-    /// the feet came down and how fast, m/s), and step the water by `dt` real seconds.
-    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], landing: Option<(GVec3, f32)>, dt: f32) {
+    /// the feet came down and how fast, m/s), and step the water by `dt` real seconds, unless it
+    /// rests: out of the view `view_proj` (world to clip) for a moment, or settled with no legs
+    /// near it.
+    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], landing: Option<(GVec3, f32)>, dt: f32, view_proj: Mat4) {
         // legs count only near the lake
         let (lo, hi) = self.near;
-        let near = legs.first().is_some_and(|(a, _, _)| a.x > lo[0] - 2.0 && a.x < hi[0] + 2.0 && a.z > lo[1] - 2.0 && a.z < hi[1] + 2.0);
+        let w = WAKE_DISTANCE;
+        let near = legs.iter().any(|(a, b, r)| {
+            let (min, max) = (a.min(*b) - *r, a.max(*b) + *r);
+            max.x > lo[0] - w && min.x < hi[0] + w && max.z > lo[1] - w && min.z < hi[1] + w
+        });
         let legs: &[(GVec3, GVec3, f32)] = if near { legs } else { &[] };
         if self.previous.len() != legs.len() {
             self.previous = legs.iter().map(|(a, b, _)| [*a, *b]).collect();
@@ -486,11 +515,47 @@ impl Lake {
         }
         self.colliders.set(&capsules);
 
+        // rest when out of view (its box, the bounds the particles are kept in) or settled
+        let (min, max) = surface.sim.bounds(0.0);
+        let in_view = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), min / SIM_SCALE, max / SIM_SCALE);
+        let speed = self.probe.take(surface.sim.gpu().0).map(|s| {
+            self.speed = (s.max * self.world_speed_scale(), s.above);
+            self.speed.0
+        });
+        let state = self.sleep.update(dt, in_view || !self.rest, !capsules.is_empty() || !self.rest, speed);
+        surface.extract = state == FluidActivity::Running;
+        surface.active = state != FluidActivity::Culled;
+        if state != FluidActivity::Running {
+            self.accumulator = 0.0;
+            return;
+        }
         self.accumulator = (self.accumulator + dt).min(STEP * MAX_STEPS as f32);
+        let mut stepped = false;
         while self.accumulator >= STEP {
             surface.sim.update_batched_with(STEP * self.time_scale, 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
             self.accumulator -= STEP;
+            stepped = true;
         }
+        if stepped {
+            self.probe.measure(&surface.sim);
+        }
+    }
+
+    /// Whether the water is running, culled or asleep.
+    pub fn state(&self) -> FluidActivity {
+        self.sleep.state()
+    }
+
+    /// The last speed read (m/s): the fastest particle, and how many moved faster than the
+    /// speed it sleeps under.
+    pub fn speed(&self) -> (f32, u32) {
+        self.speed
+    }
+
+    /// The water changed: run it until it settles again (a speed read in flight is from before).
+    fn wake(&mut self) {
+        self.sleep.wake();
+        self.probe.forget();
     }
 
     /// Change a setting of the water by name (the page's tweak panel); false for an unknown one.
@@ -514,8 +579,12 @@ impl Lake {
             "pbfScorrN" => p.pbf.scorr_n = value,
             "pbfXsph" => p.pbf.xsph = value,
             "pbfVorticity" => p.pbf.vorticity = value,
-            "timeScale" => self.time_scale = value.max(0.1),
+            "timeScale" => {
+                self.time_scale = value.max(0.1);
+                self.probe.set_threshold(surface.sim.gpu().1, SETTLE_SPEED / self.world_speed_scale());
+            }
             "drag" => self.colliders.options.drag = value,
+            "rest" => self.rest = value > 0.5,
             "splash" => self.splash_push = value,
             "friction" | "restitution" => {
                 let o = &mut self.container.options;
@@ -524,6 +593,7 @@ impl Lake {
             }
             _ => return false,
         }
+        self.wake();
         true
     }
 
@@ -536,6 +606,7 @@ impl Lake {
         }
         self.splash = None;
         self.accumulator = 0.0;
+        self.wake();
     }
 
     pub fn surface_settings(&self) -> SurfaceSettings {
@@ -559,6 +630,7 @@ impl Lake {
         surface.marching_cubes.set_iso_level(settings.iso);
         surface.marching_cubes.set_use_classic(settings.interpolate);
         self.surface = settings;
+        self.wake();
     }
 
     pub fn drag(&self) -> f32 {

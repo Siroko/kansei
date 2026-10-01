@@ -60,6 +60,8 @@
             bind(water, 'friction', { label: 'bed friction', min: 0, max: 0.2, step: 0.001 });
             bind(water, 'drag', { label: 'leg drag', min: 0, max: 1, step: 0.01 });
             bind(water, 'splash', { label: 'landing splash', min: 0, max: 4, step: 0.05 });
+            const rest = { rest: p.rest === 1 };
+            water.addBinding(rest, 'rest', { label: 'rest (culled, asleep)' }).on('change', (ev) => lake_set('rest', ev.value ? 1 : 0));
             water.addButton({ title: 'reset water' }).on('click', () => lake_reset());
 
             const surface = pane.addFolder({ title: 'surface' });

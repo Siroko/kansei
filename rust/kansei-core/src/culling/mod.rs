@@ -13,7 +13,7 @@ mod stats;
 pub const LOD_FADE_WGSL: &str = include_str!("../shaders/lod_fade.wgsl");
 
 pub use depth_pyramid::{DepthPyramid, DepthReduction};
-pub use instance_culling::{frustum_planes, InstanceCulling};
+pub use instance_culling::{aabb_in_frustum, frustum_planes, InstanceCulling};
 pub use stats::{CullStats, CullViewKind, CullingStats};
 pub(crate) use instance_culling::{CullPipeline, CulledDraw, CullView, OcclusionView};
 pub(crate) use occlusion::{MainView, Occlusion};
