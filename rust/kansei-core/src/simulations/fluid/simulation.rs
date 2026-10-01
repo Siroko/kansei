@@ -49,11 +49,19 @@ pub trait FluidSubstepPass {
 }
 
 /// SPH fluid simulation — 10 compute passes per substep.
+///
+/// The particle buffers hold [`capacity`](Self::capacity) particles, of which the first
+/// [`particle_count`](Self::particle_count) are live: every pass (the solvers, the neighbour grid,
+/// the [`FluidSubstepPass`]es, which get the live count in `SimParams`) runs on those only.
+/// [`emit`](Self::emit) appends particles into the spare capacity at runtime and
+/// [`reset_particles`](Self::reset_particles) puts back a set of them (an initial fill).
 pub struct FluidSimulation {
     pub params: FluidSimulationOptions,
     pub world_bounds_min: [f32; 3],
     pub world_bounds_max: [f32; 3],
+    /// Live particles: the first `particle_count` of `capacity`.
     particle_count: u32,
+    capacity: u32,
     grid_dims: [u32; 3],
     grid_origin: [f32; 3],
     total_cells: u32,
@@ -102,7 +110,15 @@ pub struct FluidSimulation {
 }
 
 impl FluidSimulation {
+    /// A simulation of the particles at `positions` (4 floats each: x, y, z and 1), with no
+    /// room for more.
     pub fn new(renderer: &crate::renderers::Renderer, params: FluidSimulationOptions, positions: &[f32]) -> Self {
+        Self::with_capacity(renderer, params, positions, 0)
+    }
+
+    /// [`new`](Self::new), with buffers for `capacity` particles (at least those at `positions`):
+    /// room for [`emit`](Self::emit) to add the rest at runtime.
+    pub fn with_capacity(renderer: &crate::renderers::Renderer, params: FluidSimulationOptions, positions: &[f32], capacity: u32) -> Self {
         let device = renderer.device();
         let queue = renderer.queue();
         let particle_count = (positions.len() / 4) as u32;
@@ -111,6 +127,7 @@ impl FluidSimulation {
             world_bounds_min: [0.0; 3],
             world_bounds_max: [0.0; 3],
             particle_count,
+            capacity: capacity.max(particle_count),
             grid_dims: [1, 1, 1],
             grid_origin: [0.0; 3],
             total_cells: 1,
@@ -203,7 +220,11 @@ impl FluidSimulation {
     }
 
     fn create_buffers(&mut self, positions: &[f32], device: &wgpu::Device) {
-        let n = self.particle_count as usize;
+        let n = self.capacity as usize;
+        // the live particles, then the spare capacity (zeros: never read until emitted into)
+        let mut positions = positions[..self.particle_count as usize * 4].to_vec();
+        positions.resize(n * 4, 0.0);
+        let positions = positions.as_slice();
         let tc = self.total_cells as usize;
 
         let mk_storage = |label: &str, data: &[f32]| -> wgpu::Buffer {
@@ -588,7 +609,49 @@ impl FluidSimulation {
         f[ParamOffsets::SOLVER] = f32::from_ne_bytes(((p.solver == FluidSolver::Pbf) as u32).to_ne_bytes());
     }
 
+    /// The live particles (the first `particle_count` of the buffers).
     pub fn particle_count(&self) -> u32 { self.particle_count }
+
+    /// How many particles the buffers hold: the most there can be.
+    pub fn capacity(&self) -> u32 { self.capacity }
+
+    /// Append particles at `positions` with `velocities` (the simulation's space, per simulated
+    /// second; one velocity for all, or one each) after the live ones, as many as the spare
+    /// capacity takes: they join the next step. Returns how many were added.
+    ///
+    /// Each call writes three buffers (`queue.write_buffer`, which lands before the next
+    /// submit): emit once per step, not per particle.
+    pub fn emit(&mut self, positions: &[[f32; 3]], velocities: &[[f32; 3]]) -> u32 {
+        assert!(velocities.len() == 1 || velocities.len() == positions.len(), "one velocity, or one per particle");
+        let n = (positions.len() as u32).min(self.capacity - self.particle_count);
+        if n == 0 {
+            return 0;
+        }
+        let queue = self.queue.as_ref().expect("FluidSimulation not initialized");
+        let p: Vec<f32> = positions[..n as usize].iter().flat_map(|q| [q[0], q[1], q[2], 1.0]).collect();
+        let v: Vec<f32> = (0..n as usize).flat_map(|k| {
+            let v = velocities[k.min(velocities.len() - 1)];
+            [v[0], v[1], v[2], 0.0]
+        }).collect();
+        let offset = self.particle_count as u64 * 16;
+        queue.write_buffer(self.positions_buffer.as_ref().unwrap(), offset, bytemuck::cast_slice(&p));
+        queue.write_buffer(self.original_positions_buffer.as_ref().unwrap(), offset, bytemuck::cast_slice(&p));
+        queue.write_buffer(self.velocities_buffer.as_ref().unwrap(), offset, bytemuck::cast_slice(&v));
+        self.particle_count += n;
+        n
+    }
+
+    /// Put the particles back to `positions` (4 floats each, as for [`new`](Self::new); at most
+    /// `capacity` of them), at rest: e.g. the initial fill, dropping whatever was emitted since.
+    pub fn reset_particles(&mut self, positions: &[f32]) {
+        let n = ((positions.len() / 4) as u32).min(self.capacity);
+        let queue = self.queue.as_ref().expect("FluidSimulation not initialized");
+        let p = &positions[..n as usize * 4];
+        queue.write_buffer(self.positions_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(p));
+        queue.write_buffer(self.original_positions_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(p));
+        queue.write_buffer(self.velocities_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&vec![0.0f32; n as usize * 4]));
+        self.particle_count = n;
+    }
 
     /// The device and queue the simulation runs on.
     pub fn gpu(&self) -> (&wgpu::Device, &wgpu::Queue) {
@@ -688,7 +751,7 @@ pub(crate) struct PbfPasses {
 
 impl PbfPasses {
     fn new(sim: &FluidSimulation, device: &wgpu::Device) -> Self {
-        let n = sim.particle_count.max(1) as u64;
+        let n = sim.capacity.max(1) as u64;
         let mk = |label: &str, size: u64| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let previous = mk("FluidSim/PBF/Previous", n * 16);
         let lambdas = mk("FluidSim/PBF/Lambdas", n * 4);

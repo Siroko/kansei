@@ -11,15 +11,28 @@
             color: #f2f2f2; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
             text-shadow: 0 1px 2px #000, 0 0 6px #000; white-space: pre-wrap; pointer-events: none;
         }
+        /* the cannon's prompt: shown by the cannon, and a click (or touch) on it fires */
+        #prompt {
+            position: fixed; left: 50%; bottom: 12%; transform: translateX(-50%);
+            padding: 8px 14px; border-radius: 6px; background: rgba(0, 0, 0, 0.55);
+            color: #f2f2f2; font: 14px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+            cursor: pointer; user-select: none; touch-action: none;
+        }
+        #prompt:not([data-visible="1"]) { display: none; }
     </style>
 </head>
 <body>
     <canvas id="kansei" tabindex="0"></canvas>
     <pre id="hud"></pre>
+    <div id="prompt"></div>
     <script type="module">
-        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, mill_settings, cannon_fire } from '../pkg/kansei_wasm_motion_matching.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
         await init();
+        // the cannon's prompt fires while pressed (the keyboard's E and the gamepad's X work too)
+        const prompt = document.getElementById('prompt');
+        prompt.addEventListener('pointerdown', (e) => { e.preventDefault(); cannon_fire(true); });
+        for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) prompt.addEventListener(ev, () => cannon_fire(false));
         await start('kansei');
 
         // The lake's tweak panel: P shows and hides it.
@@ -62,7 +75,22 @@
             bind(water, 'splash', { label: 'landing splash', min: 0, max: 4, step: 0.05 });
             const rest = { rest: p.rest === 1 };
             water.addBinding(rest, 'rest', { label: 'rest (culled, asleep)' }).on('change', (ev) => lake_set('rest', ev.value ? 1 : 0));
-            water.addButton({ title: 'reset water' }).on('click', () => lake_reset());
+            water.addButton({ title: 'reset water (drain)' }).on('click', () => lake_reset());
+            // how full the cannon has made it
+            const fill = { fill: '' };
+            water.addBinding(fill, 'fill', { label: 'filled', readonly: true, interval: 250 });
+            setInterval(() => {
+                const f = lake_fill();
+                if (f) fill.fill = `${Math.round(f.fill * 100)}% · ${f.particles}`;
+            }, 250);
+
+            const m = mill_settings();
+            if (m) {
+                const mill = pane.addFolder({ title: 'water mill' });
+                const on = { mill: m.mill === 1, millRpm: m.millRpm };
+                mill.addBinding(on, 'mill', { label: 'turning' }).on('change', (ev) => lake_set('mill', ev.value ? 1 : 0));
+                mill.addBinding(on, 'millRpm', { label: 'speed (rpm)', min: 0, max: 40, step: 1 }).on('change', (ev) => lake_set('millRpm', ev.value));
+            }
 
             const surface = pane.addFolder({ title: 'surface' });
             const preset = { preset: 'droplets' };

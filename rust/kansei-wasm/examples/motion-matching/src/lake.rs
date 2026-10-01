@@ -11,8 +11,14 @@
 //!
 //! The water rests when it can (`simulations::fluid::FluidSleep`): out of view for a moment it is
 //! culled (neither stepped nor drawn), and in view, once settled with nothing near it, it sleeps
-//! (not stepped, its last surface drawn). Legs or a splash near it, a setting changed, or a reset
-//! wake it.
+//! (not stepped, its last surface drawn). Legs or a splash near it, a stream poured in, a turning
+//! mill, a setting changed, or a reset wake it.
+//!
+//! Water can be added (the cannon, `cannon`): the simulation has room for the particles that
+//! raise the still water from `WATER` to `FULL` (`FluidSimulation::with_capacity`), a stream
+//! (`FluidNozzle`) adds them step by step, and the wet line on the bed follows the level. A
+//! reset drains it back to the start. Other bodies in the water (the mill, `mill`) push it as
+//! more colliders.
 
 use glam::{Mat4, Vec3 as GVec3};
 
@@ -26,7 +32,7 @@ use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 use kansei_core::simulations::fluid::{
     DensityFieldOptions, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer,
     FluidContainerOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
-    FluidActivity, FluidSleep, FluidSleepOptions, FluidSolver, FluidSpeedProbe, FluidSubstepPass, MarchingCubesOptions,
+    FluidActivity, FluidNozzle, FluidSleep, FluidSleepOptions, FluidSolver, FluidSpeedProbe, FluidSubstepPass, MarchingCubesOptions,
     PbfOptions, PlanarContainerShape, DEFAULT_OPTIONS,
 };
 
@@ -44,6 +50,10 @@ const CENTER: [f32; 2] = [21.0, -1.0];
 const HALF: [f32; 2] = [5.2, 3.4];
 /// The still water's height, a little under the ground's.
 const WATER: f32 = -0.1;
+/// The highest the water can be filled to: the brim, 10 cm up, where it starts onto the bank
+/// (whose top, `BANK`, is higher), well inside the container's walls. Higher costs too much: at
+/// 0.04 m the lake has half as many particles again and the frame takes 60% longer.
+const FULL: f32 = 0.0;
 /// The bed: its depth in the middle, and how far in from the outline it gets there, steepest at
 /// the outline (so the water's edge is short, not a long film a particle thick).
 const DEPTH: f32 = 0.6;
@@ -58,6 +68,8 @@ const BANK_OUT: f32 = 1.6;
 const SPLASH_RADIUS: f32 = 0.3;
 const SPLASH_TIME: f32 = 0.12;
 const SPLASH_PUSH: f32 = 1.2;
+/// The colliders the water takes: the legs and a landing (8), and the props in it.
+const COLLIDERS: usize = 40;
 /// Resting: legs this far (m) outside the waterline's bounds wake the water; it is culled after
 /// this long out of view (s), the last waves dying out meanwhile; and it sleeps once no particle
 /// has moved faster than this (m/s) for this long (s).
@@ -102,6 +114,31 @@ impl SurfaceSettings {
 /// Lattice spacing of the particles at the fluid clock's rest density (simulation units).
 const SPACING: f32 = 0.537;
 
+/// A lattice at rest density in `shape` (simulation space), `SPACING` apart, from its floor up to
+/// `top` (simulation units), in the columns `inside` takes (by their signed distance to the
+/// waterline): the water's initial fill, and the volume under any level.
+fn lattice_fill(shape: &PlanarContainerShape, top: f32, inside: impl Fn(f32) -> bool) -> Vec<f32> {
+    let (lo, hi) = shape.bounds();
+    let mut particles = Vec::new();
+    let mut z = lo[1];
+    while z <= hi[1] {
+        let mut x = lo[0];
+        while x <= hi[0] {
+            let [d, floor] = shape.sample(x, z);
+            if inside(d) {
+                let mut y = floor + SPACING * 0.5;
+                while y < top {
+                    particles.extend_from_slice(&[x, y, z, 1.0]);
+                    y += SPACING;
+                }
+            }
+            x += SPACING;
+        }
+        z += SPACING;
+    }
+    particles
+}
+
 /// The density poly6 (radius `h`, unit mass) sums to at a particle of a cubic lattice `spacing`
 /// apart, itself included: Position Based Fluids' rest density for water filled that way.
 fn lattice_density(spacing: f32, h: f32) -> f32 {
@@ -119,6 +156,13 @@ fn lattice_density(spacing: f32, h: f32) -> f32 {
         }
     }
     rho
+}
+
+/// The terrain's uniform: its colour, the still water's height (the wet line), the light, and how
+/// far past the waterline the water can reach.
+fn terrain_uniform(level: f32) -> [f32; 16] {
+    let d = SUN_DIR;
+    [0.32, 0.32, 0.3, level, d[0], d[1], d[2], SHORE, SUN[0], SUN[1], SUN[2], 0.0, SKY[0], SKY[1], SKY[2], 0.0]
 }
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
@@ -151,14 +195,15 @@ fn height(d: f32) -> f32 {
 
 /// Lake bed and shore: grey ground with the course's metre grid, turning to wet silt below the
 /// water and darker with depth; sun (cascade-shadowed) and sky. `surface.base_color.w` is the
-/// water's height.
+/// water's height, and `surface.sun_dir.w` how far past the waterline the water can reach (the
+/// container's walls): the vertices' `uv.x` is their distance past the waterline.
 const TERRAIN_WGSL: &str = r#"
 struct Surface { base_color: vec4<f32>, sun_dir: vec4<f32>, sun: vec4<f32>, sky: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32> };
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) shore: f32 };
 @vertex
 fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
     let world = world_matrix * position;
@@ -166,6 +211,7 @@ fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>,
     out.clip = projection_matrix * view_matrix * world;
     out.world = world.xyz;
     out.normal = normal;
+    out.shore = uv.x;
     return out;
 }
 fn grid(p: vec2<f32>, spacing: f32, width: f32) -> f32 {
@@ -181,7 +227,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
     let under = in.world.y - surface.base_color.w;
     // wet up to a damp margin over the still water (the water settles a few cm over the height
     // it is filled to), so no dry band shows through the shallows
-    let wet = smoothstep(0.08, 0.04, under);
+    let wet = smoothstep(0.08, 0.04, under) * smoothstep(surface.sun_dir.w, surface.sun_dir.w - 0.2, in.shore);
     let silt = mix(vec3<f32>(0.3, 0.26, 0.19), vec3<f32>(0.16, 0.15, 0.11), smoothstep(0.0, -0.5, under));
     let base = mix(surface.base_color.rgb, silt, wet) * (1.0 - lines * mix(1.0, 0.4, wet));
     let l = -normalize(surface.sun_dir.xyz);
@@ -269,6 +315,14 @@ fn ground_around(scene: &mut Scene, world: &mut CollisionWorld, material: Materi
 
 /// The lake: its shape, the simulation's passes, and the character's legs in it.
 pub struct Lake {
+    /// The terrain's renderable (its uniform carries the still water's height, for the wet line).
+    pub terrain: usize,
+    /// How many particles above the initial fill raise the still water to each height: (added,
+    /// level in m), from `WATER` up to `FULL`.
+    levels: Vec<(u32, f32)>,
+    /// The live particles, and the most there can be.
+    count: u32,
+    capacity: u32,
     container: FluidContainer,
     colliders: FluidColliders,
     /// The effect's index in the post-processing chain (it owns the simulation).
@@ -276,7 +330,6 @@ pub struct Lake {
     accumulator: f32,
     /// Last frame's capsule ends (world), for their velocities.
     previous: Vec<[GVec3; 2]>,
-    particles: u32,
     /// A landing's splash: where (world), how fast it came down, and for how long it has pushed.
     splash: Option<(GVec3, f32, f32)>,
     /// The waterline's bounds (x, z): legs within 2 m of them push the water.
@@ -341,11 +394,15 @@ impl Lake {
         let cells = |step: f32| [((max[0] - min[0]) / step).ceil() as usize, ((max[1] - min[1]) / step).ceil() as usize];
         let (positions, normals, indices) = heightfield(min, max, cells(0.2), &ground);
         let mut material = Material::new("Lake/Terrain", &format!("{CASCADED_SHADOWS_WGSL}\n{TERRAIN_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
-        let d = SUN_DIR;
-        material.set_uniform_bindable(0, "Lake/Terrain", &[0.32f32, 0.32, 0.3, WATER, d[0], d[1], d[2], 0.0, SUN[0], SUN[1], SUN[2], 0.0, SKY[0], SKY[1], SKY[2], 0.0]);
-        let mut r = Renderable::new(geometry("Lake/Terrain", &positions, &normals, indices), material);
+        material.set_uniform_bindable(0, "Lake/Terrain", &terrain_uniform(WATER));
+        // each vertex's distance past the waterline, for the wet line (water stays inside the walls)
+        let mut mesh = geometry("Lake/Terrain", &positions, &normals, indices);
+        for v in &mut mesh.vertices {
+            v.uv[0] = terrain.distance(v.position[0], v.position[2]);
+        }
+        let mut r = Renderable::new(mesh, material);
         r.cast_shadow = false;
-        scene.add(SceneNode::Renderable(r));
+        let terrain_index = scene.add(SceneNode::Renderable(r));
         let (positions, _, indices) = heightfield(min, max, cells(0.5), &ground);
         world.add(Shape::Mesh(TriangleMesh::from_indexed(&positions, &indices, Mat4::IDENTITY)), 1);
 
@@ -355,30 +412,19 @@ impl Lake {
 
         // the water: a lattice at rest density from the bed up to the still water's height
         let (lo, hi) = shape.bounds();
-        let mut particles = Vec::new();
-        let top = WATER * SIM_SCALE;
-        let mut z = lo[1];
-        while z <= hi[1] {
-            let mut x = lo[0];
-            while x <= hi[0] {
-                let [d, floor] = shape.sample(x, z);
-                if d < 0.0 {
-                    let mut y = floor + SPACING * 0.5;
-                    while y < top {
-                        particles.extend_from_slice(&[x, y, z, 1.0]);
-                        y += SPACING;
-                    }
-                }
-                x += SPACING;
-            }
-            z += SPACING;
-        }
+        let particles = lattice_fill(&shape, WATER * SIM_SCALE, |d| d < 0.0);
         let count = (particles.len() / 4) as u32;
-        log::info!("lake: {count} particles");
+        // room for the water poured in: the particles between the still water and the highest
+        // level, over the lake and the bank it floods (inside the walls)
+        let wet = |level: f32| (lattice_fill(&shape, level * SIM_SCALE, |d| d < SHORE - 0.2).len() / 4) as u32;
+        let base = wet(WATER);
+        let levels: Vec<(u32, f32)> = (0..=28).map(|k| WATER + (FULL - WATER) * k as f32 / 28.0).map(|level| (wet(level) - base, level)).collect();
+        let capacity = count + levels.last().unwrap().0;
+        log::info!("lake: {count} particles, room for {capacity} (still water from {WATER} m up to {FULL} m)");
 
         // the fluid clock's tuning at 80K particles, h = 1 (see its `tuning_for`), less viscous
-        let mut sim = FluidSimulation::new(renderer, FluidSimulationOptions {
-            max_particles: count,
+        let mut sim = FluidSimulation::with_capacity(renderer, FluidSimulationOptions {
+            max_particles: capacity,
             dimensions: 3,
             smoothing_radius: 1.0,
             pressure_multiplier: 46.5,
@@ -401,12 +447,12 @@ impl Lake {
             // and no faster than 12 m/s (a running foot's swing, and some)
             pbf: PbfOptions { rest_density: lattice_density(SPACING, 1.0), max_speed: 12.0 * SIM_SCALE / TIME_SCALE, ..PbfOptions::DEFAULT },
             ..DEFAULT_OPTIONS
-        }, &particles);
+        }, &particles, capacity);
         sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
         sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
         let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.002 });
-        let colliders = FluidColliders::new(&sim, 16, FluidCollidersOptions { restitution: 0.3, drag: 0.6 });
+        let colliders = FluidColliders::new(&sim, COLLIDERS, FluidCollidersOptions { restitution: 0.3, drag: 0.6 });
 
         // its surface: a surface field (the distance to the weighted mean of the particles within
         // 1.5 units, less a particle radius of 0.45) polygonised at its iso level of 1, where the bulk
@@ -440,7 +486,7 @@ impl Lake {
         let sleep = FluidSleep::new(FluidSleepOptions { cull_after: CULL_AFTER, settle_speed: SETTLE_SPEED, settle_after: SETTLE_AFTER });
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { container, colliders, effect, accumulator: 0.0, previous: Vec::new(), particles: count, splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
+        (Self { terrain: terrain_index, levels, count, capacity, container, colliders, effect, accumulator: 0.0, previous: Vec::new(), splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
     }
 
     /// The water's surface renderable, drawing the effect's marching-cubes mesh (the effect must
@@ -459,15 +505,93 @@ impl Lake {
         scene.add(SceneNode::Renderable(r));
     }
 
+    /// The live particles.
     pub fn particles(&self) -> u32 {
-        self.particles
+        self.count
     }
 
-    /// Place the character's leg capsules (world ends and radii), and a landing's splash (where
-    /// the feet came down and how fast, m/s), and step the water by `dt` real seconds, unless it
-    /// rests: out of the view `view_proj` (world to clip) for a moment, or settled with no legs
-    /// near it.
-    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], landing: Option<(GVec3, f32)>, dt: f32, view_proj: Mat4) {
+    /// The most particles there can be: the water at its highest.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// How full the lake is: 0 at the start's level, 1 at the highest.
+    pub fn fill(&self) -> f32 {
+        let room = self.levels.last().map_or(0, |l| l.0);
+        if room == 0 { 1.0 } else { (self.count.saturating_sub(self.capacity - room)) as f32 / room as f32 }
+    }
+
+    pub fn full(&self) -> bool {
+        self.count >= self.capacity
+    }
+
+    /// The still water's height (m) for the particles there are, from the lattice's fill.
+    pub fn level(&self) -> f32 {
+        let added = self.count.saturating_sub(self.capacity - self.levels.last().map_or(0, |l| l.0));
+        let k = self.levels.partition_point(|l| l.0 <= added);
+        match (self.levels.get(k.wrapping_sub(1)), self.levels.get(k)) {
+            (Some(a), Some(b)) => a.1 + (b.1 - a.1) * (added - a.0) as f32 / (b.0 - a.0).max(1) as f32,
+            (Some(a), None) => a.1,
+            _ => WATER,
+        }
+    }
+
+    /// The terrain's uniform at the still water's height now (see `terrain_uniform`).
+    pub fn terrain_uniform(&self) -> [f32; 16] {
+        terrain_uniform(self.level())
+    }
+
+    /// A point in the world in the simulation's space.
+    pub fn to_sim(&self, p: GVec3) -> [f32; 3] {
+        (p * SIM_SCALE).to_array()
+    }
+
+    /// A world velocity (m/s) in the simulation's units per simulated second.
+    pub fn velocity_to_sim(&self, v: GVec3) -> GVec3 {
+        v * SIM_SCALE / self.time_scale
+    }
+
+    /// A length (m) in the simulation's units.
+    pub fn sim_length(&self, m: f32) -> f32 {
+        m * SIM_SCALE
+    }
+
+    /// The fluid's particle spacing (m).
+    pub fn spacing(&self) -> f32 {
+        SPACING / SIM_SCALE
+    }
+
+    /// The waterline's signed distance (m) at a point (x, z) of the world: negative in the lake.
+    pub fn distance(&self, x: f32, z: f32) -> f32 {
+        self.container.shape().distance(x * SIM_SCALE, z * SIM_SCALE) / SIM_SCALE
+    }
+
+    /// The ground's height (m) at a point (x, z) of the world over the lake and its banks.
+    pub fn ground(&self, x: f32, z: f32) -> f32 {
+        self.floor_at(x * SIM_SCALE, z * SIM_SCALE)
+    }
+
+    /// The point (x, z) on the line from the lake's middle at `angle` (radians from +x toward +z)
+    /// that is `distance` (m) from the waterline: outside it if positive, in the lake if negative.
+    pub fn from_waterline(&self, angle: f32, distance: f32) -> [f32; 2] {
+        let at = |t: f32| [CENTER[0] + t * angle.cos(), CENTER[1] + t * angle.sin()];
+        let (mut a, mut b) = (0.0f32, 2.0 * HALF[0].max(HALF[1]) + SHORE);
+        for _ in 0..40 {
+            let m = 0.5 * (a + b);
+            let p = at(m);
+            if self.distance(p[0], p[1]) < distance { a = m } else { b = m }
+        }
+        at(0.5 * (a + b))
+    }
+
+    /// Place the character's leg capsules (world ends and radii), a landing's splash (where the
+    /// feet came down and how fast, m/s), and other bodies in the water (`bodies`: capsules in the
+    /// world, velocities in m/s; `stirring` when any moves), pour in what `stream` lays (a nozzle
+    /// in the simulation's space, as much as there is room for), and step the water by `dt` real
+    /// seconds, unless it rests: out of the view `view_proj` (world to clip) for a moment, or
+    /// settled with nothing near it. Returns how many particles were poured in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], landing: Option<(GVec3, f32)>, bodies: &[FluidCapsule], stirring: bool, mut stream: Option<&mut FluidNozzle>, dt: f32, view_proj: Mat4) -> u32 {
         // legs count only near the lake
         let (lo, hi) = self.near;
         let w = WAKE_DISTANCE;
@@ -513,7 +637,12 @@ impl Lake {
                 self.splash = None;
             }
         }
+        let to_sim = SIM_SCALE / self.time_scale;
+        capsules.extend(bodies.iter().map(|c| c.scaled(SIM_SCALE, to_sim)));
         self.colliders.set(&capsules);
+        // the legs, a splash, a body moving in it or water poured in keep it awake
+        let pouring = stream.is_some() && !self.full();
+        let disturbed = capsules.len() > bodies.len() || stirring || pouring;
 
         // rest when out of view (its box, the bounds the particles are kept in) or settled
         let (min, max) = surface.sim.bounds(0.0);
@@ -522,16 +651,21 @@ impl Lake {
             self.speed = (s.max * self.world_speed_scale(), s.above);
             self.speed.0
         });
-        let state = self.sleep.update(dt, in_view || !self.rest, !capsules.is_empty() || !self.rest, speed);
+        let state = self.sleep.update(dt, in_view || !self.rest, disturbed || !self.rest, speed);
         surface.extract = state == FluidActivity::Running;
         surface.active = state != FluidActivity::Culled;
         if state != FluidActivity::Running {
             self.accumulator = 0.0;
-            return;
+            return 0;
         }
         self.accumulator = (self.accumulator + dt).min(STEP * MAX_STEPS as f32);
         let mut stepped = false;
+        let mut poured = 0;
         while self.accumulator >= STEP {
+            // a step's worth of the stream, before the step: it joins it
+            if let Some(nozzle) = stream.as_deref_mut() {
+                poured += nozzle.emit_into(&mut surface.sim, STEP * self.time_scale);
+            }
             surface.sim.update_batched_with(STEP * self.time_scale, 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
             self.accumulator -= STEP;
             stepped = true;
@@ -539,6 +673,8 @@ impl Lake {
         if stepped {
             self.probe.measure(&surface.sim);
         }
+        self.count = surface.sim.particle_count();
+        poured
     }
 
     /// Whether the water is running, culled or asleep.
@@ -597,13 +733,11 @@ impl Lake {
         true
     }
 
-    /// Put the water back as it started, still.
-    pub fn reset(&mut self, surface: &FluidSurfaceEffect) {
-        let queue = surface.sim.gpu().1;
-        if let (Some(positions), Some(velocities)) = (surface.sim.positions_buffer(), surface.sim.velocities_buffer()) {
-            queue.write_buffer(positions, 0, bytemuck::cast_slice(&self.initial));
-            queue.write_buffer(velocities, 0, bytemuck::cast_slice(&vec![0.0f32; self.initial.len()]));
-        }
+    /// Put the water back as it started, still, at its starting level (draining what was poured
+    /// in).
+    pub fn reset(&mut self, surface: &mut FluidSurfaceEffect) {
+        surface.sim.reset_particles(&self.initial);
+        self.count = surface.sim.particle_count();
         self.splash = None;
         self.accumulator = 0.0;
         self.wake();

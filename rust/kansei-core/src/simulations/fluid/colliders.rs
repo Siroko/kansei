@@ -31,6 +31,16 @@ impl FluidCapsule {
         Self { a, radius, b, velocity_a, velocity_b, ..Default::default() }
     }
 
+    /// A capsule on a rigid body (a paddle on a turning wheel, a moving hull's part), its ends'
+    /// velocities from the body's motion: the body moves at `linear` and turns at `angular`
+    /// (radians per second about that axis) about `center`, so a point `p` moves at
+    /// `linear + angular × (p - center)`.
+    pub fn rigid(a: [f32; 3], b: [f32; 3], radius: f32, center: [f32; 3], linear: [f32; 3], angular: [f32; 3]) -> Self {
+        let (c, v, w) = (glam::Vec3::from(center), glam::Vec3::from(linear), glam::Vec3::from(angular));
+        let at = |p: [f32; 3]| (v + w.cross(glam::Vec3::from(p) - c)).to_array();
+        Self::new(a, b, radius, at(a), at(b))
+    }
+
     /// The same capsule in a space scaled by `s`, with its velocities scaled by `velocity_scale`
     /// (e.g. `s` over the simulation's time scale).
     pub fn scaled(&self, s: f32, velocity_scale: f32) -> Self {
@@ -192,5 +202,20 @@ impl FluidSubstepPass for FluidColliders {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(particle_count.div_ceil(64), 1, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rigid_capsule_moves_with_its_body() {
+        // a paddle 1 unit out along +x on a wheel turning at 2 rad/s about +z, carried at +y
+        let c = FluidCapsule::rigid([1.0, 0.0, -0.5], [1.0, 0.0, 0.5], 0.1, [0.0; 3], [0.0, 3.0, 0.0], [0.0, 0.0, 2.0]);
+        // ω × r = (0, 0, 2) × (1, 0, ±0.5) = (0, 2, 0), plus the carry
+        assert_eq!(c.velocity_a, [0.0, 5.0, 0.0]);
+        assert_eq!(c.velocity_b, [0.0, 5.0, 0.0]);
+        assert_eq!((c.a, c.b, c.radius), ([1.0, 0.0, -0.5], [1.0, 0.0, 0.5], 0.1));
     }
 }
