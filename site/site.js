@@ -12,7 +12,7 @@
    * Hero background. The hero starts black and one background fades in from black:
    *   1. the live lake from the Raggare web teaser, in an iframe, once it says it is ready;
    *   2. otherwise (small or touch screens, no WebGPU, ?bg=off, or no ready message within 8 s) a muted loop cut from
-   *      the teaser's film, once it can play through;
+   *      the teaser's film, once it can play through; a live scene that gets ready later still fades in over it;
    *   3. with reduced motion, or if the loop cannot play, a still of the lake.
    * Messages, all { type, ... }:
    *   iframe -> page  { type: 'kansei-bg-ready' }
@@ -27,7 +27,10 @@
     if (!media) return
 
     const DEFAULT_SRC = 'https://raggare.kansei.graphics/bg/lake/'
+    // After READY_TIMEOUT_MS the loop fades in while the live scene keeps loading; it can still take over until
+    // LIVE_GIVE_UP_MS (a first visit fetches the scene's textures, about 9 s here with an empty cache).
     const READY_TIMEOUT_MS = 8000
+    const LIVE_GIVE_UP_MS = 30000
     const VIDEO_TIMEOUT_MS = 15000
     const DRIFT_PX = 14
 
@@ -64,7 +67,7 @@
       let slow = 0
       const fail = () => {
         clearTimeout(slow)
-        if (video.classList.contains('is-shown')) return
+        if (live || video.classList.contains('is-shown')) return
         video.remove()
         showStill()
       }
@@ -170,20 +173,34 @@
     frame.setAttribute('referrerpolicy', 'strict-origin')
     frame.src = src.href
 
+    const fallBack = setTimeout(() => {
+      if (!live) showVideo()
+    }, READY_TIMEOUT_MS)
     const giveUp = setTimeout(() => {
       if (live) return
       window.removeEventListener('message', onMessage)
       frame.remove()
       frame = null
-      showVideo()
-    }, READY_TIMEOUT_MS)
+    }, LIVE_GIVE_UP_MS)
 
     function onMessage(e) {
       if (!frame || e.source !== frame.contentWindow || e.origin !== src.origin) return
       if (!e.data || e.data.type !== 'kansei-bg-ready' || live) return
+      clearTimeout(fallBack)
       clearTimeout(giveUp)
       live = true
       frame.classList.add('is-ready')
+      // If the loop was already playing, the scene fades in over it; then the loop stops.
+      if (videoOn && video && video.isConnected) {
+        frame.addEventListener(
+          'transitionend',
+          () => {
+            video.pause()
+            video.remove()
+          },
+          { once: true }
+        )
+      }
       syncPause()
     }
 
