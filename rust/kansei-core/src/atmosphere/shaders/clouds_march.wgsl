@@ -259,8 +259,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     }
     var result = vec4f(light, transmittance);
 
-    // blend with the previous frames, reprojected by the cloud's depth
-    if (cp.historyValid != 0u) {
+    // blend with the previous frames, reprojected by the cloud's depth. A texel whose ray never
+    // enters the layer before the scene stops it (the ground in front of the camera, from below
+    // the layer) has no depth to reproject by: its point would be the camera itself, which a
+    // moving camera's last frame sees anywhere on screen, sky included, so it would pull the
+    // sky's history down over the ground. It has no cloud, and keeps none.
+    if (cp.historyValid != 0u && cloudKm > 1e-4) {
         let clip = cp.prevViewProj * vec4f(world, 1.0);
         let prevUv = vec2f(clip.x, -clip.y) / clip.w * 0.5 + 0.5;
         if (clip.w > 0.0 && all(prevUv >= vec2f(0.0)) && all(prevUv <= vec2f(1.0))) {
