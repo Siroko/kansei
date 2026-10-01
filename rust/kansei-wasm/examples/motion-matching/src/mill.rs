@@ -1,5 +1,5 @@
-//! A water mill in the lake: a paddle wheel on an axle, its lower paddles in the water, turning
-//! steadily on a frame standing on the bed. Its paddles are the fluid's colliders, moving with
+//! A water mill in the lake, a blockout like the course's boxes: a paddle wheel on an axle, its
+//! lower paddles in the water, turning steadily on a frame standing on the bed. Its paddles are the fluid's colliders, moving with
 //! the wheel (`FluidCapsule::rigid`: each end at the speed its point of the wheel moves), so they
 //! scoop the water along, lift it, throw it off at the top of their dip and leave a current
 //! and a wake along the shore. The frame's legs stand in the water as still colliders.
@@ -28,9 +28,13 @@ const AXLE: f32 = 0.22;
 const RADIUS: f32 = 0.58;
 const WIDTH: f32 = 0.46;
 const PADDLES: usize = 8;
-/// The paddles' colliders: two capsules across each, at these radii, this thick.
+/// The paddles' colliders: two capsules across each, at these radii, this thick. They cover each
+/// paddle from 0.26 m out to its tip; nearer the axle it never reaches the water.
 const PADDLE_RINGS: [f32; 2] = [0.34, 0.5];
 const PADDLE_CAPSULE: f32 = 0.08;
+/// The hub's radius, and the paddles' thickness (boxes from the hub to `RADIUS`).
+const HUB: f32 = 0.14;
+const PADDLE_THICKNESS: f32 = 0.08;
 /// The frame's legs: half the spread along the axle and across it.
 const LEGS: [f32; 2] = [0.42, 0.38];
 
@@ -58,48 +62,36 @@ impl Mill {
         // local +x is the axle: a yaw `a` turns +x to (cos a, 0, -sin a)
         let yaw = (-axle.z).atan2(axle.x);
 
-        // the wheel, about local +x: a hub, two rims, spokes and the paddles
+        // the wheel, about local +x: an axle through a hub, and the paddles standing out of it,
+        // each covering its two colliders (`PADDLE_RINGS`)
         let mut wheel = Mesh::default();
-        wheel.rod(GVec3::X * -(LEGS[0] + 0.05), GVec3::X * (LEGS[0] + 0.05), 0.04, 12, Paint::Iron);
-        for side in [-1.0f32, 1.0] {
-            let x = side * WIDTH * 0.5;
-            wheel.rod(GVec3::new(x - 0.03, 0.0, 0.0), GVec3::new(x + 0.03, 0.0, 0.0), 0.12, 12, Paint::DarkWood);
-            let rim = RADIUS - 0.05;
-            for k in 0..16 {
-                let (a, b) = (k as f32 / 16.0 * std::f32::consts::TAU, (k + 1) as f32 / 16.0 * std::f32::consts::TAU);
-                let p = |t: f32| GVec3::new(x, t.cos() * rim, t.sin() * rim);
-                wheel.rod(p(a), p(b), 0.025, 6, Paint::DarkWood);
-            }
-            for k in 0..PADDLES {
-                let a = (k as f32 + 0.5) / PADDLES as f32 * std::f32::consts::TAU;
-                wheel.rod(GVec3::new(x, 0.0, 0.0), GVec3::new(x, a.cos() * rim, a.sin() * rim), 0.02, 6, Paint::Wood);
-            }
-        }
+        wheel.beam(GVec3::X * -(LEGS[0] + 0.07), GVec3::X * (LEGS[0] + 0.07), 0.07, Paint::Dark);
+        wheel.rod(GVec3::X * -(WIDTH * 0.5 + 0.03), GVec3::X * (WIDTH * 0.5 + 0.03), HUB, 16, Paint::Dark);
         for k in 0..PADDLES {
             let a = k as f32 / PADDLES as f32 * std::f32::consts::TAU;
-            let at = Mat4::from_rotation_x(a) * Mat4::from_translation(GVec3::new(0.0, (PADDLE_RINGS[0] + RADIUS) * 0.5 - 0.04, 0.0));
-            wheel.cuboid(at, GVec3::new(WIDTH + 0.04, RADIUS - PADDLE_RINGS[0] + 0.12, 0.035), Paint::Wood);
+            let at = Mat4::from_rotation_x(a) * Mat4::from_translation(GVec3::Y * (HUB + RADIUS) * 0.5);
+            wheel.cuboid(at, GVec3::new(WIDTH, RADIUS - HUB, PADDLE_THICKNESS), Paint::Blue);
         }
         let mut r = Renderable::new(wheel.geometry("Mill/Wheel"), props::material("Mill/Wheel"));
         r.object.set_position(center.x, center.y, center.z);
         r.object.rotation.y = yaw;
         let wheel = scene.add(SceneNode::Renderable(r));
 
-        // the frame: two A-frames on the bed either end of the axle, and a beam across their tops
+        // the frame: an A-frame of two posts on the bed either end of the axle, a block on top
         let local = |p: GVec3| center + Quat::from_rotation_y(yaw) * p;
         let mut legs = Vec::new();
         let mut frame = Mesh::default();
         for side in [-1.0f32, 1.0] {
-            let top = GVec3::new(side * LEGS[0], 0.06, 0.0);
+            let top = GVec3::new(side * LEGS[0], 0.0, 0.0);
             for across in [-1.0f32, 1.0] {
                 let foot = local(GVec3::new(side * LEGS[0], 0.0, across * LEGS[1]));
                 let foot = GVec3::new(foot.x, lake.ground(foot.x, foot.z) - 0.05, foot.z);
                 let foot_local = Quat::from_rotation_y(-yaw) * (foot - center);
-                frame.rod(foot_local, top, 0.035, 8, Paint::Wood);
+                frame.beam(foot_local, top, 0.08, Paint::Grey);
                 // the collider stops short of the bed (see `AXLE`)
                 legs.push([foot.lerp(local(top), 0.35), local(top)]);
             }
-            frame.cuboid(Mat4::from_translation(GVec3::new(side * LEGS[0], 0.0, 0.0)), GVec3::new(0.09, 0.1, 0.12), Paint::Iron);
+            frame.cuboid(Mat4::from_translation(top + GVec3::Y * 0.02), GVec3::new(0.12, 0.16, 0.2), Paint::Grey);
         }
         let mut r = Renderable::new(frame.geometry("Mill/Frame"), props::material("Mill/Frame"));
         r.object.set_position(center.x, center.y, center.z);
