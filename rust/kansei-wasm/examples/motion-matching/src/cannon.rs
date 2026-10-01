@@ -53,8 +53,8 @@ pub struct Cannon {
 }
 
 impl Cannon {
-    /// Build it on the bank: a carriage on two wheels and a barrel on its trunnions, in `scene`,
-    /// and its carriage as a box in `world` (the character walks round it).
+    /// Build it on the bank, a blockout like the course's boxes: a base and a barrel on its
+    /// trunnion, in `scene`, and its base as a box in `world` (the character walks round it).
     pub fn new(scene: &mut Scene, world: &mut CollisionWorld, lake: &Lake) -> Self {
         let [x, z] = lake.from_waterline(ANGLE, FROM_WATERLINE);
         let ground = lake.ground(x, z);
@@ -66,36 +66,28 @@ impl Cannon {
         let pivot = base + GVec3::Y * PIVOT;
         let aim = Quat::from_rotation_y(yaw) * GVec3::new(0.0, ELEVATION.sin(), ELEVATION.cos());
 
-        // the carriage: cheeks either side of the barrel, an axle and two wheels, a trail behind
-        let mut carriage = Mesh::default();
+        // the base: a slab on the ground and two cheeks holding the barrel's trunnion
+        let mut stand = Mesh::default();
+        stand.cuboid(Mat4::from_translation(GVec3::new(0.0, 0.1, -0.1)), GVec3::new(0.5, 0.2, 0.9), Paint::Grey);
         for side in [-1.0f32, 1.0] {
-            carriage.cuboid(Mat4::from_translation(GVec3::new(side * 0.17, 0.3, -0.1)) * Mat4::from_rotation_x(-0.25), GVec3::new(0.06, 0.32, 0.7), Paint::Wood);
-            let wheel = Mat4::from_translation(GVec3::new(side * 0.27, 0.25, 0.05)) * Mat4::from_rotation_z(side * std::f32::consts::FRAC_PI_2);
-            carriage.cylinder(wheel * Mat4::from_translation(GVec3::Y * -0.03), 0.25, 0.06, 18, Paint::DarkWood);
-            carriage.cylinder(wheel * Mat4::from_translation(GVec3::Y * -0.045), 0.07, 0.09, 10, Paint::Iron);
-            carriage.cuboid(Mat4::from_translation(GVec3::new(side * 0.17, PIVOT, 0.0)), GVec3::new(0.08, 0.08, 0.08), Paint::Iron);
+            let (bottom, top) = (0.2, PIVOT + 0.08);
+            stand.cuboid(Mat4::from_translation(GVec3::new(side * 0.18, (bottom + top) * 0.5, 0.0)), GVec3::new(0.08, top - bottom, 0.3), Paint::Grey);
         }
-        carriage.rod(GVec3::new(-0.3, 0.25, 0.05), GVec3::new(0.3, 0.25, 0.05), 0.03, 8, Paint::Iron);
-        carriage.cuboid(Mat4::from_translation(GVec3::new(0.0, 0.1, -0.55)) * Mat4::from_rotation_x(0.2), GVec3::new(0.2, 0.08, 0.5), Paint::Wood);
         let place = |r: &mut Renderable, at: GVec3| {
             r.object.set_position(at.x, at.y, at.z);
             r.object.rotation.y = yaw;
         };
-        let mut r = Renderable::new(carriage.geometry("Cannon/Carriage"), props::material("Cannon/Carriage"));
+        let mut r = Renderable::new(stand.geometry("Cannon/Base"), props::material("Cannon/Base"));
         place(&mut r, base);
         scene.add(SceneNode::Renderable(r));
 
         // the barrel, along local +z from behind its pivot to the muzzle, pitched up
         let mut barrel = Mesh::default();
-        let along = |a: f32, b: f32, radius: f32, paint: Paint, mesh: &mut Mesh| mesh.rod(GVec3::Z * a, GVec3::Z * b, radius, 20, paint);
-        along(-0.3, BARREL - 0.08, 0.15, Paint::Iron, &mut barrel);
-        along(BARREL - 0.12, BARREL, 0.165, Paint::Brass, &mut barrel);
-        along(-0.32, -0.22, 0.165, Paint::Brass, &mut barrel);
-        along(0.15, 0.22, 0.16, Paint::Brass, &mut barrel);
-        barrel.cylinder(Mat4::from_translation(GVec3::Z * -0.32) * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2) * Mat4::from_translation(GVec3::Y * -0.08), 0.05, 0.08, 10, Paint::Iron);
-        barrel.rod(GVec3::new(-0.21, 0.0, 0.0), GVec3::new(0.21, 0.0, 0.0), 0.04, 10, Paint::Iron);
-        // the bore: a dark disc just inside the muzzle
-        barrel.cylinder(Mat4::from_translation(GVec3::Z * (BARREL - 0.005)) * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2), BORE, 0.01, 20, Paint::DarkWood);
+        barrel.rod(GVec3::Z * -0.3, GVec3::Z * (BARREL - 0.1), 0.13, 16, Paint::Orange);
+        barrel.rod(GVec3::Z * (BARREL - 0.1), GVec3::Z * BARREL, 0.15, 16, Paint::Dark);
+        barrel.beam(GVec3::new(-0.22, 0.0, 0.0), GVec3::new(0.22, 0.0, 0.0), 0.07, Paint::Dark);
+        // the bore: a black disc just inside the muzzle
+        barrel.cylinder(Mat4::from_translation(GVec3::Z * (BARREL - 0.005)) * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2), BORE, 0.01, 16, Paint::Black);
         let mut r = Renderable::new(barrel.geometry("Cannon/Barrel"), props::material("Cannon/Barrel"));
         place(&mut r, pivot);
         r.object.rotation.x = -ELEVATION;
