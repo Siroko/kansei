@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kansei Graphics — games and a WebGPU engine</title>
+    <meta
+      name="description"
+      content="Kansei Graphics is a small game and graphics studio. We build our own WebGPU engine, Kansei, and use it to make Raggare, a game about 70s Swedish car culture."
+    />
+    <meta name="theme-color" content="#05090b" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="canonical" href="https://kansei.graphics/" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Kansei Graphics" />
+    <meta property="og:url" content="https://kansei.graphics/" />
+    <meta property="og:title" content="Kansei Graphics — games and a WebGPU engine" />
+    <meta
+      property="og:description"
+      content="A small game and graphics studio building its own WebGPU engine, Kansei. Now making Raggare."
+    />
+    <meta property="og:image" content="https://kansei.graphics/og.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="A car's headlights on a forest road at dusk, under the words Kansei Graphics." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Kansei Graphics — games and a WebGPU engine" />
+    <meta
+      name="twitter:description"
+      content="A small game and graphics studio building its own WebGPU engine, Kansei. Now making Raggare."
+    />
+    <meta name="twitter:image" content="https://kansei.graphics/og.jpg" />
+
+    <link rel="preload" href="/fonts/roboto-latin-300-normal.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/site.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="nav">
+      <a class="brand" href="/" aria-label="Kansei Graphics, home">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M10 7v18M10 17.5 21.5 7M14 14l8 11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        <span>Kansei Graphics</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="#engine">Engine</a>
+        <a href="#games">Games</a>
+        <a href="https://github.com/Siroko/kansei" rel="noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-media" aria-hidden="true">
+          <video
+            class="hero-video"
+            autoplay
+            muted
+            loop
+            playsinline
+            preload="metadata"
+            poster="/media/lake-poster.webp"
+          >
+            <source src="/media/lake-loop.webm" type="video/webm" />
+            <source src="/media/lake-loop.mp4" type="video/mp4" />
+          </video>
+        </div>
+        <div class="hero-copy">
+          <p class="eyebrow">Game &amp; graphics studio</p>
+          <h1 id="hero-title">Kansei <span>Graphics</span></h1>
+          <p class="lede">
+            We make games on our own engine. Kansei renders in WebGPU, so what we build runs in a browser tab as well as
+            on the desktop.
+          </p>
+          <div class="actions">
+            <a class="btn btn-primary" href="#games">See Raggare</a>
+            <a class="btn" href="https://github.com/Siroko/kansei" rel="noopener">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+              Kansei on GitHub
+            </a>
+          </div>
+        </div>
+        <p class="hero-caption">From the Raggare intro, rendered in Kansei</p>
+      </section>
+
+      <section id="engine" class="section engine" aria-labelledby="engine-title">
+        <div class="section-head">
+          <p class="eyebrow">The engine</p>
+          <h2 id="engine-title">Kansei</h2>
+          <p class="lede">
+            An open-source WebGPU engine, written for the games we want to make. It started as a TypeScript and WGSL
+            library and now has a Rust core that compiles to WebAssembly for the web and runs natively on the desktop.
+          </p>
+        </div>
+
+        <ul class="features">
+          <li>
+            <h3>Cluster LOD and impostors</h3>
+            <p>Meshes are split into clusters and drawn at the detail the camera needs. Far forests turn into baked impostor cards.</p>
+          </li>
+          <li>
+            <h3>Fluids</h3>
+            <p>Water on the GPU, with SPH and position-based solvers, a surface reconstructed for rendering, and colliders that push it around.</p>
+          </li>
+          <li>
+            <h3>Motion matching</h3>
+            <p>Characters pick each next pose from a database of motion, so movement follows the player without hand-built state machines.</p>
+          </li>
+          <li>
+            <h3>Sky, clouds and fog</h3>
+            <p>A physical atmosphere with aerial perspective, ray-marched volumetric clouds and their shadows, and froxel volumetric fog.</p>
+          </li>
+          <li>
+            <h3>Light and lens</h3>
+            <p>Cascaded shadows, planar reflections, hybrid path-traced GI, TAA, depth of field, bloom and a film look.</p>
+          </li>
+          <li>
+            <h3>Built for the web</h3>
+            <p>GPU culling, KTX2 textures transcoded per device, and every shader validated in tests. The same code ships to a tab and a window.</p>
+          </li>
+        </ul>
+
+        <div class="engine-cta">
+          <a class="btn btn-primary btn-lg" href="https://github.com/Siroko/kansei" rel="noopener">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            View on GitHub
+          </a>
+          <p class="note">MIT licensed. Experimental and moving fast.</p>
+        </div>
+
+        <div class="demos">
+          <h3 class="label">Try it in your browser</h3>
+          <ul class="demo-list">
+            <li>
+              <a href="https://fluid.kansei.graphics/" rel="noopener">
+                <span class="demo-name">Fluid</span>
+                <span class="demo-desc">Real-time particle fluid on the Rust/WASM core</span>
+              </a>
+            </li>
+            <li>
+              <a href="https://raggare.kansei.graphics/" rel="noopener">
+                <span class="demo-name">Raggare intro</span>
+                <span class="demo-desc">The game's opening film, rendered live</span>
+              </a>
+            </li>
+            <li>
+              <a href="/examples/">
+                <span class="demo-name">Examples</span>
+                <span class="demo-desc">Path tracing, post-processing, compute, text and more</span>
+              </a>
+            </li>
+            <li>
+              <a href="https://msdf.kansei.graphics/" rel="noopener">
+                <span class="demo-name">MSDF font tool</span>
+                <span class="demo-desc">Turn a font into an atlas for Kansei's text</span>
+              </a>
+            </li>
+          </ul>
+          <p class="note">The demos need a browser with WebGPU, such as a recent Chrome, Edge or Safari.</p>
+        </div>
+      </section>
+
+      <section id="games" class="section games" aria-labelledby="games-title">
+        <div class="section-head">
+          <p class="eyebrow">Games</p>
+          <h2 id="games-title">Raggare</h2>
+          <p class="status"><span class="dot" aria-hidden="true"></span>In development</p>
+        </div>
+
+        <div class="game">
+          <figure class="game-media">
+            <video
+              class="lazy-video"
+              muted
+              loop
+              playsinline
+              preload="none"
+              poster="/media/raggare-title.webp"
+              aria-label="A '73 Coupe de Ville drives up a forest road at night, headlights on."
+            >
+              <source data-src="/media/raggare-road.webm" type="video/webm" />
+              <source data-src="/media/raggare-road.mp4" type="video/mp4" />
+            </video>
+          </figure>
+          <div class="game-copy">
+            <p>
+              Rural Sweden, somewhere between the 70s and the 80s. You roll into Sjöviken, a village by a lake, behind the
+              wheel of a '73 Coupe de Ville.
+            </p>
+            <p>
+              Raggare is about the car culture of those years: big American cars, rock'n'roll and small-town nights. We are
+              making it on Kansei.
+            </p>
+            <ul class="links">
+              <li><a class="btn btn-primary" href="https://raggare.kansei.graphics/" rel="noopener">Watch the intro</a></li>
+              <li><a class="btn" href="https://www.reddit.com/r/raggaregame/" rel="noopener">r/raggaregame</a></li>
+              <!-- TODO: add the Raggare YouTube channel URL when it exists, and make this a link like the ones above. -->
+              <li><span class="btn btn-soon" aria-disabled="true">YouTube <small>soon</small></span></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <p class="footer-brand">Kansei Graphics</p>
+        <ul class="footer-links">
+          <li><a href="https://github.com/Siroko/kansei" rel="noopener">GitHub</a></li>
+          <li><a href="https://www.reddit.com/r/raggaregame/" rel="noopener">Reddit</a></li>
+          <li><a href="/examples/">Examples</a></li>
+          <!-- TODO: contact address and YouTube channel, once they exist. -->
+        </ul>
+        <p class="copy">© <span id="year">2026</span> Kansei Graphics</p>
+      </div>
+    </footer>
+
+    <script src="/site.js" defer></script>
+  </body>
+</html>
