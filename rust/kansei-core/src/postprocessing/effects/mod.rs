@@ -17,7 +17,7 @@ pub use clouds::{CloudLayer, CloudQuality, VolumetricCloudsEffect, VolumetricClo
 pub use cinematic_dof::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DofDebugView, HighlightOptions};
 pub use color_grading::{ColorGradingEffect, ColorGradingOptions};
 pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
-pub use fluid_surface::{FluidSurfaceEffect, FluidSurfaceOptions};
+pub use fluid_surface::{FluidMask, FluidSurfaceEffect, FluidSurfaceOptions};
 pub use height_fog::{HeightFogEffect, HeightFogLayer};
 pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
 pub use ssgi::{GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions};
