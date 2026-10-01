@@ -252,6 +252,11 @@ impl FluidSpeedProbe {
             return;
         }
         let (device, queue) = sim.gpu();
+        // the live particles (particles emitted since the last measurement included)
+        if self.count != sim.particle_count() {
+            self.count = sim.particle_count();
+            self.upload(queue);
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FluidSpeedProbe") });
         encoder.clear_buffer(&self.result, 0, None);
         {

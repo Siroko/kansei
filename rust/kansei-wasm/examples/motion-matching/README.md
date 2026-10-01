@@ -113,6 +113,34 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
   setting or a reset wake it at once. The HUD's `water` line shows the state and the last speed
   read; `lake_state()` (a wasm export) returns `"running"`, `"culled"` or `"asleep"`.
 
+### The water cannon
+
+A little cannon stands on the lake's west bank (`at=14.4,-3.9,10` starts beside it), aimed in an
+arc into the lake.
+- **Firing:** within 2.5 m of it, a prompt shows (`E / X — fire water`). E, the gamepad's X, or a
+  click on the prompt fires a burst; holding pours. The water leaves the muzzle at 5 m/s from a
+  disc 20 cm across, about 2,000 particles a second, flies its arc and splashes in.
+- **New particles:** the water is new particles (`FluidNozzle` into `FluidSimulation::with_capacity`'s
+  spare room), laid a particle spacing apart so they start at the lake's density.
+- **The level rises:** from −0.10 m to the brim (0.00 m), about 48K particles more (128K to 176K),
+  in about 20 s of pouring. The bed's wet line follows the level.
+- **When full:** the prompt says so and R (the gamepad's Y) by the cannon drains it back to the
+  start, as the P panel's reset does.
+- **The cap's cost:** the brim, not higher, because the full lake costs its particles: at the brim
+  a frame took about 14 ms against 13 ms at the start on the test Mac; filled to +0.04 m (half as
+  many particles again) it took about 16 ms against 10.
+
+### The water mill
+
+A paddle wheel turns in the lake's north shallows (`at=18,2.6,110` looks along the shore at it).
+- **The paddles:** they are colliders that move with the wheel (`FluidCapsule::rigid`). They lift
+  the water, throw it off as they rise and push a current along the shore. Its frame's legs are
+  still colliders.
+- **Resting:** while it turns, the lake stays awake in view and still culls out of view. Stopped,
+  the lake sleeps once its waves die down (about 30 s).
+- **The P panel** turns it on and off and sets its speed (16 rpm by default); `mill=0` starts it
+  stopped.
+
 ### Tweaking the water
 
 P shows a panel (Tweakpane), hidden at first:
@@ -121,8 +149,10 @@ P shows a panel (Tweakpane), hidden at first:
   tensile correction (`s_corr` k and n), XSPH viscosity and vorticity confinement. PBF steps 2
   substeps to SPH's 4;
 - **water:** substeps, time scale, the bed's friction, the legs' drag, the landing splash, whether
-  it may rest (culled, asleep), and a reset; and for SPH its viscosity, tensile correction (how much of the pull under the rest density
+  it may rest (culled, asleep), a reset (which drains what the cannon poured in) and how full it
+  is; and for SPH its viscosity, tensile correction (how much of the pull under the rest density
   acts), stiffness and near stiffness, and rest density;
+- **water mill:** turning or not, and its speed;
 - **surface:** presets (*Surface field, droplets*, the default; *Density iso, smooth*;
   *Performance*), and each setting: surface field or density, iso level, kernel radius, particle
   radius, grid resolution, interpolation.
@@ -145,6 +175,8 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 | run | Shift | B, right trigger |
 | jump, or traverse what is ahead | Space | A |
 | strafe (face the camera's way) | Q | left bumper |
+| fire the water cannon (by it; hold to pour) | E, or click the prompt | X |
+| drain the lake (by the cannon) | R | Y |
 | orbit, zoom | drag, wheel | right stick |
 | overlay (trajectory, feet, HUD) | B | |
 | skeleton, mesh, foot locking | K, M, L | |
@@ -161,8 +193,14 @@ URL parameters:
 - `course=0` leaves the boxes out;
 - `lake=0` leaves the lake out;
 - `rest=0` never rests the lake's water (always stepped and drawn, as before resting);
+- `mill=0` starts the water mill stopped;
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
 - `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
   3 s (`Renderer::set_profiling`).
+- A page with its own overlay can show the cannon's prompt and trigger:
+  - `cannon_prompt()` returns the prompt's text, or `""` away from the cannon. The page also sets
+    it into a `#prompt` element when it has one.
+  - `cannon_fire(down)` presses and releases the trigger.
+  - `lake_fill()` returns `{ particles, capacity, fill, level }`.
 - `lake_regions()` (a wasm export, from the console) counts the lake's particles in the lake, on the
   bank, against the walls and outside them, with their mean height: to check water drains back.
