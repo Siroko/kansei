@@ -105,6 +105,13 @@ outside it, and whose floor is the lake bed. The character's legs push it throug
 - Landing in the water (a jump or a fall) throws a crown of spray, scaled by how fast the
   character came down: a sphere at its feet pushes the water out for a moment
   (`FluidCapsule::expansion`).
+- The water rests when it can (`FluidSleep`). Out of view for 1.5 s (time for the last waves to
+  die out) it is **culled**: neither stepped nor its surface extracted or composited. In view,
+  once no particle has moved faster than 5 cm/s for a second (a GPU reduction read back a few
+  frames late, `FluidSpeedProbe`) and no leg is within 2 m of the lake, it is **asleep**: not
+  stepped, its last surface drawn as it was. Legs coming near, a landing's splash, a changed
+  setting or a reset wake it at once. The HUD's `water` line shows the state and the last speed
+  read; `lake_state()` (a wasm export) returns `"running"`, `"culled"` or `"asleep"`.
 
 ### Tweaking the water
 
@@ -113,8 +120,8 @@ P shows a panel (Tweakpane), hidden at first:
   constraint projected on the positions, Macklin & Müller 2013), with its iterations, relaxation,
   tensile correction (`s_corr` k and n), XSPH viscosity and vorticity confinement. PBF steps 2
   substeps to SPH's 4;
-- **water:** substeps, time scale, the bed's friction, the legs' drag, the landing splash, and a
-  reset; and for SPH its viscosity, tensile correction (how much of the pull under the rest density
+- **water:** substeps, time scale, the bed's friction, the legs' drag, the landing splash, whether
+  it may rest (culled, asleep), and a reset; and for SPH its viscosity, tensile correction (how much of the pull under the rest density
   acts), stiffness and near stiffness, and rest density;
 - **surface:** presets (*Surface field, droplets*, the default; *Density iso, smooth*;
   *Performance*), and each setting: surface field or density, iso level, kernel radius, particle
@@ -153,6 +160,7 @@ URL parameters:
 - `taa=0` turns TAA off;
 - `course=0` leaves the boxes out;
 - `lake=0` leaves the lake out;
+- `rest=0` never rests the lake's water (always stepped and drawn, as before resting);
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
 - `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
   3 s (`Renderer::set_profiling`).
