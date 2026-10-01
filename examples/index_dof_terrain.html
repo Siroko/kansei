@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DoF Terrain — Kansei</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector2 } from '../src/math/Vector2'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Float } from '../src/math/Float'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
+    import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
+    import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+    // Restored from the first post-processing example (examples/index_postpro.html at 82a6164a), before it became
+    // the spheres and volumetric fog scene: a scrolling field of noise-driven columns, made to test depth of field.
+
+    // ── Scene parameters ──────────────────────────────────────────────────────
+    const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
+    const GRID_SPACING   = 1;   // world-space gap between cube centres
+    const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
+    const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
+    const SCROLL_SPEED   = 35;   // world-units per second along Z
+
+    const GRID_HALF      = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
+    const GRID_SPAN      = GRID_SIZE * GRID_SPACING;              // total Z extent
+
+    // ── Lambert shader (white base colour, single directional/point light) ───
+    // Light sits top-right of the scene: high Y, positive X, slightly back.
+    // Light data is baked as WGSL constants. The whole field is one instanced draw: each instance is a column
+    // (x, start z, height), and the vertex shader scrolls it along Z by the shared offset, wrapping it to the back.
+    const lambertShader = /* wgsl */`
+      // World-space light position (top-right of the scene).
+      const LIGHT_POS : vec3f = vec3f(80.0, 150.0, -60.0);
+      const AMBIENT   : f32   = 0.12;
+      const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
+      const MAX_Z     : f32   = ${(GRID_HALF + GRID_SPACING).toFixed(4)};
+      const GRID_SPAN : f32   = ${GRID_SPAN.toFixed(4)};
+
+      struct VertexOut {
+        @builtin(position) position   : vec4f,
+        @location(0)       worldPos   : vec3f,
+        @location(1)       worldNormal: vec3f,
+      }
+
+      // Scroll along Z in world units, kept in [0, GRID_SPAN).
+      @group(0) @binding(0) var<uniform> scrollOffset   : f32;
+      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+        @location(3) column   : vec4f, // x, start z, height (y scale), unused
+      ) -> VertexOut {
+        // A column that scrolls past the front edge wraps to the back of the grid.
+        var z = column.y + scrollOffset;
+        if (z > MAX_Z) { z -= GRID_SPAN; }
+        let local    = vec4f(position.x + column.x, position.y * column.z, position.z + z, 1.0);
+        let worldPos = worldMatrix * local;
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldPos;
+        out.worldPos    = worldPos.xyz;
+        // Inverse-transpose of the column's Y scale (the tall, thin noise columns), then the renderable's normalMatrix.
+        let columnNormal = normal * vec3f(1.0, 1.0 / column.z, 1.0);
+        out.worldNormal = normalize((normalMatrix * vec4f(columnNormal, 0.0)).xyz);
+        return out;
+      }
+
+      // The GBuffer has four colour targets: colour, emissive, normal, albedo.
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let L        = normalize(LIGHT_POS - frag.worldPos);
+        let diffuse  = max(dot(frag.worldNormal, L), 0.0);
+        let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
+        return FragmentOutput(
+          vec4f(BASE_COLOR * lighting, 1.0),
+          vec4f(0.0, 0.0, 0.0, 1.0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
+          vec4f(BASE_COLOR, 0.0)
+        );
+      }
+    `;
+
+    // ── Smooth value noise (2-D, 4 octaves) ───────────────────────────────────
+    function hash2(xi, yi) {
+      const n = Math.sin(xi * 127.1 + yi * 311.7) * 43758.5453;
+      return n - Math.floor(n);
+    }
+
+    function valueNoise(x, y) {
+      const ix = Math.floor(x), iy = Math.floor(y);
+      const fx = x - ix,       fy = y - iy;
+      const ux = fx * fx * (3 - 2 * fx); // smoothstep
+      const uy = fy * fy * (3 - 2 * fy);
+      const a = hash2(ix,   iy  ), b = hash2(ix+1, iy  );
+      const c = hash2(ix,   iy+1), d = hash2(ix+1, iy+1);
+      return a + (b-a)*ux + (c-a)*uy + ((d-c)-(b-a))*ux*uy;
+    }
+
+    function fbm(x, y, octaves = 4) {
+      let v = 0, amp = 0.5, freq = 1, norm = 0;
+      for (let i = 0; i < octaves; i++) {
+        v    += valueNoise(x * freq, y * freq) * amp;
+        norm += amp;
+        amp  *= 0.5;
+        freq *= 2.0;
+      }
+      return v / norm; // normalised [0, 1]
+    }
+
+    // ── Renderer ──────────────────────────────────────────────────────────────
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: 1,
+      antialias: true,
+      sampleCount: 4
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas);
+    renderer.canvas.style.width = '100%';
+    renderer.canvas.style.height = '100%';
+
+    // ── Camera & controls ─────────────────────────────────────────────────────
+    const scene  = new Scene();
+    const camera = new Camera(26, 0.1, 1000, window.innerWidth / window.innerHeight);
+    // Drag to orbit and scroll to zoom. The opening view is set below (DEFAULT_VIEW).
+    const orbitTarget = new Vector3(0, 0, 0);
+    const cameraControls = new CameraControls(camera, orbitTarget, null, 100);
+
+    // ── Grid of columns: one instance per column ──────────────────────────────
+    // Each column keeps its height from the noise at its starting grid position; only its Z scrolls.
+    const columns = new Float32Array(GRID_SIZE * GRID_SIZE * 4);
+    for (let row = 0; row < GRID_SIZE; row++) {
+      for (let col = 0; col < GRID_SIZE; col++) {
+        const worldX = col * GRID_SPACING - GRID_HALF;
+        const worldZ = row * GRID_SPACING - GRID_HALF;
+        const i = (row * GRID_SIZE + col) * 4;
+        columns[i]     = worldX;
+        columns[i + 1] = worldZ;
+        columns[i + 2] = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM) * SCALE_Y_STRENGTH + 0.1;
+      }
+    }
+    const columnBuffer = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: columns,
+      shaderLocation: 3,
+      offset: 0,
+      stride: 4 * 4,
+      format: 'float32x4',
+    });
+
+    // ── Material (no texture — Lambert only) ──────────────────────────────────
+    const scrollOffset = new Float(0);
+    const material = new Material(lambertShader, {
+      bindings: [{ binding: 0, visibility: GPUShaderStage.VERTEX, value: scrollOffset }],
+    });
+    const geometry = new InstancedGeometry(new BoxGeometry(1, 1, 1), GRID_SIZE * GRID_SIZE, [columnBuffer]);
+    scene.add(new Renderable(geometry, material));
+
+    // ── Post-processing volume ────────────────────────────────────────────────
+    const ssaoEffect = new SSAOEffect({
+      radius: 0.8,
+      bias: 0.02,
+      kernelSize: 64,
+      strength: 0.5
+    });
+    const dofEffect = new DepthOfFieldEffect({
+      focusDistance: 101.5,
+      focusRange: 15,
+      maxBlur: 24
+    });
+    const volume = new PostProcessingVolume(renderer, [ssaoEffect, dofEffect]);
+
+    // ── Controls ──────────────────────────────────────────────────────────────
+    const pane = new Pane({ title: 'Depth of field' });
+    pane.addBinding(dofEffect, 'focusDistance', { min: 1, max: 150, step: 0.5, label: 'focus distance' });
+    pane.addBinding(dofEffect, 'focusRange', { min: 1, max: 80, step: 0.5, label: 'focus range' });
+    pane.addBinding(dofEffect, 'maxBlur', { min: 0, max: 32, step: 1, label: 'max blur' });
+    if (window.innerWidth < 768) pane.expanded = false;
+
+    // ── View: the opening camera and DoF, shareable as JSON ──────────────────
+    // 'Copy view' (or the V key) copies the current view; open the page with ?view=<that JSON> to restore it exactly.
+    // Angles are in degrees: azimuth around the target (0 = +Z side, 90 = +X side), elevation above the ground plane.
+    const DEFAULT_VIEW = {
+      radius: 150,
+      azimuth: 318,
+      elevation: 22,
+      target: [0, 0, 0],
+      fov: 26,
+      focusDistance: 101.5,
+      focusRange: 15,
+      maxBlur: 24,
+    };
+    const DEG = Math.PI / 180;
+
+    function currentView() {
+      // CameraControls keeps its orbit in turns (fractions of a full circle); its fields are TypeScript-private only.
+      const cc = cameraControls;
+      return {
+        radius: +cc.wheelDelta.toFixed(2),
+        azimuth: +(cc.currentAngles.x * 360).toFixed(2),
+        elevation: +(cc.currentAngles.y * 360).toFixed(2),
+        target: [orbitTarget.x, orbitTarget.y, orbitTarget.z].map((v) => +v.toFixed(2)),
+        fov: camera.fov,
+        focusDistance: dofEffect.focusDistance,
+        focusRange: dofEffect.focusRange,
+        maxBlur: dofEffect.maxBlur,
+      };
+    }
+
+    function applyView(view) {
+      const v = { ...DEFAULT_VIEW, ...view };
+      const cc = cameraControls;
+      cc.wheelDelta = cc.wheelDeltaEase = cc.radius = v.radius;
+      cc.azimuth = v.azimuth * DEG;
+      // Elevation has no setter: set the vertical angle and its eased value together, as the azimuth setter does.
+      cc.currentAngles.y = cc.prevAngles.y = v.elevation / 360;
+      cc.finalRadians.y = v.elevation * DEG;
+      orbitTarget.set(v.target[0], v.target[1], v.target[2]);
+      camera.fov = v.fov;
+      camera.updateProjectionMatrix();
+      dofEffect.focusDistance = v.focusDistance;
+      dofEffect.focusRange = v.focusRange;
+      dofEffect.maxBlur = v.maxBlur;
+      pane.refresh();
+    }
+
+    let openingView = { ...DEFAULT_VIEW };
+    const viewParam = new URLSearchParams(window.location.search).get('view');
+    if (viewParam) {
+      try {
+        openingView = { ...DEFAULT_VIEW, ...JSON.parse(viewParam) };
+      } catch (err) {
+        console.warn('Ignoring ?view=, it is not valid JSON:', err);
+      }
+    }
+    applyView(openingView);
+
+    async function copyView() {
+      const view = currentView();
+      const json = JSON.stringify(view);
+      const url = `${location.origin}${location.pathname}?view=${encodeURIComponent(json)}`;
+      console.log('Kansei DoF terrain view:\n' + JSON.stringify(view, null, 2) + '\n' + url);
+      try {
+        await navigator.clipboard.writeText(JSON.stringify({ ...view, url }, null, 2));
+        copyButton.title = 'Copied';
+      } catch {
+        copyButton.title = 'See console';
+      }
+      setTimeout(() => (copyButton.title = 'Copy view'), 1500);
+    }
+    const copyButton = pane.addButton({ title: 'Copy view' });
+    copyButton.on('click', copyView);
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'v' && !e.metaKey && !e.ctrlKey && !e.altKey) copyView();
+    });
+
+    // ── Render loop ───────────────────────────────────────────────────────────
+    let lastTime = performance.now();
+
+    function animate(now) {
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+
+      // Wrapped on the CPU so the offset keeps full float precision on the GPU.
+      scrollOffset.value = (scrollOffset.value + SCROLL_SPEED * dt) % GRID_SPAN;
+
+      cameraControls.update();
+      volume.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+
+</html>
