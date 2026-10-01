@@ -291,18 +291,6 @@ h2 {
   padding: 0 30px;
   font-size: 13px;
 }
-.btn-soon {
-  color: var(--ink-faint);
-  cursor: default;
-}
-.btn-soon:hover {
-  border-color: var(--line);
-}
-.btn-soon small {
-  font-size: 10px;
-  opacity: 0.8;
-}
-
 /* Sections */
 .section {
   max-width: calc(var(--max) + 2 * var(--gutter));
