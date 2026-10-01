@@ -1,69 +1,93 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8" />
-    <!-- <link rel="icon" type="image/svg+xml" href="/vite.svg" /> -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Kansei - WebGPU engine for creative dev.</title>
-    <style>
-      @font-face {
-        font-family: 'TT_supermolot';
-        src: url('./examples/assets/fonts/TT_Supermolot_Neue_Extended_ExtraLight.woff2');
-      }
-      body {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background-color: #000;
-      }
-      iframe {
-        border: none;
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-      }
-
-      #logo{
-        position: absolute;
-        top: 15px;
-        left: 20px;
-        color: white;
-        font-size: 50px;
-        font-family: 'TT_supermolot';
-        font-feature-settings: "ss01" 1;
-      }
-
-      #cursor {
-        width: 40px;
-        height: 2px;
-        background-color: white;
-        animation: blink 1s step-start infinite;
-        position: absolute;
-        top: 68px; /* Adjust as needed to position below the logo */
-        left: 265px; /* Align with the logo */
-        box-shadow: 0 0 10px white; /* Added glow effect */
-      }
-
-      @keyframes blink {
-        50% {
-          opacity: 0;
-        }
-      }
-    </style>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Examples — Kansei</title>
+    <meta name="description" content="WebGPU examples for the Kansei engine: path tracing, post-processing, compute, fluids, text and more." />
+    <meta name="theme-color" content="#05090b" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/site.css" />
   </head>
   <body>
-   <iframe id="myIframe" width="100%" height="100%" src="./examples/index_compute.html"></iframe>
-   <div id="logo">KANSEI</div>
-   <div id="cursor"></div>
+    <header class="nav nav-static">
+      <a class="brand" href="/" aria-label="Kansei Graphics, home">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M10 7v18M10 17.5 21.5 7M14 14l8 11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        <span>Kansei Graphics</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="/#engine">Engine</a>
+        <a href="/#games">Games</a>
+        <a href="https://github.com/Siroko/kansei" rel="noopener">GitHub</a>
+      </nav>
+    </header>
 
-   <script>
-    const iframe = document.getElementById('myIframe');
-    window.addEventListener('keydown', (event) => {
-      // Post the keydown event to the iframe
-      iframe.contentWindow.postMessage({ type: 'keydown', key: event.key }, '*');
-    });
-  </script>
+    <main class="section">
+      <div class="section-head">
+        <p class="eyebrow">Kansei engine</p>
+        <h1 class="page-title">Examples</h1>
+        <p class="lede">
+          Small scenes made with Kansei. Each one needs a browser with WebGPU. The sources of the TypeScript examples are
+          in <a href="https://github.com/Siroko/kansei/tree/main/examples" rel="noopener">examples/</a> on GitHub.
+        </p>
+      </div>
+
+      <ul class="demo-list examples">
+        <li>
+          <a href="./index_gi.html">
+            <span class="demo-name">Path-traced GI</span>
+            <span class="demo-desc">A Cornell box lit by hybrid path-traced global illumination</span>
+          </a>
+        </li>
+        <li>
+          <a href="./index_postpro.html">
+            <span class="demo-name">Post-processing</span>
+            <span class="demo-desc">Volumetric fog with shadows, plus bloom, depth of field and colour grading to switch on</span>
+          </a>
+        </li>
+        <li>
+          <a href="./index_dof_terrain.html">
+            <span class="demo-name">DoF terrain</span>
+            <span class="demo-desc">A scrolling field of noise-driven columns with SSAO and depth of field</span>
+          </a>
+        </li>
+        <li>
+          <a href="./index_fluid.html">
+            <span class="demo-name">Fluid</span>
+            <span class="demo-desc">A GPU particle fluid you can stir with the mouse</span>
+          </a>
+        </li>
+        <li>
+          <a href="./index_fluid_text.html">
+            <span class="demo-name">Fluid text</span>
+            <span class="demo-desc">Fluid particles that gather into letters</span>
+          </a>
+        </li>
+        <li>
+          <a href="./index_text.html">
+            <span class="demo-name">MSDF text</span>
+            <span class="demo-desc">Signed-distance-field text, animated by a compute shader</span>
+          </a>
+        </li>
+        <li>
+          <a href="https://raggare.kansei.graphics/motion/" rel="noopener">
+            <span class="demo-name">Motion matching</span>
+            <span class="demo-desc">A character controller with motion matching: walk, run, jump and parkour over obstacles, plus a fluid lake to wade through</span>
+          </a>
+        </li>
+      </ul>
+      <p class="note">The newer Rust/WASM examples live in <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/examples" rel="noopener">rust/kansei-wasm/examples</a>; build one with <code>wasm-pack</code> to run it.</p>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <p class="footer-brand">Kansei Graphics</p>
+        <ul class="footer-links">
+          <li><a href="/">Home</a></li>
+          <li><a href="https://github.com/Siroko/kansei" rel="noopener">GitHub</a></li>
+        </ul>
+        <p class="copy">© Kansei Graphics</p>
+      </div>
+    </footer>
   </body>
 </html>
