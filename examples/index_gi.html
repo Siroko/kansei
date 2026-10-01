@@ -336,15 +336,22 @@
     const pathTracerEffect = new PathTracerEffect({
       scene,
       temporalBlend: 1,
-      spatialPasses: 0,
+      spatialPasses: 2,
       spp: 1,
       useBlueNoise: false,
-      traceScale: 0.5,
-      maxBounces: 3,
+      fixedSeed: false,
+      traceScale: 1.0,
+      maxBounces: 1,
+      useSVGF: false,
       ambientColor: [0.15, 0.15, 0.15],
-      useProbes: true,
-      rasterDirect: true,
+      useProbes: false,
+      probeSpacing: 2.0,
+      probeRaysPerFrame: 16,
+      probeHysteresis: 0.97,
+      showProbes: false,
+      rasterDirect: false,
       useReSTIR: false,
+      restirMaxHistory: 20,
     });
 
     const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
