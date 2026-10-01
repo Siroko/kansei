@@ -4,8 +4,11 @@ members = [
     "kansei-core",
     "kansei-wasm",
     "kansei-native",
+    "kansei-anim-bake",
+    "tools/ktx2",
 ]
 exclude = [
+    "vendor/basisu",
     "kansei-wasm/examples/spinning-box",
     "kansei-wasm/examples/instanced-cubes",
     "kansei-wasm/examples/lit-scene",
@@ -13,6 +16,20 @@ exclude = [
     "kansei-wasm/examples/postprocess-scene",
     "kansei-wasm/examples/pathtracer",
     "kansei-wasm/examples/fluid",
+    "kansei-wasm/examples/volumetric-fog",
+    "kansei-wasm/examples/sky-atmosphere",
+    "kansei-wasm/examples/film-look",
+    "kansei-wasm/examples/spot-lights",
+    "kansei-wasm/examples/planar-reflection",
+    "kansei-wasm/examples/taa",
+    "kansei-wasm/examples/cascaded-shadows",
+    "kansei-wasm/examples/depth-of-field",
+    "kansei-wasm/examples/gi-box",
+    "kansei-wasm/examples/occlusion-culling",
+    "kansei-wasm/examples/impostors",
+    "kansei-wasm/examples/cluster-lod",
+    "kansei-wasm/examples/motion-matching",
+    "kansei-wasm/examples/ktx2-texture",
 ]
 
 [workspace.dependencies]
@@ -23,4 +40,7 @@ log = "0.4"
 env_logger = "0.11"
 pollster = "0.4"
 image = "0.25"
-gltf = { version = "1", features = ["utils"] }
+gltf = { version = "1", features = ["utils", "extensions", "allow_empty_texture"] }
+# vendored with the targets Kansei never requests removed (vendor/basisu/PATCHES.md)
+basisu = { path = "vendor/basisu" }
+optimesh = "1.1"

@@ -7,10 +7,13 @@ pub struct Texture {
     size: wgpu::Extent3d,
     usage: wgpu::TextureUsages,
     dimension: wgpu::TextureDimension,
+    /// The bound view's dimension; `None` lets wgpu pick it from the texture.
+    view_dimension: Option<wgpu::TextureViewDimension>,
     mip_levels: u32,
-    /// Optional initial data (RGBA bytes). Written to the GPU texture on first
-    /// `initialize_with_data` call, then discarded.
-    initial_data: Option<Vec<u8>>,
+    /// Optional initial data, one entry per mip level from level 0 (tightly packed rows or block
+    /// rows, layer after layer). Written to the GPU texture on first `initialize_with_data` call,
+    /// then discarded.
+    initial_data: Option<Vec<Vec<u8>>>,
 }
 
 impl Texture {
@@ -23,6 +26,7 @@ impl Texture {
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             usage,
             dimension: wgpu::TextureDimension::D2,
+            view_dimension: None,
             mip_levels: 1,
             initial_data: None,
         }
@@ -37,6 +41,7 @@ impl Texture {
             size: wgpu::Extent3d { width, height, depth_or_array_layers: depth },
             usage,
             dimension: wgpu::TextureDimension::D3,
+            view_dimension: None,
             mip_levels: 1,
             initial_data: None,
         }
@@ -55,8 +60,78 @@ impl Texture {
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             dimension: wgpu::TextureDimension::D2,
+            view_dimension: None,
             mip_levels: 1,
-            initial_data: Some(data.to_vec()),
+            initial_data: Some(vec![data.to_vec()]),
+        }
+    }
+
+    /// A 2D texture array of `layers` equal layers, bound as `texture_2d_array` (see
+    /// `Binding::texture_2d_array`), for example terrain materials packed into one binding.
+    pub fn new_2d_array(label: &str, width: u32, height: u32, layers: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> Self {
+        Self {
+            label: label.to_string(),
+            gpu_texture: None,
+            view: None,
+            format,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: layers.max(1) },
+            usage,
+            dimension: wgpu::TextureDimension::D2,
+            view_dimension: Some(wgpu::TextureViewDimension::D2Array),
+            mip_levels: 1,
+            initial_data: None,
+        }
+    }
+
+    /// An RGBA8 2D texture array from one `width` x `height` image per layer, uploaded on first
+    /// use like `from_rgba`.
+    pub fn from_rgba_layers(label: &str, width: u32, height: u32, layers: &[&[u8]]) -> Self {
+        let mut texture = Self::new_2d_array(
+            label,
+            width,
+            height,
+            layers.len() as u32,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        texture.initial_data = Some(vec![layers.concat()]);
+        texture
+    }
+
+    /// A 2D texture with its whole mip chain given, level 0 first, in any format including the
+    /// block-compressed ones (each level's blocks tightly packed, rounded up to whole blocks as
+    /// `ktx2::transcode` produces them). Uploaded on first use like `from_rgba`.
+    pub fn from_levels(label: &str, format: wgpu::TextureFormat, width: u32, height: u32, levels: Vec<Vec<u8>>) -> Self {
+        let mut texture = Self::new_2d(label, width, height, format, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        texture.mip_levels = levels.len().max(1) as u32;
+        texture.initial_data = Some(levels);
+        texture
+    }
+
+    /// A 2D array of `layers` layers with its whole mip chain given, level 0 first, each level
+    /// holding every layer in turn (as `ktx2::transcode` produces for an array KTX2), bound as
+    /// `texture_2d_array`. Uploaded on first use like `from_rgba`.
+    pub fn from_array_levels(label: &str, format: wgpu::TextureFormat, width: u32, height: u32, layers: u32, levels: Vec<Vec<u8>>) -> Self {
+        let mut texture = Self::new_2d_array(label, width, height, layers, format, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        texture.mip_levels = levels.len().max(1) as u32;
+        texture.initial_data = Some(levels);
+        texture
+    }
+
+    /// Wrap a texture created elsewhere (a render target, a LUT, a cubemap) with the view to bind,
+    /// so it can be attached to a material like any other Texture.
+    pub fn from_view(label: &str, texture: wgpu::Texture, view: wgpu::TextureView) -> Self {
+        Self {
+            label: label.to_string(),
+            format: texture.format(),
+            size: texture.size(),
+            usage: texture.usage(),
+            dimension: texture.dimension(),
+            view_dimension: None,
+            mip_levels: texture.mip_level_count(),
+            gpu_texture: Some(texture),
+            view: Some(view),
+            initial_data: None,
         }
     }
 
@@ -71,7 +146,7 @@ impl Texture {
             usage: self.usage,
             view_formats: &[],
         });
-        self.view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.view = Some(texture.create_view(&wgpu::TextureViewDescriptor { dimension: self.view_dimension, ..Default::default() }));
         self.gpu_texture = Some(texture);
     }
 
@@ -80,22 +155,36 @@ impl Texture {
     pub fn initialize_with_data(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.gpu_texture.is_some() { return; }
         self.initialize(device);
-        if let Some(data) = self.initial_data.take() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: self.gpu_texture.as_ref().unwrap(),
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.size.width * 4),
-                    rows_per_image: None,
-                },
-                self.size,
-            );
+        if let Some(levels) = self.initial_data.take() {
+            let texture = self.gpu_texture.as_ref().unwrap();
+            let (bw, bh) = self.format.block_dimensions();
+            let block_bytes = self.format.block_copy_size(None).unwrap_or(4);
+            for (level, data) in levels.iter().enumerate() {
+                let level = level as u32;
+                // compressed copies cover whole blocks: the level's physical size
+                let blocks_x = (self.size.width >> level).max(1).div_ceil(bw);
+                let blocks_y = (self.size.height >> level).max(1).div_ceil(bh);
+                let depth = if self.dimension == wgpu::TextureDimension::D3 {
+                    (self.size.depth_or_array_layers >> level).max(1)
+                } else {
+                    self.size.depth_or_array_layers
+                };
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: level,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(blocks_x * block_bytes),
+                        rows_per_image: Some(blocks_y),
+                    },
+                    wgpu::Extent3d { width: blocks_x * bw, height: blocks_y * bh, depth_or_array_layers: depth },
+                );
+            }
         }
     }
 

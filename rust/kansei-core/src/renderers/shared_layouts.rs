@@ -2,7 +2,7 @@
 /// Group 0: Material-specific (owned by Material)
 /// Group 1: Camera — view + projection matrices (owned by Renderer)
 /// Group 2: Mesh transforms — dynamic offsets into bulk matrix buffers (owned by Renderer)
-/// Group 3: Shadows (future — Plan 2)
+/// Group 3: Shadows and spot lights (owned by Renderer)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum BindGroupSlot {
@@ -17,6 +17,9 @@ pub struct SharedLayouts {
     pub camera_bgl: wgpu::BindGroupLayout,
     pub mesh_bgl: wgpu::BindGroupLayout,
     pub shadow_bgl: wgpu::BindGroupLayout,
+    /// Group 2 of cluster pipelines (`clusters::ClusterLod`): `mesh_bgl`'s matrices, then the
+    /// packed cluster mesh, the view's draw list and the instance records (vertex-stage storage).
+    pub cluster_mesh_bgl: wgpu::BindGroupLayout,
 }
 
 impl SharedLayouts {
@@ -55,6 +58,18 @@ impl SharedLayouts {
                     },
                     count: None,
                 },
+                // Binding 3: temporal data (unjittered and previous view-projection, jitter) for
+                // motion vectors (cameras::MOTION_VECTORS_WGSL)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -85,7 +100,9 @@ impl SharedLayouts {
             ],
         });
 
-        // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap)
+        // Group 3: shadows (depth texture + comparison sampler + shadow uniforms + cubemap) and
+        // spot lights (shadow atlas + light buffer + comparison sampler + clustered light lists) and
+        // cascaded shadows (depth array + cascades + comparison sampler)
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Shared/ShadowBGL"),
             entries: &[
@@ -133,9 +150,98 @@ impl SharedLayouts {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
+                // Binding 5: spot-light shadow atlas (lights::SPOT_LIGHTS_WGSL)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 6: spot lights (count + array), physical units
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 7: comparison sampler for the spot shadow atlas
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                // Binding 8: light-cluster parameters (lights::light_clusters)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 9: per-cluster light lists
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 10: cascaded shadow map (shadows::CASCADED_SHADOWS_WGSL)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Binding 11: the cascades (matrices, light, filter settings)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 12: comparison sampler for the cascades
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
 
-        Self { camera_bgl, mesh_bgl, shadow_bgl }
+        // Group 2 of cluster pipelines (clusters::cluster_vertex_stage): the mesh matrices as in
+        // `mesh_bgl`, then the packed cluster mesh, the view's draw list and the instance records
+        let matrix = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None }, count: None };
+        let storage = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let cluster_mesh_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shared/ClusterMeshBGL"),
+            entries: &[matrix(0), matrix(1), storage(2), storage(3), storage(4)],
+        });
+
+        Self { camera_bgl, mesh_bgl, shadow_bgl, cluster_mesh_bgl }
     }
 }

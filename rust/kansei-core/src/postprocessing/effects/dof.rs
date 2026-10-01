@@ -49,6 +49,13 @@ fn computeCoC(d: f32, p: DoFParams) -> f32 {
     let ld = linearDepth(d, p.near, p.far);
     return clamp((ld - p.focusDistance) / p.focusRange, -1.0, 1.0) * p.maxBlur;
 }
+// The depth under screen pixel `px`; the depth buffer is at the render size, below the screen's
+// after a temporal upscaler.
+fn loadDepth(tex: texture_depth_2d, px: vec2u, p: DoFParams) -> f32 {
+    let dims = textureDimensions(tex);
+    let q = vec2u((vec2f(px) + 0.5) * vec2f(dims) / vec2f(p.screenWidth, p.screenHeight));
+    return textureLoad(tex, min(q, dims - 1u), 0);
+}
 "#;
 
 const COC_SHADER: &str = r#"
@@ -60,7 +67,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let coord = gid.xy;
     let w = u32(params.screenWidth); let h = u32(params.screenHeight);
     if (coord.x >= w || coord.y >= h) { return; }
-    let depth = textureLoad(depthTex, coord, 0);
+    let depth = loadDepth(depthTex, coord, params);
     let coc = computeCoC(depth, params);
     textureStore(cocOut, coord, vec4f(coc, 0.0, 0.0, 0.0));
 }
@@ -132,7 +139,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     for (var dy = 0u; dy < 2u; dy++) { for (var dx = 0u; dx < 2u; dx++) {
         let fc = vec2u(min(base.x + dx, fullW - 1u), min(base.y + dy, fullH - 1u));
         let color = textureLoad(colorTex, fc, 0);
-        let depth = textureLoad(depthTex, fc, 0);
+        let depth = loadDepth(depthTex, fc, params);
         let origCoc = computeCoC(depth, params);
         if (origCoc < 0.0) {
             let coverage = saturate(abs(origCoc) / (params.maxBlur * 0.5));
@@ -259,7 +266,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let w = u32(params.screenWidth); let h = u32(params.screenHeight);
     if (coord.x >= w || coord.y >= h) { return; }
     let sharp = textureLoad(colorTex, coord, 0);
-    let depth = textureLoad(depthTex, coord, 0);
+    let depth = loadDepth(depthTex, coord, params);
     let coc = computeCoC(depth, params); let absCoc = abs(coc);
     let halfW = u32(ceil(params.screenWidth * 0.5));
     let halfH = u32(ceil(params.screenHeight * 0.5));
@@ -589,32 +596,32 @@ impl PostProcessingEffect for DepthOfFieldEffect {
         let wg_half = ((hw + 7) / 8, (hh + 7) / 8);
 
         // Pass 1: CoC
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/CoC"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/CoC"), timestamp_writes: crate::profiling::gpu_pass("DoF/CoC").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.coc_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.coc_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
         // Pass 2a: Dilate H
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateH"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateH"), timestamp_writes: crate::profiling::gpu_pass("DoF/DilateH").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.dilate_h_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.dilate_h_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
         // Pass 2b: Dilate V
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateV"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/DilateV"), timestamp_writes: crate::profiling::gpu_pass("DoF/DilateV").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.dilate_v_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.dilate_v_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
         // Pass 3: Downsample + near/far separation
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Downsample"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Downsample"), timestamp_writes: crate::profiling::gpu_pass("DoF/Downsample").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.downsample_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.downsample_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_half.0, wg_half.1, 1); }
         // Pass 4: Vogel disk blur
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Blur"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Blur"), timestamp_writes: crate::profiling::gpu_pass("DoF/Blur").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.blur_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.blur_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_half.0, wg_half.1, 1); }
         // Pass 5: Composite
-        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Composite"), timestamp_writes: None });
+        { let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("DoF/Composite"), timestamp_writes: crate::profiling::gpu_pass("DoF/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
           p.set_pipeline(self.composite_pipeline.as_ref().unwrap());
           p.set_bind_group(0, self.composite_bg.as_ref().unwrap(), &[]);
           p.dispatch_workgroups(wg_full.0, wg_full.1, 1); }
@@ -641,4 +648,33 @@ impl PostProcessingEffect for DepthOfFieldEffect {
     }
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shaders_validate_and_the_params_layout_matches() {
+        let shaders = [
+            ("coc", COC_SHADER),
+            ("dilate_h", DILATE_H_SHADER),
+            ("dilate_v", DILATE_V_SHADER),
+            ("downsample", DOWNSAMPLE_SHADER),
+            ("blur", BLUR_SHADER),
+            ("composite", COMPOSITE_SHADER),
+        ];
+        for (name, pass) in shaders {
+            let code = format!("{COMMON}\n{pass}");
+            let module = naga::front::wgsl::parse_str(&code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&code)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let span = module.types.iter().find_map(|(_, t)| match (&t.name, &t.inner) {
+                (Some(n), naga::TypeInner::Struct { span, .. }) if n == "DoFParams" => Some(*span as usize),
+                _ => None,
+            });
+            assert_eq!(span, Some(std::mem::size_of::<DoFParamsGpu>()), "{name}");
+        }
+    }
 }

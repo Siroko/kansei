@@ -5,8 +5,9 @@ struct BloomParams {
     radius: f32,
     src_width: f32,
     src_height: f32,
+    // composite: the number of mip levels summed into bloom_tex
     level: u32,
-    _pad: u32,
+    exposure: f32,
 };
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
@@ -23,7 +24,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
     let scene = textureLoad(scene_tex, vec2<i32>(gid.xy), 0).rgb;
     let bloom = textureSampleLevel(bloom_tex, bloom_sampler, uv, 0.0).rgb;
-    let result = scene + bloom * params.intensity;
+    // with a threshold, bloom is added on top (intensity = its gain); without one it is
+    // physically based: the average of the blurred levels is mixed in, intensity being the
+    // fraction of light scattered, so energy is conserved
+    var result = scene + bloom * params.intensity;
+    if (params.threshold <= 0.0) {
+        result = mix(scene, bloom / f32(params.level), params.intensity);
+    }
 
     textureStore(dst_tex, vec2<i32>(gid.xy), vec4<f32>(result, 1.0));
 }

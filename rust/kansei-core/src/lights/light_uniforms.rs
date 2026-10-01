@@ -65,7 +65,8 @@ impl LightUniforms {
                         num_point += 1;
                     }
                 }
-                Light::Area(_) => {}
+                // spot lights live in the renderer's spot-light storage buffer (group 3)
+                Light::Area(_) | Light::Spot(_) => {}
             }
         }
 
@@ -116,7 +117,8 @@ impl LightUniforms {
                         num_point += 1;
                     }
                 }
-                Light::Area(_) => {}
+                // spot lights live in the renderer's spot-light storage buffer (group 3)
+                Light::Area(_) | Light::Spot(_) => {}
             }
         }
 

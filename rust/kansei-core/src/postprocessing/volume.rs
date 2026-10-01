@@ -3,15 +3,46 @@ use crate::cameras::Camera;
 use crate::renderers::GBuffer;
 
 /// Orchestrates a chain of post-processing effects with ping-pong textures.
+///
+/// The chain starts at the GBuffer's size (the renderer's render size) and ends at the display
+/// size of the surface. With a render scale below 1 the first effect that
+/// `upscales_to_display` (the TAA resolve) takes it from one to the other, and the effects after
+/// it run on the volume's own display-size ping-pong textures; without one, the blit stretches
+/// the result to the surface.
 pub struct PostProcessingVolume {
     pub effects: Vec<Box<dyn PostProcessingEffect>>,
     gbuffer: Option<GBuffer>,
+    /// Ping-pong textures at the display size, for the effects after an upscaler.
+    display_targets: Option<DisplayTargets>,
     blit_pipeline: Option<wgpu::RenderPipeline>,
     blit_sampler: Option<wgpu::Sampler>,
     blit_bgl: Option<wgpu::BindGroupLayout>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     presentation_format: wgpu::TextureFormat,
+}
+
+struct DisplayTargets {
+    size: (u32, u32),
+    views: [wgpu::TextureView; 2],
+}
+
+/// Where an effect of the chain reads or writes.
+#[derive(Clone, Copy, PartialEq)]
+enum Slot {
+    Color,
+    Output,
+    PingPong,
+    Display(usize),
+}
+
+fn slot_view<'a>(gbuffer: &'a GBuffer, display: Option<&'a DisplayTargets>, slot: Slot) -> &'a wgpu::TextureView {
+    match slot {
+        Slot::Color => &gbuffer.color_view,
+        Slot::Output => &gbuffer.output_view,
+        Slot::PingPong => &gbuffer.ping_pong_view,
+        Slot::Display(i) => &display.expect("display targets").views[i],
+    }
 }
 
 impl PostProcessingVolume {
@@ -22,6 +53,7 @@ impl PostProcessingVolume {
         Self {
             effects,
             gbuffer: None,
+            display_targets: None,
             blit_pipeline: None,
             blit_sampler: None,
             blit_bgl: None,
@@ -31,11 +63,16 @@ impl PostProcessingVolume {
         }
     }
 
+    /// Whether any effect wants a jittered projection (the renderer then jitters the camera).
+    pub fn wants_jitter(&self) -> bool {
+        self.effects.iter().any(|e| e.is_active() && e.wants_jitter())
+    }
+
     pub fn gbuffer(&self) -> Option<&GBuffer> {
         self.gbuffer.as_ref()
     }
 
-    /// Lazily create or resize the GBuffer, returning a reference to it.
+    /// Lazily create or resize the GBuffer (at the render size), returning a reference to it.
     pub fn ensure_gbuffer(&mut self, width: u32, height: u32) -> &GBuffer {
         if self.gbuffer.is_none()
             || self
@@ -136,7 +173,33 @@ impl PostProcessingVolume {
         self.blit_sampler = Some(sampler);
     }
 
+    /// Display-size ping-pong textures, (re)created at `size`.
+    fn ensure_display_targets(&mut self, size: (u32, u32)) {
+        if self.display_targets.as_ref().is_some_and(|t| t.size == size) {
+            return;
+        }
+        let view = |label| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: GBuffer::COLOR_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let views = [view("PostProcessingVolume/DisplayA"), view("PostProcessingVolume/DisplayB")];
+        self.display_targets = Some(DisplayTargets { size, views });
+    }
+
     /// Render the scene through the post-processing chain and blit to the surface.
+    ///
+    /// `width` and `height` are the surface's size. The GBuffer is used at the size
+    /// `ensure_gbuffer` last gave it (created at the surface's size if it does not exist yet).
     pub fn render(
         &mut self,
         camera: &Camera,
@@ -144,8 +207,19 @@ impl PostProcessingVolume {
         width: u32,
         height: u32,
     ) {
-        // Lazily create/resize GBuffer
-        self.ensure_gbuffer(width, height);
+        let _post = crate::profiling::cpu_scope("post");
+        if self.gbuffer.is_none() {
+            self.ensure_gbuffer(width, height);
+        }
+        let render_size = {
+            let gbuffer = self.gbuffer.as_ref().unwrap();
+            (gbuffer.width, gbuffer.height)
+        };
+        let display_size = (width, height);
+        let upscaling = render_size != display_size && self.effects.iter().any(|e| e.is_active() && e.upscales_to_display());
+        if upscaling {
+            self.ensure_display_targets(display_size);
+        }
 
         // Initialise effects that haven't been set up yet
         {
@@ -158,65 +232,49 @@ impl PostProcessingVolume {
         // Lazily create blit pipeline
         self.initialize_blit();
 
-        // Run effect chain with ping-pong
-        // Track which texture holds the final result after the chain.
-        // ping == 0 means last output was written to output_view,
-        // ping == 1 means last output was written to ping_pong_view.
-        let mut ping = 0u32;
-        let mut ran_any_effect = false;
-
+        // Run the effect chain, each effect reading the previous one's output: at the render
+        // size on the GBuffer's output / ping-pong textures, then (from the upscaler on) at the
+        // display size on the volume's own pair.
+        let mut source = Slot::Color;
         if !self.effects.is_empty() {
             let gbuffer = self.gbuffer.as_ref().unwrap();
+            let view = |slot| slot_view(gbuffer, self.display_targets.as_ref(), slot);
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("PostProcessingVolume/EffectsEncoder"),
             });
 
-            let mut current_source_is_color = true; // first effect reads from color_view
-
             for effect in &mut self.effects {
-                let (input_view, output_view) = if ping == 0 {
-                    if current_source_is_color {
-                        (&gbuffer.color_view, &gbuffer.output_view)
-                    } else {
-                        (&gbuffer.ping_pong_view, &gbuffer.output_view)
-                    }
-                } else {
-                    (&gbuffer.output_view, &gbuffer.ping_pong_view)
+                if !effect.is_active() {
+                    continue;
+                }
+                let at_display = matches!(source, Slot::Display(_)) || (upscaling && effect.upscales_to_display());
+                let target = match source {
+                    _ if at_display => Slot::Display(if source == Slot::Display(0) { 1 } else { 0 }),
+                    Slot::Output => Slot::PingPong,
+                    _ => Slot::Output,
                 };
+                let (w, h) = if at_display { display_size } else { render_size };
 
+                let _effect = crate::profiling::cpu_scope(effect.name());
                 effect.render(
                     &self.device,
                     &self.queue,
                     &mut encoder,
                     gbuffer,
-                    input_view,
+                    view(source),
                     &gbuffer.depth_view,
-                    output_view,
+                    view(target),
                     camera,
-                    width,
-                    height,
+                    w,
+                    h,
                 );
-
-                current_source_is_color = false;
-                ran_any_effect = true;
-                ping = 1 - ping;
+                source = target;
             }
 
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        let gbuffer = self.gbuffer.as_ref().unwrap();
-
-        // Determine which texture holds the final result
-        let final_view = if !ran_any_effect {
-            &gbuffer.color_view
-        } else if ping == 1 {
-            // Last write went to output_view (ping was 0 before flip)
-            &gbuffer.output_view
-        } else {
-            // Last write went to ping_pong_view (ping was 1 before flip)
-            &gbuffer.ping_pong_view
-        };
+        let final_view = slot_view(self.gbuffer.as_ref().unwrap(), self.display_targets.as_ref(), source);
 
         // Blit the final texture to the surface
         let bgl = self.blit_bgl.as_ref().unwrap();
@@ -254,7 +312,7 @@ impl PostProcessingVolume {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: crate::profiling::gpu_pass("Blit RenderPass").as_ref().map(crate::profiling::PassStamp::render),
                 occlusion_query_set: None,
             });
 

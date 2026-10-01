@@ -6,7 +6,7 @@ struct BloomParams {
     src_width: f32,
     src_height: f32,
     level: u32,
-    _pad: u32,
+    exposure: f32,
 };
 
 @group(0) @binding(0) var smaller_tex: texture_2d<f32>;

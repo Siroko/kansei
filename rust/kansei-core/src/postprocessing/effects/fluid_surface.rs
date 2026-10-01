@@ -14,6 +14,18 @@ pub struct FluidSurfaceOptions {
     pub roughness: f32,
     pub thickness: f32,
     pub color: [f32; 4],
+    /// Key light: the direction the light travels (engine `DirectionalLight`
+    /// convention), its intensity, and color. Drives the specular highlight
+    /// and tints the rim.
+    pub light_direction: [f32; 3],
+    pub light_intensity: f32,
+    pub light_color: [f32; 3],
+    /// Strength of the rim glow at grazing angles, tinted by the key light.
+    pub rim: f32,
+    /// The sky's colour, reflected where the reflected view ray points up (open water under the
+    /// sky), mixed in by `sky_reflection` (0: screen-space reflection only).
+    pub sky_color: [f32; 3],
+    pub sky_reflection: f32,
 }
 
 impl Default for FluidSurfaceOptions {
@@ -22,6 +34,12 @@ impl Default for FluidSurfaceOptions {
             ior: 1.41, chromatic_aberration: 0.05, tint_strength: 0.3,
             fresnel_power: 2.3, roughness: 0.28, thickness: 2.4,
             color: [0.77, 0.96, 1.0, 1.0],
+            light_direction: [0.3, -1.0, 0.5],
+            light_intensity: 2.0,
+            light_color: [1.0, 1.0, 1.0],
+            rim: 0.15,
+            sky_color: [1.0, 1.0, 1.0],
+            sky_reflection: 0.0,
         }
     }
 }
@@ -39,6 +57,11 @@ struct CompositeParams {
     thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    light_dir: [f32; 4],   // xyz = direction light travels (world), w = intensity
+    light_color: [f32; 4], // rgb, w = rim strength
+    sky: [f32; 4],         // rgb, w = sky reflection
+    mask: u32,             // 0: any GBuffer normal is fluid; 1: only where emissive alpha >= 0.5
+    _pad: [u32; 3],
 }
 
 const COMPOSITE_SHADER: &str = r#"
@@ -53,6 +76,13 @@ struct Params {
     thickness: f32,
     screen_width: f32,
     screen_height: f32,
+    light_dir: vec4<f32>,   // xyz = direction light travels (world), w = intensity
+    light_color: vec4<f32>, // rgb, w = rim strength
+    sky: vec4<f32>,         // rgb, w = sky reflection
+    mask: u32,              // 0: any GBuffer normal is fluid; 1: only where emissive alpha >= 0.5
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -60,6 +90,23 @@ struct Params {
 @group(0) @binding(2) var background_tex: texture_2d<f32>; // opaque scene before MC
 @group(0) @binding(3) var normal_tex: texture_2d<f32>;     // GBuffer normals
 @group(0) @binding(4) var output_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var emissive_tex: texture_2d<f32>;   // GBuffer emissive (alpha: the fluid's mask)
+
+// Whether the fluid's surface covers this texel: a GBuffer normal, and with the emissive mask the
+// fluid material's mark (other materials writing normals, for GI, are not the fluid).
+fn is_fluid(texel: vec2u) -> bool {
+    if (length(textureLoad(normal_tex, texel, 0).rgb) < 0.01) { return false; }
+    return params.mask == 0u || textureLoad(emissive_tex, texel, 0).a >= 0.5;
+}
+
+// A refracted sample, where the fluid covers it: elsewhere the texel shows something in front of
+// the surface (a body standing out of the water), which must not appear through it, and the
+// pixel's own texel stands in.
+fn refracted_texel(uv: vec2<f32>, own: vec2u, dims: vec2<f32>) -> vec3<f32> {
+    let texel = min(vec2u(dims * uv), vec2u(dims) - vec2u(1u));
+    let covered = is_fluid(texel);
+    return textureLoad(background_tex, select(own, texel, covered), 0).rgb;
+}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -70,10 +117,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     let scene = textureLoad(scene_color, coord, 0);
     let normal_data = textureLoad(normal_tex, coord, 0).rgb;
-    let normal_len = length(normal_data);
 
     // No MC surface here → pass through scene color
-    if (normal_len < 0.01) {
+    if (!is_fluid(coord)) {
         textureStore(output_tex, coord, scene);
         return;
     }
@@ -101,9 +147,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let uv_g = clamp(screen_uv + offset, vec2<f32>(0.0), vec2<f32>(1.0));
     let uv_b = clamp(screen_uv + offset * (1.0 - ca), vec2<f32>(0.0), vec2<f32>(1.0));
 
-    let bg_r = textureLoad(background_tex, vec2u(dims_f * uv_r), 0).r;
-    let bg_g = textureLoad(background_tex, vec2u(dims_f * uv_g), 0).g;
-    let bg_b = textureLoad(background_tex, vec2u(dims_f * uv_b), 0).b;
+    let bg_r = refracted_texel(uv_r, coord, dims_f).r;
+    let bg_g = refracted_texel(uv_g, coord, dims_f).g;
+    let bg_b = refracted_texel(uv_b, coord, dims_f).b;
     var refracted = vec3<f32>(bg_r, bg_g, bg_b);
 
     // Tint refracted light by fluid color (absorption)
@@ -119,17 +165,47 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let reflect_dir = reflect(vec3<f32>(0.0, 0.0, -1.0), N_view);
     let reflect_offset = reflect_dir.xy * 0.3;
     let reflect_uv = clamp(screen_uv + reflect_offset, vec2<f32>(0.0), vec2<f32>(1.0));
-    let reflected = textureLoad(background_tex, vec2u(dims_f * reflect_uv), 0).rgb;
+    var reflected = textureLoad(background_tex, vec2u(dims_f * reflect_uv), 0).rgb;
+    // Open sky where the reflected ray points up in the world (view to world: the transpose)
+    let up = (transpose(view3) * reflect_dir).y;
+    reflected = mix(reflected, params.sky.rgb, params.sky.w * smoothstep(0.0, 0.15, up));
 
-    // Rim light for edge glow
-    let rim = pow(1.0 - ndotv, 3.0) * 0.15;
+    // Key-light GGX specular (view space: V = (0,0,1)).
+    let L = normalize(view3 * normalize(-params.light_dir.xyz));
+    let V = vec3<f32>(0.0, 0.0, 1.0);
+    let H = normalize(L + V);
+    let ndotl = max(dot(N_view, L), 0.0);
+    let ndoth = max(dot(N_view, H), 0.0);
+    let alpha = max(params.roughness * params.roughness, 1e-3);
+    let a2 = alpha * alpha;
+    let denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    let D = a2 / (3.14159 * denom * denom + 1e-4);
+    let k = alpha * 0.5;
+    let G = (ndotv / (ndotv * (1.0 - k) + k)) * (ndotl / (ndotl * (1.0 - k) + k));
+    let light_rgb = params.light_color.rgb * params.light_dir.w;
+    let specular = fresnel * D * G * ndotl * light_rgb * 0.5;
 
-    // Final: mix refracted (transmitted) and reflected (environment) via Fresnel, + rim
-    let result = mix(refracted, reflected, fresnel) + vec3<f32>(rim);
+    // Rim light for edge glow, tinted by the key light
+    let rim = pow(1.0 - ndotv, 3.0) * params.light_color.w * params.light_color.rgb * (0.5 + 0.25 * params.light_dir.w);
+
+    // Final: mix refracted (transmitted) and reflected (environment) via Fresnel, + specular + rim
+    let result = mix(refracted, reflected, fresnel) + specular + rim;
 
     textureStore(output_tex, coord, vec4<f32>(result, 1.0));
 }
 "#;
+
+/// How [`FluidSurfaceEffect`] finds the fluid's surface in the GBuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FluidMask {
+    /// Any pixel with a normal: for scenes where only the fluid writes the GBuffer's normals.
+    #[default]
+    AnyNormal,
+    /// Pixels with a normal whose emissive alpha is at least 0.5, which the fluid's surface
+    /// material writes (and other materials leave at 0): for scenes whose other materials write
+    /// normals too (for screen-space GI and AO).
+    EmissiveAlpha,
+}
 
 /// Fluid surface post-processing effect.
 ///
@@ -149,6 +225,19 @@ pub struct FluidSurfaceEffect {
     composite_bg: Option<wgpu::BindGroup>,
     cached_input_ptr: usize,
     initialized: bool,
+    /// Splat radius for the surface density field. `None` = the sim's smoothing
+    /// radius. Set it explicitly when the sim radius is smaller than a field voxel,
+    /// otherwise the field is sparse and the surface shatters into shards.
+    pub splat_radius: Option<f32>,
+    /// Whether the surface is extracted from the particles each frame (the default). Off, the
+    /// last surface extracted keeps drawing: for a simulation that is not stepping (see
+    /// `simulations::fluid::FluidSleep`).
+    pub extract: bool,
+    /// Whether the effect runs at all (the default): off, it costs nothing and composites nothing,
+    /// for a fluid out of view.
+    pub active: bool,
+    /// How the composite finds the fluid's pixels (any normal, by default).
+    pub mask: FluidMask,
 }
 
 impl FluidSurfaceEffect {
@@ -162,7 +251,8 @@ impl FluidSurfaceEffect {
         Self {
             options, sim, density_field, marching_cubes, marching_cubes_bg,
             composite_pipeline: None, composite_bgl: None, params_buf: None,
-            composite_bg: None, cached_input_ptr: 0, initialized: false,
+            composite_bg: None, cached_input_ptr: 0, initialized: false, splat_radius: None,
+            extract: true, active: true, mask: FluidMask::AnyNormal,
         }
     }
 
@@ -193,6 +283,8 @@ impl PostProcessingEffect for FluidSurfaceEffect {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             ],
         });
 
@@ -235,20 +327,22 @@ impl PostProcessingEffect for FluidSurfaceEffect {
         if !self.initialized { return; }
 
         // 1. Density field + MC extract compute passes
-        self.density_field.update_with_encoder(encoder,
-            self.sim.world_bounds_min, self.sim.world_bounds_max,
-            self.sim.particle_count(), self.sim.params.smoothing_radius);
+        if self.extract {
+            self.density_field.update_with_encoder(encoder,
+                self.sim.world_bounds_min, self.sim.world_bounds_max,
+                self.sim.particle_count(), self.splat_radius.unwrap_or(self.sim.params.smoothing_radius));
 
-        let source = SurfaceExtractionSourceContract {
-            version: SurfaceContractVersion::V1,
-            field_dims: self.density_field.tex_dims(),
-            world_bounds_min: self.sim.world_bounds_min,
-            world_bounds_max: self.sim.world_bounds_max,
-            iso_value: self.marching_cubes.iso_level(),
-        };
-        self.marching_cubes.update_with_encoder_and_queue(
-            encoder, queue, &self.marching_cubes_bg, source,
-        );
+            let source = SurfaceExtractionSourceContract {
+                version: SurfaceContractVersion::V1,
+                field_dims: self.density_field.tex_dims(),
+                world_bounds_min: self.sim.world_bounds_min,
+                world_bounds_max: self.sim.world_bounds_max,
+                iso_value: self.marching_cubes.iso_level(),
+            };
+            self.marching_cubes.update_with_encoder_and_queue(
+                encoder, queue, &self.marching_cubes_bg, source,
+            );
+        }
 
         // 2. Upload composite params
         let mut view_matrix = [0.0f32; 16];
@@ -264,6 +358,20 @@ impl PostProcessingEffect for FluidSurfaceEffect {
             thickness: self.options.thickness,
             screen_width: width as f32,
             screen_height: height as f32,
+            light_dir: [
+                self.options.light_direction[0], self.options.light_direction[1],
+                self.options.light_direction[2], self.options.light_intensity,
+            ],
+            light_color: [
+                self.options.light_color[0], self.options.light_color[1],
+                self.options.light_color[2], self.options.rim,
+            ],
+            sky: [
+                self.options.sky_color[0], self.options.sky_color[1],
+                self.options.sky_color[2], self.options.sky_reflection,
+            ],
+            mask: (self.mask == FluidMask::EmissiveAlpha) as u32,
+            _pad: [0; 3],
         };
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(&params));
 
@@ -280,17 +388,22 @@ impl PostProcessingEffect for FluidSurfaceEffect {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gbuffer.background_view) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(output) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&gbuffer.emissive_view) },
                 ],
             }));
         }
 
         // 4. Composite pass
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("FluidSurface/Composite"), timestamp_writes: None,
+            label: Some("FluidSurface/Composite"), timestamp_writes: crate::profiling::gpu_pass("FluidSurface/Composite").as_ref().map(crate::profiling::PassStamp::compute),
         });
         pass.set_pipeline(self.composite_pipeline.as_ref().unwrap());
         pass.set_bind_group(0, self.composite_bg.as_ref().unwrap(), &[]);
         pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
     }
 
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {
@@ -305,4 +418,20 @@ impl PostProcessingEffect for FluidSurfaceEffect {
 
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shader_validates_and_the_params_layout_matches() {
+        let module = naga::front::wgsl::parse_str(COMPOSITE_SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(COMPOSITE_SHADER)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
+        let span = module.types.iter().find_map(|(_, t)| match (&t.name, &t.inner) {
+            (Some(n), naga::TypeInner::Struct { span, .. }) if n == "Params" => Some(*span as usize),
+            _ => None,
+        });
+        assert_eq!(span, Some(std::mem::size_of::<CompositeParams>()));
+    }
 }

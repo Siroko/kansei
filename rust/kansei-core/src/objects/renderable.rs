@@ -14,9 +14,27 @@ pub struct Renderable {
     pub render_order: i32,
     pub visible: bool,
     pub material_dirty: bool,
+    /// Cull the instances on the GPU per view (camera, each shadow map) instead of drawing the
+    /// geometry's instance buffer as is; see `InstanceCulling`.
+    pub instance_culling: Option<crate::culling::InstanceCulling>,
+    /// Draw the camera's cut of a cluster graph instead of the geometry: see `ClusterLod`.
+    pub clusters: Option<crate::clusters::ClusterLod>,
+    /// Bitmask of the layers this renderable is on (bit 0 by default). Secondary views such
+    /// as planar reflections draw only renderables whose layers intersect their mask.
+    pub layers: u32,
+    /// Its transform changes every frame, so it is drawn directly in the pass each frame rather
+    /// than recorded into the cached render bundle (false by default). Mark anything the app
+    /// moves while it is on screen: the bundle is re-recorded only when the set of renderables
+    /// it holds changes.
+    pub dynamic: bool,
+    /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
+    pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
 
 impl Renderable {
+    /// Layer mask of a new renderable: bit 0.
+    pub const DEFAULT_LAYERS: u32 = 1;
+
     pub fn new(geometry: impl Into<Geometry>, material: Material) -> Self {
         Self {
             object: Object3D::new(),
@@ -27,7 +45,18 @@ impl Renderable {
             render_order: 0,
             visible: true,
             material_dirty: true,
+            instance_culling: None,
+            clusters: None,
+            layers: Self::DEFAULT_LAYERS,
+            dynamic: false,
+            previous_world_matrix: std::cell::Cell::new(None),
         }
+    }
+
+    /// Forget last frame's transform, so the next frame has no motion from this object (after a
+    /// teleport, or on a camera cut).
+    pub fn reset_motion(&mut self) {
+        self.previous_world_matrix.set(None);
     }
 
     /// Whether this renderable uses instanced rendering.

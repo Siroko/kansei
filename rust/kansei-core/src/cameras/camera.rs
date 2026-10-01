@@ -1,5 +1,19 @@
+use bytemuck::{Pod, Zeroable};
+
 use crate::math::{Vec3, Mat4};
 use crate::objects::Object3D;
+
+/// `KanseiCameraTemporal` in `cameras::MOTION_VECTORS_WGSL`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct CameraTemporalGpu {
+    pub view_proj: [f32; 16],
+    pub prev_view_proj: [f32; 16],
+    pub jitter: [f32; 2],
+    pub prev_jitter: [f32; 2],
+    pub frame: u32,
+    pub _pad: [u32; 3],
+}
 
 /// Perspective camera with view/projection matrices.
 pub struct Camera {
@@ -10,11 +24,20 @@ pub struct Camera {
     pub aspect: f32,
     pub view_matrix: Mat4,
     pub inverse_view_matrix: Mat4,
+    /// The projection without jitter; the GPU gets it offset by `jitter`.
     pub projection_matrix: Mat4,
+    /// Sub-pixel offset of the projection, in NDC (set by the renderer when an effect such as
+    /// TAA asks for it; zero otherwise).
+    pub jitter: [f32; 2],
     look_at_target: Option<Vec3>,
+    // last frame's unjittered view-projection and jitter, for motion vectors
+    prev_view_proj: Option<Mat4>,
+    prev_jitter: [f32; 2],
+    frame: u32,
     // GPU resources (owned by Camera, created by Renderer on first render)
     view_buf: Option<wgpu::Buffer>,
     proj_buf: Option<wgpu::Buffer>,
+    temporal_buf: Option<wgpu::Buffer>,
     camera_bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
 }
@@ -32,9 +55,14 @@ impl Camera {
             view_matrix: Mat4::identity(),
             inverse_view_matrix: Mat4::identity(),
             projection_matrix: projection,
+            jitter: [0.0; 2],
             look_at_target: None,
+            prev_view_proj: None,
+            prev_jitter: [0.0; 2],
+            frame: 0,
             view_buf: None,
             proj_buf: None,
+            temporal_buf: None,
             camera_bind_group: None,
             initialized: false,
         }
@@ -86,6 +114,12 @@ impl Camera {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
+        self.temporal_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera/Temporal"),
+            size: std::mem::size_of::<CameraTemporalGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
         self.camera_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Camera/BG"),
             layout: camera_bgl,
@@ -102,19 +136,76 @@ impl Camera {
                     binding: 2,
                     resource: light_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.temporal_buf.as_ref().unwrap().as_entire_binding(),
+                },
             ],
         }));
         self.initialized = true;
     }
 
-    /// Upload current view + projection matrices to GPU.
+    /// Upload the view, the jittered projection and the temporal data to the GPU.
     pub fn upload(&self, queue: &wgpu::Queue) {
         if let Some(ref buf) = self.view_buf {
             queue.write_buffer(buf, 0, bytemuck::cast_slice(self.view_matrix.as_slice()));
         }
         if let Some(ref buf) = self.proj_buf {
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(self.projection_matrix.as_slice()));
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(self.jittered_projection().as_slice()));
         }
+        if let Some(ref buf) = self.temporal_buf {
+            let view_proj = self.view_projection();
+            let temporal = CameraTemporalGpu {
+                view_proj: view_proj.data,
+                prev_view_proj: self.prev_view_proj.unwrap_or(view_proj).data,
+                jitter: self.jitter,
+                prev_jitter: if self.prev_view_proj.is_some() { self.prev_jitter } else { self.jitter },
+                frame: self.frame,
+                _pad: [0; 3],
+            };
+            queue.write_buffer(buf, 0, bytemuck::bytes_of(&temporal));
+        }
+    }
+
+    /// The projection with the sub-pixel `jitter` applied (what the GPU renders with).
+    pub fn jittered_projection(&self) -> Mat4 {
+        let jitter = glam::Mat4::from_translation(glam::Vec3::new(self.jitter[0], self.jitter[1], 0.0));
+        Mat4::from(jitter * self.projection_matrix.to_glam())
+    }
+
+    /// Unjittered projection times view.
+    pub fn view_projection(&self) -> Mat4 {
+        Mat4::from(self.projection_matrix.to_glam() * self.view_matrix.to_glam())
+    }
+
+    /// Last frame's unjittered view-projection, if there was a last frame since `reset_motion`.
+    pub fn previous_view_projection(&self) -> Option<Mat4> {
+        self.prev_view_proj
+    }
+
+    /// Last frame's view-projection as it drew, jitter included: what reconstructs world positions
+    /// from last frame's depth (its pixels were rendered jittered).
+    pub fn previous_jittered_view_projection(&self) -> Option<Mat4> {
+        let jitter = glam::Mat4::from_translation(glam::Vec3::new(self.prev_jitter[0], self.prev_jitter[1], 0.0));
+        self.prev_view_proj.map(|vp| Mat4::from(jitter * vp.to_glam()))
+    }
+
+    /// Frames rendered since creation (wraps).
+    pub fn frame(&self) -> u32 {
+        self.frame
+    }
+
+    /// Forget the previous frame's view, so the next frame has no camera motion (camera cuts).
+    pub fn reset_motion(&mut self) {
+        self.prev_view_proj = None;
+    }
+
+    /// Called by the renderer after a frame: this frame's view becomes the previous one. Call it
+    /// yourself when driving the post-processing effects without the renderer.
+    pub fn end_frame(&mut self) {
+        self.prev_view_proj = Some(self.view_projection());
+        self.prev_jitter = self.jitter;
+        self.frame = self.frame.wrapping_add(1);
     }
 
     /// Get the camera's bind group (group 1).
@@ -141,5 +232,27 @@ impl std::ops::Deref for Camera {
 impl std::ops::DerefMut for Camera {
     fn deref_mut(&mut self) -> &mut Object3D {
         &mut self.object
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_frames_jittered_view_is_what_its_gbuffer_was_drawn_with() {
+        let mut camera = Camera::new(60.0, 0.1, 100.0, 1.5);
+        camera.update_projection_matrix();
+        camera.set_position(1.0, 2.0, 3.0);
+        camera.update_view_matrix();
+        assert!(camera.previous_jittered_view_projection().is_none());
+        camera.jitter = [0.002, -0.003];
+        let drawn = camera.jittered_projection().to_glam() * camera.view_matrix.to_glam();
+        camera.end_frame();
+        // the next frame's jitter
+        camera.jitter = [-0.001, 0.004];
+        let previous = camera.previous_jittered_view_projection().unwrap().to_glam();
+        assert!(previous.abs_diff_eq(drawn, 1e-6), "{previous} vs {drawn}");
+        assert!(!previous.abs_diff_eq(camera.previous_view_projection().unwrap().to_glam(), 1e-6));
     }
 }

@@ -136,7 +136,7 @@ impl ApplicationHandler for App {
         sim.world_bounds_max = [12.0, 32.0, 8.0];
         sim.rebuild_grid();
 
-        self.density_field = Some(FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7 }));
+        self.density_field = Some(FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution: 64, kernel_scale: 3.7, ..Default::default() }));
         self.surface_renderer = Some(FluidSurfaceRenderer::new(&renderer));
         self.particle_renderer = Some(FluidParticleRendererCore::new(
             &renderer,
