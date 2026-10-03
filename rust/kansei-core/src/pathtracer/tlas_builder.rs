@@ -249,6 +249,17 @@ impl TLASBuilder {
                     },
                     count: None,
                 },
+                // binding 4: instance indices in Morton order
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -517,6 +528,10 @@ impl TLASBuilder {
                     binding: 3,
                     resource: self.build_params_bufs[0].as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: morton_vals.as_entire_binding(),
+                },
             ],
         });
 
@@ -583,6 +598,10 @@ impl TLASBuilder {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: self.build_params_bufs[level_idx].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: morton_vals.as_entire_binding(),
                     },
                 ],
             });

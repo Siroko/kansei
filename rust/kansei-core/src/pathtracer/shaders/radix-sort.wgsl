@@ -48,71 +48,30 @@ fn histogram(
     }
 }
 
-// ── Pass 2: Blelloch exclusive prefix sum (single workgroup) ─────────────────
+// ── Pass 2: Exclusive prefix sum over all digit × workgroup bins ────────────
+//
+// The bins are digit-major, so the scan gives every (digit, workgroup) pair its
+// first output slot. A serial scan is enough for the TLAS (16 bins per 256
+// instances) and handles any bin count.
 
-var<workgroup> prefix_temp: array<u32, 4096>;
-
-@compute @workgroup_size(256)
-fn prefix_sum(@builtin(global_invocation_id) gid: vec3u) {
+@compute @workgroup_size(1)
+fn prefix_sum() {
     let total_bins = RADIX * params.workgroup_count;
-    let idx = gid.x;
-
-    // Load
-    if (idx < total_bins) {
-        prefix_temp[idx] = histograms[idx];
-    } else {
-        prefix_temp[idx] = 0u;
-    }
-    workgroupBarrier();
-
-    // Up-sweep (reduce)
-    var offset = 1u;
-    var d = total_bins >> 1u;
-    while (d > 0u) {
-        if (idx < d) {
-            let ai = offset * (2u * idx + 1u) - 1u;
-            let bi = offset * (2u * idx + 2u) - 1u;
-            if (bi < total_bins) {
-                prefix_temp[bi] += prefix_temp[ai];
-            }
-        }
-        offset <<= 1u;
-        d >>= 1u;
-        workgroupBarrier();
-    }
-
-    // Clear last element
-    if (idx == 0u) {
-        prefix_temp[total_bins - 1u] = 0u;
-    }
-    workgroupBarrier();
-
-    // Down-sweep
-    d = 1u;
-    while (d < total_bins) {
-        offset >>= 1u;
-        if (idx < d) {
-            let ai = offset * (2u * idx + 1u) - 1u;
-            let bi = offset * (2u * idx + 2u) - 1u;
-            if (bi < total_bins) {
-                let temp = prefix_temp[ai];
-                prefix_temp[ai] = prefix_temp[bi];
-                prefix_temp[bi] += temp;
-            }
-        }
-        d <<= 1u;
-        workgroupBarrier();
-    }
-
-    // Store
-    if (idx < total_bins) {
-        histograms[idx] = prefix_temp[idx];
+    var sum = 0u;
+    for (var i = 0u; i < total_bins; i++) {
+        let c = histograms[i];
+        histograms[i] = sum;
+        sum += c;
     }
 }
 
 // ── Pass 3: Scatter elements to sorted positions ─────────────────────────────
+//
+// Stable: each element's slot within its digit is the number of earlier
+// elements in its workgroup with the same digit, so every pass keeps the order
+// the previous passes established (LSD radix sort depends on it).
 
-var<workgroup> scatter_hist: array<atomic<u32>, 16>;
+var<workgroup> scatter_digits: array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn scatter(
@@ -120,19 +79,21 @@ fn scatter(
     @builtin(workgroup_id)         wg_id: vec3u,
     @builtin(local_invocation_id)  lid  : vec3u,
 ) {
-    // Load prefix sums for this workgroup
-    if (lid.x < RADIX) {
-        atomicStore(&scatter_hist[lid.x], histograms[lid.x * params.workgroup_count + wg_id.x]);
+    let idx = gid.x;
+    var digit = RADIX; // matches no real digit
+    if (idx < params.count) {
+        digit = (keys_in[idx] >> params.bit_offset) & 0xFu;
     }
+    scatter_digits[lid.x] = digit;
     workgroupBarrier();
 
-    let idx = gid.x;
     if (idx < params.count) {
-        let key   = keys_in[idx];
-        let val   = vals_in[idx];
-        let digit = (key >> params.bit_offset) & 0xFu;
-        let dest  = atomicAdd(&scatter_hist[digit], 1u);
-        keys_out[dest] = key;
-        vals_out[dest] = val;
+        var rank = 0u;
+        for (var j = 0u; j < lid.x; j++) {
+            rank += select(0u, 1u, scatter_digits[j] == digit);
+        }
+        let dest = histograms[digit * params.workgroup_count + wg_id.x] + rank;
+        keys_out[dest] = keys_in[idx];
+        vals_out[dest] = vals_in[idx];
     }
 }
