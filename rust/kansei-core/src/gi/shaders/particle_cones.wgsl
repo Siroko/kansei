@@ -9,6 +9,8 @@
 //   indices are stable, so the average needs no history volume and hides what flicker the splat
 //   and the cones' jitter leave;
 // - the particle's own emission (rgb), as the splat put it in the volume.
+// With `useVolume` 0 it skips the cones (no volume is built): the whole sky and the sun reach
+// every particle, the cheap fallback when voxel GI is off.
 struct ConeParams {
     toSun          : vec3f,
     sunConeTan     : f32,   // tan of the sun cone's half aperture (~0.05)
@@ -20,6 +22,10 @@ struct ConeParams {
     maxSteps       : u32,
     frame          : u32,   // 0 on the first frame: no history yet
     jitter         : f32,   // voxels the cones' start moves by, per particle and frame
+    useVolume      : u32,   // 0: no cones, the sky alone (voxel GI off)
+    _pad0          : u32,
+    _pad1          : u32,
+    _pad2          : u32,
 }
 
 @group(0) @binding(0) var<uniform> vol: VoxelVolume;
@@ -42,6 +48,14 @@ const AXES = array<vec3f, 6>(
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
     if (i >= cp.particleCount) { return; }
+    lighting[2u * i + 1u] = vec4f(particleEmission(emission, i, velocities[i].xyz), 0.0);
+    if (cp.useVolume == 0u) {
+        // voxel GI off: the whole sky arrives and the sun is unoccluded
+        var sky6 = vec3f(0.0);
+        for (var k = 0u; k < 6u; k++) { sky6 += skyRadiance(sky, AXES[k]); }
+        lighting[2u * i] = vec4f(sky6 / 6.0, 1.0);
+        return;
+    }
     let p = positions[i].xyz;
     let start = (cp.startVoxels + cp.jitter * (giHash01(i * 9781u + cp.frame * 6271u) - 0.5)) * vol.voxelSize;
     var incoming = vec3f(0.0);
@@ -54,5 +68,4 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let current = vec4f(incoming, sun);
     let blend = select(cp.temporalBlend, 1.0, cp.frame == 0u);
     lighting[2u * i] = mix(lighting[2u * i], current, blend);
-    lighting[2u * i + 1u] = vec4f(particleEmission(emission, i, velocities[i].xyz), 0.0);
 }

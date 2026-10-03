@@ -259,6 +259,13 @@ fn a_cone_into_an_opaque_slab_sees_nothing_past_it() {
 
     let away = shade(&device, &queue, &volume, &voxelizer, &mut shading, 1, [-1.0, 0.0, 0.0]);
     assert!(away[0][3] > 0.99, "sun away from the slab: visibility {}", away[0][3]);
+
+    // with voxel GI off the slab is ignored: the whole sky and the sun arrive
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let off = ParticleConeSettings { to_sun: [1.0, 0.0, 0.0], use_volume: false, ..Default::default() };
+    shading.encode(&queue, &mut encoder, 1, &off);
+    let unlit: Vec<[f32; 4]> = read_buffer(&device, &queue, encoder, shading.lighting_buffer());
+    assert!(unlit[0].iter().all(|&v| (v - 1.0).abs() < 1e-5), "GI off: {:?}", unlit[0]);
 }
 
 #[test]

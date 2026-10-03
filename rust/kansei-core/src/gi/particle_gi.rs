@@ -148,11 +148,15 @@ impl ParticleGi {
         self.shading.reset_history();
     }
 
-    /// Record a frame: splat and resolve, mips, then the particles' cones.
+    /// Record a frame: splat and resolve, mips, then the particles' cones. With
+    /// `settings.cones.use_volume` false only the last runs, giving the particles the sky and
+    /// the sun unoccluded: voxel GI off at a fraction of the cost.
     pub fn encode(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, particle_count: u32) {
         self.voxelizer.set_emission(queue, self.settings.emission);
-        self.voxelizer.encode(queue, encoder, particle_count, &self.settings.splat);
-        self.volume.build_mips(encoder);
+        if self.settings.cones.use_volume {
+            self.voxelizer.encode(queue, encoder, particle_count, &self.settings.splat);
+            self.volume.build_mips(encoder);
+        }
         self.shading.encode(queue, encoder, particle_count, &self.settings.cones);
     }
 }

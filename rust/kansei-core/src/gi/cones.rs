@@ -34,6 +34,9 @@ pub struct ParticleConeSettings {
     pub jitter_voxels: f32,
     /// The most steps a cone takes (`VoxelGiQuality::cone_steps`).
     pub max_steps: u32,
+    /// false: trace no cones and give every particle the whole sky and the sun (voxel GI off;
+    /// the volume is not read, so it need not be built).
+    pub use_volume: bool,
 }
 
 impl Default for ParticleConeSettings {
@@ -47,6 +50,7 @@ impl Default for ParticleConeSettings {
             temporal_blend: 0.2,
             jitter_voxels: 0.5,
             max_steps: 48,
+            use_volume: true,
         }
     }
 }
@@ -65,6 +69,8 @@ pub(crate) struct ConeParamsGpu {
     max_steps: u32,
     frame: u32,
     jitter: f32,
+    use_volume: u32,
+    _pad: [u32; 3],
 }
 
 /// The WGSL `SkyLighting` (`SKY_LIGHTING_WGSL`): 15 vec4.
@@ -214,6 +220,8 @@ impl ParticleConeShading {
             max_steps: settings.max_steps,
             frame: self.frame,
             jitter: settings.jitter_voxels,
+            use_volume: settings.use_volume as u32,
+            _pad: [0; 3],
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         self.frame = self.frame.wrapping_add(1).max(1);
