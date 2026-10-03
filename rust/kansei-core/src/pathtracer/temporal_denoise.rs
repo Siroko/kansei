@@ -240,9 +240,13 @@ impl TemporalDenoise {
     /// Recreate all internal textures for the given resolution.
     ///
     /// Must be called before the first `denoise()` and whenever the
-    /// viewport dimensions change.
+    /// viewport dimensions change. A call at the current size keeps the
+    /// history, so it is safe to call every frame.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
+            return;
+        }
+        if self.output_tex.as_ref().is_some_and(|t| t.width() == width && t.height() == height) {
             return;
         }
 
@@ -263,8 +267,10 @@ impl TemporalDenoise {
             })
         };
 
-        let history_usage =
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
+        // History is copied into the output after each pass.
+        let history_usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
 
         let ha = make_tex("TemporalDenoise/HistoryA", history_usage);
         let hb = make_tex("TemporalDenoise/HistoryB", history_usage);
@@ -272,7 +278,10 @@ impl TemporalDenoise {
         let mb = make_tex("TemporalDenoise/MomentsB", history_usage);
         let output = make_tex(
             "TemporalDenoise/Output",
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
         );
 
         self.history_a_view = Some(ha.create_view(&Default::default()));

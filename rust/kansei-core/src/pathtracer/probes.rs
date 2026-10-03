@@ -413,7 +413,7 @@ impl ProbeGrid {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: sh_size.max(16),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
         };
@@ -605,14 +605,12 @@ impl ProbeGrid {
     /// Returns the current SH data buffer for the trace shader to read
     /// (the buffer that was most recently written to by `update()`).
     pub fn sh_buffer(&self) -> Option<&wgpu::Buffer> {
-        // After update(), ping was flipped. The buffer that was just
-        // written to is the "cur" side from the previous update call.
+        // update() wrote sh_b when ping was false, then flipped it, so a
+        // true ping means sh_b holds the newest coefficients.
         if self.ping {
-            // ping is now true, so last write was to sh_a
-            self.sh_buf_a.as_ref()
-        } else {
-            // ping is now false, so last write was to sh_b
             self.sh_buf_b.as_ref()
+        } else {
+            self.sh_buf_a.as_ref()
         }
     }
 }
