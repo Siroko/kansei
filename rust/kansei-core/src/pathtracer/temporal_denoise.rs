@@ -461,15 +461,13 @@ impl TemporalDenoise {
     ///
     /// Contains (moment1, moment2, historyLength, variance) per pixel.
     pub fn moments_view(&self) -> Option<&wgpu::TextureView> {
-        // The moments that were just written are the "write" side of the
-        // ping-pong, which will become the "read" side next frame. But
-        // the spatial denoiser runs in the *same* frame, so return the
-        // side we just wrote to.
+        // denoise() wrote moments_b when ping was false, then flipped it, so a
+        // true ping means moments_b holds this frame's moments (the spatial
+        // denoiser runs in the same frame).
         if self.ping {
-            // We just flipped, so previous write was into A-side moments
-            self.moments_a_view.as_ref()
-        } else {
             self.moments_b_view.as_ref()
+        } else {
+            self.moments_a_view.as_ref()
         }
     }
 }

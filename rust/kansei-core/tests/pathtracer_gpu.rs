@@ -180,6 +180,26 @@ fn temporal_denoise_keeps_its_history_when_resized_to_the_same_size() {
     assert!((v - 0.1).abs() < 0.01, "history lost: (0, 0) = {v}, expected 0.1");
 }
 
+#[test]
+fn temporal_denoise_hands_out_the_moments_it_just_wrote() {
+    let Some(renderer) = renderer() else { return };
+    let (depth, normal) = flat_gbuffer(&renderer);
+    let gi = rgba_texture(&renderer, &vec![[0.5, 0.5, 0.5, 1.0]; (W * H) as usize]).create_view(&Default::default());
+    let identity = glam::Mat4::IDENTITY.to_cols_array();
+
+    let mut temporal = TemporalDenoise::new(&renderer);
+    temporal.resize(W, H);
+    for frame in 0..3 {
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        temporal.denoise(&mut encoder, &gi, &depth, &normal, &identity, &identity, frame);
+        renderer.queue().submit(Some(encoder.finish()));
+        let moments = read_view(&renderer, temporal.moments_view().unwrap());
+        // moments are (m1, m2, history length, variance): frame n leaves a history of n + 1
+        let len = moments[px(10, 10)][2];
+        assert_eq!(len, (frame + 1) as f32, "frame {frame}: moments_view shows history length {len}");
+    }
+}
+
 fn box_material() -> Material {
     Material::new("Box", "", vec![], MaterialOptions::default())
 }
