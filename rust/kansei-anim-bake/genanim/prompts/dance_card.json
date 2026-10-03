@@ -1,0 +1,720 @@
+{
+ "set": "dance_card",
+ "note": "Prompts and ground paths for Kimodo (kimodo_batch.py). legs: see paths.py. Never put Epic GASP data in here (README.md).",
+ "model": "kimodo-soma-rp-v1.1",
+ "description": "Locomotion for motion matching: idle, walk and run loops, circles, starts, stops, 90 degree turns, 180 degree pivots and strafes, at the GASP walker's paces, on dense root path and heading constraints.",
+ "defaults": {
+  "samples": 2,
+  "seed": 1000,
+  "cfg": [
+   2.0,
+   2.0
+  ],
+  "diffusion_steps": 100
+ },
+ "clips": [
+  {
+   "name": "Idle/Idle_Loop",
+   "prompt": "A person stands still in a relaxed idle pose, shifting their weight slightly.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": 0
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Idle/Idle_Turn_L90",
+   "prompt": "A person standing still turns in place to the left and stands still.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": 90
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Idle/Idle_Turn_R90",
+   "prompt": "A person standing still turns in place to the right and stands still.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": -90
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Idle/Idle_Turn_L180",
+   "prompt": "A person standing still turns in place around to the left and stands still.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": 180
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Idle/Idle_Turn_R180",
+   "prompt": "A person standing still turns in place around to the right and stands still.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": -180
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Walk/Walk_Loop_F",
+   "prompt": "A person walks forward at a steady pace.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Loop_B",
+   "prompt": "A person walks backwards at a steady pace, facing forward.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.5,
+      1.5
+     ],
+     "dir": 180
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Loop_L",
+   "prompt": "A person walks sideways to the left at a steady pace, facing forward.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.8,
+      1.8
+     ],
+     "dir": 90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Loop_R",
+   "prompt": "A person walks sideways to the right at a steady pace, facing forward.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.8,
+      1.8
+     ],
+     "dir": -90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Circle_L",
+   "prompt": "A person walks in a wide circle to the left.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      2.0,
+      2.0
+     ],
+     "dir": 305.577490736439,
+     "facing": 305.577490736439,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Circle_R",
+   "prompt": "A person walks in a wide circle to the right.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      2.0,
+      2.0
+     ],
+     "dir": -305.577490736439,
+     "facing": -305.577490736439,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Start_F",
+   "prompt": "A person standing still starts walking forward.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 2.0,
+     "dir": 0,
+     "facing": 0
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Start_L90",
+   "prompt": "A person standing still turns to the left and starts walking.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 2.0,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Start_R90",
+   "prompt": "A person standing still turns to the right and starts walking.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 2.0,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Start_L180",
+   "prompt": "A person standing still turns around and starts walking.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 2.0,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Stop_F",
+   "prompt": "A person walking forward comes to a stop and stands still.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "speed": 0
+    },
+    {
+     "time": 1.5
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Turn_L90",
+   "prompt": "A person walking forward turns left and keeps walking.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Pivot_L180",
+   "prompt": "A person walking forward quickly turns around to the left and walks back the way they came.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.6
+    },
+    {
+     "time": 0.9,
+     "speed": 2.0,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Turn_R90",
+   "prompt": "A person walking forward turns right and keeps walking.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Pivot_R180",
+   "prompt": "A person walking forward quickly turns around to the right and walks back the way they came.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.6
+    },
+    {
+     "time": 0.9,
+     "speed": 2.0,
+     "dir": -180,
+     "facing": -180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Loop_F",
+   "prompt": "A person runs forward at a steady pace.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Loop_B",
+   "prompt": "A person runs backwards at a steady pace, facing forward.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      3.0,
+      3.0
+     ],
+     "dir": 180
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Loop_L",
+   "prompt": "A person runs sideways to the left at a steady pace, facing forward.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      3.5,
+      3.5
+     ],
+     "dir": 90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Loop_R",
+   "prompt": "A person runs sideways to the right at a steady pace, facing forward.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      3.5,
+      3.5
+     ],
+     "dir": -90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Circle_L",
+   "prompt": "A person runs in a wide circle to the left.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      5.0,
+      5.0
+     ],
+     "dir": 381.97186342054886,
+     "facing": 381.97186342054886,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Circle_R",
+   "prompt": "A person runs in a wide circle to the right.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      5.0,
+      5.0
+     ],
+     "dir": -381.97186342054886,
+     "facing": -381.97186342054886,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Start_F",
+   "prompt": "A person standing still starts running forward.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 5.0,
+     "dir": 0,
+     "facing": 0
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Start_L90",
+   "prompt": "A person standing still turns to the left and starts running.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 5.0,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Start_R90",
+   "prompt": "A person standing still turns to the right and starts running.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 5.0,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Start_L180",
+   "prompt": "A person standing still turns around and starts running.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 5.0,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Stop_F",
+   "prompt": "A person running forward comes to a stop and stands still.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 1.6,
+     "speed": 0
+    },
+    {
+     "time": 1.5
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Turn_L90",
+   "prompt": "A person running forward turns left and keeps running.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Pivot_L180",
+   "prompt": "A person running forward quickly turns around to the left and runs back the way they came.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 1.5
+    },
+    {
+     "time": 0.9,
+     "speed": 5.0,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Turn_R90",
+   "prompt": "A person running forward turns right and keeps running.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Pivot_R180",
+   "prompt": "A person running forward quickly turns around to the right and runs back the way they came.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 1.5
+    },
+    {
+     "time": 0.9,
+     "speed": 5.0,
+     "dir": -180,
+     "facing": -180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Transition_Walk_to_Run",
+   "prompt": "A person walking forward speeds up into a run.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "speed": 5.0
+    },
+    {
+     "time": 2.0
+    }
+   ]
+  },
+  {
+   "name": "Walk/Transition_Run_to_Walk",
+   "prompt": "A person running forward slows down to a walk.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 1.4,
+     "speed": 2.0
+    },
+    {
+     "time": 2.0
+    }
+   ]
+  }
+ ]
+}

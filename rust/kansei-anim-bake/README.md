@@ -52,6 +52,15 @@ mesh it was baked from, and carries their licence.
 
 3. **Play it**: `rust/kansei-wasm/examples/motion-matching` loads a pack from a local path.
 
+`export` may also list several folders, baked into one pack (the mesh from the first): say, an
+Unreal export and clips generated onto the same skeleton.
+
+## Generated clips
+
+[`genanim/`](genanim/README.md) makes clips with a text- and path-conditioned motion model (NVIDIA
+Kimodo) on an NVIDIA GPU, converts them to glTF on its own SOMA skeleton and body or retargets them
+onto another rig, ready for this tool. Its README says what may and may not go into the model.
+
 ## Characters
 
 A character pack (`CharacterPack`) is another body for a motion pack's animation: a mesh rigged to
