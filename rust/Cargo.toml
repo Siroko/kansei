@@ -30,6 +30,7 @@ exclude = [
     "kansei-wasm/examples/cluster-lod",
     "kansei-wasm/examples/motion-matching",
     "kansei-wasm/examples/ktx2-texture",
+    "kansei-wasm/examples/voxel-gi-particles",
 ]
 
 [workspace.dependencies]
