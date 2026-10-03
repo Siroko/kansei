@@ -38,6 +38,10 @@
 //! }
 //! ```
 //!
+//! `export` may also be a list of folders: their clips bake into one pack (say, a licensed set and
+//! clips generated onto its skeleton), the mesh coming from the first. Clip names must not repeat
+//! across them.
+//!
 //! `normal_directx` flips the normal map's green channel into glTF's convention (+Y up). Joints
 //! nothing is weighted to are left out, as for a motion pack.
 //!
@@ -69,7 +73,7 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default = "here")]
-    export: PathBuf,
+    export: Exports,
     #[serde(default = "default_mesh")]
     mesh: PathBuf,
     output: PathBuf,
@@ -112,8 +116,25 @@ struct CharacterConfig {
     color: [f32; 4],
 }
 
-fn here() -> PathBuf {
-    ".".into()
+/// One export folder, or several baked together.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Exports {
+    One(PathBuf),
+    Many(Vec<PathBuf>),
+}
+
+impl Exports {
+    fn folders(&self) -> Vec<&Path> {
+        match self {
+            Exports::One(p) => vec![p.as_path()],
+            Exports::Many(ps) => ps.iter().map(|p| p.as_path()).collect(),
+        }
+    }
+}
+
+fn here() -> Exports {
+    Exports::One(".".into())
 }
 fn default_texture_size() -> u32 {
     2048
@@ -333,7 +354,10 @@ fn run(config_path: &Path) -> Result<(), String> {
     if let Some(character) = &config.character {
         return bake_character(base, character, &base.join(&config.output), &config.meta, config.keep_unskinned);
     }
-    let export = base.join(&config.export);
+    let exports: Vec<PathBuf> = config.export.folders().iter().map(|e| base.join(e)).collect();
+    let Some(export) = exports.first() else {
+        return Err("`export` names no folder".into());
+    };
     let mesh_path = export.join(&config.mesh);
     let output = base.join(&config.output);
 
@@ -370,7 +394,15 @@ fn run(config_path: &Path) -> Result<(), String> {
     let mut builder = DatabaseBuilder::new(skeleton.clone(), roles, config.sample_rate);
     let mut baked = 0;
     let mut pending_actions = Vec::new();
-    for source in sources(&export, &mesh_path)? {
+    let mut all = Vec::new();
+    for export in &exports {
+        all.extend(sources(export, &mesh_path)?);
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(twice) = all.iter().find(|s| !seen.insert(s.name.clone())) {
+        return Err(format!("clip '{}' is in more than one export", twice.name));
+    }
+    for source in all {
         if !any_match(&config.include, &source.name) || any_match(&config.exclude, &source.name) {
             continue;
         }
@@ -500,6 +532,16 @@ mod tests {
         assert_eq!(pruned.names, ["root", "hips", "spine", "head", "prop"]);
         assert_eq!(pruned.parents, vec![None, Some(0), Some(1), Some(2), Some(0)]);
         assert_eq!(meshes[0].skin_joints, vec![4, 3, 0]);
+    }
+
+    #[test]
+    fn export_is_one_folder_or_several() {
+        let one: Config = serde_json::from_str(r#"{"export": "gasp", "output": "o.kmm"}"#).unwrap();
+        assert_eq!(one.export.folders(), [Path::new("gasp")]);
+        let many: Config = serde_json::from_str(r#"{"export": ["gasp", "generated"], "output": "o.kmm"}"#).unwrap();
+        assert_eq!(many.export.folders(), [Path::new("gasp"), Path::new("generated")]);
+        let default: Config = serde_json::from_str(r#"{"output": "o.kmm"}"#).unwrap();
+        assert_eq!(default.export.folders(), [Path::new(".")]);
     }
 
     #[test]
