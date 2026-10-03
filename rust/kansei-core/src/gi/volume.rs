@@ -60,13 +60,24 @@ impl VoxelGiQuality {
     /// limits (its accumulators in one storage binding, its sides in a 3D texture) and
     /// `budget_bytes` (0: no budget). `Low` is returned when nothing fits.
     pub fn fit(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64) -> Self {
+        self.fit_with(limits, bounds_min, bounds_max, budget_bytes, ACCUMULATOR_BYTES_PER_VOXEL)
+    }
+
+    /// `fit` for a scene's meshes (`SceneVoxelGi`): the radiance and the static surface buffer
+    /// (`gi::SURFACE_WORDS_PER_VOXEL` u32 a voxel) instead of particle accumulators.
+    pub fn fit_scene(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64) -> Self {
+        self.fit_with(limits, bounds_min, bounds_max, budget_bytes, super::voxelize::SURFACE_WORDS_PER_VOXEL * 4)
+    }
+
+    /// `fit` with `bytes_per_voxel` in one storage binding next to the radiance.
+    fn fit_with(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64, bytes_per_voxel: u64) -> Self {
         let mut q = self;
         loop {
             let layout = VolumeLayout::new(bounds_min, bounds_max, q.resolution());
             let voxels = layout.voxel_count();
-            let fits = voxels * ACCUMULATOR_BYTES_PER_VOXEL <= limits.max_storage_buffer_binding_size as u64
+            let fits = voxels * bytes_per_voxel <= limits.max_storage_buffer_binding_size as u64
                 && layout.dims.iter().all(|&d| d <= limits.max_texture_dimension_3d)
-                && (budget_bytes == 0 || layout.memory_bytes() <= budget_bytes);
+                && (budget_bytes == 0 || layout.radiance_bytes() + voxels * bytes_per_voxel <= budget_bytes);
             match (fits, q.lower()) {
                 (false, Some(lower)) => q = lower,
                 _ => return q,
@@ -108,10 +119,12 @@ impl VolumeLayout {
 
     /// The radiance texture with all its mips plus the particle accumulators.
     pub fn memory_bytes(&self) -> u64 {
-        let radiance: u64 = (0..self.mip_count())
-            .map(|l| self.dims.iter().map(|&d| (d >> l).max(1) as u64).product::<u64>() * 8)
-            .sum();
-        radiance + self.voxel_count() * ACCUMULATOR_BYTES_PER_VOXEL
+        self.radiance_bytes() + self.voxel_count() * ACCUMULATOR_BYTES_PER_VOXEL
+    }
+
+    /// The radiance texture with all its mips.
+    pub fn radiance_bytes(&self) -> u64 {
+        (0..self.mip_count()).map(|l| self.dims.iter().map(|&d| (d >> l).max(1) as u64).product::<u64>() * 8).sum()
     }
 }
 
