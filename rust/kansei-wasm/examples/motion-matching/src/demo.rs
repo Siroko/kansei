@@ -5,7 +5,7 @@
 //!   the same input, so two recordings line up (`drive_restart()` starts it over, from where the
 //!   character started, and the clips of `play=` from the first).
 //! - `play=<pattern>`: plays the pack's clips whose names start with the pattern (`*` matches any
-//!   run of characters: `play=Parkour/*_00`) one after another,
+//!   run of characters: `play=Parkour/*_00`; several patterns separated by commas) one after another,
 //!   as they are (root motion included), each from the start point, with the clip's name on the
 //!   HUD. For clips the search would never pick (a car, pushing, parkour).
 
@@ -75,9 +75,10 @@ pub struct ClipPlayer {
 }
 
 impl ClipPlayer {
-    /// The clips whose names start with `pattern`, in the pack's order.
+    /// The clips whose names start with `pattern` (or with any of several, separated by commas),
+    /// in the pack's order.
     pub fn new(db: &Database, pattern: &str, home: (Vec3, f32)) -> Self {
-        let clips = db.clips.iter().enumerate().filter(|(_, c)| starts_with(&c.name, pattern)).map(|(i, _)| i).collect();
+        let clips = db.clips.iter().enumerate().filter(|(_, c)| pattern.split(',').any(|p| starts_with(&c.name, p))).map(|(i, _)| i).collect();
         Self { clips, next: 0, until: 0.0, home }
     }
 
