@@ -22,4 +22,7 @@ log = "0.4"
 console_log = "1"
 console_error_panic_hook = "0.1"
 
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in"] }
+
 [workspace]
