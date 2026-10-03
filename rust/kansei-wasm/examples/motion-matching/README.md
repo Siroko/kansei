@@ -200,9 +200,13 @@ URL parameters:
   same input, to record them side by side. `drive_restart()` (on `window` as `driveRestart`) starts
   it over.
 - `play=<pattern>` plays the pack's clips whose names start with the pattern (`*` any run of
-  characters, e.g. `play=Parkour/*_00`) one after another, as they are, each from the start point:
+  characters, e.g. `play=Parkour/*_00`; several patterns separated by commas) one after another, as they are, each from the start point:
   for clips the search never picks (generated ones, see
   [`genanim`](../../../kansei-anim-bake/genanim/README.md)). `drive_restart()` starts them over.
+- A page can drive these at runtime: `clip_names()` lists the pack's clips, `play_clips(pattern)`
+  plays them from where the character stands (`""` gives it back to the player), and
+  `set_drive(on)` starts or stops the `drive=1` route there
+  ([`motion-matching-kimodo`](../motion-matching-kimodo/README.md) builds its clip browser on them).
 - `view=<degrees>` turns the camera round the character from behind it (90: its left side).
 - `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
   3 s (`Renderer::set_profiling`).

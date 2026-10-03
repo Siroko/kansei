@@ -398,7 +398,8 @@ fn now_secs() -> f64 {
     web_sys::window().unwrap().performance().unwrap().now() / 1000.0
 }
 
-fn query_param(name: &str) -> Option<String> {
+/// The page URL's parameter `name`, as written.
+pub fn query_param(name: &str) -> Option<String> {
     let search = web_sys::window()?.location().search().ok()?;
     search.trim_start_matches('?').split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
@@ -422,7 +423,7 @@ fn set_hud(text: &str) {
 }
 
 /// Fetch `url` as bytes; the error says what went wrong in words for the page.
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let window = web_sys::window().ok_or("no window")?;
     let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|_| format!("could not fetch {url}"))?;
     let response: web_sys::Response = response.dyn_into().map_err(|_| "not a response".to_string())?;
@@ -579,7 +580,7 @@ impl Character {
             let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
             r.dynamic = true;
             let index = scene.add(SceneNode::Renderable(r));
-            bodies.push(Body { name: "mannequin", mesh, palette, index, display: None });
+            bodies.push(Body { name: "the pack's mesh", mesh, palette, index, display: None });
         }
         if let Some(pack) = hero {
             match hero_body(renderer, scene, pack, &db) {
@@ -999,14 +1000,14 @@ impl State {
                             }
                         ),
                         format_args!(
-                            "{}character: {} (C to switch)",
+                            "{}{}",
                             self.lake.as_ref().map_or(String::new(), |l| format!(
                                 "lake   {} / {} particles, {:.0}% full (level {:+.3} m), east of the course (at=14,-1,90), P tweaks\nwater  {}, fastest {:.2} m/s, {} over {} m/s{}{}\n",
                                 l.particles(), l.capacity(), l.fill() * 100.0, l.level(), l.state().name(), l.speed().0, l.speed().1, lake::SETTLE_SPEED,
                                 self.cannon.as_ref().map_or(String::new(), |c| format!("\ncannon {}{} poured", if c.firing() { "firing, " } else if c.near { "ready, " } else { "" }, c.poured)),
                                 self.mill.as_ref().map_or(String::new(), |m| format!("\nmill   {}", if m.turning() { format!("{:.0} rpm", m.rpm) } else { "stopped".to_string() })),
                             )),
-                            c.bodies[c.showing].name,
+                            if c.bodies.len() > 1 { format!("character: {} (C to switch)", c.bodies[c.showing].name) } else { String::new() },
                         ),
                     ));
                 }
@@ -1315,6 +1316,47 @@ pub fn drive_restart() {
         }
         if let Some(p) = &mut s.player {
             p.restart();
+        }
+    });
+}
+
+/// The motion pack's clip names, in its order (empty before it has loaded): for a page's clip
+/// browser.
+#[wasm_bindgen]
+pub fn clip_names() -> Vec<String> {
+    with_state(|s| s.character.as_ref().map(|c| c.db.clips.iter().map(|c| c.name.clone()).collect())).flatten().unwrap_or_default()
+}
+
+/// Play the clips whose names start with `pattern` one after another, as `play=` does, from where
+/// the character stands now; `""` hands it back to the player (the clip playing finishes first).
+/// Returns how many clips match.
+#[wasm_bindgen]
+pub fn play_clips(pattern: &str) -> usize {
+    with_state(|s| {
+        if pattern.is_empty() {
+            s.player = None;
+            return 0;
+        }
+        let Some(c) = &s.character else { return 0 };
+        let at = c.controller.matcher.character();
+        let player = demo::ClipPlayer::new(&c.db, pattern, (at.translation, yaw_of(at.rotation)));
+        let n = player.clips.len();
+        s.player = (n > 0).then_some(player);
+        n
+    })
+    .unwrap_or(0)
+}
+
+/// Drive the `drive=1` route from where the character stands now, or hand it back to the player.
+#[wasm_bindgen]
+pub fn set_drive(on: bool) {
+    with_state(|s| {
+        s.drive = on.then(|| {
+            let at = s.character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
+            demo::Drive { start: now_secs(), home: (at.translation, yaw_of(at.rotation)) }
+        });
+        if !on {
+            s.strafe = false;
         }
     });
 }
