@@ -27,6 +27,9 @@
         //   gi         screen-space global illumination: low, medium, high or ultra (default off)
         //   preset=midsommar  the Unreal intro's light block: sun -2.5, haze 1.7, ozone 0.8, EV100 3.9,
         //              analytic height fog past 120 m and volumetric fog inside it
+        //   capturefog=1  with the preset: the sky lighting and the reflections see the sky through
+        //              its height fog, as Unreal's sky light captures it (capturefog=ue: the fog below
+        //              the horizon too, rather than the lit ground)
         document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
         import init, { start } from '../pkg/kansei_wasm_sky_atmosphere.js';
         await init();
