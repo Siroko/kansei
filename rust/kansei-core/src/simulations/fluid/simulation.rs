@@ -697,6 +697,20 @@ impl FluidSimulation {
     }
     pub fn params_buffer(&self) -> Option<&wgpu::Buffer> { self.params_buffer.as_ref() }
 
+    /// The neighbour grid of the last substep, for passes that walk it (such as ray tracing the
+    /// particles as spheres): `sorted_positions_buffer` holds the positions in cell order
+    /// (`array<vec4<f32>>`, as they were before that substep's integration),
+    /// `sorted_indices_buffer` each sorted slot's particle index (`array<u32>`), and
+    /// `cell_offsets_buffer` each cell's first slot (`array<u32>`; a cell ends where the next
+    /// begins, the last at the particle count). Cell `(x, y, z)` is `x + dims.x * (y + dims.y * z)`
+    /// of `grid_dims`, `cell_size` wide from `grid_origin`. `rebuild_grid` replaces the offsets
+    /// buffer.
+    pub fn sorted_positions_buffer(&self) -> Option<&wgpu::Buffer> { self.sorted_positions_buffer.as_ref() }
+    pub fn sorted_indices_buffer(&self) -> Option<&wgpu::Buffer> { self.sorted_indices_buffer.as_ref() }
+    pub fn cell_offsets_buffer(&self) -> Option<&wgpu::Buffer> { self.cell_offsets_buffer.as_ref() }
+    pub fn cell_size(&self) -> f32 { self.cell_size }
+    pub fn grid_origin(&self) -> [f32; 3] { self.grid_origin }
+
     /// Return the positions buffer wrapped as a `ComputeBuffer` with vec4 vertex
     /// layout at `shader_location`, ready for use with `InstancedGeometry`.
     pub fn positions_as_compute_buffer(&self, shader_location: u32) -> Option<crate::buffers::ComputeBuffer> {
