@@ -7,7 +7,7 @@ use kansei_core::controls::{CameraControls, MouseVectors};
 use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{PARTICLE_BILLBOARD_WGSL, Binding, CullMode, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Mat4, Vec3};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{PostProcessingVolume, effects::{
@@ -21,7 +21,7 @@ use kansei_core::simulations::fluid::{
     FluidSimulationOptions, FluidSurfaceRenderer, GlyphAttractor, MarchingCubesOptions, SlotLayout, RetagParams};
 use kansei_wasm::{fetch_bytes, Canvas, Frame};
 
-const FONT: &[u8] = include_bytes!("../../../../kansei-core/tests/fixtures/L10-medium.arfont");
+const FONT: &[u8] = include_bytes!("../assets/L10-medium.arfont");
 
 // ── Op-art stripe shader (matches engine bind group layout) ──
 const STRIPE_WGSL: &str = r#"
@@ -83,7 +83,6 @@ fn fragment_main(v: VOut) -> @location(0) vec4<f32> {
 "#;
 
 // ── Particle billboard shader (engine-compatible instanced Renderable) ──
-const PARTICLE_BILLBOARD_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/particle_billboard.wgsl");
 
 // ── Blit shader (fullscreen triangle) ──
 const BLIT_WGSL: &str = r#"

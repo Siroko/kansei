@@ -8,7 +8,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::Material;
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -17,15 +17,6 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::renderers::RendererConfig;
 use kansei_wasm::Canvas;
-
-const LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
-
-fn lit_material(label: &str, color: [f32; 4], specular: [f32; 4]) -> Material {
-    let data: [f32; 8] = [color[0], color[1], color[2], color[3], specular[0], specular[1], specular[2], specular[3]];
-    let mut material = Material::new(label, LIT_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
-    material.set_uniform_bindable(0, label, &data);
-    material
-}
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
@@ -39,7 +30,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let mut scene = Scene::new();
 
-    let mut floor = Renderable::new(PlaneGeometry::new(60.0, 60.0), lit_material("Floor", [0.35, 0.35, 0.33, 1.0], [0.05, 0.05, 0.05, 0.05]));
+    let mut floor = Renderable::new(PlaneGeometry::new(60.0, 60.0), Material::basic_lit("Floor", [0.35, 0.35, 0.33, 1.0], [0.05, 0.05, 0.05, 0.05]));
     floor.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     floor.cast_shadow = false;
     scene.add(SceneNode::Renderable(floor));
@@ -55,7 +46,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let height_m = 6.0 + h;
             let mut pillar = Renderable::new(
                 BoxGeometry::new(0.45, height_m, 0.45),
-                lit_material("Pillar", [0.3, 0.27, 0.24, 1.0], [0.05, 0.05, 0.05, 0.1]),
+                Material::basic_lit("Pillar", [0.3, 0.27, 0.24, 1.0], [0.05, 0.05, 0.05, 0.1]),
             );
             pillar.object.set_position(x, height_m * 0.5, z);
             scene.add(SceneNode::Renderable(pillar));

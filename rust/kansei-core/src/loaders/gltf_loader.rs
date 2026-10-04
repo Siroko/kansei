@@ -1,10 +1,8 @@
 use crate::geometries::{Geometry, Vertex};
-use crate::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use crate::materials::{CullMode, Material, MaterialOptions};
 use crate::math::Vec3;
 use crate::objects::Renderable;
 use super::ktx2::{self, CompressionSupport, GpuTarget, Ktx2Options, TranscodedTexture};
-
-const BASIC_LIT_WGSL: &str = include_str!("../shaders/basic_lit.wgsl");
 
 /// Material properties extracted from glTF PBR metallic-roughness.
 pub struct GLTFMaterialInfo {
@@ -104,17 +102,8 @@ impl GLTFResult {
                 let label = mat_info
                     .map(|m| m.name.as_str())
                     .unwrap_or("GLTF/Material");
-                let uniform: [f32; 8] = [
-                    color[0], color[1], color[2], color[3],
-                    0.15, 0.15, 0.15, 0.5,
-                ];
-                let mut material = Material::new(
-                    label,
-                    BASIC_LIT_WGSL,
-                    vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
-                    opts,
-                );
-                material.set_uniform_bindable(0, &format!("{label}/Color"), &uniform);
+                let mut material = Material::basic_lit(label, color, [0.15, 0.15, 0.15, 0.5]);
+                material.options = opts;
 
                 let s = scale_multiplier;
                 let mut r = Renderable::new(gr.geometry, material);

@@ -151,7 +151,9 @@ fn calcPointShadow(world_pos: vec3<f32>) -> f32 {
         }
     }
 
-    uv = uv * 0.5 + 0.5;
+    // texel rows run down the face as rendered (NDC y up), so v flips
+    // (cubemap_shadow_map.rs: the_point_shadow_lookup_finds_the_texel_each_face_rendered)
+    uv = vec2<f32>(uv.x, -uv.y) * 0.5 + 0.5;
 
     let tex_size = vec2<f32>(textureDimensions(cube_shadow_tex));
     let tex_coord = vec2<i32>(clamp(uv * tex_size, vec2<f32>(0.0), tex_size - 1.0));
@@ -187,6 +189,11 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var diffuse = vec3<f32>(0.0, 0.0, 0.0);
     var specular = vec3<f32>(0.0, 0.0, 0.0);
 
+    // the directional shadow map darkens the directional lights, the cube shadow only the point
+    // light it was rendered from
+    let dir_shadow = calcDirectionalShadow(input.world_position, n);
+    let point_shadow = calcPointShadow(input.world_position);
+
     // Directional lights
     for (var i = 0u; i < lights.num_directional; i = i + 1u) {
         let dl = lights.directional[i];
@@ -197,8 +204,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let ndoth = max(dot(n, half_vec), 0.0);
         let spec = pow(ndoth, shininess);
 
-        diffuse += dl.color * ndotl;
-        specular += dl.color * spec_color * spec;
+        diffuse += dl.color * ndotl * dir_shadow;
+        specular += dl.color * spec_color * spec * dir_shadow;
     }
 
     // Point lights
@@ -217,13 +224,12 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let ndoth = max(dot(n, half_vec), 0.0);
         let spec = pow(ndoth, shininess);
 
-        diffuse += pl.color * ndotl * atten;
-        specular += pl.color * spec_color * spec * atten;
+        let shadowed = shadow_uniforms.point_shadow_enabled > 0.5 && all(abs(pl.position - shadow_uniforms.point_light_pos) < vec3<f32>(1e-3));
+        let shadow = select(1.0, point_shadow, shadowed);
+        diffuse += pl.color * ndotl * atten * shadow;
+        specular += pl.color * spec_color * spec * atten * shadow;
     }
 
-    let dir_shadow = calcDirectionalShadow(input.world_position, n);
-    let point_shadow = calcPointShadow(input.world_position);
-    let shadow = dir_shadow * point_shadow;
-    let final_color = base_color * (ambient + diffuse * shadow) + specular * shadow;
+    let final_color = base_color * (ambient + diffuse) + specular;
     return vec4<f32>(final_color, material.color.a);
 }
