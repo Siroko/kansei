@@ -10,9 +10,14 @@
 //   footprints twice the level's voxels (as inject.wgsl reads a volume's mips 1..), so the bounces
 //   add up over frames;
 // - the surface's emission.
-// A voxel is a Lambertian surface: albedo / pi times its irradiance, plus its emission. It is
-// opaque. Needs clipmap.wgsl, particle_emission.wgsl (its hash), SKY_LIGHTING_WGSL,
-// spot_light_types.wgsl and compute_shadows.wgsl.
+// A voxel is a Lambertian surface: albedo / pi times its irradiance, plus its emission. Its
+// opacity comes from the surface's area in it (in voxel faces): a surface whose normals agree on
+// an axis (a wall, the ground, a sheet seen from both sides) covers the voxel as its area says,
+// at most fully; scattered ones (needles, leaves, cards turned every way) block light as randomly
+// turned leaves do, 1 - exp(-area / 2) (Ross' G = 1/2), so a sparse crown lets light through and
+// a dense one does not. Needs clipmap.wgsl,
+// particle_emission.wgsl (its hash), SKY_LIGHTING_WGSL, spot_light_types.wgsl and
+// compute_shadows.wgsl.
 
 struct ClipInjectParams {
     numDirLights    : u32,
@@ -34,8 +39,8 @@ struct ClipInjectParams {
 }
 
 @group(0) @binding(0) var<uniform> ip : ClipInjectParams;
-// four u32 per voxel by texel (voxel_write.wgsl): albedo rgb8 + count, normal xyz8 + count, the
-// folded normal xyz8 + count, emission RGB9E5
+// five u32 per voxel by texel (voxel_write.wgsl): albedo rgb8 + count, normal xyz8 + count, the
+// folded normal xyz8 + count, emission RGB9E5, the surface's area in voxel faces (1/256)
 @group(0) @binding(10) var<storage, read> staticSurfaces : array<u32>;
 @group(0) @binding(11) var<storage, read> dynamicSurfaces : array<u32>;
 @group(0) @binding(14) var radianceOut : texture_storage_3d<rgba16float, write>;
@@ -68,10 +73,15 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let origin = clipmap.levels[k].origin;
     let c = origin + ((((vec3i(gid) - origin) % d) + d) % d);
     let idx = (gid.z * clipmap.dims.y + gid.y) * clipmap.dims.x + gid.x;
-    var surface = vec4u(staticSurfaces[4u * idx], staticSurfaces[4u * idx + 1u], staticSurfaces[4u * idx + 2u], staticSurfaces[4u * idx + 3u]);
+    let base = 5u * idx;
+    var surface = vec4u(staticSurfaces[base], staticSurfaces[base + 1u], staticSurfaces[base + 2u], staticSurfaces[base + 3u]);
+    var area = f32(staticSurfaces[base + 4u]) / 256.0;
     if (ip.hasDynamic != 0u) {
-        let dyn = vec4u(dynamicSurfaces[4u * idx], dynamicSurfaces[4u * idx + 1u], dynamicSurfaces[4u * idx + 2u], dynamicSurfaces[4u * idx + 3u]);
-        if ((dyn.x >> 24u) != 0u || dyn.w != 0u) { surface = dyn; }
+        let dyn = vec4u(dynamicSurfaces[base], dynamicSurfaces[base + 1u], dynamicSurfaces[base + 2u], dynamicSurfaces[base + 3u]);
+        if ((dyn.x >> 24u) != 0u || dyn.w != 0u) {
+            surface = dyn;
+            area = f32(dynamicSurfaces[base + 4u]) / 256.0;
+        }
     }
     let albedoRaw = unpack8(surface.x);
     let emission = unpackRgb9e5(surface.w) * ip.emissionScale;
@@ -86,6 +96,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let twoSided = nLen < 0.35;
     let axis = unpack8(surface.z).xyz / 255.0 * 2.0 - 1.0;
     let n = select(nRaw / max(nLen, 1e-4), axis / max(length(axis), 1e-4), twoSided);
+    // how opaque: as a flat surface where the normals agree on an axis (either way: a sheet's two
+    // faces), as scattered leaves where they don't
+    let flat = smoothstep(0.35, 0.85, length(axis));
+    let opacity = clamp(mix(1.0 - exp(-0.5 * area), area, flat), 0.0, 1.0);
     let p = (vec3f(c) + 0.5) * size;
     let ps = p + select(n, vec3f(0.0), twoSided) * (ip.shadowOffset * size);
 
@@ -156,6 +170,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         e += gathered * ip.bounce;
     }
 
-    let out = albedo / 3.14159265 * e + emission;
-    textureStore(radianceOut, gid, vec4f(out / clipmap.radianceScale, 1.0));
+    // (premultiplied by the opacity, as the volume's voxels are by their coverage)
+    let out = (albedo / 3.14159265 * e + emission) * opacity;
+    textureStore(radianceOut, gid, vec4f(out / clipmap.radianceScale, opacity));
 }

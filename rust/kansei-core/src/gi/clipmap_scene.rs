@@ -26,12 +26,16 @@ pub struct SceneVoxelClipmapOptions {
     /// frame (coarser levels leave them out).
     pub dynamic_levels: u32,
     /// Regions (a slab a level's window moved into, or a whole window) voxelized a frame at most.
+    /// Each is a view instance culling and cluster LOD cull for (`InstanceCulling::gi_lod_range`).
     pub jobs_per_frame: u32,
+    /// The error budget of the cluster cuts drawn into the voxels (`Renderable::clusters`), in
+    /// voxels of the level voxelized: 1 keeps every error within a voxel.
+    pub cluster_error_voxels: f32,
 }
 
 impl Default for SceneVoxelClipmapOptions {
     fn default() -> Self {
-        Self { levels: 5, resolution: 64, height_resolution: 32, voxel_size: 0.5, snap_voxels: 4, radiance_scale: 1.0, dynamic_levels: 3, jobs_per_frame: 1 }
+        Self { levels: 5, resolution: 64, height_resolution: 32, voxel_size: 0.5, snap_voxels: 4, radiance_scale: 1.0, dynamic_levels: 3, jobs_per_frame: 1, cluster_error_voxels: 1.0 }
     }
 }
 
@@ -75,6 +79,11 @@ pub struct SceneVoxelClipmap {
     stale: Vec<bool>,
     /// This frame's jobs, by slot.
     jobs: Vec<ClipJob>,
+    /// Per job slot, the region it voxelized last and the frames since: its cull view stays for
+    /// `KEEP_ALIVE` frames after, so the cluster cuts drawn into it grow to what it needs.
+    slots: Vec<(Option<ClipRegion>, u32)>,
+    /// Regions to voxelize again: a cluster cut drawn into them was too small.
+    redo: Vec<ClipRegion>,
     /// The level the round of `levels_per_frame` lights next.
     next_level: u32,
     frame: u64,
@@ -105,6 +114,8 @@ impl SceneVoxelClipmap {
             injection,
             sky,
             jobs: Vec::new(),
+            slots: vec![(None, 0); options.jobs_per_frame.max(1) as usize],
+            redo: Vec::new(),
             next_level: 1,
             frame: 0,
             bounds: std::collections::HashMap::new(),
@@ -184,6 +195,7 @@ impl SceneVoxelClipmap {
     pub(crate) fn plan(&mut self, queue: &wgpu::Queue, eye: Vec3, static_changed: bool) {
         self.jobs.clear();
         if !self.settings.enabled {
+            self.slots.iter_mut().for_each(|s| s.1 = s.1.saturating_add(1));
             return;
         }
         if static_changed {
@@ -193,10 +205,44 @@ impl SceneVoxelClipmap {
         let origins: Vec<Option<IVec3>> = (0..layout.levels).map(|level| self.clipmap.origin(level)).collect();
         let mut taken = vec![false; layout.levels as usize];
         for slot in 0..self.voxelizer.job_slots() as usize {
-            let Some(job) = next_job(&layout, &origins, &self.stale, &taken, eye, self.options.snap_voxels) else { break };
+            // a region whose cluster cuts grew first, if its window still holds some of it
+            let redo = std::iter::from_fn(|| self.redo.pop()).find_map(|region| {
+                let origin = origins[region.level as usize]?;
+                let dims = UVec3::from(layout.dims).as_ivec3();
+                let (lo, hi) = (region.lo.max(origin), (region.lo + region.size.as_ivec3()).min(origin + dims));
+                (hi.cmpgt(lo).all() && !taken[region.level as usize]).then(|| ClipJob { region: ClipRegion { level: region.level, lo, size: (hi - lo).as_uvec3() }, origin })
+            });
+            let Some(job) = redo.or_else(|| next_job(&layout, &origins, &self.stale, &taken, eye, self.options.snap_voxels)) else { break };
             taken[job.region.level as usize] = true;
             self.voxelizer.set_job(queue, slot, job.region);
             self.jobs.push(job);
+        }
+        for (slot, state) in self.slots.iter_mut().enumerate() {
+            *state = match self.jobs.get(slot) {
+                Some(job) => (Some(job.region), 0),
+                None => (state.0, state.1.saturating_add(1)),
+            };
+        }
+    }
+
+    /// Frames a job slot's cull view stays after its job.
+    const KEEP_ALIVE: u32 = 8;
+
+    /// Job slot `slot`'s cull view this frame (a box round the region it voxelizes, or voxelized
+    /// in the last `KEEP_ALIVE` frames), and the voxel size of its level.
+    pub(crate) fn gi_view(&self, slot: usize) -> Option<(glam::Mat4, f32)> {
+        let (region, age) = *self.slots.get(slot)?;
+        let region = region?;
+        (age < Self::KEEP_ALIVE).then(|| (self.voxelizer.job_view(slot).view_proj(), self.clipmap.layout().level_voxel_size(region.level)))
+    }
+
+    /// A cluster cut drawn into job slot `slot`'s view grew: voxelize its region again (once the
+    /// cut holds what it needs, a few frames on, the redo is complete).
+    pub(crate) fn cut_grew(&mut self, slot: usize) {
+        if let Some((Some(region), _)) = self.slots.get(slot) {
+            if !self.redo.contains(region) {
+                self.redo.push(*region);
+            }
         }
     }
 

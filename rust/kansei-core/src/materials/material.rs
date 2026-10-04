@@ -129,6 +129,8 @@ pub struct Material {
     cluster_depth_pipeline_layout: Option<wgpu::PipelineLayout>,
     /// The velocity pass's cluster pipeline (`get_cluster_velocity_pipeline`).
     pub(crate) cluster_velocity_pipeline: Option<wgpu::RenderPipeline>,
+    /// Voxel GI's cluster voxelization pipelines (`get_cluster_voxel_pipeline`) by voxelizer.
+    pub(crate) cluster_voxel_pipeline_cache: HashMap<u64, wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     pub initialized: bool,
 }
@@ -157,6 +159,7 @@ impl Material {
             cluster_depth_pipeline_cache: HashMap::new(),
             cluster_depth_pipeline_layout: None,
             cluster_velocity_pipeline: None,
+            cluster_voxel_pipeline_cache: HashMap::new(),
             bind_group: None,
             initialized: false,
         }
@@ -369,6 +372,7 @@ impl Material {
             self.cluster_pipeline_cache.clear();
             self.cluster_depth_pipeline_cache.clear();
             self.cluster_velocity_pipeline = None;
+            self.cluster_voxel_pipeline_cache.clear();
         }
         self.cluster_module.as_ref().unwrap().1.clone()
     }
@@ -545,7 +549,7 @@ impl Material {
 
     /// Get or create the pipeline voxel GI's mesh voxelizer draws this material with: its own
     /// `vertex_main`, and its `voxel_fragment_entry` or else `engine_fragment` (the voxelizer's
-    /// `voxel_fragment`), with `voxel_bgl` as group 3, no culling and no depth, into a
+    /// entry `engine_entry`), with `voxel_bgl` as group 3, no culling and no depth, into a
     /// `sample_count`-sample `target` whose writes are masked off (a render pass needs an
     /// attachment; the fragments write the voxels through storage atomics). `voxelizer` tells
     /// voxelizers (each with its own group 3 layout) apart.
@@ -557,7 +561,7 @@ impl Material {
         voxelizer: u64,
         vertex_layouts: &[wgpu::VertexBufferLayout],
         voxel_bgl: &wgpu::BindGroupLayout,
-        engine_fragment: &wgpu::ShaderModule,
+        engine_fragment: (&wgpu::ShaderModule, &str),
         target: wgpu::TextureFormat,
         sample_count: u32,
     ) -> &wgpu::RenderPipeline {
@@ -575,7 +579,7 @@ impl Material {
             let module = self.shader_module.as_ref().unwrap();
             let (fragment_module, entry) = match self.options.voxel_fragment_entry {
                 Some(entry) => (module, entry),
-                None => (engine_fragment, "voxel_fragment"),
+                None => engine_fragment,
             };
             let targets = [Some(wgpu::ColorTargetState { format: target, blend: None, write_mask: wgpu::ColorWrites::empty() })];
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -593,6 +597,50 @@ impl Material {
             self.voxel_pipeline_cache.insert(key, pipeline);
         }
         &self.voxel_pipeline_cache[&key]
+    }
+
+    /// Get or create the pipeline voxel GI's clipmap voxelizer draws this material's cluster cuts
+    /// with (a voxel GI view's cut of `Renderable::clusters`): `get_voxel_pipeline`'s, with the
+    /// generated vertex stage and the cluster mesh group as group 2.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_cluster_voxel_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        shared: &SharedLayouts,
+        voxelizer: u64,
+        instances: Option<&crate::buffers::InstanceBufferLayout>,
+        voxel_bgl: &wgpu::BindGroupLayout,
+        engine_fragment: (&wgpu::ShaderModule, &str),
+        target: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> Result<&wgpu::RenderPipeline, String> {
+        assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        let module = self.cluster_stage(device, instances)?;
+        if !self.cluster_voxel_pipeline_cache.contains_key(&voxelizer) {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{}/ClusterVoxelPipelineLayout", self.label)),
+                bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.cluster_mesh_bgl, voxel_bgl],
+                push_constant_ranges: &[],
+            });
+            let (fragment_module, entry) = match self.options.voxel_fragment_entry {
+                Some(entry) => (&module, entry),
+                None => engine_fragment,
+            };
+            let targets = [Some(wgpu::ColorTargetState { format: target, blend: None, write_mask: wgpu::ColorWrites::empty() })];
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("{}/ClusterVoxelPipeline", self.label)),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some(crate::clusters::CLUSTER_VERTEX_ENTRY), buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: fragment_module, entry_point: Some(entry), targets: &targets, compilation_options: Default::default() }),
+                primitive: wgpu::PrimitiveState { topology: self.options.topology, cull_mode: None, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
+                multiview: None,
+                cache: None,
+            });
+            self.cluster_voxel_pipeline_cache.insert(voxelizer, pipeline);
+        }
+        Ok(&self.cluster_voxel_pipeline_cache[&voxelizer])
     }
 
     /// Create (or recreate) the material bind group from the given resources.

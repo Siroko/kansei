@@ -7,7 +7,7 @@
 use glam::{IVec3, UVec3, Vec3 as GVec3};
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::gi::{GiSurface, SceneVoxelClipmapOptions, VoxelGIEffect, VoxelGIOptions};
+use kansei_core::gi::{GiSurface, SceneVoxelClipmapOptions, VoxelGIEffect, VoxelGIOptions, CLIP_SURFACE_WORDS, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::Vec3;
@@ -17,6 +17,7 @@ use kansei_core::renderers::{GBuffer, Renderer, RendererConfig};
 
 const W: u32 = 128;
 const H: u32 = 96;
+const WORDS: usize = CLIP_SURFACE_WORDS as usize;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
@@ -183,7 +184,7 @@ fn a_box_voxelizes_into_every_level_that_holds_it() {
                     let c = origin + IVec3::new(x, y, z);
                     let corner = c.as_vec3() * vs;
                     let crosses = corner.cmple(hi).all() && (corner + vs).cmpge(lo).all() && (corner.cmplt(lo).any() || (corner + vs).cmpgt(hi).any());
-                    let a = unpack8(words[4 * texel(c, layout.dims)]);
+                    let a = unpack8(words[WORDS * texel(c, layout.dims)]);
                     let held = a[3] > 0.0;
                     if crosses {
                         shell += 1;
@@ -255,7 +256,7 @@ fn a_window_that_followed_the_camera_matches_one_built_where_it_stopped() {
             for y in lo.y..hi.y {
                 for x in lo.x..hi.x {
                     let c = IVec3::new(x, y, z);
-                    let (va, vb) = (unpack8(wa[4 * texel(c, layout.dims)]), unpack8(wb[4 * texel(c, layout.dims)]));
+                    let (va, vb) = (unpack8(wa[WORDS * texel(c, layout.dims)]), unpack8(wb[WORDS * texel(c, layout.dims)]));
                     compared += 1;
                     occupied += (vb[3] > 0.0) as u32;
                     if (va[3] > 0.0) != (vb[3] > 0.0) || (0..3).any(|ch| (va[ch] - vb[ch]).abs() > 2.0) {
@@ -399,3 +400,118 @@ fn read_radiance_2d(renderer: &Renderer, texture: &wgpu::Texture) -> Vec<[f32; 4
     }
     out
 }
+
+/// A material whose voxel entry cuts out the texels of every other quarter of u (an alpha-tested
+/// card), keeping the coverage of the samples elsewhere.
+const CUTOUT_VOXEL_WGSL: &str = r#"
+struct CutVOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn cut_vertex(v: VIn) -> CutVOut {
+    var out: CutVOut;
+    out.clip = projection_matrix * view_matrix * world_matrix * v.position;
+    out.uv = v.uv;
+    return out;
+}
+@fragment
+fn voxel_main(in: CutVOut, @builtin(front_facing) front: bool) {
+    let kept = fract(in.uv.x * 4.0) < 0.5;
+    kansei_voxel_write_coverage(in.clip, front, surface.albedo.rgb, vec3<f32>(0.0), select(0.0, 1.0, kept));
+}
+"#;
+
+fn cutout_material(albedo: [f32; 3]) -> Material {
+    // the voxel pass draws `vertex_main`: make it the cut-out's, with the uv
+    let shader = format!("{VOXEL_WRITE_WGSL}\n{}\n{CUTOUT_VOXEL_WGSL}", SURFACE_WGSL.replace("fn vertex_main(", "fn plain_vertex(")).replace("fn cut_vertex(", "fn vertex_main(").replace("fn fragment_main(in: VOut)", "fn plain_fragment(in: VOut)");
+    let shader = shader + "\n@fragment fn fragment_main(in: CutVOut) -> GBufferOut { var out: GBufferOut; out.color = vec4<f32>(0.0, 0.0, 0.0, 1.0); out.emissive = vec4<f32>(0.0); out.normal = vec4<f32>(0.5, 1.0, 0.5, 1.0); out.albedo = vec4<f32>(surface.albedo.rgb, 1.0); return out; }\n";
+    let mut material = Material::new(
+        "Cutout",
+        &shader,
+        vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
+        MaterialOptions { mrt_output_count: Some(4), voxel_fragment_entry: Some("voxel_main"), cull_mode: kansei_core::materials::CullMode::None, ..Default::default() },
+    );
+    material.set_uniform_bindable(0, "Cutout", &[albedo[0], albedo[1], albedo[2], 1.0f32]);
+    material
+}
+
+/// The area a level's voxels sum, in square metres (word 4 of each voxel, voxel faces / 256).
+fn summed_area(words: &[u32], voxel: f32) -> f32 {
+    words.chunks(WORDS).map(|w| w[4] as f32 / 256.0).sum::<f32>() * voxel * voxel
+}
+
+/// A clipmap's voxels sum the area of the surfaces in them, whatever their tilt; an alpha-tested
+/// surface's cut-out texels add none; a flat slab's voxels are opaque (its two faces in a voxel
+/// agree on their axis), those of a sheet with `GiSurface::opacity` that much.
+#[test]
+fn voxels_sum_the_surface_area_that_makes_them_opaque() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_clipmap(SceneVoxelClipmapOptions { levels: 1, resolution: 64, height_resolution: 64, voxel_size: 0.125, ..Default::default() });
+    renderer.voxel_clipmap_mut().unwrap().settings.bounce = 0.0;
+    // (the level's window: 8 m round the camera)
+    let mut camera = camera_at([0.3, 0.4, 1.0], [0.0, 0.0, 0.0]);
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let level_area = |renderer: &Renderer| {
+        let gi = renderer.voxel_clipmap().unwrap();
+        summed_area(&read_words(renderer, gi.voxelizer().static_surfaces(0)), gi.clipmap().layout().voxel_size)
+    };
+    // a 2 x 1.5 m plate tilted about two axes: 3 m^2
+    let mut scene = Scene::new();
+    let mut plate = Renderable::new(BoxGeometry::new(2.0, 0.0, 1.5), surface_material([0.5; 3])).with_gi(GiSurface::new([0.5; 3]));
+    plate.object.rotation.x = 0.5;
+    plate.object.rotation.z = 0.35;
+    plate.material.options.cull_mode = kansei_core::materials::CullMode::None;
+    scene.add(SceneNode::Renderable(plate));
+    run(&mut renderer, &mut scene, &mut camera, 2);
+    let tilted = level_area(&renderer);
+    // the same plate cut out every other quarter of u: half of it
+    renderer.voxel_clipmap_mut().unwrap().invalidate();
+    let mut cut_scene = Scene::new();
+    let mut cut = Renderable::new(kansei_core::geometries::PlaneGeometry::new(2.0, 1.5), cutout_material([0.5; 3])).with_gi(GiSurface::new([0.5; 3]));
+    cut.object.rotation.x = 0.5;
+    cut.object.rotation.z = 0.35;
+    cut_scene.add(SceneNode::Renderable(cut));
+    for _ in 0..2 {
+        renderer.render_scene_offscreen(&mut cut_scene, &mut camera, &gbuffer);
+    }
+    let cut_area = level_area(&renderer);
+    eprintln!("tilted plate: {tilted} m^2 summed (both faces of a box of no thickness: 6); cut out: {cut_area} m^2 (1.5)");
+    // (a box of zero height: its top and bottom faces, 2 x 3 m^2; the plane: one face)
+    assert!((tilted / 6.0 - 1.0).abs() < 0.06, "the plate sums {tilted} m^2");
+    assert!((cut_area / 1.5 - 1.0).abs() < 0.1, "the cut-out plane sums {cut_area} m^2");
+
+    // a level slab and a plate of opacity 0.4, both flat: their voxels' opacity
+    renderer.voxel_clipmap_mut().unwrap().invalidate();
+    let mut flat = Scene::new();
+    flat.add(gi_box([3.0, 0.06, 3.0], [-1.6, -0.94, 0.0], [0.5; 3]));
+    // (one face: a slab's two faces in one voxel would add up)
+    let mut light = Renderable::new(kansei_core::geometries::PlaneGeometry::new(3.0, 3.0), surface_material([0.5; 3])).with_gi(GiSurface::new([0.5; 3]).with_opacity(0.4));
+    light.object.rotation.x = -std::f32::consts::FRAC_PI_2;
+    light.object.set_position(1.6, -0.94, 0.0);
+    flat.add(SceneNode::Renderable(light));
+    flat.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 1.0))));
+    for _ in 0..3 {
+        renderer.render_scene_offscreen(&mut flat, &mut camera, &gbuffer);
+    }
+    let gi = renderer.voxel_clipmap().unwrap();
+    let layout = *gi.clipmap().layout();
+    let origin = gi.clipmap().origin(0).unwrap();
+    let radiance = read_radiance(&renderer, gi.clipmap().texture(0));
+    let y = (-0.94f32 / layout.voxel_size).floor() as i32;
+    let (mut opaque, mut partial) = (Vec::new(), Vec::new());
+    for z in origin.z..origin.z + layout.dims[2] as i32 {
+        for x in origin.x..origin.x + layout.dims[0] as i32 {
+            let p = (GVec3::new(x as f32, 0.0, z as f32) + 0.5) * layout.voxel_size;
+            if p.z.abs() > 1.2 || (p.x.abs() - 1.6).abs() > 1.2 {
+                continue;
+            }
+            let a = radiance[texel(IVec3::new(x, y, z), layout.dims)][3];
+            if p.x < 0.0 { opaque.push(a) } else { partial.push(a) }
+        }
+    }
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    eprintln!("slab voxels: opacity {} (of {}); with opacity 0.4: {} (of {})", mean(&opaque), opaque.len(), mean(&partial), partial.len());
+    assert!(opaque.len() > 100 && partial.len() > 100);
+    assert!(opaque.iter().all(|&a| a > 0.97), "a flat slab's voxels are opaque: {:?}", opaque.iter().cloned().fold(1.0, f32::min));
+    assert!((mean(&partial) - 0.4).abs() < 0.06, "the light slab's voxels: {}", mean(&partial));
+}
+
+

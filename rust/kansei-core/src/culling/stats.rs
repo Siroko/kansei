@@ -48,6 +48,8 @@ pub enum CullViewKind {
     Cascade(u32),
     /// The top-down view of the sky occlusion (`Renderer::enable_sky_occlusion`).
     SkyOcclusion,
+    /// A region the voxel clipmap voxelizes (`Renderer::enable_voxel_clipmap`), by job slot.
+    VoxelGi(u32),
 }
 
 /// Instance culling statistics of a recent frame, per view.
