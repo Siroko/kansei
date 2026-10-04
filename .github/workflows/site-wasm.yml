@@ -41,7 +41,8 @@ jobs:
         with:
           tool: wasm-pack
 
-      # the registry and the shared target dir; every example's lockfile keys it
+      # the registry and the shared target dir, keyed by the manifests (the examples' lockfiles
+      # are not committed)
       - uses: actions/cache@v4
         with:
           path: |
@@ -49,7 +50,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target-wasm
-          key: site-wasm-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.lock') }}
+          key: site-wasm-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml') }}
           restore-keys: site-wasm-${{ runner.os }}-
 
       - name: Build the examples
