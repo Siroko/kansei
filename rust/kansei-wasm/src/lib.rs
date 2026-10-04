@@ -24,7 +24,7 @@
 //!   delta time and any new canvas size.
 //! - [`param`], [`param_or`] and [`flag`] read the page's query string, percent-decoded.
 //! - [`now`], [`fetch_bytes`] and [`is_phone`] cover timing, loading and picking a tier;
-//!   [`set_text`] fills a HUD element.
+//!   [`set_text`], [`checkbox`] and [`thousands`] serve a HUD.
 //! - [`Keys`] and [`Gamepad`] are the input of pages that play: keys held and pressed, sticks
 //!   and buttons.
 //!
@@ -39,4 +39,4 @@ mod page;
 pub use canvas::Canvas;
 pub use frame_loop::{run, Frame};
 pub use input::{Gamepad, Keys};
-pub use page::{fetch_bytes, flag, init, is_phone, now, param, param_or, set_text};
+pub use page::{checkbox, fetch_bytes, flag, init, is_phone, now, param, param_or, set_text, thousands};

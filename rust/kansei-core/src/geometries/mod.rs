@@ -6,6 +6,7 @@ mod instanced_geometry;
 mod heightfield;
 mod cylinder;
 mod icosphere;
+mod spruce;
 
 pub use geometry::{Geometry, Vertex, VertexAttribute};
 pub use plane::PlaneGeometry;
@@ -15,6 +16,7 @@ pub use instanced_geometry::InstancedGeometry;
 pub use heightfield::HeightfieldGeometry;
 pub use cylinder::CylinderGeometry;
 pub use icosphere::IcosphereGeometry;
+pub use spruce::SpruceGeometry;
 
 #[cfg(test)]
 mod tests;

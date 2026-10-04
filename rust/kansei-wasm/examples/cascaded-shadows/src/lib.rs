@@ -14,7 +14,7 @@ use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions, GBUFFER_OUT_WGSL};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
@@ -79,11 +79,6 @@ fn surface_material(label: &str, base: [f32; 3], instanced: bool, debug: bool) -
     })
 }
 
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = Canvas::find(canvas_id)?;
@@ -111,13 +106,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // 500 m, clear around the path the camera walks
     let (mut trunks, mut crowns) = (Vec::new(), Vec::new());
     for i in 0..4000u32 {
-        let (x, z) = (-500.0 + hash(i) * 1000.0, -500.0 + hash(i + 7) * 1000.0);
+        let (x, z) = (-500.0 + hash01(i) * 1000.0, -500.0 + hash01(i + 7) * 1000.0);
         if x.abs() < 4.0 {
             continue;
         }
-        let h = 8.0 + hash(i + 13) * 10.0;
+        let h = 8.0 + hash01(i + 13) * 10.0;
         trunks.push([x, h * 0.5, z, h]);
-        crowns.push([x, h, z, 1.6 + hash(i + 17) * 1.4]);
+        crowns.push([x, h, z, 1.6 + hash01(i + 17) * 1.4]);
     }
     scene.add(SceneNode::Renderable(Renderable::instanced_culled("Trunks", BoxGeometry::new(0.035, 1.0, 0.035), &trunks, 0.6, surface_material("Trunk", [0.2, 0.15, 0.1], true, debug))));
     scene.add(SceneNode::Renderable(Renderable::instanced_culled("Crowns", SphereGeometry::new(1.0, 12, 8), &crowns, 1.0, surface_material("Crown", [0.06, 0.12, 0.05], true, debug))));

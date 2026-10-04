@@ -95,6 +95,13 @@ impl Geometry {
 }
 
 impl Geometry {
+    /// The same geometry named `label` (in profiles and GPU captures): one of the stock
+    /// generators' meshes, say, as `SpruceGeometry::new(8, 1, 3).with_label("Spruce/LOD2")`.
+    pub fn with_label(mut self, label: &str) -> Self {
+        self.label = label.to_string();
+        self
+    }
+
     pub fn new(label: &str, vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         Self {
             label: label.to_string(),

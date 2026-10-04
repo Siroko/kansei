@@ -20,7 +20,7 @@ use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::lights::{Light, SpotLight};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
@@ -177,11 +177,6 @@ fn cottage_material(label: &str, base: [f32; 3], window: [f32; 3], band: f32) ->
     m
 }
 
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
-}
-
 /// The reflection: half the canvas's resolution, everything but the water, with the fog's
 /// mirrored froxels composited in when `fog` is given.
 fn lake_reflection(renderer: &Renderer, (width, height): (u32, u32), occlusion: bool, screen_space: bool, fog: Option<&mut VolumetricFogEffect>) -> PlanarReflection {
@@ -220,9 +215,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     scene.add(SceneNode::Renderable(bank));
     let mut trees: Vec<[f32; 4]> = Vec::new();
     for i in 0..1600u32 {
-        let x = -700.0 + hash(i) * 1400.0;
-        let z = -125.0 - hash(i + 5) * 200.0;
-        let h = 12.0 + hash(i + 11) * 14.0;
+        let x = -700.0 + hash01(i) * 1400.0;
+        let z = -125.0 - hash01(i + 5) * 200.0;
+        let h = 12.0 + hash01(i + 11) * 14.0;
         trees.push([x, 4.0 + h * 0.5, z, h]);
     }
     // spruce-like silhouettes: narrow tall boxes (a stand-in; the app has real trees), culled on

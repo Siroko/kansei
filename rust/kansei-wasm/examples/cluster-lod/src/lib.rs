@@ -20,7 +20,7 @@ use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions, InstanceTra
 use kansei_core::culling::InstanceCulling;
 use kansei_core::geometries::{Geometry, IcosphereGeometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FrameTimer;
 use kansei_core::profiling::{AbBench, AbBenchOptions};
@@ -64,11 +64,6 @@ fn fragment_main(in: VOut) -> KanseiGBufferOut {
 const BANDS: [f32; 4] = [0.0, 8.0, 24.0, 72.0];
 const SPACING: f32 = 4.0;
 const MODES: [&str; 3] = ["clusters", "lods", "full"];
-
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
-}
 
 /// A noisy icosphere of `subdivisions`, about a metre across.
 fn rock(subdivisions: u32) -> Geometry {
@@ -168,9 +163,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut data: Vec<f32> = Vec::with_capacity((n * n * 8) as usize);
     for k in 0..n * n {
         let (i, j) = (k % n, k / n);
-        let x = -extent / 2.0 + (i as f32 + 0.2 + 0.6 * hash(k)) * SPACING;
-        let z = -extent / 2.0 + (j as f32 + 0.2 + 0.6 * hash(k + 7919)) * SPACING;
-        data.extend_from_slice(&[x, 0.2, z, 0.7 + 0.6 * hash(k + 104729), hash(k + 3) * std::f32::consts::TAU, 0.0, 0.0, 0.0]);
+        let x = -extent / 2.0 + (i as f32 + 0.2 + 0.6 * hash01(k)) * SPACING;
+        let z = -extent / 2.0 + (j as f32 + 0.2 + 0.6 * hash01(k + 7919)) * SPACING;
+        data.extend_from_slice(&[x, 0.2, z, 0.7 + 0.6 * hash01(k + 104729), hash01(k + 3) * std::f32::consts::TAU, 0.0, 0.0, 0.0]);
     }
     let source = ComputeBuffer::from_slice("Rocks", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &data);
     let rocks = n * n;
