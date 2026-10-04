@@ -4,10 +4,7 @@
 //! length, f-stop and focus distance; bokeh keep their energy and the aperture's shape. See
 //! www/index.html for the URL parameters.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SKY_LIGHTING_WGSL};
 use kansei_core::buffers::{BufferType, ComputeBuffer};
@@ -24,6 +21,7 @@ use kansei_core::postprocessing::effects::{
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 /// Unreal's default filmback width, mm.
 const SENSOR_MM: f32 = 23.76;
@@ -153,12 +151,6 @@ fn material(label: &str, body: &str, rgb: [f32; 3], sky: &SkyAtmosphere, cull: C
     m
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct Settings {
     focal_mm: f32,
     f_stop: f32,
@@ -180,25 +172,29 @@ struct Settings {
 }
 
 fn settings() -> Settings {
-    let search = web_sys::window().unwrap().location().search().unwrap_or_default();
-    let q = web_sys::UrlSearchParams::new_with_str(&search).unwrap();
-    let num = |k: &str| q.get(k).and_then(|v| v.parse::<f32>().ok());
     Settings {
-        focal_mm: num("focal").unwrap_or(50.0),
-        f_stop: num("fstop").unwrap_or(1.8),
-        focus_m: num("focus").unwrap_or(8.0),
-        blades: num("blades").unwrap_or(0.0) as u32,
-        rack: q.get("rack").is_some(),
-        ev: num("ev").unwrap_or(10.8),
-        off: q.get("dof").as_deref() == Some("0"),
-        taa: q.get("taa").as_deref() != Some("0"),
-        dof_after_taa: q.get("order").as_deref() == Some("after"),
-        debug: num("debug").unwrap_or(0.0) as u32,
-        scatter: q.get("scatter").as_deref() != Some("0"),
-        samples: num("samples").unwrap_or(72.0) as u32,
-        scale: num("scale").unwrap_or(1.0),
-        time: num("t"),
+        focal_mm: param_or("focal", 50.0),
+        f_stop: param_or("fstop", 1.8),
+        focus_m: param_or("focus", 8.0),
+        blades: param_or("blades", 0.0f32) as u32,
+        rack: param("rack").is_some(),
+        ev: param_or("ev", 10.8),
+        off: !flag("dof", true),
+        taa: flag("taa", true),
+        dof_after_taa: param("order").as_deref() == Some("after"),
+        debug: param_or("debug", 0.0f32) as u32,
+        scatter: flag("scatter", true),
+        samples: param_or("samples", 72.0f32) as u32,
+        scale: param_or("scale", 1.0),
+        time: param("t").and_then(|v| v.trim().parse().ok()),
     }
+}
+
+/// The camera's field of view from the lens on the filmback, at the camera's aspect.
+fn fit_lens(camera: &mut Camera, focal_mm: f32) {
+    let hfov = 2.0 * (SENSOR_MM / (2.0 * focal_mm)).atan();
+    camera.fov = (2.0 * ((hfov * 0.5).tan() / camera.aspect).atan()).to_degrees();
+    camera.update_projection_matrix();
 }
 
 struct State {
@@ -209,15 +205,6 @@ struct State {
     volume: PostProcessingVolume,
     sun_light: usize,
     settings: Settings,
-    start: f64,
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
 }
 
 impl State {
@@ -246,14 +233,8 @@ impl State {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = (canvas.client_width().max(1) as u32, canvas.client_height().max(1) as u32);
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_shadows(2048);
     let settings = settings();
     renderer.set_render_scale(settings.scale);
@@ -320,10 +301,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let sun_light = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // the camera's field of view comes from the lens on the filmback
-    let aspect = width as f32 / height as f32;
-    let hfov = 2.0 * (SENSOR_MM / (2.0 * settings.focal_mm)).atan();
-    let vfov = 2.0 * ((hfov * 0.5).tan() / aspect).atan();
-    let camera = Camera::new(vfov.to_degrees(), 0.1, 4000.0, aspect);
+    let mut camera = Camera::new(45.0, 0.1, 4000.0, canvas.aspect());
+    fit_lens(&mut camera, settings.focal_mm);
 
     // the chain: sky and aerial perspective, depth of field on the jittered frame (each pixel's
     // colour and depth still agree), TAA resolving both, then exposure and tonemapping.
@@ -368,17 +347,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let volume = PostProcessingVolume::new(&renderer, effects);
 
     log::info!("Kansei — Depth of Field (WASM) ready, {:?}", renderer.presentation_format());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, sky, volume, sun_light, settings, start: now_secs() }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let t = st.settings.time.unwrap_or((now_secs() - st.start) as f32);
-            st.frame(t);
+    let mut state = State { renderer, scene, camera, sky, volume, sun_light, settings };
+    kansei_wasm::run(&canvas, move |frame| {
+        if frame.resized.is_some() {
+            frame.resize(&mut state.renderer, &mut state.camera);
+            fit_lens(&mut state.camera, state.settings.focal_mm);
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        let t = state.settings.time.unwrap_or(frame.time as f32);
+        state.frame(t);
+    });
     Ok(())
 }

@@ -38,6 +38,7 @@ use kansei_core::postprocessing::{
     effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, now, param, param_or, Canvas};
 use kansei_core::shadows::{SkyOcclusion, SkyOcclusionOptions, SKY_OCCLUSION_WGSL};
 
 /// A diffuse surface in sunlight and haze, writing motion vectors. TREE_* (string replaced) place
@@ -435,12 +436,6 @@ impl Bench {
     }
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
@@ -449,33 +444,15 @@ struct State {
     timer: Option<GpuTimer>,
     bench: Option<Bench>,
     cam: usize,
-    start: f64,
     frozen_t: Option<f32>,
     trees: u32,
     frame: u32,
-    last_frame: f64,
     interval_ms: f64,
     gpu_ms: f64,
     cpu_ms: f64,
     keys: Rc<RefCell<Vec<String>>>,
     /// `skyocc=rebuild`: start a rebuild of the sky occlusion every frame
     rebuild_sky: bool,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
 }
 
 fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
@@ -535,28 +512,22 @@ fn hud(st: &State) -> String {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = query_param("size")
-        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
-        .unwrap_or((canvas.client_width() as u32, canvas.client_height() as u32));
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas.clone()).await;
-    if let Some(scale) = query_param("scale").and_then(|v| v.parse().ok()) {
+    let mut canvas = Canvas::find(canvas_id)?;
+    if let Some((w, h)) = param("size").and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))) {
+        canvas = canvas.with_size(w, h);
+    }
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
+    if let Some(scale) = param("scale").and_then(|v| v.parse().ok()) {
         renderer.set_render_scale(scale);
     }
     renderer.set_culling_stats(true);
-    renderer.set_occlusion_culling(query_param("occlusion").as_deref() != Some("0"));
-    let sky_occ = match query_param("skyocc").as_deref() {
+    renderer.set_occlusion_culling(flag("occlusion", true));
+    let sky_occ = match param("skyocc").as_deref() {
         Some("1") | Some("rebuild") => SkyOcc::On,
         Some("show") => SkyOcc::Show,
         _ => SkyOcc::Off,
     };
-    let rebuild_sky = query_param("skyocc").as_deref() == Some("rebuild");
+    let rebuild_sky = param("skyocc").as_deref() == Some("rebuild");
     if sky_occ != SkyOcc::Off {
         // the ground and the trees' tops (up to 26 m over the hill's 57 m) lie in the volume; the
         // top-down view draws coarser LODs (the last one reaches any distance)
@@ -580,7 +551,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the forest: base xyz and height, then yaw and tint, 32 bytes a tree; everywhere but the
     // valley's meadow and clearings where the cameras stand
-    let trees: u32 = query_param("trees").and_then(|v| v.parse().ok()).unwrap_or(60_000);
+    let trees: u32 = param_or("trees", 60_000);
     let mut data: Vec<f32> = Vec::with_capacity(trees as usize * 8);
     let clearings = [(-120.0, 60.0, 4.0), (-40.0, -130.0, 16.0)];
     let meadow = |x: f32, z: f32| x.abs() < 70.0 && (-60.0..140.0).contains(&z);
@@ -604,7 +575,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     };
     // three LODs by distance, each culled per view on the GPU; with occlusion for the camera
     let lods = [(spruce(48, 6, 6, "Spruce/LOD0"), 0.0, 80.0), (spruce(20, 2, 5, "Spruce/LOD1"), 80.0, 220.0), (spruce(8, 1, 3, "Spruce/LOD2"), 220.0, f32::INFINITY)];
-    let spheres = query_param("bounds").as_deref() == Some("sphere");
+    let spheres = param("bounds").as_deref() == Some("sphere");
     for (geometry, near, far) in lods {
         let instances = ComputeBuffer::from_external("Forest", source.clone(), BufferType::Storage).with_vertex_layout(
             32,
@@ -632,17 +603,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ToneMapEffect::new(options)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    if query_param("taa").as_deref() != Some("0") {
+    if flag("taa", true) {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
 
-    let mut camera = Camera::new(50.0, 0.3, 3000.0, width as f32 / height as f32);
+    let mut camera = Camera::new(50.0, 0.3, 3000.0, canvas.aspect());
     camera.update_projection_matrix();
 
-    let cam = CAMS.iter().position(|&c| Some(c) == query_param("cam").as_deref()).unwrap_or(0);
-    if query_param("freeze").as_deref() == Some("1") {
+    let cam = CAMS.iter().position(|&c| Some(c) == param("cam").as_deref()).unwrap_or(0);
+    if flag("freeze", false) {
         if let Some(c) = checkbox("freeze") {
             c.set_checked(true);
         }
@@ -651,86 +622,79 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         c.set_checked(renderer.occlusion_culling());
     }
     let timer = GpuTimer::new(renderer.device(), renderer.queue());
-    let bench = (query_param("bench").as_deref() == Some("1")).then(|| Bench { start: now_ms(), sums: [(0.0, 0, 0.0, 0); 2], last_frame: now_ms(), report: None });
+    let bench = flag("bench", false).then(|| Bench { start: now() * 1000.0, sums: [(0.0, 0, 0.0, 0); 2], last_frame: now() * 1000.0, report: None });
     log::info!("Kansei — Occlusion culling (WASM) ready: {trees} trees, timestamps {}", timer.is_some());
 
     let keys = Rc::new(RefCell::new(Vec::new()));
     {
         let keys = keys.clone();
         let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| keys.borrow_mut().push(e.key().to_lowercase()));
-        window.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
+        web_sys::window().ok_or("no window")?.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
         on_key.forget();
     }
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, timer, bench, cam, start: now_ms(), frozen_t, trees, frame: 0, last_frame: now_ms(), interval_ms: 0.0, gpu_ms: 0.0, cpu_ms: 0.0, keys, rebuild_sky }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut guard = state.borrow_mut();
-            let st = &mut *guard;
-            // keys and the HUD's checkboxes
-            for key in st.keys.borrow_mut().drain(..) {
-                let toggle = |id: &str| {
-                    if let Some(c) = checkbox(id) {
-                        c.set_checked(!c.checked());
-                    }
-                };
-                match key.as_str() {
-                    "o" => toggle("occlusion"),
-                    "f" => toggle("freeze"),
-                    "c" => st.cam = (st.cam + 1) % CAMS.len(),
-                    _ => {}
+    let frozen_t = param("t").and_then(|v| v.parse().ok());
+    let mut state = State { renderer, scene, camera, volume, timer, bench, cam, frozen_t, trees, frame: 0, interval_ms: 0.0, gpu_ms: 0.0, cpu_ms: 0.0, keys, rebuild_sky };
+    kansei_wasm::run(&canvas, move |frame| {
+        let st = &mut state;
+        frame.resize(&mut st.renderer, &mut st.camera);
+        // keys and the HUD's checkboxes
+        for key in st.keys.borrow_mut().drain(..) {
+            let toggle = |id: &str| {
+                if let Some(c) = checkbox(id) {
+                    c.set_checked(!c.checked());
                 }
-            }
-            let occlusion = match st.bench.as_ref().and_then(|b| b.phase(now_ms())) {
-                Some((on, _)) => on,
-                None => checkbox("occlusion").is_none_or(|c| c.checked()),
             };
-            st.renderer.set_occlusion_culling(occlusion);
-            st.renderer.set_freeze_culling(checkbox("freeze").is_some_and(|c| c.checked()));
-
-            let t = st.frozen_t.unwrap_or(((now_ms() - st.start) / 1000.0) as f32);
-            place_camera(&mut st.camera, CAMS[st.cam], t);
-
-            if let Some(timer) = st.timer.as_mut() {
-                timer.begin(st.renderer.device(), st.renderer.queue());
-            }
-            if st.rebuild_sky {
-                if let Some(sky) = st.renderer.sky_occlusion_mut() {
-                    sky.refresh();
-                }
-            }
-            let before = now_ms();
-            st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
-            st.cpu_ms += (now_ms() - before - st.cpu_ms) * 0.05;
-            if let Some(timer) = st.timer.as_mut() {
-                timer.end(st.renderer.device(), st.renderer.queue());
-            }
-
-            let now = now_ms();
-            st.interval_ms += (now - st.last_frame - st.interval_ms) * 0.05;
-            st.last_frame = now;
-            let gpu = st.timer.as_ref().map(|t| t.take()).unwrap_or_default();
-            for ms in &gpu {
-                st.gpu_ms += (ms - st.gpu_ms) * 0.05;
-            }
-            if let Some(bench) = st.bench.as_mut() {
-                let was_done = bench.report.is_some();
-                bench.record(&gpu, now);
-                if let (false, Some(report)) = (was_done, &bench.report) {
-                    log::info!("{report}");
-                    set_text("bench", report);
-                }
-            }
-            st.frame += 1;
-            if st.frame.is_multiple_of(10) {
-                set_text("hud", &hud(st));
+            match key.as_str() {
+                "o" => toggle("occlusion"),
+                "f" => toggle("freeze"),
+                "c" => st.cam = (st.cam + 1) % CAMS.len(),
+                _ => {}
             }
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        let occlusion = match st.bench.as_ref().and_then(|b| b.phase(now() * 1000.0)) {
+            Some((on, _)) => on,
+            None => checkbox("occlusion").is_none_or(|c| c.checked()),
+        };
+        st.renderer.set_occlusion_culling(occlusion);
+        st.renderer.set_freeze_culling(checkbox("freeze").is_some_and(|c| c.checked()));
+
+        let t = st.frozen_t.unwrap_or(frame.time as f32);
+        place_camera(&mut st.camera, CAMS[st.cam], t);
+
+        if let Some(timer) = st.timer.as_mut() {
+            timer.begin(st.renderer.device(), st.renderer.queue());
+        }
+        if st.rebuild_sky {
+            if let Some(sky) = st.renderer.sky_occlusion_mut() {
+                sky.refresh();
+            }
+        }
+        let before = now();
+        st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
+        st.cpu_ms += ((now() - before) * 1000.0 - st.cpu_ms) * 0.05;
+        if let Some(timer) = st.timer.as_mut() {
+            timer.end(st.renderer.device(), st.renderer.queue());
+        }
+
+        let now_ms = now() * 1000.0;
+        st.interval_ms += (frame.dt as f64 * 1000.0 - st.interval_ms) * 0.05;
+        let gpu = st.timer.as_ref().map(|t| t.take()).unwrap_or_default();
+        for ms in &gpu {
+            st.gpu_ms += (ms - st.gpu_ms) * 0.05;
+        }
+        if let Some(bench) = st.bench.as_mut() {
+            let was_done = bench.report.is_some();
+            bench.record(&gpu, now_ms);
+            if let (false, Some(report)) = (was_done, &bench.report) {
+                log::info!("{report}");
+                set_text("bench", report);
+            }
+        }
+        st.frame += 1;
+        if st.frame.is_multiple_of(10) {
+            set_text("hud", &hud(st));
+        }
+    });
     Ok(())
 }

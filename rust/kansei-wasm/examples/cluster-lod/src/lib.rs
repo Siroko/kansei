@@ -11,12 +11,9 @@
 //! that mode every 3 s, 8 times, with the camera still through each pair, and report the mean GPU
 //! time and frame interval of each).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, VertexFormat};
 use kansei_core::cameras::Camera;
@@ -29,6 +26,7 @@ use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FrameTimer;
 use kansei_core::postprocessing::{effects::{exposure_from_ev100, ToneMapEffect, ToneMapOptions}, PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, now, param, param_or, Canvas};
 
 /// Rocks placed by records of position + scale, then yaw (8 floats), lit by a low sun.
 const ROCK_WGSL: &str = r#"
@@ -175,12 +173,6 @@ impl Bench {
     }
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
@@ -194,29 +186,11 @@ struct State {
     rocks: u32,
     triangles: usize,
     build_ms: f64,
-    start: f64,
     frozen_t: Option<f32>,
     profile: bool,
     frame: u32,
-    last_frame: f64,
     interval_ms: f64,
     gpu_ms: f64,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
 }
 
 fn set_text(id: &str, text: &str) {
@@ -247,30 +221,24 @@ fn place_camera(camera: &mut Camera, extent: f32, t: f32) {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = query_param("size")
-        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
-        .unwrap_or((canvas.client_width() as u32, canvas.client_height() as u32));
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.45, 0.55, 0.7, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas.clone()).await;
-    let tau: f32 = query_param("tau").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let mut canvas = Canvas::find(canvas_id)?;
+    if let Some((w, h)) = param("size").and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))) {
+        canvas = canvas.with_size(w, h);
+    }
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.45, 0.55, 0.7, 1.0), ..Default::default() }).await;
+    let tau: f32 = param_or("tau", 1.0);
     renderer.set_cluster_error_threshold(tau);
-    let profile = query_param("profile").as_deref() == Some("1");
+    let profile = flag("profile", false);
     renderer.set_profiling(profile);
 
     // the rocks and their graph
-    let n: u32 = query_param("n").and_then(|v| v.parse().ok()).unwrap_or(24);
-    let sub: u32 = query_param("sub").and_then(|v| v.parse().ok()).unwrap_or(6);
+    let n: u32 = param_or("n", 24);
+    let sub: u32 = param_or("sub", 6);
     let geometry = rock(sub);
     let triangles = geometry.indices.len() / 3;
-    let before = now_ms();
+    let before = now();
     let mesh = Arc::new(ClusterMesh::build(&geometry, &ClusterOptions::default()));
-    let build_ms = now_ms() - before;
+    let build_ms = (now() - before) * 1000.0;
 
     // the field: position + scale, yaw (8 floats a rock)
     let extent = n as f32 * SPACING;
@@ -309,8 +277,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     r.instance_culling = Some(culling(0.0, f32::INFINITY));
     r.clusters = Some(ClusterLod::new(mesh.clone()).with_transform(InstanceTransform::Placement { position: 0, scale: Some(12), yaw: Some(16), yaw_scale: 1.0, rotation: None }));
     modes[0].push(scene.add(SceneNode::Renderable(r)));
-    // discrete LODs cut from the graph at the same budget, for the largest rock (1.3)
-    let ppr = height as f32 / (2.0 * (45f32.to_radians() / 2.0).tan());
+    // discrete LODs cut from the graph at the same budget, for the largest rock (1.3), at the
+    // starting height (they are not re-cut when the canvas resizes)
+    let ppr = canvas.size().1 as f32 / (2.0 * (45f32.to_radians() / 2.0).tan());
     for (k, &near) in BANDS.iter().enumerate() {
         let far = BANDS.get(k + 1).copied().unwrap_or(f32::INFINITY);
         // cut from a rock's reach nearer than the band's start: within the budget from any side
@@ -331,71 +300,65 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     };
     let effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(tonemap)];
     let volume = PostProcessingVolume::new(&renderer, effects);
-    let mut camera = Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32);
+    let mut camera = Camera::new(45.0, 0.1, 1000.0, canvas.aspect());
     camera.update_projection_matrix();
 
-    let mode = MODES.iter().position(|&m| Some(m) == query_param("mode").as_deref()).unwrap_or(0);
-    let bench = query_param("bench").and_then(|b| MODES.iter().position(|&m| m == b).filter(|&m| m != 0)).map(|other| Bench { other, start: now_ms(), sums: [(0.0, 0, 0.0, 0); 2], last_frame: now_ms(), report: None });
+    let mode = MODES.iter().position(|&m| Some(m) == param("mode").as_deref()).unwrap_or(0);
+    let bench = param("bench").and_then(|b| MODES.iter().position(|&m| m == b).filter(|&m| m != 0)).map(|other| Bench { other, start: now() * 1000.0, sums: [(0.0, 0, 0.0, 0); 2], last_frame: now() * 1000.0, report: None });
     let timer = FrameTimer::new(renderer.device(), renderer.queue());
     log::info!("Kansei — Cluster LOD (WASM) ready: {rocks} rocks of {triangles} triangles, {} clusters over {} levels built in {build_ms:.0} ms", mesh.clusters.len(), mesh.levels().len());
 
-    let mut state = State { renderer, scene, camera, volume, timer, bench, modes, mode, rocks, triangles, build_ms, start: now_ms(), frozen_t: query_param("t").and_then(|v| v.parse().ok()), profile, frame: 0, last_frame: now_ms(), interval_ms: 0.0, gpu_ms: 0.0 };
+    let mut state = State { renderer, scene, camera, volume, timer, bench, modes, mode, rocks, triangles, build_ms, frozen_t: param("t").and_then(|v| v.parse().ok()), profile, frame: 0, interval_ms: 0.0, gpu_ms: 0.0 };
     set_mode(&mut state, mode);
-    let state = Rc::new(RefCell::new(state));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut guard = state.borrow_mut();
-            let st = &mut *guard;
-            if let Some((mode, _)) = st.bench.as_ref().and_then(|b| b.phase(now_ms())) {
-                if mode != st.mode {
-                    set_mode(st, mode);
-                }
-            }
-            let t = match (&st.bench, st.frozen_t) {
-                (Some(bench), _) => bench.view_time(now_ms()),
-                (None, Some(t)) => t,
-                (None, None) => ((now_ms() - st.start) / 1000.0) as f32,
-            };
-            place_camera(&mut st.camera, extent, t);
-            st.timer.begin();
-            st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
-            st.timer.end();
-
-            let now = now_ms();
-            st.interval_ms += (now - st.last_frame - st.interval_ms) * 0.05;
-            st.last_frame = now;
-            let gpu = st.timer.take();
-            for ms in &gpu {
-                st.gpu_ms += (ms - st.gpu_ms) * 0.05;
-            }
-            if let Some(bench) = st.bench.as_mut() {
-                let was_done = bench.report.is_some();
-                bench.record(&gpu, now);
-                if let (false, Some(report)) = (was_done, &bench.report) {
-                    log::info!("{report}");
-                    set_text("bench", report);
-                }
-            }
-            st.frame += 1;
-            if st.profile && st.frame.is_multiple_of(240) {
-                log::info!("{}: {}", MODES[st.mode], st.renderer.take_profile().report());
-            }
-            if st.frame.is_multiple_of(10) {
-                let (w, h) = st.renderer.render_size();
-                set_text(
-                    "hud",
-                    &format!(
-                        "{} · {} rocks of {} triangles · graph built in {:.0} ms · budget {} px\n{w} x {h} · GPU {:.2} ms · {:.1} ms between frames",
-                        MODES[st.mode], st.rocks, st.triangles, st.build_ms, st.renderer.cluster_error_threshold(), st.gpu_ms, st.interval_ms
-                    ),
-                );
+    kansei_wasm::run(&canvas, move |frame| {
+        let st = &mut state;
+        frame.resize(&mut st.renderer, &mut st.camera);
+        // the bench's clock, in milliseconds
+        let now_ms = now() * 1000.0;
+        if let Some((mode, _)) = st.bench.as_ref().and_then(|b| b.phase(now_ms)) {
+            if mode != st.mode {
+                set_mode(st, mode);
             }
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        let t = match (&st.bench, st.frozen_t) {
+            (Some(bench), _) => bench.view_time(now_ms),
+            (None, Some(t)) => t,
+            (None, None) => frame.time as f32,
+        };
+        place_camera(&mut st.camera, extent, t);
+        st.timer.begin();
+        st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
+        st.timer.end();
+
+        let now_ms = now() * 1000.0;
+        st.interval_ms += (frame.dt as f64 * 1000.0 - st.interval_ms) * 0.05;
+        let gpu = st.timer.take();
+        for ms in &gpu {
+            st.gpu_ms += (ms - st.gpu_ms) * 0.05;
+        }
+        if let Some(bench) = st.bench.as_mut() {
+            let was_done = bench.report.is_some();
+            bench.record(&gpu, now_ms);
+            if let (false, Some(report)) = (was_done, &bench.report) {
+                log::info!("{report}");
+                set_text("bench", report);
+            }
+        }
+        st.frame += 1;
+        if st.profile && st.frame.is_multiple_of(240) {
+            log::info!("{}: {}", MODES[st.mode], st.renderer.take_profile().report());
+        }
+        if st.frame.is_multiple_of(10) {
+            let (w, h) = st.renderer.render_size();
+            set_text(
+                "hud",
+                &format!(
+                    "{} · {} rocks of {} triangles · graph built in {:.0} ms · budget {} px\n{w} x {h} · GPU {:.2} ms · {:.1} ms between frames",
+                    MODES[st.mode], st.rocks, st.triangles, st.build_ms, st.renderer.cluster_error_threshold(), st.gpu_ms, st.interval_ms
+                ),
+            );
+        }
+    });
     Ok(())
 }
 

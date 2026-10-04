@@ -8,9 +8,6 @@
 //! is fitted to), `t=<seconds>` (freeze the camera).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
@@ -26,6 +23,7 @@ use kansei_core::postprocessing::{
     effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, param_or, Canvas};
 use kansei_core::shadows::{CascadedShadowOptions, CASCADED_SHADOWS_WGSL};
 
 /// Sunlit diffuse surface: sun (lux) times the shadow, plus a sky hemisphere (cd/m²). INSTANCE_*
@@ -148,37 +146,6 @@ fn hash(i: u32) -> f32 {
     (x % 10007) as f32 / 10007.0
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
-struct State {
-    renderer: Renderer,
-    scene: Scene,
-    camera: Camera,
-    volume: PostProcessingVolume,
-    start_ms: f64,
-    frozen_t: Option<f32>,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
-}
-
 /// An instanced renderable of `geometry` at (position, scale) instances, GPU-culled per view.
 fn instanced(renderer: &Renderer, label: &str, geometry: kansei_core::geometries::Geometry, instances: &[f32], radius: f32, material: Material) -> Renderable {
     use wgpu::util::DeviceExt;
@@ -196,20 +163,10 @@ fn instanced(renderer: &Renderer, label: &str, geometry: kansei_core::geometries
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas.clone()).await;
-    let csm = query_param("csm").as_deref() != Some("0");
-    let debug = query_param("debug").as_deref() == Some("1");
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
+    let csm = flag("csm", true);
+    let debug = flag("debug", false);
     if csm {
         renderer.enable_cascaded_shadows(CascadedShadowOptions::default());
     } else {
@@ -260,7 +217,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ToneMapEffect::new(o)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    if query_param("fog").as_deref() == Some("1") {
+    if flag("fog", false) {
         // shafts through the canopy, shadowed by the widest cascade
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
             grid: FroxelGridOptions { near: 0.5, far: 300.0, temporal: true, ..Default::default() },
@@ -280,29 +237,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     effects.push(Box::new(tonemap));
-    let volume = PostProcessingVolume::new(&renderer, effects);
-    let far: f32 = query_param("far").and_then(|v| v.parse().ok()).unwrap_or(1200.0);
-    let camera = Camera::new(50.0, 0.3, far, width as f32 / height as f32);
+    let mut volume = PostProcessingVolume::new(&renderer, effects);
+    let far: f32 = param_or("far", 1200.0);
+    let mut camera = Camera::new(50.0, 0.3, far, canvas.aspect());
 
     log::info!("Kansei — Cascaded Shadows (WASM) ready: {} trees, cascades {csm}", trunks.len() / 4);
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, start_ms: now_secs(), frozen_t }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref start_ms, frozen_t } = *st;
-            let t = frozen_t.unwrap_or((now_secs() - *start_ms) as f32);
-            // walk down the path, looking along it and slightly toward the sun
-            let z = 8.0 - (t * 1.2) % 60.0;
-            camera.set_position(0.0, 1.7, z);
-            camera.look_at(&Vec3::new(4.0, 1.2, z - 20.0));
-            renderer.render_with_postprocessing(scene, camera, volume);
-        }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    let frozen_t: Option<f32> = kansei_wasm::param("t").and_then(|v| v.parse().ok());
+    kansei_wasm::run(&canvas, move |frame| {
+        frame.resize(&mut renderer, &mut camera);
+        let t = frozen_t.unwrap_or(frame.time as f32);
+        // walk down the path, looking along it and slightly toward the sun
+        let z = 8.0 - (t * 1.2) % 60.0;
+        camera.set_position(0.0, 1.7, z);
+        camera.look_at(&Vec3::new(4.0, 1.2, z - 20.0));
+        renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
+    });
     Ok(())
 }

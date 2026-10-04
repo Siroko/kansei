@@ -12,11 +12,8 @@
 //! in the fog's froxels).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use std::cell::RefCell;
-use std::rc::Rc;
 
-use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer};
+use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
 use kansei_core::culling::{frustum_planes, InstanceCulling};
 use kansei_core::froxels::FroxelGridOptions;
@@ -29,7 +26,8 @@ use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
     effects::{exposure_from_ev100, BloomEffect, BloomOptions, SpotScattering, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions},
 };
-use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::renderers::RendererConfig;
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 /// GGX surface lit by the spot lights plus a dim hemispherical night sky. `INSTANCE_INPUT` and
 /// `INSTANCE_OFFSET` are replaced for the instanced variant (a vec4 per trunk: xyz offset, w
@@ -128,50 +126,10 @@ fn hash(i: u32) -> f32 {
     (x % 10007) as f32 / 10007.0
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct Car {
     body: usize,
     lenses: [usize; 2],
     lights: [usize; 2],
-}
-
-struct State {
-    renderer: Renderer,
-    scene: Scene,
-    camera: Camera,
-    volume: PostProcessingVolume,
-    car: Car,
-    start_ms: f64,
-    frozen_t: Option<f32>,
-    cam: String,
-    drive: bool,
-    /// `cull=main`: (trunks, their buffer, scene index) to cull on the CPU against the camera.
-    cpu_cull: Option<(Vec<f32>, wgpu::Buffer, usize)>,
-    /// `stats=1`: CPU milliseconds spent in render_with_postprocessing, summed over a window.
-    stats: Option<(f64, u32)>,
-    /// `stats=1`: when the window started, for the frame interval (GPU-bound without vsync).
-    window_start: f64,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
 }
 
 /// Car position along Z: parked at the forest edge, or creeping forward and back with `drive=1`.
@@ -198,25 +156,9 @@ fn place_car(scene: &mut Scene, car: &Car, z: f32) {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
-    let shadows = query_param("shadows").as_deref() != Some("0");
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
+    let shadows = flag("shadows", true);
     if shadows {
         renderer.enable_spot_shadows(1024, 2);
     }
@@ -229,7 +171,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the forest: one instanced draw of unit trunks, everywhere but a small clearing around the
     // car, which stands at the forest edge with its lights into the trees
-    let cam = query_param("cam").unwrap_or_default();
+    let cam = param("cam").unwrap_or_default();
     // `cam=wall`: a corridor to a pale wall 20 m ahead, and a row of poles right by the lamps
     // that the camera (between them and the wall) doesn't see; their shadows on the wall show
     // that shadow casters are culled per light, not to the camera
@@ -265,7 +207,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     };
     // `cull=main` instead culls on the CPU against the camera only (as an app would): the bug
     // this avoids, where trunks leaving the frame stop casting shadows
-    let cull_main = query_param("cull").as_deref() == Some("main");
+    let cull_main = param("cull").as_deref() == Some("main");
     let instances = ComputeBuffer::from_external("Trunks", all_trunks.clone(), BufferType::Storage).with_vertex_vec4(3);
     let mut forest = Renderable::new(
         InstancedGeometry::new(BoxGeometry::new(0.35, 1.0, 0.35), count, vec![instances]),
@@ -295,7 +237,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // `lamps=N`: N small unshadowed downlights over the forest, in random colours (clustered
     // light culling keeps them cheap; `clusters=0` shades every pixel with every light)
-    let lamps: u32 = query_param("lamps").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let lamps: u32 = param_or("lamps", 0);
     for i in 0..lamps {
         let pos = Vec3::new(-30.0 + hash(i + 501) * 60.0, 2.5 + hash(i + 503) * 2.0, -70.0 + hash(i + 507) * 75.0);
         let hue = hash(i + 509) * 6.0;
@@ -305,10 +247,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         lamp.volumetric_scale = 0.0;
         scene.add(SceneNode::Light(Light::Spot(lamp)));
     }
-    renderer.set_clustered_lights(query_param("clusters").as_deref() != Some("0"));
+    renderer.set_clustered_lights(flag("clusters", true));
 
     // `casters=N`: N more renderables (one draw each), to measure per-draw CPU cost
-    let extra: u32 = query_param("casters").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let extra: u32 = param_or("casters", 0);
     for i in 0..extra {
         let mut post = Renderable::new(BoxGeometry::new(0.2, 2.0, 0.2), lit_material("Post", [0.3, 0.3, 0.3], 0.8, false));
         post.object.set_position(-3.0 + (i % 10) as f32 * 0.9, 1.0, -12.0 - (i / 10) as f32 * 1.5);
@@ -324,14 +266,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ToneMapEffect::new(options)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    if query_param("fog").as_deref() != Some("0") {
+    if flag("fog", true) {
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
             grid: FroxelGridOptions { near: 0.5, far: 150.0, grid_d: 96, temporal: true, ..Default::default() },
             base_density: 0.015,
             height_falloff: 0.05,
             anisotropy: 0.3,
             ambient: Vec3::new(0.25, 0.32, 0.45),
-            spot_scattering: match query_param("shafts").and_then(|v| v.parse().ok()) {
+            spot_scattering: match param("shafts").and_then(|v| v.trim().parse().ok()) {
                 Some(steps) if steps > 0 => SpotScattering::Raymarched { steps },
                 _ => SpotScattering::Froxels,
             },
@@ -342,88 +284,84 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     effects.push(Box::new(BloomEffect::new(BloomOptions { threshold: 0.0, intensity: 0.05, ..Default::default() }).with_exposure(tonemap.total_exposure())));
     effects.push(Box::new(tonemap));
-    let volume = PostProcessingVolume::new(&renderer, effects);
+    let mut volume = PostProcessingVolume::new(&renderer, effects);
 
-    let mut camera = Camera::new(40.0, 0.1, 400.0, width as f32 / height as f32);
+    let mut camera = Camera::new(40.0, 0.1, 400.0, canvas.aspect());
     camera.update_projection_matrix();
 
     log::info!("Kansei — Spot Lights (WASM) ready: {count} instanced trunks, shadows {shadows}");
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let drive = query_param("drive").as_deref() == Some("1");
+    let frozen_t: Option<f32> = param("t").and_then(|v| v.trim().parse().ok());
+    let drive = flag("drive", false);
+    // `cull=main`: (trunks, their buffer, scene index) to cull on the CPU against the camera
     let cpu_cull = cull_main.then(|| (trunks.clone(), all_trunks.clone(), forest));
-    let stats = (query_param("stats").as_deref() == Some("1")).then_some((0.0, 0));
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, car, start_ms: now_secs(), frozen_t, cam, drive, cpu_cull, stats, window_start: now_secs() }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref car, ref start_ms, frozen_t, ref cam, ref drive, ref cpu_cull, ref mut stats, ref mut window_start } = *st;
-            let clock = (now_secs() - *start_ms) as f32;
-            let t = frozen_t.unwrap_or(clock);
+    // `stats=1`: CPU milliseconds spent in render_with_postprocessing summed over a window, its
+    // frame count, and when it started (for the frame interval, GPU-bound without vsync)
+    let mut stats = flag("stats", false).then(|| (0.0f64, 0u32, kansei_wasm::now()));
+    kansei_wasm::run(&canvas, move |frame| {
+        frame.resize(&mut renderer, &mut camera);
+        let clock = frame.time as f32;
+        let t = frozen_t.unwrap_or(clock);
 
-            if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
-                fog.time = clock;
-            }
+        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+            fog.time = clock;
+        }
 
-            let z = car_z(t, *drive);
-            place_car(scene, car, z);
-            match cam.as_str() {
-                // high behind the car, looking down the beams into the forest
-                "behind" => {
-                    camera.set_position(1.75, 5.0, z + 10.0);
-                    camera.look_at(&Vec3::new(1.75, 1.0, z - 20.0));
-                }
-                // facing the wall, with the poles behind the camera
-                "wall" => {
-                    camera.set_position(1.75, 2.2, z - 9.0);
-                    camera.look_at(&Vec3::new(1.75, 2.0, z - 20.0));
-                }
-                // above the canopy, looking down on the beams through the trees
-                "top" => {
-                    camera.set_position(-10.0, 24.0, z + 6.0);
-                    camera.look_at(&Vec3::new(2.0, 0.0, z - 16.0));
-                }
-                // low, facing the lamps from inside the forest: glare, beams and the trunks'
-                // shadows radiating from the car
-                _ => {
-                    camera.set_position(-1.0, 1.8, z - 25.0);
-                    camera.look_at(&Vec3::new(1.75, 1.2, z));
-                }
+        let z = car_z(t, drive);
+        place_car(&mut scene, &car, z);
+        match cam.as_str() {
+            // high behind the car, looking down the beams into the forest
+            "behind" => {
+                camera.set_position(1.75, 5.0, z + 10.0);
+                camera.look_at(&Vec3::new(1.75, 1.0, z - 20.0));
             }
-
-            if let Some((all, buffer, forest)) = cpu_cull {
-                camera.update_view_matrix();
-                let planes = frustum_planes(camera.projection_matrix.to_glam() * camera.view_matrix.to_glam());
-                let visible: Vec<f32> = all
-                    .chunks_exact(4)
-                    .filter(|t| planes.iter().all(|p| p.x * t[0] + p.y * t[1] + p.z * t[2] + p.w >= -t[3] * 0.55))
-                    .flatten()
-                    .copied()
-                    .collect();
-                renderer.queue().write_buffer(buffer, 0, bytemuck::cast_slice(&visible));
-                if let Some(r) = scene.get_renderable_mut(*forest) {
-                    r.geometry.instance_count = visible.len() as u32 / 4;
-                }
-                renderer.invalidate_bundle();
+            // facing the wall, with the poles behind the camera
+            "wall" => {
+                camera.set_position(1.75, 2.2, z - 9.0);
+                camera.look_at(&Vec3::new(1.75, 2.0, z - 20.0));
             }
-            let before = now_secs();
-            renderer.render_with_postprocessing(scene, camera, volume);
-            if let Some((sum, frames)) = stats {
-                *sum += (now_secs() - before) * 1000.0;
-                *frames += 1;
-                if *frames == 240 {
-                    let interval = (now_secs() - *window_start) * 1000.0 / 240.0;
-                    log::info!("frame: {:.2} ms CPU in render_with_postprocessing, {interval:.2} ms between frames", *sum / 240.0);
-                    *sum = 0.0;
-                    *frames = 0;
-                    *window_start = now_secs();
-                }
+            // above the canopy, looking down on the beams through the trees
+            "top" => {
+                camera.set_position(-10.0, 24.0, z + 6.0);
+                camera.look_at(&Vec3::new(2.0, 0.0, z - 16.0));
+            }
+            // low, facing the lamps from inside the forest: glare, beams and the trunks'
+            // shadows radiating from the car
+            _ => {
+                camera.set_position(-1.0, 1.8, z - 25.0);
+                camera.look_at(&Vec3::new(1.75, 1.2, z));
             }
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+
+        if let Some((all, buffer, forest)) = &cpu_cull {
+            camera.update_view_matrix();
+            let planes = frustum_planes(camera.projection_matrix.to_glam() * camera.view_matrix.to_glam());
+            let visible: Vec<f32> = all
+                .chunks_exact(4)
+                .filter(|t| planes.iter().all(|p| p.x * t[0] + p.y * t[1] + p.z * t[2] + p.w >= -t[3] * 0.55))
+                .flatten()
+                .copied()
+                .collect();
+            renderer.queue().write_buffer(buffer, 0, bytemuck::cast_slice(&visible));
+            if let Some(r) = scene.get_renderable_mut(*forest) {
+                r.geometry.instance_count = visible.len() as u32 / 4;
+            }
+            renderer.invalidate_bundle();
+        }
+        let before = kansei_wasm::now();
+        renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
+        if let Some((sum, frames, window_start)) = stats.as_mut() {
+            let now = kansei_wasm::now();
+            *sum += (now - before) * 1000.0;
+            *frames += 1;
+            if *frames == 240 {
+                let interval = (now - *window_start) * 1000.0 / 240.0;
+                log::info!("frame: {:.2} ms CPU in render_with_postprocessing, {interval:.2} ms between frames", *sum / 240.0);
+                *sum = 0.0;
+                *frames = 0;
+                *window_start = now;
+            }
+        }
+    });
     Ok(())
 }

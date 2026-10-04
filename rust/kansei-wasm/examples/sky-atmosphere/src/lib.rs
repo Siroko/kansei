@@ -9,10 +9,7 @@
 
 mod display;
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::atmosphere::{
     direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SkyCaptureFog, CLOUD_SHADOW_WGSL, SKY_ENVIRONMENT_WGSL, SKY_LIGHTING_WGSL,
@@ -31,6 +28,7 @@ use kansei_core::postprocessing::effects::{
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 use display::DisplayEffect;
 
@@ -251,12 +249,6 @@ fn surface(label: &str, albedo: [f32; 3], sky: &SkyAtmosphere) -> Material {
     m
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct Settings {
     /// Fixed sun elevation, or None for a day cycle.
     elevation: Option<f32>,
@@ -267,21 +259,22 @@ struct Settings {
     ev: Option<f32>,
 }
 
-fn settings() -> (Settings, web_sys::UrlSearchParams) {
-    let search = web_sys::window().unwrap().location().search().unwrap_or_default();
-    let q = web_sys::UrlSearchParams::new_with_str(&search).unwrap();
-    let num = |k: &str| q.get(k).and_then(|v| v.parse::<f32>().ok());
+/// The query string's number for `name`, if it has one.
+fn num(name: &str) -> Option<f32> {
+    param(name).and_then(|v| v.trim().parse().ok())
+}
+
+fn settings() -> Settings {
     // preset=midsommar: the Unreal intro's light block (sun 2.5 degrees down, EV100 3.9)
-    let midsommar = q.get("preset").as_deref() == Some("midsommar");
-    let s = Settings {
+    let midsommar = param("preset").as_deref() == Some("midsommar");
+    Settings {
         elevation: num("elevation").or(midsommar.then_some(-2.5)),
         bearing: num("bearing").unwrap_or(140.0),
         look: num("look"),
         pitch: num("pitch").unwrap_or(6.0),
         height: num("height").unwrap_or(1.7),
         ev: num("ev").or(midsommar.then_some(3.9)),
-    };
-    (s, q)
+    }
 }
 
 /// EV100 for a sun elevation, keyed to the sky this atmosphere renders (EV100 = log2(L * 100 /
@@ -308,15 +301,6 @@ struct State {
     volume: PostProcessingVolume,
     sun_light: usize,
     settings: Settings,
-    start: f64,
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
 }
 
 impl State {
@@ -357,27 +341,21 @@ impl State {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = (canvas.client_width().max(1) as u32, canvas.client_height().max(1) as u32);
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_shadows(2048);
     let encode_srgb = !renderer.presentation_format().is_srgb();
 
-    let (settings, q) = settings();
+    let settings = settings();
     let mut sky = SkyAtmosphere::new(renderer.device(), SkyAtmosphereOptions::default());
     sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0);
-    if let Some(haze) = q.get("haze").and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(haze) = num("haze") {
         sky.params.mie_scattering_scale *= haze;
     }
-    if let Some(ozone) = q.get("ozone").and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(ozone) = num("ozone") {
         sky.params.other_absorption_scale *= ozone;
     }
-    if q.get("moon").is_some() {
+    if param("moon").is_some() {
         sky.moon.direction = direction_from_elevation_bearing(18.0, settings.bearing + 150.0);
         sky.moon.illuminance = Vec3::new(0.25, 0.25, 0.25);
     }
@@ -442,7 +420,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // gi=low|medium|high|ultra: screen-space global illumination (off by default), first in the
     // chain so the bounce lies on the surfaces under the aerial perspective
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = Vec::new();
-    let quality = match q.get("gi").as_deref() {
+    let quality = match param("gi").as_deref() {
         Some("low") => Some(GiQuality::Low),
         Some("medium") | Some("1") => Some(GiQuality::Medium),
         Some("high") => Some(GiQuality::High),
@@ -457,16 +435,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     effects.push(Box::new(AtmosphereEffect::new(&sky)));
     // clouds=<coverage 0..1> (clouds=0 none), cloudtype=<0 stratus .. 1 cumulus>, cloudbase=<m>,
     // cloudshadows=0 (no cloud shadows on the scene), cloudquality=low|medium|high
-    let clouds = q.get("clouds").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.45);
+    let clouds: f32 = param_or("clouds", 0.45);
     if clouds > 0.0 {
-        let num = |k: &str, d: f32| q.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
-        let base = num("cloudbase", 1500.0);
-        let layer = CloudLayer { coverage: clouds, cloud_type: num("cloudtype", 0.7), bottom_m: base, top_m: base + num("cloudthick", 2500.0), ..Default::default() };
+        let base: f32 = param_or("cloudbase", 1500.0);
+        let layer = CloudLayer { coverage: clouds, cloud_type: param_or("cloudtype", 0.7), bottom_m: base, top_m: base + param_or("cloudthick", 2500.0), ..Default::default() };
         let mut fx = VolumetricCloudsEffect::new(&sky, VolumetricCloudsOptions { layer, ..Default::default() });
         // cloudshadows=0: the clouds cast no shadows on the scene
-        fx.casts_shadows = q.get("cloudshadows").as_deref() != Some("0");
+        fx.casts_shadows = flag("cloudshadows", true);
         // cloudquality=low|medium|high
-        match q.get("cloudquality").as_deref() {
+        match param("cloudquality").as_deref() {
             Some("low") => fx.set_quality(CloudQuality::Low),
             Some("medium") => fx.set_quality(CloudQuality::Medium),
             Some("high") => fx.set_quality(CloudQuality::High),
@@ -474,7 +451,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         }
         effects.push(Box::new(fx));
     }
-    let midsommar = q.get("preset").as_deref() == Some("midsommar");
+    let midsommar = param("preset").as_deref() == Some("midsommar");
     if midsommar {
         // intro_scene.json's light block, as create_intro_scene.py applies it in Unreal
         sky.params.mie_scattering_scale = 0.003996 * 1.7; // haze
@@ -491,7 +468,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         // capturefog=1: the sky lighting and the reflections see the sky through this fog, as
         // Unreal's real-time sky-light capture does, from 6 m up; capturefog=ue also hides the lit
         // ground from the lighting below the horizon (Unreal's capture itself, without Lumen)
-        if let Some(mode) = q.get("capturefog").filter(|m| m != "0") {
+        if let Some(mode) = param("capturefog").filter(|m| m != "0") {
             sky.capture_fog = Some(SkyCaptureFog::from_height_fog(&height_fog, 6.0));
             sky.lighting_sees_ground = mode != "ue";
         }
@@ -510,8 +487,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         fog.set_shadow_map(renderer.shadow_map());
         effects.push(Box::new(fog));
     }
-    let fog_density = q.get("fog").and_then(|v| v.parse::<f32>().ok());
-    if !midsommar && (fog_density.is_some() || q.get("mist").is_some()) {
+    let fog_density = num("fog");
+    if !midsommar && (fog_density.is_some() || param("mist").is_some()) {
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
             grid: FroxelGridOptions { near: 1.0, far: 2500.0, temporal: true, blend_factor: 0.1, ..Default::default() },
             base_density: fog_density.unwrap_or(0.0),
@@ -522,9 +499,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         });
         fog.set_sky_lighting(Some(&sky.bindings().sky_lighting));
         fog.set_shadow_map(renderer.shadow_map());
-        if q.get("mist").is_some() {
+        if param("mist").is_some() {
             // mist lying in the clearing, thickest on the ground
-            let mut mist = if q.get("mist").as_deref() == Some("box") {
+            let mut mist = if param("mist").as_deref() == Some("box") {
                 LocalFogVolume::new_box(Vec3::new(0.0, 0.0, 0.0), Vec3::new(30.0, 5.0, 30.0))
             } else {
                 LocalFogVolume::new(Vec3::new(0.0, 0.0, 0.0), 60.0, 5.0)
@@ -539,20 +516,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     effects.push(Box::new(DisplayEffect::new(encode_srgb)));
     let volume = PostProcessingVolume::new(&renderer, effects);
-    let camera = Camera::new(62.0, 0.5, 60000.0, width as f32 / height as f32);
+    let camera = Camera::new(62.0, 0.5, 60000.0, canvas.aspect());
 
     log::info!("Kansei — Sky Atmosphere (WASM) ready, {:?}", renderer.presentation_format());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, sky, volume, sun_light, settings, start: now_secs() }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let t = (now_secs() - st.start) as f32;
-            st.frame(t);
-        }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    let mut state = State { renderer, scene, camera, sky, volume, sun_light, settings };
+    kansei_wasm::run(&canvas, move |frame| {
+        frame.resize(&mut state.renderer, &mut state.camera);
+        state.frame(frame.time as f32);
+    });
     Ok(())
 }

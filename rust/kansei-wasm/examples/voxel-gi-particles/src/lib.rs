@@ -25,7 +25,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler};
 use kansei_core::cameras::Camera;
@@ -36,6 +35,7 @@ use kansei_core::materials::{Binding, BindingResource, Compute, CullMode, Materi
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, is_phone, now, param, param_or, Canvas, Frame};
 use kansei_core::simulations::fluid::{FluidSimulation, FluidSimulationOptions};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,37 +329,10 @@ const PANEL_CONE_TAN: f32 = 0.4;
 const SKY_UP: f32 = 0.18;
 const SKY_DOWN: f32 = 0.05;
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
-}
-
 /// Toward the sun at `elevation` degrees up, `bearing` degrees from +z (the open front) toward +x.
 fn sun_direction(elevation: f32, bearing: f32) -> [f32; 3] {
     let (e, b) = (elevation.to_radians(), bearing.to_radians());
     [e.cos() * b.sin(), e.sin(), e.cos() * b.cos()]
-}
-
-fn is_phone() -> bool {
-    let agent = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
-    ["Mobi", "Android", "iPhone", "iPad"].iter().any(|k| agent.contains(k))
 }
 
 /// `count` particles on a jittered lattice filling `lo`..`hi`.
@@ -578,17 +551,15 @@ struct State {
     panel_intensity: f32,
     initial: Vec<f32>,
     sim_accumulator: f64,
-    last_time: f64,
     stats: Option<(f64, u32)>,
     frame_ms: f64,
     paused: bool,
 }
 
 impl State {
-    fn frame(&mut self) {
-        let now = now_ms();
-        let dt = ((now - self.last_time) * 0.001).clamp(0.0, 0.1);
-        self.last_time = now;
+    fn frame(&mut self, frame: &Frame) {
+        frame.resize(&mut self.renderer, &mut self.camera);
+        let dt = (frame.dt as f64).clamp(0.0, 0.1);
         self.frame_ms = self.frame_ms * 0.95 + dt * 1000.0 * 0.05;
 
         self.controls.update(&mut self.camera, 0.0);
@@ -628,8 +599,8 @@ impl State {
         if let Some((start, frames)) = &mut self.stats {
             *frames += 1;
             if *frames == 240 {
-                log::info!("frame interval {:.2} ms", (now_ms() - *start) / 240.0);
-                *start = now_ms();
+                log::info!("frame interval {:.2} ms", (now() - *start) * 1000.0 / 240.0);
+                *start = now();
                 *frames = 0;
             }
         }
@@ -691,32 +662,22 @@ fn with_state<F: FnOnce(&mut State)>(f: F) {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let window = web_sys::window().unwrap();
-    let canvas = window
-        .document()
-        .unwrap()
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width().max(1) as u32;
-    let height = canvas.client_height().max(1) as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
+    let page = Canvas::find(canvas_id)?;
+    let canvas = page.element();
 
-    let look = if query_param("scene").as_deref() == Some("cornell") { Look::Cornell } else { Look::Lightbox };
+    let look = if param("scene").as_deref() == Some("cornell") { Look::Cornell } else { Look::Lightbox };
     let lightbox = look == Look::Lightbox;
     let clear_color = if lightbox { Vec4::new(0.0, 0.0, 0.0, 1.0) } else { Vec4::new(0.32, 0.42, 0.6, 1.0) };
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 4, clear_color, ..Default::default() });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let mut renderer = page.renderer(RendererConfig { sample_count: 4, clear_color, ..Default::default() }).await;
 
     let phone = is_phone();
-    let quality = query_param("quality").as_deref().and_then(VoxelGiQuality::from_name).unwrap_or(if phone { VoxelGiQuality::Low } else { VoxelGiQuality::Medium });
-    let rt = lightbox && query_param("rt").as_deref() == Some("on");
+    let quality = param("quality").as_deref().and_then(VoxelGiQuality::from_name).unwrap_or(if phone { VoxelGiQuality::Low } else { VoxelGiQuality::Medium });
+    let rt = lightbox && flag("rt", false);
     // ray traced, fewer and larger, as in the article's bonus
     let default_count = (if rt { 8_192 } else if lightbox { 12_288 } else { 32_768 }) / (if phone { 2 } else { 1 });
-    let count: usize = query_param("particles").and_then(|v| v.parse().ok()).unwrap_or(default_count).clamp(1024, 262_144);
-    let gi_on = query_param("gi").as_deref() != Some("off");
-    let indirect = query_param("view").as_deref() == Some("indirect");
+    let count: usize = param_or("particles", default_count).clamp(1024, 262_144);
+    let gi_on = flag("gi", true);
+    let indirect = param("view").as_deref() == Some("indirect");
     let (room_min, room_max) = look.room();
     let wall = look.wall();
 
@@ -947,27 +908,27 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         particles.push((scene.add(SceneNode::Renderable(Renderable::new(instances, material))), false));
     }
 
-    let mut camera = Camera::new(40.0, 0.5, 600.0, width as f32 / height as f32);
+    let aspect = page.aspect();
+    let mut camera = Camera::new(40.0, 0.5, 600.0, aspect);
     camera.update_projection_matrix();
     // far enough that the room fits across a portrait screen too
-    let aspect = width as f32 / height as f32;
     let fit = (1.6 / aspect).max(1.0);
     let mut controls = if lightbox {
         // straight on, a little low, with the reflection under the box in view
-        let mut c = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 5.0, 0.0), 37.0 * fit).with_mouse_pan(&canvas);
+        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 5.0, 0.0), 37.0 * fit).with_mouse_pan(canvas);
         c.set_elevation(0.04);
         c
     } else {
-        let mut c = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(&canvas);
+        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(canvas);
         c.set_elevation(0.45);
         c.set_azimuth(0.18);
         c
     };
     controls.update(&mut camera, 0.0);
-    let mouse = MouseVectors::from_canvas(&canvas);
+    let mouse = MouseVectors::from_canvas(canvas);
 
-    let stats = (query_param("stats").as_deref() == Some("1")).then(|| (now_ms(), 0));
-    if query_param("profile").as_deref() == Some("1") {
+    let stats = flag("stats", false).then(|| (now(), 0));
+    if flag("profile", false) {
         renderer.set_profiling(true);
     }
     let mut state = State {
@@ -989,7 +950,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         panel_intensity: 1.0,
         initial,
         sim_accumulator: 0.0,
-        last_time: now_ms(),
         stats,
         frame_ms: 16.7,
         paused: false,
@@ -998,13 +958,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let state = Rc::new(RefCell::new(state));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        state.borrow_mut().frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&page, move |frame| state.borrow_mut().frame(frame));
     Ok(())
 }
 

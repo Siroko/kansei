@@ -39,7 +39,6 @@
 //! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -58,6 +57,7 @@ use kansei_core::postprocessing::{
     effects::{exposure_from_ev100, GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, Canvas, Frame};
 
 /// A diffuse surface lit by the spot lights only (no ambient), writing the normal and albedo the
 /// global illumination reads (GBuffer targets 2 and 3).
@@ -284,12 +284,6 @@ fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>) -> 
     material.set_uniform_bindable(0, label, &[base_color[0], base_color[1], base_color[2], 1.0f32]);
     bind_sdf(&mut material, sdf);
     material
-}
-
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
 }
 
 /// The global illumination asked for (`gi=`).
@@ -565,7 +559,6 @@ struct State {
     tall_rest: (Vec3, f32),
     dragon_rest: (Vec3, f32),
     time: f32,
-    last_ms: f64,
     stats: Option<Stats>,
 }
 
@@ -589,27 +582,6 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     let state = STATE.with(|s| s.borrow().clone())?;
     let mut st = state.borrow_mut();
     Some(f(&mut st))
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-fn is_phone() -> bool {
-    let agent = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
-    ["Mobi", "Android", "iPhone", "iPad"].iter().any(|k| agent.contains(k))
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
 }
 
 fn default_voxels(phone: bool) -> VoxelGiQuality {
@@ -649,36 +621,36 @@ fn config_from_url(phone: bool) -> Config {
         direct_sdf: false,
         slice: 0.6,
     };
-    if let Some(preset) = query_param("preset").or_else(|| query_param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
+    if let Some(preset) = param("preset").or_else(|| param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
     }
-    if let Some(gi) = query_param("gi").as_deref().and_then(Gi::from_name) {
+    if let Some(gi) = param("gi").as_deref().and_then(Gi::from_name) {
         c.gi = gi;
     }
-    if let Some(q) = query_param("voxels").as_deref().and_then(VoxelGiQuality::from_name) {
+    if let Some(q) = param("voxels").as_deref().and_then(VoxelGiQuality::from_name) {
         c.voxels = q;
     }
-    if let Some(view) = query_param("view").as_deref().and_then(View::from_name) {
+    if let Some(view) = param("view").as_deref().and_then(View::from_name) {
         c.view = view;
     }
-    if let Some(dragon) = query_param("dragon").as_deref().and_then(Dragon::from_name) {
+    if let Some(dragon) = param("dragon").as_deref().and_then(Dragon::from_name) {
         c.dragon = dragon;
     }
-    c.animate = query_param("animate").map_or(c.animate, |v| v == "1" || v == "on" || v == "true");
-    if let Some(ao) = query_param("sdf_ao").and_then(|v| v.parse::<f32>().ok()) {
+    c.animate = param("animate").map_or(c.animate, |v| v == "1" || v == "on" || v == "true");
+    if let Some(ao) = param("sdf_ao").and_then(|v| v.parse::<f32>().ok()) {
         c.sdf_ao = ao.clamp(0.0, 1.0);
     }
-    if let Some(shadows) = query_param("sdf_shadows").as_deref().and_then(sdf_shadows_from_name) {
+    if let Some(shadows) = param("sdf_shadows").as_deref().and_then(sdf_shadows_from_name) {
         c.sdf_shadows = shadows;
     }
-    if let Some(direct) = query_param("shadows") {
+    if let Some(direct) = param("shadows") {
         c.direct_sdf = direct == "sdf";
     }
-    if let Some(slice) = query_param("slice").and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(slice) = param("slice").and_then(|v| v.parse::<f32>().ok()) {
         c.slice = slice;
     }
-    c.rug = query_param("rug").as_deref() != Some("off");
-    c.textured = query_param("albedo").as_deref() != Some("constant");
+    c.rug = param("rug").as_deref() != Some("off");
+    c.textured = param("albedo").as_deref() != Some("constant");
     c
 }
 
@@ -718,28 +690,16 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool) -> Vec<Box<d
     effects
 }
 
-/// Fetch `url`'s bytes.
-async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
-    let window = web_sys::window()?;
-    let resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.ok()?;
-    let resp: web_sys::Response = resp.dyn_into().ok()?;
-    if !resp.ok() {
-        return None;
-    }
-    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
-    Some(js_sys::Uint8Array::new(&buf).to_vec())
-}
-
 /// A Stanford dragon from `www/assets` as one geometry about 1.1 m long, standing on y = 0 and
 /// centred on its origin, its parts merged with their glTF transforms baked in (None if it can't
 /// be loaded).
 async fn load_dragon(model: Dragon) -> Option<kansei_core::geometries::Geometry> {
     let result = match model {
         Dragon::Off => return None,
-        Dragon::Light => GLTFLoader::load_glb(&fetch_bytes("assets/stanford_dragon_pbr.glb").await?).ok()?,
+        Dragon::Light => GLTFLoader::load_glb(&fetch_bytes("assets/stanford_dragon_pbr.glb").await.ok()?).ok()?,
         Dragon::Full => {
-            let json = fetch_bytes("assets/scene.gltf").await?;
-            let bin = fetch_bytes("assets/scene.bin").await?;
+            let json = fetch_bytes("assets/scene.gltf").await.ok()?;
+            let bin = fetch_bytes("assets/scene.bin").await.ok()?;
             GLTFLoader::load_gltf_with_buffers(&json, vec![bin]).ok()?
         }
     };
@@ -862,10 +822,10 @@ impl State {
         self.config.dragon.slot().and_then(|slot| self.dragons[slot]).unwrap_or(self.tall)
     }
 
-    fn frame(&mut self) {
-        let now = now_ms();
-        let dt = ((now - self.last_ms) / 1000.0).clamp(0.0, 0.1) as f32;
-        self.last_ms = now;
+    fn frame(&mut self, frame: &Frame) {
+        frame.resize(&mut self.renderer, &mut self.camera);
+        let now = now() * 1000.0;
+        let dt = frame.dt.clamp(0.0, 0.1);
         if self.config.animate {
             self.time += dt;
             let animated = self.animated();
@@ -957,24 +917,8 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_spot_shadows(2048, 1);
     let phone = is_phone();
     let config = config_from_url(phone);
@@ -1031,12 +975,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     lamp.volumetric_scale = 0.0;
     scene.add(SceneNode::Light(Light::Spot(lamp)));
 
-    let camera = Camera::new(38.0, 0.1, 100.0, width as f32 / height as f32);
-    let (_, target, distance, azimuth, elevation) = CAMERAS.iter().find(|c| Some(c.0) == query_param("cam").as_deref()).copied().unwrap_or(CAMERAS[0]);
-    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(target[0], target[1], target[2]), distance).with_mouse_pan(&canvas);
+    let camera = Camera::new(38.0, 0.1, 100.0, canvas.aspect());
+    let (_, target, distance, azimuth, elevation) = CAMERAS.iter().find(|c| Some(c.0) == param("cam").as_deref()).copied().unwrap_or(CAMERAS[0]);
+    let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(target[0], target[1], target[2]), distance).with_mouse_pan(canvas.element());
     controls.set_view(Vec3::new(target[0], target[1], target[2]), distance, azimuth, elevation);
 
-    let stats = (query_param("stats").as_deref() == Some("1")).then(|| Stats { since: now_ms(), ..Default::default() });
+    let stats = flag("stats", false).then(|| Stats { since: now() * 1000.0, ..Default::default() });
     if stats.is_some() {
         renderer.set_profiling(true);
     }
@@ -1059,7 +1003,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         tall_rest,
         dragon_rest,
         time: 0.0,
-        last_ms: now_ms(),
         stats,
     };
     state.apply(config);
@@ -1067,13 +1010,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let state = Rc::new(RefCell::new(state));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        state.borrow_mut().frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&canvas, move |frame| state.borrow_mut().frame(frame));
     Ok(())
 }
 
@@ -1207,6 +1144,6 @@ pub fn set_slice(height: f32) {
 pub fn set_stats(on: bool) {
     with_state(|s| {
         s.renderer.set_profiling(on);
-        s.stats = on.then(|| Stats { since: now_ms(), ..Default::default() });
+        s.stats = on.then(|| Stats { since: now() * 1000.0, ..Default::default() });
     });
 }

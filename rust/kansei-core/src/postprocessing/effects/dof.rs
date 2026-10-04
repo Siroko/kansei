@@ -460,7 +460,14 @@ impl DepthOfFieldEffect {
 
 impl PostProcessingEffect for DepthOfFieldEffect {
     fn initialize(&mut self, device: &wgpu::Device, gbuffer: &GBuffer, _camera: &Camera) {
-        if self.initialized { return; }
+        if self.initialized {
+            // the volume initializes every frame: after a resize, rebuild the size-dependent
+            // textures (and with them the bind groups)
+            if (self.width, self.height) != (gbuffer.width, gbuffer.height) {
+                self.create_textures(device, gbuffer.width, gbuffer.height);
+            }
+            return;
+        }
 
         let (coc_bgl, dilate_bgl, downsample_bgl, blur_bgl, composite_bgl) =
             Self::create_bind_group_layouts(device);
@@ -629,9 +636,7 @@ impl PostProcessingEffect for DepthOfFieldEffect {
 
     fn resize(&mut self, width: u32, height: u32, _gbuffer: &GBuffer) {
         if width != self.width || height != self.height {
-            // Textures will be lazily recreated. For now, just mark as needing rebuild.
-            // We can't create textures here because we don't have the device.
-            // The volume calls initialize() again after resize if needed.
+            // no device here: the next initialize() rebuilds the textures at the new size
             self.width = 0;
             self.height = 0;
         }
