@@ -10,10 +10,15 @@
 // bounces alone it would leave those directions dark: the voxels' light from the same share of
 // the hemisphere, (1 - open) * E_voxels, is the least the screen's part gives.
 //
+// With probes (gi::SdfProbes, `probes`), the far field is their irradiance at each pixel
+// (`kansei_gi_irradiance`), in place of the traced cones: the same split, with the probes as the
+// scene representation.
+//
 // The voxels' irradiance holds the sky they see past the volume, so with the sky's lighting
 // bound the material's own sky ambient (albedo / pi times the sky's irradiance around its normal)
 // is taken out, `ambient` times: it is what the GI replaces. The debug views show the GI alone, or
-// the volume's mip 0 as the camera sees it (the voxelized scene and its light).
+// the volume's mip 0 as the camera sees it (the voxelized scene and its light), a slice of the
+// distance field, or the probes.
 
 @group(0) @binding(0) var<uniform> gp : VoxelGiParams;
 @group(0) @binding(1) var colorTex  : texture_2d<f32>;
@@ -29,6 +34,71 @@
 @group(0) @binding(11) var linearClamp : sampler;
 // the scene's distance field (gi::JumpFloodSdf; a 1-texel stand-in without one)
 @group(0) @binding(12) var sdfTex : texture_3d<f32>;
+// the probes (gi::SdfProbes; 1-element stand-ins without them), for probe_irradiance.wgsl
+@group(0) @binding(13) var<uniform> kansei_probe_grid : ProbeGrid;
+@group(0) @binding(14) var<storage, read> kansei_probe_sh : array<vec4f>;
+@group(0) @binding(15) var<storage, read> kansei_probe_state : array<vec4f>;
+@group(0) @binding(16) var<storage, read> kansei_probe_depth : array<vec2f>;
+
+// The probes as small balls on the camera ray through `uv`, each a white diffuse ball lit by its
+// own irradiance (E / pi toward each of its normals, so its SH shows), dark red where a probe is
+// left out; a = 0 where the ray meets none before `sceneDist`. The ray walks the grid's cells (one
+// around each probe; Amanatides and Woo) and tests each cell's probe.
+fn probeBalls(uv: vec2f, sceneDist: f32) -> vec4f {
+    let grid = kansei_probe_grid;
+    let eye = (gp.invView * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+    let far = (gp.invView * vec4f(gpViewPos(uv, 1.0), 1.0)).xyz;
+    let dir = normalize(far - eye);
+    let lo = grid.origin - 0.5 * grid.spacing;
+    let hi = lo + vec3f(grid.dims) * grid.spacing;
+    let inv = 1.0 / select(dir, vec3f(1e-8), abs(dir) < vec3f(1e-8));
+    let t0 = (lo - eye) * inv;
+    let t1 = (hi - eye) * inv;
+    let enter = max(max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z)), 0.0);
+    let exit = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    if (enter >= exit) { return vec4f(0.0); }
+    let start = eye + dir * (enter + 1e-4);
+    var cell = clamp(vec3i(floor((start - lo) / grid.spacing)), vec3i(0), vec3i(grid.dims) - 1);
+    let stepDir = vec3i(select(vec3f(-1.0), vec3f(1.0), dir >= vec3f(0.0)));
+    let delta = abs(grid.spacing * inv);
+    var next = (lo + (vec3f(cell) + select(vec3f(0.0), vec3f(1.0), dir >= vec3f(0.0))) * grid.spacing - eye) * inv;
+    let radius = 0.12 * grid.spacing;
+    var best = min(sceneDist, exit);
+    var color = vec4f(0.0);
+    let cells = grid.dims.x + grid.dims.y + grid.dims.z;
+    for (var i = 0u; i < cells; i++) {
+        let slot = probeSlot(grid, grid.base + cell);
+        let state = kansei_probe_state[2u * slot];
+        let center = grid.origin + vec3f(cell) * grid.spacing + state.xyz;
+        let oc = eye - center;
+        let b = dot(oc, dir);
+        let h = b * b - (dot(oc, oc) - radius * radius);
+        if (h >= 0.0) {
+            let t = -b - sqrt(h);
+            if (t > 0.0 && t < best) {
+                best = t;
+                let n = normalize(eye + dir * t - center);
+                let lit = kanseiProbeShIrradiance(slot, n) / 3.14159265;
+                color = vec4f(select(lit, vec3f(8.0, 0.4, 0.3), state.w > grid.backfaceLimit), 1.0);
+            }
+        }
+        // past this cell's far side, the later cells' balls lie farther than the one found
+        let leave = min(min(next.x, next.y), next.z);
+        if (color.a > 0.0 && best <= leave) { break; }
+        if (next.x <= next.y && next.x <= next.z) {
+            cell.x += stepDir.x;
+            next.x += delta.x;
+        } else if (next.y <= next.z) {
+            cell.y += stepDir.y;
+            next.y += delta.y;
+        } else {
+            cell.z += stepDir.z;
+            next.z += delta.z;
+        }
+        if (any(cell < vec3i(0)) || any(cell >= vec3i(grid.dims))) { break; }
+    }
+    return color;
+}
 
 // The distance field on the horizontal plane at the debug slice's height, where the camera ray
 // through `uv` meets it: bands every 10 cm, darker toward the surfaces, red inside them, as scene
@@ -143,6 +213,56 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     // the distance field's contact occlusion, which the coarse cones and the screen miss
     if (gp.hasSdf != 0u && gp.sdfAo > 0.0 && n.w > 0.0) {
         let world = (gp.invView * vec4f(gpViewPos(uv, depth), 1.0)).xyz;
+        e *= mix(1.0, sdfAo(vol, sdfTex, linearClamp, world, n.xyz), gp.sdfAo);
+    }
+    let bounce = albedo * e * (gp.intensity / 3.14159265);
+    if (gp.debug != 0u) {
+        textureStore(outTex, gid.xy, vec4f(bounce, color.a));
+        return;
+    }
+    var result = color.rgb + bounce;
+    if (gp.hasSky != 0u && gp.ambient > 0.0 && n.w > 0.0) {
+        result = max(result - albedo * skyIrradiance(sky, n.xyz) / 3.14159265 * gp.ambient, vec3f(0.0));
+    }
+    textureStore(outTex, gid.xy, vec4f(result, color.a));
+}
+
+// The composite with the probes as the far field (`VoxelGIEffect::set_probes`): main's, with each
+// pixel's irradiance from the probes around it in place of the traced cones, and the probes' debug
+// view (the voxels and the slice views run main). A separate entry point, so main's code (and what
+// it outputs) stays as it was.
+@compute @workgroup_size(8, 8)
+fn main_probes(@builtin(global_invocation_id) gid : vec3u) {
+    if (any(vec2f(gid.xy) >= gp.fullSize)) { return; }
+    let color = textureLoad(colorTex, gid.xy, 0);
+    let px = vec2i(gid.xy);
+    let uv = (vec2f(gid.xy) + 0.5) / gp.fullSize;
+    let depth = gpDepth(px);
+    if (gp.debug == 4u) {
+        // the probes over the lit scene (without its GI)
+        var sceneDist = 1e30;
+        if (depth < 1.0) { sceneDist = length(gpViewPos(uv, depth)); }
+        let ball = probeBalls(uv, sceneDist);
+        textureStore(outTex, gid.xy, vec4f(select(color.rgb, ball.rgb, ball.a > 0.0), color.a));
+        return;
+    }
+    let albedo = textureLoad(albedoTex, px, 0).rgb;
+    if (depth >= 1.0 || all(albedo <= vec3f(0.0))) {
+        textureStore(outTex, gid.xy, select(color, vec4f(0.0, 0.0, 0.0, color.a), gp.debug != 0u));
+        return;
+    }
+    let view = gpViewPos(uv, depth);
+    let ns = surfaceNormal(px, view);
+    let world = (gp.invView * vec4f(view, 1.0)).xyz;
+    // the lookup moved off the surface toward the viewer as well as along the normal (DDGI)
+    let toEye = normalize((gp.invView * vec4f(-view, 0.0)).xyz);
+    var e = kanseiProbeIrradiance(world, ns, ns * 0.4 + toEye * 0.6);
+    if (gp.nearField != 0u) {
+        let near = upsample(nearTex, gp.nearSize, uv, -view.z);
+        e = max(near.rgb, (1.0 - near.a) * e) + near.a * e;
+    }
+    let n = gpWorldNormal(px);
+    if (gp.hasSdf != 0u && gp.sdfAo > 0.0 && n.w > 0.0) {
         e *= mix(1.0, sdfAo(vol, sdfTex, linearClamp, world, n.xyz), gp.sdfAo);
     }
     let bounce = albedo * e * (gp.intensity / 3.14159265);

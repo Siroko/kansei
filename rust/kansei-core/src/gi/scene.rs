@@ -1,5 +1,6 @@
 use super::cones::gradient_sky_lighting;
 use super::inject::{RadianceInjection, SceneGiSettings};
+use super::probes::{SdfProbeOptions, SdfProbes};
 use super::sdf::{JumpFloodSdf, SdfSeeds};
 use super::voxelize::{MeshVoxelizer, SURFACE_WORDS_PER_VOXEL};
 use super::volume::{VoxelGiQuality, VoxelVolume};
@@ -38,7 +39,8 @@ impl Default for SceneVoxelGiOptions {
 /// 3. the volume's mips are rebuilt.
 ///
 /// Read it with `gi::VoxelGIEffect` (screen-space cones), or with `VOXEL_CONES_WGSL` from
-/// any pass or material.
+/// any pass or material. Optionally it keeps a distance field of the voxels (`enable_sdf`) and
+/// irradiance probes traced in it (`enable_probes`), updated after the mips.
 pub struct SceneVoxelGi {
     pub settings: SceneGiSettings,
     quality: VoxelGiQuality,
@@ -46,7 +48,10 @@ pub struct SceneVoxelGi {
     voxelizer: MeshVoxelizer,
     pub(crate) injection: RadianceInjection,
     sky: wgpu::Buffer,
+    /// The sky the volume's light sees past it: `sky`, or the one `use_sky_lighting` gave.
+    sky_source: wgpu::Buffer,
     sdf: Option<JumpFloodSdf>,
+    probes: Option<SdfProbes>,
     /// The field's static seeds must flood again (it was just made).
     sdf_stale: bool,
     device: wgpu::Device,
@@ -68,7 +73,7 @@ impl SceneVoxelGi {
         });
         let injection = RadianceInjection::new(device, &volume, &sky);
         let settings = SceneGiSettings { bounce_steps: quality.cone_steps() / 2, ..Default::default() };
-        Self { settings, quality, volume, voxelizer, injection, sky, sdf: None, sdf_stale: false, device: device.clone() }
+        Self { settings, quality, volume, voxelizer, injection, sky_source: sky.clone(), sky, sdf: None, probes: None, sdf_stale: false, device: device.clone() }
     }
 
     /// The tier in use (the one asked for, or lower if the device could not hold it).
@@ -105,14 +110,16 @@ impl SceneVoxelGi {
     /// `SkyAtmosphereBindings::sky_lighting`) instead of the gradient.
     pub fn use_sky_lighting(&mut self, sky_lighting: &wgpu::Buffer) {
         self.injection.set_sky(sky_lighting);
+        self.sky_source = sky_lighting.clone();
     }
 
     /// Bytes on the GPU: the radiance with its mips (and anisotropic chains), the surface
-    /// buffers and the distance field.
+    /// buffers, the distance field and the probes.
     pub fn memory_bytes(&self) -> u64 {
         let layout = self.volume.layout();
         let surfaces = 1 + self.voxelizer.dynamic_surfaces().is_some() as u64;
         layout.radiance_bytes() + self.volume.anisotropic_bytes() + surfaces * layout.voxel_count() * SURFACE_WORDS_PER_VOXEL * 4 + self.sdf.as_ref().map_or(0, |s| s.memory_bytes())
+            + self.probes.as_ref().map_or(0, |p| p.memory_bytes())
     }
 
     /// Keep a distance field of the voxelized surfaces (`JumpFloodSdf`, over the volume's
@@ -127,8 +134,35 @@ impl SceneVoxelGi {
         }
     }
 
+    /// Drop the distance field, and the probes traced in it.
     pub fn disable_sdf(&mut self) {
         self.sdf = None;
+        self.probes = None;
+    }
+
+    /// Keep irradiance probes traced in the distance field (`SdfProbes`; it enables the field):
+    /// updated each frame after the volume is lit, following the camera. Read them with
+    /// `VoxelGIEffect::set_probes` or a material's `PROBES_WGSL`. Calling it again with other
+    /// options builds them anew.
+    pub fn enable_probes(&mut self, options: SdfProbeOptions) {
+        self.enable_sdf();
+        if self.probes.as_ref().is_none_or(|p| p.options != options) {
+            self.probes = Some(SdfProbes::new(&self.device, &self.volume, options));
+        }
+    }
+
+    pub fn disable_probes(&mut self) {
+        self.probes = None;
+    }
+
+    /// The probes, if enabled.
+    pub fn probes(&self) -> Option<&SdfProbes> {
+        self.probes.as_ref()
+    }
+
+    /// The probes, to change their options between frames.
+    pub fn probes_mut(&mut self) -> Option<&mut SdfProbes> {
+        self.probes.as_mut()
     }
 
     /// The distance field, if enabled.
@@ -161,5 +195,11 @@ impl SceneVoxelGi {
     pub(crate) fn encode_lighting(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
         self.injection.encode(device, queue, encoder, &self.volume, &self.voxelizer, self.sdf.as_ref(), &self.settings);
         self.volume.build_mips(encoder);
+    }
+
+    /// Record the probes' update (after the lighting), the grid around `eye`.
+    pub(crate) fn encode_probes(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, eye: Option<[f32; 3]>) {
+        let (Some(probes), Some(sdf)) = (self.probes.as_mut(), self.sdf.as_ref()) else { return };
+        probes.encode(device, queue, encoder, &self.volume, sdf, &self.voxelizer, &self.sky_source, eye);
     }
 }

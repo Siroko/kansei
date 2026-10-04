@@ -78,10 +78,10 @@
         const custom = (f) => (e) => { if (e.last !== false) { p.preset = ''; } f(e); sync(); };
         pane.addBinding(p, 'gi', {
             label: 'GI',
-            options: { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi' },
+            options: { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi', probes: 'probes', 'probes + SSGI': 'probes+ssgi' },
         }).on('change', custom(() => set_gi(p.gi)));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
-        pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf' } }).on('change', custom(() => set_view(p.view)));
+        pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf', 'probes (debug)': 'probes' } }).on('change', custom(() => set_view(p.view)));
         pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low' } }).on('change', () => set_camera(p.camera));
         const sdf = pane.addFolder({ title: 'Distance field' });
         sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
@@ -105,7 +105,7 @@
                 `${(i.triangles / 1000).toFixed(1)}k triangles${i.dragon !== 'off' ? ` (dragon ${i.dragon})` : ''}${i.animate ? ', animated' : ''}\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `voxel GI: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, mips ${i.mips_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
-                `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + '\n' + top;
+                `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' + top;
         }, 500);
     </script>
 </body>
