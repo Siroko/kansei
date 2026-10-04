@@ -1,0 +1,5 @@
+{
+  "commit": "bf645521aad06a747faa9443277b954d89a52743",
+  "rust_tree": "37d6db8f73346df16b5a083c6583bb49ff2c843c",
+  "examples": ["cascaded-shadows", "cluster-lod", "depth-of-field", "film-look", "fluid", "fluid_clock", "gi-box", "impostors", "instanced-cubes", "ktx2-texture", "lit-scene", "occlusion-culling", "pathtracer", "planar-reflection", "postprocess-scene", "shadow-scene", "sky-atmosphere", "spinning-box", "spot-lights", "steering_text", "taa", "volumetric-fog", "voxel-gi-particles", "motion-matching"]
+}

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <base href="/examples/volumetric-fog/">
+    <meta charset="utf-8">
+    <title>Kansei — Volumetric Fog</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        import init, { start } from './pkg/kansei_wasm_volumetric_fog.js';
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>
