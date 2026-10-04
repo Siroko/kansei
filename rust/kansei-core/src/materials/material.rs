@@ -43,6 +43,13 @@ pub struct MaterialOptions {
     /// pass that keeps only that output. Without it, TAA reprojects the material's pixels by
     /// depth, which only follows the camera (fine for static things).
     pub outputs_velocity: bool,
+    /// Fragment entry point for voxel GI's mesh voxelizer (`gi::MeshVoxelizer`), for a surface
+    /// whose albedo or emission varies, such as a textured one: it takes the material's vertex
+    /// outputs and the `front_facing` builtin and calls `kansei_voxel_write` from
+    /// `gi::VOXEL_WRITE_WGSL` (prepend it to the shader) with what the surface reflects and
+    /// emits there. Group 3 is the voxelizer's in that pass, so it must not read the shadow
+    /// group. `None` voxelizes with the renderable's constant `GiSurface`.
+    pub voxel_fragment_entry: Option<&'static str>,
 }
 
 impl Default for MaterialOptions {
@@ -57,6 +64,7 @@ impl Default for MaterialOptions {
             mrt_output_count: None,
             shadow_fragment_entry: None,
             outputs_velocity: false,
+            voxel_fragment_entry: None,
         }
     }
 }
@@ -106,6 +114,10 @@ pub struct Material {
     pub(crate) depth_pipeline_cache: HashMap<DepthPipelineKey, wgpu::RenderPipeline>,
     /// Velocity-pass pipelines by vertex-buffer count.
     pub(crate) velocity_pipeline_cache: HashMap<usize, wgpu::RenderPipeline>,
+    /// Voxel GI's voxelization pipelines (`get_voxel_pipeline`) by voxelizer and vertex-buffer
+    /// count, and their layout (for one voxelizer).
+    pub(crate) voxel_pipeline_cache: HashMap<(u64, usize), wgpu::RenderPipeline>,
+    voxel_pipeline_layout: Option<(u64, wgpu::PipelineLayout)>,
     /// Cluster pipelines (`get_cluster_pipeline`), keyed with no vertex buffers.
     pub(crate) cluster_pipeline_cache: HashMap<PipelineKey, wgpu::RenderPipeline>,
     /// The cluster stage's module for the instance layout it was made for, or why there is none.
@@ -137,6 +149,8 @@ impl Material {
             pipeline_cache: HashMap::new(),
             depth_pipeline_cache: HashMap::new(),
             velocity_pipeline_cache: HashMap::new(),
+            voxel_pipeline_cache: HashMap::new(),
+            voxel_pipeline_layout: None,
             cluster_pipeline_cache: HashMap::new(),
             cluster_module: None,
             cluster_pipeline_layout: None,
@@ -527,6 +541,60 @@ impl Material {
             multiview: None,
             cache: None,
         })
+    }
+
+    /// Get or create the pipeline voxel GI's mesh voxelizer draws this material with: its own
+    /// `vertex_main`, and its `voxel_fragment_entry` or else `engine_fragment` (the voxelizer's
+    /// `voxel_fragment`), with `voxel_bgl` as group 3, no culling and no depth, into a
+    /// `sample_count`-sample `target` whose writes are masked off (a render pass needs an
+    /// attachment; the fragments write the voxels through storage atomics). `voxelizer` tells
+    /// voxelizers (each with its own group 3 layout) apart.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_voxel_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        shared: &SharedLayouts,
+        voxelizer: u64,
+        vertex_layouts: &[wgpu::VertexBufferLayout],
+        voxel_bgl: &wgpu::BindGroupLayout,
+        engine_fragment: &wgpu::ShaderModule,
+        target: wgpu::TextureFormat,
+        sample_count: u32,
+    ) -> &wgpu::RenderPipeline {
+        assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
+        let key = (voxelizer, vertex_layouts.len());
+        if !self.voxel_pipeline_cache.contains_key(&key) {
+            if self.voxel_pipeline_layout.as_ref().is_none_or(|(v, _)| *v != voxelizer) {
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(&format!("{}/VoxelPipelineLayout", self.label)),
+                    bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.mesh_bgl, voxel_bgl],
+                    push_constant_ranges: &[],
+                });
+                self.voxel_pipeline_layout = Some((voxelizer, layout));
+                self.voxel_pipeline_cache.retain(|(v, _), _| *v == voxelizer);
+            }
+            let layout = &self.voxel_pipeline_layout.as_ref().unwrap().1;
+            let module = self.shader_module.as_ref().unwrap();
+            let (fragment_module, entry) = match self.options.voxel_fragment_entry {
+                Some(entry) => (module, entry),
+                None => (engine_fragment, "voxel_fragment"),
+            };
+            let targets = [Some(wgpu::ColorTargetState { format: target, blend: None, write_mask: wgpu::ColorWrites::empty() })];
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("{}/VoxelPipeline", self.label)),
+                layout: Some(layout),
+                vertex: wgpu::VertexState { module, entry_point: Some("vertex_main"), buffers: vertex_layouts, compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: fragment_module, entry_point: Some(entry), targets: &targets, compilation_options: Default::default() }),
+                // every face from every axis: the far side of a closed mesh is a surface too
+                primitive: wgpu::PrimitiveState { topology: self.options.topology, cull_mode: None, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
+                multiview: None,
+                cache: None,
+            });
+            self.voxel_pipeline_cache.insert(key, pipeline);
+        }
+        &self.voxel_pipeline_cache[&key]
     }
 
     /// Create (or recreate) the material bind group from the given resources.

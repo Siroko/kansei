@@ -5,29 +5,62 @@
 //!
 //! The shared core:
 //! - [`VoxelVolume`]: an `rgba16float` 3D texture with mips (premultiplied radiance, opacity),
-//!   its placement as a uniform (`VOXEL_VOLUME_WGSL`) and its sampler; [`Mip3d`] builds the mips;
-//!   [`VoxelGiQuality`] sets the resolution and cost, stepping down to what a device can hold;
+//!   its placement as a uniform (`VOXEL_VOLUME_WGSL`) and its sampler; [`Mip3d`] builds the mips,
+//!   and optionally six directional (anisotropic) chains above mip 0, so a cone meets the face of
+//!   a wall it reaches first; [`VoxelGiQuality`] sets the resolution and cost, stepping down to
+//!   what a device can hold;
 //! - `VOXEL_CONES_WGSL`: `voxelConeTrace`, for any pass or material that reads the volume, with
 //!   the sky (`SKY_LIGHTING_WGSL`'s `skyRadiance`, or [`gradient_sky_lighting`] without an
 //!   atmosphere) as the light past it.
 //!
-//! Producers write mip 0; today, particles and analytic boxes ([`ParticleVoxelizer`]). Consumers
-//! today: per-particle cones ([`ParticleConeShading`]), and [`ParticleGi`] runs the three in
-//! order. The planned producers (a raster voxelizer drawing meshes through their own
-//! `vertex_main`, with a per-renderable albedo and emission by default and optionally a
-//! material's textured albedo; light injection with shadow maps) and consumers (screen-space
-//! cones, a jump-flood distance field, probes traced in it under a screen-space near field)
-//! reuse the volume, the mips and the cone library.
+//! Producers write mip 0:
+//! - particles and analytic boxes ([`ParticleVoxelizer`]; [`ParticleGi`] runs it with the mips
+//!   and the per-particle cones, [`ParticleConeShading`]);
+//! - the scene's meshes ([`SceneVoxelGi`], which the renderer runs: `Renderer::enable_voxel_gi`):
+//!   a raster voxelizer draws each renderable with a `Renderable::gi` surface through its own
+//!   `vertex_main` ([`MeshVoxelizer`]; a constant [`GiSurface`], or a material's
+//!   `voxel_fragment_entry` with `VOXEL_WRITE_WGSL` for textured albedo), then a light injection
+//!   lights the voxels through the renderer's shadow maps and bounces last frame's light.
+//!
+//! Consumers: the per-particle cones, and [`VoxelGIEffect`], diffuse GI on screen from cones
+//! traced per pixel, optionally under screen-space GI as the near field. The planned ones (a
+//! jump-flood distance field, probes traced in it) reuse the volume, the mips and the cones.
 
+mod aniso;
 mod cones;
+mod effect;
+mod inject;
 mod particle_gi;
 mod particles;
+mod scene;
 mod volume;
+mod voxelize;
 
 pub use cones::{gradient_sky_lighting, ParticleConeSettings, ParticleConeShading, SkyLightingData, PARTICLE_LIGHTING_STRIDE};
 pub use particle_gi::{ParticleGi, ParticleGiOptions, ParticleGiSettings};
 pub use particles::{GiBox, ParticleEmission, ParticleSplatSettings, ParticleVoxelizer, MAX_GI_BOXES};
 pub use volume::{Mip3d, VolumeLayout, VoxelGiQuality, VoxelVolume};
+pub use effect::{VoxelGIEffect, VoxelGIOptions};
+pub use inject::SceneGiSettings;
+pub use scene::{SceneVoxelGi, SceneVoxelGiOptions};
+pub use voxelize::{GiSurface, MeshVoxelizer, SURFACE_WORDS_PER_VOXEL};
+pub(crate) use voxelize::SurfaceSet;
+
+/// For a material's `voxel_fragment_entry` (`MaterialOptions`): the voxelizer's group 3 and
+/// `kansei_voxel_write(fragPos, front, albedo, emission)`, which puts the surface at a fragment
+/// into its voxel. Call it in uniform control flow (it takes derivatives):
+///
+/// ```wgsl
+/// @fragment
+/// fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
+///     let albedo = textureSample(base_texture, base_sampler, in.uv).rgb;
+///     kansei_voxel_write(in.clip, front, albedo, vec3f(0.0));
+/// }
+/// ```
+///
+/// `kansei_voxel_draw.albedo` and `.emission` hold the renderable's `GiSurface`. Group 3 binds
+/// 100-102 here, apart from the shadow group's, so a material may use both chunks.
+pub const VOXEL_WRITE_WGSL: &str = voxelize::VOXEL_WRITE_WGSL;
 
 /// The WGSL `VoxelVolume` struct and `voxelUvw` / `voxelLinearIndex`: bind
 /// `VoxelVolume::uniform` as a `VoxelVolume` uniform.
@@ -68,9 +101,29 @@ mod tests {
             ("resolve", particles::RESOLVE_WGSL),
             ("cones", cones::PARTICLE_CONES_WGSL),
             ("mip3d", include_str!("shaders/mip3d.wgsl")),
+            ("anisotropic mips", include_str!("shaders/aniso_mip.wgsl")),
+            ("voxel fragment", voxelize::VOXEL_FRAGMENT_WGSL),
+            ("inject", inject::INJECT_WGSL),
+            ("screen trace", effect::TRACE_WGSL),
+            ("screen temporal", effect::TEMPORAL_WGSL),
+            ("screen composite", effect::COMPOSITE_WGSL),
         ] {
             validate(name, code, &mut sizes);
         }
+        // a material with a voxel entry next to its lit fragment: the voxelizer's group 3 and
+        // the shadow group's bindings don't collide
+        validate(
+            "material voxel entry",
+            &format!(
+                "{}\n{VOXEL_WRITE_WGSL}\n@group(0) @binding(0) var t: texture_2d<f32>;\n@group(0) @binding(1) var s: sampler;\n\
+                 struct VOut {{ @builtin(position) clip: vec4f, @location(0) uv: vec2f, @location(1) world: vec3f }};\n\
+                 @vertex fn vertex_main(@location(0) p: vec4f) -> VOut {{ var o: VOut; o.clip = p; o.uv = p.xy; o.world = p.xyz; return o; }}\n\
+                 @fragment fn fragment_main(in: VOut) -> @location(0) vec4f {{ return vec4f(kansei_spot_lights_radiance(in.world, vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0), vec3f(1.0), 1.0, 0.0, in.clip.xy), 1.0); }}\n\
+                 @fragment fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {{ kansei_voxel_write(in.clip, front, textureSample(t, s, in.uv).rgb, vec3f(0.0)); }}",
+                crate::lights::SPOT_LIGHTS_WGSL
+            ),
+            &mut sizes,
+        );
         // the libraries alone, with a caller each
         validate(
             "voxel cones library",
@@ -86,6 +139,12 @@ mod tests {
         assert_eq!(sizes["ParticleEmission"], std::mem::size_of::<ParticleEmission>());
         assert_eq!(sizes["ConeParams"], std::mem::size_of::<cones::ConeParamsGpu>());
         assert_eq!(sizes["SkyLighting"], std::mem::size_of::<SkyLightingData>());
+        assert_eq!(sizes["KanseiVoxelizeParams"], std::mem::size_of::<voxelize::VoxelizeParamsGpu>());
+        assert_eq!(sizes["KanseiVoxelDraw"], std::mem::size_of::<voxelize::VoxelDrawGpu>());
+        assert_eq!(sizes["InjectParams"], std::mem::size_of::<inject::InjectParamsGpu>());
+        assert_eq!(sizes["VoxelGiParams"], std::mem::size_of::<effect::VoxelGiParamsGpu>());
+        assert_eq!(sizes["DirLightData"], std::mem::size_of::<crate::shadows::compute_shadows::DirLightGpu>());
+        assert_eq!(sizes["PointLightData"], std::mem::size_of::<crate::shadows::compute_shadows::PointLightGpu>());
     }
 
     #[test]

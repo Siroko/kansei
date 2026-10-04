@@ -53,6 +53,7 @@ impl GiQuality {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct ScreenSpaceGIOptions {
     pub quality: GiQuality,
     /// Metres searched around each point for surfaces that bounce light onto it.
@@ -258,6 +259,83 @@ impl ScreenSpaceGIEffect {
         });
     }
 
+    /// Record the trace and the temporal filter, not the composite: the accumulated bounce (rgb
+    /// its irradiance, a the share of the hemisphere left open) and its size, for an effect that
+    /// composites it with light from elsewhere (`gi::VoxelGIEffect`'s near field).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_trace(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        gbuffer: &GBuffer,
+        input: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::TextureView, [u32; 2]) {
+        if self.gpu.is_none() {
+            self.init_gpu(device);
+        }
+        self.ensure_targets(device, width, height);
+        // a gap in the camera's frames (the effect was off, or a cut) invalidates the history
+        let camera_frame = camera.frame();
+        if self.last_camera_frame.is_some_and(|f| camera_frame != f && camera_frame != f.wrapping_add(1)) {
+            self.prev_view_proj = None;
+        }
+        self.last_camera_frame = Some(camera_frame);
+        let gpu = self.gpu.as_ref().unwrap();
+        let t = gpu.targets.as_ref().unwrap();
+        let (_, slices, steps) = self.quality.settings();
+        let proj = camera.projection_matrix.to_glam();
+        let view = camera.view_matrix.to_glam();
+        let view_proj = proj * view;
+        let params = SsgiParamsGpu {
+            proj: proj.to_cols_array(),
+            inv_proj: proj.inverse().to_cols_array(),
+            view: view.to_cols_array(),
+            inv_view: view.inverse().to_cols_array(),
+            prev_view_proj: self.prev_view_proj.unwrap_or(view_proj).to_cols_array(),
+            full_size: [width as f32, height as f32],
+            trace_size: [t.width as f32, t.height as f32],
+            radius: self.radius_m.max(0.01),
+            thickness: self.thickness_m.max(0.0),
+            intensity: self.intensity.max(0.0),
+            ao_strength: self.ambient_occlusion.clamp(0.0, 1.0),
+            slices,
+            steps,
+            frame: self.frame,
+            history_valid: self.prev_view_proj.is_some() as u32,
+            max_radius_px: height as f32 * MAX_RADIUS_SCREEN,
+            blend: self.temporal_blend.clamp(0.01, 1.0),
+            has_sky: self.sky_lighting.is_some() as u32,
+            debug: self.show_indirect as u32,
+        };
+        queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
+        let current = (self.frame % 2) as usize;
+        self.frame = self.frame.wrapping_add(1);
+        self.prev_view_proj = Some(view_proj);
+
+        let tex = wgpu::BindingResource::TextureView;
+        let p = || gpu.params.as_entire_binding();
+        let trace = group(device, "SSGI/TraceBG", &gpu.trace_bgl, vec![p(), tex(input), tex(depth), tex(&gbuffer.normal_view), tex(&t.trace)]);
+        let temporal = group(
+            device,
+            "SSGI/TemporalBG",
+            &gpu.temporal_bgl,
+            vec![p(), tex(&t.trace), tex(&t.history[1 - current]), tex(depth), tex(&t.history[current]), wgpu::BindingResource::Sampler(&gpu.sampler)],
+        );
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SSGI"), timestamp_writes: crate::profiling::gpu_pass("SSGI").as_ref().map(crate::profiling::PassStamp::compute) });
+        pass.set_pipeline(&gpu.trace);
+        pass.set_bind_group(0, &trace, &[]);
+        pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        pass.set_pipeline(&gpu.temporal);
+        pass.set_bind_group(0, &temporal, &[]);
+        pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        (t.history[current].clone(), [t.width, t.height])
+    }
+
     fn ensure_targets(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let (scale, _, _) = self.quality.settings();
         let (w, h) = (((width as f32 * scale).ceil() as u32).max(1), ((height as f32 * scale).ceil() as u32).max(1));
@@ -308,73 +386,17 @@ impl PostProcessingEffect for ScreenSpaceGIEffect {
         width: u32,
         height: u32,
     ) {
-        if self.gpu.is_none() {
-            self.init_gpu(device);
-        }
-        self.ensure_targets(device, width, height);
-        // a gap in the camera's frames (the effect was off, or a cut) invalidates the history
-        let camera_frame = camera.frame();
-        if self.last_camera_frame.is_some_and(|f| camera_frame != f && camera_frame != f.wrapping_add(1)) {
-            self.prev_view_proj = None;
-        }
-        self.last_camera_frame = Some(camera_frame);
+        let (gi, _) = self.encode_trace(device, queue, encoder, gbuffer, input, depth, camera, width, height);
         let gpu = self.gpu.as_ref().unwrap();
-        let t = gpu.targets.as_ref().unwrap();
-        let (_, slices, steps) = self.quality.settings();
-        let proj = camera.projection_matrix.to_glam();
-        let view = camera.view_matrix.to_glam();
-        let view_proj = proj * view;
-        let params = SsgiParamsGpu {
-            proj: proj.to_cols_array(),
-            inv_proj: proj.inverse().to_cols_array(),
-            view: view.to_cols_array(),
-            inv_view: view.inverse().to_cols_array(),
-            prev_view_proj: self.prev_view_proj.unwrap_or(view_proj).to_cols_array(),
-            full_size: [width as f32, height as f32],
-            trace_size: [t.width as f32, t.height as f32],
-            radius: self.radius_m.max(0.01),
-            thickness: self.thickness_m.max(0.0),
-            intensity: self.intensity.max(0.0),
-            ao_strength: self.ambient_occlusion.clamp(0.0, 1.0),
-            slices,
-            steps,
-            frame: self.frame,
-            history_valid: self.prev_view_proj.is_some() as u32,
-            max_radius_px: height as f32 * MAX_RADIUS_SCREEN,
-            blend: self.temporal_blend.clamp(0.01, 1.0),
-            has_sky: self.sky_lighting.is_some() as u32,
-            debug: self.show_indirect as u32,
-        };
-        queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
-        let current = (self.frame % 2) as usize;
-        self.frame = self.frame.wrapping_add(1);
-        self.prev_view_proj = Some(view_proj);
-
         let tex = wgpu::BindingResource::TextureView;
-        let group = |label: &str, layout: &wgpu::BindGroupLayout, resources: Vec<wgpu::BindingResource>| {
-            let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
-        };
-        let p = || gpu.params.as_entire_binding();
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.no_sky);
-        let trace = group("SSGI/TraceBG", &gpu.trace_bgl, vec![p(), tex(input), tex(depth), tex(&gbuffer.normal_view), tex(&t.trace)]);
-        let temporal = group(
-            "SSGI/TemporalBG",
-            &gpu.temporal_bgl,
-            vec![p(), tex(&t.trace), tex(&t.history[1 - current]), tex(depth), tex(&t.history[current]), wgpu::BindingResource::Sampler(&gpu.sampler)],
-        );
         let composite = group(
+            device,
             "SSGI/CompositeBG",
             &gpu.composite_bgl,
-            vec![p(), tex(input), tex(depth), tex(&t.history[current]), tex(&gbuffer.albedo_view), tex(&gbuffer.normal_view), sky.as_entire_binding(), tex(output)],
+            vec![gpu.params.as_entire_binding(), tex(input), tex(depth), tex(&gi), tex(&gbuffer.albedo_view), tex(&gbuffer.normal_view), sky.as_entire_binding(), tex(output)],
         );
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SSGI"), timestamp_writes: crate::profiling::gpu_pass("SSGI").as_ref().map(crate::profiling::PassStamp::compute) });
-        pass.set_pipeline(&gpu.trace);
-        pass.set_bind_group(0, &trace, &[]);
-        pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
-        pass.set_pipeline(&gpu.temporal);
-        pass.set_bind_group(0, &temporal, &[]);
-        pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SSGI/Composite"), timestamp_writes: crate::profiling::gpu_pass("SSGI/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&gpu.composite);
         pass.set_bind_group(0, &composite, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
@@ -388,6 +410,12 @@ impl PostProcessingEffect for ScreenSpaceGIEffect {
 
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+/// A bind group of `resources` at bindings 0, 1, 2...
+fn group(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, resources: Vec<wgpu::BindingResource>) -> wgpu::BindGroup {
+    let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
+    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
 }
 
 #[cfg(test)]

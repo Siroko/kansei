@@ -2,18 +2,101 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Kansei — GI Box</title>
     <style>
         body { margin: 0; background: #000; overflow: hidden; }
-        canvas { width: 100vw; height: 100vh; display: block; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+        #stats {
+            position: fixed; left: 8px; top: 8px; margin: 0; padding: 6px 8px;
+            font: 11px/1.35 ui-monospace, Menlo, monospace; color: #e8e8e8;
+            background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none; white-space: pre;
+        }
+        #credit {
+            position: fixed; left: 8px; bottom: 6px; font: 10px sans-serif; color: #999;
+        }
+        #credit a { color: #bbb; }
     </style>
 </head>
 <body>
     <canvas id="kansei"></canvas>
+    <pre id="stats" hidden></pre>
+    <div id="credit" hidden>
+        Dragon: "<a href="https://sketchfab.com/3d-models/stanford-dragon-vrip-b602a35846e74533b1d9f06034a3b730">Stanford Dragon (Vrip)</a>"
+        by <a href="https://sketchfab.com/3dgraphics">3D graphics 101</a>,
+        <a href="http://creativecommons.org/licenses/by-nc/4.0/">CC-BY-NC-4.0</a>
+    </div>
     <script type="module">
-        import init, { start } from '../pkg/kansei_wasm_gi_box.js';
+        import init, {
+            start, info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate,
+            set_rug, set_textured, set_camera, set_stats,
+        } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
+
+        // for scripted captures: window.kansei.set_preset('best') and so on
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats };
+        const params = new URLSearchParams(location.search);
+        const read = () => JSON.parse(info());
+        let s = read();
+        const p = {
+            preset: params.get('preset') || '',
+            gi: s.gi,
+            voxels: s.voxels,
+            view: s.view,
+            camera: params.get('cam') || 'front',
+            dragon: s.dragon,
+            animate: s.animate,
+            rug: s.rug,
+            textured: s.textured,
+            stats: s.stats,
+        };
+        const statsEl = document.getElementById('stats');
+        const creditEl = document.getElementById('credit');
+        const showCredit = () => { creditEl.hidden = read().dragon === 'off'; };
+        showCredit();
+
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'GI box', expanded: !/Mobi|Android/.test(navigator.userAgent) });
+        pane.hidden = params.get('ui') === '0';
+        // the panel mirrors the engine after a preset changes several things at once
+        const sync = () => {
+            s = read();
+            Object.assign(p, { gi: s.gi, voxels: s.voxels, view: s.view, dragon: s.dragon, animate: s.animate, rug: s.rug, textured: s.textured });
+            pane.refresh();
+            showCredit();
+        };
+        const presetOptions = Object.fromEntries([['(custom)', ''], ...JSON.parse(presets()).map(([name, label]) => [label, name])]);
+        pane.addBinding(p, 'preset', { options: presetOptions }).on('change', async () => {
+            if (p.preset) { await set_preset(p.preset); sync(); }
+        });
+        const custom = (f) => (e) => { if (e.last !== false) { p.preset = ''; } f(e); sync(); };
+        pane.addBinding(p, 'gi', {
+            label: 'GI',
+            options: { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi' },
+        }).on('change', custom(() => set_gi(p.gi)));
+        pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
+        pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels' } }).on('change', custom(() => set_view(p.view)));
+        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low' } }).on('change', () => set_camera(p.camera));
+        const scene = pane.addFolder({ title: 'Scene' });
+        scene.addBinding(p, 'dragon', { options: { off: 'off', '19k triangles': 'light', '871k triangles': 'full' } }).on('change', async () => { p.preset = ''; await set_dragon(p.dragon); sync(); });
+        scene.addBinding(p, 'animate').on('change', custom(() => set_animate(p.animate)));
+        scene.addBinding(p, 'rug').on('change', custom(() => set_rug(p.rug)));
+        scene.addBinding(p, 'textured', { label: 'rug voxels textured' }).on('change', custom(() => set_textured(p.textured)));
+        pane.addBinding(p, 'stats', { label: 'stats' }).on('change', () => { set_stats(p.stats); statsEl.hidden = !p.stats; });
+
+        statsEl.hidden = !p.stats;
+        setInterval(() => {
+            if (!p.stats) return;
+            const i = read();
+            const top = i.passes.slice(0, 8).map(([label, ms]) => `  ${label.padEnd(30)} ${ms.toFixed(3)}`).join('\n');
+            statsEl.textContent =
+                `${i.gi} / ${i.view}` + (i.voxel_tier ? `, voxels ${i.voxel_tier} ${i.dims.join('x')} (${i.mib} MiB)` : '') + '\n' +
+                `${(i.triangles / 1000).toFixed(1)}k triangles${i.dragon !== 'off' ? ` (dragon ${i.dragon})` : ''}${i.animate ? ', animated' : ''}\n` +
+                `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
+                `voxel GI: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, mips ${i.mips_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
+                `SSGI ${i.ssgi_ms.toFixed(3)} ms\n` + top;
+        }, 500);
     </script>
 </body>
 </html>

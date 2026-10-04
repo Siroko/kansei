@@ -871,11 +871,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let fit = (1.6 / aspect).max(1.0);
     let mut controls = if lightbox {
         // straight on, a little low, with the reflection under the box in view
-        let mut c = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 5.0, 0.0), 37.0 * fit);
+        let mut c = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 5.0, 0.0), 37.0 * fit).with_mouse_pan(&canvas);
         c.set_elevation(0.04);
         c
     } else {
-        let mut c = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit);
+        let mut c = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(&canvas);
         c.set_elevation(0.45);
         c.set_azimuth(0.18);
         c

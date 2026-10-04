@@ -193,6 +193,8 @@ pub struct Renderer {
     depth_copy_bgl: Option<wgpu::BindGroupLayout>,
     // Fraction of the surface size the post-processing path renders the scene at
     render_scale: f32,
+    // Voxel GI of the scene's meshes (`enable_voxel_gi`)
+    voxel_gi: Option<crate::gi::SceneVoxelGi>,
 }
 
 impl Renderer {
@@ -260,6 +262,7 @@ impl Renderer {
             depth_copy_pipeline: None,
             depth_copy_bgl: None,
             render_scale: 1.0,
+            voxel_gi: None,
         }
     }
 
@@ -558,6 +561,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 12, resource: sampler(self.spot_shadow_sampler.as_ref().unwrap()) },
             ],
         }));
+        self.sync_voxel_gi_shadows();
         self.invalidate_bundle();
     }
 
@@ -1561,6 +1565,151 @@ impl Renderer {
     /// Enable perspective shadow maps for spot lights: each frame, the first `max_lights` spot
     /// lights with `cast_shadow` (in scene order) render a `resolution`² layer of the spot shadow
     /// atlas, drawing every caster through its material's own vertex shader.
+    /// Voxel GI for the scene's meshes over a box (`gi::SceneVoxelGi`): every frame, after the
+    /// shadow maps, the renderables with a `Renderable::gi` surface are voxelized (the static ones
+    /// when they change) and lit by the scene's lights through their shadow maps, with the
+    /// bounces adding up over frames. Read the result with `gi::VoxelGIEffect`. Calling it again
+    /// replaces the volume.
+    ///
+    /// ```ignore
+    /// renderer.enable_voxel_gi(SceneVoxelGiOptions { bounds_min, bounds_max, ..Default::default() });
+    /// let effect = VoxelGIEffect::new(renderer.voxel_gi().unwrap().volume(), Default::default());
+    /// ```
+    pub fn enable_voxel_gi(&mut self, options: crate::gi::SceneVoxelGiOptions) {
+        let device = self.device.as_ref().unwrap();
+        let gi = crate::gi::SceneVoxelGi::new(device, self.queue.as_ref().unwrap(), self.shared_layouts.as_ref().unwrap(), self.light_buf.as_ref().unwrap(), options);
+        log::info!("voxel GI: {:?}, {:?} voxels, {:.1} MiB", gi.quality(), gi.volume().dims(), gi.memory_bytes() as f64 / (1 << 20) as f64);
+        self.voxel_gi = Some(gi);
+        self.sync_voxel_gi_shadows();
+    }
+
+    /// Turn voxel GI off and free its volume.
+    pub fn disable_voxel_gi(&mut self) {
+        self.voxel_gi = None;
+    }
+
+    pub fn voxel_gi(&self) -> Option<&crate::gi::SceneVoxelGi> {
+        self.voxel_gi.as_ref()
+    }
+
+    pub fn voxel_gi_mut(&mut self) -> Option<&mut crate::gi::SceneVoxelGi> {
+        self.voxel_gi.as_mut()
+    }
+
+    /// Point voxel GI's light injection at the shadow maps enabled now.
+    fn sync_voxel_gi_shadows(&mut self) {
+        let Some(gi) = self.voxel_gi.as_mut() else { return };
+        let shadows = &mut gi.injection.shadows;
+        shadows.set_spot_lights(self.spot_light_buf.as_ref(), self.spot_shadow_atlas.as_ref());
+        match &self.cascaded_shadows {
+            Some(csm) => shadows.set_cascaded_shadow_map(Some(csm)),
+            None => shadows.set_shadow_map(self.shadow_map.as_ref().filter(|_| self.shadows_enabled)),
+        }
+        shadows.set_point_shadows(self.cubemap_shadow_map.as_ref());
+    }
+
+    /// Make the voxelization pipeline of a GI renderable (with vertex buffers `layouts`).
+    fn prepare_voxel_pipeline(&self, r: &mut crate::objects::Renderable, layouts: &[wgpu::VertexBufferLayout]) {
+        let (Some(gi), true) = (self.voxel_gi.as_ref(), r.gi.is_some()) else { return };
+        let voxelizer = gi.voxelizer();
+        r.material.get_voxel_pipeline(
+            self.device.as_ref().unwrap(),
+            self.shared_layouts.as_ref().unwrap(),
+            voxelizer.id(),
+            layouts,
+            voxelizer.bind_group_layout(),
+            voxelizer.fragment_module(),
+            crate::gi::MeshVoxelizer::TARGET_FORMAT,
+            crate::gi::MeshVoxelizer::SAMPLE_COUNT,
+        );
+    }
+
+    /// Voxel GI's frame: voxelize the GI renderables (the static ones when they changed, the
+    /// dynamic ones always), light the voxels through this frame's shadow maps, rebuild the mips.
+    fn run_voxel_gi(&mut self, scene: &Scene) {
+        let Some(gi) = self.voxel_gi.as_mut() else { return };
+        if !gi.settings.enabled {
+            return;
+        }
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let alignment = self.matrix_alignment;
+        gi.injection.shadows.update_lights(scene.lights(), false);
+
+        // the renderables drawn into voxels: visible, with a surface and a ready pipeline
+        let voxelizer_id = gi.voxelizer().id();
+        let draws: Vec<(usize, &crate::objects::Renderable, &wgpu::RenderPipeline)> = scene
+            .ordered_indices()
+            .filter_map(|idx| {
+                let r = scene.get_renderable(idx)?;
+                if !r.visible || !r.geometry.initialized || r.gi.is_none() {
+                    return None;
+                }
+                let pipeline = r.material.voxel_pipeline_cache.get(&(voxelizer_id, 1 + r.geometry.instance_buffers.len()))?;
+                Some((idx, r, pipeline))
+            })
+            .collect();
+        // what the static surfaces are made of: a change voxelizes them again
+        let mut key = Vec::new();
+        for (idx, r, _) in draws.iter().filter(|d| !d.1.dynamic) {
+            let surface = r.gi.unwrap();
+            key.push(*idx as u32);
+            key.extend(r.world_matrix.as_slice().iter().map(|f| f.to_bits()));
+            key.extend(surface.albedo.iter().chain(&surface.emission).map(|f| f.to_bits()));
+            key.extend([r.geometry.index_count(), r.geometry.instance_count]);
+        }
+        let surfaces: Vec<_> = draws.iter().map(|d| d.1.gi.unwrap()).collect();
+        let voxelizer = gi.voxelizer_mut();
+        voxelizer.write_draws(device, queue, &surfaces);
+        let static_changed = voxelizer.static_changed(key);
+        let any_dynamic = draws.iter().any(|d| d.1.dynamic);
+        if any_dynamic {
+            voxelizer.ensure_dynamic(device);
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/VoxelGI") });
+        let voxelizer = gi.voxelizer();
+        let sets = [(crate::gi::SurfaceSet::Static, static_changed), (crate::gi::SurfaceSet::Dynamic, voxelizer.dynamic_surfaces().is_some())];
+        for (set, redo) in sets {
+            if !redo {
+                continue;
+            }
+            voxelizer.clear(&mut encoder, set);
+            let dynamic = set == crate::gi::SurfaceSet::Dynamic;
+            if !draws.iter().any(|d| d.1.dynamic == dynamic) {
+                continue;
+            }
+            for axis in 0..3 {
+                let mut pass = voxelizer.begin_pass(&mut encoder, axis);
+                for (k, (idx, r, pipeline)) in draws.iter().enumerate() {
+                    if r.dynamic != dynamic {
+                        continue;
+                    }
+                    pass.set_pipeline(pipeline);
+                    if let Some(bg) = r.material.bind_group() {
+                        pass.set_bind_group(0, bg, &[]);
+                    }
+                    let offset = mesh_offset(*idx, alignment);
+                    pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+                    pass.set_bind_group(3, voxelizer.group(axis, set), &[voxelizer.draw_offset(k)]);
+                    // every instance: no cull view is the voxelizer's
+                    draw_geometry(&mut pass, r, usize::MAX);
+                }
+            }
+        }
+        gi.encode_lighting(device, queue, &mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Draw the scene into `gbuffer` as `render_with_postprocessing` does, without a surface
+    /// (for tests and offscreen captures).
+    #[doc(hidden)]
+    pub fn render_scene_offscreen(&mut self, scene: &mut Scene, camera: &mut Camera, gbuffer: &GBuffer) {
+        self.render_scene_to_gbuffer(scene, camera, gbuffer);
+        camera.end_frame();
+    }
+
     pub fn enable_spot_shadows(&mut self, resolution: u32, max_lights: u32) {
         let device = self.device.as_ref().unwrap();
         let shared = self.shared_layouts.as_ref().unwrap();
@@ -2351,6 +2500,7 @@ impl Renderer {
                     r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
                 }
                 self.prepare_cluster_depth_pipelines(r, spot_shadows, cascades || sky_occlusion);
+                self.prepare_voxel_pipeline(r, &layouts);
                 if reflections {
                     r.material.get_pipeline(device, &layouts, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
                     self.prepare_cluster_pipeline(r, &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, 1);
@@ -2464,6 +2614,8 @@ impl Renderer {
         // Cascaded sun/moon shadows
         self.run_cascade_shadow_pass(scene);
         self.run_sky_occlusion_pass(scene);
+        // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
+        self.run_voxel_gi(scene);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -2667,6 +2819,7 @@ impl Renderer {
                 r.material.get_depth_pipeline(device, &layouts, crate::shadows::CascadedShadowMap::FORMAT, crate::shadows::CascadedShadowMap::DEPTH_BIAS);
             }
             self.prepare_cluster_depth_pipelines(r, spot_shadows, cascades || sky_occlusion);
+            self.prepare_voxel_pipeline(r, &layouts);
             if r.material.options.outputs_velocity {
                 r.material.get_velocity_pipeline(device, &layouts);
             }
@@ -2771,6 +2924,8 @@ impl Renderer {
         // Cascaded sun/moon shadows
         self.run_cascade_shadow_pass(scene);
         self.run_sky_occlusion_pass(scene);
+        // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
+        self.run_voxel_gi(scene);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes

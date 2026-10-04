@@ -3,6 +3,7 @@ mod cubemap_shadow_map;
 mod spot_shadow_atlas;
 mod cascaded_shadow_map;
 mod sky_occlusion;
+pub(crate) mod compute_shadows;
 
 pub use shadow_map::ShadowMap;
 pub use cubemap_shadow_map::CubeMapShadowMap;
