@@ -283,7 +283,7 @@ impl ClipmapProbes {
                         from = moved;
                     }
                 }
-                _ => dispatches.push((ClipProbeUpdateGpu { mode: MODE_CLEAR, first: 0, count: per_level, ..at }, per_level)),
+                _ => dispatches.push((ClipProbeUpdateGpu { mode: MODE_CLEAR, first: 0, count: per_level, ..at }, per_level.div_ceil(16))),
             }
             self.grid_data.levels[level as usize] = ClipLevelGpu { origin: target.to_array(), valid: 1 };
             // and the next ones in turn
@@ -321,9 +321,10 @@ impl ClipmapProbes {
         let stamp = crate::profiling::gpu_pass("VoxelClipmap/Probes");
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelClipmap/Probes"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&self.pipeline);
-        for (k, (_, threads)) in dispatches.iter().enumerate() {
+        // a workgroup per probe (or per 16 slots cleared)
+        for (k, (_, probes)) in dispatches.iter().enumerate() {
             pass.set_bind_group(0, &self.group.as_ref().unwrap().0, &[(k as u64 * self.params_stride) as u32]);
-            pass.dispatch_workgroups(threads.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups((*probes).min(65535), 1, 1);
         }
     }
 }

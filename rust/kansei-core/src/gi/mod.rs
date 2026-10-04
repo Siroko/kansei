@@ -171,7 +171,7 @@ mod tests {
             ("clipmap clear", include_str!("shaders/clipmap_clear.wgsl")),
             ("clipmap trace", effect::CLIPMAP_TRACE_WGSL),
             ("clipmap probe update", clipmap_probes::CLIPMAP_PROBE_UPDATE_WGSL),
-            ("clipmap composite", effect::CLIPMAP_COMPOSITE_WGSL),
+            ("clipmap probe trace", effect::CLIPMAP_PROBE_TRACE_WGSL),
             ("screen trace", effect::TRACE_WGSL),
             ("screen temporal", effect::TEMPORAL_WGSL),
             ("screen composite", effect::COMPOSITE_WGSL),

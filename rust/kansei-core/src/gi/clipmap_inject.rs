@@ -53,7 +53,12 @@ pub struct ClipmapGiSettings {
     pub enabled: bool,
     /// The share of last frame's indirect light each voxel bounces again (1 is physical).
     pub bounce: f32,
-    /// The most steps each of a voxel's bounce and shadow cones takes.
+    /// Voxels whose albedo (its largest channel) is below this skip the bounce: they pass on
+    /// only that share of the light they receive, a dark forest's needles most of the voxels and
+    /// most of the bounce's cost.
+    pub bounce_min_albedo: f32,
+    /// The most steps each of a voxel's bounce cones takes (they widen fast: 12 cross the
+    /// clipmap).
     pub bounce_steps: u32,
     /// How much of the sky's light the bounce cones bring in where they leave the clipmap.
     pub sky_scale: f32,
@@ -65,8 +70,12 @@ pub struct ClipmapGiSettings {
     pub cone_shadows: ConeShadows,
     /// Tangent of the shadow cones' half angle: wider is softer (and cheaper).
     pub cone_shadow_tan: f32,
-    /// Levels lit each frame, in turn, the finest every frame (0: all of them every frame). The
-    /// coarse levels change slowly; lighting fewer a frame saves most of the injection's cost.
+    /// The most steps each shadow cone takes (narrow, they widen slowly: 48 reach about 20 times
+    /// as far as they start).
+    pub cone_shadow_steps: u32,
+    /// Levels lit each frame: the finest every frame and the others in turn (0: all of them every
+    /// frame). The coarse levels change slowly; lighting fewer a frame saves most of the
+    /// injection's cost.
     pub levels_per_frame: u32,
 }
 
@@ -75,13 +84,15 @@ impl Default for ClipmapGiSettings {
         Self {
             enabled: true,
             bounce: 1.0,
-            bounce_steps: 24,
+            bounce_min_albedo: 0.08,
+            bounce_steps: 12,
             sky_scale: 1.0,
             emission_scale: 1.0,
             shadow_offset_voxels: 1.0,
             cone_shadows: ConeShadows::Fallback,
             cone_shadow_tan: 0.08,
-            levels_per_frame: 0,
+            cone_shadow_steps: 48,
+            levels_per_frame: 2,
         }
     }
 }
@@ -103,7 +114,9 @@ pub(crate) struct ClipInjectParamsGpu {
     level: u32,
     cone_shadows: u32,
     shadow_tan: f32,
-    _pad: [u32; 3],
+    shadow_steps: u32,
+    bounce_min_albedo: f32,
+    _pad: u32,
 }
 
 /// The clipmap's voxelized surfaces into light, a level at a time (clipmap_inject.wgsl), from
@@ -193,7 +206,9 @@ impl ClipmapInjection {
                 level,
                 cone_shadows: settings.cone_shadows as u32,
                 shadow_tan: settings.cone_shadow_tan.max(1e-3),
-                _pad: [0; 3],
+                shadow_steps: settings.cone_shadow_steps.max(1),
+                bounce_min_albedo: settings.bounce_min_albedo.max(0.0),
+                _pad: 0,
             };
             let at = (level as u64 * self.params_stride) as usize;
             bytes[at..at + std::mem::size_of::<ClipInjectParamsGpu>()].copy_from_slice(bytemuck::bytes_of(&params));

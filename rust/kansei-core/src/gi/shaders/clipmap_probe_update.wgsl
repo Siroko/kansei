@@ -1,5 +1,5 @@
-// Irradiance probes of a voxel clipmap, update (gi::ClipmapProbes): one thread per probe traces
-// 16 cones through the clipmap (clipmap.wgsl) from its lattice point, turned by `rotation` (a new
+// Irradiance probes of a voxel clipmap, update (gi::ClipmapProbes): a workgroup per probe traces
+// 16 cones through the clipmap (clipmap.wgsl) from its lattice point, an invocation each, turned by `rotation` (a new
 // random turn each frame, so the history integrates a finer set), and projects what each brings
 // (the radiance gathered plus the sky past the clipmap times what is left of it; and that share)
 // onto order-1 spherical harmonics, blended into its history. Needs clipmap_probes.wgsl (with
@@ -52,14 +52,22 @@ fn store(slot: u32, sh: array<vec4f, 4>) {
     }
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3u) {
-    let i = gid.x;
+// each cone's share of its probe's spherical harmonics, summed by the first invocation
+var<workgroup> coneSh : array<array<vec4f, 4>, CLIP_PROBE_CONES>;
+
+// A workgroup per probe (the dispatch's `workgroup_id.x`-th), an invocation per cone: a probe's
+// cones run side by side instead of one after another.
+@compute @workgroup_size(16)
+fn main(@builtin(workgroup_id) wg : vec3u, @builtin(local_invocation_index) lane : u32) {
+    let i = wg.x;
     let grid = kansei_clip_probe_grid;
     let per_level = grid.dims.x * grid.dims.y * grid.dims.z;
     if (up.mode == 2u) {
-        if (i >= up.count) { return; }
-        store(kanseiClipProbeLevelBase(grid, up.level) + (up.first + i) % per_level, array<vec4f, 4>(vec4f(0.0, 0.0, 0.0, NEVER_TRACED), vec4f(0.0), vec4f(0.0), vec4f(0.0)));
+        // (16 slots a workgroup)
+        let n = i * 16u + lane;
+        if (n < up.count) {
+            store(kanseiClipProbeLevelBase(grid, up.level) + (up.first + n) % per_level, array<vec4f, 4>(vec4f(0.0, 0.0, 0.0, NEVER_TRACED), vec4f(0.0), vec4f(0.0), vec4f(0.0)));
+        }
         return;
     }
     let k = up.level;
@@ -83,28 +91,35 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let voxel = clipVoxelSize(up.voxelLevel);
     // a probe inside a surface sees nothing of the scene's light: left out
     let at = clipLevelAt(p, up.voxelLevel, 0.5);
-    if (at < clipmap.levelCount && clipSample(at, p).a > 0.9) {
+    let inside = at < clipmap.levelCount && clipSample(at, p).a > 0.9;
+    var sh = array<vec4f, 4>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
+    if (!inside) {
+        let w = 4.0 * 3.14159265 / f32(CLIP_PROBE_CONES);
+        let dir = normalize((up.rotation * vec4f(sphericalFibonacci(lane, CLIP_PROBE_CONES), 0.0)).xyz);
+        // a jittered start, so the sparse samples land elsewhere each update
+        let jitter = giHash01(slot * 16u + lane + up.frame * 7919u);
+        let cone = clipConeTraceNear(p, dir, vec3f(0.0), up.tanHalf, voxel, (0.5 + jitter) * voxel, 1e4, up.maxSteps, up.levelBias);
+        let light = vec4f(cone.rgb + cone.a * up.skyScale * skyRadiance(sky, dir), cone.a) * w;
+        sh = array<vec4f, 4>(light * 0.282095, light * (0.488603 * dir.x), light * (0.488603 * dir.y), light * (0.488603 * dir.z));
+    }
+    coneSh[lane] = sh;
+    workgroupBarrier();
+    if (lane != 0u) { return; }
+    if (inside) {
         store(slot, array<vec4f, 4>(vec4f(0.0, 0.0, 0.0, INSIDE), vec4f(0.0), vec4f(0.0), vec4f(0.0)));
         return;
     }
-    var sh = array<vec4f, 4>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
-    let w = 4.0 * 3.14159265 / f32(CLIP_PROBE_CONES);
+    var sum = array<vec4f, 4>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
     for (var j = 0u; j < CLIP_PROBE_CONES; j++) {
-        let dir = normalize((up.rotation * vec4f(sphericalFibonacci(j, CLIP_PROBE_CONES), 0.0)).xyz);
-        // a jittered start, so the sparse samples land elsewhere each update
-        let jitter = giHash01(slot * 16u + j + up.frame * 7919u);
-        let cone = clipConeTraceNear(p, dir, vec3f(0.0), up.tanHalf, voxel, (0.5 + jitter) * voxel, 1e4, up.maxSteps, up.levelBias);
-        let light = vec4f(cone.rgb + cone.a * up.skyScale * skyRadiance(sky, dir), cone.a) * w;
-        sh[0] += light * 0.282095;
-        sh[1] += light * (0.488603 * dir.x);
-        sh[2] += light * (0.488603 * dir.y);
-        sh[3] += light * (0.488603 * dir.z);
+        for (var b = 0u; b < 4u; b++) {
+            sum[b] += coneSh[j][b];
+        }
     }
     let old = kansei_clip_probes[4u * slot];
     // a fresh probe (never traced, inside a surface before, or in a new slab) takes its trace
     let h = select(up.hysteresis, 0.0, old.w < 0.0 || up.mode == 1u);
     for (var b = 0u; b < 4u; b++) {
-        sh[b] = mix(sh[b], select(kansei_clip_probes[4u * slot + b], old, b == 0u), h);
+        sum[b] = mix(sum[b], select(kansei_clip_probes[4u * slot + b], old, b == 0u), h);
     }
-    store(slot, sh);
+    store(slot, sum);
 }
