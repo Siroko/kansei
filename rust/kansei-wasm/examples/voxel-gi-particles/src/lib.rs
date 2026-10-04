@@ -34,6 +34,7 @@ use kansei_core::gi::{GiBox, ParticleEmission, ParticleGi, ParticleGiOptions, Vo
 use kansei_core::materials::{Binding, BindingResource, Compute, CullMode, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::pacing::FixedStep;
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, is_phone, now, param, param_or, Canvas, Frame};
 use kansei_core::simulations::fluid::{FluidSimulation, FluidSimulationOptions};
@@ -550,7 +551,8 @@ struct State {
     pile_top: Option<PileTop>,
     panel_intensity: f32,
     initial: Vec<f32>,
-    sim_accumulator: f64,
+    /// The fluid's fixed step (60 Hz, at most 3 a frame).
+    sim_step: FixedStep,
     stats: Option<(f64, u32)>,
     frame_ms: f64,
     paused: bool,
@@ -572,15 +574,15 @@ impl State {
         let proj = self.camera.projection_matrix.to_glam();
         let inv_view = self.camera.inverse_view_matrix.to_glam();
         self.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &glam::Mat4::IDENTITY.to_cols_array());
-        let step = 1.0 / 60.0;
-        self.sim_accumulator = (self.sim_accumulator + dt).min(step * 3.0);
-        if self.paused {
-            self.sim_accumulator = 0.0;
-        }
-        while self.sim_accumulator >= step {
+        let steps = if self.paused {
+            self.sim_step.reset();
+            0
+        } else {
+            self.sim_step.advance(dt)
+        };
+        for _ in 0..steps {
             let strength = self.mouse.strength.min(1.0);
-            self.sim.update_batched(step as f32, strength, [self.mouse.position.x, self.mouse.position.y], [self.mouse.direction.x, self.mouse.direction.y]);
-            self.sim_accumulator -= step;
+            self.sim.update_batched(self.sim_step.step as f32, strength, [self.mouse.position.x, self.mouse.position.y], [self.mouse.direction.x, self.mouse.direction.y]);
         }
 
         // the GI: the volume and the particles' light (or, off, the sky alone)
@@ -949,7 +951,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         pile_top,
         panel_intensity: 1.0,
         initial,
-        sim_accumulator: 0.0,
+        sim_step: FixedStep::new(1.0 / 60.0).with_max_steps(3),
         stats,
         frame_ms: 16.7,
         paused: false,

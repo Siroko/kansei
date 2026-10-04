@@ -24,8 +24,9 @@ use glam::{Mat4, Vec3 as GVec3};
 
 use kansei_core::collision::{CollisionWorld, Obb, Shape, TriangleMesh};
 use kansei_core::geometries::{Geometry, Vertex};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::pacing::FixedStep;
 use kansei_core::postprocessing::effects::{FluidSurfaceEffect, FluidSurfaceOptions};
 use kansei_core::renderers::Renderer;
 use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
@@ -236,30 +237,6 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// The water's surface (the marching-cubes mesh, in simulation space): writes its world normal to
-/// the GBuffer, where `FluidSurfaceEffect` finds it and composites the refraction and reflection.
-const WATER_WGSL: &str = r#"
-@group(0) @binding(0) var<uniform> color: vec4<f32>;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(position.xyz, 1.0);
-    out.normal = (normal_matrix * vec4<f32>(normal, 0.0)).xyz;
-    return out;
-}
-struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
-@fragment
-fn fragment_main(in: VOut) -> FOut {
-    let n = normalize(in.normal);
-    return FOut(color, vec4<f32>(0.0), vec4<f32>(n, 1.0), color);
-}
-"#;
-
 /// A grid of vertices over `[min, max]` (x, z), `cells` across, at `height(x, z)`, with normals
 /// from the heights around; triangles wound counter-clockwise seen from above.
 fn heightfield(min: [f32; 2], max: [f32; 2], cells: [usize; 2], height: &dyn Fn(f32, f32) -> f32) -> (Vec<GVec3>, Vec<[f32; 3]>, Vec<u32>) {
@@ -325,7 +302,8 @@ pub struct Lake {
     capacity: u32,
     container: FluidContainer,
     colliders: FluidColliders,
-    accumulator: f32,
+    /// The water's fixed step: `STEP` real seconds, at most `MAX_STEPS` a frame.
+    fixed: FixedStep,
     /// Last frame's capsule ends (world), for their velocities.
     previous: Vec<[GVec3; 2]>,
     /// A landing's splash: where (world), how fast it came down, and for how long it has pushed.
@@ -483,20 +461,13 @@ impl Lake {
         let sleep = FluidSleep::new(FluidSleepOptions { cull_after: CULL_AFTER, settle_speed: SETTLE_SPEED, settle_after: SETTLE_AFTER });
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { terrain: terrain_index, levels, count, capacity, container, colliders, accumulator: 0.0, previous: Vec::new(), splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
+        (Self { terrain: terrain_index, levels, count, capacity, container, colliders, fixed: FixedStep::new(STEP as f64).with_max_steps(MAX_STEPS), previous: Vec::new(), splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
     }
 
-    /// The water's surface renderable, drawing the effect's marching-cubes mesh (the effect must
-    /// be boxed at its final address: the geometry points at its buffers).
+    /// The water's surface renderable, drawing the effect's marching-cubes mesh (in simulation
+    /// space) into the GBuffer, where `FluidSurfaceEffect` composites the refraction and reflection.
     pub fn add_surface(scene: &mut Scene, surface: &FluidSurfaceEffect) {
-        let mut geometry = Geometry::new_indirect_placeholder("Lake/Water");
-        let mc = &surface.marching_cubes;
-        // SAFETY: the effect lives, boxed, in the post-processing chain for the page's life
-        unsafe { geometry.set_external_buffers(mc.vertex_buffer(), mc.index_buffer(), Some(mc.indirect_args_buffer())) };
-        let mut material = Material::new("Lake/Water", WATER_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, mrt_output_count: Some(4), ..Default::default() });
-        material.set_uniform_bindable(0, "Lake/Water", &[0.2f32, 0.3, 0.3, 1.0]);
-        let mut r = Renderable::new(geometry, material);
-        r.cast_shadow = false;
+        let mut r = surface.surface_renderable([0.2, 0.3, 0.3, 1.0]);
         let s = 1.0 / SIM_SCALE;
         r.object.scale = kansei_core::math::Vec3::new(s, s, s);
         scene.add(SceneNode::Renderable(r));
@@ -652,22 +623,19 @@ impl Lake {
         surface.extract = state == FluidActivity::Running;
         surface.active = state != FluidActivity::Culled;
         if state != FluidActivity::Running {
-            self.accumulator = 0.0;
+            self.fixed.reset();
             return 0;
         }
-        self.accumulator = (self.accumulator + dt).min(STEP * MAX_STEPS as f32);
-        let mut stepped = false;
+        let steps = self.fixed.advance(dt as f64);
         let mut poured = 0;
-        while self.accumulator >= STEP {
+        for _ in 0..steps {
             // a step's worth of the stream, before the step: it joins it
             if let Some(nozzle) = stream.as_deref_mut() {
                 poured += nozzle.emit_into(&mut surface.sim, STEP * self.time_scale);
             }
             surface.sim.update_batched_with(STEP * self.time_scale, 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
-            self.accumulator -= STEP;
-            stepped = true;
         }
-        if stepped {
+        if steps > 0 {
             self.probe.measure(&surface.sim);
         }
         self.count = surface.sim.particle_count();
@@ -736,7 +704,7 @@ impl Lake {
         surface.sim.reset_particles(&self.initial);
         self.count = surface.sim.particle_count();
         self.splash = None;
-        self.accumulator = 0.0;
+        self.fixed.reset();
         self.wake();
     }
 

@@ -1119,6 +1119,7 @@ where
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     // the water's refraction and reflection come first, on the lit scene (the lake's `effect` 0)
     let lake = lake.map(|(lake, surface)| {
+        lake::Lake::add_surface(&mut scene, &surface);
         effects.push(Box::new(surface));
         lake
     });
@@ -1127,9 +1128,6 @@ where
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
-    if let Some(surface) = volume.effect::<FluidSurfaceEffect>() {
-        lake::Lake::add_surface(&mut scene, surface);
-    }
     let mut camera = Camera::new(45.0, 0.1, 1200.0, canvas.aspect());
     camera.update_projection_matrix();
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();

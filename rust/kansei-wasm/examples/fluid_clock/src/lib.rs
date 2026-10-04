@@ -4,12 +4,13 @@ use std::rc::Rc;
 
 use kansei_core::cameras::Camera;
 use kansei_core::controls::{CameraControls, MouseVectors};
-use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry};
+use kansei_core::geometries::{InstancedGeometry, PlaneGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{PARTICLE_BILLBOARD_WGSL, Binding, CullMode, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Mat4, Vec3};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::pacing::FixedStep;
 use kansei_core::postprocessing::{PostProcessingVolume, effects::{
     DepthOfFieldEffect, DepthOfFieldOptions,
     FluidSurfaceEffect, FluidSurfaceOptions,
@@ -18,7 +19,8 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::sdf::{FontAtlas, GlyphVolumeSet};
 use kansei_core::simulations::fluid::{
     ClockState, DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation,
-    FluidSimulationOptions, FluidSurfaceRenderer, GlyphAttractor, MarchingCubesOptions, SlotLayout, RetagParams};
+    FluidSimulationOptions, GlyphAttractor, MarchingCubesOptions, RaymarchingRenderable, SlotLayout, RetagParams,
+    DEFAULT_OPTIONS};
 use kansei_wasm::{fetch_bytes, Canvas, Frame};
 
 const FONT: &[u8] = include_bytes!("../assets/L10-medium.arfont");
@@ -82,110 +84,6 @@ fn fragment_main(v: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-// ── Particle billboard shader (engine-compatible instanced Renderable) ──
-
-// ── Blit shader (fullscreen triangle) ──
-const BLIT_WGSL: &str = r#"
-@group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
-    return vec4<f32>(pos[vi], 0.0, 1.0);
-}
-struct FOut { @location(0) color: vec4<f32>, }
-@fragment fn fs(@builtin(position) frag: vec4<f32>) -> FOut {
-    let dims = vec2<f32>(textureDimensions(src));
-    var out: FOut; out.color = textureSample(src, samp, frag.xy / dims); return out;
-}
-"#;
-
-// ── MC surface shader: outputs color + world-space normal to GBuffer ──
-const MC_SURFACE_WGSL: &str = r#"
-struct Params {
-    color: vec4<f32>,
-    specular: vec4<f32>,
-};
-@group(0) @binding(0) var<uniform> params: Params;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
-@group(3) @binding(1) var shadow_sampler: sampler_comparison;
-@group(3) @binding(2) var<uniform> shadow_uniforms: vec4<f32>;
-@group(3) @binding(3) var cube_shadow_tex: texture_2d_array<f32>;
-@group(3) @binding(4) var cube_shadow_sampler: sampler;
-
-struct VOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) world_pos: vec3<f32>,
-    @location(1) world_normal: vec3<f32>,
-};
-
-@vertex
-fn vertex_main(
-    @location(0) position: vec4<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-) -> VOut {
-    let wp = (world_matrix * vec4<f32>(position.xyz, 1.0)).xyz;
-    let wn = normalize((normal_matrix * vec4<f32>(normal, 0.0)).xyz);
-    var out: VOut;
-    out.clip_pos = projection_matrix * view_matrix * vec4<f32>(wp, 1.0);
-    out.world_pos = wp;
-    out.world_normal = wn;
-    return out;
-}
-
-struct FragOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
-@fragment
-fn fragment_main(v: VOut) -> FragOut {
-    let n = normalize(v.world_normal);
-    let light = normalize(vec3<f32>(0.3, 1.0, 0.5));
-    let ndotl = max(dot(n, light), 0.0);
-    let base = params.color.rgb;
-    let lit = base * (0.2 + ndotl * 0.8);
-
-    var out: FragOut;
-    out.color = vec4<f32>(lit, 1.0);
-    out.emissive = vec4<f32>(0.0);
-    // Write world normal (normalized, with small epsilon so refraction detection works)
-    out.normal = vec4<f32>(n, 1.0);
-    out.albedo = vec4<f32>(base, 1.0);
-    return out;
-}
-"#;
-
-// ── Helper: create MC surface renderable (placeholder — no buffer ptrs yet) ──
-// Writes color + world normal to GBuffer so FluidSurfaceEffect can detect and refract it.
-fn build_mc_renderable_placeholder() -> Renderable {
-    let geo = Geometry::new_indirect_placeholder("MC/Surface");
-    let mut opts = MaterialOptions::default();
-    opts.cull_mode = CullMode::None;
-    opts.mrt_output_count = Some(4); // shader writes to all 4 GBuffer targets
-
-    let uniform_data: [f32; 8] = [
-        0.77, 0.96, 1.0, 1.0, // color
-        0.15, 0.15, 0.15, 0.5, // specular
-    ];
-    let mut mat = Material::new(
-        "MC/Surface", MC_SURFACE_WGSL,
-        vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
-        opts,
-    );
-    mat.set_uniform_bindable(0, "MC/SurfaceParams", &uniform_data);
-
-    let mut r = Renderable::new(geo, mat);
-    r.visible = false;
-    r
-}
-
 /// Everything that has to move together when the particle count changes. All of it is
 /// derived from the tuned 80K @ h=1.0 setup by keeping the fluid volume constant:
 /// radius ∝ count^(-1/3), density_target ∝ n/h (kernels integrate to 2n/h), near
@@ -200,18 +98,37 @@ pub struct SimTuning {
     pub per_slot: u32, pub emit_rate: u32, pub particle_size: f32, pub kernel_scale: f32,
 }
 
+/// The sim as tuned for `BASE_COUNT` particles at h = 1.0, which `tuning_for` scales to a count.
+const BASE_COUNT: u32 = 80_000;
+const BASE_OPTIONS: FluidSimulationOptions = FluidSimulationOptions {
+    max_particles: BASE_COUNT, dimensions: 3, smoothing_radius: 1.0,
+    pressure_multiplier: 46.5, near_pressure_multiplier: 20.0, density_target: 8.6,
+    viscosity: 1.0, damping: 1.0, gravity: [0.0, -9.8, 0.0],
+    mouse_force: 1600.0, substeps: 2, world_bounds_padding: 2.0,
+    ..DEFAULT_OPTIONS
+};
+
+/// The sim options for `tuning`: the base scaled to its count, at its band's pressure.
+fn sim_options(tuning: &SimTuning) -> FluidSimulationOptions {
+    FluidSimulationOptions {
+        pressure_multiplier: tuning.pressure,
+        ..BASE_OPTIONS.scaled_to_count(BASE_COUNT, tuning.count)
+    }
+}
+
 pub fn tuning_for(count: u32) -> SimTuning {
-    let ratio = count as f32 / 80_000.0;
-    let radius = ratio.powf(-1.0 / 3.0);
+    let ratio = count as f32 / BASE_COUNT as f32;
+    let scaled = BASE_OPTIONS.scaled_to_count(BASE_COUNT, count);
+    let radius = scaled.smoothing_radius;
     let (pressure, time_scale) = if count <= 100_000 { (46.5, 1.9) }
         else if count <= 200_000 { (12.0, 1.9) }
         else if count <= 300_000 { (12.0, 1.4) }
         else { (6.0, 1.0) };
     SimTuning {
         count, radius, pressure,
-        near_pressure: 20.0 * radius,
-        density_target: 8.6 * ratio / radius,
-        viscosity: 1.0,
+        near_pressure: scaled.near_pressure_multiplier,
+        density_target: scaled.density_target,
+        viscosity: scaled.viscosity,
         time_scale,
         per_slot: (2000.0 * ratio).round() as u32,
         emit_rate: (100.0 * ratio).round() as u32,
@@ -234,48 +151,6 @@ pub fn sim_config() -> JsValue {
     set("perSlot", t.per_slot as f64); set("emitRate", t.emit_rate as f64);
     set("particleSize", t.particle_size as f64); set("kernelScale", t.kernel_scale as f64);
     o.into()
-}
-
-/// The raymarch mode's offscreen targets at the canvas size, and the bind groups that read them.
-struct RaymarchTargets {
-    color_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
-    _output_view: wgpu::TextureView,
-    surface_bg: wgpu::BindGroup,
-    blit_bg: wgpu::BindGroup,
-}
-
-fn raymarch_targets(
-    renderer: &Renderer,
-    surface_renderer: &FluidSurfaceRenderer,
-    density_view: &wgpu::TextureView,
-    blit_bgl: &wgpu::BindGroupLayout,
-    blit_sampler: &wgpu::Sampler,
-    width: u32,
-    height: u32,
-) -> RaymarchTargets {
-    let mk_tex = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
-        let tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: fmt, usage, view_formats: &[],
-        });
-        tex.create_view(&Default::default())
-    };
-    let cu = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
-    let color_view = mk_tex("Color", wgpu::TextureFormat::Rgba16Float, cu);
-    let depth_view = mk_tex("Depth", wgpu::TextureFormat::Depth32Float,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
-    let output_view = mk_tex("Output", wgpu::TextureFormat::Rgba16Float, cu);
-
-    let surface_bg = surface_renderer.create_bind_group(&color_view, &depth_view, &output_view, density_view);
-    let blit_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None, layout: blit_bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(blit_sampler) },
-        ],
-    });
-    RaymarchTargets { color_view, depth_view, _output_view: output_view, surface_bg, blit_bg }
 }
 
 /// `count` = 0 selects the default (500K).
@@ -315,14 +190,7 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
     }
 
     // ── Sim ──
-    let mut sim = FluidSimulation::new(&renderer, FluidSimulationOptions {
-        max_particles: count as u32, dimensions: 3, smoothing_radius: tuning.radius,
-        pressure_multiplier: tuning.pressure, near_pressure_multiplier: tuning.near_pressure,
-        density_target: tuning.density_target,
-        viscosity: tuning.viscosity, damping: 1.0, gravity: [0.0, -9.8, 0.0],
-        mouse_force: 1600.0, substeps: 2, world_bounds_padding: 2.0,
-        ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
-    }, &positions);
+    let mut sim = FluidSimulation::new(&renderer, sim_options(&tuning), &positions);
     // World bounds contain the spawn box (clock band + pool) plus margin for
     // falling/settling under gravity.
     sim.world_bounds_min = [-25.0, -10.0, -10.0];
@@ -352,11 +220,10 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
     attractor.set_slots(&slot_layout);
     attractor.set_tags(&vec![-1i32; count]); // start all ordinary fluid
 
-    // ── Density field + surface renderer (for raymarch mode) ──
+    // ── Density field ──
     let density_field = FluidDensityField::new(&renderer, sim.positions_buffer().unwrap(),
         sim.world_bounds_min, sim.world_bounds_max,
         DensityFieldOptions { resolution: 128, kernel_scale: tuning.kernel_scale, ..Default::default() }); // max-axis cells; ~0.55 units/cell on the 70-tall tank (192/256 looked the same)
-    let surface_renderer = FluidSurfaceRenderer::new(&renderer);
 
     // ── Marching cubes (compute only — render via standard Renderable) ──
     let marching_cubes = FluidMarchingCubes::new(&renderer, MarchingCubesOptions {
@@ -364,6 +231,21 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
         iso_level: 0.05,
     });
     let marching_cubes_bg = marching_cubes.create_bind_group(&renderer, &density_field.density_view);
+
+    // The effect owns the sim, density field and marching cubes: density + MC compute + refraction
+    let mut fluid = FluidSurfaceEffect::new(
+        sim, density_field, marching_cubes, marching_cubes_bg,
+        FluidSurfaceOptions::default(),
+    );
+    // Surface field is splatted at the h=1.0 radius regardless of the sim
+    // radius (0.543 < one 0.55-unit voxel would give a sparse, shattered
+    // field); kernel scale divided by the 6.25x particle count keeps the
+    // field values — and the tuned iso level — where they were at 80K.
+    fluid.splat_radius = Some(SURFACE_SPLAT_RADIUS);
+
+    // ── Raymarch mode: the density field raymarched offscreen and blitted to the canvas ──
+    let raymarch = RaymarchingRenderable::new(&renderer, format, width, height,
+        &fluid.density_field, fluid.sim.world_bounds_min, fluid.sim.world_bounds_max);
 
     // ── Build scene with standard Renderables ──
     let mut scene = Scene::new();
@@ -396,8 +278,9 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
         }
     }
 
-    // MC surface renderable — placeholder geometry, pointers set after State is stable
-    let mc_renderable = build_mc_renderable_placeholder();
+    // MC surface in the GBuffer (colour + world normal), where FluidSurfaceEffect refracts it
+    let mut mc_renderable = fluid.surface_renderable([0.77, 0.96, 1.0, 1.0]);
+    mc_renderable.visible = false;
     let mc_scene_index = scene.add(SceneNode::Renderable(mc_renderable));
 
     // Light
@@ -414,8 +297,8 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
     camera.update_projection_matrix();
     camera.update_view_matrix();
 
-    // ── Particle renderable (must be created BEFORE sim moves into effect) ──
-    let positions_cb = sim.positions_as_compute_buffer(3).expect("sim should be initialized");
+    // ── Particle renderable ──
+    let positions_cb = fluid.sim.positions_as_compute_buffer(3).expect("sim should be initialized");
     let billboard_geo = PlaneGeometry::new(1.0, 1.0);
     let instanced_geo = InstancedGeometry::new(billboard_geo, count as u32, vec![positions_cb]);
 
@@ -435,53 +318,10 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
     let particle_scene_index = scene.add(SceneNode::Renderable(particle_renderable));
 
     // ── Post-processing: FluidSurface (compute + refraction) → DoF ──
-
-    // ── Blit pipeline (for raymarch mode) ──
-    let blit_shader = renderer.device().create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Blit"), source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
-    });
-    let blit_bgl = renderer.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None, entries: &[
-            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-        ],
-    });
-    let blit_pipeline = renderer.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Blit"),
-        layout: Some(&renderer.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&blit_bgl], push_constant_ranges: &[] })),
-        vertex: wgpu::VertexState { module: &blit_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &blit_shader, entry_point: Some("fs"),
-            targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-            compilation_options: Default::default() }),
-        primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
-    });
-    let blit_sampler = renderer.device().create_sampler(&wgpu::SamplerDescriptor {
-        mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default()
-    });
-
-    // ── Offscreen textures (for raymarch mode), recreated when the canvas resizes ──
-    let raymarch = raymarch_targets(&renderer, &surface_renderer, &density_field.density_view, &blit_bgl, &blit_sampler, width, height);
-
-    // Now move sim, density_field, marching_cubes into the FluidSurfaceEffect
     let volume = PostProcessingVolume::new(
         &renderer,
         vec![
-            Box::new({
-                let mut fse = FluidSurfaceEffect::new(
-                    sim, density_field, marching_cubes, marching_cubes_bg,
-                    FluidSurfaceOptions::default(),
-                );
-                // Surface field is splatted at the h=1.0 radius regardless of the sim
-                // radius (0.543 < one 0.55-unit voxel would give a sparse, shattered
-                // field); kernel scale divided by the 6.25x particle count keeps the
-                // field values — and the tuned iso level — where they were at 80K.
-                fse.splat_radius = Some(SURFACE_SPLAT_RADIUS);
-                fse
-            }),
+            Box::new(fluid),
             Box::new(DepthOfFieldEffect::new(DepthOfFieldOptions {
                 focus_distance: 90.0,
                 focus_range: 37.0,
@@ -498,14 +338,13 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
 
     let state = Rc::new(RefCell::new(State {
         renderer, scene, camera, controls, mouse, volume,
-        surface_renderer,
         mc_scene_index, dome_scene_index, light_scene_index,
         particle_scene_index,
-        blit_pipeline, blit_bgl, blit_sampler, raymarch,
+        raymarch,
         width, height,
         particle_size: tuning.particle_size, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
         use_batched_sim: true,
-        sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: tuning.time_scale, max_sim_steps: 4,
+        sim_step: FixedStep::new(1.0 / 60.0).with_max_steps(4), sim_time_scale: tuning.time_scale,
         max_render_fps: 0.0, render_accumulator: 0.0,
         frame_count: 0, frame_time_sum: 0.0,
         current_fps: 0.0, current_frame_ms: 0.0,
@@ -529,22 +368,6 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
 
-    // Now State is at its final heap address — fix up MC buffer pointers.
-    // Access MC through the FluidSurfaceEffect in the volume.
-    {
-        let st = state.borrow();
-        let fse = st.volume.effect::<FluidSurfaceEffect>().unwrap();
-        let vb = fse.marching_cubes.vertex_buffer() as *const wgpu::Buffer;
-        let ib = fse.marching_cubes.index_buffer() as *const wgpu::Buffer;
-        let ab = fse.marching_cubes.indirect_args_buffer() as *const wgpu::Buffer;
-        let idx = st.mc_scene_index;
-        drop(st);
-        let mut st = state.borrow_mut();
-        if let Some(r) = st.scene.get_renderable_mut(idx) {
-            unsafe { r.geometry.set_external_buffers(vb, ib, Some(ab)); }
-        }
-    }
-
     kansei_wasm::run(&canvas, move |frame| state.borrow_mut().render_frame(frame));
 
     log::info!("Kansei WASM — {} particles, [toggle via tweakpane]", count);
@@ -558,18 +381,16 @@ struct State {
     controls: CameraControls,
     mouse: MouseVectors,
     volume: PostProcessingVolume,
-    surface_renderer: FluidSurfaceRenderer,
     mc_scene_index: usize,
     dome_scene_index: Option<usize>,
     light_scene_index: usize,
     particle_scene_index: usize,
-    // Custom pipeline for raymarch mode only
-    blit_pipeline: wgpu::RenderPipeline, blit_bgl: wgpu::BindGroupLayout, blit_sampler: wgpu::Sampler,
-    raymarch: RaymarchTargets,
+    raymarch: RaymarchingRenderable,
     width: u32, height: u32,
     particle_size: f32, show_particles: bool, render_mode: u32, mc_iso_level: f32,
     use_batched_sim: bool,
-    sim_accumulator: f64, sim_dt_step: f32, sim_time_scale: f32, max_sim_steps: u32,
+    /// The sim's fixed step (clamped to 1/240..1/20 s) and its cap of steps a frame.
+    sim_step: FixedStep, sim_time_scale: f32,
     max_render_fps: f64, render_accumulator: f64,
     frame_count: u32, frame_time_sum: f64,
     current_fps: f64, current_frame_ms: f64,
@@ -603,9 +424,7 @@ impl State {
             frame.resize(&mut self.renderer, &mut self.camera);
             self.width = width;
             self.height = height;
-            let fse = self.volume.effect::<FluidSurfaceEffect>().unwrap();
-            self.raymarch = raymarch_targets(&self.renderer, &self.surface_renderer, &fse.density_field.density_view,
-                &self.blit_bgl, &self.blit_sampler, width, height);
+            self.raymarch.resize(&self.renderer, width, height);
         }
 
         let frame_s = frame.dt as f64;
@@ -641,39 +460,23 @@ impl State {
         let mouse_dir = [self.mouse.direction.x, self.mouse.direction.y];
         let mouse_strength = self.mouse.strength.min(1.0);
 
-        // Step fluid simulation (owned by FluidSurfaceEffect in the volume).
-        //
-        // True framerate-independent sim via a fixed-step accumulator: drain
-        // the accumulator in chunks of exactly `sim_dt_step * sim_time_scale`
-        // so the sim evolves identically at 30, 33, 60, 90, 144 fps.
-        //
-        // `update_batched` already encodes all substeps into a single submit
-        // with no CPU-GPU sync, so running 2-3 steps on a slow frame costs
-        // ~2-3× compute but almost zero CPU overhead. The `max_sim_steps`
-        // cap prevents the classic spiral of death — extra leftover time is
-        // discarded rather than accumulated forever.
+        // Step fluid simulation (owned by FluidSurfaceEffect in the volume) at a fixed step, so
+        // it evolves the same at any frame rate: each step simulates `step * sim_time_scale`.
+        // `update_batched` encodes all substeps into one submit, so a slow frame's extra steps
+        // cost GPU time but almost no CPU; past the step cap the backlog is dropped.
         let identity = glam::Mat4::IDENTITY.to_cols_array();
         // Sim time advanced this frame (the attractor integrates over it).
         let mut sim_dt_frame = 0.0f32;
         if let Some(fse) = self.volume.effect_mut::<FluidSurfaceEffect>()
         {
             fse.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
-            let step_dt  = self.sim_dt_step.clamp(1.0 / 240.0, 1.0 / 20.0);
-            let scale    = self.sim_time_scale.clamp(0.1, 4.0);
-            let scaled_dt = step_dt * scale;
-            self.sim_accumulator += frame_dt * scale as f64;
-            let mut steps = 0u32;
-            while self.sim_accumulator >= step_dt as f64 && steps < self.max_sim_steps {
+            let scale = self.sim_time_scale.clamp(0.1, 4.0);
+            let scaled_dt = self.sim_step.step as f32 * scale;
+            let steps = self.sim_step.advance(frame_dt * scale as f64);
+            for _ in 0..steps {
                 fse.step_simulation(scaled_dt, mouse_strength, mouse_ndc, mouse_dir, self.use_batched_sim);
-                self.sim_accumulator -= step_dt as f64;
-                steps += 1;
             }
             sim_dt_frame = steps as f32 * scaled_dt;
-            // Drop excess if we're running slower than the sim needs — keeps
-            // the next frame from inheriting a huge backlog.
-            if self.sim_accumulator > step_dt as f64 {
-                self.sim_accumulator = step_dt as f64;
-            }
         }
 
         // ── Clock → GPU tagging → attractor (all GPU; no readback) ──────
@@ -731,44 +534,28 @@ impl State {
             fse.density_field.update_with_encoder(&mut encoder,
                 fse.sim.world_bounds_min, fse.sim.world_bounds_max,
                 fse.sim.particle_count(), SURFACE_SPLAT_RADIUS);
+            self.raymarch.bounds_min = fse.sim.world_bounds_min;
+            self.raymarch.bounds_max = fse.sim.world_bounds_max;
 
             // Clear offscreen color + depth (raymarch reads depth to know geometry)
             {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.raymarch.color_view, resolve_target: None,
+                        view: self.raymarch.input_color_view(), resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }),
                             store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.raymarch.depth_view,
+                        view: self.raymarch.input_depth_view(),
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                         stencil_ops: None,
                     }), ..Default::default()
                 });
             }
 
-            let inv_vp = Mat4::from(inv_vp);
-            let fse = self.volume.effect_mut::<FluidSurfaceEffect>().unwrap();
-            let bounds_min = fse.sim.world_bounds_min;
-            let bounds_max = fse.sim.world_bounds_max;
-            self.surface_renderer.render(&mut encoder, &self.raymarch.surface_bg,
-                &inv_vp, [eye.x, eye.y, eye.z],
-                bounds_min, bounds_max,
-                self.width, self.height);
-
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &canvas_view, resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })], ..Default::default()
-                }).forget_lifetime();
-                pass.set_pipeline(&self.blit_pipeline);
-                pass.set_bind_group(0, &self.raymarch.blit_bg, &[]);
-                pass.draw(0..3, 0..1);
-            }
+            self.raymarch.render(&mut encoder, &canvas_view, &Mat4::from(inv_vp),
+                [eye.x, eye.y, eye.z], self.width, self.height);
             self.renderer.submit(std::iter::once(encoder.finish()));
             output.present();
 
@@ -899,7 +686,7 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
     with_state(|s| {
         let iso = v.max(0.0);
         s.mc_iso_level = iso;
-        s.surface_renderer.density_threshold = iso;
+        s.raymarch.surface_renderer_mut().density_threshold = iso;
         if let Some(fse) = s.volume.effect_mut::<FluidSurfaceEffect>() {
             fse.marching_cubes.set_iso_level(iso);
         }
@@ -914,15 +701,15 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
     });
 }
 #[wasm_bindgen] pub fn set_use_batched_sim(v: bool) { with_state(|s| s.use_batched_sim = v); }
-#[wasm_bindgen] pub fn set_sim_dt_step(v: f32) { with_state(|s| s.sim_dt_step = v.max(1.0 / 1000.0)); }
+#[wasm_bindgen] pub fn set_sim_dt_step(v: f32) { with_state(|s| s.sim_step.step = v.max(1.0 / 1000.0).clamp(1.0 / 240.0, 1.0 / 20.0) as f64); }
 #[wasm_bindgen] pub fn set_sim_time_scale(v: f32) { with_state(|s| s.sim_time_scale = v.max(0.01)); }
 #[wasm_bindgen] pub fn set_max_render_fps(v: f32) { with_state(|s| s.max_render_fps = v.max(0.0) as f64); }
-#[wasm_bindgen] pub fn set_density_scale(v: f32) { with_state(|s| s.surface_renderer.density_scale = v); }
+#[wasm_bindgen] pub fn set_density_scale(v: f32) { with_state(|s| s.raymarch.surface_renderer_mut().density_scale = v); }
 #[wasm_bindgen] pub fn set_density_threshold(v: f32) {
-    with_state(|s| { s.surface_renderer.density_threshold = v; s.mc_iso_level = v.max(0.0); });
+    with_state(|s| { s.raymarch.surface_renderer_mut().density_threshold = v; s.mc_iso_level = v.max(0.0); });
 }
-#[wasm_bindgen] pub fn set_absorption(v: f32) { with_state(|s| s.surface_renderer.absorption = v); }
-#[wasm_bindgen] pub fn set_step_count(v: u32) { with_state(|s| s.surface_renderer.step_count = v); }
+#[wasm_bindgen] pub fn set_absorption(v: f32) { with_state(|s| s.raymarch.surface_renderer_mut().absorption = v); }
+#[wasm_bindgen] pub fn set_step_count(v: u32) { with_state(|s| s.raymarch.surface_renderer_mut().step_count = v); }
 #[wasm_bindgen] pub fn set_kernel_scale(v: f32) { with_fluid(|f| f.density_field.kernel_scale = v); }
 #[wasm_bindgen] pub fn set_bounds(min_x: f32, min_y: f32, min_z: f32, max_x: f32, max_y: f32, max_z: f32) {
     with_fluid(|f| {

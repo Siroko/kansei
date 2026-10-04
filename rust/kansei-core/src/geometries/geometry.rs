@@ -121,6 +121,18 @@ impl Geometry {
         geometry
     }
 
+    /// A geometry drawn indirectly from buffers a compute pass fills (a marching-cubes mesh):
+    /// vertices laid out as [`Vertex`], u32 indices and, if given, `DrawIndexedIndirect`
+    /// arguments. The geometry keeps handles to the buffers, so they must not be replaced by
+    /// new ones afterwards (writing into them is fine).
+    pub fn from_gpu_buffers(label: &str, vertex_buffer: wgpu::Buffer, index_buffer: wgpu::Buffer, indirect_args_buffer: Option<wgpu::Buffer>) -> Self {
+        let mut geometry = Self::new_indirect_placeholder(label);
+        geometry.vertex_buffer = Some(vertex_buffer);
+        geometry.index_buffer = Some(index_buffer);
+        geometry.indirect_args_buffer = indirect_args_buffer;
+        geometry
+    }
+
     /// Several geometries as one, each moved by its matrix first (normals by its inverse
     /// transpose): a spruce from cones, a model from its glTF parts, props from boxes and
     /// cylinders. Instancing is not carried over.
@@ -219,6 +231,7 @@ impl Geometry {
     ///
     /// # Safety
     /// Pointers must remain valid for the lifetime of this Geometry.
+    #[deprecated(note = "use Geometry::from_gpu_buffers, which keeps handles to the buffers")]
     pub unsafe fn set_external_buffers(
         &mut self,
         vertex: *const wgpu::Buffer,
