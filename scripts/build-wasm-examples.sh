@@ -15,16 +15,16 @@ out="${1:-$root/build/wasm-examples}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 
-# Not published:
-#   joydivision: plays a commercial recording (Joy Division, "A Means to an End") the site has no
-#   licence to distribute.
-skip=" joydivision "
+# Not published (space-separated example names).
+skip=" "
 
 # Files a page never loads, left out of the site.
 #   pathtracer: scene.gltf/scene.bin (24 MB) are an unused scene; the example loads the dragon.
+#   joydivision: lyrics.json plays the .ogg; the .mp3 copies are unused.
 unused_files() {
     case "$1" in
         pathtracer) echo "assets/scene.gltf assets/scene.bin" ;;
+        joydivision) echo "assets/audio/a-means-to-an-end.mp3 assets/audio/a-means-to-an-end-original.mp3 assets/audio/test.mp3" ;;
     esac
 }
 
