@@ -10,6 +10,7 @@
 @group(0) @binding(5) var<storage, read> cellCounts: array<u32>;
 @group(0) @binding(6) var<storage, read> vehicleIndices: array<u32>;
 @group(0) @binding(7) var<storage, read> wordMeta: array<vec4<u32>>;
+@group(0) @binding(8) var<uniform> grid: NeighbourGrid;
 
 // Simple hash for per-vehicle random seed
 fn pcgHash(input: u32) -> u32 {
@@ -34,7 +35,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var force = vec3<f32>(0.0);
 
     // ── Boids: separation + cohesion + alignment via spatial hash ──
-    let myCoord = getCellCoord(pos, params);
+    let myCoord = neighbourCell(pos, grid);
     var sepAccum = vec3<f32>(0.0);
     var cohAccum = vec3<f32>(0.0);   // average neighbor position
     var aliAccum = vec3<f32>(0.0);   // average neighbor velocity
@@ -44,13 +45,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var dy = -1; dy <= 1; dy++) {
             for (var dx = -1; dx <= 1; dx++) {
                 let neighborCoord = myCoord + vec3<i32>(dx, dy, dz);
-                let dims = vec3<i32>(i32(params.gridDimsX), i32(params.gridDimsY), i32(params.gridDimsZ));
-
-                if (any(neighborCoord < vec3<i32>(0)) || any(neighborCoord >= dims)) {
+                if (!neighbourCellInside(neighborCoord, grid)) {
                     continue;
                 }
 
-                let neighborCell = cellHash(neighborCoord, params);
+                let neighborCell = neighbourCellIndex(neighborCoord, grid);
                 let start = cellOffsets[neighborCell];
                 let count = cellCounts[neighborCell];
 

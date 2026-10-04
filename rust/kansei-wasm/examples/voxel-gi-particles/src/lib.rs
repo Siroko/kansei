@@ -39,6 +39,7 @@ use kansei_core::pacing::FixedStep;
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, is_phone, now, param, param_or, Canvas, Frame};
 use kansei_core::simulations::fluid::{FluidSimulation, FluidSimulationOptions};
+use kansei_core::simulations::grid::NEIGHBOUR_GRID_WGSL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Look {
@@ -175,7 +176,11 @@ fn lightbox_wall_shader() -> String {
 
 /// The spheres' shader with `entry` (ROOM_SPHERES_SHADE_WGSL or ROOM_SPHERES_DEPTH_WGSL).
 fn sphere_shader(entry: &str) -> String {
-    format!("{VOXEL_CONES_WGSL}\n{SKY_LIGHTING_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_SPHERES_WGSL}\n{entry}")
+    format!("{VOXEL_CONES_WGSL}\n{SKY_LIGHTING_WGSL}\n{SCENE_WGSL}\n{NEIGHBOUR_GRID_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_SPHERES_WGSL}\n{entry}")
+}
+
+fn pile_top_shader() -> String {
+    format!("{NEIGHBOUR_GRID_WGSL}\n{}", include_str!("shaders/pile_top.wgsl"))
 }
 
 fn cornell_wall_shader() -> String {
@@ -479,16 +484,6 @@ fn mean_panel_irradiance(wall: &Wall, look: Look) -> f32 {
     sum / 64.0
 }
 
-/// The fluid's neighbour grid, for the ray-traced spheres (room_spheres.wgsl's `Grid`).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GridParams {
-    origin: [f32; 3],
-    cell_size: f32,
-    dims: [u32; 3],
-    count: u32,
-}
-
 /// The highest particle centre, each frame (pile_top.wgsl): rays leaving the pile upward stop
 /// walking the grid above it.
 struct PileTop {
@@ -506,7 +501,7 @@ impl PileTop {
             mapped_at_creation: false,
         });
         let stage = wgpu::ShaderStages::COMPUTE;
-        let mut compute = Compute::new("VoxelGIParticles/PileTop", include_str!("shaders/pile_top.wgsl"), vec![Binding::uniform(0, stage), Binding::storage(1, stage, true), Binding::storage(2, stage, false)]);
+        let mut compute = Compute::new("VoxelGIParticles/PileTop", &pile_top_shader(), vec![Binding::uniform(0, stage), Binding::storage(1, stage, true), Binding::storage(2, stage, false)]);
         compute.initialize(device);
         let whole = |buffer| BindingResource::Buffer { buffer, offset: 0, size: None };
         compute.set_bind_group(device, &[(0, whole(grid)), (1, whole(sorted_positions)), (2, whole(&buffer))]);
@@ -830,12 +825,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut particles = Vec::new();
     let mut pile_top = None;
     if lightbox {
-        let grid = GridParams { origin: sim.grid_origin(), cell_size: sim.cell_size(), dims: sim.grid_dims(), count: sim.particle_count() };
-        let grid_buffer = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("VoxelGIParticles/Grid"),
-            contents: bytemuck::bytes_of(&grid),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let grid_buffer = sim.grid().unwrap().params_buffer().clone();
         let storage = |label: &str, buffer: &wgpu::Buffer| ComputeBuffer::from_external(label, buffer.clone(), BufferType::Storage);
         let top = PileTop::new(renderer.device(), &grid_buffer, sim.sorted_positions_buffer().unwrap(), sim.particle_count());
         // a depth prepass, then the shading on equal depth: the shading (and the ray tracing)
@@ -1203,8 +1193,8 @@ mod tests {
         let spheres = validate("lightbox spheres", &sphere_shader(ROOM_SPHERES_SHADE_WGSL));
         assert_eq!(struct_size(&spheres, "SceneParams"), std::mem::size_of::<SceneParams>());
         assert_eq!(struct_size(&spheres, "SkyLighting"), sky);
-        assert_eq!(struct_size(&spheres, "Grid"), std::mem::size_of::<GridParams>());
-        assert_eq!(struct_size(&validate("pile top", include_str!("shaders/pile_top.wgsl")), "Grid"), std::mem::size_of::<GridParams>());
+        assert_eq!(struct_size(&spheres, "NeighbourGrid"), std::mem::size_of::<kansei_core::simulations::grid::GpuNeighbourGrid>());
+        assert_eq!(struct_size(&validate("pile top", &pile_top_shader()), "NeighbourGrid"), std::mem::size_of::<kansei_core::simulations::grid::GpuNeighbourGrid>());
         assert_eq!(struct_size(&spheres, "Particles"), 32);
         assert_eq!(struct_size(&validate("lightbox walls", &lightbox_wall_shader()), "Surface"), 48);
     }

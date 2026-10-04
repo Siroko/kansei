@@ -13,12 +13,11 @@
 // (pile_top.wgsl). A ray leaving the particles meets the room, lit by the panel and by one cone
 // through the volume.
 struct Particles { albedo: vec4f, size: f32, mirrored: f32, _p0: f32, _p1: f32 };
-// the fluid's neighbour grid (FluidSimulation::grid_dims, cell_size, grid_origin)
-struct Grid { origin: vec3f, cellSize: f32, dims: vec3u, count: u32 };
 
 @group(0) @binding(0) var<uniform> particles: Particles;
 @group(0) @binding(1) var<uniform> scene: SceneParams;
-@group(0) @binding(2) var<uniform> grid: Grid;
+// the fluid's neighbour grid (FluidSimulation::grid; NeighbourGrid from NEIGHBOUR_GRID_WGSL)
+@group(0) @binding(2) var<uniform> grid: NeighbourGrid;
 @group(0) @binding(3) var<storage, read> sortedPositions: array<vec4f>;
 @group(0) @binding(4) var<storage, read> cellOffsets: array<u32>;
 @group(0) @binding(5) var<storage, read> sortedIndices: array<u32>;
