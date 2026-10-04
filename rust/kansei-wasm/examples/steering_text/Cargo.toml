@@ -16,4 +16,7 @@ wasm-bindgen-futures = "0.4"
 log = "0.4"
 serde_json = "1"
 
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in"] }
+
 [workspace]

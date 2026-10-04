@@ -16,6 +16,8 @@ use kansei_wasm::{fetch_bytes, Canvas, Frame};
 mod steering_sim;
 mod text_data;
 
+// browser only (the controls read the canvas); the shaders' tests run natively
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = Canvas::find(canvas_id)?;

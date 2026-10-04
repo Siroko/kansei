@@ -1,29 +1,23 @@
-// SteeringSimulation -- compute-based 3D boids with spatial hash + verlet constraints.
+// SteeringSimulation -- compute-based 3D boids on kansei's neighbour grid + verlet constraints.
 // Engine-adjacent code: accesses renderer.device()/queue() internally.
 
+use kansei_core::simulations::grid::{GridLayout, NeighbourGrid, NeighbourGridOptions, NEIGHBOUR_GRID_WGSL};
 use wgpu::util::DeviceExt;
 
 use crate::text_data::ParticleData;
 
-const PREFIX_SUM_BLOCK_SIZE: u32 = 512;
-/// Cells per grid axis at most: 64³ cells is 512 prefix-sum blocks, all the top-level scan holds.
-const MAX_GRID_DIM: u32 = 64;
+/// Cells in the neighbour grid at most (64³), which bounds its memory when the bounds grow.
+const MAX_GRID_CELLS: u32 = 1 << 18;
 
 const SIM_PARAMS_WGSL: &str = include_str!("shaders/sim_params.wgsl");
-const GRID_CLEAR_WGSL: &str = include_str!("shaders/grid_clear.wgsl");
-const GRID_ASSIGN_WGSL: &str = include_str!("shaders/grid_assign.wgsl");
-const PREFIX_SUM_LOCAL_WGSL: &str = include_str!("shaders/prefix_sum_local.wgsl");
-const PREFIX_SUM_TOP_WGSL: &str = include_str!("shaders/prefix_sum_top.wgsl");
-const PREFIX_SUM_DISTRIBUTE_WGSL: &str = include_str!("shaders/prefix_sum_distribute.wgsl");
-const SCATTER_WGSL: &str = include_str!("shaders/scatter.wgsl");
 const STEERING_WGSL: &str = include_str!("shaders/steering.wgsl");
 const VERLET_WGSL: &str = include_str!("shaders/verlet.wgsl");
 const INTEGRATE_WGSL: &str = include_str!("shaders/integrate.wgsl");
 const REPULSION_WGSL: &str = include_str!("shaders/repulsion.wgsl");
 
-/// Prepend SimParams struct + helpers to a shader that needs them.
+/// Prepend the SimParams struct and the neighbour grid's helpers to a shader.
 fn with_params(shader: &str) -> String {
-    format!("{}\n{}", SIM_PARAMS_WGSL, shader)
+    format!("{SIM_PARAMS_WGSL}\n{NEIGHBOUR_GRID_WGSL}\n{shader}")
 }
 
 // ── Tunable parameters (exposed to lib.rs) ──
@@ -137,30 +131,15 @@ impl Pass {
     }
 }
 
-/// A zeroed `count`-element u32 storage buffer (at least one element).
-fn zeroed_u32(device: &wgpu::Device, label: &str, count: usize) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: (count.max(1) * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-/// The hash grid for `params`: cells at least as wide as both search radii (the 3×3×3
-/// neighbourhood must reach every neighbour) and wide enough that at most MAX_GRID_DIM of them
-/// span the bounds; the grid starts at -bounds on every axis.
-fn grid_layout(params: &SteeringParams) -> (f32, [u32; 3], [f32; 3]) {
+/// The neighbour grid over the bounds: cells at least as wide as both search radii (the 3×3×3
+/// neighbourhood must reach every neighbour), wider if the bounds would need more than
+/// MAX_GRID_CELLS.
+fn grid_layout(params: &SteeringParams) -> GridLayout {
     let bounds = params.bounds_size.max(1.0);
-    let cell_size = params
-        .separation_radius
-        .max(params.repulsion_radius)
-        .max(bounds * 2.0 / MAX_GRID_DIM as f32);
-    let dim = ((bounds * 2.0 / cell_size).ceil() as u32).clamp(1, MAX_GRID_DIM);
-    (cell_size, [dim; 3], [-bounds; 3])
+    GridLayout::covering([-bounds; 3], [bounds; 3], params.separation_radius.max(params.repulsion_radius).max(1e-3), MAX_GRID_CELLS)
 }
 
-// ── SimParams uniform layout (44 f32 = 176 bytes, 11 vec4 blocks) ──
+// ── SimParams uniform layout (36 f32 = 144 bytes, 9 vec4 blocks) ──
 // Offsets must match the WGSL struct exactly.
 
 struct ParamOffsets;
@@ -178,23 +157,19 @@ impl ParamOffsets {
     const BOUNDS_SIZE: usize = 10;
     const TIME: usize = 11;
     const MOUSE_STRENGTH: usize = 12;
-    const GRID_DIMS: usize = 13; // x, y, z
-    const CELL_SIZE: usize = 16;
-    const GRID_ORIGIN: usize = 17; // x, y, z
-    const TOTAL_CELLS: usize = 20;
-    const VERLET_ITERATIONS: usize = 21;
-    const MOUSE_FORCE: usize = 22;
-    const COHESION_STRENGTH: usize = 23;
-    const ALIGNMENT_STRENGTH: usize = 24;
-    const ATTRACTOR: usize = 25; // x, y, z
-    const ATTRACTOR_STRENGTH: usize = 28;
-    const REPULSION_STRENGTH: usize = 29;
-    const REPULSION_RADIUS: usize = 30;
-    const MAX_PER_CELL: usize = 31;
-    const MOUSE_RAY_ORIGIN: usize = 32; // x, y, z
-    const MOUSE_RAY_DIR: usize = 35; // x, y, z
-    const MOUSE_DIR: usize = 38; // x, y, z; 41-43 pad
-    const BUFFER_SIZE: usize = 44;
+    const VERLET_ITERATIONS: usize = 13;
+    const MOUSE_FORCE: usize = 14;
+    const COHESION_STRENGTH: usize = 15;
+    const ALIGNMENT_STRENGTH: usize = 16;
+    const ATTRACTOR: usize = 17; // x, y, z
+    const ATTRACTOR_STRENGTH: usize = 20;
+    const REPULSION_STRENGTH: usize = 21;
+    const REPULSION_RADIUS: usize = 22;
+    const MAX_PER_CELL: usize = 23;
+    const MOUSE_RAY_ORIGIN: usize = 24; // x, y, z
+    const MOUSE_RAY_DIR: usize = 27; // x, y, z
+    const MOUSE_DIR: usize = 30; // x, y, z; 33-35 pad
+    const BUFFER_SIZE: usize = 36;
 }
 
 // ── Main simulation struct ──
@@ -210,22 +185,11 @@ pub struct SteeringSimulation {
     word_meta_buffer: wgpu::Buffer,
     rest_lengths_buffer: wgpu::Buffer,
     vehicle_indices_buffer: wgpu::Buffer,
-    cell_indices_buffer: wgpu::Buffer,
-    sorted_indices_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
-    // sized by the grid: rebuilt (with every bind group) when its cell count changes
-    cell_counts_buffer: wgpu::Buffer,
-    cell_offsets_buffer: wgpu::Buffer,
-    scatter_counters_buffer: wgpu::Buffer,
-    block_sums_buffer: wgpu::Buffer,
+    /// Every letter sorted by cell each step, for the steering and repulsion searches.
+    grid: NeighbourGrid,
 
     // Compute passes
-    grid_clear: Pass,
-    grid_assign: Pass,
-    prefix_sum_local: Pass,
-    prefix_sum_top: Pass,
-    prefix_sum_distribute: Pass,
-    scatter: Pass,
     steering: Pass,
     verlet: Pass,
     integrate: Pass,
@@ -234,10 +198,6 @@ pub struct SteeringSimulation {
     // Counts
     particle_count: u32,
     vehicle_count: u32,
-    total_cells: u32,
-    grid_dims: [u32; 3],
-    grid_origin: [f32; 3],
-    cell_size: f32,
 
     // Packed params for upload
     params_data: Vec<f32>,
@@ -263,9 +223,6 @@ impl SteeringSimulation {
             }
         }
         let vehicle_count = vehicle_indices.len() as u32;
-
-        let (cell_size, grid_dims, grid_origin) = grid_layout(params);
-        let total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
 
         // Create GPU buffers
         let positions_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -299,11 +256,14 @@ impl SteeringSimulation {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let pc = particle_count as usize;
-        let cell_indices_buffer = zeroed_u32(&device, "SteeringSim/CellIndices", pc);
-        let sorted_indices_buffer = zeroed_u32(&device, "SteeringSim/SortedIndices", pc);
-        let [cell_counts_buffer, cell_offsets_buffer, scatter_counters_buffer, block_sums_buffer] =
-            Self::grid_buffers(&device, total_cells);
+        let mut grid = NeighbourGrid::new(&device, &queue, &NeighbourGridOptions {
+            label: "SteeringSim/Grid",
+            capacity: particle_count,
+            layout: grid_layout(params),
+            positions: &positions_buffer,
+            sorted_copies: &[],
+        });
+        grid.set_count(particle_count);
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("SteeringSim/Params"),
@@ -325,24 +285,14 @@ impl SteeringSimulation {
         let uniform = |binding: u32| buffer_entry(binding, wgpu::BufferBindingType::Uniform);
 
         // Bindings in the order bind_passes gives the buffers
-        let grid_clear = Pass::new(&device, "GridClear", GRID_CLEAR_WGSL, &[storage(0), storage(1)]);
-        let grid_assign = Pass::new(&device, "GridAssign", &with_params(GRID_ASSIGN_WGSL),
-            &[storage_ro(0), storage(1), storage(2), uniform(3)]);
-        let prefix_sum_local = Pass::new(&device, "PrefixSumLocal", PREFIX_SUM_LOCAL_WGSL,
-            &[storage(0), storage(1), storage(2)]);
-        let prefix_sum_top = Pass::new(&device, "PrefixSumTop", PREFIX_SUM_TOP_WGSL, &[storage(0)]);
-        let prefix_sum_distribute = Pass::new(&device, "PrefixSumDistribute", PREFIX_SUM_DISTRIBUTE_WGSL,
-            &[storage(0), storage(1)]);
-        let scatter = Pass::new(&device, "Scatter", &with_params(SCATTER_WGSL),
-            &[storage_ro(0), storage_ro(1), storage(2), storage(3), uniform(4)]);
         let steering = Pass::new(&device, "Steering", &with_params(STEERING_WGSL),
-            &[storage(0), storage(1), uniform(2), storage_ro(3), storage_ro(4), storage_ro(5), storage_ro(6), storage_ro(7)]);
+            &[storage(0), storage(1), uniform(2), storage_ro(3), storage_ro(4), storage_ro(5), storage_ro(6), storage_ro(7), uniform(8)]);
         let verlet = Pass::new(&device, "Verlet", &with_params(VERLET_WGSL),
             &[storage(0), storage_ro(1), storage_ro(2), uniform(3)]);
         let integrate = Pass::new(&device, "Integrate", &with_params(INTEGRATE_WGSL),
             &[storage(0), storage(1), uniform(2)]);
         let repulsion = Pass::new(&device, "Repulsion", &with_params(REPULSION_WGSL),
-            &[storage(0), uniform(1), storage_ro(2), storage_ro(3), storage_ro(4), storage_ro(5)]);
+            &[storage(0), uniform(1), storage_ro(2), storage_ro(3), storage_ro(4), storage_ro(5), uniform(6)]);
 
         let mut sim = Self {
             device,
@@ -352,89 +302,43 @@ impl SteeringSimulation {
             word_meta_buffer,
             rest_lengths_buffer,
             vehicle_indices_buffer,
-            cell_indices_buffer,
-            sorted_indices_buffer,
             params_buffer,
-            cell_counts_buffer,
-            cell_offsets_buffer,
-            scatter_counters_buffer,
-            block_sums_buffer,
-            grid_clear,
-            grid_assign,
-            prefix_sum_local,
-            prefix_sum_top,
-            prefix_sum_distribute,
-            scatter,
+            grid,
             steering,
             verlet,
             integrate,
             repulsion,
             particle_count,
             vehicle_count,
-            total_cells,
-            grid_dims,
-            grid_origin,
-            cell_size,
             params_data: vec![0.0f32; ParamOffsets::BUFFER_SIZE],
         };
         sim.bind_passes();
         sim
     }
 
-    /// Cell counts, cell offsets, scatter counters and prefix-sum block sums for `total_cells`.
-    fn grid_buffers(device: &wgpu::Device, total_cells: u32) -> [wgpu::Buffer; 4] {
-        let tc = total_cells as usize;
-        let blocks = tc.div_ceil(PREFIX_SUM_BLOCK_SIZE as usize);
-        [
-            zeroed_u32(device, "SteeringSim/CellCounts", tc),
-            zeroed_u32(device, "SteeringSim/CellOffsets", tc),
-            zeroed_u32(device, "SteeringSim/ScatterCounters", tc),
-            zeroed_u32(device, "SteeringSim/BlockSums", blocks),
-        ]
-    }
-
     /// (Re)create every pass's bind group from the current buffers.
     fn bind_passes(&mut self) {
         let d = &self.device;
-        // clears both cellCounts and scatterCounters
-        self.grid_clear.bind(d, &[&self.cell_counts_buffer, &self.scatter_counters_buffer]);
-        // hashes every particle's position into its cell
-        self.grid_assign.bind(d, &[&self.positions_buffer, &self.cell_indices_buffer, &self.cell_counts_buffer, &self.params_buffer]);
-        // exclusive scan of cellCounts into cellOffsets (cellCounts is left as it was)
-        self.prefix_sum_local.bind(d, &[&self.cell_counts_buffer, &self.cell_offsets_buffer, &self.block_sums_buffer]);
-        self.prefix_sum_top.bind(d, &[&self.block_sums_buffer]);
-        self.prefix_sum_distribute.bind(d, &[&self.block_sums_buffer, &self.cell_offsets_buffer]);
-        self.scatter.bind(d, &[
-            &self.cell_indices_buffer, &self.cell_offsets_buffer, &self.scatter_counters_buffer,
-            &self.sorted_indices_buffer, &self.params_buffer,
-        ]);
+        let g = &self.grid;
         // boids: reads each cell's range (cellOffsets) and size (cellCounts)
         self.steering.bind(d, &[
-            &self.positions_buffer, &self.velocities_buffer, &self.params_buffer, &self.sorted_indices_buffer,
-            &self.cell_offsets_buffer, &self.cell_counts_buffer, &self.vehicle_indices_buffer, &self.word_meta_buffer,
+            &self.positions_buffer, &self.velocities_buffer, &self.params_buffer, g.sorted_indices(),
+            g.cell_offsets(), g.cell_counts(), &self.vehicle_indices_buffer, &self.word_meta_buffer, g.params_buffer(),
         ]);
         self.verlet.bind(d, &[&self.positions_buffer, &self.word_meta_buffer, &self.rest_lengths_buffer, &self.params_buffer]);
         self.integrate.bind(d, &[&self.positions_buffer, &self.velocities_buffer, &self.params_buffer]);
         self.repulsion.bind(d, &[
-            &self.positions_buffer, &self.params_buffer, &self.sorted_indices_buffer,
-            &self.cell_offsets_buffer, &self.cell_counts_buffer, &self.word_meta_buffer,
+            &self.positions_buffer, &self.params_buffer, g.sorted_indices(),
+            g.cell_offsets(), g.cell_counts(), &self.word_meta_buffer, g.params_buffer(),
         ]);
     }
 
-    /// Fit the hash grid to the current radii and bounds; a new cell count reallocates the
-    /// grid's buffers.
+    /// Fit the neighbour grid to the current radii and bounds; a new cell count replaces its
+    /// per-cell buffers, which the searches bind.
     fn fit_grid(&mut self, params: &SteeringParams) {
-        let (cell_size, grid_dims, grid_origin) = grid_layout(params);
-        self.cell_size = cell_size;
-        self.grid_origin = grid_origin;
-        if grid_dims == self.grid_dims {
-            return;
+        if self.grid.set_layout(grid_layout(params)) {
+            self.bind_passes();
         }
-        self.grid_dims = grid_dims;
-        self.total_cells = grid_dims[0] * grid_dims[1] * grid_dims[2];
-        [self.cell_counts_buffer, self.cell_offsets_buffer, self.scatter_counters_buffer, self.block_sums_buffer] =
-            Self::grid_buffers(&self.device, self.total_cells);
-        self.bind_passes();
     }
 
     /// Pack simulation parameters into the uniform buffer.
@@ -456,15 +360,11 @@ impl SteeringSimulation {
         f[ParamOffsets::TIME] = time;
         f[ParamOffsets::MOUSE_STRENGTH] = mouse.strength;
         for axis in 0..3 {
-            f[ParamOffsets::GRID_DIMS + axis] = bits(self.grid_dims[axis]);
-            f[ParamOffsets::GRID_ORIGIN + axis] = self.grid_origin[axis];
             f[ParamOffsets::ATTRACTOR + axis] = params.attractor_pos[axis];
             f[ParamOffsets::MOUSE_RAY_ORIGIN + axis] = mouse.ray_origin[axis];
             f[ParamOffsets::MOUSE_RAY_DIR + axis] = mouse.ray_dir[axis];
             f[ParamOffsets::MOUSE_DIR + axis] = mouse.dir[axis];
         }
-        f[ParamOffsets::CELL_SIZE] = self.cell_size;
-        f[ParamOffsets::TOTAL_CELLS] = bits(self.total_cells);
         f[ParamOffsets::VERLET_ITERATIONS] = bits(params.verlet_iterations);
         f[ParamOffsets::MOUSE_FORCE] = params.mouse_force;
         f[ParamOffsets::COHESION_STRENGTH] = params.cohesion_strength;
@@ -483,8 +383,6 @@ impl SteeringSimulation {
 
         let vehicle_wg = ((self.vehicle_count + 63) / 64).max(1);
         let particle_wg = ((self.particle_count + 63) / 64).max(1);
-        let grid_wg = ((self.total_cells + 255) / 256).max(1);
-        let prefix_wg = ((self.total_cells + PREFIX_SUM_BLOCK_SIZE - 1) / PREFIX_SUM_BLOCK_SIZE).max(1);
 
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("SteeringSim") },
@@ -495,13 +393,8 @@ impl SteeringSimulation {
                 &wgpu::ComputePassDescriptor { label: None, timestamp_writes: None },
             );
 
-            // Spatial hash build
-            self.grid_clear.dispatch(&mut cp, grid_wg, 1, 1);
-            self.grid_assign.dispatch(&mut cp, particle_wg, 1, 1);
-            self.prefix_sum_local.dispatch(&mut cp, prefix_wg, 1, 1);
-            self.prefix_sum_top.dispatch(&mut cp, 1, 1, 1);
-            self.prefix_sum_distribute.dispatch(&mut cp, prefix_wg, 1, 1);
-            self.scatter.dispatch(&mut cp, particle_wg, 1, 1);
+            // every letter into its cell
+            self.grid.encode(&mut cp);
 
             // Steering forces (vehicles only)
             self.steering.dispatch(&mut cp, vehicle_wg, 1, 1);
@@ -527,5 +420,26 @@ impl SteeringSimulation {
     /// Public accessor so lib.rs can share this buffer with InstancedGeometry.
     pub fn positions_buffer(&self) -> &wgpu::Buffer {
         &self.positions_buffer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shaders_validate_and_the_params_match() {
+        for (name, code) in [("steering", STEERING_WGSL), ("verlet", VERLET_WGSL), ("integrate", INTEGRATE_WGSL), ("repulsion", REPULSION_WGSL)] {
+            let code = with_params(code);
+            let module = naga::front::wgsl::parse_str(&code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&code)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let span = module.types.iter().find_map(|(_, ty)| match (&ty.name, &ty.inner) {
+                (Some(n), naga::TypeInner::Struct { span, .. }) if n == "SimParams" => Some(*span as usize),
+                _ => None,
+            });
+            assert_eq!(span, Some(ParamOffsets::BUFFER_SIZE * 4), "{name}");
+        }
     }
 }

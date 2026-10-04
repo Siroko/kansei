@@ -1,9 +1,7 @@
 // The highest particle centre, as the bits of a non-negative f32 (which order as u32 do), from the
 // positions the neighbour grid sorted: rays above it plus the largest radius meet no particle
 // (room_spheres.wgsl). `top` is cleared to 0 before.
-struct Grid { origin: vec3f, cellSize: f32, dims: vec3u, count: u32 };
-
-@group(0) @binding(0) var<uniform> grid: Grid;
+@group(0) @binding(0) var<uniform> grid: NeighbourGrid;
 @group(0) @binding(1) var<storage, read> sortedPositions: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> top: atomic<u32>;
 
