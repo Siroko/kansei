@@ -5,11 +5,11 @@ use std::rc::Rc;
 
 use kansei_core::cameras::Camera;
 use kansei_core::controls::{CameraControls, MouseVectors};
-use kansei_core::geometries::{BoxGeometry, Geometry, InstancedGeometry, PlaneGeometry};
+use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
-use kansei_core::math::{Mat4, Vec3, Vec4};
+use kansei_core::math::{Mat4, Vec3};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{PostProcessingVolume, effects::{
     DepthOfFieldEffect, DepthOfFieldOptions,
@@ -21,7 +21,6 @@ use kansei_core::simulations::fluid::{
     FluidSurfaceRenderer, MarchingCubesOptions,
 };
 
-const BASIC_LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
 
 // ── Op-art stripe shader (matches engine bind group layout) ──
 const STRIPE_WGSL: &str = r#"
@@ -97,130 +96,6 @@ struct FOut { @location(0) color: vec4<f32>, }
 }
 "#;
 
-// ── Transmission/refraction shader ──
-const TRANSMISSION_WGSL: &str = r#"
-// Group 0: Material
-struct TransmissionParams {
-    color: vec4<f32>,       // fluid tint color
-    ior: f32,               // index of refraction
-    chromatic_aberration: f32,
-    tint_strength: f32,
-    fresnel_power: f32,
-    roughness: f32,
-    thickness: f32,         // refraction offset scale
-    _pad0: f32,
-    _pad1: f32,
-};
-@group(0) @binding(0) var<uniform> params: TransmissionParams;
-@group(0) @binding(1) var background_tex: texture_2d<f32>;
-@group(0) @binding(2) var background_sampler: sampler;
-
-// Group 1: Camera
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-
-// Group 2: Mesh
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-
-// Group 3: Shadow (required by pipeline layout, unused here)
-@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
-@group(3) @binding(1) var shadow_sampler: sampler_comparison;
-@group(3) @binding(2) var<uniform> shadow_uniforms: vec4<f32>;
-@group(3) @binding(3) var cube_shadow_tex: texture_2d_array<f32>;
-@group(3) @binding(4) var cube_shadow_sampler: sampler;
-
-struct VOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) world_pos: vec3<f32>,
-    @location(1) world_normal: vec3<f32>,
-};
-
-@vertex
-fn vertex_main(
-    @location(0) position: vec4<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-) -> VOut {
-    let wp = (world_matrix * vec4<f32>(position.xyz, 1.0)).xyz;
-    let wn = normalize((normal_matrix * vec4<f32>(normal, 0.0)).xyz);
-    var out: VOut;
-    out.clip_pos = projection_matrix * view_matrix * vec4<f32>(wp, 1.0);
-    out.world_pos = wp;
-    out.world_normal = wn;
-    return out;
-}
-
-@fragment
-fn fragment_main(v: VOut) -> @location(0) vec4<f32> {
-    let N = normalize(v.world_normal);
-    let dims = vec2<f32>(textureDimensions(background_tex));
-    let screen_uv = v.clip_pos.xy / dims;
-
-    // View direction (camera is at the origin of view space; extract from inverse view)
-    let cam_pos = vec3<f32>(
-        view_matrix[0][3] + view_matrix[3][0],
-        view_matrix[1][3] + view_matrix[3][1],
-        view_matrix[2][3] + view_matrix[3][2],
-    );
-    // Simpler: reconstruct from view matrix columns
-    let eye = -vec3<f32>(
-        dot(view_matrix[0].xyz, view_matrix[3].xyz),
-        dot(view_matrix[1].xyz, view_matrix[3].xyz),
-        dot(view_matrix[2].xyz, view_matrix[3].xyz),
-    );
-    let V = normalize(eye - v.world_pos);
-
-    // Fresnel (Schlick approximation)
-    let f0 = pow((1.0 - params.ior) / (1.0 + params.ior), 2.0);
-    let ndotv = max(dot(N, V), 0.0);
-    let fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, params.fresnel_power);
-
-    // Refraction offset in screen space
-    let refract_strength = params.thickness * (1.0 - 1.0 / params.ior);
-    let offset = N.xy * refract_strength * 0.05;
-
-    // Chromatic aberration — scale offset differently per channel
-    let ca = params.chromatic_aberration;
-    let bg_r = textureSample(background_tex, background_sampler, screen_uv + offset * (1.0 + ca)).r;
-    let bg_g = textureSample(background_tex, background_sampler, screen_uv + offset).g;
-    let bg_b = textureSample(background_tex, background_sampler, screen_uv + offset * (1.0 - ca)).b;
-    var refracted = vec3<f32>(bg_r, bg_g, bg_b);
-
-    // Apply tint
-    refracted *= mix(vec3<f32>(1.0), params.color.rgb, params.tint_strength);
-
-    // GGX specular (physically-based)
-    let alpha = params.roughness * params.roughness;
-    let a2 = alpha * alpha;
-
-    // Key light
-    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
-    let H = normalize(V + light_dir);
-    let ndoth = max(dot(N, H), 0.0);
-    let ndotl = max(dot(N, light_dir), 0.0);
-
-    // GGX distribution
-    let denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
-    let D = a2 / (3.14159 * denom * denom + 0.0001);
-
-    // Geometric attenuation (Smith-Schlick)
-    let k = alpha * 0.5;
-    let G = (ndotv / (ndotv * (1.0 - k) + k)) * (ndotl / (ndotl * (1.0 - k) + k));
-
-    let spec_color = vec3<f32>(fresnel);
-    let specular = spec_color * D * G * ndotl;
-
-    // Rim light (subtle edge glow from environment)
-    let rim = pow(1.0 - ndotv, 3.0) * 0.15;
-
-    // Blend: refracted color + specular + rim via Fresnel
-    let result = refracted * (1.0 - fresnel) + specular + vec3<f32>(rim);
-
-    return vec4<f32>(result, 1.0);
-}
-"#;
-
 // ── MC surface shader: outputs color + world-space normal to GBuffer ──
 const MC_SURFACE_WGSL: &str = r#"
 struct Params {
@@ -284,119 +159,11 @@ fn fragment_main(v: VOut) -> FragOut {
 }
 "#;
 
-// ── Cubemap capture shader: renders dome stripes to a single color target ──
-const CUBEMAP_DOME_WGSL: &str = r#"
-struct CaptureParams {
-    view_proj: mat4x4<f32>,
-    world: mat4x4<f32>,
-};
-struct StripeParams {
-    color_a: vec4<f32>,
-    color_b: vec4<f32>,
-    thickness_a: f32,
-    thickness_b: f32,
-    _pad0: f32,
-    _pad1: f32,
-};
-@group(0) @binding(0) var<uniform> capture: CaptureParams;
-@group(0) @binding(1) var<uniform> stripes: StripeParams;
-
-struct VOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) world_pos: vec3<f32>,
-};
-
-@vertex
-fn vs(
-    @location(0) position: vec4<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-) -> VOut {
-    let wp = (capture.world * vec4<f32>(position.xyz, 1.0)).xyz;
-    var out: VOut;
-    out.clip_pos = capture.view_proj * vec4<f32>(wp, 1.0);
-    out.world_pos = wp;
-    return out;
-}
-
-@fragment
-fn fs(v: VOut) -> @location(0) vec4<f32> {
-    let period = stripes.thickness_a + stripes.thickness_b;
-    let t = ((v.world_pos.x % period) + period) % period;
-    let in_a = t < stripes.thickness_a;
-    let base = select(stripes.color_b.rgb, stripes.color_a.rgb, in_a);
-    return vec4<f32>(base, 1.0);
-}
-"#;
-
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Info).ok();
     log::info!("Kansei WASM initialized");
-}
-
-// ── Helper: create a basic lit material ──
-fn make_lit_material(name: &str, color: [f32; 4], opts: MaterialOptions) -> Material {
-    let uniform: [f32; 8] = [
-        color[0], color[1], color[2], color[3],
-        0.15, 0.15, 0.15, 0.5, // specular
-    ];
-    let mut mat = Material::new(
-        name, BASIC_LIT_WGSL,
-        vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
-        opts,
-    );
-    mat.set_uniform_bindable(0, &format!("{name}/Color"), &uniform);
-    mat
-}
-
-// ── Helper: build cornell box walls as standard renderables ──
-fn front_cull_opts() -> MaterialOptions {
-    let mut opts = MaterialOptions::default();
-    opts.cull_mode = CullMode::Front;
-    opts
-}
-
-fn build_cornell_box(scene: &mut Scene, bounds_min: [f32; 3], bounds_max: [f32; 3]) {
-    let [x0, y0, z0] = bounds_min;
-    let [x1, y1, z1] = bounds_max;
-    let sx = x1 - x0;
-    let sy = y1 - y0;
-    let sz = z1 - z0;
-    let cx = (x0 + x1) * 0.5;
-    let cy = (y0 + y1) * 0.5;
-    let cz = (z0 + z1) * 0.5;
-
-    let mut floor = Renderable::new(BoxGeometry::new(sx, 0.1, sz),
-        make_lit_material("Floor", [0.7, 0.7, 0.7, 1.0], front_cull_opts()));
-    floor.object.set_position(cx, y0 - 0.05, cz);
-    scene.add(SceneNode::Renderable(floor));
-
-    let mut ceil = Renderable::new(BoxGeometry::new(sx, 0.1, sz),
-        make_lit_material("Ceiling", [0.7, 0.7, 0.7, 1.0], front_cull_opts()));
-    ceil.object.set_position(cx, y1 + 0.05, cz);
-    scene.add(SceneNode::Renderable(ceil));
-
-    let mut back = Renderable::new(BoxGeometry::new(sx, sy, 0.1),
-        make_lit_material("BackWall", [0.7, 0.7, 0.7, 1.0], front_cull_opts()));
-    back.object.set_position(cx, cy, z0 - 0.05);
-    scene.add(SceneNode::Renderable(back));
-
-    let mut left = Renderable::new(BoxGeometry::new(0.1, sy, sz),
-        make_lit_material("LeftWall", [0.8, 0.15, 0.1, 1.0], front_cull_opts()));
-    left.object.set_position(x0 - 0.05, cy, cz);
-    scene.add(SceneNode::Renderable(left));
-
-    let mut right = Renderable::new(BoxGeometry::new(0.1, sy, sz),
-        make_lit_material("RightWall", [0.15, 0.8, 0.1, 1.0], front_cull_opts()));
-    right.object.set_position(x1 + 0.05, cy, cz);
-    scene.add(SceneNode::Renderable(right));
-
-    let mut front = Renderable::new(BoxGeometry::new(sx, sy, 0.1),
-        make_lit_material("FrontWall", [0.7, 0.7, 0.7, 1.0], front_cull_opts()));
-    front.object.set_position(cx, cy, z1 + 0.05);
-    scene.add(SceneNode::Renderable(front));
 }
 
 // ── Helper: create MC surface renderable (placeholder — no buffer ptrs yet) ──
@@ -665,8 +432,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         mc_scene_index, dome_scene_index, light_scene_index,
         particle_scene_index,
         blit_pipeline, blit_bg, surface_bg,
-        color_view, depth_view, output_view,
-        count: count as u32, width, height,
+        color_view, depth_view, _output_view: output_view,
+        width, height,
         particle_size: 0.15, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
         use_batched_sim: true,
         sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: 1.0, max_sim_steps: 4,
@@ -725,8 +492,8 @@ struct State {
     particle_scene_index: usize,
     // Custom pipeline for raymarch mode only
     blit_pipeline: wgpu::RenderPipeline, blit_bg: wgpu::BindGroup, surface_bg: wgpu::BindGroup,
-    color_view: wgpu::TextureView, depth_view: wgpu::TextureView, output_view: wgpu::TextureView,
-    count: u32, width: u32, height: u32,
+    color_view: wgpu::TextureView, depth_view: wgpu::TextureView, _output_view: wgpu::TextureView,
+    width: u32, height: u32,
     particle_size: f32, show_particles: bool, render_mode: u32, mc_iso_level: f32,
     use_batched_sim: bool,
     sim_accumulator: f64, sim_dt_step: f32, sim_time_scale: f32, max_sim_steps: u32,
@@ -981,15 +748,6 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
 #[wasm_bindgen] pub fn set_absorption(v: f32) { with_state(|s| s.surface_renderer.absorption = v); }
 #[wasm_bindgen] pub fn set_step_count(v: u32) { with_state(|s| s.surface_renderer.step_count = v); }
 #[wasm_bindgen] pub fn set_kernel_scale(v: f32) { with_fluid(|f| f.density_field.kernel_scale = v); }
-#[wasm_bindgen] pub fn set_density_resolution(v: u32) {
-    // Density resolution change requires rebuilding density field + MC bind group.
-    // This is complex since the effect owns both — access through with_fluid.
-    with_fluid(|f| {
-        let device_ptr = &f.sim as *const _ as *const (); // placeholder — need renderer access
-        // For now, just update kernel scale. Full resolution change needs renderer access.
-        log::warn!("set_density_resolution: not yet supported with FluidSurfaceEffect architecture");
-    });
-}
 #[wasm_bindgen] pub fn set_bounds(min_x: f32, min_y: f32, min_z: f32, max_x: f32, max_y: f32, max_z: f32) {
     with_fluid(|f| {
         f.sim.world_bounds_min = [min_x, min_y, min_z];

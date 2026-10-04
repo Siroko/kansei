@@ -19,14 +19,14 @@
             set_use_batched_sim,
             set_sim_dt_step, set_sim_time_scale, set_max_render_fps,
             set_density_scale, set_density_threshold, set_absorption, set_step_count,
-            set_kernel_scale, set_density_resolution, set_bounds,
+            set_kernel_scale, set_bounds,
             set_stripe_params,
             set_light_direction, set_light_intensity, set_light_color,
             set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur,
             set_transmission_params,
             set_attr_stiffness, set_attr_max_speed, set_attr_basin, set_attr_target, set_attr_drag,
             set_per_slot_count, set_capture_scale, set_capture_below, set_emit_height, set_emit_spread, set_emit_rate, set_cooldown_frames,
-            set_glyph_y, resume_audio
+            set_glyph_y, set_sound
         } from '../pkg/kansei_wasm_fluid_clock.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
@@ -48,7 +48,7 @@
             viscosity: cfg.viscosity, damping: 1.0, gravityY: -9.8,
             mouseForce: 1600, mouseRadius: 0.1, substeps: 2,
             densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
-            resolution: 128, kernelScale: cfg.kernelScale, // 0.6 at 80K, ∝ 1/count (splat radius stays 1.0)
+            kernelScale: cfg.kernelScale, // 0.6 at 80K, ∝ 1/count (splat radius stays 1.0)
         };
         const simPresets = {
             // relative to the measured stable ceiling for this count
@@ -103,7 +103,6 @@
         surface.addBinding(p, 'steps', { min: 16, max: 128, step: 1 }).on('change', () => set_step_count(p.steps));
 
         const field = pane.addFolder({ title: 'Density Field', expanded: false });
-        field.addBinding(p, 'resolution', { min: 16, max: 256, step: 16 }).on('change', () => set_density_resolution(p.resolution));
         field.addBinding(p, 'kernelScale', { min: 0.01, max: 10, step: 0.01 }).on('change', () => set_kernel_scale(p.kernelScale));
 
         const sph = pane.addFolder({ title: 'SPH', expanded: false });
@@ -230,7 +229,7 @@
         cf.addBinding(cp, 'emitSpread', { min: 0, max: 10, step: 0.5, label: 'emit spread' }).on('change', e => set_emit_spread(e.value));
         cf.addBinding(cp, 'emitRate', { min: 0, max: 5000, step: 25, label: 'emit rate/frame (0=all)' }).on('change', e => set_emit_rate(e.value));
         cf.addBinding(cp, 'cooldown', { min: 0, max: 180, step: 5 }).on('change', e => set_cooldown_frames(e.value));
-        cf.addBinding(cp, 'sound').on('change', e => { if (e.value) resume_audio(); });
+        cf.addBinding(cp, 'sound').on('change', e => set_sound(e.value));
     </script>
 </body>
 </html>

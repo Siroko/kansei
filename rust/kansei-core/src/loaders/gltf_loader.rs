@@ -263,13 +263,14 @@ impl GLTFLoader {
             for primitive in mesh.primitives() {
                 if let Some(geo) = Self::parse_primitive(&primitive, buffers) {
                     let (scale, rotation, translation) = world.to_scale_rotation_translation();
-                    let euler = rotation.to_euler(glam::EulerRot::YXZ);
+                    // Object3D composes Rz * Ry * Rx, so decompose in that order
+                    let (rz, ry, rx) = rotation.to_euler(glam::EulerRot::ZYX);
 
                     renderables.push(GLTFRenderable {
                         geometry: geo,
                         material_index: primitive.material().index().unwrap_or(0),
                         position: Vec3::new(translation.x, translation.y, translation.z),
-                        rotation: Vec3::new(euler.1, euler.0, euler.2),
+                        rotation: Vec3::new(rx, ry, rz),
                         scale: Vec3::new(scale.x, scale.y, scale.z),
                     });
                 }
