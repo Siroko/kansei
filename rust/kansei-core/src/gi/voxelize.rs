@@ -19,15 +19,25 @@ pub const SURFACE_WORDS_PER_VOXEL: u64 = 4;
 pub struct GiSurface {
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
+    /// Scales how much its area makes a clipmap's voxels opaque (1 by default): below 1 for a
+    /// mesh that stands for something light passes through, such as a crown's proxy for its
+    /// needles. A volume (`SceneVoxelGi`) keeps its voxels opaque.
+    pub opacity: f32,
 }
 
 impl GiSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, emission: [0.0; 3] }
+        Self { albedo, emission: [0.0; 3], opacity: 1.0 }
     }
 
     pub fn with_emission(mut self, emission: [f32; 3]) -> Self {
         self.emission = emission;
+        self
+    }
+
+    /// See `opacity`.
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity.max(0.0);
         self
     }
 }
@@ -38,9 +48,10 @@ impl GiSurface {
 pub(crate) struct VoxelizeParamsGpu {
     clip_to_voxel: [f32; 16],
     view_dir: [f32; 3],
-    _pad0: f32,
+    words: u32,
     viewport: [f32; 2],
-    _pad1: [f32; 2],
+    pixel_area: f32,
+    _pad1: f32,
     dims: [u32; 3],
     _pad2: u32,
     region_lo: [i32; 3],
@@ -51,14 +62,17 @@ pub(crate) struct VoxelizeParamsGpu {
 
 impl VoxelizeParamsGpu {
     /// An axis' parameters for region `[lo, lo + region)` of a volume of `dims` voxels (stored
-    /// toroidally): `clip_to_voxel` maps the axis' clip space to the region's voxel coordinates.
-    pub(crate) fn new(clip_to_voxel: glam::Mat4, view_dir: glam::Vec3, viewport: [u32; 2], dims: [u32; 3], lo: [i32; 3], region: [u32; 3]) -> Self {
+    /// toroidally, `words` u32 a voxel), drawn at `pixels` per voxel along each side into a
+    /// `viewport`: `clip_to_voxel` maps the axis' clip space to the region's voxel coordinates.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(clip_to_voxel: glam::Mat4, view_dir: glam::Vec3, viewport: [u32; 2], dims: [u32; 3], lo: [i32; 3], region: [u32; 3], words: u32, pixels: u32) -> Self {
         Self {
             clip_to_voxel: clip_to_voxel.to_cols_array(),
             view_dir: view_dir.to_array(),
-            _pad0: 0.0,
+            words,
             viewport: [viewport[0] as f32, viewport[1] as f32],
-            _pad1: [0.0; 2],
+            pixel_area: 1.0 / (pixels * pixels) as f32,
+            _pad1: 0.0,
             dims,
             _pad2: 0,
             region_lo: lo,
@@ -74,14 +88,14 @@ impl VoxelizeParamsGpu {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct VoxelDrawGpu {
     albedo: [f32; 3],
-    _pad0: f32,
+    opacity: f32,
     emission: [f32; 3],
     _pad1: f32,
 }
 
 impl VoxelDrawGpu {
     pub(crate) fn new(surface: &GiSurface) -> Self {
-        Self { albedo: surface.albedo, _pad0: 0.0, emission: surface.emission, _pad1: 0.0 }
+        Self { albedo: surface.albedo, opacity: surface.opacity, emission: surface.emission, _pad1: 0.0 }
     }
 }
 
@@ -125,15 +139,15 @@ pub(crate) fn voxelize_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGro
     })
 }
 
-/// The voxelization passes' dummy target, `side` pixels square: masked off, it only sets the
-/// fragments' coverage (`MeshVoxelizer::TARGET_FORMAT`, `SAMPLE_COUNT` samples).
-pub(crate) fn voxelize_target(device: &wgpu::Device, side: u32) -> wgpu::TextureView {
+/// The voxelization passes' dummy target, `side` pixels square of `samples`: masked off, it only
+/// sets the fragments' coverage (`MeshVoxelizer::TARGET_FORMAT`).
+pub(crate) fn voxelize_target(device: &wgpu::Device, side: u32, samples: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("VoxelGI/VoxelizeTarget"),
             size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: MeshVoxelizer::SAMPLE_COUNT,
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: MeshVoxelizer::TARGET_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -164,7 +178,7 @@ impl AxisView {
 }
 
 /// The three axes (x, y, z) of a voxelization of the box from `lo` (world) of `dims` voxels of
-/// `voxel_size`.
+/// `voxel_size`, a pixel per voxel (`AxisView::viewport` in voxels).
 pub(crate) fn axis_views(lo: glam::Vec3, voxel_size: f32, dims: [u32; 3]) -> [AxisView; 3] {
     let extent = glam::UVec3::from(dims).as_vec3() * voxel_size;
     let centre = lo + extent * 0.5;
@@ -245,12 +259,12 @@ impl MeshVoxelizer {
             camera.gpu_initialize(device, &shared.camera_bgl, light_buf);
             axis.apply(camera);
             camera.upload(queue);
-            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, axis.viewport, layout.dims, [0; 3], layout.dims);
+            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, axis.viewport, layout.dims, [0; 3], layout.dims, SURFACE_WORDS_PER_VOXEL as u32, 1);
             queue.write_buffer(&params[a], 0, bytemuck::bytes_of(&gpu));
         }
 
         let [dx, dy, dz] = layout.dims;
-        let target = voxelize_target(device, dx.max(dy).max(dz));
+        let target = voxelize_target(device, dx.max(dy).max(dz), Self::SAMPLE_COUNT);
         let draw_stride = (std::mem::size_of::<VoxelDrawGpu>() as u64).next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as u64);
         let static_surfaces = Self::surface_buffer(device, &layout, "VoxelGI/StaticSurfaces");
         let mut voxelizer = Self {
@@ -316,9 +330,14 @@ impl MeshVoxelizer {
         &self.bgl
     }
 
-    /// The engine's fragment stage (`voxel_fragment`).
-    pub(crate) fn fragment_module(&self) -> &wgpu::ShaderModule {
-        &self.fragment
+    /// The engine's fragment stage: its module and entry (`voxel_fragment`).
+    pub(crate) fn fragment(&self) -> (&wgpu::ShaderModule, &'static str) {
+        (&self.fragment, "voxel_fragment")
+    }
+
+    /// Samples of its passes' target.
+    pub(crate) fn sample_count(&self) -> u32 {
+        Self::SAMPLE_COUNT
     }
 
     pub fn layout(&self) -> &VolumeLayout {

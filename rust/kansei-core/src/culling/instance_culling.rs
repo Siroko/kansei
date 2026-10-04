@@ -42,9 +42,14 @@ pub(crate) const ARGS_BYTES: u64 = 32;
 ///
 /// LOD: one renderable per LOD mesh, all sharing `source`, each with its distance band. Bands
 /// are measured from the main camera in every view, so shadows match what is on screen. Shadow
-/// maps and planar reflections can have bands of their own (`with_shadow_lod_range`,
-/// `with_reflection_lod_range`): a far LOD (an impostor) nearer there than on screen, say. Keep
-/// each kind of view's bands of a mesh's LODs adjoining, as the camera's.
+/// maps, planar reflections and voxel GI can have bands of their own (`with_shadow_lod_range`,
+/// `with_reflection_lod_range`, `with_gi_lod_range`): a far LOD (an impostor) nearer there than on
+/// screen, say. Keep each kind of view's bands of a mesh's LODs adjoining, as the camera's.
+///
+/// Voxel GI's clipmap (`Renderer::enable_voxel_clipmap`) voxelizes a renderable with a
+/// `Renderable::gi` surface through its own view too: the box of the region it voxelizes, its
+/// instances compacted as the camera's are (crossfaded ones with their fade, the layout the
+/// material reads).
 ///
 /// Tighter bounds (`with_bounds_shift`, `with_bounds_box`) cull more, in every view, and matter
 /// most for occlusion: a tree's sphere round its base reaches a tree's height below the ground
@@ -92,6 +97,11 @@ pub struct InstanceCulling {
     /// The band in planar reflections, if not `lod_range` (their `lod_distance_scale` applies to
     /// it as to `lod_range`).
     pub reflection_lod_range: Option<(f32, f32)>,
+    /// The band in voxel GI's views (`Renderer::enable_voxel_clipmap`), if not `lod_range`: a
+    /// coarse LOD voxelizes the forest at every distance, a fine one near the camera, and a LOD
+    /// that should stay out of the voxels (an impostor) gets an empty band (`near >= far`: no
+    /// instance, whatever the crossfades).
+    pub gi_lod_range: Option<(f32, f32)>,
     /// Object-space offset of the bounds' centre from the instance's centre, times the per-instance
     /// scale: where the sphere (or box) sits. It moves the centre the LOD distance is measured
     /// from too. Instances' own rotations are not applied: use it along an axis they turn about.
@@ -184,7 +194,7 @@ pub(crate) struct CullInstancesGpu {
     reflection_lod: [f32; 2],
     occlusion_view: u32,
     crossfade: f32,
-    _pad: [u32; 2],
+    gi_lod: [f32; 2],
 }
 
 /// `CullView` in instance_cull.wgsl: a view, shared by every renderable culled for it.
@@ -212,16 +222,20 @@ const FLAG_LAYERED: u32 = 128;
 const FLAG_REFLECTION: u32 = 256;
 const FLAG_OCCLUSION: u32 = 512;
 const FLAG_LINEAR_DEPTH: u32 = 1024;
+const FLAG_GI: u32 = 2048;
+const FLAG_GI_SURFACE: u32 = 4096;
 
 /// A view the renderer culls for: its view-projection, whether it only draws shadow casters (a
 /// shadow map, with `shadow_lod_range`), whether it is a planar reflection (with
-/// `reflection_lod_range`), the layers it draws if not all (a reflection's `layer_mask`), and how
-/// it scales the LOD distances (below 1 a view picks finer LODs than the camera would).
+/// `reflection_lod_range`) or voxel GI's (renderables with a GI surface, with `gi_lod_range`),
+/// the layers it draws if not all (a reflection's `layer_mask`), and how it scales the LOD
+/// distances (below 1 a view picks finer LODs than the camera would).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CullView {
     pub view_proj: glam::Mat4,
     pub casters_only: bool,
     pub reflection: bool,
+    pub gi: bool,
     pub layer_mask: Option<u32>,
     pub lod_distance_scale: f32,
 }
@@ -239,10 +253,10 @@ pub(crate) struct OcclusionView {
 }
 
 impl CullView {
-    /// Whether it draws a renderable that casts shadows or not, on `layers` (the cull shader's
-    /// `drawnIn`, less the camera's two phases).
-    pub(crate) fn draws(&self, casts_shadow: bool, layers: u32) -> bool {
-        (!self.casters_only || casts_shadow) && self.layer_mask.is_none_or(|mask| mask & layers != 0)
+    /// Whether it draws a renderable that casts shadows or not, on `layers`, with a GI surface or
+    /// not (the cull shader's `drawnIn`, less the camera's two phases).
+    pub(crate) fn draws(&self, casts_shadow: bool, layers: u32, gi_surface: bool) -> bool {
+        (!self.casters_only || casts_shadow) && (!self.gi || gi_surface) && self.layer_mask.is_none_or(|mask| mask & layers != 0)
     }
 
     /// The view for the GPU: its frustum, the LOD origin, and for a view culled in two phases
@@ -257,6 +271,9 @@ impl CullView {
         }
         if self.reflection {
             flags |= FLAG_REFLECTION;
+        }
+        if self.gi {
+            flags |= FLAG_GI;
         }
         if stats {
             flags |= FLAG_STATS;
@@ -312,6 +329,7 @@ impl InstanceCulling {
             lod_range: (0.0, f32::INFINITY),
             shadow_lod_range: None,
             reflection_lod_range: None,
+            gi_lod_range: None,
             bounds_shift: glam::Vec3::ZERO,
             bounds_box: None,
             occlusion: false,
@@ -350,6 +368,12 @@ impl InstanceCulling {
     /// See `reflection_lod_range`.
     pub fn with_reflection_lod_range(mut self, near: f32, far: f32) -> Self {
         self.reflection_lod_range = Some((near, far));
+        self
+    }
+
+    /// See `gi_lod_range`. An empty band (`near >= far`) leaves the renderable out of the voxels.
+    pub fn with_gi_lod_range(mut self, near: f32, far: f32) -> Self {
+        self.gi_lod_range = Some((near, far));
         self
     }
 
@@ -558,13 +582,15 @@ impl InstanceCulling {
 
     /// Start a frame, before its cull pass (after `ensure_views` and `set_two_phase`): write the
     /// instances' parameters for a renderable with `world` matrix and `index_count` indices,
-    /// drawn in shadow maps if `casts_shadow`, on `layers`, if they changed, and clear every
-    /// slot's draw (the cull sets the index count of those it culls into).
-    pub(crate) fn begin_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, world: glam::Mat4, index_count: u32, casts_shadow: bool, layers: u32) {
+    /// drawn in shadow maps if `casts_shadow`, on `layers`, in voxel GI's views if `gi_surface`,
+    /// if they changed, and clear every slot's draw (the cull sets the index count of those it
+    /// culls into).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, world: glam::Mat4, index_count: u32, casts_shadow: bool, layers: u32, gi_surface: bool) {
         let scale = glam::Vec3::new(world.x_axis.truncate().length(), world.y_axis.truncate().length(), world.z_axis.truncate().length());
         let band = |(near, far): (f32, f32)| [near, far.min(f32::MAX)];
         let mut flags = 0;
-        for (on, flag) in [(self.bounds_box.is_some(), FLAG_BOX), (casts_shadow, FLAG_CASTS_SHADOW), (!self.two_phase.is_empty(), FLAG_TWO_PHASE)] {
+        for (on, flag) in [(self.bounds_box.is_some(), FLAG_BOX), (casts_shadow, FLAG_CASTS_SHADOW), (!self.two_phase.is_empty(), FLAG_TWO_PHASE), (gi_surface, FLAG_GI_SURFACE)] {
             if on {
                 flags |= flag;
             }
@@ -591,7 +617,11 @@ impl InstanceCulling {
             reflection_lod: band(self.reflection_lod_range.unwrap_or(self.lod_range)),
             occlusion_view: 0,
             crossfade: self.crossfade,
-            _pad: [0; 2],
+            // an empty band is nowhere, crossfades and all
+            gi_lod: band(match self.gi_lod_range {
+                Some((near, far)) if near >= far => (f32::MAX, f32::MAX),
+                band => band.unwrap_or(self.lod_range),
+            }),
         };
         let shared = self.shared.as_mut().expect("ensure_views first");
         if shared.written != Some(params) {
@@ -835,6 +865,7 @@ mod tests {
             view_proj: proj * glam::Mat4::look_at_rh(glam::Vec3::new(x, 0.0, 20.0), glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::Y),
             casters_only,
             reflection: false,
+            gi: false,
             layer_mask,
             lod_distance_scale,
         };
@@ -857,7 +888,7 @@ mod tests {
             let chunks = culling.shared.as_ref().unwrap().chunks.len();
             assert_eq!(chunks, (views.len() as u64).div_ceil(per_chunk.min(views.len() as u64)) as usize);
             let mut encoder = device.create_command_encoder(&Default::default());
-            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false, 1);
+            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false, 1, false);
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&pipeline.pipeline);
@@ -888,7 +919,7 @@ mod tests {
             assert_eq!(ids(5), ids(0), "{label}: on a layer the view draws");
             assert_eq!(ids(6), (0, vec![]), "{label}: on no layer the view draws");
             for (v, drawn) in views.iter().zip([true, true, true, false, false, true, false]) {
-                assert_eq!(v.is_some_and(|v| v.draws(false, 1)), drawn, "{label}: CullView::draws agrees");
+                assert_eq!(v.is_some_and(|v| v.draws(false, 1, false)), drawn, "{label}: CullView::draws agrees");
             }
         }
     }
@@ -910,7 +941,7 @@ mod tests {
         let mut pipeline = CullPipeline::new(&device);
         // three views seeing the whole row: the camera, a shadow map and a reflection
         let view_proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(glam::Vec3::new(0.0, 0.0, 200.0), glam::Vec3::ZERO, glam::Vec3::Y);
-        let view = |casters_only, reflection| CullView { view_proj, casters_only, reflection, layer_mask: None, lod_distance_scale: 1.0 };
+        let view = |casters_only, reflection| CullView { view_proj, casters_only, reflection, gi: false, layer_mask: None, lod_distance_scale: 1.0 };
         let views = [view(false, false), view(true, false), view(false, true)];
         pipeline.set_views(&device, &queue, &views.map(|v| v.gpu(glam::Vec3::ZERO, None, false)));
         let mut culling = InstanceCulling::new(source, 100, 32, 0, 0.1)
@@ -920,7 +951,7 @@ mod tests {
             .with_reflection_lod_range(20.0, 30.0);
         culling.ensure_views(&device, &pipeline.bgl, views.len());
         let mut encoder = device.create_command_encoder(&Default::default());
-        culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1);
+        culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1, false);
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline.pipeline);
@@ -975,6 +1006,7 @@ mod tests {
             view_proj: glam::Mat4::perspective_rh(fov.to_radians(), 16.0 / 9.0, 0.1, far) * glam::Mat4::look_at_rh(eye, at, glam::Vec3::Y),
             casters_only: false,
             reflection: false,
+            gi: false,
             layer_mask: None,
             lod_distance_scale: 1.0,
         };
@@ -1003,7 +1035,7 @@ mod tests {
             for frame in 0..FRAMES {
                 let mut encoder = device.create_command_encoder(&Default::default());
                 for c in cullings.iter_mut() {
-                    c.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1);
+                    c.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1, false);
                 }
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1059,7 +1091,7 @@ mod tests {
         let mut pipeline = CullPipeline::new(&device);
         // the camera, a shadow map and a reflection (LOD distances x 2), all seeing the whole row
         let view_proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 1000.0) * glam::Mat4::look_at_rh(glam::Vec3::new(50.0, 0.0, 200.0), glam::Vec3::new(50.0, 0.0, 0.0), glam::Vec3::Y);
-        let view = |casters_only, reflection, lod_distance_scale| CullView { view_proj, casters_only, reflection, layer_mask: None, lod_distance_scale };
+        let view = |casters_only, reflection, lod_distance_scale| CullView { view_proj, casters_only, reflection, gi: false, layer_mask: None, lod_distance_scale };
         let views = [view(false, false, 1.0), view(true, false, 1.0), view(false, true, 2.0)];
         pipeline.set_views(&device, &queue, &views.map(|v| v.gpu(glam::Vec3::ZERO, None, false)));
         let lod = |near: f32, far: f32, shadow: (f32, f32)| InstanceCulling::new(source.clone(), 100, 32, 0, 0.1).with_lod_range(near, far).with_shadow_lod_range(shadow.0, shadow.1).with_crossfade(10.0);
@@ -1068,7 +1100,7 @@ mod tests {
         for culling in &mut lods {
             assert_eq!(culling.culled_stride(), 36);
             culling.ensure_views(&device, &pipeline.bgl, views.len());
-            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1);
+            culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, true, 1, false);
         }
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -1287,7 +1319,7 @@ mod tests {
                 assert!(culling.ensure_occlusion(&device, &pipeline, &[occluded]));
                 culling.set_two_phase(&[occluded]);
             }
-            let cull_view = CullView { view_proj: proj * view, casters_only: false, reflection: false, layer_mask: None, lod_distance_scale: 1.0 };
+            let cull_view = CullView { view_proj: proj * view, casters_only: false, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 };
             let occlusion = OcclusionView { view, proj, depth_size: (64, 64), reverse_z: false, linear_depth: linear };
             let views: Vec<_> = (0..=occluded).map(|v| cull_view.gpu(glam::Vec3::ZERO, (v == occluded).then_some(&occlusion), true)).collect();
             pipeline.set_views(&device, &queue, &views);
@@ -1303,7 +1335,7 @@ mod tests {
                 if reset {
                     culling.reset_visibility(&mut encoder);
                 }
-                culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false, 1);
+                culling.begin_frame(&queue, &mut encoder, glam::Mat4::IDENTITY, 36, false, 1, false);
                 {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     // as the renderer: every view, which leaves the one culled in two phases to them

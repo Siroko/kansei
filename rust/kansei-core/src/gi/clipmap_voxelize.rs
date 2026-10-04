@@ -8,8 +8,13 @@ use crate::renderers::SharedLayouts;
 
 const CLEAR_WGSL: &str = include_str!("shaders/clipmap_clear.wgsl");
 
-/// u32 per voxel in a clipmap level's surface buffers: `SURFACE_WORDS_PER_VOXEL`'s.
-pub(crate) const CLIP_SURFACE_WORDS: u64 = super::voxelize::SURFACE_WORDS_PER_VOXEL;
+/// u32 per voxel in a clipmap level's surface buffers: `SURFACE_WORDS_PER_VOXEL`'s, then the
+/// surface's area in the voxel (voxel faces, fixed point 1/256), which makes its opacity.
+pub const CLIP_SURFACE_WORDS: u64 = super::voxelize::SURFACE_WORDS_PER_VOXEL + 1;
+
+/// Pixels a clipmap voxelization draws along each side of a voxel face, single-sampled
+/// (voxel_write.wgsl).
+const PIXELS_PER_VOXEL: u32 = 2;
 
 /// A box of a clipmap level's lattice: voxels `lo .. lo + size` of level `level`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,9 +85,10 @@ impl RegionView {
         for (a, axis) in axis_views(region.lo.as_vec3() * size, size, region.size.to_array()).into_iter().enumerate() {
             axis.apply(&mut self.cameras[a]);
             self.cameras[a].upload(queue);
-            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, axis.viewport, layout.dims, region.lo.to_array(), region.size.to_array());
+            let viewport = axis.viewport.map(|v| v * PIXELS_PER_VOXEL);
+            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, viewport, layout.dims, region.lo.to_array(), region.size.to_array(), CLIP_SURFACE_WORDS as u32, PIXELS_PER_VOXEL);
             queue.write_buffer(&self.params[a], 0, bytemuck::bytes_of(&gpu));
-            self.viewports[a] = axis.viewport;
+            self.viewports[a] = viewport;
         }
         self.region = Some(region);
     }
@@ -181,7 +187,7 @@ impl ClipmapVoxelizer {
             layout,
             bgl: voxelize_bind_group_layout(device),
             fragment,
-            target: voxelize_target(device, dx.max(dy).max(dz)),
+            target: voxelize_target(device, dx.max(dy).max(dz) * PIXELS_PER_VOXEL, 1),
             draws: uniform("VoxelClipmap/Draws", draw_stride * 16),
             draw_stride,
             draw_capacity: 16,
@@ -206,17 +212,23 @@ impl ClipmapVoxelizer {
         &self.bgl
     }
 
-    /// The engine's fragment stage (`voxel_fragment`).
-    pub(crate) fn fragment_module(&self) -> &wgpu::ShaderModule {
-        &self.fragment
+    /// The engine's fragment stage: its module and entry (`voxel_fragment`).
+    pub(crate) fn fragment(&self) -> (&wgpu::ShaderModule, &'static str) {
+        (&self.fragment, "voxel_fragment")
+    }
+
+    /// Samples of its passes' target: one (it draws `PIXELS_PER_VOXEL` squared pixels a voxel
+    /// face instead).
+    pub(crate) fn sample_count(&self) -> u32 {
+        1
     }
 
     pub fn layout(&self) -> &ClipmapLayout {
         &self.layout
     }
 
-    /// Level `level`'s static surfaces: `SURFACE_WORDS_PER_VOXEL` u32 per voxel, by texel (x
-    /// fastest), each texel holding the voxel of the window congruent to it.
+    /// Level `level`'s static surfaces: `CLIP_SURFACE_WORDS` u32 per voxel, by texel (x fastest),
+    /// each texel holding the voxel of the window congruent to it.
     pub fn static_surfaces(&self, level: u32) -> &wgpu::Buffer {
         &self.static_surfaces[level as usize]
     }

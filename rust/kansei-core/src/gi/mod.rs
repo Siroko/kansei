@@ -56,7 +56,7 @@ mod voxelize;
 pub use clipmap::{ClipmapLayout, VoxelClipmap, MAX_CLIPMAP_LEVELS};
 pub use clipmap_inject::{ClipmapGiSettings, ConeShadows};
 pub use clipmap_scene::{SceneVoxelClipmap, SceneVoxelClipmapOptions};
-pub use clipmap_voxelize::{ClipRegion, ClipmapVoxelizer};
+pub use clipmap_voxelize::{ClipRegion, ClipmapVoxelizer, CLIP_SURFACE_WORDS};
 pub(crate) use clipmap_voxelize::ClipSurfaces;
 pub use cones::{gradient_sky_lighting, ParticleConeSettings, ParticleConeShading, SkyLightingData, PARTICLE_LIGHTING_STRIDE};
 pub use particle_gi::{ParticleGi, ParticleGiOptions, ParticleGiSettings};
