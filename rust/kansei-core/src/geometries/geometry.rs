@@ -95,6 +95,13 @@ impl Geometry {
 }
 
 impl Geometry {
+    /// The same geometry named `label` (in profiles and GPU captures): one of the stock
+    /// generators' meshes, say, as `SpruceGeometry::new(8, 1, 3).with_label("Spruce/LOD2")`.
+    pub fn with_label(mut self, label: &str) -> Self {
+        self.label = label.to_string();
+        self
+    }
+
     pub fn new(label: &str, vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         Self {
             label: label.to_string(),
@@ -110,6 +117,66 @@ impl Geometry {
             instance_count: 1,
             instance_buffers: Vec::new(),
         }
+    }
+
+    /// A geometry whose vertices a compute pass writes into `vertex_buffer` (laid out as
+    /// [`Vertex`], with VERTEX usage), drawn with `indices`. Nothing is uploaded for the vertices:
+    /// the geometry keeps a handle to the buffer (its CPU `vertices` stay empty).
+    pub fn from_gpu_vertices(label: &str, vertex_buffer: wgpu::Buffer, indices: Vec<u32>) -> Self {
+        let mut geometry = Self::new(label, Vec::new(), indices);
+        geometry.vertex_buffer = Some(vertex_buffer);
+        geometry
+    }
+
+    /// A geometry drawn indirectly from buffers a compute pass fills (a marching-cubes mesh):
+    /// vertices laid out as [`Vertex`], u32 indices and, if given, `DrawIndexedIndirect`
+    /// arguments. The geometry keeps handles to the buffers, so they must not be replaced by
+    /// new ones afterwards (writing into them is fine).
+    pub fn from_gpu_buffers(label: &str, vertex_buffer: wgpu::Buffer, index_buffer: wgpu::Buffer, indirect_args_buffer: Option<wgpu::Buffer>) -> Self {
+        let mut geometry = Self::new_indirect_placeholder(label);
+        geometry.vertex_buffer = Some(vertex_buffer);
+        geometry.index_buffer = Some(index_buffer);
+        geometry.indirect_args_buffer = indirect_args_buffer;
+        geometry
+    }
+
+    /// Several geometries as one, each moved by its matrix first (normals by its inverse
+    /// transpose): a spruce from cones, a model from its glTF parts, props from boxes and
+    /// cylinders. Instancing is not carried over.
+    pub fn merged(label: &str, parts: &[(&Geometry, glam::Mat4)]) -> Self {
+        let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+        for (geometry, matrix) in parts {
+            let normal_matrix = matrix.inverse().transpose();
+            let base = vertices.len() as u32;
+            vertices.extend(geometry.vertices.iter().map(|v| {
+                let p = matrix.transform_point3(glam::Vec3::new(v.position[0], v.position[1], v.position[2]));
+                let n = normal_matrix.transform_vector3(glam::Vec3::from(v.normal)).normalize_or_zero();
+                Vertex { position: [p.x, p.y, p.z, 1.0], normal: n.to_array(), uv: v.uv }
+            }));
+            indices.extend(geometry.indices.iter().map(|i| base + i));
+        }
+        Self::new(label, vertices, indices)
+    }
+
+    /// The axis-aligned bounds of the CPU vertices, (min, max); zero for none.
+    pub fn bounds(&self) -> (glam::Vec3, glam::Vec3) {
+        let mut points = self.vertices.iter().map(|v| glam::Vec3::new(v.position[0], v.position[1], v.position[2]));
+        let Some(first) = points.next() else { return (glam::Vec3::ZERO, glam::Vec3::ZERO) };
+        points.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)))
+    }
+
+    /// Scale the vertices uniformly to fit inside a box of `size` (use `f32::INFINITY` for an
+    /// axis that may be any size) and move them so the bottom centre of their bounds sits at the
+    /// origin: a model ready to stand on the ground.
+    pub fn fit(mut self, size: glam::Vec3) -> Self {
+        let (lo, hi) = self.bounds();
+        let scale = (size / (hi - lo).max(glam::Vec3::splat(1e-9))).min_element();
+        let anchor = glam::Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5);
+        for v in &mut self.vertices {
+            let p = (glam::Vec3::new(v.position[0], v.position[1], v.position[2]) - anchor) * scale;
+            v.position = [p.x, p.y, p.z, 1.0];
+        }
+        self
     }
 
     /// Create a Geometry placeholder for externally-owned GPU buffers (zero readback).
@@ -135,11 +202,14 @@ impl Geometry {
     pub fn initialize(&mut self, device: &wgpu::Device) {
         use wgpu::util::DeviceExt;
 
-        self.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("{}/Vertices", self.label)),
-            contents: bytemuck::cast_slice(&self.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }));
+        // a buffer handed in (`from_gpu_vertices`) is kept
+        if self.vertex_buffer.is_none() {
+            self.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("{}/Vertices", self.label)),
+                contents: bytemuck::cast_slice(&self.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }));
+        }
 
         self.index_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("{}/Indices", self.label)),
@@ -168,6 +238,7 @@ impl Geometry {
     ///
     /// # Safety
     /// Pointers must remain valid for the lifetime of this Geometry.
+    #[deprecated(note = "use Geometry::from_gpu_buffers, which keeps handles to the buffers")]
     pub unsafe fn set_external_buffers(
         &mut self,
         vertex: *const wgpu::Buffer,

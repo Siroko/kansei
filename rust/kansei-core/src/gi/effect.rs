@@ -22,6 +22,8 @@ pub(crate) const COMPOSITE_WGSL: &str = concat!(
     include_str!("shaders/screen_normal.wgsl"),
     include_str!("shaders/voxel_volume.wgsl"),
     include_str!("shaders/sdf.wgsl"),
+    include_str!("shaders/probe_common.wgsl"),
+    include_str!("shaders/probe_irradiance.wgsl"),
     include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("shaders/screen_composite.wgsl"),
 );
@@ -112,6 +114,8 @@ struct Gpu {
     temporal: wgpu::ComputePipeline,
     temporal_bgl: wgpu::BindGroupLayout,
     composite: wgpu::ComputePipeline,
+    /// The composite with the probes as the far field (`main_probes`).
+    composite_probes: wgpu::ComputePipeline,
     composite_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// The sky past the volume until `set_sky_lighting`: `sky_gradient`.
@@ -120,6 +124,8 @@ struct Gpu {
     no_near: wgpu::TextureView,
     /// Bound as the distance field without one.
     no_sdf: wgpu::TextureView,
+    /// Bound as the probes without them: the grid, the SH, the state, the depth.
+    no_probes: [wgpu::Buffer; 4],
     targets: Option<Targets>,
 }
 
@@ -152,6 +158,9 @@ pub struct VoxelGIEffect {
     /// Debug view: the distance field (`set_sdf`) on the horizontal plane at this height,
     /// metres, over the dimmed scene. Over the other views.
     pub show_sdf_slice: Option<f32>,
+    /// Debug view: the probes (`set_probes`) as balls lit by their own irradiance, dark red where
+    /// one is left out (inside geometry), over the scene without its GI. Over the other views.
+    pub show_probes: bool,
     pub sdf_ao: f32,
     /// The sky past the volume without `set_sky_lighting`: scene radiance straight up and down.
     pub sky_gradient: ([f32; 3], [f32; 3]),
@@ -161,6 +170,8 @@ pub struct VoxelGIEffect {
     volume_uniform: wgpu::Buffer,
     volume_sampler: wgpu::Sampler,
     sdf: Option<wgpu::TextureView>,
+    /// The probes' grid, SH, state and depth buffers (`set_probes`).
+    probes: Option<[wgpu::Buffer; 4]>,
     sky_lighting: Option<wgpu::Buffer>,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
@@ -185,6 +196,7 @@ impl VoxelGIEffect {
             show_indirect: false,
             show_voxels: false,
             show_sdf_slice: None,
+            show_probes: false,
             sdf_ao: options.sdf_ao,
             sky_gradient: ([0.0; 3], [0.0; 3]),
             near_field: options.near_field.map(ScreenSpaceGIEffect::new),
@@ -193,6 +205,7 @@ impl VoxelGIEffect {
             volume_uniform: volume.uniform().clone(),
             volume_sampler: volume.sampler().clone(),
             sdf: None,
+            probes: None,
             sky_lighting: None,
             prev_view_proj: None,
             last_camera_frame: None,
@@ -214,6 +227,19 @@ impl VoxelGIEffect {
     /// `sdf_ao` and `show_sdf_slice`; `None` leaves them off.
     pub fn set_sdf(&mut self, sdf: Option<&super::JumpFloodSdf>) {
         self.sdf = sdf.map(|s| s.view().clone());
+    }
+
+    /// Take the far field from `probes` (`SceneVoxelGi::probes`, over the same volume): each
+    /// pixel's irradiance from the probes around it, in place of the cones traced per pixel (whose
+    /// passes are then skipped), still under the near field if there is one. `None` goes back to
+    /// the cones.
+    pub fn set_probes(&mut self, probes: Option<&super::SdfProbes>) {
+        self.probes = probes.map(|p| [p.grid_buffer().clone(), p.sh_buffer().clone(), p.state_buffer().clone(), p.depth_buffer().clone()]);
+    }
+
+    /// Whether the far field comes from probes (`set_probes`).
+    pub fn uses_probes(&self) -> bool {
+        self.probes.is_some()
     }
 
     /// The screen-space GI in front of the voxels, if any (to tune it).
@@ -264,6 +290,12 @@ impl VoxelGIEffect {
             count: None,
         };
         let sampler = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None };
+        let storage_buffer = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: compute,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
         let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
         let d3 = wgpu::TextureViewDimension::D3;
         let trace_bgl = bgl(
@@ -304,20 +336,25 @@ impl VoxelGIEffect {
                 texture(10, true, wgpu::TextureViewDimension::D3),
                 sampler(11),
                 texture(12, true, wgpu::TextureViewDimension::D3),
+                uniform(13),
+                storage_buffer(14),
+                storage_buffer(15),
+                storage_buffer(16),
             ],
         );
-        let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| {
+        let pipeline_at = |label: &str, code: &str, layout: &wgpu::BindGroupLayout, entry: &str| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[layout], push_constant_ranges: &[] });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pl),
                 module: &module,
-                entry_point: Some("main"),
+                entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
+        let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| pipeline_at(label, code, layout, "main");
         let no_near = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("VoxelGI/NoNearField"),
@@ -342,6 +379,7 @@ impl VoxelGIEffect {
             temporal: pipeline("VoxelGI/Temporal", TEMPORAL_WGSL, &temporal_bgl),
             temporal_bgl,
             composite: pipeline("VoxelGI/Composite", COMPOSITE_WGSL, &composite_bgl),
+            composite_probes: pipeline_at("VoxelGI/CompositeProbes", COMPOSITE_WGSL, &composite_bgl, "main_probes"),
             composite_bgl,
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("VoxelGI/Linear"),
@@ -359,6 +397,13 @@ impl VoxelGIEffect {
             }),
             no_near,
             no_sdf: super::inject::no_sdf(device),
+            no_probes: [
+                ("VoxelGI/NoProbeGrid", std::mem::size_of::<super::probes::ProbeGridGpu>() as u64, wgpu::BufferUsages::UNIFORM),
+                ("VoxelGI/NoProbeSh", 16, wgpu::BufferUsages::STORAGE),
+                ("VoxelGI/NoProbeState", 16, wgpu::BufferUsages::STORAGE),
+                ("VoxelGI/NoProbeDepth", 16, wgpu::BufferUsages::STORAGE),
+            ]
+            .map(|(label, size, usage)| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })),
             targets: None,
         });
     }
@@ -446,7 +491,9 @@ impl PostProcessingEffect for VoxelGIEffect {
             blend: self.temporal_blend.clamp(0.01, 1.0),
             history_valid: self.prev_view_proj.is_some() as u32,
             has_sky: self.sky_lighting.is_some() as u32,
-            debug: if self.show_sdf_slice.is_some() && self.sdf.is_some() {
+            debug: if self.show_probes && self.probes.is_some() {
+                4
+            } else if self.show_sdf_slice.is_some() && self.sdf.is_some() {
                 3
             } else if self.show_voxels {
                 2
@@ -500,6 +547,7 @@ impl PostProcessingEffect for VoxelGIEffect {
             vec![p(), tex(&t.trace), tex(&t.history[1 - current]), tex(depth), tex(&t.history[current]), wgpu::BindingResource::Sampler(&gpu.sampler)],
         );
         let near_view = near.as_ref().map_or(&gpu.no_near, |(v, _)| v);
+        let probe_buffers = self.probes.as_ref().unwrap_or(&gpu.no_probes);
         let composite = group(
             "VoxelGI/CompositeBG",
             &gpu.composite_bgl,
@@ -517,16 +565,25 @@ impl PostProcessingEffect for VoxelGIEffect {
                 tex(&self.volume_view),
                 wgpu::BindingResource::Sampler(&self.volume_sampler),
                 tex(sdf_view),
+                probe_buffers[0].as_entire_binding(),
+                probe_buffers[1].as_entire_binding(),
+                probe_buffers[2].as_entire_binding(),
+                probe_buffers[3].as_entire_binding(),
             ],
         );
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/Screen"), timestamp_writes: crate::profiling::gpu_pass("VoxelGI/Screen").as_ref().map(crate::profiling::PassStamp::compute) });
-        pass.set_pipeline(&gpu.trace);
-        pass.set_bind_group(0, &trace, &[]);
-        pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
-        pass.set_pipeline(&gpu.temporal);
-        pass.set_bind_group(0, &temporal, &[]);
-        pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
-        pass.set_pipeline(&gpu.composite);
+        // with probes the composite reads them per pixel: no cones to trace and accumulate (the
+        // voxels and slice views show without them)
+        let probes = self.probes.is_some() && !matches!(params.debug, 2 | 3);
+        if !probes {
+            pass.set_pipeline(&gpu.trace);
+            pass.set_bind_group(0, &trace, &[]);
+            pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+            pass.set_pipeline(&gpu.temporal);
+            pass.set_bind_group(0, &temporal, &[]);
+            pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        }
+        pass.set_pipeline(if probes { &gpu.composite_probes } else { &gpu.composite });
         pass.set_bind_group(0, &composite, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }

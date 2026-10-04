@@ -11,19 +11,21 @@
 //!   the backs of the blocks) arrives too. The rug's voxels take its texture through its
 //!   material's voxel entry (`albedo=constant`: its mean colour instead).
 //! - `gi=voxel+ssgi`: screen-space GI in front for contact detail, the voxels for the rest.
+//! - `gi=probes` and `gi=probes+ssgi`: the voxels' light reaches the screen through irradiance
+//!   probes traced in the voxels' distance field (`SdfProbes`) instead of cones per pixel.
 //!
 //! Drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan. The panel
 //! (and `window.kansei`) switches everything at run time.
 //!
 //! URL parameters (a `preset` first, the others over it):
-//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice` (see `PRESETS`;
+//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
 //!   `best`, voxel + SSGI at the device's tier, unless the URL names a preset or a `gi`);
-//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi`;
+//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi`;
 //! - `voxels=low|medium|high`: the volume's resolution (default medium; low on phones, which also
 //!   keep it within 24 MiB);
 //! - `view=indirect` (only the light GI adds, 2 stops brighter), `view=voxels` (with voxel GI:
-//!   the lit voxels themselves) or `view=sdf` (a slice of voxel GI's distance field, `slice=`
-//!   metres up, default 0.6);
+//!   the lit voxels themselves), `view=sdf` (a slice of voxel GI's distance field, `slice=`
+//!   metres up, default 0.6) or `view=probes` (the probes, lit by their own irradiance);
 //! - the distance field (it turns voxel GI's scene volume on whatever the mode): `sdf_ao=0..1`
 //!   (its AO on the GI), `sdf_shadows=off|fallback|always` (the voxels' shadows through it, where
 //!   no map covers them or always), `shadows=map|sdf` (the direct light's shadows through it, by
@@ -37,7 +39,6 @@
 //! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -45,10 +46,10 @@ use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
+use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfProbeOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -56,66 +57,13 @@ use kansei_core::postprocessing::{
     effects::{exposure_from_ev100, GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, Canvas, Frame};
 
 /// A diffuse surface lit by the spot lights only (no ambient), writing the normal and albedo the
-/// global illumination reads (GBuffer targets 2 and 3).
-const LIT_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32> };
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-
-struct VIn {
-    @location(0) position: vec4<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-};
-struct VOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) world: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-};
-struct GBufferOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
-@vertex
-fn vertex_main(v: VIn) -> VOut {
-    let world = world_matrix * v.position;
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world;
-    out.world = world.xyz;
-    out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
-    return out;
-}
-
-@fragment
-fn fragment_main(in: VOut) -> GBufferOut {
-    let n = normalize(in.normal);
-    let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
-    let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
-    let v = normalize(camera_pos - in.world);
-    let base = surface.base_color.rgb;
-    var out: GBufferOut;
-    out.color = vec4<f32>(lit_radiance(in.world, n, v, base, in.clip.xy), 1.0);
-    out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
-    out.albedo = vec4<f32>(base, 1.0);
-    return out;
-}
-"#;
-
-/// The rug: `LIT_WGSL` with its base colour from a texture, and a voxel entry that gives voxel GI
-/// the same texture.
-const RUG_WGSL: &str = r#"
+/// global illumination reads (GBuffer targets 2 and 3, through `materials::GBUFFER_OUT_WGSL`): its
+/// albedo the uniform's colour times, for `TEXTURED_WGSL`, a texture.
+const SURFACE_WGSL: &str = r#"
 @group(0) @binding(0) var<uniform> surface: vec4<f32>;
-@group(0) @binding(1) var rug_texture: texture_2d<f32>;
-@group(0) @binding(2) var rug_sampler: sampler;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -132,13 +80,6 @@ struct VOut {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
 };
-struct GBufferOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
 @vertex
 fn vertex_main(v: VIn) -> VOut {
     let world = world_matrix * v.position;
@@ -150,25 +91,36 @@ fn vertex_main(v: VIn) -> VOut {
     return out;
 }
 
-@fragment
-fn fragment_main(in: VOut) -> GBufferOut {
+fn shade(in: VOut, base: vec3<f32>) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(camera_pos - in.world);
-    let base = textureSample(rug_texture, rug_sampler, in.uv).rgb;
-    var out: GBufferOut;
-    out.color = vec4<f32>(lit_radiance(in.world, n, v, base, in.clip.xy), 1.0);
-    out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
-    out.albedo = vec4<f32>(base, 1.0);
-    return out;
+    return kansei_gbuffer_out(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base);
+}
+"#;
+
+const PLAIN_WGSL: &str = r#"
+@fragment
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
+    return shade(in, surface.rgb);
+}
+"#;
+
+/// The rug: its albedo from a texture, and a voxel entry that gives voxel GI the same texture.
+const TEXTURED_WGSL: &str = r#"
+@group(0) @binding(1) var rug_texture: texture_2d<f32>;
+@group(0) @binding(2) var rug_sampler: sampler;
+
+@fragment
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
+    return shade(in, surface.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb);
 }
 
 // voxel GI's voxelizer: the rug's texture into its voxels
 @fragment
 fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
-    kansei_voxel_write(in.clip, front, textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
+    kansei_voxel_write(in.clip, front, surface.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
 }
 "#;
 
@@ -194,7 +146,7 @@ fn rug_texture() -> Texture {
 /// The rug's material; `voxel_entry` false voxelizes it with its constant `GiSurface` instead.
 fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
     let (code, bindings) = lit_shader(
-        &format!("{VOXEL_WRITE_WGSL}\n{RUG_WGSL}"),
+        &format!("{VOXEL_WRITE_WGSL}\n{SURFACE_WGSL}\n{TEXTURED_WGSL}"),
         sdf,
         vec![
             Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
@@ -255,14 +207,15 @@ impl SdfBinding {
     }
 }
 
-/// `body` (which calls `lit_radiance`) after the light chunk for `sdf` (shadows through the field)
-/// or the shadow maps, with its bindings: `bindings` plus the field's.
+/// `body` (which calls `lit_radiance`, through `SURFACE_WGSL`'s `shade`) after the GBuffer output and
+/// the light chunk for `sdf` (shadows through the field) or the shadow maps, with its bindings:
+/// `bindings` plus the field's.
 fn lit_shader(body: &str, sdf: Option<&SdfBinding>, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
     match sdf {
-        None => (format!("{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
+        None => (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
         Some(_) => {
             bindings.extend([Binding::uniform(10, ShaderStages::FRAGMENT), Binding::texture_3d(11, ShaderStages::FRAGMENT), Binding::sampler(12, ShaderStages::FRAGMENT)]);
-            (format!("{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
+            (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
         }
     }
 }
@@ -277,17 +230,11 @@ fn bind_sdf(material: &mut Material, sdf: Option<&SdfBinding>) {
 }
 
 fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>) -> Material {
-    let (code, bindings) = lit_shader(LIT_WGSL, sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
+    let (code, bindings) = lit_shader(&format!("{SURFACE_WGSL}\n{PLAIN_WGSL}"), sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
     let mut material = Material::new(label, &code, bindings, MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
     material.set_uniform_bindable(0, label, &[base_color[0], base_color[1], base_color[2], 1.0f32]);
     bind_sdf(&mut material, sdf);
     material
-}
-
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
 }
 
 /// The global illumination asked for (`gi=`).
@@ -297,6 +244,8 @@ enum Gi {
     Screen(GiQuality),
     Voxel,
     VoxelAndScreen,
+    Probes,
+    ProbesAndScreen,
 }
 
 impl Gi {
@@ -308,8 +257,10 @@ impl Gi {
             "high" | "ssgi" => Gi::Screen(GiQuality::High),
             "ultra" => Gi::Screen(GiQuality::Ultra),
             "voxel" => Gi::Voxel,
-            // a raw '+' in the query, or one decoded to a space or escaped
-            "voxel+ssgi" | "voxel ssgi" | "voxel%2Bssgi" | "voxel%2bssgi" => Gi::VoxelAndScreen,
+            // `param` decodes the query: a raw '+' arrives as a space
+            "voxel+ssgi" | "voxel ssgi" => Gi::VoxelAndScreen,
+            "probes" => Gi::Probes,
+            "probes+ssgi" | "probes ssgi" => Gi::ProbesAndScreen,
             _ => return None,
         })
     }
@@ -323,11 +274,22 @@ impl Gi {
             Gi::Screen(GiQuality::Ultra) => "ultra",
             Gi::Voxel => "voxel",
             Gi::VoxelAndScreen => "voxel+ssgi",
+            Gi::Probes => "probes",
+            Gi::ProbesAndScreen => "probes+ssgi",
         }
     }
 
     fn voxels(self) -> bool {
-        matches!(self, Gi::Voxel | Gi::VoxelAndScreen)
+        matches!(self, Gi::Voxel | Gi::VoxelAndScreen | Gi::Probes | Gi::ProbesAndScreen)
+    }
+
+    fn probes(self) -> bool {
+        matches!(self, Gi::Probes | Gi::ProbesAndScreen)
+    }
+
+    /// Screen-space GI in front of the voxels.
+    fn near_field(self) -> bool {
+        matches!(self, Gi::VoxelAndScreen | Gi::ProbesAndScreen)
     }
 }
 
@@ -380,6 +342,8 @@ enum View {
     Voxels,
     /// A horizontal slice of voxel GI's distance field (`slice=` metres up).
     Sdf,
+    /// The probes as balls lit by their irradiance.
+    Probes,
 }
 
 impl View {
@@ -389,6 +353,7 @@ impl View {
             "indirect" => View::Indirect,
             "voxels" => View::Voxels,
             "sdf" => View::Sdf,
+            "probes" => View::Probes,
             _ => return None,
         })
     }
@@ -399,15 +364,8 @@ impl View {
             View::Indirect => "indirect",
             View::Voxels => "voxels",
             View::Sdf => "sdf",
+            View::Probes => "probes",
         }
-    }
-}
-
-fn tier_name(q: VoxelGiQuality) -> &'static str {
-    match q {
-        VoxelGiQuality::Low => "low",
-        VoxelGiQuality::Medium => "medium",
-        VoxelGiQuality::High => "high",
     }
 }
 
@@ -435,32 +393,20 @@ struct Config {
 }
 
 impl Config {
+    /// Whether anything reads the probes.
+    fn needs_probes(&self) -> bool {
+        self.gi.probes() || self.view == View::Probes
+    }
+
     /// Whether anything reads the distance field.
     fn needs_sdf(&self) -> bool {
-        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf
+        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf || self.needs_probes()
     }
 
     /// Whether the scene's voxel GI must run: for the voxel modes, or for the distance field.
     fn needs_voxels(&self) -> bool {
         self.gi.voxels() || self.needs_sdf()
     }
-}
-
-fn sdf_shadows_name(s: SdfShadows) -> &'static str {
-    match s {
-        SdfShadows::Off => "off",
-        SdfShadows::Fallback => "fallback",
-        SdfShadows::Always => "always",
-    }
-}
-
-fn sdf_shadows_from_name(name: &str) -> Option<SdfShadows> {
-    Some(match name {
-        "off" => SdfShadows::Off,
-        "fallback" => SdfShadows::Fallback,
-        "always" => SdfShadows::Always,
-        _ => return None,
-    })
 }
 
 /// A preset: the GI mode, voxel tier (None: the device's default), view, dragon and the
@@ -481,7 +427,7 @@ const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxel
     Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
 }
 
-const PRESETS: [Preset; 11] = [
+const PRESETS: [Preset; 14] = [
     preset("off", "Off (direct light)", "off", None, View::Lit, Dragon::Off),
     preset("ssgi", "SSGI", "high", None, View::Lit, Dragon::Off),
     preset("voxel", "Voxel", "voxel", None, View::Lit, Dragon::Off),
@@ -494,7 +440,16 @@ const PRESETS: [Preset; 11] = [
     Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
     Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
     preset("slice", "SDF slice (debug)", "voxel", None, View::Sdf, Dragon::Off),
+    // irradiance probes traced in the distance field, under SSGI
+    preset("probes", "Probes + SSGI", "probes+ssgi", None, View::Lit, Dragon::Off),
+    preset("probe-view", "Probes (debug)", "probes+ssgi", None, View::Probes, Dragon::Off),
+    preset("probes-dragon", "Probes + dragon, 871k tris", "probes+ssgi", None, View::Lit, Dragon::Full),
 ];
+
+/// The probes for this device: a probe every 8 voxels; phones update half of them a frame.
+fn probe_options(phone: bool) -> SdfProbeOptions {
+    SdfProbeOptions { probes_per_frame: if phone { 256 } else { 0 }, ..Default::default() }
+}
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
 const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 3] = [
@@ -530,7 +485,6 @@ struct State {
     tall_rest: (Vec3, f32),
     dragon_rest: (Vec3, f32),
     time: f32,
-    last_ms: f64,
     stats: Option<Stats>,
 }
 
@@ -541,7 +495,7 @@ struct Stats {
     since: f64,
     frame_ms: f64,
     /// (label, ms per frame), most expensive first
-    passes: Vec<(String, f64)>,
+    passes: Vec<(&'static str, f64)>,
     gpu_ms: f64,
     gpu_span_ms: f64,
 }
@@ -554,27 +508,6 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     let state = STATE.with(|s| s.borrow().clone())?;
     let mut st = state.borrow_mut();
     Some(f(&mut st))
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-fn is_phone() -> bool {
-    let agent = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
-    ["Mobi", "Android", "iPhone", "iPad"].iter().any(|k| agent.contains(k))
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
 }
 
 fn default_voxels(phone: bool) -> VoxelGiQuality {
@@ -614,36 +547,36 @@ fn config_from_url(phone: bool) -> Config {
         direct_sdf: false,
         slice: 0.6,
     };
-    if let Some(preset) = query_param("preset").or_else(|| query_param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
+    if let Some(preset) = param("preset").or_else(|| param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
     }
-    if let Some(gi) = query_param("gi").as_deref().and_then(Gi::from_name) {
+    if let Some(gi) = param("gi").as_deref().and_then(Gi::from_name) {
         c.gi = gi;
     }
-    if let Some(q) = query_param("voxels").as_deref().and_then(VoxelGiQuality::from_name) {
+    if let Some(q) = param("voxels").as_deref().and_then(VoxelGiQuality::from_name) {
         c.voxels = q;
     }
-    if let Some(view) = query_param("view").as_deref().and_then(View::from_name) {
+    if let Some(view) = param("view").as_deref().and_then(View::from_name) {
         c.view = view;
     }
-    if let Some(dragon) = query_param("dragon").as_deref().and_then(Dragon::from_name) {
+    if let Some(dragon) = param("dragon").as_deref().and_then(Dragon::from_name) {
         c.dragon = dragon;
     }
-    c.animate = query_param("animate").map_or(c.animate, |v| v == "1" || v == "on" || v == "true");
-    if let Some(ao) = query_param("sdf_ao").and_then(|v| v.parse::<f32>().ok()) {
+    c.animate = param("animate").map_or(c.animate, |v| v == "1" || v == "on" || v == "true");
+    if let Some(ao) = param("sdf_ao").and_then(|v| v.parse::<f32>().ok()) {
         c.sdf_ao = ao.clamp(0.0, 1.0);
     }
-    if let Some(shadows) = query_param("sdf_shadows").as_deref().and_then(sdf_shadows_from_name) {
+    if let Some(shadows) = param("sdf_shadows").as_deref().and_then(SdfShadows::from_name) {
         c.sdf_shadows = shadows;
     }
-    if let Some(direct) = query_param("shadows") {
+    if let Some(direct) = param("shadows") {
         c.direct_sdf = direct == "sdf";
     }
-    if let Some(slice) = query_param("slice").and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(slice) = param("slice").and_then(|v| v.parse::<f32>().ok()) {
         c.slice = slice;
     }
-    c.rug = query_param("rug").as_deref() != Some("off");
-    c.textured = query_param("albedo").as_deref() != Some("constant");
+    c.rug = param("rug").as_deref() != Some("off");
+    c.textured = param("albedo").as_deref() != Some("constant");
     c
 }
 
@@ -663,13 +596,16 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool) -> Vec<Box<d
             // (the slice view shows through voxel GI's effect whatever the mode)
             let scene_gi = renderer.voxel_gi().expect("voxel GI is enabled for the voxel modes and the field");
             let near_quality = if phone || scene_gi.quality() == VoxelGiQuality::Low { GiQuality::Low } else { GiQuality::High };
-            let near_field = (config.gi == Gi::VoxelAndScreen).then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
+            let near_field = config.gi.near_field().then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
             let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, ..Default::default() });
             effect.show_indirect = indirect;
             effect.show_voxels = config.view == View::Voxels;
             effect.set_sdf(scene_gi.sdf());
             effect.sdf_ao = config.sdf_ao;
             effect.show_sdf_slice = (config.view == View::Sdf).then_some(config.slice);
+            // the probes: the far field in the probe modes (and what the debug view shows)
+            effect.set_probes(scene_gi.probes().filter(|_| config.needs_probes()));
+            effect.show_probes = config.view == View::Probes;
             effects.push(Box::new(effect));
         }
     }
@@ -680,58 +616,24 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool) -> Vec<Box<d
     effects
 }
 
-/// Fetch `url`'s bytes.
-async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
-    let window = web_sys::window()?;
-    let resp = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.ok()?;
-    let resp: web_sys::Response = resp.dyn_into().ok()?;
-    if !resp.ok() {
-        return None;
-    }
-    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
-    Some(js_sys::Uint8Array::new(&buf).to_vec())
-}
-
 /// A Stanford dragon from `www/assets` as one geometry about 1.1 m long, standing on y = 0 and
 /// centred on its origin, its parts merged with their glTF transforms baked in (None if it can't
 /// be loaded).
 async fn load_dragon(model: Dragon) -> Option<kansei_core::geometries::Geometry> {
     let result = match model {
         Dragon::Off => return None,
-        Dragon::Light => GLTFLoader::load_glb(&fetch_bytes("assets/stanford_dragon_pbr.glb").await?).ok()?,
+        Dragon::Light => GLTFLoader::load_glb(&fetch_bytes("assets/stanford_dragon_pbr.glb").await.ok()?).ok()?,
         Dragon::Full => {
-            let json = fetch_bytes("assets/scene.gltf").await?;
-            let bin = fetch_bytes("assets/scene.bin").await?;
+            let json = fetch_bytes("assets/scene.gltf").await.ok()?;
+            let bin = fetch_bytes("assets/scene.bin").await.ok()?;
             GLTFLoader::load_gltf_with_buffers(&json, vec![bin]).ok()?
         }
     };
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
-    for part in result.renderables {
-        let (r, s) = (part.rotation, part.scale);
-        let rotation = glam::Mat4::from_rotation_z(r.z) * glam::Mat4::from_rotation_y(r.y) * glam::Mat4::from_rotation_x(r.x);
-        let node = glam::Mat4::from_translation(glam::Vec3::new(part.position.x, part.position.y, part.position.z)) * rotation * glam::Mat4::from_scale(glam::Vec3::new(s.x, s.y, s.z));
-        let base = vertices.len() as u32;
-        for mut v in part.geometry.vertices {
-            let p = node.transform_point3(glam::Vec3::new(v.position[0], v.position[1], v.position[2]));
-            v.position = [p.x, p.y, p.z, 1.0];
-            v.normal = rotation.transform_vector3(glam::Vec3::from(v.normal)).normalize_or_zero().to_array();
-            lo = lo.min(p);
-            hi = hi.max(p);
-            vertices.push(v);
-        }
-        indices.extend(part.geometry.indices.iter().map(|i| i + base));
-    }
+    // 1.1 m across its wider side, standing on the floor at the centre
+    let geometry = result.merged_geometry("Dragon").fit(glam::Vec3::new(1.1, f32::INFINITY, 1.1));
+    let (lo, hi) = geometry.bounds();
     let extent = hi - lo;
-    let k = 1.1 / extent.x.max(extent.z);
-    let centre = glam::Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5);
-    for v in &mut vertices {
-        let p = (glam::Vec3::new(v.position[0], v.position[1], v.position[2]) - centre) * k;
-        v.position = [p.x, p.y, p.z, 1.0];
-    }
-    let geometry = kansei_core::geometries::Geometry::new("Dragon", vertices, indices);
-    log::info!("dragon ({}): {} triangles, {:.2} x {:.2} x {:.2} m", model.name(), geometry.index_count() / 3, extent.x * k, extent.y * k, extent.z * k);
+    log::info!("dragon ({}): {} triangles, {:.2} x {:.2} x {:.2} m", model.name(), geometry.index_count() / 3, extent.x, extent.y, extent.z);
     Some(geometry)
 }
 
@@ -768,6 +670,11 @@ impl State {
                 gi.disable_sdf();
             }
             gi.settings.sdf_shadows = config.sdf_shadows;
+            if config.needs_probes() {
+                gi.enable_probes(probe_options(self.phone));
+            } else {
+                gi.disable_probes();
+            }
         }
         self.volume.effects = build_effects(&self.renderer, &config, self.phone);
         // the lit materials: shadowed through the field (bound to this one) or by the maps
@@ -819,10 +726,10 @@ impl State {
         self.config.dragon.slot().and_then(|slot| self.dragons[slot]).unwrap_or(self.tall)
     }
 
-    fn frame(&mut self) {
-        let now = now_ms();
-        let dt = ((now - self.last_ms) / 1000.0).clamp(0.0, 0.1) as f32;
-        self.last_ms = now;
+    fn frame(&mut self, frame: &Frame) {
+        frame.resize(&mut self.renderer, &mut self.camera);
+        let now = now() * 1000.0;
+        let dt = frame.dt.clamp(0.0, 0.1);
         if self.config.animate {
             self.time += dt;
             let animated = self.animated();
@@ -844,9 +751,7 @@ impl State {
                 stats.since = now;
                 let profile = self.renderer.take_profile();
                 if profile.gpu_frames > 0 {
-                    let mut passes: Vec<(String, f64)> = profile.gpu.iter().map(|p| (p.label.to_string(), p.exclusive_ms)).collect();
-                    passes.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    stats.passes = passes;
+                    stats.passes = profile.top_passes(usize::MAX);
                     stats.gpu_ms = profile.gpu_ms;
                     stats.gpu_span_ms = profile.gpu_span_ms;
                 }
@@ -865,11 +770,11 @@ impl State {
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.config.gi.name(),
             self.config.view.name(),
-            tier_name(self.config.voxels),
-            gi.map_or("null".into(), |g| format!("\"{}\"", tier_name(g.quality()))),
+            self.config.voxels.name(),
+            gi.map_or("null".into(), |g| format!("\"{}\"", g.quality().name())),
             gi.map_or("null".into(), |g| format!("{:?}", g.volume().dims())),
             gi.map_or(0.0, |g| g.memory_bytes() as f64 / (1 << 20) as f64),
             self.config.dragon.name(),
@@ -877,11 +782,14 @@ impl State {
             self.config.rug,
             self.config.textured,
             self.config.sdf_ao,
-            sdf_shadows_name(self.config.sdf_shadows),
+            self.config.sdf_shadows.name(),
             if self.config.direct_sdf { "sdf" } else { "map" },
             self.config.slice,
             gi.and_then(|g| g.sdf()).is_some(),
             sum("VoxelGI/Sdf"),
+            gi.and_then(|g| g.probes()).is_some(),
+            gi.and_then(|g| g.probes()).map_or("null".into(), |p| format!("{:?}", p.dims())),
+            sum("VoxelGI/Probes"),
             self.triangles(),
             self.stats.is_some(),
             self.stats.as_ref().map_or(0.0, |s| s.frame_ms),
@@ -911,24 +819,8 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_spot_shadows(2048, 1);
     let phone = is_phone();
     let config = config_from_url(phone);
@@ -985,12 +877,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     lamp.volumetric_scale = 0.0;
     scene.add(SceneNode::Light(Light::Spot(lamp)));
 
-    let camera = Camera::new(38.0, 0.1, 100.0, width as f32 / height as f32);
-    let (_, target, distance, azimuth, elevation) = CAMERAS.iter().find(|c| Some(c.0) == query_param("cam").as_deref()).copied().unwrap_or(CAMERAS[0]);
-    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(target[0], target[1], target[2]), distance).with_mouse_pan(&canvas);
+    let camera = Camera::new(38.0, 0.1, 100.0, canvas.aspect());
+    let (_, target, distance, azimuth, elevation) = CAMERAS.iter().find(|c| Some(c.0) == param("cam").as_deref()).copied().unwrap_or(CAMERAS[0]);
+    let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(target[0], target[1], target[2]), distance).with_mouse_pan(canvas.element());
     controls.set_view(Vec3::new(target[0], target[1], target[2]), distance, azimuth, elevation);
 
-    let stats = (query_param("stats").as_deref() == Some("1")).then(|| Stats { since: now_ms(), ..Default::default() });
+    let stats = flag("stats", false).then(|| Stats { since: now() * 1000.0, ..Default::default() });
     if stats.is_some() {
         renderer.set_profiling(true);
     }
@@ -1013,7 +905,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         tall_rest,
         dragon_rest,
         time: 0.0,
-        last_ms: now_ms(),
         stats,
     };
     state.apply(config);
@@ -1021,13 +912,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let state = Rc::new(RefCell::new(state));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        state.borrow_mut().frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&canvas, move |frame| state.borrow_mut().frame(frame));
     Ok(())
 }
 
@@ -1138,7 +1023,7 @@ pub fn set_sdf_ao(strength: f32) {
 /// The voxels' shadows through the distance field: `off|fallback|always`.
 #[wasm_bindgen]
 pub fn set_sdf_shadows(name: &str) {
-    if let Some(sdf_shadows) = sdf_shadows_from_name(name) {
+    if let Some(sdf_shadows) = SdfShadows::from_name(name) {
         with_state(|s| s.apply(Config { sdf_shadows, ..s.config }));
     }
 }
@@ -1161,6 +1046,6 @@ pub fn set_slice(height: f32) {
 pub fn set_stats(on: bool) {
     with_state(|s| {
         s.renderer.set_profiling(on);
-        s.stats = on.then(|| Stats { since: now_ms(), ..Default::default() });
+        s.stats = on.then(|| Stats { since: now() * 1000.0, ..Default::default() });
     });
 }

@@ -3,9 +3,6 @@
 //! and its GPU memory; `?support=none|bc|astc|etc2` restricts the formats to show the fallbacks.
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use kansei_core::buffers::Sampler;
 use kansei_core::cameras::Camera;
@@ -14,13 +11,8 @@ use kansei_core::loaders::ktx2::{self, CompressionSupport, Ktx2Options, Transcod
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::renderers::{Renderer, RendererConfig};
-
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
+use kansei_core::renderers::RendererConfig;
+use kansei_wasm::{fetch_bytes, param, Canvas};
 
 /// A textured quad: colour over a checkerboard (so alpha shows), or a normal map lit by a light
 /// circling in front of it (`params.x` = 1).
@@ -56,38 +48,11 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-struct State {
-    renderer: Renderer,
-    scene: Scene,
-    camera: Camera,
-    normal_quad: usize,
-    start: f64,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
-}
-
-fn now() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
-    let window = web_sys::window().unwrap();
-    let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await?.dyn_into()?;
-    if !resp.ok() {
-        return Err(format!("{url}: HTTP {}", resp.status()).into());
-    }
-    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
-    Ok(js_sys::Uint8Array::new(&buf).to_vec())
+/// Back far enough that the three quads (3 units either side) fit the width.
+fn fit_camera(camera: &mut Camera) {
+    camera.set_position(0.0, 0.0, (3.2 / (22.5f32.to_radians().tan() * camera.aspect)).max(5.0));
+    camera.look_at(&Vec3::ZERO);
+    camera.update_projection_matrix();
 }
 
 fn quad(label: &str, texture: TranscodedTexture, normal_map: bool, x: f32) -> Renderable {
@@ -112,28 +77,13 @@ fn quad(label: &str, texture: TranscodedTexture, normal_map: bool, x: f32) -> Re
 /// Starts the page; resolves to the report lines (one per texture, plus the device's formats).
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<String, JsValue> {
-    let window = web_sys::window().unwrap();
-    let canvas = window
-        .document()
-        .unwrap()
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = (canvas.client_width() as u32, canvas.client_height() as u32);
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.03, 0.03, 0.04, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas
+        .renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.03, 0.03, 0.04, 1.0), ..Default::default() })
+        .await;
 
     let device_support = renderer.compression_support();
-    let support = match query_param("support").as_deref() {
+    let support = match param("support").as_deref() {
         Some("none") => CompressionSupport::NONE,
         Some("bc") => CompressionSupport { bc: device_support.bc, ..CompressionSupport::NONE },
         Some("astc") => CompressionSupport { astc: device_support.astc, ..CompressionSupport::NONE },
@@ -179,28 +129,18 @@ pub async fn start(canvas_id: &str) -> Result<String, JsValue> {
         }
     }
 
-    // back far enough that the three quads (3 units either side) fit the width
-    let aspect = width as f32 / height as f32;
-    let mut camera = Camera::new(45.0, 0.1, 100.0, aspect);
-    camera.set_position(0.0, 0.0, (3.2 / (22.5f32.to_radians().tan() * aspect)).max(5.0));
-    camera.look_at(&Vec3::ZERO);
-    camera.update_projection_matrix();
+    let mut camera = Camera::new(45.0, 0.1, 100.0, canvas.aspect());
+    fit_camera(&mut camera);
 
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, normal_quad, start: now() }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, normal_quad, start } = *st;
-            let t = ((now() - start) / 1000.0) as f32;
-            if let Some(buf) = scene.get_renderable(normal_quad).and_then(|r| r.material.bindable_buffer(2)) {
-                renderer.queue().write_buffer(&buf, 0, bytemuck::cast_slice(&[1.0f32, t, 0.0, 0.0]));
-            }
-            renderer.render(scene, camera);
+    kansei_wasm::run(&canvas, move |frame| {
+        if frame.resized.is_some() {
+            frame.resize(&mut renderer, &mut camera);
+            fit_camera(&mut camera);
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        if let Some(buf) = scene.get_renderable(normal_quad).and_then(|r| r.material.bindable_buffer(2)) {
+            renderer.queue().write_buffer(&buf, 0, bytemuck::cast_slice(&[1.0f32, frame.time as f32, 0.0, 0.0]));
+        }
+        renderer.render(&mut scene, &mut camera);
+    });
     Ok(report.join("\n"))
 }

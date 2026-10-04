@@ -39,7 +39,7 @@ impl Sphere {
     }
 }
 
-use crate::geometries::Vertex;
+use crate::geometries::{Geometry, Vertex};
 
 mod build;
 mod cards;
@@ -271,6 +271,13 @@ impl ClusterMesh {
                 projected_error(c.error, c.lod_bounds, view) <= view.threshold && projected_error(c.parent_error, c.parent_bounds, view) > view.threshold
             })
             .collect()
+    }
+
+    /// The cut `view` selects as an ordinary mesh: a discrete LOD baked from the graph (for LOD
+    /// bands, impostor bakes, or comparing against the per-cluster path).
+    pub fn cut_geometry(&self, label: &str, view: &LodView) -> Geometry {
+        let indices = self.select(view).into_iter().flat_map(|c| self.triangles(c).flatten().collect::<Vec<_>>()).collect();
+        Geometry::new(label, self.vertices.clone(), indices)
     }
 }
 

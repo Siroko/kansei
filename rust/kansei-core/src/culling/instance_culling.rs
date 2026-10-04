@@ -1,5 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
+use crate::buffers::{BufferType, ComputeBuffer};
+
 const WGSL: &str = include_str!("../shaders/instance_cull.wgsl");
 const NO_WORD: u32 = u32::MAX;
 
@@ -70,8 +72,9 @@ pub(crate) const ARGS_BYTES: u64 = 32;
 ///     .with_occlusion(true);
 /// ```
 pub struct InstanceCulling {
-    /// All instances; needs `BufferUsages::STORAGE`.
-    pub source: wgpu::Buffer,
+    /// All instances: a handle to the geometry's instance buffer (a clone of the same
+    /// `ComputeBuffer`), created on first use; needs `BufferUsages::STORAGE`.
+    pub source: ComputeBuffer,
     /// Instances in `source` (at most the count it was created with).
     pub count: u32,
     /// Bytes per instance, a multiple of 4.
@@ -286,7 +289,18 @@ impl CullView {
 }
 
 impl InstanceCulling {
+    /// Culling for `count` instances of `stride` bytes in a GPU buffer created elsewhere (a
+    /// simulation's). For an instance buffer of your own, `from_buffer` with the geometry's
+    /// `ComputeBuffer`.
     pub fn new(source: wgpu::Buffer, count: u32, stride: u32, center_offset: u32, radius: f32) -> Self {
+        Self::from_buffer(&ComputeBuffer::from_external("InstanceCulling/Source", source, BufferType::Storage), count, stride, center_offset, radius)
+    }
+
+    /// Culling for `count` instances of `stride` bytes in `source`, the `ComputeBuffer` the
+    /// geometry reads them from (this keeps a handle to the same GPU buffer), each a sphere of
+    /// `radius` around the 3 floats at `center_offset`.
+    pub fn from_buffer(source: &ComputeBuffer, count: u32, stride: u32, center_offset: u32, radius: f32) -> Self {
+        let source = source.clone();
         assert!(stride.is_multiple_of(4) && center_offset.is_multiple_of(4) && center_offset + 12 <= stride, "instance layout must be 4-byte words, with the centre inside");
         Self {
             source,
@@ -307,6 +321,13 @@ impl InstanceCulling {
             occlusion_slots: Vec::new(),
             two_phase: Vec::new(),
         }
+    }
+
+    /// Culling for instances of one vec4 each, position in xyz and a scale in w that multiplies
+    /// `radius` (the layout of `materials::StandardInstancing`): `from_buffer(source, count, 16, 0,
+    /// radius).with_radius_scale(12)`.
+    pub fn for_vec4_instances(source: &ComputeBuffer, count: u32, radius: f32) -> Self {
+        Self::from_buffer(source, count, 16, 0, radius).with_radius_scale(12)
     }
 
     pub fn with_radius_scale(mut self, offset: u32) -> Self {
@@ -436,7 +457,7 @@ impl InstanceCulling {
         let params = wgpu::BufferBinding { buffer: &shared.params, offset: chunk as u64 * shared.params_stride, size: std::num::NonZeroU64::new(std::mem::size_of::<CullInstancesGpu>() as u64) };
         let mut entries = vec![
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(params) },
-            wgpu::BindGroupEntry { binding: 1, resource: self.source.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: self.source.gpu_buffer().expect("ensure_views creates the source").as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: instances.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: shared.args.as_entire_binding() },
         ];
@@ -456,6 +477,8 @@ impl InstanceCulling {
 
     /// `ensure_views`, with at most `max_chunk_bytes` of compacted instances per chunk.
     fn ensure_views_within(&mut self, device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, count: usize, max_chunk_bytes: u64) -> bool {
+        // the source, unless the geometry sharing it has been drawn already
+        self.source.initialize(device);
         if self.count <= self.capacity && self.shared.as_ref().is_some_and(|s| s.views >= count && s.out_stride == self.culled_stride()) {
             return false;
         }

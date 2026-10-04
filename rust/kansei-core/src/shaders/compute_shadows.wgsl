@@ -83,7 +83,9 @@ fn pointShadowLookup(worldPos: vec3f, lightPos: vec3f, firstLayer: u32) -> f32 {
         if (dir.z > 0.0) { face = 4u; uv = vec2f( dir.x, -dir.y) / a.z; }
         else             { face = 5u; uv = vec2f(-dir.x, -dir.y) / a.z; }
     }
-    uv = uv * 0.5 + 0.5;
+    // texel rows run down the face as rendered (NDC y up), so v flips
+    // (cubemap_shadow_map.rs: the_point_shadow_lookup_finds_the_texel_each_face_rendered)
+    uv = vec2f(uv.x, -uv.y) * 0.5 + 0.5;
 
     let texDim = vec2f(textureDimensions(pointShadowAtlas, 0));
     let tc = vec2i(clamp(uv * texDim, vec2f(0.0), texDim - 1.0));

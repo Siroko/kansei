@@ -17,6 +17,8 @@ mod colliders;
 mod pbf;
 mod activity;
 mod emitter;
+mod fill;
+mod stepper;
 
 pub use params::{FluidSimulationOptions, FluidSolver, PbfOptions, DEFAULT_OPTIONS};
 pub use simulation::{FluidSimulation, FluidSubstepPass};
@@ -24,6 +26,8 @@ pub use container::{signed_distance, FluidContainer, FluidContainerOptions, Plan
 pub use activity::{FluidActivity, FluidSleep, FluidSleepOptions, FluidSpeed, FluidSpeedProbe};
 pub use colliders::{FluidCapsule, FluidColliders, FluidCollidersOptions};
 pub use emitter::FluidNozzle;
+pub use fill::{fill_box, lattice_density};
+pub use stepper::{FluidStepper, WorldScale};
 pub use density_field::{FluidDensityField, DensityFieldOptions};
 pub use surface_renderer::FluidSurfaceRenderer;
 pub use particle_renderer::FluidParticleRenderer;

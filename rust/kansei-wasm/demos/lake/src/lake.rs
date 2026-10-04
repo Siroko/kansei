@@ -1,0 +1,689 @@
+//! A small lake beside the course: an irregular outline, a bed that shelves from the waterline
+//! down to about 0.6 m in the middle, and a low shore around it. The water is the engine's SPH
+//! fluid (`simulations::fluid`, as in the fluid clock), held by a `FluidContainer` whose walls
+//! follow the outline a strip of shore outside it and whose floor is the bed, and pushed through
+//! `FluidColliders` by whatever is in it: the motion-matching character's legs, the mill's
+//! paddles. The character wades: the bed is in the collision world, so it walks down into the
+//! shallows and out again, splashing.
+//!
+//! The simulation runs 11 times the world's size (a particle every 5 cm, with the fluid clock's
+//! tuned constants at a smoothing radius of 1) and so √11 times faster than real time, which keeps
+//! gravity-driven motion (waves, splashes) at its real pace.
+//!
+//! The water rests when it can (`simulations::fluid::FluidSleep`): out of view for a moment it is
+//! culled (neither stepped nor drawn), and in view, once settled with nothing near it, it sleeps
+//! (not stepped, its last surface drawn). Legs or a splash near it, a stream poured in, a turning
+//! mill, a setting changed, or a reset wake it.
+//!
+//! Water can be added (the cannon, `cannon`): the simulation has room for the particles that
+//! raise the still water from `WATER` to `FULL` (`FluidSimulation::with_capacity`), a stream
+//! (`FluidNozzle`) adds them step by step, and the wet line on the bed follows the level. A
+//! reset drains it back to the start. Other bodies in the water (the mill, `mill`) push it as
+//! more colliders.
+
+use glam::{Mat4, Vec3 as GVec3};
+
+use kansei_core::collision::{CollisionWorld, Obb, Shape, TriangleMesh};
+use kansei_core::geometries::{Geometry, Vertex};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::postprocessing::effects::{FluidSurfaceEffect, FluidSurfaceOptions};
+use kansei_core::renderers::Renderer;
+use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
+use kansei_core::simulations::fluid::{
+    DensityFieldOptions, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer,
+    FluidContainerOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
+    FluidActivity, FluidNozzle, FluidSleepOptions, FluidSolver, FluidStepper, FluidSubstepPass, MarchingCubesOptions,
+    PbfOptions, PlanarContainerShape, WorldScale, DEFAULT_OPTIONS, lattice_density,
+};
+
+use crate::{SKY, SUN, SUN_DIR};
+
+/// 11 simulation units a metre, and simulated time √11 times as fast as real time, so gravity
+/// acts at its real pace (`WorldScale::with_real_gravity(11.0)`); the panel can change the time.
+const SCALE: WorldScale = WorldScale { length: 11.0, time: 3.316_625 };
+/// Simulation units per metre.
+const SIM_SCALE: f32 = SCALE.length;
+/// Real seconds per simulation step (up to `MAX_STEPS` a frame).
+const STEP: f32 = 1.0 / 60.0;
+const MAX_STEPS: u32 = 2;
+/// The lake's middle (x, z) and half-size along x and z.
+pub const CENTER: [f32; 2] = [21.0, -1.0];
+const HALF: [f32; 2] = [5.2, 3.4];
+/// The still water's height, a little under the ground's.
+const WATER: f32 = -0.1;
+/// The highest the water can be filled to: the brim, 10 cm up, where it starts onto the bank
+/// (whose top, `BANK`, is higher), well inside the container's walls. Higher costs too much: at
+/// 0.04 m the lake has half as many particles again and the frame takes 60% longer.
+const FULL: f32 = 0.0;
+/// The bed: its depth in the middle, and how far in from the outline it gets there, steepest at
+/// the outline (so the water's edge is short, not a long film a particle thick).
+const DEPTH: f32 = 0.6;
+const SHELF: f32 = 2.6;
+/// The shore: the container's walls stand this far outside the outline, on a low bank that
+/// drains back into the lake and goes down to the ground past them.
+const SHORE: f32 = 1.2;
+const BANK: f32 = 0.1;
+const BANK_OUT: f32 = 1.6;
+/// A landing's splash: the sphere at the feet (m), how long it pushes (s), and its push outward
+/// per m/s of the fall.
+const SPLASH_RADIUS: f32 = 0.3;
+const SPLASH_TIME: f32 = 0.12;
+const SPLASH_PUSH: f32 = 1.2;
+/// The colliders the water takes: the legs and a landing (8), and the props in it.
+const COLLIDERS: usize = 40;
+/// Resting: legs this far (m) outside the waterline's bounds wake the water; it is culled after
+/// this long out of view (s), the last waves dying out meanwhile; and it sleeps once no particle
+/// has moved faster than this (m/s) for this long (s).
+const WAKE_DISTANCE: f32 = 2.0;
+const CULL_AFTER: f32 = 1.5;
+pub const SETTLE_SPEED: f32 = 0.05;
+const SETTLE_AFTER: f32 = 1.0;
+/// How the water's surface is extracted from the particles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceSettings {
+    /// A surface field (droplets, flat layers) rather than the splatted density.
+    pub surface_field: bool,
+    /// Voxels along the field's longest side.
+    pub resolution: u32,
+    /// The splat's kernel radius (simulation units).
+    pub kernel: f32,
+    /// The surface field's particle radius (simulation units).
+    pub particle_radius: f32,
+    /// The iso level: 1 for a surface field; a density for the density field.
+    pub iso: f32,
+    /// Interpolated marching cubes (else voxel faces).
+    pub interpolate: bool,
+}
+
+impl SurfaceSettings {
+    /// The default: a surface field, spray as droplets 8 cm across, at the density build's cost.
+    pub const DROPLETS: Self = Self { surface_field: true, resolution: 256, kernel: 1.5, particle_radius: 0.45, iso: 1.0, interpolate: true };
+    /// The splatted density at an iso level, wide and smooth: spray is blobby.
+    pub const SMOOTH: Self = Self { surface_field: false, resolution: 256, kernel: 1.6, particle_radius: 0.45, iso: 0.5, interpolate: true };
+    /// A coarser surface field, for slower GPUs.
+    pub const PERFORMANCE: Self = Self { surface_field: true, resolution: 192, kernel: 1.5, particle_radius: 0.55, iso: 1.0, interpolate: true };
+
+    fn density_options(&self) -> DensityFieldOptions {
+        DensityFieldOptions {
+            resolution: self.resolution,
+            // surface field: 1 over the kernel weight of the bulk (particles per unit³ × 0.638 h³)
+            kernel_scale: if self.surface_field { 1.0 / (SPACING.powi(-3) * 0.638 * self.kernel.powi(3)) } else { 0.6 },
+            particle_radius: self.surface_field.then_some(self.particle_radius),
+        }
+    }
+}
+/// Lattice spacing of the particles at the fluid clock's rest density (simulation units).
+const SPACING: f32 = 0.537;
+
+/// The terrain's uniform: its colour, the still water's height (the wet line), the light, and how
+/// far past the waterline the water can reach.
+fn terrain_uniform(level: f32) -> [f32; 16] {
+    let d = SUN_DIR;
+    [0.32, 0.32, 0.3, level, d[0], d[1], d[2], SHORE, SUN[0], SUN[1], SUN[2], 0.0, SKY[0], SKY[1], SKY[2], 0.0]
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The waterline: a wobbly ellipse.
+fn outline() -> Vec<[f32; 2]> {
+    (0..256)
+        .map(|k| {
+            let a = k as f32 / 256.0 * std::f32::consts::TAU;
+            let r = 1.0 + 0.11 * (2.0 * a + 0.6).sin() + 0.07 * (3.0 * a + 2.1).sin() + 0.04 * (5.0 * a + 0.3).sin();
+            [CENTER[0] + HALF[0] * r * a.cos(), CENTER[1] + HALF[1] * r * a.sin()]
+        })
+        .collect()
+}
+
+/// The ground's height at signed distance `d` from the waterline (negative in the lake).
+fn height(d: f32) -> f32 {
+    if d < 0.0 {
+        let t = (-d / SHELF).min(1.0);
+        -DEPTH * (1.0 - (1.0 - t) * (1.0 - t))
+    } else if d < SHORE {
+        BANK * smoothstep(0.0, SHORE, d)
+    } else {
+        BANK * (1.0 - smoothstep(SHORE, SHORE + BANK_OUT, d))
+    }
+}
+
+/// Lake bed and shore: grey ground with the course's metre grid, turning to wet silt below the
+/// water and darker with depth; sun (cascade-shadowed) and sky. `surface.base_color.w` is the
+/// water's height, and `surface.sun_dir.w` how far past the waterline the water can reach (the
+/// container's walls): the vertices' `uv.x` is their distance past the waterline.
+const TERRAIN_WGSL: &str = r#"
+struct Surface { base_color: vec4<f32>, sun_dir: vec4<f32>, sun: vec4<f32>, sky: vec4<f32> };
+@group(0) @binding(0) var<uniform> surface: Surface;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) shore: f32 };
+@vertex
+fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+    let world = world_matrix * position;
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.normal = normal;
+    out.shore = uv.x;
+    return out;
+}
+fn grid(p: vec2<f32>, spacing: f32, width: f32) -> f32 {
+    let q = p / spacing;
+    let d = abs(fract(q - 0.5) - 0.5) / fwidth(q);
+    return 1.0 - min(min(d.x, d.y) / width, 1.0);
+}
+@fragment
+fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let shadow = kansei_sun_shadow(in.world, n, in.clip.xy);
+    let lines = max(grid(in.world.xz, 1.0, 1.0) * 0.35, grid(in.world.xz, 5.0, 1.5) * 0.6);
+    let under = in.world.y - surface.base_color.w;
+    // wet up to a damp margin over the still water (the water settles a few cm over the height
+    // it is filled to), so no dry band shows through the shallows
+    let wet = smoothstep(0.08, 0.04, under) * smoothstep(surface.sun_dir.w, surface.sun_dir.w - 0.2, in.shore);
+    let silt = mix(vec3<f32>(0.3, 0.26, 0.19), vec3<f32>(0.16, 0.15, 0.11), smoothstep(0.0, -0.5, under));
+    let base = mix(surface.base_color.rgb, silt, wet) * (1.0 - lines * mix(1.0, 0.4, wet));
+    let l = -normalize(surface.sun_dir.xyz);
+    let lit = base / 3.14159265 * surface.sun.rgb * max(dot(n, l), 0.0) * shadow + base * surface.sky.rgb * (0.6 + 0.4 * n.y);
+    return vec4<f32>(lit, 1.0);
+}
+"#;
+
+/// A grid of vertices over `[min, max]` (x, z), `cells` across, at `height(x, z)`, with normals
+/// from the heights around; triangles wound counter-clockwise seen from above.
+fn heightfield(min: [f32; 2], max: [f32; 2], cells: [usize; 2], height: &dyn Fn(f32, f32) -> f32) -> (Vec<GVec3>, Vec<[f32; 3]>, Vec<u32>) {
+    let step = [(max[0] - min[0]) / cells[0] as f32, (max[1] - min[1]) / cells[1] as f32];
+    let (mut positions, mut normals) = (Vec::new(), Vec::new());
+    for j in 0..=cells[1] {
+        for i in 0..=cells[0] {
+            let (x, z) = (min[0] + i as f32 * step[0], min[1] + j as f32 * step[1]);
+            positions.push(GVec3::new(x, height(x, z), z));
+            let e = 0.1;
+            let n = GVec3::new(height(x - e, z) - height(x + e, z), 2.0 * e, height(x, z - e) - height(x, z + e)).normalize();
+            normals.push(n.to_array());
+        }
+    }
+    let row = cells[0] as u32 + 1;
+    let mut indices = Vec::new();
+    for j in 0..cells[1] as u32 {
+        for i in 0..cells[0] as u32 {
+            let (a, b, c, d) = (j * row + i, j * row + i + 1, (j + 1) * row + i + 1, (j + 1) * row + i);
+            // (x, z) → (x, z + 1) → (x + 1, z + 1) turns counter-clockwise seen from +y
+            indices.extend_from_slice(&[a, d, c, a, c, b]);
+        }
+    }
+    (positions, normals, indices)
+}
+
+fn geometry(label: &str, positions: &[GVec3], normals: &[[f32; 3]], indices: Vec<u32>) -> Geometry {
+    let vertices = positions.iter().zip(normals).map(|(p, n)| Vertex { position: [p.x, p.y, p.z, 1.0], normal: *n, uv: [p.x, p.z] }).collect();
+    Geometry::new(label, vertices, indices)
+}
+
+/// The ground outside a rectangle `[min, max]` (x, z), out to `extent` all round: four flat quads
+/// at height 0, with the course's ground material.
+fn ground_around(scene: &mut Scene, world: &mut CollisionWorld, material: Material, min: [f32; 2], max: [f32; 2], extent: f32) {
+    let quads = [
+        ([-extent, -extent], [extent, min[1]]),
+        ([-extent, max[1]], [extent, extent]),
+        ([-extent, min[1]], [min[0], max[1]]),
+        ([max[0], min[1]], [extent, max[1]]),
+    ];
+    let (mut positions, mut indices) = (Vec::new(), Vec::new());
+    for (a, b) in quads {
+        let k = positions.len() as u32;
+        positions.extend([GVec3::new(a[0], 0.0, a[1]), GVec3::new(b[0], 0.0, a[1]), GVec3::new(b[0], 0.0, b[1]), GVec3::new(a[0], 0.0, b[1])]);
+        indices.extend_from_slice(&[k, k + 3, k + 2, k, k + 2, k + 1]);
+        world.add_box(Obb::from_min_max(GVec3::new(a[0], -1.0, a[1]), GVec3::new(b[0], 0.0, b[1])));
+    }
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    let mut r = Renderable::new(geometry("Ground", &positions, &normals, indices), material);
+    r.cast_shadow = false;
+    scene.add(SceneNode::Renderable(r));
+}
+
+/// The lake: its shape, the simulation's passes, and the character's legs in it.
+pub struct Lake {
+    /// The terrain's renderable (its uniform carries the still water's height, for the wet line).
+    pub terrain: usize,
+    /// How many particles above the initial fill raise the still water to each height: (added,
+    /// level in m), from `WATER` up to `FULL`.
+    levels: Vec<(u32, f32)>,
+    /// The live particles, and the most there can be.
+    count: u32,
+    capacity: u32,
+    container: FluidContainer,
+    colliders: FluidColliders,
+    /// The water's steps (`STEP` real seconds, at most `MAX_STEPS` a frame, at `SCALE`, the
+    /// panel's time scale) and its rest: culled out of view, asleep when settled.
+    stepper: FluidStepper,
+    /// Last frame's capsule ends (world), for their velocities.
+    previous: Vec<[GVec3; 2]>,
+    /// A landing's splash: where (world), how fast it came down, and for how long it has pushed.
+    splash: Option<(GVec3, f32, f32)>,
+    /// The waterline's bounds (x, z): legs within 2 m of them push the water.
+    near: ([f32; 2], [f32; 2]),
+    /// A landing splash's push outward per m/s of the fall.
+    pub splash_push: f32,
+    /// The particles as they started, for a reset.
+    initial: Vec<f32>,
+    surface: SurfaceSettings,
+}
+
+impl Lake {
+    /// Build the lake into `scene` and `world`: its terrain, the ground around it (with
+    /// `ground_material`), and its surface effect, for the post-processing chain.
+    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, ground_material: Material) -> (Self, FluidSurfaceEffect) {
+        let outline = outline();
+        // the terrain's heights on a grid over the lake and its banks, smoothed; flat ground
+        // around it
+        let mut terrain = PlanarContainerShape::from_outline(&outline, 0.1, SHORE + BANK_OUT + 0.5, |_, _, d| height(d));
+        terrain.smooth_floor(4);
+        let (min, max) = terrain.bounds();
+        ground_around(scene, world, ground_material, min, max, 200.0);
+        let ground = |x: f32, z: f32| terrain.floor(x, z);
+
+        // the terrain: a fine mesh to draw, a coarser one to walk on
+        let cells = |step: f32| [((max[0] - min[0]) / step).ceil() as usize, ((max[1] - min[1]) / step).ceil() as usize];
+        let (positions, normals, indices) = heightfield(min, max, cells(0.2), &ground);
+        let mut material = Material::new("Lake/Terrain", &format!("{CASCADED_SHADOWS_WGSL}\n{TERRAIN_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
+        material.set_uniform_bindable(0, "Lake/Terrain", &terrain_uniform(WATER));
+        // each vertex's distance past the waterline, for the wet line (water stays inside the walls)
+        let mut mesh = geometry("Lake/Terrain", &positions, &normals, indices);
+        for v in &mut mesh.vertices {
+            v.uv[0] = terrain.distance(v.position[0], v.position[2]);
+        }
+        let mut r = Renderable::new(mesh, material);
+        r.cast_shadow = false;
+        let terrain_index = scene.add(SceneNode::Renderable(r));
+        let (positions, _, indices) = heightfield(min, max, cells(0.5), &ground);
+        world.add(Shape::Mesh(TriangleMesh::from_indexed(&positions, &indices, Mat4::IDENTITY)), 1);
+
+        // the container, in simulation space: walls a shore's width outside the waterline, the
+        // bed as its floor
+        let shape = PlanarContainerShape::from_outline(&outline, 0.1, SHORE, |x, z, _| terrain.floor(x, z)).scaled(SIM_SCALE);
+
+        // the water: a lattice at rest density from the bed up to the still water's height
+        let (lo, hi) = shape.bounds();
+        let particles = shape.lattice(SPACING, WATER * SIM_SCALE, |d| d < 0.0);
+        let count = (particles.len() / 4) as u32;
+        // room for the water poured in: the particles between the still water and the highest
+        // level, over the lake and the bank it floods (inside the walls)
+        let wet = |level: f32| (shape.lattice(SPACING, level * SIM_SCALE, |d| d < SHORE - 0.2).len() / 4) as u32;
+        let base = wet(WATER);
+        let levels: Vec<(u32, f32)> = (0..=28).map(|k| WATER + (FULL - WATER) * k as f32 / 28.0).map(|level| (wet(level) - base, level)).collect();
+        let capacity = count + levels.last().unwrap().0;
+        log::info!("lake: {count} particles, room for {capacity} (still water from {WATER} m up to {FULL} m)");
+
+        // the fluid clock's tuning at 80K particles, h = 1 (see its `tuning_for`), less viscous
+        let mut sim = FluidSimulation::with_capacity(renderer, FluidSimulationOptions {
+            max_particles: capacity,
+            dimensions: 3,
+            smoothing_radius: 1.0,
+            pressure_multiplier: 46.5,
+            near_pressure_multiplier: 20.0,
+            density_target: 8.6,
+            // a fifth of the clock's viscosity: the water runs and splashes freely
+            viscosity: 0.15,
+            damping: 1.0,
+            gravity: [0.0, -9.8, 0.0],
+            // 4 substeps keep each one near the clock's stable 16 ms at this time scale
+            substeps: 4,
+            // 0.6 of the pull under the rest density: fewer filaments than the clock's full
+            // cohesion. Not much less: near pressure always pushes, so sparse water with little
+            // pull spreads like a gas, climbs the bank as a film and stays there (at 0.2 a
+            // minute's splashing stranded 4% of the lake on the shore; at 0.6 and 1 it drains
+            // back within 8 s)
+            negative_pressure_scale: 0.6,
+            // Position Based Fluids, when chosen (the tweak panel): at rest, the density its kernel
+            // sums to on the fill's lattice, so the water keeps its volume
+            // and no faster than 12 m/s (a running foot's swing, and some)
+            pbf: PbfOptions { rest_density: lattice_density(SPACING, 1.0), max_speed: SCALE.speed_to_sim(12.0), ..PbfOptions::DEFAULT },
+            ..DEFAULT_OPTIONS
+        }, &particles, capacity);
+        sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
+        sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
+        sim.rebuild_grid();
+        let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.002 });
+        let colliders = FluidColliders::new(&sim, COLLIDERS, FluidCollidersOptions { restitution: 0.3, drag: 0.6 });
+
+        // its surface: a surface field (the distance to the weighted mean of the particles within
+        // 1.5 units, less a particle radius of 0.45) polygonised at its iso level of 1, where the bulk
+        // is inside whatever the mean. Averaging flattens the layers the particles settle in along
+        // the sloping bed, while a lone particle stays a droplet 8 cm across and a jet of them a
+        // thin one. The voxels are 0.6 units (5.5 cm): the kernel reaches 3 of them each way.
+        let settings = SurfaceSettings::DROPLETS;
+        let density = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, settings.density_options());
+        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 600_000, iso_level: 1.0 });
+        // interpolated marching cubes (the default extraction draws voxel faces)
+        marching_cubes.set_use_classic(true);
+        let marching_cubes_bg = marching_cubes.create_bind_group(renderer, &density.density_view);
+        let mut surface = FluidSurfaceEffect::new(sim, density, marching_cubes, marching_cubes_bg, FluidSurfaceOptions {
+            ior: 1.33,
+            chromatic_aberration: 0.02,
+            tint_strength: 0.75,
+            fresnel_power: 5.0,
+            roughness: 0.12,
+            thickness: 1.2,
+            color: [0.35, 0.55, 0.6, 1.0],
+            light_direction: SUN_DIR,
+            light_intensity: 1.0,
+            light_color: SUN,
+            rim: 0.0,
+            // the sky shader's colour a little above the horizon
+            sky_color: [7000.0, 8000.0, 10000.0],
+            sky_reflection: 1.0,
+        });
+        surface.splat_radius = Some(settings.kernel);
+        let stepper = FluidStepper::new(STEP, MAX_STEPS, SCALE)
+            .with_rest(&surface.sim, FluidSleepOptions { cull_after: CULL_AFTER, settle_speed: SETTLE_SPEED, settle_after: SETTLE_AFTER });
+
+        let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
+        (Self { terrain: terrain_index, levels, count, capacity, container, colliders, stepper, previous: Vec::new(), splash: None, near: (bmin, bmax), splash_push: SPLASH_PUSH, initial: particles, surface: settings }, surface)
+    }
+
+    /// The water's surface renderable, drawing the effect's marching-cubes mesh (in simulation
+    /// space) into the GBuffer, where `FluidSurfaceEffect` composites the refraction and reflection.
+    pub fn add_surface(scene: &mut Scene, surface: &FluidSurfaceEffect) {
+        let mut r = surface.surface_renderable([0.2, 0.3, 0.3, 1.0]);
+        let s = 1.0 / SIM_SCALE;
+        r.object.scale = kansei_core::math::Vec3::new(s, s, s);
+        scene.add(SceneNode::Renderable(r));
+    }
+
+    /// The live particles.
+    pub fn particles(&self) -> u32 {
+        self.count
+    }
+
+    /// The most particles there can be: the water at its highest.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// How full the lake is: 0 at the start's level, 1 at the highest.
+    pub fn fill(&self) -> f32 {
+        let room = self.levels.last().map_or(0, |l| l.0);
+        if room == 0 { 1.0 } else { (self.count.saturating_sub(self.capacity - room)) as f32 / room as f32 }
+    }
+
+    pub fn full(&self) -> bool {
+        self.count >= self.capacity
+    }
+
+    /// The still water's height (m) for the particles there are, from the lattice's fill.
+    pub fn level(&self) -> f32 {
+        let added = self.count.saturating_sub(self.capacity - self.levels.last().map_or(0, |l| l.0));
+        let k = self.levels.partition_point(|l| l.0 <= added);
+        match (self.levels.get(k.wrapping_sub(1)), self.levels.get(k)) {
+            (Some(a), Some(b)) => a.1 + (b.1 - a.1) * (added - a.0) as f32 / (b.0 - a.0).max(1) as f32,
+            (Some(a), None) => a.1,
+            _ => WATER,
+        }
+    }
+
+    /// The terrain's uniform at the still water's height now (see `terrain_uniform`).
+    pub fn terrain_uniform(&self) -> [f32; 16] {
+        terrain_uniform(self.level())
+    }
+
+    /// A point in the world in the simulation's space.
+    pub fn to_sim(&self, p: GVec3) -> [f32; 3] {
+        (p * SIM_SCALE).to_array()
+    }
+
+    /// A world velocity (m/s) in the simulation's units per simulated second.
+    pub fn velocity_to_sim(&self, v: GVec3) -> GVec3 {
+        GVec3::from(self.stepper.scale().velocity_to_sim(v.to_array()))
+    }
+
+    /// A length (m) in the simulation's units.
+    pub fn sim_length(&self, m: f32) -> f32 {
+        m * SIM_SCALE
+    }
+
+    /// The fluid's particle spacing (m).
+    pub fn spacing(&self) -> f32 {
+        SPACING / SIM_SCALE
+    }
+
+    /// The waterline's signed distance (m) at a point (x, z) of the world: negative in the lake.
+    pub fn distance(&self, x: f32, z: f32) -> f32 {
+        self.container.shape().distance(x * SIM_SCALE, z * SIM_SCALE) / SIM_SCALE
+    }
+
+    /// The ground's height (m) at a point (x, z) of the world over the lake and its banks.
+    pub fn ground(&self, x: f32, z: f32) -> f32 {
+        self.floor_at(x * SIM_SCALE, z * SIM_SCALE)
+    }
+
+    /// The point (x, z) on the line from the lake's middle at `angle` (radians from +x toward +z)
+    /// that is `distance` (m) from the waterline: outside it if positive, in the lake if negative.
+    pub fn from_waterline(&self, angle: f32, distance: f32) -> [f32; 2] {
+        let at = |t: f32| [CENTER[0] + t * angle.cos(), CENTER[1] + t * angle.sin()];
+        let (mut a, mut b) = (0.0f32, 2.0 * HALF[0].max(HALF[1]) + SHORE);
+        for _ in 0..40 {
+            let m = 0.5 * (a + b);
+            let p = at(m);
+            if self.distance(p[0], p[1]) < distance { a = m } else { b = m }
+        }
+        at(0.5 * (a + b))
+    }
+
+    /// Place the character's leg capsules (world ends and radii), a landing's splash (where the
+    /// feet came down and how fast, m/s), and other bodies in the water (`bodies`: capsules in the
+    /// world, velocities in m/s; `stirring` when any moves), pour in what `stream` lays (a nozzle
+    /// in the simulation's space, as much as there is room for), and step the water by `dt` real
+    /// seconds, unless it rests: out of the view `view_proj` (world to clip) for a moment, or
+    /// settled with nothing near it. Returns how many particles were poured in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(&mut self, surface: &mut FluidSurfaceEffect, legs: &[(GVec3, GVec3, f32)], landing: Option<(GVec3, f32)>, bodies: &[FluidCapsule], stirring: bool, mut stream: Option<&mut FluidNozzle>, dt: f32, view_proj: Mat4) -> u32 {
+        // legs count only near the lake
+        let (lo, hi) = self.near;
+        let w = WAKE_DISTANCE;
+        let near = legs.iter().any(|(a, b, r)| {
+            let (min, max) = (a.min(*b) - *r, a.max(*b) + *r);
+            max.x > lo[0] - w && min.x < hi[0] + w && max.z > lo[1] - w && min.z < hi[1] + w
+        });
+        let legs: &[(GVec3, GVec3, f32)] = if near { legs } else { &[] };
+        if self.previous.len() != legs.len() {
+            self.previous = legs.iter().map(|(a, b, _)| [*a, *b]).collect();
+        }
+        let scale = self.stepper.scale();
+        let velocity = |now: GVec3, then: GVec3| {
+            let v = (now - then) / dt.max(1e-3);
+            // a teleport (`at=`, a switch of body) is no kick
+            let v = if v.length() > 15.0 { GVec3::ZERO } else { v };
+            scale.velocity_to_sim(v.to_array())
+        };
+        let mut capsules: Vec<FluidCapsule> = legs
+            .iter()
+            .zip(&self.previous)
+            .map(|((a, b, r), [pa, pb])| FluidCapsule::new((*a * SIM_SCALE).to_array(), (*b * SIM_SCALE).to_array(), r * SIM_SCALE, velocity(*a, *pa), velocity(*b, *pb)))
+            .collect();
+        self.previous = legs.iter().map(|(a, b, _)| [*a, *b]).collect();
+        // a landing in the water: a body-sized sphere at the feet that pushes the water out all
+        // round for a moment, as fast as the fall, throwing a crown of spray
+        if let Some((at, speed)) = landing {
+            let inside = self.container.shape().distance(at.x * SIM_SCALE, at.z * SIM_SCALE) < 0.0;
+            if inside && at.y < WATER + 0.15 && speed > 1.0 {
+                self.splash = Some((at, speed.min(8.0), 0.0));
+            }
+        }
+        if let Some((at, speed, age)) = self.splash {
+            if age < SPLASH_TIME {
+                let c = ((at + GVec3::Y * 0.1) * SIM_SCALE).to_array();
+                let up = [0.0, scale.speed_to_sim(speed * 0.4), 0.0];
+                // it grows to its radius over the splash rather than appearing whole: a
+                // position-based solver would read a whole sphere's push in one substep as a burst
+                let radius = SPLASH_RADIUS * (age / SPLASH_TIME).clamp(0.2, 1.0);
+                capsules.push(FluidCapsule { expansion: scale.speed_to_sim(speed * self.splash_push), ..FluidCapsule::new(c, c, radius * SIM_SCALE, up, up) });
+                self.splash = Some((at, speed, age + dt));
+            } else {
+                self.splash = None;
+            }
+        }
+        capsules.extend(bodies.iter().map(|c| c.scaled(scale.length, scale.speed_to_sim(1.0))));
+        self.colliders.set(&capsules);
+        // the legs, a splash, a body moving in it or water poured in keep it awake
+        let pouring = stream.is_some() && !self.full();
+        let disturbed = capsules.len() > bodies.len() || stirring || pouring;
+
+        // rest when out of view (its box, the bounds the particles are kept in) or settled
+        let (min, max) = surface.sim.bounds(0.0);
+        let in_view = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), min / SIM_SCALE, max / SIM_SCALE);
+        let state = self.stepper.update_rest(&surface.sim, dt, in_view, disturbed);
+        surface.set_activity(state);
+        let steps = self.stepper.advance(dt);
+        let mut poured = 0;
+        for _ in 0..steps {
+            // a step's worth of the stream, before the step: it joins it
+            if let Some(nozzle) = stream.as_deref_mut() {
+                poured += nozzle.emit_into(&mut surface.sim, self.stepper.step_dt());
+            }
+            surface.sim.update_batched_with(self.stepper.step_dt(), 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
+        }
+        self.stepper.stepped(&surface.sim, steps);
+        self.count = surface.sim.particle_count();
+        poured
+    }
+
+    /// Whether the water is running, culled or asleep.
+    pub fn state(&self) -> FluidActivity {
+        self.stepper.state()
+    }
+
+    /// The last speed read (m/s): the fastest particle, and how many moved faster than the
+    /// speed it sleeps under.
+    pub fn speed(&self) -> (f32, u32) {
+        self.stepper.speed().map_or((0.0, 0), |s| (s.max, s.above))
+    }
+
+    /// Simulated seconds per real second.
+    pub fn time_scale(&self) -> f32 {
+        self.stepper.scale().time
+    }
+
+    /// Whether the water may rest at all (else it always runs).
+    pub fn rest(&self) -> bool {
+        self.stepper.rest_enabled()
+    }
+
+    pub fn set_rest(&mut self, rest: bool) {
+        self.stepper.set_rest_enabled(rest);
+    }
+
+    /// The water changed: run it until it settles again (a speed read in flight is from before).
+    fn wake(&mut self) {
+        self.stepper.wake();
+    }
+
+    /// Change a setting of the water by name (the page's tweak panel); false for an unknown one.
+    pub fn set(&mut self, surface: &mut FluidSurfaceEffect, key: &str, value: f32) -> bool {
+        let p = &mut surface.sim.params;
+        match key {
+            "viscosity" => p.viscosity = value,
+            "negativePressure" => p.negative_pressure_scale = value,
+            "pressure" => p.pressure_multiplier = value,
+            "nearPressure" => p.near_pressure_multiplier = value,
+            "restDensity" => p.density_target = value,
+            "substeps" => p.substeps = value.round().clamp(1.0, 8.0) as u32,
+            // PBF is stable at twice the substep: half as many
+            "solver" => {
+                p.solver = if value > 0.5 { FluidSolver::Pbf } else { FluidSolver::Sph };
+                p.substeps = if p.solver == FluidSolver::Pbf { 2 } else { 4 };
+            }
+            "pbfIterations" => p.pbf.iterations = value.round().clamp(1.0, 12.0) as u32,
+            "pbfRelaxation" => p.pbf.relaxation = value,
+            "pbfScorrK" => p.pbf.scorr_k = value,
+            "pbfScorrN" => p.pbf.scorr_n = value,
+            "pbfXsph" => p.pbf.xsph = value,
+            "pbfVorticity" => p.pbf.vorticity = value,
+            "timeScale" => self.stepper.set_time_scale(&surface.sim, value.max(0.1)),
+            "drag" => self.colliders.options.drag = value,
+            "rest" => self.stepper.set_rest_enabled(value > 0.5),
+            "splash" => self.splash_push = value,
+            "friction" | "restitution" => {
+                let o = &mut self.container.options;
+                if key == "friction" { o.friction = value } else { o.restitution = value }
+                self.container.upload();
+            }
+            _ => return false,
+        }
+        self.wake();
+        true
+    }
+
+    /// Put the water back as it started, still, at its starting level (draining what was poured
+    /// in).
+    pub fn reset(&mut self, surface: &mut FluidSurfaceEffect) {
+        surface.sim.reset_particles(&self.initial);
+        self.count = surface.sim.particle_count();
+        self.splash = None;
+        self.stepper.reset();
+        self.wake();
+    }
+
+    pub fn surface_settings(&self) -> SurfaceSettings {
+        self.surface
+    }
+
+    /// Extract the surface as `settings` say: a new field when its kind or resolution changes,
+    /// else the kernel, radius, iso level and interpolation in place.
+    pub fn set_surface(&mut self, renderer: &Renderer, surface: &mut FluidSurfaceEffect, settings: SurfaceSettings) {
+        let old = self.surface;
+        if settings.surface_field != old.surface_field || settings.resolution != old.resolution {
+            let sim = &surface.sim;
+            let field = FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, settings.density_options());
+            surface.marching_cubes_bg = surface.marching_cubes.create_bind_group(renderer, &field.density_view);
+            surface.density_field = field;
+        } else {
+            surface.density_field.kernel_scale = settings.density_options().kernel_scale;
+            surface.density_field.set_particle_radius(settings.particle_radius);
+        }
+        surface.splat_radius = Some(settings.kernel);
+        surface.marching_cubes.set_iso_level(settings.iso);
+        surface.marching_cubes.set_use_classic(settings.interpolate);
+        self.surface = settings;
+        self.wake();
+    }
+
+    pub fn drag(&self) -> f32 {
+        self.colliders.options.drag
+    }
+
+    pub fn friction(&self) -> f32 {
+        self.container.options.friction
+    }
+
+    /// Particles by region, from positions read back (simulation space, 4 floats each): in the
+    /// lake (inside the waterline), on the bank (the shore strip's inner part), in the band
+    /// against the walls (the strip's outer 0.3 m), and past the walls; with each region's mean
+    /// height (m).
+    pub fn regions(&self, positions: &[f32]) -> [(u32, f32); 4] {
+        let shape = self.container.shape();
+        let mut out = [(0u32, 0.0f32); 4];
+        for p in positions.chunks_exact(4) {
+            let d = shape.distance(p[0], p[2]) / SIM_SCALE;
+            let k = if d < 0.0 { 0 } else if d < SHORE - 0.3 { 1 } else if d <= SHORE + 0.01 { 2 } else { 3 };
+            out[k].0 += 1;
+            out[k].1 += p[1] / SIM_SCALE;
+        }
+        out.map(|(n, y)| (n, if n > 0 { y / n as f32 } else { 0.0 }))
+    }
+
+    /// World m/s per simulation unit of speed.
+    pub fn world_speed_scale(&self) -> f32 {
+        self.stepper.scale().speed_to_world(1.0)
+    }
+
+    /// The container floor's height (world) under a point in simulation space.
+    pub fn floor_at(&self, x: f32, z: f32) -> f32 {
+        self.container.shape().floor(x, z) / SIM_SCALE
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "kansei-wasm-motion-matching"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kansei-core = { path = "../../../kansei-core" }
+kansei-wasm = { path = "../.." }
+# the world: the course, the lake, its cannon and mill, and the lake panel's exports (without the
+# lake page's own `start`)
+kansei-wasm-lake = { path = "../lake", default-features = false }
+wgpu = { version = "24", features = ["webgpu"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+image = { version = "0.25", default-features = false, features = ["webp"] }
+log = "0.4"
+
+[workspace]

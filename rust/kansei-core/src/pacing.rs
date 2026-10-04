@@ -735,6 +735,12 @@ impl FrameTimer {
         std::mem::take(&mut *self.results.lock().unwrap())
     }
 
+    /// Whether the GPU times come from timestamp queries (else they are each frame's CPU start to
+    /// its readback, an upper bound).
+    pub fn has_timestamps(&self) -> bool {
+        self.queries.is_some()
+    }
+
     /// The last frame measured, ms (NaN until one arrives).
     pub fn last_ms(&self) -> f64 {
         *self.last_ms.lock().unwrap()
@@ -751,6 +757,42 @@ fn now_ms() -> f64 {
         use std::sync::OnceLock;
         static START: OnceLock<std::time::Instant> = OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+/// A fixed-step accumulator for simulations: feed it each frame's time and it says how many
+/// steps of `step` seconds to run, so a simulation evolves the same at any frame rate. Time
+/// beyond `max_steps` steps a frame is dropped rather than carried over (no spiral of death).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FixedStep {
+    pub step: f64,
+    pub max_steps: u32,
+    accumulator: f64,
+}
+
+impl FixedStep {
+    /// Steps of `step` seconds, at most 4 a frame.
+    pub fn new(step: f64) -> Self {
+        Self { step: step.max(1e-6), max_steps: 4, accumulator: 0.0 }
+    }
+
+    pub fn with_max_steps(mut self, max_steps: u32) -> Self {
+        self.max_steps = max_steps.max(1);
+        self
+    }
+
+    /// Add `dt` seconds (scale it first to run the simulation faster or slower) and take the
+    /// whole steps they make up.
+    pub fn advance(&mut self, dt: f64) -> u32 {
+        self.accumulator = (self.accumulator + dt.max(0.0)).min(self.step * self.max_steps as f64);
+        let steps = (self.accumulator / self.step + 1e-9).floor() as u32;
+        self.accumulator -= steps as f64 * self.step;
+        steps
+    }
+
+    /// Forget the time carried over (pausing, a reset).
+    pub fn reset(&mut self) {
+        self.accumulator = 0.0;
     }
 }
 
@@ -1251,5 +1293,20 @@ mod tests {
         assert!(measured.len() >= 3, "most frames measured: {measured:?}");
         assert!(measured.iter().all(|&ms| ms > 0.0 && ms < 1000.0), "{measured:?}");
         assert!(timer.last_ms() > 0.0);
+    }
+
+    #[test]
+    fn a_fixed_step_runs_whole_steps_and_drops_the_backlog() {
+        let mut fixed = FixedStep::new(1.0 / 60.0).with_max_steps(3);
+        // a 120 Hz display: a step every other frame
+        assert_eq!((0..4).map(|_| fixed.advance(1.0 / 120.0)).sum::<u32>(), 2);
+        // a 30 Hz frame: two steps
+        assert_eq!(fixed.advance(1.0 / 30.0), 2);
+        // a one-second hitch: three steps, and nothing carried into the next frame
+        assert_eq!(fixed.advance(1.0), 3);
+        assert_eq!(fixed.advance(0.0), 0);
+        fixed.advance(1.0 / 100.0);
+        fixed.reset();
+        assert_eq!(fixed.advance(1.0 / 100.0), 0);
     }
 }

@@ -16,7 +16,9 @@ use bytemuck::{Pod, Zeroable};
 pub struct PbfOptions {
     /// Constraint projections per substep.
     pub iterations: u32,
-    /// Rest density (particles per unit volume at rest: `1 / spacing³` for a lattice fill).
+    /// Rest density: what the poly6 kernel (unit mass) sums to at a particle at rest. For a
+    /// lattice fill that is `fluid::lattice_density(spacing, h)`, which tends to `1 / spacing³` only
+    /// once the spacing is well under the smoothing radius.
     pub rest_density: f32,
     /// The constraint's relaxation (CFM): larger is softer and steadier.
     pub relaxation: f32,

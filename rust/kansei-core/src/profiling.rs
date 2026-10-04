@@ -289,6 +289,98 @@ fn gpu_profile(frames: &[FramePasses]) -> FrameProfile {
     profile
 }
 
+/// How [`AbBench`] alternates: a warm-up, then `phases` phases of `phase_ms` each, A first, each
+/// measured after `settle_ms` (caches, temporal effects and the pacing catch up first).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbBenchOptions {
+    pub warmup_ms: f64,
+    pub phase_ms: f64,
+    pub settle_ms: f64,
+    pub phases: u32,
+}
+
+impl Default for AbBenchOptions {
+    fn default() -> Self {
+        Self { warmup_ms: 3000.0, phase_ms: 3000.0, settle_ms: 500.0, phases: 8 }
+    }
+}
+
+/// An A/B benchmark inside one page: the page switches between two variants (`phase`), feeds
+/// each frame's GPU times (`pacing::FrameTimer::take`) and the clock (`record`), and gets one
+/// report line comparing the two when the phases are over. Alternating A and B in one session is
+/// what AGENTS.md prescribes, because separate runs on a shared GPU differ by tens of percent.
+#[derive(Debug, Clone)]
+pub struct AbBench {
+    labels: [String; 2],
+    options: AbBenchOptions,
+    start_ms: f64,
+    last_ms: f64,
+    /// Per variant: GPU ms summed, GPU samples, frame intervals ms summed, frames.
+    sums: [(f64, u32, f64, u32); 2],
+    report: Option<String>,
+}
+
+impl AbBench {
+    /// A bench of variants `labels[0]` (A) and `labels[1]` (B), starting at `now_ms`.
+    pub fn new(labels: [&str; 2], now_ms: f64, options: AbBenchOptions) -> Self {
+        Self { labels: labels.map(str::to_string), options, start_ms: now_ms, last_ms: now_ms, sums: [(0.0, 0, 0.0, 0); 2], report: None }
+    }
+
+    /// The variant to draw at `now_ms` (0: A, 1: B, A through the warm-up) and whether this
+    /// frame is measured; `None` once the phases are over.
+    pub fn phase(&self, now_ms: f64) -> Option<(usize, bool)> {
+        let t = now_ms - self.start_ms - self.options.warmup_ms;
+        if t < 0.0 {
+            return Some((0, false));
+        }
+        let phase = (t / self.options.phase_ms) as u32;
+        (phase < self.options.phases).then_some(((phase % 2) as usize, t % self.options.phase_ms >= self.options.settle_ms))
+    }
+
+    /// Which A-then-B pair of phases `now_ms` falls in (0 through the warm-up): hold the view
+    /// still per pair so both variants see the same frames.
+    pub fn pair(&self, now_ms: f64) -> u32 {
+        ((now_ms - self.start_ms - self.options.warmup_ms).max(0.0) / self.options.phase_ms) as u32 / 2
+    }
+
+    /// Record a frame at `now_ms` with the GPU times that arrived since the last one (ms, often
+    /// several or none: they arrive late). Returns the report on the frame it completes.
+    pub fn record(&mut self, gpu_ms: &[f64], now_ms: f64) -> Option<&str> {
+        if let Some((variant, true)) = self.phase(now_ms) {
+            let sum = &mut self.sums[variant];
+            sum.0 += gpu_ms.iter().sum::<f64>();
+            sum.1 += gpu_ms.len() as u32;
+            sum.2 += now_ms - self.last_ms;
+            sum.3 += 1;
+        }
+        self.last_ms = now_ms;
+        if self.report.is_some() || self.phase(now_ms).is_some() {
+            return None;
+        }
+        let side = |label: &str, (gpu, samples, interval, frames): (f64, u32, f64, u32)| {
+            let gpu = if samples > 0 { format!("{:.2} ms GPU ({samples} samples)", gpu / samples as f64) } else { "no GPU timestamps".to_string() };
+            format!("{label} {gpu}, {:.2} ms/frame ({frames} frames)", interval / frames.max(1) as f64)
+        };
+        self.report = Some(format!("bench: {} | {}", side(&self.labels[0], self.sums[0]), side(&self.labels[1], self.sums[1])));
+        self.report.as_deref()
+    }
+
+    /// The report, once the phases are over.
+    pub fn report(&self) -> Option<&str> {
+        self.report.as_deref()
+    }
+}
+
+impl FrameProfile {
+    /// The `n` most expensive passes by exclusive time, (label, ms per frame), for an overlay.
+    pub fn top_passes(&self, n: usize) -> Vec<(&'static str, f64)> {
+        let mut passes: Vec<(&'static str, f64)> = self.gpu.iter().map(|p| (p.label, p.exclusive_ms)).collect();
+        passes.sort_by(|a, b| b.1.total_cmp(&a.1));
+        passes.truncate(n);
+        passes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +413,34 @@ mod tests {
         assert_eq!((get("post").exclusive_ms, get("post").count), (3.0, 2.0));
         assert!(p.gpu.iter().all(|t| t.label != "empty"));
         assert_eq!((p.gpu_ms, p.gpu_span_ms), (8.0, 9.0));
+    }
+
+    /// A warm-up on A, then A and B in turn, each measured after it settles; the report averages
+    /// each side's GPU samples and frame intervals.
+    #[test]
+    fn the_ab_bench_alternates_and_averages_each_side() {
+        let options = AbBenchOptions { warmup_ms: 100.0, phase_ms: 100.0, settle_ms: 20.0, phases: 4 };
+        let mut bench = AbBench::new(["clusters", "lods"], 0.0, options);
+        assert_eq!(bench.phase(50.0), Some((0, false)));
+        assert_eq!(bench.phase(110.0), Some((0, false)));
+        assert_eq!(bench.phase(130.0), Some((0, true)));
+        assert_eq!(bench.phase(230.0), Some((1, true)));
+        assert_eq!((bench.pair(250.0), bench.pair(350.0)), (0, 1));
+        let mut report = None;
+        let mut t = 0.0;
+        while t <= 520.0 {
+            // A costs 2 ms on the GPU, B 3 ms; one sample a frame, 10 ms apart
+            let gpu = match bench.phase(t) { Some((1, _)) => 3.0, _ => 2.0 };
+            if let Some(r) = bench.record(&[gpu], t) {
+                report = Some(r.to_string());
+            }
+            t += 10.0;
+        }
+        let report = report.expect("a report once the phases are over");
+        assert!(report.starts_with("bench: clusters 2.00 ms GPU"), "{report}");
+        assert!(report.contains("| lods 3.00 ms GPU"), "{report}");
+        assert!(report.contains("10.00 ms/frame"), "{report}");
+        assert_eq!(bench.phase(600.0), None);
+        assert_eq!(bench.report(), Some(report.as_str()));
     }
 }

@@ -11,7 +11,7 @@
 <body>
     <canvas id="kansei"></canvas>
     <script type="module">
-        import init, { start, get_fps, get_frame_time,
+        import init, { start,
             set_pressure, set_near_pressure, set_density_target,
             set_viscosity, set_damping, set_gravity_y, set_mouse_force, set_mouse_radius,
             set_radial_gravity, set_gravity_center,
@@ -19,12 +19,12 @@
             set_use_batched_sim,
             set_sim_dt_step, set_sim_time_scale, set_max_render_fps,
             set_density_scale, set_density_threshold, set_absorption, set_step_count,
-            set_kernel_scale, set_density_resolution, set_bounds,
+            set_kernel_scale, set_bounds,
             set_stripe_params,
             set_light_direction, set_light_intensity, set_light_color,
             set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur,
             set_transmission_params
-        } from './pkg/kansei_wasm_fluid.js';
+        } from '../pkg/kansei_wasm_fluid.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
         await init();
@@ -41,7 +41,7 @@
             viscosity: 1.0, damping: 1.0, gravityY: -9.8,
             mouseForce: 1600, mouseRadius: 0.1, substeps: 2,
             densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
-            resolution: 128, kernelScale: 0.6,
+            kernelScale: 0.6,
         };
         const simPresets = {
             'Balanced':   { step: 1 / 60, scale: 1.0 },
@@ -95,7 +95,6 @@
         surface.addBinding(p, 'steps', { min: 16, max: 128, step: 1 }).on('change', () => set_step_count(p.steps));
 
         const field = pane.addFolder({ title: 'Density Field', expanded: false });
-        field.addBinding(p, 'resolution', { min: 16, max: 256, step: 16 }).on('change', () => set_density_resolution(p.resolution));
         field.addBinding(p, 'kernelScale', { min: 0.1, max: 10, step: 0.1 }).on('change', () => set_kernel_scale(p.kernelScale));
 
         const sph = pane.addFolder({ title: 'SPH', expanded: false });

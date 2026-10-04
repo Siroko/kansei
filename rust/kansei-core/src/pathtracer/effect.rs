@@ -1,4 +1,5 @@
 use crate::cameras::Camera;
+use crate::lights::Light;
 use crate::objects::Scene;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::{GBuffer, Renderer};
@@ -9,28 +10,22 @@ use super::{
 };
 
 /// High-level wrapper that orchestrates the full path tracing pipeline
-/// (BVH build, trace, temporal denoise, spatial denoise, composite) as a
+/// (BVH build, trace, temporal denoise, spatial denoise, output) as a
 /// single [`PostProcessingEffect`].
 ///
 /// # Pipeline stages
 ///
 /// 1. **Trace** — dispatch the path trace compute shader using the BLAS/TLAS
-///    acceleration structure built at construction time.
+///    acceleration structure built at construction time, with the lights from
+///    `set_lights`/`set_lights_from_scene`. Frames accumulate while the camera
+///    holds still and restart when it moves.
 /// 2. **Temporal denoise** — motion-compensated reprojection blending the
 ///    current noisy frame with the accumulated history.
 /// 3. **Spatial denoise** — A-trous wavelet filter guided by depth, normals,
 ///    and variance moments.
-/// 4. **Composite** — combine denoised GI with albedo, direct light, and
-///    emissive from the GBuffer.
-///
-/// # Limitations
-///
-/// The current `PostProcessingEffect::render()` signature provides only a
-/// scene color view and a depth view. Full denoising also requires a normals
-/// texture, and the compositor needs albedo/emissive. When those GBuffer
-/// attachments are not available we skip the denoise/composite stages and
-/// write the raw traced GI as output. The full pipeline is engaged when the
-/// `render_with_gbuffer()` method is called directly.
+/// 4. **Output** — the denoised radiance, in HDR: the trace already holds direct
+///    light, albedo, emission and the sky, so the effect replaces its input and
+///    leaves exposure and the tone curve to a `ToneMapEffect` after it.
 pub struct PathTracerEffect {
     bvh: BVHBuilder,
     tlas: TLASBuilder,
@@ -51,6 +46,7 @@ pub struct PathTracerEffect {
     pub spatial_passes: u32,
     /// Temporal blend factor — lower values accumulate more history (default 0.1).
     pub temporal_blend: f32,
+    light_count: u32,
     initialized: bool,
 }
 
@@ -83,6 +79,7 @@ impl PathTracerEffect {
             max_bounces: 4,
             spatial_passes: 3,
             temporal_blend: 0.1,
+            light_count: 0,
             initialized: false,
         }
     }
@@ -92,9 +89,20 @@ impl PathTracerEffect {
         self.tracer.set_materials(materials);
     }
 
-    /// Upload raw light data for the trace shader.
+    /// Trace `lights` (directional, point and area; spot lights are skipped).
+    pub fn set_lights(&mut self, lights: &[Light]) {
+        self.light_count = self.tracer.set_lights(lights);
+    }
+
+    /// `set_lights` with the scene's lights.
+    pub fn set_lights_from_scene(&mut self, scene: &Scene) {
+        self.light_count = self.tracer.set_lights_from_scene(scene);
+    }
+
+    /// Upload raw light data for the trace shader (16 floats per light).
     pub fn set_lights_raw(&mut self, data: &[f32]) {
         self.tracer.set_lights_raw(data);
+        self.light_count = (data.len() / 16) as u32;
     }
 
     /// Returns the GPU BVH data (for external use or inspection).
@@ -117,11 +125,9 @@ impl PathTracerEffect {
         &mut self.tracer
     }
 
-    /// Full pipeline render with explicit GBuffer access.
-    ///
-    /// This runs all four stages (trace, temporal denoise, spatial denoise,
-    /// composite) using the normal and depth views from the GBuffer.
-    #[allow(clippy::too_many_arguments)]
+    /// The full pipeline into `output` (an rgba16float storage texture) with the GBuffer's normals
+    /// and depth, tracing `light_count` of the lights uploaded last (what `PathTracer::set_lights`
+    /// returned). As a [`PostProcessingEffect`] it does the same with the count it keeps.
     pub fn render_with_gbuffer(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -130,9 +136,21 @@ impl PathTracerEffect {
         camera: &Camera,
         light_count: u32,
     ) {
-        let width = gbuffer.width;
-        let height = gbuffer.height;
+        self.light_count = light_count;
+        self.run(encoder, gbuffer, &gbuffer.depth_view, output, camera, gbuffer.width, gbuffer.height);
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        gbuffer: &GBuffer,
+        depth: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+    ) {
         // Ensure internal textures match viewport size
         self.tracer.resize(width, height);
         self.temporal.resize(width, height);
@@ -143,15 +161,19 @@ impl PathTracerEffect {
         self.tracer.set_max_bounces(self.max_bounces);
         self.temporal.blend = self.temporal_blend;
 
-        // Compute current view-projection matrix
+        // The trace averages every frame since its last reset: a moved camera starts it again,
+        // and the temporal filter reprojects what was seen before.
         let vp = camera.projection_matrix.mul(&camera.view_matrix);
         let curr_vp = *vp.as_slice();
+        if curr_vp != self.prev_vp {
+            self.tracer.reset_accumulation();
+        }
 
         // 1. Trace
         if let Some(ref gpu_data) = self.gpu_data {
             if let Some(tlas_buf) = self.tlas.tlas_nodes_buf.as_ref() {
                 self.tracer
-                    .trace(encoder, gpu_data, tlas_buf, camera, light_count);
+                    .trace(encoder, gpu_data, tlas_buf, camera, self.light_count);
             }
         }
 
@@ -160,7 +182,7 @@ impl PathTracerEffect {
             self.temporal.denoise(
                 encoder,
                 gi_view,
-                &gbuffer.depth_view,
+                depth,
                 &gbuffer.normal_view,
                 &self.prev_vp,
                 &curr_vp,
@@ -173,26 +195,25 @@ impl PathTracerEffect {
             (self.temporal.output_view(), self.temporal.moments_view())
         {
             self.spatial.iterations = self.spatial_passes;
-            let _denoised = self.spatial.denoise(
+            let denoised = self.spatial.denoise(
                 encoder,
                 temporal_out,
-                &gbuffer.depth_view,
+                depth,
                 &gbuffer.normal_view,
                 moments,
             );
 
-            // 4. Composite — combine denoised GI with albedo + emissive
-            // Use the spatial denoiser's output as the GI input.
+            // 4. Output: the traced radiance is complete, so nothing from the raster is added
             self.compositor.composite(
                 encoder,
-                _denoised,
+                denoised,
                 &gbuffer.albedo_view,
-                &gbuffer.color_view,    // direct light from raster pass
+                &gbuffer.color_view,
                 &gbuffer.emissive_view,
                 output,
                 width,
                 height,
-                true, // raster_direct = true (hybrid mode)
+                false,
             );
         }
 
@@ -224,38 +245,15 @@ impl PostProcessingEffect for PathTracerEffect {
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        _gbuffer: &crate::renderers::GBuffer,
+        gbuffer: &GBuffer,
         _input: &wgpu::TextureView,
-        _depth: &wgpu::TextureView,
-        _output: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        output: &wgpu::TextureView,
         camera: &Camera,
         width: u32,
         height: u32,
     ) {
-        // The trait signature only provides input (scene color) and depth views.
-        // We need the full GBuffer for normals/albedo/emissive to run the
-        // denoise and composite stages. With only these two views, we run
-        // just the trace pass and rely on the caller using render_with_gbuffer()
-        // for the full pipeline.
-
-        // Ensure sizes match
-        self.tracer.resize(width, height);
-        self.tracer.set_spp(self.spp);
-        self.tracer.set_max_bounces(self.max_bounces);
-
-        // Trace only — no denoise/composite without full GBuffer
-        if let Some(ref gpu_data) = self.gpu_data {
-            if let Some(tlas_buf) = self.tlas.tlas_nodes_buf.as_ref() {
-                self.tracer
-                    .trace(encoder, gpu_data, tlas_buf, camera, 0);
-            }
-        }
-
-        // Update VP for temporal consistency if render_with_gbuffer() is
-        // called on subsequent frames.
-        let vp = camera.projection_matrix.mul(&camera.view_matrix);
-        self.prev_vp = *vp.as_slice();
-        self.frame_index += 1;
+        self.run(encoder, gbuffer, depth, output, camera, width, height);
     }
 
     fn resize(&mut self, width: u32, height: u32, _gbuffer: &GBuffer) {

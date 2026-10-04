@@ -9,11 +9,8 @@ members = [
 ]
 exclude = [
     "vendor/basisu",
-    "kansei-wasm/examples/spinning-box",
-    "kansei-wasm/examples/instanced-cubes",
-    "kansei-wasm/examples/lit-scene",
-    "kansei-wasm/examples/shadow-scene",
-    "kansei-wasm/examples/postprocess-scene",
+    "kansei-wasm/examples/hello-scene",
+    "kansei-wasm/examples/instancing",
     "kansei-wasm/examples/pathtracer",
     "kansei-wasm/examples/fluid",
     "kansei-wasm/examples/volumetric-fog",
@@ -28,10 +25,13 @@ exclude = [
     "kansei-wasm/examples/occlusion-culling",
     "kansei-wasm/examples/impostors",
     "kansei-wasm/examples/cluster-lod",
-    "kansei-wasm/examples/motion-matching",
-    "kansei-wasm/examples/motion-matching-kimodo",
     "kansei-wasm/examples/ktx2-texture",
-    "kansei-wasm/examples/voxel-gi-particles",
+    "kansei-wasm/demos/fluid_clock",
+    "kansei-wasm/demos/joydivision",
+    "kansei-wasm/demos/lake",
+    "kansei-wasm/demos/motion-matching",
+    "kansei-wasm/demos/steering_text",
+    "kansei-wasm/demos/voxel-gi-particles",
 ]
 
 [workspace.dependencies]

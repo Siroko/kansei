@@ -11,6 +11,8 @@
 
 mod arfont;
 mod glyph_volume;
+mod text;
 
 pub use arfont::{FontAtlas, GlyphMetrics, ArFontError};
+pub use text::{layout_line, GlyphRects, MsdfTextOptions, PlacedGlyph, MSDF_TEXT_WGSL};
 pub use glyph_volume::{GlyphVolume, GlyphVolumeSet, GlyphSdf2d, crop_glyph_sdf};

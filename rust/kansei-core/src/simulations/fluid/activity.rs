@@ -10,8 +10,9 @@
 //!
 //! The caller skips [`FluidSimulation::update_batched_with`] while it is not running, and turns
 //! off the surface's extraction (`FluidSurfaceEffect::extract`, which keeps drawing the last
-//! surface) or, out of view, the whole effect (`FluidSurfaceEffect::active`). The motion-matching
-//! example's lake shows it.
+//! surface) or, out of view, the whole effect (`FluidSurfaceEffect::active`):
+//! `FluidSurfaceEffect::set_activity` does both. `super::FluidStepper` puts the two together with
+//! fixed steps; the lake example shows it.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;

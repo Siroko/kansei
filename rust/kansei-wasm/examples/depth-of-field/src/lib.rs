@@ -1,20 +1,17 @@
-//! Physical depth of field: a forest-like depth set (trunks from 3 to 120 m, alpha-tested leaf
+//! Physical depth of field: a forest-like depth set (trunks from 6 to 120 m, alpha-tested leaf
 //! cards near and far, strings of small lights behind the subject) under a low sun, seen through
 //! a CameraLens on Unreal's 23.76 mm filmback. The circle of confusion follows from the focal
 //! length, f-stop and focus distance; bokeh keep their energy and the aperture's shape. See
 //! www/index.html for the URL parameters.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SKY_LIGHTING_WGSL};
 use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
-use kansei_core::lights::{DirectionalLight, Light};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
+use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
@@ -24,28 +21,23 @@ use kansei_core::postprocessing::effects::{
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::shadows::SHADOW_MAP_WGSL;
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 /// Unreal's default filmback width, mm.
 const SENSOR_MM: f32 = 23.76;
 
-/// Shared by the materials: camera, lights, shadows, and Lambertian lighting by the sun (with the
-/// renderer's shadow map) and the sky (SkyLighting SH). Prefixed with SKY_LIGHTING_WGSL.
+/// Shared by the surfaces: camera and mesh bindings, and Lambertian lighting by the scene's
+/// directional lights (the sun with the renderer's shadow map) and the sky (SkyLighting SH).
+/// Prefixed with SKY_LIGHTING_WGSL, LIGHTS_WGSL, SHADOW_MAP_WGSL and GBUFFER_OUT_WGSL.
 const COMMON_WGSL: &str = r#"
+struct Surface { albedo: vec4<f32> };
+@group(0) @binding(0) var<uniform> material: Surface;
 @group(0) @binding(1) var<uniform> sky: SkyLighting;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct DirLight { direction: vec3<f32>, _pad0: f32, color: vec3<f32>, intensity: f32 };
-struct PtLight { position: vec3<f32>, radius: f32, color: vec3<f32>, intensity: f32 };
-struct LightUniforms { num_directional: u32, num_point: u32, _pad0: u32, _pad1: u32,
-                       directional: array<DirLight, 4>, point: array<PtLight, 8> };
-@group(1) @binding(2) var<uniform> lights: LightUniforms;
-struct ShadowUniforms { light_view_proj: mat4x4<f32>, bias: f32, normal_bias: f32, shadow_enabled: f32,
-                        point_shadow_enabled: f32, point_light_pos: vec3<f32>, point_shadow_far: f32 };
-@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
-@group(3) @binding(1) var shadow_sampler: sampler_comparison;
-@group(3) @binding(2) var<uniform> shadow_uniforms: ShadowUniforms;
 
 struct VertexInput { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
 struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) world_position: vec3<f32>,
@@ -62,52 +54,31 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
-fn sun_shadow(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
-    if (shadow_uniforms.shadow_enabled < 0.5) { return 1.0; }
-    let ls = shadow_uniforms.light_view_proj * vec4<f32>(world_pos + n * shadow_uniforms.normal_bias, 1.0);
-    let ndc = ls.xyz / ls.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    let inside = step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0) * step(ndc.z, 1.0);
-    let texel = 1.0 / vec2<f32>(textureDimensions(shadow_depth_tex));
-    var s = 0.0;
-    for (var x = -1; x <= 1; x++) {
-        for (var y = -1; y <= 1; y++) {
-            let suv = clamp(uv + vec2<f32>(f32(x), f32(y)) * texel, vec2<f32>(0.0), vec2<f32>(1.0));
-            s += textureSampleCompare(shadow_depth_tex, shadow_sampler, suv, ndc.z - shadow_uniforms.bias);
-        }
-    }
-    return mix(1.0, s / 9.0, inside);
-}
-
-// Lambertian: albedo / pi * (sun * cos * shadow + sky irradiance)
-fn lambert(albedo: vec3<f32>, world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let shadow = sun_shadow(world_pos, n);
+// Lambertian: albedo / pi * (sun * cos * shadow + sky irradiance), into the GBuffer
+fn lambert(albedo: vec3<f32>, world_pos: vec3<f32>, n: vec3<f32>) -> KanseiGBufferOut {
+    let shadow = kansei_shadow_map(world_pos, n);
     var e = skyIrradiance(sky, n);
-    for (var i = 0u; i < lights.num_directional; i++) {
-        let l = lights.directional[i];
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let l = kansei_lights.directional[i];
         e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
     }
-    return albedo / 3.14159265 * e;
+    return kansei_gbuffer_out(albedo / 3.14159265 * e, vec3<f32>(0.0), n, albedo);
 }
 "#;
 
 const SURFACE_WGSL: &str = r#"
-struct Surface { albedo: vec4<f32> };
-@group(0) @binding(0) var<uniform> material: Surface;
 @fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(lambert(material.albedo.rgb, input.world_position, normalize(input.world_normal)), 1.0);
+fn fragment_main(input: VertexOutput) -> KanseiGBufferOut {
+    return lambert(material.albedo.rgb, input.world_position, normalize(input.world_normal));
 }
 "#;
 
 /// Alpha-tested leaf cards: a grid of rotated elliptical leaves cut out of the card with discard,
 /// lit from both sides.
 const LEAVES_WGSL: &str = r#"
-struct Surface { albedo: vec4<f32> };
-@group(0) @binding(0) var<uniform> material: Surface;
 fn hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
 @fragment
-fn fragment_main(input: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput, @builtin(front_facing) front: bool) -> KanseiGBufferOut {
     let cells = 6.0;
     let g = input.uv * cells;
     let cell = floor(g);
@@ -127,36 +98,20 @@ fn fragment_main(input: VertexOutput, @builtin(front_facing) front: bool) -> @lo
     var n = normalize(input.world_normal);
     if (!front) { n = -n; }
     let tint = 0.8 + 0.4 * hash(cell + 21.0);
-    return vec4<f32>(lambert(material.albedo.rgb * tint, input.world_position, n), 1.0);
-}
-"#;
-
-/// Small lights: constant luminance (cd/m^2).
-const EMISSIVE_WGSL: &str = r#"
-struct Surface { luminance: vec4<f32> };
-@group(0) @binding(0) var<uniform> material: Surface;
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(material.luminance.rgb, 1.0);
+    return lambert(material.albedo.rgb * tint, input.world_position, n);
 }
 "#;
 
 fn material(label: &str, body: &str, rgb: [f32; 3], sky: &SkyAtmosphere, cull: CullMode) -> Material {
     let mut m = Material::new(
         label,
-        &format!("{SKY_LIGHTING_WGSL}\n{COMMON_WGSL}\n{body}"),
+        &format!("{SKY_LIGHTING_WGSL}\n{LIGHTS_WGSL}\n{SHADOW_MAP_WGSL}\n{GBUFFER_OUT_WGSL}\n{COMMON_WGSL}\n{body}"),
         vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::uniform(1, ShaderStages::FRAGMENT)],
-        MaterialOptions { cull_mode: cull, ..Default::default() },
+        MaterialOptions { cull_mode: cull, mrt_output_count: Some(4), ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[rgb[0], rgb[1], rgb[2], 1.0]);
     m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
     m
-}
-
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
 }
 
 struct Settings {
@@ -180,25 +135,29 @@ struct Settings {
 }
 
 fn settings() -> Settings {
-    let search = web_sys::window().unwrap().location().search().unwrap_or_default();
-    let q = web_sys::UrlSearchParams::new_with_str(&search).unwrap();
-    let num = |k: &str| q.get(k).and_then(|v| v.parse::<f32>().ok());
     Settings {
-        focal_mm: num("focal").unwrap_or(50.0),
-        f_stop: num("fstop").unwrap_or(1.8),
-        focus_m: num("focus").unwrap_or(8.0),
-        blades: num("blades").unwrap_or(0.0) as u32,
-        rack: q.get("rack").is_some(),
-        ev: num("ev").unwrap_or(10.8),
-        off: q.get("dof").as_deref() == Some("0"),
-        taa: q.get("taa").as_deref() != Some("0"),
-        dof_after_taa: q.get("order").as_deref() == Some("after"),
-        debug: num("debug").unwrap_or(0.0) as u32,
-        scatter: q.get("scatter").as_deref() != Some("0"),
-        samples: num("samples").unwrap_or(72.0) as u32,
-        scale: num("scale").unwrap_or(1.0),
-        time: num("t"),
+        focal_mm: param_or("focal", 50.0),
+        f_stop: param_or("fstop", 1.8),
+        focus_m: param_or("focus", 8.0),
+        blades: param_or("blades", 0.0f32) as u32,
+        rack: param("rack").is_some(),
+        ev: param_or("ev", 10.8),
+        off: !flag("dof", true),
+        taa: flag("taa", true),
+        dof_after_taa: param("order").as_deref() == Some("after"),
+        debug: param_or("debug", 0.0f32) as u32,
+        scatter: flag("scatter", true),
+        samples: param_or("samples", 72.0f32) as u32,
+        scale: param_or("scale", 1.0),
+        time: param("t").and_then(|v| v.trim().parse().ok()),
     }
+}
+
+/// The camera's field of view from the lens on the filmback, at the camera's aspect.
+fn fit_lens(camera: &mut Camera, focal_mm: f32) {
+    let hfov = 2.0 * (SENSOR_MM / (2.0 * focal_mm)).atan();
+    camera.fov = (2.0 * ((hfov * 0.5).tan() / camera.aspect).atan()).to_degrees();
+    camera.update_projection_matrix();
 }
 
 struct State {
@@ -209,15 +168,6 @@ struct State {
     volume: PostProcessingVolume,
     sun_light: usize,
     settings: Settings,
-    start: f64,
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
 }
 
 impl State {
@@ -225,10 +175,8 @@ impl State {
         let s = &self.settings;
         // a rack focus between the leaves at 2 m and the trunks at 30 m, or a fixed focus
         let focus = if s.rack { 2.0 * 15f32.powf(0.5 - 0.5 * (t * std::f32::consts::TAU / 8.0).cos()) } else { s.focus_m };
-        for effect in &mut self.volume.effects {
-            if let Some(dof) = effect.as_any_mut().downcast_mut::<CinematicDepthOfFieldEffect>() {
-                dof.lens.focus_distance_m = focus;
-            }
+        if let Some(dof) = self.volume.effect_mut::<CinematicDepthOfFieldEffect>() {
+            dof.lens.focus_distance_m = focus;
         }
         let eye = Vec3::new(0.0, 1.5, 0.0);
         self.camera.set_position(eye.x, eye.y, eye.z);
@@ -246,14 +194,8 @@ impl State {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = (canvas.client_width().max(1) as u32, canvas.client_height().max(1) as u32);
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_shadows(2048);
     let settings = settings();
     renderer.set_render_scale(settings.scale);
@@ -305,12 +247,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let x = (u - 0.5) * 26.0;
         let z = -25.0 - 15.0 * (u * 3.0).sin().abs();
         let y = 1.5 - 1.0 * (1.0 - (2.0 * u - 1.0).powi(2)) + 0.2 * hash(i + 2200);
-        let mut light = Renderable::new(SphereGeometry::new(0.08, 8, 6), material("Light", EMISSIVE_WGSL, [20000.0, 11000.0, 4000.0], &sky, CullMode::Back));
+        let mut light = Renderable::new(SphereGeometry::new(0.08, 8, 6), Material::emissive("Light", [20000.0, 11000.0, 4000.0]));
         light.object.set_position(x, y, z);
         scene.add(SceneNode::Renderable(light));
     }
     for (i, &(x, y)) in [(-0.22, 1.28), (0.18, 1.62), (-0.05, 1.18)].iter().enumerate() {
-        let mut light = Renderable::new(SphereGeometry::new(0.006, 8, 6), material("NearLight", EMISSIVE_WGSL, [5000.0, 6000.0, 8000.0], &sky, CullMode::Back));
+        let mut light = Renderable::new(SphereGeometry::new(0.006, 8, 6), Material::emissive("NearLight", [5000.0, 6000.0, 8000.0]));
         light.object.set_position(x, y, -1.2 - 0.25 * i as f32);
         scene.add(SceneNode::Renderable(light));
     }
@@ -320,10 +262,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let sun_light = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // the camera's field of view comes from the lens on the filmback
-    let aspect = width as f32 / height as f32;
-    let hfov = 2.0 * (SENSOR_MM / (2.0 * settings.focal_mm)).atan();
-    let vfov = 2.0 * ((hfov * 0.5).tan() / aspect).atan();
-    let camera = Camera::new(vfov.to_degrees(), 0.1, 4000.0, aspect);
+    let mut camera = Camera::new(45.0, 0.1, 4000.0, canvas.aspect());
+    fit_lens(&mut camera, settings.focal_mm);
 
     // the chain: sky and aerial perspective, depth of field on the jittered frame (each pixel's
     // colour and depth still agree), TAA resolving both, then exposure and tonemapping.
@@ -368,17 +308,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let volume = PostProcessingVolume::new(&renderer, effects);
 
     log::info!("Kansei — Depth of Field (WASM) ready, {:?}", renderer.presentation_format());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, sky, volume, sun_light, settings, start: now_secs() }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let t = st.settings.time.unwrap_or((now_secs() - st.start) as f32);
-            st.frame(t);
+    let mut state = State { renderer, scene, camera, sky, volume, sun_light, settings };
+    kansei_wasm::run(&canvas, move |frame| {
+        if frame.resized.is_some() {
+            frame.resize(&mut state.renderer, &mut state.camera);
+            fit_lens(&mut state.camera, state.settings.focal_mm);
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        let t = state.settings.time.unwrap_or(frame.time as f32);
+        state.frame(t);
+    });
     Ok(())
 }

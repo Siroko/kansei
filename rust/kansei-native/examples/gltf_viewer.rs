@@ -5,7 +5,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
 use kansei_core::loaders::{GLTFLoader, GLTFResult};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions};
+use kansei_core::materials::{CullMode, Material};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -15,7 +15,6 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const LIT_WGSL: &str = include_str!("../../kansei-core/src/shaders/basic_lit.wgsl");
 
 // ── Orbit camera ──
 
@@ -66,26 +65,9 @@ impl OrbitCamera {
 
 // ── Helper: create a lit material with color + specular ──
 
-fn create_lit_material(
-    label: &str,
-    color: [f32; 4],
-    specular: [f32; 4],
-    cull_mode: CullMode,
-) -> Material {
-    let mat_data: [f32; 8] = [
-        color[0], color[1], color[2], color[3],
-        specular[0], specular[1], specular[2], specular[3],
-    ];
-    let mut material = Material::new(
-        label,
-        LIT_WGSL,
-        vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
-        MaterialOptions {
-            cull_mode,
-            ..Default::default()
-        },
-    );
-    material.set_uniform_bindable(0, label, &mat_data);
+fn create_lit_material(label: &str, color: [f32; 4], specular: [f32; 4], cull_mode: CullMode) -> Material {
+    let mut material = Material::basic_lit(label, color, specular);
+    material.options.cull_mode = cull_mode;
     material
 }
 

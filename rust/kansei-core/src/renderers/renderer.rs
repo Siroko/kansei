@@ -1625,8 +1625,9 @@ impl Renderer {
     }
 
     /// Voxel GI's frame: voxelize the GI renderables (the static ones when they changed, the
-    /// dynamic ones always), light the voxels through this frame's shadow maps, rebuild the mips.
-    fn run_voxel_gi(&mut self, scene: &Scene) {
+    /// dynamic ones always), light the voxels through this frame's shadow maps, rebuild the mips,
+    /// then the distance field and the probes (around `camera`) if enabled.
+    fn run_voxel_gi(&mut self, scene: &Scene, camera: &Camera) {
         let Some(gi) = self.voxel_gi.as_mut() else { return };
         if !gi.settings.enabled {
             return;
@@ -1700,6 +1701,8 @@ impl Renderer {
         }
         gi.encode_sdf(device, &mut encoder, static_changed, any_dynamic);
         gi.encode_lighting(device, queue, &mut encoder);
+        let eye = camera.inverse_view_matrix.to_glam().w_axis;
+        gi.encode_probes(device, queue, &mut encoder, Some([eye.x, eye.y, eye.z]));
         queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -2616,7 +2619,7 @@ impl Renderer {
         self.run_cascade_shadow_pass(scene);
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
-        self.run_voxel_gi(scene);
+        self.run_voxel_gi(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -2730,6 +2733,20 @@ impl Renderer {
     }
 
     /// Render scene with post-processing effects.
+    /// Show `input` (an HDR image made without the GBuffer, such as the path tracer's) through
+    /// `volume`'s chain (its `ToneMapEffect`, ...) on the surface. Effects that read the GBuffer
+    /// find it empty.
+    pub(crate) fn present_through(&mut self, input: &wgpu::TextureView, camera: &Camera, volume: &mut crate::postprocessing::PostProcessingVolume) {
+        let (width, height) = (self.config.width, self.config.height);
+        volume.ensure_gbuffer(width, height);
+        let surface = self.surface.as_ref().unwrap();
+        let output = surface.get_current_texture().expect("Surface texture");
+        let canvas_view = output.texture.create_view(&Default::default());
+        volume.render_from(Some(input), camera, &canvas_view, width, height);
+        output.present();
+        crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+    }
+
     pub fn render_with_postprocessing(
         &mut self,
         scene: &mut Scene,
@@ -2926,7 +2943,7 @@ impl Renderer {
         self.run_cascade_shadow_pass(scene);
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
-        self.run_voxel_gi(scene);
+        self.run_voxel_gi(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -3198,6 +3215,13 @@ impl Renderer {
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Reads `buffer` (which needs `COPY_SRC`) back to the CPU without blocking: the copy is
+    /// submitted now and the future resolves once the browser has mapped it. It holds no borrow
+    /// of the renderer. Natively, awaiting it waits for the GPU.
+    pub fn read_buffer_async<T: bytemuck::Pod>(&self, buffer: &wgpu::Buffer) -> super::BufferReadback<T> {
+        super::BufferReadback::new(self.device(), self.queue(), buffer)
     }
 
     /// Read data back from a GPU buffer to CPU.

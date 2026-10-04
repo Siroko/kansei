@@ -2,6 +2,7 @@ use wgpu::util::DeviceExt;
 
 use super::buffers::{BVH4Node, BinaryBVHNode, PackedInstance, PackedTriangle};
 use super::TLASBuilder;
+use super::material::PathTracerMaterial;
 use crate::math::Mat4;
 use crate::objects::Scene;
 use crate::renderers::Renderer;
@@ -791,6 +792,18 @@ impl BVHBuilder {
 
             self.add_mesh(&positions, &normals, &geo.indices, material_index);
         }
+    }
+
+    /// The path tracer's materials for `scene`, in the order `pack_scene` gives the renderables
+    /// their material indices: each renderable's `path_tracer_material` (or the default). Hand
+    /// them to `PathTracer::set_materials`.
+    pub fn scene_materials(scene: &Scene) -> Vec<PathTracerMaterial> {
+        scene
+            .ordered_indices()
+            .filter_map(|idx| scene.get_renderable(idx))
+            .filter(|r| !r.geometry.indices.is_empty() && !r.geometry.vertices.is_empty())
+            .map(|r| r.path_tracer_material.unwrap_or_default())
+            .collect()
     }
 
     /// Pack instance data for each renderable in the scene.

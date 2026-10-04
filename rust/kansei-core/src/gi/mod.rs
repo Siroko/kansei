@@ -11,7 +11,8 @@
 //!   what a device can hold;
 //! - `VOXEL_CONES_WGSL`: `voxelConeTrace`, for any pass or material that reads the volume, with
 //!   the sky (`SKY_LIGHTING_WGSL`'s `skyRadiance`, or [`gradient_sky_lighting`] without an
-//!   atmosphere) as the light past it.
+//!   atmosphere) as the light past it; `voxelConeTraceSplit` also gives the transmittance at a
+//!   near distance (occlusion), and `voxelHemisphereCone` the five cones of a hemisphere.
 //!
 //! Producers write mip 0:
 //! - particles and analytic boxes ([`ParticleVoxelizer`]; [`ParticleGi`] runs it with the mips
@@ -22,9 +23,11 @@
 //!   `voxel_fragment_entry` with `VOXEL_WRITE_WGSL` for textured albedo), then a light injection
 //!   lights the voxels through the renderer's shadow maps and bounces last frame's light.
 //!
-//! Consumers: the per-particle cones, and [`VoxelGIEffect`], diffuse GI on screen from cones
-//! traced per pixel, optionally under screen-space GI as the near field. The planned ones (a
-//! jump-flood distance field, probes traced in it) reuse the volume, the mips and the cones.
+//! Consumers: the per-particle cones; [`VoxelGIEffect`], diffuse GI on screen from cones traced
+//! per pixel or from probes, optionally under screen-space GI as the near field; a jump-flood
+//! distance field of the voxels ([`JumpFloodSdf`]: soft shadows and AO); and irradiance probes
+//! traced in it ([`SdfProbes`], `SceneVoxelGi::enable_probes`), read by materials through
+//! `PROBES_WGSL`.
 
 mod aniso;
 mod cones;
@@ -32,6 +35,7 @@ mod effect;
 mod inject;
 mod particle_gi;
 mod particles;
+mod probes;
 mod scene;
 mod sdf;
 mod volume;
@@ -45,6 +49,7 @@ pub use effect::{VoxelGIEffect, VoxelGIOptions};
 pub use inject::{SceneGiSettings, SdfShadows};
 pub use scene::{SceneVoxelGi, SceneVoxelGiOptions};
 pub use sdf::{JumpFloodSdf, SdfSeeds};
+pub use probes::{SdfProbeOptions, SdfProbes, PROBE_RAYS};
 pub use voxelize::{GiSurface, MeshVoxelizer, SURFACE_WORDS_PER_VOXEL};
 pub(crate) use voxelize::SurfaceSet;
 
@@ -72,6 +77,14 @@ pub const VOXEL_WRITE_WGSL: &str = voxelize::VOXEL_WRITE_WGSL;
 /// The material helper for distance-field shadows and AO: bind `JumpFloodSdf::as_texture` as a
 /// `texture_3d<f32>`, and the volume's uniform and sampler, in the material's own group.
 pub const SDF_WGSL: &str = concat!(include_str!("shaders/voxel_volume.wgsl"), include_str!("shaders/sdf.wgsl"));
+
+/// Diffuse light from the scene's probes (`SdfProbes`) for a material: `ProbeGrid` and
+/// `kansei_gi_irradiance(p, n)`, the irradiance a surface at world position `p` facing `n`
+/// receives (scene units; a diffuse surface adds albedo / pi times it, in place of its own sky
+/// ambient), weighed over the eight probes around `p` as DDGI does. Declare its buffers with
+/// `SdfProbes::bindings_wgsl(group, first)` in the material's own group and bind them with
+/// `SdfProbes::bind_group_entries` (or as storage and uniform bindables).
+pub const PROBES_WGSL: &str = concat!(include_str!("shaders/probe_common.wgsl"), include_str!("shaders/probe_irradiance.wgsl"));
 
 /// The WGSL `VoxelVolume` struct and `voxelUvw` / `voxelLinearIndex`: bind
 /// `VoxelVolume::uniform` as a `VoxelVolume` uniform.
@@ -114,6 +127,7 @@ mod tests {
             ("mip3d", include_str!("shaders/mip3d.wgsl")),
             ("anisotropic mips", include_str!("shaders/aniso_mip.wgsl")),
             ("jump flood", sdf::JUMP_FLOOD_WGSL),
+            ("probe update", probes::PROBE_UPDATE_WGSL),
             ("voxel fragment", voxelize::VOXEL_FRAGMENT_WGSL),
             ("inject", inject::INJECT_WGSL),
             ("screen trace", effect::TRACE_WGSL),
@@ -128,6 +142,15 @@ mod tests {
             &format!(
                 "{SDF_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n\
                  @compute @workgroup_size(1) fn main() {{ _ = sdfDistance(vol, t, s, vec3f(0.0)) + sdfSoftShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfSurfaceShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfAo(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0)) + sdfLightShape(vol, 0.1, 3.0).x; }}"
+            ),
+            &mut sizes,
+        );
+        // the probes' library, as a material uses it
+        validate(
+            "probes library",
+            &format!(
+                "{PROBES_WGSL}\n{}\n@fragment fn main(@location(0) p: vec3f) -> @location(0) vec4f {{ return vec4f(kansei_gi_irradiance(p, vec3f(0.0, 1.0, 0.0)), 1.0); }}",
+                SdfProbes::bindings_wgsl(2, 5)
             ),
             &mut sizes,
         );
@@ -149,7 +172,7 @@ mod tests {
         validate(
             "voxel cones library",
             &format!(
-                "{VOXEL_CONES_WGSL}\n{PARTICLE_EMISSION_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n@group(0) @binding(3) var<uniform> e: ParticleEmission;\n@compute @workgroup_size(1) fn main() {{ _ = voxelConeTrace(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 1.0, 0.0, 1.0, 4u) + vec4f(particleEmission(e, 0u, vec3f(0.0)), 0.0); }}"
+                "{VOXEL_CONES_WGSL}\n{PARTICLE_EMISSION_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n@group(0) @binding(3) var<uniform> e: ParticleEmission;\n@compute @workgroup_size(1) fn main() {{ let cone = voxelHemisphereCone(vec3f(0.0, 1.0, 0.0), 2u); let split = voxelConeTraceSplit(vol, t, s, vec3f(0.0), cone.xyz, VOXEL_HEMISPHERE_TAN, 0.0, 0.5, 1.0, 4u); _ = voxelConeTrace(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 1.0, 0.0, 1.0, 4u) + vec4f(particleEmission(e, 0u, vec3f(0.0)), 0.0) + split.far * split.nearOpen * cone.w; }}"
             ),
             &mut sizes,
         );
@@ -165,6 +188,8 @@ mod tests {
         assert_eq!(sizes["InjectParams"], std::mem::size_of::<inject::InjectParamsGpu>());
         assert_eq!(sizes["VoxelGiParams"], std::mem::size_of::<effect::VoxelGiParamsGpu>());
         assert_eq!(sizes["SdfParams"], std::mem::size_of::<sdf::SdfParamsGpu>());
+        assert_eq!(sizes["ProbeGrid"], std::mem::size_of::<probes::ProbeGridGpu>());
+        assert_eq!(sizes["ProbeUpdate"], std::mem::size_of::<probes::ProbeUpdateGpu>());
         assert_eq!(sizes["DirLightData"], std::mem::size_of::<crate::shadows::compute_shadows::DirLightGpu>());
         assert_eq!(sizes["PointLightData"], std::mem::size_of::<crate::shadows::compute_shadows::PointLightGpu>());
     }

@@ -1,0 +1,64 @@
+// Repulsion: push ALL particles apart from nearby particles of DIFFERENT words.
+// Uses the same spatial hash as steering. Dispatched over particleCount.
+// Runs last, after integrate and verlet, so verlet's snapping doesn't undo the push.
+
+@group(0) @binding(0) var<storage, read_write> positions: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> params: SimParams;
+@group(0) @binding(2) var<storage, read> sortedIndices: array<u32>;
+@group(0) @binding(3) var<storage, read> cellOffsets: array<u32>;
+@group(0) @binding(4) var<storage, read> cellCounts: array<u32>;
+@group(0) @binding(5) var<storage, read> wordMetaBuf: array<vec4<u32>>;
+@group(0) @binding(6) var<uniform> grid: NeighbourGrid;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.particleCount) { return; }
+
+    let pos = positions[idx].xyz;
+    let myWordId = wordMetaBuf[idx].x;
+    let myCoord = neighbourCell(pos, grid);
+
+    var pushAccum = vec3<f32>(0.0);
+    var pushCount = 0u;
+    let repulsionRadius = params.repulsionRadius;
+
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let neighborCoord = myCoord + vec3<i32>(dx, dy, dz);
+                if (!neighbourCellInside(neighborCoord, grid)) { continue; }
+
+                let cell = neighbourCellIndex(neighborCoord, grid);
+                let start = cellOffsets[cell];
+                let count = cellCounts[cell];
+
+                // Cap iterations per cell to avoid O(N²) in dense clusters
+                let maxPerCell = min(count, params.maxPerCell);
+                for (var i = 0u; i < maxPerCell; i++) {
+                    let otherIdx = sortedIndices[start + i];
+                    if (otherIdx == idx) { continue; }
+
+                    // Only repel particles from DIFFERENT words
+                    if (wordMetaBuf[otherIdx].x == myWordId) { continue; }
+
+                    let otherPos = positions[otherIdx].xyz;
+                    let diff = pos - otherPos;
+                    let dist = length(diff);
+
+                    if (dist > 0.001 && dist < repulsionRadius) {
+                        // Soft push: stronger when closer
+                        pushAccum += normalize(diff) * (1.0 - dist / repulsionRadius);
+                        pushCount += 1u;
+                    }
+                }
+            }
+        }
+    }
+
+    if (pushCount > 0u) {
+        let push = pushAccum / f32(pushCount);
+        let nudge = push * params.repulsionStrength * params.dt;
+        positions[idx] = vec4<f32>(pos + nudge, 1.0);
+    }
+}

@@ -33,12 +33,9 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3u) {
         let direct = textureLoad(inputTex, vec2i(coord), 0).rgb;
         hdr = indirect * albedo + direct + emissive;
     } else {
-        // Full path tracer mode: GI buffer has complete radiance.
-        hdr = indirect * albedo + emissive;
+        // Full path tracer mode: the traced radiance already holds albedo, emission and sky.
+        hdr = indirect;
     }
 
-    // Reinhard tone mapping
-    let final_color = hdr / (hdr + vec3f(1.0));
-
-    textureStore(outputTex, coord, vec4f(final_color, 1.0));
+    textureStore(outputTex, coord, vec4f(hdr, 1.0));
 }

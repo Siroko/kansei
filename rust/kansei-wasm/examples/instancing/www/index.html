@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Instancing</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        import init, { start } from '../pkg/kansei_wasm_instancing.js';
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>

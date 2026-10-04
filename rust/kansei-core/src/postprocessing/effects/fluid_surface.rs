@@ -207,6 +207,29 @@ pub enum FluidMask {
     EmissiveAlpha,
 }
 
+/// The fluid surface's GBuffer material (`FluidSurfaceEffect::surface_renderable`).
+const SURFACE_MESH_WGSL: &str = r#"
+@group(0) @binding(0) var<uniform> color: vec4<f32>;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+struct VOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32> };
+@vertex
+fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(position.xyz, 1.0);
+    out.normal = (normal_matrix * vec4<f32>(normal, 0.0)).xyz;
+    return out;
+}
+struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
+@fragment
+fn fragment_main(in: VOut) -> FOut {
+    // the composite reads the normal as is, and with FluidMask::EmissiveAlpha the emissive alpha
+    return FOut(color, vec4<f32>(0.0, 0.0, 0.0, 1.0), vec4<f32>(normalize(in.normal), 1.0), color);
+}
+"#;
+
 /// Fluid surface post-processing effect.
 ///
 /// Encapsulates: density field update → MC extract → screen-space refraction composite.
@@ -241,6 +264,14 @@ pub struct FluidSurfaceEffect {
 }
 
 impl FluidSurfaceEffect {
+    /// Show a fluid's [`FluidActivity`](crate::simulations::fluid::FluidActivity): its surface
+    /// extracted while it runs, the last one drawn while it sleeps, nothing while it is culled.
+    pub fn set_activity(&mut self, activity: crate::simulations::fluid::FluidActivity) {
+        use crate::simulations::fluid::FluidActivity;
+        self.extract = activity == FluidActivity::Running;
+        self.active = activity != FluidActivity::Culled;
+    }
+
     pub fn new(
         sim: FluidSimulation,
         density_field: FluidDensityField,
@@ -257,6 +288,27 @@ impl FluidSurfaceEffect {
     }
 
     /// Run one simulation step. Call from the animation loop before render.
+    /// The renderable that puts the fluid's surface (the marching-cubes mesh this effect
+    /// extracts) into the GBuffer, which the composite then refracts: add it to the scene. It
+    /// writes `color`, the world normal (as the composite reads it, unencoded) and the
+    /// `FluidMask::EmissiveAlpha` mark, double-sided, casting no shadow.
+    pub fn surface_renderable(&self, color: [f32; 4]) -> crate::objects::Renderable {
+        use crate::materials::{Binding, CullMode, Material, MaterialOptions};
+        let mc = &self.marching_cubes;
+        let geometry = crate::geometries::Geometry::from_gpu_buffers(
+            "FluidSurface/Mesh",
+            mc.vertex_buffer().clone(),
+            mc.index_buffer().clone(),
+            Some(mc.indirect_args_buffer().clone()),
+        );
+        let options = MaterialOptions { cull_mode: CullMode::None, mrt_output_count: Some(4), ..Default::default() };
+        let mut material = Material::new("FluidSurface/Mesh", SURFACE_MESH_WGSL, vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)], options);
+        material.set_uniform_bindable(0, "FluidSurface/Color", &color);
+        let mut renderable = crate::objects::Renderable::new(geometry, material);
+        renderable.cast_shadow = false;
+        renderable
+    }
+
     pub fn step_simulation(&mut self, dt: f32, mouse_strength: f32, mouse_ndc: [f32; 2], mouse_dir: [f32; 2], batched: bool) {
         if batched {
             self.sim.update_batched(dt, mouse_strength, mouse_ndc, mouse_dir);
@@ -426,6 +478,8 @@ mod tests {
 
     #[test]
     fn the_shader_validates_and_the_params_layout_matches() {
+        let surface = naga::front::wgsl::parse_str(SURFACE_MESH_WGSL).unwrap_or_else(|e| panic!("{}", e.emit_to_string(SURFACE_MESH_WGSL)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&surface).unwrap();
         let module = naga::front::wgsl::parse_str(COMPOSITE_SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(COMPOSITE_SHADER)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
         let span = module.types.iter().find_map(|(_, t)| match (&t.name, &t.inner) {

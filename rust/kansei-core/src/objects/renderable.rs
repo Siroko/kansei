@@ -33,11 +33,28 @@ pub struct Renderable {
     /// volume: it neither bounces nor blocks light there. A `dynamic` renderable is voxelized every
     /// frame; the others again only when they change (transform, visibility, surface).
     pub gi: Option<crate::gi::GiSurface>,
+    /// How the path tracer (`pathtracer::BVHBuilder::scene_materials`) sees this renderable;
+    /// `None`: `PathTracerMaterial::default()`.
+    pub path_tracer_material: Option<crate::pathtracer::PathTracerMaterial>,
     /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
     pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
 
 impl Renderable {
+    /// `geometry` drawn once per instance, one vec4 each (position in xyz, a scale in w, read at
+    /// vertex location 3: `materials::StandardInstancing`), culled per view on the GPU against a
+    /// bounding sphere of `radius` x the scale. Change `instance_culling` (LOD bands, occlusion,
+    /// ...) on the result as needed.
+    pub fn instanced_culled(label: &str, geometry: Geometry, instances: &[[f32; 4]], radius: f32, material: Material) -> Self {
+        use crate::buffers::{BufferType, BufferUsage, ComputeBuffer};
+        let buffer = ComputeBuffer::from_slice(label, BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, instances).with_vertex_vec4(3);
+        let count = instances.len() as u32;
+        let culling = crate::culling::InstanceCulling::for_vec4_instances(&buffer, count, radius);
+        let mut renderable = Renderable::new(crate::geometries::InstancedGeometry::new(geometry, count, vec![buffer]), material);
+        renderable.instance_culling = Some(culling);
+        renderable
+    }
+
     /// Layer mask of a new renderable: bit 0.
     pub const DEFAULT_LAYERS: u32 = 1;
 
@@ -56,6 +73,7 @@ impl Renderable {
             layers: Self::DEFAULT_LAYERS,
             dynamic: false,
             gi: None,
+            path_tracer_material: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }
     }

@@ -27,6 +27,11 @@ pub const SPOT_LIGHTS_WGSL: &str = concat!(
     include_str!("../shaders/spot_lights.wgsl"),
 );
 
+/// WGSL for materials lit by the scene's directional and point lights: the light uniform the
+/// renderer packs (`kansei_lights`, camera group binding 2) and the point lights' falloff
+/// (`kansei_point_falloff`).
+pub const LIGHTS_WGSL: &str = include_str!("../shaders/light_uniforms.wgsl");
+
 /// A scene light.
 pub enum Light {
     Directional(DirectionalLight),

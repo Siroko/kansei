@@ -32,12 +32,17 @@ rust/**/pkg/
 build/
 
 # Music recordings are third-party: examples load audio from a local file or private URL, never the repo
-rust/kansei-wasm/examples/joydivision/www/assets/audio/
+rust/kansei-wasm/demos/joydivision/www/assets/audio/
 rust/kansei-wasm/examples/**/*.mp3
+rust/kansei-wasm/demos/**/*.mp3
 rust/kansei-wasm/examples/**/*.ogg
+rust/kansei-wasm/demos/**/*.ogg
 rust/kansei-wasm/examples/**/*.wav
+rust/kansei-wasm/demos/**/*.wav
 rust/kansei-wasm/examples/**/*.m4a
+rust/kansei-wasm/demos/**/*.m4a
 rust/kansei-wasm/examples/**/*.flac
+rust/kansei-wasm/demos/**/*.flac
 examples/**/*.mp3
 examples/**/*.ogg
 examples/**/*.wav

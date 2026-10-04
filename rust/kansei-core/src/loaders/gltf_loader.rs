@@ -1,10 +1,8 @@
 use crate::geometries::{Geometry, Vertex};
-use crate::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use crate::materials::{CullMode, Material, MaterialOptions};
 use crate::math::Vec3;
 use crate::objects::Renderable;
 use super::ktx2::{self, CompressionSupport, GpuTarget, Ktx2Options, TranscodedTexture};
-
-const BASIC_LIT_WGSL: &str = include_str!("../shaders/basic_lit.wgsl");
 
 /// Material properties extracted from glTF PBR metallic-roughness.
 pub struct GLTFMaterialInfo {
@@ -83,6 +81,21 @@ impl GLTFResult {
         load_texture(&self.images, texture, support)
     }
 
+    /// Every part as one geometry, each moved by its node transform (as `Object3D` composes it):
+    /// a model to draw with one material, voxelize, or path trace. `Geometry::fit` sizes it.
+    pub fn merged_geometry(&self, label: &str) -> Geometry {
+        let parts: Vec<(&Geometry, glam::Mat4)> = self
+            .renderables
+            .iter()
+            .map(|part| {
+                let (p, r, s) = (part.position, part.rotation, part.scale);
+                let rotation = glam::Mat4::from_rotation_z(r.z) * glam::Mat4::from_rotation_y(r.y) * glam::Mat4::from_rotation_x(r.x);
+                (&part.geometry, glam::Mat4::from_translation(glam::Vec3::new(p.x, p.y, p.z)) * rotation * glam::Mat4::from_scale(glam::Vec3::new(s.x, s.y, s.z)))
+            })
+            .collect();
+        Geometry::merged(label, &parts)
+    }
+
     /// Convert into engine `Renderable`s with basic lit materials derived from glTF PBR data.
     /// Applies position, rotation, scale, and an optional extra uniform scale multiplier.
     pub fn into_renderables(self, scale_multiplier: f32) -> Vec<Renderable> {
@@ -104,17 +117,8 @@ impl GLTFResult {
                 let label = mat_info
                     .map(|m| m.name.as_str())
                     .unwrap_or("GLTF/Material");
-                let uniform: [f32; 8] = [
-                    color[0], color[1], color[2], color[3],
-                    0.15, 0.15, 0.15, 0.5,
-                ];
-                let mut material = Material::new(
-                    label,
-                    BASIC_LIT_WGSL,
-                    vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
-                    opts,
-                );
-                material.set_uniform_bindable(0, &format!("{label}/Color"), &uniform);
+                let mut material = Material::basic_lit(label, color, [0.15, 0.15, 0.15, 0.5]);
+                material.options = opts;
 
                 let s = scale_multiplier;
                 let mut r = Renderable::new(gr.geometry, material);
@@ -263,13 +267,14 @@ impl GLTFLoader {
             for primitive in mesh.primitives() {
                 if let Some(geo) = Self::parse_primitive(&primitive, buffers) {
                     let (scale, rotation, translation) = world.to_scale_rotation_translation();
-                    let euler = rotation.to_euler(glam::EulerRot::YXZ);
+                    // Object3D composes Rz * Ry * Rx, so decompose in that order
+                    let (rz, ry, rx) = rotation.to_euler(glam::EulerRot::ZYX);
 
                     renderables.push(GLTFRenderable {
                         geometry: geo,
                         material_index: primitive.material().index().unwrap_or(0),
                         position: Vec3::new(translation.x, translation.y, translation.z),
-                        rotation: Vec3::new(euler.1, euler.0, euler.2),
+                        rotation: Vec3::new(rx, ry, rz),
                         scale: Vec3::new(scale.x, scale.y, scale.z),
                     });
                 }

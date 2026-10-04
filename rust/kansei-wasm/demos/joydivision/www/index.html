@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Joy Division — Unknown Pleasures</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; cursor: pointer; }
+        #audio-prompt {
+            position: fixed; left: 50%; bottom: 8vh; transform: translateX(-50%);
+            max-width: min(32rem, calc(100vw - 2rem)); box-sizing: border-box;
+            padding: 1rem 1.25rem; border: 1px dashed #777; border-radius: 6px;
+            background: rgba(0, 0, 0, 0.75); color: #ddd; text-align: center;
+            font: 14px/1.5 system-ui, sans-serif;
+        }
+        #audio-prompt.dragging { border-color: #fff; color: #fff; }
+        #audio-prompt[hidden] { display: none; }
+        #audio-prompt label { text-decoration: underline; cursor: pointer; }
+        #audio-prompt code { color: #fff; }
+        #audio-prompt .error { color: #f88; }
+        #audio-status {
+            position: fixed; left: 1rem; bottom: 1rem; color: #888;
+            font: 12px/1.4 system-ui, sans-serif; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <!-- The recording is not in the repo: the viewer brings their own copy (see README.md). -->
+    <div id="audio-prompt" hidden>
+        <p>Drop your copy of <em>A Means to an End</em> here, or
+            <label for="audio-file">choose an audio file</label>.</p>
+        <p>Or open this page with <code>?audio=&lt;url&gt;</code>.</p>
+        <p class="error" hidden></p>
+        <input id="audio-file" type="file" accept="audio/*" hidden>
+    </div>
+    <div id="audio-status"></div>
+    <script type="module">
+        import initWasm, { start, init_text, update_fft, set_fft_amplitude, set_noise_scale, set_noise_strength, set_noise_speed, set_noise_zoom, set_noise_mix, set_wave_thickness, set_peak_exponent, set_temporal_blend, set_fft_pow, set_peak_min, set_text_visible, set_text_offset, set_glyph_rot_x } from './pkg/kansei_wasm_joydivision.js';
+
+        await initWasm();
+        await start('kansei');
+
+        // ── Lyrics ── (Rust loads the font, assets/fonts/L10-medium.arfont)
+        const lyrics = await fetch('lyrics.json').then(r => r.json());
+        await init_text(
+            JSON.stringify(lyrics.lines.map(l => l.text)),
+            JSON.stringify(lyrics.lines.map(l => l.time)),
+        );
+
+        // ── Audio ──
+        // The track comes from ?audio=<url> or a file the viewer drops or picks; the repo and the
+        // site carry no recording. Without one the lines still move on the noise field.
+        let audioCtx, analyser, fftRaw, fftSmoothed;
+        let playing = false;
+        let startTime = 0;
+        let pausedAt = 0;
+        let bufferSource = null;
+        let audioBuffer = null;
+        let audioData = null;   // encoded bytes, decoded on the first click (needs a user gesture)
+
+        const prompt = document.getElementById('audio-prompt');
+        const promptError = prompt.querySelector('.error');
+        const status = document.getElementById('audio-status');
+        const fileInput = document.getElementById('audio-file');
+
+        function showPrompt(error) {
+            promptError.hidden = !error;
+            promptError.textContent = error || '';
+            prompt.hidden = false;
+            status.textContent = '';
+            document.body.dataset.audio = 'none';
+        }
+
+        function stopPlayback() {
+            if (playing) bufferSource.stop();
+            playing = false;
+            pausedAt = 0;
+        }
+
+        function setAudio(bytes, name) {
+            stopPlayback();
+            audioData = bytes;
+            audioBuffer = null;
+            prompt.hidden = true;
+            status.textContent = `${name}: click to play or pause, drop another file to replace it`;
+            document.body.dataset.audio = 'loaded';
+        }
+
+        async function decode() {
+            try {
+                audioBuffer = await audioCtx.decodeAudioData(audioData);
+            } catch (e) {
+                audioData = null;
+                showPrompt(`Could not decode that file (${e.message || e}).`);
+            }
+        }
+
+        const audioUrl = new URLSearchParams(location.search).get('audio');
+        if (audioUrl) {
+            try {
+                const r = await fetch(audioUrl);
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                setAudio(await r.arrayBuffer(), decodeURIComponent(audioUrl.split('/').pop()));
+            } catch (e) {
+                showPrompt(`Could not load ?audio=${audioUrl} (${e.message || e}).`);
+            }
+        } else {
+            showPrompt();
+        }
+
+        async function loadFile(file) {
+            if (file) setAudio(await file.arrayBuffer(), file.name);
+        }
+        fileInput.addEventListener('change', () => loadFile(fileInput.files[0]));
+        window.addEventListener('dragover', (e) => { e.preventDefault(); prompt.classList.add('dragging'); });
+        window.addEventListener('dragleave', () => prompt.classList.remove('dragging'));
+        window.addEventListener('drop', (e) => {
+            e.preventDefault();
+            prompt.classList.remove('dragging');
+            loadFile(e.dataTransfer.files[0]);
+        });
+
+        const canvas = document.getElementById('kansei');
+        canvas.addEventListener('click', async () => {
+            if (!audioData) return;
+            if (!audioCtx) {
+                audioCtx = new AudioContext();
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 256;
+                fftRaw = new Uint8Array(analyser.fftSize);
+                fftSmoothed = new Float32Array(256); // always 256 bins for the shader
+                for (let i = 0; i < 256; i++) fftSmoothed[i] = 128; // silence
+                analyser.connect(audioCtx.destination);
+            }
+            if (!audioBuffer) {
+                await decode();
+                if (!audioBuffer) return;
+            }
+
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            if (!playing) {
+                // Start or resume from pausedAt
+                const source = audioCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(analyser);
+                source.start(0, pausedAt);
+                bufferSource = source;
+                startTime = audioCtx.currentTime - pausedAt;
+                playing = true;
+                document.body.dataset.audio = 'playing';
+                source.onended = () => {
+                    // a pause or a replaced track stops its source too; only the current one counts
+                    if (bufferSource !== source || !playing) return;
+                    playing = false;
+                    pausedAt = 0;
+                    document.body.dataset.audio = 'loaded';
+                };
+            } else {
+                // Pause
+                pausedAt = audioCtx.currentTime - startTime;
+                playing = false;
+                bufferSource.stop();
+                document.body.dataset.audio = 'loaded';
+            }
+        });
+
+        function currentTime() {
+            if (!playing) return pausedAt;
+            return audioCtx.currentTime - startTime;
+        }
+
+        // ── Tweakpane ──
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Joy Division', expanded: false });
+        const p = {
+            fftAmplitude: 17, fftSize: 256, blur: 7, lineThickness: 0.44,
+            peakExponent: 15.2, peakMin: 0.08, temporalBlend: 0.70, fftPow: 2.0,
+            noiseScale: 0.09, noiseStrength: 1.30, noiseSpeed: 0.4, noiseZoom: 0.6, noiseMix: 1.0,
+            showText: true, textOffsetX: 0, textOffsetY: 0, textOffsetZ: 1, glyphRotX: 90,
+        };
+        pane.addBinding(p, 'fftAmplitude', { min: 0, max: 512, step: 1, label: 'displacement' })
+            .on('change', () => set_fft_amplitude(p.fftAmplitude));
+        pane.addBinding(p, 'fftSize', {
+            label: 'resolution',
+            options: { '64': 64, '128': 128, '256': 256, '512': 512, '1024': 1024, '2048': 2048 },
+        }).on('change', () => { if (analyser) analyser.fftSize = p.fftSize; });
+        pane.addBinding(p, 'blur', { min: 0, max: 32, step: 1, label: 'smoothing' });
+        pane.addBinding(p, 'lineThickness', { min: 0.01, max: 2, step: 0.01, label: 'line thickness' })
+            .on('change', () => set_wave_thickness(p.lineThickness));
+        pane.addBinding(p, 'peakExponent', { min: 0, max: 20, step: 0.1, label: 'peak shape' })
+            .on('change', () => set_peak_exponent(p.peakExponent));
+        pane.addBinding(p, 'peakMin', { min: 0, max: 0.5, step: 0.01, label: 'edge floor' })
+            .on('change', () => set_peak_min(p.peakMin));
+        pane.addBinding(p, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01, label: 'responsiveness' })
+            .on('change', () => set_temporal_blend(p.temporalBlend));
+        pane.addBinding(p, 'fftPow', { min: 0.01, max: 9.0, step: 0.01, label: 'fft curve' })
+            .on('change', () => set_fft_pow(p.fftPow));
+        pane.addBinding(p, 'noiseMix', { min: 0, max: 1, step: 0.01, label: 'fft / noise' })
+            .on('change', () => set_noise_mix(p.noiseMix));
+        pane.addBinding(p, 'noiseScale', { min: 0, max: 2, step: 0.01, label: 'noise scale' })
+            .on('change', () => set_noise_scale(p.noiseScale));
+        pane.addBinding(p, 'noiseStrength', { min: 0, max: 5, step: 0.01, label: 'noise amp' })
+            .on('change', () => set_noise_strength(p.noiseStrength));
+        pane.addBinding(p, 'noiseSpeed', { min: 0, max: 10, step: 0.1, label: 'noise speed' })
+            .on('change', () => set_noise_speed(p.noiseSpeed));
+        pane.addBinding(p, 'noiseZoom', { min: 0.1, max: 5, step: 0.1, label: 'noise zoom' })
+            .on('change', () => set_noise_zoom(p.noiseZoom));
+
+        // ── Text ──
+        const textFolder = pane.addFolder({ title: 'Text', expanded: false });
+        textFolder.addBinding(p, 'showText', { label: 'visible' })
+            .on('change', () => set_text_visible(p.showText));
+        textFolder.addBinding(p, 'textOffsetX', { min: -20, max: 20, step: 0.1, label: 'offset X' })
+            .on('change', () => set_text_offset(p.textOffsetX, p.textOffsetY, p.textOffsetZ));
+        textFolder.addBinding(p, 'textOffsetY', { min: -20, max: 20, step: 0.1, label: 'offset Y' })
+            .on('change', () => set_text_offset(p.textOffsetX, p.textOffsetY, p.textOffsetZ));
+        textFolder.addBinding(p, 'textOffsetZ', { min: -10, max: 10, step: 0.1, label: 'offset Z' })
+            .on('change', () => set_text_offset(p.textOffsetX, p.textOffsetY, p.textOffsetZ));
+        textFolder.addBinding(p, 'glyphRotX', { min: 0, max: 180, step: 1, label: 'glyph rot X' })
+            .on('change', () => set_glyph_rot_x(p.glyphRotX));
+
+        // ── Render + FFT loop ──
+        function loop() {
+            requestAnimationFrame(loop);
+            const t = currentTime();
+            if (analyser && playing) {
+                // Resize raw buffer if fftSize changed
+                if (fftRaw.length !== analyser.fftSize) {
+                    fftRaw = new Uint8Array(analyser.fftSize);
+                }
+                analyser.getByteTimeDomainData(fftRaw);
+
+                // Resample raw (fftSize samples) → 256 bins
+                const rawLen = fftRaw.length;
+                for (let i = 0; i < 256; i++) {
+                    const srcIdx = (i / 255) * (rawLen - 1);
+                    const lo = Math.floor(srcIdx);
+                    const hi = Math.min(lo + 1, rawLen - 1);
+                    const frac = srcIdx - lo;
+                    fftSmoothed[i] = fftRaw[lo] * (1 - frac) + fftRaw[hi] * frac;
+                }
+
+                // Spatial blur: box filter of radius p.blur for rounded curves
+                const outBuf = new Uint8Array(256);
+                const r = p.blur;
+                if (r > 0) {
+                    for (let i = 0; i < 256; i++) {
+                        let sum = 0, count = 0;
+                        const lo = Math.max(0, i - r);
+                        const hi = Math.min(255, i + r);
+                        for (let j = lo; j <= hi; j++) { sum += fftSmoothed[j]; count++; }
+                        outBuf[i] = Math.round(sum / count);
+                    }
+                } else {
+                    for (let i = 0; i < 256; i++) outBuf[i] = Math.round(fftSmoothed[i]);
+                }
+                update_fft(outBuf, t);
+            } else {
+                update_fft(new Uint8Array(256), t);
+            }
+        }
+        loop();
+    </script>
+</body>
+</html>
