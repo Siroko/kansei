@@ -15,7 +15,7 @@ use kansei_core::culling::InstanceCulling;
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -26,119 +26,59 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, param_or, Canvas};
 use kansei_core::shadows::{CascadedShadowOptions, CASCADED_SHADOWS_WGSL};
 
-/// Sunlit diffuse surface: sun (lux) times the shadow, plus a sky hemisphere (cd/m²). INSTANCE_*
-/// replaced for instanced trunks and crowns (vec4: position, scale).
-const SURFACE_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32>, sun_dir: vec4<f32>, sun: vec4<f32>, sky: vec4<f32> };  // base_color.w: debug
-@group(0) @binding(0) var<uniform> surface: Surface;
+/// `debug=1`: the sun's light only, each point tinted by the cascade that shadows it.
+const CASCADE_TINT_WGSL: &str = r#"
+@group(0) @binding(0) var<uniform> base_color: vec4<f32>;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-// the single directional map (group 3, bindings 0-2), for `csm=0`
-struct LegacyShadow { view_proj: mat4x4<f32>, bias: f32, normal_bias: f32, enabled: f32, _p: f32, _q: vec4<f32> };
-@group(3) @binding(0) var legacy_depth: texture_depth_2d;
-@group(3) @binding(1) var legacy_sampler: sampler_comparison;
-@group(3) @binding(2) var<uniform> legacy: LegacyShadow;
-
 struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>, INSTANCE_INPUT };
 struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32> };
-
 @vertex
 fn vertex_main(v: VIn) -> VOut {
     var local = v.position.xyz;
-    var offset = vec3<f32>(0.0);
     INSTANCE_PLACE
-    let world = world_matrix * vec4<f32>(local + offset, 1.0);
+    let world = world_matrix * vec4<f32>(local, 1.0);
     var out: VOut;
     out.clip = projection_matrix * view_matrix * world;
     out.world = world.xyz;
     out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
     return out;
 }
-
-fn legacy_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
-    if (legacy.enabled < 0.5) { return 1.0; }
-    let clip = legacy.view_proj * vec4<f32>(world + n * legacy.normal_bias, 1.0);
-    let uv = vec2<f32>(clip.x, -clip.y) * 0.5 + 0.5;
-    let texel = 1.0 / vec2<f32>(textureDimensions(legacy_depth));
-    var lit = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            lit += textureSampleCompareLevel(legacy_depth, legacy_sampler, uv + vec2<f32>(f32(x), f32(y)) * texel, clip.z - legacy.bias);
-        }
-    }
-    return lit / 9.0;
-}
-
 @fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
-    let l = -surface.sun_dir.xyz;
-    var shadow = 1.0;
-    if (kansei_cascades.count > 0u) {
-        shadow = kansei_sun_shadow(in.world, n, in.clip.xy);
-    } else {
-        shadow = legacy_shadow(in.world, n);
-    }
-    var base = surface.base_color.rgb;
-    if (surface.base_color.w > 0.5) {
-        let tints = array<vec3<f32>, 5>(vec3<f32>(1.0, 0.4, 0.4), vec3<f32>(0.4, 1.0, 0.4), vec3<f32>(0.4, 0.6, 1.0), vec3<f32>(1.0, 1.0, 0.4), vec3<f32>(1.0));
-        base *= tints[min(kansei_sun_cascade(in.world), 4u)];
-    }
-    let sky = mix(surface.sky.rgb * 0.15, surface.sky.rgb, n.y * 0.5 + 0.5);
-    let lit = base / 3.14159265 * surface.sun.rgb * max(dot(n, l), 0.0) * shadow + base * sky;
-    return vec4<f32>(lit, 1.0);
+    let tints = array<vec3<f32>, 5>(vec3<f32>(1.0, 0.4, 0.4), vec3<f32>(0.4, 1.0, 0.4), vec3<f32>(0.4, 0.6, 1.0), vec3<f32>(1.0, 1.0, 0.4), vec3<f32>(1.0));
+    let base = base_color.rgb * tints[min(kansei_sun_cascade(in.world), 4u)];
+    let sun = kansei_cascades.lightColor * max(dot(n, -kansei_cascades.lightDirection), 0.0) * kansei_sun_shadow(in.world, n, in.clip.xy);
+    return kansei_gbuffer_out(base / 3.14159265 * sun, vec3<f32>(0.0), n, base);
 }
 "#;
 
-const SKY_WGSL: &str = r#"
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) dir: vec3<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world_matrix * position;
-    out.dir = position.xyz;
-    return out;
-}
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    let up = saturate(normalize(in.dir).y);
-    return vec4<f32>(mix(vec3<f32>(9000.0, 9500.0, 10500.0), vec3<f32>(3000.0, 5000.0, 9000.0), sqrt(up)), 1.0);
-}
-"#;
-
-/// Low afternoon sun (lux) and its travel direction.
+/// Low afternoon sun's travel direction, and the sky's radiance from straight up (cd/m²).
 const SUN_DIR: [f32; 3] = [-0.62, -0.42, -0.66];
-const SUN: [f32; 3] = [80000.0, 70000.0, 56000.0];
 const SKY: [f32; 3] = [4000.0, 5000.0, 7000.0];
 
+/// A sunlit diffuse surface (the stock standard material), instanced for trunks and crowns
+/// (vec4: position, scale), or with `debug` the cascade tint.
 fn surface_material(label: &str, base: [f32; 3], instanced: bool, debug: bool) -> Material {
-    let shader = if instanced {
-        SURFACE_WGSL
-            .replace("INSTANCE_INPUT", "@location(3) instance: vec4<f32>,")
-            .replace("INSTANCE_PLACE", "local = local * v.instance.w; offset = v.instance.xyz;")
-    } else {
-        SURFACE_WGSL.replace("INSTANCE_INPUT", "").replace("INSTANCE_PLACE", "")
-    };
-    let d = SUN_DIR;
-    let data: [f32; 16] = [
-        base[0], base[1], base[2], debug as u32 as f32,
-        d[0], d[1], d[2], 0.0,
-        SUN[0], SUN[1], SUN[2], 0.0,
-        SKY[0], SKY[1], SKY[2], 0.0,
-    ];
-    let mut m = Material::new(
-        label,
-        &format!("{CASCADED_SHADOWS_WGSL}\n{shader}"),
-        vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
-        MaterialOptions::default(),
-    );
-    m.set_uniform_bindable(0, label, &data);
-    m
+    if debug {
+        let (input, place) = if instanced { ("@location(3) instance: vec4<f32>,", "local = local * v.instance.w + v.instance.xyz;") } else { ("", "") };
+        let shader = CASCADE_TINT_WGSL.replace("INSTANCE_INPUT", input).replace("INSTANCE_PLACE", place);
+        let options = MaterialOptions { mrt_output_count: Some(4), ..Default::default() };
+        let mut m = Material::new(label, &format!("{CASCADED_SHADOWS_WGSL}\n{GBUFFER_OUT_WGSL}\n{shader}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], options);
+        m.set_uniform_bindable(0, label, &[base[0], base[1], base[2], 1.0]);
+        return m;
+    }
+    Material::standard_lit(label, &StandardLitOptions {
+        base_color: base,
+        roughness: 0.9,
+        sky_up: SKY,
+        sky_down: SKY.map(|c| c * 0.15),
+        instancing: instanced.then_some(StandardInstancing::OffsetScale),
+        ..Default::default()
+    })
 }
 
 fn hash(i: u32) -> f32 {
@@ -174,8 +114,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     let mut scene = Scene::new();
-    let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
-    sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
+    let sky = Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [3000.0, 5000.0, 9000.0], horizon: [9000.0, 9500.0, 10500.0], ground: [9000.0, 9500.0, 10500.0], curve: 0.5 });
     let mut sky = Renderable::new(SphereGeometry::new(900.0, 32, 16), sky);
     sky.cast_shadow = false;
     scene.add(SceneNode::Renderable(sky));

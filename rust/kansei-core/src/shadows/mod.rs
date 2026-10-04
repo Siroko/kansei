@@ -16,6 +16,10 @@ pub use sky_occlusion::{SkyOcclusion, SkyOcclusionOptions};
 /// `Renderer::enable_sky_occlusion`.
 pub const SKY_OCCLUSION_WGSL: &str = include_str!("../shaders/sky_occlusion.wgsl");
 
+/// WGSL for materials shadowed by the single directional shadow map (`Renderer::enable_shadows`,
+/// group 3 bindings 0-2): call `kansei_shadow_map(worldPos, N)` on the first directional light.
+pub const SHADOW_MAP_WGSL: &str = include_str!("../shaders/shadow_map.wgsl");
+
 /// WGSL for materials shadowed by the renderer's cascaded shadow map: group 3 bindings 10-12 and
 /// `kansei_sun_shadow(worldPos, N, fragCoord.xy)`; see `Renderer::enable_cascaded_shadows`.
 pub const CASCADED_SHADOWS_WGSL: &str = include_str!("../shaders/cascaded_shadows.wgsl");

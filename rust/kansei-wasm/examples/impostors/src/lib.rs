@@ -35,7 +35,8 @@ use kansei_core::cameras::MOTION_VECTORS_WGSL;
 use kansei_core::culling::{CullViewKind, InstanceCulling, LOD_FADE_WGSL};
 use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry, SphereGeometry, Vertex};
 use kansei_core::impostors::{billboard_geometry, ImpostorOptions, IMPOSTOR_WGSL};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
+use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -48,7 +49,12 @@ use kansei_wasm::{flag, now, param, param_or, Canvas};
 
 const WATER_LAYER: u32 = 2;
 
-/// Sunlight, sky and haze, shared by the meshes and the impostors so they match.
+/// The sun: its travel direction and illuminance (lux).
+const SUN_DIR: [f32; 3] = [0.4, -0.55, 0.7];
+const SUN: [f32; 3] = [9000.0 * std::f32::consts::PI, 7600.0 * std::f32::consts::PI, 6000.0 * std::f32::consts::PI];
+
+/// The scene's directional light (the sun), sky and haze, shared by the meshes and the impostors
+/// so they match. Prefixed with LIGHTS_WGSL and GBUFFER_OUT_WGSL.
 const SHADE_WGSL: &str = r#"
 fn eye_of(view: mat4x4<f32>) -> vec3<f32> {
     let view3 = mat3x3<f32>(view[0].xyz, view[1].xyz, view[2].xyz);
@@ -56,9 +62,13 @@ fn eye_of(view: mat4x4<f32>) -> vec3<f32> {
 }
 
 fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, eye: vec3<f32>) -> vec3<f32> {
-    let sun = normalize(vec3<f32>(-0.4, 0.55, -0.7));
     let sky = mix(vec3<f32>(60.0, 55.0, 45.0), vec3<f32>(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5);
-    let lit = albedo * (sky + vec3<f32>(9000.0, 7600.0, 6000.0) * max(dot(n, sun), 0.0));
+    var sun = vec3<f32>(0.0);
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let light = kansei_lights.directional[i];
+        sun += light.color / 3.14159265 * max(dot(n, -normalize(light.direction)), 0.0);
+    }
+    let lit = albedo * (sky + sun);
     let haze = 1.0 - exp(-distance(world, eye) * 0.0015);
     return mix(lit, vec3<f32>(1500.0, 1700.0, 2000.0), haze);
 }
@@ -80,16 +90,6 @@ fn unplace(world: vec3<f32>, inst: vec4<f32>, yaw: f32) -> vec3<f32> {
     return turn((world - inst.xyz) / inst.w, -yaw);
 }
 
-struct FOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
-fn surface_out(color: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>) -> FOut {
-    return FOut(vec4<f32>(color, 1.0), vec4<f32>(0.0), vec4<f32>(normalize(n) * 0.5 + 0.5, 1.0), vec4<f32>(albedo, 1.0));
-}
 "#;
 
 /// The terrain and the spruce meshes: albedo from the material (trunks brown), lit by `shade`.
@@ -125,10 +125,10 @@ fn vertex_main(v: VIn) -> VOut {
 }
 
 @fragment
-fn fragment_main(in: VOut) -> FOut {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     FADE_DISCARD
     let n = normalize(in.normal);
-    return surface_out(FADE_TINT(shade(in.albedo, n, in.world, eye_of(view_matrix))), n, in.albedo);
+    return kansei_gbuffer_out(FADE_TINT(shade(in.albedo, n, in.world, eye_of(view_matrix))), vec3<f32>(0.0), n, in.albedo);
 }
 "#;
 
@@ -153,6 +153,7 @@ struct VOut {
     @location(3) extra: vec4<f32>,
     @location(4) @interpolate(flat) lod_fade: f32,
 };
+// KanseiGBufferOut, and with `depth=1` the depth of the surface found
 struct ImpostorOut {
     @location(0) color: vec4<f32>,
     @location(1) emissive: vec4<f32>,
@@ -187,7 +188,7 @@ fn fragment_main(in: VOut) -> ImpostorOut {
     let n = turn(s.normal, in.extra.x);
     // baked with the tint neutral: this tree's own
     let albedo = s.albedo * (0.7 + 0.6 * in.extra.y);
-    let base = surface_out(FADE_TINT(shade(albedo, n, world, eye_of(view_matrix))), n, albedo);
+    let base = kansei_gbuffer_out(FADE_TINT(shade(albedo, n, world, eye_of(view_matrix))), vec3<f32>(0.0), normalize(n), albedo);
     let clip = projection_matrix * view_matrix * vec4<f32>(world, 1.0);
     return ImpostorOut(base.color, base.emissive, base.normal, base.albedo DEPTH_VALUE);
 }
@@ -295,7 +296,7 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, fade: Fade) -> Mate
     let shader = fade.apply(&SURFACE_WGSL.replace("TREE_INPUT", input).replace("TREE_PLACE", place), tree);
     let mut m = Material::new(
         label,
-        &format!("{SHADE_WGSL}\n{shader}"),
+        &format!("{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{SHADE_WGSL}\n{shader}"),
         vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
         MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
     );
@@ -677,7 +678,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut scene = Scene::new();
     let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
     sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
-    scene.add(SceneNode::Renderable(Renderable::new(SphereGeometry::new(2500.0, 32, 16), sky)));
+    let mut sky = Renderable::new(SphereGeometry::new(2500.0, 32, 16), sky);
+    sky.cast_shadow = false;
+    scene.add(SceneNode::Renderable(sky));
+    scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]), Vec3::new(SUN[0], SUN[1], SUN[2]), 1.0))));
     let bench_fade = param("bench").as_deref() == Some("fade");
     let fade = Fade {
         width: param_or("fade", if bench_fade || param("bench").as_deref() == Some("bands") { 20.0 } else { 0.0 }),
@@ -768,7 +772,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     for (&fade, &lods) in fades.iter().zip(&lod_sets) {
         let mut material = Material::new(
             "Spruce/Impostor",
-            &format!("{IMPOSTOR_WGSL}\n{SHADE_WGSL}\n{}", fade.apply(&impostor_shader, true)),
+            &format!("{IMPOSTOR_WGSL}\n{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{SHADE_WGSL}\n{}", fade.apply(&impostor_shader, true)),
             vec![
                 Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
                 Binding::texture_2d(1, ShaderStages::FRAGMENT),

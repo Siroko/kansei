@@ -10,8 +10,8 @@ use kansei_core::atmosphere::{direction_from_elevation_bearing, SkyAtmosphere, S
 use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
-use kansei_core::lights::{DirectionalLight, Light};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
+use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
@@ -21,29 +21,23 @@ use kansei_core::postprocessing::effects::{
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::shadows::SHADOW_MAP_WGSL;
 use kansei_wasm::{flag, param, param_or, Canvas};
 
 /// Unreal's default filmback width, mm.
 const SENSOR_MM: f32 = 23.76;
 
-/// Shared by the materials: camera, lights, shadows, and Lambertian lighting by the sun (with the
-/// renderer's shadow map) and the sky (SkyLighting SH). Prefixed with SKY_LIGHTING_WGSL.
+/// Shared by the surfaces: camera and mesh bindings, and Lambertian lighting by the scene's
+/// directional lights (the sun with the renderer's shadow map) and the sky (SkyLighting SH).
+/// Prefixed with SKY_LIGHTING_WGSL, LIGHTS_WGSL, SHADOW_MAP_WGSL and GBUFFER_OUT_WGSL.
 const COMMON_WGSL: &str = r#"
+struct Surface { albedo: vec4<f32> };
+@group(0) @binding(0) var<uniform> material: Surface;
 @group(0) @binding(1) var<uniform> sky: SkyLighting;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct DirLight { direction: vec3<f32>, _pad0: f32, color: vec3<f32>, intensity: f32 };
-struct PtLight { position: vec3<f32>, radius: f32, color: vec3<f32>, intensity: f32 };
-struct LightUniforms { num_directional: u32, num_point: u32, _pad0: u32, _pad1: u32,
-                       directional: array<DirLight, 4>, point: array<PtLight, 8> };
-@group(1) @binding(2) var<uniform> lights: LightUniforms;
-struct ShadowUniforms { light_view_proj: mat4x4<f32>, bias: f32, normal_bias: f32, shadow_enabled: f32,
-                        point_shadow_enabled: f32, point_light_pos: vec3<f32>, point_shadow_far: f32 };
-@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
-@group(3) @binding(1) var shadow_sampler: sampler_comparison;
-@group(3) @binding(2) var<uniform> shadow_uniforms: ShadowUniforms;
 
 struct VertexInput { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
 struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) world_position: vec3<f32>,
@@ -60,52 +54,31 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
-fn sun_shadow(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
-    if (shadow_uniforms.shadow_enabled < 0.5) { return 1.0; }
-    let ls = shadow_uniforms.light_view_proj * vec4<f32>(world_pos + n * shadow_uniforms.normal_bias, 1.0);
-    let ndc = ls.xyz / ls.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    let inside = step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0) * step(ndc.z, 1.0);
-    let texel = 1.0 / vec2<f32>(textureDimensions(shadow_depth_tex));
-    var s = 0.0;
-    for (var x = -1; x <= 1; x++) {
-        for (var y = -1; y <= 1; y++) {
-            let suv = clamp(uv + vec2<f32>(f32(x), f32(y)) * texel, vec2<f32>(0.0), vec2<f32>(1.0));
-            s += textureSampleCompare(shadow_depth_tex, shadow_sampler, suv, ndc.z - shadow_uniforms.bias);
-        }
-    }
-    return mix(1.0, s / 9.0, inside);
-}
-
-// Lambertian: albedo / pi * (sun * cos * shadow + sky irradiance)
-fn lambert(albedo: vec3<f32>, world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let shadow = sun_shadow(world_pos, n);
+// Lambertian: albedo / pi * (sun * cos * shadow + sky irradiance), into the GBuffer
+fn lambert(albedo: vec3<f32>, world_pos: vec3<f32>, n: vec3<f32>) -> KanseiGBufferOut {
+    let shadow = kansei_shadow_map(world_pos, n);
     var e = skyIrradiance(sky, n);
-    for (var i = 0u; i < lights.num_directional; i++) {
-        let l = lights.directional[i];
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let l = kansei_lights.directional[i];
         e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
     }
-    return albedo / 3.14159265 * e;
+    return kansei_gbuffer_out(albedo / 3.14159265 * e, vec3<f32>(0.0), n, albedo);
 }
 "#;
 
 const SURFACE_WGSL: &str = r#"
-struct Surface { albedo: vec4<f32> };
-@group(0) @binding(0) var<uniform> material: Surface;
 @fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(lambert(material.albedo.rgb, input.world_position, normalize(input.world_normal)), 1.0);
+fn fragment_main(input: VertexOutput) -> KanseiGBufferOut {
+    return lambert(material.albedo.rgb, input.world_position, normalize(input.world_normal));
 }
 "#;
 
 /// Alpha-tested leaf cards: a grid of rotated elliptical leaves cut out of the card with discard,
 /// lit from both sides.
 const LEAVES_WGSL: &str = r#"
-struct Surface { albedo: vec4<f32> };
-@group(0) @binding(0) var<uniform> material: Surface;
 fn hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
 @fragment
-fn fragment_main(input: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput, @builtin(front_facing) front: bool) -> KanseiGBufferOut {
     let cells = 6.0;
     let g = input.uv * cells;
     let cell = floor(g);
@@ -125,26 +98,16 @@ fn fragment_main(input: VertexOutput, @builtin(front_facing) front: bool) -> @lo
     var n = normalize(input.world_normal);
     if (!front) { n = -n; }
     let tint = 0.8 + 0.4 * hash(cell + 21.0);
-    return vec4<f32>(lambert(material.albedo.rgb * tint, input.world_position, n), 1.0);
-}
-"#;
-
-/// Small lights: constant luminance (cd/m^2).
-const EMISSIVE_WGSL: &str = r#"
-struct Surface { luminance: vec4<f32> };
-@group(0) @binding(0) var<uniform> material: Surface;
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(material.luminance.rgb, 1.0);
+    return lambert(material.albedo.rgb * tint, input.world_position, n);
 }
 "#;
 
 fn material(label: &str, body: &str, rgb: [f32; 3], sky: &SkyAtmosphere, cull: CullMode) -> Material {
     let mut m = Material::new(
         label,
-        &format!("{SKY_LIGHTING_WGSL}\n{COMMON_WGSL}\n{body}"),
+        &format!("{SKY_LIGHTING_WGSL}\n{LIGHTS_WGSL}\n{SHADOW_MAP_WGSL}\n{GBUFFER_OUT_WGSL}\n{COMMON_WGSL}\n{body}"),
         vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::uniform(1, ShaderStages::FRAGMENT)],
-        MaterialOptions { cull_mode: cull, ..Default::default() },
+        MaterialOptions { cull_mode: cull, mrt_output_count: Some(4), ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[rgb[0], rgb[1], rgb[2], 1.0]);
     m.set_bindable(1, ComputeBuffer::from_external("SkyLighting", sky.bindings().sky_lighting.clone(), BufferType::Uniform));
@@ -286,12 +249,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let x = (u - 0.5) * 26.0;
         let z = -25.0 - 15.0 * (u * 3.0).sin().abs();
         let y = 1.5 - 1.0 * (1.0 - (2.0 * u - 1.0).powi(2)) + 0.2 * hash(i + 2200);
-        let mut light = Renderable::new(SphereGeometry::new(0.08, 8, 6), material("Light", EMISSIVE_WGSL, [20000.0, 11000.0, 4000.0], &sky, CullMode::Back));
+        let mut light = Renderable::new(SphereGeometry::new(0.08, 8, 6), Material::emissive("Light", [20000.0, 11000.0, 4000.0]));
         light.object.set_position(x, y, z);
         scene.add(SceneNode::Renderable(light));
     }
     for (i, &(x, y)) in [(-0.22, 1.28), (0.18, 1.62), (-0.05, 1.18)].iter().enumerate() {
-        let mut light = Renderable::new(SphereGeometry::new(0.006, 8, 6), material("NearLight", EMISSIVE_WGSL, [5000.0, 6000.0, 8000.0], &sky, CullMode::Back));
+        let mut light = Renderable::new(SphereGeometry::new(0.006, 8, 6), Material::emissive("NearLight", [5000.0, 6000.0, 8000.0]));
         light.object.set_position(x, y, -1.2 - 0.25 * i as f32);
         scene.add(SceneNode::Renderable(light));
     }

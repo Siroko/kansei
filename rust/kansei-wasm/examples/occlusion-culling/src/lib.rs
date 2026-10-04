@@ -30,7 +30,8 @@ use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, Sampler
 use kansei_core::cameras::{Camera, MOTION_VECTORS_WGSL};
 use kansei_core::culling::{CullStats, InstanceCulling};
 use kansei_core::geometries::{Geometry, InstancedGeometry, SphereGeometry, Vertex};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
+use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -41,9 +42,10 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, now, param, param_or, Canvas};
 use kansei_core::shadows::{SkyOcclusion, SkyOcclusionOptions, SKY_OCCLUSION_WGSL};
 
-/// A diffuse surface in sunlight and haze, writing motion vectors. TREE_* (string replaced) place
-/// a unit tree: instance vec4 (xyz base, w height), vec4 (yaw, tint, -, -). SKY_* bind the sky
-/// occlusion and dim the sky's light by it.
+/// A diffuse surface lit by the scene's directional light (the sun) and a sky hemisphere, in haze,
+/// writing motion vectors. Prefixed with LIGHTS_WGSL and MOTION_VECTORS_WGSL. TREE_* (string
+/// replaced) place a unit tree: instance vec4 (xyz base, w height), vec4 (yaw, tint, -, -). SKY_*
+/// bind the sky occlusion and dim the sky's light by it.
 const SURFACE_WGSL: &str = r#"
 struct Surface { base_color: vec4<f32>, params: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
@@ -84,11 +86,15 @@ fn vertex_main(v: VIn) -> VOut {
 @fragment
 fn fragment_main(in: VOut) -> FOut {
     let n = normalize(in.normal);
-    let sun = normalize(vec3<f32>(-0.4, 0.55, -0.7));
     let visibility = SKY_VISIBILITY;
     let sky = mix(vec3<f32>(60.0, 55.0, 45.0), vec3<f32>(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5) * visibility;
     let base = surface.base_color.rgb * (0.7 + 0.6 * in.tint);
-    var lit = base * (sky + vec3<f32>(9000.0, 7600.0, 6000.0) * max(dot(n, sun), 0.0));
+    var sun = vec3<f32>(0.0);
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let light = kansei_lights.directional[i];
+        sun += light.color / 3.14159265 * max(dot(n, -normalize(light.direction)), 0.0);
+    }
+    var lit = base * (sky + sun);
     SKY_SHOW
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let eye = -(transpose(view3) * view_matrix[3].xyz);
@@ -98,24 +104,9 @@ fn fragment_main(in: VOut) -> FOut {
 }
 "#;
 
-const SKY_WGSL: &str = r#"
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) dir: vec3<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world_matrix * position;
-    out.dir = position.xyz;
-    return out;
-}
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    let up = saturate(normalize(in.dir).y);
-    return vec4<f32>(mix(vec3<f32>(1500.0, 1700.0, 2000.0), vec3<f32>(700.0, 1100.0, 2200.0), sqrt(up)), 1.0);
-}
-"#;
+/// The sun: its travel direction and illuminance (lux).
+const SUN_DIR: [f32; 3] = [0.4, -0.55, 0.7];
+const SUN: [f32; 3] = [9000.0 * std::f32::consts::PI, 7600.0 * std::f32::consts::PI, 6000.0 * std::f32::consts::PI];
 
 /// `skyocc=`: off, on, or showing the sky visibility.
 #[derive(Clone, Copy, PartialEq)]
@@ -159,7 +150,7 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, sky: Option<(&SkyOc
     }
     let mut m = Material::new(
         label,
-        &format!("{MOTION_VECTORS_WGSL}\n{shader}"),
+        &format!("{LIGHTS_WGSL}\n{MOTION_VECTORS_WGSL}\n{shader}"),
         bindings,
         MaterialOptions { outputs_velocity: true, ..Default::default() },
     );
@@ -542,9 +533,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     let mut scene = Scene::new();
-    let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
-    sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
-    scene.add(SceneNode::Renderable(Renderable::new(SphereGeometry::new(1500.0, 32, 16), sky)));
+    let horizon = [1500.0, 1700.0, 2000.0];
+    let sky = Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [700.0, 1100.0, 2200.0], horizon, ground: horizon, curve: 0.5 });
+    let mut sky = Renderable::new(SphereGeometry::new(1500.0, 32, 16), sky);
+    sky.cast_shadow = false;
+    scene.add(SceneNode::Renderable(sky));
+    scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]), Vec3::new(SUN[0], SUN[1], SUN[2]), 1.0))));
     // the terrain: an ordinary mesh, and the main occluder
     let sky = renderer.sky_occlusion().map(|s| (s, sky_occ));
     scene.add(SceneNode::Renderable(Renderable::new(terrain(240), surface_material("Terrain", [0.09, 0.1, 0.05], false, sky))));

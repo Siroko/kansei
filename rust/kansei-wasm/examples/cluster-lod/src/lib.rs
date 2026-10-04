@@ -20,7 +20,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions, InstanceTransform, LodView};
 use kansei_core::culling::InstanceCulling;
 use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry, Vertex};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FrameTimer;
@@ -28,7 +28,8 @@ use kansei_core::postprocessing::{effects::{exposure_from_ev100, ToneMapEffect, 
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, now, param, param_or, Canvas};
 
-/// Rocks placed by records of position + scale, then yaw (8 floats), lit by a low sun.
+/// Rocks placed by records of position + scale, then yaw (8 floats), lit by a low sun. Prefixed
+/// with GBUFFER_OUT_WGSL.
 const ROCK_WGSL: &str = r#"
 struct Surface { color: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
@@ -37,7 +38,6 @@ struct Surface { color: vec4<f32> };
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
 struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(3) place: vec4<f32>, @location(4) yaw: f32 };
 struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) world: vec3<f32> };
-struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
 fn turn(v: vec3<f32>, a: f32) -> vec3<f32> {
     return vec3<f32>(cos(a) * v.x + sin(a) * v.z, v.y, -sin(a) * v.x + cos(a) * v.z);
 }
@@ -51,12 +51,12 @@ fn vertex_main(v: VIn) -> VOut {
     return out;
 }
 @fragment
-fn fragment_main(in: VOut) -> FOut {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let sun = normalize(vec3<f32>(0.4, 0.6, 0.3));
     let light = vec3<f32>(1.0, 0.95, 0.85) * max(dot(n, sun), 0.0) * 3.0 + vec3<f32>(0.25, 0.3, 0.4) * (0.6 + 0.4 * n.y);
     let color = surface.color.rgb * light;
-    return FOut(vec4<f32>(color, 1.0), vec4<f32>(0.0), vec4<f32>(n * 0.5 + 0.5, 1.0), surface.color);
+    return kansei_gbuffer_out(color, vec3<f32>(0.0), n, surface.color.rgb);
 }
 "#;
 
@@ -117,7 +117,7 @@ fn lod_mesh(mesh: &ClusterMesh, distance: f32, scale: f32, ppr: f32, tau: f32) -
 }
 
 fn material() -> Material {
-    let mut m = Material::new("Rock", ROCK_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
+    let mut m = Material::new("Rock", &format!("{GBUFFER_OUT_WGSL}\n{ROCK_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
     m.set_uniform_bindable(0, "Rock", &[[0.42f32, 0.4, 0.37, 1.0]]);
     m
 }
@@ -263,11 +263,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let culling = |near: f32, far: f32| InstanceCulling::new(source.clone(), rocks, 32, 0, 1.2).with_radius_scale(12).with_lod_range(near, far);
 
     let mut scene = Scene::new();
-    let mut ground = Renderable::new(PlaneGeometry::new(extent * 2.0, extent * 2.0), {
-        let mut m = Material::new("Ground", GROUND_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), cull_mode: CullMode::None, ..Default::default() });
-        m.set_uniform_bindable(0, "Ground", &[[0.2f32, 0.22, 0.16, 1.0]]);
-        m
-    });
+    // the ground: lit by an even sky alone (the rocks' sun is their own)
+    let ground_material = Material::standard_lit("Ground", &StandardLitOptions { base_color: [0.2, 0.22, 0.16], roughness: 0.9, sky_up: [1.6; 3], sky_down: [1.6; 3], ..Default::default() });
+    let mut ground = Renderable::new(PlaneGeometry::new(extent * 2.0, extent * 2.0), ground_material);
     ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     scene.add(SceneNode::Renderable(ground));
 
@@ -361,22 +359,3 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     });
     Ok(())
 }
-
-const GROUND_WGSL: &str = r#"
-struct Surface { color: vec4<f32> };
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32> };
-struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    return VOut(projection_matrix * view_matrix * world_matrix * position);
-}
-@fragment
-fn fragment_main(in: VOut) -> FOut {
-    let albedo = surface.color.rgb;
-    return FOut(vec4<f32>(albedo * 1.6, 1.0), vec4<f32>(0.0), vec4<f32>(0.5, 1.0, 0.5, 1.0), vec4<f32>(albedo, 1.0));
-}
-"#;

@@ -19,7 +19,7 @@ use kansei_core::culling::InstanceCulling;
 use kansei_core::cameras::Camera;
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::lights::{Light, SpotLight};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -34,42 +34,45 @@ use kansei_wasm::{flag, param, param_or, Canvas};
 const WATER_LAYER: u32 = 2;
 const LAKE_LEVEL: f32 = 0.0;
 
-/// Diffuse surface under the dusk sky (a hemispherical sky term, cd/m²), optionally instanced
-/// (vec4 per instance: xyz offset, w height scale), plus an emissive term for lit windows.
-const SURFACE_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32>, emissive: vec4<f32> };
-@group(0) @binding(0) var<uniform> surface: Surface;
+/// The dusk sky's radiance from straight up and the ground's bounce from straight down (cd/m²):
+/// 40 cd/m² from above and the west, a dark ground.
+const SKY_UP: [f32; 3] = [22.0, 26.0, 36.0];
+const SKY_DOWN: [f32; 3] = [0.4, 0.45, 0.5];
+
+/// The cottage: diffuse under the dusk sky (the hemisphere of the stock material), and its
+/// windows, a band of emission around the box's middle (|local y| < emissive.w).
+/// Prefixed with GBUFFER_OUT_WGSL.
+const COTTAGE_WGSL: &str = r#"
+struct Cottage { base_color: vec4<f32>, emissive: vec4<f32>, sky_up: vec4<f32>, sky_down: vec4<f32> };
+@group(0) @binding(0) var<uniform> cottage: Cottage;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
 
-struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>, INSTANCE_INPUT };
 struct VOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) local_y: f32 };
 
 @vertex
-fn vertex_main(v: VIn) -> VOut {
-    var local = v.position.xyz;
-    var offset = vec3<f32>(0.0);
-    INSTANCE_OFFSET
+fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
     var out: VOut;
-    out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(local + offset, 1.0);
-    out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
-    out.local_y = v.position.y;
+    out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(position.xyz, 1.0);
+    out.normal = (normal_matrix * vec4<f32>(normal, 0.0)).xyz;
+    out.local_y = position.y;
     return out;
 }
 
 @fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
-    // dusk: 40 cd/m² sky from above and the west, dark ground bounce
-    let sky = mix(vec3<f32>(0.4, 0.45, 0.5), vec3<f32>(22.0, 26.0, 36.0), saturate(n.y * 0.5 + 0.5));
-    let window = select(0.0, 1.0, surface.emissive.w > 0.0 && abs(in.local_y) < surface.emissive.w);
-    return vec4<f32>(surface.base_color.rgb * sky + surface.emissive.rgb * window, 1.0);
+    let sky = mix(cottage.sky_down.rgb, cottage.sky_up.rgb, n.y * 0.5 + 0.5);
+    let window = select(0.0, 1.0, abs(in.local_y) < cottage.emissive.w);
+    let emissive = cottage.emissive.rgb * window;
+    return kansei_gbuffer_out(cottage.base_color.rgb * sky + emissive, emissive, n, cottage.base_color.rgb);
 }
 "#;
 
 /// Dusk sky dome: horizon glow toward the (set) sun in the north-west, deep blue overhead.
+/// Prefixed with GBUFFER_OUT_WGSL.
 const SKY_WGSL: &str = r#"
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
@@ -83,18 +86,19 @@ fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>,
     return out;
 }
 @fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let d = normalize(in.dir);
     let up = saturate(d.y);
     let glow = pow(saturate(dot(d, normalize(vec3<f32>(-0.6, 0.0, -0.8))) * 0.5 + 0.5), 6.0);
     let horizon = mix(vec3<f32>(60.0, 62.0, 70.0), vec3<f32>(240.0, 150.0, 90.0), glow);
     let zenith = vec3<f32>(18.0, 28.0, 55.0);
-    return vec4<f32>(mix(horizon, zenith, pow(up, 0.45)), 1.0);
+    return kansei_gbuffer_out(mix(horizon, zenith, pow(up, 0.45)), vec3<f32>(0.0), -d, vec3<f32>(0.0));
 }
 "#;
 
 /// The lake: Fresnel mix of a dark body colour and the planar reflection, displaced by wind
-/// ripples and fogged over the reflected path.
+/// ripples and fogged over the reflected path. Prefixed with PLANAR_REFLECTION_WGSL and
+/// GBUFFER_OUT_WGSL.
 const WATER_WGSL: &str = r#"
 struct Water { params: vec4<f32>, fog: vec4<f32>, body: vec4<f32> };  // params: time, ripples, roughness, -
 @group(0) @binding(0) var<uniform> water: Water;
@@ -129,7 +133,7 @@ fn ripple_slope(p: vec2<f32>, t: f32) -> vec2<f32> {
 }
 
 @fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let up = vec3<f32>(0.0, 1.0, 0.0);
     let slope = ripple_slope(in.world.xz, water.params.x) * water.params.y;
     let n = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
@@ -147,20 +151,29 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
     let reflected = r.rgb * t + water.fog.rgb * (1.0 - t);
 
     let fresnel = 0.02 + 0.98 * pow(1.0 - saturate(dot(n, v)), 5.0);
-    return vec4<f32>(mix(water.body.rgb, reflected, fresnel), 1.0);
+    return kansei_gbuffer_out(mix(water.body.rgb, reflected, fresnel), vec3<f32>(0.0), n, vec3<f32>(0.0));
 }
 "#;
 
-fn surface_material(label: &str, base: [f32; 3], emissive: [f32; 3], window_band: f32, instanced: bool) -> Material {
-    let shader = if instanced {
-        SURFACE_WGSL
-            .replace("INSTANCE_INPUT", "@location(3) instance: vec4<f32>,")
-            .replace("INSTANCE_OFFSET", "local.y *= v.instance.w; offset = v.instance.xyz;")
-    } else {
-        SURFACE_WGSL.replace("INSTANCE_INPUT", "").replace("INSTANCE_OFFSET", "")
-    };
-    let data: [f32; 8] = [base[0], base[1], base[2], 1.0, emissive[0], emissive[1], emissive[2], window_band];
-    let mut m = Material::new(label, &shader, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)], MaterialOptions::default());
+/// A diffuse surface under the dusk sky (the stock standard material), instanced for the
+/// treeline (vec4 per instance: xyz offset, w height scale).
+fn surface_material(label: &str, base: [f32; 3], instanced: bool) -> Material {
+    Material::standard_lit(label, &StandardLitOptions {
+        base_color: base,
+        roughness: 0.9,
+        sky_up: SKY_UP,
+        sky_down: SKY_DOWN,
+        instancing: instanced.then_some(StandardInstancing::OffsetHeight),
+        ..Default::default()
+    })
+}
+
+/// The cottage, with windows glowing at `window` (cd/m²) where |local y| < `band`.
+fn cottage_material(label: &str, base: [f32; 3], window: [f32; 3], band: f32) -> Material {
+    let (u, d) = (SKY_UP, SKY_DOWN);
+    let data: [f32; 16] = [base[0], base[1], base[2], 1.0, window[0], window[1], window[2], band, u[0], u[1], u[2], 0.0, d[0], d[1], d[2], 0.0];
+    let options = MaterialOptions { mrt_output_count: Some(4), ..Default::default() };
+    let mut m = Material::new(label, &format!("{GBUFFER_OUT_WGSL}\n{COTTAGE_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], options);
     m.set_uniform_bindable(0, label, &data);
     m
 }
@@ -195,12 +208,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let mut scene = Scene::new();
     // (a pipeline layout's group 0 needs a bind group, so the sky gets an unused uniform)
-    let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
+    let sky_options = MaterialOptions { cull_mode: CullMode::None, mrt_output_count: Some(4), ..Default::default() };
+    let mut sky = Material::new("Sky", &format!("{GBUFFER_OUT_WGSL}\n{SKY_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], sky_options);
     sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
-    scene.add(SceneNode::Renderable(Renderable::new(SphereGeometry::new(900.0, 48, 24), sky)));
+    let mut sky = Renderable::new(SphereGeometry::new(900.0, 48, 24), sky);
+    sky.cast_shadow = false;
+    scene.add(SceneNode::Renderable(sky));
 
     // far shore: a bank rising out of the lake 120-400 m away, with a treeline on it
-    let mut bank = Renderable::new(BoxGeometry::new(1600.0, 6.0, 300.0), surface_material("Bank", [0.05, 0.06, 0.04], [0.0; 3], 0.0, false));
+    let mut bank = Renderable::new(BoxGeometry::new(1600.0, 6.0, 300.0), surface_material("Bank", [0.05, 0.06, 0.04], false));
     bank.object.set_position(0.0, 1.0, -270.0);
     scene.add(SceneNode::Renderable(bank));
     let mut trees: Vec<f32> = Vec::new();
@@ -223,21 +239,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // spruce-like silhouettes: narrow tall boxes (a stand-in; the app has real trees), culled on
     // the GPU for the camera and, separately, for the mirrored view
     let treeline = InstancedGeometry::new(BoxGeometry::new(2.6, 1.0, 2.6), count, vec![instances]);
-    let mut treeline = Renderable::new(treeline, surface_material("Trees", [0.03, 0.04, 0.03], [0.0; 3], 0.0, true));
+    let mut treeline = Renderable::new(treeline, surface_material("Trees", [0.03, 0.04, 0.03], true));
     let occlusion = flag("occlusion", false);
     treeline.instance_culling = Some(InstanceCulling::new(all_trees, count, 16, 0, 0.6).with_radius_scale(12).with_occlusion(occlusion));
     scene.add(SceneNode::Renderable(treeline));
 
     // the red cottage on the shore, windows glowing at 160 cd/m² (the intro's window_glow)
-    let mut cottage = Renderable::new(BoxGeometry::new(9.0, 5.0, 6.0), surface_material("Cottage", [0.35, 0.05, 0.03], [160.0, 110.0, 60.0], 0.6, false));
+    let mut cottage = Renderable::new(BoxGeometry::new(9.0, 5.0, 6.0), cottage_material("Cottage", [0.35, 0.05, 0.03], [160.0, 110.0, 60.0], 0.6));
     cottage.object.set_position(-18.0, 6.5, -128.0);
     scene.add(SceneNode::Renderable(cottage));
-    let mut roof = Renderable::new(BoxGeometry::new(9.6, 1.2, 6.6), surface_material("Roof", [0.04, 0.04, 0.04], [0.0; 3], 0.0, false));
+    let mut roof = Renderable::new(BoxGeometry::new(9.6, 1.2, 6.6), surface_material("Roof", [0.04, 0.04, 0.04], false));
     roof.object.set_position(-18.0, 9.6, -128.0);
     scene.add(SceneNode::Renderable(roof));
 
     // near shore under the camera, so the lake has an edge
-    let mut near_bank = Renderable::new(BoxGeometry::new(1600.0, 4.0, 60.0), surface_material("NearBank", [0.04, 0.05, 0.03], [0.0; 3], 0.0, false));
+    let mut near_bank = Renderable::new(BoxGeometry::new(1600.0, 4.0, 60.0), surface_material("NearBank", [0.04, 0.05, 0.03], false));
     near_bank.object.set_position(0.0, -1.2, 44.0);
     scene.add(SceneNode::Renderable(near_bank));
 
@@ -268,13 +284,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut water_params: [f32; 12] = [0.0, ripples, roughness, 0.0, 45.0, 48.0, 58.0, water_fog, 0.2, 0.3, 0.3, 1.0];
     let mut water_material = Material::new(
         "Water",
-        &format!("{PLANAR_REFLECTION_WGSL}\n{WATER_WGSL}"),
+        &format!("{PLANAR_REFLECTION_WGSL}\n{GBUFFER_OUT_WGSL}\n{WATER_WGSL}"),
         vec![
             Binding::uniform(0, ShaderStages::FRAGMENT),
             Binding::texture_2d(1, ShaderStages::FRAGMENT),
             Binding::sampler(2, ShaderStages::FRAGMENT),
         ],
-        MaterialOptions { cull_mode: CullMode::None, ..Default::default() },
+        MaterialOptions { cull_mode: CullMode::None, mrt_output_count: Some(4), ..Default::default() },
     );
     water_material.set_uniform_bindable(0, "Water", &water_params);
     water_material.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));

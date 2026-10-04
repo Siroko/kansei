@@ -1,7 +1,8 @@
 //! Spot lights: a car with the Midsommar intro's headlights (22 000 cd, 10°/30° cones, 70 m)
 //! shines into an instanced forest at night. The trunks shadow the beams on the ground and in
-//! the volumetric fog (spot shadow atlas + cone injection); surfaces use a GGX material that
-//! includes `lights::SPOT_LIGHTS_WGSL`. Exposure is the intro's EV100 3.9, through ToneMapEffect.
+//! the volumetric fog (spot shadow atlas + cone injection); surfaces use the stock GGX material
+//! (`Material::standard_lit`), lit by the scene's spot lights and their shadows.
+//! Exposure is the intro's EV100 3.9, through ToneMapEffect.
 //!
 //! URL parameters: `cam=front|behind|top|wall`, `cull=main` (CPU-cull the trunks to the camera
 //! only, the bug GPU per-view culling avoids), `drive=1`, `t=<seconds>` (freeze), `shadows=0`,
@@ -18,8 +19,8 @@ use kansei_core::cameras::Camera;
 use kansei_core::culling::{frustum_planes, InstanceCulling};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry};
-use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{Light, SpotLight};
+use kansei_core::materials::{Material, StandardInstancing, StandardLitOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -29,95 +30,18 @@ use kansei_core::postprocessing::{
 use kansei_core::renderers::RendererConfig;
 use kansei_wasm::{flag, param, param_or, Canvas};
 
-/// GGX surface lit by the spot lights plus a dim hemispherical night sky. `INSTANCE_INPUT` and
-/// `INSTANCE_OFFSET` are replaced for the instanced variant (a vec4 per trunk: xyz offset, w
-/// height scale).
-const LIT_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32>, params: vec4<f32> };   // params: roughness, metallic
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-
-struct VIn {
-    @location(0) position: vec4<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-    INSTANCE_INPUT
-};
-struct VOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) world: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-};
-
-@vertex
-fn vertex_main(v: VIn) -> VOut {
-    var local = v.position.xyz;
-    var offset = vec3<f32>(0.0);
-    INSTANCE_OFFSET
-    let world = world_matrix * vec4<f32>(local + offset, 1.0);
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world;
-    out.world = world.xyz;
-    out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
-    return out;
-}
-
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
-    let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
-    let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
-    let v = normalize(camera_pos - in.world);
-    let base = surface.base_color.rgb;
-    // night sky 0.25 cd/m² above, the ground bouncing a tenth of it
-    let sky = mix(vec3<f32>(0.02, 0.025, 0.03), vec3<f32>(0.15, 0.2, 0.3), n.y * 0.5 + 0.5);
-    let spots = kansei_spot_lights_radiance(in.world, n, v, base, surface.params.x, surface.params.y, in.clip.xy);
-    return vec4<f32>(base * sky + spots, 1.0);
-}
-"#;
-
-/// Unlit radiance (cd/m²), for the headlight lenses.
-const EMISSIVE_WGSL: &str = r#"
-@group(0) @binding(0) var<uniform> radiance: vec4<f32>;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> @builtin(position) vec4<f32> {
-    return projection_matrix * view_matrix * world_matrix * position;
-}
-@fragment
-fn fragment_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(radiance.rgb, 1.0);
-}
-"#;
-
+/// GGX surface lit by the spot lights plus a dim hemispherical night sky (0.25 cd/m² above, the
+/// ground bouncing a tenth of it): the stock standard material, instanced for the trunks (a vec4
+/// per trunk: xyz offset, w height scale).
 fn lit_material(label: &str, base_color: [f32; 3], roughness: f32, instanced: bool) -> Material {
-    let shader = if instanced {
-        LIT_WGSL
-            .replace("INSTANCE_INPUT", "@location(3) instance: vec4<f32>,")
-            .replace("INSTANCE_OFFSET", "local.y *= v.instance.w; offset = v.instance.xyz;")
-    } else {
-        LIT_WGSL.replace("INSTANCE_INPUT", "").replace("INSTANCE_OFFSET", "")
-    };
-    let data: [f32; 8] = [base_color[0], base_color[1], base_color[2], 1.0, roughness, 0.0, 0.0, 0.0];
-    let mut material = Material::new(
-        label,
-        &format!("{SPOT_LIGHTS_WGSL}\n{shader}"),
-        vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
-        MaterialOptions::default(),
-    );
-    material.set_uniform_bindable(0, label, &data);
-    material
-}
-
-fn emissive_material(label: &str, radiance: [f32; 3]) -> Material {
-    let mut material = Material::new(label, EMISSIVE_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
-    material.set_uniform_bindable(0, label, &[radiance[0], radiance[1], radiance[2], 0.0f32]);
-    material
+    Material::standard_lit(label, &StandardLitOptions {
+        base_color,
+        roughness,
+        sky_up: [0.15, 0.2, 0.3],
+        sky_down: [0.02, 0.025, 0.03],
+        instancing: instanced.then_some(StandardInstancing::OffsetHeight),
+        ..Default::default()
+    })
 }
 
 /// Deterministic 0..1 hash.
@@ -225,7 +149,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut lenses = [0; 2];
     let mut lights = [0; 2];
     for k in 0..2 {
-        let mut lens = Renderable::new(BoxGeometry::new(0.3, 0.15, 0.04), emissive_material("Lens", [4000.0, 3800.0, 3400.0]));
+        let mut lens = Renderable::new(BoxGeometry::new(0.3, 0.15, 0.04), Material::emissive("Lens", [4000.0, 3800.0, 3400.0]));
         lens.cast_shadow = false;
         lenses[k] = scene.add(SceneNode::Renderable(lens));
         let mut beam = SpotLight::new(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0), Vec3::new(1.0, 0.95, 0.85), 22000.0, 70.0, 10f32.to_radians(), 30f32.to_radians());
