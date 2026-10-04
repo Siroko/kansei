@@ -78,6 +78,9 @@ pub struct SceneVoxelClipmap {
     /// The level the round of `levels_per_frame` lights next.
     next_level: u32,
     frame: u64,
+    /// Per scene index, a geometry's local bounds and the vertex and index counts they were
+    /// taken at (`local_bounds`).
+    bounds: std::collections::HashMap<usize, (u32, u32, Vec3, Vec3)>,
 }
 
 impl SceneVoxelClipmap {
@@ -104,7 +107,24 @@ impl SceneVoxelClipmap {
             jobs: Vec::new(),
             next_level: 1,
             frame: 0,
+            bounds: std::collections::HashMap::new(),
         }
+    }
+
+    /// The local bounds of the geometry of scene renderable `index`, if it can be culled against
+    /// a region on the CPU: one mesh (no instances, nothing drawn indirectly) whose vertices are
+    /// on the CPU. Cached until its vertex or index count changes.
+    pub(crate) fn local_bounds(&mut self, index: usize, geometry: &crate::geometries::Geometry) -> Option<(Vec3, Vec3)> {
+        if !geometry.instance_buffers.is_empty() || geometry.instance_count > 1 || geometry.is_indirect() || geometry.vertices.is_empty() {
+            return None;
+        }
+        let counts = (geometry.vertex_count(), geometry.index_count());
+        let entry = self.bounds.entry(index).or_insert((u32::MAX, 0, Vec3::ZERO, Vec3::ZERO));
+        if (entry.0, entry.1) != counts {
+            let (lo, hi) = geometry.bounds();
+            *entry = (counts.0, counts.1, lo, hi);
+        }
+        Some((entry.2, entry.3))
     }
 
     pub fn options(&self) -> &SceneVoxelClipmapOptions {

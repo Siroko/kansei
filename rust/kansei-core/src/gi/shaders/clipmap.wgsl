@@ -76,10 +76,10 @@ const CLIP_LIFT : f32 = 1.5;
 // level whose voxels are as wide as the cone there (at least `minDiameter`: its first footprint),
 // or the next coarser one that holds the point, blended toward the level above by the fraction
 // of the width, and advances half the width. With a surface normal `n` (zero for none), each
-// sample is lifted off the surface until its footprint clears it (voxelSurfaceConeTrace).
-// Past the coarsest level's voxel the cone goes on as a cylinder. It stops where it leaves the
-// coarsest level. Returns the scene radiance gathered (rgb) and the transmittance left (a): add
-// `a * sky` for the light from past the clipmap.
+// sample is lifted off the surface until the voxels it reads clear it (voxelSurfaceConeTrace).
+// Wider than the coarsest level's voxels, the cone reads that level over the longer steps. It
+// stops where it leaves the coarsest level. Returns the scene radiance gathered (rgb) and the
+// transmittance left (a): add `a * sky` for the light from past the clipmap.
 fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32) -> vec4f {
     var color = vec3f(0.0);
     var transmittance = 1.0;
@@ -89,8 +89,9 @@ fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter:
     var previous = origin;
     for (var i = 0u; i < maxSteps; i++) {
         if (dist >= maxDist || transmittance < 0.01) { break; }
-        let diameter = clamp(2.0 * tanHalf * dist, minDiameter, max(coarsest, minDiameter));
-        let p = origin + dir * dist + n * max(CLIP_LIFT * diameter - dist * rise, 0.0);
+        let diameter = max(2.0 * tanHalf * dist, minDiameter);
+        // the lift clears the voxels read, no wider than the coarsest level's
+        let p = origin + dir * dist + n * max(CLIP_LIFT * min(diameter, max(coarsest, minDiameter)) - dist * rise, 0.0);
         let lod = max(log2(diameter / clipmap.voxelSize), 0.0);
         let k = clipLevelAt(p, min(u32(lod), clipmap.levelCount - 1u), 0.5);
         if (k >= clipmap.levelCount) { break; }

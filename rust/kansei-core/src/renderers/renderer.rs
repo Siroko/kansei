@@ -1716,6 +1716,16 @@ impl Renderer {
             key.extend([r.geometry.index_count(), r.geometry.instance_count]);
         }
         let surfaces: Vec<_> = draws.iter().map(|d| d.1.gi.unwrap()).collect();
+        // each mesh's world box, to skip the regions it can't reach (instanced ones: none)
+        let bounds: Vec<Option<(glam::Vec3, glam::Vec3)>> = draws
+            .iter()
+            .map(|(idx, r, _)| {
+                let (lo, hi) = gi.local_bounds(*idx, &r.geometry)?;
+                let world = r.world_matrix.to_glam();
+                let corners = (0..8).map(|k| world.transform_point3(glam::Vec3::new([lo.x, hi.x][k & 1], [lo.y, hi.y][(k >> 1) & 1], [lo.z, hi.z][(k >> 2) & 1])));
+                Some(corners.fold((glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p))))
+            })
+            .collect();
         let voxelizer = gi.voxelizer_mut();
         voxelizer.write_draws(queue, &surfaces);
         let static_changed = voxelizer.static_changed(key);
@@ -1726,12 +1736,15 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/VoxelClipmap") });
         // the static renderables into this frame's regions, each cleared first
         let voxelizer = gi.voxelizer();
-        for slot in 0..gi.jobs().len() {
+        let layout = *gi.clipmap().layout();
+        for (slot, job) in gi.jobs().iter().enumerate() {
             voxelizer.encode_clear(&mut encoder, slot, gi.clipmap());
             let Some(groups) = voxelizer.groups(crate::gi::ClipSurfaces::Static, slot) else { continue };
+            let region = job.region.bounds(&layout);
+            let reach = layout.level_voxel_size(job.region.level);
             for (axis, group) in groups.iter().enumerate() {
                 let mut pass = voxelizer.begin_pass(&mut encoder, crate::gi::ClipSurfaces::Static, slot, axis);
-                draw_clipmap_voxels(&mut pass, &draws, group, false, voxelizer, mesh_bg, alignment);
+                draw_clipmap_voxels(&mut pass, &draws, &bounds, (region, reach), group, false, voxelizer, mesh_bg, alignment);
             }
         }
         // the windows move with the regions done
@@ -1743,9 +1756,11 @@ impl Renderer {
             voxelizer.clear_dynamic(&mut encoder);
             for level in 0..voxelizer.dynamic_levels() as usize {
                 let Some(groups) = voxelizer.groups(crate::gi::ClipSurfaces::Dynamic, level) else { continue };
+                let Some(window) = gi.clipmap().level_bounds(level as u32) else { continue };
+                let reach = gi.clipmap().layout().level_voxel_size(level as u32);
                 for (axis, group) in groups.iter().enumerate() {
                     let mut pass = voxelizer.begin_pass(&mut encoder, crate::gi::ClipSurfaces::Dynamic, level, axis);
-                    draw_clipmap_voxels(&mut pass, &draws, group, true, voxelizer, mesh_bg, alignment);
+                    draw_clipmap_voxels(&mut pass, &draws, &bounds, (window, reach), group, true, voxelizer, mesh_bg, alignment);
                 }
             }
         }
@@ -3486,11 +3501,32 @@ fn spot_view(layer: u32) -> usize {
 /// dynamic offsets). Slots follow the scene index, not the draw order, so a renderable keeps its
 /// slot, and a recorded render bundle its data, whatever else is shown or hidden.
 /// Draw the `dynamic` (or static) renderables of `draws` (scene index, renderable, voxel
-/// pipeline) into a clipmap voxelization pass, with `group` as group 3.
-fn draw_clipmap_voxels<'a>(pass: &mut wgpu::RenderPass<'a>, draws: &[(usize, &'a crate::objects::Renderable, &'a wgpu::RenderPipeline)], group: &wgpu::BindGroup, dynamic: bool, voxelizer: &crate::gi::ClipmapVoxelizer, mesh_bg: &wgpu::BindGroup, alignment: u32) {
+/// pipeline) into a clipmap voxelization pass over the world box `region.0`, with `group` as
+/// group 3. A mesh whose world box (`bounds`, None: unknown) misses the region by more than
+/// `region.1` metres and 2 % of its own size is skipped.
+#[allow(clippy::too_many_arguments)]
+fn draw_clipmap_voxels<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    draws: &[(usize, &'a crate::objects::Renderable, &'a wgpu::RenderPipeline)],
+    bounds: &[Option<(glam::Vec3, glam::Vec3)>],
+    region: ((glam::Vec3, glam::Vec3), f32),
+    group: &wgpu::BindGroup,
+    dynamic: bool,
+    voxelizer: &crate::gi::ClipmapVoxelizer,
+    mesh_bg: &wgpu::BindGroup,
+    alignment: u32,
+) {
+    let ((region_lo, region_hi), reach) = region;
     for (k, (idx, r, pipeline)) in draws.iter().enumerate() {
         if r.dynamic != dynamic {
             continue;
+        }
+        if let Some((lo, hi)) = bounds[k] {
+            // (a material may sway or bend its vertices a little past the mesh's bounds)
+            let margin = glam::Vec3::splat(reach + 0.02 * (hi - lo).length());
+            if (lo - margin).cmpgt(region_hi).any() || (hi + margin).cmplt(region_lo).any() {
+                continue;
+            }
         }
         pass.set_pipeline(pipeline);
         if let Some(bg) = r.material.bind_group() {
