@@ -24,6 +24,7 @@ const TONEMAP_AGX            : u32 = 2u;
 const TONEMAP_AGX_PUNCHY     : u32 = 3u;
 const TONEMAP_KHRONOS_NEUTRAL: u32 = 4u;
 const TONEMAP_UNREAL_FILMIC  : u32 = 5u;
+const TONEMAP_EXPONENTIAL    : u32 = 6u;
 
 const FLAG_ENCODE_SRGB : u32 = 1u;
 const FLAG_DITHER      : u32 = 2u;
@@ -232,6 +233,7 @@ fn toneCurve(c: vec3f) -> vec3f {
         case TONEMAP_AGX: { return agx(c, false); }
         case TONEMAP_AGX_PUNCHY: { return agx(c, true); }
         case TONEMAP_KHRONOS_NEUTRAL: { return khronosNeutral(c); }
+        case TONEMAP_EXPONENTIAL: { return 1.0 - exp(-c); }
         default: { return saturate(c); }
     }
 }

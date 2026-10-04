@@ -53,6 +53,9 @@ pub enum ToneMapper {
     /// AP1 luma and its shadow, midtone and highlight weights), blue correction, `FilmToneMap`
     /// with `ToneMapOptions::unreal_film`'s curve, and back to sRGB. For scenes matched to Unreal.
     UnrealFilmic,
+    /// `1 - exp(-x)`: a plain exponential shoulder, for scenes tuned to it in their own shaders
+    /// (`voxel-gi-particles` tone maps that way when it renders straight to the screen).
+    Exponential,
 }
 
 impl ToneMapper {
@@ -64,6 +67,7 @@ impl ToneMapper {
             ToneMapper::AgXPunchy => 3,
             ToneMapper::KhronosNeutral => 4,
             ToneMapper::UnrealFilmic => 5,
+            ToneMapper::Exponential => 6,
         }
     }
 }

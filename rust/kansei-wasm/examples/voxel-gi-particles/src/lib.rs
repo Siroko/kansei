@@ -20,6 +20,14 @@
 //! 24 MiB), `particles=N` (default 12288 in the lightbox, 8192 ray traced, 32768 in the Cornell
 //! room, half on phones), `stats=1` (log the frame interval), `profile=1` (time each pass:
 //! `profile_report`, with `set_layers` to time the walls, particles and reflection apart).
+//!
+//! Depth of field (`dof=1`, off by default): the engine's `CinematicDepthOfFieldEffect`. With it
+//! on, the materials write HDR light instead of tone mapping it themselves, and a
+//! `PostProcessingVolume` runs the DoF and then the same `1 - exp(-x)` curve
+//! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA.
+//! `focus=` sets the focus distance in metres (default: where the view axis enters the fluid's box,
+//! the front of the particle cloud, so panning refocuses) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
+//! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
 use std::cell::RefCell;
@@ -36,6 +44,8 @@ use kansei_core::materials::{Binding, BindingResource, Compute, CullMode, Materi
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FixedStep;
+use kansei_core::postprocessing::effects::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, ToneMapEffect, ToneMapOptions, ToneMapper};
+use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, is_phone, now, param, param_or, Canvas, Frame};
 use kansei_core::simulations::fluid::{fill_box, FluidSimulation, FluidSimulationOptions};
@@ -122,7 +132,8 @@ struct SceneParams {
     rt_bounces: f32,
     mirror_share: f32,
     glass_share: f32,
-    _pad1: f32,
+    /// 1: write exposed HDR light, the depth of field's volume tone mapping it after.
+    hdr: f32,
 }
 
 const SCENE_WGSL: &str = r#"
@@ -153,14 +164,17 @@ struct SceneParams {
     rtBounces      : f32,
     mirrorShare    : f32,
     glassShare     : f32,
-    _pad1          : f32,
+    hdr            : f32,    // 1: exposed HDR out, tone mapped after the depth of field
 }
 
 const PI: f32 = 3.14159265;
 
 fn tonemap(s: SceneParams, c: vec3f) -> vec3f {
     let k = select(1.0, 2.0, s.view > 0.5);
-    return 1.0 - exp(-c * s.exposure * k);
+    let exposed = c * s.exposure * k;
+    // with depth of field the volume applies the same curve (ToneMapper::Exponential) after it
+    if (s.hdr > 0.5) { return exposed; }
+    return 1.0 - exp(-exposed);
 }
 "#;
 
@@ -511,6 +525,41 @@ struct State {
     stats: Option<(f64, u32)>,
     frame_ms: f64,
     paused: bool,
+    dof: Dof,
+    /// The depth of field's chain, made the first time it is turned on.
+    volume: Option<PostProcessingVolume>,
+    /// The background as the direct path shows it (display values).
+    clear_color: Vec4,
+}
+
+/// The depth of field's settings.
+#[derive(Clone, Copy)]
+struct Dof {
+    on: bool,
+    /// Focus distance, metres; None focuses on the orbit target.
+    focus: Option<f32>,
+    f_stop: f32,
+}
+
+const DOF_F_STOP: f32 = 1.0;
+/// The lens sees the room as a model this many times smaller: its filmback is this many times
+/// Unreal's 23.76 mm, which blurs as a 23.76 mm one would on the scene scaled down (the field of
+/// view, and so the picture, stay the camera's).
+const DOF_MODEL_SCALE: f32 = 100.0;
+
+/// The depth of field and then the materials' own curve: the materials write HDR light with their
+/// exposure applied (`SceneParams::hdr`), and the curve's output is the value they would have
+/// written to the screen (so no sRGB encoding on top).
+fn dof_effects(dof: Dof, focus: f32) -> Vec<Box<dyn PostProcessingEffect>> {
+    vec![
+        Box::new(CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+            lens: CameraLens { f_stop: dof.f_stop, focus_distance_m: focus, sensor_width_mm: 23.76 * DOF_MODEL_SCALE, ..Default::default() },
+            // no TAA here to average a rotating pattern
+            temporal_noise: false,
+            ..Default::default()
+        })),
+        Box::new(ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::Exponential, encode_srgb: false, ..Default::default() })),
+    ]
 }
 
 impl State {
@@ -541,6 +590,7 @@ impl State {
         }
 
         // the GI: the volume and the particles' light (or, off, the sky alone)
+        self.scene_params.hdr = self.dof.on as u32 as f32;
         self.scene_params.gi_on = if self.gi.settings.cones.use_volume { 1.0 } else { 0.0 };
         self.renderer.queue().write_buffer(&self.scene_buffer, 0, bytemuck::bytes_of(&self.scene_params));
         let mut encoder = self.renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("VoxelGIParticles/GI") });
@@ -551,7 +601,22 @@ impl State {
         }
         self.renderer.submit(std::iter::once(encoder.finish()));
 
-        self.renderer.render(&mut self.scene, &mut self.camera);
+        if self.dof.on {
+            let focus = self.focus_distance();
+            let volume = self.volume.get_or_insert_with(|| PostProcessingVolume::new(&self.renderer, dof_effects(self.dof, focus)));
+            if let Some(effect) = volume.effect_mut::<CinematicDepthOfFieldEffect>() {
+                effect.lens.focus_distance_m = focus;
+                effect.lens.f_stop = self.dof.f_stop;
+            }
+            // the background in HDR terms: what the curve maps back to the direct path's
+            let c = self.clear_color;
+            let hdr = |v: f32| -(1.0 - v.min(0.999)).ln();
+            self.renderer.config.clear_color = Vec4::new(hdr(c.x), hdr(c.y), hdr(c.z), c.w);
+            self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, volume);
+        } else {
+            self.renderer.config.clear_color = self.clear_color;
+            self.renderer.render(&mut self.scene, &mut self.camera);
+        }
 
         if let Some((start, frames)) = &mut self.stats {
             *frames += 1;
@@ -561,6 +626,22 @@ impl State {
                 *frames = 0;
             }
         }
+    }
+
+    /// The depth of field's focus distance: the set one, or where the view axis (toward the orbit
+    /// target) enters the fluid's box, the front of the particle cloud; the target's distance if
+    /// the axis misses the box or starts inside it.
+    fn focus_distance(&self) -> f32 {
+        self.dof.focus.unwrap_or_else(|| {
+            let eye = glam::Vec3::from(self.camera.object.position);
+            let to_target = glam::Vec3::from(self.controls.look_target()) - eye;
+            let axis = to_target.normalize_or_zero();
+            let (lo, hi) = self.look.fluid();
+            let (t0, t1) = (glam::Vec3::from(lo) - eye, glam::Vec3::from(hi) - eye);
+            let inv = axis.recip();
+            let (near, far) = ((t0 * inv).min(t1 * inv).max_element(), (t0 * inv).max(t1 * inv).min_element());
+            if near > 0.0 && near <= far { near } else { to_target.length() }.max(0.1)
+        })
     }
 
     fn set_particle_size(&mut self, size: f32) {
@@ -698,7 +779,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         rt_bounces: 2.0,
         mirror_share: 0.3,
         glass_share: 0.35,
-        _pad1: 0.0,
+        hdr: 0.0,
     };
     if lightbox {
         // the panel above: no sun, the walls lit through their emission (apply_panel), the
@@ -904,6 +985,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         stats,
         frame_ms: 16.7,
         paused: false,
+        dof: Dof {
+            on: flag("dof", false),
+            focus: param("focus").and_then(|v| v.parse::<f32>().ok()).filter(|&f| f > 0.0),
+            f_stop: param_or("fstop", DOF_F_STOP).max(0.1),
+        },
+        volume: None,
+        clear_color,
     };
     state.apply_panel();
     let state = Rc::new(RefCell::new(state));
@@ -921,7 +1009,7 @@ pub fn info() -> String {
     with_state(|s| {
         let layout = s.gi.volume().layout();
         out = format!(
-            r#"{{"scene":"{}","rt":{},"quality":"{}","dims":[{},{},{}],"voxel_m":{:.3},"mib":{:.2},"particles":{},"gi":{},"frame_ms":{:.2}}}"#,
+            r#"{{"scene":"{}","rt":{},"quality":"{}","dims":[{},{},{}],"voxel_m":{:.3},"mib":{:.2},"particles":{},"gi":{},"frame_ms":{:.2},"dof":{},"focus":{},"focus_m":{:.2},"fstop":{}}}"#,
             s.look.name(),
             s.scene_params.rt_on > 0.5,
             s.gi.quality().name(),
@@ -932,7 +1020,11 @@ pub fn info() -> String {
             s.gi.volume().memory_bytes() as f64 / (1 << 20) as f64,
             s.sim.particle_count(),
             s.gi.settings.cones.use_volume,
-            s.frame_ms
+            s.frame_ms,
+            s.dof.on,
+            s.dof.focus.map_or("null".into(), |f| f.to_string()),
+            s.focus_distance(),
+            s.dof.f_stop
         );
     });
     out
@@ -1114,6 +1206,24 @@ pub fn set_cone_jitter(voxels: f32) {
 #[wasm_bindgen]
 pub fn set_paused(paused: bool) {
     with_state(|s| s.paused = paused);
+}
+
+/// Depth of field on or off (`dof=1`).
+#[wasm_bindgen]
+pub fn set_dof(on: bool) {
+    with_state(|s| s.dof.on = on);
+}
+
+/// The depth of field's focus distance, metres; 0 or less focuses on the orbit target.
+#[wasm_bindgen]
+pub fn set_dof_focus(metres: f32) {
+    with_state(|s| s.dof.focus = (metres > 0.0).then_some(metres));
+}
+
+/// The depth of field's aperture, an f-number.
+#[wasm_bindgen]
+pub fn set_dof_fstop(f_stop: f32) {
+    with_state(|s| s.dof.f_stop = f_stop.max(0.1));
 }
 
 /// Pour again.
