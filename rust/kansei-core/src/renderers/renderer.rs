@@ -2733,6 +2733,20 @@ impl Renderer {
     }
 
     /// Render scene with post-processing effects.
+    /// Show `input` (an HDR image made without the GBuffer, such as the path tracer's) through
+    /// `volume`'s chain (its `ToneMapEffect`, ...) on the surface. Effects that read the GBuffer
+    /// find it empty.
+    pub(crate) fn present_through(&mut self, input: &wgpu::TextureView, camera: &Camera, volume: &mut crate::postprocessing::PostProcessingVolume) {
+        let (width, height) = (self.config.width, self.config.height);
+        volume.ensure_gbuffer(width, height);
+        let surface = self.surface.as_ref().unwrap();
+        let output = surface.get_current_texture().expect("Surface texture");
+        let canvas_view = output.texture.create_view(&Default::default());
+        volume.render_from(Some(input), camera, &canvas_view, width, height);
+        output.present();
+        crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+    }
+
     pub fn render_with_postprocessing(
         &mut self,
         scene: &mut Scene,

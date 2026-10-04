@@ -33,6 +33,9 @@ pub struct Renderable {
     /// volume: it neither bounces nor blocks light there. A `dynamic` renderable is voxelized every
     /// frame; the others again only when they change (transform, visibility, surface).
     pub gi: Option<crate::gi::GiSurface>,
+    /// How the path tracer (`pathtracer::BVHBuilder::scene_materials`) sees this renderable;
+    /// `None`: `PathTracerMaterial::default()`.
+    pub path_tracer_material: Option<crate::pathtracer::PathTracerMaterial>,
     /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
     pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
@@ -70,6 +73,7 @@ impl Renderable {
             layers: Self::DEFAULT_LAYERS,
             dynamic: false,
             gi: None,
+            path_tracer_material: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }
     }
