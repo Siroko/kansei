@@ -1,4 +1,4 @@
-//! Physical depth of field: a forest-like depth set (trunks from 3 to 120 m, alpha-tested leaf
+//! Physical depth of field: a forest-like depth set (trunks from 6 to 120 m, alpha-tested leaf
 //! cards near and far, strings of small lights behind the subject) under a low sun, seen through
 //! a CameraLens on Unreal's 23.76 mm filmback. The circle of confusion follows from the focal
 //! length, f-stop and focus distance; bokeh keep their energy and the aperture's shape. See
