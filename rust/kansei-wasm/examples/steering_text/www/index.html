@@ -20,47 +20,19 @@
             set_attractor_pos, set_attractor_strength,
             set_repulsion_strength, set_repulsion_radius, set_max_per_cell,
             set_auto_rotate_speed,
-            set_palette,
+            set_palette, set_background,
         } from './pkg/kansei_wasm_steering_text.js';
-        import initArfont, { ArteryFont } from './arfont/artery_font.js';
 
         // Mobile detection — wider camera orbit on touch devices
         const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
             || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
 
-        // Init both WASM modules
-        await Promise.all([initWasm(), initArfont()]);
+        await initWasm();
         await start('kansei');
 
-        // Load font
-        const fontData = await fetch('assets/fonts/L10-medium.arfont').then(r => r.arrayBuffer());
-        const fontInfo = ArteryFont.read_from_bytes(new Uint8Array(fontData));
-
-        // Extract glyph metrics for Rust
-        // image_bounds from arfont are in PIXEL coordinates — normalize to [0..1] UV
-        const atlas = fontInfo.images[0];
-        const aw = atlas.width;
-        const ah = atlas.height;
-        const glyphs = fontInfo.variants[0].glyphs.map(g => ({
-            codepoint: g.codepoint,
-            advance: g.advance.horizontal,
-            image_bounds: [
-                g.image_bounds.left   / aw,
-                g.image_bounds.top    / ah,
-                g.image_bounds.right  / aw,
-                g.image_bounds.bottom / ah,
-            ],
-            plane_bounds: [g.plane_bounds.left, g.plane_bounds.top, g.plane_bounds.right, g.plane_bounds.bottom],
-        }));
-
-        // Get MSDF atlas image as raw RGBA (atlas.data may be a plain Array — ensure Uint8Array)
-        const atlasData = new Uint8ClampedArray(atlas.data);
-
-        // Load words
+        // Load words; Rust loads the font (assets/fonts/L10-medium.arfont)
         const words = await fetch('words.json').then(r => r.text());
-
-        // Pass to Rust
-        init_text(words, JSON.stringify(glyphs), atlasData, atlas.width, atlas.height);
+        await init_text(words);
 
         // ── Tweakpane ──
         const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
@@ -108,6 +80,7 @@
             .on('change', () => set_auto_rotate_speed(vis.autoRotate));
         visual.addBinding(vis, 'bgColor', { color: { type: 'float' }, label: 'background' })
             .on('change', () => {
+                set_background(vis.bgColor.r, vis.bgColor.g, vis.bgColor.b);
                 document.body.style.backgroundColor =
                     `rgb(${Math.round(vis.bgColor.r*255)},${Math.round(vis.bgColor.g*255)},${Math.round(vis.bgColor.b*255)})`;
             });

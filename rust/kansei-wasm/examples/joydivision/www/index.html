@@ -37,30 +37,14 @@
     <div id="audio-status"></div>
     <script type="module">
         import initWasm, { start, init_text, update_fft, set_fft_amplitude, set_noise_scale, set_noise_strength, set_noise_speed, set_noise_zoom, set_noise_mix, set_wave_thickness, set_peak_exponent, set_temporal_blend, set_fft_pow, set_peak_min, set_text_visible, set_text_offset, set_glyph_rot_x } from './pkg/kansei_wasm_joydivision.js';
-        import initArfont, { ArteryFont } from './arfont/artery_font.js';
 
-        await Promise.all([initWasm(), initArfont()]);
+        await initWasm();
         await start('kansei');
 
-        // ── Font ──
-        const fontData = await fetch('assets/fonts/L10-medium.arfont').then(r => r.arrayBuffer());
-        const fontInfo = ArteryFont.read_from_bytes(new Uint8Array(fontData));
-        const atlas = fontInfo.images[0];
-        const aw = atlas.width, ah = atlas.height;
-        const glyphs = fontInfo.variants[0].glyphs.map(g => ({
-            codepoint: g.codepoint,
-            advance: g.advance.horizontal,
-            image_bounds: [g.image_bounds.left/aw, g.image_bounds.top/ah, g.image_bounds.right/aw, g.image_bounds.bottom/ah],
-            plane_bounds: [g.plane_bounds.left, g.plane_bounds.top, g.plane_bounds.right, g.plane_bounds.bottom],
-        }));
-
-        // ── Lyrics ──
+        // ── Lyrics ── (Rust loads the font, assets/fonts/L10-medium.arfont)
         const lyrics = await fetch('lyrics.json').then(r => r.json());
-
-        init_text(
+        await init_text(
             JSON.stringify(lyrics.lines.map(l => l.text)),
-            JSON.stringify(glyphs),
-            new Uint8ClampedArray(atlas.data), aw, ah,
             JSON.stringify(lyrics.lines.map(l => l.time)),
         );
 

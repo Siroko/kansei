@@ -1,4 +1,5 @@
-// Steering: separation + wander + mouse + bounds forces for each vehicle.
+// Steering: separation, cohesion, alignment, attractor, wander, mouse and bounds forces for
+// each vehicle.
 // Dispatched over vehicleCount.
 
 @group(0) @binding(0) var<storage, read_write> positions: array<vec4<f32>>;
@@ -138,13 +139,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     force += wanderDir * params.wanderStrength;
 
-    // ── Mouse force: displacement along mouse direction ──
-    let mouseDir = vec3<f32>(params.mouseDirX, params.mouseDirY, 0.0);
-    let mousePos = vec3<f32>(params.mousePosX, params.mousePosY, 0.0);
-    let toMouse = mousePos - pos;
-    let mouseDist = length(toMouse);
-    if (mouseDist > 0.01 && params.mouseStrength > 0.01) {
+    // ── Mouse force: push along the cursor's motion, strongest on letters near the ray under it ──
+    if (params.mouseStrength > 0.01) {
+        let rayOrigin = vec3<f32>(params.mouseRayOriginX, params.mouseRayOriginY, params.mouseRayOriginZ);
+        let rayDir = vec3<f32>(params.mouseRayDirX, params.mouseRayDirY, params.mouseRayDirZ);
+        let along = max(dot(pos - rayOrigin, rayDir), 0.0);
+        let mouseDist = length(pos - (rayOrigin + rayDir * along));
         let mouseInfluence = exp(-mouseDist * 0.1) * params.mouseStrength;
+        let mouseDir = vec3<f32>(params.mouseDirX, params.mouseDirY, params.mouseDirZ);
         force += mouseDir * mouseInfluence * params.mouseForce;
     }
 

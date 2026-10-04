@@ -1,6 +1,6 @@
 // Repulsion: push ALL particles apart from nearby particles of DIFFERENT words.
 // Uses the same spatial hash as steering. Dispatched over particleCount.
-// Runs after integrate, before verlet, so verlet can re-snap the chain.
+// Runs last, after integrate and verlet, so verlet's snapping doesn't undo the push.
 
 @group(0) @binding(0) var<storage, read_write> positions: array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> params: SimParams;
@@ -20,7 +20,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var pushAccum = vec3<f32>(0.0);
     var pushCount = 0u;
-    // Use a tighter radius for inter-letter repulsion (half of separation radius)
     let repulsionRadius = params.repulsionRadius;
 
     for (var dz = -1; dz <= 1; dz++) {

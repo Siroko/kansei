@@ -23,7 +23,6 @@ struct WaveParams {
 };
 
 @group(0) @binding(0) var<storage, read_write> vertices: array<f32>;
-@group(0) @binding(1) var<storage, read> baseY: array<f32>;
 @group(0) @binding(2) var elevationTex: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> params: WaveParams;
 @group(0) @binding(4) var elevationSampler: sampler;
