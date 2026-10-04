@@ -16,15 +16,14 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 
 # Not published (space-separated example names).
-skip=" "
+#   joydivision: plays a commercial recording the viewer supplies; the page stays local-only.
+skip=" joydivision "
 
 # Files a page never loads, left out of the site.
 #   pathtracer: scene.gltf/scene.bin (24 MB) are an unused scene; the example loads the dragon.
-#   joydivision: lyrics.json plays the .ogg; the .mp3 copies are unused.
 unused_files() {
     case "$1" in
         pathtracer) echo "assets/scene.gltf assets/scene.bin" ;;
-        joydivision) echo "assets/audio/a-means-to-an-end.mp3 assets/audio/a-means-to-an-end-original.mp3 assets/audio/test.mp3" ;;
     esac
 }
 
@@ -66,6 +65,13 @@ done
 
 if find "$out" -name '*.kmm' | grep -q .; then
     echo "error: a motion pack (.kmm) is in $out; packs never ship" >&2
+    exit 1
+fi
+# Music is someone else's recording: the site never hosts audio.
+audio="$(find "$out" -type f \( -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.oga' -o -iname '*.opus' -o -iname '*.wav' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.flac' \))"
+if [[ -n "$audio" ]]; then
+    echo "error: audio files are in $out; the site never ships recordings:" >&2
+    echo "$audio" >&2
     exit 1
 fi
 
