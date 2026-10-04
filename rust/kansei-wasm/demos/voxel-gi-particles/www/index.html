@@ -17,7 +17,7 @@
             set_emissive_share, set_emissive_intensity, set_speed_glow, set_temporal_blend,
             set_particle_size, set_sun, set_exposure, set_panel, set_reflectivity, set_ao,
             set_rt, set_rt_mix, set_rt_bounces, set_paused, reset, profile_report, set_layers,
-            set_dof, set_dof_focus, set_dof_fstop,
+            set_dof, set_dof_focus, set_dof_fstop, set_dof_taa,
         } from '../pkg/kansei_wasm_voxel_gi_particles.js';
         await init();
         await start('kansei');
@@ -55,6 +55,7 @@
             autofocus: state.focus === null,
             focus: state.focus_m,
             fstop: state.fstop,
+            taa: state.taa,
         };
         const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
         const pane = new Pane({ title: 'Voxel GI on particles', expanded: !/Mobi|Android/.test(navigator.userAgent) });
@@ -96,6 +97,7 @@
         });
         const focus = dof.addBinding(p, 'focus', { label: 'focus (m)', min: 5, max: 120, step: 0.1, disabled: p.autofocus })
             .on('change', () => { if (!p.autofocus) set_dof_focus(p.focus); });
+        dof.addBinding(p, 'taa', { label: 'TAA' }).on('change', () => set_dof_taa(p.taa));
         dof.addBinding(p, 'fstop', { label: 'f-stop', min: 0.2, max: 8, step: 0.05 }).on('change', () => set_dof_fstop(p.fstop));
         const look = pane.addFolder({ title: 'Scene', expanded: false });
         look.addBinding(p, 'particleSize', { label: 'particle size', min: 0.1, max: lightbox ? 0.8 : 1.5, step: 0.01 }).on('change', () => set_particle_size(p.particleSize));

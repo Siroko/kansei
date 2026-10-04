@@ -24,7 +24,9 @@
 //! Depth of field (`dof=1`, off by default): the engine's `CinematicDepthOfFieldEffect`. With it
 //! on, the materials write HDR light instead of tone mapping it themselves, and a
 //! `PostProcessingVolume` runs the DoF and then the same `1 - exp(-x)` curve
-//! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA.
+//! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA and
+//! runs `TemporalAAEffect` first instead (`taa=0` turns it off), which also lets the DoF rotate its
+//! sampling pattern. The particles write no motion vectors: the TAA reprojects them by depth.
 //! `focus=` sets the focus distance in metres (default: where the view axis enters the fluid's box,
 //! the front of the particle cloud, so panning refocuses) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
 //! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
@@ -44,7 +46,7 @@ use kansei_core::materials::{Binding, BindingResource, Compute, CullMode, Materi
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FixedStep;
-use kansei_core::postprocessing::effects::{CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, ToneMapEffect, ToneMapOptions, ToneMapper};
+use kansei_core::postprocessing::effects::{TemporalAAEffect, TemporalAAOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, ToneMapEffect, ToneMapOptions, ToneMapper};
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, is_phone, now, param, param_or, Canvas, Frame};
@@ -539,6 +541,8 @@ struct Dof {
     /// Focus distance, metres; None focuses on the orbit target.
     focus: Option<f32>,
     f_stop: f32,
+    /// Temporal anti-aliasing ahead of the lens (`taa=0` turns it off).
+    taa: bool,
 }
 
 const DOF_F_STOP: f32 = 1.0;
@@ -547,19 +551,22 @@ const DOF_F_STOP: f32 = 1.0;
 /// view, and so the picture, stay the camera's).
 const DOF_MODEL_SCALE: f32 = 100.0;
 
-/// The depth of field and then the materials' own curve: the materials write HDR light with their
+/// The TAA (when on), the depth of field and then the materials' own curve: the materials write HDR light with their
 /// exposure applied (`SceneParams::hdr`), and the curve's output is the value they would have
 /// written to the screen (so no sRGB encoding on top).
 fn dof_effects(dof: Dof, focus: f32) -> Vec<Box<dyn PostProcessingEffect>> {
-    vec![
-        Box::new(CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
-            lens: CameraLens { f_stop: dof.f_stop, focus_distance_m: focus, sensor_width_mm: 23.76 * DOF_MODEL_SCALE, ..Default::default() },
-            // no TAA here to average a rotating pattern
-            temporal_noise: false,
-            ..Default::default()
-        })),
-        Box::new(ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::Exponential, encode_srgb: false, ..Default::default() })),
-    ]
+    let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
+    if dof.taa {
+        effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions::default())));
+    }
+    effects.push(Box::new(CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
+        lens: CameraLens { f_stop: dof.f_stop, focus_distance_m: focus, sensor_width_mm: 23.76 * DOF_MODEL_SCALE, ..Default::default() },
+        // a rotating pattern only when the TAA averages it
+        temporal_noise: dof.taa,
+        ..Default::default()
+    })));
+    effects.push(Box::new(ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::Exponential, encode_srgb: false, ..Default::default() })));
+    effects
 }
 
 impl State {
@@ -603,6 +610,10 @@ impl State {
 
         if self.dof.on {
             let focus = self.focus_distance();
+            // toggling the TAA rebuilds the chain
+            if self.volume.as_mut().is_some_and(|v| v.effect_mut::<TemporalAAEffect>().is_some() != self.dof.taa) {
+                self.volume = None;
+            }
             let volume = self.volume.get_or_insert_with(|| PostProcessingVolume::new(&self.renderer, dof_effects(self.dof, focus)));
             if let Some(effect) = volume.effect_mut::<CinematicDepthOfFieldEffect>() {
                 effect.lens.focus_distance_m = focus;
@@ -989,6 +1000,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             on: flag("dof", false),
             focus: param("focus").and_then(|v| v.parse::<f32>().ok()).filter(|&f| f > 0.0),
             f_stop: param_or("fstop", DOF_F_STOP).max(0.1),
+            taa: flag("taa", true),
         },
         volume: None,
         clear_color,
@@ -1009,7 +1021,7 @@ pub fn info() -> String {
     with_state(|s| {
         let layout = s.gi.volume().layout();
         out = format!(
-            r#"{{"scene":"{}","rt":{},"quality":"{}","dims":[{},{},{}],"voxel_m":{:.3},"mib":{:.2},"particles":{},"gi":{},"frame_ms":{:.2},"dof":{},"focus":{},"focus_m":{:.2},"fstop":{}}}"#,
+            r#"{{"scene":"{}","rt":{},"quality":"{}","dims":[{},{},{}],"voxel_m":{:.3},"mib":{:.2},"particles":{},"gi":{},"frame_ms":{:.2},"dof":{},"focus":{},"focus_m":{:.2},"fstop":{},"taa":{}}}"#,
             s.look.name(),
             s.scene_params.rt_on > 0.5,
             s.gi.quality().name(),
@@ -1024,7 +1036,8 @@ pub fn info() -> String {
             s.dof.on,
             s.dof.focus.map_or("null".into(), |f| f.to_string()),
             s.focus_distance(),
-            s.dof.f_stop
+            s.dof.f_stop,
+            s.dof.taa
         );
     });
     out
@@ -1224,6 +1237,12 @@ pub fn set_dof_focus(metres: f32) {
 #[wasm_bindgen]
 pub fn set_dof_fstop(f_stop: f32) {
     with_state(|s| s.dof.f_stop = f_stop.max(0.1));
+}
+
+/// Temporal anti-aliasing in the depth of field's chain (`taa=0` turns it off).
+#[wasm_bindgen]
+pub fn set_dof_taa(on: bool) {
+    with_state(|s| s.dof.taa = on);
 }
 
 /// Pour again.
