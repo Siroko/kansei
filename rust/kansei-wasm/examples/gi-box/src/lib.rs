@@ -60,52 +60,10 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, Canvas, Frame};
 
 /// A diffuse surface lit by the spot lights only (no ambient), writing the normal and albedo the
-/// global illumination reads (GBuffer targets 2 and 3, through `materials::GBUFFER_OUT_WGSL`).
-const LIT_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32> };
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-
-struct VIn {
-    @location(0) position: vec4<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv: vec2<f32>,
-};
-struct VOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) world: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-};
-@vertex
-fn vertex_main(v: VIn) -> VOut {
-    let world = world_matrix * v.position;
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world;
-    out.world = world.xyz;
-    out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
-    return out;
-}
-
-@fragment
-fn fragment_main(in: VOut) -> KanseiGBufferOut {
-    let n = normalize(in.normal);
-    let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
-    let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
-    let v = normalize(camera_pos - in.world);
-    let base = surface.base_color.rgb;
-    return kansei_gbuffer_out(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base);
-}
-"#;
-
-/// The rug: `LIT_WGSL` with its base colour from a texture, and a voxel entry that gives voxel GI
-/// the same texture.
-const RUG_WGSL: &str = r#"
+/// global illumination reads (GBuffer targets 2 and 3, through `materials::GBUFFER_OUT_WGSL`): its
+/// albedo the uniform's colour times, for `TEXTURED_WGSL`, a texture.
+const SURFACE_WGSL: &str = r#"
 @group(0) @binding(0) var<uniform> surface: vec4<f32>;
-@group(0) @binding(1) var rug_texture: texture_2d<f32>;
-@group(0) @binding(2) var rug_sampler: sampler;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -133,20 +91,36 @@ fn vertex_main(v: VIn) -> VOut {
     return out;
 }
 
-@fragment
-fn fragment_main(in: VOut) -> KanseiGBufferOut {
+fn shade(in: VOut, base: vec3<f32>) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(camera_pos - in.world);
-    let base = textureSample(rug_texture, rug_sampler, in.uv).rgb;
     return kansei_gbuffer_out(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base);
+}
+"#;
+
+const PLAIN_WGSL: &str = r#"
+@fragment
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
+    return shade(in, surface.rgb);
+}
+"#;
+
+/// The rug: its albedo from a texture, and a voxel entry that gives voxel GI the same texture.
+const TEXTURED_WGSL: &str = r#"
+@group(0) @binding(1) var rug_texture: texture_2d<f32>;
+@group(0) @binding(2) var rug_sampler: sampler;
+
+@fragment
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
+    return shade(in, surface.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb);
 }
 
 // voxel GI's voxelizer: the rug's texture into its voxels
 @fragment
 fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
-    kansei_voxel_write(in.clip, front, textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
+    kansei_voxel_write(in.clip, front, surface.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
 }
 "#;
 
@@ -172,7 +146,7 @@ fn rug_texture() -> Texture {
 /// The rug's material; `voxel_entry` false voxelizes it with its constant `GiSurface` instead.
 fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
     let (code, bindings) = lit_shader(
-        &format!("{VOXEL_WRITE_WGSL}\n{RUG_WGSL}"),
+        &format!("{VOXEL_WRITE_WGSL}\n{SURFACE_WGSL}\n{TEXTURED_WGSL}"),
         sdf,
         vec![
             Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
@@ -233,7 +207,7 @@ impl SdfBinding {
     }
 }
 
-/// `body` (which calls `lit_radiance` and returns `kansei_gbuffer_out`) after the GBuffer output and
+/// `body` (which calls `lit_radiance`, through `SURFACE_WGSL`'s `shade`) after the GBuffer output and
 /// the light chunk for `sdf` (shadows through the field) or the shadow maps, with its bindings:
 /// `bindings` plus the field's.
 fn lit_shader(body: &str, sdf: Option<&SdfBinding>, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
@@ -256,7 +230,7 @@ fn bind_sdf(material: &mut Material, sdf: Option<&SdfBinding>) {
 }
 
 fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>) -> Material {
-    let (code, bindings) = lit_shader(LIT_WGSL, sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
+    let (code, bindings) = lit_shader(&format!("{SURFACE_WGSL}\n{PLAIN_WGSL}"), sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
     let mut material = Material::new(label, &code, bindings, MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
     material.set_uniform_bindable(0, label, &[base_color[0], base_color[1], base_color[2], 1.0f32]);
     bind_sdf(&mut material, sdf);
@@ -283,10 +257,10 @@ impl Gi {
             "high" | "ssgi" => Gi::Screen(GiQuality::High),
             "ultra" => Gi::Screen(GiQuality::Ultra),
             "voxel" => Gi::Voxel,
-            // a raw '+' in the query, or one decoded to a space or escaped
-            "voxel+ssgi" | "voxel ssgi" | "voxel%2Bssgi" | "voxel%2bssgi" => Gi::VoxelAndScreen,
+            // `param` decodes the query: a raw '+' arrives as a space
+            "voxel+ssgi" | "voxel ssgi" => Gi::VoxelAndScreen,
             "probes" => Gi::Probes,
-            "probes+ssgi" | "probes ssgi" | "probes%2Bssgi" | "probes%2bssgi" => Gi::ProbesAndScreen,
+            "probes+ssgi" | "probes ssgi" => Gi::ProbesAndScreen,
             _ => return None,
         })
     }
@@ -433,23 +407,6 @@ impl Config {
     fn needs_voxels(&self) -> bool {
         self.gi.voxels() || self.needs_sdf()
     }
-}
-
-fn sdf_shadows_name(s: SdfShadows) -> &'static str {
-    match s {
-        SdfShadows::Off => "off",
-        SdfShadows::Fallback => "fallback",
-        SdfShadows::Always => "always",
-    }
-}
-
-fn sdf_shadows_from_name(name: &str) -> Option<SdfShadows> {
-    Some(match name {
-        "off" => SdfShadows::Off,
-        "fallback" => SdfShadows::Fallback,
-        "always" => SdfShadows::Always,
-        _ => return None,
-    })
 }
 
 /// A preset: the GI mode, voxel tier (None: the device's default), view, dragon and the
@@ -609,7 +566,7 @@ fn config_from_url(phone: bool) -> Config {
     if let Some(ao) = param("sdf_ao").and_then(|v| v.parse::<f32>().ok()) {
         c.sdf_ao = ao.clamp(0.0, 1.0);
     }
-    if let Some(shadows) = param("sdf_shadows").as_deref().and_then(sdf_shadows_from_name) {
+    if let Some(shadows) = param("sdf_shadows").as_deref().and_then(SdfShadows::from_name) {
         c.sdf_shadows = shadows;
     }
     if let Some(direct) = param("shadows") {
@@ -825,7 +782,7 @@ impl State {
             self.config.rug,
             self.config.textured,
             self.config.sdf_ao,
-            sdf_shadows_name(self.config.sdf_shadows),
+            self.config.sdf_shadows.name(),
             if self.config.direct_sdf { "sdf" } else { "map" },
             self.config.slice,
             gi.and_then(|g| g.sdf()).is_some(),
@@ -1066,7 +1023,7 @@ pub fn set_sdf_ao(strength: f32) {
 /// The voxels' shadows through the distance field: `off|fallback|always`.
 #[wasm_bindgen]
 pub fn set_sdf_shadows(name: &str) {
-    if let Some(sdf_shadows) = sdf_shadows_from_name(name) {
+    if let Some(sdf_shadows) = SdfShadows::from_name(name) {
         with_state(|s| s.apply(Config { sdf_shadows, ..s.config }));
     }
 }
