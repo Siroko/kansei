@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Outdoor GI</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+        #stats {
+            position: fixed; left: 8px; top: 8px; margin: 0; padding: 6px 8px;
+            font: 11px/1.35 ui-monospace, Menlo, monospace; color: #e8e8e8;
+            background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none; white-space: pre;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <pre id="stats" hidden></pre>
+    <script type="module">
+        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats } from '../pkg/kansei_wasm_outdoor_gi.js';
+        await init();
+        await start('kansei');
+
+        // for scripted captures: window.kansei.set_gi('off') and so on
+        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats };
+        const params = new URLSearchParams(location.search);
+        const read = () => JSON.parse(info());
+        let s = read();
+        const p = { gi: s.gi, view: s.view, camera: params.get('cam') || 'road', elevation: s.elevation, stats: s.stats };
+        const statsEl = document.getElementById('stats');
+
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Outdoor GI', expanded: !/Mobi|Android/.test(navigator.userAgent) });
+        pane.hidden = params.get('ui') === '0';
+        pane.addBinding(p, 'gi', {
+            label: 'GI',
+            options: { 'off (sky unoccluded)': 'off', 'top-down sky occlusion': 'skyocc', 'clipmap sky visibility (material)': 'visibility', 'clipmap GI, cones per pixel': 'cones', 'clipmap GI, probes': 'probes' },
+        }).on('change', () => set_gi(p.gi));
+        pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels' } }).on('change', () => set_view(p.view));
+        pane.addBinding(p, 'camera', { options: { road: 'road', clearing: 'clearing', forest: 'forest', high: 'high', 'drive along the road': 'fly' } }).on('change', () => set_camera(p.camera));
+        pane.addBinding(p, 'elevation', { label: 'sun elevation', min: -2, max: 40, step: 0.5 }).on('change', () => set_elevation(p.elevation));
+        pane.addBinding(p, 'stats', { label: 'stats' }).on('change', () => { set_stats(p.stats); statsEl.hidden = !p.stats; });
+
+        statsEl.hidden = !p.stats;
+        setInterval(() => {
+            if (!p.stats) return;
+            const i = read();
+            const top = i.passes.slice(0, 10).map(([label, ms]) => `  ${label.padEnd(32)} ${ms.toFixed(3)}`).join('\n');
+            statsEl.textContent =
+                `GI ${i.gi} / ${i.view}, ${i.levels} levels of ${i.dims ? i.dims.join('x') : '-'} from ${i.voxel} m (${i.mib} MiB)${i.filling ? ', filling' : ''}\n` +
+                `${i.trees} spruces, ${(i.triangles / 1e6).toFixed(1)}M triangles in all LODs\n` +
+                `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
+                `clipmap: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` + top;
+        }, 500);
+    </script>
+</body>
+</html>
