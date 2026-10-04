@@ -18,13 +18,13 @@ struct VoxelGiParams {
     blend        : f32,       // weight of the new frame in the history
     historyValid : u32,
     hasSky       : u32,
-    debug        : u32,       // 1: output only the light the GI adds; 2: the volume's voxels; 3: a slice of the distance field
+    debug        : u32,       // 1: output only the light the GI adds; 2: the volume's voxels; 3: a slice of the distance field; 4: the probes
     nearField    : u32,       // 1: screen-space GI in front, the voxels past it
     skyScale     : f32,       // of the sky past the volume
     sdfAo        : f32,       // strength of the distance field's AO on the GI (0: none)
     sdfSlice     : f32,       // height of the debug slice, metres
     hasSdf       : u32,
-    _pad2        : u32,
+    probes       : u32,       // 1: the far field from the probes (gi::SdfProbes) instead of the cones
     _pad0        : u32,
     _pad1        : u32,
 }

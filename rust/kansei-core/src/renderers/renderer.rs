@@ -1625,8 +1625,9 @@ impl Renderer {
     }
 
     /// Voxel GI's frame: voxelize the GI renderables (the static ones when they changed, the
-    /// dynamic ones always), light the voxels through this frame's shadow maps, rebuild the mips.
-    fn run_voxel_gi(&mut self, scene: &Scene) {
+    /// dynamic ones always), light the voxels through this frame's shadow maps, rebuild the mips,
+    /// then the distance field and the probes (around `camera`) if enabled.
+    fn run_voxel_gi(&mut self, scene: &Scene, camera: &Camera) {
         let Some(gi) = self.voxel_gi.as_mut() else { return };
         if !gi.settings.enabled {
             return;
@@ -1700,6 +1701,8 @@ impl Renderer {
         }
         gi.encode_sdf(device, &mut encoder, static_changed, any_dynamic);
         gi.encode_lighting(device, queue, &mut encoder);
+        let eye = camera.inverse_view_matrix.to_glam().w_axis;
+        gi.encode_probes(device, queue, &mut encoder, Some([eye.x, eye.y, eye.z]));
         queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -2616,7 +2619,7 @@ impl Renderer {
         self.run_cascade_shadow_pass(scene);
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
-        self.run_voxel_gi(scene);
+        self.run_voxel_gi(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -2926,7 +2929,7 @@ impl Renderer {
         self.run_cascade_shadow_pass(scene);
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
-        self.run_voxel_gi(scene);
+        self.run_voxel_gi(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
