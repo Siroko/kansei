@@ -1,9 +1,10 @@
 //! A small lake beside the course: an irregular outline, a bed that shelves from the waterline
 //! down to about 0.6 m in the middle, and a low shore around it. The water is the engine's SPH
 //! fluid (`simulations::fluid`, as in the fluid clock), held by a `FluidContainer` whose walls
-//! follow the outline a strip of shore outside it and whose floor is the bed, and pushed by the
-//! character's legs through `FluidColliders`. The character wades: the bed is in the collision
-//! world, so it walks down into the shallows and out again, splashing.
+//! follow the outline a strip of shore outside it and whose floor is the bed, and pushed through
+//! `FluidColliders` by whatever is in it: the motion-matching character's legs, the mill's
+//! paddles. The character wades: the bed is in the collision world, so it walks down into the
+//! shallows and out again, splashing.
 //!
 //! The simulation runs 11 times the world's size (a particle every 5 cm, with the fluid clock's
 //! tuned constants at a smoothing radius of 1) and so √11 times faster than real time, which keeps
@@ -47,7 +48,7 @@ const TIME_SCALE: f32 = 3.316_625;
 const STEP: f32 = 1.0 / 60.0;
 const MAX_STEPS: u32 = 2;
 /// The lake's middle (x, z) and half-size along x and z.
-const CENTER: [f32; 2] = [21.0, -1.0];
+pub const CENTER: [f32; 2] = [21.0, -1.0];
 const HALF: [f32; 2] = [5.2, 3.4];
 /// The still water's height, a little under the ground's.
 const WATER: f32 = -0.1;
@@ -755,7 +756,6 @@ impl Lake {
         }
         out.map(|(n, y)| (n, if n > 0 { y / n as f32 } else { 0.0 }))
     }
-
 
     /// World m/s per simulation unit of speed.
     pub fn world_speed_scale(&self) -> f32 {

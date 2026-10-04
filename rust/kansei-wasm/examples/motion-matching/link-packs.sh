@@ -1,5 +1,6 @@
 #!/bin/sh
-# Link the private motion-matching packs into www/pack/ (gitignored; the packs stay out of git):
+# Link the private motion-matching packs for www/kimodo.html into www/pack/ (gitignored; the packs
+# stay out of git):
 #   www/pack/gen  -> <data>/genanim/pack  (gen-dance, gen-all, gen-limp, gasp-plus-gen)
 #   www/pack/gasp -> <data>/gasp/pack     (gasp-locomotion, hero: the GASP reference)
 # Usage: link-packs.sh [data]   (default: ~/Documents/dev/kansei-private-data)
