@@ -5,6 +5,7 @@ use super::clipmap::{clipmap_entries, clipmap_layout_entries, ClipLevelGpu, Clip
 
 pub(crate) const CLIPMAP_PROBE_UPDATE_WGSL: &str = concat!(
     include_str!("shaders/clipmap.wgsl"),
+    include_str!("shaders/particle_emission.wgsl"),
     include_str!("shaders/clipmap_probes.wgsl"),
     include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("shaders/clipmap_probe_update.wgsl"),
@@ -31,11 +32,16 @@ pub struct ClipmapProbeOptions {
     pub normal_bias: f32,
     /// Most steps per cone.
     pub max_steps: u32,
+    /// Levels finer than its width each cone reads (`clipConeTraceNear`): each becomes a
+    /// sparsely sampled ray that sees through gaps narrower than it (a road between trees), the
+    /// probes' history averaging the samples; 0 reads the levels as wide as the cones, which fill
+    /// such gaps.
+    pub level_bias: f32,
 }
 
 impl Default for ClipmapProbeOptions {
     fn default() -> Self {
-        Self { levels: MAX_CLIPMAP_LEVELS as u32, spacing_voxels: 2, probes_per_frame: 8192, hysteresis: 0.9, sky_scale: 1.0, normal_bias: 1.0, max_steps: 32 }
+        Self { levels: MAX_CLIPMAP_LEVELS as u32, spacing_voxels: 2, probes_per_frame: 8192, hysteresis: 0.9, sky_scale: 1.0, normal_bias: 1.0, max_steps: 32, level_bias: 4.0 }
     }
 }
 
@@ -67,7 +73,9 @@ pub(crate) struct ClipProbeUpdateGpu {
     max_steps: u32,
     voxel_level: u32,
     tan_half: f32,
-    _pad: u32,
+    level_bias: f32,
+    frame: u32,
+    _pad: [u32; 3],
 }
 
 const MODE_ROUND: u32 = 0;
@@ -238,7 +246,9 @@ impl ClipmapProbes {
             max_steps: o.max_steps.max(1),
             voxel_level: 0,
             tan_half: 0.6,
-            _pad: 0,
+            level_bias: o.level_bias.max(0.0),
+            frame: self.frame,
+            _pad: [0; 3],
         };
         // (params, workgroups) per dispatch
         let mut dispatches: Vec<(ClipProbeUpdateGpu, u32)> = Vec::new();

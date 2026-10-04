@@ -664,3 +664,43 @@ fn probes_inside_surfaces_are_left_out() {
     assert!(inside > 8 && left_out == inside);
     assert!(open > 100 && traced == open);
 }
+
+/// Down a long corridor open to the sky, the floor's centre sees the sky through the slot between
+/// the walls: sin(atan(w / h)) of a uniform sky's irradiance (the view factor of an infinite slot
+/// of half-width w between walls h high), through the cones traced per pixel and through the
+/// probes alike.
+#[test]
+fn the_cones_and_the_probes_see_the_sky_down_a_corridor() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_clipmap(SceneVoxelClipmapOptions { levels: 5, resolution: 32, height_resolution: 16, voxel_size: 0.25, ..Default::default() });
+    let gi = renderer.voxel_clipmap_mut().unwrap();
+    gi.settings.bounce = 0.0;
+    // (the default history: it averages the probes' sparse samples)
+    gi.enable_probes(kansei_core::gi::ClipmapProbeOptions { probes_per_frame: 1 << 16, ..Default::default() });
+    renderer.voxel_clipmap().unwrap().set_sky_gradient(renderer.queue(), [1.0; 3], [1.0; 3]);
+    // walls 6 m high, 1.5 m either side of the corridor's axis (along z), 200 m long, black
+    let (w, h) = (1.5f32, 6.0f32);
+    let mut scene = Scene::new();
+    scene.add(gi_box([200.0, 0.4, 200.0], [0.0, -0.2, 0.0], [0.5; 3]));
+    scene.add(gi_box([1.0, h, 200.0], [-w - 0.5, h * 0.5, 0.0], [0.0; 3]));
+    scene.add(gi_box([1.0, h, 200.0], [w + 0.5, h * 0.5, 0.0], [0.0; 3]));
+    let want = (0.5f32 * 255.0).round() / 255.0 * (w / h).atan().sin();
+    let mut camera = camera_at([0.0, 1.2, 2.0], [0.0, 0.0, -2.0]);
+    let rows = [0.95, 0.85];
+    for probes in [false, true] {
+        let mut effect = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), VoxelGIOptions::default());
+        if probes {
+            effect.set_clipmap_probes(renderer.voxel_clipmap().unwrap().probes());
+        }
+        effect.sky_gradient = ([1.0; 3], [1.0; 3]);
+        effect.show_indirect = true;
+        let got = floor_gain(&mut renderer, &mut scene, &mut camera, &mut effect, 40, &rows);
+        let label = if probes { "probes" } else { "cones" };
+        eprintln!("{label}: the corridor's floor gains {got:?}, the slot's view factor gives {want}");
+        // (cones as wide as the slot would fill it: they read voxels finer than they are wide)
+        let tolerance = if probes { 0.25 } else { 0.2 };
+        for g in &got {
+            assert!((g / want - 1.0).abs() < tolerance, "{label}: the corridor's floor gains {g} of {want}");
+        }
+    }
+}

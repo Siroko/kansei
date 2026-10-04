@@ -73,6 +73,12 @@ pub struct VoxelGIOptions {
     /// Strength of the distance field's ambient occlusion on the GI (`set_sdf`; 0: none): the
     /// contact occlusion the coarse cones miss.
     pub sdf_ao: f32,
+    /// With a clipmap (`with_clipmap`): levels finer than they are wide the cones read. Each then
+    /// samples the voxels along its axis sparsely, which sees the sky through gaps narrower than
+    /// the cone (a road between trees, a street between walls) where voxels as wide as the cone
+    /// fill them; the temporal filter averages the samples. 0 reads the levels as wide as the
+    /// cones.
+    pub clipmap_level_bias: f32,
 }
 
 impl Default for VoxelGIOptions {
@@ -87,6 +93,7 @@ impl Default for VoxelGIOptions {
             sky_scale: 1.0,
             near_field: None,
             sdf_ao: 0.0,
+            clipmap_level_bias: 2.0,
         }
     }
 }
@@ -117,7 +124,8 @@ pub(crate) struct VoxelGiParamsGpu {
     sdf_ao: f32,
     sdf_slice: f32,
     has_sdf: u32,
-    _pad: [u32; 3],
+    level_bias: f32,
+    _pad: [u32; 2],
 }
 
 struct Targets {
@@ -204,6 +212,8 @@ pub struct VoxelGIEffect {
     /// one is left out (inside geometry), over the scene without its GI. Over the other views.
     pub show_probes: bool,
     pub sdf_ao: f32,
+    /// See `VoxelGIOptions::clipmap_level_bias`.
+    pub clipmap_level_bias: f32,
     /// The sky past the volume without `set_sky_lighting`: scene radiance straight up and down.
     pub sky_gradient: ([f32; 3], [f32; 3]),
     near_field: Option<ScreenSpaceGIEffect>,
@@ -251,6 +261,7 @@ impl VoxelGIEffect {
             show_sdf_slice: None,
             show_probes: false,
             sdf_ao: options.sdf_ao,
+            clipmap_level_bias: options.clipmap_level_bias,
             sky_gradient: ([0.0; 3], [0.0; 3]),
             near_field: options.near_field.map(ScreenSpaceGIEffect::new),
             source,
@@ -597,7 +608,8 @@ impl PostProcessingEffect for VoxelGIEffect {
             sdf_ao: if self.sdf.is_some() { self.sdf_ao.clamp(0.0, 1.0) } else { 0.0 },
             sdf_slice: self.show_sdf_slice.unwrap_or(0.0),
             has_sdf: self.sdf.is_some() as u32,
-            _pad: [0; 3],
+            level_bias: self.clipmap_level_bias.max(0.0),
+            _pad: [0; 2],
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         if self.sky_lighting.is_none() {

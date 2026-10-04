@@ -22,7 +22,11 @@ struct ClipProbeUpdate {
     maxSteps   : u32,
     voxelLevel : u32,     // the clipmap level whose voxels are half the probes' spacing
     tanHalf    : f32,     // of the cones
+    levelBias  : f32,     // levels finer than the cones' width they read (clipConeTraceNear)
+    frame      : u32,
     _pad0      : u32,
+    _pad1      : u32,
+    _pad2      : u32,
 }
 
 @group(0) @binding(0) var<uniform> kansei_clip_probe_grid : ClipProbeGrid;
@@ -87,7 +91,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let w = 4.0 * 3.14159265 / f32(CLIP_PROBE_CONES);
     for (var j = 0u; j < CLIP_PROBE_CONES; j++) {
         let dir = normalize((up.rotation * vec4f(sphericalFibonacci(j, CLIP_PROBE_CONES), 0.0)).xyz);
-        let cone = clipConeTraceNear(p, dir, vec3f(0.0), up.tanHalf, voxel, 0.5 * voxel, 1e4, up.maxSteps, 4.0 * spacing);
+        // a jittered start, so the sparse samples land elsewhere each update
+        let jitter = giHash01(slot * 16u + j + up.frame * 7919u);
+        let cone = clipConeTraceNear(p, dir, vec3f(0.0), up.tanHalf, voxel, (0.5 + jitter) * voxel, 1e4, up.maxSteps, up.levelBias);
         let light = vec4f(cone.rgb + cone.a * up.skyScale * skyRadiance(sky, dir), cone.a) * w;
         sh[0] += light * 0.282095;
         sh[1] += light * (0.488603 * dir.x);
