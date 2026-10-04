@@ -50,7 +50,7 @@ mesh it was baked from, and carries their licence.
    bones) are left out. The tool prints the database's size and contact coverage, then reads
    the pack back to check it.
 
-3. **Play it**: `rust/kansei-wasm/examples/motion-matching` loads a pack from a local path.
+3. **Play it**: `rust/kansei-wasm/demos/motion-matching` loads a pack from a local path.
 
 `export` may also list several folders, baked into one pack (the mesh from the first): say, an
 Unreal export and clips generated onto the same skeleton.
