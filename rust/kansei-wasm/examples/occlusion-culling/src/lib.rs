@@ -19,8 +19,6 @@
 //! `skyocc=show` shows the sky visibility, `skyocc=rebuild` starts a rebuild every frame, to time
 //! a rebuild's first frame: the top-down pass, the pyramid and a quarter of the volume).
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -39,7 +37,7 @@ use kansei_core::postprocessing::{
 use kansei_core::pacing::FrameTimer;
 use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{flag, now, param, param_or, Canvas};
+use kansei_wasm::{flag, now, param, param_or, set_text, Canvas, Keys};
 use kansei_core::shadows::{SkyOcclusion, SkyOcclusionOptions, SKY_OCCLUSION_WGSL};
 
 /// A diffuse surface lit by the scene's directional light (the sun) and a sky hemisphere, in haze,
@@ -250,19 +248,13 @@ struct State {
     interval_ms: f64,
     gpu_ms: f64,
     cpu_ms: f64,
-    keys: Rc<RefCell<Vec<String>>>,
+    keys: Keys,
     /// `skyocc=rebuild`: start a rebuild of the sky occlusion every frame
     rebuild_sky: bool,
 }
 
 fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
     web_sys::window()?.document()?.get_element_by_id(id)?.dyn_into().ok()
-}
-
-fn set_text(id: &str, text: &str) {
-    if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
-        el.set_text_content(Some(text));
-    }
 }
 
 fn thousands(n: impl Into<u64>) -> String {
@@ -422,13 +414,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let bench = flag("bench", false).then(|| AbBench::new(["occlusion on", "off"], now() * 1000.0, AbBenchOptions::default()));
     log::info!("Kansei — Occlusion culling (WASM) ready: {trees} trees, timestamps {}", timer.has_timestamps());
 
-    let keys = Rc::new(RefCell::new(Vec::new()));
-    {
-        let keys = keys.clone();
-        let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| keys.borrow_mut().push(e.key().to_lowercase()));
-        web_sys::window().ok_or("no window")?.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
-        on_key.forget();
-    }
+    let keys = Keys::listen();
 
     let frozen_t = param("t").and_then(|v| v.parse().ok());
     let mut state = State { renderer, scene, camera, volume, timer, bench, cam, frozen_t, trees, frame: 0, interval_ms: 0.0, gpu_ms: 0.0, cpu_ms: 0.0, keys, rebuild_sky };
@@ -436,7 +422,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let st = &mut state;
         frame.resize(&mut st.renderer, &mut st.camera);
         // keys and the HUD's checkboxes
-        for key in st.keys.borrow_mut().drain(..) {
+        for key in st.keys.take_pressed() {
             let toggle = |id: &str| {
                 if let Some(c) = checkbox(id) {
                     c.set_checked(!c.checked());

@@ -52,6 +52,13 @@ pub fn is_phone() -> bool {
     ["Mobi", "Android", "iPhone", "iPad"].iter().any(|k| agent.contains(k))
 }
 
+/// Show `text` in the page element with id `id` (a HUD), if there is one.
+pub fn set_text(id: &str, text: &str) {
+    if let Some(element) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
+        element.set_text_content(Some(text));
+    }
+}
+
 /// Fetch `url` (relative to the page) as bytes; an HTTP error status is an error too.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     let window = web_sys::window().ok_or("no window")?;

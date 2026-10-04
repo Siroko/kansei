@@ -26,7 +26,7 @@ use kansei_core::pacing::FrameTimer;
 use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::postprocessing::{effects::{exposure_from_ev100, ToneMapEffect, ToneMapOptions}, PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{flag, now, param, param_or, Canvas};
+use kansei_wasm::{flag, now, param, param_or, set_text, Canvas};
 
 /// Rocks placed by records of position + scale, then yaw (8 floats), lit by a low sun. Prefixed
 /// with GBUFFER_OUT_WGSL.
@@ -120,12 +120,6 @@ struct State {
     frame: u32,
     interval_ms: f64,
     gpu_ms: f64,
-}
-
-fn set_text(id: &str, text: &str) {
-    if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
-        el.set_text_content(Some(text));
-    }
 }
 
 fn set_mode(st: &mut State, mode: usize) {
