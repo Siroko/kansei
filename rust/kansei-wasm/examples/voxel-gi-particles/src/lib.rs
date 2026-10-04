@@ -38,7 +38,7 @@ use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FixedStep;
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, is_phone, now, param, param_or, Canvas, Frame};
-use kansei_core::simulations::fluid::{FluidSimulation, FluidSimulationOptions};
+use kansei_core::simulations::fluid::{fill_box, FluidSimulation, FluidSimulationOptions};
 use kansei_core::simulations::grid::NEIGHBOUR_GRID_WGSL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,44 +332,13 @@ fn sun_direction(elevation: f32, bearing: f32) -> [f32; 3] {
     direction_from_elevation_bearing(elevation, 180.0 - bearing).to_glam().to_array()
 }
 
-/// `count` particles on a jittered lattice filling `lo`..`hi`.
-fn lattice(count: usize, lo: [f32; 3], hi: [f32; 3]) -> Vec<f32> {
-    let size: [f32; 3] = std::array::from_fn(|i| hi[i] - lo[i]);
-    let spacing = (size[0] * size[1] * size[2] / count as f32).cbrt();
-    let cells: [usize; 3] = std::array::from_fn(|i| ((size[i] / spacing).floor() as usize).max(1));
-    let mut rng: u32 = 12345;
-    let mut jitter = || {
-        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-        ((rng >> 8) as f32 / 16777216.0 - 0.5) * spacing * 0.3
-    };
-    let mut positions = Vec::with_capacity(count * 4);
-    // front (+z, toward the camera) first: particles keep their order, so they are drawn
-    // roughly front to back and the depth test spares the shading of those behind
-    'fill: for layer in 0.. {
-        for z in (0..cells[2]).rev() {
-            for y in 0..cells[1] {
-                for x in 0..cells[0] {
-                    if positions.len() >= count * 4 {
-                        break 'fill;
-                    }
-                    let base = [x, y, z].map(|c| (c as f32 + 0.5) * spacing);
-                    // a further layer, if the lattice falls short, sits half a cell above
-                    let lift = layer as f32 * spacing * 0.5;
-                    positions.extend_from_slice(&[lo[0] + base[0] + jitter(), lo[1] + base[1] + lift + jitter(), lo[2] + base[2] + jitter(), 1.0]);
-                }
-            }
-        }
-    }
-    positions
-}
-
 /// The lightbox: a rain over the whole room that settles into a pile. The Cornell room: a dam
 /// filling its left half.
 fn initial_positions(look: Look, count: usize) -> Vec<f32> {
     let (min, max) = look.fluid();
     let mut positions = match look {
-        Look::Lightbox => lattice(count, [min[0] + 0.5, 2.0, min[2] + 0.5], [max[0] - 0.5, max[1] - 0.5, max[2] - 0.5]),
-        Look::Cornell => lattice(count, [min[0] + 0.5, min[1] + 0.5, min[2] + 0.5], [-1.0, 16.0, max[2] - 0.5]),
+        Look::Lightbox => fill_box(count, [min[0] + 0.5, 2.0, min[2] + 0.5], [max[0] - 0.5, max[1] - 0.5, max[2] - 0.5], 0.3),
+        Look::Cornell => fill_box(count, [min[0] + 0.5, min[1] + 0.5, min[2] + 0.5], [-1.0, 16.0, max[2] - 0.5], 0.3),
     };
     if look == Look::Lightbox {
         set_radius_shares(&mut positions);

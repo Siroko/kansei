@@ -123,7 +123,7 @@ impl World {
         let (mut lake, mut surface, mut cannon, mut mill) = (None, None, None, None);
         if options.lake {
             let (mut l, s) = Lake::new(renderer, scene, &mut collision, ground_material);
-            l.rest = options.rest;
+            l.set_rest(options.rest);
             cannon = Some(Cannon::new(scene, &mut collision, &l));
             let mut m = Mill::new(scene, &mut collision, &l);
             m.on = options.mill;
