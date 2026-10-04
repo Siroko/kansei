@@ -10,7 +10,7 @@
 //! and the GPU time (timestamp queries when the adapter has them). Keys: I toggles the impostors
 //! (off: the coarser mesh LOD reaches the horizon), C cycles the camera.
 //!
-//! URL parameters: `cam=shore|low|high|fly|forest`, `impostors=0`, `trees=<n>`, `far=<metres>` (where
+//! URL parameters: `cam=shore|low|high|fly|forest`, `impostors=0`, `taa=0`, `trees=<n>`, `far=<metres>` (where
 //! the impostors start), `depth=1` (the impostors write the depth of the surface they find),
 //! `frames=<n>` and `frame=<texels>` (the bake), `t=<seconds>` (the fly
 //! path's time, frozen), `size=<w>x<h>`, `bench=1` (alternate the impostors on and off every 3 s,
@@ -44,6 +44,7 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::reflections::{PlanarReflection, PlanarReflectionOptions, PLANAR_REFLECTION_WGSL};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, now, param, param_or, Canvas};
 
 const WATER_LAYER: u32 = 2;
 
@@ -560,12 +561,6 @@ impl Bench {
     }
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
@@ -574,7 +569,6 @@ struct State {
     timer: Option<GpuTimer>,
     bench: Option<Bench>,
     cam: usize,
-    start: f64,
     frozen_t: Option<f32>,
     trees: u32,
     /// the LODs (with `bench=fade`, a set without crossfades and one with), and where the
@@ -582,27 +576,14 @@ struct State {
     sets: Vec<LodSet>,
     far: f32,
     bake_ms: f64,
+    /// the lake's scene index and its reflection's index in the renderer, remade at half the
+    /// canvas's size when it resizes
+    lake: usize,
+    reflection: usize,
     frame: u32,
-    last_frame: f64,
     interval_ms: f64,
     gpu_ms: f64,
     keys: Rc<RefCell<Vec<String>>>,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now()
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
 }
 
 fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
@@ -625,6 +606,16 @@ fn thousands(n: u32) -> String {
         out.push(c);
     }
     out
+}
+
+/// The lake's mirror, at half the canvas's `width` x `height`, reflecting everything but itself.
+fn lake_reflection(renderer: &Renderer, width: u32, height: u32) -> PlanarReflection {
+    PlanarReflection::new(
+        renderer,
+        Vec3::new(0.0, LAKE_LEVEL, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        PlanarReflectionOptions { width: width / 2, height: height / 2, layer_mask: !WATER_LAYER, ..Default::default() },
+    )
 }
 
 /// A set of LODs: the scene indices of the mesh LODs and the impostors, and their crossfades'
@@ -676,34 +667,28 @@ fn hud(st: &State, set: usize, impostors: bool) -> String {
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let (width, height) = query_param("size")
-        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
-        .unwrap_or((canvas.client_width() as u32, canvas.client_height() as u32));
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let mut canvas = Canvas::find(canvas_id)?;
+    if let Some((w, h)) = param("size").and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))) {
+        canvas = canvas.with_size(w, h);
+    }
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.set_culling_stats(true);
 
     let mut scene = Scene::new();
     let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
     sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
     scene.add(SceneNode::Renderable(Renderable::new(SphereGeometry::new(2500.0, 32, 16), sky)));
-    let bench_fade = query_param("bench").as_deref() == Some("fade");
+    let bench_fade = param("bench").as_deref() == Some("fade");
     let fade = Fade {
-        width: query_param("fade").and_then(|v| v.parse().ok()).unwrap_or(if bench_fade || query_param("bench").as_deref() == Some("bands") { 20.0 } else { 0.0 }),
-        show: query_param("showfade").as_deref() == Some("1"),
+        width: param_or("fade", if bench_fade || param("bench").as_deref() == Some("bands") { 20.0 } else { 0.0 }),
+        show: flag("showfade", false),
     };
     // bench=fade: a set of LODs without crossfades beside the one with them, drawn in turn
     let fades = if bench_fade { vec![Fade { width: 0.0, show: false }, fade] } else { vec![fade] };
     scene.add(SceneNode::Renderable(Renderable::new(terrain(280), surface_material("Terrain", [0.09, 0.1, 0.05], false, fade))));
 
     // the forest round the lake: base xyz and height, then yaw and tint, 32 bytes a tree
-    let trees: u32 = query_param("trees").and_then(|v| v.parse().ok()).unwrap_or(40_000);
+    let trees: u32 = param_or("trees", 40_000);
     let mut data: Vec<f32> = Vec::with_capacity(trees as usize * 8);
     let mut i = 0u32;
     while (data.len() as u32) < trees * 8 {
@@ -743,7 +728,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             .with_bounds_box(glam::Vec3::new(0.25, 0.5, 0.25))
             .with_crossfade(fade.width)
     };
-    let far: f32 = query_param("far").and_then(|v| v.parse().ok()).unwrap_or(120.0);
+    let far: f32 = param_or("far", 120.0);
     let mut lod_sets = Vec::new();
     for &fade in &fades {
         let mut lods = [0; 2];
@@ -758,9 +743,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the impostor, baked from the nearest LOD with a neutral instance (at the origin, height
     // 1, unturned, the tint that leaves the albedo as it is)
-    let frames: u32 = query_param("frames").and_then(|v| v.parse().ok()).unwrap_or(12);
-    let frame_size: u32 = query_param("frame").and_then(|v| v.parse().ok()).unwrap_or(128);
-    let before = now_ms();
+    let frames: u32 = param_or("frames", 12);
+    let frame_size: u32 = param_or("frame", 128);
+    let before = now();
     let impostor = renderer.bake_impostor(
         &mut scene,
         &lod_sets[0][..1],
@@ -772,9 +757,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             ..Default::default()
         },
     );
-    let bake_ms = now_ms() - before;
+    let bake_ms = (now() - before) * 1000.0;
     // depth=1: the impostors write the depth of the surface they find (it costs: see IMPOSTOR_WGSL)
-    let impostor_shader = if query_param("depth").as_deref() == Some("1") {
+    let impostor_shader = if flag("depth", false) {
         IMPOSTOR_MATERIAL_WGSL.replace("DEPTH_OUTPUT", "@builtin(frag_depth) depth: f32,").replace("DEPTH_VALUE", ", clip.z / clip.w")
     } else {
         IMPOSTOR_MATERIAL_WGSL.replace("DEPTH_OUTPUT", "").replace("DEPTH_VALUE", "")
@@ -802,12 +787,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     // the lake, mirroring everything but itself
-    let reflection = PlanarReflection::new(
-        &renderer,
-        Vec3::new(0.0, LAKE_LEVEL, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        PlanarReflectionOptions { width: width / 2, height: height / 2, layer_mask: !WATER_LAYER, ..Default::default() },
-    );
+    let (width, height) = canvas.size();
+    let reflection = lake_reflection(&renderer, width, height);
     let mut water_material = Material::new(
         "Water",
         &format!("{PLANAR_REFLECTION_WGSL}\n{WATER_WGSL}"),
@@ -816,13 +797,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     );
     water_material.set_bindable(0, reflection.material_texture());
     water_material.set_bindable(1, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
-    renderer.add_planar_reflection(reflection);
+    let reflection = renderer.add_planar_reflection(reflection);
     let mut lake = Renderable::new(PlaneGeometry::new(2.0 * LAKE + 200.0, 2.0 * LAKE + 200.0), water_material);
     lake.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     lake.object.set_position(0.0, LAKE_LEVEL, 0.0);
     lake.layers = WATER_LAYER;
     lake.cast_shadow = false;
-    scene.add(SceneNode::Renderable(lake));
+    let lake = scene.add(SceneNode::Renderable(lake));
 
     let tonemap = {
         let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
@@ -830,39 +811,39 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ToneMapEffect::new(options)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    if query_param("taa").as_deref() != Some("0") {
+    if flag("taa", true) {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
 
-    let mut camera = Camera::new(45.0, 0.3, 4000.0, width as f32 / height as f32);
+    let mut camera = Camera::new(45.0, 0.3, 4000.0, canvas.aspect());
     camera.update_projection_matrix();
 
-    let cam = CAMS.iter().position(|&c| Some(c) == query_param("cam").as_deref()).unwrap_or(0);
+    let cam = CAMS.iter().position(|&c| Some(c) == param("cam").as_deref()).unwrap_or(0);
     if let Some(c) = checkbox("impostors") {
-        c.set_checked(query_param("impostors").as_deref() != Some("0"));
+        c.set_checked(flag("impostors", true));
     }
     let timer = GpuTimer::new(renderer.device(), renderer.queue());
-    let bench = match query_param("bench").as_deref() {
+    let bench = match param("bench").as_deref() {
         Some("1") => Some("impostors"),
         Some("fade") => Some("crossfades"),
         Some("bands") => Some("crossfade bands"),
         _ => None,
     }
-    .map(|what| Bench { what, start: now_ms(), sums: [(0.0, 0, 0.0, 0); 2], last_frame: now_ms(), report: None });
+    .map(|what| Bench { what, start: now() * 1000.0, sums: [(0.0, 0, 0.0, 0); 2], last_frame: now() * 1000.0, report: None });
     log::info!("Kansei — Impostors (WASM) ready: {trees} trees, impostor {frames}x{frames} frames of {frame_size} texels baked in {bake_ms:.0} ms");
 
     let keys = Rc::new(RefCell::new(Vec::new()));
     {
         let keys = keys.clone();
         let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| keys.borrow_mut().push(e.key().to_lowercase()));
-        window.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
+        web_sys::window().ok_or("no window")?.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
         on_key.forget();
     }
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let state = Rc::new(RefCell::new(State {
+    let frozen_t = param("t").and_then(|v| v.parse().ok());
+    let mut state = State {
         renderer,
         scene,
         camera,
@@ -870,81 +851,87 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         timer,
         bench,
         cam,
-        start: now_ms(),
         frozen_t,
         trees,
         sets,
         far,
         bake_ms,
+        lake,
+        reflection,
         frame: 0,
-        last_frame: now_ms(),
         interval_ms: 0.0,
         gpu_ms: 0.0,
         keys,
-    }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut guard = state.borrow_mut();
-            let st = &mut *guard;
-            for key in st.keys.borrow_mut().drain(..) {
-                match key.as_str() {
-                    "i" => {
-                        if let Some(c) = checkbox("impostors") {
-                            c.set_checked(!c.checked());
-                        }
-                    }
-                    "c" => st.cam = (st.cam + 1) % CAMS.len(),
-                    _ => {}
-                }
+    };
+    kansei_wasm::run(&canvas, move |frame| {
+        let st = &mut state;
+        frame.resize(&mut st.renderer, &mut st.camera);
+        if let Some((width, height)) = frame.resized {
+            // the mirror follows the canvas at half its size
+            let reflection = lake_reflection(&st.renderer, width, height);
+            if let Some(lake) = st.scene.get_renderable_mut(st.lake) {
+                lake.material.set_bindable(0, reflection.material_texture());
+                lake.material_dirty = true;
             }
-            // the LOD set drawn (bench=fade alternates the two), whether the far band is impostors,
-            // and the crossfades' width
-            let phase = st.bench.as_ref().and_then(|b| Some((b.what, b.phase(now_ms())?.0)));
-            let checked = checkbox("impostors").is_none_or(|c| c.checked());
-            let last = st.sets.len() - 1;
-            let (set, impostors) = match phase {
-                Some(("impostors", on)) => (last, on),
-                Some(("crossfades", on)) => (on as usize, checked),
-                _ => (last, checked),
-            };
-            let fade = if phase == Some(("crossfade bands", false)) { 1e-3 } else { st.sets[set].fade };
-            set_lods(st, set, impostors, fade);
-
-            let t = st.frozen_t.unwrap_or(((now_ms() - st.start) / 1000.0) as f32);
-            place_camera(&mut st.camera, CAMS[st.cam], t);
-
-            if let Some(timer) = st.timer.as_mut() {
-                timer.begin(st.renderer.device(), st.renderer.queue());
-            }
-            st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
-            if let Some(timer) = st.timer.as_mut() {
-                timer.end(st.renderer.device(), st.renderer.queue());
-            }
-
-            let now = now_ms();
-            st.interval_ms += (now - st.last_frame - st.interval_ms) * 0.05;
-            st.last_frame = now;
-            let gpu = st.timer.as_ref().map(|t| t.take()).unwrap_or_default();
-            for ms in &gpu {
-                st.gpu_ms += (ms - st.gpu_ms) * 0.05;
-            }
-            if let Some(bench) = st.bench.as_mut() {
-                let was_done = bench.report.is_some();
-                bench.record(&gpu, now);
-                if let (false, Some(report)) = (was_done, &bench.report) {
-                    log::info!("{report}");
-                    set_text("bench", report);
-                }
-            }
-            st.frame += 1;
-            if st.frame.is_multiple_of(10) {
-                set_text("hud", &hud(st, set, impostors));
+            if let Some(slot) = st.renderer.planar_reflection_mut(st.reflection) {
+                *slot = reflection;
             }
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        for key in st.keys.borrow_mut().drain(..) {
+            match key.as_str() {
+                "i" => {
+                    if let Some(c) = checkbox("impostors") {
+                        c.set_checked(!c.checked());
+                    }
+                }
+                "c" => st.cam = (st.cam + 1) % CAMS.len(),
+                _ => {}
+            }
+        }
+        // the bench's clock, in milliseconds
+        let now_ms = now() * 1000.0;
+        // the LOD set drawn (bench=fade alternates the two), whether the far band is impostors,
+        // and the crossfades' width
+        let phase = st.bench.as_ref().and_then(|b| Some((b.what, b.phase(now_ms)?.0)));
+        let checked = checkbox("impostors").is_none_or(|c| c.checked());
+        let last = st.sets.len() - 1;
+        let (set, impostors) = match phase {
+            Some(("impostors", on)) => (last, on),
+            Some(("crossfades", on)) => (on as usize, checked),
+            _ => (last, checked),
+        };
+        let fade = if phase == Some(("crossfade bands", false)) { 1e-3 } else { st.sets[set].fade };
+        set_lods(st, set, impostors, fade);
+
+        let t = st.frozen_t.unwrap_or(frame.time as f32);
+        place_camera(&mut st.camera, CAMS[st.cam], t);
+
+        if let Some(timer) = st.timer.as_mut() {
+            timer.begin(st.renderer.device(), st.renderer.queue());
+        }
+        st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
+        if let Some(timer) = st.timer.as_mut() {
+            timer.end(st.renderer.device(), st.renderer.queue());
+        }
+
+        let now_ms = now() * 1000.0;
+        st.interval_ms += (frame.dt as f64 * 1000.0 - st.interval_ms) * 0.05;
+        let gpu = st.timer.as_ref().map(|t| t.take()).unwrap_or_default();
+        for ms in &gpu {
+            st.gpu_ms += (ms - st.gpu_ms) * 0.05;
+        }
+        if let Some(bench) = st.bench.as_mut() {
+            let was_done = bench.report.is_some();
+            bench.record(&gpu, now_ms);
+            if let (false, Some(report)) = (was_done, &bench.report) {
+                log::info!("{report}");
+                set_text("bench", report);
+            }
+        }
+        st.frame += 1;
+        if st.frame.is_multiple_of(10) {
+            set_text("hud", &hud(st, set, impostors));
+        }
+    });
     Ok(())
 }

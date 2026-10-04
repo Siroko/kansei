@@ -1,5 +1,4 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -20,6 +19,7 @@ use kansei_core::simulations::fluid::{
     DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
     FluidSurfaceRenderer, MarchingCubesOptions,
 };
+use kansei_wasm::{fetch_bytes, Canvas, Frame};
 
 
 // ── Op-art stripe shader (matches engine bind group layout) ──
@@ -159,13 +159,6 @@ fn fragment_main(v: VOut) -> FragOut {
 }
 "#;
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-    log::info!("Kansei WASM initialized");
-}
-
 // ── Helper: create MC surface renderable (placeholder — no buffer ptrs yet) ──
 // Writes color + world normal to GBuffer so FluidSurfaceEffect can detect and refract it.
 fn build_mc_renderable_placeholder() -> Renderable {
@@ -190,32 +183,53 @@ fn build_mc_renderable_placeholder() -> Renderable {
     r
 }
 
+/// The raymarch mode's offscreen targets at the canvas size, and the bind groups that read them.
+struct RaymarchTargets {
+    color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    _output_view: wgpu::TextureView,
+    surface_bg: wgpu::BindGroup,
+    blit_bg: wgpu::BindGroup,
+}
+
+fn raymarch_targets(
+    renderer: &Renderer,
+    surface_renderer: &FluidSurfaceRenderer,
+    density_view: &wgpu::TextureView,
+    blit_bgl: &wgpu::BindGroupLayout,
+    blit_sampler: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+) -> RaymarchTargets {
+    let mk_tex = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+        let tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: fmt, usage, view_formats: &[],
+        });
+        tex.create_view(&Default::default())
+    };
+    let cu = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
+    let color_view = mk_tex("Color", wgpu::TextureFormat::Rgba16Float, cu);
+    let depth_view = mk_tex("Depth", wgpu::TextureFormat::Depth32Float,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
+    let output_view = mk_tex("Output", wgpu::TextureFormat::Rgba16Float, cu);
+
+    let surface_bg = surface_renderer.create_bind_group(&color_view, &depth_view, &output_view, density_view);
+    let blit_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: blit_bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(blit_sampler) },
+        ],
+    });
+    RaymarchTargets { color_view, depth_view, _output_view: output_view, surface_bg, blit_bg }
+}
+
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = canvas_id;
-        return Err(JsValue::from_str("kansei-wasm start() is only supported on wasm32"));
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width, height,
-        sample_count: 4,
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let (width, height) = canvas.size();
+    let renderer = canvas.renderer(RendererConfig { sample_count: 4, ..Default::default() }).await;
     let format = renderer.presentation_format();
 
     // ── Particles ──
@@ -272,16 +286,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut scene = Scene::new();
 
     // Dome mesh (GLB) — loaded via GLTFLoader, added as standard Renderable
-    let dome_loaded = async {
-        let window = web_sys::window().unwrap();
-        let resp = wasm_bindgen_futures::JsFuture::from(
-            window.fetch_with_str("assets/dome.glb"),
-        ).await.ok()?;
-        let resp: web_sys::Response = resp.dyn_into().ok()?;
-        let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
-        let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-        GLTFLoader::load_glb(&bytes).ok()
-    }.await;
+    let dome_loaded = fetch_bytes("assets/dome.glb").await.ok().and_then(|bytes| GLTFLoader::load_glb(&bytes).ok());
     let mut dome_scene_index = None;
     if let Some(result) = dome_loaded {
         log::info!("Loaded dome: {} renderables", result.renderables.len());
@@ -325,7 +330,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let light_scene_index = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // ── Camera ──
-    let mut camera = Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32);
+    let mut camera = Camera::new(45.0, 0.1, 1000.0, canvas.aspect());
     camera.set_position(0.0, 20.0, 75.0);
     camera.look_at(&Vec3::new(0.0, 3.0, 0.0));
     camera.update_projection_matrix();
@@ -380,29 +385,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default()
     });
 
-    // ── Offscreen textures (for raymarch mode) ──
-    let mk_tex = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
-        let tex = renderer.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: fmt, usage, view_formats: &[],
-        });
-        let view = tex.create_view(&Default::default());
-        (tex, view)
-    };
-    let cu = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
-    let (_color_tex, color_view) = mk_tex("Color", wgpu::TextureFormat::Rgba16Float, cu);
-    let (_depth_tex, depth_view) = mk_tex("Depth", wgpu::TextureFormat::Depth32Float,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
-    let (_output_tex, output_view) = mk_tex("Output", wgpu::TextureFormat::Rgba16Float, cu);
-
-    let surface_bg = surface_renderer.create_bind_group(&color_view, &depth_view, &output_view, &density_field.density_view);
-    let blit_bg = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None, layout: &blit_bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&blit_sampler) },
-        ],
-    });
+    // ── Offscreen textures (for raymarch mode), recreated when the canvas resizes ──
+    let raymarch = raymarch_targets(&renderer, &surface_renderer, &density_field.density_view, &blit_bgl, &blit_sampler, width, height);
 
     // Now move sim, density_field, marching_cubes into the FluidSurfaceEffect
     let volume = PostProcessingVolume::new(
@@ -421,24 +405,22 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     );
 
     // Camera: back view aligned with long X axis (azimuth = π), radius 30
-    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 30.0);
+    let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(0.0, 3.0, 0.0), 30.0);
     controls.set_azimuth(std::f32::consts::PI);
-    let mouse = MouseVectors::from_canvas(&canvas);
+    let mouse = MouseVectors::from_canvas(canvas.element());
 
-    let perf_now = window.performance().map(|p| p.now()).unwrap_or(0.0);
     let state = Rc::new(RefCell::new(State {
         renderer, scene, camera, controls, mouse, volume,
         surface_renderer,
         mc_scene_index, dome_scene_index, light_scene_index,
         particle_scene_index,
-        blit_pipeline, blit_bg, surface_bg,
-        color_view, depth_view, _output_view: output_view,
+        blit_pipeline, blit_bgl, blit_sampler, raymarch,
         width, height,
         particle_size: 0.15, show_particles: true, render_mode: 0, mc_iso_level: 0.05,
         use_batched_sim: true,
         sim_accumulator: 0.0, sim_dt_step: 1.0 / 60.0, sim_time_scale: 1.0, max_sim_steps: 4,
         max_render_fps: 0.0, render_accumulator: 0.0,
-        frame_count: 0, frame_time_sum: 0.0, last_perf_time: perf_now,
+        frame_count: 0, frame_time_sum: 0.0,
         current_fps: 0.0, current_frame_ms: 0.0,
     }));
 
@@ -460,22 +442,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         }
     }
 
-    // Animation loop
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone(); let s = state.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        s.borrow_mut().render_frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&canvas, move |frame| state.borrow_mut().render_frame(frame));
 
     log::info!("Kansei WASM — {} particles, [toggle via tweakpane]", count);
     Ok(())
-    }
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
 }
 
 struct State {
@@ -491,30 +461,35 @@ struct State {
     light_scene_index: usize,
     particle_scene_index: usize,
     // Custom pipeline for raymarch mode only
-    blit_pipeline: wgpu::RenderPipeline, blit_bg: wgpu::BindGroup, surface_bg: wgpu::BindGroup,
-    color_view: wgpu::TextureView, depth_view: wgpu::TextureView, _output_view: wgpu::TextureView,
+    blit_pipeline: wgpu::RenderPipeline, blit_bgl: wgpu::BindGroupLayout, blit_sampler: wgpu::Sampler,
+    raymarch: RaymarchTargets,
     width: u32, height: u32,
     particle_size: f32, show_particles: bool, render_mode: u32, mc_iso_level: f32,
     use_batched_sim: bool,
     sim_accumulator: f64, sim_dt_step: f32, sim_time_scale: f32, max_sim_steps: u32,
     max_render_fps: f64, render_accumulator: f64,
-    frame_count: u32, frame_time_sum: f64, last_perf_time: f64,
+    frame_count: u32, frame_time_sum: f64,
     current_fps: f64, current_frame_ms: f64,
 }
 
 impl State {
-    fn render_frame(&mut self) {
-        let perf = web_sys::window().unwrap().performance().unwrap();
-        let now = perf.now();
-        let frame_ms = (now - self.last_perf_time).max(0.0);
-        self.last_perf_time = now;
+    fn render_frame(&mut self, frame: &Frame) {
+        if let Some((width, height)) = frame.resized {
+            frame.resize(&mut self.renderer, &mut self.camera);
+            self.width = width;
+            self.height = height;
+            let fse = self.volume.effects[0].as_any().downcast_ref::<FluidSurfaceEffect>().unwrap();
+            self.raymarch = raymarch_targets(&self.renderer, &self.surface_renderer, &fse.density_field.density_view,
+                &self.blit_bgl, &self.blit_sampler, width, height);
+        }
 
-        self.render_accumulator += frame_ms * 0.001;
+        let frame_s = frame.dt as f64;
+        self.render_accumulator += frame_s;
         let target_render_dt = if self.max_render_fps > 0.0 { 1.0 / self.max_render_fps } else { 0.0 };
         if target_render_dt > 0.0 && self.render_accumulator < target_render_dt { return; }
         let render_dt = if target_render_dt > 0.0 {
             let dt = self.render_accumulator; self.render_accumulator = 0.0; dt
-        } else { frame_ms * 0.001 };
+        } else { frame_s };
 
         self.frame_time_sum += render_dt * 1000.0;
         self.frame_count += 1;
@@ -605,13 +580,13 @@ impl State {
             {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.color_view, resolve_target: None,
+                        view: &self.raymarch.color_view, resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }),
                             store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_view,
+                        view: &self.raymarch.depth_view,
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                         stencil_ops: None,
                     }), ..Default::default()
@@ -622,7 +597,7 @@ impl State {
             let fse = self.volume.effects[0].as_any_mut().downcast_mut::<FluidSurfaceEffect>().unwrap();
             let bounds_min = fse.sim.world_bounds_min;
             let bounds_max = fse.sim.world_bounds_max;
-            self.surface_renderer.render(&mut encoder, &self.surface_bg,
+            self.surface_renderer.render(&mut encoder, &self.raymarch.surface_bg,
                 &inv_vp, [eye.x, eye.y, eye.z],
                 bounds_min, bounds_max,
                 self.width, self.height);
@@ -635,7 +610,7 @@ impl State {
                     })], ..Default::default()
                 }).forget_lifetime();
                 pass.set_pipeline(&self.blit_pipeline);
-                pass.set_bind_group(0, &self.blit_bg, &[]);
+                pass.set_bind_group(0, &self.raymarch.blit_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
             self.renderer.submit(std::iter::once(encoder.finish()));

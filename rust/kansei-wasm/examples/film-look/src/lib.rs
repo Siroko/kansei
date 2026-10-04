@@ -7,9 +7,6 @@
 //! (Unreal's local exposure at this highlight and shadow contrast, e.g. 0.8).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use kansei_core::cameras::Camera;
 use kansei_core::froxels::FroxelGridOptions;
@@ -22,7 +19,8 @@ use kansei_core::postprocessing::{
     PostProcessingVolume,
     effects::{exposure_from_ev100, BloomEffect, BloomOptions, LocalExposure, ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions},
 };
-use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::renderers::RendererConfig;
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 const LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
 
@@ -75,57 +73,12 @@ fn emissive_material(label: &str, radiance: [f32; 3], zenith: Option<[f32; 3]>, 
     material
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
-struct State {
-    renderer: Renderer,
-    scene: Scene,
-    camera: Camera,
-    volume: PostProcessingVolume,
-    start_ms: f64,
-    frozen_t: Option<f32>,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas
+        .renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() })
+        .await;
     renderer.enable_point_shadows(512, 1);
 
     let mut scene = Scene::new();
@@ -180,7 +133,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     fog.set_point_shadows(renderer.cubemap_shadow_map());
     fog.update_lights(scene.lights());
 
-    let tonemapper = match query_param("tm").as_deref() {
+    let tonemapper = match param("tm").as_deref() {
         Some("agx") => ToneMapper::AgX,
         Some("punchy") => ToneMapper::AgXPunchy,
         Some("neutral") => ToneMapper::KhronosNeutral,
@@ -188,8 +141,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         Some("none") => ToneMapper::None,
         _ => ToneMapper::AcesFitted,
     };
-    let film = query_param("film").as_deref() != Some("0");
-    let ev100 = query_param("ev").and_then(|v| v.parse().ok()).unwrap_or(3.9f32);
+    let film = flag("film", true);
+    let ev100 = param_or("ev", 3.9f32);
     let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
     options.tonemapper = tonemapper;
     options.exposure = exposure_from_ev100(ev100);
@@ -199,11 +152,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         options.grain = 0.22;
         options.chromatic_aberration = 0.25;
     }
-    options.local_exposure = query_param("le").and_then(|v| v.parse().ok()).map(|c: f32| LocalExposure::unreal(c, c));
+    options.local_exposure = param("le").and_then(|v| v.parse().ok()).map(|c: f32| LocalExposure::unreal(c, c));
     let tonemap = ToneMapEffect::new(options);
 
     let mut effects: Vec<Box<dyn kansei_core::postprocessing::PostProcessingEffect>> = vec![Box::new(fog)];
-    if query_param("bloom").as_deref() != Some("0") {
+    if flag("bloom", true) {
         effects.push(Box::new(
             BloomEffect::new(BloomOptions {
                 threshold: 0.0, // physically based: every light scatters a little
@@ -214,37 +167,29 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ));
     }
     effects.push(Box::new(tonemap));
-    let volume = PostProcessingVolume::new(&renderer, effects);
+    let mut volume = PostProcessingVolume::new(&renderer, effects);
 
-    let mut camera = Camera::new(45.0, 0.1, 400.0, width as f32 / height as f32);
+    let mut camera = Camera::new(45.0, 0.1, 400.0, canvas.aspect());
     camera.update_projection_matrix();
 
     log::info!("Kansei — Film Look (WASM) ready: {tonemapper:?}, EV100 {ev100}, film {film}, surface {:?}", renderer.presentation_format());
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, start_ms: now_secs(), frozen_t }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref start_ms, frozen_t } = *st;
-            let clock = (now_secs() - *start_ms) as f32;
-            let t = frozen_t.unwrap_or(clock);
+    let frozen_t: Option<f32> = param("t").and_then(|v| v.parse().ok());
+    kansei_wasm::run(&canvas, move |frame| {
+        frame.resize(&mut renderer, &mut camera);
+        let clock = frame.time as f32;
+        let t = frozen_t.unwrap_or(clock);
 
-            if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
-                fog.time = clock;
-            }
-
-            // walk slowly down the path toward the lamps
-            let z = 26.0 - (t * 0.6) % 20.0;
-            camera.set_position(0.4 * (t * 0.2).sin(), 1.7, z);
-            camera.look_at(&Vec3::new(0.0, 2.2, z - 20.0));
-
-            renderer.render_with_postprocessing(scene, camera, volume);
+        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+            fog.time = clock;
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+
+        // walk slowly down the path toward the lamps
+        let z = 26.0 - (t * 0.6) % 20.0;
+        camera.set_position(0.4 * (t * 0.2).sin(), 1.7, z);
+        camera.look_at(&Vec3::new(0.0, 2.2, z - 20.0));
+
+        renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
+    });
     Ok(())
 }

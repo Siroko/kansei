@@ -1,5 +1,4 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -11,51 +10,25 @@ use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, Shade
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{Canvas, Frame};
 
 mod steering_sim;
 mod text_data;
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-    log::info!("Kansei WASM (Steering Text) initialized");
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = canvas_id;
-        return Err(JsValue::from_str("kansei-wasm start() is only supported on wasm32"));
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-
-    let dpr = window.device_pixel_ratio().min(2.0);
-    let width = (canvas.client_width() as f64 * dpr) as u32;
-    let height = (canvas.client_height() as f64 * dpr) as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width, height,
+    let canvas = Canvas::find(canvas_id)?;
+    let (width, height) = canvas.size();
+    let renderer = canvas.renderer(RendererConfig {
         sample_count: 4,
         clear_color: Vec4::new(0.02, 0.02, 0.04, 1.0),
         ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    }).await;
 
-    let camera = Camera::new(45.0, 0.1, 1000.0, width as f32 / height as f32);
-    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 0.0, 0.0), 150.0);
-    let mouse = MouseVectors::from_canvas(&canvas);
+    let camera = Camera::new(45.0, 0.1, 1000.0, canvas.aspect());
+    let controls = CameraControls::from_canvas(canvas.element(), Vec3::new(0.0, 0.0, 0.0), 150.0);
+    let mouse = MouseVectors::from_canvas(canvas.element());
 
-    let perf_now = window.performance().map(|p| p.now()).unwrap_or(0.0);
     let state = Rc::new(RefCell::new(State {
         renderer, camera, controls, mouse,
         width, height,
@@ -65,7 +38,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         colors_buffer: None,
         auto_rotate_speed: 0.1,
         elapsed_time: 0.0,
-        last_perf_time: perf_now,
         frame_count: 0, frame_time_sum: 0.0,
         current_fps: 0.0, current_frame_ms: 0.0,
         particle_count: 0, word_count: 0,
@@ -73,22 +45,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
 
-    // Animation loop
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone(); let s = state.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        s.borrow_mut().render_frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&canvas, move |frame| state.borrow_mut().render_frame(frame));
 
     log::info!("Kansei WASM — Steering Text running");
     Ok(())
-    }
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
 }
 
 struct State {
@@ -104,7 +64,6 @@ struct State {
     colors_buffer: Option<wgpu::Buffer>,
     auto_rotate_speed: f32,
     elapsed_time: f32,
-    last_perf_time: f64,
     frame_count: u32,
     frame_time_sum: f64,
     current_fps: f64,
@@ -114,11 +73,13 @@ struct State {
 }
 
 impl State {
-    fn render_frame(&mut self) {
-        let perf = web_sys::window().unwrap().performance().unwrap();
-        let now = perf.now();
-        let frame_ms = (now - self.last_perf_time).max(0.0);
-        self.last_perf_time = now;
+    fn render_frame(&mut self, frame: &Frame) {
+        if let Some((width, height)) = frame.resized {
+            frame.resize(&mut self.renderer, &mut self.camera);
+            self.width = width;
+            self.height = height;
+        }
+        let frame_ms = frame.dt as f64 * 1000.0;
         let dt = (frame_ms * 0.001).max(1.0 / 1000.0);
 
         // FPS tracking

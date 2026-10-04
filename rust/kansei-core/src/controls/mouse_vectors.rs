@@ -46,18 +46,25 @@ impl MouseVectors {
         use wasm_bindgen::prelude::*;
         use wasm_bindgen::JsCast;
 
-        // Use CSS dimensions (client_width/height) since mouse events report CSS pixels
-        let w = canvas.client_width().max(1) as f32;
-        let h = canvas.client_height().max(1) as f32;
+        // NDC from CSS pixels (mouse events report CSS pixels), measured per event so a resized
+        // canvas maps correctly
+        let ndc = {
+            let canvas = canvas.clone();
+            move |e: &web_sys::MouseEvent| {
+                let w = canvas.client_width().max(1) as f32;
+                let h = canvas.client_height().max(1) as f32;
+                ((e.offset_x() as f32 / w - 0.5) * 2.0, (e.offset_y() as f32 / h - 0.5) * 2.0)
+            }
+        };
 
         let shared = Rc::new(RefCell::new(MouseTarget { x: 0.0, y: 0.0, snap: true }));
 
         // mousemove: update target
         { let s = shared.clone();
+          let ndc = ndc.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
             let mut t = s.borrow_mut();
-            t.x = (e.offset_x() as f32 / w - 0.5) * 2.0;
-            t.y = (e.offset_y() as f32 / h - 0.5) * 2.0;
+            (t.x, t.y) = ndc(&e);
           });
           canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).ok();
           cb.forget();
@@ -67,8 +74,7 @@ impl MouseVectors {
         { let s = shared.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
             let mut t = s.borrow_mut();
-            t.x = (e.offset_x() as f32 / w - 0.5) * 2.0;
-            t.y = (e.offset_y() as f32 / h - 0.5) * 2.0;
+            (t.x, t.y) = ndc(&e);
             t.snap = true;
           });
           canvas.add_event_listener_with_callback("mouseenter", cb.as_ref().unchecked_ref()).ok();

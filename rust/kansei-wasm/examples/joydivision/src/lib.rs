@@ -1,5 +1,4 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -11,49 +10,23 @@ use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, Shade
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{Canvas, Frame};
 
 mod fft_compute;
 mod text_layout;
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-    log::info!("Kansei WASM (Joy Division) initialized");
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = canvas_id;
-        return Err(JsValue::from_str("kansei-wasm start() is only supported on wasm32"));
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-
-    let dpr = window.device_pixel_ratio().min(2.0);
-    let width = (canvas.client_width() as f64 * dpr) as u32;
-    let height = (canvas.client_height() as f64 * dpr) as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width, height,
+    let canvas = Canvas::find(canvas_id)?;
+    let (width, height) = canvas.size();
+    let renderer = canvas.renderer(RendererConfig {
         sample_count: 4,
         clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
         ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    }).await;
 
     // Set up camera — perspective looking straight at the text plane
-    let aspect = width as f32 / height as f32;
-    let mut camera = Camera::new(45.0, 0.1, 2000.0, aspect);
+    let mut camera = Camera::new(45.0, 0.1, 2000.0, canvas.aspect());
     // Position camera far enough back to see text filling the width.
     // With font_size=2.5 and ~50 chars max, line width ~ 50*2.5*0.5 ~ 62 units.
     // At FOV 45, half-width at distance d = d * tan(22.5 deg) ~ d * 0.414
@@ -62,7 +35,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     camera.look_at(&Vec3::new(0.0, 0.0, 0.0));
     camera.update_projection_matrix();
 
-    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 0.0, 0.0), 100.0);
+    let controls = CameraControls::from_canvas(canvas.element(), Vec3::new(0.0, 0.0, 0.0), 100.0);
 
     let state = Rc::new(RefCell::new(State {
         renderer, camera, controls,
@@ -78,22 +51,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
 
-    // Animation loop
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone(); let s = state.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        s.borrow_mut().render_frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&canvas, move |frame| state.borrow_mut().render_frame(frame));
 
     log::info!("Kansei WASM — Joy Division running");
     Ok(())
-    }
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
 }
 
 struct State {
@@ -112,7 +73,12 @@ struct State {
 }
 
 impl State {
-    fn render_frame(&mut self) {
+    fn render_frame(&mut self, frame: &Frame) {
+        if let Some((width, height)) = frame.resized {
+            frame.resize(&mut self.renderer, &mut self.camera);
+            self.width = width;
+            self.height = height;
+        }
         self.controls.update(&mut self.camera, 0.0);
         self.camera.aspect = self.width as f32 / self.height as f32;
         self.camera.update_projection_matrix();

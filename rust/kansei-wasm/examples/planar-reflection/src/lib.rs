@@ -13,9 +13,6 @@
 //! reflection from the screen, `PlanarReflection::screen_space`, instead of the mirrored view).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler};
 use kansei_core::culling::InstanceCulling;
@@ -32,6 +29,7 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::reflections::{PlanarReflection, PlanarReflectionOptions, PLANAR_REFLECTION_WGSL};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 const WATER_LAYER: u32 = 2;
 const LAKE_LEVEL: f32 = 0.0;
@@ -172,59 +170,28 @@ fn hash(i: u32) -> f32 {
     (x % 10007) as f32 / 10007.0
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
-struct State {
-    renderer: Renderer,
-    scene: Scene,
-    camera: Camera,
-    volume: PostProcessingVolume,
-    water: usize,
-    water_params: [f32; 12],
-    start_ms: f64,
-    frozen_t: Option<f32>,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
+/// The reflection: half the canvas's resolution, everything but the water, with the fog's
+/// mirrored froxels composited in when `fog` is given.
+fn lake_reflection(renderer: &Renderer, (width, height): (u32, u32), occlusion: bool, screen_space: bool, fog: Option<&mut VolumetricFogEffect>) -> PlanarReflection {
+    let mut reflection = PlanarReflection::new(
+        renderer,
+        Vec3::new(0.0, LAKE_LEVEL, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        PlanarReflectionOptions { width: (width / 2).max(1), height: (height / 2).max(1), layer_mask: !WATER_LAYER, ..Default::default() },
+    );
+    reflection.occlusion_culling = occlusion;
+    reflection.screen_space = screen_space;
+    if let Some(fog) = fog {
+        let seen = fog.reflection_fog(renderer, &reflection);
+        reflection.set_fog(renderer, Some(&seen));
+    }
+    reflection
 }
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
 
     let mut scene = Scene::new();
     // (a pipeline layout's group 0 needs a bind group, so the sky gets an unused uniform)
@@ -257,7 +224,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // the GPU for the camera and, separately, for the mirrored view
     let treeline = InstancedGeometry::new(BoxGeometry::new(2.6, 1.0, 2.6), count, vec![instances]);
     let mut treeline = Renderable::new(treeline, surface_material("Trees", [0.03, 0.04, 0.03], [0.0; 3], 0.0, true));
-    let occlusion = query_param("occlusion").as_deref() == Some("1");
+    let occlusion = flag("occlusion", false);
     treeline.instance_culling = Some(InstanceCulling::new(all_trees, count, 16, 0, 0.6).with_radius_scale(12).with_occlusion(occlusion));
     scene.add(SceneNode::Renderable(treeline));
 
@@ -289,24 +256,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     lamp.volumetric_scale = 1.0;
     scene.add(SceneNode::Light(Light::Spot(lamp)));
 
-    // the reflection: half resolution, everything but the water
-    let mut reflection = PlanarReflection::new(
-        &renderer,
-        Vec3::new(0.0, LAKE_LEVEL, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        PlanarReflectionOptions { width: width / 2, height: height / 2, layer_mask: !WATER_LAYER, ..Default::default() },
-    );
-    reflection.occlusion_culling = occlusion;
-    reflection.screen_space = query_param("screen").as_deref() == Some("1");
+    let screen_space = flag("screen", false);
     renderer.set_culling_stats(occlusion);
-    let ripples: f32 = query_param("ripples").and_then(|v| v.parse().ok()).unwrap_or(0.03);
-    let roughness: f32 = query_param("rough").and_then(|v| v.parse().ok()).unwrap_or(0.05);
+    let ripples: f32 = param_or("ripples", 0.03);
+    let roughness: f32 = param_or("rough", 0.05);
     // the fog in the reflection (fogrefl=0 leaves it out, and the water fogs the reflected path
     // with a flat colour instead, as before)
-    let fog_in_reflection = query_param("fogrefl").as_deref() != Some("0");
+    let fog_in_reflection = flag("fogrefl", true);
     // time, ripples, roughness, - | fog colour, fog density | deep body colour
     let water_fog = if fog_in_reflection { 0.0 } else { 0.0012 };
-    let water_params: [f32; 12] = [0.0, ripples, roughness, 0.0, 45.0, 48.0, 58.0, water_fog, 0.2, 0.3, 0.3, 1.0];
+    let mut water_params: [f32; 12] = [0.0, ripples, roughness, 0.0, 45.0, 48.0, 58.0, water_fog, 0.2, 0.3, 0.3, 1.0];
     let mut water_material = Material::new(
         "Water",
         &format!("{PLANAR_REFLECTION_WGSL}\n{WATER_WGSL}"),
@@ -318,7 +277,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         MaterialOptions { cull_mode: CullMode::None, ..Default::default() },
     );
     water_material.set_uniform_bindable(0, "Water", &water_params);
-    water_material.set_bindable(1, reflection.material_texture());
     water_material.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
 
     let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
@@ -330,11 +288,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ..Default::default()
     });
     fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
-    if fog_in_reflection {
-        let seen = fog.reflection_fog(&renderer, &reflection);
-        reflection.set_fog(&renderer, Some(&seen));
-    }
-    renderer.add_planar_reflection(reflection);
+    let reflection = lake_reflection(&renderer, canvas.size(), occlusion, screen_space, fog_in_reflection.then_some(&mut fog));
+    water_material.set_bindable(1, reflection.material_texture());
+    let reflection_index = renderer.add_planar_reflection(reflection);
     let mut lake = Renderable::new(PlaneGeometry::new(1600.0, 400.0), water_material);
     lake.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     lake.object.set_position(0.0, LAKE_LEVEL, -100.0);
@@ -354,48 +310,52 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         Box::new(BloomEffect::new(BloomOptions { threshold: 0.0, intensity: 0.04, ..Default::default() }).with_exposure(tonemap.total_exposure())),
         Box::new(tonemap),
     ];
-    let volume = PostProcessingVolume::new(&renderer, effects);
+    let mut volume = PostProcessingVolume::new(&renderer, effects);
 
-    let mut camera = Camera::new(28.0, 0.5, 2000.0, width as f32 / height as f32);
+    let mut camera = Camera::new(28.0, 0.5, 2000.0, canvas.aspect());
     camera.update_projection_matrix();
 
     log::info!("Kansei — Planar Reflection (WASM) ready: ripples {ripples}, roughness {roughness}");
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, volume, water, water_params, start_ms: now_secs(), frozen_t }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let State { ref mut renderer, ref mut scene, ref mut camera, ref mut volume, water, ref mut water_params, ref start_ms, frozen_t } = *st;
-            let clock = (now_secs() - *start_ms) as f32;
-            let t = frozen_t.unwrap_or(clock);
-
-            if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
-                fog.time = clock;
-            }
-            water_params[0] = clock;
+    let frozen_t: Option<f32> = param("t").and_then(|v| v.trim().parse().ok());
+    kansei_wasm::run(&canvas, move |frame| {
+        frame.resize(&mut renderer, &mut camera);
+        if let Some(size) = frame.resized {
+            // the reflection's target follows the canvas: a new one, wired to the fog and the water
+            let fog = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>().filter(|_| fog_in_reflection);
+            let reflection = lake_reflection(&renderer, size, occlusion, screen_space, fog);
             if let Some(r) = scene.get_renderable_mut(water) {
-                if let Some(buf) = r.material.bindable_buffer(0) {
-                    renderer.queue().write_buffer(&buf, 0, bytemuck::cast_slice(&water_params[..]));
-                }
+                r.material.set_bindable(1, reflection.material_texture());
             }
+            if let Some(slot) = renderer.planar_reflection_mut(reflection_index) {
+                *slot = reflection;
+            }
+            renderer.invalidate_bundle();
+        }
+        let clock = frame.time as f32;
+        let t = frozen_t.unwrap_or(clock);
 
-            // low over the near shore, panning slowly along the far treeline
-            let yaw = -0.25 + 0.12 * (t * 0.05).sin();
-            camera.set_position(6.0, 2.2, 16.0);
-            camera.look_at(&Vec3::new(6.0 + yaw.sin() * 100.0, 3.0, 16.0 - yaw.cos() * 100.0));
-
-            renderer.render_with_postprocessing(scene, camera, volume);
-            if camera.frame() % 120 == 0 {
-                if let Some(stats) = renderer.culling_stats() {
-                    log::info!("culling: {:?}", stats.views);
-                }
+        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+            fog.time = clock;
+        }
+        water_params[0] = clock;
+        if let Some(r) = scene.get_renderable_mut(water) {
+            if let Some(buf) = r.material.bindable_buffer(0) {
+                renderer.queue().write_buffer(&buf, 0, bytemuck::cast_slice(&water_params[..]));
             }
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+
+        // low over the near shore, panning slowly along the far treeline
+        let yaw = -0.25 + 0.12 * (t * 0.05).sin();
+        camera.set_position(6.0, 2.2, 16.0);
+        camera.look_at(&Vec3::new(6.0 + yaw.sin() * 100.0, 3.0, 16.0 - yaw.cos() * 100.0));
+
+        renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
+        if camera.frame() % 120 == 0 {
+            if let Some(stats) = renderer.culling_stats() {
+                log::info!("culling: {:?}", stats.views);
+            }
+        }
+    });
     Ok(())
 }

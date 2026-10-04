@@ -35,7 +35,8 @@
 //! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
 //! paces; sideways and backward scale with them), `course=0` (no boxes), `lake=0` (no lake),
-//! `rest=0` (the lake's water never rests: always stepped and drawn),
+//! `rest=0` (the lake's water never rests: always stepped and drawn), `mill=0` (the mill stands
+//! still), `profile=1` (log the renderer's GPU/CPU profile every 3 s),
 //! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake),
 //! `drive=1` (a fixed route instead of the player, for side-by-side captures; `demo`),
 //! `play=<pattern>` (the pack's clips whose names start with it, `*` any run, one after another),
@@ -77,6 +78,7 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::shadows::{CascadedShadowOptions, CASCADED_SHADOWS_WGSL};
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 /// The sun's travel direction, its illuminance (lux) and the sky's luminance (cd/m²).
 const SUN_DIR: [f32; 3] = [-0.45, -0.6, -0.66];
@@ -384,27 +386,9 @@ fn surface_params(base: [f32; 3]) -> [f32; 16] {
     [base[0], base[1], base[2], 0.0, d[0], d[1], d[2], 0.0, SUN[0], SUN[1], SUN[2], 0.0, SKY[0], SKY[1], SKY[2], 0.0]
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-/// The page URL's parameter `name`, as written.
+/// The page URL's parameter `name`, percent-decoded ([`kansei_wasm::param`]).
 pub fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
+    param(name)
 }
 
 /// Show `text` in the page's HUD element.
@@ -424,14 +408,7 @@ fn set_hud(text: &str) {
 
 /// Fetch `url` as bytes; the error says what went wrong in words for the page.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let window = web_sys::window().ok_or("no window")?;
-    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|_| format!("could not fetch {url}"))?;
-    let response: web_sys::Response = response.dyn_into().map_err(|_| "not a response".to_string())?;
-    if !response.ok() {
-        return Err(format!("{url}: HTTP {}", response.status()));
-    }
-    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().map_err(|_| "no body".to_string())?).await.map_err(|_| format!("could not read {url}"))?;
-    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+    kansei_wasm::fetch_bytes(url).await.map_err(|e| e.as_string().unwrap_or_else(|| format!("could not fetch {url}")))
 }
 
 /// Instanced unit boxes placed by matrices the app rewrites each frame.
@@ -710,7 +687,7 @@ fn gamepad() -> Option<([f32; 2], [f32; 2], Vec<(bool, f32)>)> {
 
 impl State {
     fn frame(&mut self) {
-        let now = now_secs();
+        let now = kansei_wasm::now();
         let dt = ((now - self.last) as f32).clamp(1e-4, 1.0 / 15.0);
         self.last = now;
         self.frame += 1;
@@ -1038,25 +1015,18 @@ where
     F: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
     let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document.get_element_by_id(canvas_id).ok_or("Canvas not found")?.dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig { width, height, sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 60.0, ..Default::default() });
 
     let mut scene = Scene::new();
     // the floor and the course, for collision
     let mut world = CollisionWorld::new();
-    let with_lake = query_param("lake").as_deref() != Some("0");
+    let with_lake = flag("lake", true);
     if !with_lake {
         world.add_box(Obb::from_min_max(GVec3::new(-200.0, -1.0, -200.0), GVec3::new(200.0, 0.0, 200.0)));
     }
-    if query_param("course").as_deref() != Some("0") {
+    if flag("course", true) {
         build_course(&mut scene, &mut world);
     }
     let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
@@ -1070,11 +1040,11 @@ where
     let (mut cannon, mut mill) = (None, None);
     let lake = if with_lake {
         let (mut lake, surface) = lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0);
-        lake.rest = query_param("rest").as_deref() != Some("0");
+        lake.rest = flag("rest", true);
         cannon = Some(cannon::Cannon::new(&mut scene, &mut world, &lake));
         mill = Some(mill::Mill::new(&mut scene, &mut world, &lake));
         if let Some(m) = &mut mill {
-            m.on = query_param("mill").as_deref() != Some("0");
+            m.on = flag("mill", true);
         }
         Some((lake, surface))
     } else {
@@ -1089,12 +1059,12 @@ where
     scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // the character, from a pack outside the repository
-    let url = query_param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
+    let url = param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
     set_hud(&format!("Loading motion pack {url} …"));
-    let gait = query_param("gait").as_deref() != Some("0");
+    let gait = flag("gait", true);
     let motion = load(url.clone()).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
     // a second body, optional
-    let hero_url = query_param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
+    let hero_url = param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
     let hero = match &motion {
         Ok(_) => match load(hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
             Ok(h) => Some(h),
@@ -1108,12 +1078,12 @@ where
     let character = match motion {
         Ok(pack) => match Character::new(&renderer, &mut scene, pack, hero, gait) {
             Ok(mut c) => {
-                let wanted = match query_param("char").as_deref() {
+                let wanted = match param("char").as_deref() {
                     Some("mannequin") => 0,
                     _ => c.bodies.len() - 1,
                 };
                 c.show(&mut scene, wanted);
-                if let Some(at) = query_param("at") {
+                if let Some(at) = param("at") {
                     let v: Vec<f32> = at.split(',').filter_map(|x| x.parse().ok()).collect();
                     if v.len() >= 2 {
                         // on whatever is there (a box top)
@@ -1152,7 +1122,7 @@ where
         effects.push(Box::new(surface));
         lake
     });
-    if query_param("taa").as_deref() != Some("0") {
+    if flag("taa", true) {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
     effects.push(Box::new(tonemap));
@@ -1160,13 +1130,13 @@ where
     if let Some(surface) = lake.as_ref().and_then(|l| volume.effects[l.effect].as_any().downcast_ref::<FluidSurfaceEffect>()) {
         lake::Lake::add_surface(&mut scene, surface);
     }
-    let mut camera = Camera::new(45.0, 0.1, 1200.0, width as f32 / height as f32);
+    let mut camera = Camera::new(45.0, 0.1, 1200.0, canvas.aspect());
     camera.update_projection_matrix();
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
-    let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(start.translation.x, 0.9, start.translation.z), 4.5);
+    let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(start.translation.x, 0.9, start.translation.z), 4.5);
     controls.set_elevation(0.25);
     // behind the character, or turned round it by `view=<degrees>` (90: its left side)
-    let view = query_param("view").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0).to_radians();
+    let view = param_or("view", 0.0f32).to_radians();
     controls.set_azimuth(std::f32::consts::PI + yaw_of(start.rotation) + view);
 
     let keys = Rc::new(RefCell::new(Keys::default()));
@@ -1198,7 +1168,7 @@ where
         on_blur.forget();
     }
 
-    let scaled = |paces: [f32; 3], name: &str| query_param(name).and_then(|v| v.parse::<f32>().ok()).map_or(paces, |forward| paces.map(|p| p * forward / paces[0]));
+    let scaled = |paces: [f32; 3], name: &str| param(name).and_then(|v| v.parse::<f32>().ok()).map_or(paces, |forward| paces.map(|p| p * forward / paces[0]));
     let speeds = (scaled(WALK, "walk"), scaled(RUN, "run"));
     log::info!("Kansei — Motion Matching (WASM) ready: character {}", character.is_some());
     let state = Rc::new(RefCell::new(State {
@@ -1216,7 +1186,7 @@ where
         pointer_fire: (false, false),
         prompt: String::new(),
         keys,
-        last: now_secs(),
+        last: kansei_wasm::now(),
         frame: 0,
         strafe: false,
         overlay: true,
@@ -1225,7 +1195,7 @@ where
         fps: 60.0,
         searches: 0,
         switches: 0,
-        counted_since: now_secs(),
+        counted_since: kansei_wasm::now(),
         rates: (0.0, 0.0),
         profile_since: 0.0,
         air: (false, 0.0),
@@ -1233,10 +1203,10 @@ where
         drive: None,
         player: None,
     }));
-    if query_param("profile").as_deref() == Some("1") {
+    if flag("profile", false) {
         let mut s = state.borrow_mut();
         s.renderer.set_profiling(true);
-        s.profile_since = now_secs();
+        s.profile_since = kansei_wasm::now();
     }
     {
         let mut s = state.borrow_mut();
@@ -1245,23 +1215,22 @@ where
             (at.translation, yaw_of(at.rotation))
         });
         if let Some(home) = home {
-            if query_param("drive").as_deref() == Some("1") {
-                s.drive = Some(demo::Drive { start: now_secs(), home });
+            if flag("drive", false) {
+                s.drive = Some(demo::Drive { start: kansei_wasm::now(), home });
             }
-            if let Some(prefix) = query_param("play") {
+            if let Some(prefix) = param("play") {
                 let player = s.character.as_ref().map(|c| demo::ClipPlayer::new(&c.db, &prefix, home));
                 s.player = player;
             }
         }
     }
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        state.borrow_mut().frame();
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    kansei_wasm::run(&canvas, move |frame| {
+        let mut s = state.borrow_mut();
+        let State { renderer, camera, .. } = &mut *s;
+        frame.resize(renderer, camera);
+        s.frame();
+    });
     Ok(())
 }
 
@@ -1311,7 +1280,7 @@ fn surface_js(s: lake::SurfaceSettings) -> JsValue {
 pub fn drive_restart() {
     with_state(|s| {
         if let (Some(d), Some(c)) = (&mut s.drive, &mut s.character) {
-            d.start = now_secs();
+            d.start = kansei_wasm::now();
             c.controller.matcher.teleport(d.home.0, d.home.1);
         }
         if let Some(p) = &mut s.player {
@@ -1353,7 +1322,7 @@ pub fn set_drive(on: bool) {
     with_state(|s| {
         s.drive = on.then(|| {
             let at = s.character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
-            demo::Drive { start: now_secs(), home: (at.translation, yaw_of(at.rotation)) }
+            demo::Drive { start: kansei_wasm::now(), home: (at.translation, yaw_of(at.rotation)) }
         });
         if !on {
             s.strafe = false;

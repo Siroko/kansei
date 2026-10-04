@@ -16,9 +16,6 @@
 //! the blur on and off.
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer};
 use kansei_core::cameras::{Camera, MOTION_VECTORS_WGSL};
@@ -30,7 +27,8 @@ use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
     effects::{exposure_from_ev100, MotionBlurEffect, MotionBlurOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
-use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::renderers::RendererConfig;
+use kansei_wasm::{flag, param, param_or, Canvas};
 
 /// A diffuse surface under a sky and a low sun, writing motion vectors. Variants (string
 /// replaced): INSTANCE_* for instanced trunks/grass (vec4: xyz position, w yaw or height), WIND
@@ -153,72 +151,14 @@ fn hash(i: u32) -> f32 {
     (x % 10007) as f32 / 10007.0
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
-struct State {
-    renderer: Renderer,
-    scene: Scene,
-    camera: Camera,
-    volume: PostProcessingVolume,
-    animated: Vec<usize>,
-    car: usize,
-    start_ms: f64,
-    last_t: f32,
-    last_clock: f32,
-    frozen_t: Option<f32>,
-    step: Option<f32>,
-    frame: u32,
-    wind: f32,
-    /// `stats=1`: frames in the current window and when it started.
-    stats: Option<(u32, f64)>,
-    pan: f32,
-    car_speed: f32,
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window().unwrap().request_animation_frame(f.as_ref().unchecked_ref()).unwrap();
-}
-
-fn now_secs() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
-}
-
-fn query_param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
-    search.trim_start_matches('?').split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
-    if let Some(scale) = query_param("scale").and_then(|v| v.parse().ok()) {
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
+    if let Some(scale) = param("scale").and_then(|v| v.trim().parse().ok()) {
         renderer.set_render_scale(scale);
     }
-    let velocity = query_param("vel").as_deref() != Some("0");
+    let velocity = flag("vel", true);
 
     let mut scene = Scene::new();
     let mut animated = Vec::new();
@@ -272,93 +212,82 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ToneMapEffect::new(options)
     };
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    if query_param("taa").as_deref() != Some("0") {
+    if flag("taa", true) {
         effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
     }
-    let mblur: f32 = query_param("mblur").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let mblur: f32 = param_or("mblur", 0.0);
     if mblur > 0.0 {
-        let fps: f32 = query_param("mbfps").and_then(|v| v.parse().ok()).unwrap_or(30.0);
+        let fps: f32 = param_or("mbfps", 30.0);
         effects.push(Box::new(MotionBlurEffect::new(MotionBlurOptions {
             amount: mblur,
-            max: query_param("mbmax").and_then(|v| v.parse().ok()).unwrap_or(0.04),
+            max: param_or("mbmax", 0.04),
             target_fps: (fps > 0.0).then_some(fps),
             ..Default::default()
         })));
     }
     effects.push(Box::new(tonemap));
-    let volume = PostProcessingVolume::new(&renderer, effects);
+    let mut volume = PostProcessingVolume::new(&renderer, effects);
 
-    let mut camera = Camera::new(40.0, 0.1, 1000.0, width as f32 / height as f32);
+    let mut camera = Camera::new(40.0, 0.1, 1000.0, canvas.aspect());
     camera.update_projection_matrix();
 
     let (render_width, render_height) = renderer.render_size();
+    let (width, height) = canvas.size();
     log::info!("Kansei — Temporal AA (WASM) ready: motion vectors {velocity}, motion blur {mblur}, rendering {render_width}x{render_height} for {width}x{height}");
 
-    let frozen_t = query_param("t").and_then(|v| v.parse().ok());
-    let step = query_param("step").and_then(|v| v.parse().ok()).filter(|_| frozen_t.is_some());
-    let wind: f32 = query_param("wind").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let stats = (query_param("stats").as_deref() == Some("1")).then(|| (0, now_secs()));
-    let pan: f32 = query_param("pan").and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let car_speed: f32 = query_param("car").and_then(|v| v.parse().ok()).unwrap_or(9.0);
-    let state = Rc::new(RefCell::new(State {
-        renderer, scene, camera, volume, animated, car, start_ms: now_secs(), last_t: 0.0, last_clock: 0.0, frozen_t, step, frame: 0, wind, stats, pan, car_speed,
-    }));
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
-    *g.borrow_mut() = Some(Closure::new(move || {
-        {
-            let mut st = state.borrow_mut();
-            let State {
-                ref mut renderer, ref mut scene, ref mut camera, ref mut volume, ref animated, car, ref start_ms, ref mut last_t, ref mut last_clock,
-                frozen_t, step, ref mut frame, ref wind, ref mut stats, pan, car_speed,
-            } = *st;
-            let mut clock = (now_secs() - *start_ms) as f32;
-            let mut t = frozen_t.unwrap_or(clock);
-            // a still picture in motion: alternate between t and t + step
-            let mut frame_time = clock - *last_clock;
-            *last_clock = clock;
-            if let Some(step) = step {
-                t += (*frame % 2) as f32 * step;
-                clock = t;
-                frame_time = step;
+    let frozen_t: Option<f32> = param("t").and_then(|v| v.trim().parse().ok());
+    let step: Option<f32> = param("step").and_then(|v| v.trim().parse().ok()).filter(|_| frozen_t.is_some());
+    let wind: f32 = param_or("wind", 1.0);
+    // `stats=1`: frames in the current window and when it started
+    let mut stats = flag("stats", false).then(|| (0u32, kansei_wasm::now()));
+    let pan: f32 = param_or("pan", 0.0);
+    let car_speed: f32 = param_or("car", 9.0);
+    let mut last_t = 0.0f32;
+    kansei_wasm::run(&canvas, move |frame| {
+        frame.resize(&mut renderer, &mut camera);
+        let mut clock = frame.time as f32;
+        let mut t = frozen_t.unwrap_or(clock);
+        // a still picture in motion: alternate between t and t + step
+        let mut frame_time = frame.dt;
+        if let Some(step) = step {
+            t += (frame.index % 2) as f32 * step;
+            clock = t;
+            frame_time = step;
+        }
+        for effect in volume.effects.iter_mut() {
+            if let Some(mb) = effect.as_any_mut().downcast_mut::<MotionBlurEffect>() {
+                mb.set_frame_time(frame_time);
             }
-            *frame += 1;
-            for effect in volume.effects.iter_mut() {
-                if let Some(mb) = effect.as_any_mut().downcast_mut::<MotionBlurEffect>() {
-                    mb.set_frame_time(frame_time);
-                }
-            }
+        }
 
-            // wind time, this frame's and last frame's
-            for &idx in animated {
-                if let Some(r) = scene.get_renderable_mut(idx) {
-                    if let Some(buf) = r.material.bindable_buffer(0) {
-                        renderer.queue().write_buffer(&buf, 16, bytemuck::cast_slice(&[clock, *last_t, *wind]));
-                    }
-                }
-            }
-            *last_t = clock;
-
-            if let Some(r) = scene.get_renderable_mut(car) {
-                r.object.set_position(-30.0 + (clock * car_speed) % 60.0, 0.85, -8.0);
-            }
-            // swinging left and right at up to `pan` degrees a second
-            let yaw = pan.to_radians() / 0.8 * (0.8 * t).sin();
-            camera.set_position(-2.0 + t * 0.4, 1.3, 6.0);
-            camera.look_at(&Vec3::new(-2.0 + t * 0.4 + 26.0 * yaw.sin(), 2.2, 6.0 - 26.0 * yaw.cos()));
-
-            renderer.render_with_postprocessing(scene, camera, volume);
-            if let Some((frames, window_start)) = stats {
-                *frames += 1;
-                if *frames == 240 {
-                    log::info!("frame interval: {:.2} ms", (now_secs() - *window_start) * 1000.0 / 240.0);
-                    *frames = 0;
-                    *window_start = now_secs();
+        // wind time, this frame's and last frame's
+        for &idx in &animated {
+            if let Some(r) = scene.get_renderable_mut(idx) {
+                if let Some(buf) = r.material.bindable_buffer(0) {
+                    renderer.queue().write_buffer(&buf, 16, bytemuck::cast_slice(&[clock, last_t, wind]));
                 }
             }
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+        last_t = clock;
+
+        if let Some(r) = scene.get_renderable_mut(car) {
+            r.object.set_position(-30.0 + (clock * car_speed) % 60.0, 0.85, -8.0);
+        }
+        // swinging left and right at up to `pan` degrees a second
+        let yaw = pan.to_radians() / 0.8 * (0.8 * t).sin();
+        camera.set_position(-2.0 + t * 0.4, 1.3, 6.0);
+        camera.look_at(&Vec3::new(-2.0 + t * 0.4 + 26.0 * yaw.sin(), 2.2, 6.0 - 26.0 * yaw.cos()));
+
+        renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
+        if let Some((frames, window_start)) = stats.as_mut() {
+            *frames += 1;
+            if *frames == 240 {
+                let now = kansei_wasm::now();
+                log::info!("frame interval: {:.2} ms", (now - *window_start) * 1000.0 / 240.0);
+                *frames = 0;
+                *window_start = now;
+            }
+        }
+    });
     Ok(())
 }

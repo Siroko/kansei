@@ -1,5 +1,4 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -13,6 +12,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pathtracer::{BVHBuilder, GPUBVHData, PathTracer, PathTracerMaterial, TLASBuilder};
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_wasm::{fetch_bytes, Canvas};
 
 const BASIC_LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
 
@@ -180,12 +180,6 @@ impl BlitResources {
     }
 }
 
-#[wasm_bindgen(start)]
-pub fn init() {
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
@@ -231,35 +225,14 @@ fn move_object(scene: &mut Scene, idx: usize, pos: Vec3) {
     }
 }
 
-fn request_animation_frame(f: &Closure<dyn FnMut()>) {
-    web_sys::window()
-        .unwrap()
-        .request_animation_frame(f.as_ref().unchecked_ref())
-        .unwrap();
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let canvas = document
-        .get_element_by_id(canvas_id)
-        .ok_or("Canvas not found")?
-        .dyn_into::<web_sys::HtmlCanvasElement>()?;
-
-    let width = canvas.client_width() as u32;
-    let height = canvas.client_height() as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
-
-    let mut renderer = Renderer::new(RendererConfig {
-        width,
-        height,
-        sample_count: 1,
-        clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
-        ..Default::default()
-    });
-    renderer.initialize_with_canvas(canvas.clone()).await;
+    let page = Canvas::find(canvas_id)?;
+    let canvas = page.element();
+    let (width, height) = page.size();
+    let renderer = page
+        .renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() })
+        .await;
 
     // Build scene
     let mut scene = Scene::new();
@@ -315,18 +288,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let box_b_idx = scene.add(SceneNode::Renderable(box_b));
 
     // Stanford Dragon (glass) — fetch GLB via HTTP
-    let dragon_loaded = async {
-        let window = web_sys::window().unwrap();
-
-        let resp = wasm_bindgen_futures::JsFuture::from(
-            window.fetch_with_str("assets/stanford_dragon_pbr.glb"),
-        ).await.ok()?;
-        let resp: web_sys::Response = resp.dyn_into().ok()?;
-        let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().ok()?).await.ok()?;
-        let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-
-        GLTFLoader::load_glb(&bytes).ok()
-    }.await;
+    let dragon_loaded = fetch_bytes("assets/stanford_dragon_pbr.glb")
+        .await
+        .ok()
+        .and_then(|bytes| GLTFLoader::load_glb(&bytes).ok());
 
     let mut dragon_parts: Vec<(usize, Vec3)> = Vec::new();
     if let Some(result) = dragon_loaded {
@@ -432,11 +397,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         scene_dirty: false,
     }));
 
-    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-    let g = f.clone();
     let s = state.clone();
-
-    *g.borrow_mut() = Some(Closure::new(move || {
+    kansei_wasm::run(&page, move |frame| {
         {
             let mut st = s.borrow_mut();
             let State {
@@ -454,6 +416,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 ref mut scene_dirty,
                 ..
             } = *st;
+            // The tracer's output (and the blit reading it) follow the canvas size.
+            if let Some((width, height)) = frame.resized {
+                frame.resize(renderer, camera);
+                path_tracer.resize(width, height);
+                path_tracer.reset_accumulation();
+            }
             if controls.is_dirty() {
                 path_tracer.reset_accumulation();
             }
@@ -461,11 +429,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
             // Animate box B in an orbit (mirrors the TS example's animated cube)
             if animate {
-                let t = (web_sys::window()
-                    .and_then(|w| w.performance())
-                    .map(|p| p.now())
-                    .unwrap_or(0.0)
-                    * 0.001) as f32;
+                let t = frame.time as f32;
                 if let Some(r) = scene.get_renderable_mut(box_b_idx) {
                     r.object.position = Vec3::new(t.sin() * 2.5, t.cos() * 1.5 + 2.5, 0.0);
                     r.object.rotation = Vec3::new(t * 0.7, t * 1.1, t * 0.5);
@@ -504,9 +468,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             renderer.queue().submit(std::iter::once(encoder.finish()));
             output.present();
         }
-        request_animation_frame(f.borrow().as_ref().unwrap());
-    }));
-    request_animation_frame(g.borrow().as_ref().unwrap());
+    });
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
 
