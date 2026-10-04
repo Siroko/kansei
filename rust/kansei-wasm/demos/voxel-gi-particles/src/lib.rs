@@ -27,7 +27,7 @@
 //! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA and
 //! runs `TemporalAAEffect` first instead (`taa=0` turns it off). The particles write no motion vectors: the TAA reprojects them by depth.
 //! `focus=` sets the focus distance in metres (default: autofocus on the depth at the centre of
-//! the screen, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
+//! the screen, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 2.8). The room is 28 m wide and seen from 37 m, where a real
 //! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
@@ -650,7 +650,7 @@ struct Dof {
     taa: bool,
 }
 
-const DOF_F_STOP: f32 = 1.0;
+const DOF_F_STOP: f32 = 2.8;
 /// The lens sees the room as a model this many times smaller: its filmback is this many times
 /// Unreal's 23.76 mm, which blurs as a 23.76 mm one would on the scene scaled down (the field of
 /// view, and so the picture, stay the camera's).
