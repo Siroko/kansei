@@ -3217,6 +3217,13 @@ impl Renderer {
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
     }
 
+    /// Reads `buffer` (which needs `COPY_SRC`) back to the CPU without blocking: the copy is
+    /// submitted now and the future resolves once the browser has mapped it. It holds no borrow
+    /// of the renderer. Natively, awaiting it waits for the GPU.
+    pub fn read_buffer_async<T: bytemuck::Pod>(&self, buffer: &wgpu::Buffer) -> super::BufferReadback<T> {
+        super::BufferReadback::new(self.device(), self.queue(), buffer)
+    }
+
     /// Read data back from a GPU buffer to CPU.
     /// Creates a staging buffer, copies, maps, and returns the data.
     pub fn read_back_buffer_sync<T: bytemuck::Pod + Clone>(&self, buffer: &wgpu::Buffer, size: u64) -> Vec<T> {
