@@ -22,8 +22,10 @@
         await init();
         await start('kansei');
 
-        // for scripted captures and timing: window.kansei.set_gi(false) and so on
-        window.kansei = await import('../pkg/kansei_wasm_voxel_gi_particles.js');
+        // for scripted captures and timing: window.kansei.set_gi(false) and so on; frame by hand,
+        // then window.kansei.camera() gives the orbit to paste into set_camera or the default
+        const wasm = await import('../pkg/kansei_wasm_voxel_gi_particles.js');
+        window.kansei = { ...wasm, camera: () => JSON.parse(wasm.camera()) };
         const params = new URLSearchParams(location.search);
         const state = JSON.parse(info());
         const lightbox = state.scene === 'lightbox';

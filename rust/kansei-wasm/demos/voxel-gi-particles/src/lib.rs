@@ -543,7 +543,7 @@ struct State {
 struct AutoFocus {
     gpu: Option<AutoFocusGpu>,
     /// 0 idle, 1 mapping, 2 mapped.
-    state: Rc<std::cell::Cell<u8>>,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// A double-click waiting to be read, in 0..1 of the screen from the top left.
     pick: Option<[f32; 2]>,
     /// Whether the read in flight is a double-click's.
@@ -602,10 +602,11 @@ impl AutoFocus {
         let mut picked = None;
         let gpu = self.gpu.get_or_insert_with(|| AutoFocusGpu::new(renderer.device()));
         let buffer = &gpu.readback;
-        if self.state.get() == 2 {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.state.load(Relaxed) == 2 {
             let depth = bytemuck::pod_read_unaligned::<f32>(&buffer.slice(..).get_mapped_range()[..4]);
             buffer.unmap();
-            self.state.set(0);
+            self.state.store(0, Relaxed);
             if depth < 1.0 {
                 // (view depth depends on the depth alone)
                 let p = inv_proj * glam::Vec4::new(0.0, 0.0, depth, 1.0);
@@ -613,7 +614,7 @@ impl AutoFocus {
                 if self.reading_pick { picked = Some(metres) } else { self.centre = Some(metres) }
             }
         }
-        if self.state.get() == 0 && (centre || self.pick.is_some()) {
+        if self.state.load(Relaxed) == 0 && (centre || self.pick.is_some()) {
             self.reading_pick = self.pick.is_some();
             let point = self.pick.take().unwrap_or(AUTOFOCUS_POINT);
             renderer.queue().write_buffer(&gpu.point, 0, bytemuck::cast_slice(&[point[0], point[1], 0.0, 0.0]));
@@ -635,9 +636,9 @@ impl AutoFocus {
             }
             encoder.copy_buffer_to_buffer(&gpu.texel, 0, buffer, 0, 4);
             renderer.submit(std::iter::once(encoder.finish()));
-            self.state.set(1);
+            self.state.store(1, Relaxed);
             let state = self.state.clone();
-            buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| state.set(if result.is_ok() { 2 } else { 0 }));
+            buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| state.store(if result.is_ok() { 2 } else { 0 }, Relaxed));
         }
         picked
     }
@@ -1077,10 +1078,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // far enough that the room fits across a portrait screen too
     let fit = (1.6 / aspect).max(1.0);
     let mut controls = if lightbox {
-        // low over the front right of the pile, looking across it at the back left corner
-        let mut c = CameraControls::from_canvas(canvas, Vec3::new(-1.5, 6.0, -5.0), 18.55).with_mouse_pan(canvas);
-        c.set_azimuth(0.809);
-        c.set_elevation(0.217);
+        // low over the front right of the pile, looking across it at the back left corner (frame by
+        // hand, then `camera()` in the console gives these numbers)
+        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.323, 3.985, -1.679), 14.72).with_mouse_pan(canvas);
+        c.set_azimuth(0.71);
+        c.set_elevation(0.302);
         c
     } else {
         let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(canvas);
@@ -1164,6 +1166,26 @@ pub fn info() -> String {
         );
     });
     out
+}
+
+/// The orbit as JSON: the point looked at (pan included), the distance to it, and the azimuth and
+/// elevation in radians; `set_camera` takes the same numbers, to frame by hand and keep the result.
+#[wasm_bindgen]
+pub fn camera() -> String {
+    let mut out = String::from("{}");
+    with_state(|s| {
+        let t = s.controls.look_target();
+        out = format!(
+            r#"{{"target":[{:.3},{:.3},{:.3}],"radius":{:.3},"azimuth":{:.4},"elevation":{:.4}}}"#,
+            t.x, t.y, t.z, s.controls.radius, s.controls.azimuth(), s.controls.elevation()
+        );
+    });
+    out
+}
+
+#[wasm_bindgen]
+pub fn set_camera(x: f32, y: f32, z: f32, radius: f32, azimuth: f32, elevation: f32) {
+    with_state(|s| s.controls.set_view(Vec3::new(x, y, z), radius, azimuth, elevation));
 }
 
 #[wasm_bindgen]
