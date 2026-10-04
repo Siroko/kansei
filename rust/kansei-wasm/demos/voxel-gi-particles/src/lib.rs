@@ -25,10 +25,9 @@
 //! on, the materials write HDR light instead of tone mapping it themselves, and a
 //! `PostProcessingVolume` runs the DoF and then the same `1 - exp(-x)` curve
 //! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA and
-//! runs `TemporalAAEffect` first instead (`taa=0` turns it off), which also lets the DoF rotate its
-//! sampling pattern. The particles write no motion vectors: the TAA reprojects them by depth.
-//! `focus=` sets the focus distance in metres (default: where the view axis enters the fluid's box,
-//! the front of the particle cloud, so panning refocuses) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
+//! runs `TemporalAAEffect` first instead (`taa=0` turns it off). The particles write no motion vectors: the TAA reprojects them by depth.
+//! `focus=` sets the focus distance in metres (default: autofocus on the depth at the centre of
+//! the screen, so orbiting and panning refocus) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
 //! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
@@ -532,6 +531,98 @@ struct State {
     volume: Option<PostProcessingVolume>,
     /// The background as the direct path shows it (display values).
     clear_color: Vec4,
+    autofocus: AutoFocus,
+}
+
+/// Autofocus: the depth at the centre of the screen, read back from the volume's GBuffer a frame
+/// or two late, and eased toward (sky keeps the last focus). A depth texture can only be copied
+/// whole, so a one-thread pass loads the centre texel into a buffer first.
+#[derive(Default)]
+struct AutoFocus {
+    gpu: Option<AutoFocusGpu>,
+    /// 0 idle, 1 mapping, 2 mapped.
+    state: Rc<std::cell::Cell<u8>>,
+    /// The measured distance, metres, and the eased one the lens uses.
+    target: Option<f32>,
+    focus: Option<f32>,
+}
+
+struct AutoFocusGpu {
+    pipeline: wgpu::ComputePipeline,
+    texel: wgpu::Buffer,
+    readback: wgpu::Buffer,
+}
+
+const AUTOFOCUS_WGSL: &str = "
+@group(0) @binding(0) var depth: texture_depth_2d;
+@group(0) @binding(1) var<storage, read_write> texel: f32;
+@compute @workgroup_size(1)
+fn main() {
+    texel = textureLoad(depth, textureDimensions(depth) / 2u, 0);
+}
+";
+
+impl AutoFocusGpu {
+    fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGIParticles/AutoFocus"), source: wgpu::ShaderSource::Wgsl(AUTOFOCUS_WGSL.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("VoxelGIParticles/AutoFocus"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let buffer = |label, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 4, usage, mapped_at_creation: false });
+        Self {
+            pipeline,
+            texel: buffer("VoxelGIParticles/AutoFocus/Texel", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            readback: buffer("VoxelGIParticles/AutoFocus/Readback", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+        }
+    }
+}
+
+impl AutoFocus {
+    /// Take last read's depth, if it is in, and read the centre of `gbuffer`'s depth again.
+    fn update(&mut self, renderer: &Renderer, gbuffer: &kansei_core::renderers::GBuffer, inv_proj: glam::Mat4, dt: f32) {
+        let gpu = self.gpu.get_or_insert_with(|| AutoFocusGpu::new(renderer.device()));
+        let buffer = &gpu.readback;
+        if self.state.get() == 2 {
+            let depth = bytemuck::pod_read_unaligned::<f32>(&buffer.slice(..).get_mapped_range()[..4]);
+            buffer.unmap();
+            self.state.set(0);
+            if depth < 1.0 {
+                let p = inv_proj * glam::Vec4::new(0.0, 0.0, depth, 1.0);
+                self.target = Some((-p.z / p.w).max(0.1));
+            }
+        }
+        if self.state.get() == 0 {
+            let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("VoxelGIParticles/AutoFocus") });
+            let bind_group = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("VoxelGIParticles/AutoFocus"),
+                layout: &gpu.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gbuffer.depth_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: gpu.texel.as_entire_binding() },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGIParticles/AutoFocus"), timestamp_writes: None });
+                pass.set_pipeline(&gpu.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&gpu.texel, 0, buffer, 0, 4);
+            renderer.submit(std::iter::once(encoder.finish()));
+            self.state.set(1);
+            let state = self.state.clone();
+            buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| state.set(if result.is_ok() { 2 } else { 0 }));
+        }
+        if let Some(target) = self.target {
+            let focus = self.focus.unwrap_or(target);
+            self.focus = Some(focus + (target - focus) * (1.0 - (-dt / 0.15).exp()));
+        }
+    }
 }
 
 /// The depth of field's settings.
@@ -561,8 +652,8 @@ fn dof_effects(dof: Dof, focus: f32) -> Vec<Box<dyn PostProcessingEffect>> {
     }
     effects.push(Box::new(CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions {
         lens: CameraLens { f_stop: dof.f_stop, focus_distance_m: focus, sensor_width_mm: 23.76 * DOF_MODEL_SCALE, ..Default::default() },
-        // a rotating pattern only when the TAA averages it
-        temporal_noise: dof.taa,
+        // the TAA runs before the lens here, so nothing would average a rotating pattern
+        temporal_noise: false,
         ..Default::default()
     })));
     effects.push(Box::new(ToneMapEffect::new(ToneMapOptions { tonemapper: ToneMapper::Exponential, encode_srgb: false, ..Default::default() })));
@@ -624,6 +715,12 @@ impl State {
             let hdr = |v: f32| -(1.0 - v.min(0.999)).ln();
             self.renderer.config.clear_color = Vec4::new(hdr(c.x), hdr(c.y), hdr(c.z), c.w);
             self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, volume);
+            if self.dof.focus.is_none() {
+                if let Some(gbuffer) = volume.gbuffer() {
+                    let inv_proj = self.camera.projection_matrix.to_glam().inverse();
+                    self.autofocus.update(&self.renderer, gbuffer, inv_proj, dt as f32);
+                }
+            }
         } else {
             self.renderer.config.clear_color = self.clear_color;
             self.renderer.render(&mut self.scene, &mut self.camera);
@@ -639,11 +736,12 @@ impl State {
         }
     }
 
-    /// The depth of field's focus distance: the set one, or where the view axis (toward the orbit
-    /// target) enters the fluid's box, the front of the particle cloud; the target's distance if
-    /// the axis misses the box or starts inside it.
+    /// The depth of field's focus distance: the set one, or the autofocus (the depth at the centre
+    /// of the screen); until that has read anything, where the view axis (toward the orbit target)
+    /// enters the fluid's box, or the target's distance if the axis misses the box or starts
+    /// inside it.
     fn focus_distance(&self) -> f32 {
-        self.dof.focus.unwrap_or_else(|| {
+        self.dof.focus.or(self.autofocus.focus).unwrap_or_else(|| {
             let eye = glam::Vec3::from(self.camera.object.position);
             let to_target = glam::Vec3::from(self.controls.look_target()) - eye;
             let axis = to_target.normalize_or_zero();
@@ -1003,6 +1101,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             taa: flag("taa", true),
         },
         volume: None,
+        autofocus: AutoFocus::default(),
         clear_color,
     };
     state.apply_panel();

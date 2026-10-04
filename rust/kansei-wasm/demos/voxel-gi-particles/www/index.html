@@ -97,6 +97,8 @@
         });
         const focus = dof.addBinding(p, 'focus', { label: 'focus (m)', min: 5, max: 120, step: 0.1, disabled: p.autofocus })
             .on('change', () => { if (!p.autofocus) set_dof_focus(p.focus); });
+        // the autofocus distance, as the lens follows it
+        setInterval(() => { if (p.dof && p.autofocus) { p.focus = JSON.parse(info()).focus_m; focus.refresh(); } }, 250);
         dof.addBinding(p, 'taa', { label: 'TAA' }).on('change', () => set_dof_taa(p.taa));
         dof.addBinding(p, 'fstop', { label: 'f-stop', min: 0.2, max: 8, step: 0.05 }).on('change', () => set_dof_fstop(p.fstop));
         const look = pane.addFolder({ title: 'Scene', expanded: false });
