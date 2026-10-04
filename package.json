@@ -18,7 +18,8 @@
     "copy-examples": "cp -r examples dist/examples",
     "update-imports": "node scripts/bundle-examples-update-imports.cjs",
     "copy-site": "cp -R site/. dist/",
-    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site"
+    "copy-wasm-examples": "bash scripts/fetch-wasm-examples.sh",
+    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site && npm run copy-wasm-examples"
   },
   "engines": {
     "node": "24.x"
