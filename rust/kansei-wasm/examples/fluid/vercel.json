@@ -1,4 +1,10 @@
 {
+  "git": {
+    "deploymentEnabled": {
+      "main": true,
+      "**": false
+    }
+  },
   "framework": null,
   "installCommand": "",
   "buildCommand": "mkdir -p proxy && echo 'This site proxies https://kansei.graphics/examples/fluid/ (see vercel.json).' > proxy/README.txt",
