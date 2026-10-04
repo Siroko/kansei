@@ -65,7 +65,10 @@ pub(crate) use voxelize::SurfaceSet;
 pub const VOXEL_WRITE_WGSL: &str = voxelize::VOXEL_WRITE_WGSL;
 
 /// `VOXEL_VOLUME_WGSL` plus reading a `JumpFloodSdf`: `sdfDistance(vol, sdf, sampler, p)`,
-/// `sdfSoftShadow(vol, sdf, sampler, p, toLight, k, maxT)` and `sdfAo(vol, sdf, sampler, p, n)`.
+/// `sdfSoftShadow(vol, sdf, sampler, p, toLight, k, maxT)`, `sdfSurfaceShadow(vol, sdf, sampler,
+/// p, n, toLight, k, maxT)` (for a point on a surface of normal `n`: its own plane does not shadow
+/// it at grazing angles), `sdfLightShape(vol, radius, distance)` (k and the march's length for a
+/// light of that radius and distance) and `sdfAo(vol, sdf, sampler, p, n)`.
 /// The material helper for distance-field shadows and AO: bind `JumpFloodSdf::as_texture` as a
 /// `texture_3d<f32>`, and the volume's uniform and sampler, in the material's own group.
 pub const SDF_WGSL: &str = concat!(include_str!("shaders/voxel_volume.wgsl"), include_str!("shaders/sdf.wgsl"));
@@ -124,7 +127,7 @@ mod tests {
             "sdf library",
             &format!(
                 "{SDF_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n\
-                 @compute @workgroup_size(1) fn main() {{ _ = sdfDistance(vol, t, s, vec3f(0.0)) + sdfSoftShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfAo(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0)); }}"
+                 @compute @workgroup_size(1) fn main() {{ _ = sdfDistance(vol, t, s, vec3f(0.0)) + sdfSoftShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfSurfaceShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfAo(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0)) + sdfLightShape(vol, 0.1, 3.0).x; }}"
             ),
             &mut sizes,
         );

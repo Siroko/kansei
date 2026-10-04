@@ -29,13 +29,13 @@
     <script type="module">
         import init, {
             start, info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate,
-            set_rug, set_textured, set_camera, set_stats,
+            set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice,
         } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_preset('best') and so on
-        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats };
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -49,6 +49,10 @@
             animate: s.animate,
             rug: s.rug,
             textured: s.textured,
+            sdfAo: s.sdf_ao,
+            sdfShadows: s.sdf_shadows,
+            shadows: s.shadows,
+            slice: s.slice,
             stats: s.stats,
         };
         const statsEl = document.getElementById('stats');
@@ -62,7 +66,7 @@
         // the panel mirrors the engine after a preset changes several things at once
         const sync = () => {
             s = read();
-            Object.assign(p, { gi: s.gi, voxels: s.voxels, view: s.view, dragon: s.dragon, animate: s.animate, rug: s.rug, textured: s.textured });
+            Object.assign(p, { gi: s.gi, voxels: s.voxels, view: s.view, dragon: s.dragon, animate: s.animate, rug: s.rug, textured: s.textured, sdfAo: s.sdf_ao, sdfShadows: s.sdf_shadows, shadows: s.shadows, slice: s.slice });
             pane.refresh();
             showCredit();
         };
@@ -76,8 +80,13 @@
             options: { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi' },
         }).on('change', custom(() => set_gi(p.gi)));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
-        pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels' } }).on('change', custom(() => set_view(p.view)));
+        pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf' } }).on('change', custom(() => set_view(p.view)));
         pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low' } }).on('change', () => set_camera(p.camera));
+        const sdf = pane.addFolder({ title: 'Distance field' });
+        sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
+        sdf.addBinding(p, 'sdfShadows', { label: 'voxel shadows', options: { 'shadow maps': 'off', 'field where no map': 'fallback', 'field always': 'always' } }).on('change', custom(() => set_sdf_shadows(p.sdfShadows)));
+        sdf.addBinding(p, 'shadows', { label: 'direct shadows', options: { 'shadow atlas': 'map', 'distance field': 'sdf' } }).on('change', custom(() => set_shadows(p.shadows)));
+        sdf.addBinding(p, 'slice', { label: 'slice height', min: 0, max: 4, step: 0.05 }).on('change', () => set_slice(p.slice));
         const scene = pane.addFolder({ title: 'Scene' });
         scene.addBinding(p, 'dragon', { options: { off: 'off', '19k triangles': 'light', '871k triangles': 'full' } }).on('change', async () => { p.preset = ''; await set_dragon(p.dragon); sync(); });
         scene.addBinding(p, 'animate').on('change', custom(() => set_animate(p.animate)));
@@ -95,7 +104,7 @@
                 `${(i.triangles / 1000).toFixed(1)}k triangles${i.dragon !== 'off' ? ` (dragon ${i.dragon})` : ''}${i.animate ? ', animated' : ''}\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `voxel GI: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, mips ${i.mips_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
-                `SSGI ${i.ssgi_ms.toFixed(3)} ms\n` + top;
+                `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + '\n' + top;
         }, 500);
     </script>
 </body>

@@ -111,8 +111,18 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         return;
     }
     if (gp.debug == 3u) {
-        // the slice over the lit scene, which shows dimmed around it
-        let slice = sdfSliceColor((vec2f(gid.xy) + 0.5) / gp.fullSize);
+        // the slice where it lies in front of the scene, which shows dimmed around it
+        let suv = (vec2f(gid.xy) + 0.5) / gp.fullSize;
+        var slice = sdfSliceColor(suv);
+        let sceneDepth = gpDepth(vec2i(gid.xy));
+        if (slice.a > 0.0 && sceneDepth < 1.0) {
+            let eye = (gp.invView * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+            let surface = (gp.invView * vec4f(gpViewPos(suv, sceneDepth), 1.0)).xyz;
+            let far = (gp.invView * vec4f(gpViewPos(suv, 1.0), 1.0)).xyz;
+            let dir = normalize(far - eye);
+            let t = (gp.sdfSlice - eye.y) / dir.y;
+            if (length(surface - eye) < t) { slice.a = 0.0; }
+        }
         textureStore(outTex, gid.xy, vec4f(select(color.rgb * 0.25, slice.rgb * 40.0, slice.a > 0.0), color.a));
         return;
     }

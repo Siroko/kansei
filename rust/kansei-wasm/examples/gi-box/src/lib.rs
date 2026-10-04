@@ -16,12 +16,17 @@
 //! (and `window.kansei`) switches everything at run time.
 //!
 //! URL parameters (a `preset` first, the others over it):
-//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon` (see `PRESETS`);
+//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice` (see `PRESETS`);
 //! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi` (default high);
 //! - `voxels=low|medium|high`: the volume's resolution (default medium; low on phones, which also
 //!   keep it within 24 MiB);
-//! - `view=indirect` (only the light GI adds, 2 stops brighter) or `view=voxels` (with voxel GI:
-//!   the lit voxels themselves);
+//! - `view=indirect` (only the light GI adds, 2 stops brighter), `view=voxels` (with voxel GI:
+//!   the lit voxels themselves) or `view=sdf` (a slice of voxel GI's distance field, `slice=`
+//!   metres up, default 0.6);
+//! - the distance field (it turns voxel GI's scene volume on whatever the mode): `sdf_ao=0..1`
+//!   (its AO on the GI), `sdf_shadows=off|fallback|always` (the voxels' shadows through it, where
+//!   no map covers them or always), `shadows=map|sdf` (the direct light's shadows through it, by
+//!   the material helper `gi::SDF_WGSL`);
 //! - `cam=front|corner|low`;
 //! - `dragon=1|full`: the Stanford dragon (CC-BY-NC-4.0, see `www/assets/license.txt`): `1` the
 //!   decimated `.glb` (19k triangles), `full` the whole scan (871k triangles, 24 MB);
@@ -35,11 +40,11 @@ use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use kansei_core::buffers::{Sampler, Texture};
+use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, VOXEL_WRITE_WGSL};
+use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
@@ -96,7 +101,7 @@ fn fragment_main(in: VOut) -> GBufferOut {
     let v = normalize(camera_pos - in.world);
     let base = surface.base_color.rgb;
     var out: GBufferOut;
-    out.color = vec4<f32>(kansei_spot_lights_radiance(in.world, n, v, base, 1.0, 0.0, in.clip.xy), 1.0);
+    out.color = vec4<f32>(lit_radiance(in.world, n, v, base, in.clip.xy), 1.0);
     out.emissive = vec4<f32>(0.0);
     out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
     out.albedo = vec4<f32>(base, 1.0);
@@ -152,7 +157,7 @@ fn fragment_main(in: VOut) -> GBufferOut {
     let v = normalize(camera_pos - in.world);
     let base = textureSample(rug_texture, rug_sampler, in.uv).rgb;
     var out: GBufferOut;
-    out.color = vec4<f32>(kansei_spot_lights_radiance(in.world, n, v, base, 1.0, 0.0, in.clip.xy), 1.0);
+    out.color = vec4<f32>(lit_radiance(in.world, n, v, base, in.clip.xy), 1.0);
     out.emissive = vec4<f32>(0.0);
     out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
     out.albedo = vec4<f32>(base, 1.0);
@@ -186,33 +191,95 @@ fn rug_texture() -> Texture {
 }
 
 /// The rug's material; `voxel_entry` false voxelizes it with its constant `GiSurface` instead.
-fn rug_material(voxel_entry: bool) -> Material {
-    let mut material = Material::new(
-        "Rug",
-        &format!("{SPOT_LIGHTS_WGSL}
-{VOXEL_WRITE_WGSL}
-{RUG_WGSL}"),
+fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
+    let (code, bindings) = lit_shader(
+        &format!("{VOXEL_WRITE_WGSL}\n{RUG_WGSL}"),
+        sdf,
         vec![
             Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
             Binding::texture_2d(1, ShaderStages::FRAGMENT),
             Binding::sampler(2, ShaderStages::FRAGMENT),
         ],
-        MaterialOptions { mrt_output_count: Some(4), voxel_fragment_entry: voxel_entry.then_some("voxel_main"), ..Default::default() },
     );
+    let mut material = Material::new("Rug", &code, bindings, MaterialOptions { mrt_output_count: Some(4), voxel_fragment_entry: voxel_entry.then_some("voxel_main"), ..Default::default() });
+    bind_sdf(&mut material, sdf);
     material.set_uniform_bindable(0, "Rug", &[1.0f32, 1.0, 1.0, 1.0]);
     material.set_bindable(1, rug_texture());
     material.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear));
     material
 }
 
-fn lit_material(label: &str, base_color: [f32; 3]) -> Material {
-    let mut material = Material::new(
-        label,
-        &format!("{SPOT_LIGHTS_WGSL}\n{LIT_WGSL}"),
-        vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
-        MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
-    );
+/// The spot lights' light on a surface (`lit_radiance`), shadowed by the shadow atlas.
+const MAP_SHADOWS_WGSL: &str = r#"
+fn lit_radiance(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    return kansei_spot_lights_radiance(world, n, v, base, 1.0, 0.0, pixel);
+}
+"#;
+
+/// The same, shadowed through voxel GI's distance field instead (`gi::SDF_WGSL`, the material
+/// helper): soft shadows, sphere-traced in the field, bound at 10-12 of the material's group.
+const SDF_SHADOWS_WGSL: &str = r#"
+@group(0) @binding(10) var<uniform> gi_volume: VoxelVolume;
+@group(0) @binding(11) var gi_sdf: texture_3d<f32>;
+@group(0) @binding(12) var gi_sampler: sampler;
+
+fn lit_radiance(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    var radiance = vec3<f32>(0.0);
+    for (var i = 0u; i < kansei_spot_lights.count; i++) {
+        let light = kansei_spot_lights.lights[i];
+        let s = kansei_spot_sample(light, world);
+        if (max(s.illuminance.r, max(s.illuminance.g, s.illuminance.b)) <= 0.0) { continue; }
+        let brdf = kansei_brdf(n, v, s.toLight, base, 1.0, 0.0);
+        let p = world + n * gi_volume.voxelSize;
+        // as hard as the lamp's disk makes it, the march stopping short of the lamp
+        let shape = sdfLightShape(gi_volume, light.sourceRadius, length(light.position - p));
+        let visibility = sdfSurfaceShadow(gi_volume, gi_sdf, gi_sampler, p, n, s.toLight, shape.x, shape.y);
+        radiance += brdf * s.illuminance * visibility;
+    }
+    return radiance;
+}
+"#;
+
+/// Voxel GI's distance field as a material binds it for `SDF_SHADOWS_WGSL`.
+struct SdfBinding {
+    volume: wgpu::Buffer,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl SdfBinding {
+    fn of(gi: &kansei_core::gi::SceneVoxelGi) -> Option<Self> {
+        let sdf = gi.sdf()?;
+        Some(Self { volume: gi.volume().uniform().clone(), texture: sdf.texture().clone(), view: sdf.view().clone() })
+    }
+}
+
+/// `body` (which calls `lit_radiance`) after the light chunk for `sdf` (shadows through the field)
+/// or the shadow maps, with its bindings: `bindings` plus the field's.
+fn lit_shader(body: &str, sdf: Option<&SdfBinding>, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
+    match sdf {
+        None => (format!("{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
+        Some(_) => {
+            bindings.extend([Binding::uniform(10, ShaderStages::FRAGMENT), Binding::texture_3d(11, ShaderStages::FRAGMENT), Binding::sampler(12, ShaderStages::FRAGMENT)]);
+            (format!("{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
+        }
+    }
+}
+
+/// Attach the field's resources for `SDF_SHADOWS_WGSL`.
+fn bind_sdf(material: &mut Material, sdf: Option<&SdfBinding>) {
+    if let Some(sdf) = sdf {
+        material.set_bindable(10, ComputeBuffer::from_external("GiVolume", sdf.volume.clone(), BufferType::Uniform));
+        material.set_bindable(11, Texture::from_view("GiSdf", sdf.texture.clone(), sdf.view.clone()));
+        material.set_bindable(12, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge));
+    }
+}
+
+fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>) -> Material {
+    let (code, bindings) = lit_shader(LIT_WGSL, sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
+    let mut material = Material::new(label, &code, bindings, MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
     material.set_uniform_bindable(0, label, &[base_color[0], base_color[1], base_color[2], 1.0f32]);
+    bind_sdf(&mut material, sdf);
     material
 }
 
@@ -310,6 +377,8 @@ enum View {
     Indirect,
     /// Voxel GI's lit voxels.
     Voxels,
+    /// A horizontal slice of voxel GI's distance field (`slice=` metres up).
+    Sdf,
 }
 
 impl View {
@@ -318,6 +387,7 @@ impl View {
             "lit" => View::Lit,
             "indirect" => View::Indirect,
             "voxels" => View::Voxels,
+            "sdf" => View::Sdf,
             _ => return None,
         })
     }
@@ -327,6 +397,7 @@ impl View {
             View::Lit => "lit",
             View::Indirect => "indirect",
             View::Voxels => "voxels",
+            View::Sdf => "sdf",
         }
     }
 }
@@ -351,18 +422,77 @@ struct Config {
     rug: bool,
     /// The rug's voxels from its texture (its material's voxel entry) or its mean colour.
     textured: bool,
+    /// Strength of the distance field's AO on voxel GI (0: none).
+    sdf_ao: f32,
+    /// The voxels' shadows through the distance field.
+    sdf_shadows: SdfShadows,
+    /// The direct light's shadows through the distance field (the material helper) instead of
+    /// the shadow atlas.
+    direct_sdf: bool,
+    /// The SDF slice's height, metres.
+    slice: f32,
 }
 
-/// The presets: (name, label, gi, voxels (None: the device's default), view, dragon).
-const PRESETS: [(&str, &str, &str, Option<VoxelGiQuality>, View, Dragon); 8] = [
-    ("off", "Off (direct light)", "off", None, View::Lit, Dragon::Off),
-    ("ssgi", "SSGI", "high", None, View::Lit, Dragon::Off),
-    ("voxel", "Voxel", "voxel", None, View::Lit, Dragon::Off),
-    ("best", "Voxel + SSGI (best)", "voxel+ssgi", None, View::Lit, Dragon::Off),
-    ("indirect", "Indirect only", "voxel+ssgi", None, View::Indirect, Dragon::Off),
-    ("voxels", "Voxels (debug)", "voxel", None, View::Voxels, Dragon::Off),
-    ("phone", "Phone (low)", "voxel+ssgi", Some(VoxelGiQuality::Low), View::Lit, Dragon::Off),
-    ("dragon", "Dragon, 871k tris (voxel + SSGI)", "voxel+ssgi", None, View::Lit, Dragon::Full),
+impl Config {
+    /// Whether anything reads the distance field.
+    fn needs_sdf(&self) -> bool {
+        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf
+    }
+
+    /// Whether the scene's voxel GI must run: for the voxel modes, or for the distance field.
+    fn needs_voxels(&self) -> bool {
+        self.gi.voxels() || self.needs_sdf()
+    }
+}
+
+fn sdf_shadows_name(s: SdfShadows) -> &'static str {
+    match s {
+        SdfShadows::Off => "off",
+        SdfShadows::Fallback => "fallback",
+        SdfShadows::Always => "always",
+    }
+}
+
+fn sdf_shadows_from_name(name: &str) -> Option<SdfShadows> {
+    Some(match name {
+        "off" => SdfShadows::Off,
+        "fallback" => SdfShadows::Fallback,
+        "always" => SdfShadows::Always,
+        _ => return None,
+    })
+}
+
+/// A preset: the GI mode, voxel tier (None: the device's default), view, dragon and the
+/// distance field's uses (AO strength, the voxels' shadows, the direct light's).
+struct Preset {
+    name: &'static str,
+    label: &'static str,
+    gi: &'static str,
+    voxels: Option<VoxelGiQuality>,
+    view: View,
+    dragon: Dragon,
+    sdf_ao: f32,
+    sdf_shadows: SdfShadows,
+    direct_sdf: bool,
+}
+
+const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxels: Option<VoxelGiQuality>, view: View, dragon: Dragon) -> Preset {
+    Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
+}
+
+const PRESETS: [Preset; 11] = [
+    preset("off", "Off (direct light)", "off", None, View::Lit, Dragon::Off),
+    preset("ssgi", "SSGI", "high", None, View::Lit, Dragon::Off),
+    preset("voxel", "Voxel", "voxel", None, View::Lit, Dragon::Off),
+    preset("best", "Voxel + SSGI (best)", "voxel+ssgi", None, View::Lit, Dragon::Off),
+    preset("indirect", "Indirect only", "voxel+ssgi", None, View::Indirect, Dragon::Off),
+    preset("voxels", "Voxels (debug)", "voxel", None, View::Voxels, Dragon::Off),
+    preset("phone", "Phone (low)", "voxel+ssgi", Some(VoxelGiQuality::Low), View::Lit, Dragon::Off),
+    preset("dragon", "Dragon, 871k tris (voxel + SSGI)", "voxel+ssgi", None, View::Lit, Dragon::Full),
+    // the distance field: its AO on the GI and soft shadows for the voxels and the direct light
+    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
+    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
+    preset("slice", "SDF slice (debug)", "voxel", None, View::Sdf, Dragon::Off),
 ];
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
@@ -385,6 +515,12 @@ struct State {
     phone: bool,
     /// The voxel tier the renderer's voxel GI was enabled at.
     enabled_voxels: Option<VoxelGiQuality>,
+    /// Bumped whenever voxel GI or its field is made anew (materials that read the field rebind).
+    gi_generation: u32,
+    /// The generation the lit materials read the field of (None: they use the shadow maps).
+    materials_sdf: Option<u32>,
+    /// The lit renderables: (scene index, label, albedo); the rug is apart.
+    lit: Vec<(usize, &'static str, [f32; 3])>,
     tall: usize,
     rug: usize,
     /// The dragons loaded so far (`Dragon::slot`).
@@ -446,8 +582,17 @@ fn default_voxels(phone: bool) -> VoxelGiQuality {
 
 /// `config` with preset `name` applied (unknown names change nothing).
 fn with_preset(config: Config, name: &str, phone: bool) -> Config {
-    let Some(&(_, _, gi, voxels, view, dragon)) = PRESETS.iter().find(|p| p.0 == name) else { return config };
-    Config { gi: Gi::from_name(gi).unwrap(), voxels: voxels.unwrap_or(default_voxels(phone)), view, dragon, ..config }
+    let Some(p) = PRESETS.iter().find(|p| p.name == name) else { return config };
+    Config {
+        gi: Gi::from_name(p.gi).unwrap(),
+        voxels: p.voxels.unwrap_or(default_voxels(phone)),
+        view: p.view,
+        dragon: p.dragon,
+        sdf_ao: p.sdf_ao,
+        sdf_shadows: p.sdf_shadows,
+        direct_sdf: p.direct_sdf,
+        ..config
+    }
 }
 
 /// The configuration the URL asks for: its preset, then its other parameters over it.
@@ -460,6 +605,10 @@ fn config_from_url(phone: bool) -> Config {
         animate: false,
         rug: true,
         textured: true,
+        sdf_ao: 0.0,
+        sdf_shadows: SdfShadows::Off,
+        direct_sdf: false,
+        slice: 0.6,
     };
     if let Some(preset) = query_param("preset") {
         c = with_preset(c, &preset, phone);
@@ -477,6 +626,18 @@ fn config_from_url(phone: bool) -> Config {
         c.dragon = dragon;
     }
     c.animate = query_param("animate").map_or(c.animate, |v| v == "1" || v == "on" || v == "true");
+    if let Some(ao) = query_param("sdf_ao").and_then(|v| v.parse::<f32>().ok()) {
+        c.sdf_ao = ao.clamp(0.0, 1.0);
+    }
+    if let Some(shadows) = query_param("sdf_shadows").as_deref().and_then(sdf_shadows_from_name) {
+        c.sdf_shadows = shadows;
+    }
+    if let Some(direct) = query_param("shadows") {
+        c.direct_sdf = direct == "sdf";
+    }
+    if let Some(slice) = query_param("slice").and_then(|v| v.parse::<f32>().ok()) {
+        c.slice = slice;
+    }
     c.rug = query_param("rug").as_deref() != Some("off");
     c.textured = query_param("albedo").as_deref() != Some("constant");
     c
@@ -488,19 +649,23 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool) -> Vec<Box<d
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     let screen = ScreenSpaceGIOptions { radius_m: 4.0, ..Default::default() };
     match config.gi {
-        Gi::Off => {}
-        Gi::Screen(quality) => {
+        Gi::Off if config.view != View::Sdf => {}
+        Gi::Screen(quality) if config.view != View::Sdf => {
             let mut effect = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality, ..screen });
             effect.show_indirect = indirect;
             effects.push(Box::new(effect));
         }
-        Gi::Voxel | Gi::VoxelAndScreen => {
-            let scene_gi = renderer.voxel_gi().expect("voxel GI is enabled for the voxel modes");
+        _ => {
+            // (the slice view shows through voxel GI's effect whatever the mode)
+            let scene_gi = renderer.voxel_gi().expect("voxel GI is enabled for the voxel modes and the field");
             let near_quality = if phone || scene_gi.quality() == VoxelGiQuality::Low { GiQuality::Low } else { GiQuality::High };
             let near_field = (config.gi == Gi::VoxelAndScreen).then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
             let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, ..Default::default() });
             effect.show_indirect = indirect;
             effect.show_voxels = config.view == View::Voxels;
+            effect.set_sdf(scene_gi.sdf());
+            effect.sdf_ao = config.sdf_ao;
+            effect.show_sdf_slice = (config.view == View::Sdf).then_some(config.slice);
             effects.push(Box::new(effect));
         }
     }
@@ -571,8 +736,9 @@ impl State {
     fn apply(&mut self, config: Config) {
         let previous = self.config;
         self.config = config;
-        // voxel GI: enabled at the asked tier for the voxel modes, freed for the others
-        if config.gi.voxels() {
+        // voxel GI: enabled at the asked tier for the voxel modes (and the distance field), freed
+        // for the others
+        if config.needs_voxels() {
             if self.enabled_voxels != Some(config.voxels) {
                 self.renderer.enable_voxel_gi(SceneVoxelGiOptions {
                     quality: config.voxels,
@@ -582,21 +748,45 @@ impl State {
                     budget_bytes: if self.phone { 24 << 20 } else { 0 },
                 });
                 self.enabled_voxels = Some(config.voxels);
+                self.gi_generation += 1;
             }
         } else if self.enabled_voxels.is_some() {
             self.renderer.disable_voxel_gi();
             self.enabled_voxels = None;
         }
+        if let Some(gi) = self.renderer.voxel_gi_mut() {
+            if config.needs_sdf() {
+                if gi.sdf().is_none() {
+                    gi.enable_sdf();
+                    self.gi_generation += 1;
+                }
+            } else {
+                gi.disable_sdf();
+            }
+            gi.settings.sdf_shadows = config.sdf_shadows;
+        }
         self.volume.effects = build_effects(&self.renderer, &config, self.phone);
+        // the lit materials: shadowed through the field (bound to this one) or by the maps
+        let wanted = config.direct_sdf.then_some(self.gi_generation);
+        if wanted != self.materials_sdf || config.textured != previous.textured {
+            let sdf = config.direct_sdf.then(|| self.renderer.voxel_gi().and_then(SdfBinding::of)).flatten();
+            for &(index, label, albedo) in &self.lit {
+                if let Some(r) = self.scene.get_renderable_mut(index) {
+                    r.material = lit_material(label, albedo, sdf.as_ref());
+                    r.material_dirty = true;
+                }
+            }
+            if let Some(r) = self.scene.get_renderable_mut(self.rug) {
+                r.material = rug_material(config.textured, sdf.as_ref());
+                r.material_dirty = true;
+            }
+            self.materials_sdf = wanted;
+        }
 
         if let Some(r) = self.scene.get_renderable_mut(self.rug) {
             r.visible = config.rug;
         }
         if config.textured != previous.textured {
-            if let Some(r) = self.scene.get_renderable_mut(self.rug) {
-                r.material = rug_material(config.textured);
-                r.material_dirty = true;
-            }
             // the voxelizer can't see a material change
             if let Some(gi) = self.renderer.voxel_gi_mut() {
                 gi.invalidate();
@@ -671,7 +861,7 @@ impl State {
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.config.gi.name(),
             self.config.view.name(),
             tier_name(self.config.voxels),
@@ -682,6 +872,12 @@ impl State {
             self.config.animate,
             self.config.rug,
             self.config.textured,
+            self.config.sdf_ao,
+            sdf_shadows_name(self.config.sdf_shadows),
+            if self.config.direct_sdf { "sdf" } else { "map" },
+            self.config.slice,
+            gi.and_then(|g| g.sdf()).is_some(),
+            sum("VoxelGI/Sdf"),
             self.triangles(),
             self.stats.is_some(),
             self.stats.as_ref().map_or(0.0, |s| s.frame_ms),
@@ -698,9 +894,11 @@ impl State {
 }
 
 /// Add the dragon to the scene (hidden until the config shows it), returning its index.
+const DRAGON_ALBEDO: [f32; 3] = [0.75, 0.62, 0.42];
+
 fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, rest: (Vec3, f32)) -> usize {
-    let albedo = [0.75, 0.62, 0.42];
-    let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo)).with_gi(GiSurface::new(albedo));
+    let albedo = DRAGON_ALBEDO;
+    let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None)).with_gi(GiSurface::new(albedo));
     dragon.object.position = rest.0;
     dragon.object.rotation.y = rest.1;
     dragon.visible = false;
@@ -733,6 +931,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // the room: 4 m wide, high and deep, open toward the camera (z = 0), walls 0.2 m thick
     let mut scene = Scene::new();
+    let mut lit = Vec::new();
     let white = [0.73, 0.73, 0.73];
     let slabs: [(&str, [f32; 3], [f32; 3], [f32; 3]); 5] = [
         ("Floor", [4.4, 0.2, 4.2], [0.0, -0.1, -2.1], white),
@@ -742,25 +941,26 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         ("Right", [0.2, 4.4, 4.2], [2.1, 2.0, -2.1], [0.14, 0.45, 0.09]),
     ];
     for (label, size, position, color) in slabs {
-        let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), lit_material(label, color)).with_gi(GiSurface::new(color));
+        let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), lit_material(label, color, None)).with_gi(GiSurface::new(color));
         slab.object.set_position(position[0], position[1], position[2]);
-        scene.add(SceneNode::Renderable(slab));
+        lit.push((scene.add(SceneNode::Renderable(slab)), label, color));
     }
     // a tall block near the red wall and a short one near the green wall
     let tall_rest = (Vec3::new(-0.75, 1.2, -2.6), 0.33);
-    let mut tall = Renderable::new(BoxGeometry::new(1.2, 2.4, 1.2), lit_material("Tall", white)).with_gi(GiSurface::new(white));
+    let mut tall = Renderable::new(BoxGeometry::new(1.2, 2.4, 1.2), lit_material("Tall", white, None)).with_gi(GiSurface::new(white));
     tall.object.position = tall_rest.0;
     tall.object.rotation.y = tall_rest.1;
     let tall = scene.add(SceneNode::Renderable(tall));
-    let mut short = Renderable::new(BoxGeometry::new(1.2, 1.2, 1.2), lit_material("Short", white)).with_gi(GiSurface::new(white));
+    lit.push((tall, "Tall", white));
+    let mut short = Renderable::new(BoxGeometry::new(1.2, 1.2, 1.2), lit_material("Short", white, None)).with_gi(GiSurface::new(white));
     short.object.set_position(0.8, 0.6, -1.5);
     short.object.rotation.y = -0.3;
-    scene.add(SceneNode::Renderable(short));
+    lit.push((scene.add(SceneNode::Renderable(short)), "Short", white));
     // a textured rug on the floor in front of the blocks, orange before the tall one and blue
     // before the short one, whose sides facing the camera only bounces light; its constant
     // surface (its mean colour) is used where the material's voxel entry is not
     let mean: [f32; 3] = std::array::from_fn(|c| (RUG_LEFT[c] + RUG_RIGHT[c]) * 0.5);
-    let mut rug = Renderable::new(BoxGeometry::new(2.4, 0.02, 0.8), rug_material(config.textured)).with_gi(GiSurface::new(mean));
+    let mut rug = Renderable::new(BoxGeometry::new(2.4, 0.02, 0.8), rug_material(config.textured, None)).with_gi(GiSurface::new(mean));
     rug.object.set_position(0.0, 0.01, -0.55);
     let rug = scene.add(SceneNode::Renderable(rug));
     // the dragon, in the free corner at the front left, when asked for
@@ -768,6 +968,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut dragons = [None, None];
     if let Some(slot) = config.dragon.slot() {
         dragons[slot] = load_dragon(config.dragon).await.map(|g| add_dragon(&mut scene, g, dragon_rest));
+        if let Some(index) = dragons[slot] {
+            lit.push((index, "Dragon", DRAGON_ALBEDO));
+        }
     }
 
     // the key light: a shadowed downlight just under the ceiling's centre, wide enough to light
@@ -797,6 +1000,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         config,
         phone,
         enabled_voxels: None,
+        gi_generation: 0,
+        materials_sdf: None,
+        lit,
         tall,
         rug,
         dragons,
@@ -830,7 +1036,7 @@ pub fn info() -> String {
 /// The presets, as JSON `[[name, label], ...]`.
 #[wasm_bindgen]
 pub fn presets() -> String {
-    let items: Vec<String> = PRESETS.iter().map(|p| format!("[\"{}\",\"{}\"]", p.0, p.1)).collect();
+    let items: Vec<String> = PRESETS.iter().map(|p| format!("[\"{}\",\"{}\"]", p.name, p.label)).collect();
     format!("[{}]", items.join(","))
 }
 
@@ -881,7 +1087,11 @@ async fn apply_with_dragon(config: Config) {
             if let Some(geometry) = load_dragon(config.dragon).await {
                 with_state(|s| {
                     if s.dragons[slot].is_none() {
-                        s.dragons[slot] = Some(add_dragon(&mut s.scene, geometry, s.dragon_rest));
+                        let index = add_dragon(&mut s.scene, geometry, s.dragon_rest);
+                        s.dragons[slot] = Some(index);
+                        s.lit.push((index, "Dragon", DRAGON_ALBEDO));
+                        // its material follows the others' at the next apply
+                        s.materials_sdf = Some(u32::MAX);
                     }
                 });
             }
@@ -913,6 +1123,33 @@ pub fn set_camera(name: &str) {
     if let Some(&(_, t, distance, azimuth, elevation)) = CAMERAS.iter().find(|c| c.0 == name) {
         with_state(|s| s.controls.set_view(Vec3::new(t[0], t[1], t[2]), distance, azimuth, elevation));
     }
+}
+
+/// The distance field's AO on voxel GI, 0 (none) to 1.
+#[wasm_bindgen]
+pub fn set_sdf_ao(strength: f32) {
+    with_state(|s| s.apply(Config { sdf_ao: strength.clamp(0.0, 1.0), ..s.config }));
+}
+
+/// The voxels' shadows through the distance field: `off|fallback|always`.
+#[wasm_bindgen]
+pub fn set_sdf_shadows(name: &str) {
+    if let Some(sdf_shadows) = sdf_shadows_from_name(name) {
+        with_state(|s| s.apply(Config { sdf_shadows, ..s.config }));
+    }
+}
+
+/// The direct light's shadows: `map` (the shadow atlas) or `sdf` (the distance field, through the
+/// material helper `gi::SDF_WGSL`).
+#[wasm_bindgen]
+pub fn set_shadows(name: &str) {
+    with_state(|s| s.apply(Config { direct_sdf: name == "sdf", ..s.config }));
+}
+
+/// The SDF slice's height, metres (`view=sdf`).
+#[wasm_bindgen]
+pub fn set_slice(height: f32) {
+    with_state(|s| s.apply(Config { slice: height, ..s.config }));
 }
 
 /// Profile every pass (the stats in `info`).
