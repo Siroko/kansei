@@ -23,15 +23,20 @@
 //! - [`run`] drives the `requestAnimationFrame` loop and hands each frame its [`Frame`]: time,
 //!   delta time and any new canvas size.
 //! - [`param`], [`param_or`] and [`flag`] read the page's query string, percent-decoded.
-//! - [`now`], [`fetch_bytes`] and [`is_phone`] cover timing, loading and picking a tier.
+//! - [`now`], [`fetch_bytes`] and [`is_phone`] cover timing, loading and picking a tier;
+//!   [`set_text`] fills a HUD element.
+//! - [`Keys`] and [`Gamepad`] are the input of pages that play: keys held and pressed, sticks
+//!   and buttons.
 //!
 //! It is for the browser: it compiles on any target (so an example's native tests build), but
 //! only does anything in `wasm32`.
 
 mod canvas;
 mod frame_loop;
+mod input;
 mod page;
 
 pub use canvas::Canvas;
 pub use frame_loop::{run, Frame};
-pub use page::{fetch_bytes, flag, init, is_phone, now, param, param_or};
+pub use input::{Gamepad, Keys};
+pub use page::{fetch_bytes, flag, init, is_phone, now, param, param_or, set_text};

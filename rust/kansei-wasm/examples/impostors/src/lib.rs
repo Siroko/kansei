@@ -22,8 +22,6 @@
 //! a millimetre, the materials discarding either way: what the bands cost materials that
 //! discard anyway, as alpha-tested foliage does).
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -45,7 +43,7 @@ use kansei_core::reflections::{PlanarReflection, PlanarReflectionOptions, PLANAR
 use kansei_core::pacing::FrameTimer;
 use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{flag, now, param, param_or, Canvas};
+use kansei_wasm::{flag, now, param, param_or, set_text, Canvas, Keys};
 
 const WATER_LAYER: u32 = 2;
 
@@ -394,17 +392,11 @@ struct State {
     frame: u32,
     interval_ms: f64,
     gpu_ms: f64,
-    keys: Rc<RefCell<Vec<String>>>,
+    keys: Keys,
 }
 
 fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
     web_sys::window()?.document()?.get_element_by_id(id)?.dyn_into().ok()
-}
-
-fn set_text(id: &str, text: &str) {
-    if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
-        el.set_text_content(Some(text));
-    }
 }
 
 fn thousands(n: u32) -> String {
@@ -641,13 +633,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     .map(|what| (what, AbBench::new([&format!("{what} on"), "off"], now() * 1000.0, AbBenchOptions::default())));
     log::info!("Kansei — Impostors (WASM) ready: {trees} trees, impostor {frames}x{frames} frames of {frame_size} texels baked in {bake_ms:.0} ms");
 
-    let keys = Rc::new(RefCell::new(Vec::new()));
-    {
-        let keys = keys.clone();
-        let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| keys.borrow_mut().push(e.key().to_lowercase()));
-        web_sys::window().ok_or("no window")?.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
-        on_key.forget();
-    }
+    let keys = Keys::listen();
 
     let frozen_t = param("t").and_then(|v| v.parse().ok());
     let mut state = State {
@@ -684,7 +670,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 *slot = reflection;
             }
         }
-        for key in st.keys.borrow_mut().drain(..) {
+        for key in st.keys.take_pressed() {
             match key.as_str() {
                 "i" => {
                     if let Some(c) = checkbox("impostors") {

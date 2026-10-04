@@ -48,12 +48,10 @@
 mod demo;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use glam::{Mat4, Quat, Vec3 as GVec3};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::animation::motion_matching::pack::{CharacterPack, MotionPack};
 use kansei_core::animation::retarget::Retarget;
@@ -72,7 +70,7 @@ use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::Renderer;
 use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
-use kansei_wasm::{flag, param, param_or, Canvas};
+use kansei_wasm::{flag, param, param_or, set_text, Canvas, Gamepad, Keys};
 use kansei_wasm_lake::{World, WorldInput, WorldOptions, SKY, SUN, SUN_DIR};
 
 /// Paces of the walk and run loops (m/s) forward, sideways and backward: strafing moves at the
@@ -236,13 +234,6 @@ fn upload_texture(renderer: &Renderer, label: &str, image: image::RgbaImage, srg
 /// The page URL's parameter `name`, percent-decoded ([`kansei_wasm::param`]).
 pub fn query_param(name: &str) -> Option<String> {
     param(name)
-}
-
-/// Show `text` in the page's HUD element.
-fn set_hud(text: &str) {
-    if let Some(hud) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("hud")) {
-        hud.set_text_content(Some(text));
-    }
 }
 
 /// Fetch `url` as bytes; the error says what went wrong in words for the page.
@@ -461,13 +452,6 @@ impl Character {
     }
 }
 
-/// Keys held and pressed since last frame, from the page's key events.
-#[derive(Default)]
-struct Keys {
-    held: HashSet<String>,
-    pressed: Vec<String>,
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
@@ -477,13 +461,12 @@ struct State {
     controls: CameraControls,
     volume: PostProcessingVolume,
     character: Option<Character>,
-    keys: Rc<RefCell<Keys>>,
+    keys: Keys,
+    pad: Gamepad,
     last: f64,
     frame: u32,
     strafe: bool,
     overlay: bool,
-    /// Gamepad buttons held last frame (to toggle on a press, not while held).
-    pad_held: Vec<bool>,
     /// Walk and run paces: forward, sideways, backward.
     speeds: ([f32; 3], [f32; 3]),
     fps: f32,
@@ -502,20 +485,6 @@ struct State {
     player: Option<demo::ClipPlayer>,
 }
 
-/// Left stick, right stick, and the pressed state of each button of the first connected gamepad.
-fn gamepad() -> Option<([f32; 2], [f32; 2], Vec<(bool, f32)>)> {
-    let pads = web_sys::window()?.navigator().get_gamepads().ok()?;
-    let pad: web_sys::Gamepad = (0..pads.length()).find_map(|i| pads.get(i).dyn_into().ok())?;
-    let axes: Vec<f32> = pad.axes().iter().map(|a| a.as_f64().unwrap_or(0.0) as f32).collect();
-    let axis = |i: usize| axes.get(i).copied().unwrap_or(0.0);
-    let dead = |x: f32, y: f32| {
-        let m = (x * x + y * y).sqrt();
-        if m < 0.15 { [0.0, 0.0] } else { let s = ((m - 0.15) / 0.85).min(1.0) / m; [x * s, y * s] }
-    };
-    let buttons = pad.buttons().iter().map(|b| b.dyn_into::<web_sys::GamepadButton>().map(|b| (b.pressed(), b.value() as f32)).unwrap_or((false, 0.0))).collect();
-    Some((dead(axis(0), axis(1)), dead(axis(2), axis(3)), buttons))
-}
-
 impl State {
     fn frame(&mut self) {
         let now = kansei_wasm::now();
@@ -525,44 +494,31 @@ impl State {
         self.fps = self.fps * 0.95 + 0.05 / dt;
 
         // input: keyboard, then the gamepad on top
-        let (mut stick, mut run, mut toggles) = ([0.0f32; 2], false, Vec::new());
+        let keys = &self.keys;
+        let mut stick = [keys.axis(&["a", "arrowleft"], &["d", "arrowright"]), keys.axis(&["s", "arrowdown"], &["w", "arrowup"])];
+        let mut run = keys.held("shift");
+        let mut toggles = keys.take_pressed();
         // the cannon's trigger: E, the gamepad's X (a click on the prompt adds to it in the world)
-        let (mut fire_pressed, mut fire_held) = (false, false);
-        {
-            let mut keys = self.keys.borrow_mut();
-            let held = |k: &[&str]| k.iter().any(|k| keys.held.contains(*k));
-            stick[0] = held(&["d", "arrowright"]) as i32 as f32 - held(&["a", "arrowleft"]) as i32 as f32;
-            stick[1] = held(&["w", "arrowup"]) as i32 as f32 - held(&["s", "arrowdown"]) as i32 as f32;
-            run = held(&["shift"]);
-            fire_held |= held(&["e"]);
-            toggles.append(&mut keys.pressed);
-        }
+        let (mut fire_pressed, mut fire_held) = (false, keys.held("e"));
         let length = (stick[0] * stick[0] + stick[1] * stick[1]).sqrt();
         if length > 1.0 {
             stick = [stick[0] / length, stick[1] / length];
         }
-        if let Some((left, right, buttons)) = gamepad() {
-            if left != [0.0, 0.0] {
-                stick = [left[0], -left[1]];
+        let pad = &mut self.pad;
+        if pad.poll() {
+            let [x, y] = pad.left_stick();
+            if [x, y] != [0.0, 0.0] {
+                stick = [x, -y];
             }
-            self.controls.rotate(-right[0] * 2.5 * dt, right[1] * 1.5 * dt);
-            let pressed = |i: usize| buttons.get(i).is_some_and(|b| b.0);
-            run |= pressed(1) || buttons.get(7).is_some_and(|b| b.1 > 0.3);
-            let was = |i: usize| self.pad_held.get(i).copied().unwrap_or(false);
-            if pressed(0) && !was(0) {
-                toggles.push(" ".into());
+            let [x, y] = pad.right_stick();
+            self.controls.rotate(-x * 2.5 * dt, y * 1.5 * dt);
+            run |= pad.held(Gamepad::B) || pad.value(Gamepad::RIGHT_TRIGGER) > 0.3;
+            for (button, key) in [(Gamepad::A, " "), (Gamepad::LEFT_BUMPER, "q"), (Gamepad::X, "e"), (Gamepad::Y, "r")] {
+                if pad.pressed(button) {
+                    toggles.push(key.into());
+                }
             }
-            if pressed(4) && !was(4) {
-                toggles.push("q".into());
-            }
-            if pressed(2) && !was(2) {
-                toggles.push("e".into());
-            }
-            if pressed(3) && !was(3) {
-                toggles.push("r".into());
-            }
-            fire_held |= pressed(2);
-            self.pad_held = buttons.iter().map(|b| b.0).collect();
+            fire_held |= pad.held(Gamepad::X);
         }
         let (mut traverse, mut drain) = (false, false);
         for key in toggles {
@@ -743,7 +699,7 @@ impl State {
                     let s = c.controller.matcher.last_search();
                     let feet = c.controller.matcher.feet_locked();
                     let speed = c.controller.matcher.simulation().velocity.length();
-                    set_hud(&format!(
+                    set_text("hud", &format!(
                         "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock · E / X fire the cannon (by it)",
                         self.fps,
                         if run { "run" } else { "walk" },
@@ -781,7 +737,7 @@ impl State {
                         ),
                     ));
                 }
-                Some(_) => set_hud(""),
+                Some(_) => set_text("hud", ""),
                 None => {}
             }
         }
@@ -808,7 +764,6 @@ where
     L: Fn(String) -> F,
     F: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
-    let window = web_sys::window().unwrap();
     let canvas = Canvas::find(canvas_id)?;
     let renderer = kansei_wasm_lake::renderer(&canvas).await;
 
@@ -818,7 +773,7 @@ where
 
     // the character, from a pack outside the repository
     let url = param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
-    set_hud(&format!("Loading motion pack {url} …"));
+    set_text("hud", &format!("Loading motion pack {url} …"));
     let gait = flag("gait", true);
     let motion = load(url.clone()).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
     // a second body, optional
@@ -856,13 +811,13 @@ where
                 Some(c)
             }
             Err(e) => {
-                set_hud(&format!("The motion pack {url} can't be used: {e}."));
+                set_text("hud", &format!("The motion pack {url} can't be used: {e}."));
                 None
             }
         },
         Err(e) => {
             log::warn!("no motion pack: {e}");
-            set_hud(&format!(
+            set_text("hud", &format!(
                 "No motion pack ({e}).\n\nThis example animates a character from a motion-matching pack (.kmm), and Kansei ships none:\n\
                  bake one from your own glTF clips with kansei-anim-bake, then put it at\n\
                  rust/kansei-wasm/examples/motion-matching/www/pack/locomotion.kmm\n\
@@ -882,35 +837,6 @@ where
     let view = param_or("view", 0.0f32).to_radians();
     controls.set_azimuth(std::f32::consts::PI + yaw_of(start.rotation) + view);
 
-    let keys = Rc::new(RefCell::new(Keys::default()));
-    {
-        let down = keys.clone();
-        let on_down = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            let key = e.key().to_lowercase();
-            let mut keys = down.borrow_mut();
-            if !e.repeat() {
-                keys.pressed.push(key.clone());
-            }
-            keys.held.insert(key);
-            if e.key().starts_with("Arrow") || e.key() == " " {
-                e.prevent_default();
-            }
-        });
-        window.add_event_listener_with_callback("keydown", on_down.as_ref().unchecked_ref())?;
-        on_down.forget();
-        let up = keys.clone();
-        let on_up = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            up.borrow_mut().held.remove(&e.key().to_lowercase());
-        });
-        window.add_event_listener_with_callback("keyup", on_up.as_ref().unchecked_ref())?;
-        on_up.forget();
-        // a key released while the page is in the background never sends keyup
-        let blur = keys.clone();
-        let on_blur = Closure::<dyn FnMut()>::new(move || blur.borrow_mut().held.clear());
-        window.add_event_listener_with_callback("blur", on_blur.as_ref().unchecked_ref())?;
-        on_blur.forget();
-    }
-
     let scaled = |paces: [f32; 3], name: &str| param(name).and_then(|v| v.parse::<f32>().ok()).map_or(paces, |forward| paces.map(|p| p * forward / paces[0]));
     let speeds = (scaled(WALK, "walk"), scaled(RUN, "run"));
     log::info!("Kansei — Motion Matching (WASM) ready: character {}", character.is_some());
@@ -922,12 +848,12 @@ where
         controls,
         volume,
         character,
-        keys,
+        keys: Keys::listen(),
+        pad: Gamepad::new(),
         last: kansei_wasm::now(),
         frame: 0,
         strafe: false,
         overlay: true,
-        pad_held: Vec::new(),
         speeds,
         fps: 60.0,
         searches: 0,
