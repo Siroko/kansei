@@ -515,3 +515,152 @@ fn voxels_sum_the_surface_area_that_makes_them_opaque() {
 }
 
 
+
+/// An open floor that is in the clipmap itself sees the whole sky through it: its own voxels (at
+/// every level, the coarse ones thick) don't hide the sky from its cones.
+#[test]
+fn an_open_floor_in_the_clipmap_sees_the_sky() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_clipmap(SceneVoxelClipmapOptions { levels: 4, resolution: 32, height_resolution: 16, voxel_size: 0.25, ..Default::default() });
+    renderer.voxel_clipmap_mut().unwrap().settings.bounce = 0.0;
+    let albedo = [0.5, 0.5, 0.5];
+    let mut scene = Scene::new();
+    scene.add(gi_box([120.0, 0.4, 120.0], [0.0, -0.2, 0.0], albedo));
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let mut camera = camera_at([0.0, 1.5, 3.0], [0.0, 0.0, -2.0]);
+    let sky = [1.0, 1.0, 1.0];
+    let mut effect = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), VoxelGIOptions::default());
+    effect.sky_gradient = (sky, sky);
+    effect.show_indirect = true;
+    let output = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let output_view = output.create_view(&Default::default());
+    for _ in 0..8 {
+        renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        effect.render(renderer.device(), renderer.queue(), &mut encoder, &gbuffer, &gbuffer.color_view, &gbuffer.depth_view, &output_view, &camera, W, H);
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+    let pixels = read_radiance_2d(&renderer, &output);
+    // rows from near the camera to the far floor (the top third is sky)
+    let rows: Vec<f32> = [H - 6, H * 3 / 4, H * 3 / 5, H / 2, H * 2 / 5].iter().map(|&y| (W / 4..W * 3 / 4).map(|x| pixels[(y * W + x) as usize][0]).sum::<f32>() / (W / 2) as f32).collect();
+    let want = (0.5f32 * 255.0).round() / 255.0;
+    eprintln!("the floor gains {rows:?} from near to far, expected {want}");
+    for (k, got) in rows.iter().enumerate() {
+        assert!((got / want - 1.0).abs() < 0.1, "row {k}: the floor gains {got} of {want}");
+    }
+}
+
+/// The floor's gain through `effect` (`show_indirect`) after `frames` frames of `scene`: the mean
+/// of the image's rows `rows` (fractions of its height), its middle half across.
+fn floor_gain(renderer: &mut Renderer, scene: &mut Scene, camera: &mut Camera, effect: &mut VoxelGIEffect, frames: u32, rows: &[f32]) -> Vec<f32> {
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let output = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let output_view = output.create_view(&Default::default());
+    for _ in 0..frames {
+        renderer.render_scene_offscreen(scene, camera, &gbuffer);
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        effect.render(renderer.device(), renderer.queue(), &mut encoder, &gbuffer, &gbuffer.color_view, &gbuffer.depth_view, &output_view, camera, W, H);
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+    let pixels = read_radiance_2d(renderer, &output);
+    rows.iter().map(|&f| {
+        let y = ((H as f32 * f) as u32).min(H - 1);
+        (W / 4..W * 3 / 4).map(|x| pixels[(y * W + x) as usize][0]).sum::<f32>() / (W / 2) as f32
+    }).collect()
+}
+
+/// Lit through the clipmap's probes, an open floor in the clipmap gains what the cones give it,
+/// albedo times the sky; under a roof, most of the sky is gone.
+#[test]
+fn the_probes_light_an_open_floor_and_a_roof_hides_the_sky() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_clipmap(SceneVoxelClipmapOptions { levels: 3, resolution: 32, height_resolution: 16, voxel_size: 0.25, ..Default::default() });
+    let gi = renderer.voxel_clipmap_mut().unwrap();
+    gi.settings.bounce = 0.0;
+    gi.enable_probes(kansei_core::gi::ClipmapProbeOptions { probes_per_frame: 1 << 16, hysteresis: 0.5, ..Default::default() });
+    // (the probes see the clipmap's sky)
+    renderer.voxel_clipmap().unwrap().set_sky_gradient(renderer.queue(), [1.0; 3], [1.0; 3]);
+    let mut scene = Scene::new();
+    scene.add(gi_box([120.0, 0.4, 120.0], [0.0, -0.2, 0.0], [0.5; 3]));
+    let mut camera = camera_at([0.0, 1.5, 3.0], [0.0, 0.0, -2.0]);
+    let mut effect = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), VoxelGIOptions::default());
+    effect.set_clipmap_probes(renderer.voxel_clipmap().unwrap().probes());
+    assert!(effect.uses_clipmap_probes());
+    effect.sky_gradient = ([1.0; 3], [1.0; 3]);
+    effect.show_indirect = true;
+    let rows = [0.95, 0.8, 0.65, 0.55];
+    let open = floor_gain(&mut renderer, &mut scene, &mut camera, &mut effect, 10, &rows);
+    let want = (0.5f32 * 255.0).round() / 255.0;
+    eprintln!("open floor through the probes: {open:?}, expected {want}");
+    for got in &open {
+        assert!((got / want - 1.0).abs() < 0.08, "the open floor gains {got} of {want}");
+    }
+    // a roof 1.5 m up over the floor the camera sees, 12 m wide
+    scene.add(gi_box([12.0, 0.3, 12.0], [0.0, 1.5, -2.0], [0.5; 3]));
+    let mut low = camera_at([0.0, 0.8, 1.0], [0.0, 0.0, -2.0]);
+    let roofed = floor_gain(&mut renderer, &mut scene, &mut low, &mut effect, 12, &rows);
+    eprintln!("under the roof: {roofed:?}");
+    for got in &roofed {
+        assert!(*got < 0.25 * want, "under the roof the floor gains {got}");
+    }
+}
+
+/// A probe inside a block (the clipmap's voxels opaque round it) is left out; those round the
+/// block in the open are traced.
+#[test]
+fn probes_inside_surfaces_are_left_out() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_clipmap(SceneVoxelClipmapOptions { levels: 1, resolution: 32, height_resolution: 32, voxel_size: 0.25, ..Default::default() });
+    renderer.voxel_clipmap_mut().unwrap().enable_probes(kansei_core::gi::ClipmapProbeOptions { probes_per_frame: 1 << 16, ..Default::default() });
+    let mut scene = Scene::new();
+    // a solid block: its walls 0.25 m thick on every side round a 0.5 m core... the voxelizer
+    // fills only surfaces, so make the inside a stack of slabs
+    for k in 0..8 {
+        scene.add(gi_box([2.0, 0.24, 2.0], [0.0, -0.9 + k as f32 * 0.25, 0.0], [0.5; 3]));
+    }
+    let mut camera = camera_at([3.0, 1.0, 3.0], [0.0, 0.0, 0.0]);
+    run(&mut renderer, &mut scene, &mut camera, 3);
+    let gi = renderer.voxel_clipmap().unwrap();
+    let probes = gi.probes().unwrap();
+    let layout = *probes.layout();
+    let origin = probes.origin(0).unwrap();
+    let words = renderer.read_back_buffer_sync::<f32>(probes.probe_buffer(), probes.probe_buffer().size());
+    let (mut inside, mut left_out, mut open, mut traced) = (0, 0, 0, 0);
+    for z in 0..layout.dims[2] as i32 {
+        for y in 0..layout.dims[1] as i32 {
+            for x in 0..layout.dims[0] as i32 {
+                let c = origin + IVec3::new(x, y, z);
+                let p = c.as_vec3() * layout.voxel_size;
+                let a = words[16 * texel(c, layout.dims) + 3];
+                if p.x.abs() < 0.6 && p.z.abs() < 0.6 && p.y > -0.7 && p.y < 0.8 {
+                    inside += 1;
+                    left_out += (a == -1.0) as u32;
+                } else if p.x.abs() > 1.6 || p.z.abs() > 1.6 || p.y > 1.4 {
+                    open += 1;
+                    traced += (a >= 0.0) as u32;
+                }
+            }
+        }
+    }
+    eprintln!("{left_out} of {inside} probes inside the block left out; {traced} of {open} in the open traced");
+    assert!(inside > 8 && left_out == inside);
+    assert!(open > 100 && traced == open);
+}

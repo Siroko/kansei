@@ -81,6 +81,14 @@ const CLIP_LIFT : f32 = 1.5;
 // stops where it leaves the coarsest level. Returns the scene radiance gathered (rgb) and the
 // transmittance left (a): add `a * sky` for the light from past the clipmap.
 fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32) -> vec4f {
+    return clipConeTraceNear(origin, dir, n, tanHalf, minDiameter, startDist, maxDist, maxSteps, 0.0);
+}
+
+// clipConeTrace, reading voxels no coarser than `minDiameter` for the first `fineDist` metres:
+// for a cone from a point off any surface (a probe), whose surroundings the coarse levels would
+// thicken (a floor half a metre below fills a level's 1 m voxel round it), sparse samples of the
+// fine voxels there instead, over the cone's longer steps.
+fn clipConeTraceNear(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32, fineDist: f32) -> vec4f {
     var color = vec3f(0.0);
     var transmittance = 1.0;
     var dist = startDist;
@@ -92,7 +100,7 @@ fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter:
         let diameter = max(2.0 * tanHalf * dist, minDiameter);
         // the lift clears the voxels read, no wider than the coarsest level's
         let p = origin + dir * dist + n * max(CLIP_LIFT * min(diameter, max(coarsest, minDiameter)) - dist * rise, 0.0);
-        let lod = max(log2(diameter / clipmap.voxelSize), 0.0);
+        let lod = max(log2(select(diameter, minDiameter, dist < fineDist) / clipmap.voxelSize), 0.0);
         let k = clipLevelAt(p, min(u32(lod), clipmap.levelCount - 1u), 0.5);
         if (k >= clipmap.levelCount) { break; }
         var s = clipSample(k, p);

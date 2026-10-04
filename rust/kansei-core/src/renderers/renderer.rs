@@ -1708,7 +1708,8 @@ impl Renderer {
     /// planned (`plan_voxel_clipmap`) with the static GI renderables (instanced ones as culled for
     /// each region, cluster LOD ones by their cut there), voxelize the dynamic ones into the
     /// finest levels, then light the levels due this frame.
-    fn run_voxel_clipmap(&mut self, scene: &Scene) {
+    fn run_voxel_clipmap(&mut self, scene: &Scene, camera: &Camera) {
+        let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
         let job_views: Vec<usize> = (0..self.voxel_clipmap.as_ref().map_or(0, |gi| gi.jobs().len())).map(|slot| self.gi_view(slot)).collect();
         let Some(gi) = self.voxel_clipmap.as_mut() else { return };
         if !gi.settings.enabled {
@@ -1782,6 +1783,7 @@ impl Renderer {
         }
         let levels = gi.levels_to_light();
         gi.encode_lighting(device, queue, &mut encoder, &levels, any_dynamic);
+        gi.encode_probes(device, queue, &mut encoder, eye);
         queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -2815,7 +2817,7 @@ impl Renderer {
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
         self.run_voxel_gi(scene, camera);
-        self.run_voxel_clipmap(scene);
+        self.run_voxel_clipmap(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -3142,7 +3144,7 @@ impl Renderer {
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
         self.run_voxel_gi(scene, camera);
-        self.run_voxel_clipmap(scene);
+        self.run_voxel_clipmap(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
