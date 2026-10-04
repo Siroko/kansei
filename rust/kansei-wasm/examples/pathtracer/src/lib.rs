@@ -11,161 +11,14 @@ use kansei_core::materials::Material;
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pathtracer::{BVHBuilder, GPUBVHData, PathTracer, PathTracerMaterial, TLASBuilder};
+use kansei_core::postprocessing::effects::{ToneMapEffect, ToneMapOptions, ToneMapper};
+use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{fetch_bytes, Canvas};
 
 
-const BLIT_SHADER: &str = "
-@group(0) @binding(0) var t_input: texture_2d<f32>;
-@group(0) @binding(1) var s_input: sampler;
-
-struct VertexOutput {
-    @builtin(position) position: vec4f,
-    @location(0) uv: vec2f,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
-    let x = f32(i32(idx & 1u) * 4 - 1);
-    let y = f32(i32(idx & 2u) * 2 - 1);
-    var out: VertexOutput;
-    out.position = vec4f(x, y, 0.0, 1.0);
-    out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let color = textureSample(t_input, s_input, in.uv);
-    let mapped = color.rgb / (color.rgb + vec3f(1.0));
-    return vec4f(mapped, 1.0);
-}
-";
-
 fn make_basic_material(name: &str, color: [f32; 4]) -> Material {
     Material::basic_lit(name, color, [0.15, 0.15, 0.15, 0.5])
-}
-
-/// Blit pipeline resources for presenting the path tracer output to the canvas.
-struct BlitResources {
-    pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-}
-
-impl BlitResources {
-    fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blit/Shader"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
-        });
-
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Blit/BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Blit/PipelineLayout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Blit/Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Blit/Sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        Self { pipeline, bgl, sampler }
-    }
-
-    fn blit(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        device: &wgpu::Device,
-        source_view: &wgpu::TextureView,
-        target_view: &wgpu::TextureView,
-    ) {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Blit/BG"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(source_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Blit/Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..3, 0..1);
-    }
 }
 
 struct State {
@@ -177,32 +30,17 @@ struct State {
     bvh: BVHBuilder,
     bvh_data: GPUBVHData,
     tlas: TLASBuilder,
-    blit: BlitResources,
+    /// the tracer's image through a tonemapper to the screen
+    volume: PostProcessingVolume,
     // Interactive scene controls
     box_a_idx: usize,
     box_b_idx: usize,
     dragon_parts: Vec<(usize, Vec3)>,
-    light_dir: Vec3,
-    light_color: Vec3,
-    light_intensity: f32,
+    /// the sun's index in the scene, and how many lights the tracer has
+    sun: usize,
+    light_count: u32,
     animate: bool,
     scene_dirty: bool,
-}
-
-fn directional_light_data(dir: Vec3, color: Vec3, intensity: f32) -> [f32; 16] {
-    let d = if dir.length() > 1e-6 {
-        dir.normalize()
-    } else {
-        Vec3::new(0.0, -1.0, 0.0)
-    };
-    // LightData: direction(vec3) + LIGHT_DIRECTIONAL=1, color(vec3) + intensity,
-    // normal(vec3, unused) + pad, extra(vec4)
-    [
-        d.x, d.y, d.z, f32::from_bits(1u32),
-        color.x, color.y, color.z, intensity,
-        0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0,
-    ]
 }
 
 fn move_object(scene: &mut Scene, idx: usize, pos: Vec3) {
@@ -230,6 +68,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let floor_geo = BoxGeometry::new(8.0, 0.1, 8.0);
     let floor_mat = make_basic_material("Floor", [0.73, 0.73, 0.73, 1.0]);
     let mut floor = Renderable::new(floor_geo, floor_mat);
+    floor.path_tracer_material = Some(PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() });
     floor.object.set_position(0.0, -0.05, 0.0);
     scene.add(SceneNode::Renderable(floor));
 
@@ -237,6 +76,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let ceil_geo = BoxGeometry::new(8.0, 0.1, 8.0);
     let ceil_mat = make_basic_material("Ceiling", [0.73, 0.73, 0.73, 1.0]);
     let mut ceil = Renderable::new(ceil_geo, ceil_mat);
+    ceil.path_tracer_material = Some(PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() });
     ceil.object.set_position(0.0, 6.05, 0.0);
     scene.add(SceneNode::Renderable(ceil));
 
@@ -244,6 +84,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let back_geo = BoxGeometry::new(8.0, 6.0, 0.1);
     let back_mat = make_basic_material("BackWall", [0.73, 0.73, 0.73, 1.0]);
     let mut back = Renderable::new(back_geo, back_mat);
+    back.path_tracer_material = Some(PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() });
     back.object.set_position(0.0, 3.0, -4.05);
     scene.add(SceneNode::Renderable(back));
 
@@ -251,6 +92,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let left_geo = BoxGeometry::new(0.1, 6.0, 8.0);
     let left_mat = make_basic_material("LeftWall", [0.65, 0.05, 0.05, 1.0]);
     let mut left = Renderable::new(left_geo, left_mat);
+    left.path_tracer_material = Some(PathTracerMaterial { albedo: [0.65, 0.05, 0.05], ..Default::default() });
     left.object.set_position(-4.05, 3.0, 0.0);
     scene.add(SceneNode::Renderable(left));
 
@@ -258,6 +100,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let right_geo = BoxGeometry::new(0.1, 6.0, 8.0);
     let right_mat = make_basic_material("RightWall", [0.12, 0.45, 0.15, 1.0]);
     let mut right = Renderable::new(right_geo, right_mat);
+    right.path_tracer_material = Some(PathTracerMaterial { albedo: [0.12, 0.45, 0.15], ..Default::default() });
     right.object.set_position(4.05, 3.0, 0.0);
     scene.add(SceneNode::Renderable(right));
 
@@ -265,6 +108,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let box_a_geo = BoxGeometry::new(1.0, 2.0, 1.0);
     let box_a_mat = make_basic_material("BoxA", [0.9, 0.2, 0.2, 1.0]);
     let mut box_a = Renderable::new(box_a_geo, box_a_mat);
+    box_a.path_tracer_material = Some(PathTracerMaterial { albedo: [0.9, 0.2, 0.2], ..Default::default() });
     box_a.object.set_position(-1.5, 1.0, 0.0);
     let box_a_idx = scene.add(SceneNode::Renderable(box_a));
 
@@ -272,6 +116,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let box_b_geo = BoxGeometry::new(1.0, 1.0, 1.0);
     let box_b_mat = make_basic_material("BoxB", [0.2, 0.2, 0.9, 1.0]);
     let mut box_b = Renderable::new(box_b_geo, box_b_mat);
+    box_b.path_tracer_material = Some(PathTracerMaterial { albedo: [0.2, 0.2, 0.9], ..Default::default() });
     box_b.object.set_position(1.5, 0.5, 0.0);
     let box_b_idx = scene.add(SceneNode::Renderable(box_b));
 
@@ -288,6 +133,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let s = 0.03;
         for gr in result.renderables {
             let mut r = Renderable::new(gr.geometry, make_basic_material("Dragon", [0.9, 0.9, 0.95, 1.0]));
+            r.path_tracer_material = Some(PathTracerMaterial::glass(1.5));
             let base_pos = Vec3::new(gr.position.x, gr.position.y, gr.position.z + 2.5);
             r.object.position = base_pos;
             r.object.rotation = gr.rotation;
@@ -308,7 +154,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         Vec3::new(1.0, 0.95, 0.9),
         3.0,
     );
-    scene.add(SceneNode::Light(Light::Directional(sun)));
+    let sun = scene.add(SceneNode::Light(Light::Directional(sun)));
 
     // Camera
     let mut camera = Camera::new(45.0, 0.1, 100.0, width as f32 / height as f32);
@@ -336,30 +182,18 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     pt.set_spp(1);
     pt.set_max_bounces(8); // more bounces for glass refraction
 
-    // Materials: floor=0, ceiling=1, back=2, left=3, right=4, boxA=5, boxB=6, dragon=7+
-    let mut materials = vec![
-        PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // floor
-        PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // ceiling
-        PathTracerMaterial { albedo: [0.73, 0.73, 0.73], ..Default::default() }, // back wall
-        PathTracerMaterial { albedo: [0.65, 0.05, 0.05], ..Default::default() }, // left (red)
-        PathTracerMaterial { albedo: [0.12, 0.45, 0.15], ..Default::default() }, // right (green)
-        PathTracerMaterial { albedo: [0.9, 0.2, 0.2], ..Default::default() },    // box A
-        PathTracerMaterial { albedo: [0.2, 0.2, 0.9], ..Default::default() },    // box B
-    ];
-    let dragon_count = gpu_data.instance_count as usize - 7;
-    for _ in 0..dragon_count {
-        materials.push(PathTracerMaterial::glass(1.5));
-    }
-    pt.set_materials(&materials);
+    // each renderable's material, and the scene's lights
+    pt.set_materials(&BVHBuilder::scene_materials(&scene));
+    let light_count = pt.set_lights_from_scene(&scene);
 
-    // Light data for path tracer
-    let light_dir = Vec3::new(-0.3, -0.5, -1.0);
-    let light_color = Vec3::new(1.0, 0.95, 0.9);
-    let light_intensity = 3.0;
-    pt.set_lights_raw(&directional_light_data(light_dir, light_color, light_intensity));
-
-    // Blit pipeline
-    let blit = BlitResources::new(renderer.device(), renderer.presentation_format());
+    // shown through the engine's tonemapper: a neutral curve, a stop down (the old local blit's
+    // Reinhard curve kept about that much headroom)
+    let tonemap = ToneMapEffect::new(ToneMapOptions {
+        tonemapper: ToneMapper::KhronosNeutral,
+        exposure_compensation: -1.0,
+        ..ToneMapOptions::for_surface(renderer.presentation_format())
+    });
+    let volume = PostProcessingVolume::new(&renderer, vec![Box::new(tonemap)]);
 
     log::info!("Kansei — Path Tracer (WASM) ready");
 
@@ -374,13 +208,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         bvh,
         bvh_data: gpu_data,
         tlas,
-        blit,
+        volume,
         box_a_idx,
         box_b_idx,
         dragon_parts,
-        light_dir,
-        light_color,
-        light_intensity,
+        sun,
+        light_count,
         animate: false,
         scene_dirty: false,
     }));
@@ -398,13 +231,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 ref mut bvh,
                 ref bvh_data,
                 ref mut tlas,
-                ref blit,
+                ref mut volume,
                 box_b_idx,
+                light_count,
                 animate,
                 ref mut scene_dirty,
                 ..
             } = *st;
-            // The tracer's output (and the blit reading it) follow the canvas size.
+            // The tracer's output follows the canvas size.
             if let Some((width, height)) = frame.resized {
                 frame.resize(renderer, camera);
                 path_tracer.resize(width, height);
@@ -434,27 +268,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 *scene_dirty = false;
             }
 
-            // Get surface texture
-            let surface = renderer.surface().unwrap();
-            let output = surface.get_current_texture().expect("Failed to get surface texture");
-            let canvas_view = output.texture.create_view(&Default::default());
-
-            let mut encoder = renderer.device().create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
-                    label: Some("PathTracer/Frame"),
-                },
-            );
-
-            let tlas_buf = tlas.tlas_nodes_buf.as_ref().unwrap();
-            path_tracer.trace(&mut encoder, bvh_data, tlas_buf, camera, 1);
-
-            if let Some(pt_view) = path_tracer.output_view() {
-                let device = renderer.device();
-                blit.blit(&mut encoder, device, pt_view, &canvas_view);
-            }
-
-            renderer.queue().submit(std::iter::once(encoder.finish()));
-            output.present();
+            path_tracer.trace_frame(renderer, bvh_data, tlas, camera, light_count);
+            path_tracer.present(renderer, camera, volume);
         }
     });
 
@@ -469,37 +284,28 @@ fn with_state<F: FnOnce(&mut State)>(f: F) {
     GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } });
 }
 
-fn upload_lights(s: &mut State) {
-    s.path_tracer.set_lights_raw(&directional_light_data(
-        s.light_dir,
-        s.light_color,
-        s.light_intensity,
-    ));
+/// Change the sun (the scene's directional light) and hand the scene's lights to the tracer again.
+fn update_sun(s: &mut State, change: impl FnOnce(&mut DirectionalLight)) {
+    if let Some(Light::Directional(sun)) = s.scene.get_light_mut(s.sun) {
+        change(sun);
+    }
+    s.light_count = s.path_tracer.set_lights_from_scene(&s.scene);
     s.path_tracer.reset_accumulation();
 }
 
 #[wasm_bindgen]
 pub fn set_light_dir(x: f32, y: f32, z: f32) {
-    with_state(|s| {
-        s.light_dir = Vec3::new(x, y, z);
-        upload_lights(s);
-    });
+    with_state(|s| update_sun(s, |sun| sun.direction = Vec3::new(x, y, z)));
 }
 
 #[wasm_bindgen]
 pub fn set_light_color(r: f32, g: f32, b: f32) {
-    with_state(|s| {
-        s.light_color = Vec3::new(r, g, b);
-        upload_lights(s);
-    });
+    with_state(|s| update_sun(s, |sun| sun.color = Vec3::new(r, g, b)));
 }
 
 #[wasm_bindgen]
 pub fn set_light_intensity(v: f32) {
-    with_state(|s| {
-        s.light_intensity = v;
-        upload_lights(s);
-    });
+    with_state(|s| update_sun(s, |sun| sun.intensity = v));
 }
 
 /// Move an object: 0 = box A, 1 = box B, 2 = dragon (offset from load position).
