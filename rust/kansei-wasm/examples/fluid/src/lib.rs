@@ -8,7 +8,7 @@ use kansei_core::geometries::{InstancedGeometry, PlaneGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{PARTICLE_BILLBOARD_WGSL, Binding, CullMode, Material, MaterialOptions, ShaderStages};
-use kansei_core::math::{Mat4, Vec3};
+use kansei_core::math::Vec3;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FixedStep;
 use kansei_core::postprocessing::{PostProcessingVolume, effects::{
@@ -248,8 +248,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         use_batched_sim: true,
         sim_step: FixedStep::new(1.0 / 60.0).with_max_steps(4), sim_time_scale: 1.0,
         max_render_fps: 0.0, render_accumulator: 0.0,
-        frame_count: 0, frame_time_sum: 0.0,
-        current_fps: 0.0, current_frame_ms: 0.0,
     }));
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
@@ -278,8 +276,6 @@ struct State {
     /// The sim's fixed step (clamped to 1/240..1/20 s) and its cap of steps a frame.
     sim_step: FixedStep, sim_time_scale: f32,
     max_render_fps: f64, render_accumulator: f64,
-    frame_count: u32, frame_time_sum: f64,
-    current_fps: f64, current_frame_ms: f64,
 }
 
 impl State {
@@ -299,14 +295,6 @@ impl State {
             let dt = self.render_accumulator; self.render_accumulator = 0.0; dt
         } else { frame_s };
 
-        self.frame_time_sum += render_dt * 1000.0;
-        self.frame_count += 1;
-        if self.frame_count % 60 == 0 {
-            let avg = self.frame_time_sum / 60.0;
-            self.current_frame_ms = avg;
-            self.current_fps = 1000.0 / avg;
-            self.frame_time_sum = 0.0;
-        }
 
         let frame_dt = render_dt.max(1.0 / 1000.0);
         self.controls.update(&mut self.camera, 0.0);
@@ -314,11 +302,9 @@ impl State {
         self.camera.aspect = self.width as f32 / self.height as f32;
         self.camera.update_projection_matrix();
 
-        let eye = self.camera.position();
         let view = self.camera.view_matrix.to_glam();
         let proj = self.camera.projection_matrix.to_glam();
         let inv_view = self.camera.inverse_view_matrix.to_glam();
-        let inv_vp = (proj * view).inverse();
 
         let mouse_ndc = [self.mouse.position.x, self.mouse.position.y];
         let mouse_dir = [self.mouse.direction.x, self.mouse.direction.y];
@@ -355,40 +341,9 @@ impl State {
 
         // ── Render mode 1: Raymarch (custom compute + blit) ──
         } else if self.render_mode == 1 {
-            let output = self.renderer.surface().unwrap().get_current_texture().unwrap();
-            let canvas_view = output.texture.create_view(&Default::default());
-            let mut encoder = self.renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("WasmFluid/Raymarch"),
-            });
-
             let fse = self.volume.effect_mut::<FluidSurfaceEffect>().unwrap();
-            fse.density_field.update_with_encoder(&mut encoder,
-                fse.sim.world_bounds_min, fse.sim.world_bounds_max,
-                fse.sim.particle_count(), fse.sim.params.smoothing_radius);
-            self.raymarch.bounds_min = fse.sim.world_bounds_min;
-            self.raymarch.bounds_max = fse.sim.world_bounds_max;
-
-            // Clear offscreen color + depth (raymarch reads depth to know geometry)
-            {
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: self.raymarch.input_color_view(), resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }),
-                            store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: self.raymarch.input_depth_view(),
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                        stencil_ops: None,
-                    }), ..Default::default()
-                });
-            }
-
-            self.raymarch.render(&mut encoder, &canvas_view, &Mat4::from(inv_vp),
-                [eye.x, eye.y, eye.z], self.width, self.height);
-            self.renderer.submit(std::iter::once(encoder.finish()));
-            output.present();
+            let splat = fse.sim.params.smoothing_radius;
+            self.raymarch.render_frame(&self.renderer, &mut fse.density_field, &fse.sim, splat, &self.camera, wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 });
 
         // ── Render mode 2/3: MC surface via standard Renderer ──
         // FluidSurfaceEffect handles density + MC compute + refraction composite.
@@ -410,20 +365,6 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
     });
 }
 
-#[wasm_bindgen] pub fn get_fps() -> f64 {
-    GLOBAL_STATE.with(|gs| {
-        if let Some(ref rc) = *gs.borrow() {
-            rc.try_borrow().map(|s| s.current_fps).unwrap_or(0.0)
-        } else { 0.0 }
-    })
-}
-#[wasm_bindgen] pub fn get_frame_time() -> f64 {
-    GLOBAL_STATE.with(|gs| {
-        if let Some(ref rc) = *gs.borrow() {
-            rc.try_borrow().map(|s| s.current_frame_ms).unwrap_or(0.0)
-        } else { 0.0 }
-    })
-}
 
 #[wasm_bindgen] pub fn set_pressure(v: f32) { with_fluid(|f| f.sim.params.pressure_multiplier = v); }
 #[wasm_bindgen] pub fn set_near_pressure(v: f32) { with_fluid(|f| f.sim.params.near_pressure_multiplier = v); }
