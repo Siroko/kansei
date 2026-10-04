@@ -27,7 +27,7 @@
 //! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA and
 //! runs `TemporalAAEffect` first instead (`taa=0` turns it off). The particles write no motion vectors: the TAA reprojects them by depth.
 //! `focus=` sets the focus distance in metres (default: autofocus on the depth at the middle of
-//! the screen, 65% of the way down, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 2.8). The room is 28 m wide and seen from 37 m, where a real
+//! the screen, 65% of the way down, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 2.8). The room is 28 m wide and seen from 17 m or more, where a real
 //! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
@@ -1077,9 +1077,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // far enough that the room fits across a portrait screen too
     let fit = (1.6 / aspect).max(1.0);
     let mut controls = if lightbox {
-        // straight on, a little low, with the reflection under the box in view
-        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 5.0, 0.0), 37.0 * fit).with_mouse_pan(canvas);
-        c.set_elevation(0.04);
+        // low over the front right of the pile, looking across it at the back left corner
+        let mut c = CameraControls::from_canvas(canvas, Vec3::new(-1.5, 6.0, -5.0), 18.55).with_mouse_pan(canvas);
+        c.set_azimuth(0.809);
+        c.set_elevation(0.217);
         c
     } else {
         let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(canvas);
@@ -1456,3 +1457,4 @@ mod tests {
         assert!(wall > 0.0 && wall < under, "{wall}");
     }
 }
+
