@@ -16,16 +16,13 @@
             start, info, set_gi, set_view, set_extinction, set_cone_aperture, set_sun_cone,
             set_emissive_share, set_emissive_intensity, set_speed_glow, set_temporal_blend,
             set_particle_size, set_sun, set_exposure, set_panel, set_reflectivity, set_ao,
-            set_rt, set_rt_mix, set_rt_bounces, set_paused, reset,
+            set_rt, set_rt_mix, set_rt_bounces, set_paused, reset, profile_report, set_layers,
         } from '../pkg/kansei_wasm_voxel_gi_particles.js';
         await init();
         await start('kansei');
 
-        // for scripted captures: window.kansei.set_gi(false) and so on
-        window.kansei = {
-            info, set_gi, set_view, set_sun, set_extinction, set_emissive_share, set_emissive_intensity,
-            set_panel, set_reflectivity, set_ao, set_rt, set_rt_mix, set_rt_bounces, set_paused, reset,
-        };
+        // for scripted captures and timing: window.kansei.set_gi(false) and so on
+        window.kansei = await import('../pkg/kansei_wasm_voxel_gi_particles.js');
         const params = new URLSearchParams(location.search);
         const state = JSON.parse(info());
         const lightbox = state.scene === 'lightbox';
