@@ -49,7 +49,7 @@ use kansei_core::geometries::BoxGeometry;
 use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfProbeOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -60,7 +60,7 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, Canvas, Frame};
 
 /// A diffuse surface lit by the spot lights only (no ambient), writing the normal and albedo the
-/// global illumination reads (GBuffer targets 2 and 3).
+/// global illumination reads (GBuffer targets 2 and 3, through `materials::GBUFFER_OUT_WGSL`).
 const LIT_WGSL: &str = r#"
 struct Surface { base_color: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
@@ -79,13 +79,6 @@ struct VOut {
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
 };
-struct GBufferOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
 @vertex
 fn vertex_main(v: VIn) -> VOut {
     let world = world_matrix * v.position;
@@ -97,18 +90,13 @@ fn vertex_main(v: VIn) -> VOut {
 }
 
 @fragment
-fn fragment_main(in: VOut) -> GBufferOut {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(camera_pos - in.world);
     let base = surface.base_color.rgb;
-    var out: GBufferOut;
-    out.color = vec4<f32>(lit_radiance(in.world, n, v, base, in.clip.xy), 1.0);
-    out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
-    out.albedo = vec4<f32>(base, 1.0);
-    return out;
+    return kansei_gbuffer_out(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base);
 }
 "#;
 
@@ -134,13 +122,6 @@ struct VOut {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
 };
-struct GBufferOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
 @vertex
 fn vertex_main(v: VIn) -> VOut {
     let world = world_matrix * v.position;
@@ -153,18 +134,13 @@ fn vertex_main(v: VIn) -> VOut {
 }
 
 @fragment
-fn fragment_main(in: VOut) -> GBufferOut {
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(camera_pos - in.world);
     let base = textureSample(rug_texture, rug_sampler, in.uv).rgb;
-    var out: GBufferOut;
-    out.color = vec4<f32>(lit_radiance(in.world, n, v, base, in.clip.xy), 1.0);
-    out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
-    out.albedo = vec4<f32>(base, 1.0);
-    return out;
+    return kansei_gbuffer_out(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base);
 }
 
 // voxel GI's voxelizer: the rug's texture into its voxels
@@ -257,14 +233,15 @@ impl SdfBinding {
     }
 }
 
-/// `body` (which calls `lit_radiance`) after the light chunk for `sdf` (shadows through the field)
-/// or the shadow maps, with its bindings: `bindings` plus the field's.
+/// `body` (which calls `lit_radiance` and returns `kansei_gbuffer_out`) after the GBuffer output and
+/// the light chunk for `sdf` (shadows through the field) or the shadow maps, with its bindings:
+/// `bindings` plus the field's.
 fn lit_shader(body: &str, sdf: Option<&SdfBinding>, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
     match sdf {
-        None => (format!("{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
+        None => (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
         Some(_) => {
             bindings.extend([Binding::uniform(10, ShaderStages::FRAGMENT), Binding::texture_3d(11, ShaderStages::FRAGMENT), Binding::sampler(12, ShaderStages::FRAGMENT)]);
-            (format!("{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
+            (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
         }
     }
 }
@@ -415,14 +392,6 @@ impl View {
             View::Sdf => "sdf",
             View::Probes => "probes",
         }
-    }
-}
-
-fn tier_name(q: VoxelGiQuality) -> &'static str {
-    match q {
-        VoxelGiQuality::Low => "low",
-        VoxelGiQuality::Medium => "medium",
-        VoxelGiQuality::High => "high",
     }
 }
 
@@ -847,8 +816,8 @@ impl State {
             "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.config.gi.name(),
             self.config.view.name(),
-            tier_name(self.config.voxels),
-            gi.map_or("null".into(), |g| format!("\"{}\"", tier_name(g.quality()))),
+            self.config.voxels.name(),
+            gi.map_or("null".into(), |g| format!("\"{}\"", g.quality().name())),
             gi.map_or("null".into(), |g| format!("{:?}", g.volume().dims())),
             gi.map_or(0.0, |g| g.memory_bytes() as f64 / (1 << 20) as f64),
             self.config.dragon.name(),

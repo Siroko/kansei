@@ -1,10 +1,11 @@
-// The lightbox's particles (after VOXEL_CONES_WGSL, SCENE_WGSL and room_common.wgsl): spheres of
-// varied radius, ray cast on camera-facing quads at their nearest point, lit by what the GI
-// gathered for them (`lighting`, two vec4 per particle) and the panel. `mirrored` draws them under
-// the floor (the reflection). The quads keep their own depth rather than writing frag_depth, which
-// would run the shading before the depth test, for every sphere of a pile dozens deep; the
-// fragment entries follow, a depth prepass (room_spheres_depth.wgsl) and the shading on equal depth
-// (room_spheres_shade.wgsl). Each particle's position w is its radius as a share of `size`.
+// The lightbox's particles (after VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL, SCENE_WGSL and
+// room_common.wgsl): spheres of varied radius, ray cast on camera-facing quads at their nearest
+// point, lit by what the GI gathered for them (`lighting`, two vec4 per particle) and the panel.
+// `mirrored` draws them under the floor (the reflection). The quads keep their own depth rather
+// than writing frag_depth, which would run the shading before the depth test, for every sphere of
+// a pile dozens deep; the fragment entries follow, a depth prepass (room_spheres_depth.wgsl) and
+// the shading on equal depth (room_spheres_shade.wgsl). Each particle's position w is its radius
+// as a share of `size`.
 //
 // Ray traced (scene.rtOn), after the bonus of miaumiau.cat/?p=1476: a share of the particles are
 // mirrors or glass, and their reflected and refracted rays walk the fluid's own neighbour grid
@@ -27,6 +28,8 @@ struct Grid { origin: vec3f, cellSize: f32, dims: vec3u, count: u32 };
 @group(0) @binding(9) var linearClamp: sampler;
 // the highest particle centre (pile_top.wgsl), as f32 bits
 @group(0) @binding(10) var<storage, read> pileTop: u32;
+// the sky past the volume (ParticleGi::sky_buffer)
+@group(0) @binding(11) var<uniform> sky: SkyLighting;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> _normal_matrix: mat4x4<f32>;
@@ -208,7 +211,7 @@ fn shadeRoom(o: vec3f, d: vec3f, exit: vec4f) -> vec3f {
     }
     let q = p + n * vol.voxelSize;
     let c = voxelConeTrace(vol, radiance, linearClamp, q, n, 1.0, vol.voxelSize, 1e4, 12u);
-    return scene.wallAlbedo * (panelIrradiance(scene, p, n) / PI + c.rgb + c.a * skyRad(scene, n));
+    return scene.wallAlbedo * (panelIrradiance(scene, p, n) / PI + c.rgb + c.a * skyRadiance(sky, n));
 }
 
 // what a ray sees, mirrors and glass met on the way taken as matte (the last bounce)

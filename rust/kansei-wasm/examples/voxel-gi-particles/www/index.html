@@ -30,7 +30,7 @@
             scene: state.scene,
             gi: params.get('gi') !== 'off',
             indirect: params.get('view') === 'indirect',
-            quality: state.quality.toLowerCase(),
+            quality: state.quality,
             extinction: 0.6,
             coneAperture: 90,
             sunCone: lightbox ? 43.6 : 5.7,

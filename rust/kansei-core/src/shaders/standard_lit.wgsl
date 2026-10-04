@@ -89,7 +89,8 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
 
     var out: KanseiStandardOut;
     out.color = vec4f(radiance, 1.0);
-    out.emissive = vec4f(emissive, 1.0);
+    // alpha 0: FluidMask::EmissiveAlpha takes an alpha of 0.5 and over for the fluid's surface
+    out.emissive = vec4f(emissive, 0.0);
     out.normal = vec4f(N * 0.5 + 0.5, 1.0);
     out.albedo = vec4f(base, 1.0);
     KANSEI_VELOCITY_FRAGMENT
