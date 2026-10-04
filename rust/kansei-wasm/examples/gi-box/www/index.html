@@ -40,7 +40,8 @@
         const read = () => JSON.parse(info());
         let s = read();
         const p = {
-            preset: params.get('preset') || '',
+            // the engine starts from preset best when the URL names neither a preset nor a gi
+            preset: params.get('preset') || (params.has('gi') ? '' : 'best'),
             gi: s.gi,
             voxels: s.voxels,
             view: s.view,

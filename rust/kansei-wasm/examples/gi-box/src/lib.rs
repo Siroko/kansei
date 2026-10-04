@@ -16,8 +16,9 @@
 //! (and `window.kansei`) switches everything at run time.
 //!
 //! URL parameters (a `preset` first, the others over it):
-//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice` (see `PRESETS`);
-//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi` (default high);
+//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice` (see `PRESETS`;
+//!   `best`, voxel + SSGI at the device's tier, unless the URL names a preset or a `gi`);
+//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi`;
 //! - `voxels=low|medium|high`: the volume's resolution (default medium; low on phones, which also
 //!   keep it within 24 MiB);
 //! - `view=indirect` (only the light GI adds, 2 stops brighter), `view=voxels` (with voxel GI:
@@ -580,6 +581,9 @@ fn default_voxels(phone: bool) -> VoxelGiQuality {
     if phone { VoxelGiQuality::Low } else { VoxelGiQuality::Medium }
 }
 
+/// The preset of a URL that names neither a preset nor a `gi`.
+const DEFAULT_PRESET: &str = "best";
+
 /// `config` with preset `name` applied (unknown names change nothing).
 fn with_preset(config: Config, name: &str, phone: bool) -> Config {
     let Some(p) = PRESETS.iter().find(|p| p.name == name) else { return config };
@@ -610,7 +614,7 @@ fn config_from_url(phone: bool) -> Config {
         direct_sdf: false,
         slice: 0.6,
     };
-    if let Some(preset) = query_param("preset") {
+    if let Some(preset) = query_param("preset").or_else(|| query_param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
     }
     if let Some(gi) = query_param("gi").as_deref().and_then(Gi::from_name) {
