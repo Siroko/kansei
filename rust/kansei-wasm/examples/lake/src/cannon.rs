@@ -1,6 +1,6 @@
 //! A little water cannon on the lake's west bank, aimed in an arc into the lake. Walk up to it
-//! (within `REACH`) and it offers to fire: E (keyboard), X (gamepad) or a click on the prompt.
-//! A press fires a short burst; holding keeps pouring. The water comes out of the muzzle as new
+//! (within `REACH`; on the lake page, which has no character, it is always ready) and it offers to
+//! fire: E (keyboard), X (gamepad) or a click on the prompt. A press fires a short burst; holding keeps pouring. The water comes out of the muzzle as new
 //! particles (`FluidNozzle` into the lake's spare capacity), flies its arc, splashes in, and the
 //! lake's level rises, up to the lake's highest (`Lake::full`); then the prompt says so and R (Y)
 //! drains it back to the start, as the P panel's reset does.
@@ -46,7 +46,8 @@ pub struct Cannon {
     /// Held since it was fired: it keeps pouring.
     holding: bool,
     firing_for: f32,
-    /// Whether the character is near enough, and was last frame.
+    /// Whether it may fire: the character near enough (or no character needed), as of the last
+    /// update.
     pub near: bool,
     /// Particles poured in since the page opened.
     pub poured: u64,
@@ -103,13 +104,17 @@ impl Cannon {
         Self { barrel, pivot, aim, yaw, nozzle, burst: 0.0, holding: false, firing_for: 0.0, near: false, poured: 0 }
     }
 
-    /// Advance by `dt`: whether the character at `character` is near, and whether it fires
-    /// (`trigger` pressed this frame, `held`). Returns the stream to pour this frame, if firing.
-    pub fn update(&mut self, dt: f32, character: Option<GVec3>, trigger: bool, held: bool, lake: &Lake, scene: &mut Scene) -> Option<&mut FluidNozzle> {
-        self.near = character.is_some_and(|c| {
-            let d = c - self.pivot;
-            (d.x * d.x + d.z * d.z).sqrt() < REACH
-        });
+    /// Whether a character at `at` (world) is near enough to fire it.
+    pub fn in_reach(&self, at: GVec3) -> bool {
+        let d = at - self.pivot;
+        (d.x * d.x + d.z * d.z).sqrt() < REACH
+    }
+
+    /// Advance by `dt`: whether it may fire (`near`: a character within reach, or always on the
+    /// lake page), and whether it fires (`trigger` pressed this frame, `held`). Returns the stream
+    /// to pour this frame, if firing.
+    pub fn update(&mut self, dt: f32, near: bool, trigger: bool, held: bool, lake: &Lake, scene: &mut Scene) -> Option<&mut FluidNozzle> {
+        self.near = near;
         if self.near && trigger && !lake.full() {
             if !self.firing() {
                 self.nozzle.restart();
@@ -141,7 +146,7 @@ impl Cannon {
         self.firing_for > 0.0
     }
 
-    /// What the page shows near the cannon (empty when the character is not near it).
+    /// What the page shows near the cannon (empty when it may not fire).
     pub fn prompt(&self, lake: &Lake) -> String {
         if !self.near {
             String::new()

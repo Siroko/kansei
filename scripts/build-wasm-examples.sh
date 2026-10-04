@@ -17,8 +17,9 @@ out="$(cd "$out" && pwd)"
 
 # Not published (space-separated example names).
 #   joydivision: plays a commercial recording the viewer supplies; the page stays local-only.
-#   motion-matching-kimodo: needs the private animation packs and throws before rendering without them.
-skip=" joydivision motion-matching-kimodo "
+#   motion-matching: animates a character from private animation packs (.kmm) that never ship;
+#     its world without the character is the lake example, which is published.
+skip=" joydivision motion-matching "
 
 # One target dir for every example, so the engine and wgpu compile once.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/rust/target/wasm-examples}"

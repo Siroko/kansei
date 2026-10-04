@@ -2,7 +2,8 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Kansei — Motion Matching</title>
+    <title>Kansei — Lake</title>
+    <link rel="icon" href="data:,">
     <style>
         body { margin: 0; background: #000; overflow: hidden; }
         canvas { width: 100vw; height: 100vh; display: block; }
@@ -11,7 +12,8 @@
             color: #f2f2f2; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
             text-shadow: 0 1px 2px #000, 0 0 6px #000; white-space: pre-wrap; pointer-events: none;
         }
-        /* the cannon's prompt: shown by the cannon, and a click (or touch) on it fires */
+        /* the cannon's prompt: always shown (there is no character to walk up to it), and a click
+           (or touch) on it fires */
         #prompt {
             position: fixed; left: 50%; bottom: 12%; transform: translateX(-50%);
             padding: 8px 14px; border-radius: 6px; background: rgba(0, 0, 0, 0.55);
@@ -26,8 +28,7 @@
     <pre id="hud"></pre>
     <div id="prompt"></div>
     <script type="module">
-        // the lake panel's exports come from the lake example's crate (kansei-wasm-lake), in this module too
-        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, lake_regions, mill_settings, cannon_fire, drive_restart } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, lake_regions, mill_settings, cannon_fire } from '../pkg/kansei_wasm_lake.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
         await init();
         // the cannon's prompt fires while pressed (the keyboard's E and the gamepad's X work too)
@@ -35,8 +36,6 @@
         prompt.addEventListener('pointerdown', (e) => { e.preventDefault(); cannon_fire(true); });
         for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) prompt.addEventListener(ev, () => cannon_fire(false));
         await start('kansei');
-        // drive=1: start the scripted route over (to line up recordings of two packs)
-        window.driveRestart = drive_restart;
         // debug=1: the lake's particles by region, read back from the GPU (await lakeRegions())
         if (['1', 'true', 'on', 'yes'].includes(new URLSearchParams(location.search).get('debug'))) window.lakeRegions = lake_regions;
 

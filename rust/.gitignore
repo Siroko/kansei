@@ -4,7 +4,7 @@ kansei-wasm/examples/*/target/
 kansei-wasm/examples/*/pkg/
 kansei-wasm/examples/*/Cargo.lock
 *.DS_Store
-# motion-matching packs are linked in from outside the repo (see the example's README)
+# motion-matching packs are linked in from outside the repo (see the example's README; its
+# link-packs.sh links the Kimodo page's packs into www/pack/gen and www/pack/gasp)
 kansei-wasm/examples/motion-matching/www/pack
-kansei-wasm/examples/motion-matching-kimodo/www/pack
 vendor/basisu/target/
