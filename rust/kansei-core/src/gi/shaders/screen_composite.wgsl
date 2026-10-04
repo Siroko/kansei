@@ -196,16 +196,6 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         textureStore(outTex, gid.xy, vec4f(select(color.rgb * 0.25, slice.rgb * 40.0, slice.a > 0.0), color.a));
         return;
     }
-    if (gp.debug == 4u) {
-        // the probes over the lit scene (without its GI)
-        let puv = (vec2f(gid.xy) + 0.5) / gp.fullSize;
-        let sceneDepth = gpDepth(vec2i(gid.xy));
-        var sceneDist = 1e30;
-        if (sceneDepth < 1.0) { sceneDist = length(gpViewPos(puv, sceneDepth)); }
-        let ball = probeBalls(puv, sceneDist);
-        textureStore(outTex, gid.xy, vec4f(select(color.rgb, ball.rgb, ball.a > 0.0), color.a));
-        return;
-    }
     let depth = gpDepth(px);
     let albedo = textureLoad(albedoTex, px, 0).rgb;
     if (depth >= 1.0 || all(albedo <= vec3f(0.0))) {
@@ -214,15 +204,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     }
     let uv = (vec2f(gid.xy) + 0.5) / gp.fullSize;
     let z = -gpViewPos(uv, depth).z;
-    var e: vec3f;
-    if (gp.probes != 0u) {
-        let view = gpViewPos(uv, depth);
-        let ns = surfaceNormal(px, view);
-        let toEye = normalize((gp.invView * vec4f(-view, 0.0)).xyz);
-        e = kanseiProbeIrradiance((gp.invView * vec4f(view, 1.0)).xyz, ns, ns * 0.4 + toEye * 0.6);
-    } else {
-        e = upsample(giTex, gp.traceSize, uv, z).rgb;
-    }
+    var e = upsample(giTex, gp.traceSize, uv, z).rgb;
     if (gp.nearField != 0u) {
         let near = upsample(nearTex, gp.nearSize, uv, z);
         e = max(near.rgb, (1.0 - near.a) * e) + near.a * e;
@@ -231,6 +213,56 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     // the distance field's contact occlusion, which the coarse cones and the screen miss
     if (gp.hasSdf != 0u && gp.sdfAo > 0.0 && n.w > 0.0) {
         let world = (gp.invView * vec4f(gpViewPos(uv, depth), 1.0)).xyz;
+        e *= mix(1.0, sdfAo(vol, sdfTex, linearClamp, world, n.xyz), gp.sdfAo);
+    }
+    let bounce = albedo * e * (gp.intensity / 3.14159265);
+    if (gp.debug != 0u) {
+        textureStore(outTex, gid.xy, vec4f(bounce, color.a));
+        return;
+    }
+    var result = color.rgb + bounce;
+    if (gp.hasSky != 0u && gp.ambient > 0.0 && n.w > 0.0) {
+        result = max(result - albedo * skyIrradiance(sky, n.xyz) / 3.14159265 * gp.ambient, vec3f(0.0));
+    }
+    textureStore(outTex, gid.xy, vec4f(result, color.a));
+}
+
+// The composite with the probes as the far field (`VoxelGIEffect::set_probes`): main's, with each
+// pixel's irradiance from the probes around it in place of the traced cones, and the probes' debug
+// view (the voxels and the slice views run main). A separate entry point, so main's code (and what
+// it outputs) stays as it was.
+@compute @workgroup_size(8, 8)
+fn main_probes(@builtin(global_invocation_id) gid : vec3u) {
+    if (any(vec2f(gid.xy) >= gp.fullSize)) { return; }
+    let color = textureLoad(colorTex, gid.xy, 0);
+    let px = vec2i(gid.xy);
+    let uv = (vec2f(gid.xy) + 0.5) / gp.fullSize;
+    let depth = gpDepth(px);
+    if (gp.debug == 4u) {
+        // the probes over the lit scene (without its GI)
+        var sceneDist = 1e30;
+        if (depth < 1.0) { sceneDist = length(gpViewPos(uv, depth)); }
+        let ball = probeBalls(uv, sceneDist);
+        textureStore(outTex, gid.xy, vec4f(select(color.rgb, ball.rgb, ball.a > 0.0), color.a));
+        return;
+    }
+    let albedo = textureLoad(albedoTex, px, 0).rgb;
+    if (depth >= 1.0 || all(albedo <= vec3f(0.0))) {
+        textureStore(outTex, gid.xy, select(color, vec4f(0.0, 0.0, 0.0, color.a), gp.debug != 0u));
+        return;
+    }
+    let view = gpViewPos(uv, depth);
+    let ns = surfaceNormal(px, view);
+    let world = (gp.invView * vec4f(view, 1.0)).xyz;
+    // the lookup moved off the surface toward the viewer as well as along the normal (DDGI)
+    let toEye = normalize((gp.invView * vec4f(-view, 0.0)).xyz);
+    var e = kanseiProbeIrradiance(world, ns, ns * 0.4 + toEye * 0.6);
+    if (gp.nearField != 0u) {
+        let near = upsample(nearTex, gp.nearSize, uv, -view.z);
+        e = max(near.rgb, (1.0 - near.a) * e) + near.a * e;
+    }
+    let n = gpWorldNormal(px);
+    if (gp.hasSdf != 0u && gp.sdfAo > 0.0 && n.w > 0.0) {
         e *= mix(1.0, sdfAo(vol, sdfTex, linearClamp, world, n.xyz), gp.sdfAo);
     }
     let bounce = albedo * e * (gp.intensity / 3.14159265);

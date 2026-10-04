@@ -97,8 +97,7 @@ pub(crate) struct VoxelGiParamsGpu {
     sdf_ao: f32,
     sdf_slice: f32,
     has_sdf: u32,
-    probes: u32,
-    _pad: [u32; 2],
+    _pad: [u32; 3],
 }
 
 struct Targets {
@@ -115,6 +114,8 @@ struct Gpu {
     temporal: wgpu::ComputePipeline,
     temporal_bgl: wgpu::BindGroupLayout,
     composite: wgpu::ComputePipeline,
+    /// The composite with the probes as the far field (`main_probes`).
+    composite_probes: wgpu::ComputePipeline,
     composite_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// The sky past the volume until `set_sky_lighting`: `sky_gradient`.
@@ -341,18 +342,19 @@ impl VoxelGIEffect {
                 storage_buffer(16),
             ],
         );
-        let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| {
+        let pipeline_at = |label: &str, code: &str, layout: &wgpu::BindGroupLayout, entry: &str| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[layout], push_constant_ranges: &[] });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pl),
                 module: &module,
-                entry_point: Some("main"),
+                entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
+        let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| pipeline_at(label, code, layout, "main");
         let no_near = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("VoxelGI/NoNearField"),
@@ -377,6 +379,7 @@ impl VoxelGIEffect {
             temporal: pipeline("VoxelGI/Temporal", TEMPORAL_WGSL, &temporal_bgl),
             temporal_bgl,
             composite: pipeline("VoxelGI/Composite", COMPOSITE_WGSL, &composite_bgl),
+            composite_probes: pipeline_at("VoxelGI/CompositeProbes", COMPOSITE_WGSL, &composite_bgl, "main_probes"),
             composite_bgl,
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("VoxelGI/Linear"),
@@ -502,8 +505,7 @@ impl PostProcessingEffect for VoxelGIEffect {
             sdf_ao: if self.sdf.is_some() { self.sdf_ao.clamp(0.0, 1.0) } else { 0.0 },
             sdf_slice: self.show_sdf_slice.unwrap_or(0.0),
             has_sdf: self.sdf.is_some() as u32,
-            probes: self.probes.is_some() as u32,
-            _pad: [0; 2],
+            _pad: [0; 3],
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         if self.sky_lighting.is_none() {
@@ -570,8 +572,10 @@ impl PostProcessingEffect for VoxelGIEffect {
             ],
         );
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/Screen"), timestamp_writes: crate::profiling::gpu_pass("VoxelGI/Screen").as_ref().map(crate::profiling::PassStamp::compute) });
-        // with probes the composite reads them per pixel: no cones to trace and accumulate
-        if self.probes.is_none() {
+        // with probes the composite reads them per pixel: no cones to trace and accumulate (the
+        // voxels and slice views show without them)
+        let probes = self.probes.is_some() && !matches!(params.debug, 2 | 3);
+        if !probes {
             pass.set_pipeline(&gpu.trace);
             pass.set_bind_group(0, &trace, &[]);
             pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
@@ -579,7 +583,7 @@ impl PostProcessingEffect for VoxelGIEffect {
             pass.set_bind_group(0, &temporal, &[]);
             pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
         }
-        pass.set_pipeline(&gpu.composite);
+        pass.set_pipeline(if probes { &gpu.composite_probes } else { &gpu.composite });
         pass.set_bind_group(0, &composite, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }

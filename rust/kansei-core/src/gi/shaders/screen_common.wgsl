@@ -24,7 +24,7 @@ struct VoxelGiParams {
     sdfAo        : f32,       // strength of the distance field's AO on the GI (0: none)
     sdfSlice     : f32,       // height of the debug slice, metres
     hasSdf       : u32,
-    probes       : u32,       // 1: the far field from the probes (gi::SdfProbes) instead of the cones
+    _pad2        : u32,
     _pad0        : u32,
     _pad1        : u32,
 }
