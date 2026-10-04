@@ -195,6 +195,19 @@ URL parameters:
 - `rest=0` never rests the lake's water (always stepped and drawn, as before resting);
 - `mill=0` starts the water mill stopped;
 - `at=<x>,<z>,<degrees>` starts the character there, facing that way (0 is +Z).
+- `drive=1` drives a fixed route instead of the player (starts, walks, a turn, stops, a run, a
+  turn and a stop at a run, pivots, strafes, walking backwards), round and round: two packs get the
+  same input, to record them side by side. `drive_restart()` (on `window` as `driveRestart`) starts
+  it over.
+- `play=<pattern>` plays the pack's clips whose names start with the pattern (`*` any run of
+  characters, e.g. `play=Parkour/*_00`; several patterns separated by commas) one after another, as they are, each from the start point:
+  for clips the search never picks (generated ones, see
+  [`genanim`](../../../kansei-anim-bake/genanim/README.md)). `drive_restart()` starts them over.
+- A page can drive these at runtime: `clip_names()` lists the pack's clips, `play_clips(pattern)`
+  plays them from where the character stands (`""` gives it back to the player), and
+  `set_drive(on)` starts or stops the `drive=1` route there
+  ([`motion-matching-kimodo`](../motion-matching-kimodo/README.md) builds its clip browser on them).
+- `view=<degrees>` turns the camera round the character from behind it (90: its left side).
 - `profile=1` logs each labelled GPU pass's time (the fluid's included) to the console every
   3 s (`Renderer::set_profiling`).
 - A page with its own overlay can show the cannon's prompt and trigger:

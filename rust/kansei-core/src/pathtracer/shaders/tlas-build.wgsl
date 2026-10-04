@@ -44,6 +44,8 @@ struct BuildParams {
 @group(0) @binding(1) var<storage, read>       bvh4_nodes : array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> tlas_bvh4  : array<vec4f>;
 @group(0) @binding(3) var<uniform>             params     : BuildParams;
+// Instance indices in Morton order (the radix sort's values)
+@group(0) @binding(4) var<storage, read>       sorted_ids : array<u32>;
 
 fn transform_point(inst: InstanceData, p: vec3f) -> vec3f {
     return vec3f(
@@ -141,8 +143,9 @@ fn build_leaves(@builtin(global_invocation_id) gid: vec3u) {
     var cnt = array<u32, 4>(0u, 0u, 0u, 0u);
 
     for (var j = 0u; j < 4u; j++) {
-        let inst_idx = leaf_idx * 4u + j;
-        if (inst_idx < params.instance_count) {
+        let sorted_idx = leaf_idx * 4u + j;
+        if (sorted_idx < params.instance_count) {
+            let inst_idx = sorted_ids[sorted_idx];
             let aabb = instance_aabb(inst_idx);
             mn_x[j] = aabb.mn.x; mx_x[j] = aabb.mx.x;
             mn_y[j] = aabb.mn.y; mx_y[j] = aabb.mx.y;

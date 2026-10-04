@@ -27,6 +27,12 @@ pub struct Renderable {
     /// moves while it is on screen: the bundle is re-recorded only when the set of renderables
     /// it holds changes.
     pub dynamic: bool,
+    /// Its surface in voxel GI (`Renderer::enable_voxel_gi`): drawn into the scene's voxel
+    /// volume, through its material's own `vertex_main`, with this albedo and emission (or what
+    /// its material's `voxel_fragment_entry` gives). `None` (the default) leaves it out of the
+    /// volume: it neither bounces nor blocks light there. A `dynamic` renderable is voxelized every
+    /// frame; the others again only when they change (transform, visibility, surface).
+    pub gi: Option<crate::gi::GiSurface>,
     /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
     pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
@@ -49,6 +55,7 @@ impl Renderable {
             clusters: None,
             layers: Self::DEFAULT_LAYERS,
             dynamic: false,
+            gi: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }
     }
@@ -62,6 +69,12 @@ impl Renderable {
     /// Whether this renderable uses instanced rendering.
     pub fn is_instanced(&self) -> bool {
         self.geometry.is_instanced()
+    }
+
+    /// Put this renderable in voxel GI with `surface` (see `gi`).
+    pub fn with_gi(mut self, surface: crate::gi::GiSurface) -> Self {
+        self.gi = Some(surface);
+        self
     }
 
     /// Whether this renderable uses transparency.

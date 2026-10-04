@@ -19,6 +19,9 @@ struct ControlState {
     // Mouse drag state
     dragging: bool,
     last_mouse: Option<(f32, f32)>,
+    /// Right-drag and shift-drag pan (`with_mouse_pan`), and whether a pan drag is on.
+    mouse_pan: bool,
+    panning: bool,
     // Touch state
     /// Number of active touch points (0, 1, or 2).
     touch_count: u32,
@@ -74,6 +77,8 @@ impl CameraControls {
             pan_offset: [0.0, 0.0, 0.0],
             dragging: false,
             last_mouse: None,
+            mouse_pan: false,
+            panning: false,
             touch_count: 0,
             touch_positions: [(0.0, 0.0); 2],
             touch_distance: 0.0,
@@ -84,7 +89,14 @@ impl CameraControls {
         { let s = shared.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
             let mut st = s.borrow_mut();
-            if st.dragging {
+            if st.panning {
+                if let Some((lx, ly)) = st.last_mouse {
+                    let pan_scale = st.radius * 0.0015;
+                    let dx = (e.offset_x() as f32 - lx) * -pan_scale;
+                    let dy = (e.offset_y() as f32 - ly) * pan_scale;
+                    pan_by(&mut st, dx, dy);
+                }
+            } else if st.dragging {
                 if let Some((lx, ly)) = st.last_mouse {
                     let dx = (e.offset_x() as f32 - lx) * -0.005;
                     let dy = (e.offset_y() as f32 - ly) * 0.005;
@@ -101,7 +113,10 @@ impl CameraControls {
         // ── mousedown ─────────────────────────────────────────
         { let s = shared.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
-            s.borrow_mut().dragging = e.buttons() & 1 != 0;
+            let mut st = s.borrow_mut();
+            // with mouse pan: the right button, or the left with shift, pans
+            st.panning = st.mouse_pan && (e.buttons() & 2 != 0 || (e.buttons() & 1 != 0 && e.shift_key()));
+            st.dragging = !st.panning && e.buttons() & 1 != 0;
           });
           canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).ok();
           cb.forget(); }
@@ -109,7 +124,9 @@ impl CameraControls {
         // ── mouseup ───────────────────────────────────────────
         { let s = shared.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |_: web_sys::MouseEvent| {
-            s.borrow_mut().dragging = false;
+            let mut st = s.borrow_mut();
+            st.dragging = false;
+            st.panning = false;
           });
           canvas.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref()).ok();
           cb.forget(); }
@@ -208,22 +225,10 @@ impl CameraControls {
                     let dx = (mx - mx_old) * -pan_scale;
                     let dy = (my - my_old) * pan_scale;
 
-                    // Camera-local right and up from azimuth + elevation.
-                    let (sa, ca) = (st.azimuth.sin(), st.azimuth.cos());
-                    let (se, ce) = (st.elevation.sin(), st.elevation.cos());
-                    // Forward (target - camera) = -(sin(az)cos(el), sin(el), cos(az)cos(el))
-                    // Right = normalize(cross(forward, world_up))
-                    let right = (ca, 0.0, -sa);
-                    // Up = cross(right, forward)
-                    let up = (-sa * se, ce, -ca * se);
-
-                    st.pan_offset[0] += dx * right.0 + dy * up.0;
-                    st.pan_offset[1] += dx * right.1 + dy * up.1;
-                    st.pan_offset[2] += dx * right.2 + dy * up.2;
+                    pan_by(&mut st, dx, dy);
 
                     st.touch_positions[0] = (x0, y0);
                     st.touch_positions[1] = (x1, y1);
-                    st.dirty = true;
                 }
             }
           });
@@ -273,6 +278,21 @@ impl CameraControls {
             pan_offset: Vec3::new(0.0, 0.0, 0.0),
             shared: Some(shared),
         }
+    }
+
+    /// Also pan with the mouse: drag with the right button, or with the left while holding
+    /// shift (the canvas' context menu is suppressed for the right drag). Off by default.
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_mouse_pan(self, canvas: &web_sys::HtmlCanvasElement) -> Self {
+        use wasm_bindgen::prelude::*;
+        use wasm_bindgen::JsCast;
+        if let Some(shared) = &self.shared {
+            shared.borrow_mut().mouse_pan = true;
+            let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| e.prevent_default());
+            canvas.add_event_listener_with_callback("contextmenu", cb.as_ref().unchecked_ref()).ok();
+            cb.forget();
+        }
+        self
     }
 
     /// Sync state from WASM event closures (call before update).
@@ -346,4 +366,44 @@ impl CameraControls {
     }
     pub fn azimuth(&self) -> f32 { self.azimuth }
     pub fn elevation(&self) -> f32 { self.elevation }
+
+    /// Look at `target` from `radius` away, at `azimuth` and `elevation` (radians), dropping any
+    /// pan: a camera preset.
+    pub fn set_view(&mut self, target: Vec3, radius: f32, azimuth: f32, elevation: f32) {
+        self.target = target;
+        self.radius = radius;
+        self.azimuth = azimuth;
+        self.elevation = elevation.clamp(-1.5, 1.5);
+        self.pan_offset = Vec3::new(0.0, 0.0, 0.0);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared) = self.shared {
+            let mut st = shared.borrow_mut();
+            st.radius = radius;
+            st.azimuth = azimuth;
+            st.elevation = self.elevation;
+            st.pan_offset = [0.0; 3];
+        }
+    }
+
+    /// The point looked at: the target plus any pan.
+    pub fn look_target(&self) -> Vec3 {
+        Vec3::new(self.target.x + self.pan_offset.x, self.target.y + self.pan_offset.y, self.target.z + self.pan_offset.z)
+    }
+}
+
+/// Move the pan offset by `dx`, `dy` along the camera's right and up axes.
+#[cfg(target_arch = "wasm32")]
+fn pan_by(st: &mut ControlState, dx: f32, dy: f32) {
+    // Camera-local right and up from azimuth + elevation.
+    let (sa, ca) = (st.azimuth.sin(), st.azimuth.cos());
+    let (se, ce) = (st.elevation.sin(), st.elevation.cos());
+    // Forward (target - camera) = -(sin(az)cos(el), sin(el), cos(az)cos(el))
+    // Right = normalize(cross(forward, world_up))
+    let right = (ca, 0.0, -sa);
+    // Up = cross(right, forward)
+    let up = (-sa * se, ce, -ca * se);
+    st.pan_offset[0] += dx * right.0 + dy * up.0;
+    st.pan_offset[1] += dx * right.1 + dy * up.1;
+    st.pan_offset[2] += dx * right.2 + dy * up.2;
+    st.dirty = true;
 }

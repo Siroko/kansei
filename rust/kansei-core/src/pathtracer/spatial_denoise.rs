@@ -28,7 +28,12 @@ struct SpatialParams {
 pub struct SpatialDenoise {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
+    /// One `SpatialParams` slot per iteration, `params_stride` bytes apart: each
+    /// iteration has its own step size, and writes to one buffer inside a submit
+    /// would leave only the last one.
     params_buf: wgpu::Buffer,
+    params_stride: u64,
+    params_slots: u32,
     scratch_a: Option<wgpu::Texture>,
     scratch_a_view: Option<wgpu::TextureView>,
     scratch_b: Option<wgpu::Texture>,
@@ -142,17 +147,17 @@ impl SpatialDenoise {
             cache: None,
         });
 
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SpatialDenoise Params"),
-            size: std::mem::size_of::<SpatialParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let params_stride = (std::mem::size_of::<SpatialParams>() as u64).div_ceil(align) * align;
+        let params_slots = 3;
+        let params_buf = Self::create_params_buf(&device, params_stride, params_slots);
 
         Self {
             pipeline,
             bgl,
             params_buf,
+            params_stride,
+            params_slots,
             scratch_a: None,
             scratch_a_view: None,
             scratch_b: None,
@@ -163,6 +168,15 @@ impl SpatialDenoise {
             device,
             queue,
         }
+    }
+
+    fn create_params_buf(device: &wgpu::Device, stride: u64, slots: u32) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("SpatialDenoise Params"),
+            size: stride * slots as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     }
 
     /// Recreate scratch textures when the viewport changes.
@@ -222,6 +236,30 @@ impl SpatialDenoise {
         normal_view: &wgpu::TextureView,
         moments_view: &wgpu::TextureView,
     ) -> &wgpu::TextureView {
+        if self.iterations > self.params_slots {
+            self.params_slots = self.iterations;
+            self.params_buf = Self::create_params_buf(&self.device, self.params_stride, self.params_slots);
+        }
+        let mut params_bytes = vec![0u8; (self.params_stride * self.iterations as u64) as usize];
+        for i in 0..self.iterations {
+            let params = SpatialParams {
+                step_size: 1u32 << i,
+                sigma_depth: 1.0,
+                sigma_normal: 128.0,
+                sigma_lum: 4.0,
+                width: self.width,
+                height: self.height,
+                use_svgf: 1,
+                _pad: 0,
+            };
+            let offset = (self.params_stride * i as u64) as usize;
+            params_bytes[offset..offset + std::mem::size_of::<SpatialParams>()]
+                .copy_from_slice(bytemuck::bytes_of(&params));
+        }
+        if !params_bytes.is_empty() {
+            self.queue.write_buffer(&self.params_buf, 0, &params_bytes);
+        }
+
         let scratch_a_view = self
             .scratch_a_view
             .as_ref()
@@ -236,19 +274,6 @@ impl SpatialDenoise {
 
         for i in 0..self.iterations {
             let step_size = 1u32 << i;
-
-            let params = SpatialParams {
-                step_size,
-                sigma_depth: 1.0,
-                sigma_normal: 128.0,
-                sigma_lum: 4.0,
-                width: self.width,
-                height: self.height,
-                use_svgf: 1,
-                _pad: 0,
-            };
-            self.queue
-                .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
             // Determine read/write views for this iteration.
             let (read_view, write_view) = match i {
@@ -279,7 +304,11 @@ impl SpatialDenoise {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: self.params_buf.as_entire_binding(),
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.params_buf,
+                            offset: self.params_stride * i as u64,
+                            size: wgpu::BufferSize::new(std::mem::size_of::<SpatialParams>() as u64),
+                        }),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,

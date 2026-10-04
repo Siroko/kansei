@@ -36,9 +36,13 @@
 //! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
 //! paces; sideways and backward scale with them), `course=0` (no boxes), `lake=0` (no lake),
 //! `rest=0` (the lake's water never rests: always stepped and drawn),
-//! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake).
+//! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake),
+//! `drive=1` (a fixed route instead of the player, for side-by-side captures; `demo`),
+//! `play=<pattern>` (the pack's clips whose names start with it, `*` any run, one after another),
+//! `view=<degrees>` (the camera turned round the character from behind it).
 
 mod cannon;
+mod demo;
 mod lake;
 mod mill;
 mod props;
@@ -394,7 +398,8 @@ fn now_secs() -> f64 {
     web_sys::window().unwrap().performance().unwrap().now() / 1000.0
 }
 
-fn query_param(name: &str) -> Option<String> {
+/// The page URL's parameter `name`, as written.
+pub fn query_param(name: &str) -> Option<String> {
     let search = web_sys::window()?.location().search().ok()?;
     search.trim_start_matches('?').split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
@@ -418,7 +423,7 @@ fn set_hud(text: &str) {
 }
 
 /// Fetch `url` as bytes; the error says what went wrong in words for the page.
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let window = web_sys::window().ok_or("no window")?;
     let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|_| format!("could not fetch {url}"))?;
     let response: web_sys::Response = response.dyn_into().map_err(|_| "not a response".to_string())?;
@@ -575,7 +580,7 @@ impl Character {
             let mut r = Renderable::new(mesh.geometry(), skinned_lit_material("Character", params, &mesh, &palette));
             r.dynamic = true;
             let index = scene.add(SceneNode::Renderable(r));
-            bodies.push(Body { name: "mannequin", mesh, palette, index, display: None });
+            bodies.push(Body { name: "the pack's mesh", mesh, palette, index, display: None });
         }
         if let Some(pack) = hero {
             match hero_body(renderer, scene, pack, &db) {
@@ -684,6 +689,9 @@ struct State {
     last_y: f32,
     /// `profile=1`: when the profile was last logged (0: not profiling).
     profile_since: f64,
+    /// `drive=1`: the scripted route; `play=<pattern>`: the clips played in turn.
+    drive: Option<demo::Drive>,
+    player: Option<demo::ClipPlayer>,
 }
 
 /// Left stick, right stick, and the pressed state of each button of the first connected gamepad.
@@ -787,16 +795,39 @@ impl State {
         let azimuth = self.controls.azimuth();
         let forward = GVec3::new(-azimuth.sin(), 0.0, -azimuth.cos());
         let right = GVec3::new(azimuth.cos(), 0.0, -azimuth.sin());
+        let step = self.drive.as_ref().map(|d| d.step(now));
+        if let Some(step) = &step {
+            run = step.run;
+            self.strafe = step.facing.is_some();
+        }
         if let Some(c) = &mut self.character {
             let paces = if run { self.speeds.1 } else { self.speeds.0 };
             // facing the way it moves, the character walks its loops forward; strafing, the pace
             // follows the direction
             let tilt = (stick[0] * stick[0] + stick[1] * stick[1]).sqrt();
             let speed = if self.strafe && tilt > 1e-3 { pace(paces, [stick[0] / tilt, stick[1] / tilt]) } else { paces[0] };
-            let velocity = (forward * stick[1] + right * stick[0]) * speed;
-            let facing = self.strafe.then(|| forward.x.atan2(forward.z));
+            let mut velocity = (forward * stick[1] + right * stick[0]) * speed;
+            let mut facing = self.strafe.then(|| forward.x.atan2(forward.z));
+            if let Some(step) = &step {
+                // the route's direction, at the pace for it relative to the facing held
+                velocity = step.direction.map_or(GVec3::ZERO, |d| {
+                    let f = step.facing.unwrap_or(d.x.atan2(d.z));
+                    let (front, side) = (GVec3::new(f.sin(), 0.0, f.cos()), GVec3::new(-f.cos(), 0.0, f.sin()));
+                    d * pace(paces, [d.dot(side), d.dot(front)])
+                });
+                facing = step.facing;
+            }
             c.controller.matcher.settings.filter.tags = if run { c.run_tags } else { c.walk_tags };
-            c.controller.update(&c.db, &self.world, &MotionInput { velocity, facing }, dt);
+            if let Some(player) = &mut self.player {
+                // clips as they are, one after another, from the start point
+                if let Some(action) = player.due(&c.db, now) {
+                    c.controller.matcher.teleport(player.home.0, player.home.1);
+                    c.controller.matcher.start_action(&c.db, action);
+                }
+                c.controller.matcher.update(&c.db, &MotionInput { velocity: GVec3::ZERO, facing: None }, dt);
+            } else {
+                c.controller.update(&c.db, &self.world, &MotionInput { velocity, facing }, dt);
+            }
             if traverse {
                 // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump
                 let _ = c.controller.request_traverse_or_jump(&c.db, &self.world, 1.0);
@@ -969,14 +1000,14 @@ impl State {
                             }
                         ),
                         format_args!(
-                            "{}character: {} (C to switch)",
+                            "{}{}",
                             self.lake.as_ref().map_or(String::new(), |l| format!(
                                 "lake   {} / {} particles, {:.0}% full (level {:+.3} m), east of the course (at=14,-1,90), P tweaks\nwater  {}, fastest {:.2} m/s, {} over {} m/s{}{}\n",
                                 l.particles(), l.capacity(), l.fill() * 100.0, l.level(), l.state().name(), l.speed().0, l.speed().1, lake::SETTLE_SPEED,
                                 self.cannon.as_ref().map_or(String::new(), |c| format!("\ncannon {}{} poured", if c.firing() { "firing, " } else if c.near { "ready, " } else { "" }, c.poured)),
                                 self.mill.as_ref().map_or(String::new(), |m| format!("\nmill   {}", if m.turning() { format!("{:.0} rpm", m.rpm) } else { "stopped".to_string() })),
                             )),
-                            c.bodies[c.showing].name,
+                            if c.bodies.len() > 1 { format!("character: {} (C to switch)", c.bodies[c.showing].name) } else { String::new() },
                         ),
                     ));
                 }
@@ -1134,7 +1165,9 @@ where
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
     let mut controls = CameraControls::from_canvas(&canvas, Vec3::new(start.translation.x, 0.9, start.translation.z), 4.5);
     controls.set_elevation(0.25);
-    controls.set_azimuth(std::f32::consts::PI + yaw_of(start.rotation));
+    // behind the character, or turned round it by `view=<degrees>` (90: its left side)
+    let view = query_param("view").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0).to_radians();
+    controls.set_azimuth(std::f32::consts::PI + yaw_of(start.rotation) + view);
 
     let keys = Rc::new(RefCell::new(Keys::default()));
     {
@@ -1197,11 +1230,29 @@ where
         profile_since: 0.0,
         air: (false, 0.0),
         last_y: 0.0,
+        drive: None,
+        player: None,
     }));
     if query_param("profile").as_deref() == Some("1") {
         let mut s = state.borrow_mut();
         s.renderer.set_profiling(true);
         s.profile_since = now_secs();
+    }
+    {
+        let mut s = state.borrow_mut();
+        let home = s.character.as_ref().map(|c| {
+            let at = c.controller.matcher.character();
+            (at.translation, yaw_of(at.rotation))
+        });
+        if let Some(home) = home {
+            if query_param("drive").as_deref() == Some("1") {
+                s.drive = Some(demo::Drive { start: now_secs(), home });
+            }
+            if let Some(prefix) = query_param("play") {
+                let player = s.character.as_ref().map(|c| demo::ClipPlayer::new(&c.db, &prefix, home));
+                s.player = player;
+            }
+        }
     }
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
@@ -1252,6 +1303,62 @@ fn surface_js(s: lake::SurfaceSettings) -> JsValue {
     set("iso", s.iso.into());
     set("interpolate", s.interpolate.into());
     o.into()
+}
+
+/// Start the `drive=1` route (or the `play=` clips) over, the character back where it started:
+/// to line up recordings of different packs.
+#[wasm_bindgen]
+pub fn drive_restart() {
+    with_state(|s| {
+        if let (Some(d), Some(c)) = (&mut s.drive, &mut s.character) {
+            d.start = now_secs();
+            c.controller.matcher.teleport(d.home.0, d.home.1);
+        }
+        if let Some(p) = &mut s.player {
+            p.restart();
+        }
+    });
+}
+
+/// The motion pack's clip names, in its order (empty before it has loaded): for a page's clip
+/// browser.
+#[wasm_bindgen]
+pub fn clip_names() -> Vec<String> {
+    with_state(|s| s.character.as_ref().map(|c| c.db.clips.iter().map(|c| c.name.clone()).collect())).flatten().unwrap_or_default()
+}
+
+/// Play the clips whose names start with `pattern` one after another, as `play=` does, from where
+/// the character stands now; `""` hands it back to the player (the clip playing finishes first).
+/// Returns how many clips match.
+#[wasm_bindgen]
+pub fn play_clips(pattern: &str) -> usize {
+    with_state(|s| {
+        if pattern.is_empty() {
+            s.player = None;
+            return 0;
+        }
+        let Some(c) = &s.character else { return 0 };
+        let at = c.controller.matcher.character();
+        let player = demo::ClipPlayer::new(&c.db, pattern, (at.translation, yaw_of(at.rotation)));
+        let n = player.clips.len();
+        s.player = (n > 0).then_some(player);
+        n
+    })
+    .unwrap_or(0)
+}
+
+/// Drive the `drive=1` route from where the character stands now, or hand it back to the player.
+#[wasm_bindgen]
+pub fn set_drive(on: bool) {
+    with_state(|s| {
+        s.drive = on.then(|| {
+            let at = s.character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
+            demo::Drive { start: now_secs(), home: (at.translation, yaw_of(at.rotation)) }
+        });
+        if !on {
+            s.strafe = false;
+        }
+    });
 }
 
 /// The lake's current settings, for the tweak panel: the simulation's and the surface's.

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Voxel GI on particles</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        import init, {
+            start, info, set_gi, set_view, set_extinction, set_cone_aperture, set_sun_cone,
+            set_emissive_share, set_emissive_intensity, set_speed_glow, set_temporal_blend,
+            set_particle_size, set_sun, set_exposure, set_panel, set_reflectivity, set_ao,
+            set_rt, set_rt_mix, set_rt_bounces, set_paused, reset, profile_report, set_layers,
+        } from '../pkg/kansei_wasm_voxel_gi_particles.js';
+        await init();
+        await start('kansei');
+
+        // for scripted captures and timing: window.kansei.set_gi(false) and so on
+        window.kansei = await import('../pkg/kansei_wasm_voxel_gi_particles.js');
+        const params = new URLSearchParams(location.search);
+        const state = JSON.parse(info());
+        const lightbox = state.scene === 'lightbox';
+        const p = {
+            scene: state.scene,
+            gi: params.get('gi') !== 'off',
+            indirect: params.get('view') === 'indirect',
+            quality: state.quality.toLowerCase(),
+            extinction: 0.6,
+            coneAperture: 90,
+            sunCone: lightbox ? 43.6 : 5.7,
+            emissiveShare: lightbox ? (state.rt ? 0 : 0.25) : 0.03,
+            emissiveIntensity: lightbox ? 24 : 6,
+            speedGlow: 0,
+            temporalBlend: 0.2,
+            particleSize: state.rt ? 0.8 : lightbox ? 0.55 : 0.45,
+            sunElevation: 40,
+            sunBearing: 70,
+            exposure: lightbox ? 1.3 : 1.2,
+            panel: 1,
+            reflectivity: 0.4,
+            ao: 0.85,
+            rt: state.rt,
+            mirrorShare: 0.3,
+            glassShare: 0.35,
+            bounces: 2,
+            stats: '',
+        };
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Voxel GI on particles', expanded: !/Mobi|Android/.test(navigator.userAgent) });
+        pane.hidden = params.get('ui') === '0';
+        const reload = (key, value) => {
+            params.set(key, value);
+            location.search = params.toString();
+        };
+        pane.addBinding(p, 'scene', { options: { lightbox: 'lightbox', 'Cornell room': 'cornell' } }).on('change', () => reload('scene', p.scene));
+        pane.addBinding(p, 'gi', { label: 'voxel GI' }).on('change', () => set_gi(p.gi));
+        pane.addBinding(p, 'indirect', { label: 'indirect only' }).on('change', () => set_view(p.indirect ? 1 : 0));
+        pane.addBinding(p, 'quality', { options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', () => reload('quality', p.quality));
+        if (lightbox) {
+            const rt = pane.addFolder({ title: 'Ray traced' });
+            rt.addBinding(p, 'rt', { label: 'mirror and glass' }).on('change', () => set_rt(p.rt));
+            const mix = () => set_rt_mix(p.mirrorShare, p.glassShare);
+            rt.addBinding(p, 'mirrorShare', { label: 'mirrors', min: 0, max: 1, step: 0.01 }).on('change', mix);
+            rt.addBinding(p, 'glassShare', { label: 'glass', min: 0, max: 1, step: 0.01 }).on('change', mix);
+            rt.addBinding(p, 'bounces', { options: { 1: 1, 2: 2 } }).on('change', () => set_rt_bounces(p.bounces));
+        }
+        const gi = pane.addFolder({ title: 'Volume and cones' });
+        gi.addBinding(p, 'extinction', { min: 0, max: 3, step: 0.05 }).on('change', () => set_extinction(p.extinction));
+        gi.addBinding(p, 'coneAperture', { label: 'cone aperture', min: 30, max: 120, step: 1 }).on('change', () => set_cone_aperture(p.coneAperture));
+        gi.addBinding(p, 'sunCone', { label: lightbox ? 'panel cone' : 'sun cone', min: 1, max: lightbox ? 90 : 30, step: 0.1 }).on('change', () => set_sun_cone(p.sunCone));
+        gi.addBinding(p, 'temporalBlend', { label: 'temporal blend', min: 0.02, max: 1, step: 0.01 }).on('change', () => set_temporal_blend(p.temporalBlend));
+        if (lightbox) {
+            gi.addBinding(p, 'ao', { label: 'wall occlusion', min: 0, max: 1, step: 0.01 }).on('change', () => set_ao(p.ao));
+        }
+        const glow = pane.addFolder({ title: 'Emission' });
+        glow.addBinding(p, 'emissiveShare', { label: 'glowing share', min: 0, max: 0.5, step: 0.005 }).on('change', () => set_emissive_share(p.emissiveShare));
+        glow.addBinding(p, 'emissiveIntensity', { label: 'glow', min: 0, max: 60, step: 0.1 }).on('change', () => set_emissive_intensity(p.emissiveIntensity));
+        glow.addBinding(p, 'speedGlow', { label: 'speed glow', min: 0, max: 2, step: 0.01 }).on('change', () => set_speed_glow(p.speedGlow));
+        const look = pane.addFolder({ title: 'Scene', expanded: false });
+        look.addBinding(p, 'particleSize', { label: 'particle size', min: 0.1, max: lightbox ? 0.8 : 1.5, step: 0.01 }).on('change', () => set_particle_size(p.particleSize));
+        if (lightbox) {
+            look.addBinding(p, 'panel', { label: 'ceiling light', min: 0, max: 3, step: 0.05 }).on('change', () => set_panel(p.panel));
+            look.addBinding(p, 'reflectivity', { label: 'floor reflection', min: 0, max: 1, step: 0.01 }).on('change', () => set_reflectivity(p.reflectivity));
+        } else {
+            const sun = () => set_sun(p.sunElevation, p.sunBearing);
+            look.addBinding(p, 'sunElevation', { label: 'sun elevation', min: 5, max: 90, step: 1 }).on('change', sun);
+            look.addBinding(p, 'sunBearing', { label: 'sun bearing', min: -180, max: 180, step: 1 }).on('change', sun);
+        }
+        look.addBinding(p, 'exposure', { min: 0.1, max: 4, step: 0.05 }).on('change', () => set_exposure(p.exposure));
+        look.addButton({ title: 'Pour again' }).on('click', () => reset());
+        pane.addBinding(p, 'stats', { readonly: true, multiline: true, rows: 3, label: 'volume' });
+        setInterval(() => {
+            const s = JSON.parse(info());
+            p.stats = `${s.quality} ${s.dims.join('x')} @ ${s.voxel_m} m\n${s.mib} MiB, ${s.particles} particles\n${s.frame_ms} ms`;
+            pane.refresh();
+        }, 500);
+    </script>
+</body>
+</html>

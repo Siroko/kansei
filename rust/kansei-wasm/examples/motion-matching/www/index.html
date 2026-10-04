@@ -26,7 +26,7 @@
     <pre id="hud"></pre>
     <div id="prompt"></div>
     <script type="module">
-        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, mill_settings, cannon_fire } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, mill_settings, cannon_fire, drive_restart } from '../pkg/kansei_wasm_motion_matching.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
         await init();
         // the cannon's prompt fires while pressed (the keyboard's E and the gamepad's X work too)
@@ -34,6 +34,8 @@
         prompt.addEventListener('pointerdown', (e) => { e.preventDefault(); cannon_fire(true); });
         for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) prompt.addEventListener(ev, () => cannon_fire(false));
         await start('kansei');
+        // drive=1: start the scripted route over (to line up recordings of two packs)
+        window.driveRestart = drive_restart;
 
         // The lake's tweak panel: P shows and hides it.
         const p = lake_settings();

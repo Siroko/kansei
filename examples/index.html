@@ -76,7 +76,39 @@
           </a>
         </li>
       </ul>
-      <p class="note">The newer Rust/WASM examples live in <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/examples" rel="noopener">rust/kansei-wasm/examples</a>; build one with <code>wasm-pack</code> to run it.</p>
+
+      <p class="label label-spaced">Rust / WASM</p>
+      <p class="note">
+        Kansei's Rust core, compiled to WebAssembly: the engine's active line. Their sources are in
+        <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/examples" rel="noopener">rust/kansei-wasm/examples</a>
+        on GitHub; most take URL parameters, listed at the top of each one's <code>src/lib.rs</code>.
+      </p>
+      <ul class="demo-list examples">
+        <li>
+          <a href="/examples/voxel-gi-particles/">
+            <span class="demo-name">Voxel GI on particles</span>
+            <span class="demo-desc">Particles raining into a lightbox, glowing ones lighting the rest through cone-traced voxel GI</span>
+          </a>
+        </li>
+        <li>
+          <a href="/examples/voxel-gi-particles/?rt=on">
+            <span class="demo-name">Voxel GI, ray traced</span>
+            <span class="demo-desc">The same lightbox with some particles turned to mirrors and glass, their rays walking the fluid's neighbour grid</span>
+          </a>
+        </li>
+        <li>
+          <a href="/examples/pathtracer/">
+            <span class="demo-name">Path tracer: dragon</span>
+            <span class="demo-desc">A Cornell box with the Stanford dragon, path traced on the GPU against a BVH</span>
+          </a>
+        </li>
+        <li>
+          <a href="/examples/gi-box/">
+            <span class="demo-name">GI box</span>
+            <span class="demo-desc">A Cornell box under one downlight, lit by voxel GI with screen-space GI for contact detail</span>
+          </a>
+        </li>
+      </ul>
     </main>
 
     <footer class="footer">

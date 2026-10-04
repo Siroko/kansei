@@ -1,0 +1,261 @@
+{
+ "note": "SOMA (Kimodo, somaskel77 under a ground root) to Unreal Engine 5's mannequin skeleton, by joint name. See retarget.py.",
+ "joints": {
+  "root": "root",
+  "Hips": "pelvis",
+  "Spine1": "spine_02",
+  "Spine2": "spine_04",
+  "Chest": "spine_05",
+  "Neck1": "neck_01",
+  "Neck2": "neck_02",
+  "Head": "head",
+  "LeftShoulder": "clavicle_l",
+  "LeftArm": "upperarm_l",
+  "LeftForeArm": "lowerarm_l",
+  "LeftHand": "hand_l",
+  "LeftLeg": "thigh_l",
+  "LeftShin": "calf_l",
+  "LeftFoot": "foot_l",
+  "LeftToeBase": "ball_l",
+  "LeftHandThumb1": "thumb_01_l",
+  "LeftHandThumb2": "thumb_02_l",
+  "LeftHandThumb3": "thumb_03_l",
+  "LeftHandIndex1": "index_metacarpal_l",
+  "LeftHandIndex2": "index_01_l",
+  "LeftHandIndex3": "index_02_l",
+  "LeftHandIndex4": "index_03_l",
+  "LeftHandMiddle1": "middle_metacarpal_l",
+  "LeftHandMiddle2": "middle_01_l",
+  "LeftHandMiddle3": "middle_02_l",
+  "LeftHandMiddle4": "middle_03_l",
+  "LeftHandRing1": "ring_metacarpal_l",
+  "LeftHandRing2": "ring_01_l",
+  "LeftHandRing3": "ring_02_l",
+  "LeftHandRing4": "ring_03_l",
+  "LeftHandPinky1": "pinky_metacarpal_l",
+  "LeftHandPinky2": "pinky_01_l",
+  "LeftHandPinky3": "pinky_02_l",
+  "LeftHandPinky4": "pinky_03_l",
+  "RightShoulder": "clavicle_r",
+  "RightArm": "upperarm_r",
+  "RightForeArm": "lowerarm_r",
+  "RightHand": "hand_r",
+  "RightLeg": "thigh_r",
+  "RightShin": "calf_r",
+  "RightFoot": "foot_r",
+  "RightToeBase": "ball_r",
+  "RightHandThumb1": "thumb_01_r",
+  "RightHandThumb2": "thumb_02_r",
+  "RightHandThumb3": "thumb_03_r",
+  "RightHandIndex1": "index_metacarpal_r",
+  "RightHandIndex2": "index_01_r",
+  "RightHandIndex3": "index_02_r",
+  "RightHandIndex4": "index_03_r",
+  "RightHandMiddle1": "middle_metacarpal_r",
+  "RightHandMiddle2": "middle_01_r",
+  "RightHandMiddle3": "middle_02_r",
+  "RightHandMiddle4": "middle_03_r",
+  "RightHandRing1": "ring_metacarpal_r",
+  "RightHandRing2": "ring_01_r",
+  "RightHandRing3": "ring_02_r",
+  "RightHandRing4": "ring_03_r",
+  "RightHandPinky1": "pinky_metacarpal_r",
+  "RightHandPinky2": "pinky_01_r",
+  "RightHandPinky3": "pinky_02_r",
+  "RightHandPinky4": "pinky_03_r"
+ },
+ "aim": {
+  "Hips": [
+   "Spine1",
+   "spine_02"
+  ],
+  "Spine1": [
+   "Spine2",
+   "spine_04"
+  ],
+  "Spine2": [
+   "Chest",
+   "spine_05"
+  ],
+  "Chest": [
+   "Neck1",
+   "neck_01"
+  ],
+  "Neck1": [
+   "Neck2",
+   "neck_02"
+  ],
+  "Neck2": [
+   "Head",
+   "head"
+  ],
+  "LeftShoulder": [
+   "LeftArm",
+   "upperarm_l"
+  ],
+  "LeftArm": [
+   "LeftForeArm",
+   "lowerarm_l"
+  ],
+  "LeftForeArm": [
+   "LeftHand",
+   "hand_l"
+  ],
+  "LeftHand": [
+   "LeftHandMiddle2",
+   "middle_01_l"
+  ],
+  "LeftLeg": [
+   "LeftShin",
+   "calf_l"
+  ],
+  "LeftShin": [
+   "LeftFoot",
+   "foot_l"
+  ],
+  "LeftFoot": [
+   "LeftToeBase",
+   "ball_l"
+  ],
+  "LeftHandThumb1": [
+   "LeftHandThumb2",
+   "thumb_02_l"
+  ],
+  "LeftHandThumb2": [
+   "LeftHandThumb3",
+   "thumb_03_l"
+  ],
+  "LeftHandIndex1": [
+   "LeftHandIndex2",
+   "index_01_l"
+  ],
+  "LeftHandIndex2": [
+   "LeftHandIndex3",
+   "index_02_l"
+  ],
+  "LeftHandIndex3": [
+   "LeftHandIndex4",
+   "index_03_l"
+  ],
+  "LeftHandMiddle1": [
+   "LeftHandMiddle2",
+   "middle_01_l"
+  ],
+  "LeftHandMiddle2": [
+   "LeftHandMiddle3",
+   "middle_02_l"
+  ],
+  "LeftHandMiddle3": [
+   "LeftHandMiddle4",
+   "middle_03_l"
+  ],
+  "LeftHandRing1": [
+   "LeftHandRing2",
+   "ring_01_l"
+  ],
+  "LeftHandRing2": [
+   "LeftHandRing3",
+   "ring_02_l"
+  ],
+  "LeftHandRing3": [
+   "LeftHandRing4",
+   "ring_03_l"
+  ],
+  "LeftHandPinky1": [
+   "LeftHandPinky2",
+   "pinky_01_l"
+  ],
+  "LeftHandPinky2": [
+   "LeftHandPinky3",
+   "pinky_02_l"
+  ],
+  "LeftHandPinky3": [
+   "LeftHandPinky4",
+   "pinky_03_l"
+  ],
+  "RightShoulder": [
+   "RightArm",
+   "upperarm_r"
+  ],
+  "RightArm": [
+   "RightForeArm",
+   "lowerarm_r"
+  ],
+  "RightForeArm": [
+   "RightHand",
+   "hand_r"
+  ],
+  "RightHand": [
+   "RightHandMiddle2",
+   "middle_01_r"
+  ],
+  "RightLeg": [
+   "RightShin",
+   "calf_r"
+  ],
+  "RightShin": [
+   "RightFoot",
+   "foot_r"
+  ],
+  "RightFoot": [
+   "RightToeBase",
+   "ball_r"
+  ],
+  "RightHandThumb1": [
+   "RightHandThumb2",
+   "thumb_02_r"
+  ],
+  "RightHandThumb2": [
+   "RightHandThumb3",
+   "thumb_03_r"
+  ],
+  "RightHandIndex1": [
+   "RightHandIndex2",
+   "index_01_r"
+  ],
+  "RightHandIndex2": [
+   "RightHandIndex3",
+   "index_02_r"
+  ],
+  "RightHandIndex3": [
+   "RightHandIndex4",
+   "index_03_r"
+  ],
+  "RightHandMiddle1": [
+   "RightHandMiddle2",
+   "middle_01_r"
+  ],
+  "RightHandMiddle2": [
+   "RightHandMiddle3",
+   "middle_02_r"
+  ],
+  "RightHandMiddle3": [
+   "RightHandMiddle4",
+   "middle_03_r"
+  ],
+  "RightHandRing1": [
+   "RightHandRing2",
+   "ring_01_r"
+  ],
+  "RightHandRing2": [
+   "RightHandRing3",
+   "ring_02_r"
+  ],
+  "RightHandRing3": [
+   "RightHandRing4",
+   "ring_03_r"
+  ],
+  "RightHandPinky1": [
+   "RightHandPinky2",
+   "pinky_01_r"
+  ],
+  "RightHandPinky2": [
+   "RightHandPinky3",
+   "pinky_02_r"
+  ],
+  "RightHandPinky3": [
+   "RightHandPinky4",
+   "pinky_03_r"
+  ]
+ }
+}

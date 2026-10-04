@@ -1,0 +1,89 @@
+# Builds the Rust/WASM examples for kansei.graphics/examples/<name>/ and publishes them to the
+# orphan site-wasm branch, which the Vercel build of main copies into dist/ without compiling
+# anything (scripts/fetch-wasm-examples.sh). Pull requests that change the build only build.
+name: site-wasm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - 'scripts/build-wasm-examples.sh'
+      - '.github/workflows/site-wasm.yml'
+  pull_request:
+    paths:
+      - 'scripts/build-wasm-examples.sh'
+      - '.github/workflows/site-wasm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: site-wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-wasm
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      # the registry and the shared target dir, keyed by the manifests (the examples' lockfiles
+      # are not committed)
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target-wasm
+          key: site-wasm-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml') }}
+          restore-keys: site-wasm-${{ runner.os }}-
+
+      - name: Build the examples
+        run: scripts/build-wasm-examples.sh "$RUNNER_TEMP/site-wasm"
+
+      - name: Upload the build (not main)
+        if: github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-wasm
+          path: ${{ runner.temp }}/site-wasm
+          retention-days: 3
+
+      - name: Publish to the site-wasm branch
+        if: github.ref == 'refs/heads/main'
+        working-directory: ${{ runner.temp }}/site-wasm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the branch holds build output only: Vercel must not try to deploy it
+          echo '{ "git": { "deploymentEnabled": false } }' > vercel.json
+          printf '%s\n' "# site-wasm" "" "Built Rust/WASM examples for kansei.graphics/examples/, from ${GITHUB_SHA} by the site-wasm workflow. Force-pushed on every build; do not edit." > README.md
+          git init -q -b site-wasm
+          git add -A
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -qm "site-wasm: Rust/WASM examples built from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" site-wasm
+
+      # a redeploy of main, so the site picks up what was just published. Optional: add a Vercel
+      # deploy hook for main as the VERCEL_DEPLOY_HOOK_URL secret; without it the next deploy does.
+      - name: Redeploy the site
+        if: github.ref == 'refs/heads/main'
+        env:
+          HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$HOOK" ]; then curl -fsS -X POST "$HOOK" > /dev/null && echo "redeploy requested"; else echo "no VERCEL_DEPLOY_HOOK_URL secret: the site updates on its next deploy"; fi

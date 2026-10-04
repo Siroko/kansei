@@ -47,6 +47,38 @@ impl Texture {
         }
     }
 
+    /// Builder: give the texture `levels` mips (at least 1), for a 3D texture whose chain a
+    /// compute pass builds (`gi::Mip3d`) and is bound a level at a time through `mip_view`.
+    /// `full_mip_count` gives the whole chain of a size.
+    pub fn with_mip_levels(mut self, levels: u32) -> Self {
+        self.mip_levels = levels.max(1);
+        self
+    }
+
+    /// The mips down to 1 texel on the largest axis: `floor(log2(max side)) + 1`.
+    pub fn full_mip_count(width: u32, height: u32, depth: u32) -> u32 {
+        32 - width.max(height).max(depth).max(1).leading_zeros()
+    }
+
+    pub fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
+
+    /// A view of mip `level` alone (after initialization), to bind as a storage texture to write
+    /// that level or as a sampled texture to read it.
+    pub fn mip_view(&self, level: u32) -> Option<wgpu::TextureView> {
+        let texture = self.gpu_texture.as_ref()?;
+        (level < self.mip_levels).then(|| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&self.label),
+                dimension: self.view_dimension,
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+    }
+
     /// Create a 2D RGBA texture from raw byte data. The data is stored and
     /// uploaded to the GPU on the first `initialize_with_data()` call (which
     /// the renderer triggers automatically when this texture is used as a

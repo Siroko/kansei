@@ -1,0 +1,827 @@
+{
+ "set": "limp",
+ "note": "Prompts and ground paths for Kimodo (kimodo_batch.py). legs: see paths.py. Never put Epic GASP data in here (README.md).",
+ "model": "kimodo-soma-rp-v1.1",
+ "description": "One style prompt carried across a whole pack: idle, walk and run locomotion and parkour, all as a woman limping on her injured left leg, at slower paces (walk 1.2, run 3.0 m/s).",
+ "defaults": {
+  "samples": 2,
+  "seed": 3000,
+  "cfg": [
+   2.0,
+   2.0
+  ],
+  "diffusion_steps": 100
+ },
+ "clips": [
+  {
+   "name": "Idle/Idle_Loop",
+   "prompt": "A woman stands still in a relaxed idle pose, shifting her weight slightly while favouring her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": 0
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Idle/Idle_Turn_L90",
+   "prompt": "A woman standing still turns in place to the left and stands still while favouring her injured left leg.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": 90
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Idle/Idle_Turn_R90",
+   "prompt": "A woman standing still turns in place to the right and stands still while favouring her injured left leg.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": -90
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Idle/Idle_Turn_L180",
+   "prompt": "A woman standing still turns in place around to the left and stands still while favouring her injured left leg.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": 180
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Idle/Idle_Turn_R180",
+   "prompt": "A woman standing still turns in place around to the right and stands still while favouring her injured left leg.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": 0
+    },
+    {
+     "time": 1.3,
+     "facing": -180
+    },
+    {
+     "time": 1.3
+    }
+   ]
+  },
+  {
+   "name": "Walk/Walk_Loop_F",
+   "prompt": "A woman walks forward at a steady pace while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Loop_B",
+   "prompt": "A woman walks backwards at a steady pace, facing forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      0.9,
+      0.9
+     ],
+     "dir": 180
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Loop_L",
+   "prompt": "A woman walks sideways to the left at a steady pace, facing forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.0,
+      1.0
+     ],
+     "dir": 90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Loop_R",
+   "prompt": "A woman walks sideways to the right at a steady pace, facing forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.0,
+      1.0
+     ],
+     "dir": -90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Circle_L",
+   "prompt": "A woman walks in a wide circle to the left while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.2,
+      1.2
+     ],
+     "dir": 183.34649444186343,
+     "facing": 183.34649444186343,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Circle_R",
+   "prompt": "A woman walks in a wide circle to the right while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      1.2,
+      1.2
+     ],
+     "dir": -183.34649444186343,
+     "facing": -183.34649444186343,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Walk/Walk_Start_F",
+   "prompt": "A woman standing still starts walking forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 1.2,
+     "dir": 0,
+     "facing": 0
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Start_L90",
+   "prompt": "A woman standing still turns to the left and starts walking while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 1.2,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Start_R90",
+   "prompt": "A woman standing still turns to the right and starts walking while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 1.2,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Start_L180",
+   "prompt": "A woman standing still turns around and starts walking while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.4,
+     "speed": 1.2,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Stop_F",
+   "prompt": "A woman walking forward comes to a stop and stands still while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    },
+    {
+     "time": 1.2,
+     "speed": 0
+    },
+    {
+     "time": 1.5
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Turn_L90",
+   "prompt": "A woman walking forward turns left and keeps walking while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Pivot_L180",
+   "prompt": "A woman walking forward quickly turns around to the left and walks back the way she came while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.36
+    },
+    {
+     "time": 0.9,
+     "speed": 1.2,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Turn_R90",
+   "prompt": "A woman walking forward turns right and keeps walking while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Walk/Walk_Pivot_R180",
+   "prompt": "A woman walking forward quickly turns around to the right and walks back the way she came while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.36
+    },
+    {
+     "time": 0.9,
+     "speed": 1.2,
+     "dir": -180,
+     "facing": -180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Loop_F",
+   "prompt": "A woman runs forward at a steady pace while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Loop_B",
+   "prompt": "A woman runs backwards at a steady pace, facing forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      2.0,
+      2.0
+     ],
+     "dir": 180
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Loop_L",
+   "prompt": "A woman runs sideways to the left at a steady pace, facing forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      2.4,
+      2.4
+     ],
+     "dir": 90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Loop_R",
+   "prompt": "A woman runs sideways to the right at a steady pace, facing forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      2.4,
+      2.4
+     ],
+     "dir": -90
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Circle_L",
+   "prompt": "A woman runs in a wide circle to the left while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      3.0,
+      3.0
+     ],
+     "dir": 229.1831180523293,
+     "facing": 229.1831180523293,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Circle_R",
+   "prompt": "A woman runs in a wide circle to the right while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 8,
+     "speed": [
+      3.0,
+      3.0
+     ],
+     "dir": -229.1831180523293,
+     "facing": -229.1831180523293,
+     "ease": "linear"
+    }
+   ],
+   "loop": true
+  },
+  {
+   "name": "Run/Run_Start_F",
+   "prompt": "A woman standing still starts running forward while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 3.0,
+     "dir": 0,
+     "facing": 0
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Start_L90",
+   "prompt": "A woman standing still turns to the left and starts running while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 3.0,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Start_R90",
+   "prompt": "A woman standing still turns to the right and starts running while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 3.0,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Start_L180",
+   "prompt": "A woman standing still turns around and starts running while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": 0
+    },
+    {
+     "time": 1.8,
+     "speed": 3.0,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 2.3
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Stop_F",
+   "prompt": "A woman running forward comes to a stop and stands still while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    },
+    {
+     "time": 1.6,
+     "speed": 0
+    },
+    {
+     "time": 1.5
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Turn_L90",
+   "prompt": "A woman running forward turns left and keeps running while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": 90,
+     "facing": 90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Pivot_L180",
+   "prompt": "A woman running forward quickly turns around to the left and runs back the way she came while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.8999999999999999
+    },
+    {
+     "time": 0.9,
+     "speed": 3.0,
+     "dir": 180,
+     "facing": 180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Turn_R90",
+   "prompt": "A woman running forward turns right and keeps running while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    },
+    {
+     "time": 1.2,
+     "dir": -90,
+     "facing": -90
+    },
+    {
+     "time": 2.0
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Run_Pivot_R180",
+   "prompt": "A woman running forward quickly turns around to the right and runs back the way she came while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.8,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.8999999999999999
+    },
+    {
+     "time": 0.9,
+     "speed": 3.0,
+     "dir": -180,
+     "facing": -180
+    },
+    {
+     "time": 1.8
+    }
+   ],
+   "loop": false
+  },
+  {
+   "name": "Run/Transition_Walk_to_Run",
+   "prompt": "A woman walking forward speeds up into a run while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      1.2,
+      1.2
+     ]
+    },
+    {
+     "time": 1.2,
+     "speed": 3.0
+    },
+    {
+     "time": 2.0
+    }
+   ]
+  },
+  {
+   "name": "Walk/Transition_Run_to_Walk",
+   "prompt": "A woman running forward slows down to a walk while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 2.0,
+     "speed": [
+      3.0,
+      3.0
+     ]
+    },
+    {
+     "time": 1.4,
+     "speed": 1.2
+    },
+    {
+     "time": 2.0
+    }
+   ]
+  },
+  {
+   "name": "Parkour/Speed_Vault",
+   "prompt": "A woman runs forward, vaults over a waist-high obstacle with one hand on it, and keeps running, while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.2,
+     "speed": [
+      3.15,
+      3.15
+     ]
+    },
+    {
+     "time": 1.4,
+     "speed": 3.15
+    },
+    {
+     "time": 1.4
+    }
+   ]
+  },
+  {
+   "name": "Parkour/Kong_Vault",
+   "prompt": "A woman runs forward and dives over a box, pushing off it with both hands, then lands and keeps running, while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.2,
+     "speed": [
+      3.15,
+      3.15
+     ]
+    },
+    {
+     "time": 1.4,
+     "speed": 3.15
+    },
+    {
+     "time": 1.4
+    }
+   ]
+  },
+  {
+   "name": "Parkour/Wall_Run_Up",
+   "prompt": "A woman runs at a high wall, runs two steps up it, grabs the top with both hands and climbs up onto it, while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.4,
+     "speed": [
+      3.15,
+      3.15
+     ]
+    },
+    {
+     "time": 0.6,
+     "speed": 0.35
+    },
+    {
+     "time": 4.0,
+     "speed": 0.0
+    }
+   ]
+  },
+  {
+   "name": "Parkour/Roll",
+   "prompt": "A woman jumps down from a ledge, lands and does a forward shoulder roll, then gets up and keeps running, while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 0.8,
+     "speed": [
+      2.4499999999999997,
+      2.4499999999999997
+     ]
+    },
+    {
+     "time": 1.6,
+     "speed": 2.4499999999999997
+    },
+    {
+     "time": 1.6
+    }
+   ]
+  },
+  {
+   "name": "Parkour/Climb_Up",
+   "prompt": "A woman jumps up, grabs the top of a high wall with both hands and pulls herself up onto it, while limping on her injured left leg.",
+   "duration": 5.0
+  },
+  {
+   "name": "Parkour/Precision_Jump",
+   "prompt": "A woman jumps forward from both feet over a gap and lands precisely with both feet together, holding her balance, while limping on her injured left leg.",
+   "legs": [
+    {
+     "time": 1.0,
+     "speed": 0.0
+    },
+    {
+     "time": 0.8,
+     "speed": 2.0999999999999996
+    },
+    {
+     "time": 1.2,
+     "speed": 0.0
+    },
+    {
+     "time": 1.0
+    }
+   ]
+  }
+ ]
+}

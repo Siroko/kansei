@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use kansei_core::atmosphere::{
-    direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, CLOUD_SHADOW_WGSL, SKY_ENVIRONMENT_WGSL, SKY_LIGHTING_WGSL,
+    direction_from_elevation_bearing, SkyAtmosphere, SkyAtmosphereOptions, SkyCaptureFog, CLOUD_SHADOW_WGSL, SKY_ENVIRONMENT_WGSL, SKY_LIGHTING_WGSL,
 };
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
@@ -488,6 +488,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         height_fog.sky_ambient_scale = 1.0;
         height_fog.start_distance = 120.0;
         height_fog.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        // capturefog=1: the sky lighting and the reflections see the sky through this fog, as
+        // Unreal's real-time sky-light capture does, from 6 m up; capturefog=ue also hides the lit
+        // ground from the lighting below the horizon (Unreal's capture itself, without Lumen)
+        if let Some(mode) = q.get("capturefog").filter(|m| m != "0") {
+            sky.capture_fog = Some(SkyCaptureFog::from_height_fog(&height_fog, 6.0));
+            sky.lighting_sees_ground = mode != "ue";
+        }
         effects.push(Box::new(height_fog));
         // near: volumetric fog in the same layer, extinction scale 1.2, albedo (0.85, 0.88, 0.93)
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {

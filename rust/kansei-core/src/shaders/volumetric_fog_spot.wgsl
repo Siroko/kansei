@@ -1,10 +1,7 @@
 // Spot lights in the fog: the renderer's spot-light buffer and shadow atlas. Each light scatters
 // only inside its cone, falls off with the inverse square of distance, and is shadowed by its
-// atlas layer, so headlights draw beams with the shadows of what stands in them.
-
-@group(0) @binding(7) var<storage, read> spotLights : KanseiSpotLights;
-@group(0) @binding(8) var spotShadowAtlas : texture_depth_2d_array;
-@group(0) @binding(9) var spotShadowSampler : sampler_comparison;
+// atlas layer, so headlights draw beams with the shadows of what stands in them. The lights and
+// the atlas are compute_shadows.wgsl's.
 
 // `minDist`: a froxel is a volume, not a point; closer than about its size to the light, the
 // inverse square is capped (its average over the froxel stays finite).
