@@ -391,7 +391,8 @@ impl PathTracer {
         if needs_recreate {
             self.lights_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("PathTracer/Lights"),
-                size: byte_len.max(16),
+                // at least one 64-byte LightData, the shader's minimum binding size
+                size: byte_len.max(64),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
@@ -443,7 +444,7 @@ impl PathTracer {
         if self.lights_buf.is_none() {
             self.lights_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("PathTracer/Lights/Empty"),
-                size: 16,
+                size: 64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));

@@ -1,14 +1,18 @@
-//! The path tracer's denoisers, TLAS and probe grid on a real GPU: the spatial filter widens its
-//! step every iteration, the temporal filter keeps its history across same-size resizes, the TLAS
-//! leaves follow the Morton sort, and the probe grid hands out the SH it just wrote. Skipped
-//! (passes) when no adapter is available.
+//! The path tracer's denoisers, TLAS, probe grid and effect on a real GPU: the spatial filter
+//! widens its step every iteration, the temporal filter keeps its history across same-size
+//! resizes, the TLAS leaves follow the Morton sort, the probe grid hands out the SH it just wrote,
+//! and `PathTracerEffect` in a post chain writes the scene lit by its lights. Skipped (passes)
+//! when no adapter is available.
 
+use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::materials::{Material, MaterialOptions};
+use kansei_core::lights::{DirectionalLight, Light};
+use kansei_core::materials::{Material, MaterialOptions, StandardLitOptions};
 use kansei_core::math::Vec3;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::pathtracer::{BVHBuilder, PathTracerMaterial, ProbeGrid, SpatialDenoise, TLASBuilder, TemporalDenoise};
-use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::pathtracer::{BVHBuilder, PathTracerEffect, PathTracerMaterial, ProbeGrid, SpatialDenoise, TLASBuilder, TemporalDenoise};
+use kansei_core::postprocessing::PostProcessingEffect;
+use kansei_core::renderers::{GBuffer, Renderer, RendererConfig};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -282,4 +286,58 @@ fn probe_grid_returns_the_sh_it_just_wrote() {
         let l0 = sh[p * 9][0];
         assert!((l0 - 4.0 * std::f32::consts::PI.sqrt()).abs() < 0.1, "probe {p}: L0 = {l0}, expected ≈ 7.09");
     }
+}
+
+/// The mean of the image's middle quarter after `frames` frames of a floor seen from above,
+/// through `PathTracerEffect` as a post-processing effect, with the scene's sun or without lights.
+fn traced_floor(renderer: &mut Renderer, sun: bool, frames: u32) -> [f32; 3] {
+    let mut scene = Scene::new();
+    let mut floor = Renderable::new(BoxGeometry::new(6.0, 0.2, 6.0), Material::standard_lit("Floor", &StandardLitOptions::default()));
+    floor.object.set_position(0.0, -0.1, 0.0);
+    scene.add(SceneNode::Renderable(floor));
+    scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 3.0))));
+    let mut camera = Camera::new(40.0, 0.1, 50.0, 1.0);
+    camera.set_position(0.0, 3.0, 0.01);
+    camera.look_at(&Vec3::new(0.0, 0.0, 0.0));
+    camera.update_projection_matrix();
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+
+    let mut effect = PathTracerEffect::new(renderer, &scene);
+    if sun {
+        effect.set_lights_from_scene(&scene);
+    }
+    effect.initialize(renderer.device(), &gbuffer, &camera);
+    let output = texture(renderer.device(), wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING);
+    let output_view = output.create_view(&Default::default());
+    for _ in 0..frames {
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        effect.render(renderer.device(), renderer.queue(), &mut encoder, &gbuffer, &gbuffer.color_view, &gbuffer.depth_view, &output_view, &camera, W, H);
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+    let image = read_view(renderer, &output_view);
+    let mut sum = [0.0f32; 3];
+    for y in H / 4..H * 3 / 4 {
+        for x in W / 4..W * 3 / 4 {
+            let p = image[px(x, y)];
+            assert!(p.iter().all(|c| c.is_finite()), "pixel ({x}, {y}) is {p:?}");
+            (0..3).for_each(|c| sum[c] += p[c]);
+        }
+    }
+    sum.map(|c| c / (W * H / 4) as f32)
+}
+
+#[test]
+fn the_effect_writes_the_floor_lit_by_the_scenes_lights() {
+    let instance = wgpu::Instance::default();
+    let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+    let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
+    pollster::block_on(renderer.initialize_headless(&adapter));
+    let sky_only = traced_floor(&mut renderer, false, 8);
+    let sunlit = traced_floor(&mut renderer, true, 8);
+    // the dim default sky leaves a little; a white sun of 3 on the default albedo of 0.8 lifts
+    // the floor far above that, in HDR (no tone curve), and never past albedo times the sun
+    assert!(sky_only[1] > 0.0, "nothing written: {sky_only:?}");
+    assert!(sunlit[1] > sky_only[1] + 0.3, "the sun adds too little: {sunlit:?} against {sky_only:?}");
+    assert!(sunlit[1] > 1.0 && sunlit[1] < 0.8 * 3.0 + 0.2, "not the HDR radiance: {sunlit:?}");
 }

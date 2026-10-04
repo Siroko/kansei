@@ -20,9 +20,9 @@ struct CompositeParams {
 
 /// Composite pass — combines path-traced GI with the rasterized scene.
 ///
-/// Computes: `output = GI * albedo + direct + emissive` (raster-direct mode)
-/// or `output = GI * albedo + emissive` (full path-tracer mode), followed by
-/// Reinhard tone mapping.
+/// Computes: `output = GI * albedo + direct + emissive` (raster-direct mode, for an
+/// indirect-only GI such as the probes') or `output = GI` (full path-tracer mode: the
+/// trace's radiance is complete). The output stays HDR for the post chain's tone mapping.
 ///
 /// Bindings (group 0):
 ///   0 — inputTex    (texture_2d<f32>) rasterized direct-light buffer
