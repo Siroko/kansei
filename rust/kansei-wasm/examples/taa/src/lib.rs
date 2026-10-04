@@ -7,7 +7,7 @@
 //! URL parameters: `taa=0` (off), `vel=0` (no motion vectors: the car and grass reproject by
 //! depth only), `wind=<scale>`, `t=<seconds>` (freeze the camera; the car and the wind keep
 //! moving, the jitter keeps accumulating), `scale=<0.25..1>` (render the scene at that fraction
-//! of the canvas and let the TAA upscale it), `stats=1` (log the interval between frames).
+//! of the canvas and let the TAA upscale it), `stats=1` (log the interval between frames and the renderer's profile).
 //!
 //! Motion blur: `mblur=<amount>` (e.g. 0.5, a 180-degree shutter) adds a `MotionBlurEffect`
 //! after the TAA, scaled to 30 fps and capped at 4 % of the width as the Midsommar intro's
@@ -228,8 +228,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let frozen_t: Option<f32> = param("t").and_then(|v| v.trim().parse().ok());
     let step: Option<f32> = param("step").and_then(|v| v.trim().parse().ok()).filter(|_| frozen_t.is_some());
     let wind: f32 = param_or("wind", 1.0);
-    // `stats=1`: frames in the current window and when it started
+    // `stats=1`: frames in the current window and when it started, and the renderer's profile
     let mut stats = flag("stats", false).then(|| (0u32, kansei_wasm::now()));
+    renderer.set_profiling(stats.is_some());
     let pan: f32 = param_or("pan", 0.0);
     let car_speed: f32 = param_or("car", 9.0);
     let mut last_t = 0.0f32;
@@ -244,10 +245,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             clock = t;
             frame_time = step;
         }
-        for effect in volume.effects.iter_mut() {
-            if let Some(mb) = effect.as_any_mut().downcast_mut::<MotionBlurEffect>() {
-                mb.set_frame_time(frame_time);
-            }
+        if let Some(mb) = volume.effect_mut::<MotionBlurEffect>() {
+            mb.set_frame_time(frame_time);
         }
 
         // wind time, this frame's and last frame's
@@ -273,7 +272,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             *frames += 1;
             if *frames == 240 {
                 let now = kansei_wasm::now();
-                log::info!("frame interval: {:.2} ms", (now - *window_start) * 1000.0 / 240.0);
+                log::info!("frame interval: {:.2} ms\n{}", (now - *window_start) * 1000.0 / 240.0, renderer.take_profile().report());
                 *frames = 0;
                 *window_start = now;
             }

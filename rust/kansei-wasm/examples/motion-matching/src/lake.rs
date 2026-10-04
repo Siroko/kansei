@@ -325,8 +325,6 @@ pub struct Lake {
     capacity: u32,
     container: FluidContainer,
     colliders: FluidColliders,
-    /// The effect's index in the post-processing chain (it owns the simulation).
-    pub effect: usize,
     accumulator: f32,
     /// Last frame's capsule ends (world), for their velocities.
     previous: Vec<[GVec3; 2]>,
@@ -378,9 +376,8 @@ fn smooth_floor(shape: &mut PlanarContainerShape, radius: i32) {
 
 impl Lake {
     /// Build the lake into `scene` and `world`: its terrain, the ground around it (with
-    /// `ground_material`), and its surface effect, for the post-processing chain at index
-    /// `effect`.
-    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, ground_material: Material, effect: usize) -> (Self, FluidSurfaceEffect) {
+    /// `ground_material`), and its surface effect, for the post-processing chain.
+    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, ground_material: Material) -> (Self, FluidSurfaceEffect) {
         let outline = outline();
         // the terrain's heights on a grid over the lake and its banks, smoothed; flat ground
         // around it
@@ -486,7 +483,7 @@ impl Lake {
         let sleep = FluidSleep::new(FluidSleepOptions { cull_after: CULL_AFTER, settle_speed: SETTLE_SPEED, settle_after: SETTLE_AFTER });
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { terrain: terrain_index, levels, count, capacity, container, colliders, effect, accumulator: 0.0, previous: Vec::new(), splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
+        (Self { terrain: terrain_index, levels, count, capacity, container, colliders, accumulator: 0.0, previous: Vec::new(), splash: None, near: (bmin, bmax), time_scale: TIME_SCALE, splash_push: SPLASH_PUSH, initial: particles, surface: settings, sleep, probe, speed: (0.0, 0), rest: true }, surface)
     }
 
     /// The water's surface renderable, drawing the effect's marching-cubes mesh (the effect must

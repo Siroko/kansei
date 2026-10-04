@@ -890,7 +890,7 @@ impl State {
                 *was = airborne;
                 self.last_y = y;
             }
-            if let Some(surface) = self.volume.effects.get_mut(lake.effect).and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
+            if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
                 // the props: the mill turns, the cannon fires when the character stands by it
                 let (bodies, stirring) = match &mut self.mill {
                     Some(mill) => {
@@ -1039,7 +1039,7 @@ where
     // with the lake, the ground has a hole the lake's terrain fills
     let (mut cannon, mut mill) = (None, None);
     let lake = if with_lake {
-        let (mut lake, surface) = lake::Lake::new(&renderer, &mut scene, &mut world, ground_material, 0);
+        let (mut lake, surface) = lake::Lake::new(&renderer, &mut scene, &mut world, ground_material);
         lake.rest = flag("rest", true);
         cannon = Some(cannon::Cannon::new(&mut scene, &mut world, &lake));
         mill = Some(mill::Mill::new(&mut scene, &mut world, &lake));
@@ -1127,7 +1127,7 @@ where
     }
     effects.push(Box::new(tonemap));
     let volume = PostProcessingVolume::new(&renderer, effects);
-    if let Some(surface) = lake.as_ref().and_then(|l| volume.effects[l.effect].as_any().downcast_ref::<FluidSurfaceEffect>()) {
+    if let Some(surface) = volume.effect::<FluidSurfaceEffect>() {
         lake::Lake::add_surface(&mut scene, surface);
     }
     let mut camera = Camera::new(45.0, 0.1, 1200.0, canvas.aspect());
@@ -1255,7 +1255,7 @@ fn with_lake<R>(f: impl FnOnce(&mut lake::Lake, &mut FluidSurfaceEffect, &Render
         let mut state = state.borrow_mut();
         let State { lake, volume, renderer, .. } = &mut *state;
         let lake = lake.as_mut()?;
-        let surface = volume.effects.get_mut(lake.effect)?.as_any_mut().downcast_mut::<FluidSurfaceEffect>()?;
+        let surface = volume.effect_mut::<FluidSurfaceEffect>()?;
         Some(f(lake, surface, renderer))
     })
 }

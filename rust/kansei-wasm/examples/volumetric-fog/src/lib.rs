@@ -87,7 +87,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         frame.resize(&mut renderer, &mut camera);
         let t = frame.time as f32;
 
-        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+        if let Some(fog) = volume.effect_mut::<VolumetricFogEffect>() {
             fog.time = t;
         }
 

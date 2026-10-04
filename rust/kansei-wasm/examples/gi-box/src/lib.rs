@@ -569,7 +569,7 @@ struct Stats {
     since: f64,
     frame_ms: f64,
     /// (label, ms per frame), most expensive first
-    passes: Vec<(String, f64)>,
+    passes: Vec<(&'static str, f64)>,
     gpu_ms: f64,
     gpu_span_ms: f64,
 }
@@ -847,9 +847,7 @@ impl State {
                 stats.since = now;
                 let profile = self.renderer.take_profile();
                 if profile.gpu_frames > 0 {
-                    let mut passes: Vec<(String, f64)> = profile.gpu.iter().map(|p| (p.label.to_string(), p.exclusive_ms)).collect();
-                    passes.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    stats.passes = passes;
+                    stats.passes = profile.top_passes(usize::MAX);
                     stats.gpu_ms = profile.gpu_ms;
                     stats.gpu_span_ms = profile.gpu_span_ms;
                 }

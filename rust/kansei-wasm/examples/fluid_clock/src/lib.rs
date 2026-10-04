@@ -533,7 +533,7 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
     // Access MC through the FluidSurfaceEffect in the volume.
     {
         let st = state.borrow();
-        let fse = st.volume.effects[0].as_any().downcast_ref::<FluidSurfaceEffect>().unwrap();
+        let fse = st.volume.effect::<FluidSurfaceEffect>().unwrap();
         let vb = fse.marching_cubes.vertex_buffer() as *const wgpu::Buffer;
         let ib = fse.marching_cubes.index_buffer() as *const wgpu::Buffer;
         let ab = fse.marching_cubes.indirect_args_buffer() as *const wgpu::Buffer;
@@ -603,7 +603,7 @@ impl State {
             frame.resize(&mut self.renderer, &mut self.camera);
             self.width = width;
             self.height = height;
-            let fse = self.volume.effects[0].as_any().downcast_ref::<FluidSurfaceEffect>().unwrap();
+            let fse = self.volume.effect::<FluidSurfaceEffect>().unwrap();
             self.raymarch = raymarch_targets(&self.renderer, &self.surface_renderer, &fse.density_field.density_view,
                 &self.blit_bgl, &self.blit_sampler, width, height);
         }
@@ -655,8 +655,7 @@ impl State {
         let identity = glam::Mat4::IDENTITY.to_cols_array();
         // Sim time advanced this frame (the attractor integrates over it).
         let mut sim_dt_frame = 0.0f32;
-        if let Some(fse) = self.volume.effects.get_mut(0)
-            .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>())
+        if let Some(fse) = self.volume.effect_mut::<FluidSurfaceEffect>()
         {
             fse.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
             let step_dt  = self.sim_dt_step.clamp(1.0 / 240.0, 1.0 / 20.0);
@@ -692,8 +691,7 @@ impl State {
         }
         self.attractor.set_params(sim_dt_frame, self.attr_stiffness, self.attr_max_speed, self.attr_basin, self.attr_target, self.attr_drag);
 
-        if let Some(fse) = self.volume.effects.get(0)
-            .and_then(|e| e.as_any().downcast_ref::<FluidSurfaceEffect>())
+        if let Some(fse) = self.volume.effect::<FluidSurfaceEffect>()
         {
             if let (Some(pos_buf), Some(vel_buf)) = (fse.sim.positions_buffer(), fse.sim.velocities_buffer()) {
                 let mut enc = self.renderer.device().create_command_encoder(&Default::default());
@@ -729,7 +727,7 @@ impl State {
                 label: Some("WasmFluid/Raymarch"),
             });
 
-            let fse = self.volume.effects[0].as_any_mut().downcast_mut::<FluidSurfaceEffect>().unwrap();
+            let fse = self.volume.effect_mut::<FluidSurfaceEffect>().unwrap();
             fse.density_field.update_with_encoder(&mut encoder,
                 fse.sim.world_bounds_min, fse.sim.world_bounds_max,
                 fse.sim.particle_count(), SURFACE_SPLAT_RADIUS);
@@ -752,7 +750,7 @@ impl State {
             }
 
             let inv_vp = Mat4::from(inv_vp);
-            let fse = self.volume.effects[0].as_any_mut().downcast_mut::<FluidSurfaceEffect>().unwrap();
+            let fse = self.volume.effect_mut::<FluidSurfaceEffect>().unwrap();
             let bounds_min = fse.sim.world_bounds_min;
             let bounds_max = fse.sim.world_bounds_max;
             self.surface_renderer.render(&mut encoder, &self.raymarch.surface_bg,
@@ -838,8 +836,7 @@ fn apply_budgets(layout: &mut SlotLayout, per_slot: u32) {
 }
 fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
     with_state(|s| {
-        if let Some(fse) = s.volume.effects.get_mut(0)
-            .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) { f(fse); }
+        if let Some(fse) = s.volume.effect_mut::<FluidSurfaceEffect>() { f(fse); }
     });
 }
 
@@ -887,8 +884,7 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
     with_state(|s| {
         s.render_mode = v.min(3);
         s.show_particles = s.render_mode == 0;
-        if let Some(fse) = s.volume.effects.get_mut(0)
-            .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
+        if let Some(fse) = s.volume.effect_mut::<FluidSurfaceEffect>() {
             fse.marching_cubes.set_use_classic(s.render_mode == 3);
         }
         if let Some(r) = s.scene.get_renderable_mut(s.mc_scene_index) {
@@ -904,8 +900,7 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
         let iso = v.max(0.0);
         s.mc_iso_level = iso;
         s.surface_renderer.density_threshold = iso;
-        if let Some(fse) = s.volume.effects.get_mut(0)
-            .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>()) {
+        if let Some(fse) = s.volume.effect_mut::<FluidSurfaceEffect>() {
             fse.marching_cubes.set_iso_level(iso);
         }
     });
@@ -964,8 +959,7 @@ fn sync_light(s: &mut State) {
             r.material_dirty = true;
         }
     }
-    if let Some(fse) = s.volume.effects.get_mut(0)
-        .and_then(|e| e.as_any_mut().downcast_mut::<FluidSurfaceEffect>())
+    if let Some(fse) = s.volume.effect_mut::<FluidSurfaceEffect>()
     {
         fse.options.light_direction = dir;
         fse.options.light_intensity = intensity;
@@ -1009,21 +1003,21 @@ fn sync_light(s: &mut State) {
 }
 #[wasm_bindgen] pub fn set_dof_focus_distance(v: f32) {
     with_state(|s| {
-        if let Some(d) = s.volume.effects.get_mut(1).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
+        if let Some(d) = s.volume.effect_mut::<DepthOfFieldEffect>() {
             d.options.focus_distance = v;
         }
     });
 }
 #[wasm_bindgen] pub fn set_dof_focus_range(v: f32) {
     with_state(|s| {
-        if let Some(d) = s.volume.effects.get_mut(1).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
+        if let Some(d) = s.volume.effect_mut::<DepthOfFieldEffect>() {
             d.options.focus_range = v;
         }
     });
 }
 #[wasm_bindgen] pub fn set_dof_max_blur(v: f32) {
     with_state(|s| {
-        if let Some(d) = s.volume.effects.get_mut(1).and_then(|e| e.as_any_mut().downcast_mut::<DepthOfFieldEffect>()) {
+        if let Some(d) = s.volume.effect_mut::<DepthOfFieldEffect>() {
             d.options.max_blur = v;
         }
     });

@@ -735,6 +735,12 @@ impl FrameTimer {
         std::mem::take(&mut *self.results.lock().unwrap())
     }
 
+    /// Whether the GPU times come from timestamp queries (else they are each frame's CPU start to
+    /// its readback, an upper bound).
+    pub fn has_timestamps(&self) -> bool {
+        self.queries.is_some()
+    }
+
     /// The last frame measured, ms (NaN until one arrives).
     pub fn last_ms(&self) -> f64 {
         *self.last_ms.lock().unwrap()
