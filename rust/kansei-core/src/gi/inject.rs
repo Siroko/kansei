@@ -70,6 +70,25 @@ pub enum SdfShadows {
     Always,
 }
 
+impl SdfShadows {
+    pub fn name(self) -> &'static str {
+        match self {
+            SdfShadows::Off => "off",
+            SdfShadows::Fallback => "fallback",
+            SdfShadows::Always => "always",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(SdfShadows::Off),
+            "fallback" => Some(SdfShadows::Fallback),
+            "always" => Some(SdfShadows::Always),
+            _ => None,
+        }
+    }
+}
+
 impl Default for SceneGiSettings {
     fn default() -> Self {
         Self {
