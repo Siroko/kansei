@@ -23,8 +23,10 @@
         //   fog        froxel height fog, base density per metre (e.g. 0.01), lit by the sun and the sky
         //   mist=1     a local fog volume in the clearing (mist=box: a box-shaped one)
         //   clouds     volumetric cloud coverage, 0 to 1 (default 0.45; 0: none); cloudtype 0 stratus
-        //              to 1 cumulus (default 0.7); cloudbase, cloudthick in metres (1500, 2500)
-        //   gi         screen-space global illumination: low, medium, high or ultra (default off)
+        //              to 1 cumulus (default 0.7); cloudbase, cloudthick in metres (1500, 2500);
+        //              cloudshadows=0: no cloud shadows; cloudquality: low, medium or high
+        //   gi         screen-space global illumination: low, medium, high or ultra (gi=1: medium;
+        //              default off)
         //   preset=midsommar  the Unreal intro's light block: sun -2.5, haze 1.7, ozone 0.8, EV100 3.9,
         //              analytic height fog past 120 m and volumetric fog inside it
         //   capturefog=1  with the preset: the sky lighting and the reflections see the sky through
