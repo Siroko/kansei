@@ -118,6 +118,25 @@ fn kansei_clipmap_light(p: vec3f, n: vec3f) -> vec4f {
     return vec4f(0.0, 0.0, 0.0, -1.0);
 }
 
+// The light a medium at p (fog, mist) scatters toward the camera per unit scattering coefficient,
+// seen along viewDir (camera to p), with a Henyey-Greenstein phase of anisotropy g: the probes'
+// radiance round p, convolved with the phase (its bands times g^l), as SKY_LIGHTING_WGSL's
+// skyInscatter does with the sky's: the sky past the clipmap and what the scene round p bounces.
+// a is -1 where no level holds p.
+fn kansei_clipmap_inscatter(p: vec3f, viewDir: vec3f, g: f32) -> vec4f {
+    let grid = kansei_clip_probe_grid;
+    for (var k = 0u; k < grid.levelCount; k++) {
+        if (kanseiClipProbeHolds(grid, k, p, 0.0) < 0.0) { continue; }
+        // (no normal: the probes round p by their trilinear weights alone)
+        let b = kanseiClipProbeBlend(grid, k, p, vec3f(0.0));
+        if (b.weight <= 1e-5) { continue; }
+        let band1 = b.sh[1] * viewDir.x + b.sh[2] * viewDir.y + b.sh[3] * viewDir.z;
+        let l = (0.282095 * b.sh[0] + g * 0.488603 * band1) / b.weight;
+        return vec4f(max(l.rgb, vec3f(0.0)), 1.0);
+    }
+    return vec4f(0.0, 0.0, 0.0, -1.0);
+}
+
 // The cosine-weighted share of the sky a surface at p facing n sees past the trees and terrain in
 // the clipmap (1 in the open): to dim a material's own sky light by (as SKY_OCCLUSION_WGSL's
 // skyVisibility does); 1 where no probe holds p.

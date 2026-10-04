@@ -10,12 +10,12 @@
 // ambient with their own albedo, and neither the wind nor the start distance moves them.
 
 struct FogMediaParams {
-    albedo          : vec3f,   // height fog: scattering = density * albedo
-    skyAmbientScale : f32,
-    numVolumes      : u32,
-    hasSkyLighting  : u32,
-    _pad0           : u32,
-    _pad1           : u32,
+    albedo           : vec3f,   // height fog: scattering = density * albedo
+    skyAmbientScale  : f32,
+    numVolumes       : u32,
+    hasSkyLighting   : u32,
+    hasClipmapProbes : u32,     // 1: the ambient from a voxel clipmap's probes where they reach
+    _pad1            : u32,
 }
 
 struct LocalFogVolume {
@@ -42,6 +42,9 @@ struct LocalFogVolume {
 @group(0) @binding(18) var skyOcclusionVolume : texture_3d<f32>;
 @group(0) @binding(19) var skyOcclusionSampler : sampler;
 @group(0) @binding(20) var<uniform> skyOcclusion : SkyOcclusionParams;
+// a voxel clipmap's irradiance probes (gi::ClipmapProbes; stand-ins without them)
+@group(0) @binding(21) var<uniform> kansei_clip_probe_grid : ClipProbeGrid;
+@group(0) @binding(22) var<storage, read> kansei_clip_probes : array<vec4f>;
 
 struct FogMedia {
     density    : f32,     // what the light terms are scaled by
@@ -87,8 +90,13 @@ fn fogMedia(worldPos: vec3f, heightFog: f32) -> FogMedia {
 }
 
 // Sky light scattered toward the camera per unit scattering coefficient, with the fog's phase,
-// at worldPos: dimmed by how much of the sky it sees.
+// at worldPos: dimmed by how much of the sky it sees. With a voxel clipmap's probes, where they
+// reach, the light they gather in its place: the sky past the trees and what the scene bounces.
 fn skyAmbient(viewDir: vec3f, worldPos: vec3f) -> vec3f {
+    if (mediaParams.hasClipmapProbes != 0u) {
+        let probes = kansei_clipmap_inscatter(worldPos, viewDir, params.anisotropy);
+        if (probes.a >= 0.0) { return probes.rgb * mediaParams.skyAmbientScale; }
+    }
     if (mediaParams.hasSkyLighting == 0u) { return vec3f(0.0); }
     let visibility = skyVisibility(skyOcclusionVolume, skyOcclusionSampler, skyOcclusion, worldPos);
     return skyInscatter(skyLighting, viewDir, params.anisotropy) * (mediaParams.skyAmbientScale * visibility);

@@ -15,6 +15,7 @@ const INJECT_WGSL: &str = concat!(
     include_str!("../../shaders/volumetric_fog_inject.wgsl"),
     include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("../../shaders/sky_occlusion.wgsl"),
+    include_str!("../../gi/shaders/clipmap_probes.wgsl"),
     include_str!("../../shaders/volumetric_fog_media.wgsl"),
     include_str!("../../shaders/spot_light_types.wgsl"),
     include_str!("../../shaders/compute_shadows.wgsl"),
@@ -30,6 +31,7 @@ const SHAFTS_WGSL: &str = concat!(
     include_str!("../../shaders/volumetric_fog_inject.wgsl"),
     include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("../../shaders/sky_occlusion.wgsl"),
+    include_str!("../../gi/shaders/clipmap_probes.wgsl"),
     include_str!("../../shaders/volumetric_fog_media.wgsl"),
     include_str!("../../shaders/spot_light_types.wgsl"),
     include_str!("../../shaders/compute_shadows.wgsl"),
@@ -303,7 +305,8 @@ struct FogMediaParamsGpu {
     sky_ambient_scale: f32,
     num_volumes: u32,
     has_sky_lighting: u32,
-    _pad: [u32; 2],
+    has_clipmap_probes: u32,
+    _pad: u32,
 }
 
 /// A half-resolution shafts target (rgb light, a linear depth).
@@ -341,6 +344,8 @@ struct Gpu {
     /// Stand-ins for the sky occlusion: a 1-texel volume, and its parameters off
     dummy_occlusion_volume: wgpu::TextureView,
     dummy_occlusion_params: wgpu::Buffer,
+    /// Stand-ins for a clipmap's probes: their grid and buffer
+    dummy_clipmap_probes: [wgpu::Buffer; 2],
     reflection: Option<ReflectionGpu>,
     shafts: ShaftsGpu,
 }
@@ -421,6 +426,8 @@ pub struct VolumetricFogEffect {
     sky_lighting: Option<wgpu::Buffer>,
     /// The sky occlusion's volume and parameters (`set_sky_occlusion`)
     sky_occlusion: Option<(wgpu::TextureView, wgpu::Buffer)>,
+    /// A voxel clipmap's probes' grid and buffer (`set_clipmap_probes`)
+    clipmap_probes: Option<[wgpu::Buffer; 2]>,
     /// The mirror plane (unit normal, d) of the reflection fog, if any.
     reflection_plane: Option<(glam::Vec3, f32)>,
     bindings_dirty: bool,
@@ -449,6 +456,7 @@ impl VolumetricFogEffect {
             shadows: ComputeShadows::new(),
             sky_lighting: None,
             sky_occlusion: None,
+            clipmap_probes: None,
             reflection_plane: None,
             bindings_dirty: true,
             gpu: None,
@@ -521,6 +529,16 @@ impl VolumetricFogEffect {
     /// trees round a clearing hide the horizon. The fog's other lights are not affected.
     pub fn set_sky_occlusion(&mut self, sky_occlusion: Option<&crate::shadows::SkyOcclusion>) {
         self.sky_occlusion = sky_occlusion.map(|s| (s.volume.clone(), s.params.clone()));
+        self.bindings_dirty = true;
+    }
+
+    /// Light the fog with a voxel clipmap's irradiance probes (`SceneVoxelClipmap::probes`) where
+    /// they reach, in place of the sky dimmed by the sky occlusion: the sky past the trees and the
+    /// light the scene round each froxel bounces (a sunlit clearing glows into the mist over it),
+    /// convolved with the fog's phase function, times `sky_ambient_scale`. Past the probes the
+    /// sky's light stays (`set_sky_lighting`, `set_sky_occlusion`). `None` goes back to it.
+    pub fn set_clipmap_probes(&mut self, probes: Option<&crate::gi::ClipmapProbes>) {
+        self.clipmap_probes = probes.map(|p| [p.grid_buffer().clone(), p.probe_buffer().clone()]);
         self.bindings_dirty = true;
     }
 
@@ -692,6 +710,9 @@ impl VolumetricFogEffect {
                 },
                 wgpu::BindGroupLayoutEntry { binding: 19, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
                 uniform(20),
+                // a clipmap's probes (volumetric_fog_media.wgsl)
+                uniform(21),
+                storage(22),
             ]
             .into_iter()
             .chain(shadow_entries)
@@ -797,6 +818,10 @@ impl VolumetricFogEffect {
             })
             .create_view(&Default::default());
         let media_params = buffer("VolumetricFog/MediaParams", std::mem::size_of::<FogMediaParamsGpu>(), wgpu::BufferUsages::UNIFORM);
+        let dummy_clipmap_probes = [
+            buffer("VolumetricFog/NoClipProbeGrid", std::mem::size_of::<crate::gi::ClipProbeGridGpu>(), wgpu::BufferUsages::UNIFORM),
+            buffer("VolumetricFog/NoClipProbes", 64, wgpu::BufferUsages::STORAGE),
+        ];
 
         self.gpu = Some(Gpu {
             grid,
@@ -818,6 +843,7 @@ impl VolumetricFogEffect {
             dummy_sky_lighting,
             dummy_occlusion_volume,
             dummy_occlusion_params,
+            dummy_clipmap_probes,
             reflection: None,
             shafts: ShaftsGpu {
                 trace: entry_pipeline("VolumetricFog/Shafts", SHAFTS_WGSL, "shafts", &shafts_trace_bgl),
@@ -857,7 +883,8 @@ impl VolumetricFogEffect {
             sky_ambient_scale: self.sky_ambient_scale,
             num_volumes: volumes.len() as u32,
             has_sky_lighting: self.sky_lighting.is_some() as u32,
-            _pad: [0; 2],
+            has_clipmap_probes: self.clipmap_probes.is_some() as u32,
+            _pad: 0,
         };
         queue.write_buffer(&gpu.media_params, 0, bytemuck::bytes_of(&params));
     }
@@ -869,6 +896,7 @@ impl VolumetricFogEffect {
             Some((volume, params)) => (volume, params),
             None => (&gpu.dummy_occlusion_volume, &gpu.dummy_occlusion_params),
         };
+        let clipmap_probes = self.clipmap_probes.as_ref().unwrap_or(&gpu.dummy_clipmap_probes);
         let shadows = &self.shadows;
         let group = |label: &str, output: &wgpu::TextureView, params: &wgpu::Buffer| {
             let mut entries = vec![
@@ -880,6 +908,8 @@ impl VolumetricFogEffect {
                 wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(occlusion_volume) },
                 wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::Sampler(&gpu.accum_sampler) },
                 wgpu::BindGroupEntry { binding: 20, resource: occlusion_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 21, resource: clipmap_probes[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 22, resource: clipmap_probes[1].as_entire_binding() },
             ];
             entries.extend(shadows.entries());
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout: &gpu.inject_bgl, entries: &entries })

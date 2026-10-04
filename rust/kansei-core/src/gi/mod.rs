@@ -57,6 +57,7 @@ mod voxelize;
 pub use clipmap::{ClipmapLayout, VoxelClipmap, MAX_CLIPMAP_LEVELS};
 pub use clipmap_inject::{ClipmapGiSettings, ConeShadows};
 pub use clipmap_probes::{ClipmapProbeOptions, ClipmapProbes};
+pub(crate) use clipmap_probes::ClipProbeGridGpu;
 pub use clipmap_scene::{SceneVoxelClipmap, SceneVoxelClipmapOptions};
 pub use clipmap_voxelize::{ClipRegion, ClipmapVoxelizer, CLIP_SURFACE_WORDS};
 pub(crate) use clipmap_voxelize::ClipSurfaces;
@@ -127,7 +128,9 @@ pub const CLIPMAP_WGSL: &str = include_str!("shaders/clipmap.wgsl");
 /// `kansei_clipmap_light(p, n)` (the irradiance a surface at world position `p` facing `n`
 /// receives, scene units, and the cosine-weighted share of its hemisphere that sees the sky past
 /// the clipmap; a = -1 where no probe holds `p`) and `kansei_clipmap_sky_visibility(p, n)` (that
-/// share alone, 1 where no probe holds `p`: to dim a material's own sky light by). Declare its
+/// share alone, 1 where no probe holds `p`: to dim a material's own sky light by), and
+/// `kansei_clipmap_inscatter(p, viewDir, g)` (the light a medium there scatters toward the camera,
+/// for fog). Declare its
 /// buffers with `ClipmapProbes::bindings_wgsl(group, first)` in the material's own group and bind
 /// them with `ClipmapProbes::bind_group_entries`.
 pub const CLIPMAP_PROBES_WGSL: &str = include_str!("shaders/clipmap_probes.wgsl");

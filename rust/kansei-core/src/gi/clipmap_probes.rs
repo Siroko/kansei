@@ -343,3 +343,103 @@ fn random_rotation(frame: u32) -> glam::Mat4 {
     let (u1, u2, u3) = (h(1), h(2) * std::f32::consts::TAU, h(3) * std::f32::consts::TAU);
     glam::Mat4::from_quat(glam::Quat::from_xyzw((1.0 - u1).sqrt() * u2.sin(), (1.0 - u1).sqrt() * u2.cos(), u1.sqrt() * u3.sin(), u1.sqrt() * u3.cos()).normalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+        pollster::block_on(adapter.request_device(&Default::default(), None)).ok()
+    }
+
+    /// The lookups read the probes as their SH say: under a uniform sky of radiance L (every
+    /// probe's constant band L * 0.282095 * 4 pi, its sky share likewise), a surface facing any
+    /// way receives pi L and sees the whole sky, and a medium scatters L toward the camera
+    /// whatever the phase; under a sky only above (the bands of the upper hemisphere's), an
+    /// upward surface receives pi L, a downward one none, and forward scattering along +y brings
+    /// more of it.
+    #[test]
+    fn the_lookups_read_what_the_probes_hold() {
+        let Some((device, queue)) = device() else { return eprintln!("no GPU adapter: skipping") };
+        let dims = [8u32; 3];
+        let grid = ClipProbeGridGpu {
+            dims,
+            level_count: 1,
+            spacing: 1.0,
+            normal_bias: 1.0,
+            _pad: [0.0; 2],
+            levels: std::array::from_fn(|k| if k == 0 { ClipLevelGpu { origin: [-4; 3], valid: 1 } } else { ClipLevelGpu::default() }),
+        };
+        let l = [1.0f32, 2.0, 3.0];
+        let four_pi = 4.0 * std::f32::consts::PI;
+        let (y0, y1) = (0.282095f32, 0.488603f32);
+        let uniform: [[f32; 4]; 4] = [[l[0] * y0 * four_pi, l[1] * y0 * four_pi, l[2] * y0 * four_pi, y0 * four_pi], [0.0; 4], [0.0; 4], [0.0; 4]];
+        // the upper hemisphere: c0 = L Y0 2 pi, c1y = L * 0.488603 * pi (the integral of y over it)
+        let pi = std::f32::consts::PI;
+        let upper: [[f32; 4]; 4] = [[l[0] * y0 * 2.0 * pi, l[1] * y0 * 2.0 * pi, l[2] * y0 * 2.0 * pi, y0 * 2.0 * pi], [0.0; 4], [l[0] * y1 * pi, l[1] * y1 * pi, l[2] * y1 * pi, y1 * pi], [0.0; 4]];
+        let code = format!(
+            "{}\n{}\n@group(0) @binding(2) var<storage, read_write> out: array<vec4f>;\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+                 let p = vec3f(0.3, 0.2, -0.4);\n\
+                 out[0] = kansei_clipmap_light(p, normalize(vec3f(0.3, 0.8, -0.2)));\n\
+                 out[1] = kansei_clipmap_light(p, vec3f(0.0, -1.0, 0.0));\n\
+                 out[2] = kansei_clipmap_inscatter(p, vec3f(0.0, 1.0, 0.0), 0.6);\n\
+                 out[3] = kansei_clipmap_inscatter(p, vec3f(0.0, -1.0, 0.0), 0.6);\n\
+                 out[4] = kansei_clipmap_light(p, vec3f(0.0, 1.0, 0.0));\n\
+                 out[5] = kansei_clipmap_light(vec3f(40.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0));\n\
+             }}",
+            include_str!("shaders/clipmap_probes.wgsl"),
+            ClipmapProbes::bindings_wgsl(0, 0)
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        use wgpu::util::DeviceExt;
+        let run = |probe: [[f32; 4]; 4]| -> Vec<[f32; 4]> {
+            let probes: Vec<[f32; 4]> = (0..dims.iter().product::<u32>()).flat_map(|_| probe).collect();
+            let grid_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&grid), usage: wgpu::BufferUsages::UNIFORM });
+            let probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&probes), usage: wgpu::BufferUsages::STORAGE });
+            let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 6 * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            let read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 6 * 16, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: grid_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: probe_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                ],
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&out, 0, &read, 0, 6 * 16);
+            queue.submit(Some(encoder.finish()));
+            read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let values = bytemuck::cast_slice::<u8, [f32; 4]>(&read.slice(..).get_mapped_range()).to_vec();
+            values
+        };
+        let close = |a: [f32; 4], b: [f32; 4]| (0..4).all(|c| (a[c] - b[c]).abs() <= 1e-3 * b[c].abs().max(1.0));
+        let pi_l = [pi * l[0], pi * l[1], pi * l[2], 1.0];
+        let got = run(uniform);
+        eprintln!("uniform sky: {got:?}");
+        assert!(close(got[0], pi_l), "irradiance {:?}", got[0]);
+        assert!(close(got[1], pi_l), "irradiance facing down {:?}", got[1]);
+        assert!(close(got[2], [l[0], l[1], l[2], 1.0]) && close(got[3], [l[0], l[1], l[2], 1.0]), "inscattered {:?} {:?}", got[2], got[3]);
+        assert_eq!(got[5][3], -1.0, "no probe holds a point past the window");
+        let got = run(upper);
+        eprintln!("sky above: {got:?}");
+        assert!(close(got[4], pi_l), "an upward surface {:?}", got[4]);
+        assert!(got[1][0].abs() < 1e-3 && got[1][3].abs() < 1e-3, "a downward surface {:?}", got[1]);
+        // forward scattering of the light from above, seen looking up: L/2 + g * 3L/4
+        let up = [0.5 * l[0] + 0.6 * 0.75 * l[0], 0.5 * l[1] + 0.6 * 0.75 * l[1], 0.5 * l[2] + 0.6 * 0.75 * l[2], 1.0];
+        assert!(close(got[2], up), "looking up {:?} of {up:?}", got[2]);
+        assert!(got[3][0] < got[2][0], "looking down, less of it");
+    }
+}
