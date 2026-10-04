@@ -8,3 +8,8 @@ kansei-wasm/examples/*/Cargo.lock
 # link-packs.sh links the Kimodo page's packs into www/pack/gen and www/pack/gasp)
 kansei-wasm/examples/motion-matching/www/pack
 vendor/basisu/target/
+# stray browser captures and saved pages at this folder's root (examples keep theirs in www/)
+/*.png
+/*.jpg
+/*.html
+/*.htm
