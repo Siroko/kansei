@@ -264,6 +264,14 @@ pub struct FluidSurfaceEffect {
 }
 
 impl FluidSurfaceEffect {
+    /// Show a fluid's [`FluidActivity`](crate::simulations::fluid::FluidActivity): its surface
+    /// extracted while it runs, the last one drawn while it sleeps, nothing while it is culled.
+    pub fn set_activity(&mut self, activity: crate::simulations::fluid::FluidActivity) {
+        use crate::simulations::fluid::FluidActivity;
+        self.extract = activity == FluidActivity::Running;
+        self.active = activity != FluidActivity::Culled;
+    }
+
     pub fn new(
         sim: FluidSimulation,
         density_field: FluidDensityField,
