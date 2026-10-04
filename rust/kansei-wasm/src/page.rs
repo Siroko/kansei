@@ -59,6 +59,24 @@ pub fn set_text(id: &str, text: &str) {
     }
 }
 
+/// The page's checkbox with id `id`, if there is one (a HUD's toggles).
+pub fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
+    web_sys::window()?.document()?.get_element_by_id(id)?.dyn_into().ok()
+}
+
+/// `n` with its thousands apart, for a HUD: `40000` reads `40 000`.
+pub fn thousands(n: impl Into<u64>) -> String {
+    let s = n.into().to_string();
+    let mut out = String::new();
+    for (k, c) in s.chars().enumerate() {
+        if k > 0 && (s.len() - k).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Fetch `url` (relative to the page) as bytes; an HTTP error status is an error too.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     let window = web_sys::window().ok_or("no window")?;
@@ -68,4 +86,14 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     }
     let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer()?).await?;
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn thousands_group_by_three() {
+        assert_eq!(super::thousands(7u32), "7");
+        assert_eq!(super::thousands(40_000u32), "40 000");
+        assert_eq!(super::thousands(1_234_567u64), "1 234 567");
+    }
 }

@@ -23,17 +23,16 @@
 //! discard anyway, as alpha-tested foliage does).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer, InstanceAttribute, Sampler, VertexFormat};
 use kansei_core::cameras::Camera;
 use kansei_core::cameras::MOTION_VECTORS_WGSL;
 use kansei_core::culling::{CullViewKind, InstanceCulling, LOD_FADE_WGSL};
-use kansei_core::geometries::{CylinderGeometry, Geometry, HeightfieldGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
+use kansei_core::geometries::{Geometry, HeightfieldGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry, SpruceGeometry};
 use kansei_core::impostors::{billboard_geometry, ImpostorOptions, IMPOSTOR_WGSL};
 use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL, INSTANCE_PLACEMENT_WGSL};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
@@ -43,7 +42,7 @@ use kansei_core::reflections::{PlanarReflection, PlanarReflectionOptions, PLANAR
 use kansei_core::pacing::FrameTimer;
 use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{flag, now, param, param_or, set_text, Canvas, Keys};
+use kansei_wasm::{checkbox, flag, now, param, param_or, set_text, thousands, Canvas, Keys};
 
 const WATER_LAYER: u32 = 2;
 
@@ -52,7 +51,7 @@ const SUN_DIR: [f32; 3] = [0.4, -0.55, 0.7];
 const SUN: [f32; 3] = [9000.0 * std::f32::consts::PI, 7600.0 * std::f32::consts::PI, 6000.0 * std::f32::consts::PI];
 
 /// The scene's directional light (the sun), sky and haze, shared by the meshes and the impostors
-/// so they match. Prefixed with LIGHTS_WGSL and GBUFFER_OUT_WGSL.
+/// so they match. Prefixed with LIGHTS_WGSL, GBUFFER_OUT_WGSL and INSTANCE_PLACEMENT_WGSL.
 const SHADE_WGSL: &str = r#"
 fn eye_of(view: mat4x4<f32>) -> vec3<f32> {
     let view3 = mat3x3<f32>(view[0].xyz, view[1].xyz, view[2].xyz);
@@ -69,23 +68,6 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, eye: vec3<f32>) -> v
     let lit = albedo * (sky + sun);
     let haze = 1.0 - exp(-distance(world, eye) * 0.0015);
     return mix(lit, vec3<f32>(1500.0, 1700.0, 2000.0), haze);
-}
-
-// a unit spruce placed by its instance: base xyz and height, then yaw and tint
-fn place(local: vec3<f32>, inst: vec4<f32>, yaw: f32) -> vec3<f32> {
-    let c = cos(yaw);
-    let s = sin(yaw);
-    return vec3<f32>(c * local.x + s * local.z, local.y, -s * local.x + c * local.z) * inst.w + inst.xyz;
-}
-
-fn turn(v: vec3<f32>, yaw: f32) -> vec3<f32> {
-    let c = cos(yaw);
-    let s = sin(yaw);
-    return vec3<f32>(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
-}
-
-fn unplace(world: vec3<f32>, inst: vec4<f32>, yaw: f32) -> vec3<f32> {
-    return turn((world - inst.xyz) / inst.w, -yaw);
 }
 
 "#;
@@ -163,10 +145,10 @@ struct ImpostorOut {
 @vertex
 fn vertex_main(v: VIn) -> VOut {
     // the camera in the tree's own space, the billboard there, then placed as the tree
-    let eye = unplace(eye_of(view_matrix), v.inst, v.extra.x);
+    let eye = kansei_unplace(eye_of(view_matrix), v.inst, v.extra.x);
     let local = kansei_impostor_corner(impostor, v.position.xy, eye);
     var out: VOut;
-    out.clip = projection_matrix * view_matrix * vec4<f32>(place(local, v.inst, v.extra.x), 1.0);
+    out.clip = projection_matrix * view_matrix * vec4<f32>(kansei_place(local, v.inst, v.extra.x), 1.0);
     out.local = local;
     out.eye = eye;
     out.inst = v.inst;
@@ -182,8 +164,8 @@ fn fragment_main(in: VOut) -> ImpostorOut {
     if (s.alpha < 0.5) {
         discard;
     }
-    let world = place(s.position, in.inst, in.extra.x);
-    let n = turn(s.normal, in.extra.x);
+    let world = kansei_place(s.position, in.inst, in.extra.x);
+    let n = kansei_turn(s.normal, in.extra.x);
     // baked with the tint neutral: this tree's own
     let albedo = s.albedo * (0.7 + 0.6 * in.extra.y);
     let base = kansei_gbuffer_out(FADE_TINT(shade(albedo, n, world, eye_of(view_matrix))), vec3<f32>(0.0), normalize(n), albedo);
@@ -285,8 +267,8 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, fade: Fade) -> Mate
             // trunks brown; each tree tinted
             "albedo = select(albedo, vec3<f32>(0.09, 0.06, 0.04), length(v.position.xz) < 0.04); \
              albedo *= 0.7 + 0.6 * v.extra.y; \
-             world = place(v.position.xyz, v.inst, v.extra.x); \
-             n = turn(v.normal, v.extra.x);",
+             world = kansei_place(v.position.xyz, v.inst, v.extra.x); \
+             n = kansei_turn(v.normal, v.extra.x);",
         )
     } else {
         ("", "")
@@ -294,18 +276,12 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, fade: Fade) -> Mate
     let shader = fade.apply(&SURFACE_WGSL.replace("TREE_INPUT", input).replace("TREE_PLACE", place), tree);
     let mut m = Material::new(
         label,
-        &format!("{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{SHADE_WGSL}\n{shader}"),
+        &format!("{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{INSTANCE_PLACEMENT_WGSL}\n{SHADE_WGSL}\n{shader}"),
         vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)],
         MaterialOptions { mrt_output_count: Some(4), ..Default::default() },
     );
     m.set_uniform_bindable(0, label, &[base[0], base[1], base[2], 1.0, 0.0, 0.0, 0.0, 0.0f32]);
     m
-}
-
-/// Deterministic 0..1 hash.
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
 }
 
 /// Half the side of the square the forest covers, in metres.
@@ -325,25 +301,7 @@ fn ground(x: f32, z: f32) -> f32 {
 
 /// The terrain: a `cells` x `cells` grid over the forest's square.
 fn terrain(cells: u32) -> Geometry {
-    let mut terrain = HeightfieldGeometry::new([-EXTENT; 2], [EXTENT; 2], (cells, cells), ground);
-    terrain.label = "Terrain".into();
-    terrain
-}
-
-/// A spruce of height 1: a trunk and `cones` stacked cones of `segments` x `rings` quads.
-fn spruce(segments: u32, rings: u32, cones: u32, label: &str) -> Geometry {
-    let trunk = CylinderGeometry::new(0.035, 0.025, 0.3, segments.min(8), 1);
-    let crowns: Vec<(Geometry, f32)> = (0..cones)
-        .map(|k| {
-            let f = k as f32 / cones as f32;
-            let y0 = 0.15 + 0.62 * f;
-            let y1 = if k + 1 == cones { 1.0 } else { y0 + 0.42 - 0.12 * f };
-            (CylinderGeometry::new(0.24 * (1.0 - 0.55 * f), 0.0, y1 - y0, segments, rings), y0)
-        })
-        .collect();
-    let mut parts = vec![(&trunk, glam::Mat4::IDENTITY)];
-    parts.extend(crowns.iter().map(|(cone, y0)| (cone, glam::Mat4::from_translation(glam::Vec3::new(0.0, *y0, 0.0)))));
-    Geometry::merged(label, &parts)
+    HeightfieldGeometry::new([-EXTENT; 2], [EXTENT; 2], (cells, cells), ground).with_label("Terrain")
 }
 
 const CAMS: [&str; 5] = ["shore", "low", "high", "fly", "forest"];
@@ -393,22 +351,6 @@ struct State {
     interval_ms: f64,
     gpu_ms: f64,
     keys: Keys,
-}
-
-fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
-    web_sys::window()?.document()?.get_element_by_id(id)?.dyn_into().ok()
-}
-
-fn thousands(n: u32) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (k, c) in s.chars().enumerate() {
-        if k > 0 && (s.len() - k).is_multiple_of(3) {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// The lake's mirror, at half the canvas's `width` x `height`, reflecting everything but itself.
@@ -499,12 +441,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut i = 0u32;
     while (data.len() as u32) < trees * 8 {
         i += 1;
-        let (x, z) = (-EXTENT + hash(i) * 2.0 * EXTENT, -EXTENT + hash(i ^ 0x5bd1e995) * 2.0 * EXTENT);
+        let (x, z) = (-EXTENT + hash01(i) * 2.0 * EXTENT, -EXTENT + hash01(i ^ 0x5bd1e995) * 2.0 * EXTENT);
         if ground(x, z) < LAKE_LEVEL + 1.0 {
             continue;
         }
-        let h = 14.0 + 12.0 * hash(i.wrapping_mul(3) + 7);
-        data.extend_from_slice(&[x, ground(x, z) - 0.3, z, h, hash(i + 11) * std::f32::consts::TAU, hash(i + 23), 0.0, 0.0]);
+        let h = 14.0 + 12.0 * hash01(i.wrapping_mul(3) + 7);
+        data.extend_from_slice(&[x, ground(x, z) - 0.3, z, h, hash01(i + 11) * std::f32::consts::TAU, hash01(i + 23), 0.0, 0.0]);
     }
     let source = ComputeBuffer::from_slice("Forest", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &data);
     // with crossfades the culled instances carry their fade after the 32 bytes
@@ -531,7 +473,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut lod_sets = Vec::new();
     for &fade in &fades {
         let mut lods = [0; 2];
-        for (k, (geometry, near, band_far)) in [(spruce(48, 6, 6, "Spruce/LOD0"), 0.0, 50.0), (spruce(16, 2, 5, "Spruce/LOD1"), 50.0, far)].into_iter().enumerate() {
+        for (k, (geometry, near, band_far)) in [(SpruceGeometry::new(48, 6, 6).with_label("Spruce/LOD0"), 0.0, 50.0), (SpruceGeometry::new(16, 2, 5).with_label("Spruce/LOD1"), 50.0, far)].into_iter().enumerate() {
             let label = geometry.label.clone();
             let mut r = Renderable::new(InstancedGeometry::new(geometry, trees, vec![instances(fade)]), surface_material(&label, [0.05, 0.09, 0.05], true, fade));
             r.instance_culling = Some(culling(near, band_far, fade));
@@ -567,7 +509,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     for (&fade, &lods) in fades.iter().zip(&lod_sets) {
         let mut material = Material::new(
             "Spruce/Impostor",
-            &format!("{IMPOSTOR_WGSL}\n{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{SHADE_WGSL}\n{}", fade.apply(&impostor_shader, true)),
+            &format!("{IMPOSTOR_WGSL}\n{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{INSTANCE_PLACEMENT_WGSL}\n{SHADE_WGSL}\n{}", fade.apply(&impostor_shader, true)),
             vec![
                 Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
                 Binding::texture_2d(1, ShaderStages::FRAGMENT),

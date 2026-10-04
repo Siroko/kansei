@@ -20,7 +20,7 @@ use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry};
 use kansei_core::lights::{Light, SpotLight};
 use kansei_core::materials::{Material, StandardInstancing, StandardLitOptions};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
@@ -41,12 +41,6 @@ fn lit_material(label: &str, base_color: [f32; 3], roughness: f32, instanced: bo
         instancing: instanced.then_some(StandardInstancing::OffsetHeight),
         ..Default::default()
     })
-}
-
-/// Deterministic 0..1 hash.
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
 }
 
 struct Car {
@@ -101,12 +95,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let wall_test = cam == "wall";
     let mut trunks: Vec<[f32; 4]> = Vec::new();
     for i in 0..1400u32 {
-        let x = -45.0 + hash(i) * 90.0;
-        let z = -90.0 + hash(i + 13) * 110.0;
+        let x = -45.0 + hash01(i) * 90.0;
+        let z = -90.0 + hash01(i + 13) * 110.0;
         if (x - 1.75).abs() < 3.5 && z > -9.0 || wall_test && (x - 1.75).abs() < 9.0 && z > -21.0 {
             continue;
         }
-        let h = 9.0 + hash(i + 29) * 8.0;
+        let h = 9.0 + hash01(i + 29) * 8.0;
         trunks.push([x, h * 0.5, z, h]);
     }
     if wall_test {
@@ -150,8 +144,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // light culling keeps them cheap; `clusters=0` shades every pixel with every light)
     let lamps: u32 = param_or("lamps", 0);
     for i in 0..lamps {
-        let pos = Vec3::new(-30.0 + hash(i + 501) * 60.0, 2.5 + hash(i + 503) * 2.0, -70.0 + hash(i + 507) * 75.0);
-        let hue = hash(i + 509) * 6.0;
+        let pos = Vec3::new(-30.0 + hash01(i + 501) * 60.0, 2.5 + hash01(i + 503) * 2.0, -70.0 + hash01(i + 507) * 75.0);
+        let hue = hash01(i + 509) * 6.0;
         let color = Vec3::new((hue - 3.0).abs() - 1.0, 2.0 - (hue - 2.0).abs(), 2.0 - (hue - 4.0).abs());
         let color = Vec3::new(color.x.clamp(0.0, 1.0), color.y.clamp(0.0, 1.0), color.z.clamp(0.0, 1.0));
         let mut lamp = SpotLight::new(pos, Vec3::new(0.0, -1.0, 0.0), color, 800.0, 7.0, 25f32.to_radians(), 50f32.to_radians());

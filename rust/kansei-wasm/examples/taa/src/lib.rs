@@ -23,7 +23,7 @@ use kansei_core::cameras::{Camera, MOTION_VECTORS_WGSL};
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
 use kansei_core::materials::{Binding, CullMode, GradientSkyOptions, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
@@ -132,11 +132,6 @@ fn grass_material(label: &str, base: [f32; 3], velocity: bool) -> Material {
     m
 }
 
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = Canvas::find(canvas_id)?;
@@ -162,9 +157,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // thin trunks, and power lines: sub-pixel edges that crawl without AA
     let mut trunks = Vec::new();
     for i in 0..400u32 {
-        let x = -60.0 + hash(i) * 120.0;
-        let z = -12.0 - hash(i + 3) * 90.0;
-        let h = 8.0 + hash(i + 9) * 10.0;
+        let x = -60.0 + hash01(i) * 120.0;
+        let z = -12.0 - hash01(i + 3) * 90.0;
+        let h = 8.0 + hash01(i + 9) * 10.0;
         trunks.extend_from_slice(&[x, h * 0.5, z, h]);
     }
     let n = trunks.len() as u32 / 4;
@@ -182,9 +177,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // the meadow: 12 000 alpha-tested grass cards in the wind
     let mut grass = Vec::new();
     for i in 0..12000u32 {
-        let x = -25.0 + hash(i + 101) * 50.0;
-        let z = 2.0 - hash(i + 211) * 22.0;
-        grass.extend_from_slice(&[x, 0.0, z, hash(i + 307) * std::f32::consts::TAU]);
+        let x = -25.0 + hash01(i + 101) * 50.0;
+        let z = 2.0 - hash01(i + 211) * 22.0;
+        grass.extend_from_slice(&[x, 0.0, z, hash01(i + 307) * std::f32::consts::TAU]);
     }
     let grass_buf = ComputeBuffer::from_slice("Grass", BufferType::Storage, BufferUsage::VERTEX, &grass).with_vertex_vec4(3);
     let meadow = scene.add(SceneNode::Renderable(Renderable::new(

@@ -20,15 +20,14 @@
 //! a rebuild's first frame: the top-down pass, the pyramid and a quarter of the volume).
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer, InstanceAttribute, Sampler, Texture, VertexFormat};
 use kansei_core::cameras::{Camera, MOTION_VECTORS_WGSL};
 use kansei_core::culling::{CullStats, InstanceCulling};
-use kansei_core::geometries::{CylinderGeometry, Geometry, HeightfieldGeometry, InstancedGeometry, SphereGeometry};
+use kansei_core::geometries::{Geometry, HeightfieldGeometry, InstancedGeometry, SphereGeometry, SpruceGeometry};
 use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
-use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages, INSTANCE_PLACEMENT_WGSL};
+use kansei_core::math::{hash01, Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
@@ -37,7 +36,7 @@ use kansei_core::postprocessing::{
 use kansei_core::pacing::FrameTimer;
 use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{flag, now, param, param_or, set_text, Canvas, Keys};
+use kansei_wasm::{checkbox, flag, now, param, param_or, set_text, thousands, Canvas, Keys};
 use kansei_core::shadows::{SkyOcclusion, SkyOcclusionOptions, SKY_OCCLUSION_WGSL};
 
 /// A diffuse surface lit by the scene's directional light (the sun) and a sky hemisphere, in haze,
@@ -122,10 +121,7 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, sky: Option<(&SkyOc
     let (input, place) = if tree {
         (
             "@location(3) inst: vec4<f32>, @location(4) extra: vec4<f32>,",
-            "let c = cos(v.extra.x); let s = sin(v.extra.x); \
-             local = vec3<f32>(c * local.x + s * local.z, local.y, -s * local.x + c * local.z) * v.inst.w + v.inst.xyz; \
-             n = vec3<f32>(c * n.x + s * n.z, n.y, -s * n.x + c * n.z); \
-             tint = v.extra.y;",
+            "local = kansei_place(local, v.inst, v.extra.x); n = kansei_turn(n, v.extra.x); tint = v.extra.y;",
         )
     } else {
         ("", "")
@@ -148,7 +144,7 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, sky: Option<(&SkyOc
     }
     let mut m = Material::new(
         label,
-        &format!("{LIGHTS_WGSL}\n{MOTION_VECTORS_WGSL}\n{shader}"),
+        &format!("{LIGHTS_WGSL}\n{MOTION_VECTORS_WGSL}\n{INSTANCE_PLACEMENT_WGSL}\n{shader}"),
         bindings,
         MaterialOptions { outputs_velocity: true, ..Default::default() },
     );
@@ -159,12 +155,6 @@ fn surface_material(label: &str, base: [f32; 3], tree: bool, sky: Option<(&SkyOc
         m.set_bindable(3, ComputeBuffer::from_external("SkyOcclusionParams", sky.params.clone(), BufferType::Uniform));
     }
     m
-}
-
-/// Deterministic 0..1 hash.
-fn hash(i: u32) -> f32 {
-    let x = (i.wrapping_mul(747796405).wrapping_add(2891336453)) ^ (i >> 7).wrapping_mul(277803737);
-    (x % 10007) as f32 / 10007.0
 }
 
 /// Half the side of the square the forest covers, in metres.
@@ -180,25 +170,7 @@ fn ground(x: f32, z: f32) -> f32 {
 
 /// The terrain: a `cells` x `cells` grid over the forest's square.
 fn terrain(cells: u32) -> Geometry {
-    let mut terrain = HeightfieldGeometry::new([-EXTENT; 2], [EXTENT; 2], (cells, cells), ground);
-    terrain.label = "Terrain".into();
-    terrain
-}
-
-/// A spruce of height 1: a trunk and `cones` stacked cones of `segments` x `rings` quads.
-fn spruce(segments: u32, rings: u32, cones: u32, label: &str) -> Geometry {
-    let trunk = CylinderGeometry::new(0.035, 0.025, 0.3, segments.min(8), 1);
-    let crowns: Vec<(Geometry, f32)> = (0..cones)
-        .map(|k| {
-            let f = k as f32 / cones as f32;
-            let y0 = 0.15 + 0.62 * f;
-            let y1 = if k + 1 == cones { 1.0 } else { y0 + 0.42 - 0.12 * f };
-            (CylinderGeometry::new(0.24 * (1.0 - 0.55 * f), 0.0, y1 - y0, segments, rings), y0)
-        })
-        .collect();
-    let mut parts = vec![(&trunk, glam::Mat4::IDENTITY)];
-    parts.extend(crowns.iter().map(|(cone, y0)| (cone, glam::Mat4::from_translation(glam::Vec3::new(0.0, *y0, 0.0)))));
-    Geometry::merged(label, &parts)
+    HeightfieldGeometry::new([-EXTENT; 2], [EXTENT; 2], (cells, cells), ground).with_label("Terrain")
 }
 
 /// Camera presets: position and target.
@@ -251,22 +223,6 @@ struct State {
     keys: Keys,
     /// `skyocc=rebuild`: start a rebuild of the sky occlusion every frame
     rebuild_sky: bool,
-}
-
-fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
-    web_sys::window()?.document()?.get_element_by_id(id)?.dyn_into().ok()
-}
-
-fn thousands(n: impl Into<u64>) -> String {
-    let s = n.into().to_string();
-    let mut out = String::new();
-    for (k, c) in s.chars().enumerate() {
-        if k > 0 && (s.len() - k).is_multiple_of(3) {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn hud(st: &State) -> String {
@@ -353,16 +309,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut i = 0u32;
     while (data.len() as u32) < trees * 8 {
         i += 1;
-        let (x, z) = (-EXTENT + hash(i) * 2.0 * EXTENT, -EXTENT + hash(i ^ 0x5bd1e995) * 2.0 * EXTENT);
+        let (x, z) = (-EXTENT + hash01(i) * 2.0 * EXTENT, -EXTENT + hash01(i ^ 0x5bd1e995) * 2.0 * EXTENT);
         if meadow(x, z) || clearings.iter().any(|&(cx, cz, r)| (x - cx).powi(2) + (z - cz).powi(2) < r * r) {
             continue;
         }
-        let h = 14.0 + 12.0 * hash(i.wrapping_mul(3) + 7);
-        data.extend_from_slice(&[x, ground(x, z) - 0.3, z, h, hash(i + 11) * std::f32::consts::TAU, hash(i + 23), 0.0, 0.0]);
+        let h = 14.0 + 12.0 * hash01(i.wrapping_mul(3) + 7);
+        data.extend_from_slice(&[x, ground(x, z) - 0.3, z, h, hash01(i + 11) * std::f32::consts::TAU, hash01(i + 23), 0.0, 0.0]);
     }
     let source = ComputeBuffer::from_slice("Forest", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &data);
     // three LODs by distance, each culled per view on the GPU; with occlusion for the camera
-    let lods = [(spruce(48, 6, 6, "Spruce/LOD0"), 0.0, 80.0), (spruce(20, 2, 5, "Spruce/LOD1"), 80.0, 220.0), (spruce(8, 1, 3, "Spruce/LOD2"), 220.0, f32::INFINITY)];
+    let lods = [(SpruceGeometry::new(48, 6, 6).with_label("Spruce/LOD0"), 0.0, 80.0), (SpruceGeometry::new(20, 2, 5).with_label("Spruce/LOD1"), 80.0, 220.0), (SpruceGeometry::new(8, 1, 3).with_label("Spruce/LOD2"), 220.0, f32::INFINITY)];
     let spheres = param("bounds").as_deref() == Some("sphere");
     for (geometry, near, far) in lods {
         let instances = source.clone().with_vertex_layout(
