@@ -21,8 +21,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -38,6 +36,8 @@ use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
     effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
+use kansei_core::pacing::FrameTimer;
+use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, now, param, param_or, Canvas};
 use kansei_core::shadows::{SkyOcclusion, SkyOcclusionOptions, SKY_OCCLUSION_WGSL};
@@ -284,156 +284,13 @@ fn place_camera(camera: &mut Camera, cam: &str, t: f32) {
     camera.look_at(&Vec3::new(to.x, to.y, to.z));
 }
 
-/// GPU frame time from timestamp queries: a no-op compute pass before and after the frame (on
-/// Metal an empty pass resolves its timestamps to zero). The browser resolves readbacks late, so
-/// a ring of them is in flight.
-struct GpuTimer {
-    noop: wgpu::ComputePipeline,
-    period_ns: f64,
-    slots: Vec<TimerSlot>,
-    armed: Option<usize>,
-    /// measurements (ms) not yet taken
-    results: Arc<std::sync::Mutex<Vec<f64>>>,
-}
-
-struct TimerSlot {
-    set: wgpu::QuerySet,
-    resolve: wgpu::Buffer,
-    readback: wgpu::Buffer,
-    busy: Arc<AtomicBool>,
-}
-
-impl GpuTimer {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
-        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-            return None;
-        }
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("GpuTimer"), source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()) });
-        let buffer = |usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some("GpuTimer"), size: 16, usage, mapped_at_creation: false });
-        let slots = (0..16)
-            .map(|_| TimerSlot {
-                set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("GpuTimer"), ty: wgpu::QueryType::Timestamp, count: 2 }),
-                resolve: buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
-                readback: buffer(wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ),
-                busy: Arc::new(AtomicBool::new(false)),
-            })
-            .collect();
-        Some(Self {
-            noop: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("GpuTimer"),
-                layout: None,
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            }),
-            period_ns: queue.get_timestamp_period() as f64,
-            slots,
-            armed: None,
-            results: Arc::new(std::sync::Mutex::new(Vec::new())),
-        })
-    }
-
-    fn stamp(&self, encoder: &mut wgpu::CommandEncoder, slot: usize, index: u32) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("GpuTimer"),
-            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                query_set: &self.slots[slot].set,
-                beginning_of_pass_write_index: (index == 0).then_some(0),
-                end_of_pass_write_index: (index == 1).then_some(1),
-            }),
-        });
-        pass.set_pipeline(&self.noop);
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-
-    fn begin(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.armed = self.slots.iter().position(|s| !s.busy.load(Ordering::Acquire));
-        if let Some(slot) = self.armed {
-            let mut encoder = device.create_command_encoder(&Default::default());
-            self.stamp(&mut encoder, slot, 0);
-            queue.submit(Some(encoder.finish()));
-        }
-    }
-
-    fn end(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let Some(k) = self.armed.take() else { return };
-        let slot = &self.slots[k];
-        slot.busy.store(true, Ordering::Release);
-        let mut encoder = device.create_command_encoder(&Default::default());
-        self.stamp(&mut encoder, k, 1);
-        encoder.resolve_query_set(&slot.set, 0..2, &slot.resolve, 0);
-        encoder.copy_buffer_to_buffer(&slot.resolve, 0, &slot.readback, 0, 16);
-        queue.submit(Some(encoder.finish()));
-        let (busy, results, readback, period) = (slot.busy.clone(), self.results.clone(), slot.readback.clone(), self.period_ns);
-        slot.readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            if result.is_ok() {
-                let t: [u64; 2] = bytemuck::pod_read_unaligned(&readback.slice(..).get_mapped_range()[..16]);
-                readback.unmap();
-                if t[1] > t[0] {
-                    results.lock().unwrap().push((t[1] - t[0]) as f64 * period / 1.0e6);
-                }
-            }
-            busy.store(false, Ordering::Release);
-        });
-    }
-
-    /// The measurements (ms) that arrived since the last call.
-    fn take(&self) -> Vec<f64> {
-        std::mem::take(&mut *self.results.lock().unwrap())
-    }
-}
-
-/// `bench=1`: alternate occlusion on and off, averaging the GPU time and the frame interval of
-/// each (after a warm-up, and ignoring the start of each phase).
-struct Bench {
-    start: f64,
-    /// (GPU ms, GPU samples, frame intervals ms, frames) with occlusion off and on
-    sums: [(f64, u32, f64, u32); 2],
-    last_frame: f64,
-    report: Option<String>,
-}
-
-const BENCH_WARMUP_MS: f64 = 3000.0;
-const BENCH_PHASE_MS: f64 = 3000.0;
-const BENCH_SETTLE_MS: f64 = 500.0;
-const BENCH_PHASES: u32 = 8;
-
-impl Bench {
-    /// (occlusion on, measuring) at `now`, or None when done.
-    fn phase(&self, now: f64) -> Option<(bool, bool)> {
-        let t = now - self.start - BENCH_WARMUP_MS;
-        if t < 0.0 {
-            return Some((true, false));
-        }
-        let phase = (t / BENCH_PHASE_MS) as u32;
-        (phase < BENCH_PHASES).then_some((phase.is_multiple_of(2), t % BENCH_PHASE_MS >= BENCH_SETTLE_MS))
-    }
-
-    fn record(&mut self, gpu: &[f64], now: f64) {
-        if let Some((on, true)) = self.phase(now) {
-            let sum = &mut self.sums[on as usize];
-            sum.0 += gpu.iter().sum::<f64>();
-            sum.1 += gpu.len() as u32;
-            sum.2 += now - self.last_frame;
-            sum.3 += 1;
-        }
-        self.last_frame = now;
-        if self.phase(now).is_none() && self.report.is_none() {
-            let mean = |(sum, n, _, _): (f64, u32, f64, u32)| if n > 0 { format!("{:.2} ms GPU ({n} samples)", sum / n as f64) } else { "no GPU timestamps".into() };
-            let interval = |(_, _, sum, n): (f64, u32, f64, u32)| format!("{:.2} ms/frame ({n} frames)", sum / n.max(1) as f64);
-            self.report = Some(format!("bench: occlusion on {}, {} | off {}, {}", mean(self.sums[1]), interval(self.sums[1]), mean(self.sums[0]), interval(self.sums[0])));
-        }
-    }
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
     camera: Camera,
     volume: PostProcessingVolume,
-    timer: Option<GpuTimer>,
-    bench: Option<Bench>,
+    timer: FrameTimer,
+    bench: Option<AbBench>,
     cam: usize,
     frozen_t: Option<f32>,
     trees: u32,
@@ -494,7 +351,7 @@ fn hud(st: &State) -> String {
     text += &format!(
         "{w} x {h} rendered · GPU {:.2} ms{} · CPU {:.2} ms in render · {:.1} ms between frames",
         st.gpu_ms,
-        if st.timer.is_some() { "" } else { " (no timestamps)" },
+        if st.timer.has_timestamps() { "" } else { " (no timestamps)" },
         st.cpu_ms,
         st.interval_ms
     );
@@ -615,9 +472,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     if let Some(c) = checkbox("occlusion") {
         c.set_checked(renderer.occlusion_culling());
     }
-    let timer = GpuTimer::new(renderer.device(), renderer.queue());
-    let bench = flag("bench", false).then(|| Bench { start: now() * 1000.0, sums: [(0.0, 0, 0.0, 0); 2], last_frame: now() * 1000.0, report: None });
-    log::info!("Kansei — Occlusion culling (WASM) ready: {trees} trees, timestamps {}", timer.is_some());
+    let timer = FrameTimer::new(renderer.device(), renderer.queue());
+    // bench=1: occlusion on (A) and off (B) in turn
+    let bench = flag("bench", false).then(|| AbBench::new(["occlusion on", "off"], now() * 1000.0, AbBenchOptions::default()));
+    log::info!("Kansei — Occlusion culling (WASM) ready: {trees} trees, timestamps {}", timer.has_timestamps());
 
     let keys = Rc::new(RefCell::new(Vec::new()));
     {
@@ -647,7 +505,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             }
         }
         let occlusion = match st.bench.as_ref().and_then(|b| b.phase(now() * 1000.0)) {
-            Some((on, _)) => on,
+            Some((variant, _)) => variant == 0,
             None => checkbox("occlusion").is_none_or(|c| c.checked()),
         };
         st.renderer.set_occlusion_culling(occlusion);
@@ -656,9 +514,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let t = st.frozen_t.unwrap_or(frame.time as f32);
         place_camera(&mut st.camera, CAMS[st.cam], t);
 
-        if let Some(timer) = st.timer.as_mut() {
-            timer.begin(st.renderer.device(), st.renderer.queue());
-        }
+        st.timer.begin();
         if st.rebuild_sky {
             if let Some(sky) = st.renderer.sky_occlusion_mut() {
                 sky.refresh();
@@ -667,23 +523,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let before = now();
         st.renderer.render_with_postprocessing(&mut st.scene, &mut st.camera, &mut st.volume);
         st.cpu_ms += ((now() - before) * 1000.0 - st.cpu_ms) * 0.05;
-        if let Some(timer) = st.timer.as_mut() {
-            timer.end(st.renderer.device(), st.renderer.queue());
-        }
+        st.timer.end();
 
         let now_ms = now() * 1000.0;
         st.interval_ms += (frame.dt as f64 * 1000.0 - st.interval_ms) * 0.05;
-        let gpu = st.timer.as_ref().map(|t| t.take()).unwrap_or_default();
+        let gpu = st.timer.take();
         for ms in &gpu {
             st.gpu_ms += (ms - st.gpu_ms) * 0.05;
         }
-        if let Some(bench) = st.bench.as_mut() {
-            let was_done = bench.report.is_some();
-            bench.record(&gpu, now_ms);
-            if let (false, Some(report)) = (was_done, &bench.report) {
-                log::info!("{report}");
-                set_text("bench", report);
-            }
+        if let Some(report) = st.bench.as_mut().and_then(|b| b.record(&gpu, now_ms)) {
+            log::info!("{report}");
+            set_text("bench", report);
         }
         st.frame += 1;
         if st.frame.is_multiple_of(10) {

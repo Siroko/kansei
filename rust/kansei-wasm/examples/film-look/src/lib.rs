@@ -132,7 +132,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let clock = frame.time as f32;
         let t = frozen_t.unwrap_or(clock);
 
-        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+        if let Some(fog) = volume.effect_mut::<VolumetricFogEffect>() {
             fog.time = clock;
         }
 

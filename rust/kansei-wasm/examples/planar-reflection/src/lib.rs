@@ -338,7 +338,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         frame.resize(&mut renderer, &mut camera);
         if let Some(size) = frame.resized {
             // the reflection's target follows the canvas: a new one, wired to the fog and the water
-            let fog = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>().filter(|_| fog_in_reflection);
+            let fog = volume.effect_mut::<VolumetricFogEffect>().filter(|_| fog_in_reflection);
             let reflection = lake_reflection(&renderer, size, occlusion, screen_space, fog);
             if let Some(r) = scene.get_renderable_mut(water) {
                 r.material.set_bindable(1, reflection.material_texture());
@@ -351,7 +351,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let clock = frame.time as f32;
         let t = frozen_t.unwrap_or(clock);
 
-        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+        if let Some(fog) = volume.effect_mut::<VolumetricFogEffect>() {
             fog.time = clock;
         }
         water_params[0] = clock;

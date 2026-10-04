@@ -64,6 +64,17 @@ impl PostProcessingVolume {
     }
 
     /// Whether any effect wants a jittered projection (the renderer then jitters the camera).
+    /// The chain's first effect of type `T`, e.g. `volume.effect::<ToneMapEffect>()`.
+    pub fn effect<T: PostProcessingEffect + 'static>(&self) -> Option<&T> {
+        self.effects.iter().find_map(|e| e.as_any().downcast_ref::<T>())
+    }
+
+    /// The chain's first effect of type `T`, to change its options or time each frame:
+    /// `if let Some(fog) = volume.effect_mut::<VolumetricFogEffect>() { fog.time = t; }`.
+    pub fn effect_mut<T: PostProcessingEffect + 'static>(&mut self) -> Option<&mut T> {
+        self.effects.iter_mut().find_map(|e| e.as_any_mut().downcast_mut::<T>())
+    }
+
     pub fn wants_jitter(&self) -> bool {
         self.effects.iter().any(|e| e.is_active() && e.wants_jitter())
     }

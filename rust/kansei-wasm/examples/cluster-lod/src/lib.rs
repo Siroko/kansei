@@ -24,6 +24,7 @@ use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, S
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pacing::FrameTimer;
+use kansei_core::profiling::{AbBench, AbBenchOptions};
 use kansei_core::postprocessing::{effects::{exposure_from_ev100, ToneMapEffect, ToneMapOptions}, PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, now, param, param_or, Canvas};
@@ -122,64 +123,14 @@ fn material() -> Material {
     m
 }
 
-/// `bench=<mode>`: alternate clusters and `mode`, averaging each one's GPU time and frame
-/// interval (after a warm-up, and ignoring the start of each phase).
-struct Bench {
-    other: usize,
-    start: f64,
-    /// (GPU ms, GPU samples, frame intervals ms, frames) of clusters and the other mode
-    sums: [(f64, u32, f64, u32); 2],
-    last_frame: f64,
-    report: Option<String>,
-}
-
-const BENCH_WARMUP_MS: f64 = 3000.0;
-const BENCH_PHASE_MS: f64 = 3000.0;
-const BENCH_SETTLE_MS: f64 = 500.0;
-const BENCH_PHASES: u32 = 8;
-
-impl Bench {
-    /// (mode, measuring) at `now`, or None when done.
-    fn phase(&self, now: f64) -> Option<(usize, bool)> {
-        let t = now - self.start - BENCH_WARMUP_MS;
-        if t < 0.0 {
-            return Some((0, false));
-        }
-        let phase = (t / BENCH_PHASE_MS) as u32;
-        (phase < BENCH_PHASES).then_some((if phase.is_multiple_of(2) { 0 } else { self.other }, t % BENCH_PHASE_MS >= BENCH_SETTLE_MS))
-    }
-
-    /// The camera's time at `now`: still through each pair of phases (both modes see the same
-    /// view), a different stretch of the loop for each pair.
-    fn view_time(&self, now: f64) -> f32 {
-        let pair = ((now - self.start - BENCH_WARMUP_MS).max(0.0) / BENCH_PHASE_MS) as u32 / 2;
-        5.0 + 9.0 * pair as f32
-    }
-
-    fn record(&mut self, gpu: &[f64], now: f64) {
-        if let Some((mode, true)) = self.phase(now) {
-            let sum = &mut self.sums[(mode != 0) as usize];
-            sum.0 += gpu.iter().sum::<f64>();
-            sum.1 += gpu.len() as u32;
-            sum.2 += now - self.last_frame;
-            sum.3 += 1;
-        }
-        self.last_frame = now;
-        if self.phase(now).is_none() && self.report.is_none() {
-            let mean = |(sum, n, _, _): (f64, u32, f64, u32)| if n > 0 { format!("{:.2} ms GPU ({n} samples)", sum / n as f64) } else { "no GPU timestamps".into() };
-            let interval = |(_, _, sum, n): (f64, u32, f64, u32)| format!("{:.2} ms/frame ({n} frames)", sum / n.max(1) as f64);
-            self.report = Some(format!("bench: clusters {}, {} | {} {}, {}", mean(self.sums[0]), interval(self.sums[0]), MODES[self.other], mean(self.sums[1]), interval(self.sums[1])));
-        }
-    }
-}
-
 struct State {
     renderer: Renderer,
     scene: Scene,
     camera: Camera,
     volume: PostProcessingVolume,
     timer: FrameTimer,
-    bench: Option<Bench>,
+    /// `bench=<mode>`: clusters (A) and `mode` (B) in turn, and the mode B is
+    bench: Option<(AbBench, usize)>,
     /// scene indices of each mode's renderables
     modes: [Vec<usize>; 3],
     mode: usize,
@@ -302,7 +253,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     camera.update_projection_matrix();
 
     let mode = MODES.iter().position(|&m| Some(m) == param("mode").as_deref()).unwrap_or(0);
-    let bench = param("bench").and_then(|b| MODES.iter().position(|&m| m == b).filter(|&m| m != 0)).map(|other| Bench { other, start: now() * 1000.0, sums: [(0.0, 0, 0.0, 0); 2], last_frame: now() * 1000.0, report: None });
+    let bench = param("bench")
+        .and_then(|b| MODES.iter().position(|&m| m == b).filter(|&m| m != 0))
+        .map(|other| (AbBench::new([MODES[0], MODES[other]], now() * 1000.0, AbBenchOptions::default()), other));
     let timer = FrameTimer::new(renderer.device(), renderer.queue());
     log::info!("Kansei — Cluster LOD (WASM) ready: {rocks} rocks of {triangles} triangles, {} clusters over {} levels built in {build_ms:.0} ms", mesh.clusters.len(), mesh.levels().len());
 
@@ -313,13 +266,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         frame.resize(&mut st.renderer, &mut st.camera);
         // the bench's clock, in milliseconds
         let now_ms = now() * 1000.0;
-        if let Some((mode, _)) = st.bench.as_ref().and_then(|b| b.phase(now_ms)) {
+        if let Some(mode) = st.bench.as_ref().and_then(|(b, other)| Some(if b.phase(now_ms)?.0 == 0 { 0 } else { *other })) {
             if mode != st.mode {
                 set_mode(st, mode);
             }
         }
         let t = match (&st.bench, st.frozen_t) {
-            (Some(bench), _) => bench.view_time(now_ms),
+            // still through each A/B pair (both modes see the same view), another stretch of the
+            // loop for each pair
+            (Some((bench, _)), _) => 5.0 + 9.0 * bench.pair(now_ms) as f32,
             (None, Some(t)) => t,
             (None, None) => frame.time as f32,
         };
@@ -334,13 +289,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         for ms in &gpu {
             st.gpu_ms += (ms - st.gpu_ms) * 0.05;
         }
-        if let Some(bench) = st.bench.as_mut() {
-            let was_done = bench.report.is_some();
-            bench.record(&gpu, now_ms);
-            if let (false, Some(report)) = (was_done, &bench.report) {
-                log::info!("{report}");
-                set_text("bench", report);
-            }
+        if let Some(report) = st.bench.as_mut().and_then(|(b, _)| b.record(&gpu, now_ms)) {
+            log::info!("{report}");
+            set_text("bench", report);
         }
         st.frame += 1;
         if st.profile && st.frame.is_multiple_of(240) {

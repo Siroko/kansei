@@ -175,10 +175,8 @@ impl State {
         let s = &self.settings;
         // a rack focus between the leaves at 2 m and the trunks at 30 m, or a fixed focus
         let focus = if s.rack { 2.0 * 15f32.powf(0.5 - 0.5 * (t * std::f32::consts::TAU / 8.0).cos()) } else { s.focus_m };
-        for effect in &mut self.volume.effects {
-            if let Some(dof) = effect.as_any_mut().downcast_mut::<CinematicDepthOfFieldEffect>() {
-                dof.lens.focus_distance_m = focus;
-            }
+        if let Some(dof) = self.volume.effect_mut::<CinematicDepthOfFieldEffect>() {
+            dof.lens.focus_distance_m = focus;
         }
         let eye = Vec3::new(0.0, 1.5, 0.0);
         self.camera.set_position(eye.x, eye.y, eye.z);

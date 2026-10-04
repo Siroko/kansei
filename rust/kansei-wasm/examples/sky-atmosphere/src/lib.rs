@@ -264,15 +264,15 @@ impl State {
             l.intensity = 1.0;
         }
         let ev100 = s.ev.unwrap_or_else(|| auto_ev100(elevation));
-        for effect in &mut self.volume.effects {
-            if let Some(tonemap) = effect.as_any_mut().downcast_mut::<ToneMapEffect>() {
-                tonemap.options.exposure = exposure_from_ev100_lens(ev100, LENS_ATTENUATION_UE4);
-            } else if let Some(fog) = effect.as_any_mut().downcast_mut::<VolumetricFogEffect>() {
-                fog.update_lights(self.scene.lights());
-                fog.time = t;
-            } else if let Some(clouds) = effect.as_any_mut().downcast_mut::<VolumetricCloudsEffect>() {
-                clouds.time = t;
-            }
+        if let Some(tonemap) = self.volume.effect_mut::<ToneMapEffect>() {
+            tonemap.options.exposure = exposure_from_ev100_lens(ev100, LENS_ATTENUATION_UE4);
+        }
+        if let Some(fog) = self.volume.effect_mut::<VolumetricFogEffect>() {
+            fog.update_lights(self.scene.lights());
+            fog.time = t;
+        }
+        if let Some(clouds) = self.volume.effect_mut::<VolumetricCloudsEffect>() {
+            clouds.time = t;
         }
 
         self.sky.update(self.renderer.device(), self.renderer.queue(), &mut self.camera);

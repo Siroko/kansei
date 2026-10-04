@@ -6,8 +6,8 @@
 //!
 //! URL parameters: `cam=front|behind|top|wall`, `cull=main` (CPU-cull the trunks to the camera
 //! only, the bug GPU per-view culling avoids), `drive=1`, `t=<seconds>` (freeze), `shadows=0`,
-//! `fog=0`, `stats=1` (log the CPU time of the render call and the frame interval, which is the
-//! GPU time when the browser runs without vsync), `casters=<n>` (n more
+//! `fog=0`, `stats=1` (log the renderer's profile, each pass's GPU time and the CPU sections, and the
+//! frame interval, which is the GPU time when the browser runs without vsync), `casters=<n>` (n more
 //! renderables), `lamps=<n>` (n small downlights), `clusters=0` (every light at every pixel),
 //! `shafts=<steps>` (the beams raymarched per pixel with that many samples per light, instead of
 //! in the fog's froxels).
@@ -219,15 +219,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let drive = flag("drive", false);
     // `cull=main`: (trunks, their buffer, scene index) to cull on the CPU against the camera
     let cpu_cull = cull_main.then(|| (trunks.clone(), all_trunks.clone(), forest));
-    // `stats=1`: CPU milliseconds spent in render_with_postprocessing summed over a window, its
-    // frame count, and when it started (for the frame interval, GPU-bound without vsync)
-    let mut stats = flag("stats", false).then(|| (0.0f64, 0u32, kansei_wasm::now()));
+    // `stats=1`: the renderer's profile (each pass's GPU time, the frame's CPU sections) and the
+    // frame interval (GPU-bound without vsync), over windows of 240 frames
+    let mut stats = flag("stats", false).then(|| (0u32, kansei_wasm::now()));
+    renderer.set_profiling(stats.is_some());
     kansei_wasm::run(&canvas, move |frame| {
         frame.resize(&mut renderer, &mut camera);
         let clock = frame.time as f32;
         let t = frozen_t.unwrap_or(clock);
 
-        if let Some(fog) = volume.effects[0].as_any_mut().downcast_mut::<VolumetricFogEffect>() {
+        if let Some(fog) = volume.effect_mut::<VolumetricFogEffect>() {
             fog.time = clock;
         }
 
@@ -272,16 +273,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             }
             renderer.invalidate_bundle();
         }
-        let before = kansei_wasm::now();
         renderer.render_with_postprocessing(&mut scene, &mut camera, &mut volume);
-        if let Some((sum, frames, window_start)) = stats.as_mut() {
-            let now = kansei_wasm::now();
-            *sum += (now - before) * 1000.0;
+        if let Some((frames, window_start)) = stats.as_mut() {
             *frames += 1;
             if *frames == 240 {
-                let interval = (now - *window_start) * 1000.0 / 240.0;
-                log::info!("frame: {:.2} ms CPU in render_with_postprocessing, {interval:.2} ms between frames", *sum / 240.0);
-                *sum = 0.0;
+                let now = kansei_wasm::now();
+                log::info!("{:.2} ms between frames\n{}", (now - *window_start) * 1000.0 / 240.0, renderer.take_profile().report());
                 *frames = 0;
                 *window_start = now;
             }
