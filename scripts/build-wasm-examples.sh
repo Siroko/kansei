@@ -19,14 +19,6 @@ out="$(cd "$out" && pwd)"
 #   joydivision: plays a commercial recording the viewer supplies; the page stays local-only.
 skip=" joydivision "
 
-# Files a page never loads, left out of the site.
-#   pathtracer: scene.gltf/scene.bin (24 MB) are an unused scene; the example loads the dragon.
-unused_files() {
-    case "$1" in
-        pathtracer) echo "assets/scene.gltf assets/scene.bin" ;;
-    esac
-}
-
 # One target dir for every example, so the engine and wgpu compile once.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/rust/target/wasm-examples}"
 
@@ -53,7 +45,6 @@ for name in "${names[@]}"; do
     mkdir -p "$dest"
     # the page and its files; never a pkg/ committed or left in www/, nor linked private packs
     rsync -a --exclude 'pkg/' --exclude 'pack/' --exclude '*.kmm' --exclude 'make_assets.py' "$src/www/" "$dest/"
-    for f in $(unused_files "$name"); do rm -f "$dest/$f"; done
     (cd "$src" && wasm-pack --log-level warn build --target web --release --no-pack --out-dir "$dest/pkg")
     rm -f "$dest/pkg/.gitignore" "$dest/pkg"/*.d.ts
     # served as <name>/index.html with pkg/ beside it: pages written for www/ import ../pkg/.
