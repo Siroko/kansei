@@ -24,7 +24,7 @@ It can export from an Unreal Engine project, headless.
 Keep packs outside the repository and link them in. `*.kmm` is gitignored, and so is `www/pack/`:
 
 ```sh
-ln -s /path/to/private/packs rust/kansei-wasm/examples/motion-matching/www/pack
+ln -s /path/to/private/packs rust/kansei-wasm/demos/motion-matching/www/pack
 ```
 
 An app that stores its packs another way (encrypted, say) can depend on this crate and call
@@ -114,7 +114,7 @@ character is in it:
 ## Build and run
 
 ```sh
-cd rust/kansei-wasm/examples/motion-matching
+cd rust/kansei-wasm/demos/motion-matching
 wasm-pack build --target web --release
 python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html)
 ```
@@ -185,7 +185,7 @@ since the generated packs carry their own SOMA body.
 They are private and stay out of git (`www/pack/` is gitignored). Link them in:
 
 ```sh
-rust/kansei-wasm/examples/motion-matching/link-packs.sh [data]   # default ~/Documents/dev/kansei-private-data
+rust/kansei-wasm/demos/motion-matching/link-packs.sh [data]   # default ~/Documents/dev/kansei-private-data
 ```
 
 That links `<data>/genanim/pack` as `www/pack/gen` and `<data>/gasp/pack` as `www/pack/gasp`

@@ -82,7 +82,7 @@ P shows a panel (Tweakpane), hidden at first:
 ## Build and run
 
 ```sh
-cd rust/kansei-wasm/examples/lake
+cd rust/kansei-wasm/demos/lake
 wasm-pack build --target web --release
 python3 -m http.server 8080   # then open http://localhost:8080/www/
 ```

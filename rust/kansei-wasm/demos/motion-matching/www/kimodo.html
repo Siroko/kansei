@@ -117,7 +117,7 @@
         if (missing) {
             document.getElementById('missing').innerHTML =
                 `<b>The pack ${packUrl} isn't linked.</b>\n\nThe generated packs are private and stay out of git. Link them into www/pack/:\n\n` +
-                `  <code>rust/kansei-wasm/examples/motion-matching/link-packs.sh [private-data-dir]</code>\n\n` +
+                `  <code>rust/kansei-wasm/demos/motion-matching/link-packs.sh [private-data-dir]</code>\n\n` +
                 `(default ~/Documents/dev/kansei-private-data: its genanim/pack/ becomes www/pack/gen/, gasp/pack/ www/pack/gasp/), then reload, or pick a linked pack in the panel. See the motion-matching README (Kimodo).`;
             throw new Error(`pack ${packUrl} not linked`);
         }

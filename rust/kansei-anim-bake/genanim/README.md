@@ -105,7 +105,7 @@ bake config, the rig's first:
 ## 3. Bake and look
 
 Bake as usual (`cargo run --release -p kansei-anim-bake -- config.json`) with `meta` `source`
-and `license` filled in from `DATA-NOTICE.md`. In `rust/kansei-wasm/examples/motion-matching`:
+and `license` filled in from `DATA-NOTICE.md`. In `rust/kansei-wasm/demos/motion-matching`:
 
 - `?pack=<url>&drive=1` drives a fixed route (starts, turns, stops, a run, pivots, strafes) so two
   packs can be recorded with the same input; `drive_restart()` starts it over;

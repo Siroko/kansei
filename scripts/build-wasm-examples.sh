@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds every Rust/WASM example under rust/kansei-wasm/examples into a static tree served at
-# kansei.graphics/examples/<name>/: each example's www/ page and files next to its wasm-pack pkg/.
+# Builds every Rust/WASM example and demo (rust/kansei-wasm/examples and rust/kansei-wasm/demos,
+# the two tiers) into one static tree served at kansei.graphics/examples/<name>/: each one's www/
+# page and files next to its wasm-pack pkg/. Names are unique across the two folders.
 #
 #   scripts/build-wasm-examples.sh [out-dir]    (default: build/wasm-examples)
 #
@@ -10,15 +11,15 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-examples="$root/rust/kansei-wasm/examples"
+tiers=("$root/rust/kansei-wasm/examples" "$root/rust/kansei-wasm/demos")
 out="${1:-$root/build/wasm-examples}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 
-# Not published (space-separated example names).
+# Not published (space-separated names).
 #   joydivision: plays a commercial recording the viewer supplies; the page stays local-only.
 #   motion-matching: animates a character from private animation packs (.kmm) that never ship;
-#     its world without the character is the lake example, which is published.
+#     its world without the character is the lake demo, which is published.
 skip=" joydivision motion-matching "
 
 # One target dir for every example, so the engine and wgpu compile once.
@@ -26,20 +27,33 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/rust/target/wasm-examples}"
 
 # Examples with their own .cargo/config.toml (rustflags such as +simd128) last, so a shared
 # dependency is not rebuilt back and forth between flag sets.
-names=()
-for dir in "$examples"/*/; do
-    name="$(basename "$dir")"
-    [[ -f "$dir/Cargo.toml" && -f "$dir/www/index.html" ]] || continue
-    [[ "$skip" == *" $name "* ]] && { echo "skip $name"; continue; }
-    [[ -d "$dir/.cargo" ]] || names+=("$name")
+# (dirs: each one's source folder, in build order; names: the published names alike)
+dirs=()
+for tier in "${tiers[@]}"; do
+    for dir in "$tier"/*/; do
+        name="$(basename "$dir")"
+        [[ -f "$dir/Cargo.toml" && -f "$dir/www/index.html" ]] || continue
+        [[ "$skip" == *" $name "* ]] && { echo "skip $name"; continue; }
+        [[ -d "$dir/.cargo" ]] || dirs+=("${dir%/}")
+    done
 done
-for dir in "$examples"/*/; do
-    name="$(basename "$dir")"
-    [[ -d "$dir/.cargo" && -f "$dir/www/index.html" && "$skip" != *" $name "* ]] && names+=("$name")
+for tier in "${tiers[@]}"; do
+    for dir in "$tier"/*/; do
+        name="$(basename "$dir")"
+        [[ -d "$dir/.cargo" && -f "$dir/www/index.html" && "$skip" != *" $name "* ]] && dirs+=("${dir%/}")
+    done
+done
+names=()
+seen=" "
+for src in "${dirs[@]}"; do
+    name="$(basename "$src")"
+    [[ "$seen" == *" $name "* ]] && { echo "error: two examples or demos named $name" >&2; exit 1; }
+    seen+="$name "
+    names+=("$name")
 done
 
-for name in "${names[@]}"; do
-    src="$examples/$name"
+for src in "${dirs[@]}"; do
+    name="$(basename "$src")"
     dest="$out/$name"
     echo "=== $name"
     start=$SECONDS

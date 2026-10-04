@@ -1,5 +1,5 @@
-//! The examples use kansei-core through its public API: none pulls in the engine's private
-//! shaders or test fixtures by a relative path (`include_str!("../../../../kansei-core/src/...")`).
+//! The examples and demos use kansei-core through its public API: none pulls in the engine's
+//! private shaders or test fixtures by a relative path (`include_str!("../../../../kansei-core/src/...")`).
 
 use std::path::Path;
 
@@ -16,10 +16,13 @@ fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 #[test]
 fn no_example_includes_engine_sources() {
-    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    sources(&examples, &mut files);
-    assert!(files.len() > 10, "found only {} example sources under {}", files.len(), examples.display());
+    for tier in ["examples", "demos"] {
+        let before = files.len();
+        sources(&root.join(tier), &mut files);
+        assert!(files.len() - before > 5, "found only {} sources under {tier}", files.len() - before);
+    }
     let offenders: Vec<String> = files
         .iter()
         .flat_map(|file| {
@@ -27,9 +30,9 @@ fn no_example_includes_engine_sources() {
             text.lines()
                 .enumerate()
                 .filter(|(_, line)| (line.contains("include_str!") || line.contains("include_bytes!")) && line.contains("kansei-core/"))
-                .map(|(i, line)| format!("{}:{}: {}", file.strip_prefix(&examples).unwrap().display(), i + 1, line.trim()))
+                .map(|(i, line)| format!("{}:{}: {}", file.strip_prefix(root).unwrap().display(), i + 1, line.trim()))
                 .collect::<Vec<_>>()
         })
         .collect();
-    assert!(offenders.is_empty(), "examples reaching into kansei-core's files (use its public constants instead):\n{}", offenders.join("\n"));
+    assert!(offenders.is_empty(), "examples or demos reaching into kansei-core's files (use its public constants instead):\n{}", offenders.join("\n"));
 }
