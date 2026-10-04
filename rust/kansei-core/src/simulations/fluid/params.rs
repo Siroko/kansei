@@ -39,6 +39,25 @@ pub struct FluidSimulationOptions {
     pub pbf: PbfOptions,
 }
 
+impl FluidSimulationOptions {
+    /// These options, tuned for `base_count` particles, for `count` particles filling the same
+    /// volume: the smoothing radius scales by (count / base_count)^-1/3 so a neighbourhood holds
+    /// as many particles, the near pressure with the radius, and the density target by the
+    /// count ratio over the radius. Pressure and time step are left: how stiff a fluid stays
+    /// stable at a size is for the caller to tune.
+    pub fn scaled_to_count(&self, base_count: u32, count: u32) -> Self {
+        let ratio = count.max(1) as f32 / base_count.max(1) as f32;
+        let radius = ratio.powf(-1.0 / 3.0);
+        Self {
+            max_particles: count,
+            smoothing_radius: self.smoothing_radius * radius,
+            near_pressure_multiplier: self.near_pressure_multiplier * radius,
+            density_target: self.density_target * ratio / radius,
+            ..self.clone()
+        }
+    }
+}
+
 pub const DEFAULT_OPTIONS: FluidSimulationOptions = FluidSimulationOptions {
     max_particles: 10000,
     dimensions: 2,
