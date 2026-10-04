@@ -10,10 +10,14 @@ use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, Shade
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{Canvas, Frame};
+use kansei_core::sdf::{FontAtlas, MsdfTextOptions};
+use kansei_wasm::{fetch_bytes, Canvas, Frame};
 
 mod fft_compute;
 mod text_layout;
+
+/// The displacement the page's panel starts at.
+const FFT_AMPLITUDE: f32 = 17.0;
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
@@ -42,7 +46,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         width, height,
         scene: Scene::new(),
         fft_compute: None,
-        fft_amplitude: 6.0,
+        fft_amplitude: FFT_AMPLITUDE,
+        noise_dt: 0.0,
         particle_count: 0,
         text_scene_idx: None,
         text_offset: [0.0, 0.0, 1.0],
@@ -66,6 +71,8 @@ struct State {
     scene: Scene,
     fft_compute: Option<fft_compute::FftCompute>,
     fft_amplitude: f32,
+    /// Seconds rendered since the last update_fft: how far the noise field moves on the next.
+    noise_dt: f32,
     particle_count: u32,
     text_scene_idx: Option<usize>,
     text_offset: [f32; 3],
@@ -79,6 +86,7 @@ impl State {
             self.width = width;
             self.height = height;
         }
+        self.noise_dt += frame.dt;
         self.controls.update(&mut self.camera, 0.0);
         self.camera.aspect = self.width as f32 / self.height as f32;
         self.camera.update_projection_matrix();
@@ -99,38 +107,31 @@ fn with_state<F: FnOnce(&mut State)>(f: F) {
     });
 }
 
+/// Load the font and lay out the lyrics: `lines_json` and `timestamps_json` are JSON arrays of
+/// each line's text and start time (seconds).
 #[wasm_bindgen]
-pub fn init_text(
-    words_json: &str,
-    glyphs_json: &str,
-    msdf_rgba: &[u8],
-    atlas_width: u32,
-    atlas_height: u32,
-    timestamps_json: &str,
-) {
-    let lines: Vec<String> = serde_json::from_str(words_json)
-        .expect("Failed to parse lines JSON");
-    let glyphs: Vec<text_layout::GlyphMetrics> = serde_json::from_str(glyphs_json)
-        .expect("Failed to parse glyphs JSON");
-    let timestamps: Vec<f32> = serde_json::from_str(timestamps_json)
-        .expect("Failed to parse timestamps JSON");
+pub async fn init_text(lines_json: String, timestamps_json: String) -> Result<(), JsValue> {
+    let json_error = |e: serde_json::Error| JsValue::from_str(&format!("lyrics JSON: {e}"));
+    let lines: Vec<String> = serde_json::from_str(&lines_json).map_err(json_error)?;
+    let timestamps: Vec<f32> = serde_json::from_str(&timestamps_json).map_err(json_error)?;
+    let font = fetch_bytes("assets/fonts/L10-medium.arfont").await?;
+    let atlas = FontAtlas::parse(&font).map_err(|e| JsValue::from_str(&format!("font: {e:?}")))?;
 
     let font_size: f32 = 2.5;
     let line_spacing: f32 = 3.5;
-    let fft_amplitude: f32 = 6.0;
 
     let data = text_layout::build_lyrics_particles(
-        &lines, &timestamps, &glyphs, font_size, line_spacing,
+        &lines, &timestamps, &atlas, font_size, line_spacing,
     );
 
     log::info!("Joy Division: {} lines, {} total particles, atlas {}x{}, {} glyph metrics",
-        data.total_lines, data.total_particles, atlas_width, atlas_height, glyphs.len());
+        data.total_lines, data.total_particles, atlas.width, atlas.height, atlas.glyphs.len());
 
     with_state(|st| {
         st.particle_count = data.total_particles;
 
         // 1. Create FFT compute (owns the positions buffer)
-        let fft = fft_compute::FftCompute::new(&st.renderer, &data, line_spacing, fft_amplitude);
+        let fft = fft_compute::FftCompute::new(&st.renderer, &data, line_spacing, st.fft_amplitude);
 
         // 2. Wrap the compute's positions buffer as vertex source
         let pos_buf = ComputeBuffer::from_external(
@@ -138,11 +139,11 @@ pub fn init_text(
         ).with_vertex_vec4(3);
 
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
-        let img_buf = ComputeBuffer::from_slice(
-            "JoyDiv/ImageBounds", BufferType::Storage, usage, &data.image_bounds,
+        let atlas_buf = ComputeBuffer::from_slice(
+            "JoyDiv/AtlasRects", BufferType::Storage, usage, &data.atlas_rects,
         ).with_vertex_vec4(4);
         let plane_buf = ComputeBuffer::from_slice(
-            "JoyDiv/PlaneBounds", BufferType::Storage, usage, &data.plane_bounds,
+            "JoyDiv/PlaneRects", BufferType::Storage, usage, &data.plane_rects,
         ).with_vertex_vec4(5);
         let col_buf = ComputeBuffer::from_slice(
             "JoyDiv/Colors", BufferType::Storage, usage, &data.colors,
@@ -151,30 +152,12 @@ pub fn init_text(
         // 3. InstancedGeometry
         let base = PlaneGeometry::new(1.0, 1.0);
         let instanced = InstancedGeometry::new(
-            base, data.total_particles, vec![pos_buf, img_buf, plane_buf, col_buf],
+            base, data.total_particles, vec![pos_buf, atlas_buf, plane_buf, col_buf],
         );
 
-        // 4. MSDF atlas texture + sampler + material
-        let atlas = kansei_core::buffers::Texture::from_rgba("MSDF/Atlas", atlas_width, atlas_height, msdf_rgba);
-        let atlas_sampler = kansei_core::buffers::Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear)
-            .with_anisotropy(8);
-        const MSDF_WGSL: &str = include_str!("shaders/msdf_text.wgsl");
-        let mut mat = Material::new(
-            "JoyDiv/MSDF",
-            MSDF_WGSL,
-            vec![
-                Binding::texture_2d(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
-                Binding::sampler(1, ShaderStages::FRAGMENT),
-            ],
-            MaterialOptions {
-                transparent: true,
-                depth_write: Some(true),
-                cull_mode: CullMode::None,
-                ..Default::default()
-            },
-        );
-        mat.set_bindable(0, atlas);
-        mat.set_bindable(1, atlas_sampler);
+        // 4. MSDF glyph material: fft_displace puts each glyph's turn about x in position.w.
+        //    Glyphs write depth, and the atlas is sampled anisotropically.
+        let mat = Material::msdf_text("JoyDiv/MSDF", &atlas, MsdfTextOptions { rotate_x_by_w: true });
 
         // 5. Add text renderable to scene
         let renderable = Renderable::new(instanced, mat);
@@ -280,9 +263,10 @@ pub fn init_text(
             st.scene.add(SceneNode::Renderable(wave_renderable));
         }
 
-        // 7. Store FFT compute
+        // 8. Store FFT compute
         st.fft_compute = Some(fft);
     });
+    Ok(())
 }
 
 /// Called from JS each frame with FFT frequency data.
@@ -291,7 +275,7 @@ pub fn update_fft(fft_data: &[u8], current_time: f32) {
     with_state(|st| {
         if let Some(ref mut fft) = st.fft_compute {
             fft.set_fft_amplitude(st.fft_amplitude);
-            fft.update(fft_data, current_time);
+            fft.update(fft_data, current_time, std::mem::take(&mut st.noise_dt));
         }
     });
 }

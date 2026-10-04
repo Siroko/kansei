@@ -1,16 +1,7 @@
-// GlyphData parsing — convert JS glyph JSON into GPU buffer data.
+// Particle data: one particle per letter, each word a chain whose first letter steers (the
+// vehicle) and whose others follow it at their glyph advances.
 
-use std::collections::HashMap;
-use serde::Deserialize;
-
-/// Per-glyph metrics deserialized from MSDF font atlas JSON.
-#[derive(Deserialize, Clone)]
-pub struct GlyphMetrics {
-    pub codepoint: u32,
-    pub advance: f32,
-    pub image_bounds: [f32; 4], // [left, top, right, bottom] in UV space
-    pub plane_bounds: [f32; 4], // [left, top, right, bottom] in pixel space
-}
+use kansei_core::sdf::{FontAtlas, GlyphRects};
 
 /// Flat arrays ready for GPU buffer upload.
 pub struct ParticleData {
@@ -18,27 +9,28 @@ pub struct ParticleData {
     pub total_words: u32,
     pub positions: Vec<f32>,    // P * 4 (x, y, z, 1.0)
     pub velocities: Vec<f32>,   // P * 4 (vx, vy, vz, 0.0)
-    pub image_bounds: Vec<f32>, // P * 4 (MSDF UV rect)
-    pub plane_bounds: Vec<f32>, // P * 4 (glyph pixel rect, scaled by font_size)
+    pub atlas_rects: Vec<f32>,  // P * 4 (GlyphRects::atlas)
+    pub plane_rects: Vec<f32>,  // P * 4 (GlyphRects::plane, font_size world units per em)
     pub colors: Vec<f32>,       // P * 4 (rgba)
-    pub word_meta: Vec<u32>,    // P * 4 (word_id, letter_idx, word_len, particle_offset)
+    pub word_meta: Vec<u32>,    // P * 4 (word_id, letter_idx, word_len, word's first particle)
     pub rest_lengths: Vec<f32>, // P (verlet rest distance to previous letter)
 }
 
-/// Build flat particle arrays from word list and glyph metrics.
+/// Per-particle colours: each word takes the palette entry of its id.
+pub fn word_colors(word_meta: &[u32], palette: &[[f32; 4]]) -> Vec<f32> {
+    word_meta.chunks_exact(4).flat_map(|meta| palette[meta[0] as usize % palette.len()]).collect()
+}
+
+/// Build flat particle arrays from the word list and the font atlas's metrics.
 pub fn build_particle_data(
     words: &[String],
-    glyphs: &[GlyphMetrics],
+    atlas: &FontAtlas,
     font_size: f32,
     palette: &[[f32; 4]],
     bounds_size: f32,
     letter_spacing: f32,
 ) -> ParticleData {
-    // Build codepoint → glyph lookup
-    let glyph_map: HashMap<u32, &GlyphMetrics> =
-        glyphs.iter().map(|g| (g.codepoint, g)).collect();
-
-    // Collect chars per word (filter out spaces for multi-word phrases)
+    // Letters per word (spaces in multi-word phrases dropped)
     let word_chars: Vec<Vec<char>> = words
         .iter()
         .map(|w| w.chars().filter(|c| *c != ' ').collect())
@@ -50,9 +42,8 @@ pub fn build_particle_data(
 
     let mut positions = Vec::with_capacity(p * 4);
     let mut velocities = Vec::with_capacity(p * 4);
-    let mut image_bounds = Vec::with_capacity(p * 4);
-    let mut plane_bounds = Vec::with_capacity(p * 4);
-    let mut colors = Vec::with_capacity(p * 4);
+    let mut atlas_rects = Vec::with_capacity(p * 4);
+    let mut plane_rects = Vec::with_capacity(p * 4);
     let mut word_meta = Vec::with_capacity(p * 4);
     let mut rest_lengths = Vec::with_capacity(p);
 
@@ -65,12 +56,13 @@ pub fn build_particle_data(
         (*rng as f32 / u64::MAX as f32) * 2.0 - 1.0
     };
 
-    let zeroed_bounds: [f32; 4] = [0.0; 4];
+    // a character the atlas lacks draws an empty quad
+    let empty = GlyphRects { atlas: [0.0; 4], plane: [0.0; 4] };
     let mut global_particle_idx: u32 = 0;
 
     for (word_id, chars) in word_chars.iter().enumerate() {
         let word_len = chars.len() as u32;
-        // The first particle of this word — used by verlet to find the chain
+        // The first particle of this word: verlet finds the chain from it
         let word_start_offset = global_particle_idx;
 
         // Random starting position for this word
@@ -80,59 +72,25 @@ pub fn build_particle_data(
         let oz = rand_f(&mut rng) * spread;
 
         for (letter_idx, ch) in chars.iter().enumerate() {
-            let cp = *ch as u32;
-            let glyph = glyph_map.get(&cp);
+            let glyph = atlas.glyph(*ch);
 
-            // Position — all letters start at word origin
+            // All letters start at the word's origin, at rest
             positions.extend_from_slice(&[ox, oy, oz, 1.0]);
-
-            // Velocity — zero
             velocities.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
 
-            // Image bounds (UV rect)
-            let ib = glyph.map_or(&zeroed_bounds, |g| &g.image_bounds);
-            image_bounds.extend_from_slice(ib);
+            let rects = glyph.map_or(empty, |g| atlas.glyph_rects(g, font_size));
+            atlas_rects.extend_from_slice(&rects.atlas);
+            plane_rects.extend_from_slice(&rects.plane);
 
-            // Plane bounds scaled by font_size
-            let pb = glyph.map_or(&zeroed_bounds, |g| &g.plane_bounds);
-            plane_bounds.extend_from_slice(&[
-                pb[0] * font_size,
-                pb[1] * font_size,
-                pb[2] * font_size,
-                pb[3] * font_size,
-            ]);
+            // Verlet's anchor is word_start_offset + letter_idx - 1
+            word_meta.extend_from_slice(&[word_id as u32, letter_idx as u32, word_len, word_start_offset]);
 
-            // Color — cycle through palette per word
-            let word_color = palette[word_id % palette.len()];
-            colors.extend_from_slice(&word_color);
-
-            // Word meta: word_start_offset is the WORD's first particle index
-            // (not per-particle). Verlet uses: prevIdx = word_start_offset + letter_idx - 1.
-            word_meta.extend_from_slice(&[
-                word_id as u32,
-                letter_idx as u32,
-                word_len,
-                word_start_offset,
-            ]);
-
-            // Rest length — distance constraint to previous letter.
-            //
-            // Computing proper spacing per pair:
-            //   1. prev glyph's right edge (plane_bounds[2]) = how far it extends
-            //   2. curr glyph's left edge (plane_bounds[0]) = where it starts (can be negative)
-            //   3. The non-overlapping distance = prev_right - curr_left + gap
-            //
-            // This accounts for actual glyph shapes: 'm' needs more space than 'i',
-            // and 'f' followed by 'i' can be tighter than 'w' followed by 'm'.
-            // Multiplied by letter_spacing for user-tunable breathing room.
+            // Rest length to the previous letter: its advance (the typographic distance between
+            // consecutive glyph origins; half an em if the atlas lacks it) times letter_spacing
             if letter_idx == 0 {
                 rest_lengths.push(0.0);
             } else {
-                let prev_ch = chars[letter_idx - 1] as u32;
-                let prev_glyph = glyph_map.get(&prev_ch);
-                // Use previous glyph's advance — the typographically correct
-                // distance between consecutive glyph origins.
-                let prev_advance = prev_glyph.map_or(0.5, |g| g.advance);
+                let prev_advance = atlas.glyph(chars[letter_idx - 1]).map_or(0.5, |g| g.advance);
                 rest_lengths.push(prev_advance * font_size * letter_spacing);
             }
 
@@ -140,13 +98,14 @@ pub fn build_particle_data(
         }
     }
 
+    let colors = word_colors(&word_meta, palette);
     ParticleData {
         total_particles,
         total_words,
         positions,
         velocities,
-        image_bounds,
-        plane_bounds,
+        atlas_rects,
+        plane_rects,
         colors,
         word_meta,
         rest_lengths,

@@ -15,11 +15,6 @@ struct SimParams {
     time: f32,
 
     mouseStrength: f32,
-    mousePosX: f32,
-    mousePosY: f32,
-    mouseDirX: f32,
-
-    mouseDirY: f32,
     gridDimsX: u32,
     gridDimsY: u32,
     gridDimsZ: u32,
@@ -43,7 +38,22 @@ struct SimParams {
     repulsionStrength: f32,
     repulsionRadius: f32,
     maxPerCell: u32,
-    _pad3: u32,
+
+    // the cursor in world space: the ray from the camera through it, and its motion
+    mouseRayOriginX: f32,
+    mouseRayOriginY: f32,
+    mouseRayOriginZ: f32,
+    mouseRayDirX: f32,
+
+    mouseRayDirY: f32,
+    mouseRayDirZ: f32,
+    mouseDirX: f32,
+    mouseDirY: f32,
+
+    mouseDirZ: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 fn getCellCoord(pos: vec3<f32>, params: SimParams) -> vec3<i32> {

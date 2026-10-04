@@ -114,7 +114,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pos.z += params.textOffsetZ;
     }
 
-    // Pack glyph rotation in w (read by msdf_text.wgsl vertex shader)
+    // Pack glyph rotation in w (Material::msdf_text turns each glyph about x by it)
     pos.w = params.glyphRotX;
     positions[idx] = pos;
 }

@@ -6,11 +6,12 @@ use kansei_core::buffers::{ComputeBuffer, BufferType};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::{CameraControls, MouseVectors};
 use kansei_core::geometries::{PlaneGeometry, InstancedGeometry};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::Material;
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{Canvas, Frame};
+use kansei_core::sdf::{FontAtlas, MsdfTextOptions};
+use kansei_wasm::{fetch_bytes, Canvas, Frame};
 
 mod steering_sim;
 mod text_data;
@@ -36,11 +37,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         simulation: None,
         steering_params: steering_sim::SteeringParams::default(),
         colors_buffer: None,
+        word_meta: Vec::new(),
         auto_rotate_speed: 0.1,
         elapsed_time: 0.0,
         frame_count: 0, frame_time_sum: 0.0,
         current_fps: 0.0, current_frame_ms: 0.0,
-        particle_count: 0, word_count: 0,
+        particle_count: 0,
     }));
 
     GLOBAL_STATE.with(|gs| { *gs.borrow_mut() = Some(state.clone()); });
@@ -62,6 +64,8 @@ struct State {
     simulation: Option<steering_sim::SteeringSimulation>,
     steering_params: steering_sim::SteeringParams,
     colors_buffer: Option<wgpu::Buffer>,
+    /// Per particle: word id, letter index, word length, the word's first particle.
+    word_meta: Vec<u32>,
     auto_rotate_speed: f32,
     elapsed_time: f32,
     frame_count: u32,
@@ -69,7 +73,6 @@ struct State {
     current_fps: f64,
     current_frame_ms: f64,
     particle_count: u32,
-    word_count: u32,
 }
 
 impl State {
@@ -103,20 +106,11 @@ impl State {
         self.camera.update_projection_matrix();
 
         // Step the steering simulation before rendering
-        if let Some(ref mut sim) = self.simulation {
+        let mouse = self.mouse_in_world();
+        if let Some(sim) = self.simulation.as_mut() {
             let clamped_dt = (dt as f32).min(0.05); // cap to avoid explosions on tab return
             self.elapsed_time += clamped_dt;
-            let mouse = steering_sim::MouseState {
-                strength: self.mouse.strength.min(1.0),
-                pos: [self.mouse.position.x, self.mouse.position.y],
-                dir: [self.mouse.direction.x, self.mouse.direction.y],
-            };
             sim.update(&self.steering_params, clamped_dt, self.elapsed_time, &mouse);
-
-            // Debug: log every 120 frames
-            if self.frame_count % 120 == 0 {
-                log::info!("Sim: t={:.2} dt={:.4} vehicles={}", self.elapsed_time, clamped_dt, sim.vehicle_count());
-            }
         }
 
         // Render scene — engine handles surface acquire, clear, instanced draw, present.
@@ -125,43 +119,57 @@ impl State {
             self.renderer.render(&mut self.scene, &mut self.camera);
         }
     }
+
+    /// The cursor as the steering shader takes it: the ray from the camera through it (MouseVectors
+    /// gives NDC with y down) and its motion in the camera's right/up plane, in NDC units as before.
+    fn mouse_in_world(&self) -> steering_sim::MouseState {
+        let (x, y) = (self.mouse.position.x, -self.mouse.position.y);
+        let inverse_view_projection = (self.camera.projection_matrix * self.camera.view_matrix).inverse().to_glam();
+        let near = Vec3::from(inverse_view_projection.project_point3(Vec3::new(x, y, 0.0).to_glam()));
+        let far = Vec3::from(inverse_view_projection.project_point3(Vec3::new(x, y, 1.0).to_glam()));
+        let ray = Vec3::new(far.x - near.x, far.y - near.y, far.z - near.z).normalize();
+        // direction is the previous position minus the current one: the motion is (-x, +y) once y
+        // points up
+        let m = &self.camera.inverse_view_matrix.data;
+        let (right, up) = ([m[0], m[1], m[2]], [m[4], m[5], m[6]]);
+        let (dx, dy) = (-self.mouse.direction.x, self.mouse.direction.y);
+        steering_sim::MouseState {
+            strength: self.mouse.strength.min(1.0),
+            ray_origin: [near.x, near.y, near.z],
+            ray_dir: [ray.x, ray.y, ray.z],
+            dir: [0, 1, 2].map(|i| right[i] * dx + up[i] * dy),
+        }
+    }
 }
 
 // ── JS interop ──
 thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
 fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
 
-#[wasm_bindgen]
-pub fn init_text(
-    words_json: &str,
-    glyphs_json: &str,
-    msdf_rgba: &[u8],
-    atlas_width: u32,
-    atlas_height: u32,
-) {
-    let words: Vec<String> = serde_json::from_str(words_json)
-        .expect("Failed to parse words JSON");
-    let glyphs: Vec<text_data::GlyphMetrics> = serde_json::from_str(glyphs_json)
-        .expect("Failed to parse glyphs JSON");
+const PALETTE: [[f32; 4]; 6] = [
+    [1.0, 0.75, 0.80, 1.0],  // soft pink
+    [0.70, 0.82, 1.0, 1.0],  // soft blue
+    [0.75, 1.0, 0.82, 1.0],  // soft green
+    [1.0, 0.95, 0.70, 1.0],  // soft yellow
+    [0.85, 0.72, 1.0, 1.0],  // soft purple
+    [1.0, 0.82, 0.72, 1.0],  // soft coral
+];
 
-    let palette: Vec<[f32; 4]> = vec![
-        [1.0, 0.75, 0.80, 1.0],  // soft pink
-        [0.70, 0.82, 1.0, 1.0],  // soft blue
-        [0.75, 1.0, 0.82, 1.0],  // soft green
-        [1.0, 0.95, 0.70, 1.0],  // soft yellow
-        [0.85, 0.72, 1.0, 1.0],  // soft purple
-        [1.0, 0.82, 0.72, 1.0],  // soft coral
-    ];
-    let data = text_data::build_particle_data(
-        &words, &glyphs, 4.0, &palette, 100.0, 1.5,
-    );
+/// Load the font and build the words (a JSON array of strings) into the scene.
+#[wasm_bindgen]
+pub async fn init_text(words_json: String) -> Result<(), JsValue> {
+    let words: Vec<String> = serde_json::from_str(&words_json)
+        .map_err(|e| JsValue::from_str(&format!("words JSON: {e}")))?;
+    let font = fetch_bytes("assets/fonts/L10-medium.arfont").await?;
+    let atlas = FontAtlas::parse(&font).map_err(|e| JsValue::from_str(&format!("font: {e:?}")))?;
+
+    let data = text_data::build_particle_data(&words, &atlas, 4.0, &PALETTE, 100.0, 1.5);
 
     log::info!("Steering Text: {} words, {} total particles, atlas {}x{}, {} glyph metrics",
-        data.total_words, data.total_particles, atlas_width, atlas_height, glyphs.len());
+        data.total_words, data.total_particles, atlas.width, atlas.height, atlas.glyphs.len());
 
     with_state(|st| {
         st.particle_count = data.total_particles;
-        st.word_count = data.total_words;
 
         // 1. Create steering simulation (owns the authoritative positions buffer)
         let steering_params = steering_sim::SteeringParams::default();
@@ -169,24 +177,24 @@ pub fn init_text(
 
         // 2. Wrap the sim's positions buffer as a vertex source for the instanced mesh.
         //    The sim writes positions via compute; the mesh reads them as vertex input.
-        //    Other instance buffers (image_bounds, plane_bounds, colors) are static.
+        //    The glyph rects are static; colours change with the palette.
         let pos_buf = ComputeBuffer::from_external(
             "SteeringText/Positions", sim.positions_buffer().clone(), BufferType::Storage,
         ).with_vertex_vec4(3);
 
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
-        let img_buf = ComputeBuffer::from_slice(
-            "SteeringText/ImageBounds", BufferType::Storage, usage, &data.image_bounds,
+        let atlas_buf = ComputeBuffer::from_slice(
+            "SteeringText/AtlasRects", BufferType::Storage, usage, &data.atlas_rects,
         ).with_vertex_vec4(4);
         let plane_buf = ComputeBuffer::from_slice(
-            "SteeringText/PlaneBounds", BufferType::Storage, usage, &data.plane_bounds,
+            "SteeringText/PlaneRects", BufferType::Storage, usage, &data.plane_rects,
         ).with_vertex_vec4(5);
         // Colors buffer: create via device so we keep a handle for live palette updates
         use wgpu::util::DeviceExt;
         let colors_gpu = st.renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SteeringText/Colors"),
             contents: bytemuck::cast_slice(&data.colors),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage,
         });
         let col_buf = ComputeBuffer::from_external(
             "SteeringText/Colors", colors_gpu.clone(), BufferType::Storage,
@@ -195,30 +203,12 @@ pub fn init_text(
         // 3. InstancedGeometry
         let base = PlaneGeometry::new(1.0, 1.0);
         let instanced = InstancedGeometry::new(
-            base, data.total_particles, vec![pos_buf, img_buf, plane_buf, col_buf],
+            base, data.total_particles, vec![pos_buf, atlas_buf, plane_buf, col_buf],
         );
 
-        // 4. MSDF atlas texture + sampler + material
-        let atlas = kansei_core::buffers::Texture::from_rgba("MSDF/Atlas", atlas_width, atlas_height, msdf_rgba);
-        let atlas_sampler = kansei_core::buffers::Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear)
-            .with_anisotropy(8);
-        const MSDF_WGSL: &str = include_str!("shaders/msdf_text.wgsl");
-        let mut mat = Material::new(
-            "SteeringText/MSDF",
-            MSDF_WGSL,
-            vec![
-                Binding::texture_2d(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
-                Binding::sampler(1, ShaderStages::FRAGMENT),
-            ],
-            MaterialOptions {
-                transparent: true,
-                depth_write: Some(true),
-                cull_mode: CullMode::None,
-                ..Default::default()
-            },
-        );
-        mat.set_bindable(0, atlas);
-        mat.set_bindable(1, atlas_sampler);
+        // 4. MSDF glyph material (positions' w is 1: no per-glyph turn). Letters write depth
+        //    so the 3D cloud occludes itself, and the atlas is sampled anisotropically.
+        let mat = Material::msdf_text("SteeringText/MSDF", &atlas, MsdfTextOptions::default());
 
         // 5. Add renderable to the scene
         let renderable = Renderable::new(instanced, mat);
@@ -228,8 +218,10 @@ pub fn init_text(
         st.simulation = Some(sim);
         st.steering_params = steering_params;
         st.colors_buffer = Some(colors_gpu);
+        st.word_meta = data.word_meta;
         st.elapsed_time = 0.0;
     });
+    Ok(())
 }
 
 // ── Tweakpane setters ──
@@ -252,34 +244,19 @@ pub fn init_text(
 #[wasm_bindgen] pub fn set_verlet_iterations(v: u32)   { with_state(|s| s.steering_params.verlet_iterations = v); }
 #[wasm_bindgen] pub fn set_auto_rotate_speed(v: f32)   { with_state(|s| s.auto_rotate_speed = v); }
 
-/// Update color palette (6 colors × RGBA). Rewrites the entire colors buffer
-/// so every word picks up the new palette on the next frame.
+/// Set the background (the renderer's clear colour).
+#[wasm_bindgen]
+pub fn set_background(r: f32, g: f32, b: f32) {
+    with_state(|s| s.renderer.config.clear_color = Vec4::new(r, g, b, 1.0));
+}
+
+/// Update the colour palette (RGBA per entry): every letter takes its word's entry, as at start.
 #[wasm_bindgen]
 pub fn set_palette(palette_flat: &[f32]) {
     with_state(|st| {
-        if let Some(ref colors_buf) = st.colors_buffer {
-            // palette_flat = [r,g,b,a, r,g,b,a, ...] for 6 colors
-            let palette_len = palette_flat.len() / 4;
-            if palette_len == 0 { return; }
-            // Rebuild per-particle colors cycling through the palette
-            let total = st.particle_count as usize;
-            // We need word_id per particle — reconstruct from word_count
-            // Simple: particle i belongs to word (i * word_count / total) approximately.
-            // Better: just cycle by particle index / avg_word_len. But simplest:
-            // re-derive from the simulation's word structure. Since we don't store
-            // word_meta here, use a simpler heuristic: cycle colors per ~7 particles
-            // (average word length). Good enough for visual variety.
-            let avg_word_len = if st.word_count > 0 { total / st.word_count as usize } else { 7 };
-            let avg_word_len = avg_word_len.max(1);
-            let mut colors = Vec::with_capacity(total * 4);
-            for i in 0..total {
-                let word_id = i / avg_word_len;
-                let ci = (word_id % palette_len) * 4;
-                colors.push(palette_flat[ci]);
-                colors.push(palette_flat[ci + 1]);
-                colors.push(palette_flat[ci + 2]);
-                colors.push(palette_flat[ci + 3]);
-            }
+        let palette: Vec<[f32; 4]> = palette_flat.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        if let (Some(colors_buf), false) = (&st.colors_buffer, palette.is_empty()) {
+            let colors = text_data::word_colors(&st.word_meta, &palette);
             st.renderer.queue().write_buffer(colors_buf, 0, bytemuck::cast_slice(&colors));
         }
     });

@@ -130,7 +130,6 @@ pub struct FftCompute {
 
     // Wave line displacement
     wave_positions_buffer: wgpu::Buffer,
-    wave_base_y_buffer: wgpu::Buffer,
     wave_params_buffer: wgpu::Buffer,
     wave_displace_a: Pass, // reads elevation_a
     wave_displace_b: Pass, // reads elevation_b
@@ -459,12 +458,6 @@ impl FftCompute {
             mapped_at_creation: false,
         });
 
-        let wave_base_y_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("JoyDiv/WaveBaseY"),
-            contents: bytemuck::cast_slice(&data.line_y_positions),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
         let wave_params = WaveParams {
             line_count,
             verts_per_line: VERTS_PER_LINE,
@@ -496,7 +489,6 @@ impl FftCompute {
             label: Some("JoyDiv/WaveDisplace/BGL"),
             entries: &[
                 storage_rw(0),  // vertices (wave positions)
-                storage_ro(1),  // baseY
                 // binding 2: elevationTex (texture_2d<f32>, sampled with linear filtering)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
@@ -540,7 +532,6 @@ impl FftCompute {
             layout: &wave_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wave_positions_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wave_base_y_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&elevation_a_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wave_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&elevation_sampler) },
@@ -553,7 +544,6 @@ impl FftCompute {
             layout: &wave_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wave_positions_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wave_base_y_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&elevation_b_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wave_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&elevation_sampler) },
@@ -597,7 +587,6 @@ impl FftCompute {
             layout: &wave_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: fill_positions_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wave_base_y_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&elevation_a_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wave_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&elevation_sampler) },
@@ -610,7 +599,6 @@ impl FftCompute {
             layout: &wave_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: fill_positions_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wave_base_y_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&elevation_b_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wave_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&elevation_sampler) },
@@ -652,7 +640,6 @@ impl FftCompute {
             displace_a,
             displace_b,
             wave_positions_buffer,
-            wave_base_y_buffer,
             wave_params_buffer,
             wave_displace_a,
             wave_displace_b,
@@ -671,7 +658,6 @@ impl FftCompute {
         }
     }
 
-    /// Update FFT data and run the displacement compute shader.
     pub fn set_fft_amplitude(&mut self, amp: f32) {
         self.fft_amplitude = amp;
     }
@@ -700,9 +686,11 @@ impl FftCompute {
         self.glyph_rot_x = radians;
     }
 
-    pub fn update(&mut self, fft_data: &[u8], current_time: f32) {
-        // Advance wall-clock noise time (independent of song playback)
-        self.noise_time += 1.0 / 60.0;
+    /// Upload this frame's FFT row and run the passes; `current_time` is the song's position,
+    /// `dt` the seconds since the previous update (the noise field moves in real time, whatever
+    /// the frame rate and whether the song plays).
+    pub fn update(&mut self, fft_data: &[u8], current_time: f32, dt: f32) {
+        self.noise_time += dt;
 
         // Convert u8 FFT data to u32 array for GPU
         let mut fft_u32 = [0u32; FFT_BINS];
