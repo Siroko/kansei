@@ -14,11 +14,10 @@
 
 use wasm_bindgen::prelude::*;
 
-use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler};
-use kansei_core::culling::InstanceCulling;
+use kansei_core::buffers::Sampler;
 use kansei_core::cameras::Camera;
 use kansei_core::froxels::FroxelGridOptions;
-use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
+use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::lights::{Light, SpotLight};
 use kansei_core::math::{Vec3, Vec4};
@@ -219,29 +218,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut bank = Renderable::new(BoxGeometry::new(1600.0, 6.0, 300.0), surface_material("Bank", [0.05, 0.06, 0.04], false));
     bank.object.set_position(0.0, 1.0, -270.0);
     scene.add(SceneNode::Renderable(bank));
-    let mut trees: Vec<f32> = Vec::new();
+    let mut trees: Vec<[f32; 4]> = Vec::new();
     for i in 0..1600u32 {
         let x = -700.0 + hash(i) * 1400.0;
         let z = -125.0 - hash(i + 5) * 200.0;
         let h = 12.0 + hash(i + 11) * 14.0;
-        trees.extend_from_slice(&[x, 4.0 + h * 0.5, z, h]);
+        trees.push([x, 4.0 + h * 0.5, z, h]);
     }
-    let count = trees.len() as u32 / 4;
-    let all_trees = {
-        use wgpu::util::DeviceExt;
-        renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Trees"),
-            contents: bytemuck::cast_slice(&trees),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
-        })
-    };
-    let instances = ComputeBuffer::from_external("Trees", all_trees.clone(), BufferType::Storage).with_vertex_vec4(3);
     // spruce-like silhouettes: narrow tall boxes (a stand-in; the app has real trees), culled on
     // the GPU for the camera and, separately, for the mirrored view
-    let treeline = InstancedGeometry::new(BoxGeometry::new(2.6, 1.0, 2.6), count, vec![instances]);
-    let mut treeline = Renderable::new(treeline, surface_material("Trees", [0.03, 0.04, 0.03], true));
+    let mut treeline = Renderable::instanced_culled("Trees", BoxGeometry::new(2.6, 1.0, 2.6), &trees, 0.6, surface_material("Trees", [0.03, 0.04, 0.03], true));
     let occlusion = flag("occlusion", false);
-    treeline.instance_culling = Some(InstanceCulling::new(all_trees, count, 16, 0, 0.6).with_radius_scale(12).with_occlusion(occlusion));
+    if let Some(culling) = treeline.instance_culling.as_mut() {
+        culling.occlusion = occlusion;
+    }
     scene.add(SceneNode::Renderable(treeline));
 
     // the red cottage on the shore, windows glowing at 160 cd/m² (the intro's window_glow)

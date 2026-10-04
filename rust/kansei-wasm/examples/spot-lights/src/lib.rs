@@ -14,11 +14,10 @@
 
 use wasm_bindgen::prelude::*;
 
-use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
-use kansei_core::culling::{frustum_planes, InstanceCulling};
+use kansei_core::culling::frustum_planes;
 use kansei_core::froxels::FroxelGridOptions;
-use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry};
+use kansei_core::geometries::{BoxGeometry, PlaneGeometry};
 use kansei_core::lights::{Light, SpotLight};
 use kansei_core::materials::{Material, StandardInstancing, StandardLitOptions};
 use kansei_core::math::{Vec3, Vec4};
@@ -100,7 +99,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // that the camera (between them and the wall) doesn't see; their shadows on the wall show
     // that shadow casters are culled per light, not to the camera
     let wall_test = cam == "wall";
-    let mut trunks: Vec<f32> = Vec::new();
+    let mut trunks: Vec<[f32; 4]> = Vec::new();
     for i in 0..1400u32 {
         let x = -45.0 + hash(i) * 90.0;
         let z = -90.0 + hash(i + 13) * 110.0;
@@ -108,38 +107,26 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             continue;
         }
         let h = 9.0 + hash(i + 29) * 8.0;
-        trunks.extend_from_slice(&[x, h * 0.5, z, h]);
+        trunks.push([x, h * 0.5, z, h]);
     }
     if wall_test {
         for k in 0..6 {
-            trunks.extend_from_slice(&[-1.0 + k as f32 * 1.1, 1.5, -5.0, 3.0]);
+            trunks.push([-1.0 + k as f32 * 1.1, 1.5, -5.0, 3.0]);
         }
         let mut wall = Renderable::new(BoxGeometry::new(16.0, 6.0, 0.3), lit_material("Wall", [0.6, 0.6, 0.6], 0.9, false));
         wall.object.set_position(1.75, 3.0, -20.0);
         scene.add(SceneNode::Renderable(wall));
     }
-    let count = trunks.len() as u32 / 4;
+    let count = trunks.len() as u32;
     // all trunks, in a buffer the GPU culls per view: the camera, and each shadowed spot light's
-    // own frustum, so trunks outside the picture still shadow the beams in it
-    let all_trunks = {
-        use wgpu::util::DeviceExt;
-        renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Trunks"),
-            contents: bytemuck::cast_slice(&trunks),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
-    };
+    // own frustum, so trunks outside the picture still shadow the beams in it; the culling sphere
+    // sits at the trunk's middle (position.y = h/2) with radius h/2 + a margin: scaled by h
+    let mut forest = Renderable::instanced_culled("Trunks", BoxGeometry::new(0.35, 1.0, 0.35), &trunks, 0.55, lit_material("Trunks", [0.22, 0.18, 0.15], 0.8, true));
     // `cull=main` instead culls on the CPU against the camera only (as an app would): the bug
     // this avoids, where trunks leaving the frame stop casting shadows
-    let cull_main = param("cull").as_deref() == Some("main");
-    let instances = ComputeBuffer::from_external("Trunks", all_trunks.clone(), BufferType::Storage).with_vertex_vec4(3);
-    let mut forest = Renderable::new(
-        InstancedGeometry::new(BoxGeometry::new(0.35, 1.0, 0.35), count, vec![instances]),
-        lit_material("Trunks", [0.22, 0.18, 0.15], 0.8, true),
-    );
-    if !cull_main {
-        // sphere at the trunk's middle (position.y = h/2) with radius h/2 + a margin: scale by h
-        forest.instance_culling = Some(InstanceCulling::new(all_trunks.clone(), count, 16, 0, 0.55).with_radius_scale(12));
+    let cpu_cull = param("cull").as_deref() == Some("main");
+    if cpu_cull {
+        forest.instance_culling = None;
     }
     let forest = scene.add(SceneNode::Renderable(forest));
 
@@ -218,7 +205,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let frozen_t: Option<f32> = param("t").and_then(|v| v.trim().parse().ok());
     let drive = flag("drive", false);
     // `cull=main`: (trunks, their buffer, scene index) to cull on the CPU against the camera
-    let cpu_cull = cull_main.then(|| (trunks.clone(), all_trunks.clone(), forest));
+    let cpu_cull = cpu_cull.then(|| (trunks.clone(), forest));
     // `stats=1`: the renderer's profile (each pass's GPU time, the frame's CPU sections) and the
     // frame interval (GPU-bound without vsync), over windows of 240 frames
     let mut stats = flag("stats", false).then(|| (0u32, kansei_wasm::now()));
@@ -258,18 +245,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             }
         }
 
-        if let Some((all, buffer, forest)) = &cpu_cull {
+        if let Some((all, forest)) = &cpu_cull {
             camera.update_view_matrix();
             let planes = frustum_planes(camera.projection_matrix.to_glam() * camera.view_matrix.to_glam());
-            let visible: Vec<f32> = all
-                .chunks_exact(4)
-                .filter(|t| planes.iter().all(|p| p.x * t[0] + p.y * t[1] + p.z * t[2] + p.w >= -t[3] * 0.55))
-                .flatten()
-                .copied()
-                .collect();
-            renderer.queue().write_buffer(buffer, 0, bytemuck::cast_slice(&visible));
+            let visible: Vec<[f32; 4]> = all.iter().filter(|t| planes.iter().all(|p| p.x * t[0] + p.y * t[1] + p.z * t[2] + p.w >= -t[3] * 0.55)).copied().collect();
             if let Some(r) = scene.get_renderable_mut(*forest) {
-                r.geometry.instance_count = visible.len() as u32 / 4;
+                r.geometry.instance_buffers[0].write(&visible);
+                r.geometry.instance_count = visible.len() as u32;
             }
             renderer.invalidate_bundle();
         }

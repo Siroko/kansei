@@ -11,15 +11,14 @@
 //! that mode every 3 s, 8 times, with the camera still through each pair, and report the mean GPU
 //! time and frame interval of each).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
-use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, VertexFormat};
+use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer, InstanceAttribute, VertexFormat};
 use kansei_core::cameras::Camera;
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions, InstanceTransform, LodView};
 use kansei_core::culling::InstanceCulling;
-use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry, Vertex};
+use kansei_core::geometries::{Geometry, IcosphereGeometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -73,48 +72,27 @@ fn hash(i: u32) -> f32 {
 
 /// A noisy icosphere of `subdivisions`, about a metre across.
 fn rock(subdivisions: u32) -> Geometry {
-    let t = (1.0 + 5f32.sqrt()) / 2.0;
-    let mut p: Vec<glam::Vec3> = [[-1.0, t, 0.0], [1.0, t, 0.0], [-1.0, -t, 0.0], [1.0, -t, 0.0], [0.0, -1.0, t], [0.0, 1.0, t], [0.0, -1.0, -t], [0.0, 1.0, -t], [t, 0.0, -1.0], [t, 0.0, 1.0], [-t, 0.0, -1.0], [-t, 0.0, 1.0]]
-        .iter()
-        .map(|v| glam::Vec3::from(*v).normalize())
-        .collect();
-    let mut f: Vec<[u32; 3]> = vec![[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
-    for _ in 0..subdivisions {
-        let mut mid = HashMap::new();
-        let mut next = Vec::with_capacity(f.len() * 4);
-        for [a, b, c] in f {
-            let mut m = |x: u32, y: u32| {
-                *mid.entry((x.min(y), x.max(y))).or_insert_with(|| {
-                    p.push(((p[x as usize] + p[y as usize]) * 0.5).normalize());
-                    p.len() as u32 - 1
-                })
-            };
-            let (ab, bc, ca) = (m(a, b), m(b, c), m(c, a));
-            next.extend([[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]);
-        }
-        f = next;
-    }
+    let mut rock = IcosphereGeometry::new(1.0, subdivisions);
+    rock.label = "Rock".into();
     let height = |v: glam::Vec3| 1.0 + 0.12 * (5.0 * v.x).sin() * (4.0 * v.y).cos() + 0.06 * (13.0 * v.z + 2.0 * v.x).sin() + 0.02 * (37.0 * v.y).sin() * (31.0 * v.x).cos();
-    let vertices: Vec<Vertex> = p
-        .iter()
-        .map(|&v| {
-            // the normal of the displaced surface, from two nearby points on it
-            let (a, b) = (v.any_orthonormal_vector(), v.cross(v.any_orthonormal_vector()));
-            let at = |d: glam::Vec3| (d.normalize()) * height(d.normalize());
-            let n = (at(v + a * 1e-3) - at(v - a * 1e-3)).cross(at(v + b * 1e-3) - at(v - b * 1e-3)).normalize();
-            let q = v * height(v);
-            Vertex { position: [q.x, q.y * 0.7, q.z, 1.0], normal: (n * glam::Vec3::new(0.7, 1.0, 0.7)).normalize().to_array(), uv: [v.x * 0.5 + 0.5, v.y * 0.5 + 0.5] }
-        })
-        .collect();
-    Geometry::new("Rock", vertices, f.into_iter().flatten().collect())
+    for vertex in &mut rock.vertices {
+        let v = glam::Vec3::from(vertex.normal);
+        // the normal of the displaced surface, from two nearby points on it
+        let (a, b) = (v.any_orthonormal_vector(), v.cross(v.any_orthonormal_vector()));
+        let at = |d: glam::Vec3| (d.normalize()) * height(d.normalize());
+        let n = (at(v + a * 1e-3) - at(v - a * 1e-3)).cross(at(v + b * 1e-3) - at(v - b * 1e-3)).normalize();
+        let q = v * height(v);
+        vertex.position = [q.x, q.y * 0.7, q.z, 1.0];
+        vertex.normal = (n * glam::Vec3::new(0.7, 1.0, 0.7)).normalize().to_array();
+    }
+    rock
 }
 
 /// The cut of `mesh` seen from `distance` away at `tau` pixels (`ppr` pixels per radian), as a
 /// mesh: a discrete LOD for a band starting there (for the largest rock, `scale`).
 fn lod_mesh(mesh: &ClusterMesh, distance: f32, scale: f32, ppr: f32, tau: f32) -> Geometry {
     let view = LodView { eye: glam::Vec3::new(0.0, 0.0, distance / scale), pixels_per_radian: ppr, near: 0.1 / scale, threshold: tau, orthographic: false };
-    let indices: Vec<u32> = mesh.select(&view).into_iter().flat_map(|c| mesh.triangles(c).flatten().collect::<Vec<_>>()).collect();
-    Geometry::new("Rock/LOD", mesh.vertices.clone(), indices)
+    mesh.cut_geometry("Rock/LOD", &view)
 }
 
 fn material() -> Material {
@@ -200,18 +178,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let z = -extent / 2.0 + (j as f32 + 0.2 + 0.6 * hash(k + 7919)) * SPACING;
         data.extend_from_slice(&[x, 0.2, z, 0.7 + 0.6 * hash(k + 104729), hash(k + 3) * std::f32::consts::TAU, 0.0, 0.0, 0.0]);
     }
-    let source = {
-        use wgpu::util::DeviceExt;
-        renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Rocks"), contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE })
-    };
+    let source = ComputeBuffer::from_slice("Rocks", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &data);
     let rocks = n * n;
+    // every LOD and its culling share the one buffer (clones are handles to it)
     let instances = || {
-        ComputeBuffer::from_external("Rocks", source.clone(), BufferType::Storage).with_vertex_layout(
+        source.clone().with_vertex_layout(
             32,
             vec![InstanceAttribute { shader_location: 3, offset: 0, format: VertexFormat::Float32x4 }, InstanceAttribute { shader_location: 4, offset: 16, format: VertexFormat::Float32 }],
         )
     };
-    let culling = |near: f32, far: f32| InstanceCulling::new(source.clone(), rocks, 32, 0, 1.2).with_radius_scale(12).with_lod_range(near, far);
+    let culling = |near: f32, far: f32| InstanceCulling::from_buffer(&source, rocks, 32, 0, 1.2).with_radius_scale(12).with_lod_range(near, far);
 
     let mut scene = Scene::new();
     // the ground: lit by an even sky alone (the rocks' sun is their own)

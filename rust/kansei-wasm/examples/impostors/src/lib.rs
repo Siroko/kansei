@@ -27,11 +27,11 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, Sampler, VertexFormat};
+use kansei_core::buffers::{BufferType, BufferUsage, ComputeBuffer, InstanceAttribute, Sampler, VertexFormat};
 use kansei_core::cameras::Camera;
 use kansei_core::cameras::MOTION_VECTORS_WGSL;
 use kansei_core::culling::{CullViewKind, InstanceCulling, LOD_FADE_WGSL};
-use kansei_core::geometries::{Geometry, InstancedGeometry, PlaneGeometry, SphereGeometry, Vertex};
+use kansei_core::geometries::{CylinderGeometry, Geometry, HeightfieldGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::impostors::{billboard_geometry, ImpostorOptions, IMPOSTOR_WGSL};
 use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
@@ -325,75 +325,27 @@ fn ground(x: f32, z: f32) -> f32 {
     basin + hills + roll * ((r - LAKE) / 60.0).clamp(0.0, 1.0)
 }
 
-fn vertex(p: [f32; 3], n: [f32; 3], uv: [f32; 2]) -> Vertex {
-    Vertex { position: [p[0], p[1], p[2], 1.0], normal: n, uv }
-}
-
 /// The terrain: a `cells` x `cells` grid over the forest's square.
 fn terrain(cells: u32) -> Geometry {
-    let step = 2.0 * EXTENT / cells as f32;
-    let mut vertices = Vec::new();
-    for j in 0..=cells {
-        for i in 0..=cells {
-            let (x, z) = (-EXTENT + i as f32 * step, -EXTENT + j as f32 * step);
-            let e = 0.5;
-            let n = glam::Vec3::new(ground(x - e, z) - ground(x + e, z), 2.0 * e, ground(x, z - e) - ground(x, z + e)).normalize();
-            vertices.push(vertex([x, ground(x, z), z], n.to_array(), [i as f32 / cells as f32, j as f32 / cells as f32]));
-        }
-    }
-    let mut indices = Vec::new();
-    let at = |i: u32, j: u32| j * (cells + 1) + i;
-    for j in 0..cells {
-        for i in 0..cells {
-            let (p00, p10, p01, p11) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1));
-            indices.extend_from_slice(&[p00, p01, p10, p10, p01, p11]);
-        }
-    }
-    Geometry::new("Terrain", vertices, indices)
-}
-
-/// A closed truncated cone round the y axis, from radius `r0` at `y0` to `r1` at `y1`, in
-/// `rings` bands of `segments` quads, with a cap underneath.
-fn frustum(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, (y0, y1): (f32, f32), (r0, r1): (f32, f32), segments: u32, rings: u32) {
-    let base = vertices.len() as u32;
-    for k in 0..=rings {
-        let f = k as f32 / rings as f32;
-        let (y, r) = (y0 + (y1 - y0) * f, r0 + (r1 - r0) * f);
-        for s in 0..=segments {
-            let a = s as f32 / segments as f32 * std::f32::consts::TAU;
-            let n = glam::Vec3::new(a.cos() * (y1 - y0), r0 - r1, a.sin() * (y1 - y0)).normalize();
-            vertices.push(vertex([r * a.cos(), y, r * a.sin()], n.to_array(), [s as f32 / segments as f32, f]));
-        }
-    }
-    let row = segments + 1;
-    for k in 0..rings {
-        for s in 0..segments {
-            let (a, b, c, d) = (base + k * row + s, base + k * row + s + 1, base + (k + 1) * row + s, base + (k + 1) * row + s + 1);
-            indices.extend_from_slice(&[a, c, b, b, c, d]);
-        }
-    }
-    let centre = vertices.len() as u32;
-    vertices.push(vertex([0.0, y0, 0.0], [0.0, -1.0, 0.0], [0.5, 0.5]));
-    for s in 0..=segments {
-        let a = s as f32 / segments as f32 * std::f32::consts::TAU;
-        vertices.push(vertex([r0 * a.cos(), y0, r0 * a.sin()], [0.0, -1.0, 0.0], [0.5, 0.5]));
-    }
-    for s in 0..segments {
-        indices.extend_from_slice(&[centre, centre + 1 + s, centre + 2 + s]);
-    }
+    let mut terrain = HeightfieldGeometry::new([-EXTENT; 2], [EXTENT; 2], (cells, cells), ground);
+    terrain.label = "Terrain".into();
+    terrain
 }
 
 /// A spruce of height 1: a trunk and `cones` stacked cones of `segments` x `rings` quads.
 fn spruce(segments: u32, rings: u32, cones: u32, label: &str) -> Geometry {
-    let (mut vertices, mut indices) = (Vec::new(), Vec::new());
-    frustum(&mut vertices, &mut indices, (0.0, 0.3), (0.035, 0.025), segments.min(8), 1);
-    for k in 0..cones {
-        let f = k as f32 / cones as f32;
-        let y0 = 0.15 + 0.62 * f;
-        let y1 = if k + 1 == cones { 1.0 } else { y0 + 0.42 - 0.12 * f };
-        frustum(&mut vertices, &mut indices, (y0, y1), (0.24 * (1.0 - 0.55 * f), 0.0), segments, rings);
-    }
-    Geometry::new(label, vertices, indices)
+    let trunk = CylinderGeometry::new(0.035, 0.025, 0.3, segments.min(8), 1);
+    let crowns: Vec<(Geometry, f32)> = (0..cones)
+        .map(|k| {
+            let f = k as f32 / cones as f32;
+            let y0 = 0.15 + 0.62 * f;
+            let y1 = if k + 1 == cones { 1.0 } else { y0 + 0.42 - 0.12 * f };
+            (CylinderGeometry::new(0.24 * (1.0 - 0.55 * f), 0.0, y1 - y0, segments, rings), y0)
+        })
+        .collect();
+    let mut parts = vec![(&trunk, glam::Mat4::IDENTITY)];
+    parts.extend(crowns.iter().map(|(cone, y0)| (cone, glam::Mat4::from_translation(glam::Vec3::new(0.0, *y0, 0.0)))));
+    Geometry::merged(label, &parts)
 }
 
 const CAMS: [&str; 5] = ["shore", "low", "high", "fly", "forest"];
@@ -562,14 +514,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let h = 14.0 + 12.0 * hash(i.wrapping_mul(3) + 7);
         data.extend_from_slice(&[x, ground(x, z) - 0.3, z, h, hash(i + 11) * std::f32::consts::TAU, hash(i + 23), 0.0, 0.0]);
     }
-    let source = {
-        use wgpu::util::DeviceExt;
-        renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Forest"),
-            contents: bytemuck::cast_slice(&data),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
-        })
-    };
+    let source = ComputeBuffer::from_slice("Forest", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &data);
     // with crossfades the culled instances carry their fade after the 32 bytes
     let instances = |fade: Fade| {
         let mut attributes = vec![
@@ -579,11 +524,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         if fade.on() {
             attributes.push(InstanceAttribute { shader_location: 5, offset: 32, format: VertexFormat::Float32 });
         }
-        ComputeBuffer::from_external("Forest", source.clone(), BufferType::Storage).with_vertex_layout(if fade.on() { 36 } else { 32 }, attributes)
+        source.clone().with_vertex_layout(if fade.on() { 36 } else { 32 }, attributes)
     };
     // a box from the ground to the top of a tree (x its height), as wide as its lowest cone
     let culling = |near: f32, far: f32, fade: Fade| {
-        InstanceCulling::new(source.clone(), trees, 32, 0, 1.0)
+        InstanceCulling::from_buffer(&source, trees, 32, 0, 1.0)
             .with_radius_scale(12)
             .with_lod_range(near, far)
             .with_bounds_shift(glam::Vec3::new(0.0, 0.5, 0.0))

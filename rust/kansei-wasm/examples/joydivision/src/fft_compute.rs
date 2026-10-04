@@ -859,8 +859,4 @@ impl FftCompute {
     pub fn wave_verts_per_line(&self) -> u32 {
         VERTS_PER_LINE
     }
-
-    pub fn particle_count(&self) -> u32 {
-        self.particle_count
-    }
 }

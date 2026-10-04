@@ -5,7 +5,7 @@ use std::rc::Rc;
 use kansei_core::buffers::{ComputeBuffer, BufferType};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
-use kansei_core::geometries::{Geometry, PlaneGeometry, InstancedGeometry, Vertex};
+use kansei_core::geometries::{Geometry, PlaneGeometry, InstancedGeometry};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -185,8 +185,6 @@ pub fn init_text(
         {
             let line_count = fft.wave_line_count();
             let verts_per_line = fft.wave_verts_per_line();
-            let total_verts = (line_count * verts_per_line * 2) as usize;
-
             // Same index pattern as wave lines (quads from pairs of verts)
             let segs_per_line = (verts_per_line - 1) as usize;
             let total_indices = line_count as usize * segs_per_line * 6;
@@ -207,17 +205,8 @@ pub fn init_text(
                 }
             }
 
-            let placeholder_verts: Vec<Vertex> = vec![
-                Vertex {
-                    position: [0.0, 0.0, 0.0, 1.0],
-                    normal: [0.0, 0.0, 1.0],
-                    uv: [0.0, 0.0],
-                };
-                total_verts
-            ];
-            let mut fill_geo = Geometry::new("JoyDiv/WaveFill", placeholder_verts, fill_indices);
-            fill_geo.initialize(st.renderer.device());
-            fill_geo.vertex_buffer = Some(fft.fill_positions_buffer().clone());
+            // the compute pass writes the vertices
+            let fill_geo = Geometry::from_gpu_vertices("JoyDiv/WaveFill", fft.fill_positions_buffer().clone(), fill_indices);
 
             const WAVE_LINE_WGSL: &str = include_str!("shaders/wave_line.wgsl");
             let mut fill_mat = Material::new(
@@ -243,9 +232,6 @@ pub fn init_text(
         {
             let line_count = fft.wave_line_count();
             let verts_per_line = fft.wave_verts_per_line();
-            // 2 vertices per sample (top + bottom of ribbon)
-            let total_verts = (line_count * verts_per_line * 2) as usize;
-
             // Build index buffer for TriangleList topology:
             // Each segment = 2 triangles (quad) connecting 4 vertices:
             //   top_i, bottom_i, top_i+1, bottom_i, bottom_i+1, top_i+1
@@ -270,18 +256,8 @@ pub fn init_text(
                 }
             }
 
-            // Create Geometry with placeholder vertices (compute shader overwrites)
-            let placeholder_verts: Vec<Vertex> = vec![
-                Vertex {
-                    position: [0.0, 0.0, 0.0, 1.0],
-                    normal: [0.0, 0.0, 1.0],
-                    uv: [0.0, 0.0],
-                };
-                total_verts
-            ];
-            let mut wave_geo = Geometry::new("JoyDiv/WaveLines", placeholder_verts, indices);
-            wave_geo.initialize(st.renderer.device());
-            wave_geo.vertex_buffer = Some(fft.wave_positions_buffer().clone());
+            // the compute pass writes the vertices
+            let wave_geo = Geometry::from_gpu_vertices("JoyDiv/WaveLines", fft.wave_positions_buffer().clone(), indices);
 
             // Wave material: solid white triangles
             const WAVE_LINE_WGSL: &str = include_str!("shaders/wave_line.wgsl");

@@ -703,33 +703,11 @@ async fn load_dragon(model: Dragon) -> Option<kansei_core::geometries::Geometry>
             GLTFLoader::load_gltf_with_buffers(&json, vec![bin]).ok()?
         }
     };
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
-    for part in result.renderables {
-        let (r, s) = (part.rotation, part.scale);
-        let rotation = glam::Mat4::from_rotation_z(r.z) * glam::Mat4::from_rotation_y(r.y) * glam::Mat4::from_rotation_x(r.x);
-        let node = glam::Mat4::from_translation(glam::Vec3::new(part.position.x, part.position.y, part.position.z)) * rotation * glam::Mat4::from_scale(glam::Vec3::new(s.x, s.y, s.z));
-        let base = vertices.len() as u32;
-        for mut v in part.geometry.vertices {
-            let p = node.transform_point3(glam::Vec3::new(v.position[0], v.position[1], v.position[2]));
-            v.position = [p.x, p.y, p.z, 1.0];
-            v.normal = rotation.transform_vector3(glam::Vec3::from(v.normal)).normalize_or_zero().to_array();
-            lo = lo.min(p);
-            hi = hi.max(p);
-            vertices.push(v);
-        }
-        indices.extend(part.geometry.indices.iter().map(|i| i + base));
-    }
+    // 1.1 m across its wider side, standing on the floor at the centre
+    let geometry = result.merged_geometry("Dragon").fit(glam::Vec3::new(1.1, f32::INFINITY, 1.1));
+    let (lo, hi) = geometry.bounds();
     let extent = hi - lo;
-    let k = 1.1 / extent.x.max(extent.z);
-    let centre = glam::Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5);
-    for v in &mut vertices {
-        let p = (glam::Vec3::new(v.position[0], v.position[1], v.position[2]) - centre) * k;
-        v.position = [p.x, p.y, p.z, 1.0];
-    }
-    let geometry = kansei_core::geometries::Geometry::new("Dragon", vertices, indices);
-    log::info!("dragon ({}): {} triangles, {:.2} x {:.2} x {:.2} m", model.name(), geometry.index_count() / 3, extent.x * k, extent.y * k, extent.z * k);
+    log::info!("dragon ({}): {} triangles, {:.2} x {:.2} x {:.2} m", model.name(), geometry.index_count() / 3, extent.x, extent.y, extent.z);
     Some(geometry)
 }
 
