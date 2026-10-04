@@ -38,6 +38,20 @@ pub struct Renderable {
 }
 
 impl Renderable {
+    /// `geometry` drawn once per instance, one vec4 each (position in xyz, a scale in w, read at
+    /// vertex location 3: `materials::StandardInstancing`), culled per view on the GPU against a
+    /// bounding sphere of `radius` x the scale. Change `instance_culling` (LOD bands, occlusion,
+    /// ...) on the result as needed.
+    pub fn instanced_culled(label: &str, geometry: Geometry, instances: &[[f32; 4]], radius: f32, material: Material) -> Self {
+        use crate::buffers::{BufferType, BufferUsage, ComputeBuffer};
+        let buffer = ComputeBuffer::from_slice(label, BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, instances).with_vertex_vec4(3);
+        let count = instances.len() as u32;
+        let culling = crate::culling::InstanceCulling::for_vec4_instances(&buffer, count, radius);
+        let mut renderable = Renderable::new(crate::geometries::InstancedGeometry::new(geometry, count, vec![buffer]), material);
+        renderable.instance_culling = Some(culling);
+        renderable
+    }
+
     /// Layer mask of a new renderable: bit 0.
     pub const DEFAULT_LAYERS: u32 = 1;
 

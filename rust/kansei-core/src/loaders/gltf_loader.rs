@@ -81,6 +81,21 @@ impl GLTFResult {
         load_texture(&self.images, texture, support)
     }
 
+    /// Every part as one geometry, each moved by its node transform (as `Object3D` composes it):
+    /// a model to draw with one material, voxelize, or path trace. `Geometry::fit` sizes it.
+    pub fn merged_geometry(&self, label: &str) -> Geometry {
+        let parts: Vec<(&Geometry, glam::Mat4)> = self
+            .renderables
+            .iter()
+            .map(|part| {
+                let (p, r, s) = (part.position, part.rotation, part.scale);
+                let rotation = glam::Mat4::from_rotation_z(r.z) * glam::Mat4::from_rotation_y(r.y) * glam::Mat4::from_rotation_x(r.x);
+                (&part.geometry, glam::Mat4::from_translation(glam::Vec3::new(p.x, p.y, p.z)) * rotation * glam::Mat4::from_scale(glam::Vec3::new(s.x, s.y, s.z)))
+            })
+            .collect();
+        Geometry::merged(label, &parts)
+    }
+
     /// Convert into engine `Renderable`s with basic lit materials derived from glTF PBR data.
     /// Applies position, rotation, scale, and an optional extra uniform scale multiplier.
     pub fn into_renderables(self, scale_multiplier: f32) -> Vec<Renderable> {

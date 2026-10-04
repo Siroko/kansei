@@ -9,8 +9,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 kansei-core = { path = "../../../kansei-core" }
 kansei-wasm = { path = "../.." }
-wgpu = { version = "24", features = ["webgpu"] }
-bytemuck = { version = "1", features = ["derive"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 log = "0.4"

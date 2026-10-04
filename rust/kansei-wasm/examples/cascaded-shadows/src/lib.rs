@@ -9,11 +9,9 @@
 
 use wasm_bindgen::prelude::*;
 
-use kansei_core::buffers::{BufferType, ComputeBuffer};
 use kansei_core::cameras::Camera;
-use kansei_core::culling::InstanceCulling;
 use kansei_core::froxels::FroxelGridOptions;
-use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
+use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages, StandardInstancing, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
@@ -22,7 +20,7 @@ use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
     effects::{exposure_from_ev100, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions},
 };
-use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::renderers::RendererConfig;
 use kansei_wasm::{flag, param_or, Canvas};
 use kansei_core::shadows::{CascadedShadowOptions, CASCADED_SHADOWS_WGSL};
 
@@ -86,21 +84,6 @@ fn hash(i: u32) -> f32 {
     (x % 10007) as f32 / 10007.0
 }
 
-/// An instanced renderable of `geometry` at (position, scale) instances, GPU-culled per view.
-fn instanced(renderer: &Renderer, label: &str, geometry: kansei_core::geometries::Geometry, instances: &[f32], radius: f32, material: Material) -> Renderable {
-    use wgpu::util::DeviceExt;
-    let buffer = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::cast_slice(instances),
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
-    });
-    let count = instances.len() as u32 / 4;
-    let layout = ComputeBuffer::from_external(label, buffer.clone(), BufferType::Storage).with_vertex_vec4(3);
-    let mut r = Renderable::new(InstancedGeometry::new(geometry, count, vec![layout]), material);
-    r.instance_culling = Some(InstanceCulling::new(buffer, count, 16, 0, radius).with_radius_scale(12));
-    r
-}
-
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = Canvas::find(canvas_id)?;
@@ -133,11 +116,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             continue;
         }
         let h = 8.0 + hash(i + 13) * 10.0;
-        trunks.extend_from_slice(&[x, h * 0.5, z, h]);
-        crowns.extend_from_slice(&[x, h, z, 1.6 + hash(i + 17) * 1.4]);
+        trunks.push([x, h * 0.5, z, h]);
+        crowns.push([x, h, z, 1.6 + hash(i + 17) * 1.4]);
     }
-    scene.add(SceneNode::Renderable(instanced(&renderer, "Trunks", BoxGeometry::new(0.035, 1.0, 0.035), &trunks, 0.6, surface_material("Trunk", [0.2, 0.15, 0.1], true, debug))));
-    scene.add(SceneNode::Renderable(instanced(&renderer, "Crowns", SphereGeometry::new(1.0, 12, 8), &crowns, 1.0, surface_material("Crown", [0.06, 0.12, 0.05], true, debug))));
+    scene.add(SceneNode::Renderable(Renderable::instanced_culled("Trunks", BoxGeometry::new(0.035, 1.0, 0.035), &trunks, 0.6, surface_material("Trunk", [0.2, 0.15, 0.1], true, debug))));
+    scene.add(SceneNode::Renderable(Renderable::instanced_culled("Crowns", SphereGeometry::new(1.0, 12, 8), &crowns, 1.0, surface_material("Crown", [0.06, 0.12, 0.05], true, debug))));
     // a fence along the path: thin, close shadows
     for k in 0..60 {
         let mut post = Renderable::new(BoxGeometry::new(0.08, 1.2, 0.08), surface_material("Post", [0.35, 0.3, 0.25], false, debug));
@@ -180,7 +163,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let far: f32 = param_or("far", 1200.0);
     let mut camera = Camera::new(50.0, 0.3, far, canvas.aspect());
 
-    log::info!("Kansei — Cascaded Shadows (WASM) ready: {} trees, cascades {csm}", trunks.len() / 4);
+    log::info!("Kansei — Cascaded Shadows (WASM) ready: {} trees, cascades {csm}", trunks.len());
 
     let frozen_t: Option<f32> = kansei_wasm::param("t").and_then(|v| v.parse().ok());
     kansei_wasm::run(&canvas, move |frame| {

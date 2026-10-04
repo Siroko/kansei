@@ -14,12 +14,17 @@ pub type BufferUsage = wgpu::BufferUsages;
 /// A GPU buffer with CPU-side staging data and lazy initialization.
 /// Can serve as both a compute storage buffer and an instance vertex source,
 /// mirroring the TS `ComputeBuffer` which carries dual storage + vertex roles.
+///
+/// Clones are handles to one GPU buffer, created by whichever is used first: hand clones of one
+/// instance buffer to several renderables (LOD bands) and to `culling::InstanceCulling`, and they
+/// all read the same instances. Each clone keeps its own staging copy; the one written uploads.
+#[derive(Clone)]
 pub struct ComputeBuffer {
     label: String,
     buffer_type: BufferType,
     usage: BufferUsage,
     data: Vec<u8>,
-    gpu_buffer: Option<wgpu::Buffer>,
+    gpu_buffer: std::sync::Arc<std::sync::OnceLock<wgpu::Buffer>>,
     needs_update: bool,
     vertex_stride: Option<u64>,
     vertex_attributes: Vec<InstanceAttribute>,
@@ -32,7 +37,7 @@ impl ComputeBuffer {
             buffer_type,
             usage,
             data,
-            gpu_buffer: None,
+            gpu_buffer: Default::default(),
             needs_update: false,
             vertex_stride: None,
             vertex_attributes: Vec::new(),
@@ -55,7 +60,7 @@ impl ComputeBuffer {
             buffer_type,
             usage: buffer.usage(),
             data: Vec::new(),
-            gpu_buffer: Some(buffer),
+            gpu_buffer: std::sync::Arc::new(std::sync::OnceLock::from(buffer)),
             needs_update: false,
             vertex_stride: None,
             vertex_attributes: Vec::new(),
@@ -111,7 +116,7 @@ impl ComputeBuffer {
     }
 
     pub(crate) fn gpu_buffer(&self) -> Option<&wgpu::Buffer> {
-        self.gpu_buffer.as_ref()
+        self.gpu_buffer.get()
     }
 
     pub fn data(&self) -> &[u8] {
@@ -139,25 +144,27 @@ impl ComputeBuffer {
 
     /// Initialize the GPU buffer (mappedAtCreation with initial data).
     pub(crate) fn initialize(&mut self, device: &wgpu::Device) {
-        if self.gpu_buffer.is_some() {
+        if self.gpu_buffer.get().is_some() {
             return;
         }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&self.label),
-            size: self.data.len() as u64,
-            usage: self.usage | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+        self.gpu_buffer.get_or_init(|| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&self.label),
+                size: self.data.len() as u64,
+                usage: self.usage | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            buffer.slice(..).get_mapped_range_mut().copy_from_slice(&self.data);
+            buffer.unmap();
+            buffer
         });
-        buffer.slice(..).get_mapped_range_mut().copy_from_slice(&self.data);
-        buffer.unmap();
-        self.gpu_buffer = Some(buffer);
         self.needs_update = false;
     }
 
     /// Upload dirty CPU data to the GPU via queue.write_buffer.
     pub(crate) fn update(&mut self, queue: &wgpu::Queue) {
         if self.needs_update {
-            if let Some(ref buf) = self.gpu_buffer {
+            if let Some(buf) = self.gpu_buffer.get() {
                 queue.write_buffer(buf, 0, &self.data);
             }
             self.needs_update = false;
@@ -166,7 +173,7 @@ impl ComputeBuffer {
 
     /// Ensure initialized, then upload if dirty.
     pub(crate) fn ensure_ready(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.gpu_buffer.is_none() {
+        if self.gpu_buffer.get().is_none() {
             self.initialize(device);
         } else {
             self.update(queue);
@@ -188,5 +195,26 @@ impl super::Bindable for ComputeBuffer {
             offset: 0,
             size: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A clone made before the GPU buffer exists sees the buffer whichever clone creates it:
+    /// how a geometry and its InstanceCulling (or several LOD renderables) share instances.
+    #[test]
+    fn clones_share_one_gpu_buffer() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)) else { return };
+        let geometry_side = ComputeBuffer::from_slice("Instances", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &[[1.0f32; 4]; 8]).with_vertex_vec4(3);
+        let mut culling_side = geometry_side.clone();
+        assert!(geometry_side.gpu_buffer().is_none());
+        culling_side.initialize(&device);
+        let (a, b) = (geometry_side.gpu_buffer().expect("created through the clone"), culling_side.gpu_buffer().unwrap());
+        assert!(std::ptr::eq(a, b));
+        assert_eq!(a.size(), 8 * 16);
     }
 }
