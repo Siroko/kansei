@@ -1,5 +1,6 @@
 use super::cones::gradient_sky_lighting;
 use super::inject::{RadianceInjection, SceneGiSettings};
+use super::sdf::{JumpFloodSdf, SdfSeeds};
 use super::voxelize::{MeshVoxelizer, SURFACE_WORDS_PER_VOXEL};
 use super::volume::{VoxelGiQuality, VoxelVolume};
 use crate::renderers::SharedLayouts;
@@ -45,6 +46,10 @@ pub struct SceneVoxelGi {
     voxelizer: MeshVoxelizer,
     pub(crate) injection: RadianceInjection,
     sky: wgpu::Buffer,
+    sdf: Option<JumpFloodSdf>,
+    /// The field's static seeds must flood again (it was just made).
+    sdf_stale: bool,
+    device: wgpu::Device,
 }
 
 impl SceneVoxelGi {
@@ -63,7 +68,7 @@ impl SceneVoxelGi {
         });
         let injection = RadianceInjection::new(device, &volume, &sky);
         let settings = SceneGiSettings { bounce_steps: quality.cone_steps() / 2, ..Default::default() };
-        Self { settings, quality, volume, voxelizer, injection, sky }
+        Self { settings, quality, volume, voxelizer, injection, sky, sdf: None, sdf_stale: false, device: device.clone() }
     }
 
     /// The tier in use (the one asked for, or lower if the device could not hold it).
@@ -102,17 +107,59 @@ impl SceneVoxelGi {
         self.injection.set_sky(sky_lighting);
     }
 
-    /// Bytes on the GPU: the radiance with its mips (and anisotropic chains) and the surface
-    /// buffers.
+    /// Bytes on the GPU: the radiance with its mips (and anisotropic chains), the surface
+    /// buffers and the distance field.
     pub fn memory_bytes(&self) -> u64 {
         let layout = self.volume.layout();
         let surfaces = 1 + self.voxelizer.dynamic_surfaces().is_some() as u64;
-        layout.radiance_bytes() + self.volume.anisotropic_bytes() + surfaces * layout.voxel_count() * SURFACE_WORDS_PER_VOXEL * 4
+        layout.radiance_bytes() + self.volume.anisotropic_bytes() + surfaces * layout.voxel_count() * SURFACE_WORDS_PER_VOXEL * 4 + self.sdf.as_ref().map_or(0, |s| s.memory_bytes())
+    }
+
+    /// Keep a distance field of the voxelized surfaces (`JumpFloodSdf`, over the volume's
+    /// layout): the static renderables' part floods again when they change, the dynamic ones'
+    /// every frame they exist. It shadows the injection (`settings.sdf_shadows`), and
+    /// `VoxelGIEffect::set_sdf` reads it for AO and a debug slice. About 12 bytes a voxel, 20
+    /// with dynamic renderables.
+    pub fn enable_sdf(&mut self) {
+        if self.sdf.is_none() {
+            self.sdf = Some(JumpFloodSdf::new(&self.device, *self.volume.layout(), SdfSeeds::Surfaces, Some(self.voxelizer.static_surfaces())));
+            self.sdf_stale = true;
+        }
+    }
+
+    pub fn disable_sdf(&mut self) {
+        self.sdf = None;
+    }
+
+    /// The distance field, if enabled.
+    pub fn sdf(&self) -> Option<&JumpFloodSdf> {
+        self.sdf.as_ref()
+    }
+
+    /// Record the distance field's update (after the voxelization): `static_changed` when the
+    /// static surfaces were voxelized again, `any_dynamic` when dynamic ones are this frame.
+    pub(crate) fn encode_sdf(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, static_changed: bool, any_dynamic: bool) {
+        let Some(sdf) = &mut self.sdf else { return };
+        let mut changed = static_changed || std::mem::take(&mut self.sdf_stale);
+        if changed {
+            sdf.encode_static(encoder);
+        }
+        if any_dynamic != sdf.has_dynamic() {
+            sdf.set_dynamic_surfaces(device, self.voxelizer.dynamic_surfaces().filter(|_| any_dynamic));
+            changed = true;
+        }
+        if any_dynamic {
+            sdf.encode_dynamic(encoder);
+            changed = true;
+        }
+        if changed {
+            sdf.encode_distance(encoder);
+        }
     }
 
     /// Record the injection and the mips (after the voxelization).
     pub(crate) fn encode_lighting(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
-        self.injection.encode(device, queue, encoder, &self.volume, &self.voxelizer, &self.settings);
+        self.injection.encode(device, queue, encoder, &self.volume, &self.voxelizer, self.sdf.as_ref(), &self.settings);
         self.volume.build_mips(encoder);
     }
 }

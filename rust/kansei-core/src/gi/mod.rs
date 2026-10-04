@@ -33,6 +33,7 @@ mod inject;
 mod particle_gi;
 mod particles;
 mod scene;
+mod sdf;
 mod volume;
 mod voxelize;
 
@@ -41,8 +42,9 @@ pub use particle_gi::{ParticleGi, ParticleGiOptions, ParticleGiSettings};
 pub use particles::{GiBox, ParticleEmission, ParticleSplatSettings, ParticleVoxelizer, MAX_GI_BOXES};
 pub use volume::{Mip3d, VolumeLayout, VoxelGiQuality, VoxelVolume};
 pub use effect::{VoxelGIEffect, VoxelGIOptions};
-pub use inject::SceneGiSettings;
+pub use inject::{SceneGiSettings, SdfShadows};
 pub use scene::{SceneVoxelGi, SceneVoxelGiOptions};
+pub use sdf::{JumpFloodSdf, SdfSeeds};
 pub use voxelize::{GiSurface, MeshVoxelizer, SURFACE_WORDS_PER_VOXEL};
 pub(crate) use voxelize::SurfaceSet;
 
@@ -61,6 +63,15 @@ pub(crate) use voxelize::SurfaceSet;
 /// `kansei_voxel_draw.albedo` and `.emission` hold the renderable's `GiSurface`. Group 3 binds
 /// 100-102 here, apart from the shadow group's, so a material may use both chunks.
 pub const VOXEL_WRITE_WGSL: &str = voxelize::VOXEL_WRITE_WGSL;
+
+/// `VOXEL_VOLUME_WGSL` plus reading a `JumpFloodSdf`: `sdfDistance(vol, sdf, sampler, p)`,
+/// `sdfSoftShadow(vol, sdf, sampler, p, toLight, k, maxT)`, `sdfSurfaceShadow(vol, sdf, sampler,
+/// p, n, toLight, k, maxT)` (for a point on a surface of normal `n`: its own plane does not shadow
+/// it at grazing angles), `sdfLightShape(vol, radius, distance)` (k and the march's length for a
+/// light of that radius and distance) and `sdfAo(vol, sdf, sampler, p, n)`.
+/// The material helper for distance-field shadows and AO: bind `JumpFloodSdf::as_texture` as a
+/// `texture_3d<f32>`, and the volume's uniform and sampler, in the material's own group.
+pub const SDF_WGSL: &str = concat!(include_str!("shaders/voxel_volume.wgsl"), include_str!("shaders/sdf.wgsl"));
 
 /// The WGSL `VoxelVolume` struct and `voxelUvw` / `voxelLinearIndex`: bind
 /// `VoxelVolume::uniform` as a `VoxelVolume` uniform.
@@ -102,6 +113,7 @@ mod tests {
             ("cones", cones::PARTICLE_CONES_WGSL),
             ("mip3d", include_str!("shaders/mip3d.wgsl")),
             ("anisotropic mips", include_str!("shaders/aniso_mip.wgsl")),
+            ("jump flood", sdf::JUMP_FLOOD_WGSL),
             ("voxel fragment", voxelize::VOXEL_FRAGMENT_WGSL),
             ("inject", inject::INJECT_WGSL),
             ("screen trace", effect::TRACE_WGSL),
@@ -110,6 +122,15 @@ mod tests {
         ] {
             validate(name, code, &mut sizes);
         }
+        // the distance-field library, as a material uses it
+        validate(
+            "sdf library",
+            &format!(
+                "{SDF_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n\
+                 @compute @workgroup_size(1) fn main() {{ _ = sdfDistance(vol, t, s, vec3f(0.0)) + sdfSoftShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfSurfaceShadow(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 1.0, 0.0), 8.0, 10.0) + sdfAo(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0)) + sdfLightShape(vol, 0.1, 3.0).x; }}"
+            ),
+            &mut sizes,
+        );
         // a material with a voxel entry next to its lit fragment: the voxelizer's group 3 and
         // the shadow group's bindings don't collide
         validate(
@@ -143,6 +164,7 @@ mod tests {
         assert_eq!(sizes["KanseiVoxelDraw"], std::mem::size_of::<voxelize::VoxelDrawGpu>());
         assert_eq!(sizes["InjectParams"], std::mem::size_of::<inject::InjectParamsGpu>());
         assert_eq!(sizes["VoxelGiParams"], std::mem::size_of::<effect::VoxelGiParamsGpu>());
+        assert_eq!(sizes["SdfParams"], std::mem::size_of::<sdf::SdfParamsGpu>());
         assert_eq!(sizes["DirLightData"], std::mem::size_of::<crate::shadows::compute_shadows::DirLightGpu>());
         assert_eq!(sizes["PointLightData"], std::mem::size_of::<crate::shadows::compute_shadows::PointLightGpu>());
     }

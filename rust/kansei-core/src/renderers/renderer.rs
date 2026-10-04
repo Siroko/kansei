@@ -1698,6 +1698,7 @@ impl Renderer {
                 }
             }
         }
+        gi.encode_sdf(device, &mut encoder, static_changed, any_dynamic);
         gi.encode_lighting(device, queue, &mut encoder);
         queue.submit(std::iter::once(encoder.finish()));
     }

@@ -9,8 +9,11 @@
 //   this pass), so the bounces add up over frames;
 // - the surface's emission.
 // A voxel is a Lambertian surface: albedo / pi times its irradiance, plus its emission. It is
-// opaque. Needs voxel_volume.wgsl, voxel_cones.wgsl, voxel_irradiance.wgsl, particle_emission.wgsl
-// (its hash), SKY_LIGHTING_WGSL, spot_light_types.wgsl and compute_shadows.wgsl.
+// opaque. With a distance field (gi::JumpFloodSdf, voxel_irradiance.wgsl's sdfField), lights
+// can be shadowed through it instead: soft shadows past the reach of the shadow maps (a sun beyond
+// its cascades, lights without maps), or for every light. Needs voxel_volume.wgsl,
+// voxel_cones.wgsl, voxel_irradiance.wgsl, sdf.wgsl, particle_emission.wgsl (its hash),
+// SKY_LIGHTING_WGSL, spot_light_types.wgsl and compute_shadows.wgsl.
 
 struct InjectParams {
     numDirLights    : u32,
@@ -23,8 +26,12 @@ struct InjectParams {
     shadowOffset    : f32,   // voxels the shadow lookups move out along the normal
     maxSteps        : u32,   // per bounce cone
     hasDynamic      : u32,   // 1: the dynamic surfaces are bound and preferred where they exist
+    sdfShadows      : u32,   // 0: shadow maps only; 1: the distance field where no map covers; 2: always the field
+    sdfHardness     : f32,   // the field's soft shadows: k of sdfSoftShadow (higher is harder)
+    _pad3           : u32,
     _pad0           : u32,
     _pad1           : u32,
+    _pad2           : u32,
 }
 
 @group(0) @binding(0) var<uniform> vol : VoxelVolume;
@@ -39,6 +46,15 @@ struct InjectParams {
 @group(0) @binding(13) var linearClamp : sampler;
 @group(0) @binding(14) var radianceOut : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(15) var<uniform> sky : SkyLighting;
+
+// The field's soft shadow toward a light `maxT` metres away along `toLight`, from a voxel of
+// normal `n` (none for a two-sided sheet).
+fn fieldShadow(ps: vec3f, n: vec3f, twoSided: bool, toLight: vec3f, maxT: f32) -> f32 {
+    if (twoSided) {
+        return sdfSoftShadow(vol, sdfField, linearClamp, ps, toLight, ip.sdfHardness, maxT);
+    }
+    return sdfSurfaceShadow(vol, sdfField, linearClamp, ps, n, toLight, ip.sdfHardness, maxT);
+}
 
 fn unpack8(v: u32) -> vec4f {
     return vec4f(f32(v & 255u), f32((v >> 8u) & 255u), f32((v >> 16u) & 255u), f32(v >> 24u));
@@ -84,7 +100,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         ndl = select(max(ndl, 0.0), abs(ndl), twoSided);
         if (ndl <= 0.0) { continue; }
         var visibility = 1.0;
-        if (dl.shadowed != 0u && ip.hasShadowMap != 0u) {
+        let mapped = dl.shadowed != 0u && ip.hasShadowMap != 0u && dirShadowCovers(ps);
+        if (ip.sdfShadows == 2u || (ip.sdfShadows == 1u && !mapped)) {
+            visibility = fieldShadow(ps, n, twoSided, l, 1e4);
+        } else if (mapped) {
             visibility = dirShadowLookup(ps + l * vol.voxelSize);
         }
         e += dl.color * ndl * visibility;
@@ -100,7 +119,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         // basic_lit.wgsl's falloff
         let falloff = (1.0 - dist / pl.radius) * (1.0 - dist / pl.radius);
         var visibility = 1.0;
-        if (pl.shadowLayer != NO_SHADOW && ip.hasPointShadows != 0u) {
+        let mapped = pl.shadowLayer != NO_SHADOW && ip.hasPointShadows != 0u;
+        if (ip.sdfShadows == 2u || (ip.sdfShadows == 1u && !mapped)) {
+            visibility = fieldShadow(ps, n, twoSided, d / dist, dist);
+        } else if (mapped) {
             visibility = pointShadowLookup(ps + d / dist * vol.voxelSize, pl.position, pl.shadowLayer);
         }
         e += pl.color * ndl * falloff * visibility;
@@ -113,11 +135,19 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         ndl = select(max(ndl, 0.0), abs(ndl), twoSided);
         if (ndl <= 0.0) { continue; }
         var visibility = 1.0;
+        var coord = vec4f(0.0);
         if (light.shadowLayer >= 0) {
-            let coord = kansei_spot_shadow_coord(light, ps + s.toLight * vol.voxelSize);
-            if (coord.w > 0.0) {
-                visibility = textureSampleCompareLevel(spotShadowAtlas, spotShadowSampler, coord.xy, light.shadowLayer, coord.z);
+            coord = kansei_spot_shadow_coord(light, ps + s.toLight * vol.voxelSize);
+        }
+        if (ip.sdfShadows == 2u || (ip.sdfShadows == 1u && coord.w == 0.0)) {
+            let shape = sdfLightShape(vol, light.sourceRadius, length(light.position - ps));
+            if (twoSided) {
+                visibility = sdfSoftShadow(vol, sdfField, linearClamp, ps, s.toLight, shape.x, shape.y);
+            } else {
+                visibility = sdfSurfaceShadow(vol, sdfField, linearClamp, ps, n, s.toLight, shape.x, shape.y);
             }
+        } else if (coord.w > 0.0) {
+            visibility = textureSampleCompareLevel(spotShadowAtlas, spotShadowSampler, coord.xy, light.shadowLayer, coord.z);
         }
         e += s.illuminance * ndl * visibility;
     }
