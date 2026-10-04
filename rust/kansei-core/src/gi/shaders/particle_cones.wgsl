@@ -3,6 +3,10 @@
 // is the sky, plus one narrow cone toward the sun for its soft volumetric shadow. Needs
 // voxel_volume.wgsl, voxel_cones.wgsl, particle_emission.wgsl and SKY_LIGHTING_WGSL.
 //
+// With a distance field of the volume's opaque voxels (the fluid's body, the walls), the sun's
+// visibility can come from its soft shadow instead (sdf.wgsl's sdfSoftShadow): sharper than the
+// cone, which sees the volume's coarse mips.
+//
 // It writes two vec4 per particle, for its material to read as instance attributes:
 // - the mean radiance arriving at the particle (rgb; a Lambertian particle of albedo k under it
 //   reflects k times it) and its visibility of the sun (a), blended over frames: particle
@@ -23,8 +27,8 @@ struct ConeParams {
     frame          : u32,   // 0 on the first frame: no history yet
     jitter         : f32,   // voxels the cones' start moves by, per particle and frame
     useVolume      : u32,   // 0: no cones, the sky alone (voxel GI off)
-    _pad0          : u32,
-    _pad1          : u32,
+    sdfSun         : u32,   // 1: the sun's visibility from the volume's distance field (sharper) instead of the cone
+    sdfHardness    : f32,   // its soft shadow's k
     _pad2          : u32,
 }
 
@@ -37,6 +41,8 @@ struct ConeParams {
 @group(0) @binding(6) var<storage, read> positions: array<vec4f>;
 @group(0) @binding(7) var<storage, read> velocities: array<vec4f>;
 @group(0) @binding(8) var<storage, read_write> lighting: array<vec4f>;
+// the volume's distance field (gi::ParticleGi::enable_sdf; a 1-texel stand-in without one)
+@group(0) @binding(9) var sdfField: texture_3d<f32>;
 
 const AXES = array<vec3f, 6>(
     vec3f(1.0, 0.0, 0.0), vec3f(-1.0, 0.0, 0.0),
@@ -64,7 +70,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         incoming += c.rgb + c.a * skyRadiance(sky, AXES[k]);
     }
     incoming /= 6.0;
-    let sun = voxelConeTrace(vol, radiance, linearClamp, p, cp.toSun, cp.sunConeTan, start, cp.maxDistance, cp.maxSteps).a;
+    var sun = 0.0;
+    if (cp.sdfSun != 0u) {
+        sun = sdfSoftShadow(vol, sdfField, linearClamp, p, cp.toSun, cp.sdfHardness, cp.maxDistance);
+    } else {
+        sun = voxelConeTrace(vol, radiance, linearClamp, p, cp.toSun, cp.sunConeTan, start, cp.maxDistance, cp.maxSteps).a;
+    }
     let current = vec4f(incoming, sun);
     let blend = select(cp.temporalBlend, 1.0, cp.frame == 0u);
     lighting[2u * i] = mix(lighting[2u * i], current, blend);

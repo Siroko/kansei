@@ -7,6 +7,7 @@ use crate::materials::{Binding, BindingResource, Compute};
 pub(crate) const PARTICLE_CONES_WGSL: &str = concat!(
     include_str!("shaders/voxel_volume.wgsl"),
     include_str!("shaders/voxel_cones.wgsl"),
+    include_str!("shaders/sdf.wgsl"),
     include_str!("shaders/particle_emission.wgsl"),
     include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("shaders/particle_cones.wgsl"),
@@ -37,6 +38,11 @@ pub struct ParticleConeSettings {
     /// false: trace no cones and give every particle the whole sky and the sun (voxel GI off;
     /// the volume is not read, so it need not be built).
     pub use_volume: bool,
+    /// The sun's visibility from the volume's distance field (`ParticleGi::enable_sdf`) instead of
+    /// the sun cone: a sharper soft shadow. Ignored without a field.
+    pub sdf_sun: bool,
+    /// The field's soft shadow: Quilez's k, higher is harder.
+    pub sdf_sun_hardness: f32,
 }
 
 impl Default for ParticleConeSettings {
@@ -51,6 +57,8 @@ impl Default for ParticleConeSettings {
             jitter_voxels: 0.5,
             max_steps: 48,
             use_volume: true,
+            sdf_sun: false,
+            sdf_sun_hardness: 6.0,
         }
     }
 }
@@ -70,7 +78,9 @@ pub(crate) struct ConeParamsGpu {
     frame: u32,
     jitter: f32,
     use_volume: u32,
-    _pad: [u32; 3],
+    sdf_sun: u32,
+    sdf_hardness: f32,
+    _pad: u32,
 }
 
 /// The WGSL `SkyLighting` (`SKY_LIGHTING_WGSL`): 15 vec4.
@@ -103,6 +113,8 @@ pub struct ParticleConeShading {
     shade: Compute,
     capacity: u32,
     frame: u32,
+    sdf: Option<wgpu::TextureView>,
+    no_sdf: wgpu::TextureView,
 }
 
 impl ParticleConeShading {
@@ -144,10 +156,11 @@ impl ParticleConeShading {
                 Binding::storage(6, compute, true),
                 Binding::storage(7, compute, true),
                 Binding::storage(8, compute, false),
+                Binding::texture_3d(9, compute),
             ],
         );
         shade.initialize(device);
-        let mut shading = Self { params, lighting, shade, capacity, frame: 0 };
+        let mut shading = Self { params, lighting, shade, capacity, frame: 0, sdf: None, no_sdf: super::inject::no_sdf(device) };
         shading.bind(device, volume, positions, velocities, emission, sky);
         shading
     }
@@ -175,8 +188,15 @@ impl ParticleConeShading {
                 (6, buffer(positions)),
                 (7, buffer(velocities.unwrap_or(positions))),
                 (8, buffer(&self.lighting)),
+                (9, BindingResource::TextureView(self.sdf.as_ref().unwrap_or(&self.no_sdf))),
             ],
         );
+    }
+
+    /// Read `sdf` (a field over the same volume) for `ParticleConeSettings::sdf_sun`, from the
+    /// next `bind`.
+    pub fn set_sdf(&mut self, sdf: Option<&wgpu::TextureView>) {
+        self.sdf = sdf.cloned();
     }
 
     /// `PARTICLE_LIGHTING_STRIDE` bytes per particle, in the particles' order.
@@ -221,7 +241,9 @@ impl ParticleConeShading {
             frame: self.frame,
             jitter: settings.jitter_voxels,
             use_volume: settings.use_volume as u32,
-            _pad: [0; 3],
+            sdf_sun: (settings.sdf_sun && self.sdf.is_some()) as u32,
+            sdf_hardness: settings.sdf_sun_hardness.max(0.1),
+            _pad: 0,
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         self.frame = self.frame.wrapping_add(1).max(1);

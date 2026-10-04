@@ -5,7 +5,8 @@ use super::VoxelVolume;
 use super::sdf::JumpFloodSdf;
 use crate::shadows::compute_shadows::ComputeShadows;
 
-/// A 1-texel `r32float` field standing in for a distance field (far from everything).
+/// A 1-texel stand-in for a distance field, bound while there is none (and never read then).
+/// `rgba16float`, filterable on any device, where an `r32float` one needs FLOAT32_FILTERABLE.
 pub(crate) fn no_sdf(device: &wgpu::Device) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -14,7 +15,7 @@ pub(crate) fn no_sdf(device: &wgpu::Device) -> wgpu::TextureView {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Float,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })

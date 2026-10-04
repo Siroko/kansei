@@ -480,3 +480,36 @@ fn f16_value(h: u16) -> f32 {
         _ => sign * (1.0 + mantissa / 1024.0) * 2f32.powi(exponent - 15),
     }
 }
+
+/// Particles' sun through the volume's distance field: a particle four voxels short of an opaque
+/// slab is in its shadow when the sun is behind the slab, and sees it when the sun is on its side.
+#[test]
+fn particles_take_the_sun_from_the_volume_field() {
+    use kansei_core::gi::{GiBox, ParticleGi, ParticleGiOptions, VoxelGiQuality};
+    let Some((device, queue)) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let positions = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&[[2.0f32, 2.0, 2.0, 1.0]]), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX });
+    let options = ParticleGiOptions { quality: VoxelGiQuality::Low, bounds_min: [0.0; 3], bounds_max: [4.0; 3], capacity: 1, ..Default::default() };
+    let mut gi = ParticleGi::new(&device, options, &positions, None);
+    gi.set_boxes(&queue, &[GiBox::new([2.5, -1.0, -1.0], [5.0, 5.0, 5.0], [0.0; 3], [-1.0, 0.0, 0.0])]);
+    let sky = gi.sky_buffer().clone();
+    gi.enable_sdf(&device, &positions, None, &sky);
+    gi.settings.splat.density_per_particle = 0.0;
+    gi.settings.cones.sdf_sun = true;
+    gi.settings.cones.jitter_voxels = 0.0;
+    gi.settings.cones.temporal_blend = 1.0;
+    let mut sun = |to_sun: [f32; 3]| {
+        gi.settings.set_sun(to_sun, [1.0; 3]);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        gi.encode(&queue, &mut encoder, 1);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        encoder.copy_buffer_to_buffer(gi.lighting_buffer(), 0, &staging, 0, 32);
+        queue.submit(Some(encoder.finish()));
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let light: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+        light[3]
+    };
+    let (behind, beside) = (sun([1.0, 0.0, 0.0]), sun([-1.0, 0.0, 0.0]));
+    eprintln!("sun behind the slab: {behind}, on the particle's side: {beside}");
+    assert!(behind < 0.02 && beside > 0.99);
+}

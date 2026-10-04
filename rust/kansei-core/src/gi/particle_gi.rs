@@ -1,5 +1,6 @@
 use super::cones::{gradient_sky_lighting, ParticleConeSettings, ParticleConeShading};
 use super::particles::{GiBox, ParticleEmission, ParticleSplatSettings, ParticleVoxelizer};
+use super::sdf::{JumpFloodSdf, SdfSeeds};
 use super::volume::{VoxelGiQuality, VoxelVolume};
 use crate::buffers::ComputeBuffer;
 
@@ -79,6 +80,7 @@ pub struct ParticleGi {
     voxelizer: ParticleVoxelizer,
     shading: ParticleConeShading,
     sky: wgpu::Buffer,
+    sdf: Option<JumpFloodSdf>,
 }
 
 impl ParticleGi {
@@ -96,7 +98,7 @@ impl ParticleGi {
         let shading = ParticleConeShading::new(device, &volume, positions, velocities, voxelizer.emission_buffer(), &sky, options.capacity);
         let mut settings = ParticleGiSettings::default();
         settings.cones.max_steps = quality.cone_steps();
-        Self { settings, quality, volume, voxelizer, shading, sky }
+        Self { settings, quality, volume, voxelizer, shading, sky, sdf: None }
     }
 
     /// The tier in use (the one asked for, or lower if the device could not hold it).
@@ -134,6 +136,30 @@ impl ParticleGi {
         self.shading.bind(device, &self.volume, positions, velocities, self.voxelizer.emission_buffer(), sky_lighting);
     }
 
+    /// Keep a distance field of the volume's opaque voxels (the particles' body where it is at
+    /// least half opaque, and the boxes), flooded every frame after the splat, for the particles'
+    /// sun (`settings.cones.sdf_sun`): a sharper soft shadow than the sun cone. Give the
+    /// particles' buffers again, as `use_sky_lighting` takes them. The field is `r32float`, which
+    /// needs the device's FLOAT32_FILTERABLE (Kansei's renderer requires it).
+    pub fn enable_sdf(&mut self, device: &wgpu::Device, positions: &wgpu::Buffer, velocities: Option<&wgpu::Buffer>, sky: &wgpu::Buffer) {
+        if self.sdf.is_none() {
+            let sdf = JumpFloodSdf::new(device, *self.volume.layout(), SdfSeeds::Opacity { radiance: self.volume.view(), threshold: 0.5 }, None);
+            self.shading.set_sdf(Some(sdf.view()));
+            self.sdf = Some(sdf);
+        }
+        self.shading.bind(device, &self.volume, positions, velocities, self.voxelizer.emission_buffer(), sky);
+    }
+
+    /// The distance field, if enabled.
+    pub fn sdf(&self) -> Option<&JumpFloodSdf> {
+        self.sdf.as_ref()
+    }
+
+    /// The sky buffer the gradient writes (pass it to `enable_sdf` unless `use_sky_lighting`).
+    pub fn sky_buffer(&self) -> &wgpu::Buffer {
+        &self.sky
+    }
+
     /// See `ParticleConeShading::lighting_instance_buffer`.
     pub fn lighting_instance_buffer(&self, shader_location: u32) -> ComputeBuffer {
         self.shading.lighting_instance_buffer(shader_location)
@@ -155,6 +181,9 @@ impl ParticleGi {
         self.voxelizer.set_emission(queue, self.settings.emission);
         if self.settings.cones.use_volume {
             self.voxelizer.encode(queue, encoder, particle_count, &self.settings.splat);
+            if let Some(sdf) = self.sdf.as_ref().filter(|_| self.settings.cones.sdf_sun) {
+                sdf.encode(encoder);
+            }
             self.volume.build_mips(encoder);
         }
         self.shading.encode(queue, encoder, particle_count, &self.settings.cones);
