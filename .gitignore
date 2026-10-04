@@ -29,3 +29,4 @@ dist-ssr
 # Rust build output (cargo target dirs and wasm-pack pkg dirs; the site does not use them)
 target/
 rust/**/pkg/
+build/
