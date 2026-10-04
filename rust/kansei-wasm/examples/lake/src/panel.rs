@@ -215,24 +215,6 @@ pub async fn lake_regions() -> JsValue {
 
 /// The lake's particle positions (simulation space, 4 floats each), read back from the GPU.
 async fn read_lake_positions() -> Option<Vec<f32>> {
-    let (buffer, device, queue) = with_lake(|_, surface, renderer| (surface.sim.positions_buffer().cloned(), renderer.device().clone(), renderer.queue().clone()))?;
-    let buffer = buffer?;
-    let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Lake/Readback"), size: buffer.size(), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_buffer_to_buffer(&buffer, 0, &staging, 0, buffer.size());
-    queue.submit(Some(encoder.finish()));
-    let tx = Rc::new(RefCell::new(None::<js_sys::Function>));
-    let promise = {
-        let tx = tx.clone();
-        js_sys::Promise::new(&mut move |resolve, _| *tx.borrow_mut() = Some(resolve))
-    };
-    staging.slice(..).map_async(wgpu::MapMode::Read, move |_| {
-        if let Some(resolve) = tx.borrow_mut().take() {
-            let _ = resolve.call0(&JsValue::NULL);
-        }
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-    let data: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
-    staging.unmap();
-    Some(data)
+    let readback = with_lake(|_, surface, renderer| surface.sim.positions_buffer().map(|b| renderer.read_buffer_async::<f32>(b)))??;
+    readback.await.ok()
 }
