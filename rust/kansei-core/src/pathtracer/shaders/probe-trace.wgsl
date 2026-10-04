@@ -265,7 +265,9 @@ fn probe_trace_main(@builtin(global_invocation_id) gid: vec3u) {
         // Multi-bounce: sample previous frame's probe grid for indirect
         let indirect = sample_probe_grid_prev(hit.world_pos + hit.world_norm * 0.01, hit.world_norm);
 
-        radiance += (direct + indirect) * mat.albedo;
+        // Lambertian: the lights' irradiance times albedo / pi; the probes' SH holds radiance,
+        // whose cosine-weighted mean is irradiance / pi already
+        radiance += (direct / 3.14159265 + indirect) * mat.albedo;
         break;
     }
 

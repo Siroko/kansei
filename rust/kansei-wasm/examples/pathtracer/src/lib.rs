@@ -148,11 +148,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     // Directional light
-    // Low and from the front, so it shines in through the box's open side (the ceiling is solid)
+    // Low and from the front, so it shines in through the box's open side (the ceiling is solid);
+    // the tracer lights surfaces as the raster does (albedo / pi times the illuminance)
     let sun = DirectionalLight::new(
         Vec3::new(-0.3, -0.5, -1.0).normalize(),
         Vec3::new(1.0, 0.95, 0.9),
-        3.0,
+        9.5,
     );
     let sun = scene.add(SceneNode::Light(Light::Directional(sun)));
 

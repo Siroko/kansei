@@ -335,9 +335,10 @@ fn the_effect_writes_the_floor_lit_by_the_scenes_lights() {
     pollster::block_on(renderer.initialize_headless(&adapter));
     let sky_only = traced_floor(&mut renderer, false, 8);
     let sunlit = traced_floor(&mut renderer, true, 8);
-    // the dim default sky leaves a little; a white sun of 3 on the default albedo of 0.8 lifts
-    // the floor far above that, in HDR (no tone curve), and never past albedo times the sun
+    // the dim default sky leaves a little; a white sun of 3 straight down on the default albedo
+    // of 0.8 adds a Lambertian 0.8 * 3 / pi (as the raster lights it), in HDR (no tone curve)
     assert!(sky_only[1] > 0.0, "nothing written: {sky_only:?}");
-    assert!(sunlit[1] > sky_only[1] + 0.3, "the sun adds too little: {sunlit:?} against {sky_only:?}");
-    assert!(sunlit[1] > 1.0 && sunlit[1] < 0.8 * 3.0 + 0.2, "not the HDR radiance: {sunlit:?}");
+    let sun = sunlit[1] - sky_only[1];
+    let lambert = 0.8 * 3.0 / std::f32::consts::PI;
+    assert!((sun - lambert).abs() < 0.1 * lambert, "the sun adds {sun}, not {lambert}: {sunlit:?} against {sky_only:?}");
 }

@@ -310,11 +310,13 @@ fn evaluate_lighting(hit_pos: vec3f, hit_norm: vec3f, wo: vec3f,
             total += evaluate_point_light(hit_pos, hit_norm, light);
         }
     }
-    return total;
+    // the lights' irradiance through a Lambertian BRDF (albedo / pi; callers apply the albedo),
+    // as the raster and voxel GI light surfaces
+    return total / PI;
 }
 
 // ── Multi-bounce path tracer with NEE ───────────────────────────────────────
-// Returns irradiance at start_pos. At each vertex: NEE for direct light,
+// Returns the light reflected at start_pos per unit albedo. At each vertex: NEE for direct light,
 // then stochastic PBR bounce (specular or diffuse based on metallic/Fresnel).
 
 fn trace_path(start_pos: vec3f, start_norm: vec3f, skip_first_nee: u32,
