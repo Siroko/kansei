@@ -349,8 +349,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
 
     // Directional light
+    // Low and from the front, so it shines in through the box's open side (the ceiling is solid)
     let sun = DirectionalLight::new(
-        Vec3::new(-0.5, -1.0, -0.3).normalize(),
+        Vec3::new(-0.3, -0.5, -1.0).normalize(),
         Vec3::new(1.0, 0.95, 0.9),
         3.0,
     );
@@ -358,7 +359,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     // Camera
     let mut camera = Camera::new(45.0, 0.1, 100.0, width as f32 / height as f32);
-    camera.set_position(0.0, 3.0, 8.0);
+    // Back far enough to frame the whole box
+    camera.set_position(0.0, 3.0, 14.0);
     camera.look_at(&Vec3::new(0.0, 3.0, 0.0));
     camera.update_projection_matrix();
     camera.update_view_matrix();
@@ -398,7 +400,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     pt.set_materials(&materials);
 
     // Light data for path tracer
-    let light_dir = Vec3::new(-0.5, -1.0, -0.3);
+    let light_dir = Vec3::new(-0.3, -0.5, -1.0);
     let light_color = Vec3::new(1.0, 0.95, 0.9);
     let light_intensity = 3.0;
     pt.set_lights_raw(&directional_light_data(light_dir, light_color, light_intensity));
@@ -408,7 +410,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     log::info!("Kansei — Path Tracer (WASM) ready");
 
-    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 8.0);
+    let controls = CameraControls::from_canvas(&canvas, Vec3::new(0.0, 3.0, 0.0), 14.0);
 
     let state = Rc::new(RefCell::new(State {
         renderer,

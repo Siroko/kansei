@@ -17,7 +17,8 @@ out="$(cd "$out" && pwd)"
 
 # Not published (space-separated example names).
 #   joydivision: plays a commercial recording the viewer supplies; the page stays local-only.
-skip=" joydivision "
+#   motion-matching-kimodo: needs the private animation packs and throws before rendering without them.
+skip=" joydivision motion-matching-kimodo "
 
 # Files a page never loads, left out of the site.
 #   pathtracer: scene.gltf/scene.bin (24 MB) are an unused scene; the example loads the dragon.
