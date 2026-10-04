@@ -1077,10 +1077,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // far enough that the room fits across a portrait screen too
     let fit = (1.6 / aspect).max(1.0);
     let mut controls = if lightbox {
-        // low over the front right of the pile, looking across it at the back left corner
-        let mut c = CameraControls::from_canvas(canvas, Vec3::new(-1.5, 6.0, -5.0), 18.55).with_mouse_pan(canvas);
-        c.set_azimuth(0.809);
-        c.set_elevation(0.217);
+        // low over the front right of the pile, looking across it at the back left corner (frame by
+        // hand, then `camera()` in the console gives these numbers)
+        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.91, 4.76, -2.44), 18.55).with_mouse_pan(canvas);
+        c.set_azimuth(0.705);
+        c.set_elevation(0.182);
         c
     } else {
         let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(canvas);
@@ -1164,6 +1165,26 @@ pub fn info() -> String {
         );
     });
     out
+}
+
+/// The orbit as JSON: the point looked at (pan included), the distance to it, and the azimuth and
+/// elevation in radians; `set_camera` takes the same numbers, to frame by hand and keep the result.
+#[wasm_bindgen]
+pub fn camera() -> String {
+    let mut out = String::from("{}");
+    with_state(|s| {
+        let t = s.controls.look_target();
+        out = format!(
+            r#"{{"target":[{:.3},{:.3},{:.3}],"radius":{:.3},"azimuth":{:.4},"elevation":{:.4}}}"#,
+            t.x, t.y, t.z, s.controls.radius, s.controls.azimuth(), s.controls.elevation()
+        );
+    });
+    out
+}
+
+#[wasm_bindgen]
+pub fn set_camera(x: f32, y: f32, z: f32, radius: f32, azimuth: f32, elevation: f32) {
+    with_state(|s| s.controls.set_view(Vec3::new(x, y, z), radius, azimuth, elevation));
 }
 
 #[wasm_bindgen]

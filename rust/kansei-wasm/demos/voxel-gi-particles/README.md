@@ -55,7 +55,9 @@ the wall occlusion (lightbox), the emission, particle size, the ceiling light an
 (lightbox) or the sun's elevation and bearing (Cornell room), exposure, and has a Pour again
 button; it shows the volume's size, memory and the frame time. `window.kansei` exposes every
 export (`info`, the setters, `set_positions`, `set_paused`, `set_cone_jitter`) for scripted
-captures.
+captures. To frame a view by hand, orbit and pan (right drag), then `window.kansei.camera()` gives
+the orbit (`target`, `radius`, `azimuth`, `elevation` in radians) that `set_camera(x, y, z, radius,
+azimuth, elevation)` and the default camera in `src/lib.rs` take.
 
 Assets: none beyond the page; the shaders in `src/shaders/` are compiled in with `include_str!`.
 The page loads Tweakpane 4 from cdn.jsdelivr.net.
