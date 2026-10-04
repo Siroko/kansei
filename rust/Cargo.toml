@@ -22,6 +22,7 @@ exclude = [
     "kansei-wasm/examples/cascaded-shadows",
     "kansei-wasm/examples/depth-of-field",
     "kansei-wasm/examples/gi-box",
+    "kansei-wasm/examples/outdoor-gi",
     "kansei-wasm/examples/occlusion-culling",
     "kansei-wasm/examples/impostors",
     "kansei-wasm/examples/cluster-lod",
