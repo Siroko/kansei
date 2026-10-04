@@ -26,27 +26,26 @@
 //! trigger runs, the left bumper toggles strafing. Keys B, K, M, L and C toggle the trajectory
 //! overlay and HUD, the skeleton, the mesh, foot locking and the character.
 //!
-//! A small lake lies east of the course (`lake`): SPH water in a container shaped like the lake,
-//! which the character wades into, its legs pushing the water (wakes, splashes and ripples). A
-//! water cannon on its west bank (`cannon`) pours more water in when the character stands by it
-//! and presses E (X on a gamepad, or a click on its prompt), raising the lake's level; R (Y) by it
-//! drains the lake back. A water mill in the lake (`mill`) turns its paddles through the water.
+//! A small lake lies east of the course: SPH water in a container shaped like the lake, which the
+//! character wades into, its legs pushing the water (wakes, splashes and ripples). A water cannon
+//! on its west bank pours more water in when the character stands by it and presses E (X on a
+//! gamepad, or a click on its prompt), raising the lake's level; R (Y) by it drains the lake back.
+//! A water mill in the lake turns its paddles through the water. The course, the lake and its
+//! props are the lake example's world (`kansei_wasm_lake::World`, with its P panel's exports);
+//! this crate is the character on it.
 //!
-//! URL parameters: `pack=<url>`, `gait=0` (search every clip whatever the gait, instead of
-//! idle + walk or idle + run by the pack's tags), `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward
-//! paces; sideways and backward scale with them), `course=0` (no boxes), `lake=0` (no lake),
-//! `rest=0` (the lake's water never rests: always stepped and drawn), `mill=0` (the mill stands
-//! still), `profile=1` (log the renderer's GPU/CPU profile every 3 s),
+//! URL parameters: `pack=<url>`, `hero=<url>` (`hero=none`: no character pack), `gait=0`
+//! (search every clip whatever the gait, instead of idle + walk or idle + run by the pack's tags),
+//! `taa=0`, `walk=<m/s>`, `run=<m/s>` (forward paces; sideways and backward scale with them),
+//! `course=0` (no boxes), `lake=0` (no lake), `rest=0` (the lake's water never rests: always
+//! stepped and drawn), `mill=0` (the mill stands still), `profile=1` (log the renderer's GPU/CPU
+//! profile every 3 s), `debug=1` (allows `lake_regions()`, a GPU readback),
 //! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake),
 //! `drive=1` (a fixed route instead of the player, for side-by-side captures; `demo`),
 //! `play=<pattern>` (the pack's clips whose names start with it, `*` any run, one after another),
 //! `view=<degrees>` (the camera turned round the character from behind it).
 
-mod cannon;
 mod demo;
-mod lake;
-mod mill;
-mod props;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -60,30 +59,22 @@ use kansei_core::animation::motion_matching::pack::{CharacterPack, MotionPack};
 use kansei_core::animation::retarget::Retarget;
 use kansei_core::animation::motion_matching::traversal::{CharacterController, CharacterState};
 use kansei_core::animation::motion_matching::{yaw_of, Database, MotionInput, MotionMatcher, MotionMatchingSettings, ACTION_TAG};
-use kansei_core::collision::{CollisionWorld, Obb};
 use kansei_core::animation::{skin_buffer, skinned_lit_material, BonePalette, Skeleton, SkinnedLitParams, SkinnedMesh, PALETTE_BINDING, SKINNING_WGSL, SKIN_BINDING};
 use kansei_core::buffers::{Bindable, BufferType, ComputeBuffer, Sampler};
 use kansei_core::cameras::MOTION_VECTORS_WGSL;
 use kansei_core::materials::BindingResource;
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
-use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry, SphereGeometry};
-use kansei_core::lights::{DirectionalLight, Light};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
-use kansei_core::math::{Vec3, Vec4};
+use kansei_core::geometries::{BoxGeometry, InstancedGeometry};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::math::Vec3;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::postprocessing::{
-    effects::{exposure_from_ev100, FluidSurfaceEffect, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
-    PostProcessingEffect, PostProcessingVolume,
-};
-use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_core::shadows::{CascadedShadowOptions, CASCADED_SHADOWS_WGSL};
+use kansei_core::postprocessing::PostProcessingVolume;
+use kansei_core::renderers::Renderer;
+use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 use kansei_wasm::{flag, param, param_or, Canvas};
+use kansei_wasm_lake::{World, WorldInput, WorldOptions, SKY, SUN, SUN_DIR};
 
-/// The sun's travel direction, its illuminance (lux) and the sky's luminance (cd/m²).
-const SUN_DIR: [f32; 3] = [-0.45, -0.6, -0.66];
-const SUN: [f32; 3] = [80000.0, 72000.0, 60000.0];
-const SKY: [f32; 3] = [4000.0, 5000.0, 7000.0];
 /// Paces of the walk and run loops (m/s) forward, sideways and backward: strafing moves at the
 /// pace of the loop for its direction relative to the facing. `walk=` and `run=` scale them.
 const WALK: [f32; 3] = [2.0, 1.8, 1.5];
@@ -95,145 +86,6 @@ fn pace(paces: [f32; 3], direction: [f32; 2]) -> f32 {
     let along = if direction[1] >= 0.0 { paces[0] } else { paces[2] };
     1.0 / ((direction[1] / along).powi(2) + (direction[0] / paces[1]).powi(2)).sqrt().max(1e-6)
 }
-
-/// Ground: grey with a metre grid and a darker 5 m grid, lit by the sun (cascade-shadowed) and the
-/// sky, writing no motion (it does not move).
-const GROUND_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32>, sun_dir: vec4<f32>, sun: vec4<f32>, sky: vec4<f32> };
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    let world = world_matrix * position;
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world;
-    out.world = world.xyz;
-    return out;
-}
-fn grid(p: vec2<f32>, spacing: f32, width: f32) -> f32 {
-    let q = p / spacing;
-    let d = abs(fract(q - 0.5) - 0.5) / fwidth(q);
-    return 1.0 - min(min(d.x, d.y) / width, 1.0);
-}
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    let n = vec3<f32>(0.0, 1.0, 0.0);
-    let shadow = kansei_sun_shadow(in.world, n, in.clip.xy);
-    let lines = max(grid(in.world.xz, 1.0, 1.0) * 0.35, grid(in.world.xz, 5.0, 1.5) * 0.6);
-    let base = surface.base_color.rgb * (1.0 - lines);
-    let l = -normalize(surface.sun_dir.xyz);
-    let lit = base / 3.14159265 * surface.sun.rgb * max(dot(n, l), 0.0) * shadow + base * surface.sky.rgb;
-    return vec4<f32>(lit, 1.0);
-}
-"#;
-
-/// Course boxes: flat colour with a half-metre grid on every face, sun (cascade-shadowed) and sky.
-const BOX_WGSL: &str = r#"
-struct Surface { base_color: vec4<f32>, sun_dir: vec4<f32>, sun: vec4<f32>, sky: vec4<f32> };
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    let world = world_matrix * position;
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world;
-    out.world = world.xyz;
-    out.normal = (normal_matrix * vec4<f32>(normal, 0.0)).xyz;
-    return out;
-}
-fn lines(p: vec2<f32>) -> f32 {
-    let q = p / 0.5;
-    let d = abs(fract(q - 0.5) - 0.5) / fwidth(q);
-    return 1.0 - min(min(d.x, d.y), 1.0);
-}
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
-    let a = abs(n);
-    var p = in.world.xz;
-    if (a.x > a.y && a.x > a.z) { p = in.world.zy; } else if (a.z > a.y) { p = in.world.xy; }
-    let base = surface.base_color.rgb * (1.0 - 0.3 * lines(p));
-    let l = -normalize(surface.sun_dir.xyz);
-    let shadow = kansei_sun_shadow(in.world, n, in.clip.xy);
-    let sky = mix(surface.sky.rgb * 0.25, surface.sky.rgb, n.y * 0.5 + 0.5);
-    let lit = base / 3.14159265 * surface.sun.rgb * max(dot(n, l), 0.0) * shadow + base * sky;
-    return vec4<f32>(lit, 1.0);
-}
-"#;
-
-/// The course: (x, base height, z) of a box's bottom centre, its width, height and depth, its
-/// heading (radians) and colour.
-const COURSE: [([f32; 3], [f32; 3], f32, [f32; 3]); 20] = [
-    // low rails to hurdle, one long and turned
-    ([0.0, 0.0, 5.0], [3.0, 0.5, 0.25], 0.0, [0.55, 0.35, 0.2]),
-    ([-6.0, 0.0, 4.0], [4.0, 0.8, 0.25], 0.5, [0.55, 0.35, 0.2]),
-    ([6.5, 0.0, 3.0], [2.5, 1.0, 0.3], -0.4, [0.55, 0.35, 0.2]),
-    // boxes to vault
-    ([0.0, 0.0, 10.0], [2.0, 1.0, 0.8], 0.0, [0.25, 0.4, 0.55]),
-    ([-9.0, 0.0, 9.0], [2.2, 0.9, 1.0], 0.8, [0.25, 0.4, 0.55]),
-    // blocks to mantle onto
-    ([7.0, 0.0, 9.5], [3.0, 1.2, 3.0], 0.3, [0.45, 0.45, 0.4]),
-    ([-3.5, 0.0, -6.0], [3.0, 1.5, 2.5], 0.0, [0.45, 0.45, 0.4]),
-    ([4.0, 0.0, -5.0], [2.5, 1.35, 2.5], -0.7, [0.45, 0.45, 0.4]),
-    // walls to climb, with room on top
-    ([0.0, 0.0, 16.0], [4.0, 2.0, 3.0], 0.0, [0.5, 0.3, 0.3]),
-    ([-10.0, 0.0, -2.0], [3.0, 2.4, 3.5], std::f32::consts::FRAC_PI_2, [0.5, 0.3, 0.3]),
-    // long narrow beams: hurdle across, too narrow to stand along
-    ([10.0, 0.0, -3.0], [0.35, 0.6, 7.0], 0.0, [0.3, 0.3, 0.3]),
-    ([-6.0, 0.0, 13.0], [6.0, 0.7, 0.35], -0.2, [0.3, 0.3, 0.3]),
-    // stacked: mantle onto the first, then onto the second (set back: room to stand in front
-    // of it, not on the other sides)
-    ([12.0, 0.0, 12.0], [3.0, 1.2, 3.0], 0.2, [0.45, 0.45, 0.4]),
-    ([12.11, 1.2, 12.54], [1.8, 1.1, 1.8], 0.2, [0.55, 0.5, 0.35]),
-    ([-12.0, 0.0, 16.0], [3.5, 1.0, 3.5], -0.5, [0.45, 0.45, 0.4]),
-    ([-12.22, 1.0, 16.39], [1.8, 1.3, 1.8], -0.5, [0.55, 0.5, 0.35]),
-    // a low step onto a platform, and a thin wall at an angle
-    ([0.0, 0.0, -10.0], [5.0, 0.3, 3.0], 0.0, [0.4, 0.42, 0.45]),
-    ([8.0, 0.0, 16.0], [3.0, 1.1, 0.3], 0.9, [0.55, 0.35, 0.2]),
-    // two platforms with a gap to jump across (a running jump; a walking one falls short)
-    ([-14.0, 0.0, 3.0], [3.0, 1.2, 6.0], 0.0, [0.4, 0.5, 0.45]),
-    ([-14.0, 0.0, 9.5], [3.0, 1.2, 4.0], 0.0, [0.4, 0.5, 0.45]),
-];
-
-/// The course's boxes as colliders and renderables.
-fn build_course(scene: &mut Scene, world: &mut CollisionWorld) {
-    for (base, size, yaw, color) in COURSE {
-        let center = GVec3::new(base[0], base[1] + size[1] * 0.5, base[2]);
-        world.add_box(Obb::new(center, GVec3::from(size) * 0.5, Quat::from_rotation_y(yaw)));
-        let mut material = Material::new("Box", &format!("{CASCADED_SHADOWS_WGSL}\n{BOX_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
-        material.set_uniform_bindable(0, "Box", &surface_params(color));
-        let mut r = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), material);
-        r.object.set_position(center.x, center.y, center.z);
-        r.object.rotation.y = yaw;
-        scene.add(SceneNode::Renderable(r));
-    }
-}
-
-const SKY_WGSL: &str = r#"
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) dir: vec3<f32> };
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world_matrix * position;
-    out.dir = position.xyz;
-    return out;
-}
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    let up = saturate(normalize(in.dir).y);
-    return vec4<f32>(mix(vec3<f32>(9000.0, 9500.0, 10500.0), vec3<f32>(3000.0, 5000.0, 9000.0), sqrt(up)), 1.0);
-}
-"#;
 
 /// Debug markers: unit boxes placed by a per-instance matrix, one flat colour.
 const MARKER_WGSL: &str = r#"
@@ -381,25 +233,12 @@ fn upload_texture(renderer: &Renderer, label: &str, image: image::RgbaImage, srg
     GpuTexture { view: texture.create_view(&Default::default()) }
 }
 
-fn surface_params(base: [f32; 3]) -> [f32; 16] {
-    let d = SUN_DIR;
-    [base[0], base[1], base[2], 0.0, d[0], d[1], d[2], 0.0, SUN[0], SUN[1], SUN[2], 0.0, SKY[0], SKY[1], SKY[2], 0.0]
-}
-
 /// The page URL's parameter `name`, percent-decoded ([`kansei_wasm::param`]).
 pub fn query_param(name: &str) -> Option<String> {
     param(name)
 }
 
 /// Show `text` in the page's HUD element.
-/// Show `text` in the page's `#prompt` element (hidden when empty), if it has one.
-fn set_prompt(text: &str) {
-    if let Some(prompt) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("prompt")) {
-        prompt.set_text_content(Some(text));
-        let _ = prompt.set_attribute("data-visible", if text.is_empty() { "0" } else { "1" });
-    }
-}
-
 fn set_hud(text: &str) {
     if let Some(hud) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("hud")) {
         hud.set_text_content(Some(text));
@@ -632,20 +471,12 @@ struct Keys {
 struct State {
     renderer: Renderer,
     scene: Scene,
-    world: CollisionWorld,
+    /// The course, the lake and its props, and their collision.
+    world: World,
     camera: Camera,
     controls: CameraControls,
     volume: PostProcessingVolume,
     character: Option<Character>,
-    lake: Option<lake::Lake>,
-    /// The props by the lake: the water cannon and the mill (with the lake only).
-    cannon: Option<cannon::Cannon>,
-    mill: Option<mill::Mill>,
-    /// The cannon's trigger from the page (a click on its prompt): pressed since last frame, held.
-    pointer_fire: (bool, bool),
-    /// The prompt shown and the still water's height drawn, as last set.
-    prompt: String,
-    level: f32,
     keys: Rc<RefCell<Keys>>,
     last: f64,
     frame: u32,
@@ -695,9 +526,8 @@ impl State {
 
         // input: keyboard, then the gamepad on top
         let (mut stick, mut run, mut toggles) = ([0.0f32; 2], false, Vec::new());
-        // the cannon's trigger: E, the gamepad's X, or a click on the prompt
-        let (mut fire_pressed, mut fire_held) = self.pointer_fire;
-        self.pointer_fire.0 = false;
+        // the cannon's trigger: E, the gamepad's X (a click on the prompt adds to it in the world)
+        let (mut fire_pressed, mut fire_held) = (false, false);
         {
             let mut keys = self.keys.borrow_mut();
             let held = |k: &[&str]| k.iter().any(|k| keys.held.contains(*k));
@@ -803,11 +633,11 @@ impl State {
                 }
                 c.controller.matcher.update(&c.db, &MotionInput { velocity: GVec3::ZERO, facing: None }, dt);
             } else {
-                c.controller.update(&c.db, &self.world, &MotionInput { velocity, facing }, dt);
+                c.controller.update(&c.db, &self.world.collision, &MotionInput { velocity, facing }, dt);
             }
             if traverse {
                 // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump
-                let _ = c.controller.request_traverse_or_jump(&c.db, &self.world, 1.0);
+                let _ = c.controller.request_traverse_or_jump(&c.db, &self.world.collision, 1.0);
             }
             // the obstacle last looked at: its ledge, and a post down to the floor
             c.ledge.matrices.fill(Mat4::ZERO);
@@ -873,7 +703,7 @@ impl State {
             }
         }
         self.controls.update(&mut self.camera, dt);
-        if let Some(lake) = &mut self.lake {
+        if self.world.lake.is_some() {
             let legs = self.character.as_ref().map(Character::leg_capsules).unwrap_or_default();
             // a landing: back on its feet after being in the air, at the fastest it came down
             let mut landing = None;
@@ -890,43 +720,11 @@ impl State {
                 *was = airborne;
                 self.last_y = y;
             }
-            if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
-                // the props: the mill turns, the cannon fires when the character stands by it
-                let (bodies, stirring) = match &mut self.mill {
-                    Some(mill) => {
-                        mill.update(dt, &mut self.scene);
-                        (mill.capsules(), mill.turning())
-                    }
-                    None => (Vec::new(), false),
-                };
-                let at = self.character.as_ref().map(|c| c.controller.matcher.character().translation);
-                let stream = match &mut self.cannon {
-                    Some(cannon) => {
-                        if drain && cannon.near {
-                            lake.reset(surface);
-                        }
-                        cannon.update(dt, at, fire_pressed, fire_held, lake, &mut self.scene)
-                    }
-                    None => None,
-                };
-                let poured = lake.update(surface, &legs, landing, &bodies, stirring, stream, dt, self.camera.view_projection().to_glam());
-                if let Some(cannon) = &mut self.cannon {
-                    cannon.poured += poured as u64;
-                }
-            }
-            // the wet line on the bed follows the still water's height
-            let level = lake.level();
-            if (level - self.level).abs() > 0.002 {
-                if let Some(buffer) = self.scene.get_renderable_mut(lake.terrain).and_then(|r| r.material.bindable_buffer(0)) {
-                    self.renderer.queue().write_buffer(&buffer, 0, bytemuck::cast_slice(&lake.terrain_uniform()));
-                    self.level = level;
-                }
-            }
-            let prompt = self.cannon.as_ref().map_or(String::new(), |c| c.prompt(lake));
-            if prompt != self.prompt {
-                set_prompt(&prompt);
-                self.prompt = prompt;
-            }
+            // the props: the mill turns, the cannon fires when the character stands by it
+            let at = self.character.as_ref().map(|c| c.controller.matcher.character().translation);
+            let view_proj = self.camera.view_projection().to_glam();
+            let State { world, scene, volume, renderer, .. } = &mut *self;
+            world.update(WorldInput { legs: &legs, landing, at, fire: (fire_pressed, fire_held), drain }, dt, scene, volume, renderer, view_proj);
         }
 
         // HUD, a few times a second
@@ -978,12 +776,7 @@ impl State {
                         ),
                         format_args!(
                             "{}{}",
-                            self.lake.as_ref().map_or(String::new(), |l| format!(
-                                "lake   {} / {} particles, {:.0}% full (level {:+.3} m), east of the course (at=14,-1,90), P tweaks\nwater  {}, fastest {:.2} m/s, {} over {} m/s{}{}\n",
-                                l.particles(), l.capacity(), l.fill() * 100.0, l.level(), l.state().name(), l.speed().0, l.speed().1, lake::SETTLE_SPEED,
-                                self.cannon.as_ref().map_or(String::new(), |c| format!("\ncannon {}{} poured", if c.firing() { "firing, " } else if c.near { "ready, " } else { "" }, c.poured)),
-                                self.mill.as_ref().map_or(String::new(), |m| format!("\nmill   {}", if m.turning() { format!("{:.0} rpm", m.rpm) } else { "stopped".to_string() })),
-                            )),
+                            self.world.status("east of the course (at=14,-1,90), "),
                             if c.bodies.len() > 1 { format!("character: {} (C to switch)", c.bodies[c.showing].name) } else { String::new() },
                         ),
                     ));
@@ -1007,8 +800,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 }
 
 /// `start`, with the packs' bytes from `load` instead of a plain fetch: it gets each pack's URL
-/// (`pack/locomotion.kmm`, `pack/hero.kmm`, or `pack=`/`hero=`) and returns the `.kmm` bytes, or
-/// why there are none. For an app that stores its packs another way, e.g. encrypted.
+/// (`pack/locomotion.kmm`, `pack/hero.kmm`, or `pack=`/`hero=`; never asked for the character
+/// pack with `hero=none`) and returns the `.kmm` bytes, or why there are none. For an app that
+/// stores its packs another way, e.g. encrypted.
 pub async fn start_with_loader<L, F>(canvas_id: &str, load: L) -> Result<(), JsValue>
 where
     L: Fn(String) -> F,
@@ -1016,47 +810,11 @@ where
 {
     let window = web_sys::window().unwrap();
     let canvas = Canvas::find(canvas_id)?;
-    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
-    renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 60.0, ..Default::default() });
+    let renderer = kansei_wasm_lake::renderer(&canvas).await;
 
     let mut scene = Scene::new();
-    // the floor and the course, for collision
-    let mut world = CollisionWorld::new();
-    let with_lake = flag("lake", true);
-    if !with_lake {
-        world.add_box(Obb::from_min_max(GVec3::new(-200.0, -1.0, -200.0), GVec3::new(200.0, 0.0, 200.0)));
-    }
-    if flag("course", true) {
-        build_course(&mut scene, &mut world);
-    }
-    let mut sky = Material::new("Sky", SKY_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { cull_mode: CullMode::None, ..Default::default() });
-    sky.set_uniform_bindable(0, "Sky", &[0.0f32; 4]);
-    let mut sky = Renderable::new(SphereGeometry::new(900.0, 32, 16), sky);
-    sky.cast_shadow = false;
-    scene.add(SceneNode::Renderable(sky));
-    let mut ground_material = Material::new("Ground", &format!("{CASCADED_SHADOWS_WGSL}\n{GROUND_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
-    ground_material.set_uniform_bindable(0, "Ground", &surface_params([0.32, 0.32, 0.3]));
-    // with the lake, the ground has a hole the lake's terrain fills
-    let (mut cannon, mut mill) = (None, None);
-    let lake = if with_lake {
-        let (mut lake, surface) = lake::Lake::new(&renderer, &mut scene, &mut world, ground_material);
-        lake.rest = flag("rest", true);
-        cannon = Some(cannon::Cannon::new(&mut scene, &mut world, &lake));
-        mill = Some(mill::Mill::new(&mut scene, &mut world, &lake));
-        if let Some(m) = &mut mill {
-            m.on = flag("mill", true);
-        }
-        Some((lake, surface))
-    } else {
-        let mut ground = Renderable::new(PlaneGeometry::new(400.0, 400.0), ground_material);
-        ground.object.rotation.x = -std::f32::consts::FRAC_PI_2;
-        ground.cast_shadow = false;
-        scene.add(SceneNode::Renderable(ground));
-        None
-    };
-    let mut sun = DirectionalLight::new(Vec3::new(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]), Vec3::new(1.0, 0.9, 0.75), 80000.0);
-    sun.cast_shadow = true;
-    scene.add(SceneNode::Light(Light::Directional(sun)));
+    // the course, the lake and its props (`course=0`, `lake=0`, `rest=0`, `mill=0`, `taa=0`)
+    let mut world = World::new(&renderer, &mut scene, &WorldOptions::from_url());
 
     // the character, from a pack outside the repository
     let url = param("pack").unwrap_or_else(|| "pack/locomotion.kmm".to_string());
@@ -1066,6 +824,10 @@ where
     // a second body, optional
     let hero_url = param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
     let hero = match &motion {
+        Ok(_) if hero_url == "none" => {
+            log::info!("no character pack: none asked for (hero=none)");
+            None
+        }
         Ok(_) => match load(hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -1087,7 +849,7 @@ where
                     let v: Vec<f32> = at.split(',').filter_map(|x| x.parse().ok()).collect();
                     if v.len() >= 2 {
                         // on whatever is there (a box top)
-                        let y = world.ground_height(GVec3::new(v[0], 0.0, v[1]), 50.0, 50.0, u32::MAX).unwrap_or(0.0);
+                        let y = world.collision.ground_height(GVec3::new(v[0], 0.0, v[1]), 50.0, 50.0, u32::MAX).unwrap_or(0.0);
                         c.controller.matcher.teleport(GVec3::new(v[0], y, v[1]), v.get(2).copied().unwrap_or(0.0).to_radians());
                     }
                 }
@@ -1110,24 +872,7 @@ where
         }
     };
 
-    let tonemap = {
-        let mut o = ToneMapOptions::for_surface(renderer.presentation_format());
-        o.exposure = exposure_from_ev100(14.0);
-        o.vignette = 0.3;
-        ToneMapEffect::new(o)
-    };
-    let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    // the water's refraction and reflection come first, on the lit scene (the lake's `effect` 0)
-    let lake = lake.map(|(lake, surface)| {
-        lake::Lake::add_surface(&mut scene, &surface);
-        effects.push(Box::new(surface));
-        lake
-    });
-    if flag("taa", true) {
-        effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
-    }
-    effects.push(Box::new(tonemap));
-    let volume = PostProcessingVolume::new(&renderer, effects);
+    let volume = world.post_processing(&renderer, &mut scene);
     let mut camera = Camera::new(45.0, 0.1, 1200.0, canvas.aspect());
     camera.update_projection_matrix();
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
@@ -1177,12 +922,6 @@ where
         controls,
         volume,
         character,
-        level: lake.as_ref().map_or(0.0, |l| l.level()),
-        lake,
-        cannon,
-        mill,
-        pointer_fire: (false, false),
-        prompt: String::new(),
         keys,
         last: kansei_wasm::now(),
         frame: 0,
@@ -1223,6 +962,8 @@ where
         }
     }
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+    // the lake's panel and the cannon's prompt act on this world
+    kansei_wasm_lake::register(state.clone());
     kansei_wasm::run(&canvas, move |frame| {
         let mut s = state.borrow_mut();
         let State { renderer, camera, .. } = &mut *s;
@@ -1232,8 +973,14 @@ where
     Ok(())
 }
 
+impl kansei_wasm_lake::Host for State {
+    fn parts(&mut self) -> (&mut World, &mut PostProcessingVolume, &Renderer) {
+        (&mut self.world, &mut self.volume, &self.renderer)
+    }
+}
+
 thread_local! {
-    /// The page's state, for the exports the tweak panel calls between frames.
+    /// The page's state, for the exports the clip tools call between frames.
     static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
 }
 
@@ -1244,32 +991,6 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
         let mut state = state.borrow_mut();
         Some(f(&mut state))
     })
-}
-
-/// Run `f` on the lake, its surface effect and the renderer, when there is a lake.
-fn with_lake<R>(f: impl FnOnce(&mut lake::Lake, &mut FluidSurfaceEffect, &Renderer) -> R) -> Option<R> {
-    STATE.with(|s| {
-        let state = s.borrow().clone()?;
-        let mut state = state.borrow_mut();
-        let State { lake, volume, renderer, .. } = &mut *state;
-        let lake = lake.as_mut()?;
-        let surface = volume.effect_mut::<FluidSurfaceEffect>()?;
-        Some(f(lake, surface, renderer))
-    })
-}
-
-fn surface_js(s: lake::SurfaceSettings) -> JsValue {
-    let o = js_sys::Object::new();
-    let set = |k: &str, v: JsValue| {
-        let _ = js_sys::Reflect::set(&o, &k.into(), &v);
-    };
-    set("surfaceField", s.surface_field.into());
-    set("resolution", s.resolution.into());
-    set("kernel", s.kernel.into());
-    set("particleRadius", s.particle_radius.into());
-    set("iso", s.iso.into());
-    set("interpolate", s.interpolate.into());
-    o.into()
 }
 
 /// Start the `drive=1` route (or the `play=` clips) over, the character back where it started:
@@ -1326,203 +1047,4 @@ pub fn set_drive(on: bool) {
             s.strafe = false;
         }
     });
-}
-
-/// The lake's current settings, for the tweak panel: the simulation's and the surface's.
-#[wasm_bindgen]
-pub fn lake_settings() -> JsValue {
-    with_lake(|lake, surface, _| {
-        let p = &surface.sim.params;
-        let o: js_sys::Object = surface_js(lake.surface_settings()).into();
-        for (k, v) in [
-            ("viscosity", p.viscosity),
-            ("negativePressure", p.negative_pressure_scale),
-            ("pressure", p.pressure_multiplier),
-            ("nearPressure", p.near_pressure_multiplier),
-            ("restDensity", p.density_target),
-            ("substeps", p.substeps as f32),
-            ("timeScale", lake.time_scale),
-            ("drag", lake.drag()),
-            ("splash", lake.splash_push),
-            ("friction", lake.friction()),
-            ("rest", lake.rest as u32 as f32),
-            ("solver", if p.solver == kansei_core::simulations::fluid::FluidSolver::Pbf { 1.0 } else { 0.0 }),
-            ("pbfIterations", p.pbf.iterations as f32),
-            ("pbfRelaxation", p.pbf.relaxation),
-            ("pbfScorrK", p.pbf.scorr_k),
-            ("pbfScorrN", p.pbf.scorr_n),
-            ("pbfXsph", p.pbf.xsph),
-            ("pbfVorticity", p.pbf.vorticity),
-        ] {
-            let _ = js_sys::Reflect::set(&o, &k.into(), &v.into());
-        }
-        o.into()
-    })
-    .unwrap_or(JsValue::NULL)
-}
-
-/// Whether the lake's water is "running", "culled" (out of view, not stepped or drawn) or
-/// "asleep" (settled with nothing near it: not stepped, its surface drawn as it was); null without
-/// a lake.
-#[wasm_bindgen]
-pub fn lake_state() -> Option<String> {
-    with_lake(|lake, _, _| lake.state().name().to_string())
-}
-
-/// Set one of the lake's simulation settings by name (see `lake::Lake::set`), or the mill's
-/// (`mill`: 1 turning, 0 stopped; `millRpm`: its speed in turns a minute).
-#[wasm_bindgen]
-pub fn lake_set(key: &str, value: f32) -> bool {
-    if let Some(done) = with_state(|state| {
-        let mill = state.mill.as_mut()?;
-        match key {
-            "mill" => mill.on = value > 0.5,
-            "millRpm" => mill.rpm = value.clamp(0.0, 60.0),
-            _ => return None,
-        }
-        Some(true)
-    })
-    .flatten()
-    {
-        return done;
-    }
-    with_lake(|lake, surface, _| lake.set(surface, key, value)).unwrap_or(false)
-}
-
-/// The mill's settings for the tweak panel ({ mill: 0 or 1, millRpm }), or null without one.
-#[wasm_bindgen]
-pub fn mill_settings() -> JsValue {
-    with_state(|state| {
-        let mill = state.mill.as_ref()?;
-        let o = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&o, &"mill".into(), &(mill.on as u32).into());
-        let _ = js_sys::Reflect::set(&o, &"millRpm".into(), &mill.rpm.into());
-        Some(JsValue::from(o))
-    })
-    .flatten()
-    .unwrap_or(JsValue::NULL)
-}
-
-/// What the page should prompt near the cannon ("E / X — fire water …", or that the lake is
-/// full), or "" when the character is not by it: for a page that shows its own overlay.
-#[wasm_bindgen]
-pub fn cannon_prompt() -> String {
-    with_state(|state| state.prompt.clone()).unwrap_or_default()
-}
-
-/// The cannon's trigger from the page (a click or touch on the prompt): `down` fires (a burst,
-/// and it pours while held), `false` releases it. Only fires with the character by the cannon.
-#[wasm_bindgen]
-pub fn cannon_fire(down: bool) {
-    with_state(|state| state.pointer_fire = (state.pointer_fire.0 || down, down));
-}
-
-/// How full the lake is: { particles, capacity, fill (0 at the start's level, 1 full), level (m) },
-/// or null without a lake.
-#[wasm_bindgen]
-pub fn lake_fill() -> JsValue {
-    with_state(|state| {
-        let lake = state.lake.as_ref()?;
-        let o = js_sys::Object::new();
-        for (k, v) in [("particles", lake.particles() as f32), ("capacity", lake.capacity() as f32), ("fill", lake.fill()), ("level", lake.level())] {
-            let _ = js_sys::Reflect::set(&o, &k.into(), &v.into());
-        }
-        Some(JsValue::from(o))
-    })
-    .flatten()
-    .unwrap_or(JsValue::NULL)
-}
-
-/// Put the lake's water back as it started.
-#[wasm_bindgen]
-pub fn lake_reset() {
-    with_lake(|lake, surface, _| lake.reset(surface));
-}
-
-/// Extract the lake's surface with these settings.
-#[wasm_bindgen]
-pub fn lake_surface(surface_field: bool, resolution: u32, kernel: f32, particle_radius: f32, iso: f32, interpolate: bool) {
-    let settings = lake::SurfaceSettings { surface_field, resolution: resolution.clamp(32, 384), kernel: kernel.max(0.5), particle_radius, iso, interpolate };
-    with_lake(|lake, surface, renderer| lake.set_surface(renderer, surface, settings));
-}
-
-/// Apply a surface preset ("droplets", "smooth" or "performance") and return its settings.
-#[wasm_bindgen]
-pub fn lake_surface_preset(name: &str) -> JsValue {
-    let settings = match name {
-        "smooth" => lake::SurfaceSettings::SMOOTH,
-        "performance" => lake::SurfaceSettings::PERFORMANCE,
-        _ => lake::SurfaceSettings::DROPLETS,
-    };
-    with_lake(|lake, surface, renderer| lake.set_surface(renderer, surface, settings));
-    surface_js(settings)
-}
-
-/// Debugging the lake: its particles by region, read back from the GPU ("lake n (y) · bank ·
-/// wall band · outside").
-#[wasm_bindgen]
-pub async fn lake_regions() -> JsValue {
-    let Some(positions) = read_lake_buffer(false).await else { return JsValue::NULL };
-    with_lake(|lake, _, _| {
-        let r = lake.regions(&positions);
-        JsValue::from_str(&format!("lake {} ({:.3}) · bank {} ({:.3}) · wall band {} ({:.3}) · outside {} ({:.3})", r[0].0, r[0].1, r[1].0, r[1].1, r[2].0, r[2].1, r[3].0, r[3].1))
-    })
-    .unwrap_or(JsValue::NULL)
-}
-
-/// Debugging the lake: its particles' speeds (m/s in the world): [max, 99th percentile, mean, how
-/// many are past 4 m/s].
-#[wasm_bindgen]
-pub async fn lake_speeds() -> JsValue {
-    let Some(velocities) = read_lake_buffer(true).await else { return JsValue::NULL };
-    let scale = with_lake(|lake, _, _| lake.world_speed_scale()).unwrap_or(1.0);
-    let mut speeds: Vec<f32> = velocities.chunks_exact(4).map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() * scale).collect();
-    speeds.sort_by(f32::total_cmp);
-    let n = speeds.len().max(1);
-    let out = js_sys::Array::new();
-    let fast = speeds.iter().filter(|s| **s > 4.0).count() as f32;
-    for v in [speeds.last().copied().unwrap_or(0.0), speeds[(n * 99 / 100).min(n - 1)], speeds.iter().sum::<f32>() / n as f32, fast] {
-        out.push(&v.into());
-    }
-    out.into()
-}
-
-/// The lake's particle positions (or velocities), read back from the GPU.
-async fn read_lake_buffer(velocities: bool) -> Option<Vec<f32>> {
-    let (buffer, device, queue) = with_lake(|_, surface, renderer| (if velocities { surface.sim.velocities_buffer() } else { surface.sim.positions_buffer() }.cloned(), renderer.device().clone(), renderer.queue().clone()))?;
-    let buffer = buffer?;
-    let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Lake/Readback"), size: buffer.size(), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_buffer_to_buffer(&buffer, 0, &staging, 0, buffer.size());
-    queue.submit(Some(encoder.finish()));
-    let tx = Rc::new(RefCell::new(None::<js_sys::Function>));
-    let promise = {
-        let tx = tx.clone();
-        js_sys::Promise::new(&mut move |resolve, _| *tx.borrow_mut() = Some(resolve))
-    };
-    staging.slice(..).map_async(wgpu::MapMode::Read, move |_| {
-        if let Some(resolve) = tx.borrow_mut().take() {
-            let _ = resolve.call0(&JsValue::NULL);
-        }
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-    let data: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
-    staging.unmap();
-    Some(data)
-}
-
-/// Debugging the lake: its 12 fastest particles, "x y z (above the floor) speed" in the world.
-#[wasm_bindgen]
-pub async fn lake_fastest() -> JsValue {
-    let (Some(p), Some(v)) = (read_lake_buffer(false).await, read_lake_buffer(true).await) else { return JsValue::NULL };
-    let scale = with_lake(|lake, _, _| lake.world_speed_scale()).unwrap_or(1.0);
-    let mut all: Vec<(f32, usize)> = v.chunks_exact(4).enumerate().map(|(i, v)| ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() * scale, i)).collect();
-    all.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let lines: Vec<String> = all.iter().take(12).map(|(s, i)| {
-        let q = &p[i * 4..i * 4 + 4];
-        let (x, y, z) = (q[0] / 11.0, q[1] / 11.0, q[2] / 11.0);
-        let above = with_lake(|lake, _, _| lake.floor_at(q[0], q[2])).unwrap_or(0.0);
-        format!("{x:.2} {y:.3} {z:.2} (+{:.3}) {s:.2}", y - above)
-    }).collect();
-    JsValue::from_str(&lines.join(" | "))
 }

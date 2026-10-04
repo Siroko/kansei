@@ -36,7 +36,8 @@
     <div id="prompt"></div>
     <div id="missing"></div>
     <script type="module">
-        import init, { start_kimodo, cannon_fire, clip_names, play_clips, set_drive, drive_restart } from '../pkg/kansei_wasm_motion_matching_kimodo.js';
+        // the motion-matching example's module: this page is one of its pages
+        import init, { start, cannon_fire, clip_names, play_clips, set_drive, drive_restart } from '../pkg/kansei_wasm_motion_matching.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
         // The packs, linked into www/pack/ by link-packs.sh (they stay out of git). `params` are
@@ -73,6 +74,13 @@
             history.replaceState(null, '', urlFor(current, keep));
         }
         const packUrl = current ? PACKS[current].url : asked;
+        // the generated packs carry their own SOMA body, and no pack/hero.kmm sits next to them: a
+        // character pack only when the URL names one (hero=<url>), else hero=none
+        const withHero = new URLSearchParams(location.search);
+        if (!withHero.has('hero')) {
+            withHero.set('hero', 'none');
+            history.replaceState(null, '', `${location.pathname}?${withHero.toString().replace(/%2F/g, '/').replace(/%2C/g, ',').replace(/%2A/g, '*')}`);
+        }
 
         // which packs are linked (a 404 for those that aren't)
         const linked = Object.fromEntries(await Promise.all(Object.entries(PACKS).map(async ([id, p]) => {
@@ -109,12 +117,12 @@
         if (missing) {
             document.getElementById('missing').innerHTML =
                 `<b>The pack ${packUrl} isn't linked.</b>\n\nThe generated packs are private and stay out of git. Link them into www/pack/:\n\n` +
-                `  <code>rust/kansei-wasm/examples/motion-matching-kimodo/link-packs.sh [private-data-dir]</code>\n\n` +
-                `(default ~/Documents/dev/kansei-private-data: its genanim/pack/ becomes www/pack/gen/, gasp/pack/ www/pack/gasp/), then reload, or pick a linked pack in the panel. See this example's README.`;
+                `  <code>rust/kansei-wasm/examples/motion-matching/link-packs.sh [private-data-dir]</code>\n\n` +
+                `(default ~/Documents/dev/kansei-private-data: its genanim/pack/ becomes www/pack/gen/, gasp/pack/ www/pack/gasp/), then reload, or pick a linked pack in the panel. See the motion-matching README (Kimodo).`;
             throw new Error(`pack ${packUrl} not linked`);
         }
 
-        await start_kimodo('kansei');
+        await start('kansei');
         window.driveRestart = drive_restart;
 
         // the clip browser: the custom clips, played as they are from where the character stands

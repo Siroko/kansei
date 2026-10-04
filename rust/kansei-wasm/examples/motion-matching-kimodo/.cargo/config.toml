@@ -1,3 +1,0 @@
-# The motion-matching search runs on the CPU: build with WASM SIMD (every WebGPU browser has it).
-[target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]

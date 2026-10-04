@@ -11,7 +11,7 @@ use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 
 use crate::{SKY, SUN, SUN_DIR};
 
-/// The props' colours, picked per vertex (`uv.x`): the course's (`COURSE` in `lib.rs`), and black.
+/// The props' colours, picked per vertex (`uv.x`): the course's (`course::COURSE`), and black.
 #[derive(Clone, Copy)]
 pub enum Paint {
     /// The rails'.
