@@ -476,3 +476,45 @@ impl CubeMapShadowMap {
         self.matrix_alignment
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shaders' face and texel lookup (basic_lit.wgsl `calcPointShadow`, compute_shadows.wgsl
+    /// `pointShadowLookup`): which layer, and where in it, a direction from the light reads.
+    fn lookup(dir: glam::Vec3) -> (usize, glam::Vec2) {
+        let a = dir.abs();
+        let (face, uv) = if a.x >= a.y && a.x >= a.z {
+            if dir.x > 0.0 { (0, glam::Vec2::new(-dir.z, -dir.y) / a.x) } else { (1, glam::Vec2::new(dir.z, -dir.y) / a.x) }
+        } else if a.y >= a.x && a.y >= a.z {
+            if dir.y > 0.0 { (2, glam::Vec2::new(dir.x, dir.z) / a.y) } else { (3, glam::Vec2::new(dir.x, -dir.z) / a.y) }
+        } else if dir.z > 0.0 {
+            (4, glam::Vec2::new(dir.x, -dir.y) / a.z)
+        } else {
+            (5, glam::Vec2::new(-dir.x, -dir.y) / a.z)
+        };
+        (face, glam::Vec2::new(uv.x, -uv.y) * 0.5 + 0.5)
+    }
+
+    #[test]
+    fn the_point_shadow_lookup_finds_the_texel_each_face_rendered() {
+        let light = [1.0, 2.0, -3.0];
+        let mut seed = 1u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        for _ in 0..500 {
+            let dir = glam::Vec3::new(random(), random(), random()).normalize();
+            let (face, uv) = lookup(dir);
+            // where that face's render put the point: NDC, then texels with rows running down
+            let vp = glam::Mat4::from_cols_array(&CubeMapShadowMap::compute_face_vp(&light, face, 50.0));
+            let clip = vp * (glam::Vec3::from_array(light) + dir * 5.0).extend(1.0);
+            assert!(clip.w > 0.0, "{dir} is behind face {face}");
+            let ndc = clip.truncate().truncate() / clip.w;
+            let rendered = glam::Vec2::new(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            assert!(rendered.abs_diff_eq(uv, 1e-4), "{dir}: face {face} rendered it at {rendered}, the lookup reads {uv}");
+        }
+    }
+}

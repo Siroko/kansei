@@ -2,16 +2,17 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Kansei — Lit Scene</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Hello scene</title>
     <style>
         body { margin: 0; background: #000; overflow: hidden; }
-        canvas { width: 100vw; height: 100vh; display: block; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
     </style>
 </head>
 <body>
     <canvas id="kansei"></canvas>
     <script type="module">
-        import init, { start } from '../pkg/kansei_wasm_lit_scene.js';
+        import init, { start } from '../pkg/kansei_wasm_hello_scene.js';
         await init();
         await start('kansei');
     </script>

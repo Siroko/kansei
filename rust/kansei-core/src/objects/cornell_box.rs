@@ -1,9 +1,7 @@
 use super::{Object3D, Renderable};
 use crate::geometries::PlaneGeometry;
-use crate::materials::{Binding, CullMode, Material, MaterialOptions};
+use crate::materials::{CullMode, Material};
 use crate::math::Vec3;
-
-const CORNELL_WGSL: &str = include_str!("../shaders/basic_lit.wgsl");
 
 pub struct CornellBox {
     pub object: Object3D,
@@ -28,30 +26,12 @@ impl CornellBox {
         let mut push_face =
             |name: &str, color: [f32; 4], pos: Vec3, rot: Vec3, scale: Vec3| {
                 let geometry = PlaneGeometry::new(1.0, 1.0);
-                let material = Material::new(
-                    &format!("CornellBox/{name}/Material"),
-                    CORNELL_WGSL,
-                    vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
-                    MaterialOptions {
-                        cull_mode: CullMode::Front,
-                        ..Default::default()
-                    },
-                );
+                let mut material = Material::basic_lit(&format!("CornellBox/{name}"), color, [0.15, 0.15, 0.15, 0.5]);
+                material.options.cull_mode = CullMode::Front;
                 let mut renderable = Renderable::new(geometry, material);
                 renderable.object.position = pos;
                 renderable.object.rotation = rot;
                 renderable.object.scale = scale;
-
-                // basic_lit expects color + specular vec4.
-                let uniform: [f32; 8] = [
-                    color[0], color[1], color[2], color[3],
-                    0.15, 0.15, 0.15, 0.5,
-                ];
-                renderable.material.set_uniform_bindable(
-                    0,
-                    &format!("CornellBox/{name}/Color"),
-                    &uniform,
-                );
 
                 faces.push(renderable);
             };

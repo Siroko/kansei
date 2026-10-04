@@ -22,8 +22,6 @@ use kansei_core::postprocessing::{
 use kansei_core::renderers::RendererConfig;
 use kansei_wasm::{flag, param, param_or, Canvas};
 
-const LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
-
 /// Unlit radiance (cd/m²), for lamp heads; `sky` mode is a horizon-to-zenith gradient.
 const EMISSIVE_WGSL: &str = r#"
 struct Emissive { radiance: vec4<f32>, zenith: vec4<f32> };
@@ -53,13 +51,6 @@ fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-fn lit_material(label: &str, color: [f32; 4], specular: [f32; 4]) -> Material {
-    let data: [f32; 8] = [color[0], color[1], color[2], color[3], specular[0], specular[1], specular[2], specular[3]];
-    let mut material = Material::new(label, LIT_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions::default());
-    material.set_uniform_bindable(0, label, &data);
-    material
-}
-
 fn emissive_material(label: &str, radiance: [f32; 3], zenith: Option<[f32; 3]>, cull_mode: CullMode) -> Material {
     let z = zenith.unwrap_or([0.0; 3]);
     let data: [f32; 8] = [radiance[0], radiance[1], radiance[2], 0.0, z[0], z[1], z[2], zenith.is_some() as u32 as f32];
@@ -87,7 +78,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let sky = Renderable::new(SphereGeometry::new(180.0, 32, 16), emissive_material("Sky", [6.0, 5.2, 4.6], Some([0.8, 1.1, 1.8]), CullMode::None));
     scene.add(SceneNode::Renderable(sky));
 
-    let mut floor = Renderable::new(PlaneGeometry::new(120.0, 120.0), lit_material("Floor", [0.3, 0.31, 0.3, 1.0], [0.04, 0.04, 0.04, 0.05]));
+    let mut floor = Renderable::new(PlaneGeometry::new(120.0, 120.0), Material::basic_lit("Floor", [0.3, 0.31, 0.3, 1.0], [0.04, 0.04, 0.04, 0.05]));
     floor.object.rotation.x = -std::f32::consts::FRAC_PI_2;
     floor.cast_shadow = false;
     scene.add(SceneNode::Renderable(floor));
@@ -99,7 +90,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let x = side * (3.5 + (seed % 4) as f32 * 1.7);
             let z = -30.0 + i as f32 * 4.3 + (seed % 3) as f32 * 0.8;
             let h = 7.0 + (seed % 5) as f32;
-            let mut trunk = Renderable::new(BoxGeometry::new(0.4, h, 0.4), lit_material("Trunk", [0.25, 0.2, 0.16, 1.0], [0.03, 0.03, 0.03, 0.1]));
+            let mut trunk = Renderable::new(BoxGeometry::new(0.4, h, 0.4), Material::basic_lit("Trunk", [0.25, 0.2, 0.16, 1.0], [0.03, 0.03, 0.03, 0.1]));
             trunk.object.set_position(x, h * 0.5, z);
             scene.add(SceneNode::Renderable(trunk));
         }
@@ -108,7 +99,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // lamps along the path: 4000 cd/m² heads, which bloom and clip; the first one casts shadows
     for (k, z) in [-18.0f32, -4.0, 10.0].into_iter().enumerate() {
         let x = if k % 2 == 0 { -1.8 } else { 1.8 };
-        let mut pole = Renderable::new(BoxGeometry::new(0.12, 3.0, 0.12), lit_material("Pole", [0.1, 0.1, 0.1, 1.0], [0.1, 0.1, 0.1, 0.3]));
+        let mut pole = Renderable::new(BoxGeometry::new(0.12, 3.0, 0.12), Material::basic_lit("Pole", [0.1, 0.1, 0.1, 1.0], [0.1, 0.1, 0.1, 0.3]));
         pole.object.set_position(x, 1.5, z);
         scene.add(SceneNode::Renderable(pole));
         let mut head = Renderable::new(SphereGeometry::new(0.18, 16, 8), emissive_material("LampHead", [4000.0, 2600.0, 1400.0], None, CullMode::Back));

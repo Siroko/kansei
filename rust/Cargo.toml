@@ -9,11 +9,8 @@ members = [
 ]
 exclude = [
     "vendor/basisu",
-    "kansei-wasm/examples/spinning-box",
-    "kansei-wasm/examples/instanced-cubes",
-    "kansei-wasm/examples/lit-scene",
-    "kansei-wasm/examples/shadow-scene",
-    "kansei-wasm/examples/postprocess-scene",
+    "kansei-wasm/examples/hello-scene",
+    "kansei-wasm/examples/instancing",
     "kansei-wasm/examples/pathtracer",
     "kansei-wasm/examples/fluid",
     "kansei-wasm/examples/fluid_clock",

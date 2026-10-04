@@ -7,14 +7,13 @@ use kansei_core::controls::CameraControls;
 use kansei_core::geometries::BoxGeometry;
 use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, Material, MaterialOptions};
+use kansei_core::materials::Material;
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::pathtracer::{BVHBuilder, GPUBVHData, PathTracer, PathTracerMaterial, TLASBuilder};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{fetch_bytes, Canvas};
 
-const BASIC_LIT_WGSL: &str = include_str!("../../../../kansei-core/src/shaders/basic_lit.wgsl");
 
 const BLIT_SHADER: &str = "
 @group(0) @binding(0) var t_input: texture_2d<f32>;
@@ -44,18 +43,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 ";
 
 fn make_basic_material(name: &str, color: [f32; 4]) -> Material {
-    let mut mat = Material::new(
-        name,
-        BASIC_LIT_WGSL,
-        vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)],
-        MaterialOptions::default(),
-    );
-    let uniform: [f32; 8] = [
-        color[0], color[1], color[2], color[3],
-        0.15, 0.15, 0.15, 0.5,
-    ];
-    mat.set_uniform_bindable(0, &format!("{name}/Color"), &uniform);
-    mat
+    Material::basic_lit(name, color, [0.15, 0.15, 0.15, 0.5])
 }
 
 /// Blit pipeline resources for presenting the path tracer output to the canvas.
