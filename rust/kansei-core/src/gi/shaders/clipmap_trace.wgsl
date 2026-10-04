@@ -2,7 +2,9 @@
 // screen_trace.wgsl's, with clipmap.wgsl's cones. Per traced pixel, the irradiance its surface
 // receives through the clipmap (six cones over the hemisphere around its normal, turned per pixel
 // and frame), from a point a little out along the normal, by the voxels of the finest level that
-// holds the surface: a distant surface reads only coarse levels. Output: rgb the irradiance, a the
+// holds the surface: a distant surface reads only coarse levels. The cones read levels finer than
+// they are wide (`levelBias`, clipConeTraceNear), from a start jittered per pixel and frame, so
+// they see the sky through gaps narrower than they are; the temporal filter averages them. Output: rgb the irradiance, a the
 // share of the hemisphere that sees past the clipmap.
 //
 // `show_voxels`: the debug view, the clipmap's light as the camera sees it, each step of the ray
@@ -34,7 +36,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     // the voxels of the finest level holding the surface (the coarsest past them all)
     let size = clipVoxelSize(min(clipLevelAt(world, 0u, 1.0), clipmap.levelCount - 1u));
     let origin = world + n * (gp.startVoxels * size);
-    let e = clipIrradiance(sky, gp.skyScale, origin, n, angle, size, size, gp.maxDistance, gp.maxSteps);
+    // (a start jittered per pixel and frame: with a level bias the cones sample sparsely)
+    let jitter = fract(ign(vec2f(gid.yx)) + f32(gp.frame % 64u) * 0.754877);
+    let e = clipIrradianceNear(sky, gp.skyScale, origin, n, angle, size, size * (1.0 + jitter), gp.maxDistance, gp.maxSteps, gp.levelBias);
     textureStore(outTex, gid.xy, vec4f(min(e.rgb, vec3f(60000.0)), e.a));
 }
 

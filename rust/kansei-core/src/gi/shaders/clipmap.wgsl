@@ -81,6 +81,16 @@ const CLIP_LIFT : f32 = 1.5;
 // stops where it leaves the coarsest level. Returns the scene radiance gathered (rgb) and the
 // transmittance left (a): add `a * sky` for the light from past the clipmap.
 fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32) -> vec4f {
+    return clipConeTraceNear(origin, dir, n, tanHalf, minDiameter, startDist, maxDist, maxSteps, 0.0);
+}
+
+// clipConeTrace reading voxels `levelBias` levels finer than the cone is wide (no finer than
+// `minDiameter`), over the cone's steps: a ray along its axis, sampled sparsely, that sees through
+// gaps narrower than the cone (a road between trees, a slot between walls) where the coarse levels
+// would fill them; and on a uniform medium the same transmittance. Its samples land on the
+// voxels they land on: jitter `startDist` and turn the cones from one update to the next, and
+// average them (probes do).
+fn clipConeTraceNear(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32, levelBias: f32) -> vec4f {
     var color = vec3f(0.0);
     var transmittance = 1.0;
     var dist = startDist;
@@ -92,7 +102,7 @@ fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter:
         let diameter = max(2.0 * tanHalf * dist, minDiameter);
         // the lift clears the voxels read, no wider than the coarsest level's
         let p = origin + dir * dist + n * max(CLIP_LIFT * min(diameter, max(coarsest, minDiameter)) - dist * rise, 0.0);
-        let lod = max(log2(diameter / clipmap.voxelSize), 0.0);
+        let lod = max(log2(max(diameter * exp2(-levelBias), minDiameter) / clipmap.voxelSize), 0.0);
         let k = clipLevelAt(p, min(u32(lod), clipmap.levelCount - 1u), 0.5);
         if (k >= clipmap.levelCount) { break; }
         var s = clipSample(k, p);
@@ -123,6 +133,13 @@ fn clipConeTrace(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, minDiameter:
 // (SKY_LIGHTING_WGSL's skyRadiance, times skyScale) past it. Returns the irradiance (rgb, scene
 // units) and the share of the cosine-weighted hemisphere that sees past the clipmap (a).
 fn clipIrradiance(sky: SkyLighting, skyScale: f32, origin: vec3f, n: vec3f, angle: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32) -> vec4f {
+    return clipIrradianceNear(sky, skyScale, origin, n, angle, minDiameter, startDist, maxDist, maxSteps, 0.0);
+}
+
+// clipIrradiance with its cones reading `levelBias` levels finer than they are wide
+// (clipConeTraceNear): through gaps narrower than the cones, sampled sparsely (jitter `angle` and
+// `startDist`, and average).
+fn clipIrradianceNear(sky: SkyLighting, skyScale: f32, origin: vec3f, n: vec3f, angle: f32, minDiameter: f32, startDist: f32, maxDist: f32, maxSteps: u32, levelBias: f32) -> vec4f {
     // a frame around the normal (Duff et al. 2017)
     let s = select(-1.0, 1.0, n.z >= 0.0);
     let a = -1.0 / (s + n.z);
@@ -141,7 +158,7 @@ fn clipIrradiance(sky: SkyLighting, skyScale: f32, origin: vec3f, n: vec3f, angl
             dir = n * tilt + (t * cos(phi) + bt * sin(phi)) * tilt;
             w = tilt;
         }
-        let c = clipConeTrace(origin, dir, n, tanHalf, minDiameter, startDist, maxDist, maxSteps);
+        let c = clipConeTraceNear(origin, dir, n, tanHalf, minDiameter, startDist, maxDist, maxSteps, levelBias);
         e += w * (c.rgb + c.a * skyScale * skyRadiance(sky, dir));
         open += w * c.a;
     }

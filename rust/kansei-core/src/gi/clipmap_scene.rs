@@ -2,6 +2,7 @@ use glam::{IVec3, UVec3, Vec3};
 
 use super::clipmap::{ClipmapLayout, VoxelClipmap};
 use super::clipmap_inject::{ClipmapGiSettings, ClipmapInjection};
+use super::clipmap_probes::{ClipmapProbeOptions, ClipmapProbes};
 use super::clipmap_voxelize::{ClipRegion, ClipmapVoxelizer};
 use super::cones::gradient_sky_lighting;
 use crate::renderers::SharedLayouts;
@@ -75,6 +76,11 @@ pub struct SceneVoxelClipmap {
     voxelizer: ClipmapVoxelizer,
     pub(crate) injection: ClipmapInjection,
     sky: wgpu::Buffer,
+    /// The sky the voxels' and the probes' cones see past the clipmap: `sky`, or the one
+    /// `use_sky_lighting` gave.
+    sky_source: wgpu::Buffer,
+    probes: Option<ClipmapProbes>,
+    device: wgpu::Device,
     /// Levels to voxelize anew over their whole window (first fill, invalidation).
     stale: Vec<bool>,
     /// This frame's jobs, by slot.
@@ -112,7 +118,10 @@ impl SceneVoxelClipmap {
             clipmap,
             voxelizer,
             injection,
+            sky_source: sky.clone(),
             sky,
+            probes: None,
+            device: device.clone(),
             jobs: Vec::new(),
             slots: vec![(None, 0); options.jobs_per_frame.max(1) as usize],
             redo: Vec::new(),
@@ -171,11 +180,43 @@ impl SceneVoxelClipmap {
     /// `SkyAtmosphereBindings::sky_lighting`) instead of the gradient.
     pub fn use_sky_lighting(&mut self, sky_lighting: &wgpu::Buffer) {
         self.injection.set_sky(sky_lighting);
+        self.sky_source = sky_lighting.clone();
     }
 
-    /// Bytes on the GPU: the levels' radiance and the surface buffers.
+    /// Keep irradiance probes traced through the clipmap (`ClipmapProbes`), updated each frame
+    /// after its light, following the camera. Read them with `VoxelGIEffect::set_clipmap_probes`
+    /// or a material's `CLIPMAP_PROBES_WGSL`. Calling it again with other options builds them
+    /// anew.
+    pub fn enable_probes(&mut self, options: ClipmapProbeOptions) {
+        if self.probes.as_ref().is_none_or(|p| p.options != options) {
+            self.probes = Some(ClipmapProbes::new(&self.device, &self.clipmap, options));
+        }
+    }
+
+    pub fn disable_probes(&mut self) {
+        self.probes = None;
+    }
+
+    /// The probes, if enabled.
+    pub fn probes(&self) -> Option<&ClipmapProbes> {
+        self.probes.as_ref()
+    }
+
+    /// The probes, to change their options between frames.
+    pub fn probes_mut(&mut self) -> Option<&mut ClipmapProbes> {
+        self.probes.as_mut()
+    }
+
+    /// Record the probes' update (after the lighting), round `eye`.
+    pub(crate) fn encode_probes(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, eye: Vec3) {
+        if let Some(probes) = self.probes.as_mut() {
+            probes.encode(device, queue, encoder, &self.clipmap, &self.sky_source, eye);
+        }
+    }
+
+    /// Bytes on the GPU: the levels' radiance, the surface buffers and the probes.
     pub fn memory_bytes(&self) -> u64 {
-        self.clipmap.memory_bytes() + self.voxelizer.memory_bytes()
+        self.clipmap.memory_bytes() + self.voxelizer.memory_bytes() + self.probes.as_ref().map_or(0, |p| p.memory_bytes())
     }
 
     /// Whether some level is still to be filled for the first time, or again (`invalidate`).

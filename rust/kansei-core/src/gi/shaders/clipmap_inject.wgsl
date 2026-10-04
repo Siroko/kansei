@@ -33,8 +33,8 @@ struct ClipInjectParams {
     level           : u32,   // the level lit
     coneShadows     : u32,   // 0: shadow maps only; 1: cones where no map covers; 2: always cones
     shadowTan       : f32,   // tan of the shadow cones' half angle
-    _pad0           : u32,
-    _pad1           : u32,
+    shadowSteps     : u32,   // per shadow cone
+    bounceMinAlbedo : f32,   // darker voxels skip the bounce
     _pad2           : u32,
 }
 
@@ -60,7 +60,7 @@ fn unpackRgb9e5(v: u32) -> vec3f {
 // voxel out.
 fn coneShadow(ps: vec3f, n: vec3f, twoSided: bool, toLight: vec3f, maxT: f32, size: f32) -> f32 {
     let lift = select(n, vec3f(0.0), twoSided);
-    return clipConeTrace(ps, toLight, lift, ip.shadowTan, size, size, maxT, ip.maxSteps).a;
+    return clipConeTrace(ps, toLight, lift, ip.shadowTan, size, size, maxT, ip.shadowSteps).a;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -157,8 +157,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         e += s.illuminance * ndl * visibility;
     }
 
-    // the bounce, from last frame's clipmap, footprints twice this level's voxels
-    if (ip.bounce > 0.0) {
+    // the bounce, from last frame's clipmap, footprints twice this level's voxels (but on dark
+    // voxels, which pass on little of it)
+    if (ip.bounce > 0.0 && max(albedo.r, max(albedo.g, albedo.b)) >= ip.bounceMinAlbedo) {
         // the tilted cones turned per voxel, the same every frame (noise here would flicker)
         let angle = giHash01(idx * 7919u + k * 104729u) * 6.2831853;
         var gathered = clipIrradiance(sky, ip.skyScale, p + n * size, n, angle, 2.0 * size, 2.0 * size, 1e4, ip.maxSteps).rgb;
