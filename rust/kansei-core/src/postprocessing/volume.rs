@@ -218,6 +218,19 @@ impl PostProcessingVolume {
         width: u32,
         height: u32,
     ) {
+        self.render_from(None, camera, surface_view, width, height);
+    }
+
+    /// `render`, the chain starting from `input` (an image rendered some other way, such as the
+    /// path tracer's) instead of the GBuffer's colour.
+    pub(crate) fn render_from(
+        &mut self,
+        input: Option<&wgpu::TextureView>,
+        camera: &Camera,
+        surface_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
         let _post = crate::profiling::cpu_scope("post");
         if self.gbuffer.is_none() {
             self.ensure_gbuffer(width, height);
@@ -249,7 +262,11 @@ impl PostProcessingVolume {
         let mut source = Slot::Color;
         if !self.effects.is_empty() {
             let gbuffer = self.gbuffer.as_ref().unwrap();
-            let view = |slot| slot_view(gbuffer, self.display_targets.as_ref(), slot);
+            // the colour slot is only ever the chain's start: an input given stands in for it
+            let view = |slot| match (slot, input) {
+                (Slot::Color, Some(input)) => input,
+                _ => slot_view(gbuffer, self.display_targets.as_ref(), slot),
+            };
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("PostProcessingVolume/EffectsEncoder"),
             });
@@ -285,7 +302,10 @@ impl PostProcessingVolume {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        let final_view = slot_view(self.gbuffer.as_ref().unwrap(), self.display_targets.as_ref(), source);
+        let final_view = match (source, input) {
+            (Slot::Color, Some(input)) => input,
+            _ => slot_view(self.gbuffer.as_ref().unwrap(), self.display_targets.as_ref(), source),
+        };
 
         // Blit the final texture to the surface
         let bgl = self.blit_bgl.as_ref().unwrap();

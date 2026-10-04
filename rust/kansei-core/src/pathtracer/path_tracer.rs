@@ -1,4 +1,6 @@
 use crate::cameras::Camera;
+use crate::lights::Light;
+use crate::objects::Scene;
 use crate::renderers::Renderer;
 
 use super::blue_noise::generate_blue_noise;
@@ -345,6 +347,40 @@ impl PathTracer {
 
     // ── Light upload ───────────────────────────────────────────────
 
+    /// Upload `lights` as the tracer's lights; returns how many it took (the `light_count` for
+    /// `trace`). Directional, point and area lights are traced; spot lights are not (skipped).
+    pub fn set_lights(&mut self, lights: &[Light]) -> u32 {
+        let data = pack_lights(lights.iter());
+        self.set_lights_raw(&data);
+        (data.len() / 16) as u32
+    }
+
+    /// `set_lights` with the scene's lights.
+    pub fn set_lights_from_scene(&mut self, scene: &Scene) -> u32 {
+        let data = pack_lights(scene.lights());
+        self.set_lights_raw(&data);
+        (data.len() / 16) as u32
+    }
+
+    /// Trace one frame of the scene `bvh_data` and `tlas` hold, from `camera`, in an encoder of
+    /// its own (submitted), accumulating onto the frames before; `light_count` is what
+    /// `set_lights` returned. Then `present` shows it.
+    pub fn trace_frame(&mut self, renderer: &Renderer, bvh_data: &GPUBVHData, tlas: &super::TLASBuilder, camera: &Camera, light_count: u32) {
+        let Some(tlas_buf) = tlas.tlas_nodes_buf.as_ref() else { return };
+        let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("PathTracer/Frame") });
+        self.trace(&mut encoder, bvh_data, tlas_buf, camera, light_count);
+        renderer.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Show the traced image (after `trace`, its encoder submitted) on the surface through
+    /// `volume`'s post-processing chain, e.g. one `ToneMapEffect` for exposure, a tone curve and
+    /// the display's encoding. Nothing happens before the first `resize`.
+    pub fn present(&self, renderer: &mut Renderer, camera: &Camera, volume: &mut crate::postprocessing::PostProcessingVolume) {
+        if let Some(view) = self.output_view.as_ref() {
+            renderer.present_through(view, camera, volume);
+        }
+    }
+
     /// Upload raw light data (array of f32) to the GPU.
     pub fn set_lights_raw(&mut self, data: &[f32]) {
         let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
@@ -572,5 +608,57 @@ impl PathTracer {
         // bytes 128-191: padding vec4f * 4 (zeroed)
 
         params
+    }
+}
+
+/// The tracer's `LightData` records (16 floats each: position or direction and the type, colour
+/// and intensity, the facing normal, extra sizes) for the lights it supports.
+fn pack_lights<'a>(lights: impl Iterator<Item = &'a Light>) -> Vec<f32> {
+    let mut data = Vec::new();
+    for light in lights {
+        let record: [f32; 16] = match light {
+            Light::Directional(l) => {
+                let d = l.direction.to_glam().normalize_or_zero();
+                [d.x, d.y, d.z, f32::from_bits(1), l.color.x, l.color.y, l.color.z, l.intensity, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            }
+            Light::Area(l) => {
+                let n = (l.target - l.position).to_glam().normalize_or_zero();
+                [l.position.x, l.position.y, l.position.z, f32::from_bits(2), l.color.x, l.color.y, l.color.z, l.intensity, n.x, n.y, n.z, 0.0, l.width, l.height, 0.0, 0.0]
+            }
+            Light::Point(l) => [l.position.x, l.position.y, l.position.z, f32::from_bits(3), l.color.x, l.color.y, l.color.z, l.intensity, 0.0, 0.0, 0.0, 0.0, l.radius, 0.0, 0.0, 0.0],
+            Light::Spot(_) => continue,
+        };
+        data.extend_from_slice(&record);
+    }
+    data
+}
+
+#[cfg(test)]
+mod light_tests {
+    use super::*;
+    use crate::lights::{AreaLight, DirectionalLight, PointLight, SpotLight};
+    use crate::math::Vec3;
+
+    /// Each supported light becomes one 16-float LightData record with trace.wgsl's type tag
+    /// (1 directional, 2 area, 3 point); spot lights are left out.
+    #[test]
+    fn scene_lights_pack_into_light_data_records() {
+        let lights = [
+            Light::Directional(DirectionalLight::new(Vec3::new(0.0, -2.0, 0.0), Vec3::new(1.0, 0.9, 0.8), 3.0)),
+            Light::Spot(SpotLight::new(Vec3::new(0.0, 3.0, 0.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 100.0, 10.0, 0.3, 0.5)),
+            Light::Area(AreaLight::new(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 20.0, 2.0, 1.5)),
+            Light::Point(PointLight::new(Vec3::new(1.0, 2.0, 3.0), Vec3::new(0.5, 0.5, 1.0), 4.0, 9.0)),
+        ];
+        let data = pack_lights(lights.iter());
+        assert_eq!(data.len(), 3 * 16);
+        let tag = |r: usize| data[r * 16 + 3].to_bits();
+        assert_eq!((tag(0), tag(1), tag(2)), (1, 2, 3));
+        assert_eq!(&data[0..3], &[0.0, -1.0, 0.0]);
+        assert_eq!(&data[4..8], &[1.0, 0.9, 0.8, 3.0]);
+        // the area light faces its target, sized width x height
+        assert_eq!(&data[16 + 8..16 + 11], &[0.0, -1.0, 0.0]);
+        assert_eq!(&data[16 + 12..16 + 14], &[2.0, 1.5]);
+        // the point light's radius
+        assert_eq!(data[32 + 12], 9.0);
     }
 }
