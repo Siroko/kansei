@@ -130,6 +130,21 @@ impl Texture {
         texture
     }
 
+    /// An RGBA8 2D texture of `image` with its mip chain (each level a triangle-filtered half of
+    /// the one before, down to 1x1), sRGB-encoded colour or linear data (`srgb: false`: normal
+    /// maps, roughness). Uploaded on first use like `from_rgba`.
+    pub fn from_image(label: &str, image: &image::RgbaImage, srgb: bool) -> Self {
+        let (width, height) = image.dimensions();
+        let mut levels = vec![image.as_raw().clone()];
+        let mut level = image.clone();
+        while level.width() > 1 || level.height() > 1 {
+            level = image::imageops::resize(&level, (level.width() / 2).max(1), (level.height() / 2).max(1), image::imageops::FilterType::Triangle);
+            levels.push(level.as_raw().clone());
+        }
+        let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
+        Self::from_levels(label, format, width, height, levels)
+    }
+
     /// A 2D texture with its whole mip chain given, level 0 first, in any format including the
     /// block-compressed ones (each level's blocks tightly packed, rounded up to whole blocks as
     /// `ktx2::transcode` produces them). Uploaded on first use like `from_rgba`.

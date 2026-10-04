@@ -334,6 +334,18 @@ impl CameraControls {
         camera.look_at(&Vec3::new(tx, ty, tz));
     }
 
+    /// Move the target toward `target` over `dt` seconds, closing `1 - e^(-rate dt)` of the gap
+    /// (about `rate` per second at small steps, at any frame rate): a camera that trails a
+    /// moving character.
+    pub fn follow(&mut self, target: Vec3, dt: f32, rate: f32) {
+        let t = 1.0 - (-dt * rate).exp();
+        self.target = Vec3::new(
+            self.target.x + (target.x - self.target.x) * t,
+            self.target.y + (target.y - self.target.y) * t,
+            self.target.z + (target.z - self.target.z) * t,
+        );
+    }
+
     pub fn rotate(&mut self, dx: f32, dy: f32) {
         self.azimuth += dx;
         self.elevation = (self.elevation + dy).clamp(-1.5, 1.5);
