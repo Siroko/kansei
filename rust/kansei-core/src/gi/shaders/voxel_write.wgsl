@@ -5,7 +5,8 @@
 // lookup, say), and must call it in uniform control flow (it takes derivatives).
 //
 // The voxelizer draws each renderable three times, through its material's own vertex_main, with
-// an orthographic camera along x, y and z over the volume and a pixel per voxel. The target is
+// an orthographic camera along x, y and z over the volume (or a region of a clipmap level's
+// window, whose voxels it stores toroidally) and a pixel per voxel. The target is
 // multisampled, so a fragment runs wherever any sample is covered: close to conservative
 // rasterization, which WebGPU lacks. A fragment's voxel is its position and depth; its normal
 // comes from how its voxel position moves across the screen (exact for a flat triangle under an
@@ -19,13 +20,17 @@
 // brightest emission (RGB9E5 under atomicMax, whose shared exponent sits in the high bits).
 
 struct KanseiVoxelizeParams {
-    clipToVoxel : mat4x4f,   // this axis' clip space to voxel coordinates (voxel c spans [c, c + 1))
+    clipToVoxel : mat4x4f,   // this axis' clip space to the region's voxel coordinates (voxel c spans [c, c + 1))
     viewDir     : vec3f,     // the direction this axis' camera looks along
     _pad0       : f32,
     viewport    : vec2f,     // pixels of this axis' viewport
     _pad1       : vec2f,
-    dims        : vec3u,
+    dims        : vec3u,     // the volume's voxels (a clipmap level's window): voxels wrap around them
     _pad2       : u32,
+    regionLo    : vec3i,     // the region's first voxel, in the volume's lattice (0 for a whole box)
+    _pad3       : u32,
+    regionDims  : vec3u,     // the region's voxels (the volume's, for a whole box)
+    _pad4       : u32,
 }
 
 // the renderable's constant surface (gi::GiSurface), at a dynamic offset per draw
@@ -90,9 +95,11 @@ fn kansei_voxel_write(fragPos: vec4f, front: bool, albedo: vec3f, emission: vec3
     n = n * inverseSqrt(max(dot(n, n), 1e-20));
     n = select(n, -n, dot(n, kansei_voxelize.viewDir) > 0.0);
     n = select(-n, n, front);
-    let dims = vec3f(kansei_voxelize.dims);
-    if (any(v < vec3f(0.0)) || any(v >= dims)) { return; }
-    let c = vec3u(min(floor(v), dims - 1.0));
+    let region = vec3f(kansei_voxelize.regionDims);
+    if (any(v < vec3f(0.0)) || any(v >= region)) { return; }
+    // the region's voxel, in the volume's lattice, stored in its texel (toroidally)
+    let d = vec3i(kansei_voxelize.dims);
+    let c = vec3u((((kansei_voxelize.regionLo + vec3i(min(floor(v), region - 1.0))) % d) + d) % d);
     let idx = (c.z * kansei_voxelize.dims.y + c.y) * kansei_voxelize.dims.x + c.x;
     let a = abs(n);
     let major = select(select(n.z, n.y, a.y >= a.z), n.x, a.x >= a.y && a.x >= a.z);

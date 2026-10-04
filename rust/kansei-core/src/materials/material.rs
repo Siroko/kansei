@@ -115,9 +115,9 @@ pub struct Material {
     /// Velocity-pass pipelines by vertex-buffer count.
     pub(crate) velocity_pipeline_cache: HashMap<usize, wgpu::RenderPipeline>,
     /// Voxel GI's voxelization pipelines (`get_voxel_pipeline`) by voxelizer and vertex-buffer
-    /// count, and their layout (for one voxelizer).
+    /// count, and their layouts by voxelizer.
     pub(crate) voxel_pipeline_cache: HashMap<(u64, usize), wgpu::RenderPipeline>,
-    voxel_pipeline_layout: Option<(u64, wgpu::PipelineLayout)>,
+    voxel_pipeline_layouts: HashMap<u64, wgpu::PipelineLayout>,
     /// Cluster pipelines (`get_cluster_pipeline`), keyed with no vertex buffers.
     pub(crate) cluster_pipeline_cache: HashMap<PipelineKey, wgpu::RenderPipeline>,
     /// The cluster stage's module for the instance layout it was made for, or why there is none.
@@ -150,7 +150,7 @@ impl Material {
             depth_pipeline_cache: HashMap::new(),
             velocity_pipeline_cache: HashMap::new(),
             voxel_pipeline_cache: HashMap::new(),
-            voxel_pipeline_layout: None,
+            voxel_pipeline_layouts: HashMap::new(),
             cluster_pipeline_cache: HashMap::new(),
             cluster_module: None,
             cluster_pipeline_layout: None,
@@ -564,16 +564,14 @@ impl Material {
         assert!(self.pipeline_layout.is_some(), "Material not initialized — call initialize() first");
         let key = (voxelizer, vertex_layouts.len());
         if !self.voxel_pipeline_cache.contains_key(&key) {
-            if self.voxel_pipeline_layout.as_ref().is_none_or(|(v, _)| *v != voxelizer) {
-                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            let material_bgl = self.material_bgl.as_ref().unwrap();
+            let layout = self.voxel_pipeline_layouts.entry(voxelizer).or_insert_with(|| {
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some(&format!("{}/VoxelPipelineLayout", self.label)),
-                    bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.mesh_bgl, voxel_bgl],
+                    bind_group_layouts: &[material_bgl, &shared.camera_bgl, &shared.mesh_bgl, voxel_bgl],
                     push_constant_ranges: &[],
-                });
-                self.voxel_pipeline_layout = Some((voxelizer, layout));
-                self.voxel_pipeline_cache.retain(|(v, _), _| *v == voxelizer);
-            }
-            let layout = &self.voxel_pipeline_layout.as_ref().unwrap().1;
+                })
+            });
             let module = self.shader_module.as_ref().unwrap();
             let (fragment_module, entry) = match self.options.voxel_fragment_entry {
                 Some(entry) => (module, entry),
