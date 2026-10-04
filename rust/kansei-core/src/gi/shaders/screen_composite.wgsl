@@ -27,6 +27,29 @@
 @group(0) @binding(9) var<uniform> vol : VoxelVolume;
 @group(0) @binding(10) var radiance : texture_3d<f32>;
 @group(0) @binding(11) var linearClamp : sampler;
+// the scene's distance field (gi::JumpFloodSdf; a 1-texel stand-in without one)
+@group(0) @binding(12) var sdfTex : texture_3d<f32>;
+
+// The distance field on the horizontal plane at the debug slice's height, where the camera ray
+// through `uv` meets it: bands every 10 cm, darker toward the surfaces, red inside them, as scene
+// radiance of about 40 (bright under an EV100 of 5); None (a = 0) off the plane or the volume.
+fn sdfSliceColor(uv: vec2f) -> vec4f {
+    let eye = (gp.invView * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+    let far = (gp.invView * vec4f(gpViewPos(uv, 1.0), 1.0)).xyz;
+    let dir = normalize(far - eye);
+    if (abs(dir.y) < 1e-5) { return vec4f(0.0); }
+    let t = (gp.sdfSlice - eye.y) / dir.y;
+    if (t <= 0.0) { return vec4f(0.0); }
+    let p = eye + dir * t;
+    let uvw = voxelUvw(vol, p);
+    if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) { return vec4f(0.0); }
+    let d = textureSampleLevel(sdfTex, linearClamp, uvw, 0.0).r;
+    if (d < 0.5 * vol.voxelSize) { return vec4f(0.8, 0.12, 0.08, 1.0); }
+    let band = fract(d / 0.1);
+    let line = select(1.0, 0.35, band < 0.08);
+    let shade = 1.0 - exp(-d / 0.6);
+    return vec4f(mix(vec3f(0.05, 0.12, 0.35), vec3f(0.95, 0.95, 0.85), shade) * line, 1.0);
+}
 
 // The voxels' light along the camera ray through `uv`: mip 0 marched front to back, half a voxel
 // a step (from a start jittered per pixel, so the steps don't band), from where the ray enters
@@ -87,6 +110,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         textureStore(outTex, gid.xy, vec4f(marchVoxels((vec2f(gid.xy) + 0.5) / gp.fullSize), color.a));
         return;
     }
+    if (gp.debug == 3u) {
+        // the slice over the lit scene, which shows dimmed around it
+        let slice = sdfSliceColor((vec2f(gid.xy) + 0.5) / gp.fullSize);
+        textureStore(outTex, gid.xy, vec4f(select(color.rgb * 0.25, slice.rgb * 40.0, slice.a > 0.0), color.a));
+        return;
+    }
     let depth = gpDepth(px);
     let albedo = textureLoad(albedoTex, px, 0).rgb;
     if (depth >= 1.0 || all(albedo <= vec3f(0.0))) {
@@ -100,13 +129,18 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         let near = upsample(nearTex, gp.nearSize, uv, z);
         e = max(near.rgb, (1.0 - near.a) * e) + near.a * e;
     }
+    let n = gpWorldNormal(px);
+    // the distance field's contact occlusion, which the coarse cones and the screen miss
+    if (gp.hasSdf != 0u && gp.sdfAo > 0.0 && n.w > 0.0) {
+        let world = (gp.invView * vec4f(gpViewPos(uv, depth), 1.0)).xyz;
+        e *= mix(1.0, sdfAo(vol, sdfTex, linearClamp, world, n.xyz), gp.sdfAo);
+    }
     let bounce = albedo * e * (gp.intensity / 3.14159265);
     if (gp.debug != 0u) {
         textureStore(outTex, gid.xy, vec4f(bounce, color.a));
         return;
     }
     var result = color.rgb + bounce;
-    let n = gpWorldNormal(px);
     if (gp.hasSky != 0u && gp.ambient > 0.0 && n.w > 0.0) {
         result = max(result - albedo * skyIrradiance(sky, n.xyz) / 3.14159265 * gp.ambient, vec3f(0.0));
     }

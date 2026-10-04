@@ -13,6 +13,10 @@ const VOXEL_GI_PI : f32 = 3.14159265;
 // surface's back: unlit, and opaque).
 const LIFT : f32 = 1.5;
 
+// the scene's distance field (gi::JumpFloodSdf, metres; a 1-texel stand-in without one), for the
+// injection's soft shadows
+@group(0) @binding(46) var sdfField : texture_3d<f32>;
+
 // the anisotropic chains, by the direction a cone travels; level 0 is the volume's mip 1
 @group(0) @binding(40) var anisoPosX : texture_3d<f32>;
 @group(0) @binding(41) var anisoPosY : texture_3d<f32>;

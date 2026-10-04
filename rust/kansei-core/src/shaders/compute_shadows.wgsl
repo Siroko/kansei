@@ -56,6 +56,14 @@ fn dirShadowLookup(worldPos: vec3f) -> f32 {
     return pcf * 0.25;
 }
 
+// Whether the directional shadow map covers `worldPos` (dirShadowLookup gives 1 outside it).
+fn dirShadowCovers(worldPos: vec3f) -> bool {
+    let lightClip = shadowViewProj * vec4f(worldPos, 1.0);
+    let lightNDC  = lightClip.xyz / lightClip.w;
+    let shadowUV  = vec2f(lightNDC.x * 0.5 + 0.5, 1.0 - (lightNDC.y * 0.5 + 0.5));
+    return all(shadowUV >= vec2f(0.0)) && all(shadowUV <= vec2f(1.0)) && lightNDC.z <= 1.0;
+}
+
 // Same face layout as CubeMapShadowMap and basic_lit.wgsl's calcPointShadow.
 fn pointShadowLookup(worldPos: vec3f, lightPos: vec3f, firstLayer: u32) -> f32 {
     let toFrag = worldPos - lightPos;

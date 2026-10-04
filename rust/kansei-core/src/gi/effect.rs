@@ -21,6 +21,7 @@ pub(crate) const COMPOSITE_WGSL: &str = concat!(
     include_str!("shaders/screen_common.wgsl"),
     include_str!("shaders/screen_normal.wgsl"),
     include_str!("shaders/voxel_volume.wgsl"),
+    include_str!("shaders/sdf.wgsl"),
     include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("shaders/screen_composite.wgsl"),
 );
@@ -47,6 +48,9 @@ pub struct VoxelGIOptions {
     /// sees occlude each direction within its radius, at full screen detail, and the voxels light
     /// the rest of the hemisphere. `None`: the voxels alone.
     pub near_field: Option<ScreenSpaceGIOptions>,
+    /// Strength of the distance field's ambient occlusion on the GI (`set_sdf`; 0: none): the
+    /// contact occlusion the coarse cones miss.
+    pub sdf_ao: f32,
 }
 
 impl Default for VoxelGIOptions {
@@ -60,6 +64,7 @@ impl Default for VoxelGIOptions {
             material_ambient: 1.0,
             sky_scale: 1.0,
             near_field: None,
+            sdf_ao: 0.0,
         }
     }
 }
@@ -87,7 +92,10 @@ pub(crate) struct VoxelGiParamsGpu {
     debug: u32,
     near_field: u32,
     sky_scale: f32,
-    _pad: [u32; 2],
+    sdf_ao: f32,
+    sdf_slice: f32,
+    has_sdf: u32,
+    _pad: [u32; 3],
 }
 
 struct Targets {
@@ -110,6 +118,8 @@ struct Gpu {
     gradient_sky: wgpu::Buffer,
     /// Bound as the near field without one.
     no_near: wgpu::TextureView,
+    /// Bound as the distance field without one.
+    no_sdf: wgpu::TextureView,
     targets: Option<Targets>,
 }
 
@@ -139,6 +149,10 @@ pub struct VoxelGIEffect {
     /// Debug view: the volume's voxels and their light as the camera sees them (mip 0 marched
     /// per pixel), in place of the lit image, to inspect the voxelization. Over `show_indirect`.
     pub show_voxels: bool,
+    /// Debug view: the distance field (`set_sdf`) on the horizontal plane at this height,
+    /// metres, over the dimmed scene. Over the other views.
+    pub show_sdf_slice: Option<f32>,
+    pub sdf_ao: f32,
     /// The sky past the volume without `set_sky_lighting`: scene radiance straight up and down.
     pub sky_gradient: ([f32; 3], [f32; 3]),
     near_field: Option<ScreenSpaceGIEffect>,
@@ -146,6 +160,7 @@ pub struct VoxelGIEffect {
     anisotropic: [wgpu::TextureView; 6],
     volume_uniform: wgpu::Buffer,
     volume_sampler: wgpu::Sampler,
+    sdf: Option<wgpu::TextureView>,
     sky_lighting: Option<wgpu::Buffer>,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
@@ -169,12 +184,15 @@ impl VoxelGIEffect {
             sky_scale: options.sky_scale,
             show_indirect: false,
             show_voxels: false,
+            show_sdf_slice: None,
+            sdf_ao: options.sdf_ao,
             sky_gradient: ([0.0; 3], [0.0; 3]),
             near_field: options.near_field.map(ScreenSpaceGIEffect::new),
             volume_view: volume.view().clone(),
             anisotropic,
             volume_uniform: volume.uniform().clone(),
             volume_sampler: volume.sampler().clone(),
+            sdf: None,
             sky_lighting: None,
             prev_view_proj: None,
             last_camera_frame: None,
@@ -190,6 +208,12 @@ impl VoxelGIEffect {
         if let Some(near) = &mut self.near_field {
             near.set_sky_lighting(sky_lighting);
         }
+    }
+
+    /// Read the scene's distance field (`SceneVoxelGi::sdf`, over the same volume) for
+    /// `sdf_ao` and `show_sdf_slice`; `None` leaves them off.
+    pub fn set_sdf(&mut self, sdf: Option<&super::JumpFloodSdf>) {
+        self.sdf = sdf.map(|s| s.view().clone());
     }
 
     /// The screen-space GI in front of the voxels, if any (to tune it).
@@ -253,13 +277,14 @@ impl VoxelGIEffect {
                 sampler(5),
                 uniform(6),
                 storage(7),
-                // the anisotropic mips (voxel_irradiance.wgsl)
+                // the anisotropic mips and the distance field (voxel_irradiance.wgsl)
                 texture(40, true, d3),
                 texture(41, true, d3),
                 texture(42, true, d3),
                 texture(43, true, d3),
                 texture(44, true, d3),
                 texture(45, true, d3),
+                texture(46, true, d3),
             ],
         );
         let temporal_bgl = bgl("VoxelGI/TemporalBGL", &[uniform(0), texture(1, false, d2), texture(2, true, d2), depth(3), storage(4), sampler(5)]);
@@ -278,6 +303,7 @@ impl VoxelGIEffect {
                 uniform(9),
                 texture(10, true, wgpu::TextureViewDimension::D3),
                 sampler(11),
+                texture(12, true, wgpu::TextureViewDimension::D3),
             ],
         );
         let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| {
@@ -332,6 +358,7 @@ impl VoxelGIEffect {
                 mapped_at_creation: false,
             }),
             no_near,
+            no_sdf: super::inject::no_sdf(device),
             targets: None,
         });
     }
@@ -419,10 +446,19 @@ impl PostProcessingEffect for VoxelGIEffect {
             blend: self.temporal_blend.clamp(0.01, 1.0),
             history_valid: self.prev_view_proj.is_some() as u32,
             has_sky: self.sky_lighting.is_some() as u32,
-            debug: if self.show_voxels { 2 } else { self.show_indirect as u32 },
+            debug: if self.show_sdf_slice.is_some() && self.sdf.is_some() {
+                3
+            } else if self.show_voxels {
+                2
+            } else {
+                self.show_indirect as u32
+            },
             near_field: near.is_some() as u32,
             sky_scale: self.sky_scale.max(0.0),
-            _pad: [0; 2],
+            sdf_ao: if self.sdf.is_some() { self.sdf_ao.clamp(0.0, 1.0) } else { 0.0 },
+            sdf_slice: self.show_sdf_slice.unwrap_or(0.0),
+            has_sdf: self.sdf.is_some() as u32,
+            _pad: [0; 3],
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         if self.sky_lighting.is_none() {
@@ -455,6 +491,8 @@ impl PostProcessingEffect for VoxelGIEffect {
         .map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource })
         .collect();
         trace_entries.extend(self.anisotropic.iter().enumerate().map(|(i, view)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(view) }));
+        let sdf_view = self.sdf.as_ref().unwrap_or(&gpu.no_sdf);
+        trace_entries.push(wgpu::BindGroupEntry { binding: 46, resource: tex(sdf_view) });
         let trace = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/TraceBG"), layout: &gpu.trace_bgl, entries: &trace_entries });
         let temporal = group(
             "VoxelGI/TemporalBG",
@@ -478,6 +516,7 @@ impl PostProcessingEffect for VoxelGIEffect {
                 self.volume_uniform.as_entire_binding(),
                 tex(&self.volume_view),
                 wgpu::BindingResource::Sampler(&self.volume_sampler),
+                tex(sdf_view),
             ],
         );
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/Screen"), timestamp_writes: crate::profiling::gpu_pass("VoxelGI/Screen").as_ref().map(crate::profiling::PassStamp::compute) });
