@@ -47,6 +47,15 @@ impl VoxelGiQuality {
     }
 
     /// `low`, `medium` or `high`.
+    /// The tier's name, as `from_name` reads it.
+    pub fn name(self) -> &'static str {
+        match self {
+            VoxelGiQuality::Low => "low",
+            VoxelGiQuality::Medium => "medium",
+            VoxelGiQuality::High => "high",
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "low" => Some(VoxelGiQuality::Low),

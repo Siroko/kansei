@@ -1,7 +1,8 @@
-// The lightbox's walls (after VOXEL_CONES_WGSL, SCENE_WGSL and room_common.wgsl): the panel's
-// light, shadowed through the volume by a cone toward it; five cones over the hemisphere for what
-// the volume gathers (the other walls' bounce, the particles' glow), their first metres also the
-// occlusion of corners and of the pile. `flags.x` draws the wall mirrored under the floor (the
+// The lightbox's walls (after VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL, SCENE_WGSL and
+// room_common.wgsl): the panel's light, shadowed through the volume by a cone toward it; five cones
+// over the hemisphere for what the volume gathers (the other walls' bounce, the particles' glow),
+// their first metres also the occlusion of corners and of the pile; the gradient sky
+// (ParticleGi::sky_buffer) standing in for the ceiling past the volume. `flags.x` draws the wall mirrored under the floor (the
 // reflection).
 struct Surface {
     albedo   : vec4f,
@@ -13,6 +14,7 @@ struct Surface {
 @group(0) @binding(2) var<uniform> vol: VoxelVolume;
 @group(0) @binding(3) var radiance: texture_3d<f32>;
 @group(0) @binding(4) var linearClamp: sampler;
+@group(0) @binding(5) var<uniform> sky: SkyLighting;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -40,56 +42,21 @@ fn vertex_main(@location(0) position: vec4f, @location(1) normal: vec3f, @locati
 
 struct Hemisphere {
     gathered : vec3f,   // irradiance from what the cones met in the volume
-    escaped  : vec3f,   // irradiance from past the volume (the gradient standing in for the ceiling)
+    escaped  : vec3f,   // irradiance from past the volume (the sky standing in for the ceiling)
     open     : f32,     // the cones' mean transmittance
 };
 
-// gi's voxelConeTrace, which it follows step for step, also giving the transmittance it had left
-// on reaching `nearDist` (what the same cone stopped there would return): the walls' occlusion
-// cones are the first metres of their light cones.
-struct SplitCone {
-    far      : vec4f,
-    nearOpen : f32,
-};
-fn splitConeTrace(origin: vec3f, dir: vec3f, tanHalf: f32, startDist: f32, nearDist: f32, maxSteps: u32) -> SplitCone {
-    var color = vec3f(0.0);
-    var transmittance = 1.0;
-    var nearOpen = -1.0;
-    var dist = startDist;
-    let maxLod = f32(vol.mipCount - 1u);
-    for (var i = 0u; i < maxSteps; i++) {
-        if (nearOpen < 0.0 && dist >= nearDist) { nearOpen = transmittance; }
-        if (transmittance < 0.01) { break; }
-        let diameter = max(vol.voxelSize, 2.0 * tanHalf * dist);
-        let uvw = voxelUvw(vol, origin + dir * dist);
-        if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) { break; }
-        let lod = min(log2(diameter / vol.voxelSize), maxLod);
-        let s = textureSampleLevel(radiance, linearClamp, uvw, lod);
-        let step = 0.5 * diameter;
-        let crossed = step / (vol.voxelSize * exp2(lod));
-        let a = 1.0 - pow(max(1.0 - s.a, 0.0), crossed);
-        let share = select(crossed, a / s.a, s.a > 1e-4);
-        color += transmittance * s.rgb * share;
-        transmittance *= 1.0 - a;
-        dist += step;
-    }
-    return SplitCone(vec4f(color * vol.radianceScale, transmittance), select(nearOpen, transmittance, nearOpen < 0.0));
-}
-
-// one cone along n and four at 60 degrees, each 60 degrees wide (Crassin et al. 2011); `open` is
-// their mean transmittance within `nearDist`
+// one cone along n and four at 60 degrees round it (VOXEL_CONES_WGSL's voxelHemisphereCone),
+// each split at `nearDist`: `open` is their mean transmittance there, so the walls' occlusion
+// cones are the first metres of their light cones
 fn hemisphere(o: vec3f, n: vec3f, nearDist: f32) -> Hemisphere {
-    let t = normalize(select(cross(n, vec3f(0.0, 1.0, 0.0)), cross(n, vec3f(1.0, 0.0, 0.0)), abs(n.y) > 0.9));
-    let b = cross(n, t);
-    var dirs = array<vec3f, 5>(n, 0.5 * n + 0.866 * t, 0.5 * n - 0.866 * t, 0.5 * n + 0.866 * b, 0.5 * n - 0.866 * b);
     var h: Hemisphere;
-    for (var k = 0u; k < 5u; k++) {
-        let s = splitConeTrace(o, dirs[k], 0.577, vol.voxelSize, nearDist, u32(scene.coneSteps));
-        let c = s.far;
-        let w = select(0.15, 0.25, k == 0u) / 0.85;
-        h.gathered += w * PI * c.rgb;
-        h.escaped += w * PI * c.a * skyRad(scene, dirs[k]);
-        h.open += w * s.nearOpen;
+    for (var k = 0u; k < VOXEL_HEMISPHERE_CONES; k++) {
+        let cone = voxelHemisphereCone(n, k);
+        let s = voxelConeTraceSplit(vol, radiance, linearClamp, o, cone.xyz, VOXEL_HEMISPHERE_TAN, vol.voxelSize, nearDist, 1e4, u32(scene.coneSteps));
+        h.gathered += cone.w * s.far.rgb;
+        h.escaped += cone.w * s.far.a * skyRadiance(sky, cone.xyz);
+        h.open += cone.w / PI * s.nearOpen;
     }
     return h;
 }
@@ -114,7 +81,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
             color = albedo / PI * (cones.escaped * ao + cones.gathered);
         }
     } else {
-        color = albedo / PI * (direct + scene.boxSkyScale * skyIrr(scene, n));
+        color = albedo / PI * (direct + scene.boxSkyScale * skyIrradiance(sky, n));
     }
     color += surface.emission.rgb;
     if (surface.flags.x > 0.5) {

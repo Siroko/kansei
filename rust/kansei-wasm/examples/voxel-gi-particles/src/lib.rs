@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
+use kansei_core::atmosphere::{direction_from_elevation_bearing, SKY_LIGHTING_WGSL};
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::{CameraControls, MouseVectors};
@@ -98,14 +99,13 @@ struct SceneParams {
     exposure: f32,
     sun_illuminance: [f32; 3],
     gi_on: f32,
-    sky_up: [f32; 3],
     view: f32,
-    sky_down: [f32; 3],
     sun_cone_tan: f32,
     cone_steps: f32,
     box_sky_scale: f32,
     ao_distance: f32,
     ao_strength: f32,
+    _pad0: [f32; 2],
     panel_min: [f32; 3],
     panel_cone_tan: f32,
     panel_max: [f32; 3],
@@ -121,7 +121,7 @@ struct SceneParams {
     rt_bounces: f32,
     mirror_share: f32,
     glass_share: f32,
-    _pad: f32,
+    _pad1: f32,
 }
 
 const SCENE_WGSL: &str = r#"
@@ -130,14 +130,13 @@ struct SceneParams {
     exposure       : f32,
     sunIlluminance : vec3f,
     giOn           : f32,
-    skyUp          : vec3f,
     view           : f32,    // 1: indirect light only
-    skyDown        : vec3f,
     sunConeTan     : f32,
     coneSteps      : f32,
     boxSkyScale    : f32,
     aoDistance     : f32,    // lightbox: how far the walls' occlusion cones look, metres
     aoStrength     : f32,
+    _pad0          : vec2f,
     panelMin       : vec3f,  // lightbox: the ceiling panel's corners (its emitting face at panelMin.y)
     panelConeTan   : f32,    // tan of the half aperture of the cones toward it
     panelMax       : vec3f,
@@ -153,19 +152,11 @@ struct SceneParams {
     rtBounces      : f32,
     mirrorShare    : f32,
     glassShare     : f32,
-    _pad0          : f32,
+    _pad1          : f32,
 }
 
 const PI: f32 = 3.14159265;
 
-// the sky as gi::gradient_sky_lighting makes it: linear in the direction's height (in the
-// lightbox, the ceiling and the open front the volume leaves out)
-fn skyRad(s: SceneParams, d: vec3f) -> vec3f {
-    return mix(s.skyDown, s.skyUp, d.y * 0.5 + 0.5);
-}
-fn skyIrr(s: SceneParams, n: vec3f) -> vec3f {
-    return PI * (s.skyUp + s.skyDown) * 0.5 + (2.0 * PI / 3.0) * (s.skyUp - s.skyDown) * 0.5 * n.y;
-}
 fn tonemap(s: SceneParams, c: vec3f) -> vec3f {
     let k = select(1.0, 2.0, s.view > 0.5);
     return 1.0 - exp(-c * s.exposure * k);
@@ -179,25 +170,26 @@ const ROOM_SPHERES_SHADE_WGSL: &str = include_str!("shaders/room_spheres_shade.w
 const ROOM_SPHERES_DEPTH_WGSL: &str = include_str!("shaders/room_spheres_depth.wgsl");
 
 fn lightbox_wall_shader() -> String {
-    format!("{VOXEL_CONES_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_WALLS_WGSL}")
+    format!("{VOXEL_CONES_WGSL}\n{SKY_LIGHTING_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_WALLS_WGSL}")
 }
 
 /// The spheres' shader with `entry` (ROOM_SPHERES_SHADE_WGSL or ROOM_SPHERES_DEPTH_WGSL).
 fn sphere_shader(entry: &str) -> String {
-    format!("{VOXEL_CONES_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_SPHERES_WGSL}\n{entry}")
+    format!("{VOXEL_CONES_WGSL}\n{SKY_LIGHTING_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_SPHERES_WGSL}\n{entry}")
 }
 
 fn cornell_wall_shader() -> String {
-    format!("{VOXEL_CONES_WGSL}\n{SCENE_WGSL}\n{CORNELL_WALL_WGSL}")
+    format!("{VOXEL_CONES_WGSL}\n{SKY_LIGHTING_WGSL}\n{SCENE_WGSL}\n{CORNELL_WALL_WGSL}")
 }
 
 fn cornell_particle_shader() -> String {
     format!("{SCENE_WGSL}\n{CORNELL_PARTICLE_WGSL}")
 }
 
-/// The Cornell room's walls: lit by the sun and the sky, and with voxel GI on, shadowed by the
-/// fluid (a sun cone) and lit by the volume (five cones over the hemisphere: the other walls'
-/// bounce, the fluid's glow, the sky it leaves).
+/// The Cornell room's walls: lit by the sun and the sky (`ParticleGi::sky_buffer`, the gradient
+/// the particles' cones escape to), and with voxel GI on, shadowed by the fluid (a sun cone) and
+/// lit by the volume (five cones over the hemisphere: the other walls' bounce, the fluid's glow,
+/// the sky it leaves).
 const CORNELL_WALL_WGSL: &str = r#"
 struct Surface { albedo: vec4f };
 @group(0) @binding(0) var<uniform> surface: Surface;
@@ -205,6 +197,7 @@ struct Surface { albedo: vec4f };
 @group(0) @binding(2) var<uniform> vol: VoxelVolume;
 @group(0) @binding(3) var radiance: texture_3d<f32>;
 @group(0) @binding(4) var linearClamp: sampler;
+@group(0) @binding(5) var<uniform> sky: SkyLighting;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -226,18 +219,16 @@ fn vertex_main(@location(0) position: vec4f, @location(1) normal: vec3f, @locati
     return out;
 }
 
-// irradiance over the hemisphere around n from one cone along it and four at 60 degrees, each
-// 60 degrees wide (Crassin et al. 2011), the sky past them
+// irradiance over the hemisphere around n from VOXEL_CONES_WGSL's five cones (one along it and
+// four at 60 degrees, each 60 degrees wide), the sky past them
 fn hemisphere(o: vec3f, n: vec3f, start: f32) -> vec3f {
-    let t = normalize(select(cross(n, vec3f(0.0, 1.0, 0.0)), cross(n, vec3f(1.0, 0.0, 0.0)), abs(n.y) > 0.9));
-    let b = cross(n, t);
-    var dirs = array<vec3f, 5>(n, 0.5 * n + 0.866 * t, 0.5 * n - 0.866 * t, 0.5 * n + 0.866 * b, 0.5 * n - 0.866 * b);
     var sum = vec3f(0.0);
-    for (var k = 0u; k < 5u; k++) {
-        let c = voxelConeTrace(vol, radiance, linearClamp, o, dirs[k], 0.577, start, 1e4, u32(scene.coneSteps));
-        sum += select(0.15, 0.25, k == 0u) * (c.rgb + c.a * skyRad(scene, dirs[k]));
+    for (var k = 0u; k < VOXEL_HEMISPHERE_CONES; k++) {
+        let cone = voxelHemisphereCone(n, k);
+        let c = voxelConeTrace(vol, radiance, linearClamp, o, cone.xyz, VOXEL_HEMISPHERE_TAN, start, 1e4, u32(scene.coneSteps));
+        sum += cone.w * (c.rgb + c.a * skyRadiance(sky, cone.xyz));
     }
-    return PI * sum / 0.85;
+    return sum;
 }
 
 @fragment
@@ -246,7 +237,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
     let albedo = surface.albedo.rgb;
     let l = normalize(scene.toSun);
     var sunVis = 1.0;
-    var irradiance = scene.boxSkyScale * skyIrr(scene, n);
+    var irradiance = scene.boxSkyScale * skyIrradiance(sky, n);
     if (scene.giOn > 0.5) {
         // start out of the wall's own voxels
         let o = in.world + n * vol.voxelSize;
@@ -330,10 +321,10 @@ const PANEL_CONE_TAN: f32 = 0.4;
 const SKY_UP: f32 = 0.18;
 const SKY_DOWN: f32 = 0.05;
 
-/// Toward the sun at `elevation` degrees up, `bearing` degrees from +z (the open front) toward +x.
+/// Toward the sun at `elevation` degrees up, `bearing` degrees from +z (the open front) toward +x:
+/// a compass bearing (clockwise from north, -z) of 180 - `bearing`.
 fn sun_direction(elevation: f32, bearing: f32) -> [f32; 3] {
-    let (e, b) = (elevation.to_radians(), bearing.to_radians());
-    [e.cos() * b.sin(), e.sin(), e.cos() * b.cos()]
+    direction_from_elevation_bearing(elevation, 180.0 - bearing).to_glam().to_array()
 }
 
 /// `count` particles on a jittered lattice filling `lo`..`hi`.
@@ -625,8 +616,6 @@ impl State {
         let radiance = PANEL_RADIANCE.map(|c| c * self.panel_intensity);
         let (up, down) = (radiance.map(|c| c * SKY_UP), radiance.map(|c| c * SKY_DOWN));
         self.scene_params.panel_radiance = radiance;
-        self.scene_params.sky_up = up;
-        self.scene_params.sky_down = down;
         let queue = self.renderer.queue();
         self.gi.set_sky_gradient(queue, up, down);
         let boxes: Vec<GiBox> = self
@@ -723,14 +712,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         exposure: 1.2,
         sun_illuminance: [0.0; 3],
         gi_on: gi_on as u32 as f32,
-        sky_up: [0.0; 3],
         view: indirect as u32 as f32,
-        sky_down: [0.0; 3],
         sun_cone_tan: gi.settings.cones.sun_cone_tan,
         cone_steps: gi.settings.cones.max_steps as f32,
         box_sky_scale: 1.0,
         ao_distance: 5.0,
         ao_strength: 0.85,
+        _pad0: [0.0; 2],
         panel_min: [PANEL_X[0], room_max[1] - PANEL_DROP, PANEL_Z[0]],
         panel_cone_tan: PANEL_CONE_TAN,
         panel_max: [PANEL_X[1], room_max[1], PANEL_Z[1]],
@@ -746,7 +734,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         rt_bounces: 2.0,
         mirror_share: 0.3,
         glass_share: 0.35,
-        _pad: 0.0,
+        _pad1: 0.0,
     };
     if lightbox {
         // the panel above: no sun, the walls lit through their emission (apply_panel), the
@@ -770,14 +758,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         gi.set_boxes(renderer.queue(), &boxes);
         scene_params.to_sun = to_sun;
         scene_params.sun_illuminance = sun;
-        scene_params.sky_up = sky_up;
-        scene_params.sky_down = sky_down;
         scene_params.sun_cone_tan = gi.settings.cones.sun_cone_tan;
     }
     let layout = *gi.volume().layout();
     log::info!(
-        "voxel GI {:?} ({}): {:?} voxels of {:.2} m, {:.1} MiB, {} particles",
-        gi.quality(),
+        "voxel GI {} ({}): {:?} voxels of {:.2} m, {:.1} MiB, {} particles",
+        gi.quality().name(),
         look.name(),
         layout.dims,
         layout.voxel_size,
@@ -793,6 +779,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     });
     let scene_uniform = || ComputeBuffer::from_external("Scene", scene_buffer.clone(), BufferType::Uniform);
     let volume_uniform = || ComputeBuffer::from_external("VoxelVolume", gi.volume().uniform().clone(), BufferType::Uniform);
+    let sky_uniform = || ComputeBuffer::from_external("SkyLighting", gi.sky_buffer().clone(), BufferType::Uniform);
     let linear_clamp = || Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_address_mode(wgpu::AddressMode::ClampToEdge);
 
     let mut scene = Scene::new();
@@ -809,7 +796,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let mut material = Material::new(
                 wall.label,
                 &wall_shader,
-                vec![Binding::uniform(0, both), Binding::uniform(1, both), Binding::uniform(2, both), Binding::texture_3d(3, both), Binding::sampler(4, both)],
+                vec![Binding::uniform(0, both), Binding::uniform(1, both), Binding::uniform(2, both), Binding::texture_3d(3, both), Binding::sampler(4, both), Binding::uniform(5, fragment)],
                 MaterialOptions { cull_mode, ..Default::default() },
             );
             let [r, g, b] = wall.albedo;
@@ -824,6 +811,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             material.set_bindable(2, volume_uniform());
             material.set_bindable(3, gi.volume().as_texture());
             material.set_bindable(4, linear_clamp());
+            material.set_bindable(5, sky_uniform());
             let size: [f32; 3] = std::array::from_fn(|i| wall.max[i] - wall.min[i]);
             let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), material);
             slab.object.set_position((wall.min[0] + wall.max[0]) * 0.5, (wall.min[1] + wall.max[1]) * 0.5, (wall.min[2] + wall.max[2]) * 0.5);
@@ -878,6 +866,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                         Binding::texture_3d(8, fragment),
                         Binding::sampler(9, fragment),
                         Binding::storage(10, fragment, true),
+                        Binding::uniform(11, fragment),
                     ],
                     options(equal),
                 );
@@ -892,6 +881,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 material.set_bindable(8, gi.volume().as_texture());
                 material.set_bindable(9, linear_clamp());
                 material.set_bindable(10, storage("PileTop", &top.buffer));
+                material.set_bindable(11, sky_uniform());
                 let instances = InstancedGeometry::new(PlaneGeometry::new(1.0, 1.0), count as u32, vec![sim.positions_as_compute_buffer(3).unwrap()]);
                 particles.push((scene.add(SceneNode::Renderable(Renderable::new(instances, material))), mirrored));
             }
@@ -972,10 +962,10 @@ pub fn info() -> String {
     with_state(|s| {
         let layout = s.gi.volume().layout();
         out = format!(
-            r#"{{"scene":"{}","rt":{},"quality":"{:?}","dims":[{},{},{}],"voxel_m":{:.3},"mib":{:.2},"particles":{},"gi":{},"frame_ms":{:.2}}}"#,
+            r#"{{"scene":"{}","rt":{},"quality":"{}","dims":[{},{},{}],"voxel_m":{:.3},"mib":{:.2},"particles":{},"gi":{},"frame_ms":{:.2}}}"#,
             s.look.name(),
             s.scene_params.rt_on > 0.5,
-            s.gi.quality(),
+            s.gi.quality().name(),
             layout.dims[0],
             layout.dims[1],
             layout.dims[2],
@@ -1201,17 +1191,32 @@ mod tests {
 
     #[test]
     fn shaders_validate_and_the_uniforms_match() {
+        let sky = std::mem::size_of::<kansei_core::gi::SkyLightingData>();
         for (name, code) in [("lightbox walls", lightbox_wall_shader()), ("cornell walls", cornell_wall_shader()), ("cornell particles", cornell_particle_shader())] {
             let module = validate(name, &code);
             assert_eq!(struct_size(&module, "SceneParams"), std::mem::size_of::<SceneParams>(), "{name}");
+            if name != "cornell particles" {
+                assert_eq!(struct_size(&module, "SkyLighting"), sky, "{name}");
+            }
         }
         validate("lightbox sphere depth", &sphere_shader(ROOM_SPHERES_DEPTH_WGSL));
         let spheres = validate("lightbox spheres", &sphere_shader(ROOM_SPHERES_SHADE_WGSL));
         assert_eq!(struct_size(&spheres, "SceneParams"), std::mem::size_of::<SceneParams>());
+        assert_eq!(struct_size(&spheres, "SkyLighting"), sky);
         assert_eq!(struct_size(&spheres, "Grid"), std::mem::size_of::<GridParams>());
         assert_eq!(struct_size(&validate("pile top", include_str!("shaders/pile_top.wgsl")), "Grid"), std::mem::size_of::<GridParams>());
         assert_eq!(struct_size(&spheres, "Particles"), 32);
         assert_eq!(struct_size(&validate("lightbox walls", &lightbox_wall_shader()), "Surface"), 48);
+    }
+
+    #[test]
+    fn the_sun_keeps_the_panels_bearing() {
+        // bearing 0 looks out of the open front (+z), 90 toward +x
+        let close = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(close(sun_direction(0.0, 0.0), [0.0, 0.0, 1.0]));
+        assert!(close(sun_direction(0.0, 90.0), [1.0, 0.0, 0.0]));
+        let (e, b) = (40f32.to_radians(), 70f32.to_radians());
+        assert!(close(sun_direction(40.0, 70.0), [e.cos() * b.sin(), e.sin(), e.cos() * b.cos()]));
     }
 
     #[test]

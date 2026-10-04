@@ -11,7 +11,8 @@
 //!   what a device can hold;
 //! - `VOXEL_CONES_WGSL`: `voxelConeTrace`, for any pass or material that reads the volume, with
 //!   the sky (`SKY_LIGHTING_WGSL`'s `skyRadiance`, or [`gradient_sky_lighting`] without an
-//!   atmosphere) as the light past it.
+//!   atmosphere) as the light past it; `voxelConeTraceSplit` also gives the transmittance at a
+//!   near distance (occlusion), and `voxelHemisphereCone` the five cones of a hemisphere.
 //!
 //! Producers write mip 0:
 //! - particles and analytic boxes ([`ParticleVoxelizer`]; [`ParticleGi`] runs it with the mips
@@ -171,7 +172,7 @@ mod tests {
         validate(
             "voxel cones library",
             &format!(
-                "{VOXEL_CONES_WGSL}\n{PARTICLE_EMISSION_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n@group(0) @binding(3) var<uniform> e: ParticleEmission;\n@compute @workgroup_size(1) fn main() {{ _ = voxelConeTrace(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 1.0, 0.0, 1.0, 4u) + vec4f(particleEmission(e, 0u, vec3f(0.0)), 0.0); }}"
+                "{VOXEL_CONES_WGSL}\n{PARTICLE_EMISSION_WGSL}\n@group(0) @binding(0) var<uniform> vol: VoxelVolume;\n@group(0) @binding(1) var t: texture_3d<f32>;\n@group(0) @binding(2) var s: sampler;\n@group(0) @binding(3) var<uniform> e: ParticleEmission;\n@compute @workgroup_size(1) fn main() {{ let cone = voxelHemisphereCone(vec3f(0.0, 1.0, 0.0), 2u); let split = voxelConeTraceSplit(vol, t, s, vec3f(0.0), cone.xyz, VOXEL_HEMISPHERE_TAN, 0.0, 0.5, 1.0, 4u); _ = voxelConeTrace(vol, t, s, vec3f(0.0), vec3f(0.0, 1.0, 0.0), 1.0, 0.0, 1.0, 4u) + vec4f(particleEmission(e, 0u, vec3f(0.0)), 0.0) + split.far * split.nearOpen * cone.w; }}"
             ),
             &mut sizes,
         );
