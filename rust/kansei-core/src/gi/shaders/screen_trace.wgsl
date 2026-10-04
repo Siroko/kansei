@@ -1,5 +1,5 @@
 // Voxel GI on screen, trace: per traced pixel, the irradiance its surface receives through the
-// voxel volume (voxel_irradiance.wgsl's six cones over the hemisphere around its normal, turned
+// voxel volume and its anisotropic mips (voxel_irradiance.wgsl's six cones over the hemisphere around its normal, turned
 // per pixel and frame for the temporal filter to integrate), from a point a little out along the
 // normal so the surface's own voxels don't hide it. Output: rgb the irradiance (E: a diffuse
 // surface adds albedo / pi times it), a the share of the hemisphere that sees past the volume.
@@ -50,6 +50,6 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let n = surfaceNormal(px, p);
     let angle = fract(ign(vec2f(gid.xy)) + f32(gp.frame % 64u) * 0.618034) * 6.2831853;
     let origin = world + n * (gp.startVoxels * vol.voxelSize);
-    let e = voxelIrradiance(vol, radiance, linearClamp, sky, gp.skyScale, origin, n, angle, vol.voxelSize, gp.maxDistance, gp.maxSteps);
+    let e = voxelIrradiance(vol, radiance, linearClamp, sky, gp.skyScale, origin, n, angle, vol.voxelSize, gp.maxDistance, gp.maxSteps, 1.0);
     textureStore(outTex, gid.xy, vec4f(min(e.rgb, vec3f(60000.0)), e.a));
 }

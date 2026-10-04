@@ -36,7 +36,7 @@ impl Default for SceneVoxelGiOptions {
 ///    maps, plus their emission and one more bounce of last frame's light (`settings`);
 /// 3. the volume's mips are rebuilt.
 ///
-/// Read it with `voxel_gi::VoxelGIEffect` (screen-space cones), or with `VOXEL_CONES_WGSL` from
+/// Read it with `gi::VoxelGIEffect` (screen-space cones), or with `VOXEL_CONES_WGSL` from
 /// any pass or material.
 pub struct SceneVoxelGi {
     pub settings: SceneGiSettings,
@@ -50,7 +50,9 @@ pub struct SceneVoxelGi {
 impl SceneVoxelGi {
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, shared: &SharedLayouts, light_buf: &wgpu::Buffer, options: SceneVoxelGiOptions) -> Self {
         let quality = options.quality.fit_scene(&device.limits(), options.bounds_min, options.bounds_max, options.budget_bytes);
-        let volume = VoxelVolume::new(device, options.bounds_min, options.bounds_max, quality.resolution(), options.radiance_scale);
+        let mut volume = VoxelVolume::new(device, options.bounds_min, options.bounds_max, quality.resolution(), options.radiance_scale);
+        // walls show a cone the face it meets first, and stay opaque for it
+        volume.set_anisotropic_mips(device, true);
         let voxelizer = MeshVoxelizer::new(device, queue, shared, light_buf, *volume.layout());
         use wgpu::util::DeviceExt;
         // no sky past the volume until one is set
@@ -100,11 +102,12 @@ impl SceneVoxelGi {
         self.injection.set_sky(sky_lighting);
     }
 
-    /// Bytes on the GPU: the radiance with its mips and the surface buffers.
+    /// Bytes on the GPU: the radiance with its mips (and anisotropic chains) and the surface
+    /// buffers.
     pub fn memory_bytes(&self) -> u64 {
         let layout = self.volume.layout();
         let surfaces = 1 + self.voxelizer.dynamic_surfaces().is_some() as u64;
-        layout.radiance_bytes() + surfaces * layout.voxel_count() * SURFACE_WORDS_PER_VOXEL * 4
+        layout.radiance_bytes() + self.volume.anisotropic_bytes() + surfaces * layout.voxel_count() * SURFACE_WORDS_PER_VOXEL * 4
     }
 
     /// Record the injection and the mips (after the voxelization).

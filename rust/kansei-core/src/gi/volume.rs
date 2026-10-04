@@ -60,24 +60,26 @@ impl VoxelGiQuality {
     /// limits (its accumulators in one storage binding, its sides in a 3D texture) and
     /// `budget_bytes` (0: no budget). `Low` is returned when nothing fits.
     pub fn fit(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64) -> Self {
-        self.fit_with(limits, bounds_min, bounds_max, budget_bytes, ACCUMULATOR_BYTES_PER_VOXEL)
+        self.fit_with(limits, bounds_min, bounds_max, budget_bytes, ACCUMULATOR_BYTES_PER_VOXEL, false)
     }
 
-    /// `fit` for a scene's meshes (`SceneVoxelGi`): the radiance and the static surface buffer
-    /// (`gi::SURFACE_WORDS_PER_VOXEL` u32 a voxel) instead of particle accumulators.
+    /// `fit` for a scene's meshes (`SceneVoxelGi`): the radiance with its anisotropic mips and the
+    /// static surface buffer (`gi::SURFACE_WORDS_PER_VOXEL` u32 a voxel) instead of particle
+    /// accumulators.
     pub fn fit_scene(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64) -> Self {
-        self.fit_with(limits, bounds_min, bounds_max, budget_bytes, super::voxelize::SURFACE_WORDS_PER_VOXEL * 4)
+        self.fit_with(limits, bounds_min, bounds_max, budget_bytes, super::voxelize::SURFACE_WORDS_PER_VOXEL * 4, true)
     }
 
-    /// `fit` with `bytes_per_voxel` in one storage binding next to the radiance.
-    fn fit_with(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64, bytes_per_voxel: u64) -> Self {
+    /// `fit` with `bytes_per_voxel` in one storage binding next to the radiance (and its
+    /// anisotropic chains).
+    fn fit_with(self, limits: &wgpu::Limits, bounds_min: [f32; 3], bounds_max: [f32; 3], budget_bytes: u64, bytes_per_voxel: u64, anisotropic: bool) -> Self {
         let mut q = self;
         loop {
             let layout = VolumeLayout::new(bounds_min, bounds_max, q.resolution());
             let voxels = layout.voxel_count();
             let fits = voxels * bytes_per_voxel <= limits.max_storage_buffer_binding_size as u64
                 && layout.dims.iter().all(|&d| d <= limits.max_texture_dimension_3d)
-                && (budget_bytes == 0 || layout.radiance_bytes() + voxels * bytes_per_voxel <= budget_bytes);
+                && (budget_bytes == 0 || layout.radiance_bytes() + anisotropic as u64 * layout.anisotropic_bytes() + voxels * bytes_per_voxel <= budget_bytes);
             match (fits, q.lower()) {
                 (false, Some(lower)) => q = lower,
                 _ => return q,
@@ -122,6 +124,12 @@ impl VolumeLayout {
         self.radiance_bytes() + self.voxel_count() * ACCUMULATOR_BYTES_PER_VOXEL
     }
 
+    /// The six anisotropic chains (`VoxelVolume::set_anisotropic_mips`): each as the volume's
+    /// mips 1.. are.
+    pub fn anisotropic_bytes(&self) -> u64 {
+        6 * (self.radiance_bytes() - self.voxel_count() * 8)
+    }
+
     /// The radiance texture with all its mips.
     pub fn radiance_bytes(&self) -> u64 {
         (0..self.mip_count()).map(|l| self.dims.iter().map(|&d| (d >> l).max(1) as u64).product::<u64>() * 8).sum()
@@ -157,6 +165,7 @@ pub struct VoxelVolume {
     view: wgpu::TextureView,
     mip0_storage: wgpu::TextureView,
     mips: Mip3d,
+    anisotropic: Option<super::aniso::AnisotropicMips>,
     uniform: wgpu::Buffer,
     sampler: wgpu::Sampler,
     gpu: VoxelVolumeGpu,
@@ -201,7 +210,7 @@ impl VoxelVolume {
             mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Self { layout, texture, view, mip0_storage, mips, uniform, sampler, gpu }
+        Self { layout, texture, view, mip0_storage, mips, anisotropic: None, uniform, sampler, gpu }
     }
 
     pub fn layout(&self) -> &VolumeLayout {
@@ -266,9 +275,32 @@ impl VoxelVolume {
         Texture::from_view("VoxelVolume/Radiance", self.texture().clone(), self.view.clone())
     }
 
-    /// Record the rebuild of mips 1.. from mip 0.
+    /// Also build anisotropic mips (Crassin et al. 2011): from mip 1 up, six directional chains
+    /// whose voxels composite their children front to back along each axis direction, so a cone
+    /// meets the face of a wall it reaches first instead of the mean of both faces (which halves
+    /// a lit room's walls at coarse mips). `build_mips` rebuilds them; cones read them through
+    /// `anisotropic_views` (the scene GI's do). About 0.86 times the memory of mip 0 more.
+    pub fn set_anisotropic_mips(&mut self, device: &wgpu::Device, anisotropic: bool) {
+        self.anisotropic = anisotropic.then(|| super::aniso::AnisotropicMips::new(device, self.texture.gpu_texture().unwrap()));
+    }
+
+    /// The anisotropic chains (`set_anisotropic_mips`), in the order +x, +y, +z, -x, -y, -z of
+    /// the direction a cone travels; their level 0 is the volume's mip 1.
+    pub fn anisotropic_views(&self) -> Option<&[wgpu::TextureView; 6]> {
+        self.anisotropic.as_ref().map(|a| a.views())
+    }
+
+    /// Record the rebuild of mips 1.. (and the anisotropic chains) from mip 0.
     pub fn build_mips(&self, encoder: &mut wgpu::CommandEncoder) {
         self.mips.encode(encoder);
+        if let Some(anisotropic) = &self.anisotropic {
+            anisotropic.encode(encoder);
+        }
+    }
+
+    /// Bytes of the anisotropic chains (0 without them).
+    pub fn anisotropic_bytes(&self) -> u64 {
+        self.anisotropic.as_ref().map_or(0, |a| a.memory_bytes())
     }
 
     /// The radiance texture with all its mips plus the particle accumulators.

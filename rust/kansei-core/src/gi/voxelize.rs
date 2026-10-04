@@ -8,8 +8,9 @@ pub(crate) const VOXEL_WRITE_WGSL: &str = include_str!("shaders/voxel_write.wgsl
 pub(crate) const VOXEL_FRAGMENT_WGSL: &str = concat!(include_str!("shaders/voxel_write.wgsl"), include_str!("shaders/voxel_fragment.wgsl"));
 
 /// u32 per voxel in a voxelizer's surface buffers: average albedo (rgb8 + count), average
-/// normal (xyz8 + count), brightest emission (RGB9E5).
-pub const SURFACE_WORDS_PER_VOXEL: u64 = 3;
+/// normal (xyz8 + count), average normal folded onto one hemisphere (xyz8 + count: the axis of a
+/// sheet thinner than a voxel, whose two faces' normals cancel), brightest emission (RGB9E5).
+pub const SURFACE_WORDS_PER_VOXEL: u64 = 4;
 
 /// A renderable's surface in voxel GI (`Renderable::gi`): the albedo it reflects and the light it
 /// emits (scene radiance, cd/m²), the same over the whole renderable. For a textured surface,

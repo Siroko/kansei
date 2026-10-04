@@ -11,10 +11,12 @@
 // comes from how its voxel position moves across the screen (exact for a flat triangle under an
 // orthographic camera), so a material need not output one.
 //
-// Per voxel, three u32 (`kansei_voxel_surfaces`): the running averages of the albedo (rgb8 and
-// a count) and of the normal (xyz8 and a count), after Crassin and Green (OpenGL Insights, ch.
-// 22) on atomicCompareExchangeWeak, since there are no float atomics; and the brightest emission
-// (RGB9E5 under atomicMax, whose shared exponent sits in the high bits).
+// Per voxel, four u32 (`kansei_voxel_surfaces`): the running averages of the albedo (rgb8 and a
+// count), of the normal (xyz8 and a count) and of the normal folded onto the hemisphere where
+// its largest component is positive (so the two faces of a sheet thinner than a voxel, whose
+// normals cancel in the plain average, agree on its axis), after Crassin and Green (OpenGL
+// Insights, ch. 22) on atomicCompareExchangeWeak, since there are no float atomics; and the
+// brightest emission (RGB9E5 under atomicMax, whose shared exponent sits in the high bits).
 
 struct KanseiVoxelizeParams {
     clipToVoxel : mat4x4f,   // this axis' clip space to voxel coordinates (voxel c spans [c, c + 1))
@@ -92,9 +94,13 @@ fn kansei_voxel_write(fragPos: vec4f, front: bool, albedo: vec3f, emission: vec3
     if (any(v < vec3f(0.0)) || any(v >= dims)) { return; }
     let c = vec3u(min(floor(v), dims - 1.0));
     let idx = (c.z * kansei_voxelize.dims.y + c.y) * kansei_voxelize.dims.x + c.x;
-    kansei_voxel_average(3u * idx, albedo);
-    kansei_voxel_average(3u * idx + 1u, n * 0.5 + 0.5);
+    let a = abs(n);
+    let major = select(select(n.z, n.y, a.y >= a.z), n.x, a.x >= a.y && a.x >= a.z);
+    let folded = select(n, -n, major < 0.0);
+    kansei_voxel_average(4u * idx, albedo);
+    kansei_voxel_average(4u * idx + 1u, n * 0.5 + 0.5);
+    kansei_voxel_average(4u * idx + 2u, folded * 0.5 + 0.5);
     if (any(emission > vec3f(0.0))) {
-        atomicMax(&kansei_voxel_surfaces[3u * idx + 2u], kansei_pack_rgb9e5(emission));
+        atomicMax(&kansei_voxel_surfaces[4u * idx + 3u], kansei_pack_rgb9e5(emission));
     }
 }

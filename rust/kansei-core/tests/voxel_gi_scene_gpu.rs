@@ -131,11 +131,11 @@ fn unpack8(v: u32) -> [f32; 4] {
 
 /// A voxel's surface: (albedo 0..1, unit normal), or None where nothing was drawn.
 fn surface_at(words: &[u32], index: usize) -> Option<([f32; 3], glam::Vec3)> {
-    let a = unpack8(words[3 * index]);
+    let a = unpack8(words[4 * index]);
     if a[3] == 0.0 {
         return None;
     }
-    let n = unpack8(words[3 * index + 1]);
+    let n = unpack8(words[4 * index + 1]);
     let normal = glam::Vec3::new(n[0], n[1], n[2]) / 255.0 * 2.0 - 1.0;
     Some(([a[0] / 255.0, a[1] / 255.0, a[2] / 255.0], normal.normalize_or_zero()))
 }
@@ -444,4 +444,170 @@ fn the_screen_cones_see_the_sky_through_an_empty_volume() {
             assert!((got[c] / want[c] - 1.0).abs() < 0.03, "near field {}: channel {c} gains {} of {}", near_field.is_some(), got[c], want[c]);
         }
     }
+}
+
+/// What a surface of albedo 0.5 on the floor of a closed 3 m box gains from voxel GI (the
+/// floor's middle, averaged): walls 0.15 m thick (inner faces at 1.5 m from the centre, outer
+/// faces at 1.65 m) of albedo `wall_albedo` that glow with `glow`, the injection's `bounce`, a
+/// volume reaching `reach` m from the centre, after `frames` frames.
+fn glowing_box_floor_gain(glow: [f32; 3], wall_albedo: f32, bounce: f32, reach: f32, frames: u32) -> Option<[f32; 3]> {
+    let mut renderer = renderer()?;
+    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: [-reach; 3], bounds_max: [reach; 3], ..Default::default() });
+    renderer.voxel_gi_mut().unwrap().settings.bounce = bounce;
+    let mut scene = Scene::new();
+    // a 3 m box of 0.15 m walls; the floor's top at y = -1.5 is what the camera sees
+    let walls: [([f32; 3], [f32; 3]); 6] = [
+        ([3.3, 0.15, 3.3], [0.0, -1.575, 0.0]),
+        ([3.3, 0.15, 3.3], [0.0, 1.575, 0.0]),
+        ([0.15, 3.3, 3.3], [-1.575, 0.0, 0.0]),
+        ([0.15, 3.3, 3.3], [1.575, 0.0, 0.0]),
+        ([3.3, 3.3, 0.15], [0.0, 0.0, -1.575]),
+        ([3.3, 3.3, 0.15], [0.0, 0.0, 1.575]),
+    ];
+    for (size, position) in walls {
+        let surface = GiSurface::new([wall_albedo; 3]).with_emission(glow);
+        let mut wall = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), surface_material([0.5; 3])).with_gi(surface);
+        wall.object.set_position(position[0], position[1], position[2]);
+        scene.add(SceneNode::Renderable(wall));
+    }
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let mut camera = Camera::new(70.0, 0.05, 20.0, W as f32 / H as f32);
+    camera.set_position(0.0, 0.5, 1.2);
+    camera.look_at(&Vec3::new(0.0, -1.5, -0.2));
+    camera.update_projection_matrix();
+    let mut effect = VoxelGIEffect::new(renderer.voxel_gi().unwrap().volume(), VoxelGIOptions { quality: VoxelGiQuality::Medium, ..Default::default() });
+    effect.show_indirect = true;
+    let output = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let output_view = output.create_view(&Default::default());
+    for _ in 0..frames {
+        renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        effect.render(renderer.device(), renderer.queue(), &mut encoder, &gbuffer, &gbuffer.color_view, &gbuffer.depth_view, &output_view, &camera, W, H);
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+    let row = (W * 8).next_multiple_of(256);
+    let buffer = renderer.device().create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * H) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = renderer.device().create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        output.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(H) } },
+        output.size(),
+    );
+    renderer.queue().submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    renderer.device().poll(wgpu::Maintain::Wait);
+    let bytes = buffer.slice(..).get_mapped_range();
+    // the floor's middle fills the image's centre
+    let (mut sum, mut pixels) = ([0.0f32; 3], 0);
+    for y in H / 3..H * 2 / 3 {
+        for x in W / 3..W * 2 / 3 {
+            let o = (y * row + x * 8) as usize;
+            for (c, s) in sum.iter_mut().enumerate() {
+                *s += f16_value(u16::from_le_bytes([bytes[o + 2 * c], bytes[o + 2 * c + 1]]));
+            }
+            pixels += 1;
+        }
+    }
+    Some(sum.map(|s| s / pixels as f32))
+}
+
+/// Inside a closed box whose walls glow with radiance L and reflect nothing, every direction from
+/// the floor meets a wall, so its irradiance is pi L and a surface of albedo a gains a L. The sky
+/// outside is black: light leaking through the walls at coarse mips would show as a shortfall,
+/// the walls' own voxels lighting the floor as an excess.
+#[test]
+fn inside_a_glowing_box_every_cone_meets_its_walls() {
+    let glow = [3.0, 2.0, 1.0];
+    let Some(got) = glowing_box_floor_gain(glow, 0.0, 0.0, 1.7, 12) else { return eprintln!("no GPU adapter: skipping") };
+    let a = (0.5f32 * 255.0).round() / 255.0;
+    let want = glow.map(|g| a * g);
+    eprintln!("inside the glowing box the floor gains {got:?}, expected {want:?}");
+    for c in 0..3 {
+        assert!((got[c] / want[c] - 1.0).abs() < 0.04, "channel {c} gains {} of {}", got[c], want[c]);
+    }
+}
+
+/// The bounces add up over frames to what a closed box of albedo rho holds: its walls' radiance
+/// L_e / (1 - rho) (each bounce passes rho of the light on, nothing escapes).
+///
+/// Nearly so (94 %) when the volume holds the walls' inner faces alone. With the outer faces in
+/// it too, which nothing outside lights, cones also read them where interpolation between coarse
+/// voxels crosses a wall, and the box keeps about 80 % of its light: the bias of voxels that keep
+/// one radiance whichever way they are seen. Self-lighting through the bounce cones would
+/// overshoot either value.
+#[test]
+fn the_bounces_converge_to_the_closed_box_radiance() {
+    let glow = [1.0, 0.5, 0.25];
+    let rho = 0.5;
+    // the voxel albedo is 8-bit
+    let a = (0.5f32 * 255.0).round() / 255.0;
+    let want = glow.map(|g| a * g / (1.0 - (rho * 255.0f32).round() / 255.0));
+    let Some(inner) = glowing_box_floor_gain(glow, rho, 1.0, 1.56, 40) else { return eprintln!("no GPU adapter: skipping") };
+    let both = glowing_box_floor_gain(glow, rho, 1.0, 1.7, 40).unwrap();
+    eprintln!("with bounces the floor gains {inner:?} (inner faces), {both:?} (both faces), expected {want:?}");
+    for c in 0..3 {
+        let kept = inner[c] / want[c];
+        assert!((0.9..1.02).contains(&kept), "inner faces: channel {c} keeps {kept} of the light");
+        let kept = both[c] / want[c];
+        assert!((0.7..1.02).contains(&kept), "both faces: channel {c} keeps {kept} of the light");
+    }
+}
+
+/// A plate thinner than a voxel puts both its faces in the same voxels: their normals cancel in
+/// the average, but the folded normal keeps the plate's axis, and the plate is lit as a two-sided
+/// sheet (the light reaches it from above, as it would its top face).
+#[test]
+fn a_sheet_thinner_than_a_voxel_keeps_its_axis() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Low, bounds_min: [-1.0; 3], bounds_max: [1.0; 3], ..Default::default() });
+    renderer.voxel_gi_mut().unwrap().settings.bounce = 0.0;
+    let albedo = [0.5, 0.5, 0.5];
+    let mut scene = Scene::new();
+    // 1 cm thick, inside one voxel layer (voxels are 3.125 cm)
+    let mut plate = Renderable::new(BoxGeometry::new(1.2, 0.01, 1.2), surface_material(albedo)).with_gi(GiSurface::new(albedo));
+    plate.object.set_position(0.0, 0.11, 0.0);
+    scene.add(SceneNode::Renderable(plate));
+    let mut lamp = SpotLight::new(Vec3::new(0.0, 0.9, 0.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 10.0, 20.0, 60f32.to_radians(), 70f32.to_radians());
+    lamp.source_radius = 0.0;
+    scene.add(SceneNode::Light(Light::Spot(lamp)));
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let mut camera = camera();
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+
+    let gi = renderer.voxel_gi().unwrap();
+    let layout = *gi.volume().layout();
+    let words = read_words(&renderer, gi.voxelizer().static_surfaces());
+    let radiance = read_radiance(&renderer, gi.volume().texture());
+    let vs = layout.voxel_size;
+    let [dx, dy, _] = layout.dims;
+    let y = ((0.11 - layout.origin[1]) / vs) as u32;
+    let (mut sheets, mut lit) = (0, 0);
+    for z in 8..dx - 8 {
+        for x in 8..dx - 8 {
+            let p = glam::Vec3::from(layout.origin) + (glam::UVec3::new(x, y, z).as_vec3() + 0.5) * vs;
+            if p.x.abs() > 0.5 || p.z.abs() > 0.5 {
+                continue;
+            }
+            let i = ((z * dy + y) * dx + x) as usize;
+            let n = unpack8(words[4 * i + 1]);
+            let folded = unpack8(words[4 * i + 2]);
+            let signed = (glam::Vec3::new(n[0], n[1], n[2]) / 255.0 * 2.0 - 1.0).length();
+            let axis = (glam::Vec3::new(folded[0], folded[1], folded[2]) / 255.0 * 2.0 - 1.0).normalize();
+            assert!(signed < 0.1, "the faces' normals average to length {signed}");
+            assert!(axis.y > 0.99, "the folded normal is {axis}");
+            sheets += 1;
+            lit += (radiance[i][0] > 0.1) as u32;
+        }
+    }
+    eprintln!("{sheets} sheet voxels, {lit} lit");
+    assert!(sheets > 400 && lit == sheets);
 }

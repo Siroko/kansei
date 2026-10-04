@@ -20,6 +20,7 @@ pub(crate) const TEMPORAL_WGSL: &str = concat!(include_str!("shaders/screen_comm
 pub(crate) const COMPOSITE_WGSL: &str = concat!(
     include_str!("shaders/screen_common.wgsl"),
     include_str!("shaders/screen_normal.wgsl"),
+    include_str!("shaders/voxel_volume.wgsl"),
     include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("shaders/screen_composite.wgsl"),
 );
@@ -135,10 +136,14 @@ pub struct VoxelGIEffect {
     /// Debug view: output only the light the GI adds (albedo / pi times its irradiance), black
     /// elsewhere, in place of the lit image.
     pub show_indirect: bool,
+    /// Debug view: the volume's voxels and their light as the camera sees them (mip 0 marched
+    /// per pixel), in place of the lit image, to inspect the voxelization. Over `show_indirect`.
+    pub show_voxels: bool,
     /// The sky past the volume without `set_sky_lighting`: scene radiance straight up and down.
     pub sky_gradient: ([f32; 3], [f32; 3]),
     near_field: Option<ScreenSpaceGIEffect>,
     volume_view: wgpu::TextureView,
+    anisotropic: [wgpu::TextureView; 6],
     volume_uniform: wgpu::Buffer,
     volume_sampler: wgpu::Sampler,
     sky_lighting: Option<wgpu::Buffer>,
@@ -149,8 +154,10 @@ pub struct VoxelGIEffect {
 }
 
 impl VoxelGIEffect {
-    /// Read `volume` (`SceneVoxelGi::volume`); the effect keeps its own handles to it.
+    /// Read `volume` (`SceneVoxelGi::volume`, or any volume with anisotropic mips); the effect
+    /// keeps its own handles to it.
     pub fn new(volume: &VoxelVolume, options: VoxelGIOptions) -> Self {
+        let anisotropic = volume.anisotropic_views().expect("VoxelGIEffect reads a volume with anisotropic mips (VoxelVolume::set_anisotropic_mips; SceneVoxelGi's has them)").clone();
         Self {
             enabled: true,
             quality: options.quality,
@@ -161,9 +168,11 @@ impl VoxelGIEffect {
             material_ambient: options.material_ambient,
             sky_scale: options.sky_scale,
             show_indirect: false,
+            show_voxels: false,
             sky_gradient: ([0.0; 3], [0.0; 3]),
             near_field: options.near_field.map(ScreenSpaceGIEffect::new),
             volume_view: volume.view().clone(),
+            anisotropic,
             volume_uniform: volume.uniform().clone(),
             volume_sampler: volume.sampler().clone(),
             sky_lighting: None,
@@ -232,14 +241,44 @@ impl VoxelGIEffect {
         };
         let sampler = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None };
         let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
+        let d3 = wgpu::TextureViewDimension::D3;
         let trace_bgl = bgl(
             "VoxelGI/TraceBGL",
-            &[uniform(0), depth(1), texture(2, false, d2), uniform(3), texture(4, true, wgpu::TextureViewDimension::D3), sampler(5), uniform(6), storage(7)],
+            &[
+                uniform(0),
+                depth(1),
+                texture(2, false, d2),
+                uniform(3),
+                texture(4, true, d3),
+                sampler(5),
+                uniform(6),
+                storage(7),
+                // the anisotropic mips (voxel_irradiance.wgsl)
+                texture(40, true, d3),
+                texture(41, true, d3),
+                texture(42, true, d3),
+                texture(43, true, d3),
+                texture(44, true, d3),
+                texture(45, true, d3),
+            ],
         );
         let temporal_bgl = bgl("VoxelGI/TemporalBGL", &[uniform(0), texture(1, false, d2), texture(2, true, d2), depth(3), storage(4), sampler(5)]);
         let composite_bgl = bgl(
             "VoxelGI/CompositeBGL",
-            &[uniform(0), texture(1, false, d2), depth(2), texture(3, false, d2), texture(4, false, d2), texture(5, false, d2), texture(6, false, d2), uniform(7), storage(8)],
+            &[
+                uniform(0),
+                texture(1, false, d2),
+                depth(2),
+                texture(3, false, d2),
+                texture(4, false, d2),
+                texture(5, false, d2),
+                texture(6, false, d2),
+                uniform(7),
+                storage(8),
+                uniform(9),
+                texture(10, true, wgpu::TextureViewDimension::D3),
+                sampler(11),
+            ],
         );
         let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
@@ -380,7 +419,7 @@ impl PostProcessingEffect for VoxelGIEffect {
             blend: self.temporal_blend.clamp(0.01, 1.0),
             history_valid: self.prev_view_proj.is_some() as u32,
             has_sky: self.sky_lighting.is_some() as u32,
-            debug: self.show_indirect as u32,
+            debug: if self.show_voxels { 2 } else { self.show_indirect as u32 },
             near_field: near.is_some() as u32,
             sky_scale: self.sky_scale.max(0.0),
             _pad: [0; 2],
@@ -401,20 +440,22 @@ impl PostProcessingEffect for VoxelGIEffect {
         };
         let p = || gpu.params.as_entire_binding();
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.gradient_sky);
-        let trace = group(
-            "VoxelGI/TraceBG",
-            &gpu.trace_bgl,
-            vec![
-                p(),
-                tex(depth),
-                tex(&gbuffer.normal_view),
-                self.volume_uniform.as_entire_binding(),
-                tex(&self.volume_view),
-                wgpu::BindingResource::Sampler(&self.volume_sampler),
-                sky.as_entire_binding(),
-                tex(&t.trace),
-            ],
-        );
+        let mut trace_entries: Vec<_> = [
+            p(),
+            tex(depth),
+            tex(&gbuffer.normal_view),
+            self.volume_uniform.as_entire_binding(),
+            tex(&self.volume_view),
+            wgpu::BindingResource::Sampler(&self.volume_sampler),
+            sky.as_entire_binding(),
+            tex(&t.trace),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource })
+        .collect();
+        trace_entries.extend(self.anisotropic.iter().enumerate().map(|(i, view)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(view) }));
+        let trace = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/TraceBG"), layout: &gpu.trace_bgl, entries: &trace_entries });
         let temporal = group(
             "VoxelGI/TemporalBG",
             &gpu.temporal_bgl,
@@ -434,6 +475,9 @@ impl PostProcessingEffect for VoxelGIEffect {
                 tex(&gbuffer.normal_view),
                 sky.as_entire_binding(),
                 tex(output),
+                self.volume_uniform.as_entire_binding(),
+                tex(&self.volume_view),
+                wgpu::BindingResource::Sampler(&self.volume_sampler),
             ],
         );
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/Screen"), timestamp_writes: crate::profiling::gpu_pass("VoxelGI/Screen").as_ref().map(crate::profiling::PassStamp::compute) });

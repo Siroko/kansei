@@ -18,7 +18,7 @@ struct VoxelGiParams {
     blend        : f32,       // weight of the new frame in the history
     historyValid : u32,
     hasSky       : u32,
-    debug        : u32,       // 1: output only the light the GI adds
+    debug        : u32,       // 1: output only the light the GI adds; 2: the volume's voxels
     nearField    : u32,       // 1: screen-space GI in front, the voxels past it
     skyScale     : f32,       // of the sky past the volume
     _pad0        : u32,

@@ -5,8 +5,10 @@
 //!
 //! The shared core:
 //! - [`VoxelVolume`]: an `rgba16float` 3D texture with mips (premultiplied radiance, opacity),
-//!   its placement as a uniform (`VOXEL_VOLUME_WGSL`) and its sampler; [`Mip3d`] builds the mips;
-//!   [`VoxelGiQuality`] sets the resolution and cost, stepping down to what a device can hold;
+//!   its placement as a uniform (`VOXEL_VOLUME_WGSL`) and its sampler; [`Mip3d`] builds the mips,
+//!   and optionally six directional (anisotropic) chains above mip 0, so a cone meets the face of
+//!   a wall it reaches first; [`VoxelGiQuality`] sets the resolution and cost, stepping down to
+//!   what a device can hold;
 //! - `VOXEL_CONES_WGSL`: `voxelConeTrace`, for any pass or material that reads the volume, with
 //!   the sky (`SKY_LIGHTING_WGSL`'s `skyRadiance`, or [`gradient_sky_lighting`] without an
 //!   atmosphere) as the light past it.
@@ -24,6 +26,7 @@
 //! traced per pixel, optionally under screen-space GI as the near field. The planned ones (a
 //! jump-flood distance field, probes traced in it) reuse the volume, the mips and the cones.
 
+mod aniso;
 mod cones;
 mod effect;
 mod inject;
@@ -98,6 +101,7 @@ mod tests {
             ("resolve", particles::RESOLVE_WGSL),
             ("cones", cones::PARTICLE_CONES_WGSL),
             ("mip3d", include_str!("shaders/mip3d.wgsl")),
+            ("anisotropic mips", include_str!("shaders/aniso_mip.wgsl")),
             ("voxel fragment", voxelize::VOXEL_FRAGMENT_WGSL),
             ("inject", inject::INJECT_WGSL),
             ("screen trace", effect::TRACE_WGSL),

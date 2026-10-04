@@ -2,11 +2,11 @@
 // voxelizer's average albedo and normal, and its emission) into the radiance leaving it, the
 // volume's mip 0:
 // - direct light: the renderer's directional, point and spot lights, each shadowed by its map
-//   (compute_shadows.wgsl), looked up a little out along the normal so the voxel does not
-//   shadow itself;
-// - one more bounce: the irradiance the hemisphere's cones gather from mips 1.. of the volume
-//   itself, which still hold last frame's light (the chain is rebuilt after this pass, and they
-//   are other subresources than the mip 0 written here), so the bounces add up over frames;
+//   (compute_shadows.wgsl), looked up a little out along the normal and toward the light so the
+//   voxel does not shadow itself (a voxel's centre lies up to half a voxel off its surface);
+// - one more bounce: the irradiance the hemisphere's cones gather from the volume's anisotropic
+//   mips (its mips 1.. by direction), which still hold last frame's light (they are rebuilt after
+//   this pass), so the bounces add up over frames;
 // - the surface's emission.
 // A voxel is a Lambertian surface: albedo / pi times its irradiance, plus its emission. It is
 // opaque. Needs voxel_volume.wgsl, voxel_cones.wgsl, voxel_irradiance.wgsl, particle_emission.wgsl
@@ -29,10 +29,12 @@ struct InjectParams {
 
 @group(0) @binding(0) var<uniform> vol : VoxelVolume;
 @group(0) @binding(2) var<uniform> ip : InjectParams;
-// three u32 per voxel (voxel_write.wgsl): albedo rgb8 + count, normal xyz8 + count, RGB9E5
+// four u32 per voxel (voxel_write.wgsl): albedo rgb8 + count, normal xyz8 + count, the folded
+// normal xyz8 + count, emission RGB9E5
 @group(0) @binding(10) var<storage, read> staticSurfaces : array<u32>;
 @group(0) @binding(11) var<storage, read> dynamicSurfaces : array<u32>;
-// mips 1.. of the radiance texture being written
+// mips 1.. of the radiance texture being written (not read: the bounce reads the anisotropic
+// chains, voxel_irradiance.wgsl's bindings 40-45)
 @group(0) @binding(12) var previous : texture_3d<f32>;
 @group(0) @binding(13) var linearClamp : sampler;
 @group(0) @binding(14) var radianceOut : texture_storage_3d<rgba16float, write>;
@@ -51,24 +53,26 @@ fn unpackRgb9e5(v: u32) -> vec3f {
 fn main(@builtin(global_invocation_id) gid : vec3u) {
     if (any(gid >= vol.dims)) { return; }
     let idx = voxelLinearIndex(vol, gid);
-    var surface = vec3u(staticSurfaces[3u * idx], staticSurfaces[3u * idx + 1u], staticSurfaces[3u * idx + 2u]);
+    var surface = vec4u(staticSurfaces[4u * idx], staticSurfaces[4u * idx + 1u], staticSurfaces[4u * idx + 2u], staticSurfaces[4u * idx + 3u]);
     if (ip.hasDynamic != 0u) {
-        let d = vec3u(dynamicSurfaces[3u * idx], dynamicSurfaces[3u * idx + 1u], dynamicSurfaces[3u * idx + 2u]);
-        if ((d.x >> 24u) != 0u || d.z != 0u) { surface = d; }
+        let d = vec4u(dynamicSurfaces[4u * idx], dynamicSurfaces[4u * idx + 1u], dynamicSurfaces[4u * idx + 2u], dynamicSurfaces[4u * idx + 3u]);
+        if ((d.x >> 24u) != 0u || d.w != 0u) { surface = d; }
     }
     let albedoRaw = unpack8(surface.x);
-    let emission = unpackRgb9e5(surface.z) * ip.emissionScale;
+    let emission = unpackRgb9e5(surface.w) * ip.emissionScale;
     if (albedoRaw.w == 0.0 && all(emission <= vec3f(0.0))) {
         textureStore(radianceOut, gid, vec4f(0.0));
         return;
     }
     let albedo = albedoRaw.rgb / 255.0;
     // the average normal; faces that point both ways in one voxel (a sheet thinner than a voxel)
-    // average out, and are lit from both sides
+    // average out: such a voxel takes the sheet's axis (the folded average) and is lit from both
+    // sides
     let nRaw = unpack8(surface.y).xyz / 255.0 * 2.0 - 1.0;
     let nLen = length(nRaw);
     let twoSided = nLen < 0.35;
-    let n = select(nRaw / max(nLen, 1e-4), vec3f(0.0, 1.0, 0.0), nLen < 1e-3);
+    let axis = unpack8(surface.z).xyz / 255.0 * 2.0 - 1.0;
+    let n = select(nRaw / max(nLen, 1e-4), axis / max(length(axis), 1e-4), twoSided);
     let p = vol.origin + (vec3f(gid) + 0.5) * vol.voxelSize;
     let ps = p + select(n, vec3f(0.0), twoSided) * (ip.shadowOffset * vol.voxelSize);
 
@@ -81,7 +85,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         if (ndl <= 0.0) { continue; }
         var visibility = 1.0;
         if (dl.shadowed != 0u && ip.hasShadowMap != 0u) {
-            visibility = dirShadowLookup(ps);
+            visibility = dirShadowLookup(ps + l * vol.voxelSize);
         }
         e += dl.color * ndl * visibility;
     }
@@ -97,7 +101,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         let falloff = (1.0 - dist / pl.radius) * (1.0 - dist / pl.radius);
         var visibility = 1.0;
         if (pl.shadowLayer != NO_SHADOW && ip.hasPointShadows != 0u) {
-            visibility = pointShadowLookup(ps, pl.position, pl.shadowLayer);
+            visibility = pointShadowLookup(ps + d / dist * vol.voxelSize, pl.position, pl.shadowLayer);
         }
         e += pl.color * ndl * falloff * visibility;
     }
@@ -110,7 +114,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         if (ndl <= 0.0) { continue; }
         var visibility = 1.0;
         if (light.shadowLayer >= 0) {
-            let coord = kansei_spot_shadow_coord(light, ps);
+            let coord = kansei_spot_shadow_coord(light, ps + s.toLight * vol.voxelSize);
             if (coord.w > 0.0) {
                 visibility = textureSampleCompareLevel(spotShadowAtlas, spotShadowSampler, coord.xy, light.shadowLayer, coord.z);
             }
@@ -126,9 +130,13 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         half.mipCount = vol.mipCount - 1u;
         // the tilted cones turned per voxel, the same every frame (noise here would flicker)
         let angle = giHash01(idx * 7919u) * 6.2831853;
-        let origin = p + n * vol.voxelSize;
-        let gathered = voxelIrradiance(half, previous, linearClamp, sky, ip.skyScale, origin, n, angle, half.voxelSize, 1e4, ip.maxSteps);
-        e += gathered.rgb * ip.bounce;
+        var gathered = voxelIrradiance(half, previous, linearClamp, sky, ip.skyScale, p + n * vol.voxelSize, n, angle, half.voxelSize, 1e4, ip.maxSteps, 0.0).rgb;
+        if (twoSided) {
+            // a sheet: the brighter of its sides (an isotropic voxel can't keep both)
+            let back = voxelIrradiance(half, previous, linearClamp, sky, ip.skyScale, p - n * vol.voxelSize, -n, angle, half.voxelSize, 1e4, ip.maxSteps, 0.0).rgb;
+            gathered = max(gathered, back);
+        }
+        e += gathered * ip.bounce;
     }
 
     let out = albedo / VOXEL_GI_PI * e + emission;

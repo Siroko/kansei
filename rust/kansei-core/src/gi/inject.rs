@@ -90,6 +90,10 @@ impl RadianceInjection {
             entry(15, uniform),
         ];
         entries.extend(ComputeShadows::layout_entries());
+        // the anisotropic mips (voxel_irradiance.wgsl)
+        for binding in 40..46 {
+            entries.push(entry(binding, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }));
+        }
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VoxelGI/InjectBGL"), entries: &entries });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGI/Inject"), source: wgpu::ShaderSource::Wgsl(INJECT_WGSL.into()) });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/Inject"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
@@ -149,6 +153,8 @@ impl RadianceInjection {
                 wgpu::BindGroupEntry { binding: 15, resource: self.sky.as_entire_binding() },
             ];
             entries.extend(self.shadows.entries());
+            let anisotropic = volume.anisotropic_views().expect("scene GI volumes have anisotropic mips");
+            entries.extend(anisotropic.iter().enumerate().map(|(i, view)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: wgpu::BindingResource::TextureView(view) }));
             self.group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/InjectBG"), layout: &self.bgl, entries: &entries }));
             self.bound_dynamic = has_dynamic;
         }
