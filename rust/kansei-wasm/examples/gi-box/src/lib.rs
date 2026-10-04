@@ -11,19 +11,21 @@
 //!   the backs of the blocks) arrives too. The rug's voxels take its texture through its
 //!   material's voxel entry (`albedo=constant`: its mean colour instead).
 //! - `gi=voxel+ssgi`: screen-space GI in front for contact detail, the voxels for the rest.
+//! - `gi=probes` and `gi=probes+ssgi`: the voxels' light reaches the screen through irradiance
+//!   probes traced in the voxels' distance field (`SdfProbes`) instead of cones per pixel.
 //!
 //! Drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan. The panel
 //! (and `window.kansei`) switches everything at run time.
 //!
 //! URL parameters (a `preset` first, the others over it):
-//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice` (see `PRESETS`;
+//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
 //!   `best`, voxel + SSGI at the device's tier, unless the URL names a preset or a `gi`);
-//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi`;
+//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi`;
 //! - `voxels=low|medium|high`: the volume's resolution (default medium; low on phones, which also
 //!   keep it within 24 MiB);
 //! - `view=indirect` (only the light GI adds, 2 stops brighter), `view=voxels` (with voxel GI:
-//!   the lit voxels themselves) or `view=sdf` (a slice of voxel GI's distance field, `slice=`
-//!   metres up, default 0.6);
+//!   the lit voxels themselves), `view=sdf` (a slice of voxel GI's distance field, `slice=`
+//!   metres up, default 0.6) or `view=probes` (the probes, lit by their own irradiance);
 //! - the distance field (it turns voxel GI's scene volume on whatever the mode): `sdf_ao=0..1`
 //!   (its AO on the GI), `sdf_shadows=off|fallback|always` (the voxels' shadows through it, where
 //!   no map covers them or always), `shadows=map|sdf` (the direct light's shadows through it, by
@@ -45,7 +47,7 @@ use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
 use kansei_core::geometries::BoxGeometry;
-use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
+use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfProbeOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
@@ -297,6 +299,8 @@ enum Gi {
     Screen(GiQuality),
     Voxel,
     VoxelAndScreen,
+    Probes,
+    ProbesAndScreen,
 }
 
 impl Gi {
@@ -310,6 +314,8 @@ impl Gi {
             "voxel" => Gi::Voxel,
             // a raw '+' in the query, or one decoded to a space or escaped
             "voxel+ssgi" | "voxel ssgi" | "voxel%2Bssgi" | "voxel%2bssgi" => Gi::VoxelAndScreen,
+            "probes" => Gi::Probes,
+            "probes+ssgi" | "probes ssgi" | "probes%2Bssgi" | "probes%2bssgi" => Gi::ProbesAndScreen,
             _ => return None,
         })
     }
@@ -323,11 +329,22 @@ impl Gi {
             Gi::Screen(GiQuality::Ultra) => "ultra",
             Gi::Voxel => "voxel",
             Gi::VoxelAndScreen => "voxel+ssgi",
+            Gi::Probes => "probes",
+            Gi::ProbesAndScreen => "probes+ssgi",
         }
     }
 
     fn voxels(self) -> bool {
-        matches!(self, Gi::Voxel | Gi::VoxelAndScreen)
+        matches!(self, Gi::Voxel | Gi::VoxelAndScreen | Gi::Probes | Gi::ProbesAndScreen)
+    }
+
+    fn probes(self) -> bool {
+        matches!(self, Gi::Probes | Gi::ProbesAndScreen)
+    }
+
+    /// Screen-space GI in front of the voxels.
+    fn near_field(self) -> bool {
+        matches!(self, Gi::VoxelAndScreen | Gi::ProbesAndScreen)
     }
 }
 
@@ -380,6 +397,8 @@ enum View {
     Voxels,
     /// A horizontal slice of voxel GI's distance field (`slice=` metres up).
     Sdf,
+    /// The probes as balls lit by their irradiance.
+    Probes,
 }
 
 impl View {
@@ -389,6 +408,7 @@ impl View {
             "indirect" => View::Indirect,
             "voxels" => View::Voxels,
             "sdf" => View::Sdf,
+            "probes" => View::Probes,
             _ => return None,
         })
     }
@@ -399,6 +419,7 @@ impl View {
             View::Indirect => "indirect",
             View::Voxels => "voxels",
             View::Sdf => "sdf",
+            View::Probes => "probes",
         }
     }
 }
@@ -435,9 +456,14 @@ struct Config {
 }
 
 impl Config {
+    /// Whether anything reads the probes.
+    fn needs_probes(&self) -> bool {
+        self.gi.probes() || self.view == View::Probes
+    }
+
     /// Whether anything reads the distance field.
     fn needs_sdf(&self) -> bool {
-        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf
+        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf || self.needs_probes()
     }
 
     /// Whether the scene's voxel GI must run: for the voxel modes, or for the distance field.
@@ -481,7 +507,7 @@ const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxel
     Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
 }
 
-const PRESETS: [Preset; 11] = [
+const PRESETS: [Preset; 14] = [
     preset("off", "Off (direct light)", "off", None, View::Lit, Dragon::Off),
     preset("ssgi", "SSGI", "high", None, View::Lit, Dragon::Off),
     preset("voxel", "Voxel", "voxel", None, View::Lit, Dragon::Off),
@@ -494,7 +520,16 @@ const PRESETS: [Preset; 11] = [
     Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
     Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
     preset("slice", "SDF slice (debug)", "voxel", None, View::Sdf, Dragon::Off),
+    // irradiance probes traced in the distance field, under SSGI
+    preset("probes", "Probes + SSGI", "probes+ssgi", None, View::Lit, Dragon::Off),
+    preset("probe-view", "Probes (debug)", "probes+ssgi", None, View::Probes, Dragon::Off),
+    preset("probes-dragon", "Probes + dragon, 871k tris", "probes+ssgi", None, View::Lit, Dragon::Full),
 ];
+
+/// The probes for this device: a probe every 8 voxels; phones update half of them a frame.
+fn probe_options(phone: bool) -> SdfProbeOptions {
+    SdfProbeOptions { probes_per_frame: if phone { 256 } else { 0 }, ..Default::default() }
+}
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
 const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 3] = [
@@ -663,13 +698,16 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool) -> Vec<Box<d
             // (the slice view shows through voxel GI's effect whatever the mode)
             let scene_gi = renderer.voxel_gi().expect("voxel GI is enabled for the voxel modes and the field");
             let near_quality = if phone || scene_gi.quality() == VoxelGiQuality::Low { GiQuality::Low } else { GiQuality::High };
-            let near_field = (config.gi == Gi::VoxelAndScreen).then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
+            let near_field = config.gi.near_field().then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
             let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, ..Default::default() });
             effect.show_indirect = indirect;
             effect.show_voxels = config.view == View::Voxels;
             effect.set_sdf(scene_gi.sdf());
             effect.sdf_ao = config.sdf_ao;
             effect.show_sdf_slice = (config.view == View::Sdf).then_some(config.slice);
+            // the probes: the far field in the probe modes (and what the debug view shows)
+            effect.set_probes(scene_gi.probes().filter(|_| config.needs_probes()));
+            effect.show_probes = config.view == View::Probes;
             effects.push(Box::new(effect));
         }
     }
@@ -768,6 +806,11 @@ impl State {
                 gi.disable_sdf();
             }
             gi.settings.sdf_shadows = config.sdf_shadows;
+            if config.needs_probes() {
+                gi.enable_probes(probe_options(self.phone));
+            } else {
+                gi.disable_probes();
+            }
         }
         self.volume.effects = build_effects(&self.renderer, &config, self.phone);
         // the lit materials: shadowed through the field (bound to this one) or by the maps
@@ -865,7 +908,7 @@ impl State {
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.config.gi.name(),
             self.config.view.name(),
             tier_name(self.config.voxels),
@@ -882,6 +925,9 @@ impl State {
             self.config.slice,
             gi.and_then(|g| g.sdf()).is_some(),
             sum("VoxelGI/Sdf"),
+            gi.and_then(|g| g.probes()).is_some(),
+            gi.and_then(|g| g.probes()).map_or("null".into(), |p| format!("{:?}", p.dims())),
+            sum("VoxelGI/Probes"),
             self.triangles(),
             self.stats.is_some(),
             self.stats.as_ref().map_or(0.0, |s| s.frame_ms),
