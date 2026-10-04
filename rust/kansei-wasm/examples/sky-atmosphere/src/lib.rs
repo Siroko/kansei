@@ -7,8 +7,6 @@
 //! ball, a rough metal ball and a pond reflect the sky through the prefiltered environment cubemap.
 //! See www/index.html for the URL parameters.
 
-mod display;
-
 use wasm_bindgen::prelude::*;
 
 use kansei_core::atmosphere::{
@@ -17,24 +15,24 @@ use kansei_core::atmosphere::{
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
-use kansei_core::lights::{DirectionalLight, Light};
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
+use kansei_core::lights::{DirectionalLight, Light, LIGHTS_WGSL};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::postprocessing::effects::{
-    AtmosphereEffect, CloudLayer, CloudQuality, GiQuality, HeightFogEffect, HeightFogLayer, LocalFogVolume, ScreenSpaceGIEffect, ScreenSpaceGIOptions,
-    VolumetricCloudsEffect, VolumetricCloudsOptions, VolumetricFogEffect, VolumetricFogOptions,
+    exposure_from_ev100_lens, AtmosphereEffect, CloudLayer, CloudQuality, GiQuality, HeightFogEffect, HeightFogLayer, LocalFogVolume, ScreenSpaceGIEffect,
+    ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricCloudsEffect, VolumetricCloudsOptions, VolumetricFogEffect, VolumetricFogOptions,
+    LENS_ATTENUATION_UE4,
 };
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::shadows::SHADOW_MAP_WGSL;
 use kansei_wasm::{flag, param, param_or, Canvas};
-
-use display::DisplayEffect;
 
 /// Lambertian surfaces lit by the scene's directional lights (in lux) with the renderer's shadow
 /// map, and by the sky: radiance = albedo / pi * (E_sun * cos * shadow + E_sky(n)). Prefixed with
-/// SKY_LIGHTING_WGSL.
+/// SKY_LIGHTING_WGSL, CLOUD_SHADOW_WGSL, LIGHTS_WGSL, SHADOW_MAP_WGSL and GBUFFER_OUT_WGSL.
 const SURFACE_WGSL: &str = r#"
 struct MaterialUniforms { albedo: vec4<f32> };
 @group(0) @binding(0) var<uniform> material: MaterialUniforms;
@@ -46,18 +44,6 @@ struct MaterialUniforms { albedo: vec4<f32> };
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-
-struct DirLight { direction: vec3<f32>, _pad0: f32, color: vec3<f32>, intensity: f32 };
-struct PtLight { position: vec3<f32>, radius: f32, color: vec3<f32>, intensity: f32 };
-struct LightUniforms { num_directional: u32, num_point: u32, _pad0: u32, _pad1: u32,
-                       directional: array<DirLight, 4>, point: array<PtLight, 8> };
-@group(1) @binding(2) var<uniform> lights: LightUniforms;
-
-struct ShadowUniforms { light_view_proj: mat4x4<f32>, bias: f32, normal_bias: f32, shadow_enabled: f32,
-                        point_shadow_enabled: f32, point_light_pos: vec3<f32>, point_shadow_far: f32 };
-@group(3) @binding(0) var shadow_depth_tex: texture_depth_2d;
-@group(3) @binding(1) var shadow_sampler: sampler_comparison;
-@group(3) @binding(2) var<uniform> shadow_uniforms: ShadowUniforms;
 
 struct VertexInput { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
 struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) world_position: vec3<f32>,
@@ -73,53 +59,26 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
-fn sun_shadow(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
-    if (shadow_uniforms.shadow_enabled < 0.5) { return 1.0; }
-    let ls = shadow_uniforms.light_view_proj * vec4<f32>(world_pos + n * shadow_uniforms.normal_bias, 1.0);
-    let ndc = ls.xyz / ls.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    let inside = step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0) * step(ndc.z, 1.0);
-    let texel = 1.0 / vec2<f32>(textureDimensions(shadow_depth_tex));
-    var s = 0.0;
-    for (var x = -1; x <= 1; x++) {
-        for (var y = -1; y <= 1; y++) {
-            let suv = clamp(uv + vec2<f32>(f32(x), f32(y)) * texel, vec2<f32>(0.0), vec2<f32>(1.0));
-            s += textureSampleCompare(shadow_depth_tex, shadow_sampler, suv, ndc.z - shadow_uniforms.bias);
-        }
-    }
-    return mix(1.0, s / 9.0, inside);
-}
-
 // the lit colour, and the normal and albedo the screen-space GI reads (GBuffer targets 2 and 3)
-struct GBufferOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
 @fragment
-fn fragment_main(input: VertexOutput) -> GBufferOut {
+fn fragment_main(input: VertexOutput) -> KanseiGBufferOut {
     let n = normalize(input.world_normal);
-    let shadow = sun_shadow(input.world_position, n);
+    let shadow = kansei_shadow_map(input.world_position, n);
     var e = vec3<f32>(0.0);
-    for (var i = 0u; i < lights.num_directional; i++) {
-        let l = lights.directional[i];
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let l = kansei_lights.directional[i];
         // the sun (light 0) through its shadow map and the clouds
         let clouds = cloudShadow(cloud_shadow_map, cloud_shadow_sampler, cloud_shadow_params, input.world_position);
         e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow * clouds, i == 0u);
     }
-    var out: GBufferOut;
-    out.color = vec4<f32>(material.albedo.rgb / 3.14159265 * (e + skyIrradiance(sky, n)), 1.0);
-    out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
-    out.albedo = vec4<f32>(material.albedo.rgb, 1.0);
-    return out;
+    let albedo = material.albedo.rgb;
+    return kansei_gbuffer_out(albedo / 3.14159265 * (e + skyIrradiance(sky, n)), vec3<f32>(0.0), n, albedo);
 }
 "#;
 
 /// Reflective surfaces: the sky's prefiltered environment (split sum) and a GGX sun highlight
-/// over a diffuse base. Prefixed with SKY_LIGHTING_WGSL and SKY_ENVIRONMENT_WGSL.
+/// over a diffuse base. Prefixed with SKY_LIGHTING_WGSL, SKY_ENVIRONMENT_WGSL, CLOUD_SHADOW_WGSL,
+/// LIGHTS_WGSL and GBUFFER_OUT_WGSL.
 const REFLECTIVE_WGSL: &str = r#"
 struct Surface { albedo: vec4<f32>, f0_roughness: vec4<f32> };
 @group(0) @binding(0) var<uniform> material: Surface;
@@ -134,12 +93,6 @@ struct Surface { albedo: vec4<f32>, f0_roughness: vec4<f32> };
 @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
 @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
 
-struct DirLight { direction: vec3<f32>, _pad0: f32, color: vec3<f32>, intensity: f32 };
-struct PtLight { position: vec3<f32>, radius: f32, color: vec3<f32>, intensity: f32 };
-struct LightUniforms { num_directional: u32, num_point: u32, _pad0: u32, _pad1: u32,
-                       directional: array<DirLight, 4>, point: array<PtLight, 8> };
-@group(1) @binding(2) var<uniform> lights: LightUniforms;
-
 struct VertexInput { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
 struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) world_position: vec3<f32>,
                       @location(1) world_normal: vec3<f32> };
@@ -154,15 +107,8 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
-struct GBufferOut {
-    @location(0) color: vec4<f32>,
-    @location(1) emissive: vec4<f32>,
-    @location(2) normal: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
-};
-
 @fragment
-fn fragment_main(input: VertexOutput) -> GBufferOut {
+fn fragment_main(input: VertexOutput) -> KanseiGBufferOut {
     let n = normalize(input.world_normal);
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
@@ -178,8 +124,8 @@ fn fragment_main(input: VertexOutput) -> GBufferOut {
 
     // the sun: Lambert + GGX with Schlick's Fresnel and a Smith visibility approximation
     let a2 = roughness * roughness * roughness * roughness;
-    for (var i = 0u; i < lights.num_directional; i++) {
-        let l = -normalize(lights.directional[i].direction);
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let l = -normalize(kansei_lights.directional[i].direction);
         let nl = max(dot(n, l), 0.0);
         let h = normalize(l + v);
         let nh = max(dot(n, h), 0.0);
@@ -188,21 +134,16 @@ fn fragment_main(input: VertexOutput) -> GBufferOut {
         let k = roughness * roughness * 0.5;
         let vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
         let clouds = select(1.0, cloudShadow(cloud_shadow_map, cloud_shadow_sampler, cloud_shadow_params, input.world_position), i == 0u);
-        color += lights.directional[i].color * (nl * clouds) * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
+        color += kansei_lights.directional[i].color * (nl * clouds) * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
     }
-    var out: GBufferOut;
-    out.color = vec4<f32>(color, 1.0);
-    out.emissive = vec4<f32>(0.0);
-    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
-    out.albedo = vec4<f32>(material.albedo.rgb * (1.0 - spec_brdf), 1.0);
-    return out;
+    return kansei_gbuffer_out(color, vec3<f32>(0.0), n, material.albedo.rgb * (1.0 - spec_brdf));
 }
 "#;
 
 fn reflective(label: &str, albedo: [f32; 3], f0: [f32; 3], roughness: f32, sky: &SkyAtmosphere) -> Material {
     let mut m = Material::new(
         label,
-        &format!("{SKY_LIGHTING_WGSL}\n{SKY_ENVIRONMENT_WGSL}\n{CLOUD_SHADOW_WGSL}\n{REFLECTIVE_WGSL}"),
+        &format!("{SKY_LIGHTING_WGSL}\n{SKY_ENVIRONMENT_WGSL}\n{CLOUD_SHADOW_WGSL}\n{LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{REFLECTIVE_WGSL}"),
         vec![
             Binding::uniform(0, ShaderStages::FRAGMENT),
             Binding::uniform(1, ShaderStages::FRAGMENT),
@@ -233,7 +174,7 @@ fn bind_cloud_shadow(m: &mut Material, first: u32, sky: &SkyAtmosphere) {
 fn surface(label: &str, albedo: [f32; 3], sky: &SkyAtmosphere) -> Material {
     let mut m = Material::new(
         label,
-        &format!("{SKY_LIGHTING_WGSL}\n{CLOUD_SHADOW_WGSL}\n{SURFACE_WGSL}"),
+        &format!("{SKY_LIGHTING_WGSL}\n{CLOUD_SHADOW_WGSL}\n{LIGHTS_WGSL}\n{SHADOW_MAP_WGSL}\n{GBUFFER_OUT_WGSL}\n{SURFACE_WGSL}"),
         vec![
             Binding::uniform(0, ShaderStages::FRAGMENT),
             Binding::uniform(1, ShaderStages::FRAGMENT),
@@ -324,8 +265,8 @@ impl State {
         }
         let ev100 = s.ev.unwrap_or_else(|| auto_ev100(elevation));
         for effect in &mut self.volume.effects {
-            if let Some(display) = effect.as_any_mut().downcast_mut::<DisplayEffect>() {
-                display.ev100 = ev100;
+            if let Some(tonemap) = effect.as_any_mut().downcast_mut::<ToneMapEffect>() {
+                tonemap.options.exposure = exposure_from_ev100_lens(ev100, LENS_ATTENUATION_UE4);
             } else if let Some(fog) = effect.as_any_mut().downcast_mut::<VolumetricFogEffect>() {
                 fog.update_lights(self.scene.lights());
                 fog.time = t;
@@ -344,7 +285,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = Canvas::find(canvas_id)?;
     let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_shadows(2048);
-    let encode_srgb = !renderer.presentation_format().is_srgb();
 
     let settings = settings();
     let mut sky = SkyAtmosphere::new(renderer.device(), SkyAtmosphereOptions::default());
@@ -514,7 +454,16 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         }
         effects.push(Box::new(fog));
     }
-    effects.push(Box::new(DisplayEffect::new(encode_srgb)));
+    // the display transform: manual exposure (EV100 through Unreal 4's lens, set each frame), ACES
+    // and sRGB encoding. Hill's ACES fit maps grey a stop darker than the Narkowicz fit this
+    // example was keyed to: one stop of compensation puts grey back where it was
+    let ev100 = settings.ev.unwrap_or_else(|| auto_ev100(settings.elevation.unwrap_or(32.5)));
+    effects.push(Box::new(ToneMapEffect::new(ToneMapOptions {
+        exposure: exposure_from_ev100_lens(ev100, LENS_ATTENUATION_UE4),
+        exposure_compensation: 1.0,
+        tonemapper: ToneMapper::AcesFitted,
+        ..ToneMapOptions::for_surface(renderer.presentation_format())
+    })));
     let volume = PostProcessingVolume::new(&renderer, effects);
     let camera = Camera::new(62.0, 0.5, 60000.0, canvas.aspect());
 

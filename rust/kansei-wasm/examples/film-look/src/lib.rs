@@ -12,7 +12,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, PlaneGeometry, SphereGeometry};
 use kansei_core::lights::{DirectionalLight, Light, PointLight};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{GradientSkyOptions, Material};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -21,48 +21,6 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::renderers::RendererConfig;
 use kansei_wasm::{flag, param, param_or, Canvas};
-
-/// Unlit radiance (cd/m²), for lamp heads; `sky` mode is a horizon-to-zenith gradient.
-const EMISSIVE_WGSL: &str = r#"
-struct Emissive { radiance: vec4<f32>, zenith: vec4<f32> };
-@group(0) @binding(0) var<uniform> emissive: Emissive;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) local: vec3<f32> };
-
-@vertex
-fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world_matrix * position;
-    out.local = position.xyz;
-    return out;
-}
-
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4<f32> {
-    // zenith.w > 0: sky gradient over the local up axis
-    if (emissive.zenith.w > 0.0) {
-        let up = clamp(normalize(in.local).y, 0.0, 1.0);
-        return vec4<f32>(mix(emissive.radiance.rgb, emissive.zenith.rgb, pow(up, 0.5)), 1.0);
-    }
-    return vec4<f32>(emissive.radiance.rgb, 1.0);
-}
-"#;
-
-fn emissive_material(label: &str, radiance: [f32; 3], zenith: Option<[f32; 3]>, cull_mode: CullMode) -> Material {
-    let z = zenith.unwrap_or([0.0; 3]);
-    let data: [f32; 8] = [radiance[0], radiance[1], radiance[2], 0.0, z[0], z[1], z[2], zenith.is_some() as u32 as f32];
-    let mut material = Material::new(
-        label,
-        EMISSIVE_WGSL,
-        vec![Binding::uniform(0, ShaderStages::FRAGMENT)],
-        MaterialOptions { cull_mode, ..Default::default() },
-    );
-    material.set_uniform_bindable(0, label, &data);
-    material
-}
 
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
@@ -75,7 +33,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut scene = Scene::new();
 
     // dusk sky: 6 cd/m² at the horizon, 1.2 at the zenith
-    let sky = Renderable::new(SphereGeometry::new(180.0, 32, 16), emissive_material("Sky", [6.0, 5.2, 4.6], Some([0.8, 1.1, 1.8]), CullMode::None));
+    let horizon = [6.0, 5.2, 4.6];
+    let sky = Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [0.8, 1.1, 1.8], horizon, ground: horizon, curve: 0.5 });
+    let mut sky = Renderable::new(SphereGeometry::new(180.0, 32, 16), sky);
+    sky.cast_shadow = false;
     scene.add(SceneNode::Renderable(sky));
 
     let mut floor = Renderable::new(PlaneGeometry::new(120.0, 120.0), Material::basic_lit("Floor", [0.3, 0.31, 0.3, 1.0], [0.04, 0.04, 0.04, 0.05]));
@@ -102,7 +63,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let mut pole = Renderable::new(BoxGeometry::new(0.12, 3.0, 0.12), Material::basic_lit("Pole", [0.1, 0.1, 0.1, 1.0], [0.1, 0.1, 0.1, 0.3]));
         pole.object.set_position(x, 1.5, z);
         scene.add(SceneNode::Renderable(pole));
-        let mut head = Renderable::new(SphereGeometry::new(0.18, 16, 8), emissive_material("LampHead", [4000.0, 2600.0, 1400.0], None, CullMode::Back));
+        let mut head = Renderable::new(SphereGeometry::new(0.18, 16, 8), Material::emissive("LampHead", [4000.0, 2600.0, 1400.0]));
         head.object.set_position(x, 3.1, z);
         head.cast_shadow = false;
         scene.add(SceneNode::Renderable(head));
