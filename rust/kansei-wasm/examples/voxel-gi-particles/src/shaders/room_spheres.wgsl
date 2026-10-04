@@ -2,12 +2,15 @@
 // varied radius, ray cast on camera-facing quads at their nearest point, lit by what the GI
 // gathered for them (`lighting`, two vec4 per particle) and the panel. `mirrored` draws them under
 // the floor (the reflection). The quads keep their own depth rather than writing frag_depth, which
-// would run the shading before the depth test, for every sphere of a pile dozens deep.
+// would run the shading before the depth test, for every sphere of a pile dozens deep; the
+// fragment entries follow, a depth prepass (room_spheres_depth.wgsl) and the shading on equal depth
+// (room_spheres_shade.wgsl). Each particle's position w is its radius as a share of `size`.
 //
 // Ray traced (scene.rtOn), after the bonus of miaumiau.cat/?p=1476: a share of the particles are
 // mirrors or glass, and their reflected and refracted rays walk the fluid's own neighbour grid
-// (sorted positions, cell offsets) with ray-sphere tests. A ray leaving the particles meets the
-// room, lit by the panel and by one cone through the volume.
+// (sorted positions, cell offsets) with ray-sphere tests, no higher than the pile's top
+// (pile_top.wgsl). A ray leaving the particles meets the room, lit by the panel and by one cone
+// through the volume.
 struct Particles { albedo: vec4f, size: f32, mirrored: f32, _p0: f32, _p1: f32 };
 // the fluid's neighbour grid (FluidSimulation::grid_dims, cell_size, grid_origin)
 struct Grid { origin: vec3f, cellSize: f32, dims: vec3u, count: u32 };
@@ -22,6 +25,8 @@ struct Grid { origin: vec3f, cellSize: f32, dims: vec3u, count: u32 };
 @group(0) @binding(7) var<uniform> vol: VoxelVolume;
 @group(0) @binding(8) var radiance: texture_3d<f32>;
 @group(0) @binding(9) var linearClamp: sampler;
+// the highest particle centre (pile_top.wgsl), as f32 bits
+@group(0) @binding(10) var<storage, read> pileTop: u32;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
 @group(2) @binding(0) var<uniform> _normal_matrix: mat4x4<f32>;
@@ -39,9 +44,10 @@ fn hash01(x: u32) -> f32 {
     return f32(((word >> 22u) ^ word) >> 8u) / 16777216.0;
 }
 
-// under half a grid cell, so the ray walk below finds every sphere
-fn particleRadius(i: u32) -> f32 {
-    return min(0.5 * particles.size * (0.45 + 0.8 * hash01(i * 8u + 1u)), 0.49 * grid.cellSize);
+// A particle's radius from its position's w (the share of `size` it is given, see
+// `radius_share`), under half a grid cell, so the ray walk below finds every sphere.
+fn particleRadius(w: f32) -> f32 {
+    return min(0.5 * particles.size * w, 0.49 * grid.cellSize);
 }
 
 fn particleKind(i: u32) -> u32 {
@@ -80,14 +86,14 @@ fn shadeMatte(i: u32, p: vec3f, n: vec3f, v: vec3f) -> vec3f {
     return albedo * (direct / PI + light.rgb) + emission * glowTint(i) * face;
 }
 
-struct Hit { t: f32, index: u32, center: vec3f };
+struct Hit { t: f32, index: u32, center: vec3f, r: f32 };
 
 // The nearest sphere along o + t d (t < tEnd), skipping particle `skip`. A 3D DDA over the dual
 // of the fluid's grid (cells between its cells' centres): a sphere under half a cell wide that
 // reaches into a dual cell has its centre in the 2x2x2 grid cells around it, so testing those
 // finds every hit inside the dual cell, and the walk stops at the first dual cell holding one.
 fn traceParticles(o: vec3f, d: vec3f, skip: u32, tEnd: f32) -> Hit {
-    var hit = Hit(tEnd, NO_HIT, vec3f(0.0));
+    var hit = Hit(tEnd, NO_HIT, vec3f(0.0), 0.0);
     let cs = grid.cellSize;
     let dims = vec3i(grid.dims);
     let total = grid.dims.x * grid.dims.y * grid.dims.z;
@@ -95,8 +101,15 @@ fn traceParticles(o: vec3f, d: vec3f, skip: u32, tEnd: f32) -> Hit {
     // clip to the grid's box
     let lo = (grid.origin - o) * inv;
     let hi = (grid.origin + vec3f(grid.dims) * cs - o) * inv;
-    let t0 = max(max(max(min(lo.x, hi.x), min(lo.y, hi.y)), min(lo.z, hi.z)), 0.0);
-    let t1 = min(min(min(max(lo.x, hi.x), max(lo.y, hi.y)), max(lo.z, hi.z)), tEnd);
+    var t0 = max(max(max(min(lo.x, hi.x), min(lo.y, hi.y)), min(lo.z, hi.z)), 0.0);
+    var t1 = min(min(min(max(lo.x, hi.x), max(lo.y, hi.y)), max(lo.z, hi.z)), tEnd);
+    // and to the slab under the highest centre plus the largest radius: nothing is above it
+    let top = bitcast<f32>(pileTop) + 0.625 * particles.size;
+    if (d.y > 0.0) {
+        t1 = min(t1, (top - o.y) * inv.y);
+    } else if (o.y > top) {
+        t0 = max(t0, (top - o.y) * inv.y);
+    }
     if (t0 >= t1) { return hit; }
     // dual coordinates: dual cell k spans the centres of grid cells k and k + 1
     let g = (o + d * t0 - grid.origin) / cs - 0.5;
@@ -105,26 +118,48 @@ fn traceParticles(o: vec3f, d: vec3f, skip: u32, tEnd: f32) -> Hit {
     let delta = abs(cs * inv);
     var tMax = t0 + (select(vec3f(cell), vec3f(cell + 1), d > vec3f(0.0)) - g) * cs * inv;
     tMax = select(tMax, vec3f(1e30), abs(d) <= vec3f(1e-8));
+    // after a step along `axis`, the block shares 4 cells with the one before, whose spheres are
+    // already tested: test the 4 on its leading side (`side`: 1 when the step was +1)
+    var axis = 3u;
+    var side = 0u;
     for (var s = 0u; s < 96u; s++) {
-        for (var k = 0u; k < 8u; k++) {
-            let c = cell + vec3i(i32(k & 1u), i32((k >> 1u) & 1u), i32((k >> 2u) & 1u));
-            if (any(c < vec3i(0)) || any(c >= dims)) { continue; }
-            let ci = u32(c.x) + grid.dims.x * (u32(c.y) + grid.dims.y * u32(c.z));
-            let first = cellOffsets[ci];
-            let last = select(cellOffsets[ci + 1u], grid.count, ci + 1u >= total);
+        // the block's cells as 4 rows along x: neighbours along x are neighbours in the sorted
+        // order too, so each row's spheres are one range
+        for (var row = 0u; row < 4u; row++) {
+            let dy = row & 1u;
+            let dz = row >> 1u;
+            if ((axis == 1u && dy != side) || (axis == 2u && dz != side)) { continue; }
+            let y = cell.y + i32(dy);
+            let z = cell.z + i32(dz);
+            if (y < 0 || z < 0 || y >= dims.y || z >= dims.z) { continue; }
+            var x0 = cell.x;
+            var x1 = cell.x + 1;
+            if (axis == 0u) {
+                x0 = cell.x + i32(side);
+                x1 = x0;
+            }
+            x0 = max(x0, 0);
+            x1 = min(x1, dims.x - 1);
+            if (x0 > x1) { continue; }
+            let base = grid.dims.x * (u32(y) + grid.dims.y * u32(z));
+            let first = cellOffsets[base + u32(x0)];
+            let end = base + u32(x1) + 1u;
+            let last = select(cellOffsets[end], grid.count, end >= total);
             for (var j = first; j < last; j++) {
-                let index = sortedIndices[j];
-                if (index == skip) { continue; }
-                let center = sortedPositions[j].xyz;
-                let r = particleRadius(index);
-                let oc = o - center;
+                let sphere = sortedPositions[j];
+                let r = particleRadius(sphere.w);
+                let oc = o - sphere.xyz;
                 let b = dot(oc, d);
                 let h = b * b - (dot(oc, oc) - r * r);
                 if (h < 0.0) { continue; }
                 // a ray starting inside an overlapping sphere passes through it
                 let t = -b - sqrt(h);
                 if (t > 1e-4 && t < hit.t) {
-                    hit = Hit(t, index, center);
+                    // the index only for a hit: the sphere the ray leaves is no hit
+                    let index = sortedIndices[j];
+                    if (index != skip) {
+                        hit = Hit(t, index, sphere.xyz, r);
+                    }
                 }
             }
         }
@@ -134,12 +169,18 @@ fn traceParticles(o: vec3f, d: vec3f, skip: u32, tEnd: f32) -> Hit {
         if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
             cell.x += stride.x;
             tMax.x += delta.x;
+            axis = 0u;
+            side = u32(stride.x > 0);
         } else if (tMax.y <= tMax.z) {
             cell.y += stride.y;
             tMax.y += delta.y;
+            axis = 1u;
+            side = u32(stride.y > 0);
         } else {
             cell.z += stride.z;
             tMax.z += delta.z;
+            axis = 2u;
+            side = u32(stride.z > 0);
         }
     }
     return hit;
@@ -192,23 +233,47 @@ fn glassRays(p: vec3f, n: vec3f, d: vec3f, center: vec3f, r: f32) -> array<vec3f
     return array<vec3f, 4>(reflect(d, n), q, out, vec3f(0.0));
 }
 
-// what a ray sees with one more bounce: mirrors and glass it meets reflect and refract once more
-fn traceBounce(o: vec3f, d: vec3f, skip: u32) -> vec3f {
+// The rays a mirror or a glass sphere sends on from p (normal n, met along d), with their weights:
+// a mirror its reflection; glass Fresnel's share of its reflection, and the rest refracted out of
+// its far side.
+struct Rays {
+    count : u32,
+    o0    : vec3f,
+    d0    : vec3f,
+    w0    : vec3f,
+    o1    : vec3f,
+    d1    : vec3f,
+    w1    : vec3f,
+};
+fn sphereRays(kind: u32, p: vec3f, n: vec3f, d: vec3f, center: vec3f, r: f32) -> Rays {
+    let cosV = dot(-d, n);
+    if (kind == MIRROR) {
+        return Rays(1u, p, reflect(d, n), mirrorTint(cosV), vec3f(0.0), vec3f(0.0), vec3f(0.0));
+    }
+    let g = glassRays(p, n, d, center, r);
+    let f = fresnel(glassF0(), cosV);
+    return Rays(2u, p, g[0], vec3f(f), g[1], g[2], (1.0 - f) * glassTint());
+}
+
+// What a ray sees; with `bounce`, the mirrors and glass it meets send their rays on once more
+// (seen as matte past that). One call site per walk keeps the shader small.
+fn trace(o: vec3f, d: vec3f, skip: u32) -> vec3f {
     let exit = roomExit(o, d);
     let hit = traceParticles(o, d, skip, exit.w);
     if (hit.index == NO_HIT) { return shadeRoom(o, d, exit); }
     let p = o + d * hit.t;
     let n = normalize(p - hit.center);
     let kind = particleKind(hit.index);
-    if (kind == MIRROR) {
-        return mirrorTint(dot(-d, n)) * traceLast(p, reflect(d, n), hit.index);
+    if (scene.rtBounces < 1.5 || kind == MATTE) {
+        return shadeMatte(hit.index, p, n, -d);
     }
-    if (kind == GLASS) {
-        let rays = glassRays(p, n, d, hit.center, particleRadius(hit.index));
-        let f = fresnel(glassF0(), dot(-d, n));
-        return f * traceLast(p, rays[0], hit.index) + (1.0 - f) * glassTint() * traceLast(rays[1], rays[2], hit.index);
+    let rays = sphereRays(kind, p, n, d, hit.center, hit.r);
+    var sum = vec3f(0.0);
+    for (var k = 0u; k < rays.count; k++) {
+        let first = k == 0u;
+        sum += select(rays.w1, rays.w0, first) * traceLast(select(rays.o1, rays.o0, first), select(rays.d1, rays.d0, first), hit.index);
     }
-    return shadeMatte(hit.index, p, n, -d);
+    return sum;
 }
 
 fn glassF0() -> f32 {
@@ -219,10 +284,6 @@ fn glassTint() -> vec3f { return vec3f(0.94, 0.97, 0.96); }
 // glossy black: a dark metal's reflection, brighter at grazing angles
 fn mirrorTint(cosTheta: f32) -> vec3f { return vec3f(mix(0.55, 1.0, pow(1.0 - clamp(cosTheta, 0.0, 1.0), 5.0))); }
 
-fn trace(o: vec3f, d: vec3f, skip: u32) -> vec3f {
-    if (scene.rtBounces > 1.5) { return traceBounce(o, d, skip); }
-    return traceLast(o, d, skip);
-}
 
 struct VIn {
     @location(0) position: vec4f,
@@ -231,7 +292,8 @@ struct VIn {
     @location(3) center: vec4f,
 };
 struct VOut {
-    @builtin(position) clip: vec4f,
+    // invariant: the depth prepass and the shading must agree on depth to the bit
+    @builtin(position) @invariant clip: vec4f,
     @location(0) viewPos: vec3f,
     @location(1) @interpolate(flat) sphere: vec4f,   // view-space centre (as drawn), radius
     @location(2) @interpolate(flat) world: vec3f,    // world centre (unmirrored)
@@ -240,7 +302,7 @@ struct VOut {
 
 @vertex
 fn vertex_main(v: VIn, @builtin(instance_index) index: u32) -> VOut {
-    let r = particleRadius(index);
+    let r = particleRadius(v.center.w);
     var shown = v.center.xyz;
     if (particles.mirrored > 0.5) {
         shown.y = 2.0 * scene.mirrorY - shown.y;
@@ -263,49 +325,13 @@ fn vertex_main(v: VIn, @builtin(instance_index) index: u32) -> VOut {
     return out;
 }
 
-@fragment
-fn fragment_main(in: VOut) -> @location(0) vec4f {
-    // the eye ray against the sphere, in view space
+// The eye ray's hit on the sphere, in view space; the quad's corners past it are discarded.
+fn eyeHit(in: VOut) -> vec3f {
     let ray = normalize(in.viewPos);
     let c = in.sphere.xyz;
     let r = in.sphere.w;
     let b = dot(ray, c);
     let h = b * b - (dot(c, c) - r * r);
     if (h < 0.0) { discard; }
-    let pv = ray * (b - sqrt(h));
-    let nv = (pv - c) / r;
-
-    // to the world, on the room's side of the floor
-    let right = vec3f(view_matrix[0][0], view_matrix[1][0], view_matrix[2][0]);
-    let up = vec3f(view_matrix[0][1], view_matrix[1][1], view_matrix[2][1]);
-    let back = vec3f(view_matrix[0][2], view_matrix[1][2], view_matrix[2][2]);
-    var n = normalize(right * nv.x + up * nv.y + back * nv.z);
-    var d = normalize(right * ray.x + up * ray.y + back * ray.z);
-    if (particles.mirrored > 0.5) {
-        n.y = -n.y;
-        d.y = -d.y;
-    }
-    let i = in.index;
-    let p = in.world + n * r;
-    let cosV = dot(-d, n);
-
-    var color: vec3f;
-    let kind = particleKind(i);
-    if (scene.view > 0.5) {
-        let emission = lighting[2u * i + 1u].rgb;
-        color = particleAlbedo(i, any(emission > vec3f(0.0))) * lighting[2u * i].rgb;
-    } else if (kind == MIRROR) {
-        color = mirrorTint(cosV) * trace(p, reflect(d, n), i);
-    } else if (kind == GLASS) {
-        let rays = glassRays(p, n, d, in.world, r);
-        let f = fresnel(glassF0(), cosV);
-        color = f * trace(p, rays[0], i) + (1.0 - f) * glassTint() * trace(rays[1], rays[2], i);
-    } else {
-        // matte, with a soft sheen of the panel (shadowed as its light is)
-        color = shadeMatte(i, p, n, -d) + fresnel(0.04, cosV) * panelSeen(scene, p, reflect(d, n)) * lighting[2u * i].a;
-    }
-    if (particles.mirrored > 0.5) {
-        color *= floorReflection(scene, p.y);
-    }
-    return vec4f(tonemap(scene, color), 1.0);
+    return ray * (b - sqrt(h));
 }

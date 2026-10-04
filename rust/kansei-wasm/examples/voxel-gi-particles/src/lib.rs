@@ -18,7 +18,8 @@
 //! light the volume brings, without the direct light, a stop brighter), `rt=on` (lightbox),
 //! `quality=low|medium|high` (default medium, low on phones, which also keep the volume within
 //! 24 MiB), `particles=N` (default 12288 in the lightbox, 8192 ray traced, 32768 in the Cornell
-//! room, half on phones), `stats=1` (log the frame interval).
+//! room, half on phones), `stats=1` (log the frame interval), `profile=1` (time each pass:
+//! `profile_report`, with `set_layers` to time the walls, particles and reflection apart).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
 use std::cell::RefCell;
@@ -31,7 +32,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::controls::{CameraControls, MouseVectors};
 use kansei_core::geometries::{BoxGeometry, InstancedGeometry, PlaneGeometry};
 use kansei_core::gi::{GiBox, ParticleEmission, ParticleGi, ParticleGiOptions, VoxelGiQuality, VOXEL_CONES_WGSL};
-use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages};
+use kansei_core::materials::{Binding, BindingResource, Compute, CullMode, Material, MaterialOptions, ShaderStages};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -173,13 +174,16 @@ fn tonemap(s: SceneParams, c: vec3f) -> vec3f {
 const ROOM_COMMON_WGSL: &str = include_str!("shaders/room_common.wgsl");
 const ROOM_WALLS_WGSL: &str = include_str!("shaders/room_walls.wgsl");
 const ROOM_SPHERES_WGSL: &str = include_str!("shaders/room_spheres.wgsl");
+const ROOM_SPHERES_SHADE_WGSL: &str = include_str!("shaders/room_spheres_shade.wgsl");
+const ROOM_SPHERES_DEPTH_WGSL: &str = include_str!("shaders/room_spheres_depth.wgsl");
 
 fn lightbox_wall_shader() -> String {
     format!("{VOXEL_CONES_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_WALLS_WGSL}")
 }
 
-fn lightbox_sphere_shader() -> String {
-    format!("{VOXEL_CONES_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_SPHERES_WGSL}")
+/// The spheres' shader with `entry` (ROOM_SPHERES_SHADE_WGSL or ROOM_SPHERES_DEPTH_WGSL).
+fn sphere_shader(entry: &str) -> String {
+    format!("{VOXEL_CONES_WGSL}\n{SCENE_WGSL}\n{ROOM_COMMON_WGSL}\n{ROOM_SPHERES_WGSL}\n{entry}")
 }
 
 fn cornell_wall_shader() -> String {
@@ -393,9 +397,31 @@ fn lattice(count: usize, lo: [f32; 3], hi: [f32; 3]) -> Vec<f32> {
 /// filling its left half.
 fn initial_positions(look: Look, count: usize) -> Vec<f32> {
     let (min, max) = look.fluid();
-    match look {
+    let mut positions = match look {
         Look::Lightbox => lattice(count, [min[0] + 0.5, 2.0, min[2] + 0.5], [max[0] - 0.5, max[1] - 0.5, max[2] - 0.5]),
         Look::Cornell => lattice(count, [min[0] + 0.5, min[1] + 0.5, min[2] + 0.5], [-1.0, 16.0, max[2] - 0.5]),
+    };
+    if look == Look::Lightbox {
+        set_radius_shares(&mut positions);
+    }
+    positions
+}
+
+/// Particle `i`'s radius as a share of the particle size, 0.45 to 1.25: the lightbox's spheres
+/// read it from their position's w (which the fluid keeps), so the ray walk tests a sphere with
+/// one load.
+fn radius_share(i: u32) -> f32 {
+    // PCG (Jarzynski & Olano 2020), as room_spheres.wgsl's hash01
+    let x = i.wrapping_mul(8).wrapping_add(1);
+    let state = x.wrapping_mul(747796405).wrapping_add(2891336453);
+    let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737);
+    let h = (((word >> 22) ^ word) >> 8) as f32 / 16777216.0;
+    0.45 + 0.8 * h
+}
+
+fn set_radius_shares(positions: &mut [f32]) {
+    for (i, p) in positions.chunks_exact_mut(4).enumerate() {
+        p[3] = radius_share(i as u32);
     }
 }
 
@@ -498,6 +524,38 @@ struct GridParams {
     count: u32,
 }
 
+/// The highest particle centre, each frame (pile_top.wgsl): rays leaving the pile upward stop
+/// walking the grid above it.
+struct PileTop {
+    buffer: wgpu::Buffer,
+    compute: Compute,
+    count: u32,
+}
+
+impl PileTop {
+    fn new(device: &wgpu::Device, grid: &wgpu::Buffer, sorted_positions: &wgpu::Buffer, count: u32) -> Self {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("VoxelGIParticles/PileTop"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let stage = wgpu::ShaderStages::COMPUTE;
+        let mut compute = Compute::new("VoxelGIParticles/PileTop", include_str!("shaders/pile_top.wgsl"), vec![Binding::uniform(0, stage), Binding::storage(1, stage, true), Binding::storage(2, stage, false)]);
+        compute.initialize(device);
+        let whole = |buffer| BindingResource::Buffer { buffer, offset: 0, size: None };
+        compute.set_bind_group(device, &[(0, whole(grid)), (1, whole(sorted_positions)), (2, whole(&buffer))]);
+        Self { buffer, compute, count }
+    }
+
+    fn encode(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
+        queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&0u32));
+        let stamp = kansei_core::profiling::gpu_pass("VoxelGIParticles/PileTop");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGIParticles/PileTop"), timestamp_writes: stamp.as_ref().map(kansei_core::profiling::PassStamp::compute) });
+        self.compute.dispatch(&mut pass, self.count.div_ceil(64), 1, 1);
+    }
+}
+
 struct State {
     look: Look,
     renderer: Renderer,
@@ -514,6 +572,9 @@ struct State {
     particles: Vec<(usize, bool)>,
     /// The lightbox's panel renderables, likewise.
     panels: Vec<(usize, bool)>,
+    /// Every wall's renderable, likewise.
+    slabs: Vec<(usize, bool)>,
+    pile_top: Option<PileTop>,
     panel_intensity: f32,
     initial: Vec<f32>,
     sim_accumulator: f64,
@@ -557,6 +618,9 @@ impl State {
         let mut encoder = self.renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("VoxelGIParticles/GI") });
         let count = self.sim.particle_count();
         self.gi.encode(self.renderer.queue(), &mut encoder, count);
+        if let Some(top) = &self.pile_top {
+            top.encode(self.renderer.queue(), &mut encoder);
+        }
         self.renderer.submit(std::iter::once(encoder.finish()));
 
         self.renderer.render(&mut self.scene, &mut self.camera);
@@ -772,6 +836,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let both = ShaderStages::VERTEX | ShaderStages::FRAGMENT;
     let fragment = ShaderStages::FRAGMENT;
     let mut panels = Vec::new();
+    let mut slabs = Vec::new();
     // the walls; in the lightbox each again mirrored under the floor
     let mirrors: &[bool] = if lightbox { &[false, true] } else { &[false] };
     let wall_shader = if lightbox { lightbox_wall_shader() } else { cornell_wall_shader() };
@@ -800,6 +865,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), material);
             slab.object.set_position((wall.min[0] + wall.max[0]) * 0.5, (wall.min[1] + wall.max[1]) * 0.5, (wall.min[2] + wall.max[2]) * 0.5);
             let index = scene.add(SceneNode::Renderable(slab));
+            slabs.push((index, mirrored));
             if wall.panel {
                 panels.push((index, mirrored));
             }
@@ -811,6 +877,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // instance attributes
     let particle_size = if rt { 0.8 } else if lightbox { 0.55 } else { 0.45 };
     let mut particles = Vec::new();
+    let mut pile_top = None;
     if lightbox {
         let grid = GridParams { origin: sim.grid_origin(), cell_size: sim.cell_size(), dims: sim.grid_dims(), count: sim.particle_count() };
         let grid_buffer = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -819,38 +886,54 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let storage = |label: &str, buffer: &wgpu::Buffer| ComputeBuffer::from_external(label, buffer.clone(), BufferType::Storage);
-        let shader = lightbox_sphere_shader();
-        for mirrored in [false, true] {
-            let mut material = Material::new(
-                "Spheres",
-                &shader,
-                vec![
-                    Binding::uniform(0, both),
-                    Binding::uniform(1, both),
-                    Binding::uniform(2, both),
-                    Binding::storage(3, fragment, true),
-                    Binding::storage(4, fragment, true),
-                    Binding::storage(5, fragment, true),
-                    Binding::storage(6, fragment, true),
-                    Binding::uniform(7, fragment),
-                    Binding::texture_3d(8, fragment),
-                    Binding::sampler(9, fragment),
-                ],
-                MaterialOptions { cull_mode: CullMode::None, ..Default::default() },
-            );
-            material.set_uniform_bindable(0, "Particles", &[0.85f32, 0.88, 0.92, 1.0, particle_size, mirrored as u32 as f32, 0.0, 0.0]);
-            material.set_bindable(1, scene_uniform());
-            material.set_bindable(2, ComputeBuffer::from_external("Grid", grid_buffer.clone(), BufferType::Uniform));
-            material.set_bindable(3, storage("SortedPositions", sim.sorted_positions_buffer().unwrap()));
-            material.set_bindable(4, storage("CellOffsets", sim.cell_offsets_buffer().unwrap()));
-            material.set_bindable(5, storage("SortedIndices", sim.sorted_indices_buffer().unwrap()));
-            material.set_bindable(6, storage("ParticleLighting", gi.lighting_buffer()));
-            material.set_bindable(7, volume_uniform());
-            material.set_bindable(8, gi.volume().as_texture());
-            material.set_bindable(9, linear_clamp());
-            let instances = InstancedGeometry::new(PlaneGeometry::new(1.0, 1.0), count as u32, vec![sim.positions_as_compute_buffer(3).unwrap()]);
-            particles.push((scene.add(SceneNode::Renderable(Renderable::new(instances, material))), mirrored));
+        let top = PileTop::new(renderer.device(), &grid_buffer, sim.sorted_positions_buffer().unwrap(), sim.particle_count());
+        // a depth prepass, then the shading on equal depth: the shading (and the ray tracing)
+        // runs for the nearest sphere alone, not for every sphere of the pile behind it
+        let depth = sphere_shader(ROOM_SPHERES_DEPTH_WGSL);
+        let shade = sphere_shader(ROOM_SPHERES_SHADE_WGSL);
+        let options = |equal: bool| {
+            if equal {
+                MaterialOptions { cull_mode: CullMode::None, depth_compare: wgpu::CompareFunction::Equal, depth_write: Some(false), ..Default::default() }
+            } else {
+                MaterialOptions { cull_mode: CullMode::None, ..Default::default() }
+            }
+        };
+        for (label, shader, equal) in [("SpheresDepth", &depth, false), ("Spheres", &shade, true)] {
+            for mirrored in [false, true] {
+                let mut material = Material::new(
+                    label,
+                    shader,
+                    vec![
+                        Binding::uniform(0, both),
+                        Binding::uniform(1, both),
+                        Binding::uniform(2, both),
+                        Binding::storage(3, fragment, true),
+                        Binding::storage(4, fragment, true),
+                        Binding::storage(5, fragment, true),
+                        Binding::storage(6, fragment, true),
+                        Binding::uniform(7, fragment),
+                        Binding::texture_3d(8, fragment),
+                        Binding::sampler(9, fragment),
+                        Binding::storage(10, fragment, true),
+                    ],
+                    options(equal),
+                );
+                material.set_uniform_bindable(0, "Particles", &[0.85f32, 0.88, 0.92, 1.0, particle_size, mirrored as u32 as f32, 0.0, 0.0]);
+                material.set_bindable(1, scene_uniform());
+                material.set_bindable(2, ComputeBuffer::from_external("Grid", grid_buffer.clone(), BufferType::Uniform));
+                material.set_bindable(3, storage("SortedPositions", sim.sorted_positions_buffer().unwrap()));
+                material.set_bindable(4, storage("CellOffsets", sim.cell_offsets_buffer().unwrap()));
+                material.set_bindable(5, storage("SortedIndices", sim.sorted_indices_buffer().unwrap()));
+                material.set_bindable(6, storage("ParticleLighting", gi.lighting_buffer()));
+                material.set_bindable(7, volume_uniform());
+                material.set_bindable(8, gi.volume().as_texture());
+                material.set_bindable(9, linear_clamp());
+                material.set_bindable(10, storage("PileTop", &top.buffer));
+                let instances = InstancedGeometry::new(PlaneGeometry::new(1.0, 1.0), count as u32, vec![sim.positions_as_compute_buffer(3).unwrap()]);
+                particles.push((scene.add(SceneNode::Renderable(Renderable::new(instances, material))), mirrored));
+            }
         }
+        pile_top = Some(top);
     } else {
         let mut material = Material::new(
             "Particles",
@@ -884,6 +967,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mouse = MouseVectors::from_canvas(&canvas);
 
     let stats = (query_param("stats").as_deref() == Some("1")).then(|| (now_ms(), 0));
+    if query_param("profile").as_deref() == Some("1") {
+        renderer.set_profiling(true);
+    }
     let mut state = State {
         look,
         renderer,
@@ -898,6 +984,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         walls,
         particles,
         panels,
+        slabs,
+        pile_top,
         panel_intensity: 1.0,
         initial,
         sim_accumulator: 0.0,
@@ -1073,6 +1161,50 @@ pub fn set_rt_bounces(bounces: u32) {
     with_state(|s| s.scene_params.rt_bounces = bounces.clamp(1, 2) as f32);
 }
 
+/// The GPU time of each pass and the CPU sections since the last call, per frame (with
+/// `profile=1`; see `Renderer::take_profile`).
+#[wasm_bindgen]
+pub fn profile_report() -> String {
+    let mut out = String::new();
+    with_state(|s| out = s.renderer.take_profile().report());
+    out
+}
+
+/// Draw or hide the walls, the particles and the floor's reflection of both, for timing each.
+#[wasm_bindgen]
+pub fn set_layers(walls: bool, particles: bool, reflection: bool) {
+    with_state(|s| {
+        let layers = s.slabs.iter().map(|&(i, m)| (i, m, walls)).chain(s.particles.iter().map(|&(i, m)| (i, m, particles))).collect::<Vec<_>>();
+        for (index, mirrored, on) in layers {
+            if let Some(r) = s.scene.get_renderable_mut(index) {
+                r.visible = on && (reflection || !mirrored);
+            }
+        }
+    });
+}
+
+/// Put the particles at `positions` (x, y, z, w each), still, and sort the neighbour grid on them
+/// without moving them: with `set_paused`, a fixed state to compare renders of.
+#[wasm_bindgen]
+pub fn set_positions(positions: &[f32]) {
+    with_state(|s| {
+        let mut positions = positions.to_vec();
+        if s.look == Look::Lightbox {
+            set_radius_shares(&mut positions);
+        }
+        s.sim.reset_particles(&positions);
+        s.sim.update_batched(0.0, 0.0, [0.0; 2], [0.0; 2]);
+        s.gi.reset_history();
+    });
+}
+
+/// Voxels the particles' cones' start moves by each frame (0: not at all, so that with a temporal
+/// blend of 1 every frame of a still fluid is alike).
+#[wasm_bindgen]
+pub fn set_cone_jitter(voxels: f32) {
+    with_state(|s| s.gi.settings.cones.jitter_voxels = voxels.max(0.0));
+}
+
 /// Freeze the fluid (the GI keeps running), for comparing views of one moment.
 #[wasm_bindgen]
 pub fn set_paused(paused: bool) {
@@ -1117,11 +1249,21 @@ mod tests {
             let module = validate(name, &code);
             assert_eq!(struct_size(&module, "SceneParams"), std::mem::size_of::<SceneParams>(), "{name}");
         }
-        let spheres = validate("lightbox spheres", &lightbox_sphere_shader());
+        validate("lightbox sphere depth", &sphere_shader(ROOM_SPHERES_DEPTH_WGSL));
+        let spheres = validate("lightbox spheres", &sphere_shader(ROOM_SPHERES_SHADE_WGSL));
         assert_eq!(struct_size(&spheres, "SceneParams"), std::mem::size_of::<SceneParams>());
         assert_eq!(struct_size(&spheres, "Grid"), std::mem::size_of::<GridParams>());
+        assert_eq!(struct_size(&validate("pile top", include_str!("shaders/pile_top.wgsl")), "Grid"), std::mem::size_of::<GridParams>());
         assert_eq!(struct_size(&spheres, "Particles"), 32);
         assert_eq!(struct_size(&validate("lightbox walls", &lightbox_wall_shader()), "Surface"), 48);
+    }
+
+    #[test]
+    fn radius_shares_span_the_sizes_and_stay_under_the_bound() {
+        let shares: Vec<f32> = (0..4096).map(radius_share).collect();
+        // room_spheres.wgsl bounds the largest radius by 0.625 * size (half of 1.25) for the pile top
+        assert!(shares.iter().all(|&w| (0.45..1.25).contains(&w)));
+        assert!(shares.iter().any(|&w| w < 0.5) && shares.iter().any(|&w| w > 1.2));
     }
 
     #[test]
