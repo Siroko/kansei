@@ -313,7 +313,7 @@ impl ApplicationHandler for App {
         let sun = DirectionalLight::new(
             Vec3::new(-0.5, -1.0, -0.3).normalize(),
             Vec3::new(1.0, 0.95, 0.9),
-            3.0,
+            9.5,
         );
         self.scene.add(SceneNode::Light(Light::Directional(sun)));
 
