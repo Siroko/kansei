@@ -1080,9 +1080,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut controls = if lightbox {
         // low over the front right of the pile, looking across it at the back left corner (frame by
         // hand, then `camera()` in the console gives these numbers)
-        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.91, 4.76, -2.44), 18.55).with_mouse_pan(canvas);
-        c.set_azimuth(0.705);
-        c.set_elevation(0.182);
+        let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.323, 3.985, -1.679), 14.72).with_mouse_pan(canvas);
+        c.set_azimuth(0.71);
+        c.set_elevation(0.302);
         c
     } else {
         let mut c = CameraControls::from_canvas(canvas, Vec3::new(0.0, 8.0, 0.0), 58.0 * fit).with_mouse_pan(canvas);
