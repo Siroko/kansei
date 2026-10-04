@@ -27,7 +27,7 @@
 //! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA and
 //! runs `TemporalAAEffect` first instead (`taa=0` turns it off). The particles write no motion vectors: the TAA reprojects them by depth.
 //! `focus=` sets the focus distance in metres (default: autofocus on the depth at the centre of
-//! the screen, so orbiting and panning refocus) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
+//! the screen, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 1). The room is 28 m wide and seen from 37 m, where a real
 //! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
@@ -532,23 +532,29 @@ struct State {
     /// The background as the direct path shows it (display values).
     clear_color: Vec4,
     autofocus: AutoFocus,
+    /// The lens's focus distance, eased toward `focus_target` (a focus pull, not a jump).
+    lens_focus: Option<f32>,
 }
 
-/// Autofocus: the depth at the centre of the screen, read back from the volume's GBuffer a frame
-/// or two late, and eased toward (sky keeps the last focus). A depth texture can only be copied
-/// whole, so a one-thread pass loads the centre texel into a buffer first.
+/// Focus by depth: the view depth at a point of the screen (the centre for autofocus, or where
+/// the user double-clicked), read back from the volume's GBuffer a frame or two late. A depth
+/// texture can only be copied whole, so a one-thread pass loads the texel into a buffer first.
 #[derive(Default)]
 struct AutoFocus {
     gpu: Option<AutoFocusGpu>,
     /// 0 idle, 1 mapping, 2 mapped.
     state: Rc<std::cell::Cell<u8>>,
-    /// The measured distance, metres, and the eased one the lens uses.
-    target: Option<f32>,
-    focus: Option<f32>,
+    /// A double-click waiting to be read, in 0..1 of the screen from the top left.
+    pick: Option<[f32; 2]>,
+    /// Whether the read in flight is a double-click's.
+    reading_pick: bool,
+    /// The last centre depth, metres (sky keeps the previous one).
+    centre: Option<f32>,
 }
 
 struct AutoFocusGpu {
     pipeline: wgpu::ComputePipeline,
+    point: wgpu::Buffer,
     texel: wgpu::Buffer,
     readback: wgpu::Buffer,
 }
@@ -556,9 +562,11 @@ struct AutoFocusGpu {
 const AUTOFOCUS_WGSL: &str = "
 @group(0) @binding(0) var depth: texture_depth_2d;
 @group(0) @binding(1) var<storage, read_write> texel: f32;
+@group(0) @binding(2) var<uniform> point: vec4f;
 @compute @workgroup_size(1)
 fn main() {
-    texel = textureLoad(depth, textureDimensions(depth) / 2u, 0);
+    let size = textureDimensions(depth);
+    texel = textureLoad(depth, min(vec2u(point.xy * vec2f(size)), size - 1u), 0);
 }
 ";
 
@@ -573,18 +581,21 @@ impl AutoFocusGpu {
             compilation_options: Default::default(),
             cache: None,
         });
-        let buffer = |label, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 4, usage, mapped_at_creation: false });
+        let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         Self {
             pipeline,
-            texel: buffer("VoxelGIParticles/AutoFocus/Texel", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
-            readback: buffer("VoxelGIParticles/AutoFocus/Readback", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            point: buffer("VoxelGIParticles/AutoFocus/Point", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
+            texel: buffer("VoxelGIParticles/AutoFocus/Texel", 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            readback: buffer("VoxelGIParticles/AutoFocus/Readback", 4, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
         }
     }
 }
 
 impl AutoFocus {
-    /// Take last read's depth, if it is in, and read the centre of `gbuffer`'s depth again.
-    fn update(&mut self, renderer: &Renderer, gbuffer: &kansei_core::renderers::GBuffer, inv_proj: glam::Mat4, dt: f32) {
+    /// Take last read's depth, if it is in (returning a double-click's distance), and read again:
+    /// a waiting double-click, or the centre when `centre` (autofocus).
+    fn update(&mut self, renderer: &Renderer, gbuffer: &kansei_core::renderers::GBuffer, inv_proj: glam::Mat4, centre: bool) -> Option<f32> {
+        let mut picked = None;
         let gpu = self.gpu.get_or_insert_with(|| AutoFocusGpu::new(renderer.device()));
         let buffer = &gpu.readback;
         if self.state.get() == 2 {
@@ -592,11 +603,16 @@ impl AutoFocus {
             buffer.unmap();
             self.state.set(0);
             if depth < 1.0 {
+                // (view depth depends on the depth alone)
                 let p = inv_proj * glam::Vec4::new(0.0, 0.0, depth, 1.0);
-                self.target = Some((-p.z / p.w).max(0.1));
+                let metres = (-p.z / p.w).max(0.1);
+                if self.reading_pick { picked = Some(metres) } else { self.centre = Some(metres) }
             }
         }
-        if self.state.get() == 0 {
+        if self.state.get() == 0 && (centre || self.pick.is_some()) {
+            self.reading_pick = self.pick.is_some();
+            let point = self.pick.take().unwrap_or([0.5, 0.5]);
+            renderer.queue().write_buffer(&gpu.point, 0, bytemuck::cast_slice(&[point[0], point[1], 0.0, 0.0]));
             let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("VoxelGIParticles/AutoFocus") });
             let bind_group = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("VoxelGIParticles/AutoFocus"),
@@ -604,6 +620,7 @@ impl AutoFocus {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gbuffer.depth_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: gpu.texel.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: gpu.point.as_entire_binding() },
                 ],
             });
             {
@@ -618,10 +635,7 @@ impl AutoFocus {
             let state = self.state.clone();
             buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| state.set(if result.is_ok() { 2 } else { 0 }));
         }
-        if let Some(target) = self.target {
-            let focus = self.focus.unwrap_or(target);
-            self.focus = Some(focus + (target - focus) * (1.0 - (-dt / 0.15).exp()));
-        }
+        picked
     }
 }
 
@@ -700,7 +714,10 @@ impl State {
         self.renderer.submit(std::iter::once(encoder.finish()));
 
         if self.dof.on {
-            let focus = self.focus_distance();
+            let target = self.focus_target();
+            let eased = self.lens_focus.map_or(target, |f| f + (target - f) * (1.0 - (-dt as f32 / 0.15).exp()));
+            self.lens_focus = Some(eased);
+            let focus = eased;
             // toggling the TAA rebuilds the chain
             if self.volume.as_mut().is_some_and(|v| v.effect_mut::<TemporalAAEffect>().is_some() != self.dof.taa) {
                 self.volume = None;
@@ -715,10 +732,11 @@ impl State {
             let hdr = |v: f32| -(1.0 - v.min(0.999)).ln();
             self.renderer.config.clear_color = Vec4::new(hdr(c.x), hdr(c.y), hdr(c.z), c.w);
             self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, volume);
-            if self.dof.focus.is_none() {
-                if let Some(gbuffer) = volume.gbuffer() {
-                    let inv_proj = self.camera.projection_matrix.to_glam().inverse();
-                    self.autofocus.update(&self.renderer, gbuffer, inv_proj, dt as f32);
+            if let Some(gbuffer) = volume.gbuffer() {
+                let inv_proj = self.camera.projection_matrix.to_glam().inverse();
+                // a double-click sets the focus there, as if typed in (autofocus off)
+                if let Some(metres) = self.autofocus.update(&self.renderer, gbuffer, inv_proj, self.dof.focus.is_none()) {
+                    self.dof.focus = Some(metres);
                 }
             }
         } else {
@@ -736,12 +754,12 @@ impl State {
         }
     }
 
-    /// The depth of field's focus distance: the set one, or the autofocus (the depth at the centre
-    /// of the screen); until that has read anything, where the view axis (toward the orbit target)
+    /// The focus distance the lens eases toward: the set one, or the autofocus (the depth at the
+    /// centre of the screen); until that has read anything, where the view axis (toward the orbit target)
     /// enters the fluid's box, or the target's distance if the axis misses the box or starts
     /// inside it.
-    fn focus_distance(&self) -> f32 {
-        self.dof.focus.or(self.autofocus.focus).unwrap_or_else(|| {
+    fn focus_target(&self) -> f32 {
+        self.dof.focus.or(self.autofocus.centre).unwrap_or_else(|| {
             let eye = glam::Vec3::from(self.camera.object.position);
             let to_target = glam::Vec3::from(self.controls.look_target()) - eye;
             let axis = to_target.normalize_or_zero();
@@ -1102,6 +1120,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         },
         volume: None,
         autofocus: AutoFocus::default(),
+        lens_focus: None,
         clear_color,
     };
     state.apply_panel();
@@ -1134,7 +1153,7 @@ pub fn info() -> String {
             s.frame_ms,
             s.dof.on,
             s.dof.focus.map_or("null".into(), |f| f.to_string()),
-            s.focus_distance(),
+            s.lens_focus.unwrap_or_else(|| s.focus_target()),
             s.dof.f_stop,
             s.dof.taa
         );
@@ -1336,6 +1355,13 @@ pub fn set_dof_focus(metres: f32) {
 #[wasm_bindgen]
 pub fn set_dof_fstop(f_stop: f32) {
     with_state(|s| s.dof.f_stop = f_stop.max(0.1));
+}
+
+/// Focus on what is under a point of the screen (0..1 from the top left), as a double-click
+/// does: read a frame or two later, then held as the set focus distance (autofocus off).
+#[wasm_bindgen]
+pub fn focus_at(x: f32, y: f32) {
+    with_state(|s| s.autofocus.pick = Some([x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)]));
 }
 
 /// Temporal anti-aliasing in the depth of field's chain (`taa=0` turns it off).
