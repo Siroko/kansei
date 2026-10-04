@@ -129,6 +129,7 @@ pub struct RaymarchingRenderable {
     output_view: wgpu::TextureView,
     surface_bg: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
+    size: (u32, u32),
 }
 
 impl RaymarchingRenderable {
@@ -170,6 +171,7 @@ impl RaymarchingRenderable {
             output_view,
             surface_bg,
             blit_bg,
+            size: (width, height),
         }
     }
 
@@ -243,6 +245,7 @@ impl RaymarchingRenderable {
             &self.density_view,
         );
         self.blit_bg = self.blit.create_bind_group(renderer, &self.output_view);
+        self.size = (width, height);
     }
 
     pub fn set_density_source(&mut self, density_field: &FluidDensityField) {
@@ -298,6 +301,38 @@ impl RaymarchingRenderable {
         pass.set_pipeline(&self.blit.pipeline);
         pass.set_bind_group(0, &self.blit_bg, &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    /// A whole frame straight to `renderer`'s surface, without the scene: splat `sim`'s particles
+    /// into `density_field` (`splat_radius` each), raymarch it from `camera` over a `background`
+    /// colour, blit and present. The bounds follow the simulation's.
+    pub fn render_frame(&mut self, renderer: &Renderer, density_field: &mut FluidDensityField, sim: &super::FluidSimulation, splat_radius: f32, camera: &crate::cameras::Camera, background: wgpu::Color) {
+        let Some(output) = renderer.surface().and_then(|s| s.get_current_texture().ok()) else { return };
+        let canvas_view = output.texture.create_view(&Default::default());
+        let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FluidRaymarch/Frame") });
+        density_field.update_with_encoder(&mut encoder, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), splat_radius);
+        self.bounds_min = sim.world_bounds_min;
+        self.bounds_max = sim.world_bounds_max;
+        // the raymarch reads the colour behind the fluid and its depth: an empty background
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(background), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        let view_proj = camera.projection_matrix.to_glam() * camera.view_matrix.to_glam();
+        let eye = camera.position();
+        let (width, height) = self.size;
+        self.render(&mut encoder, &canvas_view, &Mat4::from(view_proj.inverse()), [eye.x, eye.y, eye.z], width, height);
+        renderer.submit(std::iter::once(encoder.finish()));
+        output.present();
     }
 
     pub fn surface_renderer_mut(&mut self) -> &mut FluidSurfaceRenderer {
