@@ -41,5 +41,8 @@ pub use gltf::SkinnedGltf;
 pub use pose::Pose;
 pub use skeleton::Skeleton;
 pub use skin::{strongest_influences, SkinnedMesh, MAX_INFLUENCES};
-pub use skinning::{skin_buffer, skinned_lit_material, skinned_material, BonePalette, SkinnedLitParams, PALETTE_BINDING, SKINNED_LIT_WGSL, SKINNING_WGSL, SKIN_BINDING};
+pub use skinning::{
+    skin_buffer, skinned_lit_material, skinned_lit_textured_material, skinned_material, BonePalette, SkinTextures, SkinnedLitParams, PALETTE_BINDING,
+    SKINNED_LIT_TEXTURED_WGSL, SKINNED_LIT_WGSL, SKINNING_WGSL, SKIN_BINDING,
+};
 pub use transform::{angular_velocity, nlerp, quat_abs, quat_exp, quat_from_scaled_angle_axis, quat_log, quat_to_scaled_angle_axis, Transform};

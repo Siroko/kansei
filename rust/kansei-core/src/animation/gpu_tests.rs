@@ -34,6 +34,8 @@ fn struct_size(module: &naga::Module, name: &str) -> usize {
 fn shaders_validate_and_the_uniform_matches() {
     let lit = validate("skinned_lit", SKINNED_LIT_WGSL);
     assert_eq!(struct_size(&lit, "KanseiSkinnedSurface"), std::mem::size_of::<SkinnedLitParams>());
+    let textured = validate("skinned_lit_textured", SKINNED_LIT_TEXTURED_WGSL);
+    assert_eq!(struct_size(&textured, "KanseiSkinnedTexturedSurface"), std::mem::size_of::<SkinnedLitParams>());
     validate("skin compute", &skin_compute_wgsl());
     validate("strip", &strip_wgsl());
 }

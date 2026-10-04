@@ -1,7 +1,7 @@
 use glam::Mat4;
 
 use super::{SkinnedMesh, Transform};
-use crate::buffers::{BufferType, BufferUsage, ComputeBuffer};
+use crate::buffers::{BufferType, BufferUsage, ComputeBuffer, Sampler, Texture};
 use crate::materials::{Binding, Material, MaterialOptions, ShaderStages};
 
 /// WGSL for skinned materials: the bone palette (group 0 binding 1), the vertices' joints and
@@ -19,6 +19,20 @@ pub const SKINNED_LIT_WGSL: &str = concat!(
     include_str!("../shaders/cascaded_shadows.wgsl"),
     "\n",
     include_str!("../shaders/skinned_lit.wgsl"),
+);
+
+/// `SKINNED_LIT_WGSL` with textures: colour (sRGB), tangent-space normal (+Y up, no stored
+/// tangents needed) and occlusion/roughness/metallic, read at the mesh's uv, with a GGX
+/// specular. Its uniform is `SkinnedLitParams` (`base_color` tints the colour texture); see
+/// `skinned_lit_textured_material`.
+pub const SKINNED_LIT_TEXTURED_WGSL: &str = concat!(
+    include_str!("../shaders/skinning.wgsl"),
+    "\n",
+    include_str!("../shaders/motion_vectors.wgsl"),
+    "\n",
+    include_str!("../shaders/cascaded_shadows.wgsl"),
+    "\n",
+    include_str!("../shaders/skinned_lit_textured.wgsl"),
 );
 
 /// Group 0 binding of the palette and of the per-vertex skin records.
@@ -140,4 +154,40 @@ pub struct SkinnedLitParams {
 /// A `SKINNED_LIT_WGSL` material for `mesh`, writing motion vectors.
 pub fn skinned_lit_material(label: &str, params: SkinnedLitParams, mesh: &SkinnedMesh, palette: &BonePalette) -> Material {
     skinned_material(label, SKINNED_LIT_WGSL, &[params], mesh, palette, MaterialOptions { outputs_velocity: true, ..Default::default() })
+}
+
+/// The textures of `skinned_lit_textured_material`: colour (sRGB), normal map and
+/// occlusion/roughness/metallic (both linear), e.g. `Texture::from_image`.
+pub struct SkinTextures {
+    pub base_color: Texture,
+    pub normal: Texture,
+    pub orm: Texture,
+}
+
+/// A `SKINNED_LIT_TEXTURED_WGSL` material for `mesh`, writing motion vectors, its textures
+/// sampled trilinearly with 8x anisotropy.
+pub fn skinned_lit_textured_material(label: &str, params: SkinnedLitParams, mesh: &SkinnedMesh, palette: &BonePalette, textures: SkinTextures) -> Material {
+    assert_eq!(palette.joints(), mesh.skin_joints.len(), "the palette has one matrix per skin joint");
+    let mut material = Material::new(
+        label,
+        SKINNED_LIT_TEXTURED_WGSL,
+        vec![
+            Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
+            Binding::storage(PALETTE_BINDING, ShaderStages::VERTEX, true),
+            Binding::storage(SKIN_BINDING, ShaderStages::VERTEX, true),
+            Binding::texture_2d(3, ShaderStages::FRAGMENT),
+            Binding::texture_2d(4, ShaderStages::FRAGMENT),
+            Binding::texture_2d(5, ShaderStages::FRAGMENT),
+            Binding::sampler(6, ShaderStages::FRAGMENT),
+        ],
+        MaterialOptions { outputs_velocity: true, ..Default::default() },
+    );
+    material.set_uniform_bindable(0, &format!("{label}/Params"), &[params]);
+    material.set_bindable(PALETTE_BINDING, palette.buffer(&format!("{label}/Palette")));
+    material.set_bindable(SKIN_BINDING, skin_buffer(&format!("{label}/Skin"), mesh));
+    material.set_bindable(3, textures.base_color);
+    material.set_bindable(4, textures.normal);
+    material.set_bindable(5, textures.orm);
+    material.set_bindable(6, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    material
 }
