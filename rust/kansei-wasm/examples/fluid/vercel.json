@@ -11,6 +11,18 @@
   "outputDirectory": "proxy",
   "rewrites": [
     {
+      "source": "/",
+      "destination": "https://kansei.graphics/examples/fluid/index.html"
+    },
+    {
+      "source": "/examples/fluid",
+      "destination": "https://kansei.graphics/examples/fluid/index.html"
+    },
+    {
+      "source": "/examples/fluid/",
+      "destination": "https://kansei.graphics/examples/fluid/index.html"
+    },
+    {
       "source": "/examples/fluid/:path*",
       "destination": "https://kansei.graphics/examples/fluid/:path*"
     },
