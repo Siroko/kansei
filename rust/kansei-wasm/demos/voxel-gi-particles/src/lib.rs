@@ -26,8 +26,8 @@
 //! `PostProcessingVolume` runs the DoF and then the same `1 - exp(-x)` curve
 //! (`ToneMapper::Exponential`); the volume's GBuffer is single-sampled, so that path has no MSAA and
 //! runs `TemporalAAEffect` first instead (`taa=0` turns it off). The particles write no motion vectors: the TAA reprojects them by depth.
-//! `focus=` sets the focus distance in metres (default: autofocus on the depth at the centre of
-//! the screen, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 2.8). The room is 28 m wide and seen from 37 m, where a real
+//! `focus=` sets the focus distance in metres (default: autofocus on the depth at the middle of
+//! the screen, 65% of the way down, so orbiting and panning refocus; double-click focuses on that point instead) and `fstop=` the aperture (default 2.8). The room is 28 m wide and seen from 37 m, where a real
 //! lens blurs nothing, so the lens sees it as a 1:100 tabletop model (`DOF_MODEL_SCALE`).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
@@ -536,7 +536,7 @@ struct State {
     lens_focus: Option<f32>,
 }
 
-/// Focus by depth: the view depth at a point of the screen (the centre for autofocus, or where
+/// Focus by depth: the view depth at a point of the screen (`AUTOFOCUS_POINT` for autofocus, or where
 /// the user double-clicked), read back from the volume's GBuffer a frame or two late. A depth
 /// texture can only be copied whole, so a one-thread pass loads the texel into a buffer first.
 #[derive(Default)]
@@ -558,6 +558,10 @@ struct AutoFocusGpu {
     texel: wgpu::Buffer,
     readback: wgpu::Buffer,
 }
+
+/// Where autofocus reads the depth, in 0..1 of the screen from the top left: below the centre,
+/// on the nearer particles.
+const AUTOFOCUS_POINT: [f32; 2] = [0.5, 0.65];
 
 const AUTOFOCUS_WGSL: &str = "
 @group(0) @binding(0) var depth: texture_depth_2d;
@@ -611,7 +615,7 @@ impl AutoFocus {
         }
         if self.state.get() == 0 && (centre || self.pick.is_some()) {
             self.reading_pick = self.pick.is_some();
-            let point = self.pick.take().unwrap_or([0.5, 0.5]);
+            let point = self.pick.take().unwrap_or(AUTOFOCUS_POINT);
             renderer.queue().write_buffer(&gpu.point, 0, bytemuck::cast_slice(&[point[0], point[1], 0.0, 0.0]));
             let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("VoxelGIParticles/AutoFocus") });
             let bind_group = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor {
