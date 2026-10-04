@@ -6,10 +6,35 @@
     <style>
         body { margin: 0; background: #000; overflow: hidden; }
         canvas { width: 100vw; height: 100vh; display: block; cursor: pointer; }
+        #audio-prompt {
+            position: fixed; left: 50%; bottom: 8vh; transform: translateX(-50%);
+            max-width: min(32rem, calc(100vw - 2rem)); box-sizing: border-box;
+            padding: 1rem 1.25rem; border: 1px dashed #777; border-radius: 6px;
+            background: rgba(0, 0, 0, 0.75); color: #ddd; text-align: center;
+            font: 14px/1.5 system-ui, sans-serif;
+        }
+        #audio-prompt.dragging { border-color: #fff; color: #fff; }
+        #audio-prompt[hidden] { display: none; }
+        #audio-prompt label { text-decoration: underline; cursor: pointer; }
+        #audio-prompt code { color: #fff; }
+        #audio-prompt .error { color: #f88; }
+        #audio-status {
+            position: fixed; left: 1rem; bottom: 1rem; color: #888;
+            font: 12px/1.4 system-ui, sans-serif; pointer-events: none;
+        }
     </style>
 </head>
 <body>
     <canvas id="kansei"></canvas>
+    <!-- The recording is not in the repo: the viewer brings their own copy (see README.md). -->
+    <div id="audio-prompt" hidden>
+        <p>Drop your copy of <em>A Means to an End</em> here, or
+            <label for="audio-file">choose an audio file</label>.</p>
+        <p>Or open this page with <code>?audio=&lt;url&gt;</code>.</p>
+        <p class="error" hidden></p>
+        <input id="audio-file" type="file" accept="audio/*" hidden>
+    </div>
+    <div id="audio-status"></div>
     <script type="module">
         import initWasm, { start, init_text, update_fft, set_fft_amplitude, set_noise_scale, set_noise_strength, set_noise_speed, set_noise_zoom, set_noise_mix, set_wave_thickness, set_peak_exponent, set_temporal_blend, set_fft_pow, set_peak_min, set_text_visible, set_text_offset, set_glyph_rot_x } from './pkg/kansei_wasm_joydivision.js';
         import initArfont, { ArteryFont } from './arfont/artery_font.js';
@@ -39,19 +64,82 @@
             JSON.stringify(lyrics.lines.map(l => l.time)),
         );
 
-        // ── Audio (fetch + decodeAudioData — works with any static server) ──
+        // ── Audio ──
+        // The track comes from ?audio=<url> or a file the viewer drops or picks; the repo and the
+        // site carry no recording. Without one the lines still move on the noise field.
         let audioCtx, analyser, fftRaw, fftSmoothed;
         let playing = false;
         let startTime = 0;
         let pausedAt = 0;
         let bufferSource = null;
         let audioBuffer = null;
+        let audioData = null;   // encoded bytes, decoded on the first click (needs a user gesture)
 
-        // Pre-fetch the audio file so playback starts instantly on click
-        const audioData = await fetch(lyrics.audio).then(r => r.arrayBuffer());
+        const prompt = document.getElementById('audio-prompt');
+        const promptError = prompt.querySelector('.error');
+        const status = document.getElementById('audio-status');
+        const fileInput = document.getElementById('audio-file');
+
+        function showPrompt(error) {
+            promptError.hidden = !error;
+            promptError.textContent = error || '';
+            prompt.hidden = false;
+            status.textContent = '';
+            document.body.dataset.audio = 'none';
+        }
+
+        function stopPlayback() {
+            if (playing) bufferSource.stop();
+            playing = false;
+            pausedAt = 0;
+        }
+
+        function setAudio(bytes, name) {
+            stopPlayback();
+            audioData = bytes;
+            audioBuffer = null;
+            prompt.hidden = true;
+            status.textContent = `${name}: click to play or pause, drop another file to replace it`;
+            document.body.dataset.audio = 'loaded';
+        }
+
+        async function decode() {
+            try {
+                audioBuffer = await audioCtx.decodeAudioData(audioData);
+            } catch (e) {
+                audioData = null;
+                showPrompt(`Could not decode that file (${e.message || e}).`);
+            }
+        }
+
+        const audioUrl = new URLSearchParams(location.search).get('audio');
+        if (audioUrl) {
+            try {
+                const r = await fetch(audioUrl);
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                setAudio(await r.arrayBuffer(), decodeURIComponent(audioUrl.split('/').pop()));
+            } catch (e) {
+                showPrompt(`Could not load ?audio=${audioUrl} (${e.message || e}).`);
+            }
+        } else {
+            showPrompt();
+        }
+
+        async function loadFile(file) {
+            if (file) setAudio(await file.arrayBuffer(), file.name);
+        }
+        fileInput.addEventListener('change', () => loadFile(fileInput.files[0]));
+        window.addEventListener('dragover', (e) => { e.preventDefault(); prompt.classList.add('dragging'); });
+        window.addEventListener('dragleave', () => prompt.classList.remove('dragging'));
+        window.addEventListener('drop', (e) => {
+            e.preventDefault();
+            prompt.classList.remove('dragging');
+            loadFile(e.dataTransfer.files[0]);
+        });
 
         const canvas = document.getElementById('kansei');
         canvas.addEventListener('click', async () => {
+            if (!audioData) return;
             if (!audioCtx) {
                 audioCtx = new AudioContext();
                 analyser = audioCtx.createAnalyser();
@@ -59,29 +147,38 @@
                 fftRaw = new Uint8Array(analyser.fftSize);
                 fftSmoothed = new Float32Array(256); // always 256 bins for the shader
                 for (let i = 0; i < 256; i++) fftSmoothed[i] = 128; // silence
-                audioBuffer = await audioCtx.decodeAudioData(audioData);
+                analyser.connect(audioCtx.destination);
+            }
+            if (!audioBuffer) {
+                await decode();
+                if (!audioBuffer) return;
             }
 
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
             if (!playing) {
                 // Start or resume from pausedAt
-                bufferSource = audioCtx.createBufferSource();
-                bufferSource.buffer = audioBuffer;
-                bufferSource.connect(analyser);
-                analyser.connect(audioCtx.destination);
-                bufferSource.start(0, pausedAt);
+                const source = audioCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(analyser);
+                source.start(0, pausedAt);
+                bufferSource = source;
                 startTime = audioCtx.currentTime - pausedAt;
                 playing = true;
-                bufferSource.onended = () => {
+                document.body.dataset.audio = 'playing';
+                source.onended = () => {
+                    // a pause or a replaced track stops its source too; only the current one counts
+                    if (bufferSource !== source || !playing) return;
                     playing = false;
                     pausedAt = 0;
+                    document.body.dataset.audio = 'loaded';
                 };
             } else {
                 // Pause
                 pausedAt = audioCtx.currentTime - startTime;
-                bufferSource.stop();
                 playing = false;
+                bufferSource.stop();
+                document.body.dataset.audio = 'loaded';
             }
         });
 
