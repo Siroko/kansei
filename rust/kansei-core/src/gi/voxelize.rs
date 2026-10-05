@@ -19,15 +19,25 @@ pub const SURFACE_WORDS_PER_VOXEL: u64 = 4;
 pub struct GiSurface {
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
+    /// Scales how much its area makes a clipmap's voxels opaque (1 by default): below 1 for a
+    /// mesh that stands for something light passes through, such as a crown's proxy for its
+    /// needles. A volume (`SceneVoxelGi`) keeps its voxels opaque.
+    pub opacity: f32,
 }
 
 impl GiSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, emission: [0.0; 3] }
+        Self { albedo, emission: [0.0; 3], opacity: 1.0 }
     }
 
     pub fn with_emission(mut self, emission: [f32; 3]) -> Self {
         self.emission = emission;
+        self
+    }
+
+    /// See `opacity`.
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity.max(0.0);
         self
     }
 }
@@ -38,11 +48,39 @@ impl GiSurface {
 pub(crate) struct VoxelizeParamsGpu {
     clip_to_voxel: [f32; 16],
     view_dir: [f32; 3],
-    _pad0: f32,
+    words: u32,
     viewport: [f32; 2],
-    _pad1: [f32; 2],
+    pixel_area: f32,
+    _pad1: f32,
     dims: [u32; 3],
     _pad2: u32,
+    region_lo: [i32; 3],
+    _pad3: u32,
+    region_dims: [u32; 3],
+    _pad4: u32,
+}
+
+impl VoxelizeParamsGpu {
+    /// An axis' parameters for region `[lo, lo + region)` of a volume of `dims` voxels (stored
+    /// toroidally, `words` u32 a voxel), drawn at `pixels` per voxel along each side into a
+    /// `viewport`: `clip_to_voxel` maps the axis' clip space to the region's voxel coordinates.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(clip_to_voxel: glam::Mat4, view_dir: glam::Vec3, viewport: [u32; 2], dims: [u32; 3], lo: [i32; 3], region: [u32; 3], words: u32, pixels: u32) -> Self {
+        Self {
+            clip_to_voxel: clip_to_voxel.to_cols_array(),
+            view_dir: view_dir.to_array(),
+            words,
+            viewport: [viewport[0] as f32, viewport[1] as f32],
+            pixel_area: 1.0 / (pixels * pixels) as f32,
+            _pad1: 0.0,
+            dims,
+            _pad2: 0,
+            region_lo: lo,
+            _pad3: 0,
+            region_dims: region,
+            _pad4: 0,
+        }
+    }
 }
 
 /// The WGSL `KanseiVoxelDraw`.
@@ -50,9 +88,114 @@ pub(crate) struct VoxelizeParamsGpu {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct VoxelDrawGpu {
     albedo: [f32; 3],
-    _pad0: f32,
+    opacity: f32,
     emission: [f32; 3],
     _pad1: f32,
+}
+
+impl VoxelDrawGpu {
+    pub(crate) fn new(surface: &GiSurface) -> Self {
+        Self { albedo: surface.albedo, opacity: surface.opacity, emission: surface.emission, _pad1: 0.0 }
+    }
+}
+
+/// A new voxelizer's id (`MeshVoxelizer::id`, `ClipmapVoxelizer::id`): tells voxelizers apart in
+/// the materials' pipeline caches.
+pub(crate) fn next_voxelizer_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Group 3 of the voxelization pipelines (voxel_write.wgsl): the axis' parameters (100), the
+/// draw's surface at a dynamic offset (101), the surfaces written (102).
+pub(crate) fn voxelize_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let fragment_visible = wgpu::ShaderStages::FRAGMENT;
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("VoxelGI/VoxelizeBGL"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 100,
+                visibility: fragment_visible,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 101,
+                visibility: fragment_visible,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<VoxelDrawGpu>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 102,
+                visibility: fragment_visible,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The voxelization passes' dummy target, `side` pixels square of `samples`: masked off, it only
+/// sets the fragments' coverage (`MeshVoxelizer::TARGET_FORMAT`).
+pub(crate) fn voxelize_target(device: &wgpu::Device, side: u32, samples: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("VoxelGI/VoxelizeTarget"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: MeshVoxelizer::TARGET_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+/// One axis of a voxelization: an orthographic camera looking along `look` over a box, a pixel per
+/// voxel in a `viewport` of the box's cross-section, and the map from its clip space to the box's
+/// voxel coordinates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AxisView {
+    pub view: glam::Mat4,
+    pub projection: glam::Mat4,
+    pub look: glam::Vec3,
+    pub viewport: [u32; 2],
+    pub clip_to_voxel: glam::Mat4,
+}
+
+impl AxisView {
+    /// Point `camera` along this axis.
+    pub(crate) fn apply(&self, camera: &mut Camera) {
+        camera.view_matrix = self.view.into();
+        camera.inverse_view_matrix = self.view.inverse().into();
+        camera.projection_matrix = self.projection.into();
+    }
+}
+
+/// The three axes (x, y, z) of a voxelization of the box from `lo` (world) of `dims` voxels of
+/// `voxel_size`, a pixel per voxel (`AxisView::viewport` in voxels).
+pub(crate) fn axis_views(lo: glam::Vec3, voxel_size: f32, dims: [u32; 3]) -> [AxisView; 3] {
+    let extent = glam::UVec3::from(dims).as_vec3() * voxel_size;
+    let centre = lo + extent * 0.5;
+    let world_to_voxel = glam::Mat4::from_scale(glam::Vec3::splat(1.0 / voxel_size)) * glam::Mat4::from_translation(-lo);
+    let [dx, dy, dz] = dims;
+    // (looking along, up, viewport width and height in voxels, extents across, depth)
+    let axes = [
+        (glam::Vec3::NEG_X, glam::Vec3::Y, [dz, dy], [extent.z, extent.y], extent.x),
+        (glam::Vec3::NEG_Y, glam::Vec3::NEG_Z, [dx, dz], [extent.x, extent.z], extent.y),
+        (glam::Vec3::NEG_Z, glam::Vec3::Y, [dx, dy], [extent.x, extent.y], extent.z),
+    ];
+    axes.map(|(look, up, viewport, across, depth)| {
+        let eye = centre - look * (depth * 0.5);
+        let view = glam::Mat4::look_at_rh(eye, centre, up);
+        let projection = glam::Mat4::orthographic_rh(-across[0] * 0.5, across[0] * 0.5, -across[1] * 0.5, across[1] * 0.5, 0.0, depth);
+        AxisView { view, projection, look, viewport, clip_to_voxel: world_to_voxel * (projection * view).inverse() }
+    })
 }
 
 /// Which surface buffer a voxelization pass writes.
@@ -102,93 +245,30 @@ impl MeshVoxelizer {
 
     /// A voxelizer over `layout`, whose cameras' group 1 also holds `light_buf` (the renderer's).
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, shared: &SharedLayouts, light_buf: &wgpu::Buffer, layout: VolumeLayout) -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let fragment_visible = wgpu::ShaderStages::FRAGMENT;
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("VoxelGI/VoxelizeBGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 100,
-                    visibility: fragment_visible,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 101,
-                    visibility: fragment_visible,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<VoxelDrawGpu>() as u64),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 102,
-                    visibility: fragment_visible,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-            ],
-        });
+        let bgl = voxelize_bind_group_layout(device);
         let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGI/VoxelFragment"), source: wgpu::ShaderSource::Wgsl(VOXEL_FRAGMENT_WGSL.into()) });
 
         // the three cameras: orthographic over the volume along x, y and z, one pixel per voxel
-        let lo = glam::Vec3::from(layout.origin);
-        let extent = glam::UVec3::from(layout.dims).as_vec3() * layout.voxel_size;
-        let centre = lo + extent * 0.5;
-        let world_to_voxel = glam::Mat4::from_scale(glam::Vec3::splat(1.0 / layout.voxel_size)) * glam::Mat4::from_translation(-lo);
-        let [dx, dy, dz] = layout.dims;
-        // (looking along, up, viewport width and height in voxels, extents across, depth)
-        let axes = [
-            (glam::Vec3::NEG_X, glam::Vec3::Y, [dz, dy], [extent.z, extent.y], extent.x),
-            (glam::Vec3::NEG_Y, glam::Vec3::NEG_Z, [dx, dz], [extent.x, extent.z], extent.y),
-            (glam::Vec3::NEG_Z, glam::Vec3::Y, [dx, dy], [extent.x, extent.y], extent.z),
-        ];
         let uniform = |label: &str, size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
         };
         let mut cameras: [Camera; 3] = std::array::from_fn(|_| Camera::new(60.0, 0.1, 100.0, 1.0));
         let params: [wgpu::Buffer; 3] = std::array::from_fn(|_| uniform("VoxelGI/VoxelizeParams", std::mem::size_of::<VoxelizeParamsGpu>() as u64));
-        for (a, (look, up, viewport, across, depth)) in axes.into_iter().enumerate() {
-            let eye = centre - look * (depth * 0.5);
-            let view = glam::Mat4::look_at_rh(eye, centre, up);
-            let projection = glam::Mat4::orthographic_rh(-across[0] * 0.5, across[0] * 0.5, -across[1] * 0.5, across[1] * 0.5, 0.0, depth);
+        for (a, axis) in axis_views(glam::Vec3::from(layout.origin), layout.voxel_size, layout.dims).into_iter().enumerate() {
             let camera = &mut cameras[a];
             camera.gpu_initialize(device, &shared.camera_bgl, light_buf);
-            camera.view_matrix = view.into();
-            camera.inverse_view_matrix = view.inverse().into();
-            camera.projection_matrix = projection.into();
+            axis.apply(camera);
             camera.upload(queue);
-            let gpu = VoxelizeParamsGpu {
-                clip_to_voxel: (world_to_voxel * (projection * view).inverse()).to_cols_array(),
-                view_dir: look.to_array(),
-                _pad0: 0.0,
-                viewport: [viewport[0] as f32, viewport[1] as f32],
-                _pad1: [0.0; 2],
-                dims: layout.dims,
-                _pad2: 0,
-            };
+            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, axis.viewport, layout.dims, [0; 3], layout.dims, SURFACE_WORDS_PER_VOXEL as u32, 1);
             queue.write_buffer(&params[a], 0, bytemuck::bytes_of(&gpu));
         }
 
-        let side = dx.max(dy).max(dz);
-        let target = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("VoxelGI/VoxelizeTarget"),
-                size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: Self::SAMPLE_COUNT,
-                dimension: wgpu::TextureDimension::D2,
-                format: Self::TARGET_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-            .create_view(&Default::default());
+        let [dx, dy, dz] = layout.dims;
+        let target = voxelize_target(device, dx.max(dy).max(dz), Self::SAMPLE_COUNT);
         let draw_stride = (std::mem::size_of::<VoxelDrawGpu>() as u64).next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as u64);
         let static_surfaces = Self::surface_buffer(device, &layout, "VoxelGI/StaticSurfaces");
         let mut voxelizer = Self {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_voxelizer_id(),
             layout,
             bgl,
             fragment,
@@ -250,9 +330,14 @@ impl MeshVoxelizer {
         &self.bgl
     }
 
-    /// The engine's fragment stage (`voxel_fragment`).
-    pub(crate) fn fragment_module(&self) -> &wgpu::ShaderModule {
-        &self.fragment
+    /// The engine's fragment stage: its module and entry (`voxel_fragment`).
+    pub(crate) fn fragment(&self) -> (&wgpu::ShaderModule, &'static str) {
+        (&self.fragment, "voxel_fragment")
+    }
+
+    /// Samples of its passes' target.
+    pub(crate) fn sample_count(&self) -> u32 {
+        Self::SAMPLE_COUNT
     }
 
     pub fn layout(&self) -> &VolumeLayout {
@@ -295,7 +380,7 @@ impl MeshVoxelizer {
         }
         let mut data = vec![0u8; (self.draw_stride * surfaces.len() as u64) as usize];
         for (k, s) in surfaces.iter().enumerate() {
-            let draw = VoxelDrawGpu { albedo: s.albedo, _pad0: 0.0, emission: s.emission, _pad1: 0.0 };
+            let draw = VoxelDrawGpu::new(s);
             let at = k * self.draw_stride as usize;
             data[at..at + std::mem::size_of::<VoxelDrawGpu>()].copy_from_slice(bytemuck::bytes_of(&draw));
         }

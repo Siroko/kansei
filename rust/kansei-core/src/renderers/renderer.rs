@@ -195,6 +195,8 @@ pub struct Renderer {
     render_scale: f32,
     // Voxel GI of the scene's meshes (`enable_voxel_gi`)
     voxel_gi: Option<crate::gi::SceneVoxelGi>,
+    // Voxel GI of an open scene's meshes, in a clipmap round the camera (`enable_voxel_clipmap`)
+    voxel_clipmap: Option<crate::gi::SceneVoxelClipmap>,
 }
 
 impl Renderer {
@@ -263,6 +265,7 @@ impl Renderer {
             depth_copy_bgl: None,
             render_scale: 1.0,
             voxel_gi: None,
+            voxel_clipmap: None,
         }
     }
 
@@ -1425,6 +1428,12 @@ impl Renderer {
         self.cascade_view(self.cascaded_shadows.as_ref().map_or(0, |c| c.slots.len()))
     }
 
+    /// Cull view of the voxel clipmap's job slot `slot` (the region it voxelizes), after the sky
+    /// occlusion's.
+    fn gi_view(&self, slot: usize) -> usize {
+        self.sky_occlusion_view() + self.sky_occlusion.is_some() as usize + slot
+    }
+
     /// Sky occlusion around the camera: how much of the sky each point sees past the canopy
     /// (`SkyOcclusion`), for materials to dim their sky ambient light by with
     /// `shadows::SKY_OCCLUSION_WGSL`. The shadow casters on its layers are drawn from straight
@@ -1596,32 +1605,186 @@ impl Renderer {
         self.voxel_gi.as_mut()
     }
 
-    /// Point voxel GI's light injection at the shadow maps enabled now.
+    /// Point voxel GI's light injections (the volume's and the clipmap's) at the shadow maps
+    /// enabled now.
     fn sync_voxel_gi_shadows(&mut self) {
-        let Some(gi) = self.voxel_gi.as_mut() else { return };
-        let shadows = &mut gi.injection.shadows;
-        shadows.set_spot_lights(self.spot_light_buf.as_ref(), self.spot_shadow_atlas.as_ref());
-        match &self.cascaded_shadows {
-            Some(csm) => shadows.set_cascaded_shadow_map(Some(csm)),
-            None => shadows.set_shadow_map(self.shadow_map.as_ref().filter(|_| self.shadows_enabled)),
+        let volume = self.voxel_gi.as_mut().map(|gi| &mut gi.injection.shadows);
+        let clipmap = self.voxel_clipmap.as_mut().map(|gi| &mut gi.injection.shadows);
+        for shadows in volume.into_iter().chain(clipmap) {
+            shadows.set_spot_lights(self.spot_light_buf.as_ref(), self.spot_shadow_atlas.as_ref());
+            match &self.cascaded_shadows {
+                Some(csm) => shadows.set_cascaded_shadow_map(Some(csm)),
+                None => shadows.set_shadow_map(self.shadow_map.as_ref().filter(|_| self.shadows_enabled)),
+            }
+            shadows.set_point_shadows(self.cubemap_shadow_map.as_ref());
         }
-        shadows.set_point_shadows(self.cubemap_shadow_map.as_ref());
     }
 
-    /// Make the voxelization pipeline of a GI renderable (with vertex buffers `layouts`).
+    /// Make the voxelization pipelines of a GI renderable (with vertex buffers `layouts`), for
+    /// the volume's voxelizer and the clipmap's.
     fn prepare_voxel_pipeline(&self, r: &mut crate::objects::Renderable, layouts: &[wgpu::VertexBufferLayout]) {
-        let (Some(gi), true) = (self.voxel_gi.as_ref(), r.gi.is_some()) else { return };
-        let voxelizer = gi.voxelizer();
-        r.material.get_voxel_pipeline(
-            self.device.as_ref().unwrap(),
-            self.shared_layouts.as_ref().unwrap(),
-            voxelizer.id(),
-            layouts,
-            voxelizer.bind_group_layout(),
-            voxelizer.fragment_module(),
-            crate::gi::MeshVoxelizer::TARGET_FORMAT,
-            crate::gi::MeshVoxelizer::SAMPLE_COUNT,
+        if r.gi.is_none() {
+            return;
+        }
+        let volume = self.voxel_gi.as_ref().map(|gi| (gi.voxelizer().id(), gi.voxelizer().bind_group_layout(), gi.voxelizer().fragment(), gi.voxelizer().sample_count()));
+        let clipmap = self.voxel_clipmap.as_ref().map(|gi| (gi.voxelizer().id(), gi.voxelizer().bind_group_layout(), gi.voxelizer().fragment(), gi.voxelizer().sample_count()));
+        let (device, shared) = (self.device.as_ref().unwrap(), self.shared_layouts.as_ref().unwrap());
+        for (id, bgl, fragment, samples) in volume.into_iter().chain(clipmap) {
+            r.material.get_voxel_pipeline(device, shared, id, layouts, bgl, fragment, crate::gi::MeshVoxelizer::TARGET_FORMAT, samples);
+        }
+        // the clipmap draws the cut of a renderable with cluster LOD (its mesh where it can't)
+        if let (Some((id, bgl, fragment, samples)), true) = (clipmap, r.clusters.is_some()) {
+            let instances = r.geometry.instance_buffers.first().and_then(|cb| cb.vertex_layout());
+            if let Err(problem) = r.material.get_cluster_voxel_pipeline(device, shared, id, instances.as_ref(), bgl, fragment, crate::gi::MeshVoxelizer::TARGET_FORMAT, samples) {
+                log::warn!("{}: voxelized as a mesh, not by its cluster cuts ({problem})", r.material.label);
+            }
+        }
+    }
+
+    /// Voxel GI for an open scene's meshes, in a clipmap round the camera
+    /// (`gi::SceneVoxelClipmap`): nested windows of voxels, each twice as coarse as the one
+    /// before, following the camera. Every frame, after the shadow maps, the windows move in steps
+    /// and the slabs they moved into are voxelized (a region a frame, `jobs_per_frame`), the
+    /// dynamic renderables are voxelized into the finest levels, and the voxels are lit by the
+    /// scene's lights through their shadow maps (or cones through the clipmap where those don't
+    /// reach), the bounces adding up over frames. Read the result with
+    /// `gi::VoxelGIEffect::with_clipmap`. Calling it again replaces the clipmap; it can run next to
+    /// `enable_voxel_gi`'s volume.
+    ///
+    /// ```ignore
+    /// renderer.enable_voxel_clipmap(SceneVoxelClipmapOptions { voxel_size: 0.5, levels: 5, ..Default::default() });
+    /// let effect = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), Default::default());
+    /// ```
+    pub fn enable_voxel_clipmap(&mut self, options: crate::gi::SceneVoxelClipmapOptions) {
+        let device = self.device.as_ref().unwrap();
+        let gi = crate::gi::SceneVoxelClipmap::new(device, self.shared_layouts.as_ref().unwrap(), self.light_buf.as_ref().unwrap(), options);
+        let layout = *gi.clipmap().layout();
+        log::info!(
+            "voxel GI clipmap: {} levels of {:?} voxels, {} m to {} m voxels, {:.1} MiB",
+            layout.levels,
+            layout.dims,
+            layout.voxel_size,
+            layout.level_voxel_size(layout.levels - 1),
+            gi.memory_bytes() as f64 / (1 << 20) as f64
         );
+        self.voxel_clipmap = Some(gi);
+        self.sync_voxel_gi_shadows();
+    }
+
+    /// Turn the voxel clipmap off and free it.
+    pub fn disable_voxel_clipmap(&mut self) {
+        self.voxel_clipmap = None;
+    }
+
+    pub fn voxel_clipmap(&self) -> Option<&crate::gi::SceneVoxelClipmap> {
+        self.voxel_clipmap.as_ref()
+    }
+
+    pub fn voxel_clipmap_mut(&mut self) -> Option<&mut crate::gi::SceneVoxelClipmap> {
+        self.voxel_clipmap.as_mut()
+    }
+
+    /// Plan the voxel clipmap's frame (`enable_voxel_clipmap`) before the culling, whose views its
+    /// regions are: whether the static GI renderables changed (every level is voxelized again
+    /// then), and the regions voxelized this frame, the windows following `camera`.
+    fn plan_voxel_clipmap(&mut self, scene: &Scene, camera: &Camera) {
+        let Some(gi) = self.voxel_clipmap.as_mut() else { return };
+        // what the static surfaces are made of
+        let mut key = Vec::new();
+        for idx in scene.ordered_indices() {
+            let Some(r) = scene.get_renderable(idx) else { continue };
+            let Some(surface) = r.gi.filter(|_| r.visible && r.geometry.initialized && !r.dynamic) else { continue };
+            key.push(idx as u32);
+            key.extend(r.world_matrix.as_slice().iter().map(|f| f.to_bits()));
+            key.extend(surface.albedo.iter().chain(&surface.emission).map(|f| f.to_bits()));
+            key.extend([r.geometry.index_count(), r.geometry.instance_count]);
+        }
+        let static_changed = gi.voxelizer_mut().static_changed(key);
+        let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        gi.plan(self.queue.as_ref().unwrap(), eye, static_changed);
+    }
+
+    /// The voxel clipmap's frame, after the culling and the shadow maps: voxelize the regions
+    /// planned (`plan_voxel_clipmap`) with the static GI renderables (instanced ones as culled for
+    /// each region, cluster LOD ones by their cut there), voxelize the dynamic ones into the
+    /// finest levels, then light the levels due this frame.
+    fn run_voxel_clipmap(&mut self, scene: &Scene, camera: &Camera) {
+        let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        let job_views: Vec<usize> = (0..self.voxel_clipmap.as_ref().map_or(0, |gi| gi.jobs().len())).map(|slot| self.gi_view(slot)).collect();
+        let Some(gi) = self.voxel_clipmap.as_mut() else { return };
+        if !gi.settings.enabled {
+            return;
+        }
+        let device = self.device.as_ref().unwrap();
+        let queue = self.queue.as_ref().unwrap();
+        let mesh_bg = self.mesh_bind_group.as_ref().unwrap();
+        let alignment = self.matrix_alignment;
+        let cuts = &self.cluster_cuts;
+        gi.injection.shadows.update_lights(scene.lights(), false);
+
+        // the renderables drawn into voxels: visible, with a surface and a ready pipeline (their
+        // mesh's, or their cluster cuts')
+        let voxelizer_id = gi.voxelizer().id();
+        let draws: Vec<ClipmapDraw> = scene
+            .ordered_indices()
+            .filter_map(|idx| {
+                let r = scene.get_renderable(idx)?;
+                if !r.visible || !r.geometry.initialized || r.gi.is_none() {
+                    return None;
+                }
+                let mesh = r.material.voxel_pipeline_cache.get(&(voxelizer_id, 1 + r.geometry.instance_buffers.len()));
+                let cluster = r.clusters.as_ref().and(r.material.cluster_voxel_pipeline_cache.get(&voxelizer_id));
+                (mesh.is_some() || cluster.is_some()).then_some(ClipmapDraw { index: idx, renderable: r, mesh, cluster })
+            })
+            .collect();
+        let surfaces: Vec<_> = draws.iter().map(|d| d.renderable.gi.unwrap()).collect();
+        // each mesh's world box, to skip the regions it can't reach (instanced ones: none)
+        let bounds: Vec<Option<(glam::Vec3, glam::Vec3)>> = draws
+            .iter()
+            .map(|d| {
+                let (lo, hi) = gi.local_bounds(d.index, &d.renderable.geometry)?;
+                let world = d.renderable.world_matrix.to_glam();
+                let corners = (0..8).map(|k| world.transform_point3(glam::Vec3::new([lo.x, hi.x][k & 1], [lo.y, hi.y][(k >> 1) & 1], [lo.z, hi.z][(k >> 2) & 1])));
+                Some(corners.fold((glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p))))
+            })
+            .collect();
+        gi.voxelizer_mut().write_draws(queue, &surfaces);
+        let any_dynamic = draws.iter().any(|d| d.renderable.dynamic);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/VoxelClipmap") });
+        // the static renderables into this frame's regions, each cleared first
+        let voxelizer = gi.voxelizer();
+        let layout = *gi.clipmap().layout();
+        for (slot, job) in gi.jobs().iter().enumerate() {
+            voxelizer.encode_clear(&mut encoder, slot, gi.clipmap());
+            let Some(groups) = voxelizer.groups(crate::gi::ClipSurfaces::Static, slot) else { continue };
+            let pass_of = ClipmapPass { region: job.region.bounds(&layout), reach: layout.level_voxel_size(job.region.level), view: Some(job_views[slot]), cuts };
+            for (axis, group) in groups.iter().enumerate() {
+                let mut pass = voxelizer.begin_pass(&mut encoder, crate::gi::ClipSurfaces::Static, slot, axis);
+                draw_clipmap_voxels(&mut pass, &draws, &bounds, &pass_of, group, voxelizer, mesh_bg, alignment);
+            }
+        }
+        // the windows move with the regions done
+        gi.commit_jobs(queue);
+        // the dynamic renderables into the finest levels' whole windows
+        if any_dynamic {
+            gi.voxelizer_mut().ensure_dynamic();
+            let voxelizer = gi.voxelizer();
+            voxelizer.clear_dynamic(&mut encoder);
+            for level in 0..voxelizer.dynamic_levels() as usize {
+                let Some(groups) = voxelizer.groups(crate::gi::ClipSurfaces::Dynamic, level) else { continue };
+                let Some(window) = gi.clipmap().level_bounds(level as u32) else { continue };
+                let pass_of = ClipmapPass { region: window, reach: gi.clipmap().layout().level_voxel_size(level as u32), view: None, cuts };
+                for (axis, group) in groups.iter().enumerate() {
+                    let mut pass = voxelizer.begin_pass(&mut encoder, crate::gi::ClipSurfaces::Dynamic, level, axis);
+                    draw_clipmap_voxels(&mut pass, &draws, &bounds, &pass_of, group, voxelizer, mesh_bg, alignment);
+                }
+            }
+        }
+        let levels = gi.levels_to_light();
+        gi.encode_lighting(device, queue, &mut encoder, &levels, any_dynamic);
+        gi.encode_probes(device, queue, &mut encoder, eye);
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Voxel GI's frame: voxelize the GI renderables (the static ones when they changed, the
@@ -1936,11 +2099,11 @@ impl Renderer {
     /// for every layer of the spot shadow atlas (`None` when no light uses it this frame), then
     /// `reflection_view(r)` for every planar reflection, then `cascade_view(c)` for every cascade.
     fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
-        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, reflection: false, layer_mask: None, lod_distance_scale: 1.0 })];
+        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 })];
         if let Some(atlas) = &self.spot_shadow_atlas {
             views.resize(1 + atlas.layers as usize, None);
             for slot in &self.spot_lights.shadows {
-                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, reflection: false, layer_mask: None, lod_distance_scale: 1.0 });
+                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 });
             }
         }
         // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
@@ -1950,19 +2113,26 @@ impl Renderer {
                 view_proj: r.cull_view_proj(),
                 casters_only: false,
                 reflection: true,
+                gi: false,
                 layer_mask: Some(r.layer_mask),
                 lod_distance_scale: r.lod_distance_scale,
             })
         }));
         // then the cascades (`cascade_view`)
         if let Some(csm) = &self.cascaded_shadows {
-            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, reflection: false, layer_mask: None, lod_distance_scale: 1.0 })));
+            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 })));
         }
         // then the sky occlusion's top-down view (`sky_occlusion_view`), while it is being rebuilt
         if let Some(sky) = &self.sky_occlusion {
             let lod_distance_scale = sky.options.lod_distance_scale;
             let layer_mask = Some(sky.options.layer_mask);
-            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, reflection: false, layer_mask, lod_distance_scale }));
+            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, reflection: false, gi: false, layer_mask, lod_distance_scale }));
+        }
+        // then the voxel clipmap's regions (`gi_view`), while they are voxelized
+        if let Some(gi) = &self.voxel_clipmap {
+            views.extend((0..gi.voxelizer().job_slots() as usize).map(|slot| {
+                gi.gi_view(slot).map(|(view_proj, _)| crate::culling::CullView { view_proj, casters_only: false, reflection: false, gi: true, layer_mask: None, lod_distance_scale: 1.0 })
+            }));
         }
         views
     }
@@ -1980,6 +2150,9 @@ impl Renderer {
         }
         if self.sky_occlusion.is_some() {
             kinds.push(CullViewKind::SkyOcclusion);
+        }
+        if let Some(gi) = &self.voxel_clipmap {
+            kinds.extend((0..gi.voxelizer().job_slots()).map(CullViewKind::VoxelGi));
         }
         kinds
     }
@@ -2037,7 +2210,7 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
         for &idx in &culled {
             let r = scene.get_renderable_mut(idx).unwrap();
-            let (world, index_count, casts_shadow, layers) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers);
+            let (world, index_count, casts_shadow, layers, gi_surface) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers, r.gi.is_some());
             // cluster LOD has no occlusion phases yet
             let clustered = r.clusters.is_some();
             let culling = r.instance_culling.as_mut().unwrap();
@@ -2054,7 +2227,7 @@ impl Renderer {
             if culling.two_phase_in(MAIN_VIEW) {
                 self.two_phase.push(idx);
             }
-            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow, layers);
+            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow, layers, gi_surface);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/InstanceCulling").as_ref().map(crate::profiling::PassStamp::compute) });
@@ -2067,7 +2240,7 @@ impl Renderer {
                 culling.dispatch(&mut pass);
                 for (slot, view) in views.iter().enumerate() {
                     let Some(view) = view else { continue };
-                    if !view.draws(r.cast_shadow, r.layers) || culling.two_phase_in(slot) {
+                    if !view.draws(r.cast_shadow, r.layers, r.gi.is_some()) || culling.two_phase_in(slot) {
                         continue;
                     }
                     let draw = culling.view(slot).unwrap();
@@ -2082,7 +2255,7 @@ impl Renderer {
                     for &idx in &self.two_phase_any {
                         let r = scene.get_renderable(idx).unwrap();
                         let culling = r.instance_culling.as_ref().unwrap();
-                        if !culling.two_phase_in(view) || !views[view].is_some_and(|v| v.draws(r.cast_shadow, r.layers)) {
+                        if !culling.two_phase_in(view) || !views[view].is_some_and(|v| v.draws(r.cast_shadow, r.layers, r.gi.is_some())) {
                             continue;
                         }
                         culling.dispatch_early(&mut pass, view);
@@ -2122,6 +2295,9 @@ impl Renderer {
         views[MAIN_VIEW] = Some(main.cull);
         let lods = self.cluster_views(camera, main, target_height);
         debug_assert_eq!(views.len(), lods.len(), "cluster views in cull_views order");
+        // the voxel clipmap's views: a cut there that grew was too small for what it voxelized
+        let gi_views = self.voxel_clipmap.as_ref().map_or(0..0, |gi| self.gi_view(0)..self.gi_view(gi.voxelizer().job_slots() as usize));
+        let mut grown_gi = Vec::new();
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let culling = self.cluster_culling.get_or_insert_with(|| crate::clusters::ClusterCulling::new(device));
@@ -2139,7 +2315,7 @@ impl Renderer {
             let back_faces_culled = !r.is_transparent() && r.material.options.cull_mode == crate::materials::CullMode::Back;
             for (slot, view) in views.iter().enumerate() {
                 let (Some(view), Some(_)) = (view, lods[slot]) else { continue };
-                if !view.draws(r.cast_shadow, r.layers) {
+                if !view.draws(r.cast_shadow, r.layers, r.gi.is_some()) {
                     continue;
                 }
                 let source = match (first, r.instance_culling.as_ref()) {
@@ -2156,6 +2332,9 @@ impl Renderer {
                 let changed = r.clusters.as_mut().unwrap().prepare(device, queue, culling, layout, matrices, slot as u32, source, stride, world, back_faces_culled);
                 // (only the camera's passes record bundles)
                 stale |= changed && slot == MAIN_VIEW;
+                if changed && gi_views.contains(&slot) && !r.dynamic {
+                    grown_gi.push(slot - gi_views.start);
+                }
                 cuts.push((idx, slot));
             }
         }
@@ -2177,6 +2356,11 @@ impl Renderer {
         // (in draw order until now: transparent renderables last, back to front)
         cuts.sort_unstable();
         self.cluster_cuts = cuts;
+        if let Some(gi) = self.voxel_clipmap.as_mut() {
+            for slot in grown_gi {
+                gi.cut_grew(slot);
+            }
+        }
     }
 
     /// Each cull view's cluster view (`cull_views` order, `None` where that has none): its
@@ -2205,6 +2389,17 @@ impl Renderer {
         if let Some(sky) = &self.sky_occlusion {
             let c = sky.camera();
             views.push(sky.cull_view().map(|view_proj| cluster_view(view_proj, c.projection_matrix.to_glam(), c.view_matrix.to_glam(), sky.options.resolution, projection_near(c.projection_matrix.to_glam()), threshold * sky.options.lod_error_scale)));
+        }
+        // the clipmap's regions: orthographic, a pixel a voxel, the cut's errors within its budget
+        // of voxels
+        if let Some(gi) = &self.voxel_clipmap {
+            let budget = gi.options().cluster_error_voxels;
+            views.extend((0..gi.voxelizer().job_slots() as usize).map(|slot| {
+                gi.gi_view(slot).map(|(view_proj, voxel)| {
+                    let centre = view_proj.inverse().transform_point3(glam::Vec3::new(0.0, 0.0, 0.5));
+                    crate::clusters::ClusterViewGpu::new(view_proj, centre, 1.0 / voxel, 0.01, budget, true)
+                })
+            }));
         }
         views
     }
@@ -2528,6 +2723,8 @@ impl Renderer {
         if let Some(sky) = self.sky_occlusion.as_mut() {
             sky.update(self.queue.as_ref().unwrap(), camera);
         }
+        // the voxel clipmap's regions are views the culling serves
+        self.plan_voxel_clipmap(scene, camera);
         self.run_instance_culling(scene, camera, None, self.config.height);
         self.cull_stats.end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), camera.frame());
 
@@ -2620,6 +2817,7 @@ impl Renderer {
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
         self.run_voxel_gi(scene, camera);
+        self.run_voxel_clipmap(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -2863,6 +3061,8 @@ impl Renderer {
         }
         // occlusion needs the GBuffer's single-sampled depth
         let depth_size = (gbuffer.sample_count == 1).then_some((gbuffer.width, gbuffer.height));
+        // the voxel clipmap's regions are views the culling serves
+        self.plan_voxel_clipmap(scene, camera);
         self.run_instance_culling(scene, camera, depth_size, gbuffer.height);
         drop(t);
         let t = crate::profiling::cpu_scope("scene/shadows");
@@ -2944,6 +3144,7 @@ impl Renderer {
         self.run_sky_occlusion_pass(scene);
         // voxel GI: the GI renderables into voxels, lit through this frame's shadow maps
         self.run_voxel_gi(scene, camera);
+        self.run_voxel_clipmap(scene, camera);
 
         // Planar reflections (they sample this frame's shadow maps), shaded with every light,
         // then the light clusters for the camera's passes
@@ -3353,6 +3554,81 @@ fn spot_view(layer: u32) -> usize {
 /// Byte offset of scene child `scene_idx`'s slot in the per-object matrix buffers (group 2's
 /// dynamic offsets). Slots follow the scene index, not the draw order, so a renderable keeps its
 /// slot, and a recorded render bundle its data, whatever else is shown or hidden.
+/// A renderable voxel GI's clipmap draws: its scene index, and its voxelization pipelines for
+/// its mesh and for its cluster cuts (`Renderable::clusters`), whichever it has.
+struct ClipmapDraw<'a> {
+    index: usize,
+    renderable: &'a crate::objects::Renderable,
+    mesh: Option<&'a wgpu::RenderPipeline>,
+    cluster: Option<&'a wgpu::RenderPipeline>,
+}
+
+/// A clipmap voxelization pass: the world box it voxelizes, the voxel size there, and for a
+/// static region its cull view (the renderables' compacted instances and cluster cuts there:
+/// `Renderer::gi_view`, with this frame's `cuts`); None for the dynamic renderables' whole window.
+struct ClipmapPass<'c> {
+    region: (glam::Vec3, glam::Vec3),
+    reach: f32,
+    view: Option<usize>,
+    cuts: &'c [(usize, usize)],
+}
+
+/// Draw the static renderables of `draws` (with `pass_of.view`) or the dynamic ones (without)
+/// into a clipmap voxelization pass, with `group` as group 3:
+/// - a mesh whose world box (`bounds`, None: unknown) misses the region by more than a voxel and
+///   2 % of its own size is skipped;
+/// - in a static region, an instanced renderable draws its instances culled for the region (with
+///   the layout its material reads), and one with cluster LOD its cut there;
+/// - a dynamic one draws its instances as they are, unless culling would change their layout
+///   (crossfades): it is left out.
+#[allow(clippy::too_many_arguments)]
+fn draw_clipmap_voxels<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    draws: &[ClipmapDraw<'a>],
+    bounds: &[Option<(glam::Vec3, glam::Vec3)>],
+    pass_of: &ClipmapPass<'a>,
+    group: &wgpu::BindGroup,
+    voxelizer: &crate::gi::ClipmapVoxelizer,
+    mesh_bg: &wgpu::BindGroup,
+    alignment: u32,
+) {
+    let (region_lo, region_hi) = pass_of.region;
+    let dynamic = pass_of.view.is_none();
+    for (k, d) in draws.iter().enumerate() {
+        let r = d.renderable;
+        if r.dynamic != dynamic {
+            continue;
+        }
+        if let Some((lo, hi)) = bounds[k] {
+            // (a material may sway or bend its vertices a little past the mesh's bounds)
+            let margin = glam::Vec3::splat(pass_of.reach + 0.02 * (hi - lo).length());
+            if (lo - margin).cmpgt(region_hi).any() || (hi + margin).cmplt(region_lo).any() {
+                continue;
+            }
+        }
+        let offset = mesh_offset(d.index, alignment);
+        if let Some(view) = pass_of.view {
+            // its cut for the region, on the cluster path
+            if let Some((cut, pipeline)) = cluster_cut(pass_of.cuts, r, d.index, view).zip(d.cluster) {
+                pass.set_bind_group(3, group, &[voxelizer.draw_offset(k)]);
+                draw_cut(pass, r, cut, pipeline, offset);
+                continue;
+            }
+        } else if r.instance_culling.as_ref().is_some_and(|c| c.culled_stride() != c.stride) {
+            continue;
+        }
+        let Some(pipeline) = d.mesh else { continue };
+        pass.set_pipeline(pipeline);
+        if let Some(bg) = r.material.bind_group() {
+            pass.set_bind_group(0, bg, &[]);
+        }
+        pass.set_bind_group(2, mesh_bg, &[offset, offset]);
+        pass.set_bind_group(3, group, &[voxelizer.draw_offset(k)]);
+        // a static region's view culls the instances; the dynamic window draws them all
+        draw_geometry(pass, r, pass_of.view.filter(|_| r.instance_culling.is_some()).unwrap_or(usize::MAX));
+    }
+}
+
 fn mesh_offset(scene_idx: usize, alignment: u32) -> u32 {
     scene_idx as u32 * alignment
 }

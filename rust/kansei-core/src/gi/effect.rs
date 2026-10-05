@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
 use super::cones::gradient_sky_lighting;
+use super::clipmap::{clipmap_layout_entries, VoxelClipmap, MAX_CLIPMAP_LEVELS};
 use super::volume::{VoxelGiQuality, VoxelVolume};
 use crate::cameras::Camera;
 use crate::postprocessing::effects::{ScreenSpaceGIEffect, ScreenSpaceGIOptions};
@@ -15,6 +16,20 @@ pub(crate) const TRACE_WGSL: &str = concat!(
     include_str!("shaders/voxel_irradiance.wgsl"),
     include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
     include_str!("shaders/screen_trace.wgsl"),
+);
+pub(crate) const CLIPMAP_TRACE_WGSL: &str = concat!(
+    include_str!("shaders/screen_common.wgsl"),
+    include_str!("shaders/screen_normal.wgsl"),
+    include_str!("shaders/clipmap.wgsl"),
+    include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("shaders/clipmap_trace.wgsl"),
+);
+pub(crate) const CLIPMAP_PROBE_TRACE_WGSL: &str = concat!(
+    include_str!("shaders/screen_common.wgsl"),
+    include_str!("shaders/screen_normal.wgsl"),
+    include_str!("../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("shaders/clipmap_probes.wgsl"),
+    include_str!("shaders/clipmap_probe_trace.wgsl"),
 );
 pub(crate) const TEMPORAL_WGSL: &str = concat!(include_str!("shaders/screen_common.wgsl"), include_str!("shaders/screen_temporal.wgsl"));
 pub(crate) const COMPOSITE_WGSL: &str = concat!(
@@ -53,6 +68,12 @@ pub struct VoxelGIOptions {
     /// Strength of the distance field's ambient occlusion on the GI (`set_sdf`; 0: none): the
     /// contact occlusion the coarse cones miss.
     pub sdf_ao: f32,
+    /// With a clipmap (`with_clipmap`): levels finer than they are wide the cones read. Each then
+    /// samples the voxels along its axis sparsely, which sees the sky through gaps narrower than
+    /// the cone (a road between trees, a street between walls) where voxels as wide as the cone
+    /// fill them; the temporal filter averages the samples. 0 reads the levels as wide as the
+    /// cones.
+    pub clipmap_level_bias: f32,
 }
 
 impl Default for VoxelGIOptions {
@@ -67,6 +88,7 @@ impl Default for VoxelGIOptions {
             sky_scale: 1.0,
             near_field: None,
             sdf_ao: 0.0,
+            clipmap_level_bias: 2.0,
         }
     }
 }
@@ -97,7 +119,8 @@ pub(crate) struct VoxelGiParamsGpu {
     sdf_ao: f32,
     sdf_slice: f32,
     has_sdf: u32,
-    _pad: [u32; 3],
+    level_bias: f32,
+    _pad: [u32; 2],
 }
 
 struct Targets {
@@ -126,7 +149,29 @@ struct Gpu {
     no_sdf: wgpu::TextureView,
     /// Bound as the probes without them: the grid, the SH, the state, the depth.
     no_probes: [wgpu::Buffer; 4],
+    /// The passes of a clipmap source, when the effect reads one.
+    clipmap: Option<ClipmapGpu>,
     targets: Option<Targets>,
+}
+
+/// The trace and the voxels' view of a clipmap source (clipmap_trace.wgsl), and the stand-ins the
+/// composite binds for the volume it doesn't read.
+struct ClipmapGpu {
+    trace: wgpu::ComputePipeline,
+    show_voxels: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    no_volume: wgpu::Buffer,
+    /// The trace from the clipmap's probes in place of cones (clipmap_probe_trace.wgsl).
+    probe_trace: wgpu::ComputePipeline,
+    probe_trace_bgl: wgpu::BindGroupLayout,
+}
+
+/// What the effect cone traces.
+enum Source {
+    /// A volume with anisotropic mips (its view, chains, uniform and sampler).
+    Volume { view: wgpu::TextureView, anisotropic: [wgpu::TextureView; 6], uniform: wgpu::Buffer, sampler: wgpu::Sampler },
+    /// A clipmap (its uniform, levels and sampler).
+    Clipmap { uniform: wgpu::Buffer, levels: [wgpu::TextureView; MAX_CLIPMAP_LEVELS], sampler: wgpu::Sampler },
 }
 
 /// Diffuse global illumination on screen from a voxel volume of the scene's light (the
@@ -162,16 +207,17 @@ pub struct VoxelGIEffect {
     /// one is left out (inside geometry), over the scene without its GI. Over the other views.
     pub show_probes: bool,
     pub sdf_ao: f32,
+    /// See `VoxelGIOptions::clipmap_level_bias`.
+    pub clipmap_level_bias: f32,
     /// The sky past the volume without `set_sky_lighting`: scene radiance straight up and down.
     pub sky_gradient: ([f32; 3], [f32; 3]),
     near_field: Option<ScreenSpaceGIEffect>,
-    volume_view: wgpu::TextureView,
-    anisotropic: [wgpu::TextureView; 6],
-    volume_uniform: wgpu::Buffer,
-    volume_sampler: wgpu::Sampler,
+    source: Source,
     sdf: Option<wgpu::TextureView>,
     /// The probes' grid, SH, state and depth buffers (`set_probes`).
     probes: Option<[wgpu::Buffer; 4]>,
+    /// A clipmap's probes' grid and buffer (`set_clipmap_probes`).
+    clipmap_probes: Option<[wgpu::Buffer; 2]>,
     sky_lighting: Option<wgpu::Buffer>,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
@@ -184,6 +230,18 @@ impl VoxelGIEffect {
     /// keeps its own handles to it.
     pub fn new(volume: &VoxelVolume, options: VoxelGIOptions) -> Self {
         let anisotropic = volume.anisotropic_views().expect("VoxelGIEffect reads a volume with anisotropic mips (VoxelVolume::set_anisotropic_mips; SceneVoxelGi's has them)").clone();
+        Self::from_source(Source::Volume { view: volume.view().clone(), anisotropic, uniform: volume.uniform().clone(), sampler: volume.sampler().clone() }, options)
+    }
+
+    /// Read `clipmap` (`SceneVoxelClipmap::clipmap`) instead of a volume: the cones read the
+    /// levels as they read a volume's mips, a distant surface the coarse levels alone. The
+    /// distance field and the probes (`set_sdf`, `set_probes`) are a volume's: ignored here.
+    pub fn with_clipmap(clipmap: &VoxelClipmap, options: VoxelGIOptions) -> Self {
+        let levels = clipmap.level_views().map(|v| v.clone());
+        Self::from_source(Source::Clipmap { uniform: clipmap.uniform().clone(), levels, sampler: clipmap.sampler().clone() }, options)
+    }
+
+    fn from_source(source: Source, options: VoxelGIOptions) -> Self {
         Self {
             enabled: true,
             quality: options.quality,
@@ -198,20 +256,38 @@ impl VoxelGIEffect {
             show_sdf_slice: None,
             show_probes: false,
             sdf_ao: options.sdf_ao,
+            clipmap_level_bias: options.clipmap_level_bias,
             sky_gradient: ([0.0; 3], [0.0; 3]),
             near_field: options.near_field.map(ScreenSpaceGIEffect::new),
-            volume_view: volume.view().clone(),
-            anisotropic,
-            volume_uniform: volume.uniform().clone(),
-            volume_sampler: volume.sampler().clone(),
+            source,
             sdf: None,
             probes: None,
+            clipmap_probes: None,
             sky_lighting: None,
             prev_view_proj: None,
             last_camera_frame: None,
             frame: 0,
             gpu: None,
         }
+    }
+
+    /// Whether it reads a clipmap (`with_clipmap`).
+    pub fn reads_clipmap(&self) -> bool {
+        matches!(self.source, Source::Clipmap { .. })
+    }
+
+    /// Take the far field from a clipmap's irradiance probes (`SceneVoxelClipmap::probes`):
+    /// each pixel's light from the probes round it, in place of cones traced per pixel (whose
+    /// passes are then skipped), still under the near field if there is one; where no probe holds
+    /// a pixel it keeps the material's own sky light. `None` goes back to the cones. Ignored
+    /// without a clipmap (`with_clipmap`).
+    pub fn set_clipmap_probes(&mut self, probes: Option<&super::ClipmapProbes>) {
+        self.clipmap_probes = probes.filter(|_| self.reads_clipmap()).map(|p| [p.grid_buffer().clone(), p.probe_buffer().clone()]);
+    }
+
+    /// Whether the far field comes from a clipmap's probes (`set_clipmap_probes`).
+    pub fn uses_clipmap_probes(&self) -> bool {
+        self.clipmap_probes.is_some()
     }
 
     /// The sky's lighting (`SkyAtmosphereBindings::sky_lighting`): the light past the volume,
@@ -226,7 +302,7 @@ impl VoxelGIEffect {
     /// Read the scene's distance field (`SceneVoxelGi::sdf`, over the same volume) for
     /// `sdf_ao` and `show_sdf_slice`; `None` leaves them off.
     pub fn set_sdf(&mut self, sdf: Option<&super::JumpFloodSdf>) {
-        self.sdf = sdf.map(|s| s.view().clone());
+        self.sdf = sdf.filter(|_| !self.reads_clipmap()).map(|s| s.view().clone());
     }
 
     /// Take the far field from `probes` (`SceneVoxelGi::probes`, over the same volume): each
@@ -234,7 +310,7 @@ impl VoxelGIEffect {
     /// passes are then skipped), still under the near field if there is one. `None` goes back to
     /// the cones.
     pub fn set_probes(&mut self, probes: Option<&super::SdfProbes>) {
-        self.probes = probes.map(|p| [p.grid_buffer().clone(), p.sh_buffer().clone(), p.state_buffer().clone(), p.depth_buffer().clone()]);
+        self.probes = probes.filter(|_| !self.reads_clipmap()).map(|p| [p.grid_buffer().clone(), p.sh_buffer().clone(), p.state_buffer().clone(), p.depth_buffer().clone()]);
     }
 
     /// Whether the far field comes from probes (`set_probes`).
@@ -404,6 +480,25 @@ impl VoxelGIEffect {
                 ("VoxelGI/NoProbeDepth", 16, wgpu::BufferUsages::STORAGE),
             ]
             .map(|(label, size, usage)| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })),
+            clipmap: matches!(self.source, Source::Clipmap { .. }).then(|| {
+                let mut entries = vec![uniform(0), depth(1), texture(2, false, d2), uniform(6), storage(7)];
+                entries.extend(clipmap_layout_entries(compute));
+                let probe_trace_bgl = bgl("VoxelGI/ClipmapProbeTraceBGL", &[uniform(0), depth(1), texture(2, false, d2), uniform(6), storage(7), uniform(60), storage_buffer(61)]);
+                let bgl = bgl("VoxelGI/ClipmapTraceBGL", &entries);
+                ClipmapGpu {
+                    trace: pipeline("VoxelGI/ClipmapTrace", CLIPMAP_TRACE_WGSL, &bgl),
+                    show_voxels: pipeline_at("VoxelGI/ClipmapVoxels", CLIPMAP_TRACE_WGSL, &bgl, "show_voxels"),
+                    probe_trace: pipeline("VoxelGI/ClipmapProbeTrace", CLIPMAP_PROBE_TRACE_WGSL, &probe_trace_bgl),
+                    probe_trace_bgl,
+                    bgl,
+                    no_volume: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("VoxelGI/NoVolume"),
+                        size: std::mem::size_of::<super::volume::VoxelVolumeGpu>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                }
+            }),
             targets: None,
         });
     }
@@ -505,7 +600,8 @@ impl PostProcessingEffect for VoxelGIEffect {
             sdf_ao: if self.sdf.is_some() { self.sdf_ao.clamp(0.0, 1.0) } else { 0.0 },
             sdf_slice: self.show_sdf_slice.unwrap_or(0.0),
             has_sdf: self.sdf.is_some() as u32,
-            _pad: [0; 3],
+            level_bias: self.clipmap_level_bias.max(0.0),
+            _pad: [0; 2],
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         if self.sky_lighting.is_none() {
@@ -523,24 +619,54 @@ impl PostProcessingEffect for VoxelGIEffect {
         };
         let p = || gpu.params.as_entire_binding();
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.gradient_sky);
-        let mut trace_entries: Vec<_> = [
-            p(),
-            tex(depth),
-            tex(&gbuffer.normal_view),
-            self.volume_uniform.as_entire_binding(),
-            tex(&self.volume_view),
-            wgpu::BindingResource::Sampler(&self.volume_sampler),
-            sky.as_entire_binding(),
-            tex(&t.trace),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource })
-        .collect();
-        trace_entries.extend(self.anisotropic.iter().enumerate().map(|(i, view)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(view) }));
+        // the trace through the volume (with its anisotropic chains and distance field) or the
+        // clipmap, and what the composite binds for the volume
         let sdf_view = self.sdf.as_ref().unwrap_or(&gpu.no_sdf);
-        trace_entries.push(wgpu::BindGroupEntry { binding: 46, resource: tex(sdf_view) });
-        let trace = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/TraceBG"), layout: &gpu.trace_bgl, entries: &trace_entries });
+        let (trace, volume) = match &self.source {
+            Source::Volume { view, anisotropic, uniform, sampler } => {
+                let mut trace_entries: Vec<_> = [p(), tex(depth), tex(&gbuffer.normal_view), uniform.as_entire_binding(), tex(view), wgpu::BindingResource::Sampler(sampler), sky.as_entire_binding(), tex(&t.trace)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource })
+                    .collect();
+                trace_entries.extend(anisotropic.iter().enumerate().map(|(i, view)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(view) }));
+                trace_entries.push(wgpu::BindGroupEntry { binding: 46, resource: tex(sdf_view) });
+                let trace = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/TraceBG"), layout: &gpu.trace_bgl, entries: &trace_entries });
+                (trace, (uniform, view, sampler))
+            }
+            Source::Clipmap { uniform, levels, sampler } => {
+                let clipmap = gpu.clipmap.as_ref().unwrap();
+                let entries = |target: &wgpu::TextureView| {
+                    let view = wgpu::BindingResource::TextureView;
+                    let mut entries: Vec<_> = [(0, p()), (1, view(depth)), (2, view(&gbuffer.normal_view)), (6, sky.as_entire_binding()), (7, view(target)), (50, uniform.as_entire_binding()), (57, wgpu::BindingResource::Sampler(sampler))]
+                        .into_iter()
+                        .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource })
+                        .collect();
+                    entries.extend(levels.iter().enumerate().map(|(k, level)| wgpu::BindGroupEntry { binding: 51 + k as u32, resource: view(level) }));
+                    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/ClipmapTraceBG"), layout: &clipmap.bgl, entries: &entries })
+                };
+                if self.show_voxels {
+                    // the clipmap's voxels in place of the lit image
+                    let group = entries(output);
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/ClipmapVoxels"), timestamp_writes: None });
+                    pass.set_pipeline(&clipmap.show_voxels);
+                    pass.set_bind_group(0, &group, &[]);
+                    pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+                    return;
+                }
+                let trace = match &self.clipmap_probes {
+                    // the far field from the probes, in place of the cones
+                    Some([grid, probes]) => {
+                        let view = wgpu::BindingResource::TextureView;
+                        let resources = [(0, p()), (1, view(depth)), (2, view(&gbuffer.normal_view)), (6, sky.as_entire_binding()), (7, view(&t.trace)), (60, grid.as_entire_binding()), (61, probes.as_entire_binding())];
+                        let entries: Vec<_> = resources.into_iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource }).collect();
+                        device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/ClipmapProbeTraceBG"), layout: &clipmap.probe_trace_bgl, entries: &entries })
+                    }
+                    None => entries(&t.trace),
+                };
+                (trace, (&clipmap.no_volume, &gpu.no_sdf, &gpu.sampler))
+            }
+        };
         let temporal = group(
             "VoxelGI/TemporalBG",
             &gpu.temporal_bgl,
@@ -555,15 +681,15 @@ impl PostProcessingEffect for VoxelGIEffect {
                 p(),
                 tex(input),
                 tex(depth),
-                tex(&t.history[current]),
+                tex(if self.clipmap_probes.is_some() { &t.trace } else { &t.history[current] }),
                 tex(near_view),
                 tex(&gbuffer.albedo_view),
                 tex(&gbuffer.normal_view),
                 sky.as_entire_binding(),
                 tex(output),
-                self.volume_uniform.as_entire_binding(),
-                tex(&self.volume_view),
-                wgpu::BindingResource::Sampler(&self.volume_sampler),
+                volume.0.as_entire_binding(),
+                tex(volume.1),
+                wgpu::BindingResource::Sampler(volume.2),
                 tex(sdf_view),
                 probe_buffers[0].as_entire_binding(),
                 probe_buffers[1].as_entire_binding(),
@@ -576,12 +702,19 @@ impl PostProcessingEffect for VoxelGIEffect {
         // voxels and slice views show without them)
         let probes = self.probes.is_some() && !matches!(params.debug, 2 | 3);
         if !probes {
-            pass.set_pipeline(&gpu.trace);
+            pass.set_pipeline(match &gpu.clipmap {
+                Some(clipmap) if self.clipmap_probes.is_some() => &clipmap.probe_trace,
+                Some(clipmap) => &clipmap.trace,
+                None => &gpu.trace,
+            });
             pass.set_bind_group(0, &trace, &[]);
             pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
-            pass.set_pipeline(&gpu.temporal);
-            pass.set_bind_group(0, &temporal, &[]);
-            pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+            // (the probes' light needs no temporal filter: the composite reads the trace)
+            if self.clipmap_probes.is_none() {
+                pass.set_pipeline(&gpu.temporal);
+                pass.set_bind_group(0, &temporal, &[]);
+                pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+            }
         }
         pass.set_pipeline(if probes { &gpu.composite_probes } else { &gpu.composite });
         pass.set_bind_group(0, &composite, &[]);

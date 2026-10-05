@@ -5,7 +5,8 @@
 // lookup, say), and must call it in uniform control flow (it takes derivatives).
 //
 // The voxelizer draws each renderable three times, through its material's own vertex_main, with
-// an orthographic camera along x, y and z over the volume and a pixel per voxel. The target is
+// an orthographic camera along x, y and z over the volume (or a region of a clipmap level's
+// window, whose voxels it stores toroidally) and a pixel per voxel. The target is
 // multisampled, so a fragment runs wherever any sample is covered: close to conservative
 // rasterization, which WebGPU lacks. A fragment's voxel is its position and depth; its normal
 // comes from how its voxel position moves across the screen (exact for a flat triangle under an
@@ -17,21 +18,34 @@
 // normals cancel in the plain average, agree on its axis), after Crassin and Green (OpenGL
 // Insights, ch. 22) on atomicCompareExchangeWeak, since there are no float atomics; and the
 // brightest emission (RGB9E5 under atomicMax, whose shared exponent sits in the high bits).
+// A clipmap's voxels (`words` 5) also sum the surface's area in them, in voxel faces (fixed
+// point, 1/256): each fragment adds its pixel's share of a voxel face (`pixelArea`) over the sum
+// of its normal's components, so the three axes' passes add up to the area once, whatever the
+// surface's tilt. A clipmap's voxelizer draws 2 x 2 pixels a voxel face and no multisampling: a
+// fragment wherever a triangle covers one of four points of the face, as a volume's 4x
+// multisampled target gives, but every fragment once (some devices run a multisampled pass's
+// fragments once per sample) and its derivatives at pixel rate (per sample, they break at
+// triangle edges).
 
 struct KanseiVoxelizeParams {
-    clipToVoxel : mat4x4f,   // this axis' clip space to voxel coordinates (voxel c spans [c, c + 1))
+    clipToVoxel : mat4x4f,   // this axis' clip space to the region's voxel coordinates (voxel c spans [c, c + 1))
     viewDir     : vec3f,     // the direction this axis' camera looks along
-    _pad0       : f32,
+    words       : u32,       // u32 per voxel in the surfaces: 4, or 5 with the area (a clipmap's)
     viewport    : vec2f,     // pixels of this axis' viewport
-    _pad1       : vec2f,
-    dims        : vec3u,
+    pixelArea   : f32,       // the share of a voxel face a pixel covers
+    _pad1       : f32,
+    dims        : vec3u,     // the volume's voxels (a clipmap level's window): voxels wrap around them
     _pad2       : u32,
+    regionLo    : vec3i,     // the region's first voxel, in the volume's lattice (0 for a whole box)
+    _pad3       : u32,
+    regionDims  : vec3u,     // the region's voxels (the volume's, for a whole box)
+    _pad4       : u32,
 }
 
 // the renderable's constant surface (gi::GiSurface), at a dynamic offset per draw
 struct KanseiVoxelDraw {
     albedo   : vec3f,
-    _pad0    : f32,
+    opacity  : f32,     // scales the area it adds (a clipmap's voxels)
     emission : vec3f,   // scene radiance
     _pad1    : f32,
 }
@@ -81,6 +95,14 @@ fn kansei_pack_rgb9e5(c: vec3f) -> u32 {
 // Put a surface into the fragment's voxel: what it reflects (`albedo`) and emits (`emission`,
 // scene radiance). Call it in uniform control flow.
 fn kansei_voxel_write(fragPos: vec4f, front: bool, albedo: vec3f, emission: vec3f) {
+    kansei_voxel_write_coverage(fragPos, front, albedo, emission, 1.0);
+}
+
+// kansei_voxel_write for a fragment whose surface covers `coverage` of it: 1 (as
+// kansei_voxel_write), less for a partly transparent texel, 0 where an alpha-tested surface is
+// cut out, which writes nothing. It weighs the area a clipmap's voxels sum (their opacity). Call
+// it in uniform control flow, whatever the coverage.
+fn kansei_voxel_write_coverage(fragPos: vec4f, front: bool, albedo: vec3f, emission: vec3f, coverage: f32) {
     let ndc = vec2f(fragPos.x / kansei_voxelize.viewport.x * 2.0 - 1.0, 1.0 - fragPos.y / kansei_voxelize.viewport.y * 2.0);
     let h = kansei_voxelize.clipToVoxel * vec4f(ndc, fragPos.z, 1.0);
     let v = h.xyz / h.w;
@@ -90,17 +112,24 @@ fn kansei_voxel_write(fragPos: vec4f, front: bool, albedo: vec3f, emission: vec3
     n = n * inverseSqrt(max(dot(n, n), 1e-20));
     n = select(n, -n, dot(n, kansei_voxelize.viewDir) > 0.0);
     n = select(-n, n, front);
-    let dims = vec3f(kansei_voxelize.dims);
-    if (any(v < vec3f(0.0)) || any(v >= dims)) { return; }
-    let c = vec3u(min(floor(v), dims - 1.0));
+    let region = vec3f(kansei_voxelize.regionDims);
+    if (coverage <= 0.0 || any(v < vec3f(0.0)) || any(v >= region)) { return; }
+    // the region's voxel, in the volume's lattice, stored in its texel (toroidally)
+    let d = vec3i(kansei_voxelize.dims);
+    let c = vec3u((((kansei_voxelize.regionLo + vec3i(min(floor(v), region - 1.0))) % d) + d) % d);
     let idx = (c.z * kansei_voxelize.dims.y + c.y) * kansei_voxelize.dims.x + c.x;
     let a = abs(n);
     let major = select(select(n.z, n.y, a.y >= a.z), n.x, a.x >= a.y && a.x >= a.z);
     let folded = select(n, -n, major < 0.0);
-    kansei_voxel_average(4u * idx, albedo);
-    kansei_voxel_average(4u * idx + 1u, n * 0.5 + 0.5);
-    kansei_voxel_average(4u * idx + 2u, folded * 0.5 + 0.5);
+    let base = kansei_voxelize.words * idx;
+    kansei_voxel_average(base, albedo);
+    kansei_voxel_average(base + 1u, n * 0.5 + 0.5);
+    kansei_voxel_average(base + 2u, folded * 0.5 + 0.5);
     if (any(emission > vec3f(0.0))) {
-        atomicMax(&kansei_voxel_surfaces[4u * idx + 3u], kansei_pack_rgb9e5(emission));
+        atomicMax(&kansei_voxel_surfaces[base + 3u], kansei_pack_rgb9e5(emission));
+    }
+    if (kansei_voxelize.words > 4u) {
+        let area = min(coverage, 1.0) * kansei_voxelize.pixelArea * kansei_voxel_draw.opacity / max(a.x + a.y + a.z, 1.0);
+        atomicAdd(&kansei_voxel_surfaces[base + 4u], u32(round(area * 256.0)));
     }
 }

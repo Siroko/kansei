@@ -24,7 +24,7 @@ struct VoxelGiParams {
     sdfAo        : f32,       // strength of the distance field's AO on the GI (0: none)
     sdfSlice     : f32,       // height of the debug slice, metres
     hasSdf       : u32,
-    _pad2        : u32,
+    levelBias    : f32,       // a clipmap's cones: levels finer than they are wide they read
     _pad0        : u32,
     _pad1        : u32,
 }

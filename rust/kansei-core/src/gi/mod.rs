@@ -28,8 +28,21 @@
 //! distance field of the voxels ([`JumpFloodSdf`]: soft shadows and AO); and irradiance probes
 //! traced in it ([`SdfProbes`], `SceneVoxelGi::enable_probes`), read by materials through
 //! `PROBES_WGSL`.
+//!
+//! Outdoors, one box is either too small or too coarse: [`VoxelClipmap`] holds the light in
+//! nested windows around the camera instead, each twice as coarse as the one before, stored
+//! toroidally so a window that moves rewrites only the slab it moved into. [`SceneVoxelClipmap`]
+//! (`Renderer::enable_voxel_clipmap`) voxelizes the scene into it a region at a time
+//! ([`ClipmapVoxelizer`]) and lights it as `SceneVoxelGi` lights its volume, with shadows from
+//! cones through the clipmap where the shadow maps don't reach; [`VoxelGIEffect::with_clipmap`]
+//! traces it on screen, and `CLIPMAP_WGSL` from any compute pass.
 
 mod aniso;
+mod clipmap;
+mod clipmap_inject;
+mod clipmap_probes;
+mod clipmap_scene;
+mod clipmap_voxelize;
 mod cones;
 mod effect;
 mod inject;
@@ -41,6 +54,13 @@ mod sdf;
 mod volume;
 mod voxelize;
 
+pub use clipmap::{ClipmapLayout, VoxelClipmap, MAX_CLIPMAP_LEVELS};
+pub use clipmap_inject::{ClipmapGiSettings, ConeShadows};
+pub use clipmap_probes::{ClipmapProbeOptions, ClipmapProbes};
+pub(crate) use clipmap_probes::ClipProbeGridGpu;
+pub use clipmap_scene::{SceneVoxelClipmap, SceneVoxelClipmapOptions};
+pub use clipmap_voxelize::{ClipRegion, ClipmapVoxelizer, CLIP_SURFACE_WORDS};
+pub(crate) use clipmap_voxelize::ClipSurfaces;
 pub use cones::{gradient_sky_lighting, ParticleConeSettings, ParticleConeShading, SkyLightingData, PARTICLE_LIGHTING_STRIDE};
 pub use particle_gi::{ParticleGi, ParticleGiOptions, ParticleGiSettings};
 pub use particles::{GiBox, ParticleEmission, ParticleSplatSettings, ParticleVoxelizer, MAX_GI_BOXES};
@@ -95,6 +115,26 @@ pub const VOXEL_VOLUME_WGSL: &str = include_str!("shaders/voxel_volume.wgsl");
 /// left past it (a). Bind `VoxelVolume::view` as `texture_3d<f32>` and `VoxelVolume::sampler`.
 pub const VOXEL_CONES_WGSL: &str = concat!(include_str!("shaders/voxel_volume.wgsl"), include_str!("shaders/voxel_cones.wgsl"));
 
+/// A voxel clipmap for a compute pass (`VoxelClipmap`): the `VoxelClipmap` uniform and the levels
+/// bound in group 0 (binding 50 `VoxelClipmap::uniform`, 51-56 `level_views`, 57 `sampler`);
+/// `clipSample(level, p)`, `clipContains`, `clipLevelAt(p, first, margin)`, `clipVoxelSize`;
+/// `clipConeTrace(origin, dir, n, tanHalf, minDiameter, startDist, maxDist, maxSteps)`, a cone
+/// through the levels (radiance gathered, transmittance left), and `clipIrradiance(sky, skyScale,
+/// origin, n, angle, minDiameter, startDist, maxDist, maxSteps)`, a surface's irradiance from six
+/// cones and the sky past the clipmap (needs `SKY_LIGHTING_WGSL`).
+pub const CLIPMAP_WGSL: &str = include_str!("shaders/clipmap.wgsl");
+
+/// The irradiance probes of a voxel clipmap for a material (`ClipmapProbes`): `ClipProbeGrid`,
+/// `kansei_clipmap_light(p, n)` (the irradiance a surface at world position `p` facing `n`
+/// receives, scene units, and the cosine-weighted share of its hemisphere that sees the sky past
+/// the clipmap; a = -1 where no probe holds `p`) and `kansei_clipmap_sky_visibility(p, n)` (that
+/// share alone, 1 where no probe holds `p`: to dim a material's own sky light by), and
+/// `kansei_clipmap_inscatter(p, viewDir, g)` (the light a medium there scatters toward the camera,
+/// for fog). Declare its
+/// buffers with `ClipmapProbes::bindings_wgsl(group, first)` in the material's own group and bind
+/// them with `ClipmapProbes::bind_group_entries`.
+pub const CLIPMAP_PROBES_WGSL: &str = include_str!("shaders/clipmap_probes.wgsl");
+
 /// `ParticleEmission` and `particleEmission(e, index, velocity)`, to tell which particles glow as
 /// the GI does (it also hands each particle its emission in the lighting buffer).
 pub const PARTICLE_EMISSION_WGSL: &str = include_str!("shaders/particle_emission.wgsl");
@@ -130,6 +170,11 @@ mod tests {
             ("probe update", probes::PROBE_UPDATE_WGSL),
             ("voxel fragment", voxelize::VOXEL_FRAGMENT_WGSL),
             ("inject", inject::INJECT_WGSL),
+            ("clipmap inject", clipmap_inject::CLIPMAP_INJECT_WGSL),
+            ("clipmap clear", include_str!("shaders/clipmap_clear.wgsl")),
+            ("clipmap trace", effect::CLIPMAP_TRACE_WGSL),
+            ("clipmap probe update", clipmap_probes::CLIPMAP_PROBE_UPDATE_WGSL),
+            ("clipmap probe trace", effect::CLIPMAP_PROBE_TRACE_WGSL),
             ("screen trace", effect::TRACE_WGSL),
             ("screen temporal", effect::TEMPORAL_WGSL),
             ("screen composite", effect::COMPOSITE_WGSL),
@@ -151,6 +196,15 @@ mod tests {
             &format!(
                 "{PROBES_WGSL}\n{}\n@fragment fn main(@location(0) p: vec3f) -> @location(0) vec4f {{ return vec4f(kansei_gi_irradiance(p, vec3f(0.0, 1.0, 0.0)), 1.0); }}",
                 SdfProbes::bindings_wgsl(2, 5)
+            ),
+            &mut sizes,
+        );
+        // the clipmap probes' library, as a material uses it
+        validate(
+            "clipmap probes library",
+            &format!(
+                "{CLIPMAP_PROBES_WGSL}\n{}\n@fragment fn main(@location(0) p: vec3f) -> @location(0) vec4f {{ return vec4f(kansei_clipmap_light(p, vec3f(0.0, 1.0, 0.0)).rgb * kansei_clipmap_sky_visibility(p, vec3f(0.0, 1.0, 0.0)), 1.0); }}",
+                ClipmapProbes::bindings_wgsl(2, 5)
             ),
             &mut sizes,
         );
@@ -186,6 +240,10 @@ mod tests {
         assert_eq!(sizes["KanseiVoxelizeParams"], std::mem::size_of::<voxelize::VoxelizeParamsGpu>());
         assert_eq!(sizes["KanseiVoxelDraw"], std::mem::size_of::<voxelize::VoxelDrawGpu>());
         assert_eq!(sizes["InjectParams"], std::mem::size_of::<inject::InjectParamsGpu>());
+        assert_eq!(sizes["VoxelClipmap"], std::mem::size_of::<clipmap::VoxelClipmapGpu>());
+        assert_eq!(sizes["ClipInjectParams"], std::mem::size_of::<clipmap_inject::ClipInjectParamsGpu>());
+        assert_eq!(sizes["ClipProbeGrid"], std::mem::size_of::<clipmap_probes::ClipProbeGridGpu>());
+        assert_eq!(sizes["ClipProbeUpdate"], std::mem::size_of::<clipmap_probes::ClipProbeUpdateGpu>());
         assert_eq!(sizes["VoxelGiParams"], std::mem::size_of::<effect::VoxelGiParamsGpu>());
         assert_eq!(sizes["SdfParams"], std::mem::size_of::<sdf::SdfParamsGpu>());
         assert_eq!(sizes["ProbeGrid"], std::mem::size_of::<probes::ProbeGridGpu>());
