@@ -30,12 +30,13 @@
         import init, {
             start, info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate,
             set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice,
+            set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution,
         } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_preset('best') and so on
-        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice };
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -82,7 +83,7 @@
         }).on('change', custom(() => set_gi(p.gi)));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf', 'probes (debug)': 'probes' } }).on('change', custom(() => set_view(p.view)));
-        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low' } }).on('change', () => set_camera(p.camera));
+        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor' } }).on('change', () => set_camera(p.camera));
         const sdf = pane.addFolder({ title: 'Distance field' });
         sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
         sdf.addBinding(p, 'sdfShadows', { label: 'voxel shadows', options: { 'shadow maps': 'off', 'field where no map': 'fallback', 'field always': 'always' } }).on('change', custom(() => set_sdf_shadows(p.sdfShadows)));
@@ -93,6 +94,15 @@
         scene.addBinding(p, 'animate').on('change', custom(() => set_animate(p.animate)));
         scene.addBinding(p, 'rug').on('change', custom(() => set_rug(p.rug)));
         scene.addBinding(p, 'textured', { label: 'rug voxels textured' }).on('change', custom(() => set_textured(p.textured)));
+        // reflect=1: the polished floor's ray-traced reflections
+        if (s.reflect) {
+            const r = { on: s.reflect.enabled, view: s.reflect.view, rays: s.reflect.grid ? 'grid' : 'voxels', res: s.reflect.res };
+            const folder = pane.addFolder({ title: 'Reflections (ray traced)' });
+            folder.addBinding(r, 'on', { label: 'on' }).on('change', () => set_reflections(r.on));
+            folder.addBinding(r, 'view', { options: { lit: 'lit', 'reflection only': 'reflection', 'mirror image': 'mirror', 'cost (cells + triangles a ray)': 'cost' } }).on('change', () => set_reflection_view(r.view));
+            folder.addBinding(r, 'rays', { options: { 'grid of triangles': 'grid', 'voxel cone only': 'voxels' } }).on('change', () => set_reflection_grid(r.rays === 'grid'));
+            folder.addBinding(r, 'res', { label: 'trace', options: { 'half (2x2)': 'half', 'quarter (4x4)': 'quarter' } }).on('change', () => set_reflection_resolution(r.res));
+        }
         pane.addBinding(p, 'stats', { label: 'stats' }).on('change', () => { set_stats(p.stats); statsEl.hidden = !p.stats; });
 
         statsEl.hidden = !p.stats;
@@ -105,7 +115,9 @@
                 `${(i.triangles / 1000).toFixed(1)}k triangles${i.dragon !== 'off' ? ` (dragon ${i.dragon})` : ''}${i.animate ? ', animated' : ''}\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `voxel GI: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, mips ${i.mips_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
-                `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' + top;
+                `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' +
+                (i.reflect ? `rt grid: ${i.reflect.triangles} triangles, ${i.reflect.references} refs, ${i.reflect.big} big, ${i.reflect.mib} MiB; ${i.reflect.rebuilt ? 'rebuilt' : 'kept'} (${i.reflect.rebuilds}), GPU ${i.rt_ms.toFixed(3)} ms\n` +
+                    `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
         }, 500);
     </script>
 </body>

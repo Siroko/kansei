@@ -10,7 +10,9 @@
 //! The terrain is tiles of a height field; the spruces (17 576) are instanced, culled on the GPU
 //! per view with dithered crossfades between LODs, as a film's forest is: needle-spray cards with
 //! cluster LOD near the camera, cone meshes farther. The clipmap voxelizes them through its own
-//! cull view. See README.md for the URL parameters.
+//! cull view. With `reflect=1` the road is wet and reflects the forest, traced through a grid of
+//! the scene's triangles (`Renderer::enable_rt_grid`, `RtReflectionsEffect`). See README.md for
+//! the URL parameters.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,7 +36,7 @@ use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::shadows::{CascadedShadowOptions, SkyOcclusion, SkyOcclusionOptions, CASCADED_SHADOWS_WGSL, SKY_OCCLUSION_WGSL};
 use kansei_core::buffers::{Sampler, Texture};
-use kansei_core::rt::{RtGridOptions, RtPlacement, RtSurface, SceneRtGridOptions};
+use kansei_core::rt::{RtGridOptions, RtPlacement, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions};
 use kansei_wasm::{flag, now, param, param_or, Canvas, Frame};
 
 /// The road's centre line across the valley: x at z (metres). Kept in step with ROAD_WGSL.
@@ -99,11 +101,12 @@ fn sky_light(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 /// Lambertian surfaces lit by the sun (its cascades) and the sky (AMBIENT_WGSL's `sky_light`),
 /// writing the GBuffer's albedo and normal for the GI. ALBEDO (string replaced) is a function
-/// `surface_albedo(world, n) -> vec3f`; the voxel entry writes the same albedo into the GI's
-/// voxels. Prefixed with AMBIENT_WGSL and its chunks, CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL,
+/// `surface_albedo(world, n) -> vec3f` and `surface_specular(world, n) -> vec2f`, a wet surface's
+/// F0 and roughness (`surface.wet`; 0 when dry) for the ray-traced reflections; the voxel entry
+/// writes the same albedo into the GI's voxels. Prefixed with AMBIENT_WGSL and its chunks, CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL,
 /// VOXEL_WRITE_WGSL and ROAD_WGSL.
 const GROUND_WGSL: &str = r#"
-struct Surface { albedo: vec4<f32>, road: vec4<f32>, rock: vec4<f32> };
+struct Surface { albedo: vec4<f32>, road: vec4<f32>, rock: vec4<f32>, wet: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
@@ -130,7 +133,9 @@ fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let albedo = surface_albedo(in.world, n);
     let sun = kansei_cascades.lightColor * max(dot(n, -kansei_cascades.lightDirection), 0.0) * kansei_sun_shadow(in.world, n, in.clip.xy);
-    return kansei_gbuffer_out(albedo / 3.14159265 * (sun + sky_light(in.world, n)), vec3<f32>(0.0), n, albedo);
+    // a wet surface's reflectance and roughness, for the ray-traced reflections (F0 0: none)
+    let wet = surface_specular(in.world, n);
+    return kansei_gbuffer_out_specular(albedo / 3.14159265 * (sun + sky_light(in.world, n)), vec3<f32>(0.0), n, albedo, wet.x, wet.y);
 }
 
 @fragment
@@ -148,12 +153,23 @@ fn surface_albedo(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let variation = 0.85 + 0.3 * fract(sin(dot(floor(world.xz / 3.0), vec2<f32>(12.9898, 78.233))) * 43758.5453);
     return mix(mix(surface.albedo.rgb * variation, surface.road.rgb, road), surface.rock.rgb, rock);
 }
+
+// wet: the road's bed (`surface.wet.x`, F0) where it is level, the rest by `surface.wet.y`
+fn surface_specular(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+    let road = 1.0 - smoothstep(2.8, 4.0, abs(world.x - road_x(world.z)));
+    let level = smoothstep(0.85, 0.95, n.y);
+    return vec2<f32>(mix(surface.wet.y, surface.wet.x * level, road), surface.wet.z);
+}
 "#;
 
 /// A constant albedo (rocks, the cabin).
 const CONSTANT_ALBEDO_WGSL: &str = r#"
 fn surface_albedo(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return surface.albedo.rgb;
+}
+
+fn surface_specular(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+    return surface.wet.yz;
 }
 "#;
 
@@ -310,6 +326,15 @@ fn kansei_rt_place(record: u32, p: vec3f) -> vec3f {
 }
 "#;
 
+/// Where a spruce card's surface is, for the ray-traced reflections' alpha test (TREE_WGSL's
+/// `covered`): bark on the trunk (u past 1.5), the needle sprays where the needles' alpha is.
+const CARD_COVERED_WGSL: &str = r#"
+fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {
+    if (uv.x > 1.5) { return true; }
+    return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;
+}
+"#;
+
 /// How much of the light the crowns' voxels stop for their area: the meshes are closed cones
 /// standing for needles light passes between.
 const CROWN_OPACITY: f32 = 0.35;
@@ -356,15 +381,16 @@ impl AmbientSources<'_> {
     }
 }
 
-fn ground_material(label: &str, albedo_wgsl: &str, albedo: [f32; 3], ambient: &AmbientSources) -> Material {
+fn ground_material(label: &str, albedo_wgsl: &str, albedo: [f32; 3], ambient: &AmbientSources, wet: [f32; 4]) -> Material {
     let shader = GROUND_WGSL.replace("ALBEDO", albedo_wgsl);
     let code = format!("{}\n{CASCADED_SHADOWS_WGSL}\n{GBUFFER_OUT_WGSL}\n{VOXEL_WRITE_WGSL}\n{ROAD_WGSL}\n{shader}", AmbientSources::wgsl());
     let options = MaterialOptions { mrt_output_count: Some(4), voxel_fragment_entry: Some("voxel_main"), ..Default::default() };
     let mut m = Material::new(label, &code, AmbientSources::bindings(), options);
-    let mut u = [0.0f32; 12];
+    let mut u = [0.0f32; 16];
     for (k, c) in [albedo, ROAD, ROCK].iter().enumerate() {
         u[4 * k..4 * k + 3].copy_from_slice(c);
     }
+    u[12..].copy_from_slice(&wet);
     m.set_uniform_bindable(0, label, &u);
     ambient.bind(&mut m);
     m
@@ -557,6 +583,26 @@ impl View {
     }
 }
 
+/// The reflections' view by name: `lit`, `reflection`, `mirror` or `cost`.
+fn reflection_view(name: &str) -> Option<RtReflectionsView> {
+    match name {
+        "lit" => Some(RtReflectionsView::Lit),
+        "reflection" => Some(RtReflectionsView::Reflection),
+        "mirror" => Some(RtReflectionsView::Mirror),
+        "cost" => Some(RtReflectionsView::Cost),
+        _ => None,
+    }
+}
+
+fn reflection_view_name(view: RtReflectionsView) -> &'static str {
+    match view {
+        RtReflectionsView::Lit => "lit",
+        RtReflectionsView::Reflection => "reflection",
+        RtReflectionsView::Mirror => "mirror",
+        RtReflectionsView::Cost => "cost",
+    }
+}
+
 /// Camera presets: name, target, distance, azimuth and elevation (radians).
 const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 4] = [
     ("road", [6.0, 1.6, -10.0], 9.0, 2.6, 0.05),
@@ -727,6 +773,25 @@ impl State {
         )
     }
 
+    /// The reflections' settings and counters as JSON (null without them).
+    fn reflect_info(&self) -> String {
+        let Some(r) = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtReflectionsEffect>()) else { return "null".into() };
+        let s = r.stats().unwrap_or_default();
+        format!(
+            "{{\"enabled\":{},\"view\":\"{}\",\"res\":\"{}\",\"alpha\":{},\"grid\":{},\"rays\":{},\"hits\":{},\"cells\":{},\"tests\":{},\"max_cost\":{}}}",
+            r.enabled,
+            reflection_view_name(r.view),
+            if r.resolution() == RtTraceResolution::Quarter { "quarter" } else { "half" },
+            r.alpha_test,
+            r.trace_grid,
+            s.rays,
+            s.hits,
+            s.cells,
+            s.tests,
+            s.max_cost
+        )
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_clipmap();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
@@ -735,9 +800,11 @@ impl State {
         let eye = self.camera.position();
         let layout = gi.map(|g| *g.clipmap().layout());
         format!(
-            "{{\"rt\":{},\"rt_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"rt\":{},\"rt_ms\":{:.3},\"reflect\":{},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
             self.rt_info(),
-            sum("Rt/"),
+            sum("Rt/Gather") + sum("Rt/Grid"),
+            self.reflect_info(),
+            sum("Rt/Trace") + sum("Rt/Resolve"),
             self.gi.name(),
             self.view.name(),
             layout.map_or(0, |l| l.levels),
@@ -782,7 +849,15 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // rt=1: a ray tracing grid of the scene's triangles round the camera, 64 x 32 x 64 m of 0.5 m
     // cells, its trees by their cluster cut at a cell of error; rt_cell=<m> (the box stays
     // 64 m across), rt_rebuild=1 rebuilds it every frame
-    let rt = flag("rt", false);
+    // reflect=1: ray-traced reflections on the road, wet (wet=all: everywhere), through the grid
+    let reflect = flag("reflect", false);
+    let rt = flag("rt", false) || reflect;
+    // the wet surfaces' F0 (the road's, the rest's) and roughness, 0 when dry (the default)
+    let wet = match (reflect, param("wet").as_deref()) {
+        (false, _) => [0.0; 4],
+        (true, Some("all")) => [param_or("wet_f0", 0.04), param_or("wet_f0", 0.04), param_or("wet_rough", 0.1), 0.0],
+        (true, _) => [param_or("wet_f0", 0.04), 0.0, param_or("wet_rough", 0.1), 0.0],
+    };
     if rt {
         let cell: f32 = param_or("rt_cell", 0.5);
         let across = (64.0 / cell / 4.0).round() as u32 * 4;
@@ -824,7 +899,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let mut geometry = HeightfieldGeometry::new(min, [min[0] + tile, min[1] + tile], (80, 80), height);
             geometry.label = "Terrain".into();
             triangles += geometry.indices.len() as u64 / 3;
-            let mut r = Renderable::new(geometry, ground_material("Terrain", TERRAIN_ALBEDO_WGSL, GRASS, &ambient)).with_gi(GiSurface::new(GRASS));
+            let mut r = Renderable::new(geometry, ground_material("Terrain", TERRAIN_ALBEDO_WGSL, GRASS, &ambient, wet)).with_gi(GiSurface::new(GRASS));
             r.cast_shadow = true;
             r.rt = rt.then(|| RtSurface::new(GRASS));
             scene.add(SceneNode::Renderable(r));
@@ -836,7 +911,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let side = if hash01(k + 9) > 0.5 { 1.0 } else { -1.0 };
         let x = road_x(z) + side * (5.0 + 3.0 * hash01(k + 2));
         let size = 0.4 + 1.4 * hash01(k + 4).powi(2);
-        let mut rock = Renderable::new(IcosphereGeometry::new(size, 2), ground_material("Rock", CONSTANT_ALBEDO_WGSL, ROCK, &ambient)).with_gi(GiSurface::new(ROCK));
+        let mut rock = Renderable::new(IcosphereGeometry::new(size, 2), ground_material("Rock", CONSTANT_ALBEDO_WGSL, ROCK, &ambient, wet)).with_gi(GiSurface::new(ROCK));
         rock.object.set_position(x, height(x, z) + 0.2 * size, z);
         rock.object.scale = Vec3::new(1.0, 0.6, 1.2);
         rock.object.rotation.y = hash01(k + 6) * 3.0;
@@ -847,7 +922,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let wall = [0.42, 0.18, 0.12];
     let ground = height(cx, cz);
     for (size, offset, albedo) in [([6.0, 3.2, 4.5], [0.0, 1.6, 0.0], wall), ([6.6, 0.3, 5.4], [0.0, 3.5, 0.0], [0.2, 0.2, 0.22])] {
-        let mut part = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), ground_material("Cabin", CONSTANT_ALBEDO_WGSL, albedo, &ambient)).with_gi(GiSurface::new(albedo));
+        let mut part = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), ground_material("Cabin", CONSTANT_ALBEDO_WGSL, albedo, &ambient, wet)).with_gi(GiSurface::new(albedo));
         part.object.set_position(cx + offset[0], ground + offset[1] - 0.3, cz + offset[2]);
         part.object.rotation.y = 0.5;
         part.rt = rt.then(|| RtSurface::new(albedo));
@@ -925,7 +1000,27 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     });
     let mut gi = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), VoxelGIOptions { intensity: param_or("intensity", 1.0), ..Default::default() });
     gi.set_sky_lighting(Some(&sky.bindings().sky_lighting));
-    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(gi), Box::new(AtmosphereEffect::new(&sky))];
+    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(gi)];
+    // the reflections: after the GI (they reflect its light), under the aerial perspective
+    if reflect {
+        let options = RtReflectionsOptions {
+            resolution: if param("rt_res").as_deref() == Some("quarter") { RtTraceResolution::Quarter } else { RtTraceResolution::Half },
+            alpha_test: flag("rt_alpha", true),
+            covered_wgsl: Some(CARD_COVERED_WGSL.into()),
+            ..Default::default()
+        };
+        let mut reflections = RtReflectionsEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), renderer.rt_grid().unwrap().handle(), options);
+        reflections.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        let mut needles = needle_texture();
+        needles.initialize_with_data(renderer.device(), renderer.queue());
+        reflections.set_alpha_texture(needles.view());
+        reflections.view = param("rt_view").and_then(|v| reflection_view(&v)).unwrap_or_default();
+        reflections.heat_scale = exposure_from_ev100_lens(param_or("ev", forest_ev100(elevation)), LENS_ATTENUATION_UE4).recip() * 0.5;
+        reflections.collect_stats = flag("stats", false);
+        reflections.trace_grid = param("rt_trace").as_deref() != Some("voxels");
+        effects.push(Box::new(reflections));
+    }
+    effects.push(Box::new(AtmosphereEffect::new(&sky)));
     // fog=<density>: mist in the valley, lit by the sun through the cascades and by the sky, or by
     // the clipmap's probes in its modes (the light of the sunlit clearing, the sky past the trees)
     let fog_density: f32 = param_or("fog", 0.0);
@@ -1046,4 +1141,45 @@ pub fn set_stats(on: bool) {
         s.renderer.set_profiling(on);
         s.stats = on.then(|| Stats { since: now() * 1000.0, ..Default::default() });
     });
+}
+
+fn with_reflections(f: impl FnOnce(&mut RtReflectionsEffect)) {
+    with_state(|s| {
+        if let Some(r) = s.volume.effect_mut::<RtReflectionsEffect>() {
+            f(r);
+        }
+    });
+}
+
+/// The ray-traced reflections on or off (with `reflect=1`).
+#[wasm_bindgen]
+pub fn set_reflections(on: bool) {
+    with_reflections(|r| {
+        r.enabled = on;
+        r.reset_history();
+    });
+}
+
+/// `lit`, `reflection` (the light they add), `mirror` (what the rays see) or `cost`.
+#[wasm_bindgen]
+pub fn set_reflection_view(name: &str) {
+    with_reflections(|r| r.view = reflection_view(name).unwrap_or_default());
+}
+
+/// The cards' alpha test in the reflections (off: the cards are solid).
+#[wasm_bindgen]
+pub fn set_reflection_alpha(on: bool) {
+    with_reflections(|r| r.alpha_test = on);
+}
+
+/// Trace the grid of triangles, or (off) the voxel cone alone.
+#[wasm_bindgen]
+pub fn set_reflection_grid(on: bool) {
+    with_reflections(|r| r.trace_grid = on);
+}
+
+/// `half` or `quarter`: one pixel of each 2 x 2 or 4 x 4 traced a frame.
+#[wasm_bindgen]
+pub fn set_reflection_resolution(name: &str) {
+    with_reflections(|r| r.set_resolution(if name == "quarter" { RtTraceResolution::Quarter } else { RtTraceResolution::Half }));
 }

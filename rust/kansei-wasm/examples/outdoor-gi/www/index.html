@@ -18,12 +18,12 @@
     <canvas id="kansei"></canvas>
     <pre id="stats" hidden></pre>
     <script type="module">
-        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats } from '../pkg/kansei_wasm_outdoor_gi.js';
+        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution } from '../pkg/kansei_wasm_outdoor_gi.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_gi('off') and so on
-        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats };
+        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -41,6 +41,16 @@
         pane.addBinding(p, 'camera', { options: { road: 'road', clearing: 'clearing', forest: 'forest', high: 'high', 'drive along the road': 'fly' } }).on('change', () => set_camera(p.camera));
         pane.addBinding(p, 'elevation', { label: 'sun elevation', min: -2, max: 40, step: 0.5 }).on('change', () => set_elevation(p.elevation));
         pane.addBinding(p, 'stats', { label: 'stats' }).on('change', () => { set_stats(p.stats); statsEl.hidden = !p.stats; });
+        // reflect=1: the wet road's ray-traced reflections
+        if (s.reflect) {
+            const r = { on: s.reflect.enabled, view: s.reflect.view, rays: s.reflect.grid ? 'grid' : 'voxels', alpha: s.reflect.alpha, res: s.reflect.res };
+            const folder = pane.addFolder({ title: 'Reflections (ray traced)' });
+            folder.addBinding(r, 'on', { label: 'on' }).on('change', () => set_reflections(r.on));
+            folder.addBinding(r, 'view', { options: { lit: 'lit', 'reflection only': 'reflection', 'mirror image': 'mirror', 'cost (cells + triangles a ray)': 'cost' } }).on('change', () => set_reflection_view(r.view));
+            folder.addBinding(r, 'rays', { options: { 'grid of triangles': 'grid', 'voxel cone only': 'voxels' } }).on('change', () => set_reflection_grid(r.rays === 'grid'));
+            folder.addBinding(r, 'alpha', { label: 'cards alpha test' }).on('change', () => set_reflection_alpha(r.alpha));
+            folder.addBinding(r, 'res', { label: 'trace', options: { 'half (2x2)': 'half', 'quarter (4x4)': 'quarter' } }).on('change', () => set_reflection_resolution(r.res));
+        }
 
         statsEl.hidden = !p.stats;
         setInterval(() => {
@@ -52,7 +62,8 @@
                 `${i.trees} spruces, ${(i.triangles / 1e6).toFixed(1)}M triangles in all LODs\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `clipmap: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
-                (i.rt ? `rt grid: ${i.rt.triangles} triangles, ${i.rt.references} refs, ${i.rt.sources} sources, ${i.rt.mib} MiB; ${i.rt.rebuilt ? 'rebuilt' : 'kept'} (${i.rt.rebuilds}), CPU ${i.rt.cpu_ms.toFixed(2)} ms, GPU ${i.rt_ms.toFixed(3)} ms\n` : '') + top;
+                (i.rt ? `rt grid: ${i.rt.triangles} triangles, ${i.rt.references} refs, ${i.rt.sources} sources, ${i.rt.mib} MiB; ${i.rt.rebuilt ? 'rebuilt' : 'kept'} (${i.rt.rebuilds}), CPU ${i.rt.cpu_ms.toFixed(2)} ms, GPU ${i.rt_ms.toFixed(3)} ms\n` : '') +
+                (i.reflect ? `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
         }, 500);
     </script>
 </body>

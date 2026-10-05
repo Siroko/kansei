@@ -14,6 +14,11 @@ materials' own sky light sees no trees.
 - The sun shadows through four cascades out to 160 m.
 - The sky is an atmosphere, with its aerial perspective.
 
+With `reflect=1` the road is wet and reflects the forest: rays traced through a grid of the
+scene's triangles round the camera (64 x 32 x 64 m of 0.5 m cells, the trees by the cut of their
+cluster LOD at a cell of error, their needle sprays alpha-tested), the hits lit by the clipmap,
+the voxel cone past the grid.
+
 The GI modes (`gi=`) compare what lights the shade:
 
 | Mode | What lights the surfaces besides the sun |
@@ -53,6 +58,9 @@ Engine API:
 - `Renderer::enable_rt_grid` (`SceneRtGridOptions`), `Renderable::rt` (`RtSurface`) and
   `rt_placement` (`RtPlacement::Wgsl`: the spruces' records widen them by their tint, which
   `InstanceTransform` can't say).
+- `RtReflectionsEffect::with_clipmap` (`RtReflectionsOptions::covered_wgsl`: the cards' alpha
+  test, `set_alpha_texture`) and `GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular` (the wet
+  road's F0 and roughness).
 
 | URL parameter | Effect |
 |---|---|
@@ -76,6 +84,13 @@ Engine API:
 | `shadowsteps=<n>` | steps of the voxels' shadow cones (default 48) |
 | `intensity=<scale>` | scale of the light the on-screen GI adds (default 1) |
 | `shadow_far=<metres>` | the cascades' reach (default 160) |
+| `reflect=1` | ray-traced reflections on the wet road (builds the grid: `rt=1`) |
+| `wet=all` | everything wet, not only the road's bed |
+| `wet_f0=<0..1>`, `wet_rough=<0..1>` | the wet surfaces' F0 (default 0.04) and roughness (default 0.1) |
+| `rt_view=lit\|reflection\|mirror\|cost` | the lit image (default), the light the reflections add, what the rays see, their cost (cells and triangles a ray) |
+| `rt_trace=voxels` | reflections from the voxel cone alone (for comparison) |
+| `rt_alpha=0` | the cards solid in the reflections (no alpha test) |
+| `rt_res=quarter` | trace one pixel of each 4 x 4 a frame (default 2 x 2) |
 | `rt=1` | build a ray tracing grid of the scene round the camera (64 x 32 x 64 m): the trees culled for its box and cut at a cell of error, on the GPU; the stats show its triangles and build |
 | `rt_cell=<metres>` | the grid's cells (default 0.5; the box stays 64 m across) |
 | `rt_rebuild=1` | rebuild the grid every frame, not only when its box moves |

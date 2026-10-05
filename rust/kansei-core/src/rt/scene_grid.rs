@@ -93,6 +93,12 @@ impl SceneRtGrid {
         &self.grid
     }
 
+    /// A handle to the grid's buffers for an effect (`RtReflectionsEffect`): it follows them when
+    /// the grid grows.
+    pub fn handle(&self) -> super::RtGridHandle {
+        self.grid.handle()
+    }
+
     /// Rebuild next frame (after changing what the renderer can't see, such as a GPU-written
     /// instance buffer of a renderable that isn't `dynamic`).
     pub fn invalidate(&mut self) {

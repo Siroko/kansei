@@ -12,6 +12,11 @@ through its material's voxel entry); voxel GI with screen-space GI in front for 
 irradiance probes traced in the voxels' distance field in place of the per-pixel cones. The
 distance field can also add AO to the GI and shadow the voxels and the direct light.
 
+With `reflect=1` the floor is polished and reflects the room: rays traced through a grid of the
+room's triangles (96 cells of 4.8 cm each way, rebuilt on the GPU when something in it moves), the
+hits lit by the voxels, the voxel cone past the grid. The dragon goes into the grid as the cut of
+its cluster LOD at a cell of error (the 871k-triangle scan as 29k triangles).
+
 Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`),
 `Renderable::with_gi` (`GiSurface`), `MaterialOptions::voxel_fragment_entry` with
 `gi::VOXEL_WRITE_WGSL`, `SceneVoxelGi::enable_sdf` / `enable_probes` (`SdfProbeOptions`) /
@@ -19,7 +24,10 @@ Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`
 `set_probes`), `ScreenSpaceGIEffect` (`GiQuality`), `gi::SDF_WGSL`, `SpotLight` with
 `lights::SPOT_LIGHTS_WGSL` and `Renderer::enable_spot_shadows`, `materials::GBUFFER_OUT_WGSL`,
 `GLTFLoader::load_glb` / `load_gltf_with_buffers`, `CameraControls::with_mouse_pan`,
-`Renderer::set_profiling` / `take_profile`, `ToneMapEffect`.
+`Renderer::set_profiling` / `take_profile`, `ToneMapEffect`; with `reflect=1`,
+`Renderer::enable_rt_grid` (`SceneRtGridOptions`, a fixed box), `Renderable::rt` (`RtSurface`),
+`ClusterLod` on the dragon, `RtReflectionsEffect::with_volume` and `GBUFFER_OUT_WGSL`'s
+`kansei_gbuffer_out_specular` (the floor's F0 and roughness).
 
 | URL parameter | Effect |
 |---|---|
@@ -31,11 +39,17 @@ Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`
 | `sdf_ao=<0..1>` | strength of the distance field's AO on the GI (default 0) |
 | `sdf_shadows=off\|fallback\|always` | the voxels' shadows through the distance field: never (default), where no shadow map covers them, or always |
 | `shadows=map\|sdf` | the direct light's shadows from the shadow atlas (default) or the distance field |
-| `cam=front\|corner\|low` | starting camera (default front) |
+| `cam=front\|corner\|low\|floor` | starting camera (default front; `floor` looks down onto the floor) |
 | `dragon=1\|full` | add the Stanford dragon: `1` (or `light`) the 19k-triangle `.glb`, `full` the 871k-triangle scan (24 MB) |
 | `animate=1` | the dragon (or, without it, the tall block) turns and slides, revoxelized each frame |
 | `albedo=constant` | the rug's voxels take its mean colour instead of its texture |
 | `rug=off` | no rug |
+| `reflect=1` | the polished floor's ray-traced reflections (turns voxel GI's volume on whatever the `gi` mode) |
+| `floor_f0=<0..1>`, `floor_rough=<0..1>` | the floor's F0 (default 0.3) and roughness (default 0.05) |
+| `rt_view=lit\|reflection\|mirror\|cost` | the lit image (default), the light the reflections add, what the rays see, their cost (cells and triangles a ray) |
+| `rt_trace=voxels` | reflections from the voxel cone alone (for comparison) |
+| `rt_res=quarter` | trace one pixel of each 4 x 4 a frame (default 2 x 2) |
+| `rt_lod=0` | the dragon into the grid whole, not by its cluster cut (the full scan's graph takes about 4 s to build) |
 | `ui=0` | hide the panel |
 | `stats=1` | overlay: triangles, frame interval and each pass's GPU time |
 | `dpr=<ratio>` | drawing-buffer pixels per CSS pixel (default: the screen's, at most 2) |
