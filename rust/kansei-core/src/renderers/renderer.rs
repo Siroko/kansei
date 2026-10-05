@@ -2477,6 +2477,13 @@ impl Renderer {
         crate::profiling::set_enabled(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), enabled);
     }
 
+    /// End a profiled frame of work recorded without a surface (offscreen tools and tests: the
+    /// surface's frames end their own).
+    #[doc(hidden)]
+    pub fn end_profiled_frame(&self) {
+        crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+    }
+
     /// The frames profiled since the last call, averaged per frame (the GPU's arrive a few frames
     /// late); `FrameProfile::report` formats them.
     pub fn take_profile(&self) -> crate::profiling::FrameProfile {
