@@ -55,6 +55,7 @@ mod volume;
 mod voxelize;
 
 pub use clipmap::{ClipmapLayout, VoxelClipmap, MAX_CLIPMAP_LEVELS};
+pub(crate) use clipmap::clipmap_layout_entries;
 pub use clipmap_inject::{ClipmapGiSettings, ConeShadows};
 pub use clipmap_probes::{ClipmapProbeOptions, ClipmapProbes};
 pub(crate) use clipmap_probes::ClipProbeGridGpu;

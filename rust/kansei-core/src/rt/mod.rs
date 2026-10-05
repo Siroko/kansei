@@ -24,13 +24,18 @@
 //!   [`split_large_triangles`] splits a mesh's big triangles at load.
 //! - [`RT_GRID_WGSL`]'s `kansei_rt_trace` traces it from any compute pass, with the buffers
 //!   `RtGrid::bindings_wgsl` declares.
+//! - [`RtReflectionsEffect`] traces sharp and glossy reflections through it on the surfaces whose
+//!   material writes an F0 (`materials::GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular`), the
+//!   hits lit by the voxel GI (the light leaving the surface there), the voxel cone past it.
 
+mod effect;
 mod grid;
 mod mesh;
 mod scene;
 mod scene_grid;
 
-pub use grid::{RtGrid, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
+pub use effect::{RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
+pub use grid::{RtGrid, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
@@ -104,6 +109,25 @@ mod tests {
             ),
         );
         assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+    }
+
+    #[test]
+    fn shaders_validate_reflections() {
+        let custom = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { if (uv.x > 1.5) { return true; } return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5; }";
+        for clipmap in [true, false] {
+            for covered in [super::effect::trace_wgsl(clipmap, "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { return true; }"), super::effect::trace_wgsl(clipmap, custom)] {
+                let trace = validate(&format!("reflection trace (clipmap {clipmap})"), &covered);
+                assert_eq!(struct_span(&trace, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
+                assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+            }
+        }
+        let resolve = validate("reflection resolve", &super::effect::resolve_wgsl());
+        assert_eq!(struct_span(&resolve, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
+        // the material hook
+        validate(
+            "gbuffer out specular",
+            &format!("{}\n@fragment fn main() -> KanseiGBufferOut {{ return kansei_gbuffer_out_specular(vec3f(1.0), vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.5), 0.04, 0.2); }}", crate::materials::GBUFFER_OUT_WGSL),
+        );
     }
 
     #[test]

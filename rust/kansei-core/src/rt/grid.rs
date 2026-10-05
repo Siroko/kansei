@@ -155,6 +155,30 @@ pub struct RtGridStats {
     pub builds: u64,
 }
 
+/// The buffers a pass traces an `RtGrid` through, which follow the grid when its buffers are made
+/// anew (`RtGrid::handle`): an effect holds one and binds what it holds each frame.
+#[derive(Clone)]
+pub struct RtGridHandle {
+    shared: Arc<std::sync::Mutex<GridBuffers>>,
+}
+
+#[derive(Clone)]
+struct GridBuffers {
+    uniform: wgpu::Buffer,
+    triangles: wgpu::Buffer,
+    cells: wgpu::Buffer,
+    generation: u64,
+}
+
+impl RtGridHandle {
+    /// The buffers of `RtGrid::bindings_wgsl`, in order, and the grid's generation (changed when
+    /// they are made anew).
+    pub fn buffers(&self) -> ([wgpu::Buffer; 3], u64) {
+        let b = self.shared.lock().unwrap();
+        ([b.uniform.clone(), b.triangles.clone(), b.cells.clone()], b.generation)
+    }
+}
+
 /// Where a source's records place its mesh, before the source's `world` matrix.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RtPlacement {
@@ -345,6 +369,7 @@ pub struct RtGrid {
     readback: Readback,
     stats: RtGridStats,
     generation: u64,
+    handle: RtGridHandle,
     /// between `begin` and `finish`: whether this build gathered yet
     gathered: Option<bool>,
 }
@@ -451,6 +476,7 @@ impl RtGrid {
             },
             stats: RtGridStats::default(),
             generation: 0,
+            handle: RtGridHandle { shared: Arc::new(std::sync::Mutex::new(GridBuffers { uniform: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()), triangles: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()), cells: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()), generation: 0 })) },
             gathered: None,
         };
         grid.resize(device, options.triangle_capacity.max(64), options.reference_capacity.max(1024));
@@ -553,6 +579,12 @@ impl RtGrid {
         }
         self.bind_groups = None;
         self.generation += 1;
+        *self.handle.shared.lock().unwrap() = GridBuffers { uniform: self.uniform.clone(), triangles: self.triangles.clone(), cells: self.cells.clone(), generation: self.generation };
+    }
+
+    /// A handle to the buffers passes trace the grid through, which follows the grid's.
+    pub fn handle(&self) -> RtGridHandle {
+        self.handle.clone()
     }
 
     /// Room for `triangles` this build (call between `begin` and `gather`, when the sources know
