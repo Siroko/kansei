@@ -58,18 +58,24 @@ caller samples its own foliage texture: WebGPU has no bindless textures.
 
 ## 2. The GPU feed
 
-`Renderer::enable_rt_grid(options)`; renderables join with `Renderable::rt` (`RtSurface`: an
-albedo, an optional alpha layer and placement). The grid's box becomes one more cull view, after
-the clipmap's: `InstanceCulling` compacts the instances meeting it (by `rt_lod_range`, the
-camera's bands by default), and a cluster view cuts clustered renderables there, orthographic, at
-`cluster_error_cells` cells of error. The gather then reads, on the GPU:
+`Renderer::enable_rt_grid(SceneRtGridOptions)`; renderables join with `Renderable::rt`
+(`RtSurface`: an albedo, an optional alpha layer) and, when instanced, `Renderable::rt_placement`
+(an `InstanceTransform`, or WGSL for a material whose vertex stage does more: outdoor-gi's spruces
+are widened by their tint). The grid's box becomes one more cull view, after the clipmap's:
+`InstanceCulling` compacts the instances meeting it (by `rt_lod_range`, the camera's bands by
+default), and a cluster view cuts clustered renderables there, orthographic, at
+`cluster_error_cells` cells of error. The gather then reads, on the GPU, each source's count
+(a `prepare` dispatch writes its indirect dispatch):
 
 - a clustered renderable's cut: its draw list of (record, cluster), a workgroup an entry;
 - an instanced renderable's culled records times its mesh;
 - a single mesh, when its world box meets the grid's (a CPU test of one box per renderable).
 
-The scout's 2-2.5 ms of CPU picking instances out of 17 682 goes away, and the cut bounds the
-triangles a cell holds (the 871k dragon traced as 29k triangles).
+It rebuilds when the box moves, when the static renderables in it change (their transform,
+visibility, surface), when a cut it gathered grew, on `invalidate`, and every frame while a
+`dynamic` one is in it. In outdoor-gi (`rt=1`, the road camera, 1080p, this Mac) the grid holds
+21k triangles from 14 sources; a rebuild records in 0.1 ms of CPU (the scout's CPU selection took
+2-2.5 ms) and costs 0.7-1.1 ms of GPU (gather 0.1-0.2, count 0.2-0.4, scan 0.1, fill 0.25-0.35).
 
 ## 3. `RtReflectionsEffect`
 

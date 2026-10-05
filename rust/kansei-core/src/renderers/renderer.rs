@@ -197,6 +197,7 @@ pub struct Renderer {
     voxel_gi: Option<crate::gi::SceneVoxelGi>,
     // Voxel GI of an open scene's meshes, in a clipmap round the camera (`enable_voxel_clipmap`)
     voxel_clipmap: Option<crate::gi::SceneVoxelClipmap>,
+    rt_grid: Option<crate::rt::SceneRtGrid>,
 }
 
 impl Renderer {
@@ -266,6 +267,7 @@ impl Renderer {
             render_scale: 1.0,
             voxel_gi: None,
             voxel_clipmap: None,
+            rt_grid: None,
         }
     }
 
@@ -1641,6 +1643,67 @@ impl Renderer {
         }
     }
 
+    /// A ray tracing grid of the scene's triangles round the camera (`rt::SceneRtGrid`), for
+    /// passes that trace rays through it (`rt::RT_GRID_WGSL`): the renderables with
+    /// `Renderable::rt`, culled for its box and cut by cluster LOD at
+    /// `cluster_error_cells` of error on the GPU, rebuilt after the frame's culling when the box
+    /// moves or what it holds changes. Calling it again replaces the grid.
+    ///
+    /// ```ignore
+    /// renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [128, 64, 128], cell: 0.5, ..Default::default() }, ..Default::default() });
+    /// let grid = renderer.rt_grid().unwrap().grid(); // bind grid.bind_group_entries(first)
+    /// ```
+    pub fn enable_rt_grid(&mut self, options: crate::rt::SceneRtGridOptions) {
+        self.rt_grid = Some(crate::rt::SceneRtGrid::new(self.device.as_ref().unwrap(), options));
+    }
+
+    pub fn disable_rt_grid(&mut self) {
+        self.rt_grid = None;
+    }
+
+    /// The ray tracing grid, once `enable_rt_grid` has been called.
+    pub fn rt_grid(&self) -> Option<&crate::rt::SceneRtGrid> {
+        self.rt_grid.as_ref()
+    }
+
+    pub fn rt_grid_mut(&mut self) -> Option<&mut crate::rt::SceneRtGrid> {
+        self.rt_grid.as_mut()
+    }
+
+    /// Cull view of the ray tracing grid's box, after the voxel clipmap's.
+    fn rt_view(&self) -> usize {
+        self.gi_view(self.voxel_clipmap.as_ref().map_or(0, |gi| gi.voxelizer().job_slots() as usize))
+    }
+
+    /// Plan the ray tracing grid's frame before the culling, whose view its box is: follow the
+    /// camera, and whether to rebuild (the static renderables in it changed, a dynamic one is).
+    fn plan_rt_grid(&mut self, scene: &Scene, camera: &Camera) {
+        let Some(rt) = self.rt_grid.as_mut() else { return };
+        let mut key = Vec::new();
+        let mut any_dynamic = false;
+        for idx in scene.ordered_indices() {
+            let Some(r) = scene.get_renderable(idx) else { continue };
+            let Some(surface) = r.rt.filter(|_| r.visible && r.geometry.initialized) else { continue };
+            if r.dynamic {
+                any_dynamic = true;
+                continue;
+            }
+            key.push(idx as u32);
+            key.extend(r.world_matrix.as_slice().iter().map(|f| f.to_bits()));
+            key.extend(surface.albedo.iter().map(|f| f.to_bits()));
+            key.extend([surface.surface_word(), r.geometry.index_count(), r.geometry.instance_count, r.rt_placement.as_ref().map_or(0, |p| p.wgsl().len() as u32)]);
+        }
+        let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
+        rt.plan(self.device.as_ref().unwrap(), eye, key, any_dynamic);
+    }
+
+    /// The ray tracing grid's rebuild, after the culling (its view's culled instances and cuts).
+    fn run_rt_grid(&mut self, scene: &Scene) {
+        let slot = self.rt_view();
+        let Some(rt) = self.rt_grid.as_mut().filter(|rt| rt.rebuilding()) else { return };
+        rt.build(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), scene, slot);
+    }
+
     /// Voxel GI for an open scene's meshes, in a clipmap round the camera
     /// (`gi::SceneVoxelClipmap`): nested windows of voxels, each twice as coarse as the one
     /// before, following the camera. Every frame, after the shadow maps, the windows move in steps
@@ -2099,11 +2162,11 @@ impl Renderer {
     /// for every layer of the spot shadow atlas (`None` when no light uses it this frame), then
     /// `reflection_view(r)` for every planar reflection, then `cascade_view(c)` for every cascade.
     fn cull_views(&self, camera: &Camera) -> Vec<Option<crate::culling::CullView>> {
-        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 })];
+        let mut views = vec![Some(crate::culling::CullView { view_proj: camera.projection_matrix.to_glam() * camera.view_matrix.to_glam(), casters_only: false, reflection: false, gi: false, rt: false, layer_mask: None, lod_distance_scale: 1.0 })];
         if let Some(atlas) = &self.spot_shadow_atlas {
             views.resize(1 + atlas.layers as usize, None);
             for slot in &self.spot_lights.shadows {
-                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 });
+                views[spot_view(slot.layer)] = Some(crate::culling::CullView { view_proj: slot.projection * slot.view, casters_only: true, reflection: false, gi: false, rt: false, layer_mask: None, lod_distance_scale: 1.0 });
             }
         }
         // then planar reflections (`reflection_view`): the mirrored camera, near plane at the water
@@ -2114,25 +2177,30 @@ impl Renderer {
                 casters_only: false,
                 reflection: true,
                 gi: false,
+                rt: false,
                 layer_mask: Some(r.layer_mask),
                 lod_distance_scale: r.lod_distance_scale,
             })
         }));
         // then the cascades (`cascade_view`)
         if let Some(csm) = &self.cascaded_shadows {
-            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, reflection: false, gi: false, layer_mask: None, lod_distance_scale: 1.0 })));
+            views.extend(csm.slots.iter().map(|s| Some(crate::culling::CullView { view_proj: s.projection * s.view, casters_only: true, reflection: false, gi: false, rt: false, layer_mask: None, lod_distance_scale: 1.0 })));
         }
         // then the sky occlusion's top-down view (`sky_occlusion_view`), while it is being rebuilt
         if let Some(sky) = &self.sky_occlusion {
             let lod_distance_scale = sky.options.lod_distance_scale;
             let layer_mask = Some(sky.options.layer_mask);
-            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, reflection: false, gi: false, layer_mask, lod_distance_scale }));
+            views.push(sky.cull_view().map(|view_proj| crate::culling::CullView { view_proj, casters_only: true, reflection: false, gi: false, rt: false, layer_mask, lod_distance_scale }));
         }
         // then the voxel clipmap's regions (`gi_view`), while they are voxelized
         if let Some(gi) = &self.voxel_clipmap {
             views.extend((0..gi.voxelizer().job_slots() as usize).map(|slot| {
-                gi.gi_view(slot).map(|(view_proj, _)| crate::culling::CullView { view_proj, casters_only: false, reflection: false, gi: true, layer_mask: None, lod_distance_scale: 1.0 })
+                gi.gi_view(slot).map(|(view_proj, _)| crate::culling::CullView { view_proj, casters_only: false, reflection: false, gi: true, rt: false, layer_mask: None, lod_distance_scale: 1.0 })
             }));
+        }
+        // then the ray tracing grid's box (`rt_view`)
+        if let Some(rt) = &self.rt_grid {
+            views.push(Some(crate::culling::CullView { view_proj: rt.cull_view_proj(), casters_only: false, reflection: false, gi: false, rt: true, layer_mask: None, lod_distance_scale: 1.0 }));
         }
         views
     }
@@ -2153,6 +2221,9 @@ impl Renderer {
         }
         if let Some(gi) = &self.voxel_clipmap {
             kinds.extend((0..gi.voxelizer().job_slots()).map(CullViewKind::VoxelGi));
+        }
+        if self.rt_grid.is_some() {
+            kinds.push(CullViewKind::RtGrid);
         }
         kinds
     }
@@ -2210,7 +2281,7 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/InstanceCulling") });
         for &idx in &culled {
             let r = scene.get_renderable_mut(idx).unwrap();
-            let (world, index_count, casts_shadow, layers, gi_surface) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers, r.gi.is_some());
+            let (world, index_count, casts_shadow, layers, gi_surface, rt_surface) = (r.world_matrix.to_glam(), r.geometry.index_count(), r.cast_shadow, r.layers, r.gi.is_some(), r.rt.is_some());
             // cluster LOD has no occlusion phases yet
             let clustered = r.clusters.is_some();
             let culling = r.instance_culling.as_mut().unwrap();
@@ -2227,7 +2298,7 @@ impl Renderer {
             if culling.two_phase_in(MAIN_VIEW) {
                 self.two_phase.push(idx);
             }
-            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow, layers, gi_surface);
+            culling.begin_frame(queue, &mut encoder, world, index_count, casts_shadow, layers, gi_surface, rt_surface);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Renderer/InstanceCulling"), timestamp_writes: crate::profiling::gpu_pass("Renderer/InstanceCulling").as_ref().map(crate::profiling::PassStamp::compute) });
@@ -2240,7 +2311,7 @@ impl Renderer {
                 culling.dispatch(&mut pass);
                 for (slot, view) in views.iter().enumerate() {
                     let Some(view) = view else { continue };
-                    if !view.draws(r.cast_shadow, r.layers, r.gi.is_some()) || culling.two_phase_in(slot) {
+                    if !view.draws(r.cast_shadow, r.layers, r.gi.is_some(), r.rt.is_some()) || culling.two_phase_in(slot) {
                         continue;
                     }
                     let draw = culling.view(slot).unwrap();
@@ -2255,7 +2326,7 @@ impl Renderer {
                     for &idx in &self.two_phase_any {
                         let r = scene.get_renderable(idx).unwrap();
                         let culling = r.instance_culling.as_ref().unwrap();
-                        if !culling.two_phase_in(view) || !views[view].is_some_and(|v| v.draws(r.cast_shadow, r.layers, r.gi.is_some())) {
+                        if !culling.two_phase_in(view) || !views[view].is_some_and(|v| v.draws(r.cast_shadow, r.layers, r.gi.is_some(), r.rt.is_some())) {
                             continue;
                         }
                         culling.dispatch_early(&mut pass, view);
@@ -2298,6 +2369,9 @@ impl Renderer {
         // the voxel clipmap's views: a cut there that grew was too small for what it voxelized
         let gi_views = self.voxel_clipmap.as_ref().map_or(0..0, |gi| self.gi_view(0)..self.gi_view(gi.voxelizer().job_slots() as usize));
         let mut grown_gi = Vec::new();
+        // the ray tracing grid's view: a cut there that grew left clusters out of its build
+        let rt_view = self.rt_grid.as_ref().map(|_| self.rt_view());
+        let mut grown_rt = false;
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let culling = self.cluster_culling.get_or_insert_with(|| crate::clusters::ClusterCulling::new(device));
@@ -2315,7 +2389,7 @@ impl Renderer {
             let back_faces_culled = !r.is_transparent() && r.material.options.cull_mode == crate::materials::CullMode::Back;
             for (slot, view) in views.iter().enumerate() {
                 let (Some(view), Some(_)) = (view, lods[slot]) else { continue };
-                if !view.draws(r.cast_shadow, r.layers, r.gi.is_some()) {
+                if !view.draws(r.cast_shadow, r.layers, r.gi.is_some(), r.rt.is_some()) {
                     continue;
                 }
                 let source = match (first, r.instance_culling.as_ref()) {
@@ -2335,6 +2409,7 @@ impl Renderer {
                 if changed && gi_views.contains(&slot) && !r.dynamic {
                     grown_gi.push(slot - gi_views.start);
                 }
+                grown_rt |= changed && Some(slot) == rt_view;
                 cuts.push((idx, slot));
             }
         }
@@ -2360,6 +2435,9 @@ impl Renderer {
             for slot in grown_gi {
                 gi.cut_grew(slot);
             }
+        }
+        if let (true, Some(rt)) = (grown_rt, self.rt_grid.as_mut()) {
+            rt.cut_grew();
         }
     }
 
@@ -2400,6 +2478,10 @@ impl Renderer {
                     crate::clusters::ClusterViewGpu::new(view_proj, centre, 1.0 / voxel, 0.01, budget, true)
                 })
             }));
+        }
+        // the ray tracing grid's box: orthographic, a pixel a cell
+        if let Some(rt) = &self.rt_grid {
+            views.push(Some(rt.cluster_view()));
         }
         views
     }
@@ -3068,9 +3150,11 @@ impl Renderer {
         }
         // occlusion needs the GBuffer's single-sampled depth
         let depth_size = (gbuffer.sample_count == 1).then_some((gbuffer.width, gbuffer.height));
-        // the voxel clipmap's regions are views the culling serves
+        // the voxel clipmap's regions and the ray tracing grid's box are views the culling serves
         self.plan_voxel_clipmap(scene, camera);
+        self.plan_rt_grid(scene, camera);
         self.run_instance_culling(scene, camera, depth_size, gbuffer.height);
+        self.run_rt_grid(scene);
         drop(t);
         let t = crate::profiling::cpu_scope("scene/shadows");
 

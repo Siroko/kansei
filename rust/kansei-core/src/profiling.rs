@@ -162,7 +162,7 @@ thread_local! {
     static PROFILER: RefCell<Option<Profiler>> = const { RefCell::new(None) };
 }
 
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
         web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())

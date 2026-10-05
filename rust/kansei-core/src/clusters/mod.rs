@@ -48,7 +48,7 @@ mod vertex_stage;
 pub(crate) use vertex_stage::{cluster_vertex_stage, CLUSTER_VERTEX_ENTRY};
 
 pub use gpu::{ClusterLod, InstanceTransform};
-pub(crate) use gpu::{ClusterCulling, ClusterGpu, ClusterViewGpu, Cut, InstanceSource, DRAW_ARGS_BYTES};
+pub(crate) use gpu::{ClusterCulling, ClusterGpu, ClusterViewGpu, Cut, InstanceSource, CLAIMED_WORD, DRAW_ARGS_BYTES};
 
 /// How `ClusterMesh::build` splits and simplifies.
 #[derive(Clone, Copy, Debug)]
