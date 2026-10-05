@@ -50,6 +50,8 @@ pub enum CullViewKind {
     SkyOcclusion,
     /// A region the voxel clipmap voxelizes (`Renderer::enable_voxel_clipmap`), by job slot.
     VoxelGi(u32),
+    /// The ray tracing grid's box (`Renderer::enable_rt_grid`).
+    RtGrid,
 }
 
 /// Instance culling statistics of a recent frame, per view.

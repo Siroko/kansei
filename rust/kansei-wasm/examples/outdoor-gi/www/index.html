@@ -51,7 +51,8 @@
                 `GI ${i.gi} / ${i.view}, ${i.levels} levels of ${i.dims ? i.dims.join('x') : '-'} from ${i.voxel} m (${i.mib} MiB)${i.filling ? ', filling' : ''}\n` +
                 `${i.trees} spruces, ${(i.triangles / 1e6).toFixed(1)}M triangles in all LODs\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
-                `clipmap: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` + top;
+                `clipmap: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
+                (i.rt ? `rt grid: ${i.rt.triangles} triangles, ${i.rt.references} refs, ${i.rt.sources} sources, ${i.rt.mib} MiB; ${i.rt.rebuilt ? 'rebuilt' : 'kept'} (${i.rt.rebuilds}), CPU ${i.rt.cpu_ms.toFixed(2)} ms, GPU ${i.rt_ms.toFixed(3)} ms\n` : '') + top;
         }, 500);
     </script>
 </body>

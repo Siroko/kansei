@@ -58,6 +58,9 @@ pub(crate) struct RtSourceGpu {
     surface: u32,
     albedo: u32,
     source: u32,
+    slot: u32,
+    kind: u32,
+    _pad: [u32; 2],
 }
 
 /// What `RtGrid::new` sets up.
@@ -258,6 +261,39 @@ pub struct RtSource<'a> {
     pub id: u32,
 }
 
+/// A source as the gather runs it: `RtSource`'s, or one the renderer feeds from its culled views.
+pub(crate) struct GatherSource<'a> {
+    pub mesh: GatherMesh<'a>,
+    /// Instance records `stride` bytes each; none: the mesh once.
+    pub records: Option<(&'a wgpu::Buffer, u32)>,
+    pub first_record: u32,
+    pub count: GatherCount<'a>,
+    pub world: Mat4,
+    /// Its `kansei_rt_place` (`RtPlacement::wgsl`).
+    pub placement: String,
+    pub surface: RtSurface,
+    pub id: u32,
+}
+
+/// What a source places.
+pub(crate) enum GatherMesh<'a> {
+    /// An `RtMesh`'s words.
+    Mesh { buffer: &'a wgpu::Buffer, triangles: u32 },
+    /// A cluster LOD cut: the mesh's words (`ClusterMesh::gpu_words`) and the cut's draw list of
+    /// (record, cluster), whose records are absolute (`first_record` is ignored).
+    Clusters { buffer: &'a wgpu::Buffer, draws: &'a wgpu::Buffer },
+}
+
+/// How many records (or draw-list entries) a source has.
+pub(crate) enum GatherCount<'a> {
+    Fixed(u32),
+    /// Word `word` of `args` says, at most `at_most`.
+    Word { args: &'a wgpu::Buffer, word: u32, at_most: u32 },
+}
+
+/// A source's bind group: its mesh, records, count and draw list.
+type SourceKey = (wgpu::Buffer, Option<wgpu::Buffer>, Option<wgpu::Buffer>, Option<wgpu::Buffer>);
+
 struct Readback {
     staging: wgpu::Buffer,
     pending: Option<Arc<AtomicU8>>,
@@ -288,6 +324,11 @@ pub struct RtGrid {
     prepare_bgl: wgpu::BindGroupLayout,
     gather_grid_bgl: wgpu::BindGroupLayout,
     gather_source_bgl: wgpu::BindGroupLayout,
+    gather_prepare_bgl: wgpu::BindGroupLayout,
+    gather_prepare: wgpu::ComputePipeline,
+    /// the sources' indirect dispatches, and the bind group writing them
+    gather_dispatch: wgpu::Buffer,
+    gather_dispatch_group: Option<wgpu::BindGroup>,
     prepare: wgpu::ComputePipeline,
     prepare_wide: wgpu::ComputePipeline,
     count: wgpu::ComputePipeline,
@@ -298,9 +339,9 @@ pub struct RtGrid {
     scan_sums: wgpu::ComputePipeline,
     scan_add: wgpu::ComputePipeline,
     gather_layout: wgpu::PipelineLayout,
-    gather_pipelines: HashMap<String, wgpu::ComputePipeline>,
+    gather_pipelines: HashMap<(String, bool), wgpu::ComputePipeline>,
     bind_groups: Option<(wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup)>,
-    source_groups: HashMap<(wgpu::Buffer, Option<wgpu::Buffer>), wgpu::BindGroup>,
+    source_groups: HashMap<SourceKey, wgpu::BindGroup>,
     readback: Readback,
     stats: RtGridStats,
     generation: u64,
@@ -324,8 +365,9 @@ impl RtGrid {
         let gather_grid_bgl = layout("RtGrid/GatherGrid", &[entry(0, uniform), entry(1, rw), entry(2, rw)]);
         let gather_source_bgl = layout(
             "RtGrid/GatherSource",
-            &[entry(0, buffer(wgpu::BufferBindingType::Uniform, true)), entry(1, ro), entry(2, ro), entry(3, ro)],
+            &[entry(0, buffer(wgpu::BufferBindingType::Uniform, true)), entry(1, ro), entry(2, ro), entry(3, ro), entry(4, ro)],
         );
+        let gather_prepare_bgl = layout("RtGrid/GatherPrepare", &[entry(5, rw)]);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("RtGrid/Build"), source: wgpu::ShaderSource::Wgsl(BUILD_WGSL.into()) });
         let pipeline = |entry_point: &str, bgl: &wgpu::BindGroupLayout| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("RtGrid/Build"), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
@@ -343,6 +385,25 @@ impl RtGrid {
             bind_group_layouts: &[&gather_grid_bgl, &gather_source_bgl],
             push_constant_ranges: &[],
         });
+        let gather_prepare = {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("RtGrid/GatherPrepare"),
+                source: wgpu::ShaderSource::Wgsl(gather_wgsl(&RtPlacement::None.wgsl()).into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("RtGrid/GatherPrepare"),
+                bind_group_layouts: &[&gather_prepare_bgl, &gather_source_bgl],
+                push_constant_ranges: &[],
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("RtGrid/GatherPrepare"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("prepare"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
         let storage = |label, size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | usage, mapped_at_creation: false });
         let mut grid = Self {
             options,
@@ -376,6 +437,10 @@ impl RtGrid {
             prepare_bgl,
             gather_grid_bgl,
             gather_source_bgl,
+            gather_prepare_bgl,
+            gather_prepare,
+            gather_dispatch: storage("RtGrid/GatherDispatch", 16, wgpu::BufferUsages::INDIRECT),
+            gather_dispatch_group: None,
             gather_layout,
             gather_pipelines: HashMap::new(),
             bind_groups: None,
@@ -573,9 +638,10 @@ impl RtGrid {
         }
     }
 
-    /// The gather pipeline for a placement.
-    fn gather_pipeline(&mut self, device: &wgpu::Device, placement: &str) -> wgpu::ComputePipeline {
-        if let Some(p) = self.gather_pipelines.get(placement) {
+    /// The gather pipeline for a placement, of meshes or of cluster cuts.
+    fn gather_pipeline(&mut self, device: &wgpu::Device, placement: &str, clusters: bool) -> wgpu::ComputePipeline {
+        let key = (placement.to_string(), clusters);
+        if let Some(p) = self.gather_pipelines.get(&key) {
             return p.clone();
         }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -586,17 +652,36 @@ impl RtGrid {
             label: Some("RtGrid/Gather"),
             layout: Some(&self.gather_layout),
             module: &module,
-            entry_point: Some("gather"),
+            entry_point: Some(if clusters { "gather_clusters" } else { "gather" }),
             compilation_options: Default::default(),
             cache: None,
         });
-        self.gather_pipelines.insert(placement.to_string(), pipeline.clone());
+        self.gather_pipelines.insert(key, pipeline.clone());
         pipeline
     }
 
     /// Append the triangles of `sources` that meet the box (once a build, between `begin` and
     /// `finish`: their parameters go up in one write, which lands before the frame's work).
     pub fn gather(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, sources: &[RtSource]) {
+        let sources: Vec<GatherSource> = sources
+            .iter()
+            .map(|s| GatherSource {
+                mesh: GatherMesh::Mesh { buffer: s.mesh, triangles: s.triangles },
+                records: s.records,
+                first_record: s.first_record,
+                count: GatherCount::Fixed(s.record_count),
+                world: s.world,
+                placement: s.placement.wgsl(),
+                surface: s.surface,
+                id: s.id,
+            })
+            .collect();
+        self.gather_sources(device, queue, encoder, &sources);
+    }
+
+    /// `gather` for the crate's sources: each source's dispatch sized on the GPU from its count
+    /// (`prepare`), then the gathers, dispatched indirectly.
+    pub(crate) fn gather_sources(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, sources: &[GatherSource]) {
         assert_eq!(self.gathered, Some(false), "RtGrid::gather once a build, between begin and finish");
         self.gathered = Some(true);
         if sources.is_empty() {
@@ -612,52 +697,90 @@ impl RtGrid {
             });
             self.source_groups.clear();
         }
+        if self.gather_dispatch.size() < sources.len() as u64 * 16 {
+            self.gather_dispatch = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("RtGrid/GatherDispatch"),
+                size: (sources.len() as u64 * 16).next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                mapped_at_creation: false,
+            });
+            self.gather_dispatch_group = None;
+        }
         let mut bytes = vec![0u8; needed as usize];
         for (k, s) in sources.iter().enumerate() {
+            let (triangles, kind) = match s.mesh {
+                GatherMesh::Mesh { triangles, .. } => (triangles, 0),
+                GatherMesh::Clusters { .. } => (0, 1),
+            };
+            let (records, count_word) = match s.count {
+                GatherCount::Fixed(n) => (n, NO_WORD),
+                GatherCount::Word { word, at_most, .. } => (at_most, word),
+            };
             let gpu = RtSourceGpu {
                 world: s.world.to_cols_array(),
-                triangles: s.triangles,
+                triangles,
                 stride_words: s.records.map_or(0, |(_, stride)| stride / 4),
                 first_record: s.first_record,
-                records: s.record_count,
-                count_word: NO_WORD,
+                records,
+                count_word,
                 surface: s.surface.surface_word(),
                 albedo: s.surface.albedo_word(),
                 source: (s.id & 0xfff) << 20,
+                slot: k as u32,
+                kind,
+                _pad: [0; 2],
             };
             bytes[k * SOURCE_STRIDE as usize..][..std::mem::size_of::<RtSourceGpu>()].copy_from_slice(bytemuck::bytes_of(&gpu));
         }
         queue.write_buffer(&self.sources, 0, &bytes);
-        let pipelines: Vec<wgpu::ComputePipeline> = sources.iter().map(|s| self.gather_pipeline(device, &s.placement.wgsl())).collect();
-        for s in sources {
-            let key = (s.mesh.clone(), s.records.map(|(r, _)| r.clone()));
-            self.source_groups.entry(key).or_insert_with(|| {
+        let pipelines: Vec<wgpu::ComputePipeline> = sources.iter().map(|s| self.gather_pipeline(device, &s.placement, matches!(s.mesh, GatherMesh::Clusters { .. }))).collect();
+        let keys: Vec<SourceKey> = sources.iter().map(source_key).collect();
+        for (s, key) in sources.iter().zip(&keys) {
+            let (bgl, uniform, empty) = (&self.gather_source_bgl, &self.sources, &self.empty);
+            self.source_groups.entry(key.clone()).or_insert_with(|| {
                 let size = std::num::NonZeroU64::new(std::mem::size_of::<RtSourceGpu>() as u64);
+                let (mesh, draws) = match s.mesh {
+                    GatherMesh::Mesh { buffer, .. } => (buffer, empty),
+                    GatherMesh::Clusters { buffer, draws } => (buffer, draws),
+                };
+                let args = match s.count {
+                    GatherCount::Word { args, .. } => args,
+                    GatherCount::Fixed(_) => empty,
+                };
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("RtGrid/Source"),
-                    layout: &self.gather_source_bgl,
+                    layout: bgl,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.sources, offset: 0, size }) },
-                        wgpu::BindGroupEntry { binding: 1, resource: s.mesh.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: s.records.map_or(&self.empty, |(r, _)| r).as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: self.empty.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: uniform, offset: 0, size }) },
+                        entry(1, mesh),
+                        entry(2, s.records.map_or(empty, |(r, _)| r)),
+                        entry(3, args),
+                        entry(4, draws),
                     ],
                 })
             });
         }
+        if self.gather_dispatch_group.is_none() {
+            self.gather_dispatch_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RtGrid/GatherPrepare"),
+                layout: &self.gather_prepare_bgl,
+                entries: &[entry(5, &self.gather_dispatch)],
+            }));
+        }
         self.ensure_bind_groups(device);
         let gather = &self.bind_groups.as_ref().unwrap().2;
         let mut pass = timed_pass(encoder, "Rt/Gather");
+        pass.set_pipeline(&self.gather_prepare);
+        pass.set_bind_group(0, self.gather_dispatch_group.as_ref().unwrap(), &[]);
+        for (k, key) in keys.iter().enumerate() {
+            pass.set_bind_group(1, &self.source_groups[key], &[(k as u64 * SOURCE_STRIDE) as u32]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
         pass.set_bind_group(0, gather, &[]);
-        for (k, (s, pipeline)) in sources.iter().zip(&pipelines).enumerate() {
-            if s.record_count == 0 || s.triangles == 0 {
-                continue;
-            }
-            let group = &self.source_groups[&(s.mesh.clone(), s.records.map(|(r, _)| r.clone()))];
+        for (k, (key, pipeline)) in keys.iter().zip(&pipelines).enumerate() {
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(1, group, &[(k as u64 * SOURCE_STRIDE) as u32]);
-            let y = s.record_count.min(65535);
-            pass.dispatch_workgroups(s.triangles.div_ceil(64), y, s.record_count.div_ceil(65535));
+            pass.set_bind_group(1, &self.source_groups[key], &[(k as u64 * SOURCE_STRIDE) as u32]);
+            pass.dispatch_workgroups_indirect(&self.gather_dispatch, k as u64 * 16);
         }
     }
 
@@ -718,6 +841,11 @@ impl RtGrid {
         let done = state.clone();
         self.readback.staging.slice(..).map_async(wgpu::MapMode::Read, move |r| done.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release));
         self.readback.pending = Some(state);
+    }
+
+    /// Take a readback that finished into `stats` (`begin` does too).
+    pub fn poll_readback(&mut self, device: &wgpu::Device) {
+        self.collect_readback(device);
     }
 
     /// Take a finished readback into `stats`.
@@ -794,6 +922,19 @@ impl RtGrid {
     pub fn cells_layout_words(&self) -> (u32, u32, u32) {
         self.cells_layout()
     }
+}
+
+/// The buffers of a source's bind group.
+fn source_key(s: &GatherSource) -> SourceKey {
+    let (mesh, draws) = match s.mesh {
+        GatherMesh::Mesh { buffer, .. } => (buffer.clone(), None),
+        GatherMesh::Clusters { buffer, draws } => (buffer.clone(), Some(draws.clone())),
+    };
+    let args = match s.count {
+        GatherCount::Word { args, .. } => Some(args.clone()),
+        GatherCount::Fixed(_) => None,
+    };
+    (mesh, s.records.map(|(r, _)| r.clone()), args, draws)
 }
 
 /// A bind group entry for the whole of `buffer`.

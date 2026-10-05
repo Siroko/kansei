@@ -16,6 +16,10 @@
 //!   workgroup a triangle spanning more than 32 columns of cells, and room-sized ones in a short
 //!   list every ray tests (`big_triangle_cells`). Its buffers grow to what a build needed, read
 //!   back (`read_back`, then `stats`).
+//! - [`SceneRtGrid`] (`Renderer::enable_rt_grid`) is the renderer's grid round the camera, fed on
+//!   the GPU from the renderables with `Renderable::rt`: its box is a cull view, so instances are
+//!   culled for it and cluster LOD cut there at about a cell of error, and the gather reads those
+//!   views' draw lists and records directly.
 //! - [`RtScene`] places meshes ([`RtMesh`]) on the CPU for a grid with no renderer;
 //!   [`split_large_triangles`] splits a mesh's big triangles at load.
 //! - [`RT_GRID_WGSL`]'s `kansei_rt_trace` traces it from any compute pass, with the buffers
@@ -24,10 +28,12 @@
 mod grid;
 mod mesh;
 mod scene;
+mod scene_grid;
 
 pub use grid::{RtGrid, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
+pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
 
 /// Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
 /// `kansei_rt_trace(origin, dir, t_min, t_max, flags)`, the closest hit of a ray among the grid's

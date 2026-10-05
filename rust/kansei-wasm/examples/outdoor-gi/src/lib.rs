@@ -34,6 +34,7 @@ use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::shadows::{CascadedShadowOptions, SkyOcclusion, SkyOcclusionOptions, CASCADED_SHADOWS_WGSL, SKY_OCCLUSION_WGSL};
 use kansei_core::buffers::{Sampler, Texture};
+use kansei_core::rt::{RtGridOptions, RtPlacement, RtSurface, SceneRtGridOptions};
 use kansei_wasm::{flag, now, param, param_or, Canvas, Frame};
 
 /// The road's centre line across the valley: x at z (metres). Kept in step with ROAD_WGSL.
@@ -294,6 +295,20 @@ const CROSSFADE: f32 = 8.0;
 /// How much wider than its height the tree material may make an instance (`place_width`), for
 /// the cards' cluster cull.
 const TREE_STRETCH: f32 = 1.15;
+
+/// Where a spruce's record puts a point of its mesh, as TREE_WGSL's `vertex_main` does (a little
+/// wider or narrower by its tint, which `InstanceTransform` can't say), for the ray tracing grid.
+const TREE_PLACEMENT_WGSL: &str = r#"
+fn kansei_rt_place(record: u32, p: vec3f) -> vec3f {
+    let place = kansei_rt_record_vec4(record, 0u);
+    let extra = kansei_rt_record_vec4(record, 4u);
+    let width = 0.85 + 0.3 * extra.y;
+    let q = p * vec3f(width, 1.0, width) * place.w;
+    let c = cos(extra.x);
+    let s = sin(extra.x);
+    return vec3f(c * q.x + s * q.z, q.y, -s * q.x + c * q.z) + place.xyz;
+}
+"#;
 
 /// How much of the light the crowns' voxels stop for their area: the meshes are closed cones
 /// standing for needles light passes between.
@@ -701,6 +716,17 @@ impl State {
         }
     }
 
+    /// The ray tracing grid's figures as JSON (null without it).
+    fn rt_info(&self) -> String {
+        let Some(rt) = self.renderer.rt_grid() else { return "null".into() };
+        let s = rt.stats();
+        let (lo, hi) = rt.grid().bounds();
+        format!(
+            "{{\"triangles\":{},\"references\":{},\"big\":{},\"sources\":{},\"rebuilt\":{},\"rebuilds\":{},\"cpu_ms\":{:.3},\"mib\":{:.1},\"box\":[[{:.1},{:.1},{:.1}],[{:.1},{:.1},{:.1}]]}}",
+            s.grid.triangles, s.grid.references, s.grid.big_triangles, s.sources, s.rebuilt, s.rebuilds, s.cpu_ms, rt.memory_bytes() as f64 / (1 << 20) as f64, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+        )
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_clipmap();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
@@ -709,7 +735,9 @@ impl State {
         let eye = self.camera.position();
         let layout = gi.map(|g| *g.clipmap().layout());
         format!(
-            "{{\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"rt\":{},\"rt_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            self.rt_info(),
+            sum("Rt/"),
             self.gi.name(),
             self.view.name(),
             layout.map_or(0, |l| l.levels),
@@ -751,6 +779,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     renderer.enable_voxel_clipmap(options);
     // the film's sky occlusion, for comparison: the trees seen from above
     renderer.enable_sky_occlusion(SkyOcclusionOptions { extent_m: 320.0, min_height_m: -10.0, max_height_m: 90.0, volume_size: (128, 32), layer_mask: TREE_LAYER, ..Default::default() });
+    // rt=1: a ray tracing grid of the scene's triangles round the camera, 64 x 32 x 64 m of 0.5 m
+    // cells, its trees by their cluster cut at a cell of error; rt_cell=<m> (the box stays
+    // 64 m across), rt_rebuild=1 rebuilds it every frame
+    let rt = flag("rt", false);
+    if rt {
+        let cell: f32 = param_or("rt_cell", 0.5);
+        let across = (64.0 / cell / 4.0).round() as u32 * 4;
+        renderer.enable_rt_grid(SceneRtGridOptions {
+            grid: RtGridOptions { dims: [across, across / 2, across], cell, below: 0.25, ..Default::default() },
+            cluster_error_cells: 1.0,
+            rebuild_every_frame: flag("rt_rebuild", false),
+        });
+    }
 
     let mut sky = SkyAtmosphere::new(renderer.device(), SkyAtmosphereOptions::default());
     sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0);
@@ -785,6 +826,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             triangles += geometry.indices.len() as u64 / 3;
             let mut r = Renderable::new(geometry, ground_material("Terrain", TERRAIN_ALBEDO_WGSL, GRASS, &ambient)).with_gi(GiSurface::new(GRASS));
             r.cast_shadow = true;
+            r.rt = rt.then(|| RtSurface::new(GRASS));
             scene.add(SceneNode::Renderable(r));
         }
     }
@@ -798,6 +840,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         rock.object.set_position(x, height(x, z) + 0.2 * size, z);
         rock.object.scale = Vec3::new(1.0, 0.6, 1.2);
         rock.object.rotation.y = hash01(k + 6) * 3.0;
+        rock.rt = rt.then(|| RtSurface::new(ROCK));
         scene.add(SceneNode::Renderable(rock));
     }
     let (cx, cz, _) = CLEARING;
@@ -807,6 +850,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let mut part = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), ground_material("Cabin", CONSTANT_ALBEDO_WGSL, albedo, &ambient)).with_gi(GiSurface::new(albedo));
         part.object.set_position(cx + offset[0], ground + offset[1] - 0.3, cz + offset[2]);
         part.object.rotation.y = 0.5;
+        part.rt = rt.then(|| RtSurface::new(albedo));
         scene.add(SceneNode::Renderable(part));
     }
 
@@ -843,6 +887,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let opacity = if clusters.is_some() { 1.0 } else { param_or("crown_opacity", CROWN_OPACITY) };
         let mut r = Renderable::new(InstancedGeometry::new(Geometry::new("Spruce", mesh.vertices, mesh.indices), trees as u32, vec![culled]), tree_material("Spruce", &ambient, clusters.is_some()))
             .with_gi(GiSurface::new(NEEDLES).with_opacity(opacity));
+        // in the ray tracing grid: the cards' sprays cut out by the needles' alpha (layer 0)
+        if rt {
+            let surface = RtSurface::new(NEEDLES);
+            r.rt = Some(if clusters.is_some() { surface.with_alpha_layer(0) } else { surface });
+            r.rt_placement = Some(RtPlacement::Wgsl(TREE_PLACEMENT_WGSL.into()));
+        }
         r.clusters = clusters;
         // the canopy the sky occlusion sees from above (the terrain is not)
         r.layers = Renderable::DEFAULT_LAYERS | TREE_LAYER;

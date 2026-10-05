@@ -50,6 +50,9 @@ Engine API:
 - `VolumetricFogEffect` (`set_clipmap_probes`, `set_sky_occlusion`).
 - `TemporalAAEffect`, `ToneMapEffect`.
 - `Renderer::set_profiling` / `take_profile`.
+- `Renderer::enable_rt_grid` (`SceneRtGridOptions`), `Renderable::rt` (`RtSurface`) and
+  `rt_placement` (`RtPlacement::Wgsl`: the spruces' records widen them by their tint, which
+  `InstanceTransform` can't say).
 
 | URL parameter | Effect |
 |---|---|
@@ -73,6 +76,9 @@ Engine API:
 | `shadowsteps=<n>` | steps of the voxels' shadow cones (default 48) |
 | `intensity=<scale>` | scale of the light the on-screen GI adds (default 1) |
 | `shadow_far=<metres>` | the cascades' reach (default 160) |
+| `rt=1` | build a ray tracing grid of the scene round the camera (64 x 32 x 64 m): the trees culled for its box and cut at a cell of error, on the GPU; the stats show its triangles and build |
+| `rt_cell=<metres>` | the grid's cells (default 0.5; the box stays 64 m across) |
+| `rt_rebuild=1` | rebuild the grid every frame, not only when its box moves |
 | `stats=1` | overlay: the clipmap, triangles, frame interval and each pass's GPU time |
 | `ui=0` | hide the panel |
 | `dpr=<ratio>` | drawing-buffer pixels per CSS pixel (default: the screen's, at most 2) |
