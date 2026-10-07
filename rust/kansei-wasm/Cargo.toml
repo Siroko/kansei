@@ -6,6 +6,7 @@ description = "Kansei engine — web runtime shared by the WASM examples"
 
 [dependencies]
 kansei-core = { path = "../kansei-core" }
+wgpu = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [

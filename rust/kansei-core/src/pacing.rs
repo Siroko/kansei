@@ -822,7 +822,14 @@ mod tests {
         shown: Vec<f64>,
     }
 
-    fn run(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> Run {
+    fn run(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, seen: impl FnMut(f64, u32)) -> Run {
+        run_capped(cadence, start, refresh, seconds, 2, gpu, seen)
+    }
+
+    /// `run` with at most `cap` frames on the GPU before a refresh is held back (the browser's
+    /// two, or a frame loop's own cap, as `kansei_wasm::run`'s, which skips such a refresh: the
+    /// pacer is not asked on it).
+    fn run_capped(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, cap: usize, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> Run {
         let mut in_flight: VecDeque<f64> = VecDeque::new(); // when each frame on the GPU is done
         let mut gpu_free = start;
         let (mut rendered, mut shown) = (Vec::new(), Vec::<f64>::new());
@@ -831,7 +838,7 @@ mod tests {
             while in_flight.front().is_some_and(|&done| done <= t) {
                 in_flight.pop_front();
             }
-            if in_flight.len() >= 2 {
+            if in_flight.len() >= cap {
                 // the browser waits: the next refresh after the oldest frame is done
                 let done = in_flight[0];
                 t = start + ((done - start) / refresh).ceil() * refresh;
@@ -965,6 +972,26 @@ mod tests {
             // cadence)
             let tail: Vec<f64> = frames.into_iter().filter(|&t| t > 42000.0).collect();
             assert!(steady(&tail, divisor as f64 * refresh), "{gpu} ms frames at {:.0} Hz: {tail:?}", 1000.0 / refresh);
+        }
+    }
+
+    #[test]
+    fn a_frame_loop_that_caps_frames_in_flight_renders_the_same_cadence() {
+        // a frame loop that skips refreshes while `cap` frames are on the GPU, without asking the
+        // pacer: at two that is the browser's own hold-back. At one it also hides refreshes the
+        // pacer would have declined (20 ms frames at 60 Hz: the one after each frame), so it may
+        // learn a longer refresh (33 ms, every one) but renders the same steady frames
+        let (r60, r120) = (1000.0 / 60.0, 1000.0 / 120.0);
+        for cap in [1, 2] {
+            for (refresh, gpu, divisor) in [(r60, 12.0, 1), (r60, 20.0, 2), (r120, 12.0, 2), (r120, 20.0, 3), (r120, 6.0, 1), (r120, 30.0, 4)] {
+                let mut cadence = Cadence::new(FramePacerOptions::default());
+                let run = run_capped(&mut cadence, 0.0, refresh, 45.0, cap, |t| if t < 500.0 { 2.0 } else { gpu }, |_, _| {});
+                let tail: Vec<f64> = run.rendered.into_iter().filter(|&t| t > 42000.0).collect();
+                assert!(steady(&tail, divisor as f64 * refresh), "cap {cap}, {gpu} ms frames at {:.0} Hz: {tail:?}", 1000.0 / refresh);
+                if cap == 2 {
+                    assert_eq!(cadence.held(), divisor);
+                }
+            }
         }
     }
 
