@@ -33,13 +33,17 @@ class ShadowMap {
     private _pipeline: GPURenderPipeline | null = null;
     private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
-    // Light VP uniform (group 0)
+    // Shadow passes bind like the Rust engine's depth pipelines: group 0 the renderable's
+    // shadowExtraBG (empty without one), group 1 the light (its "camera"), group 2 the mesh.
+    // Light VP uniform (group 1)
     private _lightVPBuffer: GPUBuffer;
     private _lightVPBGL: GPUBindGroupLayout;
     private _lightVPBG: GPUBindGroup;
 
-    // Own mesh matrix buffers (group 1, same layout as Renderer's shared mesh)
+    // Own mesh matrix buffers (group 2, same layout as Renderer's shared mesh)
     private _meshBGL: GPUBindGroupLayout;
+    private _emptyBGL: GPUBindGroupLayout;
+    private _emptyBG: GPUBindGroup;
     private _worldMatBuf: GPUBuffer | null = null;
     private _normalMatBuf: GPUBuffer | null = null;
     private _meshBG: GPUBindGroup | null = null;
@@ -88,6 +92,10 @@ class ShadowMap {
             layout: this._lightVPBGL,
             entries: [{ binding: 0, resource: { buffer: this._lightVPBuffer } }],
         });
+
+        // Group 0 of the pipelines without a shadowExtraBGL.
+        this._emptyBGL = device.createBindGroupLayout({ label: 'EmptyBGL', entries: [] });
+        this._emptyBG = device.createBindGroup({ layout: this._emptyBGL, entries: [] });
 
         this._meshBGL = device.createBindGroupLayout({
             label: 'ShadowMap/Mesh BGL',
@@ -275,9 +283,9 @@ class ShadowMap {
         if (this._pipeline) return;
 
         const shaderCode = /* wgsl */`
-            @group(0) @binding(0) var<uniform> lightViewProj : mat4x4f;
-            @group(1) @binding(0) var<uniform> normalMatrix  : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix   : mat4x4f;
+            @group(1) @binding(0) var<uniform> lightViewProj : mat4x4f;
+            @group(2) @binding(0) var<uniform> normalMatrix  : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix   : mat4x4f;
 
             @vertex
             fn shadow_vs(
@@ -296,7 +304,7 @@ class ShadowMap {
 
         const pipelineLayout = this._device.createPipelineLayout({
             label: 'ShadowMap/PipelineLayout',
-            bindGroupLayouts: [this._lightVPBGL, this._meshBGL],
+            bindGroupLayouts: [this._emptyBGL, this._lightVPBGL, this._meshBGL],
         });
 
         this._pipeline = this._device.createRenderPipeline({
@@ -328,9 +336,9 @@ class ShadowMap {
         if (pipeline) return pipeline;
 
         const shaderCode = /* wgsl */`
-            @group(0) @binding(0) var<uniform> lightViewProj : mat4x4f;
-            @group(1) @binding(0) var<uniform> normalMatrix  : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix   : mat4x4f;
+            @group(1) @binding(0) var<uniform> lightViewProj : mat4x4f;
+            @group(2) @binding(0) var<uniform> normalMatrix  : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix   : mat4x4f;
 
             ${shadowVertexCode}
 
@@ -351,8 +359,7 @@ class ShadowMap {
             code: shaderCode,
         });
 
-        const layouts: GPUBindGroupLayout[] = [this._lightVPBGL, this._meshBGL];
-        if (extraBGL) layouts.push(extraBGL);
+        const layouts: GPUBindGroupLayout[] = [extraBGL ?? this._emptyBGL, this._lightVPBGL, this._meshBGL];
 
         pipeline = this._device.createRenderPipeline({
             label: 'ShadowMap/CustomPipeline',
@@ -433,7 +440,7 @@ class ShadowMap {
             },
         });
 
-        pass.setBindGroup(0, this._lightVPBG);
+        pass.setBindGroup(1, this._lightVPBG);
 
         let activePipeline: GPURenderPipeline | null = null;
         let currentVertexBuffer: GPUBuffer | null = null;
@@ -464,11 +471,8 @@ class ShadowMap {
             }
 
             const offset = i * alignment;
-            pass.setBindGroup(1, this._meshBG!, [offset, offset]);
-
-            if (obj.shadowExtraBG) {
-                pass.setBindGroup(2, obj.shadowExtraBG);
-            }
+            pass.setBindGroup(2, this._meshBG!, [offset, offset]);
+            pass.setBindGroup(0, obj.shadowVertexCode && obj.shadowExtraBG ? obj.shadowExtraBG : this._emptyBG);
 
             if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                 pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);

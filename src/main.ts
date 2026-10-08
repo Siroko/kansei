@@ -1,5 +1,6 @@
 export { Renderer } from "./renderers/Renderer";
 export type { RendererOptions, RequiredLimits, CompressionSupport } from "./renderers/Renderer";
+export { BindGroupSlot, LIGHT_UNIFORM_BYTES, CAMERA_TEMPORAL_BYTES, MESH_TRANSFORMS_BYTES } from "./renderers/SharedLayouts";
 export { Geometry } from "./buffers/Geometry";
 export { BoxGeometry } from "./geometries/BoxGeometry";
 export { PlaneGeometry } from "./geometries/PlaneGeometry";

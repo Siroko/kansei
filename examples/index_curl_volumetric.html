@@ -251,10 +251,10 @@
       }
 
       @group(0) @binding(0) var<uniform> lp : LightParams;
-      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -281,10 +281,10 @@
 
       @group(0) @binding(0) var<uniform> lp : LightParams;
       @group(0) @binding(3) var<uniform> terrainParams : vec4f; // x: heightScale, y: noiseScale, z: unused, w: unused
-      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
 
       fn getTerrainHeight(xz: vec2f) -> f32 {
         let ns = terrainParams.y;
@@ -412,10 +412,10 @@
 
       @group(0) @binding(0) var<uniform> lp                    : LightParams;
       @group(0) @binding(2) var<storage, read> trailTransforms : array<vec4f>;
-      @group(1) @binding(0) var<uniform> normalMatrix          : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix           : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix            : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix          : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix           : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix            : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix      : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -909,7 +909,7 @@
       const SHADOW_BOX_HALF_Y : f32 = ${trailHalfY};
       const SHADOW_NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
 
-      @group(2) @binding(0) var<storage, read> trailTransforms : array<vec4f>;
+      @group(0) @binding(0) var<storage, read> trailTransforms : array<vec4f>;
 
       fn shadowWorldPos(position : vec4f, instanceIdx : u32) -> vec4f {
         let normY = (position.y + SHADOW_BOX_HALF_Y) / (2.0 * SHADOW_BOX_HALF_Y);

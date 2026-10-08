@@ -11,11 +11,11 @@ struct VertexOut {
 @group(0) @binding(2) var mySampler: sampler;
 @group(0) @binding(3) var<uniform> res:vec4<f32>;
 
-@group(1) @binding(0) var<uniform> modelMatrix:mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+@group(2) @binding(0) var<uniform> modelMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
 
-@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+@group(1) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
 
 @vertex
 fn vertex_main(
