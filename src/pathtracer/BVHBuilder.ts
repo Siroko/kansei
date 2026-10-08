@@ -1023,6 +1023,16 @@ export class BVHBuilder {
     /**
      * Pack all PathTracerMaterials into the GPU material buffer.
      */
+    /** The CPU-packed TLAS instances of the last `buildTLAS` (slots expanded on the GPU are not written here). */
+    public get instanceData(): Float32Array {
+        return this._instanceStaging?.subarray(0, this._totalInstances * BVHBuilder.INSTANCE_STRIDE) ?? new Float32Array(0);
+    }
+
+    /** The packed path tracer materials of the last `updateMaterials`. */
+    public get materialData(): Float32Array {
+        return this._materialStaging?.subarray(0, this.materialCount * PathTracerMaterial.GPU_STRIDE / 4) ?? new Float32Array(0);
+    }
+
     public updateMaterials(scene: Scene): void {
         const objects = scene.getOrderedObjects();
         const materials: PathTracerMaterial[] = [];

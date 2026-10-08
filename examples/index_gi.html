@@ -29,12 +29,17 @@
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
+    import { ToneMapEffect, ToneMapper, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { AreaLight } from '../src/lights/AreaLight'
     import { ShadowMap } from '../src/shadows/ShadowMap'
     import { Float } from '../src/math/Float'
     import { GLTFLoader } from '../src/loaders/GLTFLoader'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+    // ?reference=1 starts in reference mode: camera rays through the BVH, averaged over frames
+    // while nothing moves, shown through ToneMapEffect (the Rust `pathtracer` example's path)
+    const startReference = new URLSearchParams(location.search).get('reference') === '1';
 
     // ── Cornell box dimensions ────────────────────────────────────────────
     const WALL = 10;    // wall size
@@ -280,7 +285,7 @@
       ],
     });
     const sphere = new Renderable(sphereGeo, glassRasterMat);
-    sphere.position.set(0, 1.5, 8);
+    sphere.position.set(0, 4, 8);
     const glassMat = new PathTracerMaterial();
     glassMat.albedo = [1, 1, 1];
     glassMat.roughness = 0.0;
@@ -345,12 +350,33 @@
       rasterDirect: false,
       useReSTIR: false,
       restirMaxHistory: 20,
+      reference: startReference,
     });
 
-    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+    // Reference mode writes HDR radiance: a neutral curve a stop down, as the Rust example. The
+    // hybrid mode tonemaps in its composite, so the tone map runs only in reference mode.
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: ToneMapper.KhronosNeutral,
+      exposureCompensation: -1.0,
+    });
+    tonemap.isActive = () => pathTracerEffect.reference;
+
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect, tonemap]);
 
     // ── Tweakpane ─────────────────────────────────────────────────────────
     const pane = new Pane({ title: 'GI Controls' });
+
+    const refFolder = pane.addFolder({ title: 'Reference' });
+    refFolder.addBinding(pathTracerEffect, 'reference', { label: 'camera rays' }).on('change', (ev) => {
+      sceneParams.animateCube = !ev.value;
+      pane.refresh();
+    });
+    const refInfo = { frames: '0' };
+    const refMonitor = refFolder.addBinding(refInfo, 'frames', { readonly: true, label: 'accumulated' });
+    setInterval(() => { refInfo.frames = String(pathTracerEffect.accumulatedFrames); refMonitor.refresh(); }, 250);
+    refFolder.addButton({ title: 'Reset accumulation' }).on('click', () => pathTracerEffect.resetAccumulation());
+    refFolder.addBinding(tonemap.options, 'exposureCompensation', { min: -4, max: 4, step: 0.1, label: 'exposure (EV)' });
 
     const ptFolder = pane.addFolder({ title: 'Path Tracer' });
     ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
@@ -394,7 +420,8 @@
     alFolder.addBinding(areaLightParams, 'targetY', { min: -10, max: 10, step: 0.1, label: 'target Y' }).on('change', updateTarget);
     alFolder.addBinding(areaLightParams, 'targetZ', { min: -10, max: 10, step: 0.1, label: 'target Z' }).on('change', updateTarget);
 
-    const sceneParams = { animateCube: true };
+    // a moving cube restarts the reference accumulation every frame, so it holds still there
+    const sceneParams = { animateCube: !startReference };
     const sceneFolder = pane.addFolder({ title: 'Scene' });
     sceneFolder.addBinding(sceneParams, 'animateCube', { label: 'Animate Cube' });
 
