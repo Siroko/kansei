@@ -19,9 +19,13 @@
 
 <body>
   <div id="panel">
-    <label>gi <select id="gi"><option>off</option><option>voxel</option></select></label>
+    <label>preset <select id="preset"></select></label>
+    <label>gi <select id="gi"><option>off</option><option>voxel</option><option>probes</option></select></label>
     <label>voxels <select id="voxels"><option>low</option><option>medium</option><option>high</option></select></label>
-    <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option></select></label>
+    <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option><option>sdf</option><option>probes</option></select></label>
+    <label>sdf ao <input type="range" id="sdfAo" min="0" max="1" step="0.05"></label>
+    <label>voxel shadows <select id="sdfShadows"><option>off</option><option>fallback</option><option>always</option></select></label>
+    <label>shadows <select id="shadows"><option>map</option><option>sdf</option></select></label>
     <label>camera <select id="cam"><option>front</option><option>corner</option><option>low</option><option>floor</option></select></label>
     <label>animate <input type="checkbox" id="animate"></label>
     <label>rug texture in voxels <input type="checkbox" id="textured"></label>
@@ -39,13 +43,26 @@
     // voxels take its texture through its material's voxel entry (`albedo=constant`: its mean
     // colour instead).
     //
+    // The voxels' distance field (`SceneVoxelGi.enableSdf`, a jump flood of the voxelized surfaces)
+    // adds AO to the GI (`sdf_ao`), soft shadows to the voxels' light (`sdf_shadows`) and to the
+    // direct light (`shadows=sdf`, the material helper `SDF_WGSL`'s `sdfSurfaceShadow` in place of
+    // the cube shadow); `gi=probes` brings the voxels' light to the screen through irradiance
+    // probes traced in that field (`SceneVoxelGi.enableProbes`, `VoxelGIEffect.setProbes`) instead
+    // of cones per pixel. The Rust example's probes run under SSGI, which the TS engine lacks yet:
+    // here they light the screen alone.
+    //
     // The TS engine has no spot lights yet: the lamp is a point light with a cube shadow inside a
     // fixture open at the bottom (a hard-edged cone of 76 degrees, the Rust spot's outer angle), lit
     // with the falloff the voxel injection uses, so the direct light and the voxels' agree.
     //
-    // URL parameters, as the Rust example's (its voxel modes): gi=off|voxel (default voxel),
-    // voxels=low|medium|high, view=lit|indirect|voxels, cam=front|corner|low|floor, animate=1,
-    // albedo=constant, rug=off, ui=0, profile=1 (each pass's GPU time; examples/profile-hud.js).
+    // URL parameters, as the Rust example's (its voxel, SDF and probe modes; no SSGI, dragon or
+    // reflections): preset=off|voxel|indirect|voxels|phone|sdf|slice|probes|probe-view (applied
+    // first, the other parameters over it), gi=off|voxel|probes (default voxel),
+    // voxels=low|medium|high, view=lit|indirect|voxels|sdf|probes, slice=<metres> (the sdf view's
+    // height, default 0.6), sdf_ao=0..1, sdf_shadows=off|fallback|always, shadows=map|sdf,
+    // cam=front|corner|low|floor, animate=1, albedo=constant, rug=off, ui=0, profile=1 (each
+    // pass's GPU time; examples/profile-hud.js). Any use of the distance field turns voxel GI's
+    // volume on whatever the gi mode.
     // `window.kansei` holds the setters and `info()` for scripted captures.
     import { Canvas, run, param, flag, isPhone } from '../src/web/index'
     import { Camera } from '../src/cameras/Camera'
@@ -64,7 +81,8 @@
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { GBUFFER_OUT_WGSL, SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
-    import { VOXEL_WRITE_WGSL } from '../src/gi/GiWGSL'
+    import { SDF_WGSL, VOXEL_WRITE_WGSL } from '../src/gi/GiWGSL'
+    import { BindingLayouts } from '../src/materials/Binding'
     import { VoxelGiQuality } from '../src/gi/VoxelVolume'
     import { VoxelGIEffect } from '../src/gi/VoxelGIEffect'
     import { FrameTimer } from '../src/pacing/FrameTimer'
@@ -82,11 +100,14 @@
     const LAMP_COLOR = [1.0, 0.92, 0.8];
     // the Rust spot's 1600 cd gives 108 lx on the floor below it; the falloff here keeps 0.46 there
     const LAMP_INTENSITY = 240;
+    // the lamp's radius, for the distance field's soft shadows (the Rust spot's source radius)
+    const LAMP_SOURCE_RADIUS = 0.15;
 
-    // A diffuse surface lit by the lamp (its falloff and cube shadow, as voxel GI's injection
-    // lights the voxels: inject.wgsl), writing the normal and albedo the GI reads (GBuffer targets
-    // 2 and 3, through GBUFFER_OUT_WGSL): its albedo the uniform's colour times, for the rug, a
-    // texture.
+    // A diffuse surface lit by the lamp (its falloff and shadow, as voxel GI's injection lights
+    // the voxels: inject.wgsl), writing the normal and albedo the GI reads (GBuffer targets 2 and
+    // 3, through GBUFFER_OUT_WGSL): its albedo the uniform's colour times, for the rug, a texture.
+    // The shadow is `lamp_visibility`'s: the cube shadow (MAP_SHADOWS_WGSL) or the distance field
+    // (SDF_SHADOWS_WGSL).
     const SURFACE_WGSL = /* wgsl */`
       struct Surface { albedo: vec4<f32>, emission: vec4<f32> };
       @group(0) @binding(0) var<uniform> surface: Surface;
@@ -126,10 +147,30 @@
         let d = LAMP_POSITION - in.world;
         let dist = length(d);
         let falloff = max(1.0 - dist / LAMP_RADIUS, 0.0);
-        let irradiance = LAMP_COLOR * max(dot(n, d / dist), 0.0) * falloff * falloff
-          * kansei_point_shadow(in.world + n * 0.02);   // a little off the surface: no acne at grazing angles
+        let irradiance = LAMP_COLOR * max(dot(n, d / dist), 0.0) * falloff * falloff * lamp_visibility(in.world, n);
         let emission = surface.emission.rgb;
         return kansei_gbuffer_out(base / 3.14159265 * irradiance + emission, emission, n, base);
+      }
+    `;
+    // The lamp's shadow from its cube shadow map.
+    const MAP_SHADOWS_WGSL = /* wgsl */`
+      fn lamp_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+        return kansei_point_shadow(world + n * 0.02);   // a little off the surface: no acne at grazing angles
+      }
+    `;
+    // The same through voxel GI's distance field (SDF_WGSL, the material helper): soft shadows,
+    // sphere-traced in the field, bound at 10-12 of the material's group.
+    const SDF_SHADOWS_WGSL = /* wgsl */`
+      @group(0) @binding(10) var<uniform> gi_volume: VoxelVolume;
+      @group(0) @binding(11) var gi_sdf: texture_3d<f32>;
+      @group(0) @binding(12) var gi_sampler: sampler;
+
+      fn lamp_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+        let p = world + n * gi_volume.voxelSize;
+        let toLamp = LAMP_POSITION - p;
+        // as hard as the lamp's disk makes it, the march stopping short of the lamp
+        let shape = sdfLightShape(gi_volume, ${LAMP_SOURCE_RADIUS.toFixed(2)}, length(toLamp));
+        return sdfSurfaceShadow(gi_volume, gi_sdf, gi_sampler, p, n, normalize(toLamp), shape.x, shape.y);
       }
     `;
     const PLAIN_WGSL = /* wgsl */`
@@ -161,11 +202,23 @@
       buffer: new Float32Array([...albedo, 1, ...emission, 0]),
     });
     const vertexFragment = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
-    const litMaterial = (label, albedo) => new Material(`${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SURFACE_WGSL}\n${PLAIN_WGSL}`, {
-      label,
-      mrtOutputCount: 4,
-      bindings: [{ binding: 0, visibility: vertexFragment, value: surfaceUniform(albedo) }],
-    });
+    // `body` after the GBuffer output and the lamp's shadow, from the cube map or, with `sdf`
+    // (voxel GI's `SceneVoxelGi`, its field enabled), the distance field, with its bindings:
+    // `bindings` plus the field's.
+    function litShader(body, sdf, bindings) {
+      if (!sdf) return [`${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SURFACE_WGSL}\n${MAP_SHADOWS_WGSL}\n${body}`, bindings];
+      const fragment = GPUShaderStage.FRAGMENT;
+      return [`${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SDF_WGSL}\n${SURFACE_WGSL}\n${SDF_SHADOWS_WGSL}\n${body}`, [
+        ...bindings,
+        { binding: 10, visibility: fragment, value: ComputeBuffer.fromExternal(sdf.volume.uniform, 'uniform') },
+        { binding: 11, visibility: fragment, value: sdf.sdf.asTexture(), layout: BindingLayouts.texture3d() },
+        { binding: 12, visibility: fragment, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+      ]];
+    }
+    const litMaterial = (label, albedo, sdf) => {
+      const [code, bindings] = litShader(PLAIN_WGSL, sdf, [{ binding: 0, visibility: vertexFragment, value: surfaceUniform(albedo) }]);
+      return new Material(code, { label, mrtOutputCount: 4, bindings });
+    };
 
     // The rug's two halves (linear albedo), split across its width; its texture orange on the left
     // half, blue on the right, with a thin pale border (the Rust example's bytes, read as unorm).
@@ -187,16 +240,14 @@
     const rugTex = rugTexture();
     const rugSampler = new Sampler('linear', 'linear');
     // `voxelEntry` false voxelizes the rug with its constant `GiSurface` instead
-    const rugMaterial = (voxelEntry) => new Material(`${VOXEL_WRITE_WGSL}\n${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SURFACE_WGSL}\n${TEXTURED_WGSL}`, {
-      label: 'Rug',
-      mrtOutputCount: 4,
-      voxelFragmentEntry: voxelEntry ? 'voxel_main' : undefined,
-      bindings: [
+    const rugMaterial = (voxelEntry, sdf) => {
+      const [code, bindings] = litShader(`${VOXEL_WRITE_WGSL}\n${TEXTURED_WGSL}`, sdf, [
         { binding: 0, visibility: vertexFragment, value: surfaceUniform([1, 1, 1]) },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: rugTex },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: rugSampler },
-      ],
-    });
+      ]);
+      return new Material(code, { label: 'Rug', mrtOutputCount: 4, voxelFragmentEntry: voxelEntry ? 'voxel_main' : undefined, bindings });
+    };
 
     // ── the room ──────────────────────────────────────────────────────────────────────────────
     const scene = new Scene();
@@ -208,11 +259,14 @@
       ['Left', [0.2, 4.4, 4.2], [-2.1, 2.0, -2.1], [0.63, 0.065, 0.05]],
       ['Right', [0.2, 4.4, 4.2], [2.1, 2.0, -2.1], [0.14, 0.45, 0.09]],
     ];
+    // the renderables lit by the lamp, whose materials `shadows` swaps: (renderable, label, albedo)
+    const lit = [];
     for (const [label, size, position, color] of slabs) {
       const slab = new Renderable(new BoxGeometry(...size), litMaterial(label, color));
       slab.position.set(...position);
       slab.gi = { albedo: color };
       scene.add(slab);
+      lit.push([slab, label, color]);
     }
     const tallRest = { position: [-0.75, 1.2, -2.6], yaw: 0.33 };
     const tall = new Renderable(new BoxGeometry(1.2, 2.4, 1.2), litMaterial('Tall', white));
@@ -220,11 +274,13 @@
     tall.rotation.y = tallRest.yaw;
     tall.gi = { albedo: white };
     scene.add(tall);
+    lit.push([tall, 'Tall', white]);
     const short = new Renderable(new BoxGeometry(1.2, 1.2, 1.2), litMaterial('Short', white));
     short.position.set(0.8, 0.6, -1.5);
     short.rotation.y = -0.3;
     short.gi = { albedo: white };
     scene.add(short);
+    lit.push([short, 'Short', white]);
     const rugMean = [0, 1, 2].map((c) => (RUG_LEFT[c] + RUG_RIGHT[c]) * 0.5);
     const rug = new Renderable(new BoxGeometry(2.4, 0.02, 0.8), rugMaterial(true));
     rug.position.set(0, 0.01, -0.55);
@@ -270,24 +326,72 @@
     }
 
     // ── what the URL and the panel set ────────────────────────────────────────────────────────
+    // The Rust example's presets that the TS engine can show (no SSGI, dragon or reflections yet:
+    // its probe presets run the probes alone here): [name, gi, voxels, view, sdf ao, voxel
+    // shadows, direct shadows from the field].
+    const PRESETS = [
+      ['off', 'off', null, 'lit', 0, 'off', false],
+      ['voxel', 'voxel', null, 'lit', 0, 'off', false],
+      ['indirect', 'voxel', null, 'indirect', 0, 'off', false],
+      ['voxels', 'voxel', null, 'voxels', 0, 'off', false],
+      ['phone', 'voxel', 'low', 'lit', 0, 'off', false],
+      // the distance field: its AO on the GI and soft shadows for the voxels and the direct light
+      ['sdf', 'voxel', null, 'lit', 0.8, 'always', true],
+      ['slice', 'voxel', null, 'sdf', 0, 'off', false],
+      // irradiance probes traced in the distance field
+      ['probes', 'probes', null, 'lit', 0, 'off', false],
+      ['probe-view', 'probes', null, 'probes', 0, 'off', false],
+    ];
+    const GI_MODES = ['off', 'voxel', 'probes'];
+    const VIEWS = ['lit', 'indirect', 'voxels', 'sdf', 'probes'];
+    const SDF_SHADOWS = ['off', 'fallback', 'always'];
+    const defaultVoxels = phone ? 'low' : 'medium';
     const config = {
-      gi: param('gi') === 'off' ? 'off' : 'voxel',
-      voxels: VoxelGiQuality.fromName(param('voxels')) ?? (phone ? 'low' : 'medium'),
-      view: ['lit', 'indirect', 'voxels'].includes(param('view')) ? param('view') : 'lit',
+      preset: 'voxel',
+      gi: 'voxel',
+      voxels: defaultVoxels,
+      view: 'lit',
+      sdfAo: 0,
+      sdfShadows: 'off',
+      shadows: 'map',
+      slice: 0.6,
       cam: 'front',
       animate: flag('animate', false),
       textured: param('albedo') !== 'constant',
       rug: param('rug') !== 'off',
     };
+    // `config` with preset `name` applied (unknown names change nothing)
+    function applyPreset(name) {
+      const p = PRESETS.find(([n]) => n === name);
+      if (!p) return;
+      const [, gi, voxels, view, sdfAo, sdfShadows, directSdf] = p;
+      Object.assign(config, { preset: name, gi, voxels: voxels ?? defaultVoxels, view, sdfAo, sdfShadows, shadows: directSdf ? 'sdf' : 'map' });
+    }
+    // the URL's preset, then its other parameters over it
+    applyPreset(param('preset') ?? 'voxel');
+    if (GI_MODES.includes(param('gi'))) config.gi = param('gi');
+    config.voxels = VoxelGiQuality.fromName(param('voxels')) ?? config.voxels;
+    if (VIEWS.includes(param('view'))) config.view = param('view');
+    if (param('sdf_ao') !== null && Number.isFinite(parseFloat(param('sdf_ao')))) config.sdfAo = Math.min(Math.max(parseFloat(param('sdf_ao')), 0), 1);
+    if (SDF_SHADOWS.includes(param('sdf_shadows'))) config.sdfShadows = param('sdf_shadows');
+    if (param('shadows') !== null) config.shadows = param('shadows') === 'sdf' ? 'sdf' : 'map';
+    if (param('slice') !== null && Number.isFinite(parseFloat(param('slice')))) config.slice = parseFloat(param('slice'));
     setCamera(param('cam') ?? 'front');
+
+    // Whether anything reads the probes, the distance field, the voxels.
+    const needsProbes = () => config.gi === 'probes' || config.view === 'probes';
+    const needsSdf = () => config.sdfAo > 0 || config.sdfShadows !== 'off' || config.view === 'sdf' || config.shadows === 'sdf' || needsProbes();
+    const needsVoxels = () => config.gi !== 'off' || needsSdf();
 
     const volume = new PostProcessingVolume(renderer, []);
     let enabledVoxels = null;
     let textured = true;
+    // the field the lit materials are shadowed through (null: the cube map)
+    let materialsSdf = null;
 
     // Bring the renderer, the chain and the scene to `config`.
     function apply() {
-      if (config.gi === 'voxel') {
+      if (needsVoxels()) {
         if (enabledVoxels !== config.voxels) {
           renderer.enableVoxelGI({
             quality: config.voxels,
@@ -301,25 +405,46 @@
         renderer.disableVoxelGI();
         enabledVoxels = null;
       }
-      volume.clearEffects();
-      const indirect = config.view === 'indirect';
       const gi = renderer.voxelGI;
       if (gi) {
-        const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality });
+        if (needsSdf()) gi.enableSdf();
+        else gi.disableSdf();
+        gi.settings.sdfShadows = config.sdfShadows;
+        // a probe every 8 voxels; phones update a quarter of them a frame
+        if (needsProbes()) gi.enableProbes({ probesPerFrame: phone ? 256 : 0 });
+        else gi.disableProbes();
+      }
+      volume.clearEffects();
+      const indirect = config.view === 'indirect';
+      // (the slice view shows through voxel GI's effect whatever the mode)
+      const effectOn = gi && (config.gi !== 'off' || config.view === 'sdf');
+      if (effectOn) {
+        const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality, sdfAo: config.sdfAo });
         effect.showIndirect = indirect;
         effect.showVoxels = config.view === 'voxels';
+        effect.setSdf(gi.sdf);
+        effect.showSdfSlice = config.view === 'sdf' ? config.slice : null;
+        // the probes: the far field in the probe mode (and what the debug view shows)
+        effect.setProbes(needsProbes() ? gi.probes : null);
+        effect.showProbes = config.view === 'probes';
         volume.addEffect(effect);
       }
       volume.addEffect(new ToneMapEffect({
         ...toneMapOptionsForSurface(renderer.presentationFormat),
         // the indirect view alone is 2 stops brighter
-        exposure: exposureFromEV100(5) * (indirect && gi ? 4 : 1),
+        exposure: exposureFromEV100(5) * (indirect && effectOn ? 4 : 1),
       }));
-      if (config.textured !== textured) {
-        rug.material = rugMaterial(config.textured);
-        textured = config.textured;
-        // the voxelizer can't see a material change
-        gi?.invalidate();
+      // the lit materials: shadowed through the field (bound to this one) or by the cube map
+      const sdf = config.shadows === 'sdf' && gi?.sdf ? { volume: gi.volume, sdf: gi.sdf } : null;
+      if ((sdf?.sdf ?? null) !== materialsSdf || config.textured !== textured) {
+        for (const [r, label, albedo] of lit) r.material = litMaterial(label, albedo, sdf);
+        rug.material = rugMaterial(config.textured, sdf);
+        materialsSdf = sdf?.sdf ?? null;
+        if (config.textured !== textured) {
+          textured = config.textured;
+          // the voxelizer can't see a material change
+          gi?.invalidate();
+        }
       }
       rug.visible = config.rug;
       tall.dynamic = config.animate;
@@ -327,9 +452,10 @@
         tall.position.set(...tallRest.position);
         tall.rotation.y = tallRest.yaw;
       }
-      for (const key of ['gi', 'voxels', 'view', 'cam']) document.getElementById(key).value = config[key];
+      for (const key of ['preset', 'gi', 'voxels', 'view', 'cam', 'sdfAo', 'sdfShadows', 'shadows']) document.getElementById(key).value = config[key];
       for (const key of ['animate', 'textured', 'rug']) document.getElementById(key).checked = config[key];
     }
+    for (const [name] of PRESETS) document.getElementById('preset').add(new Option(name, name));
     apply();
 
     const info = () => {
@@ -339,16 +465,23 @@
         voxelTier: gi?.quality ?? null,
         dims: gi ? [...gi.volume.dims] : null,
         mib: gi ? +(gi.memoryBytes() / (1 << 20)).toFixed(1) : 0,
+        sdf: !!gi?.sdf,
+        probes: !!gi?.probes,
+        probeDims: gi?.probes ? [...gi.probes.dims] : null,
       };
     };
     const set = (key) => (value) => { config[key] = value; apply(); };
+    const setPreset = (name) => { applyPreset(name); apply(); };
     window.kansei = {
       info,
-      setGi: set('gi'), setVoxels: set('voxels'), setView: set('view'), setAnimate: set('animate'),
-      setTextured: set('textured'), setRug: set('rug'), setCamera,
+      setPreset, setGi: set('gi'), setVoxels: set('voxels'), setView: set('view'), setAnimate: set('animate'),
+      setTextured: set('textured'), setRug: set('rug'), setSdfAo: set('sdfAo'), setSdfShadows: set('sdfShadows'),
+      setShadows: set('shadows'), setSlice: set('slice'), setCamera,
       renderer, scene, camera,
     };
-    for (const key of ['gi', 'voxels', 'view']) document.getElementById(key).onchange = (e) => set(key)(e.target.value);
+    document.getElementById('preset').onchange = (e) => setPreset(e.target.value);
+    for (const key of ['gi', 'voxels', 'view', 'sdfShadows', 'shadows']) document.getElementById(key).onchange = (e) => set(key)(e.target.value);
+    document.getElementById('sdfAo').onchange = (e) => set('sdfAo')(parseFloat(e.target.value));
     document.getElementById('cam').onchange = (e) => setCamera(e.target.value);
     for (const key of ['animate', 'textured', 'rug']) document.getElementById(key).onchange = (e) => set(key)(e.target.checked);
     if (!flag('ui', true)) document.getElementById('panel').style.display = 'none';

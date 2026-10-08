@@ -5,10 +5,12 @@ import { PostProcessingEffect } from '../postprocessing/PostProcessingEffect';
 import { gpuPass } from '../profiling/Profiler';
 import { SCREEN_COMPOSITE_WGSL, SCREEN_TEMPORAL_WGSL, SCREEN_TRACE_WGSL } from './GiWGSL';
 import { gradientSkyLighting } from './ParticleConeShading';
+import type { JumpFloodSdf } from './JumpFloodSdf';
+import { PROBE_GRID_BYTES, SdfProbes } from './SdfProbes';
 import { noSdfView } from './VoxelInjection';
 import { Vec3, VoxelGiQuality, VoxelVolume } from './VoxelVolume';
 
-/** What `VoxelGIEffect` sets up. Rust: `gi::VoxelGIOptions` (its near field, SDF and clipmap options come with SSGI, G-3 and G-4). */
+/** What `VoxelGIEffect` sets up. Rust: `gi::VoxelGIOptions` (its near field and clipmap options come with SSGI and G-4). */
 export interface VoxelGIOptions {
     /** Resolution of the trace (`low` a quarter each way, else half) and the cones' steps. Default `medium`. */
     quality?: VoxelGiQuality;
@@ -27,12 +29,15 @@ export interface VoxelGIOptions {
     materialAmbient?: number;
     /** Scale of the sky past the volume. Default 1. */
     skyScale?: number;
+    /**
+     * Strength of the distance field's ambient occlusion on the GI (`setSdf`; 0, the default:
+     * none): the contact occlusion the coarse cones miss.
+     */
+    sdfAo?: number;
 }
 
 /** Bytes of the WGSL `VoxelGiParams` (screen_common.wgsl; Rust `VoxelGiParamsGpu`). */
 export const VOXEL_GI_PARAMS_BYTES = 352;
-/** Bytes of the WGSL `ProbeGrid` (probe_common.wgsl), bound as a stand-in without probes. */
-const PROBE_GRID_BYTES = 64;
 
 interface Targets {
     width: number;
@@ -48,6 +53,8 @@ interface Gpu {
     temporal: GPUComputePipeline;
     temporalBGL: GPUBindGroupLayout;
     composite: GPUComputePipeline;
+    /** The composite with the probes as the far field (`main_probes`). */
+    compositeProbes: GPUComputePipeline;
     compositeBGL: GPUBindGroupLayout;
     sampler: GPUSampler;
     /** The sky past the volume until `setSkyLighting`: `skyGradient`. */
@@ -70,8 +77,10 @@ interface Gpu {
  *
  * Add it first in the chain. `enabled = false` skips it at no cost. It adds light only where a
  * material writes the GBuffer's albedo (and normal), and replaces the materials' sky ambient once
- * the sky's lighting is set. Rust: `gi::VoxelGIEffect` (the volume source; the screen-space near
- * field, the distance field and the probes come with SSGI and G-3, a clipmap source with G-4).
+ * the sky's lighting is set. With `setProbes` the far field comes from irradiance probes instead of
+ * per-pixel cones; with `setSdf` the distance field adds contact AO (`sdfAo`). Rust:
+ * `gi::VoxelGIEffect` (the volume source; the screen-space near field comes with SSGI, a clipmap
+ * source with G-4).
  */
 export class VoxelGIEffect extends PostProcessingEffect {
     public enabled = true;
@@ -92,12 +101,26 @@ export class VoxelGIEffect extends PostProcessingEffect {
      * pixel), in place of the lit image, to inspect the voxelization. Over `showIndirect`.
      */
     public showVoxels = false;
+    /**
+     * Debug view: the distance field (`setSdf`) on the horizontal plane at this height, metres,
+     * over the dimmed scene. Over the other views. Null: off.
+     */
+    public showSdfSlice: number | null = null;
+    /**
+     * Debug view: the probes (`setProbes`) as balls lit by their own irradiance, dark red where one
+     * is left out (inside geometry), over the scene without its GI. Over the other views.
+     */
+    public showProbes = false;
+    public sdfAo: number;
     /** The sky past the volume without `setSkyLighting`: scene radiance straight up and down. */
     public skyGradient: [Vec3, Vec3] = [[0, 0, 0], [0, 0, 0]];
 
     private readonly volume: VoxelVolume;
     private readonly anisotropic: GPUTextureView[];
     private skyLighting: GPUBuffer | null = null;
+    private sdf: GPUTextureView | null = null;
+    /** The probes' grid, SH, state and depth buffers (`setProbes`). */
+    private probes: GPUBuffer[] | null = null;
     private prevViewProj: mat4 | null = null;
     private frame = 0;
     private gpu: Gpu | null = null;
@@ -121,6 +144,29 @@ export class VoxelGIEffect extends PostProcessingEffect {
         this.temporalBlend = options.temporalBlend ?? 0.1;
         this.materialAmbient = options.materialAmbient ?? 1;
         this.skyScale = options.skyScale ?? 1;
+        this.sdfAo = options.sdfAo ?? 0;
+    }
+
+    /**
+     * Read the scene's distance field (`SceneVoxelGi.sdf`, over the same volume) for `sdfAo` and
+     * `showSdfSlice`; null leaves them off.
+     */
+    public setSdf(sdf: JumpFloodSdf | null): void {
+        this.sdf = sdf?.view ?? null;
+    }
+
+    /**
+     * Take the far field from `probes` (`SceneVoxelGi.probes`, over the same volume): each pixel's
+     * irradiance from the probes around it, in place of the cones traced per pixel (whose passes
+     * are then skipped). Null goes back to the cones.
+     */
+    public setProbes(probes: SdfProbes | null): void {
+        this.probes = probes ? [probes.gridBuffer, probes.shBuffer, probes.stateBuffer, probes.depthBuffer] : null;
+    }
+
+    /** Whether the far field comes from probes (`setProbes`). */
+    public get usesProbes(): boolean {
+        return this.probes !== null;
     }
 
     /**
@@ -173,10 +219,10 @@ export class VoxelGIEffect extends PostProcessingEffect {
             uniform(7), storage(8), uniform(9), texture(10, true, '3d'), sampler(11), texture(12, true, '3d'),
             uniform(13), storageBuffer(14), storageBuffer(15), storageBuffer(16),
         ]);
-        const pipeline = (label: string, code: string, layout: GPUBindGroupLayout) => device.createComputePipeline({
+        const pipeline = (label: string, code: string, layout: GPUBindGroupLayout, entryPoint = 'main') => device.createComputePipeline({
             label,
             layout: device.createPipelineLayout({ label, bindGroupLayouts: [layout] }),
-            compute: { module: device.createShaderModule({ label, code }), entryPoint: 'main' },
+            compute: { module: device.createShaderModule({ label, code }), entryPoint },
         });
         const buffer = (label: string, size: number, usage: GPUBufferUsageFlags) => device.createBuffer({ label, size, usage });
         return {
@@ -186,6 +232,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
             temporal: pipeline('VoxelGI/Temporal', SCREEN_TEMPORAL_WGSL, temporalBGL),
             temporalBGL,
             composite: pipeline('VoxelGI/Composite', SCREEN_COMPOSITE_WGSL, compositeBGL),
+            compositeProbes: pipeline('VoxelGI/CompositeProbes', SCREEN_COMPOSITE_WGSL, compositeBGL, 'main_probes'),
             compositeBGL,
             sampler: device.createSampler({ label: 'VoxelGI/Linear', magFilter: 'linear', minFilter: 'linear' }),
             gradientSky: buffer('VoxelGI/GradientSky', gradientSkyLighting([0, 0, 0], [0, 0, 0]).byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
@@ -255,14 +302,17 @@ export class VoxelGIEffect extends PostProcessingEffect {
         f32[76] = Math.min(Math.max(this.temporalBlend, 0.01), 1);
         u32[77] = this.prevViewProj ? 1 : 0;
         u32[78] = this.skyLighting ? 1 : 0;
-        u32[79] = this.showVoxels ? 2 : this.showIndirect ? 1 : 0;
+        const debug = this.showProbes && this.probes ? 4
+            : this.showSdfSlice !== null && this.sdf ? 3
+            : this.showVoxels ? 2
+            : this.showIndirect ? 1 : 0;
+        u32[79] = debug;
         u32[80] = 0;   // no near field
         f32[81] = Math.max(this.skyScale, 0);
-        // no distance field: no AO, no slice
-        f32[82] = 0;
-        f32[83] = 0;
-        u32[84] = 0;
-        f32[85] = 0;
+        f32[82] = this.sdf ? Math.min(Math.max(this.sdfAo, 0), 1) : 0;
+        f32[83] = this.showSdfSlice ?? 0;
+        u32[84] = this.sdf ? 1 : 0;
+        f32[85] = 0;   // (a clipmap's level bias)
         device.queue.writeBuffer(gpu.params, 0, data);
         if (!this.skyLighting) {
             device.queue.writeBuffer(gpu.gradientSky, 0, gradientSkyLighting(this.skyGradient[0], this.skyGradient[1]));
@@ -284,7 +334,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
             [0, params], [1, depthView], [2, normalView], [3, { buffer: this.volume.uniform }], [4, this.volume.view],
             [5, this.volume.sampler], [6, sky], [7, traceView],
             ...this.anisotropic.map((v, i) => [40 + i, v] as [number, GPUBindingResource]),
-            [46, gpu.noSdf],
+            [46, this.sdf ?? gpu.noSdf],
         ]);
         const temporal = group('VoxelGI/TemporalBG', gpu.temporalBGL, [
             [0, params], [1, traceView], [2, history[1 - current]], [3, depthView], [4, history[current]], [5, gpu.sampler],
@@ -292,18 +342,23 @@ export class VoxelGIEffect extends PostProcessingEffect {
         const composite = group('VoxelGI/CompositeBG', gpu.compositeBGL, [
             [0, params], [1, input.createView()], [2, depthView], [3, history[current]], [4, gpu.noNear.createView()],
             [5, gbuffer.albedoTexture.createView()], [6, normalView], [7, sky], [8, output.createView()],
-            [9, { buffer: this.volume.uniform }], [10, this.volume.view], [11, this.volume.sampler], [12, gpu.noSdf],
-            ...gpu.noProbes.map((buffer, i) => [13 + i, { buffer }] as [number, GPUBindingResource]),
+            [9, { buffer: this.volume.uniform }], [10, this.volume.view], [11, this.volume.sampler], [12, this.sdf ?? gpu.noSdf],
+            ...(this.probes ?? gpu.noProbes).map((buffer, i) => [13 + i, { buffer }] as [number, GPUBindingResource]),
         ]);
 
         const pass = commandEncoder.beginComputePass({ label: 'VoxelGI/Screen', timestampWrites: gpuPass('VoxelGI/Screen') });
-        pass.setPipeline(gpu.trace);
-        pass.setBindGroup(0, trace);
-        pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
-        pass.setPipeline(gpu.temporal);
-        pass.setBindGroup(0, temporal);
-        pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
-        pass.setPipeline(gpu.composite);
+        // with probes the composite reads them per pixel: no cones to trace and accumulate (the
+        // voxels and slice views show without them)
+        const probes = this.probes !== null && debug !== 2 && debug !== 3;
+        if (!probes) {
+            pass.setPipeline(gpu.trace);
+            pass.setBindGroup(0, trace);
+            pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
+            pass.setPipeline(gpu.temporal);
+            pass.setBindGroup(0, temporal);
+            pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
+        }
+        pass.setPipeline(probes ? gpu.compositeProbes : gpu.composite);
         pass.setBindGroup(0, composite);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
         pass.end();

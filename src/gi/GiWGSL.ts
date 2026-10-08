@@ -2,8 +2,9 @@
  * Voxel GI's WGSL, imported from `rust/kansei-core/src/gi/shaders` (Vite `?raw`) as
  * `materials/shaders/SharedWGSL.ts` imports the rest, so both engines run the same source and
  * `cargo test -p kansei-core` validates it. The exported names match the Rust constants
- * (`gi::VOXEL_VOLUME_WGSL`, `gi::VOXEL_CONES_WGSL`, `gi::PARTICLE_EMISSION_WGSL`,
- * `atmosphere::SKY_LIGHTING_WGSL`); the rest are the passes' own, assembled as Rust's `concat!`.
+ * (`gi::VOXEL_VOLUME_WGSL`, `gi::VOXEL_CONES_WGSL`, `gi::SDF_WGSL`, `gi::PROBES_WGSL`,
+ * `gi::PARTICLE_EMISSION_WGSL`, `atmosphere::SKY_LIGHTING_WGSL`); the rest are the passes' own,
+ * assembled as Rust's `concat!`.
  */
 import { assemble } from '../materials/shaders/ShaderUtils';
 import voxelVolume from '../../rust/kansei-core/src/gi/shaders/voxel_volume.wgsl?raw';
@@ -27,6 +28,8 @@ import screenTemporal from '../../rust/kansei-core/src/gi/shaders/screen_tempora
 import screenComposite from '../../rust/kansei-core/src/gi/shaders/screen_composite.wgsl?raw';
 import probeCommon from '../../rust/kansei-core/src/gi/shaders/probe_common.wgsl?raw';
 import probeIrradiance from '../../rust/kansei-core/src/gi/shaders/probe_irradiance.wgsl?raw';
+import probeUpdate from '../../rust/kansei-core/src/gi/shaders/probe_update.wgsl?raw';
+import jumpFlood from '../../rust/kansei-core/src/gi/shaders/jump_flood.wgsl?raw';
 import { COMPUTE_SHADOWS_WGSL } from '../shadows/ComputeShadows';
 
 /**
@@ -76,6 +79,28 @@ export const SKY_LIGHTING_WGSL: string = skyLighting;
  */
 export const VOXEL_WRITE_WGSL: string = voxelWrite;
 
+/**
+ * `VOXEL_VOLUME_WGSL` plus reading a `JumpFloodSdf`: `sdfDistance(vol, sdf, sampler, p)`,
+ * `sdfSoftShadow(vol, sdf, sampler, p, toLight, k, maxT)`, `sdfSurfaceShadow(vol, sdf, sampler,
+ * p, n, toLight, k, maxT)` (for a point on a surface of normal `n`: its own plane does not shadow
+ * it at grazing angles), `sdfLightShape(vol, radius, distance)` (k and the march's length for a
+ * light of that radius and distance) and `sdfAo(vol, sdf, sampler, p, n)`.
+ * The material helper for distance-field shadows and AO: bind `JumpFloodSdf.asTexture()` as a
+ * `texture_3d<f32>`, and the volume's uniform and sampler, in the material's own group.
+ * Rust: `gi::SDF_WGSL`.
+ */
+export const SDF_WGSL: string = assemble([voxelVolume, sdf]);
+
+/**
+ * Diffuse light from the scene's probes (`SdfProbes`) for a material: `ProbeGrid` and
+ * `kansei_gi_irradiance(p, n)`, the irradiance a surface at world position `p` facing `n`
+ * receives (scene units; a diffuse surface adds albedo / pi times it, in place of its own sky
+ * ambient), weighed over the eight probes around `p` as DDGI does. Declare its buffers with
+ * `SdfProbes.bindingsWGSL(group, first)` in the material's own group and bind them with
+ * `SdfProbes.bindGroupEntries` (or as storage and uniform bindables). Rust: `gi::PROBES_WGSL`.
+ */
+export const PROBES_WGSL: string = assemble([probeCommon, probeIrradiance]);
+
 /** One mip of a 3D chain (`Mip3d`). */
 export const MIP3D_WGSL: string = mip3d;
 /** The six directional mip chains (`AnisotropicMips`). */
@@ -90,6 +115,10 @@ export const PARTICLE_CONES_WGSL: string = assemble([voxelVolume, voxelCones, sd
 export const VOXEL_FRAGMENT_WGSL: string = assemble([voxelWrite, voxelFragment]);
 /** `VoxelInjection`'s pass: the voxelized surfaces into light (Rust `gi::inject::INJECT_WGSL`). */
 export const INJECT_WGSL: string = assemble([voxelVolume, voxelCones, voxelIrradiance, sdf, particleEmission, skyLighting, COMPUTE_SHADOWS_WGSL, inject]);
+/** `JumpFloodSdf`'s seed, flood and distance passes (Rust `gi::sdf::JUMP_FLOOD_WGSL`). */
+export const JUMP_FLOOD_WGSL: string = jumpFlood;
+/** `SdfProbes`' update (Rust `gi::probes::PROBE_UPDATE_WGSL`). */
+export const PROBE_UPDATE_WGSL: string = assemble([voxelVolume, voxelCones, voxelIrradiance, skyLighting, probeCommon, probeUpdate]);
 /** `VoxelGIEffect`'s trace through a volume (Rust `gi::effect::TRACE_WGSL`). */
 export const SCREEN_TRACE_WGSL: string = assemble([screenCommon, screenNormal, voxelVolume, voxelCones, voxelIrradiance, skyLighting, screenTrace]);
 /** `VoxelGIEffect`'s temporal filter. */

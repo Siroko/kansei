@@ -6,17 +6,20 @@ import type { PointLight } from '../lights/PointLight';
 import type { AreaLight } from '../lights/AreaLight';
 import { gpuPass } from '../profiling/Profiler';
 import { INJECT_WGSL } from './GiWGSL';
+import type { JumpFloodSdf } from './JumpFloodSdf';
 import type { MeshVoxelizer } from './MeshVoxelizer';
 import type { VoxelVolume } from './VoxelVolume';
 
 /**
- * Where the injection takes shadows from the distance field (G-3's `SceneVoxelGi.enableSdf`;
- * without a field every setting reads the shadow maps alone). Rust: `gi::SdfShadows`.
+ * Where the injection takes shadows from the distance field (`SceneVoxelGi.enableSdf`; without a
+ * field every setting reads the shadow maps alone). Rust: `gi::SdfShadows`.
  * - `off`: the shadow maps alone (and none where they don't reach);
  * - `fallback`: the field where no shadow map covers the voxel;
  * - `always`: the field for every light.
  */
 export type SdfShadows = 'off' | 'fallback' | 'always';
+/** `SdfShadows` in the order of the WGSL's `InjectParams.sdfShadows`. */
+const SDF_SHADOWS_MODES: readonly SdfShadows[] = ['off', 'fallback', 'always'];
 
 /** How the scene's voxels are lit (`SceneVoxelGi.settings`); change it freely between frames. Rust: `gi::SceneGiSettings`. */
 export interface SceneGiSettings {
@@ -94,6 +97,8 @@ export class VoxelInjection {
     private readonly noSdf: GPUTextureView;
     /** Whether `group` binds the voxelizer's dynamic surfaces. */
     private boundDynamic = false;
+    /** The distance field `group` binds. */
+    private boundSdf: JumpFloodSdf | null = null;
     private shadowMap: ShadowMap | null = null;
     private pointShadows: CubeMapShadowMap | null = null;
 
@@ -162,10 +167,13 @@ export class VoxelInjection {
         this.shadows.updateLights(dir, point, area, false, false);
     }
 
-    /** Record the injection into the volume's mip 0 (build its mips next). */
-    public encode(encoder: GPUCommandEncoder, voxelizer: MeshVoxelizer, settings: SceneGiSettings): void {
+    /**
+     * Record the injection into the volume's mip 0 (build its mips next), shadowed through `sdf`
+     * as `settings.sdfShadows` says when there is one.
+     */
+    public encode(encoder: GPUCommandEncoder, voxelizer: MeshVoxelizer, sdf: JumpFloodSdf | null, settings: SceneGiSettings): void {
         const dynamic = voxelizer.dynamicSurfaces;
-        if (this.shadows.prepare(this.device) || (dynamic !== null) !== this.boundDynamic) this.group = null;
+        if (this.shadows.prepare(this.device) || (dynamic !== null) !== this.boundDynamic || sdf !== this.boundSdf) this.group = null;
         if (!this.group) {
             const anisotropic = this.volume.anisotropicViews;
             if (!anisotropic) throw new Error('scene GI volumes have anisotropic mips');
@@ -183,10 +191,11 @@ export class VoxelInjection {
                     { binding: 15, resource: { buffer: this.sky } },
                     ...this.shadows.entries(),
                     ...anisotropic.map((view, i) => ({ binding: 40 + i, resource: view })),
-                    { binding: 46, resource: this.noSdf },
+                    { binding: 46, resource: sdf?.view ?? this.noSdf },
                 ],
             });
             this.boundDynamic = dynamic !== null;
+            this.boundSdf = sdf;
         }
         const data = new ArrayBuffer(INJECT_PARAMS_BYTES);
         const u32 = new Uint32Array(data);
@@ -201,8 +210,8 @@ export class VoxelInjection {
         f32[7] = settings.shadowOffsetVoxels;
         u32[8] = Math.max(settings.bounceSteps, 1);
         u32[9] = dynamic ? 1 : 0;
-        // no distance field yet: the shadow maps alone (`sdfShadows` needs one)
-        u32[10] = 0;
+        // (`sdfShadows` needs a field: the shadow maps alone without one)
+        u32[10] = sdf ? SDF_SHADOWS_MODES.indexOf(settings.sdfShadows) : 0;
         f32[11] = Math.max(settings.sdfShadowHardness, 0.1);
         this.device.queue.writeBuffer(this.params, 0, data);
 

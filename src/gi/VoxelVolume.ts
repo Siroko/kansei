@@ -92,11 +92,13 @@ export class VolumeLayout {
     public readonly dims: Vec3;
 
     constructor(boundsMin: Vec3, boundsMax: Vec3, resolution: number) {
-        const extent = [0, 1, 2].map((i) => Math.max(Math.abs(boundsMax[i] - boundsMin[i]), 1e-3));
-        // f32, as Rust computes it, so both engines place the same voxels
-        this.voxelSize = Math.fround(Math.max(...extent) / Math.max(resolution, 1));
-        this.dims = [0, 1, 2].map((i) => Math.ceil(Math.max(Math.ceil(extent[i] / this.voxelSize), 1) / 8) * 8) as Vec3;
-        this.origin = [0, 1, 2].map((i) => (boundsMin[i] + boundsMax[i]) * 0.5 - this.dims[i] * this.voxelSize * 0.5) as Vec3;
+        // every step in f32, as Rust computes it, so both engines place the same voxels (in f64 a
+        // 4.6 m box over 96 voxels needs 97 and rounds up to 104)
+        const f = Math.fround;
+        const extent = [0, 1, 2].map((i) => f(Math.max(Math.abs(f(f(boundsMax[i]) - f(boundsMin[i]))), 1e-3)));
+        this.voxelSize = f(Math.max(...extent) / Math.max(resolution, 1));
+        this.dims = [0, 1, 2].map((i) => Math.ceil(Math.max(Math.ceil(f(extent[i] / this.voxelSize)), 1) / 8) * 8) as Vec3;
+        this.origin = [0, 1, 2].map((i) => f(f(f(f(boundsMin[i]) + f(boundsMax[i])) * 0.5) - f(f(this.dims[i] * this.voxelSize) * 0.5))) as Vec3;
     }
 
     public voxelCount(): number {
