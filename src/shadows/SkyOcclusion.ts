@@ -48,6 +48,11 @@ export interface SkyOcclusionOptions {
      */
     lodDistanceScale?: number;
     /**
+     * Scales the cluster LOD budget (`Renderable.clusters`) of the top-down view: above 1 it
+     * draws coarser cuts than the camera. 1 by default.
+     */
+    lodErrorScale?: number;
+    /**
      * The layers (`Renderable.layers`) whose shadow casters occlude the sky; all by default.
      * Leave solid ground out (put the vegetation on a layer of its own): the volume counts what
      * is under a top as inside it, so where it is interpolated across the ground the voxels below
@@ -68,6 +73,7 @@ const DEFAULTS: Required<SkyOcclusionOptions> = {
     frames: 4,
     depthTiles: 2,
     lodDistanceScale: 1,
+    lodErrorScale: 1,
     layerMask: 0xffffffff,
 };
 
@@ -334,6 +340,21 @@ export class SkyOcclusion {
         const res = this._resolution;
         const [x0, x1, y0, y1] = this._tileTexels(this._tile).map((t) => t / res * 2 - 1);
         return mat4.multiply(this._cullViewProj, crop(x0, x1, -y1, -y0), this._viewProj) as Float32Array;
+    }
+
+    /** The top-down view's view matrix (its camera's, as `update` placed it). */
+    get viewMatrix(): Float32Array {
+        return this._view as Float32Array;
+    }
+
+    /** The top-down view's (orthographic) projection. */
+    get projectionMatrix(): Float32Array {
+        return this._projection as Float32Array;
+    }
+
+    /** Texels per side of its depth map. */
+    get resolution(): number {
+        return this._resolution;
     }
 
     /** Whether a tile of the top-down pass is due this frame. */

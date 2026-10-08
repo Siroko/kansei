@@ -1,5 +1,6 @@
 import { gpuPass } from '../profiling/Profiler';
 import { RT_BUILD_WGSL, rtGatherWgsl } from './RtWGSL';
+import type { InstanceTransform } from '../clusters/ClusterLod';
 
 type Vec3 = [number, number, number];
 
@@ -22,16 +23,8 @@ export const RT_GRID_UNIFORM_BYTES = 80;
 const RT_SOURCE_BYTES = 112;
 const NO_WORD = 0xffffffff;
 
-/**
- * How an instance record places a mesh, as cluster LOD reads it: a column-major 4x4 matrix of
- * f32 at byte `offset`, or a position (3 x f32), then optionally a uniform scale (f32), a turn
- * about +y (f32 times `yawScale` radians: -1 for a bearing that turns a mesh by minus itself) and
- * a rotation (a unit quaternion, x y z w): `position + yaw * rotation * (scale * p)`. Offsets in
- * bytes. Rust: `clusters::InstanceTransform` (TS has no cluster LOD yet: it lives here until V-5).
- */
-export type InstanceTransform =
-    | { kind: 'matrix'; offset: number }
-    | { kind: 'placement'; position: number; scale?: number | null; yaw?: number | null; yawScale?: number; rotation?: number | null };
+/** How an instance record places a mesh, as cluster LOD reads it (`clusters/ClusterLod`). */
+export type { InstanceTransform };
 
 /** A WGSL float literal (always with a point or an exponent). */
 function wgslFloat(x: number): string {
@@ -214,12 +207,17 @@ export type GatherCount = { fixed: number } | { args: GPUBuffer; word: number; a
 
 /**
  * A source as the gather runs it: `RtSource`'s, or one the renderer feeds from its culled views
- * (`SceneRtGrid`). Rust's `GatherSource` also gathers cluster LOD cuts (`gather_clusters`): they
- * come with cluster LOD (V-5).
+ * and cluster cuts (`SceneRtGrid`). Rust: `GatherSource`.
  */
 export interface GatherSource {
+    /** An `RtMesh`'s words, or with `draws` a cluster mesh's (`ClusterMesh.gpuWords`). */
     mesh: GPUBuffer;
     triangles: number;
+    /**
+     * A cluster LOD cut's draw list of (record, cluster), gathered by `gather_clusters`: its
+     * records are absolute (`firstRecord` is ignored) and `count` says how many entries.
+     */
+    draws?: GPUBuffer | null;
     records: { buffer: GPUBuffer; stride: number } | null;
     firstRecord: number;
     count: GatherCount;
@@ -540,15 +538,16 @@ export class RtGrid {
     }
 
     /** The gather pipeline for a placement. */
-    private gatherPipeline(placement: string): GPUComputePipeline {
-        let p = this.gatherPipelines.get(placement);
+    private gatherPipeline(placement: string, clusters: boolean): GPUComputePipeline {
+        const key = `${clusters ? 'clusters' : 'mesh'}\n${placement}`;
+        let p = this.gatherPipelines.get(key);
         if (!p) {
             p = this.device.createComputePipeline({
                 label: 'RtGrid/Gather',
                 layout: this.gatherLayout,
-                compute: { module: this.device.createShaderModule({ label: 'RtGrid/Gather', code: rtGatherWgsl(placement) }), entryPoint: 'gather' },
+                compute: { module: this.device.createShaderModule({ label: 'RtGrid/Gather', code: rtGatherWgsl(placement) }), entryPoint: clusters ? 'gather_clusters' : 'gather' },
             });
-            this.gatherPipelines.set(placement, p);
+            this.gatherPipelines.set(key, p);
         }
         return p;
     }
@@ -602,7 +601,7 @@ export class RtGrid {
             f.set(s.world, 0);
             const [records, countWord] = 'fixed' in s.count ? [s.count.fixed, NO_WORD] : [s.count.atMost, s.count.word];
             u.set([s.triangles, s.records ? s.records.stride / 4 : 0, s.firstRecord, records, countWord,
-                rtSurfaceWord(s.surface), rtAlbedoWord(s.surface), ((s.id & 0xfff) << 20) >>> 0, k, 0, 0, 0], 16);
+                rtSurfaceWord(s.surface), rtAlbedoWord(s.surface), ((s.id & 0xfff) << 20) >>> 0, k, s.draws ? 1 : 0, 0, 0], 16);
         });
         device.queue.writeBuffer(this.sources, 0, bytes);
 
@@ -610,7 +609,7 @@ export class RtGrid {
         if (this.sourceGroups.size > 512) this.sourceGroups.clear();
         const groups = sources.map((s) => {
             const args = 'fixed' in s.count ? null : s.count.args;
-            const key = `${bufferId(s.mesh)},${bufferId(s.records?.buffer)},${bufferId(args)}`;
+            const key = `${bufferId(s.mesh)},${bufferId(s.records?.buffer)},${bufferId(args)},${bufferId(s.draws)}`;
             let group = this.sourceGroups.get(key);
             if (!group) {
                 group = device.createBindGroup({
@@ -621,14 +620,14 @@ export class RtGrid {
                         { binding: 1, resource: { buffer: s.mesh } },
                         { binding: 2, resource: { buffer: s.records?.buffer ?? this.empty } },
                         { binding: 3, resource: { buffer: args ?? this.empty } },
-                        { binding: 4, resource: { buffer: this.empty } },
+                        { binding: 4, resource: { buffer: s.draws ?? this.empty } },
                     ],
                 });
                 this.sourceGroups.set(key, group);
             }
             return group;
         });
-        const pipelines = sources.map((s) => this.gatherPipeline(s.placement));
+        const pipelines = sources.map((s) => this.gatherPipeline(s.placement, !!s.draws));
         this.gatherDispatchGroup ??= device.createBindGroup({
             label: 'RtGrid/GatherPrepare',
             layout: this.gatherPrepareBGL,

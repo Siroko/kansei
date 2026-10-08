@@ -4,6 +4,7 @@ import type { DepthBias, Material } from '../materials/Material';
 import type { SpotShadowSlot } from '../lights/SpotLightsGpu';
 import { gpuPass } from '../profiling/Profiler';
 import { BindGroupSlot, CAMERA_TEMPORAL_BYTES, LIGHT_UNIFORM_BYTES, cameraBindGroupLayoutEntries } from '../renderers/SharedLayouts';
+import type { ClusterDepthDraw } from '../clusters/ClusterLod';
 
 /**
  * Perspective shadow maps for spot lights (Rust `shadows::SpotShadowAtlas`): one layer of a
@@ -81,6 +82,7 @@ class SpotShadowAtlas {
         meshBindGroup: GPUBindGroup,
         meshOffset: (renderable: Renderable) => number,
         firstCullView: number,
+        clusterDraw?: ClusterDepthDraw,
     ): void {
         const device = this._device;
         const queue = device.queue;
@@ -112,6 +114,13 @@ class SpotShadowAtlas {
             for (const obj of objects) {
                 const geometry = obj.geometry;
                 if (!obj.castShadow || !geometry.initialized) continue;
+                // its cut for this view, on the cluster path
+                if (clusterDraw && obj.clusters && clusterDraw(pass, obj, firstCullView + slot.layer, SpotShadowAtlas.FORMAT, SpotShadowAtlas.DEPTH_BIAS, meshOffset(obj))) {
+                    pipeline = null;
+                    material = null;
+                    indexBuffer = null;
+                    continue;
+                }
                 if (obj.material !== material || geometry.vertexBuffersDescriptors !== layouts) {
                     if (obj.material !== material) {
                         // the renderer updated it this frame
