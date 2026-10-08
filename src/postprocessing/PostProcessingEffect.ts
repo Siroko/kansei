@@ -17,6 +17,11 @@ import { GBuffer } from './GBuffer';
  *  3. resize() is called whenever the viewport changes — recreate size-dependent
  *     resources (bind groups that reference textures, params uniforms, etc.).
  *  4. destroy() releases all GPU resources.
+ *
+ * Chain hooks (the Rust engine's `PostProcessingEffect`, `postprocessing/effect.rs`), with
+ * defaults so an effect overrides only what it needs: `isActive` skips the effect for a frame,
+ * `wantsJitter` asks for a sub-pixel jittered projection (TAA), `upscalesToDisplay` marks a
+ * temporal upscaler.
  */
 abstract class PostProcessingEffect {
     public initialized: boolean = false;
@@ -39,6 +44,9 @@ abstract class PostProcessingEffect {
      * @param camera         - Active camera for per-frame projection data.
      * @param width          - Current render width in pixels.
      * @param height         - Current render height in pixels.
+     * @param emissive       - The GBuffer's emissive texture.
+     * @param gbuffer        - The whole GBuffer (normal, albedo, background...), as the Rust
+     *                         engine passes it to every effect.
      */
     abstract render(
         commandEncoder: GPUCommandEncoder,
@@ -48,7 +56,8 @@ abstract class PostProcessingEffect {
         camera: Camera,
         width: number,
         height: number,
-        emissive?: GPUTexture
+        emissive?: GPUTexture,
+        gbuffer?: GBuffer
     ): void;
 
     /**
@@ -59,6 +68,28 @@ abstract class PostProcessingEffect {
 
     /** Release all GPU resources owned by this effect. */
     abstract destroy(): void;
+
+    /**
+     * Whether the effect runs this frame. An inactive effect is skipped: the next effect reads
+     * what it would have read, and it costs nothing (a toggle for expensive effects).
+     */
+    isActive(): boolean {
+        return true;
+    }
+
+    /** Whether the effect wants the scene rendered with a sub-pixel jittered projection (TAA). */
+    wantsJitter(): boolean {
+        return false;
+    }
+
+    /**
+     * Whether the effect reads its input at the GBuffer's size and writes its output at the
+     * display size (a temporal upscaler); every effect after it runs at the display size. The two
+     * sizes are the same until the renderer has a render scale below 1.
+     */
+    upscalesToDisplay(): boolean {
+        return false;
+    }
 }
 
 export { PostProcessingEffect };

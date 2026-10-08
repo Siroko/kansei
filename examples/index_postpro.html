@@ -37,6 +37,7 @@
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
     import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
     import { ColorGradingEffect } from '../src/postprocessing/effects/ColorGradingEffect'
+    import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, unrealLocalExposure } from '../src/postprocessing/effects/ToneMapEffect'
     import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
@@ -342,13 +343,20 @@
 
     const colorGradingEffect = new ColorGradingEffect();
 
+    // the display transform, last in the HDR chain (a display-space colour grade may follow it)
+    const toneMapEffect = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: ToneMapper.AcesFitted,
+      exposure: exposureFromEV100(1),
+    });
+
     const pathTracerEffect = new PathTracerEffect({
       scene,
       temporalBlend: 0.1,
       spatialPasses: 3,
     });
 
-    const allEffects = [pathTracerEffect, fogEffect, bloomEffect, dofEffect, colorGradingEffect];
+    const allEffects = [pathTracerEffect, fogEffect, bloomEffect, dofEffect, toneMapEffect, colorGradingEffect];
     const volume = new PostProcessingVolume(renderer, [...allEffects]);
 
     // ── Effect toggles ──────────────────────────────────────────────────────────
@@ -357,6 +365,7 @@
       fog: true,
       bloom: false,
       dof: false,
+      toneMap: true,
       colorGrading: false,
     };
 
@@ -366,6 +375,7 @@
       if (effectToggles.fog)          volume.effects.push(fogEffect);
       if (effectToggles.bloom)        volume.effects.push(bloomEffect);
       if (effectToggles.dof)          volume.effects.push(dofEffect);
+      if (effectToggles.toneMap)      volume.effects.push(toneMapEffect);
       if (effectToggles.colorGrading) volume.effects.push(colorGradingEffect);
     }
     rebuildEffectChain();
@@ -424,6 +434,22 @@
     dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 200, step: 1 });
     dofFolder.addBinding(dofEffect, 'focusRange',    { min: 1, max: 100, step: 1 });
     dofFolder.addBinding(dofEffect, 'maxBlur',       { min: 0, max: 64, step: 1 });
+
+    const toneParams = { ev100: 1, localExposure: false, localContrast: 0.8 };
+    const syncLocalExposure = () => {
+      toneMapEffect.options.localExposure = toneParams.localExposure ? unrealLocalExposure(toneParams.localContrast, toneParams.localContrast) : null;
+    };
+    const toneFolder = pane.addFolder({ title: 'Tone Map' });
+    toneFolder.addBinding(effectToggles, 'toneMap', { label: 'enabled' }).on('change', rebuildEffectChain);
+    toneFolder.addBinding(toneMapEffect.options, 'tonemapper', { options: ToneMapper });
+    toneFolder.addBinding(toneParams, 'ev100', { min: -4, max: 6, step: 0.1, label: 'EV100' }).on('change', (ev) => {
+      toneMapEffect.options.exposure = exposureFromEV100(ev.value);
+    });
+    toneFolder.addBinding(toneMapEffect.options, 'vignette', { min: 0, max: 1, step: 0.01 });
+    toneFolder.addBinding(toneMapEffect.options, 'grain', { min: 0, max: 1, step: 0.01 });
+    toneFolder.addBinding(toneMapEffect.options, 'chromaticAberration', { min: 0, max: 2, step: 0.01, label: 'aberration' });
+    toneFolder.addBinding(toneParams, 'localExposure', { label: 'local exposure' }).on('change', syncLocalExposure);
+    toneFolder.addBinding(toneParams, 'localContrast', { min: 0, max: 1, step: 0.01, label: 'local contrast' }).on('change', syncLocalExposure);
 
     const gradeFolder = pane.addFolder({ title: 'Color Grading' });
     gradeFolder.addBinding(effectToggles, 'colorGrading', { label: 'enabled' }).on('change', rebuildEffectChain);

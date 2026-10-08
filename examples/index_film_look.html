@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei — Film Look</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Film look: a dusk path between tree trunks, lit by three lamps, in physical units (cd/m²)
+    // through the HDR chain (volumetric fog, bloom), then ToneMapEffect: EV100 exposure, a filmic
+    // curve, vignette, grain, chromatic aberration, sRGB encoding and dither. The TS counterpart
+    // of the Rust example rust/kansei-wasm/examples/film-look, with the same URL parameters:
+    //   tm=aces|agx|punchy|neutral|unreal|exp|none   tone curve (default aces)
+    //   ev=<EV100>      exposure (default 3.9)
+    //   film=0          no vignette, grain or chromatic aberration
+    //   bloom=0         no bloom
+    //   le=<contrast>   Unreal's local exposure at this highlight and shadow contrast, e.g. 0.8
+    //   t=<seconds>     freeze the camera at this point of its walk
+    //   dpr=<ratio>     drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
+    //   fog=0           no volumetric fog (TS only)
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { PointLight } from '../src/lights/PointLight'
+    import { CubeMapShadowMap } from '../src/shadows/CubeMapShadowMap'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
+    import {
+      ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, unrealLocalExposure,
+    } from '../src/postprocessing/effects/ToneMapEffect'
+
+    const query = new URLSearchParams(location.search);
+    const param = (name) => query.get(name);
+    const flag = (name, fallback) => query.has(name) ? !['0', 'false', 'off'].includes(query.get(name)) : fallback;
+    const number = (name, fallback) => {
+      const v = parseFloat(query.get(name) ?? '');
+      return Number.isFinite(v) ? v : fallback;
+    };
+
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: number('dpr', Math.min(window.devicePixelRatio, 2)),
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas);
+    renderer.shadowsEnabled = true;
+
+    const scene = new Scene();
+
+    // ── Lights (the Rust example's): three lamps, the middle one casting shadows; a cool fill ──
+    const lampZ = [-18, -4, 10];
+    const lamps = lampZ.map((z, k) => {
+      const lamp = new PointLight(14, [1.0, 0.62, 0.32], 60);
+      lamp.position.set(k % 2 === 0 ? -1.8 : 1.8, 3.1, z);
+      scene.add(lamp);
+      return lamp;
+    });
+    const shadowLamp = lamps[1];
+    const fill = new DirectionalLight([0.3, -1.0, 0.2], [0.55, 0.7, 1.0], 1.5);
+    scene.add(fill);
+
+    // The scene lights as the lit material reads them (colour times intensity)
+    const lightData = new Float32Array(4 + 4 + lamps.length * 8);
+    const lightUniform = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: lightData,
+    });
+    lightData.set([...fill.direction, 0, ...fill.color.map(c => c * fill.intensity), 0], 0);
+    lamps.forEach((l, i) => lightData.set([l.position.x, l.position.y, l.position.z, l.radius, ...l.color.map(c => c * l.intensity), 0], 8 + i * 8));
+
+    const gbufferOut = /* wgsl */`
+      struct GBufferOut {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+    `;
+    const vertex = /* wgsl */`
+      @group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+
+      struct VertexOut {
+        @builtin(position) position : vec4f,
+        @location(0) worldPos : vec3f,
+        @location(1) normal   : vec3f,
+        @location(2) local    : vec3f,
+      }
+
+      @vertex
+      fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VertexOut {
+        let world = worldMatrix * vec4f(position.xyz, 1.0);
+        var out : VertexOut;
+        out.position = projectionMatrix * viewMatrix * world;
+        out.worldPos = world.xyz;
+        out.normal = (normalMatrix * vec4f(normal, 0.0)).xyz;
+        out.local = position.xyz;
+        return out;
+      }
+    `;
+
+    // Rust's basic_lit: ambient 0.08, Lambert plus Blinn-Phong under the scene's lights, the cube
+    // shadow on the lamp it was rendered from
+    const litShader = vertex + gbufferOut + /* wgsl */`
+      #include <shadows>
+
+      struct Surface { color : vec4f, specular : vec4f }
+      struct Lamp { position : vec3f, radius : f32, color : vec3f, _pad : f32 }
+      struct Lights { direction : vec4f, color : vec4f, point : array<Lamp, ${lamps.length}> }
+      @group(0) @binding(0) var<uniform> surface : Surface;
+      @group(0) @binding(1) var<uniform> lights  : Lights;
+
+      @fragment
+      fn fragment_main(in : VertexOut) -> GBufferOut {
+        let n = normalize(in.normal);
+        let view3 = mat3x3f(viewMatrix[0].xyz, viewMatrix[1].xyz, viewMatrix[2].xyz);
+        let cameraPos = -(transpose(view3) * viewMatrix[3].xyz);
+        let V = normalize(cameraPos - in.worldPos);
+        let shininess = surface.specular.a * 256.0;
+        let pointShadow = kansei_point_shadow(in.worldPos);
+
+        let L = normalize(-lights.direction.xyz);
+        var diffuse = lights.color.rgb * max(dot(n, L), 0.0);
+        var specular = lights.color.rgb * surface.specular.rgb * pow(max(dot(n, normalize(L + V)), 0.0), shininess);
+        for (var i = 0u; i < ${lamps.length}u; i++) {
+          let lamp = lights.point[i];
+          let toLight = lamp.position - in.worldPos;
+          let d = length(toLight);
+          let Lp = toLight / d;
+          let f = max(1.0 - d / lamp.radius, 0.0);
+          let shadow = select(1.0, pointShadow, kansei_is_point_shadow_light(lamp.position));
+          let atten = f * f * shadow;
+          diffuse += lamp.color * max(dot(n, Lp), 0.0) * atten;
+          specular += lamp.color * surface.specular.rgb * pow(max(dot(n, normalize(Lp + V)), 0.0), shininess) * atten;
+        }
+        let color = surface.color.rgb * (vec3f(0.08) + diffuse) + specular;
+        return GBufferOut(vec4f(color, 1.0), vec4f(0.0), vec4f(n * 0.5 + 0.5, 1.0), vec4f(surface.color.rgb, 1.0));
+      }
+    `;
+
+    // Rust's Material::emissive: the radiance, as colour and as emission
+    const emissiveShader = vertex + gbufferOut + /* wgsl */`
+      @group(0) @binding(0) var<uniform> radiance : vec4f;
+
+      @fragment
+      fn fragment_main(in : VertexOut) -> GBufferOut {
+        return GBufferOut(vec4f(radiance.rgb, 1.0), vec4f(radiance.rgb, 1.0), vec4f(normalize(in.normal) * 0.5 + 0.5, 1.0), vec4f(0.0, 0.0, 0.0, 1.0));
+      }
+    `;
+
+    // Rust's Material::gradient_sky (gradient_sky.wgsl)
+    const skyShader = vertex + gbufferOut + /* wgsl */`
+      struct Sky { zenith : vec4f, horizon : vec4f, ground : vec4f }
+      @group(0) @binding(0) var<uniform> sky : Sky;
+
+      @fragment
+      fn fragment_main(in : VertexOut) -> GBufferOut {
+        let d = normalize(in.local);
+        let up = pow(saturate(d.y), sky.zenith.w);
+        let down = sqrt(saturate(-d.y));
+        let c = select(mix(sky.horizon.rgb, sky.ground.rgb, down), mix(sky.horizon.rgb, sky.zenith.rgb, up), d.y >= 0.0);
+        return GBufferOut(vec4f(c, 1.0), vec4f(0.0), vec4f(-d * 0.5 + 0.5, 1.0), vec4f(0.0, 0.0, 0.0, 1.0));
+      }
+    `;
+
+    const uniform = (values) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array(values),
+    });
+    const fragmentUniform = (binding, value) => ({ binding, visibility: GPUShaderStage.FRAGMENT, value });
+    const basicLit = (color, specular, cullMode = 'back') => new Material(litShader, {
+      cullMode,
+      bindings: [fragmentUniform(0, uniform([...color, ...specular])), fragmentUniform(1, lightUniform)],
+    });
+    const emissive = (radiance) => new Material(emissiveShader, { outputsEmissive: true, bindings: [fragmentUniform(0, uniform([...radiance, 0]))] });
+
+    // dusk sky: 6 cd/m² at the horizon, 1.2 at the zenith
+    const horizon = [6.0, 5.2, 4.6, 0];
+    const skyMaterial = new Material(skyShader, {
+      cullMode: 'none',
+      bindings: [fragmentUniform(0, uniform([0.8, 1.1, 1.8, 0.5, ...horizon, ...horizon]))],
+    });
+    const sky = new Renderable(new SphereGeometry(180, 32, 16), skyMaterial);
+    sky.castShadow = false;
+    scene.add(sky);
+
+    // the TS PlaneGeometry winds clockwise seen from its normal (+z), so the floor is drawn unculled
+    const floor = new Renderable(new PlaneGeometry(120, 120), basicLit([0.3, 0.31, 0.3, 1.0], [0.04, 0.04, 0.04, 0.05], 'none'));
+    floor.rotation.x = -Math.PI / 2;
+    floor.castShadow = false;
+    scene.add(floor);
+
+    // a grove of trunks either side of a path
+    const trunkMaterial = basicLit([0.25, 0.2, 0.16, 1.0], [0.03, 0.03, 0.03, 0.1]);
+    for (let i = 0; i < 14; i++) {
+      for (const side of [-1, 1]) {
+        const seed = (i * 31 + (side > 0 ? 7 : 0)) % 11;
+        const h = 7 + (seed % 5);
+        const trunk = new Renderable(new BoxGeometry(0.4, h, 0.4), trunkMaterial);
+        trunk.position.set(side * (3.5 + (seed % 4) * 1.7), h * 0.5, -30 + i * 4.3 + (seed % 3) * 0.8);
+        scene.add(trunk);
+      }
+    }
+
+    // lamps along the path: 4000 cd/m² heads, which bloom and clip
+    const poleMaterial = basicLit([0.1, 0.1, 0.1, 1.0], [0.1, 0.1, 0.1, 0.3]);
+    const headMaterial = emissive([4000, 2600, 1400]);
+    const poleGeometry = new BoxGeometry(0.12, 3.0, 0.12);
+    const headGeometry = new SphereGeometry(0.18, 16, 8);
+    for (const lamp of lamps) {
+      const pole = new Renderable(poleGeometry, poleMaterial);
+      pole.position.set(lamp.position.x, 1.5, lamp.position.z);
+      scene.add(pole);
+      const head = new Renderable(headGeometry, headMaterial);
+      head.position.set(lamp.position.x, 3.1, lamp.position.z);
+      head.castShadow = false;
+      scene.add(head);
+    }
+
+    const cubeShadows = new CubeMapShadowMap(renderer.gpuDevice, { resolution: 512, maxLights: 1 });
+    renderer.cubeMapShadowMap = cubeShadows;
+
+    // ── The chain: fog, bloom, then the display transform ──
+    const tonemappers = {
+      aces: ToneMapper.AcesFitted, agx: ToneMapper.AgX, punchy: ToneMapper.AgXPunchy, neutral: ToneMapper.KhronosNeutral,
+      unreal: ToneMapper.UnrealFilmic, exp: ToneMapper.Exponential, none: ToneMapper.None,
+    };
+    const tm = param('tm') in tonemappers ? param('tm') : 'aces';
+    const ev100 = number('ev', 3.9);
+    const film = flag('film', true);
+    const le = number('le', NaN);
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: tonemappers[tm],
+      exposure: exposureFromEV100(ev100),
+      // the Unreal intro's lens and film settings
+      ...(film ? { vignette: 0.5, grain: 0.22, chromaticAberration: 0.25 } : {}),
+      localExposure: Number.isFinite(le) ? unrealLocalExposure(le, le) : null,
+    });
+
+    const effects = [];
+    let fog = null;
+    if (flag('fog', true)) {
+      fog = new VolumetricFogEffect({
+        froxelGrid: new FroxelGrid(renderer.gpuDevice, { far: 150, temporal: true }),
+        cubeMapShadowMap: cubeShadows,
+        baseDensity: 0.018,
+        heightFalloff: 0.08,
+        anisotropy: 0.5,
+      });
+      effects.push(fog);
+    }
+    if (flag('bloom', true)) {
+      // the TS bloom has no physical mode yet: bloom from the emissive heads, at the Rust example's intensity
+      effects.push(new BloomEffect({ threshold: 0.0, intensity: 0.06 }));
+    }
+    effects.push(tonemap);
+    const volume = new PostProcessingVolume(renderer, effects);
+
+    const camera = new Camera(45, 0.1, 400, window.innerWidth / window.innerHeight);
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+
+    console.log(`Kansei — Film Look (TS) ready: ${tm}, EV100 ${ev100}, film ${film}, surface ${renderer.presentationFormat}`);
+
+    const frozen = number('t', NaN);
+    const target = new Vector3();
+    const start = performance.now();
+    function frame(now) {
+      const clock = (now - start) / 1000;
+      const t = Number.isFinite(frozen) ? frozen : clock;
+      // walk slowly down the path toward the lamps
+      const z = 26 - (t * 0.6) % 20;
+      camera.position.set(0.4 * Math.sin(t * 0.2), 1.7, z);
+      target.set(0, 2.2, z - 20);
+      camera.lookAt(target);
+
+      cubeShadows.render(renderer, scene, camera, [shadowLamp]);
+      renderer.setPointShadowParams(shadowLamp.position.x, shadowLamp.position.y, shadowLamp.position.z, shadowLamp.radius);
+      fog?.updateLights([fill], lamps);
+      volume.render(scene, camera);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body>
+
+</html>
