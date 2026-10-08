@@ -21,8 +21,13 @@
       // The world is in metres; the fluid runs 11 units a metre with time √11 as fast (the Rust
       // lake's WorldScale), so the surface renderable is scaled back by 1/11.
       //
+      // The water rests (FluidStepper.withRest): out of view for 1.5 s it is culled (not stepped or
+      // drawn), and in view, settled (every particle under 5 cm/s for a second) with nothing
+      // stirring it, it sleeps (not stepped, its last surface drawn). The turning mill and a splash
+      // keep it awake; the panel shows its state.
+      //
       // ?res=<voxels> along the field's longest side (192); ?mill=0 starts with the mill stopped;
-      // ?solver=pbf starts on Position Based Fluids instead of SPH;
+      // ?solver=pbf starts on Position Based Fluids instead of SPH; ?rest=0 steps it every frame;
       // ?hud=1 frame-time overlay; ?profile=1 GPU time per pass (examples/profile-hud.js).
       import { Renderer } from '../src/renderers/Renderer'
       import { Scene } from '../src/objects/Scene'
@@ -40,6 +45,9 @@
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
       import { DEFAULT_PBF_OPTIONS, latticeDensity } from '../src/simulations/fluid/FluidSimulationParams'
       import { FluidStepper, WorldScale } from '../src/simulations/fluid/FluidStepper'
+      import { FluidActivity } from '../src/simulations/fluid/FluidActivity'
+      import { frustumPlanes, aabbInFrustum } from '../src/culling/Frustum'
+      import { Matrix4 } from '../src/math/Matrix4'
       import { PlanarContainerShape, FluidContainer } from '../src/simulations/fluid/FluidContainer'
       import { FluidCapsule, FluidColliders } from '../src/simulations/fluid/FluidColliders'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
@@ -336,7 +344,9 @@ fn fragment_main(v: VOut) -> FragOut {
       sim.rebuildGrid();
       const container = new FluidContainer(sim, shape, { margin: 0.1, restitution: 0.05, friction: 0.002 });
       const colliders = new FluidColliders(sim, 40, { restitution: 0.3, drag: 0.6 });
-      const stepper = new FluidStepper(1 / 60, 2, SCALE);
+      // rest by the Rust lake's settings (speeds in m/s)
+      const stepper = new FluidStepper(1 / 60, 2, SCALE).withRest(sim, { cullAfter: 1.5, settleSpeed: 0.05, settleAfter: 1.0 });
+      stepper.restEnabled = query.get('rest') !== '0';
       console.log(`lake: ${count} particles`);
 
       // its surface: a surface field (the distance to the weighted mean of the particles within
@@ -382,28 +392,36 @@ fn fragment_main(v: VOut) -> FragOut {
 
       // ── Panel ─────────────────────────────────────────────
       const pane = new Pane({ title: 'Lake', expanded: false });
-      const info = { particles: count };
+      const info = { particles: count, state: FluidActivity.Running, speed: 0 };
       pane.addBinding(info, 'particles', { readonly: true, format: (v) => v.toFixed(0) });
+      pane.addBinding(info, 'state', { readonly: true });
+      pane.addBinding(info, 'speed', { readonly: true, label: 'max speed (m/s)', format: (v) => v.toFixed(3) });
+      const rest = { rest: stepper.restEnabled };
+      pane.addBinding(rest, 'rest').on('change', () => { stepper.restEnabled = rest.rest; });
       const millFolder = pane.addFolder({ title: 'Mill' });
       millFolder.addBinding(mill, 'on');
       millFolder.addBinding(mill, 'rpm', { min: 0, max: 40, step: 0.5 });
       const waterFolder = pane.addFolder({ title: 'Water', expanded: false });
       const solver = { solver: sim.params.solver };
-      waterFolder.addBinding(solver, 'solver', { options: { SPH: 'sph', PBF: 'pbf' } }).on('change', () => { sim.params.solver = solver.solver; });
+      waterFolder.addBinding(solver, 'solver', { options: { SPH: 'sph', PBF: 'pbf' } }).on('change', () => { sim.params.solver = solver.solver; stepper.wake(); });
       const timing = { time: SCALE.time };
-      waterFolder.addBinding(timing, 'time', { min: 0.5, max: 6, step: 0.05, label: 'time scale' }).on('change', () => stepper.setTimeScale(timing.time));
-      waterFolder.addBinding(surfaceSettings, 'particleRadius', { min: 0.1, max: 1.2, step: 0.01, label: 'particle radius' }).on('change', () => { densityField.particleRadius = surfaceSettings.particleRadius; });
+      waterFolder.addBinding(timing, 'time', { min: 0.5, max: 6, step: 0.05, label: 'time scale' }).on('change', () => { stepper.setTimeScale(timing.time); stepper.wake(); });
+      waterFolder.addBinding(surfaceSettings, 'particleRadius', { min: 0.1, max: 1.2, step: 0.01, label: 'particle radius' }).on('change', () => { densityField.particleRadius = surfaceSettings.particleRadius; stepper.wake(); });
       waterFolder.addBinding(surfaceSettings, 'kernel', { min: 0.8, max: 3, step: 0.05 }).on('change', () => {
         densityField.splatRadius = surfaceSettings.kernel;
         densityField.kernelScale = kernelScale(surfaceSettings.kernel);
+        stepper.wake();
       });
-      waterFolder.addBinding(surfaceSettings, 'iso', { min: 0.5, max: 1.5, step: 0.01 }).on('change', () => { marchingCubes.isoLevel = surfaceSettings.iso; });
+      waterFolder.addBinding(surfaceSettings, 'iso', { min: 0.5, max: 1.5, step: 0.01 }).on('change', () => { marchingCubes.isoLevel = surfaceSettings.iso; stepper.wake(); });
       pane.addButton({ title: 'Splash' }).on('click', drop);
-      pane.addButton({ title: 'Reset' }).on('click', () => { sim.resetParticles(initial); stepper.reset(); });
+      pane.addButton({ title: 'Reset' }).on('click', () => { sim.resetParticles(initial); stepper.reset(); stepper.wake(); });
 
       // ── Loop ──────────────────────────────────────────────
       const hud = installProfileHud({ renderer, FrameTimer, AbBench });
       let lastSteps = 0;
+      const viewProj = new Matrix4();
+      // the water's box (the bounds the particles are kept in), in metres
+      const [boxMin, boxMax] = sim.bounds().map((p) => SCALE.pointToWorld(p));
       let last = performance.now();
       function animate() {
         requestAnimationFrame(animate);
@@ -415,6 +433,15 @@ fn fragment_main(v: VOut) -> FragOut {
 
         mill.angle = (mill.angle + millOmega() * dt) % (Math.PI * 2);
         wheel.rotation.x = mill.angle;
+
+        // rest when out of view or settled; the turning mill or a splash keep it awake
+        camera.updateViewMatrix();
+        viewProj.multiply(camera.projectionMatrix, camera.viewMatrix);
+        const inView = aabbInFrustum(frustumPlanes(viewProj), boxMin, boxMax);
+        const disturbed = (mill.on && mill.rpm > 0) || splash !== null;
+        fluidSurface.setActivity(stepper.updateRest(dt, inView, disturbed));
+        info.state = stepper.state;
+        info.speed = stepper.speed?.max ?? 0;
 
         const steps = stepper.advance(dt);
         lastSteps = steps;
@@ -433,6 +460,7 @@ fn fragment_main(v: VOut) -> FragOut {
           // the colliders first, so the walls and the floor have the last word
           sim.updateBatched(stepper.stepDt, steps, undefined, undefined, 0, [colliders, container]);
         }
+        stepper.stepped(sim, steps);
         // the effect extracts the surface (drawn from the next frame on) and composites it
         volume.render(scene, camera);
         hud.end(now);

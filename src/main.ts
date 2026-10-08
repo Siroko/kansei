@@ -78,6 +78,8 @@ export type { FluidSimulationOptions, FluidSolver, PbfOptions } from "./simulati
 export { PRESETS as FluidPresets, scaledToCount, DEFAULT_PBF_OPTIONS, latticeDensity } from "./simulations/fluid/FluidSimulationParams";
 export { FluidNozzle } from "./simulations/fluid/FluidNozzle";
 export { FluidStepper, WorldScale } from "./simulations/fluid/FluidStepper";
+export { FluidActivity, FluidSleep, FluidSpeedProbe, DEFAULT_FLUID_SLEEP_OPTIONS } from "./simulations/fluid/FluidActivity";
+export type { FluidSleepOptions, FluidSpeed } from "./simulations/fluid/FluidActivity";
 export { PlanarContainerShape, FluidContainer, signedDistance, fillBox } from "./simulations/fluid/FluidContainer";
 export type { FluidContainerOptions } from "./simulations/fluid/FluidContainer";
 export { FluidCapsule, FluidColliders } from "./simulations/fluid/FluidColliders";
@@ -109,6 +111,9 @@ export { AbBench, DEFAULT_AB_BENCH_OPTIONS } from "./profiling/AbBench";
 export type { AbBenchOptions } from "./profiling/AbBench";
 export { FrameTimer } from "./pacing/FrameTimer";
 export { FixedStep, MAX_FRAME_DT } from "./pacing/FixedStep";
+export { ReadbackRing } from "./renderers/ReadbackRing";
+export { frustumPlanes, aabbInFrustum } from "./culling/Frustum";
+export type { Plane } from "./culling/Frustum";
 export { ToneMapEffect, ToneMapper, LENS_ATTENUATION_UE5, LENS_ATTENUATION_UE4, exposureFromEV100, ev100FromCamera, whiteBalanceMatrix, unrealWhiteBalanceMatrix, defaultToneMapOptions, toneMapOptionsForSurface, defaultColorGrade, defaultUnrealFilm, unrealLocalExposure } from "./postprocessing/effects/ToneMapEffect";
 export type { ToneMapOptions, ColorGrade, UnrealFilm, LocalExposure } from "./postprocessing/effects/ToneMapEffect";
 export { hash01 } from "./math/hash01";

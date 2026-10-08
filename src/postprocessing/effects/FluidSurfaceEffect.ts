@@ -9,6 +9,7 @@ import { Renderable } from '../../objects/Renderable';
 import { Vector4 } from '../../math/Vector4';
 import type { FluidDensityField } from '../../simulations/fluid/FluidDensityField';
 import type { FluidMarchingCubes } from '../../simulations/fluid/FluidMarchingCubes';
+import { FluidActivity } from '../../simulations/fluid/FluidActivity';
 import { gpuPass } from '../../profiling/Profiler';
 
 /**
@@ -199,6 +200,15 @@ class FluidSurfaceEffect extends PostProcessingEffect {
             compute: { module, entryPoint: 'main' },
         });
         this.initialized = true;
+    }
+
+    /**
+     * Show a fluid's `FluidActivity`: its surface extracted while it runs, the last one drawn
+     * while it sleeps, nothing while it is culled.
+     */
+    setActivity(activity: FluidActivity): void {
+        this.extract = activity === FluidActivity.Running;
+        this.active = activity !== FluidActivity.Culled;
     }
 
     isActive(): boolean {

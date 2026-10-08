@@ -587,6 +587,20 @@ class FluidSimulation {
         return this._particleCount;
     }
 
+    /** The device the simulation runs on. */
+    public get gpuDevice(): GPUDevice {
+        return this.renderer.gpuDevice;
+    }
+
+    /**
+     * The box the particles are kept in (`worldBoundsMin`/`Max`, the simulation's space), grown by
+     * `margin`: e.g. for `aabbInFrustum`.
+     */
+    public bounds(margin: number = 0): [[number, number, number], [number, number, number]] {
+        const [a, b] = [this.worldBoundsMin, this.worldBoundsMax];
+        return [[a[0] - margin, a[1] - margin, a[2] - margin], [b[0] + margin, b[1] + margin, b[2] + margin]];
+    }
+
     /** How many particles the buffers hold (`params.maxParticles`): the most there can be. */
     public get capacity(): number {
         return this._capacity;
