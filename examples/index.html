@@ -31,25 +31,84 @@
       .area .label {
         margin-top: 64px;
       }
+      /* One row per example: its name and description, then a button per build of it. */
+      .example-list {
+        margin: 0 0 18px;
+        padding: 0;
+        list-style: none;
+        border-top: 1px solid var(--line);
+      }
+      .example-list li {
+        display: grid;
+        grid-template-columns: minmax(0, 14em) minmax(0, 1fr) minmax(0, 15em);
+        gap: 10px 24px;
+        align-items: baseline;
+        padding: 20px 4px;
+        border-bottom: 1px solid var(--line);
+      }
+      .run {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      .run a,
       .tag {
-        display: inline-block;
-        margin-left: 6px;
-        padding: 1px 7px;
+        display: inline-flex;
+        align-items: center;
         border: 1px solid var(--line);
-        border-radius: 3px;
+        color: var(--ink);
+        font-size: 11px;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        text-decoration: none;
+        white-space: nowrap;
+      }
+      .run a {
+        min-height: 34px;
+        padding: 0 14px;
+        transition:
+          background 0.2s,
+          border-color 0.2s,
+          color 0.2s;
+      }
+      .run a:hover {
+        border-color: var(--ink);
+        background: var(--bg-2);
+      }
+      .run .run-rust {
+        border-color: rgba(242, 227, 166, 0.4);
+        color: var(--lamp);
+      }
+      .run .run-rust:hover {
+        border-color: var(--lamp);
+      }
+      /* A variant: the same page with other parameters, or a sibling page. */
+      .run .run-variant {
+        min-height: 28px;
+        padding: 0 10px;
+        border-style: dashed;
+        font-size: 10px;
+        letter-spacing: 0.14em;
+      }
+      .run .run-ts.run-variant,
+      .run .run-ext {
         color: var(--ink-dim);
+      }
+      .tag {
+        padding: 1px 7px;
+        border-radius: 3px;
         font-size: 10.5px;
         letter-spacing: 0.14em;
-        text-transform: uppercase;
-        vertical-align: 3px;
-        white-space: nowrap;
+        vertical-align: 2px;
       }
       .tag-rust {
         border-color: rgba(242, 227, 166, 0.4);
         color: var(--lamp);
       }
-      .tag-ext {
-        color: var(--ink-faint);
+      .tag-variant {
+        border-style: dashed;
+        color: var(--ink-dim);
       }
       .remote-note {
         display: none;
@@ -57,6 +116,14 @@
       }
       .remote .remote-note {
         display: block;
+      }
+      @media (max-width: 760px) {
+        .example-list li {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .run {
+          justify-content: flex-start;
+        }
       }
     </style>
   </head>
@@ -78,18 +145,18 @@
         <p class="eyebrow">Kansei engine</p>
         <h1 class="page-title">Examples</h1>
         <p class="lede">
-          Small scenes made with Kansei. Each one needs a browser with WebGPU. Pages marked <span class="tag">TS</span>
-          run the TypeScript engine; their sources are in
-          <a href="https://github.com/Siroko/kansei/tree/main/examples" rel="noopener">examples/</a>. Pages marked
-          <span class="tag tag-rust">Rust / WASM</span> run Kansei's Rust core compiled to WebAssembly, the engine's active
-          line; their sources are in
-          <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/examples" rel="noopener">rust/kansei-wasm/examples</a>
-          and <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/demos" rel="noopener">demos</a>,
-          and most take the URL parameters listed in their READMEs. Where both exist, the TS page shows the Rust one's scene.
+          Small scenes made with Kansei. Each one needs a browser with WebGPU. Every row is one example; its buttons open
+          the builds of it that exist. <span class="tag">TS</span> runs the TypeScript engine, whose pages are in
+          <a href="https://github.com/Siroko/kansei/tree/main/examples" rel="noopener">examples/</a>.
+          <span class="tag tag-rust">WASM</span> runs Kansei's Rust core compiled to WebAssembly, the engine's active line,
+          from <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/examples" rel="noopener">rust/kansei-wasm/examples</a>
+          and <a href="https://github.com/Siroko/kansei/tree/development/rust/kansei-wasm/demos" rel="noopener">demos</a>;
+          most take the URL parameters listed in their READMEs. Where both exist they show the same scene unless the row says otherwise.
+          <span class="tag tag-variant">Dashed</span> buttons open a variant: other parameters or a sibling page.
         </p>
         <p class="note remote-note">
           This server has no Rust/WASM builds (they come with the site build, <code>pnpm bundle-examples</code>, or a local
-          <code>scripts/build-wasm-examples.sh</code>), so their links open kansei.graphics.
+          <code>scripts/build-wasm-examples.sh</code>), so their buttons open kansei.graphics.
         </p>
         <ul class="area-nav" aria-label="Areas">
           <li><a href="#rendering">Rendering</a></li>
@@ -104,439 +171,318 @@
         </ul>
       </div>
 
+      <!--
+        Curated: test, regression and duplicate pages are left out of this list but stay at their URLs:
+        index_flora (identical copy of index_compute), index_texture_bindings (binding PASS/FAIL test),
+        index_transparent_transmissive (draw-order regression test), index_shadow_casters (shadow-pass test),
+        index_particles (the trail particles in fog of index_curl_volumetric and index_gi_compute),
+        index_helpers (a tour of stock geometries and debug helpers).
+      -->
       <section class="area" id="rendering" aria-labelledby="rendering-title">
         <h2 class="label label-spaced" id="rendering-title">Rendering</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_hello_scene.html">
-              <span class="demo-name">Hello scene <span class="tag">TS</span></span>
-              <span class="demo-desc">The smallest complete scene: a floor, a spinning box and a sphere in the stock lit material, a sun and two point lights, shadows and an orbit camera</span>
-            </a>
+            <span class="demo-name">Hello scene</span>
+            <span class="demo-desc">The smallest complete scene: a floor, a spinning box and a sphere in the stock lit material, a sun and two point lights, shadows and an orbit camera</span>
+            <span class="run">
+              <a class="run-ts" href="./index_hello_scene.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/hello-scene/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/hello-scene/" data-rust>
-              <span class="demo-name">Hello scene <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same scene on the Rust core</span>
-            </a>
+            <span class="demo-name">Instancing</span>
+            <span class="demo-desc">A 10 × 10 × 10 grid of cubes in one draw call, each cube's model matrix an instance attribute the CPU rewrites every frame</span>
+            <span class="run">
+              <a class="run-ts" href="./index_instancing.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/instancing/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_instancing.html">
-              <span class="demo-name">Instancing <span class="tag">TS</span></span>
-              <span class="demo-desc">A 10 × 10 × 10 grid of cubes in one draw call, each cube's model matrix an instance attribute the CPU rewrites every frame</span>
-            </a>
+            <span class="demo-name">Flowing cubes</span>
+            <span class="demo-desc">A swarm of textured cubes flowing on nested trigonometry, through SSAO, god rays and depth of field</span>
+            <span class="run">
+              <a class="run-ts" href="./index_render.html" title="TypeScript">TS</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/instancing/" data-rust>
-              <span class="demo-name">Instancing <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same grid of instanced cubes on the Rust core</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_render.html">
-              <span class="demo-name">Flowing cubes <span class="tag">TS</span></span>
-              <span class="demo-desc">A swarm of textured cubes flowing on nested trigonometry, through SSAO, god rays and depth of field</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_compute.html">
-              <span class="demo-name">Compute particles <span class="tag">TS</span></span>
-              <span class="demo-desc">300 000 particles moved by a compute shader and pushed around by the mouse</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_flora.html">
-              <span class="demo-name">Flora <span class="tag">TS</span></span>
-              <span class="demo-desc">The compute particles page under its older name; the two files are identical</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_transparent_transmissive.html">
-              <span class="demo-name">Transparent and transmissive <span class="tag">TS</span></span>
-              <span class="demo-desc">Regression page: two transparent boxes orbit a transmissive sphere over an opaque floor, and all four must draw every frame (<code>?check=1</code> logs PASS/FAIL)</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_texture_bindings.html">
-              <span class="demo-name">Texture bindings <span class="tag">TS</span></span>
-              <span class="demo-desc">Every binding kind a material or compute pass can declare (3D, cube, 2D array, storage, depth through a comparison sampler, an external buffer), each read back and marked PASS or FAIL</span>
-            </a>
+            <span class="demo-name">Compute particles</span>
+            <span class="demo-desc">300 000 particles moved by a compute shader and pushed around by the mouse</span>
+            <span class="run">
+              <a class="run-ts" href="./index_compute.html" title="TypeScript">TS</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="lighting" aria-labelledby="lighting-title">
         <h2 class="label label-spaced" id="lighting-title">Lighting and shadows</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_shadow_casters.html">
-              <span class="demo-name">Shadow casters <span class="tag">TS</span></span>
-              <span class="demo-desc">The renderer's directional shadow map drawn through each material's own vertex shader: instanced cubes off their origin and an alpha-tested card whose shadow keeps its holes</span>
-            </a>
+            <span class="demo-name">Cascaded shadows</span>
+            <span class="demo-desc">4 000 instanced trees under a low sun, shadowed by four 2048² cascades with contact-hardening penumbrae, culled per cascade on the GPU</span>
+            <span class="run">
+              <a class="run-ts" href="./index_cascaded_shadows.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/cascaded-shadows/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_cascaded_shadows.html">
-              <span class="demo-name">Cascaded shadows <span class="tag">TS</span></span>
-              <span class="demo-desc">4 000 instanced trees under a low sun, shadowed by four 2048² cascades with contact-hardening penumbrae, culled per cascade on the GPU</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/cascaded-shadows/" data-rust>
-              <span class="demo-name">Cascaded shadows <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same forest on the Rust core, through TAA</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_spot_lights.html">
-              <span class="demo-name">Spot lights <span class="tag">TS</span></span>
-              <span class="demo-desc">A car's headlights in a night forest: photometric spot lights with contact-hardening shadows from an atlas, shaded through clustered light lists and scattered in the fog</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/spot-lights/" data-rust>
-              <span class="demo-name">Spot lights <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same night forest on the Rust core</span>
-            </a>
+            <span class="demo-name">Spot lights</span>
+            <span class="demo-desc">A car's headlights in a night forest: photometric spot lights with contact-hardening shadows from an atlas, shaded through clustered light lists and scattered in the fog</span>
+            <span class="run">
+              <a class="run-ts" href="./index_spot_lights.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/spot-lights/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="gi" aria-labelledby="gi-title">
         <h2 class="label label-spaced" id="gi-title">Global illumination and ray tracing</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_gi.html">
-              <span class="demo-name">Path-traced GI <span class="tag">TS</span></span>
-              <span class="demo-desc">A Cornell box with the Stanford dragon lit by the hybrid path tracer over the raster GBuffer; <code>?reference=1</code> traces camera rays and accumulates</span>
-            </a>
+            <span class="demo-name">Path-traced Cornell box</span>
+            <span class="demo-desc">The Stanford dragon in a Cornell box, path traced on the GPU against a BVH: in TS a hybrid tracer over the raster GBuffer, with compute-driven trails or a voxelized scene to trace instead</span>
+            <span class="run">
+              <a class="run-ts" href="./index_gi.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/pathtracer/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-ts run-variant" href="./index_gi.html?reference=1" title="Camera rays traced and accumulated (TypeScript)">Reference</a>
+              <a class="run-ts run-variant" href="./index_gi_compute.html" title="Compute-driven trail particles, path traced too, and a glass model (TypeScript)">Trails</a>
+              <a class="run-ts run-variant" href="./index_voxels.html" title="Trace a voxelization of the scene instead of its BVH (TypeScript)">Voxels</a>
+            </span>
           </li>
           <li>
-            <a href="./index_gi_compute.html">
-              <span class="demo-name">Path-traced GI with trails <span class="tag">TS</span></span>
-              <span class="demo-desc">The path-traced Cornell box with compute-driven trail particles, path traced too, and a glass model</span>
-            </a>
+            <span class="demo-name">GI box</span>
+            <span class="demo-desc">A Cornell box under one downlight to compare GI methods: screen-space GI, or voxel GI with its distance field, probes and ray-traced reflections</span>
+            <span class="run">
+              <a class="run-ts" href="./index_gi_box.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/gi-box/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_voxels.html">
-              <span class="demo-name">Voxel tracer <span class="tag">TS</span></span>
-              <span class="demo-desc">The path-traced Cornell box with a switch to tracing a voxelization of the scene instead of its BVH</span>
-            </a>
+            <span class="demo-name">Outdoor GI</span>
+            <span class="demo-desc">A forest valley 1.3 km across under a low sun, with voxel GI in a clipmap round the camera</span>
+            <span class="run">
+              <a class="run-ts" href="./index_outdoor_gi.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/outdoor-gi/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/pathtracer/" data-rust>
-              <span class="demo-name">Path tracer: dragon <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">A Cornell box with a glass Stanford dragon, path traced on the GPU against a BVH</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_gi_box.html">
-              <span class="demo-name">Voxel GI <span class="tag">TS</span></span>
-              <span class="demo-desc">A Cornell box under one downlight to compare GI methods: screen-space GI, or voxel GI with its distance field, probes and ray-traced reflections</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/gi-box/" data-rust>
-              <span class="demo-name">GI box <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same room on the Rust core, lit by voxel GI with screen-space GI for contact detail</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_outdoor_gi.html">
-              <span class="demo-name">Outdoor GI <span class="tag">TS</span></span>
-              <span class="demo-desc">A forest valley 1.3 km across under a low sun, with voxel GI in a clipmap round the camera</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/outdoor-gi/" data-rust>
-              <span class="demo-name">Outdoor GI <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same valley on the Rust core</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_voxel_gi_particles.html">
-              <span class="demo-name">Voxel GI on particles <span class="tag">TS</span></span>
-              <span class="demo-desc">An SPH fluid dam-breaks in an open-topped Cornell room, its particles splatted into a voxel volume and cone traced for their light</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/voxel-gi-particles/" data-rust>
-              <span class="demo-name">Voxel GI on particles <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The Rust demo: particles raining into a lightbox, glowing ones lighting the rest through cone-traced voxel GI</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/voxel-gi-particles/?rt=on" data-rust>
-              <span class="demo-name">Voxel GI, ray traced <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same lightbox with some particles turned to mirrors and glass, their rays walking the fluid's neighbour grid</span>
-            </a>
+            <span class="demo-name">Voxel GI on particles</span>
+            <span class="demo-desc">Particles splatted into a voxel volume and cone traced for their light: in TS an SPH dam break in an open Cornell room, in Rust particles raining into a lightbox, glowing ones lighting the rest</span>
+            <span class="run">
+              <a class="run-ts" href="./index_voxel_gi_particles.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/voxel-gi-particles/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-rust run-variant" href="/examples/voxel-gi-particles/?rt=on" data-rust title="Some particles turned to mirrors and glass, their rays walking the fluid&#x27;s neighbour grid (Rust / WASM)">Ray traced</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="atmosphere" aria-labelledby="atmosphere-title">
         <h2 class="label label-spaced" id="atmosphere-title">Atmosphere and fog</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_sky.html">
-              <span class="demo-name">Sky atmosphere <span class="tag">TS</span></span>
-              <span class="demo-desc">A physically based sky from noon to dusk: Hillaire's LUTs, aerial perspective on distant hills, sky-lit surfaces and reflections of its prefiltered cubemap</span>
-            </a>
+            <span class="demo-name">Sky atmosphere</span>
+            <span class="demo-desc">A physically based sky from noon to dusk: Hillaire's LUTs, aerial perspective on distant hills, sky-lit surfaces and reflections of its prefiltered cubemap; the Rust one adds volumetric clouds</span>
+            <span class="run">
+              <a class="run-ts" href="./index_sky.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/sky-atmosphere/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/sky-atmosphere/" data-rust>
-              <span class="demo-name">Sky atmosphere <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same sky on the Rust core, with volumetric clouds</span>
-            </a>
+            <span class="demo-name">Volumetric fog</span>
+            <span class="demo-desc">A grove of pillars under a low sun: froxel fog with shafts through the directional shadow, a lamp's cube shadow and a dim sky</span>
+            <span class="run">
+              <a class="run-ts" href="./index_volumetric_fog.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/volumetric-fog/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_volumetric_fog.html">
-              <span class="demo-name">Volumetric fog <span class="tag">TS</span></span>
-              <span class="demo-desc">A grove of pillars under a low sun: froxel fog with shafts through the directional shadow, a lamp's cube shadow and a dim sky</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/volumetric-fog/" data-rust>
-              <span class="demo-name">Volumetric fog <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same grove on the Rust core</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_curl_volumetric.html">
-              <span class="demo-name">Curl volumetric <span class="tag">TS</span></span>
-              <span class="demo-desc">Curl-noise particle trails through volumetric fog, in a Cornell box or over a scrolling noise terrain</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_particles.html">
-              <span class="demo-name">Particles in fog <span class="tag">TS</span></span>
-              <span class="demo-desc">4 096 trail particles in a Cornell box lit by a point light, through volumetric fog and post-processing</span>
-            </a>
+            <span class="demo-name">Curl volumetric</span>
+            <span class="demo-desc">Curl-noise particle trails through volumetric fog, in a Cornell box or over a scrolling noise terrain</span>
+            <span class="run">
+              <a class="run-ts" href="./index_curl_volumetric.html" title="TypeScript">TS</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="post" aria-labelledby="post-title">
         <h2 class="label label-spaced" id="post-title">Post-processing</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_postpro.html">
-              <span class="demo-name">Post-processing <span class="tag">TS</span></span>
-              <span class="demo-desc">Spheres in volumetric fog with shadows and a filmic tone map, plus path-traced GI, bloom, depth of field and colour grading to switch on</span>
-            </a>
+            <span class="demo-name">Post-processing</span>
+            <span class="demo-desc">Spheres in volumetric fog with shadows and a filmic tone map, plus path-traced GI, bloom, depth of field and colour grading to switch on</span>
+            <span class="run">
+              <a class="run-ts" href="./index_postpro.html" title="TypeScript">TS</a>
+            </span>
           </li>
           <li>
-            <a href="./index_film_look.html">
-              <span class="demo-name">Film look <span class="tag">TS</span></span>
-              <span class="demo-desc">A dusk path in physical light units through fog, bloom and the tone mapper: EV100 exposure, filmic curves, vignette and grain</span>
-            </a>
+            <span class="demo-name">Film look</span>
+            <span class="demo-desc">A dusk path in physical light units through fog, bloom and the tone mapper: EV100 exposure, filmic curves, vignette and grain</span>
+            <span class="run">
+              <a class="run-ts" href="./index_film_look.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/film-look/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/film-look/" data-rust>
-              <span class="demo-name">Film look <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same dusk path on the Rust core</span>
-            </a>
+            <span class="demo-name">Temporal AA</span>
+            <span class="demo-desc">Thin trunks, power lines, 12 000 swaying grass cards and a passing car: motion vectors and temporal anti-aliasing on a single-sample GBuffer; the Rust one can upscale and motion blur</span>
+            <span class="run">
+              <a class="run-ts" href="./index_taa.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/taa/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_taa.html">
-              <span class="demo-name">Temporal AA <span class="tag">TS</span></span>
-              <span class="demo-desc">Thin trunks, power lines, 12 000 swaying grass cards and a passing car: motion vectors and temporal anti-aliasing on a single-sample GBuffer</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/taa/" data-rust>
-              <span class="demo-name">Temporal AA <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same scene on the Rust core, optionally upscaled and motion blurred</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_dof_terrain.html">
-              <span class="demo-name">DoF terrain <span class="tag">TS</span></span>
-              <span class="demo-desc">A scrolling field of noise-driven columns with SSAO and a physical lens: two-layer depth of field and bokeh</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/depth-of-field/" data-rust>
-              <span class="demo-name">Depth of field <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">Physical depth of field on the Rust core: trunks, leaf cards and strings of lights through a camera lens</span>
-            </a>
+            <span class="demo-name">Depth of field</span>
+            <span class="demo-desc">Physical depth of field through a camera lens, two layers and scattered bokeh: in TS a scrolling field of noise-driven columns, in Rust trunks, leaf cards and strings of lights</span>
+            <span class="run">
+              <a class="run-ts" href="./index_dof_terrain.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/depth-of-field/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-ts run-variant" href="./index_dof_terrain.html?lights=1" title="Some column tops glow, small bright sources that scatter as bokeh (TypeScript)">Lights</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="visibility" aria-labelledby="visibility-title">
         <h2 class="label label-spaced" id="visibility-title">Visibility, LOD and reflections</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_occlusion_culling.html">
-              <span class="demo-name">Occlusion culling <span class="tag">TS</span></span>
-              <span class="demo-desc">60 000 spruces in three LODs, culled on the GPU per view by frustum, LOD band and, for the camera, a two-phase depth pyramid</span>
-            </a>
+            <span class="demo-name">Occlusion culling</span>
+            <span class="demo-desc">60 000 spruces in three LODs, culled on the GPU per view by frustum, LOD band and, for the camera, a two-phase depth pyramid</span>
+            <span class="run">
+              <a class="run-ts" href="./index_occlusion_culling.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/occlusion-culling/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/occlusion-culling/" data-rust>
-              <span class="demo-name">Occlusion culling <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same forest on the Rust core</span>
-            </a>
+            <span class="demo-name">Impostors</span>
+            <span class="demo-desc">A lake ringed by 40 000 spruces whose far LOD is an octahedral impostor baked at start-up, mirrored in the water</span>
+            <span class="run">
+              <a class="run-ts" href="./index_impostors.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/impostors/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_impostors.html">
-              <span class="demo-name">Impostors <span class="tag">TS</span></span>
-              <span class="demo-desc">A lake ringed by 40 000 spruces whose far LOD is an octahedral impostor baked at start-up, mirrored in the water</span>
-            </a>
+            <span class="demo-name">Cluster LOD</span>
+            <span class="demo-desc">A field of rocks drawn three ways: cluster LOD cut per cluster on the GPU, discrete LODs from the same graph, or the full mesh</span>
+            <span class="run">
+              <a class="run-ts" href="./index_cluster_lod.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/cluster-lod/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-ts run-variant" href="./index_meshlet_field.html" title="Up to 16 384 rocks to the horizon: the triangles drawn barely rise while the full mesh&#x27;s climb (TypeScript)">Field</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/impostors/" data-rust>
-              <span class="demo-name">Impostors <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same lake and forest on the Rust core</span>
-            </a>
+            <span class="demo-name">Meshlet inspector</span>
+            <span class="demo-desc">The Stanford dragon's 871 000 triangles in clusters, coloured by cluster, level, group or error against the budget, with the cut frozen while the camera flies</span>
+            <span class="run">
+              <a class="run-ts" href="./index_meshlet_inspector.html" title="TypeScript">TS</a>
+            </span>
           </li>
           <li>
-            <a href="./index_cluster_lod.html">
-              <span class="demo-name">Cluster LOD <span class="tag">TS</span></span>
-              <span class="demo-desc">A field of rocks drawn three ways: cluster LOD cut per cluster on the GPU, discrete LODs from the same graph, or the full mesh</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_meshlet_inspector.html">
-              <span class="demo-name">Meshlet inspector <span class="tag">TS</span></span>
-              <span class="demo-desc">The Stanford dragon's 871 000 triangles in clusters, coloured by cluster, level, group or error against the budget, with the cut frozen while the camera flies</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_meshlet_field.html">
-              <span class="demo-name">Meshlet field <span class="tag">TS</span></span>
-              <span class="demo-desc">Up to 16 384 rocks of 81 920 triangles to the horizon: as the field grows, the triangles drawn barely rise while the full mesh's climb</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/cluster-lod/" data-rust>
-              <span class="demo-name">Cluster LOD <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same field of rocks on the Rust core</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_planar_reflection.html">
-              <span class="demo-name">Planar reflection <span class="tag">TS</span></span>
-              <span class="demo-desc">A lake at dusk mirroring the far shore, a lit cottage and a searchlight's beam in the mist: a mirrored view with an oblique clip plane, rippled and blurred by roughness</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/planar-reflection/" data-rust>
-              <span class="demo-name">Planar reflection <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same lake on the Rust core, with a screen-space mirror to compare</span>
-            </a>
+            <span class="demo-name">Planar reflection</span>
+            <span class="demo-desc">A lake at dusk mirroring the far shore, a lit cottage and a searchlight's beam in the mist: a mirrored view with an oblique clip plane, rippled and blurred by roughness; the Rust one has a screen-space mirror to compare</span>
+            <span class="run">
+              <a class="run-ts" href="./index_planar_reflection.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/planar-reflection/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="fluid" aria-labelledby="fluid-title">
         <h2 class="label label-spaced" id="fluid-title">Fluid</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_fluid.html">
-              <span class="demo-name">Fluid <span class="tag">TS</span></span>
-              <span class="demo-desc">A GPU particle fluid you can stir with the mouse, with a nozzle that pours more in</span>
-            </a>
+            <span class="demo-name">Fluid</span>
+            <span class="demo-desc">A GPU particle fluid you can stir with the mouse, meshed by marching cubes and refracted</span>
+            <span class="run">
+              <a class="run-ts" href="./index_fluid.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/fluid/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-ts run-variant" href="./index_fluid.html?nozzle=1" title="A nozzle pours more in from the start (TypeScript)">Nozzle</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/fluid/" data-rust>
-              <span class="demo-name">Fluid <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">50 000 SPH particles meshed by marching cubes and refracted, on the Rust core</span>
-            </a>
+            <span class="demo-name">Lake</span>
+            <span class="demo-desc">Water held by a shaped bed and shore, stirred by a mill wheel's paddles, its surface drawn from a surface field; the Rust demo adds a course of boxes and a water cannon</span>
+            <span class="run">
+              <a class="run-ts" href="./index_fluid_lake.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/lake/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_fluid_lake.html">
-              <span class="demo-name">Lake <span class="tag">TS</span></span>
-              <span class="demo-desc">Water held by a shaped bed and shore, stirred by a mill wheel's paddles, its surface drawn from a surface field</span>
-            </a>
+            <span class="demo-name">Fluid text</span>
+            <span class="demo-desc">2D fluid particles that gather into letters</span>
+            <span class="run">
+              <a class="run-ts" href="./index_fluid_text.html" title="TypeScript">TS</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/lake/" data-rust>
-              <span class="demo-name">Lake <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The Rust demo: a lake beside a course of boxes, with a water cannon and a mill, cascaded shadows and TAA</span>
-            </a>
+            <span class="demo-name">Fluid clock</span>
+            <span class="demo-desc">The time of day formed out of an SPH fluid, its digits pulling particles into extruded glyphs</span>
+            <span class="run">
+              <a class="run-rust" href="/examples/fluid_clock/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="./index_fluid_text.html">
-              <span class="demo-name">Fluid text <span class="tag">TS</span></span>
-              <span class="demo-desc">2D fluid particles that gather into letters</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/fluid_clock/" data-rust>
-              <span class="demo-name">Fluid clock <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The time of day formed out of an SPH fluid, its digits pulling particles into extruded glyphs</span>
-            </a>
-          </li>
-          <li>
-            <a href="/examples/steering_text/" data-rust>
-              <span class="demo-name">Steering text <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">About 1 600 words flocking in 3D as boids, their letters trailing on distance constraints</span>
-            </a>
+            <span class="demo-name">Steering text</span>
+            <span class="demo-desc">About 1 600 words flocking in 3D as boids, their letters trailing on distance constraints</span>
+            <span class="run">
+              <a class="run-rust" href="/examples/steering_text/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="animation" aria-labelledby="animation-title">
         <h2 class="label label-spaced" id="animation-title">Animation</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_skinning.html">
-              <span class="demo-name">Skinning <span class="tag">TS</span></span>
-              <span class="demo-desc">A ring of procedurally rigged tentacles skinned in their materials' vertex shaders, casting bending shadows</span>
-            </a>
+            <span class="demo-name">Skinning</span>
+            <span class="demo-desc">A ring of procedurally rigged tentacles skinned in their materials' vertex shaders, casting bending shadows</span>
+            <span class="run">
+              <a class="run-ts" href="./index_skinning.html" title="TypeScript">TS</a>
+            </span>
           </li>
           <li>
-            <a href="./index_motion_matching.html">
-              <span class="demo-name">Motion matching <span class="tag">TS</span></span>
-              <span class="demo-desc">A character controller on the TS motion-matching runtime over a course of boxes; needs a local animation pack (none ships), and shows the course alone without one</span>
-            </a>
-          </li>
-          <li>
-            <a href="https://raggare.kansei.graphics/motion/" rel="noopener">
-              <span class="demo-name">Motion matching, live <span class="tag tag-ext">External</span></span>
-              <span class="demo-desc">Walk, run, jump and parkour over obstacles, plus a fluid lake to wade through, on raggare.kansei.graphics</span>
-            </a>
+            <span class="demo-name">Motion matching</span>
+            <span class="demo-desc">A character controller over a course of boxes. The TS page needs a local animation pack (none ships) and shows the course alone without one; the live one on raggare.kansei.graphics walks, runs, jumps and wades through a fluid lake</span>
+            <span class="run">
+              <a class="run-ts" href="./index_motion_matching.html" title="TypeScript">TS</a>
+              <a class="run-ext run-variant" href="https://raggare.kansei.graphics/motion/" rel="noopener" title="Walk, run, jump and parkour over obstacles, on raggare.kansei.graphics (External)">Live ↗</a>
+            </span>
           </li>
         </ul>
       </section>
 
       <section class="area" id="tools" aria-labelledby="tools-title">
         <h2 class="label label-spaced" id="tools-title">Loaders, text and tools</h2>
-        <ul class="demo-list examples">
+        <ul class="example-list examples">
           <li>
-            <a href="./index_ktx2.html">
-              <span class="demo-name">KTX2 textures <span class="tag">TS</span></span>
-              <span class="demo-desc">ETC1S and UASTC textures and a glTF through KHR_texture_basisu, transcoded to the best format this device samples, with sizes and timings</span>
-            </a>
+            <span class="demo-name">KTX2 textures</span>
+            <span class="demo-desc">ETC1S and UASTC textures and a glTF through KHR_texture_basisu, transcoded to the best format this device samples, with sizes and timings</span>
+            <span class="run">
+              <a class="run-ts" href="./index_ktx2.html" title="TypeScript">TS</a>
+              <a class="run-rust" href="/examples/ktx2-texture/" data-rust title="Rust / WASM">WASM</a>
+            </span>
           </li>
           <li>
-            <a href="/examples/ktx2-texture/" data-rust>
-              <span class="demo-name">KTX2 textures <span class="tag tag-rust">Rust / WASM</span></span>
-              <span class="demo-desc">The same textures transcoded by the Rust core</span>
-            </a>
+            <span class="demo-name">MSDF text</span>
+            <span class="demo-desc">Signed-distance-field text, animated by a compute shader</span>
+            <span class="run">
+              <a class="run-ts" href="./index_text.html" title="TypeScript">TS</a>
+            </span>
           </li>
           <li>
-            <a href="./index_text.html">
-              <span class="demo-name">MSDF text <span class="tag">TS</span></span>
-              <span class="demo-desc">Signed-distance-field text, animated by a compute shader</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_video.html">
-              <span class="demo-name">Video texture <span class="tag">TS</span></span>
-              <span class="demo-desc">The webcam as an external video texture across 250 stacked instanced planes (asks for camera access)</span>
-            </a>
-          </li>
-          <li>
-            <a href="./index_helpers.html">
-              <span class="demo-name">Helpers <span class="tag">TS</span></span>
-              <span class="demo-desc">Stock geometries (heightfield, spruce, icosphere, cylinder), debug boxes, a follow camera and the web runtime</span>
-            </a>
+            <span class="demo-name">Video texture</span>
+            <span class="demo-desc">The webcam as an external video texture across 250 stacked instanced planes (asks for camera access)</span>
+            <span class="run">
+              <a class="run-ts" href="./index_video.html" title="TypeScript">TS</a>
+            </span>
           </li>
         </ul>
       </section>
-
-
     </main>
 
     <footer class="footer">
@@ -552,7 +498,7 @@
 
     <script>
       // The Rust/WASM pages exist only where the site build (or a local build of them) put them.
-      // Elsewhere, such as the vite dev server, point their links at the published ones.
+      // Elsewhere, such as the vite dev server, point their buttons at the published ones.
       if (location.hostname !== 'kansei.graphics') {
         const links = [...document.querySelectorAll('a[data-rust]')]
         const probe = new URL(links[0].getAttribute('href'), location.href).pathname
@@ -565,7 +511,7 @@
             for (const a of links) {
               a.href = 'https://kansei.graphics' + a.getAttribute('href')
               a.rel = 'noopener'
-              a.querySelector('.tag-rust').textContent = 'Rust / WASM ↗'
+              a.textContent += ' ↗'
             }
           })
       }
