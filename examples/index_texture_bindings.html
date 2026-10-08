@@ -21,7 +21,7 @@
     // texture, a cubemap, a 2D array and an rgba16float storage texture a compute pass writes
     // each frame (its time comes from an external GPUBuffer). A probe pass then reads each one
     // back, plus a depth texture through a comparison sampler, and the overlay says PASS or FAIL.
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Camera } from '../src/cameras/Camera'
     import { CameraControls } from '../src/controls/CameraControls'
     import { Scene } from '../src/objects/Scene'
@@ -38,15 +38,11 @@
     import { Vector3 } from '../src/math/Vector3'
 
     const status = document.getElementById('status');
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 1,
+    const canvas = Canvas.fill().withMaxPixelRatio(1);
+    const renderer = await canvas.renderer({
       antialias: true,
       sampleCount: 4,
     });
-    await renderer.initialize();
-    document.body.appendChild(renderer.canvas);
     const device = renderer.device;
 
     const scene = new Scene();
@@ -248,14 +244,10 @@
       sphere.rotation.y = t * 0.4;
       controls.update();
       renderer.render(scene, camera);
-      requestAnimationFrame(frame);
     }
-    frame();
-
-    window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      frame();
     });
   </script>
 </body>

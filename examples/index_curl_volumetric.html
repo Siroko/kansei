@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { Compute } from '../src/materials/Compute'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
@@ -669,18 +669,11 @@
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: window.devicePixelRatio,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: true,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
     dirLight.enableShadows(renderer.gpuDevice, { resolution: 1024 });
     pointLight.enableShadows(renderer.gpuDevice, { resolution: 512, near: 0.1, shadowFar: 50 });
     areaLight.enableShadows(renderer.gpuDevice, { resolution: 1024, fov: 120 });
@@ -1302,15 +1295,10 @@
       fogEffect.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
 
       volume.render(scene, camera);
-
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
-
-    window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate();
     });
   </script>
 </body>

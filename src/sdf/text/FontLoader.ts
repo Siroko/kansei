@@ -1,103 +1,46 @@
 import { Texture } from '../../buffers/Texture';
-import init, { ArteryFont } from './loader/artery_font';
+import { ArFont, parseArFont } from './ArFont';
 
-interface FontImage {
-    width: number;
-    height: number;
-    data: number[];
-    channels: number; // 4
-    child_images: number; // 0
-    flags: number; // 0
-    image_type: string; // Mtsdf
-    metadata: string; // ""
-    pixel_format: string; // Unsigned8
-    texture_flags: number; // 0
-}
+export type { FontImage, FontGlyph, FontVariant, FontMetrics, FontKernPair } from './ArFont';
 
-export interface FontInfo {
-    images: FontImage[];
-    appendices: [];
-    variants: FontVariant[];
-    metadata_format: string; // None, Json
+/** A parsed `.arfont` and its first atlas image as a texture. */
+export interface FontInfo extends ArFont {
     sdfTexture: Texture;
 }
 
-interface FontGlyphAdvance {
-    horizontal: number;
-    vertical: number;
-}
-
-interface FontGlyphBounds {
-    left: number;
-    bottom: number;
-    right: number;
-    top: number;
-}
-
-export interface FontGlyph {
-    codepoint: number;
-    advance: FontGlyphAdvance;
-    image: number; // 0
-    image_bounds: FontGlyphBounds;
-    plane_bounds: FontGlyphBounds;
-}
-
-interface FontMetrics {
-    font_size: number;
-    distance_range: number;
-    em_size: number;
-    ascender: number;
-    descender: number;
-}
-
-export interface FontVariant {
-    name: string;
-    codepoint_type: string; // Indexed, Unicode
-    fallback_glyph: number; // 0
-    fallback_variant: number; // 0
-    flags: number; // 0
-    glyphs: FontGlyph[];
-    image_type: string; // Mtsdf
-    kern_pairs: [];
-    metadata: string;
-    metadata_format: string; // None, Json
-    metrics: FontMetrics;
-    weight: number; // 0
-}
-
+/**
+ * Loads an `.arfont` MTSDF atlas (msdf-atlas-gen's Artery Font output): glyph metrics for
+ * `TextGeometry` and the atlas as a texture. Parsed in plain TS (`ArFont.ts`), as the Rust
+ * engine's `FontAtlas::parse` does.
+ */
 export class FontLoader {
-    private wasmInitialized = false;
-
     public fontInfo?: FontInfo;
     public sdfTexture?: Texture;
 
     async load(url: string): Promise<FontInfo> {
-        // Initialize WASM only once
-        if (!this.wasmInitialized) {
-            await (init as unknown as () => Promise<void>)();
-            this.wasmInitialized = true;
-        }
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+        return this.parse(new Uint8Array(await response.arrayBuffer()));
+    }
 
-        const fontData = await fetch(url).then(res => res.arrayBuffer());
-        const uint8Array = new Uint8Array(fontData);
-        this.fontInfo = ArteryFont.read_from_bytes(uint8Array);
-
-        // Return the first processed image
-        const image = this.fontInfo?.images[0];
+    /** Parse a `.arfont` file's bytes. */
+    async parse(bytes: Uint8Array): Promise<FontInfo> {
+        const font = await parseArFont(bytes);
+        const image = font.images[0];
         if (!image) {
             throw new Error('No image found');
         }
-        const canvas = document.createElement('canvas');
-        canvas.width = image.width;
-        canvas.height = image.height;
-        const ctx = canvas.getContext('2d');
-        const dataArray = new Uint8ClampedArray(image.data);
-        const imgData = new ImageData(dataArray, image.width, image.height);
-        ctx!.putImageData(imgData, 0, 0);
-
-        this.sdfTexture = new Texture(canvas);
-        this.fontInfo!.sdfTexture = this.sdfTexture;
-
-        return this.fontInfo!;
+        // The channels are distances, not colour: upload them as they are (linear RGBA8, rows
+        // from the atlas's bottom, as the glyphs' image bounds count them).
+        let rgba = image.data;
+        if (image.channels !== 4) {
+            rgba = new Uint8Array(image.width * image.height * 4);
+            for (let i = 0, n = image.width * image.height; i < n; i++) {
+                for (let c = 0; c < 4; c++) rgba[i * 4 + c] = c < image.channels ? image.data[i * image.channels + c] : 255;
+            }
+        }
+        this.sdfTexture = new Texture({ label: 'FontAtlas', width: image.width, height: image.height, format: 'rgba8unorm', levels: [rgba] });
+        this.fontInfo = { ...font, sdfTexture: this.sdfTexture };
+        return this.fontInfo;
     }
-} 
+}

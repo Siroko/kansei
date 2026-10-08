@@ -33,7 +33,7 @@
   <body>
     <script type="module">
       import { FontLoader } from '../src/sdf/text/FontLoader'
-      import { Renderer } from '../src/renderers/Renderer'
+      import { Canvas, run } from '../src/web/index'
       import { Material } from '../src/materials/Material'
       import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
       import { Renderable } from '../src/objects/Renderable'
@@ -54,17 +54,13 @@
       import { Float } from '../src/math/Float'
 
       const time = new Vector4(0, 0, 0, 0);
-      const renderer = new Renderer({
+      const canvas = Canvas.fill();
+      const renderer = await canvas.renderer({
         alphaMode: "premultiplied",
         clearColor: new Vector4(0, 0, 0, 0),  // Fully transparent black
-        width: window.innerWidth,
-        height: window.innerHeight,
-        devicePixelRatio: Math.min(window.devicePixelRatio, 2) ,
         antialias: true,
         sampleCount: 1
       });
-      await renderer.initialize();
-      document.body.appendChild(renderer.canvas);
 
       const mouseVectors = new MouseVectors();
 
@@ -208,17 +204,11 @@
         await renderer.compute(computeVelocities, Math.ceil(poem.length / 64));
         await renderer.compute(compute, Math.ceil(poem.length / 64));
         renderer.render(scene, camera);
-        
-        requestAnimationFrame(animate);
       }
-      animate();
-
-      function onResize() {
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
-      }
-      window.addEventListener('resize', onResize);
+      run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        return animate();
+      });
     </script>
     <div id="info">
       Made with ❤️ and <a href="https://github.com/siroko/kansei">KANSEI</a>

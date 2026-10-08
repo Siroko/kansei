@@ -12,7 +12,7 @@
   </head>
   <body>
     <script type="module">
-      import { Renderer } from '../src/renderers/Renderer'
+      import { Canvas, run } from '../src/web/index'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
       import { CameraControls } from '../src/controls/CameraControls'
@@ -43,15 +43,11 @@
       import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
       // ── Renderer ──────────────────────────────────────────
-      const renderer = new Renderer({
+      const canvas = Canvas.fill().withMaxPixelRatio(1);
+      const renderer = await canvas.renderer({
         clearColor: new Vector4(0.02, 0.02, 0.04, 1),
-        width: window.innerWidth,
-        height: window.innerHeight,
-        devicePixelRatio: 1,
         sampleCount: 4,
       });
-      await renderer.initialize();
-      document.body.appendChild(renderer.canvas);
 
       // ── Scene & Camera ────────────────────────────────────
       const scene = new Scene();
@@ -564,8 +560,6 @@ fn fragment_main(v: VOut) -> FragOut {
       const hud = installProfileHud({ renderer, FrameTimer, AbBench });
 
       function animate() {
-        requestAnimationFrame(animate);
-
         const now = performance.now();
         hud.begin(now);
         // Raw frame delta. Clamped to avoid zero-division and to drop huge
@@ -613,13 +607,9 @@ fn fragment_main(v: VOut) -> FragOut {
         volume.render(scene, camera);
         hud.end(now);
       }
-      animate();
-
-      // ── Resize ────────────────────────────────────────────
-      window.addEventListener('resize', () => {
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
+      run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        animate();
       });
     </script>
   </body>
