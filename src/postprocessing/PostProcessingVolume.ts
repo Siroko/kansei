@@ -3,6 +3,7 @@ import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
 import { GBuffer } from './GBuffer';
 import { PostProcessingEffect } from './PostProcessingEffect';
+import { cpuScope, endProfiledFrame, gpuPass } from '../profiling/Profiler';
 
 /**
  * PostProcessingVolume
@@ -65,6 +66,7 @@ class PostProcessingVolume {
      * Call this instead of renderer.render() every frame.
      */
     public render(scene: Scene, camera: Camera): void {
+        const frameScope = cpuScope('frame');
         const device = this.renderer.gpuDevice;
         const w = this.renderer.renderWidth;
         const h = this.renderer.renderHeight;
@@ -86,6 +88,7 @@ class PostProcessingVolume {
         // Step 1: render scene into the GBuffer.
         this.renderer.renderToGBuffer(scene, camera, this._gbuffer);
 
+        const postScope = cpuScope('post');
         // Step 2: initialise any uninitialised effects.
         for (const effect of this.effects) {
             if (!effect.initialized) {
@@ -108,6 +111,8 @@ class PostProcessingVolume {
                     ? this._gbuffer.outputTexture
                     : this._gbuffer.pingPongTexture;
 
+                // the effect's class name, as Rust's `effect.name()` (a minifier may shorten it)
+                const effectScope = cpuScope(effect.constructor.name);
                 effect.render(
                     commandEncoder,
                     currentSource,
@@ -118,6 +123,7 @@ class PostProcessingVolume {
                     h,
                     this._gbuffer.emissiveTexture
                 );
+                effectScope?.end();
 
                 currentSource = outputTex;
                 pingPongIdx = 1 - pingPongIdx;
@@ -128,6 +134,9 @@ class PostProcessingVolume {
 
         // Step 4: blit the final texture to the canvas.
         this._blit(device, currentSource);
+        postScope?.end();
+        frameScope?.end();
+        endProfiledFrame();
     }
 
     // ── Blit pass ────────────────────────────────────────────────────────────
@@ -212,9 +221,13 @@ class PostProcessingVolume {
         }
 
         const commandEncoder = device.createCommandEncoder();
+        const surfaceScope = cpuScope('frame/surface');
         const swapchainView = this.renderer.context!.getCurrentTexture().createView();
+        surfaceScope?.end();
 
         const pass = commandEncoder.beginRenderPass({
+            label: 'Blit RenderPass',
+            timestampWrites: gpuPass('Blit RenderPass'),
             colorAttachments: [{
                 view: swapchainView,
                 loadOp: 'clear',

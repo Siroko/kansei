@@ -42,6 +42,9 @@
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { PointLight } from '../src/lights/PointLight'
     import { Float } from '../src/math/Float'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
@@ -367,6 +370,12 @@
     }
     rebuildEffectChain();
 
+    // ?profile=1: per-pass GPU times; ?bench=1: fog on against off (examples/profile-hud.js)
+    const hud = installProfileHud({
+      renderer, FrameTimer, AbBench,
+      bench: { labels: ['fog on', 'off'], set: (v) => { effectToggles.fog = v === 0; rebuildEffectChain(); } },
+    });
+
     // ── Tweakpane ───────────────────────────────────────────────────────────────
     const params = {
       scrollSpeed: SCROLL_SPEED,
@@ -484,6 +493,7 @@
     const maxZ = half + GRID_SPACING;
 
     function animate(now) {
+      hud.begin(now);
       const dt = (now - lastTime) / 1000;
       lastTime = now;
 
@@ -518,6 +528,7 @@
       }
       fogEffect.updateLights(scene.directionalLights, scene.pointLights);
       volume.render(scene, camera);
+      hud.end(now);
       requestAnimationFrame(animate);
     }
     requestAnimationFrame(animate);

@@ -1,6 +1,7 @@
 import { Camera } from '../../cameras/Camera';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface ColorGradingOptions {
     /** Additive brightness shift (-1 to 1). Default 0.0 */
@@ -193,7 +194,7 @@ class ColorGradingEffect extends PostProcessingEffect {
         this._device!.queue.writeBuffer(this._paramsBuffer!, 0, paramsData);
 
         const wg = (t: number) => Math.ceil(t / 8);
-        const pass = commandEncoder.beginComputePass({ label: 'ColorGrading' });
+        const pass = commandEncoder.beginComputePass({ label: 'ColorGrading', timestampWrites: gpuPass('ColorGrading') });
         pass.setPipeline(this._pipeline!);
         pass.setBindGroup(0, this._bindGroup!);
         pass.dispatchWorkgroups(wg(width), wg(height));

@@ -6,6 +6,7 @@ import { Scene } from '../objects/Scene';
 import { DirectionalLight } from '../lights/DirectionalLight';
 import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
+import { gpuPass } from '../profiling/Profiler';
 
 export interface ShadowMapOptions {
     resolution?: number;
@@ -431,6 +432,8 @@ class ShadowMap {
 
         const commandEncoder = device.createCommandEncoder({ label: 'ShadowMap' });
         const pass = commandEncoder.beginRenderPass({
+            label: 'Renderer/ShadowPass',
+            timestampWrites: gpuPass('Renderer/ShadowPass'),
             colorAttachments: [],
             depthStencilAttachment: {
                 view: this._depthTexture.createView(),

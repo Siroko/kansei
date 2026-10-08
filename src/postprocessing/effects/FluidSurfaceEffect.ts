@@ -4,6 +4,7 @@ import { PostProcessingEffect } from '../PostProcessingEffect';
 import { FluidDensityField } from '../../simulations/fluid/FluidDensityField';
 import { shaderCode } from './shaders/fluid-surface.wgsl';
 import { mat4 } from 'gl-matrix';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface FluidSurfaceOptions {
     densityField: FluidDensityField;
@@ -149,7 +150,7 @@ class FluidSurfaceEffect extends PostProcessingEffect {
 
         this._device!.queue.writeBuffer(this._paramsBuffer!, 0, data.buffer, 0, 144);
 
-        const pass = commandEncoder.beginComputePass({ label: 'FluidSurface/March' });
+        const pass = commandEncoder.beginComputePass({ label: 'FluidSurface/March', timestampWrites: gpuPass('FluidSurface/March') });
         pass.setPipeline(this._pipeline);
         pass.setBindGroup(0, this._bg!);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));

@@ -1,3 +1,5 @@
+import { gpuPass } from '../profiling/Profiler';
+
 export interface FroxelGridOptions {
     gridW?: number;  // default 160
     gridH?: number;  // default 90
@@ -416,7 +418,7 @@ class FroxelGrid {
         device.queue.writeBuffer(this._temporalParamsBuffer!, 0, buf);
 
         // Dispatch temporal blend
-        const pass = encoder.beginComputePass({ label: 'FroxelGrid/TemporalBlend' });
+        const pass = encoder.beginComputePass({ label: 'FroxelGrid/TemporalBlend', timestampWrites: gpuPass('FroxelGrid/TemporalBlend') });
         pass.setPipeline(this._temporalPipeline!);
         pass.setBindGroup(0, this._temporalBG[readIdx]);
         pass.dispatchWorkgroups(
@@ -437,7 +439,7 @@ class FroxelGrid {
      * Call after the injection pass (and temporal blend if enabled).
      */
     accumulate(encoder: GPUCommandEncoder): void {
-        const pass = encoder.beginComputePass({ label: 'FroxelGrid/Accumulate' });
+        const pass = encoder.beginComputePass({ label: 'FroxelGrid/Accumulate', timestampWrites: gpuPass('FroxelGrid/Accumulate') });
         pass.setPipeline(this._accumPipeline!);
 
         if (this._temporal && this._hasPrevFrame) {

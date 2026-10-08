@@ -9,6 +9,7 @@ import type { PositionalLight } from '../../shadows/CubeMapShadowMap';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
 import { mat4 } from 'gl-matrix';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface VolumetricFogOptions {
     froxelGrid: FroxelGrid;
@@ -666,7 +667,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         }
 
         // ── Pass 1: Fog injection ──
-        const injectPass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Inject' });
+        const injectPass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Inject', timestampWrites: gpuPass('VolumetricFog/Inject') });
         injectPass.setPipeline(this._injectPipeline!);
         injectPass.setBindGroup(0, this._injectBG!);
         injectPass.dispatchWorkgroups(
@@ -689,7 +690,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         grid.accumulate(commandEncoder);
 
         // ── Pass 4: Composite fog onto scene ──
-        const compositePass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Composite' });
+        const compositePass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Composite', timestampWrites: gpuPass('VolumetricFog/Composite') });
         compositePass.setPipeline(this._compositePipeline!);
         compositePass.setBindGroup(0, this._compositeBG!);
         compositePass.dispatchWorkgroups(

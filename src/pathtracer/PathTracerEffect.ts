@@ -17,6 +17,7 @@ import { probeDebugShader } from './shaders/probe-debug.wgsl';
 import { voxelDDAShader } from './shaders/voxel-dda.wgsl';
 import { voxelClearShader, voxelizeShader, voxelMipBuildShader } from './shaders/voxelize.wgsl';
 import { mat4 } from 'gl-matrix';
+import { gpuPass } from '../profiling/Profiler';
 
 export interface PathTracerOptions {
     scene: Scene;
@@ -1069,7 +1070,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 1, resource: { buffer: this._voxelColors! } },
             ],
         });
-        const clearPass = commandEncoder.beginComputePass({ label: 'Voxel/Clear' });
+        const clearPass = commandEncoder.beginComputePass({ label: 'Voxel/Clear', timestampWrites: gpuPass('Voxel/Clear') });
         clearPass.setPipeline(this._voxelClearPipeline!);
         clearPass.setBindGroup(0, clearBG);
         clearPass.dispatchWorkgroups(Math.ceil(totalVoxels / 64));
@@ -1087,7 +1088,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 5, resource: { buffer: this._voxelColors! } },
             ],
         });
-        const voxPass = commandEncoder.beginComputePass({ label: 'Voxel/Voxelize' });
+        const voxPass = commandEncoder.beginComputePass({ label: 'Voxel/Voxelize', timestampWrites: gpuPass('Voxel/Voxelize') });
         voxPass.setPipeline(this._voxelizePipeline!);
         voxPass.setBindGroup(0, voxBG);
         voxPass.dispatchWorkgroups(Math.ceil(builder.totalInstanceTriangles / 64));
@@ -1120,7 +1121,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                     { binding: 2, resource: { buffer: this._voxelColors! } },
                 ],
             });
-            const mipPass = commandEncoder.beginComputePass({ label: `Voxel/MipBuild/${level}` });
+            const mipPass = commandEncoder.beginComputePass({ label: `Voxel/MipBuild/${level}`, timestampWrites: gpuPass('Voxel/MipBuild') });
             mipPass.setPipeline(this._voxelMipBuildPipeline!);
             mipPass.setBindGroup(0, mipBG);
             mipPass.dispatchWorkgroups(Math.ceil((coarseRes * coarseRes * coarseRes) / 64));
@@ -1205,7 +1206,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const pass = commandEncoder.beginComputePass({ label: 'Voxel/Trace' });
+        const pass = commandEncoder.beginComputePass({ label: 'Voxel/Trace', timestampWrites: gpuPass('Voxel/Trace') });
         pass.setPipeline(this._voxelTracePipeline!);
         pass.setBindGroup(0, traceBG);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1542,7 +1543,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/Trace' });
+        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/Trace', timestampWrites: gpuPass('PathTracer/Trace') });
         pass.setPipeline(this._tracePipeline!);
         pass.setBindGroup(0, traceBG);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1590,7 +1591,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/TemporalDenoise' });
+        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/TemporalDenoise', timestampWrites: gpuPass('TemporalDenoise') });
         pass.setPipeline(this._temporalPipeline!);
         pass.setBindGroup(0, temporalBG);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1643,7 +1644,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 ],
             });
 
-            const pass = commandEncoder.beginComputePass({ label: `PathTracer/SpatialDenoise/${i}` });
+            const pass = commandEncoder.beginComputePass({ label: `PathTracer/SpatialDenoise/${i}`, timestampWrites: gpuPass('PathTracer/SpatialDenoise') });
             pass.setPipeline(this._spatialPipeline!);
             pass.setBindGroup(0, spatialBG);
             pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1683,7 +1684,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/Composite' });
+        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/Composite', timestampWrites: gpuPass('Compositor') });
         pass.setPipeline(this._compositePipeline!);
         pass.setBindGroup(0, compositeBG);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1741,7 +1742,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const genPass = commandEncoder.beginComputePass({ label: 'PathTracer/ReSTIR-Generate' });
+        const genPass = commandEncoder.beginComputePass({ label: 'PathTracer/ReSTIR-Generate', timestampWrites: gpuPass('ReSTIR/Generate') });
         genPass.setPipeline(this._restirGenPipeline!);
         genPass.setBindGroup(0, genBG);
         genPass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1765,7 +1766,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const spatialPass = commandEncoder.beginComputePass({ label: 'PathTracer/ReSTIR-Spatial' });
+        const spatialPass = commandEncoder.beginComputePass({ label: 'PathTracer/ReSTIR-Spatial', timestampWrites: gpuPass('ReSTIR/Spatial') });
         spatialPass.setPipeline(this._restirSpatialPipeline!);
         spatialPass.setBindGroup(0, spatialBG);
         spatialPass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
@@ -1822,7 +1823,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         });
 
         const totalRays = totalProbes * raysPerProbe;
-        const tracePass = commandEncoder.beginComputePass({ label: 'PathTracer/ProbeTrace' });
+        const tracePass = commandEncoder.beginComputePass({ label: 'PathTracer/ProbeTrace', timestampWrites: gpuPass('ProbeGrid/Trace') });
         tracePass.setPipeline(this._probeTracePipeline!);
         tracePass.setBindGroup(0, traceBG);
         tracePass.dispatchWorkgroups(Math.ceil(totalRays / 64));
@@ -1850,7 +1851,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const updatePass = commandEncoder.beginComputePass({ label: 'PathTracer/ProbeUpdate' });
+        const updatePass = commandEncoder.beginComputePass({ label: 'PathTracer/ProbeUpdate', timestampWrites: gpuPass('ProbeGrid/Update') });
         updatePass.setPipeline(this._probeUpdatePipeline!);
         updatePass.setBindGroup(0, updateBG);
         updatePass.dispatchWorkgroups(Math.ceil(totalProbes / 64));
@@ -1918,7 +1919,7 @@ export class PathTracerEffect extends PostProcessingEffect {
             ],
         });
 
-        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/ProbeDebug' });
+        const pass = commandEncoder.beginComputePass({ label: 'PathTracer/ProbeDebug', timestampWrites: gpuPass('PathTracer/ProbeDebug') });
         pass.setPipeline(this._probeDebugPipeline!);
         pass.setBindGroup(0, bg);
         pass.dispatchWorkgroups(Math.ceil(totalProbes / 64));

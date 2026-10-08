@@ -1,6 +1,7 @@
 import { Camera } from '../../cameras/Camera';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface DepthOfFieldOptions {
     /** World-space distance to the in-focus plane. Default 5.0 */
@@ -637,7 +638,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Pass 1: CoC computation (full-res)
         {
-            const pass = commandEncoder.beginComputePass({ label: 'DoF/CoC' });
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/CoC', timestampWrites: gpuPass('DoF/CoC') });
             pass.setPipeline(this._cocPipeline!);
             pass.setBindGroup(0, this._cocBindGroup!);
             pass.dispatchWorkgroups(wg(width), wg(height));
@@ -646,7 +647,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Pass 2a: Dilate horizontal (full-res)
         {
-            const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateH' });
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateH', timestampWrites: gpuPass('DoF/DilateH') });
             pass.setPipeline(this._dilateHPipeline!);
             pass.setBindGroup(0, this._dilateHBindGroup!);
             pass.dispatchWorkgroups(wg(width), wg(height));
@@ -655,7 +656,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Pass 2b: Dilate vertical (full-res)
         {
-            const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateV' });
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/DilateV', timestampWrites: gpuPass('DoF/DilateV') });
             pass.setPipeline(this._dilateVPipeline!);
             pass.setBindGroup(0, this._dilateVBindGroup!);
             pass.dispatchWorkgroups(wg(width), wg(height));
@@ -664,7 +665,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Pass 3: Downsample + separation (full->half)
         {
-            const pass = commandEncoder.beginComputePass({ label: 'DoF/Downsample' });
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/Downsample', timestampWrites: gpuPass('DoF/Downsample') });
             pass.setPipeline(this._downsamplePipeline!);
             pass.setBindGroup(0, this._downsampleBindGroup!);
             pass.dispatchWorkgroups(wg(halfW), wg(halfH));
@@ -673,7 +674,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Pass 4: Vogel disk blur (half-res)
         {
-            const pass = commandEncoder.beginComputePass({ label: 'DoF/Blur' });
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/Blur', timestampWrites: gpuPass('DoF/Blur') });
             pass.setPipeline(this._blurPipeline!);
             pass.setBindGroup(0, this._blurBindGroup!);
             pass.dispatchWorkgroups(wg(halfW), wg(halfH));
@@ -682,7 +683,7 @@ class DepthOfFieldEffect extends PostProcessingEffect {
 
         // Pass 5: Composite (full-res)
         {
-            const pass = commandEncoder.beginComputePass({ label: 'DoF/Composite' });
+            const pass = commandEncoder.beginComputePass({ label: 'DoF/Composite', timestampWrites: gpuPass('DoF/Composite') });
             pass.setPipeline(this._compositePipeline!);
             pass.setBindGroup(0, this._compositeBindGroup!);
             pass.dispatchWorkgroups(wg(width), wg(height));
