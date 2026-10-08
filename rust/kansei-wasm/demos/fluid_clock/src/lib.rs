@@ -330,10 +330,10 @@ pub async fn start(canvas_id: &str, count: u32) -> Result<(), JsValue> {
         ],
     );
 
-    // Camera: back view aligned with long X axis (azimuth = π), radius wide
-    // enough to see the full ~34-unit clock band (slots span x ∈ [-17, 17]).
+    // Camera: front view on the +Z side (azimuth = 0), where the digits read the right way
+    // round, radius wide enough to see the full ~34-unit clock band (slots span x ∈ [-17, 17]).
     let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(0.0, 22.0, 0.0), 95.0);
-    controls.set_azimuth(std::f32::consts::PI);
+    controls.set_azimuth(0.0);
     let mouse = MouseVectors::from_canvas(canvas.element());
 
     let state = Rc::new(RefCell::new(State {
