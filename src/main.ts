@@ -128,3 +128,10 @@ export type { ParticleConeSettings } from "./gi/ParticleConeShading";
 export { ParticleGi, ParticleGiSettings } from "./gi/ParticleGi";
 export type { ParticleGiOptions } from "./gi/ParticleGi";
 export { VOXEL_VOLUME_WGSL, VOXEL_CONES_WGSL, PARTICLE_EMISSION_WGSL, SKY_LIGHTING_WGSL } from "./gi/GiWGSL";
+export {
+    Transform, nlerp, quatAbs, quatLog, quatExp, quatToScaledAngleAxis, quatFromScaledAngleAxis, angularVelocity,
+    Skeleton, Pose, Clip, SkinnedMesh, MAX_INFLUENCES, strongestInfluences, SkinnedGltf,
+    SKINNING_WGSL, SKINNED_LIT_WGSL, SKINNED_LIT_TEXTURED_WGSL, PALETTE_BINDING, SKIN_BINDING, SKINNED_LIT_PARAMS_BYTES,
+    BonePalette, skinBuffer, skinnedMaterial, skinnedLitMaterial, skinnedLitTexturedMaterial, packSkinnedLitParams,
+} from "./animation/index";
+export type { SkinnedLitParams, SkinTextures } from "./animation/index";
