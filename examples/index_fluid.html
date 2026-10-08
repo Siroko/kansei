@@ -366,15 +366,14 @@ fn fragment_main(v: VOut) -> FragOut {
       //   simStepDt    — real-world duration of a single sim step. The sim
       //                  is integrated in chunks of this size regardless of
       //                  the current render framerate, so behaviour is
-      //                  deterministic at 30, 33, 60, 90, 144 fps.
+      //                  deterministic at 60, 90, 144 fps (below 60 fps a
+      //                  frame still takes only a 60 Hz frame's steps).
       //   simTimeScale — speed multiplier applied to the sim dt (user facing).
       //                  Changes how fast the sim advances vs. wall clock
       //                  without changing the number of steps per second.
       //   maxSimSteps  — upper bound on how many sim steps we're allowed to
-      //                  run per rendered frame. Prevents the classic
-      //                  "spiral of death" where a slow frame triggers more
-      //                  catch-up work which makes the next frame even slower.
-      //                  Extra accumulated time is simply discarded.
+      //                  run per rendered frame. Extra accumulated time is
+      //                  simply discarded.
       const timing = { simStepDt: 1 / 60, simTimeScale: 1.9, maxSimSteps: 4 };
       const timingFolder = pane.addFolder({ title: 'Sim Timing', expanded: false });
       timingFolder.addBinding(timing, 'simStepDt',    { min: 1 / 240, max: 1 / 30, step: 1 / 240, label: 'sim dt step' });
@@ -521,10 +520,11 @@ fn fragment_main(v: VOut) -> FragOut {
       // Fixed-timestep simulation: drain an accumulator in chunks of exactly
       // `simStepDt`, calling `sim.updateBatched()` with the number of steps
       // to run in a single command encoder. This gives framerate-independent
-      // behaviour — 30 / 33 / 60 / 90 / 144 fps all produce the same sim
-      // evolution over the same wall-clock window.
+      // behaviour — 60 / 90 / 144 fps all produce the same sim evolution over
+      // the same wall-clock window.
       let lastPerf     = performance.now();
       let simAccumulator = 0;
+      const MAX_FRAME_DT = 1 / 60;
 
       function animate() {
         requestAnimationFrame(animate);
@@ -539,17 +539,18 @@ fn fragment_main(v: VOut) -> FragOut {
         mouseVectors.update(frameDt);
         cameraControls.update(now / 1000);
 
-        // Accumulate wall-clock, convert to sim-clock via simTimeScale.
-        simAccumulator += frameDt * timing.simTimeScale;
+        // Accumulate wall-clock, convert to sim-clock via simTimeScale. As the
+        // Rust engine's FixedStep: a frame feeds at most a 60 Hz frame's time,
+        // so below 60 fps the sim runs slower than real time rather than taking
+        // more steps (each lengthens the next frame, which then asks for more,
+        // until every frame runs maxSimSteps); time past maxSimSteps is dropped.
         const stepDt = timing.simStepDt;
-        let steps = 0;
-        while (simAccumulator >= stepDt && steps < timing.maxSimSteps) {
-          simAccumulator -= stepDt;
-          steps++;
-        }
-        // If we still have a large leftover after maxSimSteps, the renderer
-        // can't keep up — drop the excess so we don't spiral on the next frame.
-        if (simAccumulator > stepDt) simAccumulator = stepDt;
+        simAccumulator = Math.min(
+          simAccumulator + Math.min(frameDt, MAX_FRAME_DT) * timing.simTimeScale,
+          stepDt * timing.maxSimSteps,
+        );
+        const steps = Math.floor(simAccumulator / stepDt + 1e-9);
+        simAccumulator -= steps * stepDt;
         lastSimSteps = steps;
 
         if (steps > 0) {

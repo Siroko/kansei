@@ -59,5 +59,5 @@ export function installFrameHud({ steps = () => NaN } = {}) {
       + `1 / 2 / 3 / 4+ refreshes  ${pct}   cadence changes ${Math.round(100 * s.changeRate)}%\n`
       + `sim steps this frame ${s.steps}   (frames by steps ${stepShare})`;
   }, 250);
-  window.frameHud = { stats };
+  window.frameHud = { stats, steps };
 }

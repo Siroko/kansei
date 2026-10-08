@@ -319,14 +319,15 @@ impl State {
         // Step fluid simulation (owned by FluidSurfaceEffect in the volume) at a fixed step, so
         // it evolves the same at any frame rate: each step simulates `step * sim_time_scale`.
         // `update_batched` encodes all substeps into one submit, so a slow frame's extra steps
-        // cost GPU time but almost no CPU; past the step cap the backlog is dropped.
+        // cost GPU time but almost no CPU. A frame feeds at most a 60 Hz frame's time: slower,
+        // the sim falls behind real time rather than the frame rate behind it (`FixedStep`).
         let identity = glam::Mat4::IDENTITY.to_cols_array();
         if let Some(fse) = self.volume.effect_mut::<FluidSurfaceEffect>()
         {
             fse.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
             let scale = self.sim_time_scale.clamp(0.1, 4.0);
             let scaled_dt = self.sim_step.step as f32 * scale;
-            let steps = self.sim_step.advance(frame_dt * scale as f64);
+            let steps = self.sim_step.advance_scaled(frame_dt, scale as f64);
             for _ in 0..steps {
                 fse.step_simulation(scaled_dt, mouse_strength, mouse_ndc, mouse_dir, self.use_batched_sim);
             }
