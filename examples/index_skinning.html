@@ -39,7 +39,6 @@
     import { Texture } from '../src/buffers/Texture'
     import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
     import { BufferBase } from '../src/buffers/BufferBase'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { Vector3 } from '../src/math/Vector3'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
@@ -221,10 +220,11 @@
     const controls = new CameraControls(camera, new Vector3(0, 1.4, 0), renderer.canvas, 11);
 
     const SUN_DIRECTION = [0.45, -0.75, -0.5];
+    // The renderer renders the shadow map each frame from the sun, which casts shadows.
     const sunLight = new DirectionalLight(SUN_DIRECTION, [1, 1, 1], 1.0);
-    const shadowMap = new ShadowMap(device, { resolution: 2048, maxShadowDistance: 24 });
-    renderer.shadowMap = shadowMap;
-    renderer.shadowsEnabled = true;
+    sunLight.castShadow = true;
+    scene.add(sunLight);
+    renderer.enableShadows({ resolution: 2048, maxShadowDistance: 24 });
     // Physical units: a clear-day sun (lux) and sky (cd/m²).
     const light = { sunDirection: SUN_DIRECTION, sun: [1.0e5, 0.96e5, 0.88e5], sky: [0.55e4, 0.7e4, 1.0e4] };
 
@@ -370,7 +370,6 @@
         pose.toModel(gltf.skeleton, model);
         t.palette.update(mesh, model);
       }
-      shadowMap.render(renderer, scene, camera, sunLight);
       volume.render(scene, camera);
     });
 

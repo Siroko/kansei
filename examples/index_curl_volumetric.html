@@ -674,27 +674,18 @@
       antialias: true,
       sampleCount: 1
     });
-    dirLight.enableShadows(renderer.gpuDevice, { resolution: 1024 });
-    pointLight.enableShadows(renderer.gpuDevice, { resolution: 512, near: 0.1, shadowFar: 50 });
-    areaLight.enableShadows(renderer.gpuDevice, { resolution: 1024, fov: 120 });
+    // The renderer renders its shadow maps each frame from the lights that cast: the 2D map
+    // from the directional or else the area light, the cube map from the point light.
+    const shadowMap = renderer.enableShadows({ resolution: 1024, fov: 120 });
+    const cubeMapShadowMap = renderer.enablePointShadows({ resolution: 512, near: 0.1, shadowFar: 50 });
     const shadowSource = { value: 'area' };
-    let fogEffectRef = null;
-    renderer.cubeMapShadowMap = pointLight.shadowMap;
+    let fogEffectRef = null; // set after fog is created
     function updateShadowSource() {
-      let sm = null;
-      if (shadowSource.value === 'directional' && dirLight.shadowMap) {
-        sm = dirLight.shadowMap;
-      } else if (shadowSource.value === 'area' && areaLight.shadowMap) {
-        sm = areaLight.shadowMap;
-      }
-      if (shadowSource.value === 'point') {
-        renderer.shadowMap = null;
-      } else if (sm) {
-        renderer.shadowMap = sm;
-      }
-      if (fogEffectRef) fogEffectRef.shadowMap = sm;
+      dirLight.castShadow = shadowSource.value === 'directional';
+      areaLight.castShadow = shadowSource.value === 'area';
+      pointLight.castShadow = shadowSource.value === 'point';
+      if (fogEffectRef) fogEffectRef.shadowMap = shadowSource.value === 'point' ? null : shadowMap;
     }
-    renderer.shadowsEnabled = true;
     updateShadowSource();
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
@@ -984,8 +975,8 @@
     // ── Post-processing effects ──────────────────────────────────────────
     const fogEffect = new VolumetricFogEffect({
       froxelGrid,
-      shadowMap: areaLight.shadowMap,
-      cubeMapShadowMap: pointLight.shadowMap,
+      shadowMap,
+      cubeMapShadowMap,
       baseDensity: 0.02,
       heightFalloff: 0.005,
       anisotropy: 0.6,
@@ -1278,19 +1269,6 @@
       pointLight.volumetric = lightToggles.point;
       areaLight.volumetric = lightToggles.area;
       updateLightParams();
-
-      // Render shadow from selected source
-      if (shadowSource.value === 'area' && areaLight.shadowMap) {
-        areaLight.shadowMap.render(renderer, scene, camera, areaLight);
-      } else if (shadowSource.value === 'directional' && dirLight.shadowMap) {
-        dirLight.shadowMap.render(renderer, scene, camera, dirLight);
-      }
-      if (shadowSource.value === 'point' && pointLight.shadowMap) {
-        pointLight.shadowMap.render(renderer, scene, camera, [pointLight]);
-        pointLight.updateModelMatrix();
-        const wm = pointLight.worldMatrix.internalMat4;
-        renderer.setPointShadowParams(wm[12], wm[13], wm[14], pointLight.radius);
-      }
 
       fogEffect.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
 

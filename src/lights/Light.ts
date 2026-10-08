@@ -6,6 +6,12 @@ abstract class Light extends Object3D {
     public color: [number, number, number];
     public intensity: number;
     public volumetric: boolean;
+    /**
+     * Whether the renderer's shadow maps are rendered from this light (`Renderer.enableShadows`:
+     * the first directional light that casts, else the first area light; `enablePointShadows`:
+     * the point lights that cast). Off by default, as in the Rust engine.
+     */
+    public castShadow: boolean = false;
 
     constructor(
         lightType: 'directional' | 'point' | 'area',

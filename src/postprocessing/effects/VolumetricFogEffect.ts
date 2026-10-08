@@ -520,14 +520,15 @@ class VolumetricFogEffect extends PostProcessingEffect {
         this._ensureLightBuffers(this._numDirLights, this._numPointLights);
         if (this._injectBGDirty) this._rebuildInjectBG();
 
-        // The 2D shadow map shadows the light that owns it (light.shadowMap), or, when no
-        // light owns it, the first directional light, as in the Rust fog.
+        // The 2D shadow map shadows the light it was rendered from (sm.light, as for the
+        // renderer's own map) or that owns it (light.shadowMap), or, when neither is known, the
+        // first directional light, as in the Rust fog.
         const sm = this._shadowMap;
-        const smOwned = sm !== null
-            && (dirLights.some(l => l.shadowMap === sm) || areaLights.some(l => l.shadowMap === sm));
+        const owns = (l: DirectionalLight | AreaLight) => sm !== null && (sm.light === l || l.shadowMap === sm);
+        const smOwned = dirLights.some(owns) || areaLights.some(owns);
         const firstDir = dirLights[0];
         const dirShadowed = (l: DirectionalLight) =>
-            sm !== null && (smOwned ? l.shadowMap === sm : l === firstDir);
+            sm !== null && (smOwned ? owns(l) : l === firstDir);
 
         // A positional light reads its own cube faces, if the cube map drew it last frame.
         const cubeLights = this._cubeMapShadowMap?.lights ?? [];
@@ -574,7 +575,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 // non-volumetric: color stays (0,0,0) — scatter contribution is zero
                 const cubeIndex = cubeLights.indexOf(light);
                 uintView[off + 7] = cubeIndex >= 0 ? cubeIndex * 6
-                    : (sm !== null && light instanceof AreaLight && light.shadowMap === sm) ? SHADOW_MAP
+                    : (light instanceof AreaLight && owns(light)) ? SHADOW_MAP
                     : NO_SHADOW;
             }
             this._device.queue.writeBuffer(this._pointLightsBuffer!, 0, data.buffer as ArrayBuffer);

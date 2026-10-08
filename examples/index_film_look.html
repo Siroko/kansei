@@ -38,7 +38,6 @@
     import { BufferBase } from '../src/buffers/BufferBase'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { PointLight } from '../src/lights/PointLight'
-    import { CubeMapShadowMap } from '../src/shadows/CubeMapShadowMap'
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
@@ -71,6 +70,7 @@
       return lamp;
     });
     const shadowLamp = lamps[1];
+    shadowLamp.castShadow = true;
     const fill = new DirectionalLight([0.3, -1.0, 0.2], [0.55, 0.7, 1.0], 1.5);
     scene.add(fill);
 
@@ -236,8 +236,8 @@
       scene.add(head);
     }
 
-    const cubeShadows = new CubeMapShadowMap(renderer.gpuDevice, { resolution: 512, maxLights: 1 });
-    renderer.cubeMapShadowMap = cubeShadows;
+    // The renderer renders the shadow-casting lamp's cube faces each frame
+    const cubeShadows = renderer.enablePointShadows({ resolution: 512, maxLights: 1 });
 
     // ── The chain: fog, bloom, then the display transform ──
     const tonemappers = {
@@ -295,8 +295,6 @@
       target.set(0, 2.2, z - 20);
       camera.lookAt(target);
 
-      cubeShadows.render(renderer, scene, camera, [shadowLamp]);
-      renderer.setPointShadowParams(shadowLamp.position.x, shadowLamp.position.y, shadowLamp.position.z, shadowLamp.radius);
       fog?.updateLights([fill], lamps);
       volume.render(scene, camera);
     }
