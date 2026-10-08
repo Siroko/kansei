@@ -46,6 +46,7 @@
 //! `view=<degrees>` (the camera turned round the character from behind it).
 
 mod demo;
+mod timing;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -257,6 +258,8 @@ struct State {
     /// `drive=1`: the scripted route; `play=<pattern>`: the clips played in turn.
     drive: Option<demo::Drive>,
     player: Option<demo::ClipPlayer>,
+    /// The character's update (search, pose, IK) per frame, in ms: the last `timing::WINDOW` frames.
+    update_ms: timing::Window,
 }
 
 impl State {
@@ -363,7 +366,9 @@ impl State {
                 }
                 c.controller.matcher.update(&c.db, &MotionInput { velocity: GVec3::ZERO, facing: None }, dt);
             } else {
+                let t0 = kansei_wasm::now();
                 c.controller.update(&c.db, &self.world.collision, &MotionInput { velocity, facing }, dt);
+                self.update_ms.push(((kansei_wasm::now() - t0) * 1000.0) as f32);
             }
             if traverse {
                 // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump
@@ -471,7 +476,7 @@ impl State {
                     let feet = c.controller.matcher.feet_locked();
                     let speed = c.controller.matcher.simulation().velocity.length();
                     set_text("hud", &format!(
-                        "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock · E / X fire the cannon (by it)",
+                        "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nupdate {}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock · E / X fire the cannon (by it)",
                         self.fps,
                         if run { "run" } else { "walk" },
                         format_args!("{speed:.1} m/s"),
@@ -483,6 +488,7 @@ impl State {
                         self.rates.0,
                         self.rates.1,
                         s.cost,
+                        self.update_ms.summary(),
                         if feet[0] { "L planted" } else { "L free" },
                         if feet[1] { "R planted" } else { "R free" },
                         if c.controller.matcher.settings.foot_lock { "on" } else { "off" },
@@ -636,6 +642,7 @@ where
         last_y: 0.0,
         drive: None,
         player: None,
+        update_ms: timing::Window::default(),
     }));
     if flag("profile", false) {
         let mut s = state.borrow_mut();
@@ -744,4 +751,44 @@ pub fn set_drive(on: bool) {
             s.strafe = false;
         }
     });
+}
+
+/// The character's update times (ms per frame) over the last frames, as JSON (`timing::Window`).
+#[wasm_bindgen]
+pub fn motion_timings() -> String {
+    with_state(|s| s.update_ms.json()).unwrap_or_default()
+}
+
+/// Milliseconds per `Database::search` over the pack's own frames as queries (every `step`th,
+/// nudged), the default filter: the same queries as the TS page's `benchSearch`.
+#[wasm_bindgen]
+pub fn bench_search(step: usize) -> f64 {
+    with_state(|s| s.character.as_ref().map(|c| timing::bench_search(&c.db, step))).flatten().unwrap_or(-1.0)
+}
+
+/// Milliseconds to sample a pose between two frames, run its forward kinematics and fill the
+/// first body's bone palette, `count` times over the pack: the same as the TS page's `benchPose`.
+#[wasm_bindgen]
+pub fn bench_pose(count: usize) -> f64 {
+    with_state(|s| {
+        s.character.as_mut().map(|c| {
+            let body = &mut c.bodies[0];
+            let (mesh, palette) = (&body.mesh, &mut body.palette);
+            let skeleton = body.display.as_ref().map_or(&c.db.skeleton, |d| &d.0).clone();
+            let retarget = body.display.as_ref().map(|d| d.1.clone());
+            timing::bench_pose(&c.db, count, |pose, model| {
+                match &retarget {
+                    Some(r) => {
+                        let mut out = kansei_core::animation::Pose { local: Vec::new() };
+                        r.apply(pose, &mut out);
+                        out.to_model(&skeleton, model);
+                    }
+                    None => pose.to_model(&skeleton, model),
+                }
+                palette.update(mesh, model);
+            })
+        })
+    })
+    .flatten()
+    .unwrap_or(-1.0)
 }

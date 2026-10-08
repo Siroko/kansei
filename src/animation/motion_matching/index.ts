@@ -21,6 +21,8 @@
  *   searches, root motion, inertialized transitions, the animated character kept near the
  *   simulation, and foot locking with two-joint IK.
  * - `MotionPack` and `CharacterPack` read (and write) `.kmm` packs. None ships with Kansei.
+ * - `CharacterController` (`Traversal`) keeps a matcher out of a `CollisionWorld`, on its ground,
+ *   falling and landing, and hurdles, vaults, mantles, climbs or jumps on request.
  */
 export { FORWARD, yawOf, yawRotation, wrapAngle } from "./Heading";
 export {
@@ -35,3 +37,8 @@ export { ActionKind, ActionClip, actionKindName, actionKindFromName, crosses } f
 export type { ActionClipFields } from "./ActionClip";
 export { MotionPack, CharacterPack, PackError } from "./Pack";
 export type { PackMesh, PackImage } from "./Pack";
+export {
+    detectObstacle, defaultDetectionSettings, Refusal, isRefusal, defaultTraversalRules, standsAt, traversalKind, planTraversal, planJump,
+    CharacterController,
+} from "./Traversal";
+export type { Obstacle, DetectionSettings, TraversalResult, TraversalRules, CharacterState } from "./Traversal";
