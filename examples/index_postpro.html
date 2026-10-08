@@ -322,7 +322,7 @@
     });
 
     const bloomEffect = new BloomEffect({
-      threshold: 0.0,
+      threshold: 0.01, // every emissive surface blooms (0 or below is physically based bloom)
       knee: 0.1,
       intensity: 0.8,
       radius: 1.0,

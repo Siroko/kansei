@@ -270,8 +270,11 @@
       effects.push(fog);
     }
     if (flag('bloom', true)) {
-      // the TS bloom has no physical mode yet: bloom from the emissive heads, at the Rust example's intensity
-      effects.push(new BloomEffect({ threshold: 0.0, intensity: 0.06 }));
+      effects.push(new BloomEffect({
+        threshold: 0.0, // physically based: every light scatters a little
+        intensity: 0.06,
+        exposure: tonemap.totalExposure(),
+      }));
     }
     effects.push(tonemap);
     const volume = new PostProcessingVolume(renderer, effects);

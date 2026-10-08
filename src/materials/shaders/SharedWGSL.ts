@@ -8,6 +8,9 @@ import lightUniforms from '../../../rust/kansei-core/src/shaders/light_uniforms.
 import tonemapParams from '../../../rust/kansei-core/src/shaders/tonemap_params.wgsl?raw';
 import tonemap from '../../../rust/kansei-core/src/shaders/tonemap.wgsl?raw';
 import localExposure from '../../../rust/kansei-core/src/shaders/local_exposure.wgsl?raw';
+import bloomDownsample from '../../../rust/kansei-core/src/shaders/bloom_downsample.wgsl?raw';
+import bloomUpsample from '../../../rust/kansei-core/src/shaders/bloom_upsample.wgsl?raw';
+import bloomComposite from '../../../rust/kansei-core/src/shaders/bloom_composite.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -33,3 +36,13 @@ export const TONEMAP_WGSL: string = `${tonemapParams}\n${tonemap}`;
  * `blurX` and `blurY` entry points. Rust: `tonemap.rs`'s `LOCAL_EXPOSURE_WGSL`.
  */
 export const LOCAL_EXPOSURE_WGSL: string = `${tonemapParams}\n${localExposure}`;
+
+/**
+ * `BloomEffect`'s three passes, each with its 32-byte `BloomParams` at group 0 binding 2 or 4:
+ * the first level's Karis-weighted tent downsample and exposure-aware threshold, the tent
+ * upsample (spread by `radius`), and the composite (added on top, or mixed in when
+ * `threshold <= 0`). Rust: `postprocessing/effects/bloom.rs`.
+ */
+export const BLOOM_DOWNSAMPLE_WGSL: string = bloomDownsample;
+export const BLOOM_UPSAMPLE_WGSL: string = bloomUpsample;
+export const BLOOM_COMPOSITE_WGSL: string = bloomComposite;
