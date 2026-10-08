@@ -15,6 +15,9 @@ import {
     meshBindGroupLayoutEntries, meshSlotStride, shadowBindGroupLayoutEntries,
 } from "./SharedLayouts";
 import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled, takeProfile } from "../profiling/Profiler";
+import { CULL_VIEW_BYTES, CullPipeline, CullView, cullView, cullViewDraws, drawGeometry, packCullView } from "../culling/InstanceCulling";
+import { CullViewKind, CullingStats, StatsReadback } from "../culling/CullingStats";
+import { mat4 } from "gl-matrix";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -92,6 +95,11 @@ function sameKey(a: unknown[], b: unknown[]): boolean {
     for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
     return true;
 }
+
+/** The cull view of the main camera (`Renderable.instanceCulling`). */
+const MAIN_VIEW = 0;
+/** The cull view of the directional shadow map the renderer owns (`enableShadows`). */
+const SHADOW_VIEW = 1;
 
 /** Encoder state already set while recording draws, so repeated state is not set again. */
 interface DrawState {
@@ -276,6 +284,26 @@ class Renderer {
     private _clusterLightsBuf: GPUBuffer | null = null;
     private _cascadesBuf: GPUBuffer | null = null;
     private _shadowBGDirty: boolean = true;
+
+    // GPU instance culling (renderables with `instanceCulling`): the cull pipeline, the frame's
+    // views packed for the GPU, and the culling statistics.
+    private _cullPipeline: CullPipeline | null = null;
+    private _cullViewBytes = new ArrayBuffer(4 * CULL_VIEW_BYTES);
+    private _cullStats = new StatsReadback();
+    private _viewProjScratch = mat4.create();
+
+    /**
+     * Read back each view's instance culling statistics (instances tested, outside their LOD band,
+     * outside the frustum, drawn, triangles), a few frames late (`cullingStats`). Off by default.
+     */
+    public setCullingStats(enabled: boolean): void {
+        this._cullStats.enabled = enabled;
+    }
+
+    /** The latest instance culling statistics while `setCullingStats` is on, or null. */
+    public get cullingStats(): CullingStats | null {
+        return this._cullStats.latest;
+    }
 
     /** The directional shadow map materials sample (group 3 binding 0), or null. */
     public get shadowMap(): ShadowMap | null { return this._shadowMap; }
@@ -768,9 +796,11 @@ class Renderer {
             }
         });
 
-        // Shadow views, then their uniforms.
+        // The instances each view draws, then the shadow views and their uniforms.
         const commandRenderEncoder = this.device!.createCommandEncoder();
-        this._encodeShadowPasses(commandRenderEncoder, stack, camera);
+        this._planShadowViews(stack, camera);
+        this._runInstanceCulling(commandRenderEncoder, stack, camera);
+        this._encodeShadowPasses(commandRenderEncoder, stack);
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
 
@@ -812,6 +842,7 @@ class Renderer {
         }
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
+        this._endCulledFrame(camera);
         camera.endFrame();
         endProfiledFrame();
     }
@@ -1002,10 +1033,15 @@ class Renderer {
         });
         t?.end();
 
-        // Shadow views, then their uniforms.
-        t = cpuScope('scene/shadows');
+        // The instances each view draws (after the shadow maps' lights are placed), then the
+        // shadow views and their uniforms.
+        t = cpuScope('scene/culling');
         const commandEncoder = this.device!.createCommandEncoder();
-        this._encodeShadowPasses(commandEncoder, stack, camera);
+        this._planShadowViews(stack, camera);
+        this._runInstanceCulling(commandEncoder, stack, camera);
+        t?.end();
+        t = cpuScope('scene/shadows');
+        this._encodeShadowPasses(commandEncoder, stack);
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
         t?.end();
@@ -1174,32 +1210,40 @@ class Renderer {
 
         t = cpuScope('scene/submit');
         this.device!.queue.submit([commandEncoder.finish()]);
+        this._endCulledFrame(camera);
         t?.end();
         sceneScope?.end();
     }
 
     /**
-     * The shadow views of a frame, in the Rust renderer's order (`renderer.rs` `render`): after
-     * the matrix upload, before the scene pass, into the frame's encoder. The directional map
-     * follows the first directional light with `castShadow` (else the first area light with
-     * it), the cube map the point lights with it; each draws the visible `castShadow`
-     * renderables at their scene slots of the shared mesh buffers, with the light as the camera
-     * (group 1). Maps the caller binds through the setters are left to the caller.
+     * Places the shadow views of a frame before its culling, which culls for the directional map
+     * too: the map the renderer owns follows the first directional light with `castShadow` (else
+     * the first area light with it), or has no light this frame.
      */
-    private _encodeShadowPasses(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
+    private _planShadowViews(stack: Scene, camera: Camera): void {
+        const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
+        if (!shadowMap) return;
+        const light = stack.directionalLights.find((l) => l.castShadow)
+            ?? stack.areaLights.find((l) => l.castShadow);
+        if (light) shadowMap.update(camera, light);
+        else shadowMap.light = null;
+    }
+
+    /**
+     * The shadow views of a frame, in the Rust renderer's order (`renderer.rs` `render`): after
+     * the matrix upload and the culling, before the scene pass, into the frame's encoder. The
+     * directional map (placed by `_planShadowViews`) draws the instances culled for its light,
+     * the cube map the point lights with `castShadow` (every instance); each draws the visible
+     * `castShadow` renderables at their scene slots of the shared mesh buffers, with the light as
+     * the camera (group 1). Maps the caller binds through the setters are left to the caller.
+     */
+    private _encodeShadowPasses(encoder: GPUCommandEncoder, stack: Scene): void {
         const objects = stack.getOrderedObjects();
         const meshOffset = (r: Renderable) => stack.slotOf(r) * this._matrixAlignment;
 
         const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
-        if (shadowMap) {
-            const light = stack.directionalLights.find((l) => l.castShadow)
-                ?? stack.areaLights.find((l) => l.castShadow);
-            if (light) {
-                shadowMap.update(camera, light);
-                shadowMap.encode(encoder, objects, this._sharedMeshBG!, meshOffset);
-            } else {
-                shadowMap.light = null;
-            }
+        if (shadowMap?.light) {
+            shadowMap.encode(encoder, objects, this._sharedMeshBG!, meshOffset, SHADOW_VIEW);
         }
 
         const cubeMap = this._ownsCubeMapShadowMap ? this._cubeMapShadowMap : null;
@@ -1210,6 +1254,75 @@ class Renderer {
             const wm = first.worldMatrix.internalMat4;
             this.setPointShadowParams(wm[12], wm[13], wm[14], first.radius);
         }
+    }
+
+    /**
+     * The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then while the renderer
+     * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame).
+     */
+    private _cullViews(camera: Camera): (CullView | null)[] {
+        // the unjittered projection: the frustum, not where pixels sample
+        const views: (CullView | null)[] = [cullView(camera.viewProjection(this._viewProjScratch))];
+        if (this._ownsShadowMap && this._shadowMap) {
+            const map = this._shadowMap;
+            views.push(map.light ? cullView(map.lightViewProjMatrix, { castersOnly: true }) : null);
+        }
+        return views;
+    }
+
+    /** What each cull view is, in `_cullViews` order (for the stats). */
+    private _cullViewKinds(): CullViewKind[] {
+        const kinds: CullViewKind[] = ['camera'];
+        if (this._ownsShadowMap && this._shadowMap) kinds.push('shadow');
+        return kinds;
+    }
+
+    /**
+     * Culls every visible renderable with `instanceCulling` for every view that draws it, into
+     * `encoder` (after the frame's uploads and `_planShadowViews`, before its shadow and main
+     * passes): the frame's views in one write, then one compute pass, a dispatch per renderable
+     * (per chunk of views). Buffers made for more views re-record the cached bundles.
+     */
+    private _runInstanceCulling(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
+        this._cullStats.beginFrame(this._cullViewKinds());
+        const culled = stack.getOrderedObjects().filter((r) => r.instanceCulling && r.geometry.initialized && r.geometry.isInstancedGeometry);
+        if (culled.length === 0) return;
+        const device = this.device!;
+        const views = this._cullViews(camera);
+        const pipeline = this._cullPipeline ??= new CullPipeline(device);
+        // the frame's views, in one write; distances are measured from the camera in every view
+        if (this._cullViewBytes.byteLength < views.length * CULL_VIEW_BYTES) this._cullViewBytes = new ArrayBuffer(views.length * CULL_VIEW_BYTES);
+        const eye = camera.inverseViewMatrix.internalMat4;
+        const lodOrigin = [eye[12], eye[13], eye[14]];
+        views.forEach((view, k) => packCullView(this._cullViewBytes, k * CULL_VIEW_BYTES, view, lodOrigin, this._cullStats.enabled));
+        pipeline.setViews(this._cullViewBytes, views.length);
+
+        let staleBundles = false;
+        for (const r of culled) {
+            const culling = r.instanceCulling!;
+            staleBundles = culling.ensureViews(device, pipeline.layout, views.length) || staleBundles;
+            culling.beginFrame(device.queue, encoder, r.worldMatrix.internalMat4, r.geometry.vertexCount, r.castShadow, r.layers);
+        }
+        const pass = encoder.beginComputePass({ label: 'Renderer/InstanceCulling', timestampWrites: gpuPass('Renderer/InstanceCulling') });
+        pass.setPipeline(pipeline.pipeline);
+        pass.setBindGroup(1, pipeline.viewBindGroup);
+        // a renderable's views in one dispatch; the shader skips those it is not drawn in
+        for (const r of culled) {
+            const culling = r.instanceCulling!;
+            culling.dispatch(pass);
+            views.forEach((view, slot) => {
+                if (!view || !cullViewDraws(view, r.castShadow, r.layers)) return;
+                const draw = culling.view(slot)!;
+                this._cullStats.record(slot, culling.tested, draw.args, draw.offset);
+            });
+        }
+        pass.end();
+        if (staleBundles) this.invalidateBundle();
+    }
+
+    /** After the frame's culling is submitted: read its statistics back (when on). */
+    private _endCulledFrame(camera: Camera): void {
+        this._cullStats.endFrame(this.device!, camera.frame);
     }
 
     /**
@@ -1296,7 +1409,7 @@ class Renderer {
                 if (!isBundled(r)) continue;
                 const geo = r.geometry;
                 key.push(r, stack.slotOf(r), r.material, r.material.currentBindGroup, geo, geo.initialized, geo.vertexCount,
-                    geo.isInstancedGeometry ? (geo as InstancedGeometry).instanceCount : 1);
+                    geo.isInstancedGeometry ? (geo as InstancedGeometry).instanceCount : 1, r.instanceCulling);
             }
             if (entry.valid && sameKey(entry.key, key)) continue;
             entry.bundle = this._recordBundle(sets[set], stack, cameraBindGroup, targets);
@@ -1397,14 +1510,6 @@ class Renderer {
             state.vertexBuffer = geometry.vertexBuffer!;
         }
 
-        if (geometry.isInstancedGeometry) {
-            const geo = geometry as InstancedGeometry;
-            let idx = 1;
-            for (const extraBuffer of geo.extraBuffers) {
-                encoder.setVertexBuffer(idx++, extraBuffer.resource.buffer);
-            }
-        }
-
         // Phase 1 updated it this frame (`_updateRenderables`).
         const materialBindGroup = renderable.material.currentBindGroup!;
         if (materialBindGroup !== state.materialBindGroup) {
@@ -1417,14 +1522,8 @@ class Renderer {
         const offset = slot * this._matrixAlignment;
         encoder.setBindGroup(BindGroupSlot.Mesh, this._sharedMeshBG!, [offset, offset]);
 
-        if (geometry.isInstancedGeometry) {
-            const geo = geometry as InstancedGeometry;
-            encoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
-        } else if (geometry.indirectArgsBuffer) {
-            encoder.drawIndexedIndirect(geometry.indirectArgsBuffer, 0);
-        } else {
-            encoder.drawIndexed(geometry.vertexCount);
-        }
+        // The instances culled for the camera, if culled (indirect: the count changes, the bundle not).
+        drawGeometry(encoder, geometry, renderable.instanceCulling?.view(MAIN_VIEW) ?? null);
         return true;
     }
 

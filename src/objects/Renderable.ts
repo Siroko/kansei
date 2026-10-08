@@ -4,6 +4,7 @@ import { Material } from "../materials/Material";
 import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
 import { PathTracerMaterial } from "../pathtracer/PathTracerMaterial";
+import type { InstanceCulling } from "../culling/InstanceCulling";
 
 /**
  * Represents a 3D renderable object that extends Object3D.
@@ -40,6 +41,12 @@ class Renderable extends Object3D {
      *  it had when the bundle was recorded, and bundles are re-recorded only when what they hold
      *  changes. */
     public dynamic: boolean = false;
+
+    /** Per-view GPU culling of its instances (an `InstancedGeometry` whose first instance buffer
+     *  is the culling's source): each view the renderer draws it in (the camera, the directional
+     *  shadow map) draws only the instances inside its frustum and LOD band. Null: every instance
+     *  everywhere. */
+    public instanceCulling: InstanceCulling | null = null;
 
     /** Kept for compatibility: shadow maps draw casters through their material's own
      *  `vertex_main` (`Material.getDepthPipeline`, with `shadowFragmentEntry` for alpha-tested
