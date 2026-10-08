@@ -6,6 +6,7 @@ import { FroxelGrid } from '../../froxels/FroxelGrid';
 import { ShadowMap } from '../../shadows/ShadowMap';
 import { CubeMapShadowMap } from '../../shadows/CubeMapShadowMap';
 import type { SkyOcclusion } from '../../shadows/SkyOcclusion';
+import type { SpotShadowAtlas } from '../../shadows/SpotShadowAtlas';
 import { COMPUTE_SHADOWS_WGSL, ComputeShadows, SHADOW_MAP } from '../../shadows/ComputeShadows';
 import type { CascadedShadowSource } from '../../shadows/ComputeShadows';
 import { GBuffer } from '../GBuffer';
@@ -21,6 +22,22 @@ import clipmapProbes from '../../../rust/kansei-core/src/gi/shaders/clipmap_prob
 import fogMedia from '../../../rust/kansei-core/src/shaders/volumetric_fog_media.wgsl?raw';
 import fogSpot from '../../../rust/kansei-core/src/shaders/volumetric_fog_spot.wgsl?raw';
 import fogComposite from '../../../rust/kansei-core/src/shaders/volumetric_fog_composite.wgsl?raw';
+import shaftsCommon from '../../../rust/kansei-core/src/shaders/volumetric_fog_shafts_common.wgsl?raw';
+import fogShafts from '../../../rust/kansei-core/src/shaders/volumetric_fog_shafts.wgsl?raw';
+import shaftsTemporal from '../../../rust/kansei-core/src/shaders/volumetric_fog_shafts_temporal.wgsl?raw';
+
+/**
+ * How the fog scatters the spot lights' light. Rust: `SpotScattering`.
+ *
+ * - `froxels`: in the froxel grid with the fog's other light (the default). Cheap, but the grid's
+ *   slices are metres deep where the beams are, so a shadow thinner than that (a trunk or grass
+ *   shadowing a beam that crosses the view) fades into the lit fog around it.
+ * - `raymarched`: along each view ray at half resolution, `steps` samples per light over the part
+ *   of the ray inside its cone, each through the light's shadow map; filtered over frames and
+ *   upsampled by depth. The shadows of thin things stay sharp in the beams. The froxels keep the
+ *   medium and the other lights.
+ */
+export type SpotScattering = { kind: 'froxels' } | { kind: 'raymarched'; steps: number };
 
 export interface VolumetricFogOptions {
     froxelGrid: FroxelGrid;
@@ -59,6 +76,8 @@ export interface VolumetricFogOptions {
     albedo?: [number, number, number];
     /** Scales the sky's light on the fog once a sky is bound (`setSkyLighting`); 1 (the default) is physical. */
     skyAmbientScale?: number;
+    /** How the spot lights scatter: in the froxels, or raymarched per pixel for sharp shafts. */
+    spotScattering?: SpotScattering;
 }
 
 /** The shape of a `LocalFogVolume`. */
@@ -152,6 +171,8 @@ export class LocalFogVolume {
 const FOG_PARAMS_BYTES = 208;
 const COMPOSITE_PARAMS_BYTES = 32;
 const MEDIA_PARAMS_BYTES = 32;
+/** Bytes of the WGSL `ShaftParams` (`volumetric_fog_shafts_common.wgsl`). */
+const SHAFT_PARAMS_BYTES = 208;
 /** Bytes of a `LocalFogVolume`, the `SkyLighting` uniform and a `ClipProbeGrid`. */
 const LOCAL_FOG_VOLUME_BYTES = 80;
 const SKY_LIGHTING_BYTES = 240;
@@ -168,18 +189,52 @@ function patch(text: string, from: string, to: string): string {
  * owns the 2D shadow map: its `PointLightData.shadowLayer` is `SHADOW_MAP`, read through the
  * directional map's binding.
  */
-const INJECT_WGSL = patch(
+const injectWGSL = (...extra: string[]) => patch(
     assemble([
         froxelCommon, fogInject, skyLighting, skyOcclusion, clipmapProbes, fogMedia,
         COMPUTE_SHADOWS_WGSL, fogSpot,
         `const SHADOW_MAP : u32 = ${SHADOW_MAP}u;`,
+        ...extra,
     ]),
     'if (pl.shadowLayer != NO_SHADOW && params.hasPointShadows != 0u) {',
     'if (pl.shadowLayer == SHADOW_MAP) {\n'
     + '            if (params.hasShadowMap != 0u) { visibility = dirShadowLookup(worldPos); }\n'
     + '        } else if (pl.shadowLayer != NO_SHADOW && params.hasPointShadows != 0u) {',
 );
+const INJECT_WGSL = injectWGSL();
 const COMPOSITE_WGSL = assemble([froxelCommon, fogComposite]);
+/** The injection's shader with the shafts' entry point (`shafts`) appended. */
+const SHAFTS_WGSL = injectWGSL(shaftsCommon, fogShafts);
+const SHAFTS_TEMPORAL_WGSL = assemble([shaftsCommon, shaftsTemporal]);
+
+/** A half-resolution shafts target (rgb light, a linear depth). */
+function shaftsTarget(device: GPUDevice, label: string, width: number, height: number): GPUTexture {
+    return device.createTexture({
+        label,
+        size: [Math.max(width, 1), Math.max(height, 1)],
+        format: 'rgba16float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    });
+}
+
+/** The raymarched spot-light shafts (`SpotScattering` `raymarched`). */
+interface ShaftsGpu {
+    trace: GPUComputePipeline;
+    traceBGL: GPUBindGroupLayout;
+    temporal: GPUComputePipeline;
+    temporalBGL: GPUBindGroupLayout;
+    params: GPUBuffer;
+    /** Width, height, the trace and history A and B, at half the image's resolution. */
+    targets: { width: number; height: number; trace: GPUTexture; history: [GPUTexture, GPUTexture] } | null;
+    /** The trace's bind group and the resources it was made from. */
+    traceBG: GPUBindGroup | null;
+    traceKey: unknown[];
+    /** The temporal pass's bind groups, writing history A and B. */
+    temporalBGs: [GPUBindGroup, GPUBindGroup] | null;
+    frame: number;
+    prevViewProj: Float32Array | null;
+    lastCameraFrame: number | null;
+}
 
 /**
  * Froxel volumetric fog, a port of the Rust `VolumetricFogEffect` on its WGSL: per froxel, a
@@ -189,9 +244,10 @@ const COMPOSITE_WGSL = assemble([froxelCommon, fogComposite]);
  * (`setSkyLighting`); jittered per frame on a temporal grid; integrated front to back and
  * composited over the scene.
  *
- * Its spot lights and clipmap probes are bound to stand-ins (none) until those land in the TS
- * engine. The sky occlusion (`setSkyOcclusion`) dims the sky lighting only, so it shows once the
- * fog has a sky (`setSkyLighting`).
+ * The renderer's spot lights (`setSpotLights`) scatter in their cones, in the froxels or
+ * raymarched per pixel (`spotScattering`). Its clipmap probes are bound to stand-ins (none) until
+ * those land in the TS engine. The sky occlusion (`setSkyOcclusion`) dims the sky lighting only,
+ * so it shows once the fog has a sky (`setSkyLighting`).
  */
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -220,6 +276,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
      * Each scatters the fog's lights and sky with its own albedo.
      */
     localVolumes: LocalFogVolume[] = [];
+    /** How the spot lights scatter: in the froxels, or raymarched per pixel for sharp shafts. */
+    spotScattering: SpotScattering;
     /**
      * Seconds, drives the wind offset. Null: the effect's own clock, from its construction. Rust
      * has no clock and sets `time` per frame.
@@ -262,6 +320,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _compositeParamsBuffer: GPUBuffer | null = null;
     private _accumSampler: GPUSampler | null = null;
     private _noShafts: GPUTexture | null = null;
+    private _shafts: ShaftsGpu | null = null;
+    /** The shafts' half-resolution history bound in the composite, or null for `_noShafts`. */
+    private _currentShafts: GPUTexture | null = null;
     private _currentInput: GPUTexture | null = null;
     private _currentDepth: GPUTexture | null = null;
     private _currentOutput: GPUTexture | null = null;
@@ -285,6 +346,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         this.ambient         = options.ambient ?? [0, 0, 0];
         this.albedo          = options.albedo ?? [1, 1, 1];
         this.skyAmbientScale = options.skyAmbientScale ?? 1;
+        this.spotScattering  = options.spotScattering ?? { kind: 'froxels' };
         if (options.cascadedShadowMap) this.setCascadedShadowMap(options.cascadedShadowMap);
         else this.setShadowMap(options.shadowMap ?? null);
         this.setPointShadows(options.cubeMapShadowMap ?? null);
@@ -302,9 +364,10 @@ class VolumetricFogEffect extends PostProcessingEffect {
         return this.maxDistance > 0 ? Math.min(this.maxDistance, far) : far;
     }
 
-    /** Drop the temporal history; call on camera cuts. No-op without a temporal grid. */
+    /** Drop the temporal history (the grid's and the shafts'); call on camera cuts. */
     resetHistory(): void {
         this._froxelGrid.resetHistory();
+        if (this._shafts) this._shafts.prevViewProj = null;
     }
 
     /** The directional shadow map the shafts come through (`setShadowMap`). */
@@ -332,6 +395,16 @@ class VolumetricFogEffect extends PostProcessingEffect {
     setPointShadows(cube: CubeMapShadowMap | null): void {
         this._cubeMapShadowMap = cube;
         this._shadows.setPointShadows(cube);
+    }
+
+    /**
+     * Scatter the renderer's spot lights (`Renderer.spotLightsBuffer`, rewritten every frame) in
+     * their cones, shadowed by its spot shadow atlas (`Renderer.spotShadowAtlas`). Call again after
+     * `Renderer.enableSpotShadows`. Each light's `volumetricScale` scales its scattering; 0 keeps
+     * it out of the fog. Rust: `set_spot_lights`.
+     */
+    setSpotLights(lights: GPUBuffer | null, shadowAtlas: SpotShadowAtlas | null): void {
+        this._shadows.setSpotLights(lights, shadowAtlas?.arrayView ?? null);
     }
 
     /**
@@ -451,7 +524,57 @@ class VolumetricFogEffect extends PostProcessingEffect {
             compute: { module: device.createShaderModule({ label: 'VolumetricFog/Composite', code: COMPOSITE_WGSL }), entryPoint: 'main' },
         });
 
-        this._buildCompositeBG(gbuffer.colorTexture, gbuffer.depthTexture, gbuffer.outputTexture);
+        // ── Shafts: the injection's medium, lights and parameters, the scene's depth, the accumulated
+        // grid (for the transmittance), their target and parameters; then a temporal filter ──
+        const uniform = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility: compute, buffer: { type: 'uniform' } });
+        const storage2d = (binding: number): GPUBindGroupLayoutEntry =>
+            ({ binding, visibility: compute, storageTexture: { access: 'write-only', format: 'rgba16float' } });
+        const traceBGL = device.createBindGroupLayout({
+            label: 'VolumetricFog/ShaftsBGL',
+            entries: [
+                uniform(2),
+                uniform(10),
+                { binding: 11, visibility: compute, buffer: { type: 'read-only-storage' } },
+                uniform(12),
+                { binding: 13, visibility: compute, texture: { sampleType: 'depth' } },
+                { binding: 14, visibility: compute, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 15, visibility: compute, sampler: { type: 'filtering' } },
+                storage2d(16),
+                uniform(17),
+                ...ComputeShadows.layoutEntries().filter((e) => e.binding >= 7 && e.binding <= 9),
+            ],
+        });
+        const temporalBGL = device.createBindGroupLayout({
+            label: 'VolumetricFog/ShaftsTemporalBGL',
+            entries: [
+                uniform(0),
+                { binding: 1, visibility: compute, texture: { sampleType: 'unfilterable-float' } },
+                { binding: 2, visibility: compute, texture: { sampleType: 'float' } },
+                storage2d(3),
+                { binding: 4, visibility: compute, sampler: { type: 'filtering' } },
+            ],
+        });
+        const pipeline = (label: string, code: string, entryPoint: string, layout: GPUBindGroupLayout) => device.createComputePipeline({
+            label,
+            layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+            compute: { module: device.createShaderModule({ label, code }), entryPoint },
+        });
+        this._shafts = {
+            trace: pipeline('VolumetricFog/Shafts', SHAFTS_WGSL, 'shafts', traceBGL),
+            traceBGL,
+            temporal: pipeline('VolumetricFog/ShaftsTemporal', SHAFTS_TEMPORAL_WGSL, 'main', temporalBGL),
+            temporalBGL,
+            params: buffer('VolumetricFog/ShaftParams', SHAFT_PARAMS_BYTES, GPUBufferUsage.UNIFORM),
+            targets: null,
+            traceBG: null,
+            traceKey: [],
+            temporalBGs: null,
+            frame: 0,
+            prevViewProj: null,
+            lastCameraFrame: null,
+        };
+
+        this._buildCompositeBG(gbuffer.colorTexture, gbuffer.depthTexture, gbuffer.outputTexture, null);
         this.initialized = true;
     }
 
@@ -508,7 +631,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         device.queue.writeBuffer(this._mediaParamsBuffer!, 0, this._mediaParams);
     }
 
-    private _buildCompositeBG(input: GPUTexture, depth: GPUTexture, output: GPUTexture): void {
+    private _buildCompositeBG(input: GPUTexture, depth: GPUTexture, output: GPUTexture, shafts: GPUTexture | null): void {
         const accum = this._froxelGrid.accumTex;
         this._compositeBG = this._device!.createBindGroup({
             label: 'VolumetricFog/CompositeBG',
@@ -520,9 +643,10 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 { binding: 3, resource: accum.createView() },
                 { binding: 4, resource: this._accumSampler! },
                 { binding: 5, resource: { buffer: this._compositeParamsBuffer! } },
-                { binding: 6, resource: this._noShafts!.createView() },
+                { binding: 6, resource: (shafts ?? this._noShafts!).createView() },
             ],
         });
+        this._currentShafts = shafts;
         this._currentInput  = input;
         this._currentDepth  = depth;
         this._currentOutput = output;
@@ -549,6 +673,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
         if (this._shadows.prepare(device) || this._injectBGDirty || grid.scatterExtinctionTex !== this._injectTarget) {
             this._rebuildInjectBG();
         }
+        // the spots raymarched per pixel instead of in the froxels (only with spot lights bound)
+        const raymarchSteps = this.spotScattering.kind === 'raymarched' && this._shadows.hasSpotLights
+            ? Math.max(Math.floor(this.spotScattering.steps), 1) : 0;
 
         mat4.multiply(this._vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
         mat4.invert(this._invVP, this._vp);
@@ -579,7 +706,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         f32[40] = this.anisotropy;
         f32[41] = this.startDistance;
         u32[42] = grid.isTemporal ? this._frame : 0;
-        u32[43] = 0;                       // skipSpots: no raymarched spot shafts
+        u32[43] = raymarchSteps > 0 ? 1 : 0; // skipSpots: the spots are raymarched instead
         f32.set([0, 0, 0, 1], 44);         // clipPlane: keep all the fog
         f32[48] = this.reach();
         this._frame = this._frame % 1024 + 1;
@@ -587,14 +714,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
 
         // ── CompositeParams ──
         device.queue.writeBuffer(this._compositeParamsBuffer!, 0, new Float32Array([
-            camera.near, camera.far, grid.near, grid.far, grid.gridD, width, height, 0,
+            camera.near, camera.far, grid.near, grid.far, grid.gridD, width, height, raymarchSteps > 0 ? 1 : 0,
         ]));
-
-        // Rebuild composite bind group on texture change (ping-pong, or a resized grid)
-        if (input !== this._currentInput || depth !== this._currentDepth || output !== this._currentOutput
-            || grid.accumTex !== this._currentAccum) {
-            this._buildCompositeBG(input, depth, output);
-        }
 
         // ── 1. inject density and lighting into the froxels ──
         const injectPass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Inject', timestampWrites: gpuPass('VolumetricFog/Inject') });
@@ -617,7 +738,19 @@ class VolumetricFogEffect extends PostProcessingEffect {
         );
         grid.accumulate(commandEncoder);
 
-        // ── 4. composite over the scene ──
+        // ── 4. the spot lights' shafts, raymarched per pixel at half resolution ──
+        const shafts = raymarchSteps > 0
+            ? this._renderShafts(commandEncoder, depth, camera, width, height, raymarchSteps)
+            : null;
+
+        // Rebuild composite bind group on texture change (ping-pong, the shafts' history, or a
+        // resized grid)
+        if (input !== this._currentInput || depth !== this._currentDepth || output !== this._currentOutput
+            || grid.accumTex !== this._currentAccum || shafts !== this._currentShafts) {
+            this._buildCompositeBG(input, depth, output, shafts);
+        }
+
+        // ── 5. composite over the scene ──
         const compositePass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Composite', timestampWrites: gpuPass('VolumetricFog/Composite') });
         compositePass.setPipeline(this._compositePipeline);
         compositePass.setBindGroup(0, this._compositeBG!);
@@ -626,6 +759,120 @@ class VolumetricFogEffect extends PostProcessingEffect {
             Math.ceil(height / 8)
         );
         compositePass.end();
+    }
+
+    /**
+     * March the spot lights' beams into the half-resolution trace, filter it into this frame's
+     * history texture and return that texture.
+     */
+    private _renderShafts(
+        encoder: GPUCommandEncoder,
+        depth: GPUTexture,
+        camera: Camera,
+        width: number,
+        height: number,
+        steps: number,
+    ): GPUTexture {
+        const device = this._device!;
+        const sg = this._shafts!;
+        const grid = this._froxelGrid;
+        const sw = Math.ceil(width / 2);
+        const sh = Math.ceil(height / 2);
+        if (!sg.targets || sg.targets.width !== sw || sg.targets.height !== sh) {
+            if (sg.targets) for (const t of [sg.targets.trace, ...sg.targets.history]) t.destroy();
+            sg.targets = {
+                width: sw,
+                height: sh,
+                trace: shaftsTarget(device, 'VolumetricFog/ShaftsTrace', sw, sh),
+                history: [
+                    shaftsTarget(device, 'VolumetricFog/ShaftsHistoryA', sw, sh),
+                    shaftsTarget(device, 'VolumetricFog/ShaftsHistoryB', sw, sh),
+                ],
+            };
+            sg.traceBG = null;
+            sg.temporalBGs = null;
+            sg.prevViewProj = null;
+        }
+        // a gap in the camera's frames (a cut, or the shafts were off) invalidates the history
+        const cameraFrame = camera.frame;
+        if (sg.lastCameraFrame !== null && cameraFrame !== sg.lastCameraFrame && cameraFrame !== ((sg.lastCameraFrame + 1) >>> 0)) {
+            sg.prevViewProj = null;
+        }
+        sg.lastCameraFrame = cameraFrame;
+
+        // ── ShaftParams ──
+        const iv = camera.inverseViewMatrix.internalMat4;
+        const forward = [-iv[8], -iv[9], -iv[10]];
+        const len = Math.hypot(forward[0], forward[1], forward[2]) || 1;
+        const data = new ArrayBuffer(SHAFT_PARAMS_BYTES);
+        const f32 = new Float32Array(data);
+        const u32 = new Uint32Array(data);
+        f32.set(this._invVP, 0);
+        f32.set(sg.prevViewProj ?? this._vp, 16);
+        f32.set([iv[12], iv[13], iv[14]], 32);
+        u32[35] = sg.frame;
+        f32.set(forward.map((v) => v / len), 36);
+        u32[39] = steps;
+        u32.set([sw, sh, width, height], 40);
+        f32[44] = grid.near;
+        f32[45] = grid.far;
+        f32[46] = grid.gridD;
+        f32[47] = Math.min(Math.max(grid.blendFactor, 0.05), 1);
+        f32[48] = camera.near;
+        f32[49] = camera.far;
+        u32[50] = sg.prevViewProj ? 1 : 0;
+        device.queue.writeBuffer(sg.params, 0, data);
+        const current = sg.frame % 2;
+        sg.frame = (sg.frame + 1) >>> 0;
+        sg.prevViewProj = new Float32Array(this._vp);
+
+        // the trace's bind group, again when what it binds changed
+        const { trace, history } = sg.targets;
+        const spot = this._shadows.spotEntries();
+        const key = [depth, grid.accumTex, trace, this._volumesBuffer, this._skyLighting, ...spot.map((e) => (e.resource as GPUBufferBinding).buffer ?? e.resource)];
+        if (!sg.traceBG || key.length !== sg.traceKey.length || key.some((k, i) => k !== sg.traceKey[i])) {
+            sg.traceBG = device.createBindGroup({
+                label: 'VolumetricFog/ShaftsBG',
+                layout: sg.traceBGL,
+                entries: [
+                    { binding: 2, resource: { buffer: this._fogParamsBuffer! } },
+                    { binding: 10, resource: { buffer: this._mediaParamsBuffer! } },
+                    { binding: 11, resource: { buffer: this._volumesBuffer! } },
+                    { binding: 12, resource: { buffer: this._skyLighting ?? this._noSkyLighting! } },
+                    { binding: 13, resource: depth.createView() },
+                    { binding: 14, resource: grid.accumTex.createView() },
+                    { binding: 15, resource: this._accumSampler! },
+                    { binding: 16, resource: trace.createView() },
+                    { binding: 17, resource: { buffer: sg.params } },
+                    ...spot,
+                ],
+            });
+            sg.traceKey = key;
+        }
+        if (!sg.temporalBGs) {
+            const temporal = (out: number) => device.createBindGroup({
+                label: 'VolumetricFog/ShaftsTemporalBG',
+                layout: sg.temporalBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: sg.params } },
+                    { binding: 1, resource: trace.createView() },
+                    { binding: 2, resource: history[1 - out].createView() },
+                    { binding: 3, resource: history[out].createView() },
+                    { binding: 4, resource: this._accumSampler! },
+                ],
+            });
+            sg.temporalBGs = [temporal(0), temporal(1)];
+        }
+
+        const pass = encoder.beginComputePass({ label: 'VolumetricFog/Shafts', timestampWrites: gpuPass('VolumetricFog/Shafts') });
+        pass.setPipeline(sg.trace);
+        pass.setBindGroup(0, sg.traceBG);
+        pass.dispatchWorkgroups(Math.ceil(sw / 8), Math.ceil(sh / 8));
+        pass.setPipeline(sg.temporal);
+        pass.setBindGroup(0, sg.temporalBGs[current]);
+        pass.dispatchWorkgroups(Math.ceil(sw / 8), Math.ceil(sh / 8));
+        pass.end();
+        return history[current];
     }
 
     resize(_w: number, _h: number, _gbuffer: GBuffer): void {
@@ -639,6 +886,11 @@ class VolumetricFogEffect extends PostProcessingEffect {
         ]) b?.destroy();
         this._noOcclusionVolume?.destroy();
         this._noShafts?.destroy();
+        const sg = this._shafts;
+        sg?.params.destroy();
+        if (sg?.targets) for (const t of [sg.targets.trace, ...sg.targets.history]) t.destroy();
+        this._shafts = null;
+        this._currentShafts = null;
         this._shadows.destroy();
         this._fogParamsBuffer = null;
         this._compositeParamsBuffer = null;
