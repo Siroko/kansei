@@ -44,10 +44,9 @@ export class PlaneGeometry extends Geometry {
                 const c = (x + 1) + (y * (segmentsX + 1));
                 const d = (x + 1) + ((y + 1) * (segmentsX + 1));
 
-                // First triangle
-                this._indices.push(a, b, c);
-                // Second triangle
-                this._indices.push(c, b, d);
+                // counter-clockwise seen from the normal (+z), as Rust's PlaneGeometry
+                this._indices.push(a, c, b);
+                this._indices.push(c, d, b);
             }
         }
 

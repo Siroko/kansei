@@ -203,8 +203,7 @@
     sky.castShadow = false;
     scene.add(sky);
 
-    // the TS PlaneGeometry winds clockwise seen from its normal (+z), so the floor is drawn unculled
-    const floor = new Renderable(new PlaneGeometry(120, 120), basicLit([0.3, 0.31, 0.3, 1.0], [0.04, 0.04, 0.04, 0.05], 'none'));
+    const floor = new Renderable(new PlaneGeometry(120, 120), basicLit([0.3, 0.31, 0.3, 1.0], [0.04, 0.04, 0.04, 0.05]));
     floor.rotation.x = -Math.PI / 2;
     floor.castShadow = false;
     scene.add(floor);

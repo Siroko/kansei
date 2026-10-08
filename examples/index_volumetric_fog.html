@@ -145,8 +145,7 @@
       bindings: [fragmentUniform(0, uniform([...color, ...specular])), fragmentUniform(1, lightUniform)],
     });
 
-    // the TS PlaneGeometry winds clockwise seen from its normal (+z), so the floor is drawn unculled
-    const floor = new Renderable(new PlaneGeometry(60, 60), basicLit([0.35, 0.35, 0.33, 1.0], [0.05, 0.05, 0.05, 0.05], 'none'));
+    const floor = new Renderable(new PlaneGeometry(60, 60), basicLit([0.35, 0.35, 0.33, 1.0], [0.05, 0.05, 0.05, 0.05]));
     floor.rotation.x = -Math.PI / 2;
     floor.castShadow = false;
     scene.add(floor);

@@ -799,11 +799,11 @@
     const terrainGeo = new PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGS, TERRAIN_SEGS);
 
     const terrainPlaneA = new Renderable(terrainGeo, terrainRaster.mat);
-    terrainPlaneA.rotation.x = Math.PI / 2;
+    terrainPlaneA.rotation.x = -Math.PI / 2;
     terrainPlaneA.position.set(0, 0, 0);
 
     const terrainPlaneB = new Renderable(terrainGeo, terrainRaster.mat);
-    terrainPlaneB.rotation.x = Math.PI / 2;
+    terrainPlaneB.rotation.x = -Math.PI / 2;
     terrainPlaneB.position.set(0, 0, 20);
 
     // Not added to scene yet — terrain mode will add them
