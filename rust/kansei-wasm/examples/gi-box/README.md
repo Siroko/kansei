@@ -12,7 +12,7 @@ through its material's voxel entry); voxel GI with screen-space GI in front for 
 irradiance probes traced in the voxels' distance field in place of the per-pixel cones. The
 distance field can also add AO to the GI and shadow the voxels and the direct light.
 
-The hybrid (`gi=rt`) traces the GI instead: one ray for each 2 x 2 pixels from the surface
+The hybrid (`gi=rt`, the default) traces the GI instead: one ray for each 2 x 2 pixels from the surface
 through a grid of the room's triangles (below), the hits lit by the lamp (shadow rays through the
 grid) and one cone through the voxels for the further bounces, denoised by SVGF and upsampled. It
 comes closest to a path-traced reference: no banding, no light leaking onto the short block's
@@ -55,7 +55,7 @@ grid below; with `reflect=1`,
 
 | URL parameter | Effect |
 |---|---|
-| `preset=<name>` | `off`, `ssgi`, `voxel`, `best`, `indirect`, `voxels`, `phone`, `dragon`, `sdf`, `sdf-dragon`, `slice`, `probes`, `probe-view` or `probes-dragon` (`PRESETS` in `src/lib.rs`); applied first, the other parameters override it. Default `best` (voxel + SSGI) unless the URL has `gi=` |
+| `preset=<name>` | `hybrid`, `off`, `ssgi`, `voxel`, `best`, `indirect`, `voxels`, `phone`, `dragon`, `sdf`, `sdf-dragon`, `slice`, `probes`, `probe-view` or `probes-dragon` (`PRESETS` in `src/lib.rs`); applied first, the other parameters override it. Default `hybrid` (the hybrid path tracing, `gi=rt`) unless the URL has `gi=`; `best` is voxel + SSGI |
 | `gi=<mode>` | `off`; screen-space `low`, `medium`, `high` (or `ssgi`), `ultra`; `voxel`, `voxel+ssgi`, `probes`, `probes+ssgi`; `rt` (the hybrid; builds the grid of triangles, as `rt=1` does: the panel offers it only then, and reloads the page with `gi=rt` otherwise) |
 | `rtgi_res=half\|full` | the hybrid's rays: one for each 2 x 2 pixels (default) or one a pixel |
 | `rtgi_denoise=svgf\|temporal\|off` | SVGF (default), its temporal accumulation alone, or the raw 1 spp signal |

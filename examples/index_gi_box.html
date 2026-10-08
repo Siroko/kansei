@@ -81,7 +81,7 @@
     // probes traced in that field (`SceneVoxelGi.enableProbes`, `VoxelGIEffect.setProbes`) instead
     // of cones per pixel, under SSGI with `gi=probes+ssgi`.
     //
-    // The hybrid (`gi=rt`, `RtDiffuseGiEffect`) traces the GI instead: one ray for each 2 x 2
+    // The hybrid (`gi=rt`, the default, `RtDiffuseGiEffect`) traces the GI instead: one ray for each 2 x 2
     // pixels from the surface through a grid of the room's triangles, the hits lit by the lamp
     // (shadow rays through the grid) and one cone through the voxels for the further bounces,
     // denoised by SVGF and upsampled; closest to the path-traced reference in the contacts and
@@ -105,8 +105,9 @@
     // with the falloff the voxel injection uses, so the direct light and the voxels' agree.
     //
     // URL parameters, as the Rust example's (no dragon):
-    // preset=off|ssgi|voxel|best|indirect|voxels|phone|sdf|slice|probes|probe-view (applied first,
-    // the other parameters over it; `best`, voxel + SSGI, unless the URL names a preset or a gi),
+    // preset=hybrid|off|ssgi|voxel|best|indirect|voxels|phone|sdf|slice|probes|probe-view (applied
+    // first, the other parameters over it; `hybrid`, gi=rt, unless the URL names a preset or a gi;
+    // `best` is voxel + SSGI),
     // gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi|rt (ssgi: high; rt, or rt=1,
     // builds the grid of triangles at load: the panel reloads the page with gi=rt without it), with
     // gi=rt the hybrid's rtgi_res=half|full, rtgi_denoise=svgf|temporal|off, rtgi_kernel=3x3|5x5,
@@ -322,7 +323,9 @@
     // rt=1)
     const reflect = flag('reflect', false);
     const balls = flag('mirror', true) || flag('glass', true);
-    const grid = reflect || balls || param('gi') === 'rt' || flag('rt', false);
+    // (the default preset is the hybrid's)
+    const hybridAtLoad = param('gi') === 'rt' || (param('gi') === null && (param('preset') ?? 'hybrid') === 'hybrid');
+    const grid = reflect || balls || hybridAtLoad || flag('rt', false);
     const floorSpecular = reflect ? [paramOr('floor_f0', 0.3), paramOr('floor_rough', 0.05)] : [0, 0];
     const specularOf = (label) => label === 'Floor' ? floorSpecular : [0, 0];
     const rt = (albedo) => grid ? { albedo } : null;
@@ -458,6 +461,8 @@
     // The Rust example's presets but its dragon's: [name, gi, voxels, view, sdf ao, voxel shadows,
     // direct shadows from the field].
     const PRESETS = [
+      // the default: diffuse GI path traced through the grid (one ray for each 2 x 2 pixels, SVGF)
+      ['hybrid', 'rt', null, 'lit', 0, 'off', false],
       ['off', 'off', null, 'lit', 0, 'off', false],
       ['ssgi', 'high', null, 'lit', 0, 'off', false],
       ['voxel', 'voxel', null, 'lit', 0, 'off', false],
@@ -526,7 +531,7 @@
       Object.assign(config, { preset: name, gi, voxels: voxels ?? defaultVoxels, view, sdfAo, sdfShadows, shadows: directSdf ? 'sdf' : 'map' });
     }
     // the URL's preset, then its other parameters over it
-    const DEFAULT_PRESET = 'best';
+    const DEFAULT_PRESET = 'hybrid';
     const preset = param('preset') ?? (param('gi') === null ? DEFAULT_PRESET : null);
     if (preset) applyPreset(preset);
     config.gi = giFromName(param('gi')) ?? config.gi;
@@ -735,7 +740,13 @@
       };
     };
     const set = (key) => (value) => { config[key] = value; apply(); };
-    const setPreset = (name) => { applyPreset(name); apply(); };
+    // (the hybrid needs the grid, built at load: without it the GI stays as it is)
+    const setPreset = (name) => {
+      const gi = config.gi;
+      applyPreset(name);
+      if (config.gi === 'rt' && !renderer.rtGrid) config.gi = gi;
+      apply();
+    };
     // the balls' settings (only where the page built the grid)
     const setBall = (key) => (value) => {
       if (!mirrorBall) return;

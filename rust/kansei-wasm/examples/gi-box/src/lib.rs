@@ -13,7 +13,7 @@
 //! - `gi=voxel+ssgi`: screen-space GI in front for contact detail, the voxels for the rest.
 //! - `gi=probes` and `gi=probes+ssgi`: the voxels' light reaches the screen through irradiance
 //!   probes traced in the voxels' distance field (`SdfProbes`) instead of cones per pixel.
-//! - `gi=rt`: the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels from the surface
+//! - `gi=rt` (the default): the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels from the surface
 //!   through a grid of the room's triangles, the hits lit by the lamp (shadow rays through the
 //!   grid) and one cone through the voxels for the further bounces, denoised by SVGF; closest to
 //!   the path-traced reference in the contacts and behind the blocks.
@@ -28,8 +28,9 @@
 //! (and `window.kansei`) switches everything at run time.
 //!
 //! URL parameters (a `preset` first, the others over it):
-//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
-//!   `best`, voxel + SSGI at the device's tier, unless the URL names a preset or a `gi`);
+//! - `preset=hybrid|off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
+//!   `hybrid`, the hybrid path tracing (`gi=rt`), unless the URL names a preset or a `gi`; `best` is
+//!   voxel + SSGI at the device's tier);
 //! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi|rt` (`rt`, or `rt=1`,
 //!   builds the grid of triangles at load; the panel reloads the page to switch to it without);
 //! - with `gi=rt`, the hybrid's settings (`RtGi`): `rtgi_res=half|full`,
@@ -617,11 +618,13 @@ const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxel
     Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
 }
 
-const PRESETS: [Preset; 14] = [
+const PRESETS: [Preset; 15] = [
+    // the default: diffuse GI path traced through the grid (one ray for each 2 x 2 pixels, SVGF)
+    preset("hybrid", "Hybrid path tracing (default)", "rt", None, View::Lit, Dragon::Off),
     preset("off", "Off (direct light)", "off", None, View::Lit, Dragon::Off),
     preset("ssgi", "SSGI", "high", None, View::Lit, Dragon::Off),
     preset("voxel", "Voxel", "voxel", None, View::Lit, Dragon::Off),
-    preset("best", "Voxel + SSGI (best)", "voxel+ssgi", None, View::Lit, Dragon::Off),
+    preset("best", "Voxel + SSGI", "voxel+ssgi", None, View::Lit, Dragon::Off),
     preset("indirect", "Indirect only", "voxel+ssgi", None, View::Indirect, Dragon::Off),
     preset("voxels", "Voxels (debug)", "voxel", None, View::Voxels, Dragon::Off),
     preset("phone", "Phone (low)", "voxel+ssgi", Some(VoxelGiQuality::Low), View::Lit, Dragon::Off),
@@ -714,7 +717,7 @@ fn default_voxels(phone: bool) -> VoxelGiQuality {
 }
 
 /// The preset of a URL that names neither a preset nor a `gi`.
-const DEFAULT_PRESET: &str = "best";
+const DEFAULT_PRESET: &str = "hybrid";
 
 /// `config` with preset `name` applied (unknown names change nothing).
 fn with_preset(config: Config, name: &str, phone: bool) -> Config {
@@ -1332,7 +1335,13 @@ pub fn presets() -> String {
 /// Apply preset `name` (`PRESETS`): GI mode, voxel tier, view and the dragon together.
 #[wasm_bindgen]
 pub async fn set_preset(name: String) {
-    let Some(config) = with_state(|s| with_preset(s.config, &name, s.phone)) else { return };
+    // (the hybrid needs the grid, built at load: without it the GI stays as it is)
+    let Some(config) = with_state(|s| {
+        let c = with_preset(s.config, &name, s.phone);
+        if c.gi == Gi::Rt && !s.config.grid { Config { gi: s.config.gi, ..c } } else { c }
+    }) else {
+        return;
+    };
     apply_with_dragon(config).await;
 }
 

@@ -259,12 +259,12 @@
           </li>
           <li>
             <span class="demo-name">GI Path traced Cornell</span>
-            <span class="demo-desc">A Cornell box under one downlight to compare GI methods: voxel GI under screen-space GI, or the hybrid that path traces the diffuse light through a grid of the room's triangles; its panel has the distance field, probes and ray-traced reflections too</span>
+            <span class="demo-desc">A Cornell box under one downlight, its diffuse light path traced through a grid of the room's triangles (one ray for each 2 x 2 pixels, denoised), with a chrome ball and a glass ball ray traced through the same grid: reflection, refraction through both surfaces, frosted glass and rough chrome. Its panel switches to voxel GI, screen-space GI or a path-traced reference, and has the distance field, probes and the balls' roughness and index of refraction</span>
             <span class="run">
-              <a class="run-ts" href="./index_gi_box.html?preset=best" title="Voxel GI + SSGI (TypeScript)">TS</a>
-              <a class="run-rust" href="/examples/gi-box/?preset=best" data-rust title="Voxel GI + SSGI (Rust / WASM)">WASM</a>
-              <a class="run-ts run-variant" href="./index_gi_box.html?gi=rt" title="Hybrid path tracing: one ray for each 2 x 2 pixels through the grid of triangles, denoised (TypeScript)">Hybrid path tracing</a>
-              <a class="run-rust run-variant" href="/examples/gi-box/?gi=rt" data-rust title="Hybrid path tracing: one ray for each 2 x 2 pixels through the grid of triangles, denoised (Rust / WASM)">Hybrid path tracing</a>
+              <a class="run-ts" href="./index_gi_box.html?gi=rt" title="Hybrid path tracing: one ray for each 2 x 2 pixels through the grid of triangles, denoised (TypeScript)">TS</a>
+              <a class="run-rust" href="/examples/gi-box/?gi=rt" data-rust title="Hybrid path tracing: one ray for each 2 x 2 pixels through the grid of triangles, denoised (Rust / WASM)">WASM</a>
+              <a class="run-ts run-variant" href="./index_gi_box.html?preset=best" title="Voxel GI + SSGI (TypeScript)">Voxel + SSGI</a>
+              <a class="run-rust run-variant" href="/examples/gi-box/?preset=best" data-rust title="Voxel GI + SSGI (Rust / WASM)">Voxel + SSGI</a>
             </span>
           </li>
           <li hidden>
@@ -277,11 +277,12 @@
           </li>
           <li>
             <span class="demo-name">Voxel GI on particles</span>
-            <span class="demo-desc">Particles splatted into a voxel volume and cone traced for their light: in TS an SPH dam break in an open Cornell room, in Rust particles raining into a lightbox, glowing ones lighting the rest</span>
+            <span class="demo-desc">Spheres of an SPH fluid raining into a lightbox under an emissive panel, splatted into a voxel volume and cone traced for their light, glowing ones lighting the rest over a glossy floor; the same demo in TS and Rust. Ray traced turns some into mirrors and glass, with depth of field</span>
             <span class="run">
               <a class="run-ts" href="./index_voxel_gi_particles.html" title="TypeScript">TS</a>
               <a class="run-rust" href="/examples/voxel-gi-particles/" data-rust title="Rust / WASM">WASM</a>
-              <a class="run-rust run-variant" href="/examples/voxel-gi-particles/?rt=on" data-rust title="Some particles turned to mirrors and glass, their rays walking the fluid&#x27;s neighbour grid (Rust / WASM)">Ray traced</a>
+              <a class="run-ts run-variant" href="./index_voxel_gi_particles.html?rt=on&amp;dof=1" title="Some particles turned to mirrors and glass, their rays walking the fluid&#x27;s neighbour grid, with depth of field (TypeScript)">Ray traced</a>
+              <a class="run-rust run-variant" href="/examples/voxel-gi-particles/?rt=on&amp;dof=1" data-rust title="Some particles turned to mirrors and glass, their rays walking the fluid&#x27;s neighbour grid, with depth of field (Rust / WASM)">Ray traced</a>
             </span>
           </li>
         </ul>
