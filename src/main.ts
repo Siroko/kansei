@@ -138,6 +138,9 @@ export { Impostor, IMPOSTOR_WGSL, IMPOSTOR_PARAMS_BYTES, billboardGeometry, impo
 export type { ImpostorLayout, ImpostorOptions } from "./impostors/Impostor";
 export { bakeImpostor } from "./impostors/bakeImpostor";
 export type { ImpostorBakeContext } from "./impostors/bakeImpostor";
+export { ClusterMesh, DEFAULT_CLUSTER_OPTIONS, enclosingSphere, sphereContains, clusterBackfacing, projectedError, projectedErrorAt, levelMayDraw, WINDOW_SLACK } from "./clusters/ClusterMesh";
+export type { Cluster, ClusterOptions, LevelBounds, LodView, Sphere } from "./clusters/ClusterMesh";
+export { buildClusterMesh } from "./clusters/build";
 export { ToneMapEffect, ToneMapper, LENS_ATTENUATION_UE5, LENS_ATTENUATION_UE4, exposureFromEV100, ev100FromCamera, whiteBalanceMatrix, unrealWhiteBalanceMatrix, defaultToneMapOptions, toneMapOptionsForSurface, defaultColorGrade, defaultUnrealFilm, unrealLocalExposure } from "./postprocessing/effects/ToneMapEffect";
 export type { ToneMapOptions, ColorGrade, UnrealFilm, LocalExposure } from "./postprocessing/effects/ToneMapEffect";
 export { SkyAtmosphere, defaultSkyAtmosphereOptions, skyCaptureFogFromHeightFog } from "./atmosphere/SkyAtmosphere";
