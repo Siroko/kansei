@@ -1,5 +1,37 @@
 # kansei
 
+<!-- Gallery: two cells per <tr>, each image a ~1600 px wide JPEG under 300 KB in docs/media/readme/
+     linking to its live example. To add an entry, add a <td> (start a new <tr> after every two);
+     an odd last entry can take colspan="2" as a wide hero. -->
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="https://kansei.graphics/examples/instancing/"><img src="docs/media/readme/instancing.jpg" alt="Instancing" width="100%"></a><br>
+      <a href="https://kansei.graphics/examples/instancing/"><b>Instancing</b></a><br>
+      <sub>A ball pushes through a carpet of instanced cubes, simulated in compute</sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="https://kansei.graphics/examples/voxel-gi-particles/?rt=on&amp;dof=1"><img src="docs/media/readme/voxel-gi-particles.jpg" alt="Voxel GI on particles" width="100%"></a><br>
+      <a href="https://kansei.graphics/examples/voxel-gi-particles/?rt=on&amp;dof=1"><b>Voxel GI on particles</b></a><br>
+      <sub>An SPH pile lit by voxel cone tracing, with ray-traced mirror and glass spheres and depth of field</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="https://kansei.graphics/examples/depth-of-field/"><img src="docs/media/readme/depth-of-field.jpg" alt="Depth of field" width="100%"></a><br>
+      <a href="https://kansei.graphics/examples/depth-of-field/"><b>Depth of field</b></a><br>
+      <sub>Physical lens depth of field with bokeh on a scrolling field of glowing columns</sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="https://kansei.graphics/examples/fluid/"><img src="docs/media/readme/fluid.jpg" alt="Fluid" width="100%"></a><br>
+      <a href="https://kansei.graphics/examples/fluid/"><b>Fluid</b></a><br>
+      <sub>A 3D particle fluid splashing in a box, meshed with marching cubes and refracting the room</sub>
+    </td>
+  </tr>
+</table>
+
+Live examples: [kansei.graphics](https://kansei.graphics/)
+
 Kansei is a Toy WebGPU engine built with TypeScript, inspired by old school 3D frameworks like Papervision3D, Flash API or some more modern ones like Pixi.js, Three.js or Unity compute pipeline, this library is not intended to cover a generalist use case but will be specifically targeting WebGPU and provide tools to render and compute simulations by using native WGSL. 
 
 Note that the library is highly experimental and WIP, so it will take some time to be production-ready 😅 
