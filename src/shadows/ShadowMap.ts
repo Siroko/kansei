@@ -8,6 +8,7 @@ import { DirectionalLight } from '../lights/DirectionalLight';
 import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
 import { gpuPass } from '../profiling/Profiler';
+import { drawGeometry } from '../culling/InstanceCulling';
 import type { DepthBias, Material } from '../materials/Material';
 import { CAMERA_TEMPORAL_BYTES, LIGHT_UNIFORM_BYTES, MESH_TRANSFORMS_BYTES, cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries, meshSlotStride } from '../renderers/SharedLayouts';
 
@@ -397,13 +398,15 @@ class ShadowMap {
     /**
      * Encodes the shadow pass: clears the map and draws the `castShadow` renderables among
      * `objects` from the light (`update`), each with its matrices in `meshBindGroup` (group 2) at
-     * `meshOffset(renderable, index)`.
+     * `meshOffset(renderable, index)`. Renderables with `instanceCulling` draw the instances culled
+     * for the renderer's cull view `view` when it is given, else every instance.
      */
     encode(
         commandEncoder: GPUCommandEncoder,
         objects: readonly Renderable[],
         meshBindGroup: GPUBindGroup,
         meshOffset: (renderable: Renderable, index: number) => number,
+        view?: number,
     ): void {
         const device = this._device;
         const pass = commandEncoder.beginRenderPass({
@@ -480,18 +483,12 @@ class ShadowMap {
             }
 
             if (obj.geometry.isInstancedGeometry) {
-                const geo = obj.geometry as InstancedGeometry;
-                let idx = 1;
-                for (const extraBuf of geo.extraBuffers) {
+                for (const extraBuf of (obj.geometry as InstancedGeometry).extraBuffers) {
                     if (!extraBuf.initialized) extraBuf.initialize(device);
-                    pass.setVertexBuffer(idx++, extraBuf.resource.buffer);
                 }
-                pass.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
-            } else if (obj.geometry.indirectArgsBuffer) {
-                pass.drawIndexedIndirect(obj.geometry.indirectArgsBuffer, 0);
-            } else {
-                pass.drawIndexed(obj.geometry.vertexCount);
             }
+            // culled against this light's frustum, not the camera's
+            drawGeometry(pass, obj.geometry, view === undefined ? null : obj.instanceCulling?.view(view) ?? null);
         }
 
         pass.end();
