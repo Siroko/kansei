@@ -176,5 +176,15 @@ export {
     FORWARD, yawOf, yawRotation, wrapAngle,
 } from "./animation/index";
 export type { Root } from "./animation/index";
+export {
+    FEATURES, STRIDE, BOUND_SMALL, BOUND_LARGE, TRAJECTORY_TIMES, ACTION_TAG,
+    findJointRoles, defaultFeatureWeights, defaultContactThresholds, defaultSearchFilter, filterAllows,
+    ClipInfo, Database, DatabaseBuilder, MotionMatcher, defaultMotionMatchingSettings,
+    ActionKind, ActionClip, actionKindName, actionKindFromName, crosses, MotionPack, CharacterPack, PackError,
+} from "./animation/motion_matching/index";
+export type {
+    JointRoles, FeatureWeights, ContactThresholds, SearchFilter, Match, RootSample,
+    MotionMatchingSettings, MotionInput, Simulation, SearchInfo, RootPath, Action, Constrain, ActionClipFields, PackMesh, PackImage,
+} from "./animation/motion_matching/index";
 export { Obb, TriangleMesh, CollisionWorld, ALL_LAYERS, rayCapsule, raySphere, rayTriangle, closestPointTriangle } from "./collision/index";
 export type { Triangle, Shape, Collider, Hit, CastResult } from "./collision/index";
