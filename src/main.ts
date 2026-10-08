@@ -43,6 +43,8 @@ export { PostProcessingEffect } from "./postprocessing/PostProcessingEffect";
 export { PostProcessingVolume } from "./postprocessing/PostProcessingVolume";
 export { SSAOEffect } from "./postprocessing/effects/SSAOEffect";
 export { DepthOfFieldEffect } from "./postprocessing/effects/DepthOfFieldEffect";
+export { CinematicDepthOfFieldEffect, CameraLens, DofDebugView } from "./postprocessing/effects/CinematicDepthOfFieldEffect";
+export type { CinematicDepthOfFieldOptions, CameraLensOptions, HighlightOptions } from "./postprocessing/effects/CinematicDepthOfFieldEffect";
 export { GodRaysEffect } from "./postprocessing/effects/GodRaysEffect";
 export { Light } from "./lights/Light";
 export { DirectionalLight } from "./lights/DirectionalLight";
