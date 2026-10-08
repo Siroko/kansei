@@ -29,7 +29,7 @@ export function emptyCullStats(): CullStats {
  * (`Renderer.enableShadows`), or the sky occlusion's top-down view
  * (`Renderer.enableSkyOcclusion`).
  */
-export type CullViewKind = 'camera' | 'shadow' | 'skyOcclusion';
+export type CullViewKind = 'camera' | 'shadow' | 'skyOcclusion' | 'spot';
 
 /** Instance culling statistics of a recent frame, per view. */
 export class CullingStats {

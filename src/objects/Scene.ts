@@ -5,6 +5,7 @@ import { Light } from "../lights/Light";
 import { DirectionalLight } from "../lights/DirectionalLight";
 import { PointLight } from "../lights/PointLight";
 import { AreaLight } from "../lights/AreaLight";
+import { SpotLight } from "../lights/SpotLight";
 
 /**
  * Represents a 3D scene which can contain multiple objects.
@@ -27,6 +28,7 @@ class Scene extends Object3D {
     private _directionalLights: DirectionalLight[] = [];
     private _pointLights: PointLight[] = [];
     private _areaLights: AreaLight[] = [];
+    private _spotLights: SpotLight[] = [];
 
     // Slot allocator: each renderable's slot and the `prepare` that last found it.
     private _slots = new Map<Renderable, { slot: number, seen: number }>();
@@ -37,6 +39,8 @@ class Scene extends Object3D {
     public get directionalLights(): readonly DirectionalLight[] { return this._directionalLights; }
     public get pointLights(): readonly PointLight[] { return this._pointLights; }
     public get areaLights(): readonly AreaLight[] { return this._areaLights; }
+    /** The spot lights, in tree order (the order `Renderer.enableSpotShadows` gives atlas layers in). */
+    public get spotLights(): readonly SpotLight[] { return this._spotLights; }
 
     /** The visible opaque renderables, in tree order. */
     public get opaque(): readonly Renderable[] { return this.opaqueObjects; }
@@ -68,6 +72,7 @@ class Scene extends Object3D {
         this._directionalLights.length = 0;
         this._pointLights.length = 0;
         this._areaLights.length = 0;
+        this._spotLights.length = 0;
         const stamp = ++this._prepareCount;
         let found = 0;
         // Give every renderable a slot; sort the visible ones into opaque, transmissive and
@@ -78,6 +83,7 @@ class Scene extends Object3D {
                 if (light.lightType === 'directional') this._directionalLights.push(light as DirectionalLight);
                 else if (light.lightType === 'point') this._pointLights.push(light as PointLight);
                 else if (light.lightType === 'area') this._areaLights.push(light as AreaLight);
+                else if (light.lightType === 'spot') this._spotLights.push(light as SpotLight);
             }
             if (object.isRenderable) {
                 const renderable = object as Renderable;
