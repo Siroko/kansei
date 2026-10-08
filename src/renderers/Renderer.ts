@@ -25,6 +25,7 @@ import { mat4 } from "gl-matrix";
 import { SceneVoxelGi, SceneVoxelGiOptions } from "../gi/SceneVoxelGi";
 import { bakeImpostor } from "../impostors/bakeImpostor";
 import type { Impostor, ImpostorOptions } from "../impostors/Impostor";
+import { SceneRtGrid, SceneRtGridOptions } from "../rt/SceneRtGrid";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -464,6 +465,36 @@ class Renderer {
 
     /** Whether spot lights are shaded through the clustered light lists (`setClusteredLights`). */
     public get clusteredLights(): boolean { return this._clusteredLights; }
+
+    // The ray tracing grid of the scene's triangles (`enableRtGrid`)
+    private _rtGrid: SceneRtGrid | null = null;
+    private _rtViewProj = mat4.create();
+
+    /**
+     * A ray tracing grid of the scene's triangles round the camera (`SceneRtGrid`, Rust's
+     * `enable_rt_grid`), for passes that trace rays through it (`RT_GRID_WGSL`): the renderables
+     * with `Renderable.rt`, culled for its box on the GPU, rebuilt after the frame's culling when
+     * the box moves or what it holds changes. Calling it again replaces the grid.
+     *
+     * ```ts
+     * const rt = renderer.enableRtGrid({ grid: { dims: [128, 64, 128], cell: 0.5 } });
+     * const reflections = new RtReflectionsEffect(renderer.voxelGI!.volume, rt.handle);
+     * ```
+     */
+    public enableRtGrid(options: SceneRtGridOptions = {}): SceneRtGrid {
+        this._rtGrid?.destroy();
+        this._rtGrid = new SceneRtGrid(this.device!, options);
+        return this._rtGrid;
+    }
+
+    /** Turn the ray tracing grid off and free it. */
+    public disableRtGrid(): void {
+        this._rtGrid?.destroy();
+        this._rtGrid = null;
+    }
+
+    /** The ray tracing grid, once `enableRtGrid` has been called. */
+    public get rtGrid(): SceneRtGrid | null { return this._rtGrid; }
 
     constructor(
         private options: RendererOptions = {}
@@ -1171,7 +1202,10 @@ class Renderer {
         t = cpuScope('scene/culling');
         const commandEncoder = this.device!.createCommandEncoder();
         this._planShadowViews(stack, camera);
+        // the ray tracing grid's box is a view the culling serves
+        this._planRtGrid(stack, camera);
         this._runInstanceCulling(commandEncoder, stack, camera);
+        this._runRtGrid(commandEncoder, stack);
         t?.end();
         t = cpuScope('scene/shadows');
         this._encodeShadowPasses(commandEncoder, stack);
@@ -1351,6 +1385,7 @@ class Renderer {
 
         t = cpuScope('scene/submit');
         this.device!.queue.submit([commandEncoder.finish()]);
+        this._rtGrid?.afterSubmit();
         this._endCulledFrame(camera);
         t?.end();
         sceneScope?.end();
@@ -1497,7 +1532,8 @@ class Renderer {
      * The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then while the renderer
      * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame),
      * then with sky occlusion `_skyOcclusionView` (`null` unless a tile of its top-down pass is due),
-     * then every layer of the spot shadow atlas from `_spotViewBase()` (`null` when no light uses it).
+     * then every layer of the spot shadow atlas from `_spotViewBase()` (`null` when no light uses it),
+     * then with a ray tracing grid its box (`_rtView`).
      */
     private _cullViews(camera: Camera): (CullView | null)[] {
         // the unjittered projection: the frustum, not where pixels sample
@@ -1517,7 +1553,14 @@ class Renderer {
             for (let l = 0; l < this._spotShadowAtlas.layers; l++) views.push(null);
             for (const slot of this._spotLights.shadows) views[base + slot.layer] = cullView(slot.viewProj, { castersOnly: true });
         }
+        // then the ray tracing grid's box (`_rtView`)
+        if (this._rtGrid) views.push(cullView(this._rtGrid.cullViewProj(this._rtViewProj), { rt: true }));
         return views;
+    }
+
+    /** The cull view of the ray tracing grid's box, after the spot atlas's layers (Rust's order). */
+    private _rtView(): number {
+        return this._spotViewBase() + (this._spotShadowAtlas?.layers ?? 0);
     }
 
     /** What each cull view is, in `_cullViews` order (for the stats). */
@@ -1526,6 +1569,7 @@ class Renderer {
         if (this._ownsShadowMap && this._shadowMap) kinds.push('shadow');
         if (this._skyOcclusion) kinds.push('skyOcclusion');
         for (let l = 0; l < (this._spotShadowAtlas?.layers ?? 0); l++) kinds.push('spot');
+        if (this._rtGrid) kinds.push('rtGrid');
         return kinds;
     }
 
@@ -1553,7 +1597,7 @@ class Renderer {
         for (const r of culled) {
             const culling = r.instanceCulling!;
             staleBundles = culling.ensureViews(device, pipeline.layout, views.length) || staleBundles;
-            culling.beginFrame(device.queue, encoder, r.worldMatrix.internalMat4, r.geometry.vertexCount, r.castShadow, r.layers);
+            culling.beginFrame(device.queue, encoder, r.worldMatrix.internalMat4, r.geometry.vertexCount, r.castShadow, r.layers, r.gi !== null, r.rt !== null);
         }
         const pass = encoder.beginComputePass({ label: 'Renderer/InstanceCulling', timestampWrites: gpuPass('Renderer/InstanceCulling') });
         pass.setPipeline(pipeline.pipeline);
@@ -1563,13 +1607,29 @@ class Renderer {
             const culling = r.instanceCulling!;
             culling.dispatch(pass);
             views.forEach((view, slot) => {
-                if (!view || !cullViewDraws(view, r.castShadow, r.layers)) return;
+                if (!view || !cullViewDraws(view, r.castShadow, r.layers, r.gi !== null, r.rt !== null)) return;
                 const draw = culling.view(slot)!;
                 this._cullStats.record(slot, culling.tested, draw.args, draw.offset);
             });
         }
         pass.end();
         if (staleBundles) this.invalidateBundle();
+    }
+
+    /**
+     * Plan the ray tracing grid's frame before the culling, whose view its box is: follow the
+     * camera, and whether to rebuild.
+     */
+    private _planRtGrid(stack: Scene, camera: Camera): void {
+        if (!this._rtGrid) return;
+        const eye = camera.inverseViewMatrix.internalMat4;
+        this._rtGrid.plan(stack, [eye[12], eye[13], eye[14]]);
+    }
+
+    /** The ray tracing grid's rebuild, after the culling (its view's culled instances). */
+    private _runRtGrid(encoder: GPUCommandEncoder, stack: Scene): void {
+        if (!this._rtGrid?.rebuilding) return;
+        this._rtGrid.build(encoder, stack, this._rtView());
     }
 
     /** After the frame's culling is submitted: read its statistics back (when on). */
