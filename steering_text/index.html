@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <base href="/examples/steering_text/">
+    <meta charset="utf-8">
+    <title>Kansei — Steering Text</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        import initWasm, { start, init_text,
+            set_separation_strength, set_separation_radius,
+            set_wander_strength, set_wander_speed,
+            set_mouse_force, set_max_speed, set_max_force,
+            set_damping, set_bounds_size, set_verlet_iterations,
+            set_cohesion_strength, set_alignment_strength,
+            set_attractor_pos, set_attractor_strength,
+            set_repulsion_strength, set_repulsion_radius, set_max_per_cell,
+            set_auto_rotate_speed,
+            set_palette, set_background,
+        } from './pkg/kansei_wasm_steering_text.js';
+
+        // Mobile detection — wider camera orbit on touch devices
+        const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+            || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+        await initWasm();
+        await start('kansei');
+
+        // Load words; Rust loads the font (assets/fonts/L10-medium.arfont)
+        const words = await fetch('words.json').then(r => r.text());
+        await init_text(words);
+
+        // ── Tweakpane ──
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Steering Text', expanded: true });
+
+        const p = {
+            separationStrength: 8.0, separationRadius: 14.5,
+            cohesionStrength: 8.3, alignmentStrength: 7.9,
+            wanderStrength: 0.0, wanderSpeed: 0.2,
+            repulsionStrength: 15.0, repulsionRadius: 6.0, maxPerCell: 64,
+            mouseForce: 1500.0, maxSpeed: 100.0, maxForce: 32.0,
+            damping: 1.0, boundsSize: 100.0, verletIterations: 3,
+        };
+        const steer = pane.addFolder({ title: 'Steering', expanded: false });
+        steer.addBinding(p, 'wanderStrength', { min: 0, max: 50, step: 0.5, label: 'wander' }).on('change', () => set_wander_strength(p.wanderStrength));
+        steer.addBinding(p, 'wanderSpeed', { min: 0, max: 10, step: 0.1, label: 'wander speed' }).on('change', () => set_wander_speed(p.wanderSpeed));
+        steer.addBinding(p, 'separationStrength', { min: 0, max: 20, step: 0.5, label: 'separation' }).on('change', () => set_separation_strength(p.separationStrength));
+        steer.addBinding(p, 'cohesionStrength', { min: 0, max: 10, step: 0.1, label: 'cohesion' }).on('change', () => set_cohesion_strength(p.cohesionStrength));
+        steer.addBinding(p, 'alignmentStrength', { min: 0, max: 10, step: 0.1, label: 'alignment' }).on('change', () => set_alignment_strength(p.alignmentStrength));
+        steer.addBinding(p, 'separationRadius', { min: 0, max: 30, step: 0.5, label: 'sep radius' }).on('change', () => set_separation_radius(p.separationRadius));
+        steer.addBinding(p, 'maxSpeed', { min: 1, max: 100, step: 1, label: 'max speed' }).on('change', () => set_max_speed(p.maxSpeed));
+        steer.addBinding(p, 'maxForce', { min: 1, max: 60, step: 1, label: 'max force' }).on('change', () => set_max_force(p.maxForce));
+        steer.addBinding(p, 'damping', { min: 0.8, max: 1.0, step: 0.005, label: 'damping' }).on('change', () => set_damping(p.damping));
+        steer.addBinding(p, 'mouseForce', { min: 0, max: 5000, step: 50, label: 'mouse force' }).on('change', () => set_mouse_force(p.mouseForce));
+        steer.addBinding(p, 'boundsSize', { min: 10, max: 1000, step: 10, label: 'bounds' }).on('change', () => set_bounds_size(p.boundsSize));
+        steer.addBinding(p, 'verletIterations', { min: 0, max: 10, step: 1, label: 'verlet iters' }).on('change', () => set_verlet_iterations(p.verletIterations));
+
+        const collision = pane.addFolder({ title: 'Letter Collision', expanded: false });
+        collision.addBinding(p, 'repulsionStrength', { min: 0, max: 30, step: 0.5, label: 'strength' }).on('change', () => set_repulsion_strength(p.repulsionStrength));
+        collision.addBinding(p, 'repulsionRadius', { min: 0, max: 20, step: 0.5, label: 'radius' }).on('change', () => set_repulsion_radius(p.repulsionRadius));
+        collision.addBinding(p, 'maxPerCell', { min: 4, max: 256, step: 4, label: 'max/cell' }).on('change', () => set_max_per_cell(p.maxPerCell));
+
+        const attractor = pane.addFolder({ title: 'Attractor', expanded: false });
+        const att = { x: 0, y: 0, z: 0, strength: 2.0 };
+        const syncAtt = () => set_attractor_pos(att.x, att.y, att.z);
+        attractor.addBinding(att, 'strength', { min: 0, max: 20, step: 0.1 }).on('change', () => set_attractor_strength(att.strength));
+        attractor.addBinding(att, 'x', { min: -500, max: 500, step: 1 }).on('change', syncAtt);
+        attractor.addBinding(att, 'y', { min: -500, max: 500, step: 1 }).on('change', syncAtt);
+        attractor.addBinding(att, 'z', { min: -500, max: 500, step: 1 }).on('change', syncAtt);
+
+        // ── Visual ──
+        const visual = pane.addFolder({ title: 'Visual', expanded: false });
+        const vis = { autoRotate: 0.1, bgColor: { r: 0.02, g: 0.02, b: 0.04 } };
+        visual.addBinding(vis, 'autoRotate', { min: 0, max: 2, step: 0.01, label: 'auto rotate' })
+            .on('change', () => set_auto_rotate_speed(vis.autoRotate));
+        visual.addBinding(vis, 'bgColor', { color: { type: 'float' }, label: 'background' })
+            .on('change', () => {
+                set_background(vis.bgColor.r, vis.bgColor.g, vis.bgColor.b);
+                document.body.style.backgroundColor =
+                    `rgb(${Math.round(vis.bgColor.r*255)},${Math.round(vis.bgColor.g*255)},${Math.round(vis.bgColor.b*255)})`;
+            });
+
+        // ── Color Palette ──
+        const colors = pane.addFolder({ title: 'Palette', expanded: false });
+        const pal = {
+            c0: { r: 1.0, g: 0.75, b: 0.80 },
+            c1: { r: 0.70, g: 0.82, b: 1.0 },
+            c2: { r: 0.75, g: 1.0, b: 0.82 },
+            c3: { r: 1.0, g: 0.95, b: 0.70 },
+            c4: { r: 0.85, g: 0.72, b: 1.0 },
+            c5: { r: 1.0, g: 0.82, b: 0.72 },
+        };
+        const syncPalette = () => {
+            const flat = new Float32Array([
+                pal.c0.r, pal.c0.g, pal.c0.b, 1,
+                pal.c1.r, pal.c1.g, pal.c1.b, 1,
+                pal.c2.r, pal.c2.g, pal.c2.b, 1,
+                pal.c3.r, pal.c3.g, pal.c3.b, 1,
+                pal.c4.r, pal.c4.g, pal.c4.b, 1,
+                pal.c5.r, pal.c5.g, pal.c5.b, 1,
+            ]);
+            set_palette(flat);
+        };
+        colors.addBinding(pal, 'c0', { color: { type: 'float' }, label: 'color 1' }).on('change', syncPalette);
+        colors.addBinding(pal, 'c1', { color: { type: 'float' }, label: 'color 2' }).on('change', syncPalette);
+        colors.addBinding(pal, 'c2', { color: { type: 'float' }, label: 'color 3' }).on('change', syncPalette);
+        colors.addBinding(pal, 'c3', { color: { type: 'float' }, label: 'color 4' }).on('change', syncPalette);
+        colors.addBinding(pal, 'c4', { color: { type: 'float' }, label: 'color 5' }).on('change', syncPalette);
+        colors.addBinding(pal, 'c5', { color: { type: 'float' }, label: 'color 6' }).on('change', syncPalette);
+    </script>
+</body>
+</html>
