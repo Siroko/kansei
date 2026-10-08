@@ -33,6 +33,7 @@ import { SceneRtGrid, SceneRtGridOptions } from "../rt/SceneRtGrid";
 import type { PlanarReflection } from "../reflections/PlanarReflection";
 import { ClusterCulling, ClusterDepthDraw, ClusterGpu, ClusterView, Cut, InstanceSource, clusterViewOf, drawCut, instanceLayoutOf, projectionNear } from "../clusters/ClusterLod";
 import { clusterMeshBindGroupLayoutEntries } from "./SharedLayouts";
+import { ClusterDebug } from "../clusters/ClusterDebug";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -419,6 +420,24 @@ class Renderer {
     private _clustered: Renderable[] = [];
     private _clusterMeshBGL: GPUBindGroupLayout | null = null;
     private _clusterScratch = { viewProj: mat4.create(), inverse: mat4.create(), cascades: Array.from({ length: MAX_CASCADES }, () => mat4.create()) };
+    private _clusterDebug: ClusterDebug | null = null;
+
+    /**
+     * Cluster LOD's debug view (`ClusterDebug`; null, the default, turns it off): the camera draws
+     * its cluster cuts coloured by cluster, level, group, error over the budget, instance or
+     * triangle, edges optional, and counts their clusters and triangles per level
+     * (`ClusterDebug.levels`). Shadows, reflections and the velocity pass draw as usual. Changing
+     * the view's settings costs nothing; turning it on or off re-records the bundles. TS only.
+     */
+    public setClusterDebug(debug: ClusterDebug | null): void {
+        if (debug === this._clusterDebug) return;
+        this._clusterDebug?.destroy();
+        this._clusterDebug = debug;
+        this.invalidateBundle();
+    }
+
+    /** The cluster debug view (`setClusterDebug`), if on. */
+    public get clusterDebug(): ClusterDebug | null { return this._clusterDebug; }
 
     /**
      * Cluster LOD's error budget (`Renderable.clusters`), in pixels at the render size: each
@@ -1247,6 +1266,7 @@ class Renderer {
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
         this._clusterCulling?.submitted();
+        this._clusterDebug?.submitted();
         this._endCulledFrame(camera);
         camera.endFrame();
         endProfiledFrame();
@@ -1657,6 +1677,7 @@ class Renderer {
         t = cpuScope('scene/submit');
         this.device!.queue.submit([commandEncoder.finish()]);
         this._clusterCulling?.submitted();
+        this._clusterDebug?.submitted();
         this._rtGrid?.afterSubmit();
         this._endCulledFrame(camera);
         t?.end();
@@ -2163,6 +2184,10 @@ class Renderer {
         }
         culling.encode(encoder, gpus);
         for (const [gpu, slot] of gpus) this._cullStats.recordClusters(slot, gpu.cut(slot)!.args);
+        if (this._clusterDebug) {
+            this._clusterDebug.uniform(device);
+            this._clusterDebug.encodeStats(encoder, gpus.filter(([, slot]) => slot === MAIN_VIEW).map(([gpu, slot]) => [gpu, gpu.cut(slot)!]));
+        }
         // renderables joining or leaving the camera's cluster path are drawn the other way
         const prepared = clustered.filter((r) => cuts.get(r)!.has(MAIN_VIEW));
         if (stale || !sameKey(prepared, this._clustered)) this.invalidateBundle();
@@ -2266,6 +2291,20 @@ class Renderer {
         }
         state.indexBuffer = cut.indices;
         return drawCut(encoder, cut, slot * this._matrixAlignment);
+    }
+
+    /**
+     * Encodes the cluster debug view's draw of `renderable`'s camera cut `cut` (`setClusterDebug`),
+     * its matrices at `slot`, with its material's debug pipeline for `targets`.
+     */
+    private _encodeDebugCutDraw(encoder: GPURenderPassEncoder | GPURenderBundleEncoder, renderable: Renderable, slot: number, cut: Cut, targets: PassTargets, state: DrawState): boolean {
+        const pipeline = renderable.material.getClusterDebugPipeline(this.device!, instanceLayoutOf(renderable), targets.colorFormats, targets.sampleCount, targets.depthFormat);
+        // (the debug draw sets its own pipeline and group 2, and reads no index buffer)
+        state.pipeline = pipeline;
+        const materialBindGroup = renderable.material.currentBindGroup!;
+        encoder.setBindGroup(BindGroupSlot.Material, materialBindGroup);
+        state.materialBindGroup = materialBindGroup;
+        return this._clusterDebug!.encodeDraw(encoder, this._clusterCulling!, renderable.clusters!.gpu!, cut, pipeline, slot * this._matrixAlignment, MESH_TRANSFORMS_BYTES);
     }
 
     /**
@@ -2620,7 +2659,11 @@ class Renderer {
         if (!pipeline && targets) {
             const cut = this._clusterCut(renderable, view);
             const clusterPipeline = cut?.drawBindGroup ? renderable.material.clusterPipeline(targets.colorFormats, targets.sampleCount, targets.depthFormat) : null;
-            if (cut && clusterPipeline) return set !== DrawSet.Late && this._encodeCutDraw(encoder, renderable, slot, cut, clusterPipeline, state);
+            if (cut && clusterPipeline) {
+                if (set === DrawSet.Late) return false;
+                if (this._clusterDebug && view === MAIN_VIEW) return this._encodeDebugCutDraw(encoder, renderable, slot, cut, targets, state);
+                return this._encodeCutDraw(encoder, renderable, slot, cut, clusterPipeline, state);
+            }
         }
         pipeline ??= this._pipelineFor(renderable, targets!);
 

@@ -361,6 +361,11 @@ export class ClusterCulling {
         this.viewBindGroup = device.createBindGroup({ label: 'ClusterCulling/View', layout: viewLayout, entries: [{ binding: 0, resource: { buffer: this.views } }] });
     }
 
+    /** The frame's views (`ClusterView` packed, by index), which the cluster debug view reads too. */
+    get viewsBuffer(): GPUBuffer {
+        return this.views;
+    }
+
     /**
      * The frame's views, by index (`ClusterGpu.bind`'s `view`), in one write: a write per view
      * would leave every cut with the last.

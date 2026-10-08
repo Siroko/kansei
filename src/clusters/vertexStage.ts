@@ -81,6 +81,52 @@ export interface InstanceLayout {
  * buffer's format doesn't match.
  */
 export function clusterVertexStage(source: string, instances: InstanceLayout | null): string {
+    return generate(source, instances, false);
+}
+
+/** The debug view's vertex body: the generated stage as a plain function of the cut's index. */
+export const CLUSTER_VERTEX_FN = 'kansei_cluster_vertex';
+
+/**
+ * `clusterVertexStage`'s code with the stage as a plain function instead of an entry point,
+ * `kansei_cluster_vertex(cut index, instance index) -> vertex_main's output`, for the cluster
+ * debug view (`ClusterDebug`), which reads the cut's index itself; and the name of the
+ * `@builtin(position)` member of that output (null when the output is the position itself).
+ * Throws as `clusterVertexStage` does.
+ */
+export function clusterVertexFunction(source: string, instances: InstanceLayout | null): { code: string; position: string | null } {
+    const code = generate(source, instances, true);
+    const stripped = stripComments(source);
+    return { code, position: positionMember(stripped, stripAttributes(vertexReturns(stripped))) };
+}
+
+/** What `vertex_main` returns, attributes and all. */
+function vertexReturns(code: string): string {
+    const name = findFn(code, 'vertex_main')!;
+    const close = matchingParen(code, code.indexOf('(', name))!;
+    return code.slice(close + 1, code.indexOf('{', close)).trim().slice(2).trim();
+}
+
+/** The member of `struct <ty>` marked `@builtin(position)`, or null when `ty` is no struct. */
+function positionMember(code: string, ty: string): string | null {
+    for (let at = code.indexOf('struct'); at >= 0; at = code.indexOf('struct', at + 1)) {
+        const rest = code.slice(at + 'struct'.length).trimStart();
+        if (!rest.startsWith(ty) || isIdent(rest[ty.length])) continue;
+        const after = rest.slice(ty.length).trimStart();
+        if (!after.startsWith('{')) continue;
+        const start = code.length - after.length;
+        const end = code.indexOf('}', start);
+        for (const member of splitTopLevel(code.slice(start + 1, end), ',')) {
+            if (!/@builtin\s*\(\s*position\s*\)/.test(member)) continue;
+            const name = stripAttributes(member);
+            return name.slice(0, name.indexOf(':')).trim();
+        }
+        throw new Error(`${ty} has no @builtin(position) member`);
+    }
+    return null;
+}
+
+function generate(source: string, instances: InstanceLayout | null, plain: boolean): string {
     const code = stripComments(source);
     const name = findFn(code, 'vertex_main');
     if (name === null) throw new Error('no fn vertex_main');
@@ -126,7 +172,9 @@ export function clusterVertexStage(source: string, instances: InstanceLayout | n
     out += `) -> ${stripAttributes(returns)} `;
     out += code.slice(body);
     out += `\nconst KANSEI_RECORD_WORDS: u32 = ${recordWords}u;\n${PRELUDE}\n${CLUSTER_MESH_WGSL}\n`;
-    out += `@vertex\nfn ${CLUSTER_VERTEX_ENTRY}(@builtin(vertex_index) kansei_vertex_index: u32, @builtin(instance_index) kansei_instance_index: u32) -> ${returns} {\n`;
+    out += plain
+        ? `fn ${CLUSTER_VERTEX_FN}(kansei_vertex_index: u32, kansei_instance_index: u32) -> ${stripAttributes(returns)} {\n`
+        : `@vertex\nfn ${CLUSTER_VERTEX_ENTRY}(@builtin(vertex_index) kansei_vertex_index: u32, @builtin(instance_index) kansei_instance_index: u32) -> ${returns} {\n`;
     // (the cut's index: its draw-list entry, and the vertex's index in the entry's cluster)
     out += '    let kansei_draw = kansei_cluster_draws[kansei_vertex_index >> 8u];\n';
     out += '    let kansei_vertex = kansei_cluster_local_vertex(kansei_draw.y, kansei_vertex_index & 0xffu);\n';

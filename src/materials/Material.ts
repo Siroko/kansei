@@ -5,7 +5,8 @@ import { GBuffer } from "../postprocessing/GBuffer";
 // the stock materials construct Materials only when called, so this cycle is safe
 import { GradientSkyOptions, StandardLitOptions, emissive, gradientSky, standardLit } from "./StandardLit";
 import { basicInstanced, basicLit } from "./Stock";
-import { CLUSTER_VERTEX_ENTRY, InstanceLayout, clusterVertexStage } from "../clusters/vertexStage";
+import { CLUSTER_VERTEX_ENTRY, InstanceLayout, clusterVertexFunction, clusterVertexStage } from "../clusters/vertexStage";
+import { CLUSTER_DEBUG_FRAGMENT_ENTRY, CLUSTER_DEBUG_VERTEX_ENTRY, clusterDebugBindGroupLayoutEntries, clusterDebugWgsl } from "../clusters/ClusterDebug";
 import { clusterMeshBindGroupLayoutEntries } from "../renderers/SharedLayouts";
 
 /**
@@ -128,6 +129,8 @@ class Material {
     private _clusterDepthPipelineCache: Map<string, GPURenderPipeline> = new Map();
     private _clusterVelocityPipelineCache: Map<number, GPURenderPipeline> = new Map();
     private _clusterVoxelPipelineCache: Map<number, GPURenderPipeline> = new Map();
+    // The cluster debug view's pipelines (`Renderer.setClusterDebug`), by instance layout and targets.
+    private _clusterDebugPipelineCache: Map<string, GPURenderPipeline> = new Map();
     private _clusterPipelineLayout?: GPUPipelineLayout;
     private _clusterDepthPipelineLayout?: GPUPipelineLayout;
 
@@ -610,6 +613,51 @@ class Material {
         if (!pipeline) {
             pipeline = this._buildVelocityPipeline(gpuDevice, this._clusterLayout(gpuDevice), module, CLUSTER_VERTEX_ENTRY, [], sampleCount, 'ClusterVelocityPipeline');
             this._clusterVelocityPipelineCache.set(sampleCount, pipeline);
+        }
+        return pipeline;
+    }
+
+    /**
+     * Returns the cluster debug view's pipeline (`Renderer.setClusterDebug`, `ClusterDebug`) for a
+     * pass of these targets: the generated cluster vertex stage as a function
+     * (`clusterVertexFunction`) for `instances`' records, under the debug view's own stages
+     * (`clusterDebugWgsl`), group 2 the debug group (`clusterDebugBindGroupLayoutEntries`), drawn
+     * without an index buffer. Throws as `getClusterPipeline` does.
+     */
+    public getClusterDebugPipeline(
+        gpuDevice: GPUDevice,
+        instances: InstanceLayout | null,
+        colorFormats: GPUTextureFormat[],
+        sampleCount: number,
+        depthFormat: GPUTextureFormat,
+    ): GPURenderPipeline {
+        this._ensureSharedResources(gpuDevice);
+        const layoutKey = instances ? vertexLayoutKey([instances as GPUVertexBufferLayout]) : '-';
+        const key = `${layoutKey}|${colorFormats.join(',')}:${sampleCount}:${depthFormat}`;
+        let pipeline = this._clusterDebugPipelineCache.get(key);
+        if (!pipeline) {
+            const stage = clusterVertexFunction(parseIncludes(this.shaderCode), instances);
+            const module = gpuDevice.createShaderModule({
+                label: `${this.label}/ClusterDebugShader`,
+                code: `${stage.code}\n${clusterDebugWgsl(stage.position, colorFormats.length)}`,
+            });
+            pipeline = gpuDevice.createRenderPipeline({
+                label: `${this.label}/ClusterDebugPipeline`,
+                layout: gpuDevice.createPipelineLayout({
+                    label: `${this.label}/ClusterDebugPipelineLayout`,
+                    bindGroupLayouts: [
+                        this.bindableGroup.bindGroupLayout!,
+                        this.bindableGroup.cameraBindablesGroupLayout!,
+                        gpuDevice.createBindGroupLayout({ label: 'ClusterDebug BindGroupLayout', entries: clusterDebugBindGroupLayoutEntries() }),
+                    ],
+                }),
+                multisample: { count: sampleCount },
+                vertex: { module, entryPoint: CLUSTER_DEBUG_VERTEX_ENTRY, buffers: [] },
+                fragment: { module, entryPoint: CLUSTER_DEBUG_FRAGMENT_ENTRY, targets: colorFormats.map((format) => ({ format })) },
+                primitive: { topology: 'triangle-list', cullMode: this.transparent ? 'none' : this.cullMode },
+                depthStencil: { depthWriteEnabled: true, depthCompare: this.depthCompare, format: depthFormat },
+            });
+            this._clusterDebugPipelineCache.set(key, pipeline);
         }
         return pipeline;
     }

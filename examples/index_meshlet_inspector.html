@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - meshlet inspector</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; font: 12px/1.45 ui-monospace, Menlo, monospace; color: #e8eef5; }
+    #panel { position: fixed; left: 12px; top: 12px; width: 300px; max-height: calc(100vh - 24px); overflow: auto; padding: 10px 12px; background: rgba(8, 12, 18, 0.78); border-radius: 6px; box-sizing: border-box; }
+    #panel h1 { font-size: 13px; margin: 0 0 6px; }
+    #panel fieldset { border: 0; padding: 0; margin: 8px 0; }
+    #panel legend { color: #8fa3b8; margin-bottom: 2px; }
+    #panel label { display: inline-block; margin: 1px 8px 1px 0; cursor: pointer; }
+    #panel input[type=range] { width: 100%; }
+    #hud, #levels, #credit { margin: 0; white-space: pre-wrap; }
+    #levels { margin-top: 6px; }
+    .bar { display: inline-block; height: 8px; vertical-align: middle; border-radius: 1px; }
+    .swatch { display: inline-block; width: 10px; height: 10px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+    #ramp { height: 8px; border-radius: 2px; background: linear-gradient(90deg, #0808ff, #466699, #a6ff33, #ff6600, #ff0808); margin: 4px 0 2px; }
+    #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 14px; pointer-events: none; }
+    #credit { color: #74879a; font-size: 10px; margin-top: 8px; }
+    @media (max-width: 640px) { #panel { width: calc(100vw - 24px); max-height: 45vh; } }
+  </style>
+</head>
+
+<body>
+  <div id="status">loading the mesh...</div>
+  <div id="panel">
+    <h1>Meshlet inspector</h1>
+    <pre id="hud"></pre>
+    <fieldset id="modes">
+      <legend>colour</legend>
+    </fieldset>
+    <fieldset>
+      <label><input type="checkbox" id="edges" /> edges</label>
+      <label><input type="checkbox" id="freeze" /> freeze cut (F)</label>
+      <label><input type="checkbox" id="fly" checked /> fly in and out</label>
+    </fieldset>
+    <fieldset>
+      <legend>error budget: <span id="tauValue"></span> px</legend>
+      <input type="range" id="tau" min="-3" max="6" step="0.05" />
+    </fieldset>
+    <div id="legend"></div>
+    <pre id="levels"></pre>
+    <pre id="credit"></pre>
+  </div>
+  <script type="module">
+    // A meshlet inspector: one dense mesh with cluster LOD (`Renderable.clusters`), drawn through
+    // the cluster debug view (`Renderer.setClusterDebug`). By default the Stanford dragon (871 306
+    // triangles, the nine primitives of examples/assets/geom/scene.gltf merged), its cluster graph
+    // built here in TypeScript (`ClusterMesh.build`, about ten seconds); `mesh=rock` takes a noisy
+    // icosphere instead (`sub=<subdivisions>`, 7 by default: 327 680 triangles, built in a couple).
+    //
+    // The panel switches what the colours show (the material, or each cluster, its level, its
+    // group, its error over the budget, or each triangle), the triangle edges, and the budget (the
+    // error in pixels the cut may leave); "freeze cut" keeps the cut the camera had (as
+    // `Renderer.setFreezeCulling` does for culling) while the camera keeps flying, to see the LOD
+    // from where it was made. Drag to orbit, wheel to zoom (once "fly" is off). The HUD shows the
+    // clusters and triangles drawn against the full mesh, the cut's clusters and triangles per level
+    // (read back from the GPU), the frame's GPU time and the cluster cull's and GBuffer's (the
+    // profiler, `Renderer.setProfiling`).
+    //
+    // URL parameters: `mesh=dragon|rock`, `sub=<subdivisions>`, `view=material|cluster|level|group|
+    // error|triangle`, `edges=1`, `tau=<pixels>`, `fly=0`, `t=<seconds>` (the flight, frozen),
+    // `freeze=<seconds>` (freeze the cut at that time of the flight), `size=<w>x<h>`.
+    import { Canvas, run, param, paramOr, flag, setText, thousands } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { GBUFFER_OUT_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Geometry } from '../src/buffers/Geometry'
+    import { IcosphereGeometry } from '../src/geometries/IcosphereGeometry'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { GLTFLoader } from '../src/loaders/GLTFLoader'
+    import { ClusterMesh } from '../src/clusters/ClusterMesh'
+    import { ClusterLod } from '../src/clusters/ClusterLod'
+    import { ClusterDebug } from '../src/clusters/ClusterDebug'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+
+    const status = document.getElementById('status');
+    const frame0 = () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+
+    let canvas = Canvas.fill();
+    const size = (param('size') ?? '').split('x').map(Number);
+    if (size.length === 2 && size.every((n) => n > 0)) canvas = canvas.withSize(size[0], size[1]);
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0.16, 0.19, 0.24, 1) });
+    renderer.setCullingStats(true);
+    renderer.setProfiling(true);
+
+    // A lit surface for the "material" view: a warm grey under a sun and the sky.
+    const SURFACE_WGSL = /* wgsl */`
+      struct Surface { color: vec4<f32> };
+      @group(0) @binding(0) var<uniform> surface: Surface;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+      struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32> };
+      @vertex
+      fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>) -> VOut {
+          var out: VOut;
+          out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(position.xyz, 1.0);
+          out.normal = (world_matrix * vec4<f32>(normal, 0.0)).xyz;
+          return out;
+      }
+      @fragment
+      fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferOut {
+          var n = normalize(in.normal);
+          if (!front) { n = -n; }
+          let sun = normalize(vec3<f32>(0.4, 0.8, 0.3));
+          let light = vec3<f32>(1.0, 0.95, 0.85) * max(dot(n, sun), 0.0) * 1.4 + vec3<f32>(0.25, 0.3, 0.4) * (0.7 + 0.3 * n.y);
+          return kansei_gbuffer_out(surface.color.rgb * light, vec3<f32>(0.0), n, surface.color.rgb);
+      }
+    `;
+    const material = new Material(`${GBUFFER_OUT_WGSL}\n${SURFACE_WGSL}`, {
+      label: 'Surface',
+      bindings: [{
+        binding: 0, visibility: GPUShaderStage.FRAGMENT, value: new ComputeBuffer({
+          type: BufferBase.BUFFER_TYPE_UNIFORM,
+          usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+          buffer: new Float32Array([0.62, 0.58, 0.52, 1]),
+        }),
+      }],
+      mrtOutputCount: 4,
+    });
+
+    /** `geometries` merged into one, centred on the origin and `height` metres tall. */
+    function merged(geometries, height) {
+      let vertices = 0, indices = 0;
+      for (const g of geometries) { vertices += g.vertices.length / 9; indices += g.indices.length; }
+      const v = new Float32Array(vertices * 9), ix = new Uint32Array(indices);
+      let vo = 0, io = 0;
+      for (const g of geometries) {
+        v.set(g.vertices, vo * 9);
+        for (let k = 0; k < g.indices.length; k++) ix[io + k] = g.indices[k] + vo;
+        vo += g.vertices.length / 9;
+        io += g.indices.length;
+      }
+      const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (let o = 0; o < v.length; o += 9) for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], v[o + a]); hi[a] = Math.max(hi[a], v[o + a]); }
+      const s = height / (hi[1] - lo[1]);
+      for (let o = 0; o < v.length; o += 9) for (let a = 0; a < 3; a++) v[o + a] = (v[o + a] - (lo[a] + hi[a]) / 2) * s;
+      return Geometry.fromArrays('Mesh', v, ix);
+    }
+
+    /** A noisy icosphere of `subdivisions`, a metre and a half across. */
+    function rock(subdivisions) {
+      const geometry = new IcosphereGeometry(0.75, subdivisions).withLabel('Rock');
+      const v = geometry.vertices;
+      const height = (x, y, z) => 1 + 0.12 * Math.sin(5 * x) * Math.cos(4 * y) + 0.06 * Math.sin(13 * z + 2 * x) + 0.008 * Math.sin(37 * y) * Math.cos(31 * x);
+      for (let o = 0; o < v.length; o += 9) {
+        const [x, y, z] = [v[o + 4], v[o + 5], v[o + 6]];
+        const h = 0.75 * height(x, y, z);
+        v.set([x * h, y * h * 0.75, z * h], o);
+      }
+      // normals from the displaced faces
+      const n = new Float32Array(v.length / 9 * 3), ix = geometry.indices;
+      for (let t = 0; t < ix.length; t += 3) {
+        const [a, b, c] = [ix[t] * 9, ix[t + 1] * 9, ix[t + 2] * 9];
+        const e1 = [v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]], e2 = [v[c] - v[a], v[c + 1] - v[a + 1], v[c + 2] - v[a + 2]];
+        const f = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        for (const i of [ix[t], ix[t + 1], ix[t + 2]]) for (let k = 0; k < 3; k++) n[i * 3 + k] += f[k];
+      }
+      for (let i = 0; i < n.length / 3; i++) {
+        const l = Math.hypot(n[3 * i], n[3 * i + 1], n[3 * i + 2]) || 1;
+        v.set([n[3 * i] / l, n[3 * i + 1] / l, n[3 * i + 2] / l], i * 9 + 4);
+      }
+      return geometry;
+    }
+
+    const which = paramOr('mesh', 'dragon');
+    let geometry;
+    if (which === 'rock') {
+      geometry = rock(paramOr('sub', 7));
+      setText('credit', '');
+    } else {
+      const gltf = await new GLTFLoader().load('./assets/geom/scene.gltf', material);
+      geometry = merged(gltf.geometries, 1.6);
+      setText('credit', 'Stanford Dragon (Vrip) by 3D graphics 101 on Sketchfab, CC-BY-NC-4.0 (examples/assets/geom/license.txt)');
+    }
+    const triangles = geometry.indices.length / 3;
+    status.textContent = `building the cluster graph of ${thousands(triangles)} triangles...`;
+    await frame0();
+    const before = performance.now();
+    const mesh = ClusterMesh.build(geometry);
+    const buildMs = performance.now() - before;
+    status.textContent = '';
+    const levelCount = mesh.levels().length;
+    console.info(`Kansei — meshlet inspector ready: ${triangles} triangles, ${mesh.clusters.length} clusters over ${levelCount} levels built in ${buildMs.toFixed(0)} ms`);
+
+    const scene = new Scene();
+    const subject = new Renderable(geometry, material);
+    subject.clusters = new ClusterLod(mesh);
+    scene.add(subject);
+
+    const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(0.5) });
+    const volume = new PostProcessingVolume(renderer, [tonemap]);
+    const camera = new Camera(45, 0.02, 500, canvas.aspect);
+    const target = new Vector3(0, 0, 0);
+    const controls = new CameraControls(camera, target, canvas.element, 3);
+
+    // the panel
+    const VIEWS = ['material', 'cluster', 'level', 'group', 'error', 'triangle'];
+    const debug = new ClusterDebug({ mode: 'cluster', edges: flag('edges', false) });
+    const modes = document.getElementById('modes');
+    let view = VIEWS.includes(param('view')) ? param('view') : 'cluster';
+    for (const name of VIEWS) {
+      const label = document.createElement('label');
+      label.innerHTML = `<input type="radio" name="view" value="${name}" ${name === view ? 'checked' : ''}/> ${name}`;
+      label.querySelector('input').addEventListener('change', () => setView(name));
+      modes.appendChild(label);
+    }
+    const LEVEL_COLOURS = ['#1f77b4', '#ff800d', '#2ba12b', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#808080', '#bdbd21', '#17bfcf', '#aec7e8', '#ffbb78'];
+    function setView(name) {
+      view = name;
+      if (name === 'material') {
+        renderer.setClusterDebug(null);
+      } else {
+        debug.mode = name;
+        renderer.setClusterDebug(debug);
+      }
+      const legend = document.getElementById('legend');
+      if (name === 'level') {
+        legend.innerHTML = Array.from({ length: levelCount }, (_, l) => `<span class="swatch" style="background:${LEVEL_COLOURS[l % 12]}"></span>${l}`).join(' ');
+      } else if (name === 'error') {
+        legend.innerHTML = '<div id="ramp"></div>0 (full detail) &hellip; the budget; past it magenta';
+      } else {
+        legend.innerHTML = { material: '', cluster: 'each cluster its colour', group: 'clusters simplified together share one', triangle: 'each triangle its colour' }[name];
+      }
+    }
+    setView(view);
+    const edges = document.getElementById('edges');
+    edges.checked = debug.edges;
+    edges.addEventListener('change', () => { debug.edges = edges.checked; });
+
+    const tau = document.getElementById('tau');
+    function setTau(pixels) {
+      renderer.setClusterErrorThreshold(pixels);
+      setText('tauValue', pixels < 1 ? pixels.toFixed(2) : pixels.toFixed(1));
+    }
+    tau.value = String(Math.log2(paramOr('tau', 1)));
+    tau.addEventListener('input', () => setTau(2 ** Number(tau.value)));
+    setTau(2 ** Number(tau.value));
+
+    const freeze = document.getElementById('freeze');
+    const setFreeze = (on) => { freeze.checked = on; renderer.setFreezeCulling(on); };
+    freeze.addEventListener('change', () => setFreeze(freeze.checked));
+    addEventListener('keydown', (e) => { if (e.key === 'f' || e.key === 'F') setFreeze(!freeze.checked); });
+    const fly = document.getElementById('fly');
+    fly.checked = flag('fly', true);
+
+    /** The flight: round the mesh, from close up to far away and back, every 24 s. */
+    function placeCamera(t) {
+      const a = t * 0.2;
+      const r = 1.5 + 9 * (0.5 - 0.5 * Math.cos(t * Math.PI / 12)) ** 2;
+      camera.position.set(r * Math.sin(a), 0.25 + 0.15 * r, r * Math.cos(a));
+      camera.lookAt(target);
+    }
+
+    // GPU time: the frame's (FrameTimer), and the profiler's passes every second
+    const timer = new FrameTimer(renderer.gpuDevice);
+    let gpuMs = 0, passes = '';
+    setInterval(() => {
+      const profile = renderer.takeProfile();
+      const ms = (label) => profile.gpu.find((p) => p.label === label)?.exclusiveMs ?? 0;
+      if (profile.gpuFrames > 0) {
+        passes = `cluster cull ${ms('Renderer/ClusterCulling').toFixed(3)} ms · GBuffer ${ms('Renderer/GBufferOpaquePass').toFixed(3)} ms`
+          + (view === 'material' ? '' : ` · level counts ${ms('ClusterDebug/Levels').toFixed(3)} ms`);
+      }
+    }, 1000);
+
+    const frozenT = Number(param('t') ?? NaN);
+    const freezeAt = Number(param('freeze') ?? NaN);
+    let flightT = 0;
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      if (Number.isFinite(frozenT)) {
+        placeCamera(frozenT);
+      } else if (fly.checked) {
+        flightT += frame.dt;
+        placeCamera(flightT);
+        if (Number.isFinite(freezeAt) && flightT >= freezeAt && flightT - frame.dt < freezeAt) setFreeze(true);
+      } else {
+        controls.update(frame.dt);
+      }
+
+      timer.begin();
+      volume.render(scene, camera);
+      timer.end();
+      for (const ms of timer.take()) gpuMs += (ms - gpuMs) * 0.1;
+
+      if (frame.index % 10 === 0) {
+        const stats = renderer.cullingStats?.camera();
+        const [w, h] = renderer.renderSize;
+        setText('hud', [
+          `${thousands(triangles)} triangles · ${thousands(mesh.clusters.length)} clusters · ${levelCount} levels · built in ${(buildMs / 1000).toFixed(1)} s`,
+          stats ? `drawn: ${thousands(stats.clusters)} clusters · ${thousands(stats.triangles)} triangles (${(100 * stats.triangles / triangles).toFixed(1)}% of the mesh)` : '',
+          `${w} x ${h} · GPU ${gpuMs.toFixed(2)} ms${timer.hasTimestamps ? '' : ' (no timestamps)'}${freeze.checked ? ' · cut frozen' : ''}`,
+          passes,
+        ].filter(Boolean).join('\n'));
+        const levels = view === 'material' ? null : debug.levels;
+        if (levels) {
+          const most = Math.max(...levels.map((l) => l.triangles), 1);
+          document.getElementById('levels').innerHTML = 'the cut by level: clusters, triangles\n' + levels.map((l, k) =>
+            `${String(k).padStart(2)} ${String(thousands(l.clusters)).padStart(6)} ${String(thousands(l.triangles)).padStart(9)} <span class="bar" style="width:${Math.round(90 * l.triangles / most)}px;background:${LEVEL_COLOURS[k % 12]}"></span>`).join('\n');
+        } else {
+          document.getElementById('levels').textContent = view === 'material' ? '(per-level counts in the debug views)' : '';
+        }
+      }
+    });
+  </script>
+</body>
+
+</html>
