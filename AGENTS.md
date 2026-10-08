@@ -18,7 +18,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 ## Sharp edges
 
-- The TS engine imports some WGSL straight from `rust/kansei-core/src` with Vite `?raw` (`src/materials/shaders/SharedWGSL.ts`, under the Rust constant names; `assemble` in `ShaderUtils.ts` mirrors Rust's concat and `KANSEI_*` replace). Editing one of those files, or the bindings it declares, changes both engines: load the TS examples that include it too.
+- The TS engine imports some WGSL straight from `rust/kansei-core/src` with Vite `?raw` (`src/materials/shaders/SharedWGSL.ts` and `src/gi/GiWGSL.ts`, under the Rust constant names; `assemble` in `ShaderUtils.ts` mirrors Rust's concat and `KANSEI_*` replace). Editing one of those files, or the bindings it declares, changes both engines: load the TS examples that include it too.
 - `queue.write_buffer` lands before the next submit: several writes to one buffer inside a submit leave only the last one for every pass. Give per-dispatch parameters their own slots (or buffers).
 - Each `queue.write_buffer` costs tens of microseconds in Chrome: upload a frame's data in one write, not one per dispatch or object (`culling::InstanceCulling` writes all its views once a frame, into one buffer its dispatches index).
 - Depth is `[0, 1]` in both engines (`glam::Mat4::perspective_rh`; TS `Matrix4.perspective`/`ortho` use gl-matrix's `perspectiveZO`/`orthoZO`, never plain `mat4.perspective`), cleared to 1.0, so a depth of 1.0 means sky. Front faces are counter-clockwise and materials cull back faces by default.
