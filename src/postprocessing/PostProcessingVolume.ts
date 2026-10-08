@@ -152,6 +152,7 @@ class PostProcessingVolume {
         // Step 4: blit the final texture to the canvas.
         this._blit(device, currentSource);
         postScope?.end();
+        camera.endFrame();
         frameScope?.end();
         endProfiledFrame();
     }

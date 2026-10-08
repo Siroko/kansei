@@ -1,6 +1,9 @@
 import { BindGroupDescriptor, BindableGroup } from "./BindableGroup";
 import { parseIncludes } from "./shaders/ShaderUtils";
 import { GBuffer } from "../postprocessing/GBuffer";
+// the stock materials construct Materials only when called, so this cycle is safe
+import { GradientSkyOptions, StandardLitOptions, emissive, gradientSky, standardLit } from "./StandardLit";
+import { basicInstanced, basicLit } from "./Stock";
 
 /**
  * Configuration of a render material (Rust `MaterialOptions`).
@@ -134,6 +137,53 @@ class Material {
         this.cullMode = this.options.cullMode || 'back';
         this.topology = this.options.topology || 'triangle-list';
         this.depthStencilFormat = this.options.depthStencilFormat || 'depth24plus';
+    }
+
+    /**
+     * The standard lit material (Rust `Material::standard_lit`): a GGX / Lambert surface lit by
+     * the scene's directional lights (the first through the single shadow map of
+     * `Renderer.enableShadows`), its point lights (the one `enablePointShadows` renders through
+     * its cube shadow), the spot lights and cascades group 3 carries, a hemisphere of sky and its
+     * own emission. It writes the GBuffer's four targets, so draw it through a
+     * `PostProcessingVolume`.
+     */
+    public static standardLit(label: string, options: StandardLitOptions = {}): Material {
+        return standardLit(label, options);
+    }
+
+    /**
+     * An unlit material emitting `radiance` (cd/m²) into the GBuffer: lamp heads, windows, a
+     * backdrop. Shorthand for `standardLit` with a black base and that emission.
+     */
+    public static emissive(label: string, radiance: [number, number, number]): Material {
+        return emissive(label, radiance);
+    }
+
+    /**
+     * A cheap sky (Rust `Material::gradient_sky`): put it on a large sphere around the scene
+     * (`SphereGeometry`, with `castShadow = false`) and it shows `options`' gradient by direction
+     * from the sphere's centre, into the GBuffer.
+     */
+    public static gradientSky(label: string, options: GradientSkyOptions = {}): Material {
+        return gradientSky(label, options);
+    }
+
+    /**
+     * A `BASIC_LIT_WGSL` material (Rust `Material::basic_lit`): `color` (rgba, linear) under the
+     * scene's lights, with a Blinn-Phong highlight of `specular` (rgb; `a` is the shininess /
+     * 256). Forward, one colour output: draw it with `Renderer.render`. `options` adds to the
+     * material's (cull mode and the like); its bindings are the colour's.
+     */
+    public static basicLit(label: string, color: [number, number, number, number], specular: [number, number, number, number], options: MaterialOptions = {}): Material {
+        return basicLit(label, color, specular, options);
+    }
+
+    /**
+     * A `BASIC_INSTANCED_WGSL` material of one `color` (rgba, linear), for an `InstancedGeometry`
+     * whose instance matrices sit at vertex locations 3-6 (Rust `Material::basic_instanced`).
+     */
+    public static basicInstanced(label: string, color: [number, number, number, number], options: MaterialOptions = {}): Material {
+        return basicInstanced(label, color, options);
     }
 
     /** See `MaterialOptions.mrtOutputCount`. */

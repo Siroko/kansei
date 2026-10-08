@@ -8,8 +8,10 @@ import { Scene } from "../objects/Scene";
 import { GBuffer } from "../postprocessing/GBuffer";
 import { ShadowMap, ShadowMapOptions } from "../shadows/ShadowMap";
 import { CubeMapShadowMap, CubeMapShadowMapOptions } from "../shadows/CubeMapShadowMap";
+import { LightUniforms } from "../lights/LightUniforms";
+import { BufferBase } from "../buffers/BufferBase";
 import {
-    BindGroupSlot, CASCADES_BYTES, CLUSTER_PARAMS_BYTES, MESH_TRANSFORMS_BYTES, SHADOW_UNIFORM_BYTES, SPOT_LIGHTS_BUFFER_BYTES,
+    BindGroupSlot, CASCADES_BYTES, CLUSTER_PARAMS_BYTES, LIGHT_UNIFORM_BYTES, MESH_TRANSFORMS_BYTES, SHADOW_UNIFORM_BYTES, SPOT_LIGHTS_BUFFER_BYTES,
     meshBindGroupLayoutEntries, meshSlotStride, shadowBindGroupLayoutEntries,
 } from "./SharedLayouts";
 import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled, takeProfile } from "../profiling/Profiler";
@@ -228,6 +230,23 @@ class Renderer {
     private _meshSlotCapacity: number = 0;
     // The renderable each slot was last written for: its world matrix there is the previous one.
     private _slotOwners: (Renderable | null)[] = [];
+
+    // The scene's directional and point lights, packed each frame (`LightUniforms`) into one
+    // uniform that every camera drawn with binds at group 1 binding 2.
+    private _lightPacker = new LightUniforms();
+    private _lightData = new Float32Array(LIGHT_UNIFORM_BYTES / 4);
+    private _lightUniforms = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_UNIFORM,
+        usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+        buffer: this._lightData,
+    });
+
+    /**
+     * The scene light uniform (`KanseiLights` in `LIGHTS_WGSL`) the renderer binds in every
+     * camera's group 1 at binding 2, rewritten when the scene's lights change. Effects that light
+     * by the scene's lights can bind it too.
+     */
+    public get lightUniforms(): ComputeBuffer { return this._lightUniforms; }
 
     // ── Shadow resources (group 3, see SharedLayouts.shadowBindGroupLayoutEntries) ──
     /**
@@ -730,7 +749,7 @@ class Renderer {
         stack.prepare(camera);
         camera.updateViewMatrix();
 
-        const cameraBindGroup = camera.getBindGroup(this.device!);
+        const cameraBindGroup = this._prepareCamera(stack, camera);
         const targets: PassTargets = {
             colorFormats: [this.presentationFormat],
             depthFormat: 'depth24plus',
@@ -793,7 +812,29 @@ class Renderer {
         }
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
+        camera.endFrame();
         endProfiledFrame();
+    }
+
+    /**
+     * Packs the scene's lights into the shared light uniform (written only when they changed),
+     * binds it in `camera`'s group, writes the camera's jittered projection and temporal data,
+     * and returns its bind group with everything uploaded.
+     */
+    private _prepareCamera(stack: Scene, camera: Camera): GPUBindGroup {
+        const packed = this._lightPacker.data;
+        this._lightPacker.pack(stack.directionalLights, stack.pointLights);
+        const current = this._lightData;
+        for (let i = 0; i < packed.length; i++) {
+            if (packed[i] !== current[i]) {
+                current.set(packed);
+                this._lightUniforms.needsUpdate = true;
+                break;
+            }
+        }
+        camera.useLightUniforms(this._lightUniforms);
+        camera.uploadTemporal();
+        return camera.getBindGroup(this.device!);
     }
 
     /**
@@ -919,6 +960,10 @@ class Renderer {
      * targets the GBuffer's rgba16float colour texture and depth32float depth texture at
      * sampleCount=1 (no MSAA — post-processing handles aliasing via FXAA etc.).
      *
+     * It does not end the camera's frame: `PostProcessingVolume.render` calls `camera.endFrame()`
+     * after its effects, which may read this frame's and last frame's view; call it yourself when
+     * driving a GBuffer without the volume.
+     *
      * @param stack   - The scene to render.
      * @param camera  - The camera to use.
      * @param gbuffer - The GBuffer to write colour and depth data into.
@@ -929,7 +974,7 @@ class Renderer {
         stack.prepare(camera);
         camera.updateViewMatrix();
 
-        const cameraBindGroup = camera.getBindGroup(this.device!);
+        const cameraBindGroup = this._prepareCamera(stack, camera);
 
         // MRT format array: one entry per color attachment.
         const mrtFormats: GPUTextureFormat[] = [
