@@ -11,6 +11,7 @@ import localExposure from '../../../rust/kansei-core/src/shaders/local_exposure.
 import bloomDownsample from '../../../rust/kansei-core/src/shaders/bloom_downsample.wgsl?raw';
 import bloomUpsample from '../../../rust/kansei-core/src/shaders/bloom_upsample.wgsl?raw';
 import bloomComposite from '../../../rust/kansei-core/src/shaders/bloom_composite.wgsl?raw';
+import gbufferOut from '../../../rust/kansei-core/src/shaders/gbuffer_out.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -46,3 +47,13 @@ export const LOCAL_EXPOSURE_WGSL: string = `${tonemapParams}\n${localExposure}`;
 export const BLOOM_DOWNSAMPLE_WGSL: string = bloomDownsample;
 export const BLOOM_UPSAMPLE_WGSL: string = bloomUpsample;
 export const BLOOM_COMPOSITE_WGSL: string = bloomComposite;
+
+/**
+ * The GBuffer's four colour targets for a fragment shader (`KanseiGBufferOut`): return
+ * `kansei_gbuffer_out(color, emissive, N, albedo)`, or `kansei_gbuffer_out_specular(..)` for a
+ * surface that reflects, from a material with `mrtOutputCount: 4`. Rust: `materials::GBUFFER_OUT_WGSL`.
+ *
+ * Its alphas follow the Rust GBuffer: the normal's alpha is 1 (1 - F0 for specular surfaces),
+ * which the TS `FluidTransmissionEffect` still reads as its fluid mask.
+ */
+export const GBUFFER_OUT_WGSL: string = gbufferOut;

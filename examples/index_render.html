@@ -52,6 +52,8 @@
     const texture = new Texture(imageBitmap, true);
     const sampler = new Sampler('linear', 'linear');
     const material = new Material(shaderCode, {
+      // The shader writes colour only: leave the GBuffer's other three targets untouched.
+      mrtOutputCount: 1,
       bindings: [
         {
           binding: 0,
