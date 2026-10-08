@@ -30,6 +30,7 @@ import { SceneVoxelClipmap, SceneVoxelClipmapOptions } from "../gi/SceneVoxelCli
 import { bakeImpostor } from "../impostors/bakeImpostor";
 import type { Impostor, ImpostorOptions } from "../impostors/Impostor";
 import { SceneRtGrid, SceneRtGridOptions } from "../rt/SceneRtGrid";
+import type { PlanarReflection } from "../reflections/PlanarReflection";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -630,6 +631,36 @@ class Renderer {
     /** The ray tracing grid, once `enableRtGrid` has been called. */
     public get rtGrid(): SceneRtGrid | null { return this._rtGrid; }
 
+    // Planar reflections, drawn after the shadow maps and before the main pass
+    private _planarReflections: PlanarReflection[] = [];
+    private _reflectionViewProjs: mat4[] = [];
+
+    /**
+     * Register a planar reflection; the renderer draws it every frame, after its shadow maps and
+     * before the main pass (Rust `add_planar_reflection`). Returns its index for
+     * `planarReflection` and `setPlanarReflection`.
+     */
+    public addPlanarReflection(reflection: PlanarReflection): number {
+        this._planarReflections.push(reflection);
+        return this._planarReflections.length - 1;
+    }
+
+    /** The planar reflection registered at `index`, or null. */
+    public planarReflection(index: number): PlanarReflection | null {
+        return this._planarReflections[index] ?? null;
+    }
+
+    /**
+     * Put `reflection` in the place of the one at `index` (a new size after the canvas resized),
+     * freeing the one it replaces.
+     */
+    public setPlanarReflection(index: number, reflection: PlanarReflection): void {
+        const old = this._planarReflections[index];
+        if (!old) throw new Error(`setPlanarReflection: no planar reflection at ${index}`);
+        if (old !== reflection) old.destroy();
+        this._planarReflections[index] = reflection;
+    }
+
     /**
      * Enables cascaded shadow maps for the scene's first directional light, when it has
      * `castShadow` (the sun, or the moon at night; Rust's `enable_cascaded_shadows`): each frame,
@@ -1117,13 +1148,15 @@ class Renderer {
         });
 
         // The instances each view draws, then the shadow views and their uniforms, then the
-        // light clusters for the camera.
-        const commandRenderEncoder = this.device!.createCommandEncoder();
+        // planar reflections, then the light clusters for the camera.
+        let commandRenderEncoder = this.device!.createCommandEncoder();
+        this._updatePlanarReflectionCameras(camera);
         this._planShadowViews(stack, camera);
         this._runInstanceCulling(commandRenderEncoder, stack, camera, null);
         this._encodeShadowPasses(commandRenderEncoder, stack);
         this._encodeVoxelGI(commandRenderEncoder, stack, camera);
         this._uploadShadowUniforms();
+        commandRenderEncoder = this._encodePlanarReflections(commandRenderEncoder, stack, null);
         this._encodeLightClusters(commandRenderEncoder, camera, this.width, this.height);
         this._updateShadowBindGroup();
 
@@ -1363,7 +1396,8 @@ class Renderer {
         // The instances each view draws (after the shadow maps' lights are placed), then the
         // shadow views and their uniforms.
         t = cpuScope('scene/culling');
-        const commandEncoder = this.device!.createCommandEncoder();
+        let commandEncoder = this.device!.createCommandEncoder();
+        this._updatePlanarReflectionCameras(camera);
         this._planShadowViews(stack, camera);
         // the voxel clipmap's regions and the ray tracing grid's box are views the culling serves
         this._planVoxelClipmap(stack, camera);
@@ -1380,6 +1414,12 @@ class Renderer {
         t = cpuScope('scene/voxel_gi');
         this._encodeVoxelGI(commandEncoder, stack, camera);
         this._encodeVoxelClipmap(commandEncoder, stack, camera);
+        t?.end();
+
+        // Planar reflections (they sample this frame's shadow maps), shaded with every light;
+        // the screen-space ones project the GBuffer, still last frame's.
+        t = cpuScope('scene/reflections');
+        commandEncoder = this._encodePlanarReflections(commandEncoder, stack, { camera, gbuffer });
         t?.end();
 
         // The light clusters for the camera, over the GBuffer's pixels (the render size).
@@ -1809,6 +1849,14 @@ class Renderer {
         }
         // then the ray tracing grid's box (`_rtView`)
         if (this._rtGrid) views.push(cullView(this._rtGrid.cullViewProj(this._rtViewProj), { rt: true }));
+        // then the planar reflections (`_reflectionView`): the mirrored camera, near plane at the
+        // water (none for those reflecting the screen)
+        this._planarReflections.forEach((r, i) => {
+            const viewProj = this._reflectionViewProjs[i] ??= mat4.create();
+            views.push(r.isActive && !r.screenSpace
+                ? cullView(r.cullViewProj(viewProj), { reflection: true, layerMask: r.layerMask, lodDistanceScale: r.lodDistanceScale })
+                : null);
+        });
         return views;
     }
 
@@ -1820,6 +1868,11 @@ class Renderer {
     /** The cull view of the ray tracing grid's box, after the voxel clipmap's (Rust's order). */
     private _rtView(): number {
         return this._giView(this._voxelClipmap?.voxelizer.jobSlots ?? 0);
+    }
+
+    /** The cull view of planar reflection `index`, after the ray tracing grid's. */
+    private _reflectionView(index: number): number {
+        return this._rtView() + (this._rtGrid ? 1 : 0) + index;
     }
 
     /** Cull view of cascade `index`, after the camera and the directional map's. */
@@ -1836,6 +1889,7 @@ class Renderer {
         for (let l = 0; l < (this._spotShadowAtlas?.layers ?? 0); l++) kinds.push('spot');
         for (let slot = 0; slot < (this._voxelClipmap?.voxelizer.jobSlots ?? 0); slot++) kinds.push(`voxelGi${slot}`);
         if (this._rtGrid) kinds.push('rtGrid');
+        this._planarReflections.forEach((_, i) => kinds.push(`reflection${i}`));
         return kinds;
     }
 
@@ -2067,6 +2121,85 @@ class Renderer {
         this._pointShadowParams[4] = shadowFar;
     }
 
+    /** Point every planar reflection's mirrored camera for this frame (before culling, which culls for them too). */
+    private _updatePlanarReflectionCameras(camera: Camera): void {
+        for (const reflection of this._planarReflections) reflection.updateCamera(camera);
+    }
+
+    /**
+     * Draw every active planar reflection into `encoder` (Rust `render_planar_reflections`), after
+     * the shadow maps they sample: the scene from the mirrored camera (only renderables on the
+     * reflection's layer mask) with the materials' GBuffer pipelines, then its resolve and mips.
+     * Those with `screenSpace` project `screen`'s GBuffer instead (still last frame's, before this
+     * frame's pass; without one, or with a multisampled one, they are not updated). The light
+     * clusters are off for them (every light shades), so the encoder is submitted before the
+     * clusters are built for the camera, and a new one returned.
+     */
+    private _encodePlanarReflections(
+        encoder: GPUCommandEncoder,
+        stack: Scene,
+        screen: { camera: Camera; gbuffer: GBuffer } | null,
+    ): GPUCommandEncoder {
+        const active = this._planarReflections.map((r, i) => ({ r, view: this._reflectionView(i) })).filter(({ r }) => r.isActive);
+        if (active.length === 0) return encoder;
+        this._lightClusters?.disable();
+        this._updateShadowBindGroup();
+        if (screen && screen.gbuffer.msaaSampleCount === 1) {
+            for (const { r } of active) {
+                if (r.screenSpace) r.projectScreenSpace(encoder, screen.camera, screen.gbuffer);
+            }
+        }
+        const targets: PassTargets = { colorFormats: [...GBuffer.MRT_FORMATS], depthFormat: GBuffer.DEPTH_FORMAT, sampleCount: 1 };
+        for (const { r, view } of active) {
+            if (r.screenSpace) continue;
+            this._drawReflection(encoder, stack, r, view, targets);
+            r.resolve(encoder);
+        }
+        this.device!.queue.submit([encoder.finish()]);
+        return this.device!.createCommandEncoder();
+    }
+
+    /**
+     * A planar reflection's pass (Rust `draw_reflection`): the scene's visible renderables on its
+     * layers, drawn live from the mirrored camera at their scene slots, the instanced ones culled
+     * for its cull view `view`, scissored to the surface's part of the screen when its bounds are
+     * known.
+     */
+    private _drawReflection(encoder: GPUCommandEncoder, stack: Scene, reflection: PlanarReflection, view: number, targets: PassTargets): void {
+        const cc = this.options.clearColor;
+        const black = { r: 0, g: 0, b: 0, a: 0 };
+        const colorAttachments: GPURenderPassColorAttachment[] = reflection.colorTargets.map((texture, i) => ({
+            view: texture.createView(),
+            clearValue: i === 0 ? { r: cc?.x || 0, g: cc?.y || 0, b: cc?.z || 0, a: cc?.w || 0 } : black,
+            loadOp: 'clear',
+            storeOp: 'store',
+        }));
+        const pass = encoder.beginRenderPass({
+            label: 'Renderer/PlanarReflectionPass',
+            colorAttachments,
+            depthStencilAttachment: {
+                view: reflection.depthTarget.createView(),
+                depthClearValue: 1.0,
+                depthLoadOp: 'clear',
+                depthStoreOp: 'store',
+            },
+            timestampWrites: gpuPass('Renderer/PlanarReflectionPass'),
+        });
+        // only the surface's part of the screen, when its bounds are known
+        const scissor = reflection.scissor();
+        if (scissor) pass.setScissorRect(...scissor);
+        pass.setBindGroup(BindGroupSlot.Camera, reflection.camera.getBindGroup(this.device!));
+        if (this._shadowBG) pass.setBindGroup(BindGroupSlot.Shadow, this._shadowBG);
+        const state: DrawState = { pipeline: null, materialBindGroup: null, indexBuffer: null, vertexBuffer: null };
+        for (const r of stack.getOrderedObjects()) {
+            if ((r.layers & reflection.layerMask) === 0) continue;
+            // culled against the mirrored view, whose near plane is the water
+            // (a single phase: reflections are not occlusion-culled)
+            this._encodeDraw(pass, r, stack.slotOf(r), targets, state, DrawSet.Opaque, undefined, view);
+        }
+        pass.end();
+    }
+
     /** The pipeline of `renderable`'s material for a pass with `targets`. */
     private _pipelineFor(renderable: Renderable, targets: PassTargets): GPURenderPipeline {
         const formats = targets.colorFormats;
@@ -2196,6 +2329,7 @@ class Renderer {
         state: DrawState,
         set: DrawSet,
         pipeline?: GPURenderPipeline,
+        view: number = MAIN_VIEW,
     ): boolean {
         const geometry = renderable.geometry;
         if (!geometry.initialized) return false;
@@ -2229,11 +2363,11 @@ class Renderer {
         const offset = slot * this._matrixAlignment;
         encoder.setBindGroup(BindGroupSlot.Mesh, this._sharedMeshBG!, [offset, offset]);
 
-        // The instances culled for the camera, if culled (indirect: the count changes, the bundle
-        // not); with occlusion culling, the phases of `set`.
+        // The instances culled for the view (the camera's unless given), if culled (indirect: the
+        // count changes, the bundle not); with occlusion culling, the phases of `set`.
         const culling = renderable.instanceCulling;
-        if (set !== DrawSet.Late) drawGeometry(encoder, geometry, culling?.view(MAIN_VIEW) ?? null);
-        const late = set !== DrawSet.Opaque ? culling?.late(MAIN_VIEW) : null;
+        if (set !== DrawSet.Late) drawGeometry(encoder, geometry, culling?.view(view) ?? null);
+        const late = set !== DrawSet.Opaque ? culling?.late(view) : null;
         if (late) drawGeometry(encoder, geometry, late);
         return true;
     }

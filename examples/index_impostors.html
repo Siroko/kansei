@@ -20,17 +20,17 @@
     <pre id="bench"></pre>
   </div>
   <script type="module">
-    // Impostors: a lake ringed by a forest of spruces (40 000 by default), the Rust impostors
-    // example's scene. The spruces have two mesh LODs and, beyond `far` metres, an octahedral
+    // Impostors: a lake ringed by a forest of spruces (40 000 by default), mirrored in the water
+    // (a `PlanarReflection`), the Rust impostors example's scene. The spruces have two mesh LODs and, beyond `far` metres, an octahedral
     // impostor baked at start-up from the nearest LOD (`Renderer.bakeImpostor`): a billboard per
     // tree whose material (`IMPOSTOR_WGSL`) reads the albedo, normal and depth of the three baked
     // views nearest its view direction and shades them as the mesh's material does. All three
     // share one instance buffer, culled per view on the GPU (`InstanceCulling`), and `fade=`
-    // dissolves each LOD into the next (`withCrossfade`, `LOD_FADE_WGSL`). The Rust example also
-    // mirrors the forest in the lake (a planar reflection) and resolves the dither with TAA; the
-    // TS engine has neither yet, so here the lake reflects the sky's gradient only.
+    // dissolves each LOD into the next (`withCrossfade`, `LOD_FADE_WGSL`). The reflection sees the
+    // far shore from below: the impostor is baked from the whole sphere of directions. The Rust
+    // example also resolves the dither with TAA, which this page does not use yet.
     //
-    // The HUD shows the instances drawn for the camera (`Renderer.cullingStats`), the bake time
+    // The HUD shows the instances drawn for the camera and the reflection (`Renderer.cullingStats`), the bake time
     // and the GPU time. Keys: I toggles the impostors (off: the coarser mesh LOD reaches the
     // horizon), C cycles the camera.
     //
@@ -68,6 +68,7 @@
     import { INSTANCE_PLACEMENT_WGSL } from '../src/materials/Stock'
     import { GBUFFER_OUT_WGSL, LIGHTS_WGSL, MOTION_VECTORS_WGSL, SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { PlanarReflection, PLANAR_REFLECTION_WGSL } from '../src/reflections/PlanarReflection'
     import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { FrameTimer } from '../src/pacing/FrameTimer'
     import { AbBench } from '../src/profiling/AbBench'
@@ -256,17 +257,21 @@
       }
     `;
 
-    // The lake: a Fresnel mix of a dark body colour and the sky it reflects.
+    // The lake: a Fresnel mix of a dark body colour and the reflection. Prefixed with
+    // PLANAR_REFLECTION_WGSL and GBUFFER_OUT_WGSL.
     const WATER_WGSL = /* wgsl */`
+      @group(0) @binding(0) var reflection_tex: texture_2d<f32>;
+      @group(0) @binding(1) var reflection_sampler: sampler;
       @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
       @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
       @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
-      struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32> };
+      struct VOut { @builtin(position) pixel: vec4<f32>, @location(0) world: vec3<f32>, @location(1) clip: vec4<f32> };
       @vertex
       fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
         let world = world_matrix * position;
         var out: VOut;
         out.clip = projection_matrix * view_matrix * world;
+        out.pixel = out.clip;
         out.world = world.xyz;
         return out;
       }
@@ -274,9 +279,9 @@
       fn fragment_main(in: VOut) -> KanseiGBufferOut {
         let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
         let v = normalize(-(transpose(view3) * view_matrix[3].xyz) - in.world);
-        let r = sky_color(reflect(-v, vec3<f32>(0.0, 1.0, 0.0)));
+        let r = kansei_planar_reflection(reflection_tex, reflection_sampler, kansei_screen_uv(in.clip), vec2<f32>(0.0), 0.02);
         let fresnel = 0.02 + 0.98 * pow(1.0 - saturate(v.y), 5.0);
-        return kansei_gbuffer_out(mix(vec3<f32>(20.0, 30.0, 30.0), r, max(fresnel, 0.35)), vec3<f32>(0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
+        return kansei_gbuffer_out(mix(vec3<f32>(20.0, 30.0, 30.0), r.rgb, max(fresnel, 0.35)), vec3<f32>(0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
       }
     `;
 
@@ -334,6 +339,8 @@
     /** The lake's radius (roughly: its shore follows the terrain) and level. */
     const LAKE = 170;
     const LAKE_LEVEL = 0;
+    /** The lake's layer, which its reflection leaves out. */
+    const WATER_LAYER = 2;
     const clamp01 = (x) => Math.min(Math.max(x, 0), 1);
 
     /** Terrain height: a basin holding the lake, rising to hills round it. */
@@ -449,11 +456,25 @@
       return { lods: lodSets[k], impostor: billboards, fade: fade.width };
     });
 
-    // the lake
-    const lake = new Renderable(new PlaneGeometry(2 * LAKE + 200, 2 * LAKE + 200),
-      new Material(`${GBUFFER_OUT_WGSL}\n${SKY_COLOR_WGSL}\n${WATER_WGSL}`, { label: 'Water', cullMode: 'none', mrtOutputCount: 4 }));
+    // the lake, mirroring everything but itself, at half the canvas's size
+    const lakeReflection = ([width, height]) => new PlanarReflection(renderer, new Vector3(0, LAKE_LEVEL, 0), new Vector3(0, 1, 0), {
+      width: Math.max(width >> 1, 1), height: Math.max(height >> 1, 1), layerMask: ~WATER_LAYER,
+    });
+    const reflection = lakeReflection(canvas.size);
+    const waterMaterial = new Material(`${PLANAR_REFLECTION_WGSL}\n${GBUFFER_OUT_WGSL}\n${WATER_WGSL}`, {
+      label: 'Water',
+      cullMode: 'none',
+      mrtOutputCount: 4,
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: reflection.materialTexture() },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+      ],
+    });
+    const reflectionIndex = renderer.addPlanarReflection(reflection);
+    const lake = new Renderable(new PlaneGeometry(2 * LAKE + 200, 2 * LAKE + 200), waterMaterial);
     lake.rotation.x = -Math.PI / 2;
     lake.position.set(0, LAKE_LEVEL, 0);
+    lake.layers = WATER_LAYER;
     lake.castShadow = false;
     scene.add(lake);
 
@@ -511,6 +532,12 @@
     let gpuMs = 0, intervalMs = 0;
     run(canvas, (frame) => {
       frame.resize(renderer, camera);
+      if (frame.resized) {
+        // the mirror follows the canvas at half its size
+        const resized = lakeReflection(frame.resized);
+        waterMaterial.setBindable(0, resized.materialTexture());
+        renderer.setPlanarReflection(reflectionIndex, resized);
+      }
       for (const key of keys.takePressed()) {
         if (key === 'i' && toggle) toggle.checked = !toggle.checked;
         if (key === 'c') cam = (cam + 1) % CAMS.length;
@@ -548,11 +575,12 @@
       if (frame.index % 10 === 0) {
         const stats = renderer.cullingStats;
         const camStats = stats?.views.find(([kind]) => kind === 'camera')?.[1];
+        const reflStats = stats?.views.find(([kind]) => kind === 'reflection0')?.[1];
         const fadeWidth = sets[set].fade;
         setText('hud', [
           `${thousands(trees)} spruces · impostors ${impostors ? 'on' : 'off'} beyond ${far} m (I) · ` +
             `${fadeWidth > 0 ? `crossfades ${fadeWidth} m` : 'no crossfades'} · camera ${CAMS[cam]} (C) · baked in ${bakeMs.toFixed(0)} ms`,
-          camStats ? `drawn: ${thousands(camStats.drawn)} for the camera (meshes and impostors)` : '',
+          camStats ? `drawn: ${thousands(camStats.drawn)} for the camera, ${reflStats ? thousands(reflStats.drawn) : '-'} for the reflection (meshes and impostors)` : '',
           `${renderer.renderWidth} x ${renderer.renderHeight} · GPU ${gpuMs.toFixed(2)} ms${timer.hasTimestamps ? '' : ' (no timestamps)'} · ${intervalMs.toFixed(1)} ms between frames`,
         ].filter(Boolean).join('\n'));
       }

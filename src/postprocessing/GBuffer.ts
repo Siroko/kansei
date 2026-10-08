@@ -39,6 +39,8 @@
  *                   depth-tests against `depthTexture`.
  */
 class GBuffer {
+    /** Formats of the four MRT targets: colour, emissive, normal, albedo (Rust `GBuffer::MRT_FORMATS`). */
+    static readonly MRT_FORMATS: readonly GPUTextureFormat[] = ['rgba16float', 'rgba16float', 'rgba16float', 'rgba8unorm'];
     /** Format of the scene depth (Rust `GBuffer::DEPTH_FORMAT`). */
     static readonly DEPTH_FORMAT: GPUTextureFormat = 'depth32float';
     /** Format of screen-space motion, written by materials with `outputsVelocity` in the velocity pass (Rust `GBuffer::VELOCITY_FORMAT`). */

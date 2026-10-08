@@ -1,4 +1,5 @@
 import { BindGroupDescriptor, BindableGroup } from "./BindableGroup";
+import type { IBindable } from "../buffers/IBindable";
 import { parseIncludes } from "./shaders/ShaderUtils";
 import { GBuffer } from "../postprocessing/GBuffer";
 // the stock materials construct Materials only when called, so this cycle is safe
@@ -549,6 +550,18 @@ class Material {
     public getBindGroup(gpuDevice: GPUDevice): GPUBindGroup {
         this.bindableGroup.getBindGroup(gpuDevice);
         return this.bindableGroup.bindGroup!;
+    }
+
+    /**
+     * Bind `value` at `binding` of group 0 in place of what was bound there (a resized render
+     * target, a planar reflection remade at a new size), keeping the layout: the bind group is
+     * rebuilt on its next use. Rust: `Material::set_bindable`.
+     */
+    public setBindable(binding: number, value: IBindable): void {
+        const bindable = this.bindableGroup.bindables.find((b) => b.binding === binding);
+        if (!bindable) throw new Error(`${this.label}: no binding ${binding} to set`);
+        bindable.value = value;
+        this.bindableGroup.bindGroup = undefined;
     }
 
     /**
