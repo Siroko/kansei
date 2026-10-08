@@ -1,4 +1,11 @@
+/** The solver a `FluidSimulation` steps with: Smoothed Particle Hydrodynamics. */
+export type FluidSolver = 'sph';
+
+/** The `solver` word in `SimParams`, as the Rust engine packs it (0 = SPH, 1 = PBF). */
+export const SOLVER_WORD: Record<FluidSolver, number> = { sph: 0 };
+
 export interface FluidSimulationOptions {
+    /** How many particles the buffers hold: the most there can be (see `FluidSimulation.emit`). */
     maxParticles: number;
     dimensions: 2 | 3;
     smoothingRadius: number;
@@ -17,6 +24,14 @@ export interface FluidSimulationOptions {
     mouseForce: number;
     substeps: number;
     worldBoundsPadding: number;
+    /**
+     * How much of the pressure below the rest density acts (a pull between particles): 1 as
+     * computed, less to weaken it. The pull is what strings a sparse free surface into
+     * filaments (SPH's tensile instability); the near pressure still keeps particles apart.
+     */
+    negativePressureScale: number;
+    /** The solver (SPH only for now). */
+    solver: FluidSolver;
 }
 
 export const DEFAULT_OPTIONS: FluidSimulationOptions = {
@@ -36,7 +51,28 @@ export const DEFAULT_OPTIONS: FluidSimulationOptions = {
     mouseForce: 1630.0,
     substeps: 3,
     worldBoundsPadding: 0.2,
+    negativePressureScale: 1.0,
+    solver: 'sph',
 };
+
+/**
+ * `options`, tuned for `baseCount` particles, for `count` particles filling the same volume:
+ * the smoothing radius scales by (count / baseCount)^-1/3 so a neighbourhood holds as many
+ * particles, the near pressure with the radius, and the density target by the count ratio over
+ * the radius. Pressure and time step are left: how stiff a fluid stays stable at a size is for
+ * the caller to tune.
+ */
+export function scaledToCount(options: FluidSimulationOptions, baseCount: number, count: number): FluidSimulationOptions {
+    const ratio = Math.max(count, 1) / Math.max(baseCount, 1);
+    const radius = Math.pow(ratio, -1 / 3);
+    return {
+        ...options,
+        maxParticles: count,
+        smoothingRadius: options.smoothingRadius * radius,
+        nearPressureMultiplier: options.nearPressureMultiplier * radius,
+        densityTarget: options.densityTarget * ratio / radius,
+    };
+}
 
 export interface FluidSimulationPreset extends Partial<FluidSimulationOptions> {
     name: string;
@@ -85,7 +121,7 @@ export const PRESETS: Record<string, FluidSimulationPreset> = {
     },
 };
 
-// SimParams uniform buffer layout (160 bytes = 40 f32s)
+// SimParams uniform buffer layout (192 bytes = 48 f32s; sim-params.wgsl, Rust `ParamOffsets`)
 // Fields marked [u32] must be written via Uint32Array view
 export const PARAMS = {
     dt:                       0,  // f32
@@ -134,13 +170,15 @@ export const PARAMS = {
     spikyPow3Factor:         36,  // f32
     spikyPow2DerivFactor:    37,  // f32
     spikyPow3DerivFactor:    38,  // f32
-    _pad:                    39,  // f32 padding (struct size must be 16-byte multiple)
+    negativePressureScale:   39,  // f32
     // --- 16-byte aligned boundary (offset 160) ---
     gravityCenterX:          40,  // vec3<f32> gravityCenter
     gravityCenterY:          41,
     gravityCenterZ:          42,
     radialGravity:           43,  // f32 (0 or 1)
-    BUFFER_SIZE:             44,  // total f32 count
+    // --- 16-byte aligned boundary (offset 176) ---
+    solver:                  44,  // [u32] 0 = SPH, 1 = PBF (then 3 words of padding)
+    BUFFER_SIZE:             48,  // total f32 count
 } as const;
 
 export function computeKernelFactors2D(h: number) {
