@@ -91,8 +91,9 @@ fn calcPointShadow(worldPos: vec3f) -> f32 {
         }
     }
 
-    // Map [-1,1] to [0,1]
-    uv = uv * 0.5 + 0.5;
+    // Map [-1,1] to [0,1]; texel rows run down the face as rendered
+    // (NDC y up), so v flips (as in the Rust engine's shadow_map.wgsl)
+    uv = vec2f(uv.x, -uv.y) * 0.5 + 0.5;
 
     let texSize = vec2f(textureDimensions(cubeShadowTex));
     let texCoord = vec2i(clamp(uv * texSize, vec2f(0.0), texSize - 1.0));

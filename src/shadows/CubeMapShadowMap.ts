@@ -380,11 +380,8 @@ class CubeMapShadowMap {
             // Shadow far plane is decoupled from light radius so distant
             // occluders outside the attenuation volume are still captured.
             const shadowFar = Math.max(this._shadowFar, light.radius);
-            mat4.perspective(this._projMat, Math.PI / 2, 1.0, this._near, shadowFar);
-            // Remap Z from [-1,1] to [0,1] for WebGPU
-            (this._projMat as unknown as Float32Array)[10] *= 0.5;
-            (this._projMat as unknown as Float32Array)[14] =
-                (this._projMat as unknown as Float32Array)[14] * 0.5 + 0.5;
+            // WebGPU depth is [0,1]; the faces depth-test 'less', so depth must grow with distance
+            mat4.perspectiveZO(this._projMat, Math.PI / 2, 1.0, this._near, shadowFar);
 
             for (let face = 0; face < 6; face++) {
                 const dir = FACE_DIRS[face];
