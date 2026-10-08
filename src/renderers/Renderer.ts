@@ -11,6 +11,9 @@ import { CubeMapShadowMap, CubeMapShadowMapOptions } from "../shadows/CubeMapSha
 import { SkyOcclusion, SkyOcclusionOptions } from "../shadows/SkyOcclusion";
 import { LightUniforms } from "../lights/LightUniforms";
 import { BufferBase } from "../buffers/BufferBase";
+import { SpotShadowAtlas } from "../shadows/SpotShadowAtlas";
+import { SpotLightsGpu } from "../lights/SpotLightsGpu";
+import { LightClusters } from "../lights/LightClusters";
 import {
     BindGroupSlot, CASCADES_BYTES, CLUSTER_PARAMS_BYTES, LIGHT_UNIFORM_BYTES, MESH_TRANSFORMS_BYTES, SHADOW_UNIFORM_BYTES, SPOT_LIGHTS_BUFFER_BYTES,
     meshBindGroupLayoutEntries, meshSlotStride, shadowBindGroupLayoutEntries,
@@ -277,13 +280,12 @@ class Renderer {
     private _dummyShadowDepthTex: GPUTexture | null = null;
     private _dummyCubeShadowTex: GPUTexture | null = null;
     private _cubeShadowSampler: GPUSampler | null = null;
-    // Bindings 5-12 (spot lights, light clusters, cascades) until those features land: a 1x1
-    // depth array for the atlases and zeroed buffers (no spot lights, clusters off, no cascades).
+    // Bindings 5-12: a 1x1 depth array for the atlases not enabled (spot shadows, cascades) and
+    // zeroed buffers (clusters off until a frame has spot lights, no cascades).
     private _dummyDepthArrayTex: GPUTexture | null = null;
-    private _spotLightsBuf: GPUBuffer | null = null;
     private _spotShadowSampler: GPUSampler | null = null;
-    private _clusterParamsBuf: GPUBuffer | null = null;
-    private _clusterLightsBuf: GPUBuffer | null = null;
+    private _noClusterParamsBuf: GPUBuffer | null = null;
+    private _noClusterLightsBuf: GPUBuffer | null = null;
     private _cascadesBuf: GPUBuffer | null = null;
     private _shadowBGDirty: boolean = true;
     private _skyOcclusion: SkyOcclusion | null = null;
@@ -307,6 +309,16 @@ class Renderer {
     public get cullingStats(): CullingStats | null {
         return this._cullStats.latest;
     }
+
+    // Spot lights (group 3 bindings 5-9): the scene's, packed each frame into a fixed-capacity
+    // storage buffer (so bind groups never go stale), the shadow atlas once enabled, and the
+    // light clusters, created by the first frame that has spot lights to cluster.
+    private _spotLightsBuf: GPUBuffer | null = null;
+    private _spotLights = new SpotLightsGpu();
+    private _spotLightsUploaded: number = 0;
+    private _spotShadowAtlas: SpotShadowAtlas | null = null;
+    private _lightClusters: LightClusters | null = null;
+    private _clusteredLights: boolean = true;
 
     /** The directional shadow map materials sample (group 3 binding 0), or null. */
     public get shadowMap(): ShadowMap | null { return this._shadowMap; }
@@ -364,6 +376,8 @@ class Renderer {
 
     // Voxel GI of the scene's meshes (`enableVoxelGI`)
     private _voxelGI: SceneVoxelGi | null = null;
+    // The voxel GI and spot atlas its injection was last given the spot lights for.
+    private _voxelGISpots: { gi: SceneVoxelGi, atlas: SpotShadowAtlas | null } | null = null;
 
     /**
      * Voxel GI for the scene's meshes over a box (`SceneVoxelGi`, Rust's `enable_voxel_gi`): every
@@ -409,6 +423,45 @@ class Renderer {
 
     /** The sky occlusion, once `enableSkyOcclusion` has been called. */
     public get skyOcclusion(): SkyOcclusion | null { return this._skyOcclusion; }
+
+    /**
+     * Enables perspective shadow maps for spot lights (Rust's `enable_spot_shadows`): each frame,
+     * before the scene pass, the first `maxLights` spot lights with `castShadow` (in scene order)
+     * render a `resolution`² layer of the spot shadow atlas, drawing every visible `castShadow`
+     * renderable through its material's depth pipeline. Materials sample it through
+     * `SPOT_LIGHTS_WGSL` (`kansei_spot_shadow`, PCSS by each light's `sourceRadius`).
+     */
+    public enableSpotShadows(resolution: number, maxLights: number): SpotShadowAtlas {
+        this._spotShadowAtlas?.destroy();
+        this._spotShadowAtlas = new SpotShadowAtlas(this.device!, resolution, maxLights);
+        this._shadowBGDirty = true;
+        return this._spotShadowAtlas;
+    }
+
+    /** The spot-light shadow atlas, once `enableSpotShadows` has been called. */
+    public get spotShadowAtlas(): SpotShadowAtlas | null { return this._spotShadowAtlas; }
+
+    /**
+     * The storage buffer holding the scene's spot lights (`KanseiSpotLights` in
+     * `SPOT_LIGHT_TYPES_WGSL`), rewritten every frame. Materials see it at group 3 binding 6;
+     * effects bind it themselves.
+     */
+    public get spotLightsBuffer(): GPUBuffer {
+        this._ensureShadowResources();
+        return this._spotLightsBuf!;
+    }
+
+    /**
+     * Shade spot lights through the clustered light lists (the default; Rust's
+     * `set_clustered_lights`): each fragment visits only the lights whose range and cone reach
+     * its cluster. Off, every fragment visits every light (for comparisons and debugging).
+     */
+    public setClusteredLights(enabled: boolean): void {
+        this._clusteredLights = enabled;
+    }
+
+    /** Whether spot lights are shaded through the clustered light lists (`setClusteredLights`). */
+    public get clusteredLights(): boolean { return this._clusteredLights; }
 
     constructor(
         private options: RendererOptions = {}
@@ -750,15 +803,17 @@ class Renderer {
         });
         const zeroed = (label: string, size: number, usage: GPUBufferUsageFlags) =>
             this.device!.createBuffer({ label, size, usage: usage | GPUBufferUsage.COPY_DST });
-        this._spotLightsBuf = zeroed('Shadow/SpotLights', SPOT_LIGHTS_BUFFER_BYTES, GPUBufferUsage.STORAGE);
-        this._clusterParamsBuf = zeroed('Shadow/NoLightClusters', CLUSTER_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
-        this._clusterLightsBuf = zeroed('Shadow/NoClusterLights', 16, GPUBufferUsage.STORAGE);
+        this._spotLightsBuf = zeroed('Renderer/SpotLights', SPOT_LIGHTS_BUFFER_BYTES, GPUBufferUsage.STORAGE);
+        this._noClusterParamsBuf = zeroed('Shadow/NoLightClusters', CLUSTER_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
+        this._noClusterLightsBuf = zeroed('Shadow/NoClusterLights', 16, GPUBufferUsage.STORAGE);
         this._cascadesBuf = zeroed('Shadow/NoCascades', CASCADES_BYTES, GPUBufferUsage.UNIFORM);
         this._spotShadowSampler = this.device!.createSampler({
-            label: 'Shadow/SpotSampler',
+            label: 'Renderer/SpotShadowSampler',
             compare: 'less-equal',
             magFilter: 'linear',
             minFilter: 'linear',
+            addressModeU: 'clamp-to-edge',
+            addressModeV: 'clamp-to-edge',
         });
 
         this._shadowBGL = this.device!.createBindGroupLayout({
@@ -785,6 +840,8 @@ class Renderer {
             ? this._cubeMapShadowMap.distanceTexture
             : this._dummyCubeShadowTex!;
         const depthArray = this._dummyDepthArrayTex!.createView({ dimension: '2d-array' });
+        const spotAtlas = this._spotShadowAtlas?.arrayView ?? depthArray;
+        const clusters = this._lightClusters;
 
         this._shadowBG = this.device!.createBindGroup({
             label: 'Shadow BindGroup',
@@ -795,11 +852,11 @@ class Renderer {
                 { binding: 2, resource: { buffer: this._shadowUniformBuf! } },
                 { binding: 3, resource: cubeTex.createView({ dimension: '2d-array' }) },
                 { binding: 4, resource: this._cubeShadowSampler! },
-                { binding: 5, resource: depthArray },
+                { binding: 5, resource: spotAtlas },
                 { binding: 6, resource: { buffer: this._spotLightsBuf! } },
                 { binding: 7, resource: this._spotShadowSampler! },
-                { binding: 8, resource: { buffer: this._clusterParamsBuf! } },
-                { binding: 9, resource: { buffer: this._clusterLightsBuf! } },
+                { binding: 8, resource: { buffer: clusters?.params ?? this._noClusterParamsBuf! } },
+                { binding: 9, resource: { buffer: clusters?.lights ?? this._noClusterLightsBuf! } },
                 { binding: 10, resource: depthArray },
                 { binding: 11, resource: { buffer: this._cascadesBuf! } },
                 { binding: 12, resource: this._spotShadowSampler! },
@@ -847,13 +904,15 @@ class Renderer {
             }
         });
 
-        // The instances each view draws, then the shadow views and their uniforms.
+        // The instances each view draws, then the shadow views and their uniforms, then the
+        // light clusters for the camera.
         const commandRenderEncoder = this.device!.createCommandEncoder();
         this._planShadowViews(stack, camera);
         this._runInstanceCulling(commandRenderEncoder, stack, camera);
         this._encodeShadowPasses(commandRenderEncoder, stack);
         this._encodeVoxelGI(commandRenderEncoder, stack);
         this._uploadShadowUniforms();
+        this._encodeLightClusters(commandRenderEncoder, camera, this.width, this.height);
         this._updateShadowBindGroup();
 
         // Phase 2 — (re-)record the bundles whose draws changed.
@@ -1095,11 +1154,15 @@ class Renderer {
         t = cpuScope('scene/shadows');
         this._encodeShadowPasses(commandEncoder, stack);
         this._uploadShadowUniforms();
-        this._updateShadowBindGroup();
         t?.end();
-
         t = cpuScope('scene/voxel_gi');
         this._encodeVoxelGI(commandEncoder, stack);
+        t?.end();
+
+        // The light clusters for the camera, over the GBuffer's pixels (the render size).
+        t = cpuScope('scene/clusters');
+        this._encodeLightClusters(commandEncoder, camera, gbuffer.width, gbuffer.height);
+        this._updateShadowBindGroup();
         t?.end();
 
         // With transmissive objects the pass splits: opaque, a snapshot of the colour into
@@ -1272,12 +1335,14 @@ class Renderer {
     }
 
     /**
-     * Places the shadow views of a frame before its culling, which culls for the directional map
-     * too: the map the renderer owns follows the first directional light with `castShadow` (else
-     * the first area light with it), or has no light this frame.
+     * Places the shadow views of a frame before its culling, which culls for them too: the map
+     * the renderer owns follows the first directional light with `castShadow` (else the first
+     * area light with it), or has no light this frame; the scene's spot lights are packed and
+     * uploaded, the first `castShadow` ones taking the spot atlas' layers.
      */
     private _planShadowViews(stack: Scene, camera: Camera): void {
         this._skyOcclusion?.update(camera);
+        this._uploadSpotLights(stack);
         const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
         if (!shadowMap) return;
         const light = stack.directionalLights.find((l) => l.castShadow)
@@ -1290,9 +1355,11 @@ class Renderer {
      * The shadow views of a frame, in the Rust renderer's order (`renderer.rs` `render`): after
      * the matrix upload and the culling, before the scene pass, into the frame's encoder. The
      * directional map (placed by `_planShadowViews`) draws the instances culled for its light,
-     * the cube map the point lights with `castShadow` (every instance); each draws the visible
-     * `castShadow` renderables at their scene slots of the shared mesh buffers, with the light as
-     * the camera (group 1). Maps the caller binds through the setters are left to the caller.
+     * the cube map the point lights with `castShadow` (every instance), each spot atlas layer the
+     * instances culled for its light; each draws the visible `castShadow` renderables at their
+     * scene slots of the shared mesh buffers, with the light as the camera (group 1); then the
+     * sky occlusion's tile while it rebuilds. Maps the caller binds through the setters are left
+     * to the caller.
      */
     private _encodeShadowPasses(encoder: GPUCommandEncoder, stack: Scene): void {
         const objects = stack.getOrderedObjects();
@@ -1310,6 +1377,11 @@ class Renderer {
             const first = cubeMap.lights[0];
             const wm = first.worldMatrix.internalMat4;
             this.setPointShadowParams(wm[12], wm[13], wm[14], first.radius);
+        }
+
+        const atlas = this._spotShadowAtlas;
+        if (atlas && this._spotLights.shadows.length > 0) {
+            atlas.encode(encoder, this._spotLights.shadows, objects, this._sharedMeshBG!, meshOffset, this._spotViewBase());
         }
 
         this._encodeSkyOcclusionPass(encoder, objects, meshOffset);
@@ -1364,9 +1436,46 @@ class Renderer {
     }
 
     /**
+     * Packs the scene's spot lights (the first `castShadow` ones get the atlas layers) and
+     * uploads them, skipping the write while the scene has none and the buffer says so.
+     */
+    private _uploadSpotLights(stack: Scene): void {
+        this._ensureShadowResources();
+        const atlas = this._spotShadowAtlas;
+        this._spotLights.pack(stack.spotLights, atlas?.layers ?? 0, atlas?.resolution ?? 0);
+        if (this._spotLights.count === 0 && this._spotLightsUploaded === 0) return;
+        this.device!.queue.writeBuffer(this._spotLightsBuf!, 0, this._spotLights.bytes);
+        this._spotLightsUploaded = this._spotLights.count;
+    }
+
+    /**
+     * Builds the light clusters for `camera` over a `width` x `height` target (Rust's
+     * `LightClusters::build`), or shades with every light while clustering is off. Nothing to
+     * build without spot lights; the clusters (and their buffers) are created by the first frame
+     * with some.
+     */
+    private _encodeLightClusters(encoder: GPUCommandEncoder, camera: Camera, width: number, height: number): void {
+        if (!this._clusteredLights || this._spotLights.count === 0) {
+            this._lightClusters?.disable();
+            return;
+        }
+        if (!this._lightClusters) {
+            this._lightClusters = new LightClusters(this.device!, this._spotLightsBuf!);
+            this._shadowBGDirty = true;
+        }
+        this._lightClusters.encode(encoder, camera, width, height);
+    }
+
+    /** The cull view of spot atlas layer 0 (layer l culls at `_spotViewBase() + l`), after the sky occlusion's. */
+    private _spotViewBase(): number {
+        return this._skyOcclusionView() + (this._skyOcclusion ? 1 : 0);
+    }
+
+    /**
      * The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then while the renderer
      * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame),
-     * then with sky occlusion `_skyOcclusionView` (`null` unless a tile of its top-down pass is due).
+     * then with sky occlusion `_skyOcclusionView` (`null` unless a tile of its top-down pass is due),
+     * then every layer of the spot shadow atlas from `_spotViewBase()` (`null` when no light uses it).
      */
     private _cullViews(camera: Camera): (CullView | null)[] {
         // the unjittered projection: the frustum, not where pixels sample
@@ -1381,6 +1490,11 @@ class Renderer {
             const viewProj = sky.cullView();
             views.push(viewProj ? cullView(viewProj, { castersOnly: true, layerMask: sky.options.layerMask, lodDistanceScale: sky.options.lodDistanceScale }) : null);
         }
+        if (this._spotShadowAtlas) {
+            const base = views.length;
+            for (let l = 0; l < this._spotShadowAtlas.layers; l++) views.push(null);
+            for (const slot of this._spotLights.shadows) views[base + slot.layer] = cullView(slot.viewProj, { castersOnly: true });
+        }
         return views;
     }
 
@@ -1389,6 +1503,7 @@ class Renderer {
         const kinds: CullViewKind[] = ['camera'];
         if (this._ownsShadowMap && this._shadowMap) kinds.push('shadow');
         if (this._skyOcclusion) kinds.push('skyOcclusion');
+        for (let l = 0; l < (this._spotShadowAtlas?.layers ?? 0); l++) kinds.push('spot');
         return kinds;
     }
 
@@ -1443,11 +1558,17 @@ class Renderer {
     /**
      * Voxel GI's frame (`enableVoxelGI`), after the shadow views and before the scene pass, in
      * the Rust renderer's order: the GI renderables voxelized at their scene slots, lit through
-     * the shadow maps materials sample (the directional one only while it has a light), and the
-     * mips rebuilt.
+     * the shadow maps materials sample (the directional one only while it has a light) and the
+     * spot lights with their atlas, and the mips rebuilt.
      */
     private _encodeVoxelGI(encoder: GPUCommandEncoder, stack: Scene): void {
         if (!this._voxelGI) return;
+        const spots = this._voxelGISpots;
+        if (spots?.gi !== this._voxelGI || spots.atlas !== this._spotShadowAtlas) {
+            this._ensureShadowResources();
+            this._voxelGI.injection.shadows.setSpotLights(this._spotLightsBuf, this._spotShadowAtlas?.arrayView ?? null);
+            this._voxelGISpots = { gi: this._voxelGI, atlas: this._spotShadowAtlas };
+        }
         const sm = this._shadowMap;
         const shadowMap = sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null;
         this._voxelGI.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,

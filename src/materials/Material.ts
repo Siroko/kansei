@@ -365,7 +365,7 @@ class Material {
      * @param gpuDevice - The GPU device.
      * @param vertexBuffersDescriptors - Vertex buffer layouts of the geometry drawn.
      * @param depthFormat - Format of the shadow depth target.
-     * @param bias - Depth bias of the pass (none by default).
+     * @param bias - Depth bias of the pass (none by default; ignored for point and line topologies).
      */
     public getDepthPipeline(
         gpuDevice: GPUDevice,
@@ -374,7 +374,11 @@ class Material {
         bias: DepthBias = {},
     ): GPURenderPipeline {
         this._ensureSharedResources(gpuDevice);
-        const constant = bias.constant ?? 0, slopeScale = bias.slopeScale ?? 0, clamp = bias.clamp ?? 0;
+        // WebGPU allows a depth bias on triangle topologies only.
+        const triangles = this.topology === 'triangle-list' || this.topology === 'triangle-strip';
+        const constant = triangles ? bias.constant ?? 0 : 0;
+        const slopeScale = triangles ? bias.slopeScale ?? 0 : 0;
+        const clamp = triangles ? bias.clamp ?? 0 : 0;
         const key = `${depthFormat}:${constant}:${slopeScale}:${clamp}:${vertexLayoutKey(vertexBuffersDescriptors)}`;
         let pipeline = this._depthPipelineCache.get(key);
         if (!pipeline) {

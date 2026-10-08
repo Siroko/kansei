@@ -21,6 +21,7 @@ import particleBillboard from '../../../rust/kansei-core/src/shaders/particle_bi
 import spotLightTypes from '../../../rust/kansei-core/src/shaders/spot_light_types.wgsl?raw';
 import spotLights from '../../../rust/kansei-core/src/shaders/spot_lights.wgsl?raw';
 import cascadedShadows from '../../../rust/kansei-core/src/shaders/cascaded_shadows.wgsl?raw';
+import lightClusters from '../../../rust/kansei-core/src/shaders/light_clusters.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -122,3 +123,9 @@ export const SPOT_LIGHTS_WGSL: string = `${spotLightTypes}${spotLights}`;
  * Rust: `shadows::CASCADED_SHADOWS_WGSL`.
  */
 export const CASCADED_SHADOWS_WGSL: string = cascadedShadows;
+
+/**
+ * The clustered light culling compute pass (`LightClusters`): `main` at group 0 (cluster
+ * parameters, spot lights, per-cluster light lists). Rust: `lights/light_clusters.rs`'s `WGSL`.
+ */
+export const LIGHT_CLUSTERS_WGSL: string = `${spotLightTypes}\n${lightClusters}`;
