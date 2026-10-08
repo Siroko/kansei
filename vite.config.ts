@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import dts from 'vite-plugin-dts'
 import wasm from 'vite-plugin-wasm'
 
+import { readFileSync } from 'fs'
 import { extname, relative, resolve } from 'path'
 import { fileURLToPath } from 'node:url'
 import { glob } from 'glob'
@@ -11,10 +12,29 @@ import { devSite } from './scripts/vite-dev-site'
 // https://vitejs.dev/config/
 export default defineConfig({
     plugins: [
-        dts({ include: ['src'] }),
+        dts({
+            include: ['src'],
+            // The declarations use WebGPU's global types: load them for the package's users too.
+            beforeWriteFile: (filePath, content) => filePath.endsWith('/dist/main.d.ts')
+                ? { content: `/// <reference types="@webgpu/types" />\n${content}` }
+                : undefined,
+        }),
         mkcert(),
         wasm(),
-        devSite(__dirname)
+        devSite(__dirname),
+        {
+            // The KTX2 loader inlines the vendored Basis Universal transcoder (Apache-2.0): ship its
+            // licence beside it in the package.
+            name: 'basis-licence',
+            apply: 'build',
+            generateBundle() {
+                this.emitFile({
+                    type: 'asset',
+                    fileName: 'loaders/ktx2/basis/LICENSE',
+                    source: readFileSync(resolve(__dirname, 'src/loaders/ktx2/basis/LICENSE')),
+                })
+            },
+        },
     ],
     build: {
         rollupOptions: {
