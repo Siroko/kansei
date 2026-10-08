@@ -135,12 +135,14 @@ class Renderer {
     private _gbufferBundleOrder: Renderable[] = [];
 
     // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float).
-    // When the scene contains transmissive objects, rendering is split into two
-    // sub-bundles so the renderer can snapshot the opaque result into
-    // GBuffer.backgroundTexture before drawing the transmissive ones.
+    // When the scene contains transmissive objects, rendering is split into
+    // opaque, transmissive and transparent sub-bundles so the renderer can
+    // snapshot the opaque result into GBuffer.backgroundTexture before drawing
+    // the other two.
     private _gbufferBundle: GPURenderBundle | null = null;
     private _gbufferOpaqueBundle: GPURenderBundle | null = null;
     private _gbufferTransmissiveBundle: GPURenderBundle | null = null;
+    private _gbufferTransparentBundle: GPURenderBundle | null = null;
     private _gbufferLastObjectCount: number = -1;
     private _gbufferLastOpaqueCount: number = -1;
     private _gbufferLastTransmissiveCount: number = -1;
@@ -790,6 +792,7 @@ class Renderer {
                 this._gbufferBundle = null;
                 this._gbufferOpaqueBundle = null;
                 this._gbufferTransmissiveBundle = null;
+                this._gbufferTransparentBundle = null;
                 renderable.materialDirty = false;
             }
         }
@@ -803,15 +806,19 @@ class Renderer {
             this._gbufferLastTransmissiveCount !== transmissiveCount ||
             this._gbufferLastSampleCount !== gbuffer.msaaSampleCount;
 
+        const transparentStart = opaqueCount + transmissiveCount;
         if (hasTransmissive) {
-            if (bundleStale || !this._gbufferOpaqueBundle || !this._gbufferTransmissiveBundle) {
+            if (bundleStale || !this._gbufferOpaqueBundle || !this._gbufferTransmissiveBundle || !this._gbufferTransparentBundle) {
                 const opaqueSlice = orderedObjects.slice(0, opaqueCount);
-                const transmissiveSlice = orderedObjects.slice(opaqueCount, opaqueCount + transmissiveCount);
+                const transmissiveSlice = orderedObjects.slice(opaqueCount, transparentStart);
                 this._gbufferOpaqueBundle = this._buildRenderBundle(
                     opaqueSlice, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, 0
                 );
                 this._gbufferTransmissiveBundle = this._buildRenderBundle(
                     transmissiveSlice, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, opaqueCount
+                );
+                this._gbufferTransparentBundle = this._buildRenderBundle(
+                    orderedObjects.slice(transparentStart), cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, transparentStart
                 );
                 this._gbufferBundle = null;
             }
@@ -821,6 +828,7 @@ class Renderer {
             );
             this._gbufferOpaqueBundle = null;
             this._gbufferTransmissiveBundle = null;
+            this._gbufferTransparentBundle = null;
         }
         this._gbufferLastObjectCount = orderedObjects.length;
         this._gbufferLastOpaqueCount = opaqueCount;
@@ -943,9 +951,9 @@ class Renderer {
                 { width: gbuffer.width, height: gbuffer.height, depthOrArrayLayers: 1 },
             );
 
-            // Pass 2 — transmissive objects (continues drawing on top of the opaque result).
+            // Pass 2 — transmissive then transparent objects (continues drawing on top of the opaque result).
             const transmissivePass = commandEncoder.beginRenderPass(makePassDescriptor(true));
-            transmissivePass.executeBundles([this._gbufferTransmissiveBundle!]);
+            transmissivePass.executeBundles([this._gbufferTransmissiveBundle!, this._gbufferTransparentBundle!]);
             transmissivePass.end();
         } else {
             const pass = commandEncoder.beginRenderPass(makePassDescriptor(false));
