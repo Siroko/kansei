@@ -181,10 +181,13 @@ export {
     findJointRoles, defaultFeatureWeights, defaultContactThresholds, defaultSearchFilter, filterAllows,
     ClipInfo, Database, DatabaseBuilder, MotionMatcher, defaultMotionMatchingSettings,
     ActionKind, ActionClip, actionKindName, actionKindFromName, crosses, MotionPack, CharacterPack, PackError,
+    detectObstacle, defaultDetectionSettings, Refusal, isRefusal, defaultTraversalRules, standsAt, traversalKind, planTraversal, planJump,
+    CharacterController,
 } from "./animation/motion_matching/index";
 export type {
     JointRoles, FeatureWeights, ContactThresholds, SearchFilter, Match, RootSample,
     MotionMatchingSettings, MotionInput, Simulation, SearchInfo, RootPath, Action, Constrain, ActionClipFields, PackMesh, PackImage,
+    Obstacle, DetectionSettings, TraversalResult, TraversalRules, CharacterState,
 } from "./animation/motion_matching/index";
 export { Obb, TriangleMesh, CollisionWorld, ALL_LAYERS, rayCapsule, raySphere, rayTriangle, closestPointTriangle } from "./collision/index";
 export type { Triangle, Shape, Collider, Hit, CastResult } from "./collision/index";

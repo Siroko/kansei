@@ -16,11 +16,12 @@
     "format": "prettier --write .",
     "prepare": "husky install",
     "prepublishOnly": "npm run build",
-    "copy-examples": "cp -r examples dist/examples",
+    "copy-examples": "cp -r examples dist/examples && rm -rf dist/examples/pack",
     "update-imports": "node scripts/bundle-examples-update-imports.cjs",
     "copy-site": "cp -R site/. dist/",
     "copy-wasm-examples": "bash scripts/fetch-wasm-examples.sh",
-    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site && npm run copy-wasm-examples"
+    "check-no-packs": "bash scripts/check-no-packs.sh",
+    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site && npm run copy-wasm-examples && npm run check-no-packs"
   },
   "engines": {
     "node": "24.x"
