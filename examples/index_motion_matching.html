@@ -474,7 +474,7 @@
       tonemapper: ToneMapper.AcesFitted,
       exposure: exposureFromEV100(paramOr('ev', 14.5)),
     });
-    const volume = new PostProcessingVolume(renderer, [tonemap]);
+    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
 
     const zero = new Float32Array(16);
     const fixed = (x, digits = 3) => x.toFixed(digits);

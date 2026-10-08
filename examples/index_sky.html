@@ -432,7 +432,7 @@
       tonemapper: ToneMapper.AcesFitted,
     });
     effects.push(tonemap);
-    const volume = new PostProcessingVolume(renderer, effects);
+    const volume = new PostProcessingVolume(renderer, effects, { msaaSampleCount: 4 });
     const camera = new Camera(62, 0.5, 60000, canvas.aspect);
     // bench=1: the clouds at two qualities, alternated in this page
     const benchQualities = [param('cloudquality') ?? 'low', param('benchquality') ?? 'high'];

@@ -181,7 +181,7 @@
       effects.push(fog);
     }
     effects.push(new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(14.5), vignette: 0.4 }));
-    const volume = new PostProcessingVolume(renderer, effects);
+    const volume = new PostProcessingVolume(renderer, effects, { msaaSampleCount: 4 });
     const camera = new Camera(50, 0.3, paramOr('far', 1200), canvas.aspect);
     const profile = installProfileHud({ renderer });
 

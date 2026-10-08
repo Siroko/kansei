@@ -222,7 +222,7 @@
       spotScattering: shaftSteps > 0 ? { kind: 'raymarched', steps: shaftSteps } : { kind: 'froxels' },
     }) : null;
     fog?.setSpotLights(renderer.spotLightsBuffer, renderer.spotShadowAtlas);
-    const volume = new PostProcessingVolume(renderer, fog ? [fog, bloom, tonemap] : [bloom, tonemap]);
+    const volume = new PostProcessingVolume(renderer, fog ? [fog, bloom, tonemap] : [bloom, tonemap], { msaaSampleCount: 4 });
 
     const camera = new Camera(40, 0.1, 400, canvas.aspect);
 
