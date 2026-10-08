@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei – Instancing</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { touch-action: none; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Instancing: a 10 x 10 x 10 grid of cubes drawn in one call, the TS twin of the Rust
+    // `instancing` example. Each cube's model matrix is an instance attribute (four vec4s at
+    // locations 3-6) of one `InstancedGeometry`, drawn with the stock `Material.basicInstanced`;
+    // the CPU rewrites all the matrices each frame to turn the cubes. Drag to orbit, wheel or
+    // pinch to zoom.
+    //
+    // URL parameters: `n=<cubes per side>` (default 10, at most 40).
+    import { Canvas, run, paramOr } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+
+    const SPACING = 3;
+    const n = Math.min(Math.max(Math.floor(paramOr('n', 10)), 1), 40);
+    const count = n * n * n;
+
+    // The cubes' model matrices (column-major, 16 floats each) at `time` seconds: a turn about
+    // +y, then the cube's place in the grid.
+    const writeInstanceMatrices = (data, time) => {
+      const offset = (n - 1) * SPACING * 0.5;
+      let o = 0;
+      for (let x = 0; x < n; x++) {
+        for (let y = 0; y < n; y++) {
+          for (let z = 0; z < n; z++) {
+            const angle = time * 0.5 + (x + y + z) * 0.3;
+            const c = Math.cos(angle), s = Math.sin(angle);
+            data.set([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0,
+                      x * SPACING - offset, y * SPACING - offset, z * SPACING - offset, 1], o);
+            o += 16;
+          }
+        }
+      }
+    };
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 4, clearColor: new Vector4(0.05, 0.05, 0.08, 1) });
+
+    // one vertex buffer of matrices, read per instance at locations 3-6
+    const matrixData = new Float32Array(count * 16);
+    writeInstanceMatrices(matrixData, 0);
+    const matrices = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_STORAGE,
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: matrixData,
+      stride: 64,
+      attributes: [0, 1, 2, 3].map((column) => ({ shaderLocation: 3 + column, offset: column * 16, format: 'float32x4' })),
+    });
+    const geometry = new InstancedGeometry(new BoxGeometry(1, 1, 1), count, [matrices]);
+    const scene = new Scene();
+    scene.add(new Renderable(geometry, Material.basicInstanced('Cubes', [0.4, 0.7, 0.9, 1])));
+
+    const camera = new Camera(45, 0.1, 500, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 0, 0), renderer.canvas, n * SPACING * 1.6);
+    controls.azimuth = 0;
+    controls.elevation = 0.35;
+    console.info(`Kansei — Instancing (TS): ${count} cubes`);
+
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      writeInstanceMatrices(matrixData, frame.time);
+      matrices.update(renderer.gpuDevice);
+      controls.update(frame.dt);
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+
+</html>

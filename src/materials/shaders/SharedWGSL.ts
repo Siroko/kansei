@@ -12,6 +12,15 @@ import bloomDownsample from '../../../rust/kansei-core/src/shaders/bloom_downsam
 import bloomUpsample from '../../../rust/kansei-core/src/shaders/bloom_upsample.wgsl?raw';
 import bloomComposite from '../../../rust/kansei-core/src/shaders/bloom_composite.wgsl?raw';
 import gbufferOut from '../../../rust/kansei-core/src/shaders/gbuffer_out.wgsl?raw';
+import motionVectors from '../../../rust/kansei-core/src/shaders/motion_vectors.wgsl?raw';
+import standardLit from '../../../rust/kansei-core/src/shaders/standard_lit.wgsl?raw';
+import gradientSky from '../../../rust/kansei-core/src/shaders/gradient_sky.wgsl?raw';
+import basicLit from '../../../rust/kansei-core/src/shaders/basic_lit.wgsl?raw';
+import basicInstanced from '../../../rust/kansei-core/src/shaders/basic_instanced.wgsl?raw';
+import particleBillboard from '../../../rust/kansei-core/src/shaders/particle_billboard.wgsl?raw';
+import spotLightTypes from '../../../rust/kansei-core/src/shaders/spot_light_types.wgsl?raw';
+import spotLights from '../../../rust/kansei-core/src/shaders/spot_lights.wgsl?raw';
+import cascadedShadows from '../../../rust/kansei-core/src/shaders/cascaded_shadows.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -57,3 +66,59 @@ export const BLOOM_COMPOSITE_WGSL: string = bloomComposite;
  * which the TS `FluidTransmissionEffect` still reads as its fluid mask.
  */
 export const GBUFFER_OUT_WGSL: string = gbufferOut;
+
+/**
+ * For materials that write motion vectors (`MaterialOptions.outputsVelocity`): the camera's
+ * temporal uniform (`kansei_camera_temporal`, group 1 binding 3), `KanseiMeshTransforms` (group 2
+ * binding 1: world and previous world matrix) and `kansei_motion_vector`.
+ * Rust: `cameras::MOTION_VECTORS_WGSL`.
+ */
+export const MOTION_VECTORS_WGSL: string = motionVectors;
+
+/**
+ * Blinn-Phong under the scene's directional and point lights (camera group binding 2), with the
+ * single directional shadow map and the point-light cube shadow (group 3). Forward, one colour
+ * output. Group 0 binding 0: `color` then `specular` (rgb, shininess / 256 in `a`), two vec4s.
+ * `Material.basicLit` builds it. Rust: `materials::BASIC_LIT_WGSL`.
+ */
+export const BASIC_LIT_WGSL: string = basicLit;
+
+/**
+ * A flat colour lit by a fixed light from above, for instanced geometry: the instance's model
+ * matrix comes as four vec4 vertex attributes at locations 3-6. Group 0 binding 0: `color`
+ * (vec4). `Material.basicInstanced` builds it. Rust: `materials::BASIC_INSTANCED_WGSL`.
+ */
+export const BASIC_INSTANCED_WGSL: string = basicInstanced;
+
+/**
+ * Camera-facing quads for particles, one per instance at a vec4 position (location 3), coloured
+ * by height. Group 0 binding 0: `size`, `height_min`, `height_max`, a pad, then `color_low` and
+ * `color_high` (vec4s), 48 bytes. Rust: `materials::PARTICLE_BILLBOARD_WGSL`.
+ */
+export const PARTICLE_BILLBOARD_WGSL: string = particleBillboard;
+
+/** The standard lit material's body, with its `KANSEI_*` placeholders (`Material.standardLit` fills them). */
+export const STANDARD_LIT_BODY_WGSL: string = standardLit;
+
+/** The gradient sky's body, prefixed by `GBUFFER_OUT_WGSL` (`Material.gradientSky`). */
+export const GRADIENT_SKY_BODY_WGSL: string = gradientSky;
+
+/**
+ * The spot-light data (`KanseiSpotLight`, `KanseiSpotLights`) and the light's own falloff, cone
+ * and shadow-map coordinates. Rust: `lights::SPOT_LIGHT_TYPES_WGSL`.
+ */
+export const SPOT_LIGHT_TYPES_WGSL: string = spotLightTypes;
+
+/**
+ * For materials lit by the renderer's spot lights: `SPOT_LIGHT_TYPES_WGSL`, the group 3 bindings
+ * 5-9 (shadow atlas, light buffer, comparison sampler, light clusters), PCSS shadows and a GGX /
+ * Lambert BRDF (`kansei_brdf`). Call `kansei_spot_lights_radiance`. Rust: `lights::SPOT_LIGHTS_WGSL`.
+ */
+export const SPOT_LIGHTS_WGSL: string = `${spotLightTypes}${spotLights}`;
+
+/**
+ * The cascaded sun shadow for materials (group 3 bindings 10-12): `kansei_sun_shadow(worldPos,
+ * N, fragCoord.xy)`, and `kansei_cascades` (`count` 0 while no cascades are on).
+ * Rust: `shadows::CASCADED_SHADOWS_WGSL`.
+ */
+export const CASCADED_SHADOWS_WGSL: string = cascadedShadows;
