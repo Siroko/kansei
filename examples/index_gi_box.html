@@ -20,7 +20,7 @@
 <body>
   <div id="panel">
     <label>preset <select id="preset"></select></label>
-    <label>gi <select id="gi"><option>off</option><option>voxel</option><option>probes</option></select></label>
+    <label>gi <select id="gi"><option>off</option><option>low</option><option>medium</option><option>high</option><option>ultra</option><option>voxel</option><option>voxel+ssgi</option><option>probes</option><option>probes+ssgi</option></select></label>
     <label>voxels <select id="voxels"><option>low</option><option>medium</option><option>high</option></select></label>
     <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option><option>sdf</option><option>probes</option></select></label>
     <label>sdf ao <input type="range" id="sdfAo" min="0" max="1" step="0.05"></label>
@@ -40,23 +40,24 @@
   </div>
   <script type="module">
     // GI box: the Rust `gi-box` example's room (rust/kansei-wasm/examples/gi-box) on the TS engine,
-    // for its voxel GI: a Cornell box (white floor, ceiling and back wall, a red wall on the left,
+    // to compare global illumination methods: a Cornell box (white floor, ceiling and back wall, a red wall on the left,
     // a green one on the right, two white blocks, a rug half orange and half blue) under one
     // shadowed downlight. Without GI the scene has direct light only, so the ceiling and the
-    // shadows are black; with voxel GI (`Renderer.enableVoxelGI`, `VoxelGIEffect`) the renderables
+    // shadows are black. Screen-space GI (`gi=low|medium|high|ultra`, `ScreenSpaceGIEffect`) brings
+    // one bounce of the light on screen, and sees only what is on screen; with voxel GI (`Renderer.enableVoxelGI`, `VoxelGIEffect`) the renderables
     // are voxelized through their own vertex shaders, lit through the lamp's shadow map with the
     // bounces adding up over frames, and cones traced per pixel through the voxels bring the
     // floor's light to the ceiling and the walls' colour onto the floor and the blocks. The rug's
     // voxels take its texture through its material's voxel entry (`albedo=constant`: its mean
-    // colour instead).
+    // colour instead). `gi=voxel+ssgi` puts screen-space GI in front of the voxels for contact
+    // detail (`VoxelGIEffect`'s `nearField`), the voxels lighting the rest.
     //
     // The voxels' distance field (`SceneVoxelGi.enableSdf`, a jump flood of the voxelized surfaces)
     // adds AO to the GI (`sdf_ao`), soft shadows to the voxels' light (`sdf_shadows`) and to the
     // direct light (`shadows=sdf`, the material helper `SDF_WGSL`'s `sdfSurfaceShadow` in place of
     // the cube shadow); `gi=probes` brings the voxels' light to the screen through irradiance
     // probes traced in that field (`SceneVoxelGi.enableProbes`, `VoxelGIEffect.setProbes`) instead
-    // of cones per pixel. The Rust example's probes run under SSGI, which the TS engine lacks yet:
-    // here they light the screen alone.
+    // of cones per pixel, under SSGI with `gi=probes+ssgi`.
     //
     // With `reflect=1` the floor is polished and its reflections are traced through a grid of the
     // room's triangles (`Renderer.enableRtGrid`, `RtReflectionsEffect`), the hits lit by the voxels.
@@ -65,9 +66,10 @@
     // fixture open at the bottom (a hard-edged cone of 76 degrees, the Rust spot's outer angle), lit
     // with the falloff the voxel injection uses, so the direct light and the voxels' agree.
     //
-    // URL parameters, as the Rust example's (its voxel, SDF, probe and reflection modes; no SSGI
-    // or dragon): preset=off|voxel|indirect|voxels|phone|sdf|slice|probes|probe-view (applied
-    // first, the other parameters over it), gi=off|voxel|probes (default voxel),
+    // URL parameters, as the Rust example's (no dragon):
+    // preset=off|ssgi|voxel|best|indirect|voxels|phone|sdf|slice|probes|probe-view (applied first,
+    // the other parameters over it; `best`, voxel + SSGI, unless the URL names a preset or a gi),
+    // gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi (ssgi: high),
     // voxels=low|medium|high, view=lit|indirect|voxels|sdf|probes, slice=<metres> (the sdf view's
     // height, default 0.6), sdf_ao=0..1, sdf_shadows=off|fallback|always, shadows=map|sdf,
     // cam=front|corner|low|floor, animate=1, albedo=constant, rug=off, ui=0, profile=1 (each
@@ -97,6 +99,7 @@
     import { BindingLayouts } from '../src/materials/Binding'
     import { VoxelGiQuality } from '../src/gi/VoxelVolume'
     import { VoxelGIEffect } from '../src/gi/VoxelGIEffect'
+    import { ScreenSpaceGIEffect } from '../src/postprocessing/effects/ScreenSpaceGIEffect'
     import { RtReflectionsEffect } from '../src/rt/RtReflectionsEffect'
     import { FrameTimer } from '../src/pacing/FrameTimer'
     import { AbBench } from '../src/profiling/AbBench'
@@ -355,29 +358,33 @@
     }
 
     // ── what the URL and the panel set ────────────────────────────────────────────────────────
-    // The Rust example's presets that the TS engine can show (no SSGI, dragon or reflections yet:
-    // its probe presets run the probes alone here): [name, gi, voxels, view, sdf ao, voxel
-    // shadows, direct shadows from the field].
+    // The Rust example's presets but its dragon's: [name, gi, voxels, view, sdf ao, voxel shadows,
+    // direct shadows from the field].
     const PRESETS = [
       ['off', 'off', null, 'lit', 0, 'off', false],
+      ['ssgi', 'high', null, 'lit', 0, 'off', false],
       ['voxel', 'voxel', null, 'lit', 0, 'off', false],
-      ['indirect', 'voxel', null, 'indirect', 0, 'off', false],
+      ['best', 'voxel+ssgi', null, 'lit', 0, 'off', false],
+      ['indirect', 'voxel+ssgi', null, 'indirect', 0, 'off', false],
       ['voxels', 'voxel', null, 'voxels', 0, 'off', false],
-      ['phone', 'voxel', 'low', 'lit', 0, 'off', false],
+      ['phone', 'voxel+ssgi', 'low', 'lit', 0, 'off', false],
       // the distance field: its AO on the GI and soft shadows for the voxels and the direct light
-      ['sdf', 'voxel', null, 'lit', 0.8, 'always', true],
+      ['sdf', 'voxel+ssgi', null, 'lit', 0.8, 'always', true],
       ['slice', 'voxel', null, 'sdf', 0, 'off', false],
-      // irradiance probes traced in the distance field
-      ['probes', 'probes', null, 'lit', 0, 'off', false],
-      ['probe-view', 'probes', null, 'probes', 0, 'off', false],
+      // irradiance probes traced in the distance field, under SSGI
+      ['probes', 'probes+ssgi', null, 'lit', 0, 'off', false],
+      ['probe-view', 'probes+ssgi', null, 'probes', 0, 'off', false],
     ];
-    const GI_MODES = ['off', 'voxel', 'probes'];
+    const SCREEN_GI = ['low', 'medium', 'high', 'ultra'];
+    const GI_MODES = ['off', ...SCREEN_GI, 'voxel', 'voxel+ssgi', 'probes', 'probes+ssgi'];
+    // the URL's gi: `ssgi` is `high`, and a raw '+' arrives as a space
+    const giFromName = (name) => name === 'ssgi' ? 'high' : GI_MODES.find((g) => g === name?.replace(' ', '+')) ?? null;
     const VIEWS = ['lit', 'indirect', 'voxels', 'sdf', 'probes'];
     const SDF_SHADOWS = ['off', 'fallback', 'always'];
     const defaultVoxels = phone ? 'low' : 'medium';
     const config = {
-      preset: 'voxel',
-      gi: 'voxel',
+      preset: null,
+      gi: 'high',
       voxels: defaultVoxels,
       view: 'lit',
       sdfAo: 0,
@@ -402,8 +409,10 @@
       Object.assign(config, { preset: name, gi, voxels: voxels ?? defaultVoxels, view, sdfAo, sdfShadows, shadows: directSdf ? 'sdf' : 'map' });
     }
     // the URL's preset, then its other parameters over it
-    applyPreset(param('preset') ?? 'voxel');
-    if (GI_MODES.includes(param('gi'))) config.gi = param('gi');
+    const DEFAULT_PRESET = 'best';
+    const preset = param('preset') ?? (param('gi') === null ? DEFAULT_PRESET : null);
+    if (preset) applyPreset(preset);
+    config.gi = giFromName(param('gi')) ?? config.gi;
     config.voxels = VoxelGiQuality.fromName(param('voxels')) ?? config.voxels;
     if (VIEWS.includes(param('view'))) config.view = param('view');
     if (param('sdf_ao') !== null && Number.isFinite(parseFloat(param('sdf_ao')))) config.sdfAo = Math.min(Math.max(parseFloat(param('sdf_ao')), 0), 1);
@@ -413,10 +422,11 @@
     setCamera(param('cam') ?? 'front');
 
     // Whether anything reads the probes, the distance field, the voxels.
-    const needsProbes = () => config.gi === 'probes' || config.view === 'probes';
+    const needsProbes = () => config.gi.startsWith('probes') || config.view === 'probes';
     const needsSdf = () => config.sdfAo > 0 || config.sdfShadows !== 'off' || config.view === 'sdf' || config.shadows === 'sdf' || needsProbes();
     // (the reflections' hits are lit by the voxels)
-    const needsVoxels = () => config.gi !== 'off' || needsSdf() || reflect;
+    const screenGi = () => SCREEN_GI.includes(config.gi);
+    const needsVoxels = () => (config.gi !== 'off' && !screenGi()) || needsSdf() || reflect;
 
     const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 });
     let enabledVoxels = null;
@@ -452,15 +462,25 @@
       }
       volume.clearEffects();
       const indirect = config.view === 'indirect';
+      // the screen-space GI's options, alone or as the voxels' near field
+      const screen = { radiusM: 4 };
       // (the slice view shows through voxel GI's effect whatever the mode)
-      const effectOn = gi && (config.gi !== 'off' || config.view === 'sdf');
-      if (effectOn) {
-        const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality, sdfAo: config.sdfAo });
+      const screenOn = screenGi() && config.view !== 'sdf';
+      const voxelOn = !screenOn && gi && (config.gi !== 'off' || config.view === 'sdf');
+      const effectOn = screenOn || voxelOn;
+      if (screenOn) {
+        const effect = new ScreenSpaceGIEffect({ ...screen, quality: config.gi });
+        effect.showIndirect = indirect;
+        volume.addEffect(effect);
+      } else if (voxelOn) {
+        const nearQuality = phone || gi.quality === 'low' ? 'low' : 'high';
+        const nearField = config.gi.endsWith('+ssgi') ? { ...screen, quality: nearQuality } : undefined;
+        const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality, sdfAo: config.sdfAo, nearField });
         effect.showIndirect = indirect;
         effect.showVoxels = config.view === 'voxels';
         effect.setSdf(gi.sdf);
         effect.showSdfSlice = config.view === 'sdf' ? config.slice : null;
-        // the probes: the far field in the probe mode (and what the debug view shows)
+        // the probes: the far field in the probe modes (and what the debug view shows)
         effect.setProbes(needsProbes() ? gi.probes : null);
         effect.showProbes = config.view === 'probes';
         volume.addEffect(effect);
@@ -535,7 +555,7 @@
     const setPreset = (name) => { applyPreset(name); apply(); };
     window.kansei = {
       info,
-      setPreset, setGi: set('gi'), setVoxels: set('voxels'), setView: set('view'), setAnimate: set('animate'),
+      setPreset, setGi: (name) => set('gi')(giFromName(name) ?? config.gi), setVoxels: set('voxels'), setView: set('view'), setAnimate: set('animate'),
       setTextured: set('textured'), setRug: set('rug'), setSdfAo: set('sdfAo'), setSdfShadows: set('sdfShadows'),
       setShadows: set('shadows'), setSlice: set('slice'), setCamera,
       setReflections: set('reflections'), setRtView: set('rtView'), setRtTrace: set('rtTrace'), setRtRes: set('rtRes'),

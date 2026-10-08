@@ -28,7 +28,9 @@
     // (`CLOUD_SHADOW_WGSL`) and occlude and tint the sky lighting and the environment through
     // their cloud map.
     //
-    // Not here yet, as it comes with a later port: the Rust page's screen-space GI.
+    // With `gi=`, screen-space GI (`ScreenSpaceGIEffect`) adds the light that bounces between the
+    // surfaces on screen and takes the sky's light out where the sky is hidden (its ambient
+    // occlusion, through the same `SkyLighting`).
     //
     // URL parameters (all optional):
     //   elevation  sun elevation in degrees (negative: below the horizon); default: a 60 s day
@@ -50,6 +52,7 @@
     //              cumulus (0.7); cloudbase: base altitude in m (1500); cloudthick: m (2500)
     //   cloudshadows=0  the clouds cast no shadows on the scene
     //   cloudquality=low|medium|high  the clouds' cost preset (default medium)
+    //   gi=low|medium|high|ultra  screen-space global illumination (off by default; gi=1: medium)
     //   profile=1  GPU time per pass (examples/profile-hud.js)
     //   bench=1    with clouds: alternates two cloud qualities (cloudquality and benchquality,
     //              default low and high) and compares their GPU time (examples/profile-hud.js)
@@ -69,6 +72,7 @@
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, LENS_ATTENUATION_UE4 } from '../src/postprocessing/effects/ToneMapEffect'
     import { AtmosphereEffect } from '../src/postprocessing/effects/AtmosphereEffect'
+    import { ScreenSpaceGIEffect } from '../src/postprocessing/effects/ScreenSpaceGIEffect'
     import { HeightFogEffect, heightFogLayerFromUnreal } from '../src/postprocessing/effects/HeightFogEffect'
     import { VolumetricFogEffect, LocalFogVolume } from '../src/postprocessing/effects/VolumetricFogEffect'
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
@@ -351,7 +355,16 @@
 
     // the chain: the sky and its aerial perspective, the clouds, the fog in front of them, the
     // display transform
-    const effects = [new AtmosphereEffect(sky)];
+    const effects = [];
+    // gi=low|medium|high|ultra: screen-space global illumination (off by default), first in the
+    // chain so the bounce lies on the surfaces under the aerial perspective
+    const giQuality = { low: 'low', medium: 'medium', 1: 'medium', high: 'high', ultra: 'ultra' }[param('gi')];
+    if (giQuality) {
+      const gi = new ScreenSpaceGIEffect({ quality: giQuality });
+      gi.setSkyLighting(sky.bindings.skyLighting);
+      effects.push(gi);
+    }
+    effects.push(new AtmosphereEffect(sky));
     let fog = null;
     const qualities = { low: CloudQuality.Low, medium: CloudQuality.Medium, high: CloudQuality.High };
     const coverage = num('clouds') ?? 0.45;
