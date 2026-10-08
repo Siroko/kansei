@@ -33,7 +33,12 @@
     //   car=<m/s>       the car's speed (default 9)
     //   stats=1         log every 240 frames the interval between frames and the renderer's profile
     //   dpr=<ratio>     drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
-    // Motion blur (`mblur`, `mbfps`, `mbmax`) is not ported yet.
+    // Motion blur:
+    //   mblur=<amount>  add a `MotionBlurEffect` after the TAA (0.5: a 180-degree shutter), scaled
+    //                   to 30 fps and capped at 4 % of the width
+    //   mbfps=<fps>     the frame rate the blur is scaled to (default 30; 0: each frame's motion)
+    //   mbmax=<frac>    the longest blur radius, as a fraction of the width (default 0.04)
+    // With `t` and `step` the blur sees each frame's step as that frame's duration.
     import { Canvas, run, param, paramOr, flag, now } from '../src/web/index'
     import { Camera } from '../src/cameras/Camera'
     import { Scene } from '../src/objects/Scene'
@@ -49,6 +54,7 @@
     import { LIGHTS_WGSL, MOTION_VECTORS_WGSL } from '../src/materials/shaders/SharedWGSL'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { TemporalAAEffect } from '../src/postprocessing/effects/TemporalAAEffect'
+    import { MotionBlurEffect } from '../src/postprocessing/effects/MotionBlurEffect'
     import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { hash01 } from '../src/math/hash01'
     import { Vector3 } from '../src/math/Vector3'
@@ -222,12 +228,19 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> FOut {
     const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(11) });
     const effects = [];
     if (flag('taa', true)) effects.push(new TemporalAAEffect({ exposure: tonemap.totalExposure() }));
+    const mblur = paramOr('mblur', 0);
+    let motionBlur = null;
+    if (mblur > 0) {
+      const fps = paramOr('mbfps', 30);
+      motionBlur = new MotionBlurEffect({ amount: mblur, max: paramOr('mbmax', 0.04), targetFps: fps > 0 ? fps : null });
+      effects.push(motionBlur);
+    }
     effects.push(tonemap);
     const volume = new PostProcessingVolume(renderer, effects);
 
     const camera = new Camera(40, 0.1, 1000, canvas.aspect);
     const [renderWidth, renderHeight] = renderer.renderSize;
-    console.info(`Kansei — Temporal AA (TS) ready: motion vectors ${velocity}, rendering ${renderWidth}x${renderHeight} for ${renderer.renderWidth}x${renderer.renderHeight}`);
+    console.info(`Kansei — Temporal AA (TS) ready: motion vectors ${velocity}, motion blur ${mblur}, rendering ${renderWidth}x${renderHeight} for ${renderer.renderWidth}x${renderer.renderHeight}`);
 
     const frozenT = parseFloat(param('t') ?? '');
     const step = Number.isFinite(frozenT) ? parseFloat(param('step') ?? '') : NaN;
@@ -246,10 +259,13 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> FOut {
       let clock = frame.time;
       let t = Number.isFinite(frozenT) ? frozenT : clock;
       // a still picture in motion: alternate between t and t + step
+      let frameTime = frame.dt;
       if (Number.isFinite(step)) {
         t += (frame.index % 2) * step;
         clock = t;
+        frameTime = step;
       }
+      motionBlur?.setFrameTime(frameTime);
 
       // wind time, this frame's and last frame's
       grassData[4] = clock;

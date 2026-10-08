@@ -23,6 +23,10 @@ import spotLights from '../../../rust/kansei-core/src/shaders/spot_lights.wgsl?r
 import cascadedShadows from '../../../rust/kansei-core/src/shaders/cascaded_shadows.wgsl?raw';
 import lightClusters from '../../../rust/kansei-core/src/shaders/light_clusters.wgsl?raw';
 import taaResolve from '../../../rust/kansei-core/src/shaders/taa_resolve.wgsl?raw';
+import motionBlurCommon from '../../../rust/kansei-core/src/shaders/motion_blur_common.wgsl?raw';
+import motionBlurPrepare from '../../../rust/kansei-core/src/shaders/motion_blur_prepare.wgsl?raw';
+import motionBlurNeighbours from '../../../rust/kansei-core/src/shaders/motion_blur_neighbours.wgsl?raw';
+import motionBlurGather from '../../../rust/kansei-core/src/shaders/motion_blur_gather.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -65,6 +69,15 @@ export const BLOOM_COMPOSITE_WGSL: string = bloomComposite;
  * history at 5-6. Rust: `postprocessing/effects/taa.rs`'s `WGSL`.
  */
 export const TAA_RESOLVE_WGSL: string = taaResolve;
+
+/**
+ * `MotionBlurEffect`'s three passes, each prefixed by the common `MotionBlurParams` (224 bytes):
+ * the per-pixel blur vectors and per-tile maximum (group 0 bindings 0-4), the neighbour-tile
+ * maximum (0-2), and the gather (0-4). Rust: `postprocessing/effects/motion_blur.rs`.
+ */
+export const MOTION_BLUR_PREPARE_WGSL: string = `${motionBlurCommon}\n${motionBlurPrepare}`;
+export const MOTION_BLUR_NEIGHBOURS_WGSL: string = `${motionBlurCommon}\n${motionBlurNeighbours}`;
+export const MOTION_BLUR_GATHER_WGSL: string = `${motionBlurCommon}\n${motionBlurGather}`;
 
 /**
  * The GBuffer's four colour targets for a fragment shader (`KanseiGBufferOut`): return
