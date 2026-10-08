@@ -2,6 +2,7 @@ import { ComputeBuffer } from '../buffers/ComputeBuffer';
 import { Texture } from '../buffers/Texture';
 import { BindingLayouts } from '../materials/Binding';
 import { Compute } from '../materials/Compute';
+import { gpuPass } from '../profiling/Profiler';
 import { RESOLVE_WGSL, SPLAT_WGSL } from './GiWGSL';
 import { ACCUMULATOR_BYTES_PER_VOXEL, Vec3, VoxelVolume } from './VoxelVolume';
 
@@ -235,7 +236,7 @@ export class ParticleVoxelizer {
     public encodeSplat(encoder: GPUCommandEncoder, particleCount: number, settings: ParticleSplatSettings): void {
         this.writeParams(particleCount, settings);
         if (particleCount === 0) return;
-        const pass = encoder.beginComputePass({ label: 'VoxelGI/Splat' });
+        const pass = encoder.beginComputePass({ label: 'VoxelGI/Splat', timestampWrites: gpuPass('VoxelGI/Splat') });
         pass.setPipeline(this.splat.pipeline!);
         pass.setBindGroup(0, this.splat.getBindGroup(this.device));
         pass.dispatchWorkgroups(Math.ceil(particleCount / 64));
@@ -245,7 +246,7 @@ export class ParticleVoxelizer {
     /** Record the resolve into the volume's mip 0 (clearing the accumulators). */
     public encodeResolve(encoder: GPUCommandEncoder): void {
         const [w, h, d] = this.dims;
-        const pass = encoder.beginComputePass({ label: 'VoxelGI/Resolve' });
+        const pass = encoder.beginComputePass({ label: 'VoxelGI/Resolve', timestampWrites: gpuPass('VoxelGI/Resolve') });
         pass.setPipeline(this.resolve.pipeline!);
         pass.setBindGroup(0, this.resolve.getBindGroup(this.device));
         pass.dispatchWorkgroups(Math.ceil(w / 4), Math.ceil(h / 4), Math.ceil(d / 4));

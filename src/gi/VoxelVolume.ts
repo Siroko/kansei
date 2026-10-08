@@ -1,6 +1,7 @@
 import { Texture } from '../buffers/Texture';
 import { MIP3D_WGSL } from './GiWGSL';
 import { AnisotropicMips } from './AnisotropicMips';
+import { gpuPass } from '../profiling/Profiler';
 
 /**
  * Resolution and cost tiers of voxel GI. Each sets the voxels across the volume's longest axis
@@ -292,7 +293,7 @@ export class Mip3d {
     /** Record the chain's rebuild from level 0. */
     public encode(encoder: GPUCommandEncoder): void {
         if (this.levels.length === 0) return;
-        const pass = encoder.beginComputePass({ label: 'VoxelGI/Mips' });
+        const pass = encoder.beginComputePass({ label: 'VoxelGI/Mips', timestampWrites: gpuPass('VoxelGI/Mips') });
         pass.setPipeline(this.pipeline);
         for (const { bindGroup, size: [w, h, d] } of this.levels) {
             pass.setBindGroup(0, bindGroup);

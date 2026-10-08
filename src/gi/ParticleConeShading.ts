@@ -3,6 +3,7 @@ import { Sampler } from '../buffers/Sampler';
 import { Texture } from '../buffers/Texture';
 import { BindingLayouts } from '../materials/Binding';
 import { Compute } from '../materials/Compute';
+import { gpuPass } from '../profiling/Profiler';
 import { PARTICLE_CONES_WGSL } from './GiWGSL';
 import { computeBinding, GiBufferSource, giBuffer, normalizeOrUp } from './ParticleVoxelizer';
 import { Vec3, VoxelVolume } from './VoxelVolume';
@@ -207,7 +208,7 @@ export class ParticleConeShading {
         this.device.queue.writeBuffer(this.params, 0, data);
         this.frame = Math.max((this.frame + 1) >>> 0, 1);
         if (particleCount === 0) return;
-        const pass = encoder.beginComputePass({ label: 'VoxelGI/ParticleCones' });
+        const pass = encoder.beginComputePass({ label: 'VoxelGI/ParticleCones', timestampWrites: gpuPass('VoxelGI/ParticleCones') });
         pass.setPipeline(this.shade.pipeline!);
         pass.setBindGroup(0, this.shade.getBindGroup(this.device));
         pass.dispatchWorkgroups(Math.ceil(particleCount / 64));

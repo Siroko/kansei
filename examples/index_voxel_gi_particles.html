@@ -20,7 +20,8 @@
       //
       // URL parameters, as the Rust demo's: gi=off, view=indirect, quality=low|medium|high,
       // particles=<n> (default 32768, half on phones), stats=1 (frame interval in the console),
-      // ui=0 (no panel). `window.kansei` holds the GI, the fluid and `info()` for scripted captures.
+      // profile=1 (time each pass: `window.kansei.profileReport()`), ui=0 (no panel).
+      // `window.kansei` holds the GI, the fluid and `info()` for scripted captures.
       import { Renderer } from '../src/renderers/Renderer'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
@@ -43,6 +44,7 @@
       import { VoxelGiQuality } from '../src/gi/VoxelVolume'
       import { VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL } from '../src/gi/GiWGSL'
       import { assemble } from '../src/materials/shaders/ShaderUtils'
+      import { FixedStep } from '../src/pacing/FixedStep'
 
       const query = new URLSearchParams(location.search);
       const flag = (name, fallback) => {
@@ -403,7 +405,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
       if (flag('ui', true)) {
         const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js');
         const pane = new Pane({ title: 'Voxel GI on particles', expanded: !isPhone });
-        pane.addBinding({ volume: info() }, 'volume', { readonly: true, multiline: true, rows: 2 });
+        pane.addBinding({ volume: info().replace(': ', ':\n') }, 'volume', { readonly: true, multiline: true, rows: 3 });
         pane.addBinding(panel, 'frame', { readonly: true, label: 'frame ms' });
         pane.addBinding(panel, 'gi', { label: 'voxel GI' }).on('change', (e) => { gi.settings.cones.useVolume = e.value; gi.resetHistory(); });
         pane.addBinding(panel, 'indirect', { label: 'indirect only' }).on('change', (e) => { sceneParams.view = e.value ? 1 : 0; });
@@ -429,13 +431,13 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
       }
 
       // ── frame loop: the fluid at a fixed step (at most 3 a frame), the GI, then the scene ──
-      const STEP = 1 / 60;
-      let accumulator = 0;
+      const simStep = new FixedStep(1 / 60).withMaxSteps(3);
       let last = performance.now();
       let frameMs = 16.7;
       const stats = flag('stats', false) ? { start: performance.now(), frames: 0 } : undefined;
       let paused = false;
-      window.kansei = { gi, sim, info, pourAgain, setPaused: (p) => { paused = p; } };
+      if (flag('profile', false)) renderer.setProfiling(true);
+      window.kansei = { gi, sim, info, pourAgain, setPaused: (p) => { paused = p; }, profileReport: () => renderer.takeProfile().report() };
 
       function frame() {
         requestAnimationFrame(frame);
@@ -451,14 +453,12 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
 
         let steps = 0;
         if (paused) {
-          accumulator = 0;
+          simStep.reset();
         } else {
-          accumulator += dt;
-          while (accumulator >= STEP && steps < 3) { accumulator -= STEP; steps++; }
-          if (accumulator > STEP) accumulator = STEP;
+          steps = simStep.advance(dt);
         }
         if (steps > 0) {
-          sim.updateBatched(STEP, steps, mouse.mousePosition, mouse.mouseDirection, Math.min(mouse.mouseStrength, 1));
+          sim.updateBatched(simStep.step, steps, mouse.mousePosition, mouse.mouseDirection, Math.min(mouse.mouseStrength, 1));
         }
 
         writeScene();

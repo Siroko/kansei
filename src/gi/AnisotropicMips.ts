@@ -1,5 +1,6 @@
 import { ANISO_MIP_WGSL } from './GiWGSL';
 import type { Vec3 } from './VoxelVolume';
+import { gpuPass } from '../profiling/Profiler';
 
 /**
  * The six directional mip chains of a `VoxelVolume` (`VoxelVolume.setAnisotropicMips`): from its
@@ -83,7 +84,7 @@ export class AnisotropicMips {
 
     /** Record the chains' rebuild from the volume's mip 0. */
     public encode(encoder: GPUCommandEncoder): void {
-        const pass = encoder.beginComputePass({ label: 'VoxelGI/AnisotropicMips' });
+        const pass = encoder.beginComputePass({ label: 'VoxelGI/AnisotropicMips', timestampWrites: gpuPass('VoxelGI/AnisotropicMips') });
         for (const { pipeline, bindGroup, size: [w, h, d] } of this.passes) {
             pass.setPipeline(this.pipelines[pipeline]);
             pass.setBindGroup(0, bindGroup);
