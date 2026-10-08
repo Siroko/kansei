@@ -138,10 +138,12 @@ export { SkyAtmosphere, defaultSkyAtmosphereOptions, skyCaptureFogFromHeightFog 
 export type { SkyAtmosphereOptions, SkyAtmosphereBindings, SkyCaptureFog, SkyLowerHemisphere } from "./atmosphere/SkyAtmosphere";
 export { earthAtmosphere, sunLight, moonLight, directionFromElevationBearing, transmittanceToSpace } from "./atmosphere/AtmosphereParams";
 export type { AtmosphereParams, CelestialLight } from "./atmosphere/AtmosphereParams";
-export { ATMOSPHERE_WGSL, SKY_ENVIRONMENT_WGSL } from "./atmosphere/AtmosphereWGSL";
+export { ATMOSPHERE_WGSL, SKY_ENVIRONMENT_WGSL, CLOUD_SHADOW_WGSL } from "./atmosphere/AtmosphereWGSL";
 export { AtmosphereEffect } from "./postprocessing/effects/AtmosphereEffect";
 export { HeightFogEffect, heightFogLayerFromUnreal, heightFogOpticalDepth } from "./postprocessing/effects/HeightFogEffect";
 export type { HeightFogLayer } from "./postprocessing/effects/HeightFogEffect";
+export { VolumetricCloudsEffect, CloudQuality, defaultCloudLayer, defaultVolumetricCloudsOptions } from "./postprocessing/effects/VolumetricCloudsEffect";
+export type { CloudLayer, VolumetricCloudsOptions } from "./postprocessing/effects/VolumetricCloudsEffect";
 export { hash01 } from "./math/hash01";
 export { DebugBoxes, segment, DEBUG_BOXES_WGSL } from "./debug/DebugBoxes";
 export { Canvas, Frame, run, Keys, Gamepad, deadZone, now, param, paramOr, flag, isPhone, setText, checkbox, thousands, fetchBytes } from "./web";
