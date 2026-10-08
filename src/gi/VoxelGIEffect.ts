@@ -4,14 +4,16 @@ import { GBuffer } from '../postprocessing/GBuffer';
 import { PostProcessingEffect } from '../postprocessing/PostProcessingEffect';
 import { ScreenSpaceGIEffect, ScreenSpaceGIOptions } from '../postprocessing/effects/ScreenSpaceGIEffect';
 import { gpuPass } from '../profiling/Profiler';
-import { SCREEN_COMPOSITE_WGSL, SCREEN_TEMPORAL_WGSL, SCREEN_TRACE_WGSL } from './GiWGSL';
+import { CLIPMAP_PROBE_TRACE_WGSL, CLIPMAP_TRACE_WGSL, SCREEN_COMPOSITE_WGSL, SCREEN_TEMPORAL_WGSL, SCREEN_TRACE_WGSL } from './GiWGSL';
+import type { ClipmapProbes } from './ClipmapProbes';
+import { VoxelClipmap, clipmapEntries, clipmapLayoutEntries } from './VoxelClipmap';
 import { gradientSkyLighting } from './ParticleConeShading';
 import type { JumpFloodSdf } from './JumpFloodSdf';
 import { PROBE_GRID_BYTES, SdfProbes } from './SdfProbes';
 import { noSdfView } from './VoxelInjection';
-import { Vec3, VoxelGiQuality, VoxelVolume } from './VoxelVolume';
+import { VOXEL_VOLUME_BYTES, Vec3, VoxelGiQuality, VoxelVolume } from './VoxelVolume';
 
-/** What `VoxelGIEffect` sets up. Rust: `gi::VoxelGIOptions` (its clipmap options come with G-4). */
+/** What `VoxelGIEffect` sets up. Rust: `gi::VoxelGIOptions`. */
 export interface VoxelGIOptions {
     /** Resolution of the trace (`low` a quarter each way, else half) and the cones' steps. Default `medium`. */
     quality?: VoxelGiQuality;
@@ -41,6 +43,30 @@ export interface VoxelGIOptions {
      * none): the contact occlusion the coarse cones miss.
      */
     sdfAo?: number;
+    /**
+     * With a clipmap (`withClipmap`): levels finer than they are wide the cones read. Each then
+     * samples the voxels along its axis sparsely, which sees the sky through gaps narrower than the
+     * cone (a road between trees, a street between walls) where voxels as wide as the cone fill
+     * them; the temporal filter averages the samples. 0 reads the levels as wide as the cones.
+     * Default 2.
+     */
+    clipmapLevelBias?: number;
+}
+
+/** What the effect reads: a volume (with its anisotropic chains) or a clipmap. */
+type Source =
+    | { kind: 'volume', volume: VoxelVolume, anisotropic: GPUTextureView[] }
+    | { kind: 'clipmap', clipmap: VoxelClipmap };
+
+/** The trace and the voxels' view of a clipmap source, and the stand-in the composite binds for the volume. */
+interface ClipmapGpu {
+    trace: GPUComputePipeline;
+    showVoxels: GPUComputePipeline;
+    bgl: GPUBindGroupLayout;
+    /** The trace from the clipmap's probes in place of cones (clipmap_probe_trace.wgsl). */
+    probeTrace: GPUComputePipeline;
+    probeTraceBGL: GPUBindGroupLayout;
+    noVolume: GPUBuffer;
 }
 
 /** Bytes of the WGSL `VoxelGiParams` (screen_common.wgsl; Rust `VoxelGiParamsGpu`). */
@@ -72,6 +98,8 @@ interface Gpu {
     noSdf: GPUTextureView;
     /** Bound as the probes without them: the grid, the SH, the state, the depth. */
     noProbes: GPUBuffer[];
+    /** The passes of a clipmap source, when the effect reads one. */
+    clipmap: ClipmapGpu | null;
     targets: Targets | null;
 }
 
@@ -86,8 +114,11 @@ interface Gpu {
  * material writes the GBuffer's albedo (and normal), and replaces the materials' sky ambient once
  * the sky's lighting is set. With `setProbes` the far field comes from irradiance probes instead of
  * per-pixel cones; with `setSdf` the distance field adds contact AO (`sdfAo`); with the
- * `nearField` option screen-space GI goes first and the voxels light what it cannot see. Rust:
- * `gi::VoxelGIEffect` (the volume source; a clipmap source comes with G-4).
+ * `nearField` option screen-space GI goes first and the voxels light what it cannot see.
+ *
+ * `withClipmap` reads a voxel clipmap (`SceneVoxelClipmap.clipmap`) instead: the cones read its
+ * levels, each the level as wide as the cone there that holds the point, and `setClipmapProbes`
+ * takes the far field from its probes. Rust: `gi::VoxelGIEffect`.
  */
 export class VoxelGIEffect extends PostProcessingEffect {
     public enabled = true;
@@ -119,16 +150,19 @@ export class VoxelGIEffect extends PostProcessingEffect {
      */
     public showProbes = false;
     public sdfAo: number;
+    /** See `VoxelGIOptions.clipmapLevelBias`. */
+    public clipmapLevelBias: number;
     /** The sky past the volume without `setSkyLighting`: scene radiance straight up and down. */
     public skyGradient: [Vec3, Vec3] = [[0, 0, 0], [0, 0, 0]];
 
-    private readonly volume: VoxelVolume;
-    private readonly anisotropic: GPUTextureView[];
+    private readonly source: Source;
     private skyLighting: GPUBuffer | null = null;
     private readonly near: ScreenSpaceGIEffect | null;
     private sdf: GPUTextureView | null = null;
     /** The probes' grid, SH, state and depth buffers (`setProbes`). */
     private probes: GPUBuffer[] | null = null;
+    /** A clipmap's probes' grid and buffer (`setClipmapProbes`). */
+    private clipmapProbes: [GPUBuffer, GPUBuffer] | null = null;
     private prevViewProj: mat4 | null = null;
     private frame = 0;
     private gpu: Gpu | null = null;
@@ -137,14 +171,19 @@ export class VoxelGIEffect extends PostProcessingEffect {
     /**
      * Read `volume` (`SceneVoxelGi.volume`, or any volume with anisotropic mips).
      */
-    constructor(volume: VoxelVolume, options: VoxelGIOptions = {}) {
+    constructor(volume: VoxelVolume, options?: VoxelGIOptions);
+    constructor(source: Source, options?: VoxelGIOptions);
+    constructor(volume: VoxelVolume | Source, options: VoxelGIOptions = {}) {
         super();
-        const anisotropic = volume.anisotropicViews;
-        if (!anisotropic) {
-            throw new Error('VoxelGIEffect reads a volume with anisotropic mips (VoxelVolume.setAnisotropicMips; SceneVoxelGi\'s has them)');
+        if (volume instanceof VoxelVolume) {
+            const anisotropic = volume.anisotropicViews;
+            if (!anisotropic) {
+                throw new Error('VoxelGIEffect reads a volume with anisotropic mips (VoxelVolume.setAnisotropicMips; SceneVoxelGi\'s has them)');
+            }
+            this.source = { kind: 'volume', volume, anisotropic };
+        } else {
+            this.source = volume;
         }
-        this.volume = volume;
-        this.anisotropic = anisotropic;
         this.quality = options.quality ?? 'medium';
         this.intensity = options.intensity ?? 1;
         this.startVoxels = options.startVoxels ?? 1.5;
@@ -153,6 +192,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
         this.materialAmbient = options.materialAmbient ?? 1;
         this.skyScale = options.skyScale ?? 1;
         this.sdfAo = options.sdfAo ?? 0;
+        this.clipmapLevelBias = options.clipmapLevelBias ?? 2;
         this.near = options.nearField ? new ScreenSpaceGIEffect(options.nearField) : null;
     }
 
@@ -162,11 +202,39 @@ export class VoxelGIEffect extends PostProcessingEffect {
     }
 
     /**
+     * Read `clipmap` (`SceneVoxelClipmap.clipmap`) instead of a volume: the cones read its levels
+     * (the distance field and the volume's probes don't apply). Rust: `VoxelGIEffect::with_clipmap`.
+     */
+    public static withClipmap(clipmap: VoxelClipmap, options: VoxelGIOptions = {}): VoxelGIEffect {
+        return new VoxelGIEffect({ kind: 'clipmap', clipmap }, options);
+    }
+
+    /** Whether it reads a clipmap (`withClipmap`). */
+    public get readsClipmap(): boolean {
+        return this.source.kind === 'clipmap';
+    }
+
+    /**
+     * Take the far field from a clipmap's irradiance probes (`SceneVoxelClipmap.probes`): each
+     * pixel's irradiance from the probes around it, in place of the cones traced through the
+     * clipmap (whose temporal filter is then skipped). Null goes back to the cones. Ignored without
+     * a clipmap (`withClipmap`).
+     */
+    public setClipmapProbes(probes: ClipmapProbes | null): void {
+        this.clipmapProbes = probes && this.readsClipmap ? [probes.gridBuffer, probes.probeBuffer] : null;
+    }
+
+    /** Whether the far field comes from a clipmap's probes (`setClipmapProbes`). */
+    public get usesClipmapProbes(): boolean {
+        return this.clipmapProbes !== null;
+    }
+
+    /**
      * Read the scene's distance field (`SceneVoxelGi.sdf`, over the same volume) for `sdfAo` and
      * `showSdfSlice`; null leaves them off.
      */
     public setSdf(sdf: JumpFloodSdf | null): void {
-        this.sdf = sdf?.view ?? null;
+        this.sdf = this.readsClipmap ? null : sdf?.view ?? null;
     }
 
     /**
@@ -175,7 +243,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
      * are then skipped), still under the near field if there is one. Null goes back to the cones.
      */
     public setProbes(probes: SdfProbes | null): void {
-        this.probes = probes ? [probes.gridBuffer, probes.shBuffer, probes.stateBuffer, probes.depthBuffer] : null;
+        this.probes = probes && !this.readsClipmap ? [probes.gridBuffer, probes.shBuffer, probes.stateBuffer, probes.depthBuffer] : null;
     }
 
     /** Whether the far field comes from probes (`setProbes`). */
@@ -208,11 +276,11 @@ export class VoxelGIEffect extends PostProcessingEffect {
 
     public initialize(device: GPUDevice, _gbuffer: GBuffer, _camera: Camera): void {
         this.device = device;
-        if (!this.gpu) this.gpu = VoxelGIEffect.initGpu(device);
+        if (!this.gpu) this.gpu = VoxelGIEffect.initGpu(device, this.readsClipmap);
         this.initialized = true;
     }
 
-    private static initGpu(device: GPUDevice): Gpu {
+    private static initGpu(device: GPUDevice, clipmap: boolean): Gpu {
         const visibility = GPUShaderStage.COMPUTE;
         const uniform = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility, buffer: { type: 'uniform' } });
         const texture = (binding: number, filterable: boolean, viewDimension: GPUTextureViewDimension = '2d'): GPUBindGroupLayoutEntry =>
@@ -260,6 +328,24 @@ export class VoxelGIEffect extends PostProcessingEffect {
                 buffer('VoxelGI/NoProbeState', 16, GPUBufferUsage.STORAGE),
                 buffer('VoxelGI/NoProbeDepth', 16, GPUBufferUsage.STORAGE),
             ],
+            clipmap: clipmap ? (() => {
+                const bgl = device.createBindGroupLayout({
+                    label: 'VoxelGI/ClipmapTraceBGL',
+                    entries: [uniform(0), depth(1), texture(2, false), uniform(6), storage(7), ...clipmapLayoutEntries(visibility)],
+                });
+                const probeTraceBGL = device.createBindGroupLayout({
+                    label: 'VoxelGI/ClipmapProbeTraceBGL',
+                    entries: [uniform(0), depth(1), texture(2, false), uniform(6), storage(7), uniform(60), storageBuffer(61)],
+                });
+                return {
+                    trace: pipeline('VoxelGI/ClipmapTrace', CLIPMAP_TRACE_WGSL, bgl),
+                    showVoxels: pipeline('VoxelGI/ClipmapVoxels', CLIPMAP_TRACE_WGSL, bgl, 'show_voxels'),
+                    bgl,
+                    probeTrace: pipeline('VoxelGI/ClipmapProbeTrace', CLIPMAP_PROBE_TRACE_WGSL, probeTraceBGL),
+                    probeTraceBGL,
+                    noVolume: buffer('VoxelGI/NoVolume', VOXEL_VOLUME_BYTES, GPUBufferUsage.UNIFORM),
+                };
+            })() : null,
             targets: null,
         };
     }
@@ -330,7 +416,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
         f32[82] = this.sdf ? Math.min(Math.max(this.sdfAo, 0), 1) : 0;
         f32[83] = this.showSdfSlice ?? 0;
         u32[84] = this.sdf ? 1 : 0;
-        f32[85] = 0;   // (a clipmap's level bias)
+        f32[85] = Math.max(this.clipmapLevelBias, 0);
         device.queue.writeBuffer(gpu.params, 0, data);
         if (!this.skyLighting) {
             device.queue.writeBuffer(gpu.gradientSky, 0, gradientSkyLighting(this.skyGradient[0], this.skyGradient[1]));
@@ -348,19 +434,63 @@ export class VoxelGIEffect extends PostProcessingEffect {
         const group = (label: string, layout: GPUBindGroupLayout, resources: [number, GPUBindingResource][]) =>
             device.createBindGroup({ label, layout, entries: resources.map(([binding, resource]) => ({ binding, resource })) });
 
-        const trace = group('VoxelGI/TraceBG', gpu.traceBGL, [
-            [0, params], [1, depthView], [2, normalView], [3, { buffer: this.volume.uniform }], [4, this.volume.view],
-            [5, this.volume.sampler], [6, sky], [7, traceView],
-            ...this.anisotropic.map((v, i) => [40 + i, v] as [number, GPUBindingResource]),
-            [46, this.sdf ?? gpu.noSdf],
-        ]);
+        const source = this.source;
+        // the trace through the volume (with its anisotropic chains and distance field) or the
+        // clipmap, and what the composite binds for the volume
+        let trace: GPUBindGroup;
+        let volume: [GPUBuffer, GPUTextureView, GPUSampler];
+        let tracePipeline: GPUComputePipeline;
+        if (source.kind === 'volume') {
+            const v = source.volume;
+            trace = group('VoxelGI/TraceBG', gpu.traceBGL, [
+                [0, params], [1, depthView], [2, normalView], [3, { buffer: v.uniform }], [4, v.view],
+                [5, v.sampler], [6, sky], [7, traceView],
+                ...source.anisotropic.map((view, i) => [40 + i, view] as [number, GPUBindingResource]),
+                [46, this.sdf ?? gpu.noSdf],
+            ]);
+            volume = [v.uniform, v.view, v.sampler];
+            tracePipeline = gpu.trace;
+        } else {
+            const clipmap = gpu.clipmap!;
+            const clipmapGroup = (target: GPUTextureView) => device.createBindGroup({
+                label: 'VoxelGI/ClipmapTraceBG',
+                layout: clipmap.bgl,
+                entries: [
+                    ...([[0, params], [1, depthView], [2, normalView], [6, sky], [7, target]] as [number, GPUBindingResource][])
+                        .map(([binding, resource]) => ({ binding, resource })),
+                    ...clipmapEntries(source.clipmap),
+                ],
+            });
+            if (this.showVoxels) {
+                // the clipmap's voxels in place of the lit image
+                const pass = commandEncoder.beginComputePass({ label: 'VoxelGI/ClipmapVoxels' });
+                pass.setPipeline(clipmap.showVoxels);
+                pass.setBindGroup(0, clipmapGroup(output.createView()));
+                pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+                pass.end();
+                return;
+            }
+            if (this.clipmapProbes) {
+                // the far field from the probes, in place of the cones
+                const [grid, probes] = this.clipmapProbes;
+                trace = group('VoxelGI/ClipmapProbeTraceBG', clipmap.probeTraceBGL, [
+                    [0, params], [1, depthView], [2, normalView], [6, sky], [7, traceView], [60, { buffer: grid }], [61, { buffer: probes }],
+                ]);
+                tracePipeline = clipmap.probeTrace;
+            } else {
+                trace = clipmapGroup(traceView);
+                tracePipeline = clipmap.trace;
+            }
+            volume = [clipmap.noVolume, gpu.noSdf, gpu.sampler];
+        }
         const temporal = group('VoxelGI/TemporalBG', gpu.temporalBGL, [
             [0, params], [1, traceView], [2, history[1 - current]], [3, depthView], [4, history[current]], [5, gpu.sampler],
         ]);
+        // (the clipmap probes' light needs no temporal filter: the composite reads the trace)
         const composite = group('VoxelGI/CompositeBG', gpu.compositeBGL, [
-            [0, params], [1, input.createView()], [2, depthView], [3, history[current]], [4, (near?.texture ?? gpu.noNear).createView()],
+            [0, params], [1, input.createView()], [2, depthView], [3, this.clipmapProbes ? traceView : history[current]], [4, (near?.texture ?? gpu.noNear).createView()],
             [5, gbuffer.albedoTexture.createView()], [6, normalView], [7, sky], [8, output.createView()],
-            [9, { buffer: this.volume.uniform }], [10, this.volume.view], [11, this.volume.sampler], [12, this.sdf ?? gpu.noSdf],
+            [9, { buffer: volume[0] }], [10, volume[1]], [11, volume[2]], [12, this.sdf ?? gpu.noSdf],
             ...(this.probes ?? gpu.noProbes).map((buffer, i) => [13 + i, { buffer }] as [number, GPUBindingResource]),
         ]);
 
@@ -369,12 +499,14 @@ export class VoxelGIEffect extends PostProcessingEffect {
         // voxels and slice views show without them)
         const probes = this.probes !== null && debug !== 2 && debug !== 3;
         if (!probes) {
-            pass.setPipeline(gpu.trace);
+            pass.setPipeline(tracePipeline);
             pass.setBindGroup(0, trace);
             pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
-            pass.setPipeline(gpu.temporal);
-            pass.setBindGroup(0, temporal);
-            pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
+            if (!this.clipmapProbes) {
+                pass.setPipeline(gpu.temporal);
+                pass.setBindGroup(0, temporal);
+                pass.dispatchWorkgroups(Math.ceil(t.width / 8), Math.ceil(t.height / 8));
+            }
         }
         pass.setPipeline(probes ? gpu.compositeProbes : gpu.composite);
         pass.setBindGroup(0, composite);
@@ -388,6 +520,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
         const gpu = this.gpu;
         if (!gpu) return;
         for (const b of [gpu.params, gpu.gradientSky, ...gpu.noProbes]) b.destroy();
+        gpu.clipmap?.noVolume.destroy();
         gpu.noNear.destroy();
         this.near?.destroy();
         if (gpu.targets) for (const t of [gpu.targets.trace, ...gpu.targets.history]) t.destroy();

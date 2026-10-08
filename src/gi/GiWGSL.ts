@@ -3,7 +3,8 @@
  * `materials/shaders/SharedWGSL.ts` imports the rest, so both engines run the same source and
  * `cargo test -p kansei-core` validates it. The exported names match the Rust constants
  * (`gi::VOXEL_VOLUME_WGSL`, `gi::VOXEL_CONES_WGSL`, `gi::SDF_WGSL`, `gi::PROBES_WGSL`,
- * `gi::PARTICLE_EMISSION_WGSL`, `atmosphere::SKY_LIGHTING_WGSL`); the rest are the passes' own,
+ * `gi::PARTICLE_EMISSION_WGSL`, `gi::CLIPMAP_WGSL`, `gi::CLIPMAP_PROBES_WGSL`,
+ * `atmosphere::SKY_LIGHTING_WGSL`); the rest are the passes' own,
  * assembled as Rust's `concat!`.
  */
 import { assemble } from '../materials/shaders/ShaderUtils';
@@ -30,6 +31,13 @@ import probeCommon from '../../rust/kansei-core/src/gi/shaders/probe_common.wgsl
 import probeIrradiance from '../../rust/kansei-core/src/gi/shaders/probe_irradiance.wgsl?raw';
 import probeUpdate from '../../rust/kansei-core/src/gi/shaders/probe_update.wgsl?raw';
 import jumpFlood from '../../rust/kansei-core/src/gi/shaders/jump_flood.wgsl?raw';
+import clipmap from '../../rust/kansei-core/src/gi/shaders/clipmap.wgsl?raw';
+import clipmapClear from '../../rust/kansei-core/src/gi/shaders/clipmap_clear.wgsl?raw';
+import clipmapInject from '../../rust/kansei-core/src/gi/shaders/clipmap_inject.wgsl?raw';
+import clipmapProbes from '../../rust/kansei-core/src/gi/shaders/clipmap_probes.wgsl?raw';
+import clipmapProbeUpdate from '../../rust/kansei-core/src/gi/shaders/clipmap_probe_update.wgsl?raw';
+import clipmapProbeTrace from '../../rust/kansei-core/src/gi/shaders/clipmap_probe_trace.wgsl?raw';
+import clipmapTrace from '../../rust/kansei-core/src/gi/shaders/clipmap_trace.wgsl?raw';
 import { COMPUTE_SHADOWS_WGSL } from '../shadows/ComputeShadows';
 
 /**
@@ -101,6 +109,30 @@ export const SDF_WGSL: string = assemble([voxelVolume, sdf]);
  */
 export const PROBES_WGSL: string = assemble([probeCommon, probeIrradiance]);
 
+/**
+ * A voxel clipmap for a compute pass (`VoxelClipmap`): the `VoxelClipmap` uniform and the levels
+ * bound in group 0 (binding 50 `VoxelClipmap.uniform`, 51-56 `levelViews`, 57 `sampler`;
+ * `clipmapLayoutEntries` and `clipmapEntries` lay them out and bind them); `clipSample(level, p)`,
+ * `clipContains`, `clipLevelAt(p, first, margin)`, `clipVoxelSize`; `clipConeTrace(origin, dir, n,
+ * tanHalf, minDiameter, startDist, maxDist, maxSteps)`, a cone through the levels (radiance
+ * gathered, transmittance left), and `clipIrradiance(sky, skyScale, origin, n, angle, minDiameter,
+ * startDist, maxDist, maxSteps)`, a surface's irradiance from six cones and the sky past the
+ * clipmap (needs `SKY_LIGHTING_WGSL`). Rust: `gi::CLIPMAP_WGSL`.
+ */
+export const CLIPMAP_WGSL: string = clipmap;
+
+/**
+ * The irradiance probes of a voxel clipmap for a material (`ClipmapProbes`): `ClipProbeGrid`,
+ * `kansei_clipmap_light(p, n)` (the irradiance a surface at world position `p` facing `n`
+ * receives, scene units, and the cosine-weighted share of its hemisphere that sees the sky past
+ * the clipmap; a = -1 where no probe holds `p`), `kansei_clipmap_sky_visibility(p, n)` (that share
+ * alone, 1 where no probe holds `p`: to dim a material's own sky light by) and
+ * `kansei_clipmap_inscatter(p, viewDir, g)` (the light a medium there scatters toward the camera,
+ * for fog). Declare its buffers with `ClipmapProbes.bindingsWGSL(group, first)` in the material's
+ * own group and bind them with `ClipmapProbes.bindGroupEntries`. Rust: `gi::CLIPMAP_PROBES_WGSL`.
+ */
+export const CLIPMAP_PROBES_WGSL: string = clipmapProbes;
+
 /** One mip of a 3D chain (`Mip3d`). */
 export const MIP3D_WGSL: string = mip3d;
 /** The six directional mip chains (`AnisotropicMips`). */
@@ -125,3 +157,13 @@ export const SCREEN_TRACE_WGSL: string = assemble([screenCommon, screenNormal, v
 export const SCREEN_TEMPORAL_WGSL: string = assemble([screenCommon, screenTemporal]);
 /** `VoxelGIEffect`'s composite (`main`, and `main_probes` with probes as the far field). */
 export const SCREEN_COMPOSITE_WGSL: string = assemble([screenCommon, screenNormal, voxelVolume, sdf, probeCommon, probeIrradiance, skyLighting, screenComposite]);
+/** `ClipmapVoxelizer`'s clear of a region (Rust `gi::clipmap_voxelize::CLEAR_WGSL`). */
+export const CLIPMAP_CLEAR_WGSL: string = clipmapClear;
+/** `ClipmapInjection`'s pass (Rust `gi::clipmap_inject::CLIPMAP_INJECT_WGSL`). */
+export const CLIPMAP_INJECT_WGSL: string = assemble([clipmap, particleEmission, skyLighting, COMPUTE_SHADOWS_WGSL, clipmapInject]);
+/** `ClipmapProbes`' update (Rust `gi::clipmap_probes::CLIPMAP_PROBE_UPDATE_WGSL`). */
+export const CLIPMAP_PROBE_UPDATE_WGSL: string = assemble([clipmap, particleEmission, clipmapProbes, skyLighting, clipmapProbeUpdate]);
+/** `VoxelGIEffect`'s trace through a clipmap, and its `show_voxels` (Rust `gi::effect::CLIPMAP_TRACE_WGSL`). */
+export const CLIPMAP_TRACE_WGSL: string = assemble([screenCommon, screenNormal, clipmap, skyLighting, clipmapTrace]);
+/** `VoxelGIEffect`'s trace from a clipmap's probes (Rust `gi::effect::CLIPMAP_PROBE_TRACE_WGSL`). */
+export const CLIPMAP_PROBE_TRACE_WGSL: string = assemble([screenCommon, screenNormal, skyLighting, clipmapProbes, clipmapProbeTrace]);

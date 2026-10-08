@@ -131,7 +131,7 @@ export class VolumeLayout {
 }
 
 /** Bytes of the WGSL `VoxelVolume` (voxel_volume.wgsl; Rust `VoxelVolumeGpu`). */
-const VOXEL_VOLUME_BYTES = 48;
+export const VOXEL_VOLUME_BYTES = 48;
 
 /**
  * A voxel volume of the scene's light, the core every voxel-GI producer writes and every

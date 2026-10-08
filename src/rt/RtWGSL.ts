@@ -13,7 +13,7 @@ import rtGather from '../../rust/kansei-core/src/rt/shaders/rt_gather.wgsl?raw';
 import rtReflectCommon from '../../rust/kansei-core/src/rt/shaders/rt_reflect_common.wgsl?raw';
 import rtReflectTrace from '../../rust/kansei-core/src/rt/shaders/rt_reflect_trace.wgsl?raw';
 import rtReflectResolve from '../../rust/kansei-core/src/rt/shaders/rt_reflect_resolve.wgsl?raw';
-import { SKY_LIGHTING_WGSL, VOXEL_CONES_WGSL } from '../gi/GiWGSL';
+import { CLIPMAP_WGSL, SKY_LIGHTING_WGSL, VOXEL_CONES_WGSL } from '../gi/GiWGSL';
 
 /**
  * Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
@@ -67,6 +67,29 @@ fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, ma
 `;
 
 /**
+ * The voxel source's functions for the trace (`srcVoxelSize`, `srcHitRadiance`, `srcCone`), over a
+ * clipmap (`CLIPMAP_WGSL`'s group 0 bindings 50-57).
+ */
+const CLIPMAP_SOURCE_WGSL = /* wgsl */`
+fn srcVoxelSize(p: vec3f) -> f32 {
+    return clipVoxelSize(min(clipLevelAt(p, 0u, 1.0), clipmap.levelCount - 1u));
+}
+// The light leaving a surface at p (face normal nf) as the voxels hold it: the finest level's
+// sample a quarter voxel out of the surface (or in, where nothing is out), by its coverage.
+fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
+    let k = clipLevelAt(p, 0u, 1.0);
+    if (k >= clipmap.levelCount) { return vec3f(0.0); }
+    let size = clipVoxelSize(k);
+    var s = clipSample(k, p + nf * (0.25 * size));
+    if (s.a < 0.05) { s = clipSample(k, p - nf * (0.25 * size)); }
+    return s.rgb / max(s.a, 0.05) * clipmap.radianceScale;
+}
+fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
+    return clipConeTrace(origin, dir, n, tanHalf, srcVoxelSize(origin), startDist, maxDist, steps);
+}
+`;
+
+/**
  * The alpha test's texture and sampler (group 1 bindings 3 and 4) for `RtReflectionsEffect`'s
  * trace, which a `coveredWgsl` may sample.
  */
@@ -76,11 +99,12 @@ const ALPHA_BINDINGS_WGSL = '@group(1) @binding(3) var kansei_rt_alpha_texture :
 export const RT_DEFAULT_COVERED_WGSL = 'fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {\n    return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;\n}\n';
 
 /**
- * `RtReflectionsEffect`'s trace over a voxel volume, with `covered` (`kansei_rt_covered`). Rust:
- * `rt::effect::trace_wgsl(false, covered)` (the clipmap source comes with G-4).
+ * `RtReflectionsEffect`'s trace over a voxel clipmap (`clipmap`) or volume, with `covered`
+ * (`kansei_rt_covered`). Rust: `rt::effect::trace_wgsl(clipmap, covered)`.
  */
-export function rtReflectTraceWgsl(covered: string): string {
-    return `${SKY_LIGHTING_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${VOXEL_CONES_WGSL}${VOLUME_SOURCE_WGSL}\n${rtReflectTrace}`;
+export function rtReflectTraceWgsl(covered: string, clipmap: boolean = false): string {
+    const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}` : `${VOXEL_CONES_WGSL}${VOLUME_SOURCE_WGSL}`;
+    return `${SKY_LIGHTING_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${source}\n${rtReflectTrace}`;
 }
 
 /** `RtReflectionsEffect`'s resolve. */

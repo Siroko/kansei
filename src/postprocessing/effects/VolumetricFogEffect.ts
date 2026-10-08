@@ -6,6 +6,7 @@ import { FroxelGrid } from '../../froxels/FroxelGrid';
 import { ShadowMap } from '../../shadows/ShadowMap';
 import { CubeMapShadowMap } from '../../shadows/CubeMapShadowMap';
 import type { SkyOcclusion } from '../../shadows/SkyOcclusion';
+import type { ClipmapProbes } from '../../gi/ClipmapProbes';
 import type { SpotShadowAtlas } from '../../shadows/SpotShadowAtlas';
 import { COMPUTE_SHADOWS_WGSL, ComputeShadows, SHADOW_MAP } from '../../shadows/ComputeShadows';
 import type { CascadedShadowSource } from '../../shadows/ComputeShadows';
@@ -245,9 +246,9 @@ interface ShaftsGpu {
  * composited over the scene.
  *
  * The renderer's spot lights (`setSpotLights`) scatter in their cones, in the froxels or
- * raymarched per pixel (`spotScattering`). Its clipmap probes are bound to stand-ins (none) until
- * those land in the TS engine. The sky occlusion (`setSkyOcclusion`) dims the sky lighting only,
- * so it shows once the fog has a sky (`setSkyLighting`).
+ * raymarched per pixel (`spotScattering`). The sky occlusion (`setSkyOcclusion`) dims the sky
+ * lighting only, so it shows once the fog has a sky (`setSkyLighting`); a voxel clipmap's probes
+ * (`setClipmapProbes`) replace that ambient where they reach.
  */
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -290,6 +291,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _cubeMapShadowMap: CubeMapShadowMap | null = null;
     /** The sky occlusion's volume and parameters (`setSkyOcclusion`). */
     private _skyOcclusion: { volume: GPUTextureView; params: GPUBuffer } | null = null;
+    /** A voxel clipmap's probes' grid and buffer (`setClipmapProbes`). */
+    private _clipmapProbes: [GPUBuffer, GPUBuffer] | null = null;
     private _skyLighting: GPUBuffer | null = null;
     /** The injection bind group is stale (a sky or sky occlusion bound, the volume buffer grown). */
     private _injectBGDirty = false;
@@ -416,6 +419,19 @@ class VolumetricFogEffect extends PostProcessingEffect {
      */
     setSkyOcclusion(skyOcclusion: SkyOcclusion | null): void {
         this._skyOcclusion = skyOcclusion ? { volume: skyOcclusion.volume, params: skyOcclusion.params } : null;
+        this._injectBGDirty = true;
+    }
+
+    /**
+     * Light the fog with a voxel clipmap's irradiance probes (`SceneVoxelClipmap.probes`) where
+     * they reach, in place of the sky dimmed by the sky occlusion: the sky past the trees and the
+     * light the scene round each froxel bounces (a sunlit clearing glows into the mist over it),
+     * convolved with the fog's phase function, times `skyAmbientScale`. Past the probes the sky's
+     * light stays (`setSkyLighting`, `setSkyOcclusion`). Null goes back to it. Rust:
+     * `set_clipmap_probes`.
+     */
+    setClipmapProbes(probes: ClipmapProbes | null): void {
+        this._clipmapProbes = probes ? [probes.gridBuffer, probes.probeBuffer] : null;
         this._injectBGDirty = true;
     }
 
@@ -593,8 +609,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 { binding: 18, resource: this._skyOcclusion?.volume ?? this._noOcclusionVolume!.createView() },
                 { binding: 19, resource: this._accumSampler! },
                 { binding: 20, resource: { buffer: this._skyOcclusion?.params ?? this._noOcclusionParams! } },
-                { binding: 21, resource: { buffer: this._noClipProbeGrid! } },
-                { binding: 22, resource: { buffer: this._noClipProbes! } },
+                { binding: 21, resource: { buffer: this._clipmapProbes?.[0] ?? this._noClipProbeGrid! } },
+                { binding: 22, resource: { buffer: this._clipmapProbes?.[1] ?? this._noClipProbes! } },
                 ...this._shadows.entries(),
             ],
         });
@@ -627,7 +643,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         const u32 = new Uint32Array(this._mediaParams);
         f32.set(this.albedo, 0);
         f32[3] = this.skyAmbientScale;
-        u32.set([count, this._skyLighting ? 1 : 0, 0, 0], 4);
+        u32.set([count, this._skyLighting ? 1 : 0, this._clipmapProbes ? 1 : 0, 0], 4);
         device.queue.writeBuffer(this._mediaParamsBuffer!, 0, this._mediaParams);
     }
 

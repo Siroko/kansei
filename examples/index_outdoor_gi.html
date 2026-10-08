@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - outdoor GI</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    #panel {
+      position: fixed; right: 12px; top: 12px; color: #ddd; font: 12px/1.6 monospace;
+      background: rgba(0, 0, 0, 0.6); padding: 8px 10px; border-radius: 4px;
+    }
+    #panel label { display: flex; justify-content: space-between; gap: 10px; }
+    #panel select, #panel input { font: inherit; }
+    #stats { position: fixed; left: 8px; top: 8px; margin: 0; padding: 6px 8px; color: #e8f0ff; font: 12px/1.35 ui-monospace, Menlo, monospace;
+      background: rgba(0, 0, 0, 0.6); white-space: pre; display: none; }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <label>gi <select id="gi"><option>off</option><option>skyocc</option><option>visibility</option><option>cones</option><option>probes</option></select></label>
+    <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option></select></label>
+    <label>camera <select id="cam"><option>road</option><option>clearing</option><option>forest</option><option>high</option><option>fly</option></select></label>
+    <label>sun <input type="range" id="elevation" min="-4" max="60" step="0.5"></label>
+  </div>
+  <pre id="stats"></pre>
+  <script type="module">
+    // Outdoor GI: the Rust `outdoor-gi` example (rust/kansei-wasm/examples/outdoor-gi) on the TS
+    // engine. A forest valley 1.3 km across under a low sun, with voxel GI in a clipmap round the
+    // camera (`Renderer.enableVoxelClipmap`): the sky's light reaches the forest floor and the road
+    // only where the canopy and the terrain let it through, and the sunlit ground and trees light
+    // what lies in their shade. With GI off, the materials' own sky light sees no trees.
+    //
+    // The terrain is 64 tiles of a height field. The spruces (17 576 by default) are instanced and
+    // culled on the GPU per view, with dithered crossfades between their LODs: near ones are cards
+    // of needle sprays (cut out by an alpha test, in their shadows and voxels too), farther ones two
+    // LODs of cone meshes. The clipmap voxelizes them through its own cull views (`withGiLodRange`):
+    // the cards within 20 m, the middle cones to 60 m, the coarsest past that. The sun shadows
+    // through four cascades out to 160 m; the sky is an atmosphere with its aerial perspective.
+    //
+    // The Rust example draws the near cards with cluster LOD and voxelizes their cut; the TS engine
+    // has no cluster LOD yet (V-5), so here the cards are drawn and voxelized as their whole mesh.
+    //
+    // The GI modes (gi=) compare what lights the shade: `off` the materials' own sky light (the
+    // whole sky); `skyocc` that dimmed by the top-down sky occlusion (`enableSkyOcclusion`);
+    // `visibility` dimmed by the sky visibility the clipmap's probes measure, in the material
+    // (`kansei_clipmap_sky_visibility`); `cones` voxel GI on screen, six cones a pixel through the
+    // clipmap (`VoxelGIEffect.withClipmap`); `probes` the same light from the clipmap's irradiance
+    // probes (`setClipmapProbes`). With `fog=<density>` the mist's ambient comes from the probes in
+    // the clipmap's modes (`VolumetricFogEffect.setClipmapProbes`). With `reflect=1` the road is wet
+    // and reflects the forest, traced through a grid of the scene's triangles round the camera
+    // (`enableRtGrid`, `RtReflectionsEffect.withClipmap`), the hits lit by the clipmap.
+    //
+    // URL parameters, as the Rust example's: gi=off|skyocc|visibility|cones|probes (default cones),
+    // view=lit|indirect|voxels, cam=road|clearing|forest|high|fly, elevation=<degrees> (16),
+    // bearing=<degrees> (160), ev=<EV100>, fog=<density>, trees=<n> (20000), cards=0 (cone meshes
+    // near too), crown_opacity=<0..1> (0.35), levels=<n> (5), res=<voxels> (64), vox=<metres> (0.5),
+    // lit=<n> (2), probes=<n> (8192), coneshadows=off|fallback|always, bounce=<share>,
+    // shadowsteps=<n>, intensity=<scale>, shadow_far=<metres> (160), taa=0, reflect=1 (wet=all,
+    // wet_f0, wet_rough, rt_view=lit|reflection|mirror|cost, rt_trace=voxels, rt_alpha=0,
+    // rt_res=quarter), rt=1 (the grid alone), rt_cell=<metres>, rt_rebuild=1, stats=1 (overlay:
+    // the clipmap, the frame interval and each pass's GPU time), ui=0, dpr=<ratio>; profile=1 and
+    // bench=1 through profile-hud.js. `window.kansei` holds the setters and `info()`.
+    import { Canvas, run, param, paramOr, flag, setText } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { BindingLayouts } from '../src/materials/Binding'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Geometry } from '../src/buffers/Geometry'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { CylinderGeometry } from '../src/geometries/CylinderGeometry'
+    import { HeightfieldGeometry } from '../src/geometries/HeightfieldGeometry'
+    import { IcosphereGeometry } from '../src/geometries/IcosphereGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { SpruceGeometry } from '../src/geometries/SpruceGeometry'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { hash01 } from '../src/math/hash01'
+    import { InstanceCulling, LOD_FADE_WGSL } from '../src/culling/InstanceCulling'
+    import { SKY_OCCLUSION_WGSL } from '../src/shadows/SkyOcclusion'
+    import { CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL, MOTION_VECTORS_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { CLIPMAP_PROBES_WGSL, VOXEL_WRITE_WGSL } from '../src/gi/GiWGSL'
+    import { VoxelGIEffect } from '../src/gi/VoxelGIEffect'
+    import { SkyAtmosphere } from '../src/atmosphere/SkyAtmosphere'
+    import { directionFromElevationBearing } from '../src/atmosphere/AtmosphereParams'
+    import { SKY_LIGHTING_WGSL } from '../src/atmosphere/AtmosphereWGSL'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { AtmosphereEffect } from '../src/postprocessing/effects/AtmosphereEffect'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { TemporalAAEffect } from '../src/postprocessing/effects/TemporalAAEffect'
+    import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, LENS_ATTENUATION_UE4 } from '../src/postprocessing/effects/ToneMapEffect'
+    import { RtPlacement } from '../src/rt/RtGrid'
+    import { RtReflectionsEffect } from '../src/rt/RtReflectionsEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
+
+    // ── the valley ────────────────────────────────────────────────────────────────────────────
+    // The road's centre line across the valley: x at z (metres). Kept in step with ROAD_WGSL.
+    const roadX = (z) => 22 * Math.sin(z / 85) + 9 * Math.sin(z / 37 + 1.3);
+    const ROAD_WGSL = /* wgsl */`
+      fn road_x(z: f32) -> f32 {
+          return 22.0 * sin(z / 85.0) + 9.0 * sin(z / 37.0 + 1.3);
+      }
+    `;
+    // The clearing beside the road: its centre and radius.
+    const CLEARING = [45, 60, 26];
+    const smoothstep = (e0, e1, x) => {
+      const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1);
+      return t * t * (3 - 2 * t);
+    };
+    // The valley: hills rising away from the road, bumps everywhere but on the road's bed.
+    function height(x, z) {
+      const u = x - roadX(z);
+      const valley = 32 * (1 - Math.exp(-((u / 210) ** 2)));
+      const bumps = 7 * Math.sin(x / 97 + 0.4) * Math.cos(z / 131) + 4 * Math.sin((x - z) / 61) + 1.6 * Math.sin(x / 23) * Math.sin(z / 29);
+      const bed = smoothstep(4, 22, Math.abs(u));
+      return valley + bumps * (0.25 + 0.75 * bed);
+    }
+    // The layer the trees are on besides the default one: the canopy the sky occlusion sees.
+    const TREE_LAYER = 1 << 1;
+    // Half the side of the terrain (metres) and its tiles per side.
+    const WORLD = 640;
+    const TILES = 8;
+
+    // The sky light every surface receives, by the page's GI mode: the sky's SH whole (its own
+    // ambient: off, and the voxel GI's modes, which replace it on screen), dimmed by the top-down
+    // sky occlusion, or by the sky visibility the clipmap's probes measure. Group 0 bindings 1 (the
+    // sky) and 2-7. After SKY_LIGHTING_WGSL, SKY_OCCLUSION_WGSL and CLIPMAP_PROBES_WGSL.
+    const AMBIENT_WGSL = /* wgsl */`
+      struct Ambient { mode: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+      @group(0) @binding(1) var<uniform> sky: SkyLighting;
+      @group(0) @binding(2) var<uniform> ambient: Ambient;
+      @group(0) @binding(3) var sky_volume: texture_3d<f32>;
+      @group(0) @binding(4) var sky_sampler: sampler;
+      @group(0) @binding(5) var<uniform> sky_occlusion: SkyOcclusionParams;
+      @group(0) @binding(6) var<uniform> kansei_clip_probe_grid: ClipProbeGrid;
+      @group(0) @binding(7) var<storage, read> kansei_clip_probes: array<vec4<f32>>;
+
+      fn sky_light(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+          let e = skyIrradiance(sky, n);
+          switch (ambient.mode) {
+              case 1u: { return e * skyVisibility(sky_volume, sky_sampler, sky_occlusion, world); }
+              case 2u: { return e * kansei_clipmap_sky_visibility(world, n); }
+              default: { return e; }
+          }
+      }
+    `;
+
+    // Lambertian surfaces lit by the sun (its cascades) and the sky (AMBIENT_WGSL's `sky_light`),
+    // writing the GBuffer's albedo and normal for the GI. ALBEDO (string replaced) is a function
+    // `surface_albedo(world, n) -> vec3f` and `surface_specular(world, n) -> vec2f`, a wet
+    // surface's F0 and roughness (0 when dry) for the ray-traced reflections; the voxel entry
+    // writes the same albedo into the GI's voxels.
+    const GROUND_WGSL = /* wgsl */`
+      struct Surface { albedo: vec4<f32>, road: vec4<f32>, rock: vec4<f32>, wet: vec4<f32> };
+      @group(0) @binding(0) var<uniform> surface: Surface;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
+      struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32> };
+
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+          var out: VOut;
+          let world = world_matrix * v.position;
+          out.clip = projection_matrix * view_matrix * world;
+          out.world = world.xyz;
+          out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+          return out;
+      }
+
+      ALBEDO
+
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+          let n = normalize(in.normal);
+          let albedo = surface_albedo(in.world, n);
+          let sun = kansei_cascades.lightColor * max(dot(n, -kansei_cascades.lightDirection), 0.0) * kansei_sun_shadow(in.world, n, in.clip.xy);
+          // a wet surface's reflectance and roughness, for the ray-traced reflections (F0 0: none)
+          let wet = surface_specular(in.world, n);
+          return kansei_gbuffer_out_specular(albedo / 3.14159265 * (sun + sky_light(in.world, n)), vec3<f32>(0.0), n, albedo, wet.x, wet.y);
+      }
+
+      @fragment
+      fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
+          kansei_voxel_write(in.clip, front, surface_albedo(in.world, normalize(in.normal)), vec3<f32>(0.0));
+      }
+    `;
+
+    // The terrain's albedo: grass, the road's dirt within 3.5 m of its centre, rock on steep slopes.
+    const TERRAIN_ALBEDO_WGSL = /* wgsl */`
+      fn surface_albedo(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+          let road = 1.0 - smoothstep(2.8, 4.0, abs(world.x - road_x(world.z)));
+          let rock = smoothstep(0.75, 0.6, n.y);
+          // a little variation in the grass
+          let variation = 0.85 + 0.3 * fract(sin(dot(floor(world.xz / 3.0), vec2<f32>(12.9898, 78.233))) * 43758.5453);
+          return mix(mix(surface.albedo.rgb * variation, surface.road.rgb, road), surface.rock.rgb, rock);
+      }
+
+      // wet: the road's bed (surface.wet.x, F0) where it is level, the rest by surface.wet.y
+      fn surface_specular(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+          let road = 1.0 - smoothstep(2.8, 4.0, abs(world.x - road_x(world.z)));
+          let level = smoothstep(0.85, 0.95, n.y);
+          return vec2<f32>(mix(surface.wet.y, surface.wet.x * level, road), surface.wet.z);
+      }
+    `;
+    // A constant albedo (rocks, the cabin).
+    const CONSTANT_ALBEDO_WGSL = /* wgsl */`
+      fn surface_albedo(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+          return surface.albedo.rgb;
+      }
+
+      fn surface_specular(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+          return surface.wet.yz;
+      }
+    `;
+
+    // Spruces placed by instance records of 32 bytes (base xyz, height; yaw, tint, -, -) plus the
+    // crossfade's fade (36 bytes as culled), lit as GROUND_WGSL's surfaces; the fade drops pixels
+    // in every pass but the voxels'. Two kinds (`bark.w`): SpruceGeometry's cones, bark within
+    // 0.045 of the axis and needles outside it; or `cardSpruce`'s cards, bark where u is past 1.5
+    // and needle sprays cut out of the cards by the needle texture's alpha, in every pass (the
+    // voxels' too: their area is the sprays').
+    const TREE_WGSL = /* wgsl */`
+      struct Tree { bark: vec4<f32>, needles: vec4<f32> };
+      @group(0) @binding(0) var<uniform> tree: Tree;
+      @group(0) @binding(8) var needle_texture: texture_2d<f32>;
+      @group(0) @binding(9) var needle_sampler: sampler;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      struct VIn {
+          @location(0) position: vec4<f32>,
+          @location(1) normal: vec3<f32>,
+          @location(2) uv: vec2<f32>,
+          @location(3) place: vec4<f32>,
+          @location(4) extra: vec4<f32>,
+          @location(5) fade: f32,
+      };
+      struct VOut {
+          @builtin(position) @invariant clip: vec4<f32>,
+          @location(0) world: vec3<f32>,
+          @location(1) normal: vec3<f32>,
+          @location(2) radius: f32,
+          @location(3) tint: f32,
+          @location(4) fade: f32,
+          @location(5) up: f32,
+          @location(6) uv: vec2<f32>,
+      };
+
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+          // a spruce place.w tall, a little wider or narrower by its tint, turned by its yaw
+          let width = place_width(v.extra.y);
+          let s = vec3<f32>(width, 1.0, width) * v.place.w;
+          let c = cos(v.extra.x);
+          let sn = sin(v.extra.x);
+          let q = v.position.xyz * s;
+          let local = vec3<f32>(c * q.x + sn * q.z, q.y, -sn * q.x + c * q.z) + v.place.xyz;
+          let m = v.normal / vec3<f32>(width, 1.0, width);
+          let n = vec3<f32>(c * m.x + sn * m.z, m.y, -sn * m.x + c * m.z);
+          let world = world_matrix * vec4<f32>(local, 1.0);
+          var out: VOut;
+          out.clip = projection_matrix * view_matrix * world;
+          out.world = world.xyz;
+          out.normal = (normal_matrix * vec4<f32>(n, 0.0)).xyz;
+          out.radius = length(v.position.xz);
+          out.tint = v.extra.y;
+          out.fade = v.fade;
+          out.up = v.position.y;
+          out.uv = v.uv;
+          return out;
+      }
+
+      fn place_width(tint: f32) -> f32 {
+          return 0.85 + 0.3 * tint;
+      }
+
+      fn is_bark(in: VOut) -> bool {
+          return select((in.radius < 0.045), (in.uv.x > 1.5), (tree.bark.w > 0.5));
+      }
+
+      fn tree_albedo(in: VOut) -> vec3<f32> {
+          if (is_bark(in)) { return tree.bark.rgb; }
+          // lighter toward the tips of the whorls and the top
+          return tree.needles.rgb * (0.8 + 0.4 * in.tint) * (0.8 + 0.35 * in.up);
+      }
+
+      // Whether the needle sprays cover this point of a card (always on bark and cones). alpha is
+      // the needle texture's there, sampled in uniform control flow.
+      fn covered(in: VOut, alpha: f32) -> bool {
+          return tree.bark.w < 0.5 || in.uv.x > 1.5 || alpha >= 0.5;
+      }
+
+      @fragment
+      fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferOut {
+          let alpha = textureSample(needle_texture, needle_sampler, in.uv).a;
+          if (kansei_lod_fade_discard(in.fade, in.clip.xy, kansei_camera_temporal.frame) || !covered(in, alpha)) { discard; }
+          var n = normalize(in.normal);
+          if (!front) { n = -n; }
+          let albedo = tree_albedo(in);
+          // needles let a little light through: some of the sun on the far side
+          let ndl = dot(n, -kansei_cascades.lightDirection);
+          let wrap = select(max(ndl, 0.0), max(ndl, 0.0) * 0.8 + 0.2 * abs(ndl), in.radius >= 0.045);
+          let sun = kansei_cascades.lightColor * wrap * kansei_sun_shadow(in.world, n, in.clip.xy);
+          return kansei_gbuffer_out(albedo / 3.14159265 * (sun + sky_light(in.world, n)), vec3<f32>(0.0), n, albedo);
+      }
+
+      @fragment
+      fn shadow_fragment(in: VOut) {
+          let alpha = textureSample(needle_texture, needle_sampler, in.uv).a;
+          if (kansei_lod_fade_discard(in.fade, in.clip.xy, kansei_camera_temporal.frame) || !covered(in, alpha)) { discard; }
+      }
+
+      @fragment
+      fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
+          // the sprays' area alone: the cut-out texels write nothing
+          let alpha = textureSample(needle_texture, needle_sampler, in.uv).a;
+          kansei_voxel_write_coverage(in.clip, front, tree_albedo(in), vec3<f32>(0.0), select(0.0, 1.0, covered(in, alpha)));
+      }
+    `;
+
+    const GRASS = [0.1, 0.13, 0.055];
+    const ROAD = [0.22, 0.19, 0.15];
+    const ROCK = [0.24, 0.23, 0.21];
+    const BARK = [0.11, 0.085, 0.065];
+    const NEEDLES = [0.045, 0.075, 0.035];
+
+    // The spruce LODs: their mesh ('cards', or SpruceGeometry's cones: segments, rings, cones), their
+    // bands on screen and in voxel GI's views (from the camera, metres), and the crossfade. Near the
+    // camera the cards, voxelized within 20 m (the clipmap's finest levels); then the cones, the
+    // coarsest at every distance past 60 m. With cards=0 the finest cones stand in for the cards
+    // (and stay out of the voxels: their detail is finer than them).
+    const LODS = [
+      ['cards', [0, 45], [0, 20]],
+      [[8, 2, 6], [45, 160], [20, 60]],
+      [[5, 1, 4], [160, Infinity], [60, Infinity]],
+    ];
+    const CROSSFADE = 8;
+    // How much of the light the crowns' voxels stop for their area: the meshes are closed cones
+    // standing for needles light passes between.
+    const CROWN_OPACITY = 0.35;
+
+    // Where a spruce's record puts a point of its mesh, as TREE_WGSL's vertex_main does (a little
+    // wider or narrower by its tint), for the ray tracing grid.
+    const TREE_PLACEMENT_WGSL = /* wgsl */`
+      fn kansei_rt_place(record: u32, p: vec3f) -> vec3f {
+          let place = kansei_rt_record_vec4(record, 0u);
+          let extra = kansei_rt_record_vec4(record, 4u);
+          let width = 0.85 + 0.3 * extra.y;
+          let q = p * vec3f(width, 1.0, width) * place.w;
+          let c = cos(extra.x);
+          let s = sin(extra.x);
+          return vec3f(c * q.x + s * q.z, q.y, -s * q.x + c * q.z) + place.xyz;
+      }
+    `;
+    // Where a spruce card's surface is, for the reflections' alpha test (TREE_WGSL's `covered`).
+    const CARD_COVERED_WGSL = /* wgsl */`
+      fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {
+          if (uv.x > 1.5) { return true; }
+          return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;
+      }
+    `;
+
+    // A needle spray, 32 x 64 texels (u across the spray, v from its base to its tip): a twig down
+    // the middle and needles slanting off it toward the tip, the spray tapering at both ends; alpha
+    // 1 on them, 0 between. White (the material tints it).
+    function needleTexels() {
+      const [w, h] = [32, 64];
+      const texels = new Uint8Array(w * h * 4);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const [u, v] = [(x + 0.5) / w, (y + 0.5) / h];
+          const across = Math.abs(u - 0.5);
+          const halfWidth = 0.46 * Math.pow(Math.sin(Math.PI * Math.min(v, 0.97)), 0.6);
+          const twig = across < 0.04;
+          const needle = across < halfWidth && ((v * 18 + across * 2.2) % 1) < 0.42;
+          texels.set([255, 255, 255, twig || needle ? 255 : 0], (y * w + x) * 4);
+        }
+      }
+      return [w, h, texels];
+    }
+
+    // A spruce 1 high of needle-spray cards: a trunk (its u past 1.5, for the material's bark) under
+    // whorls of sprays, each branch two crossed cards from the trunk out to the crown's cone,
+    // drooping, the crown as SpruceGeometry's (0.24 wide at its base, at 0.15 up, to a point).
+    function cardSpruce() {
+      const trunk = new CylinderGeometry(0.03, 0.008, 0.98, 8, 4);
+      for (let i = 7; i < trunk.vertices.length; i += 9) trunk.vertices[i] += 2;
+      const vertices = [], indices = [];
+      const norm = (v) => { const l = Math.hypot(...v); return v.map((c) => c / l); };
+      const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+      const whorls = 16;
+      for (let k = 0; k < whorls; k++) {
+        const f = k / whorls;
+        const y = 0.16 + 0.8 * f;
+        const reach = 0.25 * Math.pow(1 - f, 0.9) + 0.02;
+        const branches = 7 - Math.floor(k / 5);
+        for (let b = 0; b < branches; b++) {
+          const a = (b + 0.5 * (k % 2)) / branches * Math.PI * 2 + hash01(k * 31 + b) * 0.4;
+          const out = norm([Math.cos(a), -0.25 - 0.2 * f, Math.sin(a)]);
+          const side = [-Math.sin(a), 0, Math.cos(a)];
+          const width = 0.35 * reach + 0.02;
+          // two crossed cards along the branch: flat, and tilted about it
+          [0, 1.1].forEach((tilt, k2) => {
+            const up = norm(cross(out, side));
+            const across = side.map((s, i) => (s * Math.cos(tilt) + up[i] * Math.sin(tilt)) * width);
+            const n = norm(cross(out, across));
+            const base = vertices.length / 9;
+            const root = [out[0] * 0.01, y + out[1] * 0.01, out[2] * 0.01];
+            for (const [s, t] of [[-1, 0], [1, 0], [1, 1], [-1, 1]]) {
+              const p = [0, 1, 2].map((i) => root[i] + out[i] * reach * t + across[i] * s * 0.5 + (i === 1 ? 0.02 * k2 : 0));
+              vertices.push(...p, 1, ...n, (s + 1) * 0.5, t);
+            }
+            indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+          });
+        }
+      }
+      const cards = Geometry.fromArrays('Cards', new Float32Array(vertices), new Uint32Array(indices));
+      const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+      return Geometry.merged('CardSpruce', [[trunk, identity], [cards, identity]]);
+    }
+
+    // The spruces' instance records: (base x, y, z, height), (yaw, tint, 0, 0), on a jittered 7 m
+    // grid, off the road and the clearing, thinned in patches; at most `count`.
+    function forest(count) {
+      const records = [];
+      const spacing = 7;
+      const n = Math.floor(2 * WORLD / spacing);
+      for (let k = 0; k < n * n; k++) {
+        const [i, j] = [k % n, Math.floor(k / n)];
+        const x = -WORLD + (i + 0.15 + 0.7 * hash01(k)) * spacing;
+        const z = -WORLD + (j + 0.15 + 0.7 * hash01(k + 7919)) * spacing;
+        if (Math.abs(x - roadX(z)) < 7.5 + 3 * hash01(k + 31) || Math.abs(x) > WORLD - 8 || Math.abs(z) > WORLD - 8) continue;
+        const [cx, cz, r] = CLEARING;
+        if (Math.hypot(x - cx, z - cz) < r + 4 * hash01(k + 47)) continue;
+        // patches thinner and denser than the rest
+        const density = 0.55 + 0.45 * (Math.sin(x / 83) * Math.cos(z / 71) + 0.4 * Math.sin((x + z) / 37));
+        if (hash01(k + 101) > density) continue;
+        const h = 14 + 14 * Math.pow(hash01(k + 13), 0.7);
+        records.push(x, height(x, z) - 0.3, z, h, hash01(k + 3) * Math.PI * 2, hash01(k + 5), 0, 0);
+        if (records.length >= count * 8) break;
+      }
+      return new Float32Array(records);
+    }
+
+    // EV100 for a sun `elevation` degrees up (index_sky's curve), opened up 1.8 stops for the
+    // forest's shade.
+    const autoEv100 = (elevation) => {
+      const curve = [[-8, 5], [-4, 7.3], [-2.5, 8.2], [0, 9.8], [2, 11.2], [6, 12.8], [15, 14.3], [40, 15]];
+      if (elevation <= curve[0][0]) return curve[0][1];
+      for (let i = 1; i < curve.length; i++) {
+        const [e0, v0] = curve[i - 1], [e1, v1] = curve[i];
+        if (elevation <= e1) return v0 + (v1 - v0) * (elevation - e0) / (e1 - e0);
+      }
+      return curve[curve.length - 1][1];
+    };
+    const forestEv100 = (elevation) => autoEv100(elevation) - 1.8;
+    const num = (name) => {
+      const v = param(name);
+      const n = v === null ? NaN : parseFloat(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    // ── the renderer: cascades, the voxel clipmap with its probes, the sky occlusion ───────────
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    const device = renderer.gpuDevice;
+    renderer.enableCascadedShadows({ maxDistance: paramOr('shadow_far', 160), casterDistance: 120 });
+    const gi = renderer.enableVoxelClipmap({
+      levels: paramOr('levels', 5),
+      resolution: paramOr('res', 64),
+      heightResolution: paramOr('res', 64) / 2,
+      voxelSize: paramOr('vox', 0.5),
+    });
+    // the film's sky occlusion, for comparison: the trees seen from above
+    const skyOcclusion = renderer.enableSkyOcclusion({ extentM: 320, minHeightM: -10, maxHeightM: 90, volumeSize: [128, 32], layerMask: TREE_LAYER });
+    // reflect=1: ray-traced reflections on the wet road (wet=all: everywhere), through a grid of the
+    // scene's triangles round the camera, 64 x 32 x 64 m (rt=1: the grid alone)
+    const reflect = flag('reflect', false);
+    const rt = flag('rt', false) || reflect;
+    const wet = !reflect ? [0, 0, 0, 0]
+      : param('wet') === 'all' ? [paramOr('wet_f0', 0.04), paramOr('wet_f0', 0.04), paramOr('wet_rough', 0.1), 0]
+      : [paramOr('wet_f0', 0.04), 0, paramOr('wet_rough', 0.1), 0];
+    if (rt) {
+      const cell = paramOr('rt_cell', 0.5);
+      const across = Math.round(64 / cell / 4) * 4;
+      renderer.enableRtGrid({ grid: { dims: [across, across / 2, across], cell, below: 0.25 }, clusterErrorCells: 1, rebuildEveryFrame: flag('rt_rebuild', false) });
+    }
+
+    const sky = new SkyAtmosphere(device);
+    sky.sun.illuminance = [100000, 100000, 100000];
+    gi.useSkyLighting(sky.bindings.skyLighting);
+    // lit=<levels a frame> (0: all), coneshadows=off|fallback|always, bounce=<share>, shadowsteps=<n>
+    gi.settings.levelsPerFrame = paramOr('lit', gi.settings.levelsPerFrame);
+    if (['off', 'fallback', 'always'].includes(param('coneshadows'))) gi.settings.coneShadows = param('coneshadows');
+    gi.settings.bounce = paramOr('bounce', gi.settings.bounce);
+    gi.settings.coneShadowSteps = paramOr('shadowsteps', gi.settings.coneShadowSteps);
+    const probes = gi.enableProbes({ probesPerFrame: paramOr('probes', 8192) });
+    const ambientMode = device.createBuffer({ label: 'AmbientMode', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // What every material's sky light reads (AMBIENT_WGSL): the sky, the GI mode, the sky occlusion
+    // and the clipmap's probes, group 0 bindings 1-7.
+    const fragment = GPUShaderStage.FRAGMENT;
+    const ambientBindings = [
+      { binding: 1, visibility: fragment, value: ComputeBuffer.fromExternal(sky.bindings.skyLighting, BufferBase.BUFFER_TYPE_UNIFORM) },
+      { binding: 2, visibility: fragment, value: ComputeBuffer.fromExternal(ambientMode, BufferBase.BUFFER_TYPE_UNIFORM) },
+      { binding: 3, visibility: fragment, value: Texture.fromView('SkyOcclusion', skyOcclusion.volumeTexture, skyOcclusion.volume), layout: BindingLayouts.texture3d() },
+      { binding: 4, visibility: fragment, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+      { binding: 5, visibility: fragment, value: ComputeBuffer.fromExternal(skyOcclusion.params, BufferBase.BUFFER_TYPE_UNIFORM) },
+      { binding: 6, visibility: fragment, value: ComputeBuffer.fromExternal(probes.gridBuffer, BufferBase.BUFFER_TYPE_UNIFORM) },
+      { binding: 7, visibility: fragment, value: ComputeBuffer.fromExternal(probes.probeBuffer, BufferBase.BUFFER_TYPE_READ_ONLY_STORAGE), layout: BindingLayouts.storage(true) },
+    ];
+    const AMBIENT = [SKY_LIGHTING_WGSL, SKY_OCCLUSION_WGSL, CLIPMAP_PROBES_WGSL, AMBIENT_WGSL].join('\n');
+    const uniform = (values) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array(values),
+    });
+    const groundMaterial = (label, albedoWgsl, albedo) => new Material(
+      [AMBIENT, CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL, VOXEL_WRITE_WGSL, ROAD_WGSL, GROUND_WGSL.replace('ALBEDO', albedoWgsl)].join('\n'),
+      {
+        label,
+        mrtOutputCount: 4,
+        voxelFragmentEntry: 'voxel_main',
+        bindings: [{ binding: 0, visibility: fragment, value: uniform([...albedo, 0, ...ROAD, 0, ...ROCK, 0, ...wet]) }, ...ambientBindings],
+      },
+    );
+    const [needleW, needleH, needleData] = needleTexels();
+    const needles = Texture.fromRGBA('NeedleSpray', needleW, needleH, needleData);
+    const treeMaterial = (label, cards) => new Material(
+      [AMBIENT, CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL, VOXEL_WRITE_WGSL, MOTION_VECTORS_WGSL, LOD_FADE_WGSL, TREE_WGSL].join('\n'),
+      {
+        label,
+        mrtOutputCount: 4,
+        cullMode: 'none',
+        shadowFragmentEntry: 'shadow_fragment',
+        voxelFragmentEntry: 'voxel_main',
+        bindings: [
+          { binding: 0, visibility: fragment, value: uniform([...BARK, cards ? 1 : 0, ...NEEDLES, 1]) },
+          ...ambientBindings,
+          { binding: 8, visibility: fragment, value: needles },
+          { binding: 9, visibility: fragment, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+        ],
+      },
+    );
+
+    // ── the scene ─────────────────────────────────────────────────────────────────────────────
+    const scene = new Scene();
+    let triangles = 0;
+    // the terrain, in tiles (the voxelizer skips those away from what it voxelizes)
+    const tile = 2 * WORLD / TILES;
+    for (let j = 0; j < TILES; j++) {
+      for (let i = 0; i < TILES; i++) {
+        const min = [-WORLD + i * tile, -WORLD + j * tile];
+        const geometry = new HeightfieldGeometry(min, [min[0] + tile, min[1] + tile], [80, 80], height).withLabel('Terrain');
+        triangles += geometry.indices.length / 3;
+        const r = new Renderable(geometry, groundMaterial('Terrain', TERRAIN_ALBEDO_WGSL, GRASS));
+        r.gi = { albedo: GRASS };
+        r.rt = rt ? { albedo: GRASS } : null;
+        scene.add(r);
+      }
+    }
+    // rocks along the road and a cabin in the clearing
+    const rockMaterial = groundMaterial('Rock', CONSTANT_ALBEDO_WGSL, ROCK);
+    for (let k = 0; k < 40; k++) {
+      const z = -200 + k * 10 + 6 * hash01(k);
+      const side = hash01(k + 9) > 0.5 ? 1 : -1;
+      const x = roadX(z) + side * (5 + 3 * hash01(k + 2));
+      const size = 0.4 + 1.4 * hash01(k + 4) ** 2;
+      const rock = new Renderable(new IcosphereGeometry(size, 2), rockMaterial);
+      rock.position.set(x, height(x, z) + 0.2 * size, z);
+      rock.scale.set(1, 0.6, 1.2);
+      rock.rotation.y = hash01(k + 6) * 3;
+      rock.gi = { albedo: ROCK };
+      rock.rt = rt ? { albedo: ROCK } : null;
+      scene.add(rock);
+    }
+    const [cx, cz] = CLEARING;
+    const ground = height(cx, cz);
+    for (const [size, offset, albedo] of [[[6, 3.2, 4.5], [0, 1.6, 0], [0.42, 0.18, 0.12]], [[6.6, 0.3, 5.4], [0, 3.5, 0], [0.2, 0.2, 0.22]]]) {
+      const part = new Renderable(new BoxGeometry(...size), groundMaterial('Cabin', CONSTANT_ALBEDO_WGSL, albedo));
+      part.position.set(cx + offset[0], ground + offset[1] - 0.3, cz + offset[2]);
+      part.rotation.y = 0.5;
+      part.gi = { albedo };
+      part.rt = rt ? { albedo } : null;
+      scene.add(part);
+    }
+
+    // the forest: three LODs of one spruce sharing the instances, each culled per view with
+    // crossfades at its bands' edges
+    const records = forest(paramOr('trees', 20000));
+    const trees = records.length / 8;
+    const attributes = [
+      { shaderLocation: 3, offset: 0, format: 'float32x4' },
+      { shaderLocation: 4, offset: 16, format: 'float32x4' },
+    ];
+    const source = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_STORAGE,
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_STORAGE,
+      buffer: records,
+      stride: 32,
+      attributes,
+    });
+    // as culled: the fade after the record
+    const culledLayout = source.withVertexLayout(36, [...attributes, { shaderLocation: 5, offset: 32, format: 'float32' }]);
+    const cardsOn = flag('cards', true);
+    for (const [kind, [near, far], [giNear, giFar]] of LODS) {
+      const cards = kind === 'cards' && cardsOn;
+      const cones = kind === 'cards' ? (cards ? null : [14, 5, 9]) : kind;
+      const giBand = kind === 'cards' && !cards ? [0, 0] : [giNear, giFar];
+      const mesh = cards ? cardSpruce() : new SpruceGeometry(...cones);
+      triangles += mesh.indices.length / 3 * trees;
+      // the cones stand for needles light passes between; the cards' sprays are the needles
+      const opacity = cards ? 1 : paramOr('crown_opacity', CROWN_OPACITY);
+      const r = new Renderable(new InstancedGeometry(mesh.withLabel(cards ? 'Spruce/Cards' : 'Spruce'), trees, [culledLayout]), treeMaterial('Spruce', cards));
+      r.gi = { albedo: NEEDLES, opacity };
+      // in the ray tracing grid: the cards' sprays cut out by the needles' alpha (layer 0)
+      if (rt) {
+        r.rt = cards ? { albedo: NEEDLES, alphaLayer: 0 } : { albedo: NEEDLES };
+        r.rtPlacement = RtPlacement.wgsl(TREE_PLACEMENT_WGSL);
+      }
+      // the canopy the sky occlusion sees from above (the terrain is not)
+      r.layers |= TREE_LAYER;
+      r.instanceCulling = new InstanceCulling(source, trees, 32, 0, 0.6)
+        .withRadiusScale(12)
+        .withBoundsShift([0, 0.5, 0])
+        .withBoundsBox([0.3, 0.5, 0.3])
+        .withLodRange(near, far)
+        .withGiLodRange(giBand[0], giBand[1])
+        .withCrossfade(CROSSFADE);
+      scene.add(r);
+    }
+
+    const sun = new DirectionalLight([0, -1, 0], [0, 0, 0], 1);
+    sun.castShadow = true;
+    scene.add(sun);
+
+    // ── the chain: the GI first (it lies on the surfaces under the aerial perspective), the
+    // reflections, the atmosphere, the fog, TAA, the display transform ──────────────────────────
+    const config = {
+      gi: ['off', 'skyocc', 'visibility', 'cones', 'probes'].includes(param('gi')) ? param('gi') : 'cones',
+      view: ['lit', 'indirect', 'voxels'].includes(param('view')) ? param('view') : 'lit',
+      elevation: num('elevation') ?? 16,
+      bearing: num('bearing') ?? 160,
+      cam: 'road',
+    };
+    const ev = () => num('ev') ?? forestEv100(config.elevation);
+    const tonemapOptions = () => ({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      exposure: exposureFromEV100(ev(), LENS_ATTENUATION_UE4),
+      exposureCompensation: 1,
+      tonemapper: ToneMapper.AcesFitted,
+    });
+    const tonemap = new ToneMapEffect(tonemapOptions());
+    const giEffect = VoxelGIEffect.withClipmap(gi.clipmap, { intensity: paramOr('intensity', 1) });
+    giEffect.setSkyLighting(sky.bindings.skyLighting);
+    const effects = [giEffect];
+    let reflections = null;
+    if (reflect) {
+      reflections = RtReflectionsEffect.withClipmap(gi.clipmap, renderer.rtGrid.handle, {
+        resolution: param('rt_res') === 'quarter' ? 'quarter' : 'half',
+        alphaTest: flag('rt_alpha', true),
+        coveredWgsl: CARD_COVERED_WGSL,
+      });
+      reflections.setSkyLighting(sky.bindings.skyLighting);
+      const alpha = device.createTexture({ label: 'NeedleSpray/Alpha', size: [needleW, needleH], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      device.queue.writeTexture({ texture: alpha }, needleData, { bytesPerRow: needleW * 4 }, [needleW, needleH]);
+      reflections.setAlphaTexture(alpha.createView());
+      reflections.view = ['lit', 'reflection', 'mirror', 'cost'].includes(param('rt_view')) ? param('rt_view') : 'lit';
+      reflections.heatScale = 0.5 / exposureFromEV100(ev(), LENS_ATTENUATION_UE4);
+      reflections.collectStats = flag('stats', false);
+      reflections.traceGrid = param('rt_trace') !== 'voxels';
+      effects.push(reflections);
+    }
+    effects.push(new AtmosphereEffect(sky));
+    // fog=<density>: mist in the valley, lit by the sun through the cascades and by the sky, or by
+    // the clipmap's probes in its modes (the light of the sunlit clearing, the sky past the trees)
+    let fog = null;
+    const fogDensity = num('fog') ?? 0;
+    if (fogDensity > 0) {
+      fog = new VolumetricFogEffect({
+        froxelGrid: new FroxelGrid(device, { near: 0.5, far: 240, temporal: true, blendFactor: 0.1 }),
+        cascadedShadowMap: renderer.cascadedShadowMap,
+        baseDensity: fogDensity,
+        heightFalloff: 0.06,
+        anisotropy: 0.55,
+        albedo: [0.9, 0.92, 0.95],
+      });
+      fog.setSkyLighting(sky.bindings.skyLighting);
+      effects.push(fog);
+    }
+    if (flag('taa', true)) effects.push(new TemporalAAEffect({ exposure: tonemap.totalExposure() }));
+    effects.push(tonemap);
+    const volume = new PostProcessingVolume(renderer, effects);
+    // the voxels' debug view: the GI effect's view of them and the display transform alone
+    const voxelsEffect = VoxelGIEffect.withClipmap(gi.clipmap);
+    voxelsEffect.showVoxels = true;
+    const debugTonemap = new ToneMapEffect(tonemapOptions());
+    const debugVolume = new PostProcessingVolume(renderer, [voxelsEffect, debugTonemap]);
+
+    const camera = new Camera(55, 0.2, 4000, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 0, 0), renderer.canvas, 10).withMousePan();
+    // Camera presets: target, distance, azimuth and elevation (radians).
+    const CAMERAS = {
+      road: [[6, 1.6, -10], 9, 2.6, 0.05],
+      clearing: [[45, 2, 60], 24, 1.1, 0.12],
+      forest: [[-40, 2, 30], 6, 0.4, 0.15],
+      high: [[0, 10, 0], 120, 2.4, 0.55],
+    };
+    // `fly`: the camera drives along the road at 12 m/s, so the clipmap's windows move
+    let fly = null;
+    function setCamera(name) {
+      fly = name === 'fly' ? 12 : null;
+      const [target, distance, azimuth, elevation] = CAMERAS[name] ?? CAMERAS.road;
+      controls.setView(new Vector3(target[0], height(target[0], target[2]) + target[1], target[2]), distance, azimuth, elevation);
+      camera.resetMotion();
+      giEffect.resetHistory();
+      voxelsEffect.resetHistory();
+      config.cam = name in CAMERAS || name === 'fly' ? name : 'road';
+    }
+
+    // Bring the clipmap, the materials' ambient and the chain to the GI mode and the view.
+    function apply() {
+      // the clipmap runs for its GI and its probes; the effect shows the GI on screen
+      const clipmap = ['visibility', 'cones', 'probes'].includes(config.gi);
+      const onScreen = config.gi === 'cones' || config.gi === 'probes';
+      gi.settings.enabled = clipmap;
+      device.queue.writeBuffer(ambientMode, 0, new Uint32Array([{ skyocc: 1, visibility: 2 }[config.gi] ?? 0, 0, 0, 0]));
+      // the fog: lit by the probes with the clipmap, by the sky dimmed by the sky occlusion with it
+      if (fog) {
+        fog.setClipmapProbes(clipmap ? probes : null);
+        fog.setSkyOcclusion(config.gi === 'skyocc' ? skyOcclusion : null);
+      }
+      giEffect.enabled = onScreen;
+      giEffect.setClipmapProbes(config.gi === 'probes' ? probes : null);
+      giEffect.showIndirect = config.view === 'indirect';
+      giEffect.resetHistory();
+      for (const key of ['gi', 'view', 'cam', 'elevation']) document.getElementById(key).value = config[key];
+    }
+    function setElevation(degrees) {
+      config.elevation = degrees;
+      for (const t of [tonemap, debugTonemap]) t.options.exposure = exposureFromEV100(ev(), LENS_ATTENUATION_UE4);
+    }
+
+    // ── stats and scripted captures ───────────────────────────────────────────────────────────
+    const stats = flag('stats', false) ? { since: performance.now(), frames: 0, frameMs: 0, gpuMs: 0, gpuSpanMs: 0, passes: [] } : null;
+    if (stats) {
+      renderer.setProfiling(true);
+      document.getElementById('stats').style.display = 'block';
+    }
+    const sum = (prefix) => (stats?.passes ?? []).filter(([label]) => label.startsWith(prefix)).reduce((s, [, ms]) => s + ms, 0);
+    const rtInfo = () => {
+      const grid = renderer.rtGrid;
+      if (!grid) return null;
+      const s = grid.stats;
+      return { triangles: s.grid.triangles, references: s.grid.references, big: s.grid.bigTriangles, sources: s.sources, rebuilt: s.rebuilt, rebuilds: s.rebuilds, cpuMs: +s.cpuMs.toFixed(3), mib: +(grid.memoryBytes() / (1 << 20)).toFixed(1) };
+    };
+    const info = () => {
+      const layout = gi.clipmap.layout;
+      const eye = camera.position;
+      return {
+        gi: config.gi, view: config.view, levels: layout.levels, dims: [...layout.dims], voxel: layout.voxelSize,
+        mib: +(gi.memoryBytes() / (1 << 20)).toFixed(1), filling: gi.filling, trees, triangles, elevation: config.elevation,
+        eye: [eye.x, eye.y, eye.z].map((v) => +v.toFixed(1)), stats: !!stats,
+        frameMs: +(stats?.frameMs ?? 0).toFixed(2), gpuMs: +(stats?.gpuMs ?? 0).toFixed(3), gpuSpanMs: +(stats?.gpuSpanMs ?? 0).toFixed(3),
+        voxelizeMs: +(sum('VoxelClipmap/Voxelize') + sum('VoxelClipmap/Dynamic')).toFixed(3),
+        injectMs: +sum('VoxelClipmap/Inject').toFixed(3), probesMs: +sum('VoxelClipmap/Probes').toFixed(3), screenMs: +sum('VoxelGI/Screen').toFixed(3),
+        rt: rtInfo(), rtMs: +(sum('Rt/Gather') + sum('Rt/Grid')).toFixed(3), reflectMs: +(sum('Rt/Trace') + sum('Rt/Resolve')).toFixed(3),
+        passes: (stats?.passes ?? []).map(([label, ms]) => [label, +ms.toFixed(3)]),
+      };
+    };
+    const set = (key) => (value) => { config[key] = value; apply(); };
+    window.kansei = {
+      info, setGi: set('gi'), setView: set('view'), setCamera, setElevation,
+      setStats: (on) => renderer.setProfiling(on),
+      setReflections: (on) => { if (reflections) { reflections.enabled = on; reflections.resetHistory(); } },
+      setReflectionView: (name) => { if (reflections) reflections.view = name; },
+      renderer, scene, camera, gi,
+    };
+    for (const key of ['gi', 'view']) document.getElementById(key).onchange = (e) => set(key)(e.target.value);
+    document.getElementById('cam').onchange = (e) => setCamera(e.target.value);
+    document.getElementById('elevation').oninput = (e) => setElevation(parseFloat(e.target.value));
+    if (!flag('ui', true)) document.getElementById('panel').style.display = 'none';
+
+    setCamera(param('cam') ?? 'road');
+    apply();
+    const hud = installProfileHud({ renderer, FrameTimer, AbBench });
+    console.log(`Kansei — Outdoor GI (TS) ready: ${JSON.stringify(info())}`);
+
+    let time = 0;
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      const dt = Math.min(Math.max(frame.dt, 0), 0.1);
+      time += dt;
+      if (fly !== null) {
+        // along the road, eyes 1.7 m up, looking ahead
+        const z = 200 - (time * fly) % 400;
+        const [x, ahead] = [roadX(z), z - 25];
+        camera.position.set(x, height(x, z) + 1.7, z);
+        camera.lookAt(new Vector3(roadX(ahead), height(roadX(ahead), ahead) + 1.2, ahead));
+      } else {
+        controls.update(dt);
+      }
+      const sunDir = directionFromElevationBearing(config.elevation, config.bearing);
+      sky.sun.direction = sunDir;
+      const eye = [camera.position.x, camera.position.y, camera.position.z];
+      sun.direction = [-sunDir[0], -sunDir[1], -sunDir[2]];
+      sun.color = sky.sunIlluminanceAt(eye);
+      sun.intensity = 1;
+      if (fog) {
+        fog.updateLights(scene.directionalLights, scene.pointLights);
+        fog.time = time;
+      }
+      sky.update(camera);
+      hud.begin(performance.now());
+      (config.view === 'voxels' && gi.settings.enabled ? debugVolume : volume).render(scene, camera);
+      hud.end(performance.now());
+      if (stats) {
+        stats.frames++;
+        const now = performance.now();
+        if (now - stats.since >= 1000) {
+          stats.frameMs = (now - stats.since) / stats.frames;
+          stats.frames = 0;
+          stats.since = now;
+          const profile = renderer.takeProfile();
+          if (profile.gpuFrames > 0) {
+            stats.passes = profile.topPasses(Infinity);
+            stats.gpuMs = profile.gpuMs;
+            stats.gpuSpanMs = profile.gpuSpanMs;
+          }
+          const i = info();
+          setText('stats', [
+            `clipmap ${i.levels} x [${i.dims}] of ${i.voxel} m, ${i.mib} MiB${i.filling ? ', filling' : ''}`,
+            `${trees} trees, ${(triangles / 1e6).toFixed(1)} M triangles`,
+            `frame ${i.frameMs} ms, GPU ${i.gpuMs} ms of passes (span ${i.gpuSpanMs})`,
+            `voxelize ${i.voxelizeMs}  inject ${i.injectMs}  probes ${i.probesMs}  screen ${i.screenMs} ms`,
+            ...stats.passes.slice(0, 12).map(([label, ms]) => `${label.padEnd(32)} ${ms.toFixed(3)}`),
+          ].join('\n'));
+        }
+      }
+    });
+  </script>
+</body>
+
+</html>

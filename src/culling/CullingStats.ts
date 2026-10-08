@@ -31,7 +31,7 @@ export function emptyCullStats(): CullStats {
  * (`Renderer.enableSkyOcclusion`), a layer of the spot shadow atlas
  * (`Renderer.enableSpotShadows`), or the ray tracing grid's box (`Renderer.enableRtGrid`).
  */
-export type CullViewKind = 'camera' | 'shadow' | `cascade${number}` | 'skyOcclusion' | 'spot' | 'rtGrid';
+export type CullViewKind = 'camera' | 'shadow' | `cascade${number}` | 'skyOcclusion' | 'spot' | `voxelGi${number}` | 'rtGrid';
 
 /** Instance culling statistics of a recent frame, per view. */
 export class CullingStats {

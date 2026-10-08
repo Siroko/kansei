@@ -119,7 +119,12 @@ export class MeshVoxelizer {
     static readonly SAMPLE_COUNT = 4;
 
     /** Tells voxelizers apart in the materials' pipeline caches. */
-    public readonly id = nextVoxelizerId++;
+    public readonly id = MeshVoxelizer.nextId();
+
+    /** A new voxelizer id (the clipmap's voxelizer takes one too). Rust: `gi::voxelize::next_voxelizer_id`. */
+    static nextId(): number {
+        return nextVoxelizerId++;
+    }
     /** Group 3 of the voxelization pipelines: the axis' parameters (100), the draw's surface at a dynamic offset (101), the surfaces written (102). */
     public readonly bindGroupLayout: GPUBindGroupLayout;
     /** The engine's fragment stage (`voxel_fragment`). */

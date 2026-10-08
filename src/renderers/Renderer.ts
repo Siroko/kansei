@@ -26,6 +26,7 @@ import type { DepthPyramid } from "../culling/DepthPyramid";
 import { CullViewKind, CullingStats, StatsReadback } from "../culling/CullingStats";
 import { mat4 } from "gl-matrix";
 import { SceneVoxelGi, SceneVoxelGiOptions } from "../gi/SceneVoxelGi";
+import { SceneVoxelClipmap, SceneVoxelClipmapOptions } from "../gi/SceneVoxelClipmap";
 import { bakeImpostor } from "../impostors/bakeImpostor";
 import type { Impostor, ImpostorOptions } from "../impostors/Impostor";
 import { SceneRtGrid, SceneRtGridOptions } from "../rt/SceneRtGrid";
@@ -502,6 +503,47 @@ class Renderer {
 
     /** The scene's voxel GI, once `enableVoxelGI` has been called. */
     public get voxelGI(): SceneVoxelGi | null { return this._voxelGI; }
+
+    // Voxel GI of an open scene's meshes, in a clipmap round the camera (`enableVoxelClipmap`)
+    private _voxelClipmap: SceneVoxelClipmap | null = null;
+    // The clipmap and spot atlas its injection was last given the spot lights for.
+    private _voxelClipmapSpots: { gi: SceneVoxelClipmap, atlas: SpotShadowAtlas | null } | null = null;
+    private _giViewProjs: mat4[] = [];
+
+    /**
+     * Voxel GI for an open scene's meshes, in a clipmap round the camera (`SceneVoxelClipmap`,
+     * Rust's `enable_voxel_clipmap`): nested windows of voxels, each twice as coarse as the one
+     * before, following the camera. Every frame, after the shadow maps, the windows move in steps
+     * and the slabs they moved into are voxelized (a region a frame, `jobsPerFrame`, each region a
+     * view instance culling culls for), the dynamic renderables are voxelized into the finest
+     * levels, and the voxels are lit by the scene's lights through their shadow maps (or cones
+     * through the clipmap where those don't reach), the bounces adding up over frames. Read the
+     * result with `VoxelGIEffect.withClipmap`. Calling it again replaces the clipmap; it can run
+     * next to `enableVoxelGI`'s volume.
+     *
+     * ```ts
+     * const gi = renderer.enableVoxelClipmap({ voxelSize: 0.5, levels: 5 });
+     * const effect = VoxelGIEffect.withClipmap(gi.clipmap);
+     * ```
+     */
+    public enableVoxelClipmap(options: Partial<SceneVoxelClipmapOptions> = {}): SceneVoxelClipmap {
+        this._voxelClipmap?.destroy();
+        this._voxelClipmap = new SceneVoxelClipmap(this.device!, options);
+        const gi = this._voxelClipmap;
+        const layout = gi.clipmap.layout;
+        console.info(`voxel GI clipmap: ${layout.levels} levels of [${layout.dims.join(', ')}] voxels, `
+            + `${layout.voxelSize} m to ${layout.levelVoxelSize(layout.levels - 1)} m voxels, ${(gi.memoryBytes() / (1 << 20)).toFixed(1)} MiB`);
+        return gi;
+    }
+
+    /** Turn the voxel clipmap off and free it. */
+    public disableVoxelClipmap(): void {
+        this._voxelClipmap?.destroy();
+        this._voxelClipmap = null;
+    }
+
+    /** The scene's voxel clipmap, once `enableVoxelClipmap` has been called. */
+    public get voxelClipmap(): SceneVoxelClipmap | null { return this._voxelClipmap; }
 
     /**
      * Sky occlusion around the camera: how much of the sky each point sees past the canopy
@@ -1323,7 +1365,8 @@ class Renderer {
         t = cpuScope('scene/culling');
         const commandEncoder = this.device!.createCommandEncoder();
         this._planShadowViews(stack, camera);
-        // the ray tracing grid's box is a view the culling serves
+        // the voxel clipmap's regions and the ray tracing grid's box are views the culling serves
+        this._planVoxelClipmap(stack, camera);
         this._planRtGrid(stack, camera);
         // occlusion needs the GBuffer's single-sampled depth
         const depthSize: [number, number] | null = gbuffer.msaaSampleCount === 1 ? [gbuffer.width, gbuffer.height] : null;
@@ -1336,6 +1379,7 @@ class Renderer {
         t?.end();
         t = cpuScope('scene/voxel_gi');
         this._encodeVoxelGI(commandEncoder, stack, camera);
+        this._encodeVoxelClipmap(commandEncoder, stack, camera);
         t?.end();
 
         // The light clusters for the camera, over the GBuffer's pixels (the render size).
@@ -1728,8 +1772,10 @@ class Renderer {
      * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame),
      * then this frame's cascades (`_cascadeView`), then with sky occlusion `_skyOcclusionView`
      * (`null` unless a tile of its top-down pass is due), then every layer of the spot shadow
-     * atlas from `_spotViewBase()` (`null` when no light uses it), then with a ray tracing grid
-     * its box (`_rtView`). `main` is the camera's (`Occlusion.mainView`: live, or frozen).
+     * atlas from `_spotViewBase()` (`null` when no light uses it), then with a voxel clipmap
+     * each of its job slots' region (`_giView`, `null` unless voxelized lately), then with a ray
+     * tracing grid its box (`_rtView`). `main` is the camera's (`Occlusion.mainView`: live, or
+     * frozen).
      */
     private _cullViews(main: CullView): (CullView | null)[] {
         const views: (CullView | null)[] = [main];
@@ -1752,14 +1798,28 @@ class Renderer {
             for (let l = 0; l < this._spotShadowAtlas.layers; l++) views.push(null);
             for (const slot of this._spotLights.shadows) views[base + slot.layer] = cullView(slot.viewProj, { castersOnly: true });
         }
+        // then the voxel clipmap's regions (`_giView`), while they are voxelized
+        const gi = this._voxelClipmap;
+        if (gi) {
+            for (let slot = 0; slot < gi.voxelizer.jobSlots; slot++) {
+                const view = gi.giView(slot);
+                const viewProj = this._giViewProjs[slot] ??= mat4.create();
+                views.push(view ? cullView(mat4.copy(viewProj, view.viewProj), { gi: true }) : null);
+            }
+        }
         // then the ray tracing grid's box (`_rtView`)
         if (this._rtGrid) views.push(cullView(this._rtGrid.cullViewProj(this._rtViewProj), { rt: true }));
         return views;
     }
 
-    /** The cull view of the ray tracing grid's box, after the spot atlas's layers (Rust's order). */
+    /** Cull view of the voxel clipmap's job slot `slot` (the region it voxelizes), after the spot atlas's layers. */
+    private _giView(slot: number): number {
+        return this._spotViewBase() + (this._spotShadowAtlas?.layers ?? 0) + slot;
+    }
+
+    /** The cull view of the ray tracing grid's box, after the voxel clipmap's (Rust's order). */
     private _rtView(): number {
-        return this._spotViewBase() + (this._spotShadowAtlas?.layers ?? 0);
+        return this._giView(this._voxelClipmap?.voxelizer.jobSlots ?? 0);
     }
 
     /** Cull view of cascade `index`, after the camera and the directional map's. */
@@ -1774,6 +1834,7 @@ class Renderer {
         this._cascadedShadowMap?.slots.forEach((_, c) => kinds.push(`cascade${c}`));
         if (this._skyOcclusion) kinds.push('skyOcclusion');
         for (let l = 0; l < (this._spotShadowAtlas?.layers ?? 0); l++) kinds.push('spot');
+        for (let slot = 0; slot < (this._voxelClipmap?.voxelizer.jobSlots ?? 0); slot++) kinds.push(`voxelGi${slot}`);
         if (this._rtGrid) kinds.push('rtGrid');
         return kinds;
     }
@@ -1918,6 +1979,40 @@ class Renderer {
         const eye = camera.inverseViewMatrix.internalMat4;
         this._voxelGI.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,
             shadowMap, this._cubeMapShadowMap, [eye[12], eye[13], eye[14]]);
+    }
+
+    /**
+     * Plan the voxel clipmap's frame (`enableVoxelClipmap`) before the culling, whose views its
+     * regions are: whether the static GI renderables changed, and the regions voxelized this
+     * frame, the windows following `camera`.
+     */
+    private _planVoxelClipmap(stack: Scene, camera: Camera): void {
+        if (!this._voxelClipmap) return;
+        const eye = camera.inverseViewMatrix.internalMat4;
+        this._voxelClipmap.plan(stack, [eye[12], eye[13], eye[14]]);
+    }
+
+    /**
+     * The voxel clipmap's frame, after the culling and the shadow maps: the regions planned
+     * (`_planVoxelClipmap`) voxelized with the static GI renderables (instanced ones as culled for
+     * each region's view), the dynamic ones into the finest levels, then the levels due lit through
+     * the shadow maps (as `_encodeVoxelGI`'s) and the probes updated round `camera`.
+     */
+    private _encodeVoxelClipmap(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
+        const gi = this._voxelClipmap;
+        if (!gi) return;
+        const spots = this._voxelClipmapSpots;
+        if (spots?.gi !== gi || spots.atlas !== this._spotShadowAtlas) {
+            this._ensureShadowResources();
+            gi.injection.shadows.setSpotLights(this._spotLightsBuf, this._spotShadowAtlas?.arrayView ?? null);
+            this._voxelClipmapSpots = { gi, atlas: this._spotShadowAtlas };
+        }
+        const sm = this._shadowMap;
+        const shadowMap = this._cascadedShadowMap
+            ?? (sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null);
+        const eye = camera.inverseViewMatrix.internalMat4;
+        gi.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,
+            (slot) => this._giView(slot), shadowMap, this._cubeMapShadowMap, [eye[12], eye[13], eye[14]]);
     }
 
     /**
