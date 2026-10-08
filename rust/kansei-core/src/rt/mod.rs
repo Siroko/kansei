@@ -27,13 +27,19 @@
 //! - [`RtReflectionsEffect`] traces sharp and glossy reflections through it on the surfaces whose
 //!   material writes an F0 (`materials::GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular`), the
 //!   hits lit by the voxel GI (the light leaving the surface there), the voxel cone past it.
+//! - [`RtDiffuseGiEffect`] traces diffuse GI through it: one ray a pixel (by default one for each
+//!   2 x 2) from the GBuffer's surfaces, the hits lit by their exact direct light and one voxel
+//!   cone, the voxels past the grid's box, denoised by SVGF; an opt-in GI path beside voxel cones
+//!   (`gi::VoxelGIEffect`) and screen-space GI, with a reference path tracer through the grid.
 
+mod diffuse;
 mod effect;
 mod grid;
 mod mesh;
 mod scene;
 mod scene_grid;
 
+pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
 pub use grid::{RtGrid, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
@@ -128,6 +134,19 @@ mod tests {
             "gbuffer out specular",
             &format!("{}\n@fragment fn main() -> KanseiGBufferOut {{ return kansei_gbuffer_out_specular(vec3f(1.0), vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.5), 0.04, 0.2); }}", crate::materials::GBUFFER_OUT_WGSL),
         );
+    }
+
+    #[test]
+    fn shaders_validate_diffuse_gi() {
+        for clipmap in [true, false] {
+            let trace = validate(&format!("gi trace (clipmap {clipmap})"), &super::diffuse::trace_wgsl(clipmap, RT_OPAQUE_WGSL));
+            assert_eq!(struct_span(&trace, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
+        }
+        let svgf = validate("gi svgf", &super::diffuse::svgf_wgsl());
+        assert_eq!(struct_span(&svgf, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
+        assert_eq!(struct_span(&svgf, "AtrousParams"), std::mem::size_of::<super::diffuse::AtrousParamsGpu>());
+        let composite = validate("gi composite", &super::diffuse::composite_wgsl());
+        assert_eq!(struct_span(&composite, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
     }
 
     #[test]
