@@ -69,6 +69,44 @@ export function packPbfParams(o: PbfOptions, h: number, out: Float32Array): void
 }
 
 /**
+ * `count` particles (4 floats each, w = 1) on a cubic lattice through the box `lo`..`hi`, its
+ * spacing chosen so they fill it, each coordinate moved by up to `jitter` / 2 of a spacing (the
+ * same pseudo-random offsets every call) so the lattice does not stay a crystal. When the
+ * rounding leaves the lattice short of `count`, further layers fill in half a cell higher.
+ *
+ * The rows nearest +z come first: a renderer that draws particles in their order, seen from +z,
+ * then draws them roughly front to back, and the depth test spares the shading of those behind.
+ * Rust: `simulations::fluid::fill_box`.
+ */
+export function fillBox(count: number, lo: [number, number, number], hi: [number, number, number], jitter: number): Float32Array {
+    const size = [0, 1, 2].map((i) => hi[i] - lo[i]);
+    const spacing = Math.cbrt(size[0] * size[1] * size[2] / Math.max(count, 1));
+    const cells = size.map((s) => Math.max(Math.floor(s / spacing), 1));
+    let rng = 12345;
+    const offset = () => {
+        rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0;
+        return ((rng >>> 8) / 16777216 - 0.5) * spacing * jitter;
+    };
+    const positions = new Float32Array(count * 4);
+    let k = 0;
+    for (let layer = 0; k < count; layer++) {
+        const lift = layer * spacing * 0.5;
+        for (let z = cells[2] - 1; z >= 0 && k < count; z--) {
+            for (let y = 0; y < cells[1] && k < count; y++) {
+                for (let x = 0; x < cells[0] && k < count; x++, k++) {
+                    // x, y, z in this order: the offsets are drawn as Rust draws them
+                    positions[k * 4] = lo[0] + (x + 0.5) * spacing + offset();
+                    positions[k * 4 + 1] = lo[1] + (y + 0.5) * spacing + lift + offset();
+                    positions[k * 4 + 2] = lo[2] + (z + 0.5) * spacing + offset();
+                    positions[k * 4 + 3] = 1;
+                }
+            }
+        }
+    }
+    return positions;
+}
+
+/**
  * The density poly6 (smoothing radius `h`, unit mass) sums to at a particle of a cubic lattice
  * `spacing` apart, itself included: Position Based Fluids' rest density
  * (`PbfOptions.restDensity`) for a fluid filled on that lattice, so it keeps its volume. About

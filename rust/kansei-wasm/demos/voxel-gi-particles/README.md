@@ -60,6 +60,9 @@ the orbit (`target`, `radius`, `azimuth`, `elevation` in radians) that `set_came
 azimuth, elevation)` and the default camera in `src/lib.rs` take.
 
 Assets: none beyond the page; the shaders in `src/shaders/` are compiled in with `include_str!`.
+The TS engine's twin of this demo, `examples/index_voxel_gi_particles.html` (same scenes, URL
+parameters, panel and `window.kansei`), runs a copy of this demo's WGSL from
+`examples/voxel-gi-particles-shaders.js`: change both together.
 The page loads Tweakpane 4 from cdn.jsdelivr.net.
 
 Build: `wasm-pack build --target web --release` here, serve this folder, open `www/`.

@@ -2,6 +2,7 @@ import { Camera } from '../../cameras/Camera';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
 import { assemble } from '../../materials/shaders/ShaderUtils';
+import { gpuPass } from '../../profiling/Profiler';
 // The Rust engine's shaders, unchanged: `cargo test -p kansei-core` validates them with naga and
 // checks DofParams, HighlightParams and Sprite against the sizes packed below.
 import COMMON from '../../../rust/kansei-core/src/shaders/cinematic_dof_common.wgsl?raw';
@@ -419,7 +420,7 @@ class CinematicDepthOfFieldEffect extends PostProcessingEffect {
         // the highlights are counted and binned afresh every frame
         commandEncoder.clearBuffer(this._spriteCount!);
         commandEncoder.clearBuffer(targets.binCount);
-        const pass = commandEncoder.beginComputePass({ label: 'CinematicDoF' });
+        const pass = commandEncoder.beginComputePass({ label: 'CinematicDoF', timestampWrites: gpuPass('CinematicDoF') });
         for (const [pipeline, bindGroup, x, y] of passes) {
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, bindGroup);
