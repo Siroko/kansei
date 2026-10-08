@@ -159,11 +159,19 @@ class Texture implements IBindable {
     /**
      * An image as an RGBA8 texture, its colour sRGB-encoded (read back linear, through an
      * `rgba8unorm-srgb` view) or linear data (`srgb: false`: normal maps, roughness).
+     *
+     * `mipmaps` applies to linear data only: the mip chain is written through a storage binding,
+     * which WebGPU forbids on a texture read through a view of another format, so an sRGB image
+     * keeps one level.
      */
     public static fromImage(source: TextureSource, options: { label?: string; srgb?: boolean; mipmaps?: boolean } = {}): Texture {
-        const texture = new Texture(source, options.mipmaps ?? false);
+        const srgb = options.srgb ?? false;
+        const texture = new Texture(source, (options.mipmaps ?? false) && !srgb);
         if (options.label) texture.label = options.label;
-        if (options.srgb) texture.viewFormat = 'rgba8unorm-srgb';
+        if (srgb) {
+            texture.viewFormat = 'rgba8unorm-srgb';
+            texture.usage &= ~GPUTextureUsage.STORAGE_BINDING;
+        }
         return texture;
     }
 
