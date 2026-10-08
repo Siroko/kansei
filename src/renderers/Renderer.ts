@@ -85,6 +85,13 @@ class Renderer {
     // Pre-recorded bundle for the standard canvas render pass.
     private _renderBundle: GPURenderBundle | null = null;
     private _lastObjectCount: number = -1;
+    // Objects in the order each bundle recorded them. A bundle draws object i
+    // with matrix slot i, and slots are filled in draw order every frame, so a
+    // bundle must be re-recorded whenever that order changes (transparent
+    // objects are re-sorted back-to-front each frame). Stable per-object slots
+    // would avoid the re-record.
+    private _renderBundleOrder: Renderable[] = [];
+    private _gbufferBundleOrder: Renderable[] = [];
 
     // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float).
     // When the scene contains transmissive objects, rendering is split into two
@@ -481,7 +488,8 @@ class Renderer {
         }
 
         // Phase 2 — (re-)record the render bundle when the scene composition changes.
-        if (!this._renderBundle || this._lastObjectCount !== orderedObjects.length) {
+        const orderChanged = Renderer._syncOrder(this._renderBundleOrder, orderedObjects);
+        if (!this._renderBundle || this._lastObjectCount !== orderedObjects.length || orderChanged) {
             this._renderBundle = this._buildRenderBundle(orderedObjects, cameraBindGroup);
             this._lastObjectCount = orderedObjects.length;
         }
@@ -688,7 +696,9 @@ class Renderer {
         }
 
         // Phase 2 — build GBuffer bundle(s) if stale.
+        const orderChanged = Renderer._syncOrder(this._gbufferBundleOrder, orderedObjects);
         const bundleStale =
+            orderChanged ||
             this._gbufferLastObjectCount !== orderedObjects.length ||
             this._gbufferLastOpaqueCount !== opaqueCount ||
             this._gbufferLastTransmissiveCount !== transmissiveCount ||
@@ -898,6 +908,23 @@ class Renderer {
         this._pointShadowParams[2] = posY;
         this._pointShadowParams[3] = posZ;
         this._pointShadowParams[4] = shadowFar;
+    }
+
+    /**
+     * Copies `current` into `recorded` and returns whether they differed, i.e.
+     * whether a bundle recorded in `recorded`'s order now pairs draws with
+     * other objects' matrix slots.
+     */
+    private static _syncOrder(recorded: Renderable[], current: Renderable[]): boolean {
+        let changed = recorded.length !== current.length;
+        if (changed) recorded.length = current.length;
+        for (let i = 0; i < current.length; i++) {
+            if (recorded[i] !== current[i]) {
+                recorded[i] = current[i];
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     /**
