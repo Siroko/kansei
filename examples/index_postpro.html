@@ -108,7 +108,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
@@ -137,7 +137,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;

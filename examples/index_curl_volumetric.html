@@ -334,7 +334,7 @@
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
         let albedo = albedoMetal.rgb;
-        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let shadow = kansei_shadow_map(frag.worldPos, frag.worldNormal) * kansei_point_shadow(frag.worldPos);
         let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
         let lighting = albedo * lp.flags.y + albedo * lit;
         return FragmentOutput(
@@ -363,7 +363,7 @@
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
         let albedo = albedoMetal.rgb;
-        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let shadow = kansei_shadow_map(frag.worldPos, frag.worldNormal) * kansei_point_shadow(frag.worldPos);
         let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
         let lighting = albedo * lp.flags.y + albedo * lit;
         return FragmentOutput(
@@ -480,7 +480,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let shadow = kansei_shadow_map(frag.worldPos, frag.worldNormal) * kansei_point_shadow(frag.worldPos);
         let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
         let lighting = albedo * lp.flags.y + albedo * lit;
         return FragmentOutput(
