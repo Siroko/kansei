@@ -13,77 +13,291 @@
 
 <body>
   <script type="module">
-    // Instancing: a 10 x 10 x 10 grid of cubes drawn in one call, the TS twin of the Rust
-    // `instancing` example. Each cube's model matrix is an instance attribute (four vec4s at
-    // locations 3-6) of one `InstancedGeometry`, drawn with the stock `Material.basicInstanced`;
-    // the CPU rewrites all the matrices each frame to turn the cubes. Drag to orbit, wheel or
-    // pinch to zoom.
+    // Instancing: a clone of square.felixmartinez.dev (three.js) on Kansei, the TS twin of the Rust
+    // `instancing` example. A carpet of 128 x 128 cubes, one instanced draw, that an orange ball
+    // ploughs through: a compute shader moves every cube each step (pushed out of the ball's way
+    // within 6.5 m, drawn towards it beyond, and springing back home) and writes its position
+    // into the instance buffer the cubes are drawn from (a vec4 per cube at vertex location 3,
+    // `Material.standardLit`'s `offsetScale` instancing), so the positions never leave the GPU.
+    // A shadowed spot light lights the scene; the cubes shadow each other and the floor through
+    // their own vertex shader. Drag to orbit, wheel or pinch to zoom.
     //
-    // URL parameters: `n=<cubes per side>` (default 10, at most 40).
-    import { Canvas, run, paramOr } from '../src/web/index'
+    // The look is the original's: a palette row picked at random each load colours the cubes
+    // (its middle swatch) and the fog (its first, halved); the colours go through three.js's
+    // unmanaged pipeline, sRGB numbers lit as they are, ACES-fitted and written without encoding,
+    // then a linear distance fog and a radial vignette in display space (`FogVignetteEffect`).
+    // The simulation steps at a fixed 60 Hz, where the original stepped once per frame.
+    //
+    // URL parameters: `n=<cubes per side>` (default 128, 8 to 512), `palette=<row>` (0 to 10:
+    // the palette row, default random), `shadows=0` (no spot shadow map).
+    import { Canvas, run, paramOr, flag } from '../src/web/index'
     import { Camera } from '../src/cameras/Camera'
     import { CameraControls } from '../src/controls/CameraControls'
     import { Scene } from '../src/objects/Scene'
     import { Renderable } from '../src/objects/Renderable'
     import { Material } from '../src/materials/Material'
+    import { Compute } from '../src/materials/Compute'
     import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
     import { BufferBase } from '../src/buffers/BufferBase'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
     import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { SpotLight } from '../src/lights/SpotLight'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { PostProcessingEffect } from '../src/postprocessing/PostProcessingEffect'
+    import { ToneMapEffect, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { FixedStep } from '../src/pacing/FixedStep'
     import { Vector3 } from '../src/math/Vector3'
     import { Vector4 } from '../src/math/Vector4'
 
-    const SPACING = 3;
-    const n = Math.min(Math.max(Math.floor(paramOr('n', 10)), 1), 40);
-    const count = n * n * n;
+    // The original's palette (assets/color_palette.png, 5 x 11): a row per look
+    const PALETTE = [
+      ['1b1b3a', 'dad1e9', 'ffb64d', 'e2370c', '701523'],
+      ['0d4631', '419e09', 'f3dc6b', 'fff2f1', 'fb4861'],
+      ['2c111a', 'f5af06', '6c9ae6', 'cef151', 'f5f1ce'],
+      ['f7c693', 'ff948f', 'ff6167', 'a91832', '671427'],
+      ['2f4a6f', 'b663b3', 'da8bbd', 'aef5c6', 'ffffb6'],
+      ['879be3', 'fbfeff', 'a4b2b6', '292e34', '27292b'],
+      ['646b6c', '37112f', '9c0e57', 'ef0041', 'ff939b'],
+      ['1e291a', 'e8a11a', 'fe5632', 'ebd5cb', '2981a5'],
+      ['ff6da3', '8d0e77', '1d42d0', '35deff', '98ffe2'],
+      ['1b1c2d', '005ca9', '4dede0', 'f9f15b', 'ff5440'],
+      ['9d6163', 'e4ceab', 'e59fa3', '75b0d7', '3d97be'],
+    ];
+    const rgb = (hex, scale = 1) => [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255 * scale);
 
-    // The cubes' model matrices (column-major, 16 floats each) at `time` seconds: a turn about
-    // +y, then the cube's place in the grid.
-    const writeInstanceMatrices = (data, time) => {
-      const offset = (n - 1) * SPACING * 0.5;
-      let o = 0;
-      for (let x = 0; x < n; x++) {
-        for (let y = 0; y < n; y++) {
-          for (let z = 0; z < n; z++) {
-            const angle = time * 0.5 + (x + y + z) * 0.3;
-            const c = Math.cos(angle), s = Math.sin(angle);
-            data.set([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0,
-                      x * SPACING - offset, y * SPACING - offset, z * SPACING - offset, 1], o);
-            o += 16;
-          }
-        }
-      }
-    };
+    // The original's scene in metres (it measured in centimetres)
+    const SPACING = 0.1;            // a cube's size and the carpet's pitch
+    const BALL_RADIUS = 1;
+    const STEP = 1 / 60;            // the simulation's step, s
+    // the ball's path at `t` seconds: a figure eight that bobs a little
+    const ballAt = (t) => [
+      8 * Math.sin(5 * t) * Math.cos(t),
+      0.3 * Math.sin(5 * t) * Math.cos(t),
+      8 * Math.cos(0.5 * t) * Math.sin(-t),
+    ];
+    // where the ball is for the very first step: 100 m up, so the carpet leaps towards it and
+    // drops back into place, as the original's does
+    const BALL_START = [0, 100, 0];
+
+    const n = Math.min(Math.max(Math.floor(paramOr('n', 128)), 8), 512);
+    const count = n * n;
+    const row = PALETTE[Math.min(Math.max(Math.floor(paramOr('palette', Math.floor(Math.random() * PALETTE.length))), 0), PALETTE.length - 1)];
+    const shadows = flag('shadows', true);
 
     const canvas = Canvas.fill();
-    const renderer = await canvas.renderer({ sampleCount: 4, clearColor: new Vector4(0.05, 0.05, 0.08, 1) });
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    if (shadows) renderer.enableSpotShadows(2048, 1);
 
-    // one vertex buffer of matrices, read per instance at locations 3-6
-    const matrixData = new Float32Array(count * 16);
-    writeInstanceMatrices(matrixData, 0);
-    const matrices = new ComputeBuffer({
-      type: BufferBase.BUFFER_TYPE_STORAGE,
-      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
-      buffer: matrixData,
-      stride: 64,
-      attributes: [0, 1, 2, 3].map((column) => ({ shaderLocation: 3 + column, offset: column * 16, format: 'float32x4' })),
+    // ── the cubes ──
+    // Each cube's place on the carpet (its home), and its position now: xyz, w its scale.
+    const home = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) {
+      home.set([(i % n) * SPACING - n * SPACING * 0.5, 0, Math.floor(i / n) * SPACING - n * SPACING * 0.5, 1], i * 4);
+    }
+    const homes = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE,
+      type: BufferBase.BUFFER_TYPE_READ_ONLY_STORAGE,
+      buffer: home,
     });
-    const geometry = new InstancedGeometry(new BoxGeometry(1, 1, 1), count, [matrices]);
-    const scene = new Scene();
-    scene.add(new Renderable(geometry, Material.basicInstanced('Cubes', [0.4, 0.7, 0.9, 1])));
+    // the compute shader's output and the cubes' instance attribute: one buffer
+    const positions = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX,
+      type: BufferBase.BUFFER_TYPE_STORAGE,
+      buffer: home.slice(),
+      shaderLocation: 3,
+      offset: 0,
+      stride: 16,
+      format: 'float32x4',
+    });
+    // ball xyz and the steps to run (w); the cube count
+    const paramData = new Float32Array([...BALL_START, 0, count, 0, 0, 0]);
+    const params = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      buffer: paramData,
+    });
+    // One step per cube, as the original's position shader: every cube is drawn back a tenth of
+    // the way home and pushed along the ball's radius by 0.4 m x (1 - distance / 6.5 m), out of
+    // the ball's way when it is near and towards it when it is far.
+    const step = new Compute(/* wgsl */`
+      struct Params { ball : vec4f, count : vec4f }
+      @group(0) @binding(0) var<uniform> params : Params;
+      @group(0) @binding(1) var<storage, read_write> positions : array<vec4f>;
+      @group(0) @binding(2) var<storage, read> homes : array<vec4f>;
 
-    const camera = new Camera(45, 0.1, 500, canvas.aspect);
-    const controls = new CameraControls(camera, new Vector3(0, 0, 0), renderer.canvas, n * SPACING * 1.6);
-    controls.azimuth = 0;
-    controls.elevation = 0.35;
+      const RETURN = 0.1;
+      const PUSH = 0.4;
+      const REACH = 6.5;
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) id : vec3u) {
+        let i = id.x;
+        if (i >= u32(params.count.x)) { return; }
+        let home = homes[i].xyz;
+        var p = positions[i].xyz;
+        for (var s = 0u; s < u32(params.ball.w); s++) {
+          let away = p - params.ball.xyz;
+          let d = length(away);
+          let push = select(vec3f(0.0), away / d, d > 1e-6) * (1.0 - d / REACH) * PUSH;
+          p += (home - p) * RETURN + push;
+        }
+        positions[i] = vec4f(p, 1.0);
+      }
+    `, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: params },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: positions },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, value: homes },
+    ]);
+
+    // Surfaces lit by the spot light and a flat ambient of 0.15, the original's: three.js's legacy
+    // lights give albedo x N·L x intensity, which the spot light below matches at the carpet's
+    // middle. Its cubes are Lambert and its ball Phong without highlights (roughness 1); its
+    // floor is Phong with a broad dull highlight (shininess 30)
+    const surface = (label, baseColor, roughness, instanced = false) => Material.standardLit(label, {
+      baseColor,
+      roughness,
+      skyUp: [0.15, 0.15, 0.15],
+      skyDown: [0.15, 0.15, 0.15],
+      instancing: instanced ? 'offsetScale' : undefined,
+    });
+
+    const scene = new Scene();
+    const cubes = new Renderable(new InstancedGeometry(new BoxGeometry(SPACING, SPACING, SPACING), count, [positions]),
+      surface('Cubes', rgb(row[2], 1.3), 1, true));
+    scene.add(cubes);
+
+    const ball = new Renderable(new SphereGeometry(BALL_RADIUS, 14), surface('Ball', rgb('ff553f'), 1));
+    ball.position.set(...BALL_START);
+    scene.add(ball);
+
+    const floor = new Renderable(new PlaneGeometry(500, 500), surface('Floor', rgb(row[0], 0.3), 0.65));
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(0, -5, 0);
+    floor.castShadow = false;
+    scene.add(floor);
+
+    // the spot light, on the original's ray to the carpet's middle but twice as far, since the
+    // original's light doesn't fall off with distance and Kansei's falls off with its square;
+    // its intensity gives an illuminance of π at the middle (three.js's unit light)
+    const LIGHT_DISTANCE = 2;
+    const spot = new SpotLight([0, 0, -1], [1, 1, 1], Math.PI * (15 * 15 * 2) * LIGHT_DISTANCE ** 2, 300, 25 * Math.PI / 180, 30 * Math.PI / 180);
+    spot.position.set(15 * LIGHT_DISTANCE, 15 * LIGHT_DISTANCE, 0.01 * LIGHT_DISTANCE);
+    spot.lookAt(new Vector3(0, 0, 0));
+    spot.castShadow = shadows;
+    spot.sourceRadius = 0.15;
+    scene.add(spot);
+
+    // ── the picture: ACES-fitted at the original's exposure (three.js divides it by 0.6), not
+    // sRGB-encoded, then the fog and the vignette ──
+    class FogVignetteEffect extends PostProcessingEffect {
+      constructor(color, near, far) {
+        super();
+        this.color = color;
+        this.near = near;
+        this.far = far;
+        this.frame = 0;
+      }
+
+      initialize(device, gbuffer) {
+        this.device = device;
+        this.params = device.createBuffer({ label: 'FogVignette/Params', size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        // three.js's linear fog (a smoothstep over the view depth) after tone mapping, then its
+        // vignette: darker with the distance from the middle (y scaled by the aspect), dithered
+        const module = device.createShaderModule({ code: /* wgsl */`
+          struct Params { fogColor : vec4f, range : vec4f, size : vec4f }
+          @group(0) @binding(0) var inputTex : texture_2d<f32>;
+          @group(0) @binding(1) var depthTex : texture_depth_2d;
+          @group(0) @binding(2) var outputTex : texture_storage_2d<rgba16float, write>;
+          @group(0) @binding(3) var<uniform> params : Params;
+
+          @compute @workgroup_size(8, 8)
+          fn main(@builtin(global_invocation_id) id : vec3u) {
+            let size = params.size.xy;
+            if (f32(id.x) >= size.x || f32(id.y) >= size.y) { return; }
+            var color = textureLoad(inputTex, id.xy, 0).rgb;
+            // view depth from the [0, 1] depth: range.zw are the camera's near and far
+            let depth = textureLoad(depthTex, id.xy, 0);
+            let near = params.range.z;
+            let far = params.range.w;
+            let z = near * far / (far - depth * (far - near));
+            color = mix(color, params.fogColor.rgb, smoothstep(params.range.x, params.range.y, z));
+            let pixel = vec2f(id.xy) + 0.5;
+            var q = pixel / size - 0.5;
+            q.y /= size.x / size.y;
+            let vignette = smoothstep(0.0, 0.99, length(q));
+            let dither = mix(-6.0 / 255.0, 6.0 / 255.0, fract(sin(dot(pixel + params.size.z, vec2f(12.9898, 78.233))) * 43758.5453));
+            color = color * (1.0 - vignette) + dither * vignette;
+            textureStore(outputTex, id.xy, vec4f(color, 1.0));
+          }
+        ` });
+        this.pipeline = device.createComputePipeline({ label: 'FogVignette', layout: 'auto', compute: { module, entryPoint: 'main' } });
+        this.initialized = true;
+      }
+
+      render(encoder, input, depth, output, camera, width, height) {
+        this.frame = (this.frame + 1) % 1024;
+        this.device.queue.writeBuffer(this.params, 0, new Float32Array([
+          ...this.color, 1, this.near, this.far, camera.near, camera.far, width, height, this.frame, 0,
+        ]));
+        if (input !== this.input || output !== this.output || depth !== this.depth) {
+          this.bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: input.createView() },
+              { binding: 1, resource: depth.createView() },
+              { binding: 2, resource: output.createView() },
+              { binding: 3, resource: { buffer: this.params } },
+            ],
+          });
+          Object.assign(this, { input, output, depth });
+        }
+        const pass = encoder.beginComputePass({ label: 'FogVignette' });
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+        pass.end();
+      }
+
+      resize() {}
+
+      destroy() {
+        this.params?.destroy();
+      }
+    }
+
+    const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: 1.5 / 0.6, encodeSrgb: false });
+    const fog = new FogVignetteEffect(rgb(row[0], 0.5), 12, 40);
+    const volume = new PostProcessingVolume(renderer, [tonemap, fog], { msaaSampleCount: 4 });
+
+    // the original's near and far planes (1 mm, 100 m): at the carpet's distance its depth
+    // resolves about a fifth of a cube, so where the carpet is squeezed and its cubes overlap,
+    // their faces fight along the edges: the carpet's woven grain
+    const camera = new Camera(60, 0.001, 100, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 0, 0), renderer.canvas, 18, { invertWheel: true });
+    controls.azimuth = 0.3422115 * Math.PI * 2;
+    controls.elevation = 0.1249 * Math.PI * 2;
     console.info(`Kansei — Instancing (TS): ${count} cubes`);
 
+    const fixed = new FixedStep(STEP);
+    let simTime = 0;
+    let started = false;
     run(canvas, (frame) => {
       frame.resize(renderer, camera);
-      writeInstanceMatrices(matrixData, frame.time);
-      matrices.update(renderer.gpuDevice);
+      const steps = fixed.advance(frame.dt);
+      if (steps > 0) {
+        // the ball where it was at the start of these steps, as the original pushes the cubes
+        // with last frame's ball
+        paramData.set([...(started ? ballAt(simTime) : BALL_START), steps]);
+        params.needsUpdate = true;
+        renderer.compute(step, Math.ceil(count / 64));
+        simTime += steps * STEP;
+        started = true;
+        ball.position.set(...ballAt(simTime));
+      }
       controls.update(frame.dt);
-      renderer.render(scene, camera);
+      volume.render(scene, camera);
     });
   </script>
 </body>
