@@ -232,7 +232,8 @@ class Renderer {
             requiredLimits: Renderer.resolveLimits(this.options.requiredLimits ?? 'default', adapter.limits),
         });
         const c = Renderer.compressionSupportOf(device);
-        console.info(`texture compression: CompressionSupport { bc: ${c.bc}, astc: ${c.astc}, etc2: ${c.etc2} }`);
+        // Same lines as the Rust renderer's device log (WebGPU has no ASTC HDR feature).
+        console.info(`texture compression: CompressionSupport { bc: ${c.bc}, astc: ${c.astc}, etc2: ${c.etc2}, astc_hdr: false }`);
         const limits = device.limits;
         console.info(
             `device limits: ${limits.maxSampledTexturesPerShaderStage} sampled textures, ` +
