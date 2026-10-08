@@ -28,6 +28,10 @@
       .area {
         scroll-margin-top: 24px;
       }
+      /* Rows and areas taken off the list keep their markup, hidden (see the comment above the list). */
+      [hidden] {
+        display: none !important;
+      }
       .area .label {
         margin-top: 64px;
       }
@@ -160,9 +164,9 @@
         </p>
         <ul class="area-nav" aria-label="Areas">
           <li><a href="#rendering">Rendering</a></li>
-          <li><a href="#lighting">Lighting and shadows</a></li>
+          <li hidden><a href="#lighting">Lighting and shadows</a></li>
           <li><a href="#gi">GI and ray tracing</a></li>
-          <li><a href="#atmosphere">Atmosphere and fog</a></li>
+          <li hidden><a href="#atmosphere">Atmosphere and fog</a></li>
           <li><a href="#post">Post-processing</a></li>
           <li><a href="#visibility">Visibility, LOD and reflections</a></li>
           <li><a href="#fluid">Fluid</a></li>
@@ -177,11 +181,14 @@
         index_transparent_transmissive (draw-order regression test), index_shadow_casters (shadow-pass test),
         index_particles (the trail particles in fog of index_curl_volumetric and index_gi_compute),
         index_helpers (a tour of stock geometries and debug helpers).
+        Rows marked `hidden` are off the list by the owner's curation, their pages kept at their URLs, and
+        come back by dropping the attribute (an area whose rows are all hidden is hidden with its nav link).
+        Outdoor GI is among them until its visuals improve.
       -->
       <section class="area" id="rendering" aria-labelledby="rendering-title">
         <h2 class="label label-spaced" id="rendering-title">Rendering</h2>
         <ul class="example-list examples">
-          <li>
+          <li hidden>
             <span class="demo-name">Hello scene</span>
             <span class="demo-desc">The smallest complete scene: a floor, a spinning box and a sphere in the stock lit material, a sun and two point lights, shadows and an orbit camera</span>
             <span class="run">
@@ -197,7 +204,7 @@
               <a class="run-rust" href="/examples/instancing/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Flowing cubes</span>
             <span class="demo-desc">A swarm of textured cubes flowing on nested trigonometry, through SSAO, god rays and depth of field</span>
             <span class="run">
@@ -214,10 +221,10 @@
         </ul>
       </section>
 
-      <section class="area" id="lighting" aria-labelledby="lighting-title">
+      <section class="area" id="lighting" hidden aria-labelledby="lighting-title">
         <h2 class="label label-spaced" id="lighting-title">Lighting and shadows</h2>
         <ul class="example-list examples">
-          <li>
+          <li hidden>
             <span class="demo-name">Cascaded shadows</span>
             <span class="demo-desc">4 000 instanced trees under a low sun, shadowed by four 2048² cascades with contact-hardening penumbrae, culled per cascade on the GPU</span>
             <span class="run">
@@ -225,7 +232,7 @@
               <a class="run-rust" href="/examples/cascaded-shadows/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Spot lights</span>
             <span class="demo-desc">A car's headlights in a night forest: photometric spot lights with contact-hardening shadows from an atlas, shaded through clustered light lists and scattered in the fog</span>
             <span class="run">
@@ -239,7 +246,7 @@
       <section class="area" id="gi" aria-labelledby="gi-title">
         <h2 class="label label-spaced" id="gi-title">Global illumination and ray tracing</h2>
         <ul class="example-list examples">
-          <li>
+          <li hidden>
             <span class="demo-name">Path-traced Cornell box</span>
             <span class="demo-desc">The Stanford dragon in a Cornell box, path traced on the GPU against a BVH: in TS a hybrid tracer over the raster GBuffer, with compute-driven trails or a voxelized scene to trace instead</span>
             <span class="run">
@@ -251,14 +258,16 @@
             </span>
           </li>
           <li>
-            <span class="demo-name">GI box</span>
-            <span class="demo-desc">A Cornell box under one downlight to compare GI methods: screen-space GI, or voxel GI with its distance field, probes and ray-traced reflections</span>
+            <span class="demo-name">GI Path traced Cornell</span>
+            <span class="demo-desc">A Cornell box under one downlight to compare GI methods: voxel GI under screen-space GI, or the hybrid that path traces the diffuse light through a grid of the room's triangles; its panel has the distance field, probes and ray-traced reflections too</span>
             <span class="run">
-              <a class="run-ts" href="./index_gi_box.html" title="TypeScript">TS</a>
-              <a class="run-rust" href="/examples/gi-box/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-ts" href="./index_gi_box.html?preset=best" title="Voxel GI + SSGI (TypeScript)">TS</a>
+              <a class="run-rust" href="/examples/gi-box/?preset=best" data-rust title="Voxel GI + SSGI (Rust / WASM)">WASM</a>
+              <a class="run-ts run-variant" href="./index_gi_box.html?gi=rt" title="Hybrid path tracing: one ray for each 2 x 2 pixels through the grid of triangles, denoised (TypeScript)">Hybrid path tracing</a>
+              <a class="run-rust run-variant" href="/examples/gi-box/?gi=rt" data-rust title="Hybrid path tracing: one ray for each 2 x 2 pixels through the grid of triangles, denoised (Rust / WASM)">Hybrid path tracing</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Outdoor GI</span>
             <span class="demo-desc">A forest valley 1.3 km across under a low sun, with voxel GI in a clipmap round the camera</span>
             <span class="run">
@@ -278,10 +287,10 @@
         </ul>
       </section>
 
-      <section class="area" id="atmosphere" aria-labelledby="atmosphere-title">
+      <section class="area" id="atmosphere" hidden aria-labelledby="atmosphere-title">
         <h2 class="label label-spaced" id="atmosphere-title">Atmosphere and fog</h2>
         <ul class="example-list examples">
-          <li>
+          <li hidden>
             <span class="demo-name">Sky atmosphere</span>
             <span class="demo-desc">A physically based sky from noon to dusk: Hillaire's LUTs, aerial perspective on distant hills, sky-lit surfaces and reflections of its prefiltered cubemap; the Rust one adds volumetric clouds</span>
             <span class="run">
@@ -289,7 +298,7 @@
               <a class="run-rust" href="/examples/sky-atmosphere/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Volumetric fog</span>
             <span class="demo-desc">A grove of pillars under a low sun: froxel fog with shafts through the directional shadow, a lamp's cube shadow and a dim sky</span>
             <span class="run">
@@ -297,7 +306,7 @@
               <a class="run-rust" href="/examples/volumetric-fog/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Curl volumetric</span>
             <span class="demo-desc">Curl-noise particle trails through volumetric fog, in a Cornell box or over a scrolling noise terrain</span>
             <span class="run">
@@ -312,12 +321,12 @@
         <ul class="example-list examples">
           <li>
             <span class="demo-name">Post-processing</span>
-            <span class="demo-desc">Spheres in volumetric fog with shadows and a filmic tone map, plus path-traced GI, bloom, depth of field and colour grading to switch on</span>
+            <span class="demo-desc">Spheres in volumetric fog with shadows and a filmic tone map, bloom on emissive surfaces, plus path-traced GI, depth of field and colour grading to switch on</span>
             <span class="run">
               <a class="run-ts" href="./index_postpro.html" title="TypeScript">TS</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Film look</span>
             <span class="demo-desc">A dusk path in physical light units through fog, bloom and the tone mapper: EV100 exposure, filmic curves, vignette and grain</span>
             <span class="run">
@@ -325,7 +334,7 @@
               <a class="run-rust" href="/examples/film-look/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Temporal AA</span>
             <span class="demo-desc">Thin trunks, power lines, 12 000 swaying grass cards and a passing car: motion vectors and temporal anti-aliasing on a single-sample GBuffer; the Rust one can upscale and motion blur</span>
             <span class="run">
@@ -335,11 +344,10 @@
           </li>
           <li>
             <span class="demo-name">Depth of field</span>
-            <span class="demo-desc">Physical depth of field through a camera lens, two layers and scattered bokeh: in TS a scrolling field of noise-driven columns, in Rust trunks, leaf cards and strings of lights</span>
+            <span class="demo-desc">Physical depth of field through a camera lens, two layers and scattered bokeh: in TS a scrolling field of noise-driven columns, some tops glowing, in Rust trunks, leaf cards and strings of lights</span>
             <span class="run">
               <a class="run-ts" href="./index_dof_terrain.html" title="TypeScript">TS</a>
               <a class="run-rust" href="/examples/depth-of-field/" data-rust title="Rust / WASM">WASM</a>
-              <a class="run-ts run-variant" href="./index_dof_terrain.html?lights=1" title="Some column tops glow, small bright sources that scatter as bokeh (TypeScript)">Lights</a>
             </span>
           </li>
         </ul>
@@ -348,7 +356,7 @@
       <section class="area" id="visibility" aria-labelledby="visibility-title">
         <h2 class="label label-spaced" id="visibility-title">Visibility, LOD and reflections</h2>
         <ul class="example-list examples">
-          <li>
+          <li hidden>
             <span class="demo-name">Occlusion culling</span>
             <span class="demo-desc">60 000 spruces in three LODs, culled on the GPU per view by frustum, LOD band and, for the camera, a two-phase depth pyramid</span>
             <span class="run">
@@ -356,7 +364,7 @@
               <a class="run-rust" href="/examples/occlusion-culling/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Impostors</span>
             <span class="demo-desc">A lake ringed by 40 000 spruces whose far LOD is an octahedral impostor baked at start-up, mirrored in the water</span>
             <span class="run">
@@ -364,7 +372,7 @@
               <a class="run-rust" href="/examples/impostors/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Cluster LOD</span>
             <span class="demo-desc">A field of rocks drawn three ways: cluster LOD cut per cluster on the GPU, discrete LODs from the same graph, or the full mesh</span>
             <span class="run">
@@ -380,7 +388,7 @@
               <a class="run-ts" href="./index_meshlet_inspector.html" title="TypeScript">TS</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Planar reflection</span>
             <span class="demo-desc">A lake at dusk mirroring the far shore, a lit cottage and a searchlight's beam in the mist: a mirrored view with an oblique clip plane, rippled and blurred by roughness; the Rust one has a screen-space mirror to compare</span>
             <span class="run">
@@ -425,7 +433,7 @@
               <a class="run-rust" href="/examples/fluid_clock/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Steering text</span>
             <span class="demo-desc">About 1 600 words flocking in 3D as boids, their letters trailing on distance constraints</span>
             <span class="run">
@@ -438,7 +446,7 @@
       <section class="area" id="animation" aria-labelledby="animation-title">
         <h2 class="label label-spaced" id="animation-title">Animation</h2>
         <ul class="example-list examples">
-          <li>
+          <li hidden>
             <span class="demo-name">Skinning</span>
             <span class="demo-desc">A ring of procedurally rigged tentacles skinned in their materials' vertex shaders, casting bending shadows</span>
             <span class="run">
@@ -474,7 +482,7 @@
               <a class="run-ts" href="./index_text.html" title="TypeScript">TS</a>
             </span>
           </li>
-          <li>
+          <li hidden>
             <span class="demo-name">Video texture</span>
             <span class="demo-desc">The webcam as an external video texture across 250 stacked instanced planes (asks for camera access)</span>
             <span class="run">
