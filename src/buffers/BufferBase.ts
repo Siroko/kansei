@@ -55,10 +55,21 @@ class BufferBase implements IBindable {
      * @returns GPUBufferBinding object
      */
     get resource(): GPUBufferBinding {
+        if (this.bindingRange) {
+            return { buffer: this._resource!, ...this.bindingRange };
+        }
         return {
             buffer: this._resource!
         };
     }
+
+    /** The GPU buffer, once initialized. */
+    get gpuBuffer(): GPUBuffer | undefined {
+        return this._resource;
+    }
+
+    /** The bound byte range of an external buffer (the whole buffer when unset). */
+    protected bindingRange?: { offset: number; size?: number };
     /** Internal GPU buffer reference */
     protected _resource?: GPUBuffer;
     /** Internal buffer data storage */
@@ -87,7 +98,7 @@ class BufferBase implements IBindable {
      * @param gpuDevice The GPU device to update the buffer on
      */
     public update(gpuDevice: GPUDevice) {
-        if (this._resource) {
+        if (this._resource && this.buffer) {
             gpuDevice!.queue.writeBuffer(this._resource, 0, this.buffer!.buffer as ArrayBuffer);
         }
         this.needsUpdate = false;

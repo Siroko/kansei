@@ -1,4 +1,5 @@
 import { IBindable } from "../buffers/IBindable";
+import { BindingLayout, bindingLayoutFromType } from "./Binding";
 import { cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries } from "../renderers/SharedLayouts";
 
 /**
@@ -8,6 +9,11 @@ export class BindGroupDescriptor {
     binding?: number;
     visibility?: GPUFlagsConstant;
     value?: IBindable;
+    /**
+     * The binding's layout (see `BindingLayouts`), for when the value's own is not the one the
+     * shader declares: a depth or unfilterable read, a storage texture, a comparison sampler.
+     */
+    layout?: BindingLayout;
 }
 
 /**
@@ -18,7 +24,6 @@ class BindableGroup {
     public bindGroup?: GPUBindGroup;
     public initialized: boolean = false;
     public pipelineBindGroupLayout?: GPUPipelineLayout;
-    private bindableGroupLayout?: GPUBindGroupLayout;
     public cameraBindablesGroupLayout?: GPUBindGroupLayout;
     public meshBindablesGroupLayout?: GPUBindGroupLayout;
     public shadowBindablesGroupLayout?: GPUBindGroupLayout;
@@ -70,42 +75,21 @@ class BindableGroup {
      * @param gpuDevice - The GPU device used to create the bind group layout.
      */
     public createBindGroupLayout(gpuDevice: GPUDevice) {
-        const entries = [];
+        const entries: GPUBindGroupLayoutEntry[] = [];
         for (const bindable of this.bindables) {
-            const entry: GPUBindGroupLayoutEntry = {
-                binding: bindable.binding!,
-                visibility: bindable.visibility!
-            };
-            switch (bindable.value!.type) {
-                case 'storage':
-                case 'read-only-storage':
-                case 'uniform':
-                    entry.buffer = {
-                        type: bindable.value!.type as GPUBufferBindingType
-                    };
-                    break;
-                case 'sampler':
-                    entry.sampler = { type: 'filtering' };
-                    break;
-                case 'texture':
-                    entry.texture = { sampleType: 'float' };
-                    break;
-                case 'storage-texture':
-                    entry.storageTexture = {
-                        access: 'write-only',
-                        format: 'rgba8unorm'
-                    };
-                    break;
-                case 'external-texture':
-                    entry.externalTexture = {
-                        sampleType: 'float',
-                    };
-                    break;
-                default:
-                    console.error(`Unknown binding type: ${bindable.value!.type}`);
-                    continue;
+            const value = bindable.value!;
+            const layout = value.getBindingLayout
+                ? value.getBindingLayout(gpuDevice, bindable.layout)
+                : bindable.layout ?? bindingLayoutFromType(value.type);
+            if (!layout) {
+                console.error(`Unknown binding type: ${value.type}`);
+                continue;
             }
-            entries.push(entry);
+            entries.push({
+                binding: bindable.binding!,
+                visibility: bindable.visibility!,
+                ...layout,
+            } as GPUBindGroupLayoutEntry);
         }
 
         this.bindGroupLayout = gpuDevice.createBindGroupLayout({
@@ -140,7 +124,7 @@ class BindableGroup {
             if (!bindable.value?.initialized) {
                 bindable.value?.initialize(gpuDevice);
             }
-            if (!this.bindableGroupLayout) {
+            if (!this.bindGroupLayout) {
                 this.createBindGroupLayout(gpuDevice)
             }
             if (!this.pipelineBindGroupLayout) {
