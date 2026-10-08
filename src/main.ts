@@ -143,7 +143,9 @@ export type { Cluster, ClusterOptions, LevelBounds, LodView, Sphere } from "./cl
 export { buildClusterMesh } from "./clusters/build";
 export { ClusterLod, CLUSTER_CULL_WGSL } from "./clusters/ClusterLod";
 export type { ClusterView } from "./clusters/ClusterLod";
-export { CLUSTER_MESH_WGSL, CLUSTER_VERTEX_ENTRY, clusterVertexStage } from "./clusters/vertexStage";
+export { CLUSTER_MESH_WGSL, CLUSTER_VERTEX_ENTRY, clusterVertexStage, clusterVertexFunction } from "./clusters/vertexStage";
+export { ClusterDebug, CLUSTER_DEBUG_MODES } from "./clusters/ClusterDebug";
+export type { ClusterDebugMode, ClusterDebugOptions, ClusterLevelCount } from "./clusters/ClusterDebug";
 export { ToneMapEffect, ToneMapper, LENS_ATTENUATION_UE5, LENS_ATTENUATION_UE4, exposureFromEV100, ev100FromCamera, whiteBalanceMatrix, unrealWhiteBalanceMatrix, defaultToneMapOptions, toneMapOptionsForSurface, defaultColorGrade, defaultUnrealFilm, unrealLocalExposure } from "./postprocessing/effects/ToneMapEffect";
 export type { ToneMapOptions, ColorGrade, UnrealFilm, LocalExposure } from "./postprocessing/effects/ToneMapEffect";
 export { SkyAtmosphere, defaultSkyAtmosphereOptions, skyCaptureFogFromHeightFog } from "./atmosphere/SkyAtmosphere";
