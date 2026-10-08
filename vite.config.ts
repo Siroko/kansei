@@ -6,13 +6,15 @@ import { extname, relative, resolve } from 'path'
 import { fileURLToPath } from 'node:url'
 import { glob } from 'glob'
 import mkcert from 'vite-plugin-mkcert'
+import { devSite } from './scripts/vite-dev-site'
 
 // https://vitejs.dev/config/
 export default defineConfig({
     plugins: [
         dts({ include: ['src'] }),
         mkcert(),
-        wasm()
+        wasm(),
+        devSite(__dirname)
     ],
     build: {
         rollupOptions: {

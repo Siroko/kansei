@@ -34,7 +34,7 @@ struct CullInstances {
     strideWords  : u32,
     centerWord   : u32,               // word offset of the instance centre (3 x f32)
     scaleWord    : u32,               // word offset of an f32 the bounds scale by, or NO_WORD
-    flags        : u32,               // FLAG_BOX, FLAG_CASTS_SHADOW, FLAG_TWO_PHASE, FLAG_GI_SURFACE
+    flags        : u32,               // FLAG_BOX, FLAG_CASTS_SHADOW, FLAG_TWO_PHASE, FLAG_GI_SURFACE, FLAG_RT_SURFACE
     indexCount   : u32,               // the indirect draw's (its args are cleared every frame)
     firstView    : u32,               // `main`: the view of the dispatch's first row (y = 0);
                                       // `early`: the first view of occlusionView's chunk
@@ -46,6 +46,8 @@ struct CullInstances {
     occlusionView: u32,               // `early` and `late`: the view culled in two phases
     crossfade    : f32,               // the width of the bands' crossfades (LOD distance); 0: none
     giLod        : vec2f,             // the LOD band in voxel GI's views (FLAG_GI views)
+    rtLod        : vec2f,             // the LOD band in the ray tracing grid's view (FLAG_RT views)
+    pad          : vec2f,
 }
 
 // A view: all of them in one buffer, written once a frame.
@@ -54,7 +56,7 @@ struct CullView {
     view         : mat4x4f,           // occlusion: the view's view matrix
     proj         : mat4x4f,           // occlusion: its projection, as rasterized (jittered)
     lodOrigin    : vec3f,             // the main camera, for every view
-    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_REFLECTION, FLAG_GI, FLAG_LAYERED, FLAG_OCCLUSION, FLAG_STATS, FLAG_REVERSE_Z
+    flags        : u32,               // FLAG_VIEW, FLAG_CASTERS_ONLY, FLAG_REFLECTION, FLAG_GI, FLAG_RT, FLAG_LAYERED, FLAG_OCCLUSION, FLAG_STATS, FLAG_REVERSE_Z
     depthSize    : vec2f,             // occlusion: the depth buffer's size in pixels
     lodScale     : f32,               // the view's LOD distance scale (reflections pick finer LODs)
     layerMask    : u32,               // FLAG_LAYERED: the layers it draws (a reflection's)
@@ -95,6 +97,8 @@ const FLAG_OCCLUSION : u32 = 512u;
 const FLAG_LINEAR_DEPTH : u32 = 1024u;
 const FLAG_GI : u32 = 2048u;
 const FLAG_GI_SURFACE : u32 = 4096u;
+const FLAG_RT : u32 = 8192u;
+const FLAG_RT_SURFACE : u32 = 16384u;
 
 // what became of an instance
 const KEPT : u32 = 0u;
@@ -127,7 +131,8 @@ fn bounds(i : u32) -> Bounds {
     return b;
 }
 
-// The view's kind's LOD band: a shadow map's, a reflection's, voxel GI's, or the camera's.
+// The view's kind's LOD band: a shadow map's, a reflection's, voxel GI's, the ray tracing
+// grid's, or the camera's.
 fn lodBand(v : u32) -> vec2f {
     if ((views[v].flags & FLAG_CASTERS_ONLY) != 0u) {
         return ci.shadowLod;
@@ -135,6 +140,8 @@ fn lodBand(v : u32) -> vec2f {
         return ci.reflectionLod;
     } else if ((views[v].flags & FLAG_GI) != 0u) {
         return ci.giLod;
+    } else if ((views[v].flags & FLAG_RT) != 0u) {
+        return ci.rtLod;
     }
     return vec2f(ci.lodNear, ci.lodFar);
 }
@@ -281,6 +288,7 @@ fn drawnIn(v : u32) -> bool {
     return (flags & FLAG_VIEW) != 0u
         && ((flags & FLAG_CASTERS_ONLY) == 0u || (ci.flags & FLAG_CASTS_SHADOW) != 0u)
         && ((flags & FLAG_GI) == 0u || (ci.flags & FLAG_GI_SURFACE) != 0u)
+        && ((flags & FLAG_RT) == 0u || (ci.flags & FLAG_RT_SURFACE) != 0u)
         && ((flags & FLAG_LAYERED) == 0u || (views[v].layerMask & ci.layers) != 0u)
         && !((flags & FLAG_OCCLUSION) != 0u && (ci.flags & FLAG_TWO_PHASE) != 0u);
 }

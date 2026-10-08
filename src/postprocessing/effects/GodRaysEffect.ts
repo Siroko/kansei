@@ -3,6 +3,7 @@ import { Vector2 } from '../../math/Vector2';
 import { Vector3 } from '../../math/Vector3';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface GodRaysOptions {
     /**
@@ -248,7 +249,7 @@ class GodRaysEffect extends PostProcessingEffect {
         this._device!.queue.writeBuffer(this._paramsBuffer!, 0, paramsData);
 
         const wg = (t: number) => Math.ceil(t / 8);
-        const pass = commandEncoder.beginComputePass({ label: 'GodRays' });
+        const pass = commandEncoder.beginComputePass({ label: 'GodRays', timestampWrites: gpuPass('GodRays') });
         pass.setPipeline(this._pipeline!);
         pass.setBindGroup(0, this._bindGroup!);
         pass.dispatchWorkgroups(wg(width), wg(height));

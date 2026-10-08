@@ -4,13 +4,16 @@
 //! canopy lets it through, and the sunlit ground and trees light what is in their shade. The GI
 //! modes compare what lights the shade: the materials' own sky light (`gi=off`), dimmed by the
 //! top-down sky occlusion the film uses (`skyocc`) or by the clipmap's sky visibility
-//! (`visibility`, read in the material), or voxel GI on screen from cones per pixel (`cones`) or
-//! the clipmap's probes (`probes`).
+//! (`visibility`, read in the material), voxel GI on screen from cones per pixel (`cones`) or
+//! the clipmap's probes (`probes`), or the hybrid (`rt`, `RtDiffuseGiEffect`): rays through a grid
+//! of the scene's triangles near the camera, the clipmap past them.
 //!
 //! The terrain is tiles of a height field; the spruces (17 576) are instanced, culled on the GPU
 //! per view with dithered crossfades between LODs, as a film's forest is: needle-spray cards with
 //! cluster LOD near the camera, cone meshes farther. The clipmap voxelizes them through its own
-//! cull view. See README.md for the URL parameters.
+//! cull view. With `reflect=1` the road is wet and reflects the forest, traced through a grid of
+//! the scene's triangles (`Renderer::enable_rt_grid`, `RtReflectionsEffect`). See README.md for
+//! the URL parameters.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,6 +37,10 @@ use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::shadows::{CascadedShadowOptions, SkyOcclusion, SkyOcclusionOptions, CASCADED_SHADOWS_WGSL, SKY_OCCLUSION_WGSL};
 use kansei_core::buffers::{Sampler, Texture};
+use kansei_core::rt::{
+    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGridOptions, RtPlacement, RtReflectionsEffect,
+    RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+};
 use kansei_wasm::{flag, now, param, param_or, Canvas, Frame};
 
 /// The road's centre line across the valley: x at z (metres). Kept in step with ROAD_WGSL.
@@ -98,11 +105,12 @@ fn sky_light(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 /// Lambertian surfaces lit by the sun (its cascades) and the sky (AMBIENT_WGSL's `sky_light`),
 /// writing the GBuffer's albedo and normal for the GI. ALBEDO (string replaced) is a function
-/// `surface_albedo(world, n) -> vec3f`; the voxel entry writes the same albedo into the GI's
-/// voxels. Prefixed with AMBIENT_WGSL and its chunks, CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL,
+/// `surface_albedo(world, n) -> vec3f` and `surface_specular(world, n) -> vec2f`, a wet surface's
+/// F0 and roughness (`surface.wet`; 0 when dry) for the ray-traced reflections; the voxel entry
+/// writes the same albedo into the GI's voxels. Prefixed with AMBIENT_WGSL and its chunks, CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL,
 /// VOXEL_WRITE_WGSL and ROAD_WGSL.
 const GROUND_WGSL: &str = r#"
-struct Surface { albedo: vec4<f32>, road: vec4<f32>, rock: vec4<f32> };
+struct Surface { albedo: vec4<f32>, road: vec4<f32>, rock: vec4<f32>, wet: vec4<f32> };
 @group(0) @binding(0) var<uniform> surface: Surface;
 @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
 @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
@@ -129,7 +137,9 @@ fn fragment_main(in: VOut) -> KanseiGBufferOut {
     let n = normalize(in.normal);
     let albedo = surface_albedo(in.world, n);
     let sun = kansei_cascades.lightColor * max(dot(n, -kansei_cascades.lightDirection), 0.0) * kansei_sun_shadow(in.world, n, in.clip.xy);
-    return kansei_gbuffer_out(albedo / 3.14159265 * (sun + sky_light(in.world, n)), vec3<f32>(0.0), n, albedo);
+    // a wet surface's reflectance and roughness, for the ray-traced reflections (F0 0: none)
+    let wet = surface_specular(in.world, n);
+    return kansei_gbuffer_out_specular(albedo / 3.14159265 * (sun + sky_light(in.world, n)), vec3<f32>(0.0), n, albedo, wet.x, wet.y);
 }
 
 @fragment
@@ -147,12 +157,23 @@ fn surface_albedo(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let variation = 0.85 + 0.3 * fract(sin(dot(floor(world.xz / 3.0), vec2<f32>(12.9898, 78.233))) * 43758.5453);
     return mix(mix(surface.albedo.rgb * variation, surface.road.rgb, road), surface.rock.rgb, rock);
 }
+
+// wet: the road's bed (`surface.wet.x`, F0) where it is level, the rest by `surface.wet.y`
+fn surface_specular(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+    let road = 1.0 - smoothstep(2.8, 4.0, abs(world.x - road_x(world.z)));
+    let level = smoothstep(0.85, 0.95, n.y);
+    return vec2<f32>(mix(surface.wet.y, surface.wet.x * level, road), surface.wet.z);
+}
 "#;
 
 /// A constant albedo (rocks, the cabin).
 const CONSTANT_ALBEDO_WGSL: &str = r#"
 fn surface_albedo(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return surface.albedo.rgb;
+}
+
+fn surface_specular(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+    return surface.wet.yz;
 }
 "#;
 
@@ -295,6 +316,29 @@ const CROSSFADE: f32 = 8.0;
 /// the cards' cluster cull.
 const TREE_STRETCH: f32 = 1.15;
 
+/// Where a spruce's record puts a point of its mesh, as TREE_WGSL's `vertex_main` does (a little
+/// wider or narrower by its tint, which `InstanceTransform` can't say), for the ray tracing grid.
+const TREE_PLACEMENT_WGSL: &str = r#"
+fn kansei_rt_place(record: u32, p: vec3f) -> vec3f {
+    let place = kansei_rt_record_vec4(record, 0u);
+    let extra = kansei_rt_record_vec4(record, 4u);
+    let width = 0.85 + 0.3 * extra.y;
+    let q = p * vec3f(width, 1.0, width) * place.w;
+    let c = cos(extra.x);
+    let s = sin(extra.x);
+    return vec3f(c * q.x + s * q.z, q.y, -s * q.x + c * q.z) + place.xyz;
+}
+"#;
+
+/// Where a spruce card's surface is, for the ray-traced reflections' alpha test (TREE_WGSL's
+/// `covered`): bark on the trunk (u past 1.5), the needle sprays where the needles' alpha is.
+const CARD_COVERED_WGSL: &str = r#"
+fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {
+    if (uv.x > 1.5) { return true; }
+    return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;
+}
+"#;
+
 /// How much of the light the crowns' voxels stop for their area: the meshes are closed cones
 /// standing for needles light passes between.
 const CROWN_OPACITY: f32 = 0.35;
@@ -341,15 +385,16 @@ impl AmbientSources<'_> {
     }
 }
 
-fn ground_material(label: &str, albedo_wgsl: &str, albedo: [f32; 3], ambient: &AmbientSources) -> Material {
+fn ground_material(label: &str, albedo_wgsl: &str, albedo: [f32; 3], ambient: &AmbientSources, wet: [f32; 4]) -> Material {
     let shader = GROUND_WGSL.replace("ALBEDO", albedo_wgsl);
     let code = format!("{}\n{CASCADED_SHADOWS_WGSL}\n{GBUFFER_OUT_WGSL}\n{VOXEL_WRITE_WGSL}\n{ROAD_WGSL}\n{shader}", AmbientSources::wgsl());
     let options = MaterialOptions { mrt_output_count: Some(4), voxel_fragment_entry: Some("voxel_main"), ..Default::default() };
     let mut m = Material::new(label, &code, AmbientSources::bindings(), options);
-    let mut u = [0.0f32; 12];
+    let mut u = [0.0f32; 16];
     for (k, c) in [albedo, ROAD, ROCK].iter().enumerate() {
         u[4 * k..4 * k + 3].copy_from_slice(c);
     }
+    u[12..].copy_from_slice(&wet);
     m.set_uniform_bindable(0, label, &u);
     ambient.bind(&mut m);
     m
@@ -484,10 +529,13 @@ enum Gi {
     Cones,
     /// Voxel GI on screen from the clipmap's probes: the same light, cheaper and smoother.
     Probes,
+    /// The hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels through the grid of
+    /// triangles near the camera, the hits lit by the sun and the clipmap, the clipmap past them.
+    Rt,
 }
 
 impl Gi {
-    const ALL: [Gi; 5] = [Gi::Off, Gi::SkyOcc, Gi::Visibility, Gi::Cones, Gi::Probes];
+    const ALL: [Gi; 6] = [Gi::Off, Gi::SkyOcc, Gi::Visibility, Gi::Cones, Gi::Probes, Gi::Rt];
 
     fn name(self) -> &'static str {
         match self {
@@ -496,6 +544,7 @@ impl Gi {
             Gi::Visibility => "visibility",
             Gi::Cones => "cones",
             Gi::Probes => "probes",
+            Gi::Rt => "rt",
         }
     }
 
@@ -542,6 +591,116 @@ impl View {
     }
 }
 
+/// The reflections' view by name: `lit`, `reflection`, `mirror` or `cost`.
+fn reflection_view(name: &str) -> Option<RtReflectionsView> {
+    match name {
+        "lit" => Some(RtReflectionsView::Lit),
+        "reflection" => Some(RtReflectionsView::Reflection),
+        "mirror" => Some(RtReflectionsView::Mirror),
+        "cost" => Some(RtReflectionsView::Cost),
+        _ => None,
+    }
+}
+
+fn reflection_view_name(view: RtReflectionsView) -> &'static str {
+    match view {
+        RtReflectionsView::Lit => "lit",
+        RtReflectionsView::Reflection => "reflection",
+        RtReflectionsView::Mirror => "mirror",
+        RtReflectionsView::Cost => "cost",
+    }
+}
+
+/// The hybrid's settings (`gi=rt`): the URL's `rtgi_*` parameters and `set_rtgi`'s keys.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RtGi {
+    resolution: RtGiResolution,
+    denoise: RtGiDenoise,
+    kernel: RtGiKernel,
+    hit: RtGiHitLighting,
+    shadows: RtGiShadows,
+    mode: RtGiMode,
+    accumulate: bool,
+    view: RtGiView,
+    /// Metres a ray walks the grid before the clipmap takes over (0: the grid's box).
+    near: f32,
+}
+
+impl RtGi {
+    const KEYS: [&'static str; 9] = ["res", "denoise", "kernel", "hit", "shadows", "mode", "accum", "view", "near"];
+
+    fn from_url() -> Self {
+        // an 8 m near field: half the trace of the whole 64 m box, for some light lost under the
+        // canopy past it, which the clipmap's voxels are too coarse to hold
+        let mut r = Self {
+            resolution: RtGiResolution::Half,
+            denoise: RtGiDenoise::Svgf,
+            kernel: RtGiKernel::Three,
+            hit: RtGiHitLighting::Direct,
+            shadows: RtGiShadows::Rays,
+            mode: RtGiMode::Hybrid,
+            accumulate: false,
+            view: RtGiView::Lit,
+            near: 8.0,
+        };
+        for key in Self::KEYS {
+            if let Some(v) = param(&format!("rtgi_{key}")) {
+                r.set(key, &v);
+            }
+        }
+        r
+    }
+
+    /// One setting by its key and name; false if either is unknown.
+    fn set(&mut self, key: &str, v: &str) -> bool {
+        match key {
+            "res" => RtGiResolution::from_name(v).map(|x| self.resolution = x),
+            "denoise" => RtGiDenoise::from_name(v).map(|x| self.denoise = x),
+            "kernel" => RtGiKernel::from_name(v).map(|x| self.kernel = x),
+            "hit" => RtGiHitLighting::from_name(v).map(|x| self.hit = x),
+            "shadows" => RtGiShadows::from_name(v).map(|x| self.shadows = x),
+            "mode" => RtGiMode::from_name(v).map(|x| self.mode = x),
+            "accum" => {
+                self.accumulate = v == "1" || v == "true";
+                Some(())
+            }
+            "view" => RtGiView::from_name(v).map(|x| self.view = x),
+            "near" => v.parse::<f32>().ok().map(|x| self.near = x.max(0.0)),
+            _ => None,
+        }
+        .is_some()
+    }
+
+    /// Bring `e` to these settings (its history restarts).
+    fn apply_to(&self, e: &mut RtDiffuseGiEffect) {
+        e.set_resolution(self.resolution);
+        e.denoise = self.denoise;
+        e.kernel = self.kernel;
+        e.hit_lighting = self.hit;
+        e.shadows = self.shadows;
+        e.mode = self.mode;
+        e.accumulate = self.accumulate;
+        e.near_distance = self.near;
+        e.reset_history();
+    }
+
+    /// The settings as JSON members (for `info`).
+    fn json(&self) -> String {
+        format!(
+            "\"res\":\"{}\",\"denoise\":\"{}\",\"kernel\":\"{}\",\"hit\":\"{}\",\"shadows\":\"{}\",\"mode\":\"{}\",\"accum\":{},\"view\":\"{}\",\"near\":{}",
+            self.resolution.name(),
+            self.denoise.name(),
+            self.kernel.name(),
+            self.hit.name(),
+            self.shadows.name(),
+            self.mode.name(),
+            self.accumulate,
+            self.view.name(),
+            self.near
+        )
+    }
+}
+
 /// Camera presets: name, target, distance, azimuth and elevation (radians).
 const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 4] = [
     ("road", [6.0, 1.6, -10.0], 9.0, 2.6, 0.05),
@@ -583,6 +742,8 @@ struct State {
     trees: usize,
     triangles: u64,
     stats: Option<Stats>,
+    /// The hybrid's settings (its effect exists with the grid: `gi=rt`, `rt=1` or `reflect=1`).
+    rtgi: RtGi,
 }
 
 thread_local! {
@@ -619,7 +780,7 @@ fn auto_ev100(elevation: f32) -> f32 {
 impl State {
     fn apply(&mut self) {
         // the clipmap runs for its GI and its probes; the effect shows the GI on screen
-        let clipmap = matches!(self.gi, Gi::Visibility | Gi::Cones | Gi::Probes);
+        let clipmap = matches!(self.gi, Gi::Visibility | Gi::Cones | Gi::Probes | Gi::Rt);
         let on_screen = matches!(self.gi, Gi::Cones | Gi::Probes);
         if let Some(gi) = self.renderer.voxel_clipmap_mut() {
             gi.settings.enabled = clipmap;
@@ -639,6 +800,12 @@ impl State {
             effect.show_indirect = self.view == View::Indirect;
             effect.reset_history();
         }
+        let (rtgi, indirect) = (self.rtgi, self.view == View::Indirect);
+        if let Some(effect) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            effect.enabled = self.gi == Gi::Rt;
+            rtgi.apply_to(effect);
+            effect.view = if indirect { RtGiView::Indirect } else { rtgi.view };
+        }
     }
 
     fn set_camera(&mut self, name: &str) {
@@ -651,6 +818,9 @@ impl State {
             if let Some(effect) = volume.effect_mut::<VoxelGIEffect>() {
                 effect.reset_history();
             }
+        }
+        if let Some(effect) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            effect.reset_history();
         }
     }
 
@@ -682,6 +852,9 @@ impl State {
             fog.update_lights(self.scene.lights());
             fog.time = self.time;
         }
+        if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            gi.update_lights(self.scene.lights());
+        }
         self.sky.update(self.renderer.device(), self.renderer.queue(), &mut self.camera);
         let volume = if self.view == View::Voxels && self.renderer.voxel_clipmap().is_some_and(|g| g.settings.enabled) { &mut self.debug_volume } else { &mut self.volume };
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, volume);
@@ -701,6 +874,54 @@ impl State {
         }
     }
 
+    /// The ray tracing grid's figures as JSON (null without it).
+    fn rt_info(&self) -> String {
+        let Some(rt) = self.renderer.rt_grid() else { return "null".into() };
+        let s = rt.stats();
+        let (lo, hi) = rt.grid().bounds();
+        format!(
+            "{{\"triangles\":{},\"references\":{},\"big\":{},\"sources\":{},\"rebuilt\":{},\"rebuilds\":{},\"cpu_ms\":{:.3},\"mib\":{:.1},\"box\":[[{:.1},{:.1},{:.1}],[{:.1},{:.1},{:.1}]]}}",
+            s.grid.triangles, s.grid.references, s.grid.big_triangles, s.sources, s.rebuilt, s.rebuilds, s.cpu_ms, rt.memory_bytes() as f64 / (1 << 20) as f64, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+        )
+    }
+
+    /// The reflections' settings and counters as JSON (null without them).
+    fn reflect_info(&self) -> String {
+        let Some(r) = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtReflectionsEffect>()) else { return "null".into() };
+        let s = r.stats().unwrap_or_default();
+        format!(
+            "{{\"enabled\":{},\"view\":\"{}\",\"res\":\"{}\",\"alpha\":{},\"grid\":{},\"rays\":{},\"hits\":{},\"cells\":{},\"tests\":{},\"max_cost\":{}}}",
+            r.enabled,
+            reflection_view_name(r.view),
+            if r.resolution() == RtTraceResolution::Quarter { "quarter" } else { "half" },
+            r.alpha_test,
+            r.trace_grid,
+            s.rays,
+            s.hits,
+            s.cells,
+            s.tests,
+            s.max_cost
+        )
+    }
+
+    /// The hybrid's settings, and with its effect its counters, memory and accumulated frames
+    /// (null without the effect).
+    fn rtgi_info(&self) -> String {
+        let Some(e) = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtDiffuseGiEffect>()) else { return "null".into() };
+        let s = e.stats().unwrap_or_default();
+        format!(
+            "{{{},\"on\":{},\"accumulated\":{},\"mib\":{:.1},\"rays\":{},\"hits\":{},\"cost\":{},\"shadow_rays\":{}}}",
+            self.rtgi.json(),
+            e.enabled,
+            e.accumulated(),
+            e.memory_bytes() as f64 / (1 << 20) as f64,
+            s.rays,
+            s.hits,
+            s.cost,
+            s.shadow_rays
+        )
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_clipmap();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
@@ -709,7 +930,13 @@ impl State {
         let eye = self.camera.position();
         let layout = gi.map(|g| *g.clipmap().layout());
         format!(
-            "{{\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"rtgi\":{},\"rtgi_ms\":{:.3},\"rt\":{},\"rt_ms\":{:.3},\"reflect\":{},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            self.rtgi_info(),
+            sum("RtGi/"),
+            self.rt_info(),
+            sum("Rt/Gather") + sum("Rt/Grid"),
+            self.reflect_info(),
+            sum("Rt/Trace") + sum("Rt/Resolve"),
             self.gi.name(),
             self.view.name(),
             layout.map_or(0, |l| l.levels),
@@ -751,6 +978,29 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     renderer.enable_voxel_clipmap(options);
     // the film's sky occlusion, for comparison: the trees seen from above
     renderer.enable_sky_occlusion(SkyOcclusionOptions { extent_m: 320.0, min_height_m: -10.0, max_height_m: 90.0, volume_size: (128, 32), layer_mask: TREE_LAYER, ..Default::default() });
+    // rt=1: a ray tracing grid of the scene's triangles round the camera, 64 x 32 x 64 m of 0.5 m
+    // cells, its trees by their cluster cut at a cell of error; rt_cell=<m> (the box stays
+    // 64 m across), rt_rebuild=1 rebuilds it every frame
+    // reflect=1: ray-traced reflections on the road, wet (wet=all: everywhere), through the grid;
+    // gi=rt: the hybrid GI's rays through it
+    let reflect = flag("reflect", false);
+    let gi_mode = param("gi").and_then(|g| Gi::from_name(&g)).unwrap_or(Gi::Cones);
+    let rt = flag("rt", false) || reflect || gi_mode == Gi::Rt;
+    // the wet surfaces' F0 (the road's, the rest's) and roughness, 0 when dry (the default)
+    let wet = match (reflect, param("wet").as_deref()) {
+        (false, _) => [0.0; 4],
+        (true, Some("all")) => [param_or("wet_f0", 0.04), param_or("wet_f0", 0.04), param_or("wet_rough", 0.1), 0.0],
+        (true, _) => [param_or("wet_f0", 0.04), 0.0, param_or("wet_rough", 0.1), 0.0],
+    };
+    if rt {
+        let cell: f32 = param_or("rt_cell", 0.5);
+        let across = (64.0 / cell / 4.0).round() as u32 * 4;
+        renderer.enable_rt_grid(SceneRtGridOptions {
+            grid: RtGridOptions { dims: [across, across / 2, across], cell, below: 0.25, ..Default::default() },
+            cluster_error_cells: 1.0,
+            rebuild_every_frame: flag("rt_rebuild", false),
+        });
+    }
 
     let mut sky = SkyAtmosphere::new(renderer.device(), SkyAtmosphereOptions::default());
     sky.sun.illuminance = Vec3::new(100_000.0, 100_000.0, 100_000.0);
@@ -783,8 +1033,10 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             let mut geometry = HeightfieldGeometry::new(min, [min[0] + tile, min[1] + tile], (80, 80), height);
             geometry.label = "Terrain".into();
             triangles += geometry.indices.len() as u64 / 3;
-            let mut r = Renderable::new(geometry, ground_material("Terrain", TERRAIN_ALBEDO_WGSL, GRASS, &ambient)).with_gi(GiSurface::new(GRASS));
+            let mut r = Renderable::new(geometry, ground_material("Terrain", TERRAIN_ALBEDO_WGSL, GRASS, &ambient, wet)).with_gi(GiSurface::new(GRASS));
             r.cast_shadow = true;
+            // the hits shaded with the height field's vertex normals, not its facets
+            r.rt = rt.then(|| RtSurface::new(GRASS).with_smooth_normals());
             scene.add(SceneNode::Renderable(r));
         }
     }
@@ -794,19 +1046,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let side = if hash01(k + 9) > 0.5 { 1.0 } else { -1.0 };
         let x = road_x(z) + side * (5.0 + 3.0 * hash01(k + 2));
         let size = 0.4 + 1.4 * hash01(k + 4).powi(2);
-        let mut rock = Renderable::new(IcosphereGeometry::new(size, 2), ground_material("Rock", CONSTANT_ALBEDO_WGSL, ROCK, &ambient)).with_gi(GiSurface::new(ROCK));
+        let mut rock = Renderable::new(IcosphereGeometry::new(size, 2), ground_material("Rock", CONSTANT_ALBEDO_WGSL, ROCK, &ambient, wet)).with_gi(GiSurface::new(ROCK));
         rock.object.set_position(x, height(x, z) + 0.2 * size, z);
         rock.object.scale = Vec3::new(1.0, 0.6, 1.2);
         rock.object.rotation.y = hash01(k + 6) * 3.0;
+        rock.rt = rt.then(|| RtSurface::new(ROCK));
         scene.add(SceneNode::Renderable(rock));
     }
     let (cx, cz, _) = CLEARING;
     let wall = [0.42, 0.18, 0.12];
     let ground = height(cx, cz);
     for (size, offset, albedo) in [([6.0, 3.2, 4.5], [0.0, 1.6, 0.0], wall), ([6.6, 0.3, 5.4], [0.0, 3.5, 0.0], [0.2, 0.2, 0.22])] {
-        let mut part = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), ground_material("Cabin", CONSTANT_ALBEDO_WGSL, albedo, &ambient)).with_gi(GiSurface::new(albedo));
+        let mut part = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), ground_material("Cabin", CONSTANT_ALBEDO_WGSL, albedo, &ambient, wet)).with_gi(GiSurface::new(albedo));
         part.object.set_position(cx + offset[0], ground + offset[1] - 0.3, cz + offset[2]);
         part.object.rotation.y = 0.5;
+        part.rt = rt.then(|| RtSurface::new(albedo));
         scene.add(SceneNode::Renderable(part));
     }
 
@@ -843,6 +1097,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let opacity = if clusters.is_some() { 1.0 } else { param_or("crown_opacity", CROWN_OPACITY) };
         let mut r = Renderable::new(InstancedGeometry::new(Geometry::new("Spruce", mesh.vertices, mesh.indices), trees as u32, vec![culled]), tree_material("Spruce", &ambient, clusters.is_some()))
             .with_gi(GiSurface::new(NEEDLES).with_opacity(opacity));
+        // in the ray tracing grid: the cards' sprays cut out by the needles' alpha (layer 0)
+        if rt {
+            let surface = RtSurface::new(NEEDLES);
+            r.rt = Some(if clusters.is_some() { surface.with_alpha_layer(0) } else { surface });
+            r.rt_placement = Some(RtPlacement::Wgsl(TREE_PLACEMENT_WGSL.into()));
+        }
         r.clusters = clusters;
         // the canopy the sky occlusion sees from above (the terrain is not)
         r.layers = Renderable::DEFAULT_LAYERS | TREE_LAYER;
@@ -875,7 +1135,42 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     });
     let mut gi = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), VoxelGIOptions { intensity: param_or("intensity", 1.0), ..Default::default() });
     gi.set_sky_lighting(Some(&sky.bindings().sky_lighting));
-    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(gi), Box::new(AtmosphereEffect::new(&sky))];
+    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(gi)];
+    // with the grid, the hybrid in voxel GI's place (on in gi=rt): rays through the grid, the
+    // cards alpha-tested, the hits lit by the sun (shadow rays, the cascades past the grid) and
+    // the clipmap, the clipmap and the sky past the grid
+    if rt {
+        let options = RtDiffuseGiOptions { covered_wgsl: Some(CARD_COVERED_WGSL.into()), ..Default::default() };
+        let mut hybrid = RtDiffuseGiEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), renderer.rt_grid().unwrap().handle(), options);
+        hybrid.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        let mut needles = needle_texture();
+        needles.initialize_with_data(renderer.device(), renderer.queue());
+        hybrid.set_alpha_texture(needles.view());
+        hybrid.set_cascaded_shadow_map(renderer.cascaded_shadow_map());
+        hybrid.heat_scale = exposure_from_ev100_lens(param_or("ev", forest_ev100(elevation)), LENS_ATTENUATION_UE4).recip() * 0.5;
+        hybrid.collect_stats = flag("stats", false);
+        effects.push(Box::new(hybrid));
+    }
+    // the reflections: after the GI (they reflect its light), under the aerial perspective
+    if reflect {
+        let options = RtReflectionsOptions {
+            resolution: if param("rt_res").as_deref() == Some("quarter") { RtTraceResolution::Quarter } else { RtTraceResolution::Half },
+            alpha_test: flag("rt_alpha", true),
+            covered_wgsl: Some(CARD_COVERED_WGSL.into()),
+            ..Default::default()
+        };
+        let mut reflections = RtReflectionsEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), renderer.rt_grid().unwrap().handle(), options);
+        reflections.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        let mut needles = needle_texture();
+        needles.initialize_with_data(renderer.device(), renderer.queue());
+        reflections.set_alpha_texture(needles.view());
+        reflections.view = param("rt_view").and_then(|v| reflection_view(&v)).unwrap_or_default();
+        reflections.heat_scale = exposure_from_ev100_lens(param_or("ev", forest_ev100(elevation)), LENS_ATTENUATION_UE4).recip() * 0.5;
+        reflections.collect_stats = flag("stats", false);
+        reflections.trace_grid = param("rt_trace").as_deref() != Some("voxels");
+        effects.push(Box::new(reflections));
+    }
+    effects.push(Box::new(AtmosphereEffect::new(&sky)));
     // fog=<density>: mist in the valley, lit by the sun through the cascades and by the sky, or by
     // the clipmap's probes in its modes (the light of the sunlit clearing, the sky past the trees)
     let fog_density: f32 = param_or("fog", 0.0);
@@ -920,7 +1215,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         volume,
         debug_volume,
         sun_light,
-        gi: param("gi").and_then(|g| Gi::from_name(&g)).unwrap_or(Gi::Cones),
+        gi: gi_mode,
         ambient_mode,
         view: param("view").and_then(|v| View::from_name(&v)).unwrap_or(View::Lit),
         elevation,
@@ -930,6 +1225,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         trees,
         triangles,
         stats,
+        rtgi: RtGi::from_url(),
     };
     state.set_camera(param("cam").as_deref().unwrap_or("road"));
     state.apply();
@@ -947,12 +1243,27 @@ pub fn info() -> String {
     with_state(|s| s.info()).unwrap_or_default()
 }
 
-/// `off`, `skyocc`, `visibility`, `cones` or `probes` (`Gi`).
+/// `off`, `skyocc`, `visibility`, `cones`, `probes` or `rt` (`Gi`; `rt` only where the page
+/// built the grid: `gi=rt`, `rt=1` or `reflect=1`).
 #[wasm_bindgen]
 pub fn set_gi(name: &str) {
     with_state(|s| {
         if let Some(gi) = Gi::from_name(name) {
+            if gi == Gi::Rt && s.volume.effect_mut::<RtDiffuseGiEffect>().is_none() {
+                return;
+            }
             s.gi = gi;
+            s.apply();
+        }
+    });
+}
+
+/// One of the hybrid's settings at run time, by its `rtgi_*` URL parameter's key (`res`,
+/// `denoise`, `kernel`, `hit`, `shadows`, `mode`, `accum`, `view`, `near`) and value.
+#[wasm_bindgen]
+pub fn set_rtgi(key: &str, value: &str) {
+    with_state(|s| {
+        if s.rtgi.set(key, value) {
             s.apply();
         }
     });
@@ -996,4 +1307,45 @@ pub fn set_stats(on: bool) {
         s.renderer.set_profiling(on);
         s.stats = on.then(|| Stats { since: now() * 1000.0, ..Default::default() });
     });
+}
+
+fn with_reflections(f: impl FnOnce(&mut RtReflectionsEffect)) {
+    with_state(|s| {
+        if let Some(r) = s.volume.effect_mut::<RtReflectionsEffect>() {
+            f(r);
+        }
+    });
+}
+
+/// The ray-traced reflections on or off (with `reflect=1`).
+#[wasm_bindgen]
+pub fn set_reflections(on: bool) {
+    with_reflections(|r| {
+        r.enabled = on;
+        r.reset_history();
+    });
+}
+
+/// `lit`, `reflection` (the light they add), `mirror` (what the rays see) or `cost`.
+#[wasm_bindgen]
+pub fn set_reflection_view(name: &str) {
+    with_reflections(|r| r.view = reflection_view(name).unwrap_or_default());
+}
+
+/// The cards' alpha test in the reflections (off: the cards are solid).
+#[wasm_bindgen]
+pub fn set_reflection_alpha(on: bool) {
+    with_reflections(|r| r.alpha_test = on);
+}
+
+/// Trace the grid of triangles, or (off) the voxel cone alone.
+#[wasm_bindgen]
+pub fn set_reflection_grid(on: bool) {
+    with_reflections(|r| r.trace_grid = on);
+}
+
+/// `half` or `quarter`: one pixel of each 2 x 2 or 4 x 4 traced a frame.
+#[wasm_bindgen]
+pub fn set_reflection_resolution(name: &str) {
+    with_reflections(|r| r.set_resolution(if name == "quarter" { RtTraceResolution::Quarter } else { RtTraceResolution::Half }));
 }

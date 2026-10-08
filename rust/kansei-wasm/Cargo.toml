@@ -6,12 +6,13 @@ description = "Kansei engine — web runtime shared by the WASM examples"
 
 [dependencies]
 kansei-core = { path = "../kansei-core" }
+wgpu = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Window", "Document", "Element", "HtmlCanvasElement", "Location", "Navigator", "Performance",
     "Response", "UrlSearchParams", "ResizeObserver", "HtmlElement", "HtmlInputElement", "EventTarget", "KeyboardEvent",
-    "Gamepad", "GamepadButton",
+    "Gamepad", "GamepadButton", "OffscreenCanvas",
 ] }
 js-sys = "0.3"
 log = "0.4"

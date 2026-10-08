@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { SphereGeometry } from '../src/geometries/SphereGeometry'
@@ -31,17 +31,19 @@
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
     import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
-    import { CubeMapShadowMap } from '../src/shadows/CubeMapShadowMap'
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
     import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
     import { ColorGradingEffect } from '../src/postprocessing/effects/ColorGradingEffect'
+    import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, unrealLocalExposure } from '../src/postprocessing/effects/ToneMapEffect'
     import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { PointLight } from '../src/lights/PointLight'
     import { Float } from '../src/math/Float'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // ── Scene parameters ──────────────────────────────────────────────────────
@@ -54,6 +56,7 @@
     // ── Scene lights ──────────────────────────────────────────────────────
     const dirLight = new DirectionalLight([0.5, -0.2, 0.5], [1.0, 0.95, 0.85], 1.0);
     dirLight.volumetric = true;
+    dirLight.castShadow = true;
 
     // ── Lambert shader (white base colour, single directional light) ──────
     // Uses the same lightDir as the volumetric fog so shading is consistent.
@@ -74,10 +77,10 @@
       }
 
       @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
-      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -108,7 +111,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
@@ -137,7 +140,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
@@ -180,25 +183,18 @@
     }
 
     // ── Renderer ──────────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 2,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: true,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
 
-    // ── Shadow receiving on geometry ─────────────────────────────────────
-    renderer.shadowsEnabled = true;
+    // ── Shadows: the renderer renders them each frame from the lights that cast ──
+    // (dirLight; the point lights while volumetric), for the geometry and the fog
+    const shadowMap = renderer.enableShadows({ resolution: 2048 });
+    const cubeMapShadowMap = renderer.enablePointShadows({ resolution: 512 });
 
     // ── Volumetric fog resources ──────────────────────────────────────────
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
-    renderer.shadowMap = shadowMap;
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
       near: 0.5, far: 300,
@@ -206,7 +202,6 @@
       blendFactor: 0.05,
     });
 
-    const cubeMapShadowMap = new CubeMapShadowMap(renderer.gpuDevice, { resolution: 512 });
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
@@ -325,7 +320,7 @@
     });
 
     const bloomEffect = new BloomEffect({
-      threshold: 0.0,
+      threshold: 0.01, // every emissive surface blooms (0 or below is physically based bloom)
       knee: 0.1,
       intensity: 0.8,
       radius: 1.0,
@@ -339,21 +334,29 @@
 
     const colorGradingEffect = new ColorGradingEffect();
 
+    // the display transform, last in the HDR chain (a display-space colour grade may follow it)
+    const toneMapEffect = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: ToneMapper.AcesFitted,
+      exposure: exposureFromEV100(1),
+    });
+
     const pathTracerEffect = new PathTracerEffect({
       scene,
       temporalBlend: 0.1,
       spatialPasses: 3,
     });
 
-    const allEffects = [pathTracerEffect, fogEffect, bloomEffect, dofEffect, colorGradingEffect];
-    const volume = new PostProcessingVolume(renderer, [...allEffects]);
+    const allEffects = [pathTracerEffect, fogEffect, bloomEffect, dofEffect, toneMapEffect, colorGradingEffect];
+    const volume = new PostProcessingVolume(renderer, [...allEffects], { msaaSampleCount: 4 });
 
     // ── Effect toggles ──────────────────────────────────────────────────────────
     const effectToggles = {
       pathTracer: false,
       fog: true,
-      bloom: false,
+      bloom: true,
       dof: false,
+      toneMap: true,
       colorGrading: false,
     };
 
@@ -363,9 +366,16 @@
       if (effectToggles.fog)          volume.effects.push(fogEffect);
       if (effectToggles.bloom)        volume.effects.push(bloomEffect);
       if (effectToggles.dof)          volume.effects.push(dofEffect);
+      if (effectToggles.toneMap)      volume.effects.push(toneMapEffect);
       if (effectToggles.colorGrading) volume.effects.push(colorGradingEffect);
     }
     rebuildEffectChain();
+
+    // ?profile=1: per-pass GPU times; ?bench=1: fog on against off (examples/profile-hud.js)
+    const hud = installProfileHud({
+      renderer, FrameTimer, AbBench,
+      bench: { labels: ['fog on', 'off'], set: (v) => { effectToggles.fog = v === 0; rebuildEffectChain(); } },
+    });
 
     // ── Tweakpane ───────────────────────────────────────────────────────────────
     const params = {
@@ -398,6 +408,12 @@
     fogFolder.addBinding(fogEffect, 'heightFalloff',  { min: 0, max: 0.5, step: 0.001 });
     fogFolder.addBinding(fogEffect, 'extinctionCoeff', { min: 0, max: 5, step: 0.01, label: 'extinction' });
     fogFolder.addBinding(fogEffect, 'anisotropy',     { min: -1, max: 1, step: 0.01 });
+    fogFolder.addBinding(fogEffect, 'fogHeight',      { min: -10, max: 40, step: 0.1, label: 'fog height' });
+    fogFolder.addBinding(fogEffect, 'startDistance',  { min: 0, max: 50, step: 0.1, label: 'start distance' });
+    fogFolder.addBinding(fogEffect, 'maxDistance',    { min: 0, max: fogEffect.froxelGrid.far, step: 1, label: 'reach (0 = far)' });
+    const fogAmbient = { color: { r: 0, g: 0, b: 0 } };
+    fogFolder.addBinding(fogAmbient, 'color', { color: { type: 'float' }, label: 'ambient' })
+      .on('change', (ev) => { fogEffect.ambient = [ev.value.r, ev.value.g, ev.value.b]; });
     fogFolder.addBinding(params, 'lightX', { min: -1, max: 1, step: 0.01, label: 'light X' }).on('change', syncLightDir);
     fogFolder.addBinding(params, 'lightY', { min: -1, max: 1, step: 0.01, label: 'light Y' }).on('change', syncLightDir);
     fogFolder.addBinding(params, 'lightZ', { min: -1, max: 1, step: 0.01, label: 'light Z' }).on('change', syncLightDir);
@@ -415,6 +431,22 @@
     dofFolder.addBinding(dofEffect, 'focusDistance', { min: 1, max: 200, step: 1 });
     dofFolder.addBinding(dofEffect, 'focusRange',    { min: 1, max: 100, step: 1 });
     dofFolder.addBinding(dofEffect, 'maxBlur',       { min: 0, max: 64, step: 1 });
+
+    const toneParams = { ev100: 1, localExposure: false, localContrast: 0.8 };
+    const syncLocalExposure = () => {
+      toneMapEffect.options.localExposure = toneParams.localExposure ? unrealLocalExposure(toneParams.localContrast, toneParams.localContrast) : null;
+    };
+    const toneFolder = pane.addFolder({ title: 'Tone Map' });
+    toneFolder.addBinding(effectToggles, 'toneMap', { label: 'enabled' }).on('change', rebuildEffectChain);
+    toneFolder.addBinding(toneMapEffect.options, 'tonemapper', { options: ToneMapper });
+    toneFolder.addBinding(toneParams, 'ev100', { min: -4, max: 6, step: 0.1, label: 'EV100' }).on('change', (ev) => {
+      toneMapEffect.options.exposure = exposureFromEV100(ev.value);
+    });
+    toneFolder.addBinding(toneMapEffect.options, 'vignette', { min: 0, max: 1, step: 0.01 });
+    toneFolder.addBinding(toneMapEffect.options, 'grain', { min: 0, max: 1, step: 0.01 });
+    toneFolder.addBinding(toneMapEffect.options, 'chromaticAberration', { min: 0, max: 2, step: 0.01, label: 'aberration' });
+    toneFolder.addBinding(toneParams, 'localExposure', { label: 'local exposure' }).on('change', syncLocalExposure);
+    toneFolder.addBinding(toneParams, 'localContrast', { min: 0, max: 1, step: 0.01, label: 'local contrast' }).on('change', syncLocalExposure);
 
     const gradeFolder = pane.addFolder({ title: 'Color Grading' });
     gradeFolder.addBinding(effectToggles, 'colorGrading', { label: 'enabled' }).on('change', rebuildEffectChain);
@@ -449,7 +481,7 @@
       color: { r: ptLight1.color[0], g: ptLight1.color[1], b: ptLight1.color[2] },
     };
     const ptFolder1 = pane.addFolder({ title: 'Point Light 1' });
-    ptFolder1.addBinding(ptLight1Params, 'volumetric').on('change', (ev) => { ptLight1.volumetric = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'volumetric').on('change', (ev) => { ptLight1.volumetric = ptLight1.castShadow = ev.value; });
     ptFolder1.addBinding(ptLight1Params, 'x', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.x = ev.value; });
     ptFolder1.addBinding(ptLight1Params, 'y', { min: 0, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.y = ev.value; });
     ptFolder1.addBinding(ptLight1Params, 'z', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.z = ev.value; });
@@ -465,7 +497,7 @@
       color: { r: ptLight2.color[0], g: ptLight2.color[1], b: ptLight2.color[2] },
     };
     const ptFolder2 = pane.addFolder({ title: 'Point Light 2' });
-    ptFolder2.addBinding(ptLight2Params, 'volumetric').on('change', (ev) => { ptLight2.volumetric = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'volumetric').on('change', (ev) => { ptLight2.volumetric = ptLight2.castShadow = ev.value; });
     ptFolder2.addBinding(ptLight2Params, 'x', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.x = ev.value; });
     ptFolder2.addBinding(ptLight2Params, 'y', { min: 0, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.y = ev.value; });
     ptFolder2.addBinding(ptLight2Params, 'z', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.z = ev.value; });
@@ -484,6 +516,7 @@
     const maxZ = half + GRID_SPACING;
 
     function animate(now) {
+      hud.begin(now);
       const dt = (now - lastTime) / 1000;
       lastTime = now;
 
@@ -510,17 +543,14 @@
       }
 
       cameraControls.update();
-      shadowMap.render(renderer, scene, camera, dirLight);
-      // Only render cubemap shadows for volumetric point lights
-      const volPtLights = scene.pointLights.filter(l => l.volumetric);
-      if (volPtLights.length > 0) {
-        cubeMapShadowMap.render(renderer, scene, camera, volPtLights);
-      }
       fogEffect.updateLights(scene.directionalLights, scene.pointLights);
       volume.render(scene, camera);
-      requestAnimationFrame(animate);
+      hud.end(now);
     }
-    requestAnimationFrame(animate);
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate(performance.now());
+    });
   </script>
 </body>
 

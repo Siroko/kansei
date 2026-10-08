@@ -12,7 +12,7 @@
   </head>
   <body>
     <script type="module">
-      import { Renderer } from '../src/renderers/Renderer'
+      import { Canvas, run } from '../src/web/index'
       import { Scene } from '../src/objects/Scene'
       import { Camera } from '../src/cameras/Camera'
       import { CameraControls } from '../src/controls/CameraControls'
@@ -23,10 +23,12 @@
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
       import { BufferBase } from '../src/buffers/BufferBase'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { FluidNozzle } from '../src/simulations/fluid/FluidNozzle'
+      import { DEFAULT_PBF_OPTIONS, latticeDensity } from '../src/simulations/fluid/FluidSimulationParams'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
       import { FluidMarchingCubes } from '../src/simulations/fluid/FluidMarchingCubes'
-      import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
-      import { FluidTransmissionEffect } from '../src/postprocessing/effects/FluidTransmissionEffect'
+      import { FluidSurfaceEffect, FluidMask } from '../src/postprocessing/effects/FluidSurfaceEffect'
+      import { FluidRaymarchEffect } from '../src/postprocessing/effects/FluidRaymarchEffect'
       import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
       import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
       import { Material } from '../src/materials/Material'
@@ -35,18 +37,18 @@
       import { GLTFLoader } from '../src/loaders/GLTFLoader'
       import { DirectionalLight } from '../src/lights/DirectionalLight'
       import { Float } from '../src/math/Float'
+      import { FixedStep } from '../src/pacing/FixedStep'
+      import { FrameTimer } from '../src/pacing/FrameTimer'
+      import { AbBench } from '../src/profiling/AbBench'
+      import { installProfileHud } from './profile-hud.js'
       import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
       // ── Renderer ──────────────────────────────────────────
-      const renderer = new Renderer({
+      const canvas = Canvas.fill().withMaxPixelRatio(1);
+      const renderer = await canvas.renderer({
         clearColor: new Vector4(0.02, 0.02, 0.04, 1),
-        width: window.innerWidth,
-        height: window.innerHeight,
-        devicePixelRatio: 1,
         sampleCount: 4,
       });
-      await renderer.initialize();
-      document.body.appendChild(renderer.canvas);
 
       // ── Scene & Camera ────────────────────────────────────
       const scene = new Scene();
@@ -68,11 +70,27 @@
       const sun = new DirectionalLight([0.3, -1.0, 0.5], [1, 1, 1], 2.0);
       scene.add(sun);
 
+      // ?n=<particles> (75k by default); ?nozzle=1 starts the nozzle pouring, into room for
+      // 1.5 n particles unless ?capacity=<particles> says otherwise (without either there is no
+      // room: spare capacity measured a few percent slower per step at 400k); ?hud=1 shows a
+      // frame-time overlay (examples/frame-hud.js); ?profile=1 the GPU time of each pass
+      // (examples/profile-hud.js); ?solver=pbf starts on Position Based Fluids instead of SPH.
+      const query = new URLSearchParams(location.search);
+      let lastSimSteps = 0;
+      if (query.get('hud') === '1') {
+        const { installFrameHud } = await import('./frame-hud.js');
+        installFrameHud({ steps: () => lastSimSteps });
+      }
+
       // ── Particle positions: 75k particles in an ellipsoid centered on the bounds ──
-      const particleCount = 75000;
+      const particleCount = Math.max(1000, parseInt(query.get('n') || '75000', 10) || 75000);
       const center = [0, 11, 0]; // (min+max)/2 of bounds
       const half = [22, 17, 14];  // ~88% of bounds half-extent
-      const positions = new Float32Array(particleCount * 4);
+      const pourAtStart = query.get('nozzle') === '1';
+      const capacity = Math.max(particleCount,
+        parseInt(query.get('capacity') || '', 10) || (pourAtStart ? Math.ceil(particleCount * 1.5) : particleCount));
+      // the buffers hold `capacity` particles; the first `particleCount` are the initial fill
+      const positions = new Float32Array(capacity * 4);
       for (let i = 0; i < particleCount; i++) {
         let ux, uy, uz;
         do {
@@ -86,6 +104,8 @@
         positions[i * 4 + 3] = 1;
       }
 
+      const initialFill = positions.slice(0, particleCount * 4);
+
       const positionsBuffer = new ComputeBuffer({
         type: BufferBase.BUFFER_TYPE_STORAGE,
         usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC,
@@ -98,7 +118,7 @@
 
       // ── Fluid Simulation ──────────────────────────────────
       const simSettings = {
-        maxParticles: particleCount,
+        maxParticles: capacity,
         dimensions: 3,
         smoothingRadius: 1.0,
         pressureMultiplier: 46.5,
@@ -114,6 +134,10 @@
         mouseForce: 2500.0,
         substeps: 2,
         worldBoundsPadding: 0.3,
+        solver: query.get('solver') === 'pbf' ? 'pbf' : 'sph',
+        // Position Based Fluids keeps the fluid at the density of a lattice at the nozzle's
+        // spacing, so what it pours joins at rest
+        pbf: { ...DEFAULT_PBF_OPTIONS, restDensity: latticeDensity(0.62, 1.0) },
       };
 
       const sim = new FluidSimulation(renderer, simSettings);
@@ -123,7 +147,7 @@
         projectionMatrix: camera.projectionMatrix,
         inverseViewMatrix: camera.inverseViewMatrix,
         worldMatrix: identityMatrix,
-      });
+      }, particleCount);
       sim.worldBoundsMin = [-25, -8, -16];
       sim.worldBoundsMax = [25, 30, 16];
       sim.rebuildGrid();
@@ -151,13 +175,14 @@
       // Fluid mesh material: writes base colour + world-space normal to the GBuffer.
       // It is marked `transmissive: true` so the renderer splits the GBuffer pass,
       // snapshots the opaque-only colour into GBuffer.backgroundTexture, and then
-      // draws the mesh — so FluidTransmissionEffect can refract the background.
+      // draws the mesh — so FluidSurfaceEffect can refract the background. Its emissive alpha
+      // of 1 marks the fluid's pixels (FluidMask.EmissiveAlpha): the dome writes normals too.
       const fluidMeshShader = /* wgsl */`
 @group(0) @binding(0) var<uniform> fluidColor: vec4<f32>;
-@group(1) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+@group(1) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -194,7 +219,7 @@ fn fragment_main(v: VOut) -> FragOut {
     let lit = fluidColor.rgb * (0.2 + ndotl * 0.8);
     var out: FragOut;
     out.color = vec4<f32>(lit, 1.0);
-    out.emissive = vec4<f32>(0.0);
+    out.emissive = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     out.normal = vec4<f32>(n, 1.0);
     out.albedo = vec4<f32>(fluidColor.rgb, 1.0);
     return out;
@@ -212,18 +237,22 @@ fn fragment_main(v: VOut) -> FragOut {
       scene.add(fluidMesh);
 
       // ── Post-processing chain ──
-      // Mesh mode:     [FluidTransmissionEffect, DepthOfFieldEffect]
-      // Raymarch mode: [FluidSurfaceEffect,      DepthOfFieldEffect]
-      const transmissionEffect = new FluidTransmissionEffect({
-        color: [0.77, 0.96, 1.0],
+      // Mesh mode:     [FluidSurfaceEffect,  DepthOfFieldEffect]
+      // Raymarch mode: [FluidRaymarchEffect, DepthOfFieldEffect]
+      const fluidSurface = new FluidSurfaceEffect({
+        color: [0.77, 0.96, 1.0, 1.0],
         ior: 1.41,
         chromaticAberration: 0.05,
         tintStrength: 0.30,
         fresnelPower: 2.3,
         roughness: 0.28,
         thickness: 2.4,
+        // the sun's key light: specular and rim
+        lightDirection: [0.3, -1.0, 0.5],
+        lightIntensity: 2.0,
+        mask: FluidMask.EmissiveAlpha,
       });
-      const surfaceEffect = new FluidSurfaceEffect({
+      const raymarchEffect = new FluidRaymarchEffect({
         densityField,
         fluidColor: [0.77, 0.96, 1.0],
         densityScale: 1.1,
@@ -236,7 +265,7 @@ fn fragment_main(v: VOut) -> FragOut {
         focusRange: 37,
         maxBlur: 7,
       });
-      const volume = new PostProcessingVolume(renderer, [transmissionEffect, dofEffect]);
+      const volume = new PostProcessingVolume(renderer, [fluidSurface, dofEffect], { msaaSampleCount: 4 });
 
       // ── Render mode switcher ──
       // 'mesh'      — GPU-built marching cubes mesh rendered as a standard Renderable
@@ -249,10 +278,10 @@ fn fragment_main(v: VOut) -> FragOut {
 @group(0) @binding(0) var<uniform> colorA: vec4<f32>;
 @group(0) @binding(1) var<uniform> colorB: vec4<f32>;
 @group(0) @binding(2) var<uniform> thickness: vec4<f32>; // x = thicknessA, y = thicknessB
-@group(1) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
-@group(2) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+@group(1) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -294,7 +323,7 @@ fn fragment_main(v: VOut) -> FragOut {
     var out: FragOut;
     out.color = vec4<f32>(lit, 1.0);
     out.emissive = vec4<f32>(0.0);
-    // normal.w = 0 → dome is NOT transmissive (FluidTransmissionEffect ignores it)
+    // emissive alpha 0: not the fluid (FluidSurfaceEffect's mask)
     out.normal = vec4<f32>(n, 0.0);
     out.albedo = vec4<f32>(base, 1.0);
     return out;
@@ -332,7 +361,7 @@ fn fragment_main(v: VOut) -> FragOut {
       // doesn't dispatch their compute passes at all (no ping-pong, no work).
       const dofOpts = { enabled: true };
       const rebuildEffectChain = () => {
-        const base = renderMode.mode === 'raymarch' ? surfaceEffect : transmissionEffect;
+        const base = renderMode.mode === 'raymarch' ? raymarchEffect : fluidSurface;
         volume.effects = dofOpts.enabled ? [base, dofEffect] : [base];
       };
 
@@ -358,28 +387,70 @@ fn fragment_main(v: VOut) -> FragOut {
       //   simStepDt    — real-world duration of a single sim step. The sim
       //                  is integrated in chunks of this size regardless of
       //                  the current render framerate, so behaviour is
-      //                  deterministic at 30, 33, 60, 90, 144 fps.
+      //                  deterministic at 60, 90, 144 fps (below 60 fps a
+      //                  frame still takes only a 60 Hz frame's steps).
       //   simTimeScale — speed multiplier applied to the sim dt (user facing).
       //                  Changes how fast the sim advances vs. wall clock
       //                  without changing the number of steps per second.
       //   maxSimSteps  — upper bound on how many sim steps we're allowed to
-      //                  run per rendered frame. Prevents the classic
-      //                  "spiral of death" where a slow frame triggers more
-      //                  catch-up work which makes the next frame even slower.
-      //                  Extra accumulated time is simply discarded.
+      //                  run per rendered frame. Extra accumulated time is
+      //                  simply discarded.
       const timing = { simStepDt: 1 / 60, simTimeScale: 1.9, maxSimSteps: 4 };
       const timingFolder = pane.addFolder({ title: 'Sim Timing', expanded: false });
       timingFolder.addBinding(timing, 'simStepDt',    { min: 1 / 240, max: 1 / 30, step: 1 / 240, label: 'sim dt step' });
       timingFolder.addBinding(timing, 'simTimeScale', { min: 0.1, max: 4.0, step: 0.05, label: 'sim scale' });
       timingFolder.addBinding(timing, 'maxSimSteps',  { min: 1, max: 8, step: 1, label: 'max steps/frame' });
 
-      // ── SPH ──
-      const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
+      // ── Nozzle ──
+      // A stream poured in at runtime (FluidSimulation.emit) into the room the buffers keep
+      // above the initial fill; Reset puts the fill back. The spacing is about the fill's.
+      const nozzleOpts = {
+        on: pourAtStart,
+        speed: 22,
+        radius: 1.6,
+        spacing: 0.62,
+        particles: particleCount,
+      };
+      const nozzle = new FluidNozzle([-20, 22, 0], [1, -0.35, 0.15], nozzleOpts.radius, nozzleOpts.speed, nozzleOpts.spacing);
+      const nozzleFolder = pane.addFolder({ title: capacity > particleCount ? 'Nozzle' : 'Nozzle (?nozzle=1 for room)', expanded: false });
+      nozzleFolder.addBinding(nozzleOpts, 'on', { label: 'pour', disabled: capacity === particleCount }).on('change', () => { if (nozzleOpts.on) nozzle.restart(); });
+      nozzleFolder.addBinding(nozzleOpts, 'speed', { min: 1, max: 60, step: 0.5 }).on('change', () => { nozzle.speed = nozzleOpts.speed; });
+      nozzleFolder.addBinding(nozzleOpts, 'radius', { min: 0.3, max: 4, step: 0.05 }).on('change', () => { nozzle.radius = nozzleOpts.radius; });
+      nozzleFolder.addBinding(nozzleOpts, 'spacing', { min: 0.3, max: 1.5, step: 0.01 }).on('change', () => { nozzle.spacing = nozzleOpts.spacing; });
+      nozzleFolder.addBinding(nozzleOpts, 'particles', { readonly: true, format: (v) => `${v.toFixed(0)} / ${capacity}` });
+      nozzleFolder.addButton({ title: 'Reset fill' }).on('click', () => {
+        sim.resetParticles(initialFill);
+        simStep.reset();
+      });
+
+      // ── Solver ──
+      // SPH, or Position Based Fluids on the same particles, grid and nozzle (the mouse pushes
+      // SPH only: PBF runs no forces pass)
+      const solverFolder = pane.addFolder({ title: 'Solver', expanded: false });
+      solverFolder.addBinding(simSettings, 'solver', { options: { SPH: 'sph', PBF: 'pbf' } }).on('change', () => {
+        sim.params.solver = simSettings.solver;
+        sphFolder.hidden = simSettings.solver !== 'sph';
+        pbfFolder.hidden = simSettings.solver !== 'pbf';
+      });
+      // both solvers damp the velocity
+      solverFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
+      const sphFolder = solverFolder.addFolder({ title: 'SPH' });
       sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
       sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
       sphFolder.addBinding(simSettings, 'densityTarget', { min: 0, max: 20, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
       sphFolder.addBinding(simSettings, 'viscosity', { min: 0, max: 1, step: 0.01 }).on('change', () => { sim.params.viscosity = simSettings.viscosity; });
-      sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
+      const pbfFolder = solverFolder.addFolder({ title: 'PBF' });
+      const pbfOpts = sim.params.pbf;
+      pbfFolder.addBinding(pbfOpts, 'iterations', { min: 1, max: 12, step: 1 });
+      pbfFolder.addBinding(pbfOpts, 'restDensity', { min: 1, max: 12, step: 0.05, label: 'rest density' });
+      pbfFolder.addBinding(pbfOpts, 'relaxation', { min: 0.1, max: 50, step: 0.1 });
+      pbfFolder.addBinding(pbfOpts, 'scorrK', { min: 0, max: 0.5, step: 0.005, label: 'scorr k' });
+      pbfFolder.addBinding(pbfOpts, 'scorrN', { min: 1, max: 8, step: 0.5, label: 'scorr n' });
+      pbfFolder.addBinding(pbfOpts, 'xsph', { min: 0, max: 0.5, step: 0.005 });
+      pbfFolder.addBinding(pbfOpts, 'vorticity', { min: 0, max: 2, step: 0.01 });
+      pbfFolder.addBinding(pbfOpts, 'maxSpeed', { min: 0, max: 100, step: 1, label: 'max speed' });
+      sphFolder.hidden = simSettings.solver !== 'sph';
+      pbfFolder.hidden = simSettings.solver !== 'pbf';
 
       // ── Forces ──
       const forcesFolder = pane.addFolder({ title: 'Forces', expanded: false });
@@ -408,17 +479,18 @@ fn fragment_main(v: VOut) -> FragOut {
         sun.direction[0] = lt.dirX / len;
         sun.direction[1] = lt.dirY / len;
         sun.direction[2] = lt.dirZ / len;
+        fluidSurface.lightDirection = [sun.direction[0], sun.direction[1], sun.direction[2]];
       };
       lightFolder.addBinding(lt, 'dirX', { min: -1, max: 1, step: 0.01, label: 'dir X' }).on('change', syncLightDir);
       lightFolder.addBinding(lt, 'dirY', { min: -1, max: 1, step: 0.01, label: 'dir Y' }).on('change', syncLightDir);
       lightFolder.addBinding(lt, 'dirZ', { min: -1, max: 1, step: 0.01, label: 'dir Z' }).on('change', syncLightDir);
-      lightFolder.addBinding(lt, 'intensity', { min: 0, max: 10, step: 0.1 }).on('change', () => { sun.intensity = lt.intensity; });
-      lightFolder.addBinding(lt, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', () => { sun.color[0] = lt.r; });
-      lightFolder.addBinding(lt, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', () => { sun.color[1] = lt.g; });
-      lightFolder.addBinding(lt, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', () => { sun.color[2] = lt.b; });
+      lightFolder.addBinding(lt, 'intensity', { min: 0, max: 10, step: 0.1 }).on('change', () => { sun.intensity = lt.intensity; fluidSurface.lightIntensity = lt.intensity; });
+      lightFolder.addBinding(lt, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', () => { sun.color[0] = lt.r; fluidSurface.lightColor[0] = lt.r; });
+      lightFolder.addBinding(lt, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', () => { sun.color[1] = lt.g; fluidSurface.lightColor[1] = lt.g; });
+      lightFolder.addBinding(lt, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', () => { sun.color[2] = lt.b; fluidSurface.lightColor[2] = lt.b; });
 
-      // ── Transmission (mesh mode) ──
-      const txFolder = pane.addFolder({ title: 'Transmission', expanded: false });
+      // ── Surface (mesh mode) ──
+      const txFolder = pane.addFolder({ title: 'Surface (Mesh)', expanded: false });
       const tx = {
         ior: 1.41,
         chromaticAberration: 0.05,
@@ -429,13 +501,13 @@ fn fragment_main(v: VOut) -> FragOut {
         color: { r: 0.77, g: 0.96, b: 1.0 },
       };
       const syncTx = () => {
-        transmissionEffect.ior = tx.ior;
-        transmissionEffect.chromaticAberration = tx.chromaticAberration;
-        transmissionEffect.tintStrength = tx.tintStrength;
-        transmissionEffect.fresnelPower = tx.fresnelPower;
-        transmissionEffect.roughness = tx.roughness;
-        transmissionEffect.thickness = tx.thickness;
-        transmissionEffect.color = [tx.color.r, tx.color.g, tx.color.b];
+        fluidSurface.ior = tx.ior;
+        fluidSurface.chromaticAberration = tx.chromaticAberration;
+        fluidSurface.tintStrength = tx.tintStrength;
+        fluidSurface.fresnelPower = tx.fresnelPower;
+        fluidSurface.roughness = tx.roughness;
+        fluidSurface.thickness = tx.thickness;
+        fluidSurface.color = [tx.color.r, tx.color.g, tx.color.b, 1];
         fluidColorU.x = tx.color.r;
         fluidColorU.y = tx.color.g;
         fluidColorU.z = tx.color.b;
@@ -451,14 +523,14 @@ fn fragment_main(v: VOut) -> FragOut {
       // ── Surface (raymarch mode) ──
       const surfaceFolder = pane.addFolder({ title: 'Surface (Raymarch)', expanded: false });
       const colorObj = { r: 0.77, g: 0.96, b: 1.0 };
-      const syncColor = () => { surfaceEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
+      const syncColor = () => { raymarchEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
       surfaceFolder.addBinding(colorObj, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', syncColor);
       surfaceFolder.addBinding(colorObj, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', syncColor);
       surfaceFolder.addBinding(colorObj, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', syncColor);
-      surfaceFolder.addBinding(surfaceEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
-      surfaceFolder.addBinding(surfaceEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
-      surfaceFolder.addBinding(surfaceEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
-      surfaceFolder.addBinding(surfaceEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
+      surfaceFolder.addBinding(raymarchEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
+      surfaceFolder.addBinding(raymarchEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
+      surfaceFolder.addBinding(raymarchEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
+      surfaceFolder.addBinding(raymarchEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
 
       // ── Depth of Field ──
       const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
@@ -496,6 +568,12 @@ fn fragment_main(v: VOut) -> FragOut {
         sim.worldBoundsMax = [boundsObj.maxX, boundsObj.maxY, boundsObj.maxZ];
         sim.rebuildGrid();
       };
+      // ?bounds=minX,minY,minZ,maxX,maxY,maxZ: as if set in the panel
+      const boundsParam = (query.get('bounds') || '').split(',').map(Number);
+      if (boundsParam.length === 6 && boundsParam.every(Number.isFinite)) {
+        [boundsObj.minX, boundsObj.minY, boundsObj.minZ, boundsObj.maxX, boundsObj.maxY, boundsObj.maxZ] = boundsParam;
+        syncBounds();
+      }
       boundsFolder.addBinding(boundsObj, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
       boundsFolder.addBinding(boundsObj, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
       boundsFolder.addBinding(boundsObj, 'minZ', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
@@ -504,18 +582,18 @@ fn fragment_main(v: VOut) -> FragOut {
       boundsFolder.addBinding(boundsObj, 'maxZ', { min: 0, max: 50, step: 0.5 }).on('change', syncBounds);
 
       // ── Render loop ───────────────────────────────────────
-      // Fixed-timestep simulation: drain an accumulator in chunks of exactly
-      // `simStepDt`, calling `sim.updateBatched()` with the number of steps
-      // to run in a single command encoder. This gives framerate-independent
-      // behaviour — 30 / 33 / 60 / 90 / 144 fps all produce the same sim
-      // evolution over the same wall-clock window.
+      // Fixed-timestep simulation (FixedStep, as the Rust fluid example):
+      // steps of exactly `simStepDt`, run by `sim.updateBatched()` in a single
+      // command encoder. This gives framerate-independent behaviour — 60 / 90
+      // / 144 fps all produce the same sim evolution over the same wall-clock
+      // window.
       let lastPerf     = performance.now();
-      let simAccumulator = 0;
+      const simStep = new FixedStep(timing.simStepDt).withMaxSteps(timing.maxSimSteps);
+      const hud = installProfileHud({ renderer, FrameTimer, AbBench });
 
       function animate() {
-        requestAnimationFrame(animate);
-
         const now = performance.now();
+        hud.begin(now);
         // Raw frame delta. Clamped to avoid zero-division and to drop huge
         // pauses (hidden tab, devtools, GC stall) on the floor so we don't
         // try to catch up hundreds of steps.
@@ -525,19 +603,21 @@ fn fragment_main(v: VOut) -> FragOut {
         mouseVectors.update(frameDt);
         cameraControls.update(now / 1000);
 
-        // Accumulate wall-clock, convert to sim-clock via simTimeScale.
-        simAccumulator += frameDt * timing.simTimeScale;
+        // Wall-clock to sim-clock via simTimeScale. A frame feeds at most a
+        // 60 Hz frame's time, so below 60 fps the sim runs slower than real
+        // time rather than taking more steps (each lengthens the next frame,
+        // which then asks for more, until every frame runs maxSimSteps); time
+        // past maxSimSteps is dropped.
         const stepDt = timing.simStepDt;
-        let steps = 0;
-        while (simAccumulator >= stepDt && steps < timing.maxSimSteps) {
-          simAccumulator -= stepDt;
-          steps++;
-        }
-        // If we still have a large leftover after maxSimSteps, the renderer
-        // can't keep up — drop the excess so we don't spiral on the next frame.
-        if (simAccumulator > stepDt) simAccumulator = stepDt;
+        simStep.step = stepDt;
+        simStep.withMaxSteps(timing.maxSimSteps);
+        const steps = simStep.advanceScaled(frameDt, timing.simTimeScale);
+        lastSimSteps = steps;
 
         if (steps > 0) {
+          // the frame's flow in one emit, ahead of the steps it joins
+          if (nozzleOpts.on) nozzle.emitInto(sim, steps * stepDt);
+          nozzleOpts.particles = sim.particleCount;
           sim.updateBatched(
             stepDt,
             steps,
@@ -547,24 +627,21 @@ fn fragment_main(v: VOut) -> FragOut {
           );
         }
 
-        // Density field update — engine handles its own encoder/submit.
-        densityField.update();
-
-        // Marching cubes: rebuild the mesh each frame from the density field.
-        // Skipped in raymarch mode to save GPU time.
+        // Density field, then the marching cubes mesh from it (skipped in raymarch mode to
+        // save GPU time): one encoder, one submit.
+        const surfaceEncoder = renderer.createCommandEncoder('Fluid/Surface');
+        densityField.update(surfaceEncoder);
         if (renderMode.mode === 'mesh') {
-          mc.update(mcExtractBG, densityField);
+          mc.update(mcExtractBG, densityField, surfaceEncoder);
         }
+        renderer.submit(surfaceEncoder.finish());
 
         volume.render(scene, camera);
+        hud.end(now);
       }
-      animate();
-
-      // ── Resize ────────────────────────────────────────────
-      window.addEventListener('resize', () => {
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
+      run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        animate();
       });
     </script>
   </body>

@@ -3,9 +3,14 @@ import { Material } from "../materials/Material";
 import { Renderable } from "../objects/Renderable";
 import { Object3D } from "../objects/Object3D";
 import { mat4 } from "gl-matrix";
+import { Texture } from "../buffers/Texture";
+import type { CompressionSupport } from "../renderers/Renderer";
+import { KTX2Loader } from "./KTX2Loader";
+import { isKtx2 } from "./ktx2/Ktx2Container";
 
 interface GLTFAccessor {
-    bufferView: number;
+    bufferView?: number;
+    normalized?: boolean;
     byteOffset?: number;
     componentType: number;
     count: number;
@@ -43,18 +48,85 @@ interface GLTFNode {
     scale?: number[];
 }
 
-interface GLTFMaterialInfo {
+interface GLTFImageDef {
+    name?: string;
+    uri?: string;
+    mimeType?: string;
+    bufferView?: number;
+}
+
+interface GLTFTextureDef {
+    source?: number;
+    extensions?: { KHR_texture_basisu?: { source?: number } };
+}
+
+/** A material's `textureInfo` (`baseColorTexture`, `normalTexture`, ...). */
+interface GLTFTextureInfo {
+    index?: number;
+    texCoord?: number;
+}
+
+/** A material's texture: which image to load and how its texels are read. */
+export interface GLTFTextureRef {
+    /** The glTF texture index. */
+    texture: number;
+    /**
+     * The image to load: the `KHR_texture_basisu` KTX2 image when the texture has one,
+     * otherwise the texture's own source.
+     */
+    image: number;
+    /** The texture's PNG/JPEG source when a KTX2 image is preferred over it. */
+    fallbackImage?: number;
+    /** Which UV set it reads. */
+    texCoord: number;
+    /** Colour (base colour, emissive) rather than linear data. */
+    srgb: boolean;
+}
+
+/** Material properties extracted from glTF PBR metallic-roughness. */
+export interface GLTFMaterialInfo {
     name?: string;
     baseColor: [number, number, number, number];
     metallic: number;
     roughness: number;
     doubleSided: boolean;
+    /** sRGB colour (x base colour factor). */
+    baseColorTexture?: GLTFTextureRef;
+    /** Linear: roughness in G, metalness in B. */
+    metallicRoughnessTexture?: GLTFTextureRef;
+    /** Linear tangent-space normals. */
+    normalTexture?: GLTFTextureRef;
+    /** Linear: occlusion in R. */
+    occlusionTexture?: GLTFTextureRef;
+    /** sRGB colour. */
+    emissiveTexture?: GLTFTextureRef;
+}
+
+/** An image of the glTF file, its encoded bytes resolved where the file holds them. */
+export interface GLTFImage {
+    name?: string;
+    /** "image/ktx2", "image/png", "image/jpeg" (from the file, or guessed from the bytes). */
+    mimeType?: string;
+    /** The URI of an image stored outside the file, fetched (beside the file) when first loaded. */
+    uri?: string;
+    /** The encoded image; unset for an external image not read yet. */
+    data?: Uint8Array;
 }
 
 export interface GLTFResult {
     scene: Object3D;
     geometries: Geometry[];
+    /** Each geometry's glTF material index (parallel to `geometries`; unset without a material). */
+    materialIndices: (number | undefined)[];
     materials: GLTFMaterialInfo[];
+    images: GLTFImage[];
+    /**
+     * Decode or transcode a material texture for a device with `support`: KTX2 images (from
+     * `KHR_texture_basisu`) become the best block-compressed format it samples
+     * (`KTX2Loader.transcode`), PNG/JPEG images RGBA8 (one mip). Colour textures load as sRGB,
+     * the rest as linear. External images are fetched beside the glTF file.
+     */
+    loadTexture(texture: GLTFTextureRef, support: CompressionSupport): Promise<Texture>;
 }
 
 const COMPONENT_TYPE_SIZES: Record<number, number> = {
@@ -64,6 +136,14 @@ const COMPONENT_TYPE_SIZES: Record<number, number> = {
     5123: 2, // UNSIGNED_SHORT
     5125: 4, // UNSIGNED_INT
     5126: 4, // FLOAT
+};
+
+/** Normalized integers to floats: glTF's `c / (2^bits - 1)`, clamped to -1 for signed types. */
+const NORMALIZED_SCALE: Record<number, number> = {
+    5120: 1 / 127,
+    5121: 1 / 255,
+    5122: 1 / 32767,
+    5123: 1 / 65535,
 };
 
 const TYPE_COUNTS: Record<string, number> = {
@@ -82,23 +162,54 @@ class GLTFLoader {
     private baseUrl: string = "";
 
     async load(url: string, defaultMaterial: Material): Promise<GLTFResult> {
+        await this.open(url);
+        return this.result(defaultMaterial);
+    }
+
+    /**
+     * Read a .gltf or .glb file and its buffers without building anything, for readers of other
+     * parts of it (`SkinnedGltf`): then `json`, `accessorFloats`, `accessorUints`,
+     * `parseMaterials` and `parseImages`.
+     */
+    async open(url: string): Promise<void> {
         this.baseUrl = url.substring(0, url.lastIndexOf("/") + 1);
-
-        // Detect GLB (binary glTF) by extension or by fetching the magic bytes
-        if (url.toLowerCase().endsWith('.glb')) {
-            return this.loadGLB(url, defaultMaterial);
-        }
-
         const response = await fetch(url);
-        this.gltf = await response.json();
-
+        if (!response.ok) throw new Error(`GLTFLoader: ${url}: HTTP ${response.status}`);
+        const bytes = await response.arrayBuffer();
+        // A .glb by its magic bytes, whatever the file is called.
+        if (bytes.byteLength >= 4 && new DataView(bytes).getUint32(0, true) === 0x46546c67) {
+            await this.openGLB(bytes);
+            return;
+        }
+        this.gltf = JSON.parse(new TextDecoder().decode(bytes));
         await this.loadBuffers();
+    }
 
-        const materials = this.parseMaterials();
-        const geometries = this.parseMeshes();
-        const scene = this.buildScene(geometries, defaultMaterial);
+    /**
+     * Read an in-memory .glb (or a .gltf's JSON text as bytes, with data-URI or external
+     * buffers), as `open` does. External buffers and images resolve against `baseUrl`.
+     */
+    async openBytes(bytes: ArrayBuffer | Uint8Array, baseUrl: string = ""): Promise<void> {
+        this.baseUrl = baseUrl;
+        const buffer = bytes instanceof Uint8Array
+            ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+            : bytes;
+        if (buffer.byteLength >= 4 && new DataView(buffer).getUint32(0, true) === 0x46546c67) {
+            await this.openGLB(buffer);
+            return;
+        }
+        this.gltf = JSON.parse(new TextDecoder().decode(buffer));
+        await this.loadBuffers();
+    }
 
-        return { scene, geometries, materials };
+    /** The glTF JSON of the file `open` read. */
+    get json(): any {
+        return this.gltf;
+    }
+
+    /** The base URL images and buffers outside the file resolve against. */
+    get base(): string {
+        return this.baseUrl;
     }
 
     /**
@@ -107,9 +218,7 @@ class GLTFLoader {
      *   chunk0 (JSON): u32 length + u32 type ("JSON") + JSON bytes
      *   chunk1 (BIN, optional): u32 length + u32 type ("BIN ") + binary bytes
      */
-    private async loadGLB(url: string, defaultMaterial: Material): Promise<GLTFResult> {
-        const response = await fetch(url);
-        const buffer = await response.arrayBuffer();
+    private async openGLB(buffer: ArrayBuffer): Promise<void> {
         const view = new DataView(buffer);
 
         const magic = view.getUint32(0, true);
@@ -148,23 +257,82 @@ class GLTFLoader {
                     if (!binChunk) throw new Error('GLTFLoader: GLB references binary buffer but no BIN chunk');
                     return binChunk;
                 }
-                const resp = await fetch(this.baseUrl + buf.uri);
+                const resp = await fetch(this.resolveUri(buf.uri));
                 return resp.arrayBuffer();
             })
         );
+    }
 
+    private result(defaultMaterial: Material): GLTFResult {
         const materials = this.parseMaterials();
-        const geometries = this.parseMeshes();
+        const { geometries, materialIndices } = this.parseMeshes();
         const scene = this.buildScene(geometries, defaultMaterial);
+        const images = this.parseImages();
+        const baseUrl = this.baseUrl;
+        return {
+            scene,
+            geometries,
+            materialIndices,
+            materials,
+            images,
+            loadTexture: (texture, support) => loadTexture(images, baseUrl, texture, support),
+        };
+    }
 
-        return { scene, geometries, materials };
+    /**
+     * Each image's encoded bytes, read from its buffer view or its data URI; images at external
+     * URIs are fetched by `loadTexture`.
+     */
+    public parseImages(): GLTFImage[] {
+        const defs: GLTFImageDef[] = this.gltf.images || [];
+        return defs.map((img): GLTFImage => {
+            let data: Uint8Array | undefined;
+            let mimeType: string | undefined = img.mimeType;
+            let uri: string | undefined;
+            if (img.bufferView !== undefined) {
+                const view: GLTFBufferView = this.gltf.bufferViews[img.bufferView];
+                const buffer = this.buffers[view.buffer];
+                if (buffer) data = new Uint8Array(buffer, view.byteOffset || 0, view.byteLength);
+            } else if (typeof img.uri === 'string') {
+                if (img.uri.startsWith('data:')) {
+                    data = decodeDataUri(img.uri);
+                    mimeType ??= img.uri.slice(5).split(/[;,]/)[0] || undefined;
+                } else {
+                    uri = img.uri;
+                }
+            }
+            if (!mimeType && data && isKtx2(data)) mimeType = 'image/ktx2';
+            return { name: img.name, mimeType, uri, data };
+        });
+    }
+
+    private textureRef(info: GLTFTextureInfo | undefined, srgb: boolean): GLTFTextureRef | undefined {
+        if (!info || info.index === undefined) return undefined;
+        const texture: GLTFTextureDef | undefined = (this.gltf.textures || [])[info.index];
+        if (!texture) return undefined;
+        const basisu: number | undefined = texture.extensions?.KHR_texture_basisu?.source;
+        const source: number | undefined = texture.source;
+        const image = basisu ?? source;
+        if (image === undefined) return undefined;
+        return {
+            texture: info.index,
+            image,
+            fallbackImage: source !== undefined && source !== image ? source : undefined,
+            texCoord: info.texCoord ?? 0,
+            srgb,
+        };
+    }
+
+    /** A buffer URI: data URIs as they are, others beside the glTF file. */
+    private resolveUri(uri: string): string {
+        return uri.startsWith('data:') ? uri : this.baseUrl + uri;
     }
 
     private async loadBuffers(): Promise<void> {
         const bufferDefs = this.gltf.buffers || [];
         this.buffers = await Promise.all(
             bufferDefs.map(async (buf: any) => {
-                const resp = await fetch(this.baseUrl + buf.uri);
+                const resp = await fetch(this.resolveUri(buf.uri));
                 return resp.arrayBuffer();
             })
         );
@@ -172,7 +340,7 @@ class GLTFLoader {
 
     private getAccessorData(accessorIndex: number): { data: Float32Array | Uint16Array | Uint32Array; count: number; componentCount: number } {
         const accessor: GLTFAccessor = this.gltf.accessors[accessorIndex];
-        const bufferView: GLTFBufferView = this.gltf.bufferViews[accessor.bufferView];
+        const bufferView: GLTFBufferView = this.gltf.bufferViews[accessor.bufferView!];
         const buffer = this.buffers[bufferView.buffer];
 
         const componentSize = COMPONENT_TYPE_SIZES[accessor.componentType];
@@ -220,7 +388,55 @@ class GLTFLoader {
         return { data, count: accessor.count, componentCount };
     }
 
-    private parseMaterials(): GLTFMaterialInfo[] {
+    /**
+     * An accessor's elements as floats, any component type and byte stride unpacked; normalized
+     * integers map to [0, 1] (unsigned) or [-1, 1] (signed), as glTF defines them. An accessor
+     * without a buffer view reads zeros; sparse accessors are not supported.
+     */
+    public accessorFloats(index: number): Float32Array {
+        const { accessor, components, read } = this.accessorReader(index);
+        const out = new Float32Array(accessor.count * components);
+        const scale = accessor.normalized ? NORMALIZED_SCALE[accessor.componentType] ?? 1 : 1;
+        for (let i = 0; i < out.length; i++) {
+            const v = read(i) * scale;
+            out[i] = scale !== 1 ? Math.max(v, -1) : v;
+        }
+        return out;
+    }
+
+    /** An accessor's elements as unsigned integers (indices, joints), as `accessorFloats` reads them. */
+    public accessorUints(index: number): Uint32Array {
+        const { accessor, components, read } = this.accessorReader(index);
+        const out = new Uint32Array(accessor.count * components);
+        for (let i = 0; i < out.length; i++) out[i] = read(i);
+        return out;
+    }
+
+    /** Element `i` of accessor `index` (component `i % components` of element `i / components`), and its shape. */
+    private accessorReader(index: number): { accessor: GLTFAccessor; components: number; read: (i: number) => number } {
+        const accessor: GLTFAccessor = this.gltf.accessors?.[index];
+        if (!accessor) throw new Error(`GLTFLoader: no accessor ${index}`);
+        if ((accessor as any).sparse) throw new Error(`GLTFLoader: accessor ${index} is sparse, which is not supported`);
+        const components = TYPE_COUNTS[accessor.type];
+        const size = COMPONENT_TYPE_SIZES[accessor.componentType];
+        if (!components || !size) throw new Error(`GLTFLoader: accessor ${index} has type ${accessor.type}/${accessor.componentType}`);
+        if (accessor.bufferView === undefined) return { accessor, components, read: () => 0 };
+        const view: GLTFBufferView = this.gltf.bufferViews[accessor.bufferView];
+        const data = new DataView(this.buffers[view.buffer], (view.byteOffset || 0) + (accessor.byteOffset || 0));
+        const stride = view.byteStride || components * size;
+        const at = (i: number) => Math.floor(i / components) * stride + (i % components) * size;
+        const reads: Record<number, (i: number) => number> = {
+            5120: (i) => data.getInt8(at(i)),
+            5121: (i) => data.getUint8(at(i)),
+            5122: (i) => data.getInt16(at(i), true),
+            5123: (i) => data.getUint16(at(i), true),
+            5125: (i) => data.getUint32(at(i), true),
+            5126: (i) => data.getFloat32(at(i), true),
+        };
+        return { accessor, components, read: reads[accessor.componentType] };
+    }
+
+    public parseMaterials(): GLTFMaterialInfo[] {
         const defs = this.gltf.materials || [];
         return defs.map((m: any) => {
             const pbr = m.pbrMetallicRoughness || {};
@@ -231,22 +447,28 @@ class GLTFLoader {
                 metallic: pbr.metallicFactor ?? 1.0,
                 roughness: pbr.roughnessFactor ?? 1.0,
                 doubleSided: m.doubleSided ?? false,
+                baseColorTexture: this.textureRef(pbr.baseColorTexture, true),
+                metallicRoughnessTexture: this.textureRef(pbr.metallicRoughnessTexture, false),
+                normalTexture: this.textureRef(m.normalTexture, false),
+                occlusionTexture: this.textureRef(m.occlusionTexture, false),
+                emissiveTexture: this.textureRef(m.emissiveTexture, true),
             };
         });
     }
 
-    private parseMeshes(): Geometry[] {
+    private parseMeshes(): { geometries: Geometry[]; materialIndices: (number | undefined)[] } {
         const meshDefs: GLTFMesh[] = this.gltf.meshes || [];
         const geometries: Geometry[] = [];
+        const materialIndices: (number | undefined)[] = [];
 
         for (const meshDef of meshDefs) {
             for (const prim of meshDef.primitives) {
-                const geo = this.parsePrimitive(prim);
-                geometries.push(geo);
+                geometries.push(this.parsePrimitive(prim));
+                materialIndices.push(prim.material);
             }
         }
 
-        return geometries;
+        return { geometries, materialIndices };
     }
 
     private parsePrimitive(prim: GLTFPrimitive): Geometry {
@@ -428,8 +650,49 @@ class GLTFLoader {
     }
 }
 
+/**
+ * `texture`'s image from `images`, transcoded (KTX2) or decoded (PNG/JPEG, one RGBA8 mip) in its
+ * colour space; external images are fetched from `baseUrl`. What `GLTFResult.loadTexture` does.
+ */
+export async function loadTexture(images: GLTFImage[], baseUrl: string, texture: GLTFTextureRef, support: CompressionSupport): Promise<Texture> {
+    const image = images[texture.image];
+    if (!image) throw new Error(`GLTFLoader: no image ${texture.image}`);
+    const label = image.name ?? `GLTF/Image${texture.image}`;
+    if (!image.data) {
+        if (!image.uri) throw new Error(`GLTFLoader: ${label}: image data not loaded`);
+        const response = await fetch(baseUrl + image.uri);
+        if (!response.ok) throw new Error(`GLTFLoader: ${label}: ${image.uri}: HTTP ${response.status}`);
+        image.data = new Uint8Array(await response.arrayBuffer());
+        if (!image.mimeType && isKtx2(image.data)) image.mimeType = 'image/ktx2';
+    }
+    const bytes = image.data;
+    if (isKtx2(bytes)) {
+        const options = texture.srgb ? KTX2Loader.color() : KTX2Loader.linear();
+        return (await KTX2Loader.transcode(label, bytes, options, support)).toTexture();
+    }
+    const bitmap = await createImageBitmap(new Blob([bytes], image.mimeType ? { type: image.mimeType } : undefined), {
+        colorSpaceConversion: 'none',
+        premultiplyAlpha: 'none',
+    });
+    return Texture.fromImage(bitmap, { label, srgb: texture.srgb });
+}
+
+/** A base64 data URI's bytes (`data:<mime>;base64,<data>`); percent-encoded ones are decoded too. */
+function decodeDataUri(uri: string): Uint8Array {
+    const comma = uri.indexOf(',');
+    const header = uri.slice(5, comma);
+    const payload = uri.slice(comma + 1);
+    if (header.endsWith(';base64')) {
+        const binary = atob(payload.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/'));
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
+    }
+    return new TextEncoder().encode(decodeURIComponent(payload));
+}
+
 function quaternionToEuler(x: number, y: number, z: number, w: number): [number, number, number] {
-    // YXZ order to match Object3D.updateModelMatrix (rotateZ, rotateY, rotateX)
+    // ZYX decomposition: Object3D.updateModelMatrix composes Rz * Ry * Rx (rotateZ, rotateY, rotateX)
     const sinr_cosp = 2 * (w * x + y * z);
     const cosr_cosp = 1 - 2 * (x * x + y * y);
     const rx = Math.atan2(sinr_cosp, cosr_cosp);

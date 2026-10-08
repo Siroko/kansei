@@ -43,9 +43,10 @@ cone-tracing WGSL are engine API.
 | `quality=low\|medium\|high` | voxel volume resolution (default medium; low on phones, which also keep the volume within 24 MiB); an unknown name is the default |
 | `particles=<n>` | particle count, clamped to 1024..262 144 (default 12 288 in the lightbox, 8192 with `rt=on`, 32 768 in the Cornell room, half of each on phones) |
 | `stats=1` | log the frame interval to the console every 240 frames |
-| `profile=1` | time each pass; read it with `window.kansei.profile_report()`, and `set_layers` to time the walls, particles and reflection apart |
+| `profile=1` | time each pass; read it with `await window.kansei.profile_report()`, and `set_layers` to time the walls, particles and reflection apart |
 | `ui=0` | hide the panel |
 | `dpr=<ratio>` | drawing-buffer pixels per CSS pixel (default: the screen's, at most 2) |
+| `worker=1` | run the demo in a Web Worker on the canvas as an `OffscreenCanvas` (`kansei_wasm::launch`); the panel stays on the page and sends its changes as calls |
 
 Controls: drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan;
 moving the pointer over the fluid pushes it. A Tweakpane panel (collapsed on phones) switches the
@@ -55,11 +56,15 @@ the wall occlusion (lightbox), the emission, particle size, the ceiling light an
 (lightbox) or the sun's elevation and bearing (Cornell room), exposure, and has a Pour again
 button; it shows the volume's size, memory and the frame time. `window.kansei` exposes every
 export (`info`, the setters, `set_positions`, `set_paused`, `set_cone_jitter`) for scripted
-captures. To frame a view by hand, orbit and pan (right drag), then `window.kansei.camera()` gives
+captures, each returning a promise of its result (with `worker=1` the call runs in the worker).
+To frame a view by hand, orbit and pan (right drag), then `await window.kansei.camera()` gives
 the orbit (`target`, `radius`, `azimuth`, `elevation` in radians) that `set_camera(x, y, z, radius,
 azimuth, elevation)` and the default camera in `src/lib.rs` take.
 
 Assets: none beyond the page; the shaders in `src/shaders/` are compiled in with `include_str!`.
+The TS engine's twin of this demo, `examples/index_voxel_gi_particles.html` (same scenes, URL
+parameters, panel and `window.kansei`), runs a copy of this demo's WGSL from
+`examples/voxel-gi-particles-shaders.js`: change both together.
 The page loads Tweakpane 4 from cdn.jsdelivr.net.
 
 Build: `wasm-pack build --target web --release` here, serve this folder, open `www/`.

@@ -2,6 +2,7 @@ import { Camera } from '../../cameras/Camera';
 import { Matrix4 } from '../../math/Matrix4';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface SSAOOptions {
     /** World-space sampling radius around each fragment. Default 0.5 */
@@ -274,7 +275,7 @@ class SSAOEffect extends PostProcessingEffect {
         this._device!.queue.writeBuffer(this._paramsBuffer!, 0, params.buffer as ArrayBuffer);
 
         const wg = (t: number) => Math.ceil(t / 8);
-        const pass = commandEncoder.beginComputePass({ label: 'SSAO' });
+        const pass = commandEncoder.beginComputePass({ label: 'SSAO', timestampWrites: gpuPass('SSAO') });
         pass.setPipeline(this._pipeline!);
         pass.setBindGroup(0, this._bindGroup!);
         pass.dispatchWorkgroups(wg(width), wg(height));

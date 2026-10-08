@@ -51,6 +51,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::profiling::now_ms;
+
 /// How `FramePacer` picks its cadence.
 #[derive(Debug, Clone, Copy)]
 pub struct FramePacerOptions {
@@ -747,33 +749,34 @@ impl FrameTimer {
     }
 }
 
-fn now_ms() -> f64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::sync::OnceLock;
-        static START: OnceLock<std::time::Instant> = OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
-    }
-}
+
+/// The most real time one frame feeds a [`FixedStep`]: a 60 Hz frame's.
+pub const MAX_FRAME_DT: f64 = 1.0 / 60.0;
 
 /// A fixed-step accumulator for simulations: feed it each frame's time and it says how many
-/// steps of `step` seconds to run, so a simulation evolves the same at any frame rate. Time
-/// beyond `max_steps` steps a frame is dropped rather than carried over (no spiral of death).
+/// steps of `step` seconds to run, so a simulation evolves the same at any frame rate.
+///
+/// A frame feeds it at most `max_frame_dt` of real time (a 60 Hz frame's, [`MAX_FRAME_DT`]), so
+/// below 60 fps the simulation runs slower than real time instead of taking more steps. A frame's
+/// time includes the GPU time of the steps before it: where a step costs nearly the real time it
+/// stands for (a fluid at 1.9 times real time in steps of 1/60 s: 8.8 ms), each extra step
+/// lengthens the next frame by about the time it simulated, so that frame asks for another, and
+/// the frames settle at `max_steps` (4 steps of 8 ms: under 30 fps) while simulating little
+/// more than two steps a frame would (the GPU runs steps as fast as it can either way). Time
+/// beyond `max_steps` steps is dropped rather than carried over.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FixedStep {
     pub step: f64,
     pub max_steps: u32,
+    /// Real seconds one frame may feed (see the type's docs).
+    pub max_frame_dt: f64,
     accumulator: f64,
 }
 
 impl FixedStep {
-    /// Steps of `step` seconds, at most 4 a frame.
+    /// Steps of `step` seconds, at most 4 a frame, fed at most [`MAX_FRAME_DT`] a frame.
     pub fn new(step: f64) -> Self {
-        Self { step: step.max(1e-6), max_steps: 4, accumulator: 0.0 }
+        Self { step: step.max(1e-6), max_steps: 4, max_frame_dt: MAX_FRAME_DT, accumulator: 0.0 }
     }
 
     pub fn with_max_steps(mut self, max_steps: u32) -> Self {
@@ -781,12 +784,25 @@ impl FixedStep {
         self
     }
 
-    /// Add `dt` seconds (scale it first to run the simulation faster or slower) and take the
-    /// whole steps they make up.
+    pub fn with_max_frame_dt(mut self, max_frame_dt: f64) -> Self {
+        self.max_frame_dt = max_frame_dt.max(0.0);
+        self
+    }
+
+    /// Add a frame of `dt` real seconds and take the whole steps they make up.
     pub fn advance(&mut self, dt: f64) -> u32 {
-        self.accumulator = (self.accumulator + dt.max(0.0)).min(self.step * self.max_steps as f64);
-        let steps = (self.accumulator / self.step + 1e-9).floor() as u32;
-        self.accumulator -= steps as f64 * self.step;
+        self.advance_scaled(dt, 1.0)
+    }
+
+    /// Add a frame of `dt` real seconds simulated `time_scale` times as fast (each step still
+    /// `step` seconds of the scaled clock), and take the whole steps they make up.
+    pub fn advance_scaled(&mut self, dt: f64, time_scale: f64) -> u32 {
+        let fed = dt.clamp(0.0, self.max_frame_dt) * time_scale.max(0.0);
+        self.accumulator = (self.accumulator + fed).min(self.step * self.max_steps as f64);
+        // (a step given as an f32 1/60 is a hair longer than `MAX_FRAME_DT`: count it whole and
+        // carry no debt)
+        let steps = (self.accumulator / self.step + 1e-6).floor() as u32;
+        self.accumulator = (self.accumulator - steps as f64 * self.step).max(0.0);
         steps
     }
 
@@ -822,7 +838,14 @@ mod tests {
         shown: Vec<f64>,
     }
 
-    fn run(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> Run {
+    fn run(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, gpu: impl Fn(f64) -> f64, seen: impl FnMut(f64, u32)) -> Run {
+        run_capped(cadence, start, refresh, seconds, 2, gpu, seen)
+    }
+
+    /// `run` with at most `cap` frames on the GPU before a refresh is held back (the browser's
+    /// two, or a frame loop's own cap, as `kansei_wasm::run`'s, which skips such a refresh: the
+    /// pacer is not asked on it).
+    fn run_capped(cadence: &mut Cadence, start: f64, refresh: f64, seconds: f64, cap: usize, gpu: impl Fn(f64) -> f64, mut seen: impl FnMut(f64, u32)) -> Run {
         let mut in_flight: VecDeque<f64> = VecDeque::new(); // when each frame on the GPU is done
         let mut gpu_free = start;
         let (mut rendered, mut shown) = (Vec::new(), Vec::<f64>::new());
@@ -831,7 +854,7 @@ mod tests {
             while in_flight.front().is_some_and(|&done| done <= t) {
                 in_flight.pop_front();
             }
-            if in_flight.len() >= 2 {
+            if in_flight.len() >= cap {
                 // the browser waits: the next refresh after the oldest frame is done
                 let done = in_flight[0];
                 t = start + ((done - start) / refresh).ceil() * refresh;
@@ -965,6 +988,26 @@ mod tests {
             // cadence)
             let tail: Vec<f64> = frames.into_iter().filter(|&t| t > 42000.0).collect();
             assert!(steady(&tail, divisor as f64 * refresh), "{gpu} ms frames at {:.0} Hz: {tail:?}", 1000.0 / refresh);
+        }
+    }
+
+    #[test]
+    fn a_frame_loop_that_caps_frames_in_flight_renders_the_same_cadence() {
+        // a frame loop that skips refreshes while `cap` frames are on the GPU, without asking the
+        // pacer: at two that is the browser's own hold-back. At one it also hides refreshes the
+        // pacer would have declined (20 ms frames at 60 Hz: the one after each frame), so it may
+        // learn a longer refresh (33 ms, every one) but renders the same steady frames
+        let (r60, r120) = (1000.0 / 60.0, 1000.0 / 120.0);
+        for cap in [1, 2] {
+            for (refresh, gpu, divisor) in [(r60, 12.0, 1), (r60, 20.0, 2), (r120, 12.0, 2), (r120, 20.0, 3), (r120, 6.0, 1), (r120, 30.0, 4)] {
+                let mut cadence = Cadence::new(FramePacerOptions::default());
+                let run = run_capped(&mut cadence, 0.0, refresh, 45.0, cap, |t| if t < 500.0 { 2.0 } else { gpu }, |_, _| {});
+                let tail: Vec<f64> = run.rendered.into_iter().filter(|&t| t > 42000.0).collect();
+                assert!(steady(&tail, divisor as f64 * refresh), "cap {cap}, {gpu} ms frames at {:.0} Hz: {tail:?}", 1000.0 / refresh);
+                if cap == 2 {
+                    assert_eq!(cadence.held(), divisor);
+                }
+            }
         }
     }
 
@@ -1297,7 +1340,7 @@ mod tests {
 
     #[test]
     fn a_fixed_step_runs_whole_steps_and_drops_the_backlog() {
-        let mut fixed = FixedStep::new(1.0 / 60.0).with_max_steps(3);
+        let mut fixed = FixedStep::new(1.0 / 60.0).with_max_steps(3).with_max_frame_dt(1.0);
         // a 120 Hz display: a step every other frame
         assert_eq!((0..4).map(|_| fixed.advance(1.0 / 120.0)).sum::<u32>(), 2);
         // a 30 Hz frame: two steps
@@ -1308,5 +1351,50 @@ mod tests {
         fixed.advance(1.0 / 100.0);
         fixed.reset();
         assert_eq!(fixed.advance(1.0 / 100.0), 0);
+    }
+
+    #[test]
+    fn a_fixed_step_takes_a_60_hz_frame_of_time_at_most() {
+        // twice real time in steps of 1/60 s: a 60 Hz frame is about two steps
+        let mut fixed = FixedStep::new(1.0 / 60.0);
+        let steps: u32 = (0..60).map(|_| fixed.advance_scaled(1.0 / 60.0, 2.0)).sum();
+        assert_eq!(steps, 120, "real time at 60 fps");
+        // a 120 Hz display: real time too
+        let steps: u32 = (0..120).map(|_| fixed.advance_scaled(1.0 / 120.0, 2.0)).sum();
+        assert_eq!(steps, 120);
+        // 30 fps frames: still two steps each, not four (the simulation runs at half speed)
+        assert!((0..30).all(|_| fixed.advance_scaled(1.0 / 30.0, 2.0) == 2));
+    }
+
+    /// The loop a slow simulation settles in: each frame's time is the GPU time of the frame
+    /// before (`render` ms plus `per_step` ms a step), at `time_scale` times real time in steps
+    /// of 1/60 s. The frame rate and the share of real time simulated, after 20 s.
+    fn settle(fixed: &mut FixedStep, render: f64, per_step: f64, time_scale: f64) -> (f64, f64) {
+        let (mut dt, mut wall, mut frames, mut steps, mut measured) = (1.0 / 60.0, 0.0, 0, 0, 0.0);
+        while wall < 20.0 {
+            let n = fixed.advance_scaled(dt, time_scale);
+            dt = (render + per_step * n as f64) / 1000.0;
+            if wall > 10.0 {
+                frames += 1;
+                steps += n;
+                measured += dt;
+            }
+            wall += dt;
+        }
+        (frames as f64 / measured, steps as f64 / 60.0 / time_scale / measured)
+    }
+
+    #[test]
+    fn a_slow_simulation_keeps_the_frame_rate_of_a_60_hz_frame_of_steps() {
+        // the fluid example at 1.9 times real time: 3 ms to render, 8.3 ms a step (of 8.8)
+        let (fps, speed) = settle(&mut FixedStep::new(1.0 / 60.0).with_max_frame_dt(1.0), 3.0, 8.3, 1.9);
+        assert!(fps < 29.0, "without the clamp, 4 steps a frame: {fps:.1} fps");
+        assert!(speed > 0.95, "{speed:.2}");
+        let (fps, speed) = settle(&mut FixedStep::new(1.0 / 60.0), 3.0, 8.3, 1.9);
+        assert!(fps > 50.0, "about two: {fps:.1} fps");
+        assert!(speed > 0.85, "{speed:.2}");
+        // a light one keeps real time either way
+        let (fps, speed) = settle(&mut FixedStep::new(1.0 / 60.0), 3.0, 2.0, 1.9);
+        assert!(fps > 90.0 && speed > 0.99, "{fps:.1} fps, {speed:.2}");
     }
 }

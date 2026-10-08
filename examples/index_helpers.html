@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei – helpers</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #hud {
+      position: absolute; left: 12px; bottom: 12px; color: #ddd;
+      font: 12px/1.5 ui-monospace, monospace; pointer-events: none; white-space: pre;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud"></div>
+  <script type="module">
+    // The small helpers the Rust engine's examples share, in TS: stock geometries (heightfield,
+    // spruce, icosphere, cylinder; merged and fitted), DebugBoxes, a follow camera, and the web
+    // runtime (DPR-sized canvas that follows the page, frame loop, query params, keys).
+    //
+    // ?post=0 draws straight to the canvas instead of through a PostProcessingVolume (GBuffer);
+    // ?xray=0 draws the markers depth-tested; ?trees=<n> plants n spruces (800 by default).
+    // Keys: F toggles the follow camera, R resets the view. Right- or shift-drag pans.
+    import { Canvas, run, Keys, paramOr, flag, setText, thousands } from '../src/web/index'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Material } from '../src/materials/Material'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Geometry } from '../src/buffers/Geometry'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { HeightfieldGeometry } from '../src/geometries/HeightfieldGeometry'
+    import { SpruceGeometry } from '../src/geometries/SpruceGeometry'
+    import { IcosphereGeometry } from '../src/geometries/IcosphereGeometry'
+    import { CylinderGeometry } from '../src/geometries/CylinderGeometry'
+    import { DebugBoxes, segment } from '../src/debug/DebugBoxes'
+    import { hash01 } from '../src/math/hash01'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+
+    const post = flag('post', true);
+    const treeCount = paramOr('trees', 800);
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ clearColor: new Vector4(0.55, 0.65, 0.78, 1), sampleCount: post ? 1 : 4 });
+    const scene = new Scene();
+    const camera = new Camera(50, 0.1, 400, canvas.aspect);
+    const volume = post ? new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 }) : null;
+
+    // One lit shader for everything: per-instance offset and scale at location 3 (zero for none).
+    const shader = (instanced) => /* wgsl */`
+      struct VertexOut { @builtin(position) position: vec4f, @location(0) normal: vec3f, @location(1) local: vec3f };
+      @group(0) @binding(0) var<uniform> baseColor: vec4f;
+      @group(1) @binding(0) var<uniform> viewMatrix: mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix: mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix: mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix: mat4x4f;
+      @vertex
+      fn vertex_main(@location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f
+                     ${instanced ? ', @location(3) instance: vec4f' : ''}) -> VertexOut {
+        let placement = ${instanced ? 'instance' : 'vec4f(0.0, 0.0, 0.0, 1.0)'};
+        var out: VertexOut;
+        out.position = projectionMatrix * viewMatrix * worldMatrix * vec4f(position.xyz * placement.w + placement.xyz, 1.0);
+        out.normal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        out.local = position.xyz;
+        return out;
+      }
+      struct FragmentOutput { @location(0) color: vec4f, ${post ? '@location(1) emissive: vec4f, @location(2) normal: vec4f, @location(3) albedo: vec4f,' : ''} };
+      @fragment
+      fn fragment_main(in: VertexOut) -> FragmentOutput {
+        // a spruce's trunk is within 0.04 of its axis, under its crowns (from 0.15 up)
+        var albedo = baseColor.rgb;
+        if (baseColor.a < 0.5 && length(in.local.xz) < 0.04 && in.local.y < 0.15) { albedo = vec3f(0.3, 0.2, 0.12); }
+        let light = 0.35 + 0.65 * max(dot(in.normal, normalize(vec3f(0.5, 1.0, 0.3))), 0.0);
+        return FragmentOutput(vec4f(albedo * light, 1.0) ${post ? ', vec4f(0.0, 0.0, 0.0, 1.0), vec4f(in.normal * 0.5 + 0.5, 1.0), vec4f(albedo, 1.0)' : ''});
+      }`;
+    const material = (color, instanced = false, alpha = 1) => new Material(shader(instanced), {
+      bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: new Vector4(...color, alpha) }],
+    });
+
+    // ── Terrain ───────────────────────────────────────────────────────────
+    const height = (x, z) => 2.2 * Math.sin(x * 0.11) * Math.cos(z * 0.09) + 0.8 * Math.sin(x * 0.31 + z * 0.23);
+    const terrain = new HeightfieldGeometry([-60, -60], [60, 60], [160, 160], height);
+    scene.add(new Renderable(terrain, material([0.42, 0.5, 0.3])));
+
+    // ── Spruces: one merged mesh, instanced, scattered by hash01 ──────────
+    const spruce = new SpruceGeometry(10, 2, 4).withLabel('Spruce');
+    const placements = new Float32Array(treeCount * 4);
+    for (let i = 0; i < treeCount; i++) {
+      const x = (hash01(i * 3) - 0.5) * 110, z = (hash01(i * 3 + 1) - 0.5) * 110;
+      placements.set([x, height(x, z), z, 2.5 + 3 * hash01(i * 3 + 2)], i * 4);
+    }
+    const instances = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: placements, shaderLocation: 3, offset: 0, stride: 16, format: 'float32x4',
+    });
+    scene.add(new Renderable(new InstancedGeometry(spruce, treeCount, [instances]), material([0.16, 0.33, 0.2], true, 0)));
+
+    // ── Rocks and a post: an icosphere and a cylinder merged, fitted to stand on the ground ──
+    // column-major 4x4 matrices: a squashed rock, a post beside it
+    const rockMatrix = [1.4, 0, 0, 0, 0, 0.8, 0, 0, 0, 0, 1.1, 0, 0, 0, 0, 1];
+    const postMatrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1.6, 0, 0, 1];
+    const cairn = Geometry.merged('Cairn', [[new IcosphereGeometry(1, 2), rockMatrix], [new CylinderGeometry(0.15, 0.1, 3, 12, 1), postMatrix]])
+      .fit([3, Infinity, 3]);
+    for (const [x, z] of [[8, 4], [-12, 10], [5, -14]]) {
+      const r = new Renderable(cairn, material([0.55, 0.53, 0.5]));
+      r.position.set(x, height(x, z), z);
+      scene.add(r);
+    }
+
+    // ── The runner, its trail and its markers (DebugBoxes) ────────────────
+    const runner = new Renderable(new IcosphereGeometry(0.5, 3), material([0.9, 0.35, 0.2]));
+    scene.add(runner);
+    const TRAIL = 120;
+    const trail = new DebugBoxes(scene, TRAIL, [1.0, 0.85, 0.2]);
+    const markers = new DebugBoxes(scene, 2, [0.2, 0.7, 1.0], flag('xray', true));
+    const history = [];
+
+    // ── Camera: orbit, follow the runner, pan ─────────────────────────────
+    const target = new Vector3(0, 0, 0);
+    const controls = new CameraControls(camera, target, canvas.element, 22).withMousePan();
+    const keys = Keys.listen();
+    let following = true;
+    const resetView = () => controls.setView(new Vector3(0, 0, 0), 30, 0.6, 0.9);
+    resetView();
+
+    const runnerAt = (t) => {
+      const x = 30 * Math.sin(t * 0.21), z = 22 * Math.sin(t * 0.33);
+      return [x, height(x, z) + 0.5, z];
+    };
+    let last = [0, 0, 0];
+    const triangles = (terrain.indices.length + spruce.indices.length * treeCount + cairn.indices.length * 3) / 3;
+
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      for (const key of keys.takePressed()) {
+        if (key === 'f') following = !following;
+        if (key === 'r') resetView();
+      }
+      const p = runnerAt(frame.time);
+      runner.position.set(...p);
+      if (following) controls.follow(runner.position, frame.dt, 3);
+
+      if (frame.index % 3 === 0) {
+        history.push(p);
+        if (history.length > TRAIL + 1) history.shift();
+      }
+      for (let i = 0; i < TRAIL; i++) {
+        trail.setMatrix(i, history[i + 1] ? segment(history[i], history[i + 1], 0.12) : new Float32Array(16));
+      }
+      // a box over the runner and a ray to where it was a moment ago, drawn through the trees
+      markers.setMatrix(0, [0.4, 0, 0, 0, 0, 0.4, 0, 0, 0, 0, 0.4, 0, p[0], p[1] + 1.4, p[2], 1]);
+      markers.setMatrix(1, segment([p[0], p[1] + 1.4, p[2]], [last[0], last[1] + 1.4, last[2]], 0.05));
+      if (frame.index % 30 === 0) last = p;
+      trail.upload(renderer);
+      markers.upload(renderer);
+
+      controls.update(frame.dt);
+      if (volume) volume.render(scene, camera); else renderer.render(scene, camera);
+      const [w, h] = frame.size;
+      setText('hud', `${w} x ${h} px (dpr ${canvas.pixelRatio})   ${thousands(triangles)} triangles   follow ${following ? 'on' : 'off'} (F)   reset (R)`);
+    });
+  </script>
+</body>
+
+</html>

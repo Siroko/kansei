@@ -81,20 +81,23 @@ impl MouseVectors {
           cb.forget();
         }
 
-        // window blur / focus: snap on next update (focus lost/regained)
-        if let Some(window) = web_sys::window() {
+        // window blur / focus: snap on next update (focus lost/regained). On the global scope, the
+        // page's window or, for a renderer in a worker, the worker's scope (which kansei_wasm
+        // hands the page's blur and focus)
+        {
+            let global = global_scope();
             { let s = shared.clone();
               let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
                 s.borrow_mut().snap = true;
               });
-              window.add_event_listener_with_callback("blur", cb.as_ref().unchecked_ref()).ok();
+              global.add_event_listener_with_callback("blur", cb.as_ref().unchecked_ref()).ok();
               cb.forget();
             }
             { let s = shared.clone();
               let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
                 s.borrow_mut().snap = true;
               });
-              window.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref()).ok();
+              global.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref()).ok();
               cb.forget();
             }
         }
@@ -162,6 +165,18 @@ impl MouseVectors {
         self.direction = Vec2::new(prev.x - self.position.x, prev.y - self.position.y);
         self.strength = self.direction.length();
     }
+}
+
+/// The global scope (`globalThis`) as an event target.
+#[cfg(target_arch = "wasm32")]
+fn global_scope() -> web_sys::EventTarget {
+    use wasm_bindgen::prelude::*;
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(thread_local_v2, js_name = globalThis)]
+        static GLOBAL_THIS: web_sys::EventTarget;
+    }
+    GLOBAL_THIS.with(Clone::clone)
 }
 
 impl Default for MouseVectors {

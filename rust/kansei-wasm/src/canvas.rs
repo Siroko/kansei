@@ -1,14 +1,18 @@
 //! The canvas an example draws to: its drawing buffer sized from its CSS box and the device
-//! pixel ratio, kept in step when the page resizes.
+//! pixel ratio, kept in step when the page resizes. On the page it is the `<canvas>`; in a worker
+//! ([`crate::launch`]) it is that canvas transferred as an `OffscreenCanvas`, with the CSS box
+//! and the ratio posted by the page.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
 use kansei_core::renderers::{Renderer, RendererConfig};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::HtmlCanvasElement;
+use web_sys::{HtmlCanvasElement, OffscreenCanvas};
+
+use crate::worker;
 
 /// The canvas's drawing buffer is its CSS size times `devicePixelRatio`, at most this much
 /// unless [`Canvas::with_max_pixel_ratio`] or `?dpr=` says otherwise.
@@ -21,12 +25,23 @@ const DEFAULT_MAX_PIXEL_RATIO: f32 = 2.0;
 /// `?dpr=<ratio>` on the page's URL fixes the ratio (`?dpr=1` draws one pixel per CSS pixel).
 /// The page must give the canvas a CSS size (`width: 100vw; height: 100vh`, say): its box is
 /// measured, and a box sized by the drawing buffer would grow with it.
+///
+/// In a worker the canvas draws to the `OffscreenCanvas` and [`Canvas::element`] is a stand-in
+/// for the page's element (see there).
 #[derive(Clone)]
 pub struct Canvas {
     inner: Rc<Inner>,
 }
 
+/// What the renderer draws to.
+enum Target {
+    Element(HtmlCanvasElement),
+    Offscreen(OffscreenCanvas),
+}
+
 struct Inner {
+    target: Target,
+    /// The `<canvas>`, or in a worker its stand-in.
     element: HtmlCanvasElement,
     max_pixel_ratio: Cell<f32>,
     /// `?dpr=`, read once.
@@ -37,37 +52,60 @@ struct Inner {
     box_changed: Rc<Cell<bool>>,
     /// The ratio last measured, to notice a move to a screen with another ratio.
     pixel_ratio: Cell<f64>,
-    _observer: Option<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>,
+    /// The device and queue of the renderer made by [`Canvas::renderer`], for the frame loop's
+    /// frames-in-flight cap.
+    gpu: RefCell<Option<(wgpu::Device, wgpu::Queue)>>,
+    _observer: Option<web_sys::ResizeObserver>,
+    _on_resize: Closure<dyn FnMut()>,
 }
 
 impl Canvas {
-    /// The `<canvas>` with this id, sized for the screen. Also routes panics and logs to the
-    /// console ([`crate::init`]).
+    /// The `<canvas>` with this id, sized for the screen (in a worker, the one the page
+    /// transferred). Also routes panics and logs to the console ([`crate::init`]).
     pub fn find(id: &str) -> Result<Canvas, JsValue> {
         crate::init();
-        let element = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id(id))
-            .ok_or_else(|| JsValue::from_str(&format!("no element #{id}")))?
-            .dyn_into::<HtmlCanvasElement>()?;
+        let missing = || JsValue::from_str(&format!("no element #{id}"));
+        let (target, element) = if worker::in_worker() {
+            let found = worker::worker_canvas(id);
+            if found.is_undefined() {
+                return Err(missing());
+            }
+            let canvas = js_sys::Reflect::get(&found, &"canvas".into())?.dyn_into::<OffscreenCanvas>()?;
+            let element = js_sys::Reflect::get(&found, &"element".into())?.unchecked_into::<HtmlCanvasElement>();
+            (Target::Offscreen(canvas), element)
+        } else {
+            let element = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id(id))
+                .ok_or_else(missing)?
+                .dyn_into::<HtmlCanvasElement>()?;
+            (Target::Element(element.clone()), element)
+        };
         let box_changed = Rc::new(Cell::new(false));
-        let observer = {
+        let on_resize = {
             let flag = box_changed.clone();
-            let callback = Closure::<dyn FnMut()>::new(move || flag.set(true));
-            web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()).ok().map(|o| {
-                o.observe(&element);
-                (o, callback)
-            })
+            Closure::<dyn FnMut()>::new(move || flag.set(true))
+        };
+        // the page's canvas box, observed; in a worker the page posts it and the stand-in says so
+        let observer = match target {
+            Target::Element(_) => web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()).ok().inspect(|o| o.observe(&element)),
+            Target::Offscreen(_) => {
+                element.add_event_listener_with_callback("kansei-resize", on_resize.as_ref().unchecked_ref())?;
+                None
+            }
         };
         let canvas = Canvas {
             inner: Rc::new(Inner {
+                target,
                 element,
                 max_pixel_ratio: Cell::new(DEFAULT_MAX_PIXEL_RATIO),
                 pixel_ratio_param: crate::param("dpr").and_then(|v| v.parse::<f64>().ok()).filter(|r| *r > 0.0),
                 fixed_size: Cell::new(None),
                 box_changed,
                 pixel_ratio: Cell::new(0.0),
+                gpu: RefCell::new(None),
                 _observer: observer,
+                _on_resize: on_resize,
             }),
         };
         canvas.measure();
@@ -92,13 +130,22 @@ impl Canvas {
     }
 
     /// The `<canvas>` element, for input listeners (`CameraControls::from_canvas`, ...).
+    ///
+    /// In a worker it is a stand-in: an event target that receives the page canvas's events
+    /// (forwarded by the page for each type listened to) and has its CSS size (`clientWidth`,
+    /// `clientHeight`, `getBoundingClientRect`). Nothing else of an element works on it; the
+    /// listeners cannot `preventDefault` (the page cancels touches and the context menu itself).
     pub fn element(&self) -> &HtmlCanvasElement {
         &self.inner.element
     }
 
     /// The drawing buffer's size in pixels.
     pub fn size(&self) -> (u32, u32) {
-        (self.inner.element.width().max(1), self.inner.element.height().max(1))
+        let (width, height) = match &self.inner.target {
+            Target::Element(canvas) => (canvas.width(), canvas.height()),
+            Target::Offscreen(canvas) => (canvas.width(), canvas.height()),
+        };
+        (width.max(1), height.max(1))
     }
 
     /// Width over height, for a camera's projection.
@@ -108,14 +155,23 @@ impl Canvas {
     }
 
     /// A renderer drawing to this canvas, at its size: `config`'s other fields (sample count,
-    /// clear colour, limits, ...) as given.
+    /// clear colour, limits, ...) as given. [`crate::run`] keeps its frames in flight in check.
     #[cfg(target_arch = "wasm32")]
     pub async fn renderer(&self, config: RendererConfig) -> Renderer {
         let (width, height) = self.size();
         let device_pixel_ratio = self.inner.pixel_ratio.get() as f32;
         let mut renderer = Renderer::new(RendererConfig { width, height, device_pixel_ratio, ..config });
-        renderer.initialize_with_canvas(self.inner.element.clone()).await;
+        match &self.inner.target {
+            Target::Element(canvas) => renderer.initialize_with_canvas(canvas.clone()).await,
+            Target::Offscreen(canvas) => renderer.initialize_with_offscreen_canvas(canvas.clone()).await,
+        }
+        *self.inner.gpu.borrow_mut() = Some((renderer.device().clone(), renderer.queue().clone()));
         renderer
+    }
+
+    /// The device and queue of the renderer [`Canvas::renderer`] made, if it made one.
+    pub(crate) fn gpu(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
+        self.inner.gpu.borrow().clone()
     }
 
     /// Re-measure if the CSS box or the pixel ratio changed; the new drawing-buffer size when it
@@ -138,7 +194,11 @@ impl Canvas {
         if let Some(ratio) = self.inner.pixel_ratio_param {
             return ratio.clamp(0.1, 4.0);
         }
-        let device = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
+        let device = match self.inner.target {
+            Target::Element(_) => web_sys::window().map_or(1.0, |w| w.device_pixel_ratio()),
+            // the page's, posted to the stand-in
+            Target::Offscreen(_) => js_sys::Reflect::get(&self.inner.element, &"devicePixelRatio".into()).ok().and_then(|r| r.as_f64()).unwrap_or(1.0),
+        };
         device.min(self.inner.max_pixel_ratio.get() as f64)
     }
 
@@ -156,12 +216,23 @@ impl Canvas {
     }
 
     fn set_size(&self, (width, height): (u32, u32)) {
-        let element = &self.inner.element;
-        if element.width() != width {
-            element.set_width(width);
-        }
-        if element.height() != height {
-            element.set_height(height);
+        match &self.inner.target {
+            Target::Element(canvas) => {
+                if canvas.width() != width {
+                    canvas.set_width(width);
+                }
+                if canvas.height() != height {
+                    canvas.set_height(height);
+                }
+            }
+            Target::Offscreen(canvas) => {
+                if canvas.width() != width {
+                    canvas.set_width(width);
+                }
+                if canvas.height() != height {
+                    canvas.set_height(height);
+                }
+            }
         }
     }
 }

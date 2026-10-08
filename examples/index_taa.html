@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei – Temporal AA</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Temporal anti-aliasing on a scene that aliases, the TS twin of the Rust `taa` example
+    // (rust/kansei-wasm/examples/taa): thin trunks and power lines (edge aliasing), a meadow of
+    // 12 000 alpha-tested grass cards swaying in the wind, and a car crossing the frame, under a
+    // moving camera. The surfaces write motion vectors: `Material.standardLit` with
+    // `outputsVelocity`, and the grass its wind's own (`MaterialOptions.outputsVelocity` with
+    // `MOTION_VECTORS_WGSL`); the sky is reprojected by depth. The GBuffer is single-sample:
+    // the TAA is the only anti-aliasing.
+    //
+    // URL parameters, as the Rust page's:
+    //   taa=0           no TAA
+    //   vel=0           no motion vectors: the car and the grass reproject by depth only
+    //   scale=<0.25..1> render the scene at that fraction of the canvas and let the TAA upscale it
+    //   wind=<scale>    wind strength on the grass (default 1)
+    //   t=<seconds>     freeze the camera at that time; the car and the wind keep moving
+    //   step=<seconds>  with t, alternate the camera, the car and the wind between t and t + step
+    //                   every frame
+    //   pan=<deg/s>     swing the camera left and right at up to that speed (default 0)
+    //   car=<m/s>       the car's speed (default 9)
+    //   stats=1         log every 240 frames the interval between frames and the renderer's profile
+    //   dpr=<ratio>     drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
+    // Motion blur:
+    //   mblur=<amount>  add a `MotionBlurEffect` after the TAA (0.5: a 180-degree shutter), scaled
+    //                   to 30 fps and capped at 4 % of the width
+    //   mbfps=<fps>     the frame rate the blur is scaled to (default 30; 0: each frame's motion)
+    //   mbmax=<frac>    the longest blur radius, as a fraction of the width (default 0.04)
+    // With `t` and `step` the blur sees each frame's step as that frame's duration.
+    import { Canvas, run, param, paramOr, flag, now } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { LIGHTS_WGSL, MOTION_VECTORS_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { TemporalAAEffect } from '../src/postprocessing/effects/TemporalAAEffect'
+    import { MotionBlurEffect } from '../src/postprocessing/effects/MotionBlurEffect'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { hash01 } from '../src/math/hash01'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+
+    // Alpha-tested grass cards bending in the wind, writing motion vectors (this frame's and
+    // last frame's wind): diffuse, lit by the scene's directional lights and the sky
+    // hemisphere. Each instance is a vec4: xyz position, w yaw; a 0.5 x 0.7 card standing on
+    // the ground, five tapering blades cut out of it. Prefixed with LIGHTS_WGSL and
+    // MOTION_VECTORS_WGSL. The Rust page's shader, with the TS plane's v (0 at the bottom).
+    const GRASS_WGSL = /* wgsl */`
+// params: time, previous time, wind
+struct Grass { base_color: vec4<f32>, params: vec4<f32>, sky_up: vec4<f32>, sky_down: vec4<f32> };
+@group(0) @binding(0) var<uniform> grass: Grass;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> mesh: KanseiMeshTransforms;
+
+struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>, @location(3) instance: vec4<f32> };
+struct VOut {
+    @builtin(position) @invariant clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) curr: vec4<f32>,
+    @location(3) prev: vec4<f32>,
+};
+// the shaded colour, and the motion for the velocity pass
+struct FOut { @location(0) color: vec4<f32>, @location(4) velocity: vec2<f32> };
+
+// the card at time t: yawed onto its spot, then the wind bending its top
+fn place(v: VIn, t: f32) -> vec3<f32> {
+    let c = cos(v.instance.w);
+    let s = sin(v.instance.w);
+    var local = vec3<f32>(c * v.position.x, v.position.y + 0.35, -s * v.position.x);
+    let h = saturate(v.uv.y);
+    let gust = sin(t * 1.7 + v.instance.x * 0.9 + v.instance.z * 0.6) + 0.4 * sin(t * 4.1 + v.instance.x * 2.3);
+    local.x += gust * 0.12 * h * h * grass.params.z;
+    local.z += gust * 0.05 * h * h * grass.params.z;
+    return local + v.instance.xyz;
+}
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let p = place(v, grass.params.x);
+    let prev_p = place(v, grass.params.y);
+    let world = mesh.world * vec4<f32>(p, 1.0);
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+    out.uv = v.uv;
+    out.curr = kansei_camera_temporal.viewProj * world;
+    out.prev = kansei_camera_temporal.prevViewProj * (mesh.prevWorld * vec4<f32>(prev_p, 1.0));
+    return out;
+}
+
+@fragment
+fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> FOut {
+    let bx = fract(in.uv.x * 5.0) - 0.5;
+    let width = 0.45 * ((1.0 - in.uv.y) * 0.9 + 0.1);
+    if (abs(bx) > width) { discard; }
+    var n = normalize(in.normal);
+    if (!front) { n = -n; }
+    let base = grass.base_color.rgb;
+    var lit = base * mix(grass.sky_down.rgb, grass.sky_up.rgb, n.y * 0.5 + 0.5);
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let light = kansei_lights.directional[i];
+        lit += base / 3.14159265 * light.color * max(dot(n, -normalize(light.direction)), 0.0);
+    }
+    return FOut(vec4<f32>(lit, 1.0), kansei_motion_vector(in.curr, in.prev));
+}
+`;
+
+    // The low sun: the direction it travels, and its colour times illuminance (lux).
+    const SUN_DIR = [0.5, -0.35, 0.8];
+    const SUN = [9000 * Math.PI, 7600 * Math.PI, 6000 * Math.PI];
+    // The sky hemisphere's radiance from straight up and straight down (cd/m²).
+    const SKY_UP = [900, 1100, 1500];
+    const SKY_DOWN = [60, 55, 45];
+
+    const scale = parseFloat(param('scale') ?? '');
+    const velocity = flag('vel', true);
+
+    // A diffuse surface under the sun and the sky (the stock standard material), writing motion
+    // vectors with `velocity`; `instanced` for the trunks (vec4: xyz position, w height).
+    const surfaceMaterial = (label, base, instanced) => Material.standardLit(label, {
+      baseColor: base,
+      roughness: 0.9,
+      skyUp: SKY_UP,
+      skyDown: SKY_DOWN,
+      instancing: instanced ? 'offsetHeight' : undefined,
+      outputsVelocity: velocity,
+    });
+
+    // the grass uniform: base colour, then time, previous time and wind, then the sky
+    const grassUniform = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array([0.1, 0.16, 0.04, 1, 0, 0, 0, 0, ...SKY_UP, 0, ...SKY_DOWN, 0]),
+    });
+    const grassMaterial = new Material(`${LIGHTS_WGSL}\n${MOTION_VECTORS_WGSL}\n${GRASS_WGSL}`, {
+      label: 'Grass',
+      bindings: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: grassUniform }],
+      cullMode: 'none',
+      mrtOutputCount: 1,
+      outputsVelocity: velocity,
+    });
+
+    // a vec4 per instance at vertex location 3
+    const instances = (label, data) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_STORAGE,
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array(data),
+      shaderLocation: 3,
+      offset: 0,
+      stride: 16,
+      format: 'float32x4',
+    });
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    if (Number.isFinite(scale)) renderer.setRenderScale(scale);
+
+    const scene = new Scene();
+    const horizon = [2600, 2800, 3100];
+    const sky = new Renderable(new SphereGeometry(500, 4), Material.gradientSky('Sky', { zenith: [900, 1300, 2400], horizon, ground: horizon, curve: 0.5 }));
+    sky.castShadow = false;
+    scene.add(sky);
+    scene.add(new DirectionalLight(SUN_DIR, SUN, 1));
+
+    // a thin box rather than Rust's PlaneGeometry: the TS plane winds its triangles clockwise
+    // seen from its normal, so back-face culling hides its lit side
+    const ground = new Renderable(new BoxGeometry(400, 0.02, 400), surfaceMaterial('Ground', [0.08, 0.1, 0.05], false));
+    ground.position.set(0, -0.01, 0);
+    scene.add(ground);
+
+    // thin trunks, and power lines: sub-pixel edges that crawl without AA
+    const trunks = [];
+    for (let i = 0; i < 400; i++) {
+      const x = -60 + hash01(i) * 120;
+      const z = -12 - hash01(i + 3) * 90;
+      const h = 8 + hash01(i + 9) * 10;
+      trunks.push(x, h * 0.5, z, h);
+    }
+    scene.add(new Renderable(
+      new InstancedGeometry(new BoxGeometry(0.18, 1, 0.18), trunks.length / 4, [instances('Trunks', trunks)]),
+      surfaceMaterial('Trunks', [0.12, 0.1, 0.08], true),
+    ));
+    for (let k = 0; k < 3; k++) {
+      const wire = new Renderable(new BoxGeometry(200, 0.03, 0.03), surfaceMaterial('Wire', [0.02, 0.02, 0.02], false));
+      wire.position.set(0, 7.5 + k * 0.6, -14);
+      scene.add(wire);
+    }
+
+    // the meadow: 12 000 alpha-tested grass cards in the wind
+    const grass = [];
+    for (let i = 0; i < 12000; i++) {
+      const x = -25 + hash01(i + 101) * 50;
+      const z = 2 - hash01(i + 211) * 22;
+      grass.push(x, 0, z, hash01(i + 307) * Math.PI * 2);
+    }
+    scene.add(new Renderable(
+      new InstancedGeometry(new PlaneGeometry(0.5, 0.7), grass.length / 4, [instances('Grass', grass)]),
+      grassMaterial,
+    ));
+
+    // a car crossing the frame
+    const car = new Renderable(new BoxGeometry(4.4, 1.3, 1.8), surfaceMaterial('Car', [0.3, 0.02, 0.02], false));
+    scene.add(car);
+
+    const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(11) });
+    const effects = [];
+    if (flag('taa', true)) effects.push(new TemporalAAEffect({ exposure: tonemap.totalExposure() }));
+    const mblur = paramOr('mblur', 0);
+    let motionBlur = null;
+    if (mblur > 0) {
+      const fps = paramOr('mbfps', 30);
+      motionBlur = new MotionBlurEffect({ amount: mblur, max: paramOr('mbmax', 0.04), targetFps: fps > 0 ? fps : null });
+      effects.push(motionBlur);
+    }
+    effects.push(tonemap);
+    const volume = new PostProcessingVolume(renderer, effects);
+
+    const camera = new Camera(40, 0.1, 1000, canvas.aspect);
+    const [renderWidth, renderHeight] = renderer.renderSize;
+    console.info(`Kansei — Temporal AA (TS) ready: motion vectors ${velocity}, motion blur ${mblur}, rendering ${renderWidth}x${renderHeight} for ${renderer.renderWidth}x${renderer.renderHeight}`);
+
+    const frozenT = parseFloat(param('t') ?? '');
+    const step = Number.isFinite(frozenT) ? parseFloat(param('step') ?? '') : NaN;
+    const wind = paramOr('wind', 1);
+    const pan = paramOr('pan', 0);
+    const carSpeed = paramOr('car', 9);
+    // `stats=1`: frames in the current window and when it started, and the renderer's profile
+    const stats = flag('stats', false) ? { frames: 0, start: now() } : null;
+    renderer.setProfiling(stats !== null);
+    const grassData = grassUniform.buffer;
+    let lastT = 0;
+    const target = new Vector3();
+
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      let clock = frame.time;
+      let t = Number.isFinite(frozenT) ? frozenT : clock;
+      // a still picture in motion: alternate between t and t + step
+      let frameTime = frame.dt;
+      if (Number.isFinite(step)) {
+        t += (frame.index % 2) * step;
+        clock = t;
+        frameTime = step;
+      }
+      motionBlur?.setFrameTime(frameTime);
+
+      // wind time, this frame's and last frame's
+      grassData[4] = clock;
+      grassData[5] = lastT;
+      grassData[6] = wind;
+      grassUniform.needsUpdate = true;
+      lastT = clock;
+
+      car.position.set(-30 + (clock * carSpeed) % 60, 0.85, -8);
+      // swinging left and right at up to `pan` degrees a second
+      const yaw = (pan * Math.PI / 180) / 0.8 * Math.sin(0.8 * t);
+      camera.position.set(-2 + t * 0.4, 1.3, 6);
+      target.set(-2 + t * 0.4 + 26 * Math.sin(yaw), 2.2, 6 - 26 * Math.cos(yaw));
+      camera.lookAt(target);
+
+      volume.render(scene, camera);
+      if (stats && ++stats.frames === 240) {
+        const time = now();
+        console.info(`frame interval: ${((time - stats.start) * 1000 / 240).toFixed(2)} ms\n${renderer.takeProfile().report()}`);
+        stats.frames = 0;
+        stats.start = time;
+      }
+    });
+  </script>
+</body>
+
+</html>

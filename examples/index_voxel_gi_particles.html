@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kansei - voxel GI on particles</title>
+    <style>
+      body { margin: 0; background: #000; overflow: hidden; }
+      canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+    </style>
+  </head>
+  <body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+      // Voxel GI on particles: Hector Arellano's "indirect lighting on particles" (miaumiau.cat,
+      // p=1476) on Kansei's voxel GI, the TS twin of the Rust demo
+      // `rust/kansei-wasm/demos/voxel-gi-particles` (its README and `src/lib.rs`), with the same
+      // scenes, URL parameters, panel and `window.kansei`. Every frame the particles of an SPH
+      // fluid splat their density and emission into a voxel volume, with the walls as analytic
+      // boxes (`ParticleGi`); each particle then cone traces its incoming light (six 90-degree
+      // cones) and its visibility of the key light (one narrow cone), so the pile darkens inside,
+      // glowing particles light their neighbours, and the walls, tracing the same volume, take the
+      // pile's shadow and glow.
+      //
+      // Two scenes:
+      // - the lightbox (default): a closed white room lit by an emissive panel in its ceiling, on
+      //   black, over a glossy floor that reflects it; spheres of varied size, charcoal and brown
+      //   with a share glowing orange to yellow, rain down into a pile. `rt=on`: some spheres turn
+      //   to mirrors and glass, their rays walking the fluid's own neighbour grid;
+      // - `scene=cornell`: the fluid dam-breaks in an open-topped Cornell room (red and green side
+      //   walls) under a sun and a blue sky, drawn as camera-facing discs.
+      //
+      // URL parameters: scene=lightbox|cornell, gi=off, view=indirect, rt=on (lightbox),
+      // quality=low|medium|high (default medium, low on phones, which also keep the volume within
+      // 24 MiB), particles=<n> (1024..262144; default 12288 in the lightbox, 8192 ray traced, 32768
+      // in the Cornell room, half on phones), dof=1 (the cinematic depth of field; focus=<m>,
+      // fstop=<N>, default 2.8, autofocus on the depth 65% of the way down the screen and
+      // double-click to focus on a point), taa=0 (no TAA ahead of the DoF), stats=1 (log the
+      // frame interval every 240 frames), profile=1 (time each pass:
+      // `window.kansei.profile_report()`, with `set_layers` to time the walls, particles and
+      // reflection apart), ui=0 (no panel), dpr=<ratio> (drawing-buffer pixels per CSS pixel).
+      //
+      // The demo's own WGSL (sphere impostors and their ray walk, rect light, walls) is
+      // examples/voxel-gi-particles-shaders.js, copied from the Rust demo's.
+      import { Canvas, run, param, paramOr, flag, isPhone, now } from '../src/web/index'
+      import { Scene } from '../src/objects/Scene'
+      import { Camera } from '../src/cameras/Camera'
+      import { CameraControls } from '../src/controls/CameraControls'
+      import { MouseVectors } from '../src/controls/MouseVectors'
+      import { Vector3 } from '../src/math/Vector3'
+      import { Vector4 } from '../src/math/Vector4'
+      import { Matrix4 } from '../src/math/Matrix4'
+      import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { BufferBase } from '../src/buffers/BufferBase'
+      import { Sampler } from '../src/buffers/Sampler'
+      import { Material } from '../src/materials/Material'
+      import { Compute } from '../src/materials/Compute'
+      import { BindingLayouts } from '../src/materials/Binding'
+      import { Renderable } from '../src/objects/Renderable'
+      import { BoxGeometry } from '../src/geometries/BoxGeometry'
+      import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+      import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+      import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { fillBox } from '../src/simulations/fluid/FluidSimulationParams'
+      import { neighbourGridWgsl } from '../src/simulations/grid/NeighbourGrid'
+      import { ParticleGi } from '../src/gi/ParticleGi'
+      import { VoxelGiQuality } from '../src/gi/VoxelVolume'
+      import { VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL } from '../src/gi/GiWGSL'
+      import { directionFromElevationBearing } from '../src/atmosphere/AtmosphereParams'
+      import { assemble } from '../src/materials/shaders/ShaderUtils'
+      import { FixedStep } from '../src/pacing/FixedStep'
+      import { gpuPass } from '../src/profiling/Profiler'
+      import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+      import { TemporalAAEffect } from '../src/postprocessing/effects/TemporalAAEffect'
+      import { CinematicDepthOfFieldEffect } from '../src/postprocessing/effects/CinematicDepthOfFieldEffect'
+      import { ToneMapEffect, ToneMapper } from '../src/postprocessing/effects/ToneMapEffect'
+      import {
+        SCENE_WGSL, ROOM_COMMON_WGSL, ROOM_WALLS_WGSL, ROOM_SPHERES_WGSL, ROOM_SPHERES_SHADE_WGSL,
+        ROOM_SPHERES_DEPTH_WGSL, PILE_TOP_WGSL, CORNELL_WALL_WGSL, CORNELL_PARTICLE_WGSL, AUTOFOCUS_WGSL,
+      } from './voxel-gi-particles-shaders.js'
+
+      // ── the scenes ────────────────────────────────────────────────────────────────────────
+      const look = param('scene') === 'cornell' ? 'cornell' : 'lightbox';
+      const lightbox = look === 'lightbox';
+      // the room's inside (the fluid's bounds), metres, and its walls' thickness, outside it
+      const roomMin = [-14, 0, -7];
+      const roomMax = lightbox ? [14, 15, 7] : [14, 22, 7];
+      const wall = lightbox ? 0.8 : 2.0;
+      // the box the fluid is kept in: the room, but in the lightbox short of the open front,
+      // leaving a strip of floor where the pile's glow pools in view
+      const fluidMin = [...roomMin];
+      const fluidMax = [roomMax[0], roomMax[1], roomMax[2] - (lightbox ? 1.5 : 0)];
+
+      // the lightbox's panel, in the ceiling (x and z extents), hanging PANEL_DROP under it
+      const PANEL_X = [-11.5, 11.5];
+      const PANEL_Z = [-4.0, 4.0];
+      const PANEL_DROP = 0.04;
+      // its radiance at intensity 1, a cool white
+      const PANEL_RADIANCE = [7.4, 7.9, 8.2];
+      // tan of the half aperture of the cones toward it (the particles' and the walls'): the
+      // softness of the pile's shadow
+      const PANEL_CONE_TAN = 0.4;
+      // the lightbox's "sky" (what the volume leaves out: the ceiling around the panel above, the
+      // open front level), per unit of the panel's radiance
+      const SKY_UP = 0.18;
+      const SKY_DOWN = 0.05;
+      // the lightbox's walls, a pale green-grey
+      const LIGHTBOX_ALBEDO = [0.72, 0.79, 0.77];
+      // the particles' glow (scene radiance), tinted per particle by the material
+      const GLOW = [24.0, 8.8, 2.0];
+
+      // toward the sun at `elevation` degrees up, `bearing` degrees from +z (the open front)
+      // toward +x: a compass bearing (clockwise from north, -z) of 180 - `bearing`
+      const sunDirection = (elevation, bearing) => directionFromElevationBearing(elevation, 180 - bearing);
+
+      // particle `i`'s radius as a share of the particle size, 0.45 to 1.25: the lightbox's
+      // spheres read it from their position's w (which the fluid keeps), so the ray walk tests a
+      // sphere with one load. PCG (Jarzynski & Olano 2020), as room_spheres.wgsl's hash01.
+      const radiusShare = (i) => {
+        const x = (Math.imul(i, 8) + 1) >>> 0;
+        const state = (Math.imul(x, 747796405) + 2891336453) >>> 0;
+        const word = Math.imul(((state >>> ((state >>> 28) + 4)) ^ state) >>> 0, 277803737) >>> 0;
+        const h = (((word >>> 22) ^ word) >>> 8) / 16777216;
+        return 0.45 + 0.8 * h;
+      };
+      const setRadiusShares = (positions) => {
+        for (let i = 0; i < positions.length / 4; i++) positions[i * 4 + 3] = radiusShare(i);
+      };
+
+      // the lightbox: a rain over the whole room that settles into a pile. The Cornell room: a
+      // dam filling its left half.
+      const initialPositions = (count) => {
+        const positions = lightbox
+          ? fillBox(count, [fluidMin[0] + 0.5, 2.0, fluidMin[2] + 0.5], [fluidMax[0] - 0.5, fluidMax[1] - 0.5, fluidMax[2] - 0.5], 0.3)
+          : fillBox(count, [fluidMin[0] + 0.5, fluidMin[1] + 0.5, fluidMin[2] + 0.5], [-1.0, 16.0, fluidMax[2] - 0.5], 0.3);
+        if (lightbox) setRadiusShares(positions);
+        return positions;
+      };
+
+      // the walls: `render` (drawn), `gi` (in the volume: the lightbox's ceiling is not, the
+      // volume stopping under it and the sky gradient standing in for it), `panel` (the emissive
+      // panel)
+      const walls = (() => {
+        const [x0, y0, z0] = roomMin;
+        const [x1, y1, z1] = roomMax;
+        const w = wall;
+        const slab = (label, min, max, albedo, normal, extra = {}) => ({ label, min, max, albedo, normal, render: true, gi: true, panel: false, ...extra });
+        if (lightbox) {
+          const a = LIGHTBOX_ALBEDO;
+          return [
+            slab('Floor', [x0 - w, y0 - w, z0 - w], [x1 + w, y0, z1], a, [0, 1, 0]),
+            slab('Back', [x0 - w, y0, z0 - w], [x1 + w, y1, z0], a, [0, 0, 1]),
+            slab('Left', [x0 - w, y0, z0], [x0, y1, z1], a, [1, 0, 0]),
+            slab('Right', [x1, y0, z0], [x1 + w, y1, z1], a, [-1, 0, 0]),
+            slab('Ceiling', [x0 - w, y1, z0 - w], [x1 + w, y1 + w, z1], a, [0, -1, 0], { gi: false }),
+            slab('Panel', [PANEL_X[0], y1 - PANEL_DROP, PANEL_Z[0]], [PANEL_X[1], y1, PANEL_Z[1]], [0, 0, 0], [0, -1, 0], { gi: false, panel: true }),
+          ];
+        }
+        const white = [0.75, 0.75, 0.75];
+        return [
+          slab('Floor', [x0 - w, y0 - w, z0 - w], [x1 + w, y0, z1], white, [0, 1, 0]),
+          slab('Back', [x0 - w, y0, z0 - w], [x1 + w, y1, z0], white, [0, 0, 1]),
+          slab('Left', [x0 - w, y0, z0], [x0, y1, z1], [0.75, 0.08, 0.06], [1, 0, 0]),
+          slab('Right', [x1, y0, z0], [x1 + w, y1, z1], [0.1, 0.6, 0.12], [-1, 0, 0]),
+        ];
+      })();
+
+      // room_common.wgsl's `panelIrradiance` per unit of the panel's radiance (its face at
+      // height `y`)
+      const panelIrradiance = (p, n, y) => {
+        const corners = [[PANEL_X[0], y, PANEL_Z[0]], [PANEL_X[1], y, PANEL_Z[0]], [PANEL_X[1], y, PANEL_Z[1]], [PANEL_X[0], y, PANEL_Z[1]]];
+        const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        const norm = (a) => { const l = Math.hypot(...a); return [a[0] / l, a[1] / l, a[2] / l]; };
+        const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let f = 0;
+        for (let k = 0; k < 4; k++) {
+          const a = norm(sub(corners[k], p));
+          const b = norm(sub(corners[(k + 1) % 4], p));
+          const g = cross(b, a);
+          if (Math.hypot(...g) > 1e-6) f += Math.acos(Math.min(Math.max(dot(a, b), -1), 1)) * dot(norm(g), n);
+        }
+        return Math.max(0.5 * f, 0);
+      };
+
+      // the panel's mean irradiance over the part of `w`'s lit face inside the room, per unit of
+      // its radiance: what the volume stores the wall as (its light bounces from there; the walls
+      // draw it per pixel, shadowed)
+      const meanPanelIrradiance = (w) => {
+        let axis = w.normal.findIndex((c) => c !== 0);
+        if (axis < 0) axis = 1;
+        const face = w.normal[axis] > 0 ? w.max[axis] : w.min[axis];
+        const a = (axis + 1) % 3, b = (axis + 2) % 3;
+        const span = (i, t) => {
+          const s0 = Math.max(w.min[i], roomMin[i]), s1 = Math.min(w.max[i], roomMax[i]);
+          return s0 + (s1 - s0) * t;
+        };
+        let sum = 0;
+        for (let i = 0; i < 8; i++) {
+          for (let j = 0; j < 8; j++) {
+            const p = [0, 0, 0];
+            p[axis] = face;
+            p[a] = span(a, (i + 0.5) / 8);
+            p[b] = span(b, (j + 0.5) / 8);
+            sum += panelIrradiance(p, w.normal, roomMax[1] - PANEL_DROP);
+          }
+        }
+        return sum / 64;
+      };
+
+      // ── renderer, tier, particles ─────────────────────────────────────────────────────────
+      const canvas = Canvas.find('kansei');
+      // the background as the direct path shows it (display values); `clear` is the renderer's,
+      // set each frame (in HDR terms under the depth of field)
+      const clearColor = lightbox ? [0, 0, 0, 1] : [0.32, 0.42, 0.6, 1];
+      const clear = new Vector4(...clearColor);
+      const renderer = await canvas.renderer({ sampleCount: 4, clearColor: clear });
+      const device = renderer.gpuDevice;
+
+      const phone = isPhone();
+      const quality = VoxelGiQuality.fromName(param('quality')) ?? (phone ? 'low' : 'medium');
+      const rt = lightbox && flag('rt', false);
+      // ray traced, fewer and larger, as in the article's bonus
+      const defaultCount = (rt ? 8192 : lightbox ? 12288 : 32768) / (phone ? 2 : 1);
+      const count = Math.min(Math.max(Math.trunc(paramOr('particles', defaultCount)), 1024), 262144);
+      const giOn = flag('gi', true);
+      const indirect = param('view') === 'indirect';
+
+      // ── the fluid; in the lightbox damped and viscous, so the rain settles into a pile ──────
+      const initial = initialPositions(count);
+      const positionsBuffer = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_STORAGE,
+        usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC | BufferBase.BUFFER_USAGE_COPY_DST,
+        buffer: initial.slice(),
+        shaderLocation: 3,
+        offset: 0,
+        stride: 16,
+        format: 'float32x4',
+      });
+      const camera = new Camera(40, 0.5, 600, canvas.aspect);
+      const sim = new FluidSimulation(renderer, {
+        maxParticles: count,
+        dimensions: 3,
+        smoothingRadius: 1.0,
+        pressureMultiplier: 46.5,
+        nearPressureMultiplier: 20.0,
+        densityTarget: 8.6,
+        viscosity: lightbox ? 3.0 : 1.0,
+        damping: lightbox ? 0.994 : 1.0,
+        gravity: [0, -9.8, 0],
+        mouseForce: 1600,
+        substeps: 2,
+        worldBoundsPadding: 0.3,
+      });
+      sim.initialize(positionsBuffer, positionsBuffer.clone(), {
+        viewMatrix: camera.viewMatrix,
+        projectionMatrix: camera.projectionMatrix,
+        inverseViewMatrix: camera.inverseViewMatrix,
+        worldMatrix: new Matrix4(),
+      });
+      sim.worldBoundsMin = [...fluidMin];
+      sim.worldBoundsMax = [...fluidMax];
+      sim.rebuildGrid();
+
+      // ── the GI over the room and its walls, up to the ceiling and the open front (in the
+      // lightbox a little past it, so the frame's front faces gather the pile's glow) ─────────
+      const gi = new ParticleGi(renderer, {
+        quality,
+        boundsMin: [roomMin[0] - wall, roomMin[1] - wall, roomMin[2] - wall],
+        boundsMax: [roomMax[0] + wall, roomMax[1], roomMax[2] + (lightbox ? 1.5 : 0)],
+        capacity: count,
+        radianceScale: 1,
+        budgetBytes: phone ? 24 << 20 : 0,
+      }, sim.positionsBufferRef, sim.velocitiesBufferRef);
+      gi.settings.splat.extinction = 0.6;
+      gi.settings.cones.useVolume = giOn;
+
+      // light shared by every material (WGSL `SceneParams`, 44 floats)
+      const sceneParams = {
+        toSun: [0, 1, 0],
+        exposure: 1.2,
+        sunIlluminance: [0, 0, 0],
+        view: indirect ? 1 : 0,
+        sunConeTan: gi.settings.cones.sunConeTan,
+        boxSkyScale: 1,
+        aoDistance: 5,
+        aoStrength: 0.85,
+        panelMin: [PANEL_X[0], roomMax[1] - PANEL_DROP, PANEL_Z[0]],
+        panelConeTan: PANEL_CONE_TAN,
+        panelMax: [PANEL_X[1], roomMax[1], PANEL_Z[1]],
+        mirrorY: roomMin[1] - wall,
+        panelRadiance: [0, 0, 0],
+        reflectivity: 0.4,
+        reflectFade: 7,
+        ior: 1.5,
+        rtOn: rt ? 1 : 0,
+        rtBounces: 2,
+        mirrorShare: 0.3,
+        glassShare: 0.35,
+      };
+      if (lightbox) {
+        // the panel above: no sun, the walls lit through their emission (applyPanel), the
+        // particles' narrow cone looking up at the panel
+        gi.settings.splat.sunIlluminance = [0, 0, 0];
+        gi.settings.splat.boxSkyScale = 0;
+        gi.settings.cones.toSun = [0, 1, 0];
+        gi.settings.cones.sunConeTan = PANEL_CONE_TAN;
+        gi.settings.emission = { ...gi.settings.emission, color: [...GLOW], share: rt ? 0 : 0.25, speedColor: [0, 0, 0] };
+        sceneParams.exposure = 1.3;
+      } else {
+        // low from the right, so the red wall is lit and the fluid shadows itself and the back wall
+        const toSun = sunDirection(40, 70);
+        const sun = [2.6, 2.45, 2.2];
+        gi.setSkyGradient([0.25, 0.35, 0.55], [0.04, 0.04, 0.04]);
+        gi.settings.setSun(toSun, sun);
+        gi.settings.splat.boxSkyScale = 1;
+        gi.settings.emission = { ...gi.settings.emission, color: GLOW.map((c) => c * 0.25), share: 0.03, speedColor: [0, 0, 0] };
+        gi.setBoxes(walls.map((w) => ({ min: w.min, max: w.max, albedo: w.albedo, normal: w.normal })));
+        sceneParams.toSun = toSun;
+        sceneParams.sunIlluminance = sun;
+        sceneParams.sunConeTan = gi.settings.cones.sunConeTan;
+      }
+      const layout = gi.volume.layout;
+      const mib = () => gi.volume.memoryBytes() / (1 << 20);
+      console.info(`voxel GI ${gi.quality} (${look}): [${layout.dims.join(', ')}] voxels of ${layout.voxelSize.toFixed(2)} m, ${mib().toFixed(1)} MiB, ${count} particles`);
+
+      const sceneBuffer = device.createBuffer({ label: 'VoxelGIParticles/Scene', size: 44 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const sceneData = new Float32Array(44);
+      const writeScene = () => {
+        const s = sceneParams, d = sceneData;
+        d.set(s.toSun, 0); d[3] = s.exposure;
+        d.set(s.sunIlluminance, 4); d[7] = gi.settings.cones.useVolume ? 1 : 0;
+        d[8] = s.view; d[9] = s.sunConeTan; d[10] = gi.settings.cones.maxSteps; d[11] = s.boxSkyScale;
+        d[12] = s.aoDistance; d[13] = s.aoStrength; d[14] = 0; d[15] = 0;
+        d.set(s.panelMin, 16); d[19] = s.panelConeTan;
+        d.set(s.panelMax, 20); d[23] = s.mirrorY;
+        d.set(s.panelRadiance, 24); d[27] = s.reflectivity;
+        d.set(roomMin, 28); d[31] = s.reflectFade;
+        d.set(roomMax, 32); d[35] = s.ior;
+        d.set(LIGHTBOX_ALBEDO, 36); d[39] = s.rtOn;
+        d[40] = s.rtBounces; d[41] = s.mirrorShare; d[42] = s.glassShare;
+        // 1: the materials write exposed HDR light, the depth of field's chain tone mapping it
+        d[43] = dof.on ? 1 : 0;
+        device.queue.writeBuffer(sceneBuffer, 0, d);
+      };
+
+      const uniform = (data) => new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_UNIFORM,
+        usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+        buffer: data,
+      });
+      const external = (buffer, type) => ComputeBuffer.fromExternal(buffer, type);
+      const sceneUniform = () => external(sceneBuffer, 'uniform');
+      const volumeUniform = () => external(gi.volume.uniform, 'uniform');
+      const skyUniform = () => external(gi.skyBuffer, 'uniform');
+      const linearClamp = new Sampler('linear', 'linear', 'clamp-to-edge', 1, { mipmapFilter: 'linear' });
+
+      const scene = new Scene();
+      const both = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+      const fragment = GPUShaderStage.FRAGMENT;
+      // the renderables and whether each is the floor's reflection: every wall (`slabs`), the
+      // lightbox's panel (`panels`, with its Surface data), the particles (with their uniform)
+      const slabs = [];
+      const panels = [];
+      const particles = [];
+
+      // ── the walls; in the lightbox each again mirrored under the floor ────────────────────
+      const wallShader = lightbox
+        ? assemble([VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL, SCENE_WGSL, ROOM_COMMON_WGSL, ROOM_WALLS_WGSL])
+        : assemble([VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL, SCENE_WGSL, CORNELL_WALL_WGSL]);
+      for (const w of walls.filter((w) => w.render)) {
+        for (const mirrored of lightbox ? [false, true] : [false]) {
+          // the panel's radiance follows set_panel (applyPanel)
+          const emission = w.panel ? PANEL_RADIANCE : [0, 0, 0];
+          const surface = lightbox
+            ? new Float32Array([...w.albedo, 1, ...emission, 1, mirrored ? 1 : 0, 0, 0, 0])
+            : new Float32Array([...w.albedo, 1]);
+          const surfaceBuffer = uniform(surface);
+          const material = new Material(wallShader, {
+            label: w.label,
+            cullMode: mirrored ? 'none' : 'back',
+            mrtOutputCount: 1,
+            bindings: [
+              { binding: 0, visibility: both, value: surfaceBuffer },
+              { binding: 1, visibility: both, value: sceneUniform() },
+              { binding: 2, visibility: both, value: volumeUniform() },
+              { binding: 3, visibility: both, value: gi.volume.asTexture(), layout: BindingLayouts.texture3d() },
+              { binding: 4, visibility: both, value: linearClamp },
+              { binding: 5, visibility: fragment, value: skyUniform() },
+            ],
+          });
+          const size = [0, 1, 2].map((i) => w.max[i] - w.min[i]);
+          const slab = new Renderable(new BoxGeometry(size[0], size[1], size[2]), material);
+          slab.position.set(...[0, 1, 2].map((i) => (w.min[i] + w.max[i]) * 0.5));
+          scene.add(slab);
+          slabs.push({ renderable: slab, mirrored });
+          if (w.panel) panels.push({ surface, surfaceBuffer, mirrored });
+        }
+      }
+
+      // ── the particles: in the lightbox ray-cast spheres reading the GI's light and the fluid's
+      // grid as storage, twice (the second the reflection); in the Cornell room discs reading it
+      // as instance attributes ─────────────────────────────────────────────────────────────────
+      const particleSize = rt ? 0.8 : lightbox ? 0.55 : 0.45;
+      let pileTop = null;
+      if (lightbox) {
+        const grid = sim.neighbourGrid;
+        const readOnly = BindingLayouts.storage(true);
+        // the highest particle centre, each frame (pile_top.wgsl): rays leaving the pile upward
+        // stop walking the grid above it
+        const topBuffer = device.createBuffer({ label: 'VoxelGIParticles/PileTop', size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const C = GPUShaderStage.COMPUTE;
+        const topCompute = new Compute(assemble([neighbourGridWgsl, PILE_TOP_WGSL]), [
+          { binding: 0, visibility: C, value: grid.paramsBuffer },
+          { binding: 1, visibility: C, value: grid.sorted(0), layout: readOnly },
+          { binding: 2, visibility: C, value: external(topBuffer, 'storage') },
+        ]);
+        const zero = new Uint32Array(1);
+        pileTop = {
+          encode(encoder) {
+            if (!topCompute.initialized) topCompute.initialize(device);
+            device.queue.writeBuffer(topBuffer, 0, zero);
+            const pass = encoder.beginComputePass({ label: 'VoxelGIParticles/PileTop', timestampWrites: gpuPass('VoxelGIParticles/PileTop') });
+            pass.setPipeline(topCompute.pipeline);
+            pass.setBindGroup(0, topCompute.getBindGroup(device));
+            pass.dispatchWorkgroups(Math.ceil(sim.particleCount / 64));
+            pass.end();
+          },
+        };
+        // a depth prepass, then the shading on equal depth: the shading (and the ray tracing)
+        // runs for the nearest sphere alone, not for every sphere of the pile behind it
+        const sphereShader = (entry) => assemble([VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL, SCENE_WGSL, neighbourGridWgsl, ROOM_COMMON_WGSL, ROOM_SPHERES_WGSL, entry]);
+        const depthShader = sphereShader(ROOM_SPHERES_DEPTH_WGSL);
+        const shadeShader = sphereShader(ROOM_SPHERES_SHADE_WGSL);
+        for (const [label, shader, equal] of [['SpheresDepth', depthShader, false], ['Spheres', shadeShader, true]]) {
+          for (const mirrored of [false, true]) {
+            const data = new Float32Array([0.85, 0.88, 0.92, 1, particleSize, mirrored ? 1 : 0, 0, 0]);
+            const params = uniform(data);
+            const material = new Material(shader, {
+              label,
+              cullMode: 'none',
+              mrtOutputCount: 1,
+              ...(equal ? { depthCompare: 'equal', depthWriteEnabled: false } : {}),
+              bindings: [
+                { binding: 0, visibility: both, value: params },
+                { binding: 1, visibility: both, value: sceneUniform() },
+                { binding: 2, visibility: both, value: grid.paramsBuffer },
+                { binding: 3, visibility: fragment, value: grid.sorted(0), layout: readOnly },
+                { binding: 4, visibility: fragment, value: grid.cellOffsets, layout: readOnly },
+                { binding: 5, visibility: fragment, value: grid.sortedIndices, layout: readOnly },
+                { binding: 6, visibility: fragment, value: external(gi.lightingBuffer, 'read-only-storage') },
+                { binding: 7, visibility: fragment, value: volumeUniform() },
+                { binding: 8, visibility: fragment, value: gi.volume.asTexture(), layout: BindingLayouts.texture3d() },
+                { binding: 9, visibility: fragment, value: linearClamp },
+                { binding: 10, visibility: fragment, value: external(topBuffer, 'read-only-storage') },
+                { binding: 11, visibility: fragment, value: skyUniform() },
+              ],
+            });
+            const instances = new InstancedGeometry(new PlaneGeometry(1, 1), count, [positionsBuffer]);
+            const renderable = new Renderable(instances, material);
+            scene.add(renderable);
+            particles.push({ renderable, mirrored, data, params });
+          }
+        }
+      } else {
+        const data = new Float32Array([0.85, 0.88, 0.92, 1, particleSize, 0, 0, 0]);
+        const params = uniform(data);
+        const material = new Material(assemble([SCENE_WGSL, CORNELL_PARTICLE_WGSL]), {
+          label: 'Particles',
+          cullMode: 'none',
+          mrtOutputCount: 1,
+          bindings: [
+            { binding: 0, visibility: both, value: params },
+            { binding: 1, visibility: both, value: sceneUniform() },
+          ],
+        });
+        const instances = new InstancedGeometry(new PlaneGeometry(1, 1), count, [positionsBuffer, gi.lightingInstanceBuffer(4)]);
+        const renderable = new Renderable(instances, material);
+        scene.add(renderable);
+        particles.push({ renderable, mirrored: false, data, params });
+      }
+
+      // ── camera ────────────────────────────────────────────────────────────────────────────
+      // far enough that the room fits across a portrait screen too
+      const fit = Math.max(1.6 / canvas.aspect, 1);
+      const controls = lightbox
+        // low over the front right of the pile, looking across it at the back left corner (frame
+        // by hand, then `window.kansei.camera()` gives these numbers)
+        ? new CameraControls(camera, new Vector3(0.323, 3.985, -1.679), canvas.element, 14.72, { invertWheel: true }).withMousePan()
+        : new CameraControls(camera, new Vector3(0, 8, 0), canvas.element, 58 * fit, { invertWheel: true }).withMousePan();
+      controls.azimuth = lightbox ? 0.71 : 0.18;
+      controls.elevation = lightbox ? 0.302 : 0.45;
+      controls.update(0);
+      const mouse = new MouseVectors(canvas.element);
+
+      // ── the lightbox's light at `panelIntensity`: the panel, the walls as the volume holds them
+      // (lit by it) and the sky standing in for the ceiling ──────────────────────────────────
+      let panelIntensity = 1;
+      const applyPanel = () => {
+        if (!lightbox) return;
+        const radiance = PANEL_RADIANCE.map((c) => c * panelIntensity);
+        sceneParams.panelRadiance = radiance;
+        gi.setSkyGradient(radiance.map((c) => c * SKY_UP), radiance.map((c) => c * SKY_DOWN));
+        gi.setBoxes(walls.filter((w) => w.gi).map((w) => {
+          const e = meanPanelIrradiance(w) / Math.PI;
+          return { min: w.min, max: w.max, albedo: w.albedo, normal: w.normal, emission: [0, 1, 2].map((c) => w.albedo[c] * e * radiance[c]) };
+        }));
+        for (const p of panels) {
+          p.surface.set([0, 0, 0, 1, ...radiance, 1, p.mirrored ? 1 : 0, 0, 0, 0]);
+          p.surfaceBuffer.needsUpdate = true;
+        }
+      };
+      applyPanel();
+
+      // ── depth of field: the TAA (when on), the cinematic DoF and then the materials' own curve.
+      // The materials write HDR light with their exposure applied (SceneParams.hdr), and the
+      // curve's output is the value they would have written to the screen (so no sRGB encoding
+      // on top). The room is 28 m wide and seen from 17 m or more, where a real lens blurs
+      // nothing, so the lens sees it as a 1:100 tabletop model: its filmback is DOF_MODEL_SCALE
+      // times Unreal's 23.76 mm (the field of view, and so the picture, stay the camera's). ──
+      const DOF_F_STOP = 2.8;
+      const DOF_MODEL_SCALE = 100;
+      const focusParam = Number(param('focus'));
+      const dof = {
+        on: flag('dof', false),
+        // focus distance, metres; null: autofocus
+        focus: Number.isFinite(focusParam) && focusParam > 0 ? focusParam : null,
+        fStop: Math.max(paramOr('fstop', DOF_F_STOP), 0.1),
+        taa: flag('taa', true),
+      };
+      let volume = null;
+      let volumeTaa = false;
+      let dofEffect = null;
+      // the lens's focus distance, eased toward `focusTarget` (a focus pull, not a jump)
+      let lensFocus = null;
+      const dofVolume = (focus) => {
+        // toggling the TAA rebuilds the chain
+        if (volume && volumeTaa !== dof.taa) {
+          volume.destroy();
+          volume = null;
+        }
+        if (!volume) {
+          dofEffect = new CinematicDepthOfFieldEffect({
+            lens: { fStop: dof.fStop, focusDistanceM: focus, sensorWidthMm: 23.76 * DOF_MODEL_SCALE },
+            // the TAA runs before the lens here, so nothing would average a rotating pattern
+            temporalNoise: false,
+          });
+          const effects = dof.taa ? [new TemporalAAEffect()] : [];
+          effects.push(dofEffect, new ToneMapEffect({ tonemapper: ToneMapper.Exponential, encodeSrgb: false }));
+          volume = new PostProcessingVolume(renderer, effects);
+          volumeTaa = dof.taa;
+        }
+        return volume;
+      };
+
+      // Focus by depth: the view depth at a point of the screen (AUTOFOCUS_POINT for autofocus,
+      // or where the user double-clicked), read back from the volume's GBuffer a frame or two
+      // late. A depth texture can only be copied whole, so a one-thread pass loads the texel into
+      // a buffer first.
+      const AUTOFOCUS_POINT = [0.5, 0.65];
+      const autofocus = {
+        gpu: null,
+        // 0 idle, 1 mapping, 2 mapped
+        state: 0,
+        // a double-click waiting to be read, in 0..1 of the screen from the top left
+        pick: null,
+        // whether the read in flight is a double-click's
+        readingPick: false,
+        // the last centre depth, metres (sky keeps the previous one)
+        centre: null,
+        // take the last read's depth, if it is in (returning a double-click's distance), and read
+        // again: a waiting double-click, or the centre when `centre` (autofocus)
+        update(gbuffer, centre) {
+          let picked = null;
+          if (!this.gpu) {
+            const module = device.createShaderModule({ label: 'VoxelGIParticles/AutoFocus', code: AUTOFOCUS_WGSL });
+            const buffer = (label, size, usage) => device.createBuffer({ label, size, usage });
+            this.gpu = {
+              pipeline: device.createComputePipeline({ label: 'VoxelGIParticles/AutoFocus', layout: 'auto', compute: { module, entryPoint: 'main' } }),
+              point: buffer('VoxelGIParticles/AutoFocus/Point', 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
+              texel: buffer('VoxelGIParticles/AutoFocus/Texel', 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
+              readback: buffer('VoxelGIParticles/AutoFocus/Readback', 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+            };
+          }
+          const gpu = this.gpu;
+          if (this.state === 2) {
+            const depth = new Float32Array(gpu.readback.getMappedRange(0, 4))[0];
+            gpu.readback.unmap();
+            this.state = 0;
+            if (depth < 1) {
+              // the view depth of a [0, 1] perspective depth
+              const n = camera.near, f = camera.far;
+              const metres = Math.max(n * f / (f - depth * (f - n)), 0.1);
+              if (this.readingPick) picked = metres; else this.centre = metres;
+            }
+          }
+          if (this.state === 0 && (centre || this.pick)) {
+            this.readingPick = this.pick !== null;
+            const point = this.pick ?? AUTOFOCUS_POINT;
+            this.pick = null;
+            device.queue.writeBuffer(gpu.point, 0, new Float32Array([point[0], point[1], 0, 0]));
+            const encoder = renderer.createCommandEncoder('VoxelGIParticles/AutoFocus');
+            const bindGroup = device.createBindGroup({
+              label: 'VoxelGIParticles/AutoFocus',
+              layout: gpu.pipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: gbuffer.depthTexture.createView() },
+                { binding: 1, resource: { buffer: gpu.texel } },
+                { binding: 2, resource: { buffer: gpu.point } },
+              ],
+            });
+            const pass = encoder.beginComputePass({ label: 'VoxelGIParticles/AutoFocus' });
+            pass.setPipeline(gpu.pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            encoder.copyBufferToBuffer(gpu.texel, 0, gpu.readback, 0, 4);
+            renderer.submit(encoder.finish());
+            this.state = 1;
+            gpu.readback.mapAsync(GPUMapMode.READ).then(() => { this.state = 2; }, () => { this.state = 0; });
+          }
+          return picked;
+        },
+      };
+
+      // The focus distance the lens eases toward: the set one, or the autofocus (the depth at the
+      // autofocus point); until that has read anything, where the view axis (toward the orbit
+      // target) enters the fluid's box, or the target's distance if the axis misses the box or
+      // starts inside it.
+      const focusTarget = () => {
+        const set = dof.focus ?? autofocus.centre;
+        if (set !== null) return set;
+        const eye = [camera.position.x, camera.position.y, camera.position.z];
+        const t = controls.lookTarget();
+        const toTarget = [t.x - eye[0], t.y - eye[1], t.z - eye[2]];
+        const length = Math.hypot(...toTarget);
+        let near = -Infinity, far = Infinity;
+        for (let i = 0; i < 3; i++) {
+          const inv = length > 0 ? length / toTarget[i] : Infinity;
+          const t0 = (fluidMin[i] - eye[i]) * inv, t1 = (fluidMax[i] - eye[i]) * inv;
+          near = Math.max(near, Math.min(t0, t1));
+          far = Math.min(far, Math.max(t0, t1));
+        }
+        return Math.max(near > 0 && near <= far ? near : length, 0.1);
+      };
+
+      // ── frame loop: the fluid at a fixed step (60 Hz, at most 3 a frame), the GI, then the
+      // scene, through the depth of field's chain when it is on ───────────────────────────────
+      const simStep = new FixedStep(1 / 60).withMaxSteps(3);
+      let frameMs = 16.7;
+      let paused = false;
+      const stats = flag('stats', false) ? { start: now(), frames: 0 } : null;
+      if (flag('profile', false)) renderer.setProfiling(true);
+
+      run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        const dt = Math.min(Math.max(frame.dt, 0), 0.1);
+        frameMs = frameMs * 0.95 + dt * 1000 * 0.05;
+
+        controls.update(0);
+        mouse.update(Math.max(dt, 1e-3));
+        camera.updateProjectionMatrix();
+        camera.updateViewMatrix();
+
+        let steps = 0;
+        if (paused) simStep.reset();
+        else steps = simStep.advance(dt);
+        sim.updateBatched(simStep.step, steps, mouse.mousePosition, mouse.mouseDirection, Math.min(mouse.mouseStrength, 1));
+
+        // the GI: the volume and the particles' light (or, off, the sky alone)
+        writeScene();
+        const encoder = renderer.createCommandEncoder('VoxelGIParticles/GI');
+        gi.encode(encoder, sim.particleCount);
+        pileTop?.encode(encoder);
+        renderer.submit(encoder.finish());
+
+        if (dof.on) {
+          const target = focusTarget();
+          lensFocus = lensFocus === null ? target : lensFocus + (target - lensFocus) * (1 - Math.exp(-dt / 0.15));
+          const chain = dofVolume(lensFocus);
+          dofEffect.lens.focusDistanceM = lensFocus;
+          dofEffect.lens.fStop = dof.fStop;
+          // the background in HDR terms: what the curve maps back to the direct path's
+          const hdr = (v) => -Math.log(1 - Math.min(v, 0.999));
+          clear.set(hdr(clearColor[0]), hdr(clearColor[1]), hdr(clearColor[2]), clearColor[3]);
+          chain.render(scene, camera);
+          if (chain.gbuffer) {
+            // a double-click sets the focus there, as if typed in (autofocus off)
+            const metres = autofocus.update(chain.gbuffer, dof.focus === null);
+            if (metres !== null) dof.focus = metres;
+          }
+        } else {
+          clear.set(...clearColor);
+          renderer.render(scene, camera);
+        }
+
+        if (stats && ++stats.frames === 240) {
+          console.info(`frame interval ${((now() - stats.start) * 1000 / 240).toFixed(2)} ms`);
+          stats.start = now();
+          stats.frames = 0;
+        }
+      });
+
+      // ── window.kansei: the Rust demo's exports, for scripted captures and timing ───────────
+      const resetHistory = () => gi.resetHistory();
+      const api = {
+        // the scene, the tier in use, the volume's size and memory, the particles and the frame
+        // time, as JSON
+        info: () => JSON.stringify({
+          scene: look,
+          rt: sceneParams.rtOn > 0.5,
+          quality: gi.quality,
+          dims: [...layout.dims],
+          voxel_m: +layout.voxelSize.toFixed(3),
+          mib: +mib().toFixed(2),
+          particles: sim.particleCount,
+          gi: gi.settings.cones.useVolume,
+          frame_ms: +frameMs.toFixed(2),
+          dof: dof.on,
+          focus: dof.focus,
+          focus_m: +(lensFocus ?? focusTarget()).toFixed(2),
+          fstop: dof.fStop,
+          taa: dof.taa,
+        }),
+        // the orbit: the point looked at (pan included), the distance to it, and the azimuth and
+        // elevation in radians, as set_camera takes them
+        camera: () => {
+          const t = controls.lookTarget();
+          return { target: [t.x, t.y, t.z].map((v) => +v.toFixed(3)), radius: +controls.radius.toFixed(3), azimuth: +controls.azimuth.toFixed(4), elevation: +controls.elevation.toFixed(4) };
+        },
+        set_camera: (x, y, z, radius, azimuth, elevation) => controls.setView(new Vector3(x, y, z), radius, azimuth, elevation),
+        set_gi: (on) => {
+          if (gi.settings.cones.useVolume !== on) {
+            gi.settings.cones.useVolume = on;
+            resetHistory();
+          }
+        },
+        // 0: lit, 1: indirect light only
+        set_view: (view) => { sceneParams.view = Math.min(view, 1); },
+        set_extinction: (v) => { gi.settings.splat.extinction = Math.max(v, 0); },
+        // the diffuse cones' full aperture, degrees (90: six cones tiling the sphere)
+        set_cone_aperture: (degrees) => { gi.settings.cones.diffuseConeTan = Math.tan(Math.min(Math.max(degrees, 5), 150) * Math.PI / 360); },
+        // the full aperture of the cone toward the key light (the sun, or the lightbox's panel),
+        // degrees: the softness of the particles' shadow
+        set_sun_cone: (degrees) => {
+          const tan = Math.tan(Math.min(Math.max(degrees, 0.5), 120) * Math.PI / 360);
+          gi.settings.cones.sunConeTan = tan;
+          sceneParams.sunConeTan = tan;
+          sceneParams.panelConeTan = tan;
+        },
+        set_emissive_share: (share) => { gi.settings.emission.share = Math.min(Math.max(share, 0), 1); },
+        set_emissive_intensity: (v) => { gi.settings.emission.color = GLOW.map((c) => c * Math.max(v, 0) / GLOW[0]); },
+        // glow per unit of speed (a blue added to every particle)
+        set_speed_glow: (v) => { gi.settings.emission.speedColor = [0.02, 0.06, 0.15].map((c) => c * Math.max(v, 0)); },
+        set_temporal_blend: (v) => { gi.settings.cones.temporalBlend = Math.min(Math.max(v, 0.01), 1); },
+        set_particle_size: (v) => {
+          for (const p of particles) {
+            p.data[4] = Math.max(v, 0.01);
+            p.params.needsUpdate = true;
+          }
+        },
+        // the sun's elevation and bearing, degrees (the Cornell room)
+        set_sun: (elevation, bearing) => {
+          if (lightbox) return;
+          const toSun = sunDirection(elevation, bearing);
+          sceneParams.toSun = toSun;
+          gi.settings.setSun(toSun, sceneParams.sunIlluminance);
+        },
+        set_exposure: (v) => { sceneParams.exposure = Math.max(v, 0); },
+        // the lightbox's panel, relative to its default
+        set_panel: (intensity) => {
+          panelIntensity = Math.max(intensity, 0);
+          applyPanel();
+        },
+        // how much of the box the glossy floor under it reflects (the lightbox)
+        set_reflectivity: (v) => { sceneParams.reflectivity = Math.min(Math.max(v, 0), 1); },
+        // how much the walls' short cones darken corners and the pile's surroundings (the lightbox)
+        set_ao: (strength) => { sceneParams.aoStrength = Math.min(Math.max(strength, 0), 1); },
+        // ray-traced mirror and glass particles (the lightbox)
+        set_rt: (on) => { sceneParams.rtOn = on ? 1 : 0; },
+        // the shares of mirror and glass particles when ray traced; the rest stay matte
+        set_rt_mix: (mirror, glass) => {
+          sceneParams.glassShare = Math.min(Math.max(glass, 0), 1);
+          sceneParams.mirrorShare = Math.min(Math.max(mirror, 0), 1 - sceneParams.glassShare);
+        },
+        // 1: a mirror or glass particle's rays see the others as matte; 2: they reflect and
+        // refract once more
+        set_rt_bounces: (bounces) => { sceneParams.rtBounces = Math.min(Math.max(Math.trunc(bounces), 1), 2); },
+        // the GPU time of each pass and the CPU sections since the last call, per frame (with
+        // profile=1)
+        profile_report: () => renderer.takeProfile().report(),
+        // draw or hide the walls, the particles and the floor's reflection of both, for timing each
+        set_layers: (wallsOn, particlesOn, reflection) => {
+          for (const [list, on] of [[slabs, wallsOn], [particles, particlesOn]]) {
+            for (const p of list) p.renderable.visible = on && (reflection || !p.mirrored);
+          }
+        },
+        // put the particles at `positions` (x, y, z, w each), still, and sort the neighbour grid
+        // on them without moving them: with set_paused, a fixed state to compare renders of
+        set_positions: (positions) => {
+          const p = Float32Array.from(positions);
+          if (lightbox) setRadiusShares(p);
+          sim.resetParticles(p);
+          sim.updateBatched(0, 1);
+          resetHistory();
+        },
+        // voxels the particles' cones' start moves by each frame (0: not at all, so that with a
+        // temporal blend of 1 every frame of a still fluid is alike)
+        set_cone_jitter: (voxels) => { gi.settings.cones.jitterVoxels = Math.max(voxels, 0); },
+        // freeze the fluid (the GI keeps running), for comparing views of one moment
+        set_paused: (p) => { paused = p; },
+        set_dof: (on) => { dof.on = on; },
+        // the depth of field's focus distance, metres; 0 or less: autofocus
+        set_dof_focus: (metres) => { dof.focus = metres > 0 ? metres : null; },
+        set_dof_fstop: (fStop) => { dof.fStop = Math.max(fStop, 0.1); },
+        // focus on what is under a point of the screen (0..1 from the top left), as a
+        // double-click does: read a frame or two later, then held as the set focus distance
+        focus_at: (x, y) => { autofocus.pick = [Math.min(Math.max(x, 0), 1), Math.min(Math.max(y, 0), 1)]; },
+        set_dof_taa: (on) => { dof.taa = on; },
+        // pour again
+        reset: () => {
+          sim.resetParticles(initial);
+          resetHistory();
+        },
+      };
+      window.kansei = { ...api, gi, sim, renderer };
+
+      // ── panel (Tweakpane, collapsed on phones) ──────────────────────────────────────────────
+      const state = JSON.parse(api.info());
+      const p = {
+        scene: look,
+        gi: param('gi') !== 'off',
+        indirect,
+        quality: state.quality,
+        extinction: 0.6,
+        coneAperture: 90,
+        sunCone: lightbox ? 43.6 : 5.7,
+        emissiveShare: lightbox ? (state.rt ? 0 : 0.25) : 0.03,
+        emissiveIntensity: lightbox ? 24 : 6,
+        speedGlow: 0,
+        temporalBlend: 0.2,
+        particleSize,
+        sunElevation: 40,
+        sunBearing: 70,
+        exposure: sceneParams.exposure,
+        panel: 1,
+        reflectivity: 0.4,
+        ao: 0.85,
+        rt: state.rt,
+        mirrorShare: 0.3,
+        glassShare: 0.35,
+        bounces: 2,
+        stats: '',
+        dof: state.dof,
+        autofocus: state.focus === null,
+        focus: state.focus_m,
+        fstop: state.fstop,
+        taa: state.taa,
+      };
+      const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js');
+      const pane = new Pane({ title: 'Voxel GI on particles', expanded: !phone });
+      pane.hidden = param('ui') === '0';
+      const reload = (key, value) => {
+        const query = new URLSearchParams(location.search);
+        query.set(key, value);
+        location.search = query.toString();
+      };
+      pane.addBinding(p, 'scene', { options: { lightbox: 'lightbox', 'Cornell room': 'cornell' } }).on('change', () => reload('scene', p.scene));
+      pane.addBinding(p, 'gi', { label: 'voxel GI' }).on('change', () => api.set_gi(p.gi));
+      pane.addBinding(p, 'indirect', { label: 'indirect only' }).on('change', () => api.set_view(p.indirect ? 1 : 0));
+      pane.addBinding(p, 'quality', { options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', () => reload('quality', p.quality));
+      if (lightbox) {
+        const rtFolder = pane.addFolder({ title: 'Ray traced' });
+        rtFolder.addBinding(p, 'rt', { label: 'mirror and glass' }).on('change', () => api.set_rt(p.rt));
+        const mix = () => api.set_rt_mix(p.mirrorShare, p.glassShare);
+        rtFolder.addBinding(p, 'mirrorShare', { label: 'mirrors', min: 0, max: 1, step: 0.01 }).on('change', mix);
+        rtFolder.addBinding(p, 'glassShare', { label: 'glass', min: 0, max: 1, step: 0.01 }).on('change', mix);
+        rtFolder.addBinding(p, 'bounces', { options: { 1: 1, 2: 2 } }).on('change', () => api.set_rt_bounces(p.bounces));
+      }
+      const cones = pane.addFolder({ title: 'Volume and cones' });
+      cones.addBinding(p, 'extinction', { min: 0, max: 3, step: 0.05 }).on('change', () => api.set_extinction(p.extinction));
+      cones.addBinding(p, 'coneAperture', { label: 'cone aperture', min: 30, max: 120, step: 1 }).on('change', () => api.set_cone_aperture(p.coneAperture));
+      cones.addBinding(p, 'sunCone', { label: lightbox ? 'panel cone' : 'sun cone', min: 1, max: lightbox ? 90 : 30, step: 0.1 }).on('change', () => api.set_sun_cone(p.sunCone));
+      cones.addBinding(p, 'temporalBlend', { label: 'temporal blend', min: 0.02, max: 1, step: 0.01 }).on('change', () => api.set_temporal_blend(p.temporalBlend));
+      if (lightbox) {
+        cones.addBinding(p, 'ao', { label: 'wall occlusion', min: 0, max: 1, step: 0.01 }).on('change', () => api.set_ao(p.ao));
+      }
+      const glow = pane.addFolder({ title: 'Emission' });
+      glow.addBinding(p, 'emissiveShare', { label: 'glowing share', min: 0, max: 0.5, step: 0.005 }).on('change', () => api.set_emissive_share(p.emissiveShare));
+      glow.addBinding(p, 'emissiveIntensity', { label: 'glow', min: 0, max: 60, step: 0.1 }).on('change', () => api.set_emissive_intensity(p.emissiveIntensity));
+      glow.addBinding(p, 'speedGlow', { label: 'speed glow', min: 0, max: 2, step: 0.01 }).on('change', () => api.set_speed_glow(p.speedGlow));
+      // the lens sees the room as a 1:100 tabletop model (DOF_MODEL_SCALE)
+      const dofFolder = pane.addFolder({ title: 'Depth of field', expanded: p.dof });
+      dofFolder.addBinding(p, 'dof', { label: 'on' }).on('change', () => api.set_dof(p.dof));
+      const autofocusBinding = dofFolder.addBinding(p, 'autofocus', { label: 'autofocus' }).on('change', () => {
+        api.set_dof_focus(p.autofocus ? 0 : p.focus);
+        focusBinding.disabled = p.autofocus;
+      });
+      const focusBinding = dofFolder.addBinding(p, 'focus', { label: 'focus (m)', min: 5, max: 120, step: 0.1, disabled: p.autofocus })
+        .on('change', () => { if (!p.autofocus) api.set_dof_focus(p.focus); });
+      // the autofocus distance, as the lens follows it
+      setInterval(() => {
+        if (p.dof && p.autofocus) {
+          p.focus = JSON.parse(api.info()).focus_m;
+          focusBinding.refresh();
+        }
+      }, 250);
+      // double-click: focus on that point (autofocus off), read back a frame or two later
+      canvas.element.addEventListener('dblclick', (e) => {
+        if (!p.dof) return;
+        const r = e.currentTarget.getBoundingClientRect();
+        api.focus_at((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+        setTimeout(() => {
+          const s = JSON.parse(api.info());
+          if (s.focus === null) return; // sky: nothing to focus on
+          p.focus = s.focus;
+          p.autofocus = false;
+          focusBinding.disabled = false;
+          autofocusBinding.refresh();
+          focusBinding.refresh();
+        }, 200);
+      });
+      dofFolder.addBinding(p, 'taa', { label: 'TAA' }).on('change', () => api.set_dof_taa(p.taa));
+      dofFolder.addBinding(p, 'fstop', { label: 'f-stop', min: 0.2, max: 8, step: 0.05 }).on('change', () => api.set_dof_fstop(p.fstop));
+      const lookFolder = pane.addFolder({ title: 'Scene', expanded: false });
+      lookFolder.addBinding(p, 'particleSize', { label: 'particle size', min: 0.1, max: lightbox ? 0.8 : 1.5, step: 0.01 }).on('change', () => api.set_particle_size(p.particleSize));
+      if (lightbox) {
+        lookFolder.addBinding(p, 'panel', { label: 'ceiling light', min: 0, max: 3, step: 0.05 }).on('change', () => api.set_panel(p.panel));
+        lookFolder.addBinding(p, 'reflectivity', { label: 'floor reflection', min: 0, max: 1, step: 0.01 }).on('change', () => api.set_reflectivity(p.reflectivity));
+      } else {
+        const sun = () => api.set_sun(p.sunElevation, p.sunBearing);
+        lookFolder.addBinding(p, 'sunElevation', { label: 'sun elevation', min: 5, max: 90, step: 1 }).on('change', sun);
+        lookFolder.addBinding(p, 'sunBearing', { label: 'sun bearing', min: -180, max: 180, step: 1 }).on('change', sun);
+      }
+      lookFolder.addBinding(p, 'exposure', { min: 0.1, max: 4, step: 0.05 }).on('change', () => api.set_exposure(p.exposure));
+      lookFolder.addButton({ title: 'Pour again' }).on('click', () => api.reset());
+      pane.addBinding(p, 'stats', { readonly: true, multiline: true, rows: 3, label: 'volume' });
+      setInterval(() => {
+        const s = JSON.parse(api.info());
+        // the focus slider follows the autofocus
+        if (p.autofocus) p.focus = s.focus_m;
+        p.stats = `${s.quality} ${s.dims.join('x')} @ ${s.voxel_m} m\n${s.mib} MiB, ${s.particles} particles\n${s.frame_ms} ms`;
+        pane.refresh();
+      }, 500);
+    </script>
+  </body>
+</html>

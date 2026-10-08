@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - cascaded shadows</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #eee; }
+    #panel { position: fixed; left: 12px; top: 12px; padding: 8px 10px; background: rgba(0, 0, 0, 0.6); border-radius: 4px; }
+    #hud { margin: 0; white-space: pre-wrap; }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <pre id="hud"></pre>
+  </div>
+  <script type="module">
+    // Cascaded shadows: the TS twin of the Rust `cascaded-shadows` example. A forest of 4000
+    // instanced trees and a fence under a low afternoon sun, shadowed by four 2048² cascades out
+    // to 250 m with contact-hardening (PCSS) penumbrae (`Renderer.enableCascadedShadows`), through
+    // the tonemapper. The trees are culled per cascade on the GPU (`InstanceCulling`); the HUD
+    // shows what each view drew. The camera walks down a path through the forest. Rust also runs
+    // TAA, which the TS engine does not have yet.
+    //
+    // URL parameters: `csm=0` (the single 2048² directional map instead, for comparison),
+    // `debug=1` (the sun's light only, each surface tinted by the cascade that shadows it),
+    // `fog=1` (volumetric fog, its shafts shadowed by the widest cascade or the single map),
+    // `far=<metres>` (camera far plane, which the single map is fitted to; default 1200),
+    // `t=<seconds>` (freeze the camera at this point of its walk), `dpr=<ratio>`;
+    // `profile=1` (each pass's GPU time) through profile-hud.js.
+    import { Canvas, run, param, paramOr, flag, setText, thousands } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { hash01 } from '../src/math/hash01'
+    import { InstanceCulling } from '../src/culling/InstanceCulling'
+    import { CASCADED_SHADOWS_WGSL, GBUFFER_OUT_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { uniformBindable } from '../src/materials/StandardLit'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { installProfileHud } from './profile-hud.js'
+
+    // `debug=1`: the sun's light only, each point tinted by the cascade that shadows it.
+    const CASCADE_TINT_WGSL = /* wgsl */`
+      @group(0) @binding(0) var<uniform> base_color : vec4f;
+      @group(1) @binding(0) var<uniform> view_matrix : mat4x4f;
+      @group(1) @binding(1) var<uniform> projection_matrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normal_matrix : mat4x4f;
+      @group(2) @binding(1) var<uniform> world_matrix : mat4x4f;
+      struct VIn { @location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f, INSTANCE_INPUT };
+      struct VOut { @builtin(position) clip : vec4f, @location(0) world : vec3f, @location(1) normal : vec3f };
+      @vertex
+      fn vertex_main(v : VIn) -> VOut {
+        var local = v.position.xyz;
+        INSTANCE_PLACE
+        let world = world_matrix * vec4f(local, 1.0);
+        var out : VOut;
+        out.clip = projection_matrix * view_matrix * world;
+        out.world = world.xyz;
+        out.normal = (normal_matrix * vec4f(v.normal, 0.0)).xyz;
+        return out;
+      }
+      @fragment
+      fn fragment_main(in : VOut) -> KanseiGBufferOut {
+        let n = normalize(in.normal);
+        let tints = array<vec3f, 5>(vec3f(1.0, 0.4, 0.4), vec3f(0.4, 1.0, 0.4), vec3f(0.4, 0.6, 1.0), vec3f(1.0, 1.0, 0.4), vec3f(1.0));
+        let base = base_color.rgb * tints[min(kansei_sun_cascade(in.world), 4u)];
+        let sun = kansei_cascades.lightColor * max(dot(n, -kansei_cascades.lightDirection), 0.0) * kansei_sun_shadow(in.world, n, in.clip.xy);
+        return kansei_gbuffer_out(base / 3.14159265 * sun, vec3f(0.0), n, base);
+      }
+    `;
+
+    // Low afternoon sun's travel direction, and the sky's radiance from straight up (cd/m²).
+    const SUN_DIR = [-0.62, -0.42, -0.66];
+    const SKY = [4000, 5000, 7000];
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1 });
+    const csm = flag('csm', true);
+    const debug = flag('debug', false);
+    if (csm) renderer.enableCascadedShadows();
+    else renderer.enableShadows({ resolution: 2048 });
+    renderer.setCullingStats(true);
+
+    // A sunlit diffuse surface (the stock standard material), instanced for trunks and crowns
+    // (vec4: position, scale), or with `debug` the cascade tint.
+    function surfaceMaterial(label, base, instanced) {
+      if (debug) {
+        const shader = CASCADE_TINT_WGSL
+          .replace('INSTANCE_INPUT', instanced ? '@location(3) instance : vec4f,' : '')
+          .replace('INSTANCE_PLACE', instanced ? 'local = local * v.instance.w + v.instance.xyz;' : '');
+        return new Material(`${CASCADED_SHADOWS_WGSL}\n${GBUFFER_OUT_WGSL}\n${shader}`, {
+          label,
+          bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: uniformBindable(new Float32Array([...base, 1])) }],
+          mrtOutputCount: 4,
+        });
+      }
+      return Material.standardLit(label, {
+        baseColor: base,
+        roughness: 0.9,
+        skyUp: SKY,
+        skyDown: SKY.map((c) => c * 0.15),
+        instancing: instanced ? 'offsetScale' : undefined,
+      });
+    }
+
+    const scene = new Scene();
+    const sky = new Renderable(new SphereGeometry(900, 4), Material.gradientSky('Sky', {
+      zenith: [3000, 5000, 9000], horizon: [9000, 9500, 10500], ground: [9000, 9500, 10500], curve: 0.5,
+    }));
+    sky.castShadow = false;
+    scene.add(sky);
+
+    const ground = new Renderable(new PlaneGeometry(1600, 1600), surfaceMaterial('Ground', [0.16, 0.18, 0.1], false));
+    ground.rotation.x = -Math.PI / 2;
+    ground.castShadow = false;
+    scene.add(ground);
+
+    // a forest: trunks (unit boxes scaled by height) and crowns (spheres), 4000 trees out to
+    // 500 m, clear around the path the camera walks
+    const trunks = [], crowns = [];
+    for (let i = 0; i < 4000; i++) {
+      const x = -500 + hash01(i) * 1000, z = -500 + hash01(i + 7) * 1000;
+      if (Math.abs(x) < 4) continue;
+      const h = 8 + hash01(i + 13) * 10;
+      trunks.push(x, h * 0.5, z, h);
+      crowns.push(x, h, z, 1.6 + hash01(i + 17) * 1.4);
+    }
+    // one vec4 an instance (position, scale), culled per view on the GPU within `radius` x scale
+    function instancedCulled(label, geometry, data, radius, material) {
+      const count = data.length / 4;
+      const instances = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_STORAGE,
+        usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_STORAGE,
+        buffer: new Float32Array(data),
+        stride: 16,
+        attributes: [{ shaderLocation: 3, offset: 0, format: 'float32x4' }],
+      });
+      const r = new Renderable(new InstancedGeometry(geometry.withLabel(label), count, [instances]), material);
+      r.instanceCulling = InstanceCulling.forVec4Instances(instances, count, radius);
+      return r;
+    }
+    scene.add(instancedCulled('Trunks', new BoxGeometry(0.035, 1, 0.035), trunks, 0.6, surfaceMaterial('Trunk', [0.2, 0.15, 0.1], true)));
+    scene.add(instancedCulled('Crowns', new SphereGeometry(1, 2), crowns, 1, surfaceMaterial('Crown', [0.06, 0.12, 0.05], true)));
+    // a fence along the path: thin, close shadows
+    for (let k = 0; k < 60; k++) {
+      const post = new Renderable(new BoxGeometry(0.08, 1.2, 0.08), surfaceMaterial('Post', [0.35, 0.3, 0.25], false));
+      post.position.set(2.5, 0.6, 10 - k * 2);
+      scene.add(post);
+    }
+
+    const sun = new DirectionalLight(SUN_DIR, [1, 0.875, 0.7], 80000);
+    sun.castShadow = true;
+    scene.add(sun);
+
+    const effects = [];
+    let fog = null;
+    if (flag('fog', false)) {
+      // shafts through the canopy, shadowed by the widest cascade
+      fog = new VolumetricFogEffect({
+        froxelGrid: new FroxelGrid(renderer.gpuDevice, { near: 0.5, far: 300, temporal: true }),
+        baseDensity: 0.01,
+        heightFalloff: 0.05,
+        anisotropy: 0.6,
+        ambient: SKY.map((c) => c * 0.5),
+        ...(csm ? { cascadedShadowMap: renderer.cascadedShadowMap } : { shadowMap: renderer.shadowMap }),
+      });
+      effects.push(fog);
+    }
+    effects.push(new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(14.5), vignette: 0.4 }));
+    const volume = new PostProcessingVolume(renderer, effects, { msaaSampleCount: 4 });
+    const camera = new Camera(50, 0.3, paramOr('far', 1200), canvas.aspect);
+    const profile = installProfileHud({ renderer });
+
+    console.info(`Kansei — Cascaded Shadows (TS) ready: ${trunks.length / 4} trees, cascades ${csm}`);
+
+    const frozen = param('t') === null ? null : Number(param('t'));
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      const t = frozen ?? frame.time;
+      // walk down the path, looking along it and slightly toward the sun
+      const z = 8 - (t * 1.2) % 60;
+      camera.position.set(0, 1.7, z);
+      camera.lookAt(new Vector3(4, 1.2, z - 20));
+      if (fog) fog.updateLights(scene.directionalLights, scene.pointLights);
+      profile.begin(performance.now());
+      volume.render(scene, camera);
+      profile.end(performance.now());
+
+      const stats = renderer.cullingStats;
+      if (stats && frame.index % 15 === 0) {
+        const rows = stats.views.map(([kind, s]) => `${kind.padEnd(9)} ${thousands(s.drawn).padStart(6)} of ${thousands(s.tested)}`);
+        setText('hud', [`${csm ? 'cascaded shadows (4 x 2048²)' : 'single shadow map (2048²)'}${debug ? ', debug' : ''}`, 'instances drawn per view:', ...rows].join('\n'));
+      }
+    });
+  </script>
+</body>
+
+</html>

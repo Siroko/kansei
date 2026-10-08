@@ -447,6 +447,16 @@ impl Cut {
         &self.indices
     }
 
+    /// Its draw list: (record, cluster) per listed cluster, `capacity` entries.
+    pub(crate) fn draws(&self) -> &wgpu::Buffer {
+        &self.draws
+    }
+
+    /// Its draw list's length, in entries.
+    pub(crate) fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
     /// The vertex stage's group 2 for this cut, once `ClusterGpu::bind_draw` made it.
     pub(crate) fn draw_bind_group(&self) -> Option<&wgpu::BindGroup> {
         self.draw.as_ref().map(|(_, group)| group)
@@ -466,6 +476,11 @@ impl ClusterGpu {
             cuts: Vec::new(),
             triangle_limit: u32::MAX,
         }
+    }
+
+    /// The mesh's words (`ClusterMesh::gpu_words`).
+    pub(crate) fn mesh_buffer(&self) -> &wgpu::Buffer {
+        &self.mesh
     }
 
     /// View `view`'s cut, if it was ever bound.

@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - GI box</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    #panel {
+      position: fixed; right: 12px; top: 12px; color: #ddd; font: 12px/1.6 monospace;
+      background: rgba(0, 0, 0, 0.6); padding: 8px 10px; border-radius: 4px;
+    }
+    #panel label { display: flex; justify-content: space-between; gap: 10px; }
+    #panel select { font: inherit; }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <label>preset <select id="preset"></select></label>
+    <label>gi <select id="gi"><option>off</option><option>low</option><option>medium</option><option>high</option><option>ultra</option><option>voxel</option><option>voxel+ssgi</option><option>probes</option><option>probes+ssgi</option><option value="rt">hybrid RT (grid rays + SVGF)</option></select></label>
+    <label>voxels <select id="voxels"><option>low</option><option>medium</option><option>high</option></select></label>
+    <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option><option>sdf</option><option>probes</option></select></label>
+    <label>sdf ao <input type="range" id="sdfAo" min="0" max="1" step="0.05"></label>
+    <label>voxel shadows <select id="sdfShadows"><option>off</option><option>fallback</option><option>always</option></select></label>
+    <label>shadows <select id="shadows"><option>map</option><option>sdf</option></select></label>
+    <label>camera <select id="cam"><option>front</option><option>corner</option><option>low</option><option>floor</option></select></label>
+    <label>animate <input type="checkbox" id="animate"></label>
+    <label>rug texture in voxels <input type="checkbox" id="textured"></label>
+    <label>rug <input type="checkbox" id="rug"></label>
+    <div id="rtgi-panel" style="display: none">
+      <b>hybrid RT GI</b>
+      <label>trace <select id="rtgi-res"><option value="half">half (1 ray / 2x2)</option><option value="full">full (1 ray / pixel)</option></select></label>
+      <label>denoise <select id="rtgi-denoise"><option value="svgf">SVGF</option><option value="temporal">temporal only</option><option value="off">off (1 spp)</option></select></label>
+      <label>wavelet <select id="rtgi-kernel"><option>3x3</option><option>5x5</option></select></label>
+      <label>hits lit by <select id="rtgi-hit"><option value="direct">direct light + voxel cone</option><option value="voxels">voxels only</option></select></label>
+      <label>hit shadows <select id="rtgi-shadows"><option value="rays">rays</option><option value="maps">shadow maps</option></select></label>
+      <label>mode <select id="rtgi-mode"><option value="hybrid">hybrid</option><option value="reference">reference (path traced)</option></select></label>
+      <label>accumulate <input type="checkbox" id="rtgi-accum"></label>
+      <label>debug view <select id="rtgi-view"><option>lit</option><option>indirect</option><option>signal</option><option>variance</option><option>history</option><option>cost</option></select></label>
+      <div id="rtgi-stats"></div>
+    </div>
+    <div id="reflect-panel" style="display: none">
+      <label>reflections <input type="checkbox" id="reflections"></label>
+      <label>rt view <select id="rtView"><option>lit</option><option>reflection</option><option>mirror</option><option>cost</option></select></label>
+      <label>rt trace <select id="rtTrace"><option>grid</option><option>voxels</option></select></label>
+      <label>rt res <select id="rtRes"><option>half</option><option>quarter</option></select></label>
+      <div id="rt-stats"></div>
+    </div>
+  </div>
+  <script type="module">
+    // GI box: the Rust `gi-box` example's room (rust/kansei-wasm/examples/gi-box) on the TS engine,
+    // to compare global illumination methods: a Cornell box (white floor, ceiling and back wall, a red wall on the left,
+    // a green one on the right, two white blocks, a rug half orange and half blue) under one
+    // shadowed downlight. Without GI the scene has direct light only, so the ceiling and the
+    // shadows are black. Screen-space GI (`gi=low|medium|high|ultra`, `ScreenSpaceGIEffect`) brings
+    // one bounce of the light on screen, and sees only what is on screen; with voxel GI (`Renderer.enableVoxelGI`, `VoxelGIEffect`) the renderables
+    // are voxelized through their own vertex shaders, lit through the lamp's shadow map with the
+    // bounces adding up over frames, and cones traced per pixel through the voxels bring the
+    // floor's light to the ceiling and the walls' colour onto the floor and the blocks. The rug's
+    // voxels take its texture through its material's voxel entry (`albedo=constant`: its mean
+    // colour instead). `gi=voxel+ssgi` puts screen-space GI in front of the voxels for contact
+    // detail (`VoxelGIEffect`'s `nearField`), the voxels lighting the rest.
+    //
+    // The voxels' distance field (`SceneVoxelGi.enableSdf`, a jump flood of the voxelized surfaces)
+    // adds AO to the GI (`sdf_ao`), soft shadows to the voxels' light (`sdf_shadows`) and to the
+    // direct light (`shadows=sdf`, the material helper `SDF_WGSL`'s `sdfSurfaceShadow` in place of
+    // the cube shadow); `gi=probes` brings the voxels' light to the screen through irradiance
+    // probes traced in that field (`SceneVoxelGi.enableProbes`, `VoxelGIEffect.setProbes`) instead
+    // of cones per pixel, under SSGI with `gi=probes+ssgi`.
+    //
+    // The hybrid (`gi=rt`, `RtDiffuseGiEffect`) traces the GI instead: one ray for each 2 x 2
+    // pixels from the surface through a grid of the room's triangles, the hits lit by the lamp
+    // (shadow rays through the grid) and one cone through the voxels for the further bounces,
+    // denoised by SVGF and upsampled; closest to the path-traced reference in the contacts and
+    // behind the blocks. Its panel switches the resolution, the denoiser, the hits' lighting and
+    // shadows, a reference path tracer through the grid (`mode`, with `accumulate` for a converged
+    // image) and debug views.
+    //
+    // With `reflect=1` the floor is polished and its reflections are traced through a grid of the
+    // room's triangles (`Renderer.enableRtGrid`, `RtReflectionsEffect`), the hits lit by the voxels.
+    //
+    // The TS engine has no spot lights yet: the lamp is a point light with a cube shadow inside a
+    // fixture open at the bottom (a hard-edged cone of 76 degrees, the Rust spot's outer angle), lit
+    // with the falloff the voxel injection uses, so the direct light and the voxels' agree.
+    //
+    // URL parameters, as the Rust example's (no dragon):
+    // preset=off|ssgi|voxel|best|indirect|voxels|phone|sdf|slice|probes|probe-view (applied first,
+    // the other parameters over it; `best`, voxel + SSGI, unless the URL names a preset or a gi),
+    // gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi|rt (ssgi: high; rt, or rt=1,
+    // builds the grid of triangles at load: the panel reloads the page with gi=rt without it), with
+    // gi=rt the hybrid's rtgi_res=half|full, rtgi_denoise=svgf|temporal|off, rtgi_kernel=3x3|5x5,
+    // rtgi_hit=direct|voxels, rtgi_shadows=rays|maps, rtgi_mode=hybrid|reference, rtgi_accum=1,
+    // rtgi_view=lit|indirect|signal|variance|history|cost,
+    // voxels=low|medium|high, view=lit|indirect|voxels|sdf|probes, slice=<metres> (the sdf view's
+    // height, default 0.6), sdf_ao=0..1, sdf_shadows=off|fallback|always, shadows=map|sdf,
+    // cam=front|corner|low|floor, animate=1, albedo=constant, rug=off, ui=0, profile=1 (each
+    // pass's GPU time; examples/profile-hud.js). Any use of the distance field turns voxel GI's
+    // volume on whatever the gi mode. reflect=1 with floor_f0 (0.3), floor_rough (0.05),
+    // rt_view=lit|reflection|mirror|cost, rt_trace=voxels (the voxel cone alone), rt_res=quarter,
+    // stats=1 (the rays' counters); the reflections' hits turn voxel GI's volume on too.
+    // `window.kansei` holds the setters and `info()` for scripted captures.
+    import { Canvas, run, param, paramOr, flag, isPhone } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PointLight } from '../src/lights/PointLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { GBUFFER_OUT_WGSL, SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { SDF_WGSL, VOXEL_WRITE_WGSL } from '../src/gi/GiWGSL'
+    import { BindingLayouts } from '../src/materials/Binding'
+    import { VoxelGiQuality } from '../src/gi/VoxelVolume'
+    import { VoxelGIEffect } from '../src/gi/VoxelGIEffect'
+    import { ScreenSpaceGIEffect } from '../src/postprocessing/effects/ScreenSpaceGIEffect'
+    import { RtReflectionsEffect } from '../src/rt/RtReflectionsEffect'
+    import { RtDiffuseGiEffect, RT_GI_DENOISERS, RT_GI_HIT_LIGHTINGS, RT_GI_KERNELS, RT_GI_MODES, RT_GI_RESOLUTIONS, RT_GI_SHADOWS, RT_GI_VIEWS } from '../src/rt/RtDiffuseGiEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
+
+    const phone = isPhone();
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    const hud = installProfileHud({ renderer, FrameTimer, AbBench });
+
+    // ── the lamp: a shadowed point light in a fixture open at the bottom ──────────────────────
+    const LAMP = [0, 3.75, -2];
+    const LAMP_RADIUS = 12;
+    const LAMP_COLOR = [1.0, 0.92, 0.8];
+    // the Rust spot's 1600 cd gives 108 lx on the floor below it; the falloff here keeps 0.46 there
+    const LAMP_INTENSITY = 240;
+    // the lamp's radius, for the distance field's soft shadows (the Rust spot's source radius)
+    const LAMP_SOURCE_RADIUS = 0.15;
+
+    // A diffuse surface lit by the lamp (its falloff and shadow, as voxel GI's injection lights
+    // the voxels: inject.wgsl), writing the normal and albedo the GI reads (GBuffer targets 2 and
+    // 3, through GBUFFER_OUT_WGSL): its albedo the uniform's colour times, for the rug, a texture.
+    // The shadow is `lamp_visibility`'s: the cube shadow (MAP_SHADOWS_WGSL) or the distance field
+    // (SDF_SHADOWS_WGSL).
+    const SURFACE_WGSL = /* wgsl */`
+      struct Surface { albedo: vec4<f32>, emission: vec4<f32>, specular: vec4<f32> };
+      @group(0) @binding(0) var<uniform> surface: Surface;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      const LAMP_POSITION = vec3<f32>(${LAMP.join(', ')});
+      const LAMP_RADIUS = ${LAMP_RADIUS.toFixed(1)};
+      const LAMP_COLOR = vec3<f32>(${LAMP_COLOR.map((c) => (c * LAMP_INTENSITY).toFixed(3)).join(', ')});
+
+      struct VIn {
+        @location(0) position: vec4<f32>,
+        @location(1) normal: vec3<f32>,
+        @location(2) uv: vec2<f32>,
+      };
+      struct VOut {
+        @builtin(position) clip: vec4<f32>,
+        @location(0) world: vec3<f32>,
+        @location(1) normal: vec3<f32>,
+        @location(2) uv: vec2<f32>,
+      };
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+        let world = world_matrix * v.position;
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * world;
+        out.world = world.xyz;
+        out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+        out.uv = v.uv;
+        return out;
+      }
+
+      fn shade(in: VOut, base: vec3<f32>) -> KanseiGBufferOut {
+        let n = normalize(in.normal);
+        let d = LAMP_POSITION - in.world;
+        let dist = length(d);
+        let falloff = max(1.0 - dist / LAMP_RADIUS, 0.0);
+        let irradiance = LAMP_COLOR * max(dot(n, d / dist), 0.0) * falloff * falloff * lamp_visibility(in.world, n);
+        let emission = surface.emission.rgb;
+        // (F0 and roughness: zeros reflect nothing; the polished floor's with reflect=1)
+        return kansei_gbuffer_out_specular(base / 3.14159265 * irradiance + emission, emission, n, base, surface.specular.x, surface.specular.y);
+      }
+    `;
+    // The lamp's shadow from its cube shadow map.
+    const MAP_SHADOWS_WGSL = /* wgsl */`
+      fn lamp_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+        return kansei_point_shadow(world + n * 0.02);   // a little off the surface: no acne at grazing angles
+      }
+    `;
+    // The same through voxel GI's distance field (SDF_WGSL, the material helper): soft shadows,
+    // sphere-traced in the field, bound at 10-12 of the material's group.
+    const SDF_SHADOWS_WGSL = /* wgsl */`
+      @group(0) @binding(10) var<uniform> gi_volume: VoxelVolume;
+      @group(0) @binding(11) var gi_sdf: texture_3d<f32>;
+      @group(0) @binding(12) var gi_sampler: sampler;
+
+      fn lamp_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
+        let p = world + n * gi_volume.voxelSize;
+        let toLamp = LAMP_POSITION - p;
+        // as hard as the lamp's disk makes it, the march stopping short of the lamp
+        let shape = sdfLightShape(gi_volume, ${LAMP_SOURCE_RADIUS.toFixed(2)}, length(toLamp));
+        return sdfSurfaceShadow(gi_volume, gi_sdf, gi_sampler, p, n, normalize(toLamp), shape.x, shape.y);
+      }
+    `;
+    const PLAIN_WGSL = /* wgsl */`
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        return shade(in, surface.albedo.rgb);
+      }
+    `;
+    // The rug: its albedo from a texture, and a voxel entry that gives voxel GI the same texture.
+    const TEXTURED_WGSL = /* wgsl */`
+      @group(0) @binding(1) var rug_texture: texture_2d<f32>;
+      @group(0) @binding(2) var rug_sampler: sampler;
+
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        return shade(in, surface.albedo.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb);
+      }
+
+      // voxel GI's voxelizer: the rug's texture into its voxels
+      @fragment
+      fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
+        kansei_voxel_write(in.clip, front, surface.albedo.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
+      }
+    `;
+
+    // `specular`: F0 and roughness (zeros: matte)
+    const surfaceUniform = (albedo, specular = [0, 0]) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array([...albedo, 1, 0, 0, 0, 0, ...specular, 0, 0]),
+    });
+    const vertexFragment = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    // `body` after the GBuffer output and the lamp's shadow, from the cube map or, with `sdf`
+    // (voxel GI's `SceneVoxelGi`, its field enabled), the distance field, with its bindings:
+    // `bindings` plus the field's.
+    function litShader(body, sdf, bindings) {
+      if (!sdf) return [`${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SURFACE_WGSL}\n${MAP_SHADOWS_WGSL}\n${body}`, bindings];
+      const fragment = GPUShaderStage.FRAGMENT;
+      return [`${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SDF_WGSL}\n${SURFACE_WGSL}\n${SDF_SHADOWS_WGSL}\n${body}`, [
+        ...bindings,
+        { binding: 10, visibility: fragment, value: ComputeBuffer.fromExternal(sdf.volume.uniform, 'uniform') },
+        { binding: 11, visibility: fragment, value: sdf.sdf.asTexture(), layout: BindingLayouts.texture3d() },
+        { binding: 12, visibility: fragment, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+      ]];
+    }
+    const litMaterial = (label, albedo, sdf, specular = [0, 0]) => {
+      const [code, bindings] = litShader(PLAIN_WGSL, sdf, [{ binding: 0, visibility: vertexFragment, value: surfaceUniform(albedo, specular) }]);
+      return new Material(code, { label, mrtOutputCount: 4, bindings });
+    };
+
+    // The rug's two halves (linear albedo), split across its width; its texture orange on the left
+    // half, blue on the right, with a thin pale border (the Rust example's bytes, read as unorm).
+    const RUG_LEFT = [0.85, 0.35, 0.05];
+    const RUG_RIGHT = [0.05, 0.25, 0.8];
+    function rugTexture() {
+      const N = 64;
+      const srgb = (c) => Math.round((c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055) * 255);
+      const texels = new Uint8Array(N * N * 4);
+      for (let y = 0; y < N; y++) {
+        for (let x = 0; x < N; x++) {
+          const border = x < 3 || y < 3 || x >= N - 3 || y >= N - 3;
+          const c = border ? [0.8, 0.75, 0.6] : x < N / 2 ? RUG_LEFT : RUG_RIGHT;
+          texels.set([srgb(c[0]), srgb(c[1]), srgb(c[2]), 255], (y * N + x) * 4);
+        }
+      }
+      return Texture.fromRGBA('Rug', N, N, texels);
+    }
+    const rugTex = rugTexture();
+    const rugSampler = new Sampler('linear', 'linear');
+    // `voxelEntry` false voxelizes the rug with its constant `GiSurface` instead
+    const rugMaterial = (voxelEntry, sdf) => {
+      const [code, bindings] = litShader(`${VOXEL_WRITE_WGSL}\n${TEXTURED_WGSL}`, sdf, [
+        { binding: 0, visibility: vertexFragment, value: surfaceUniform([1, 1, 1]) },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: rugTex },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: rugSampler },
+      ]);
+      return new Material(code, { label: 'Rug', mrtOutputCount: 4, voxelFragmentEntry: voxelEntry ? 'voxel_main' : undefined, bindings });
+    };
+
+    // ── the room ──────────────────────────────────────────────────────────────────────────────
+    // reflect=1 (set at load): the floor polished, and every surface in the grid of triangles its
+    // reflections trace; the grid is also the hybrid GI's (gi=rt, rt=1)
+    const reflect = flag('reflect', false);
+    const grid = reflect || param('gi') === 'rt' || flag('rt', false);
+    const floorSpecular = reflect ? [paramOr('floor_f0', 0.3), paramOr('floor_rough', 0.05)] : [0, 0];
+    const specularOf = (label) => label === 'Floor' ? floorSpecular : [0, 0];
+    const rt = (albedo) => grid ? { albedo } : null;
+    const scene = new Scene();
+    const white = [0.73, 0.73, 0.73];
+    const slabs = [
+      ['Floor', [4.4, 0.2, 4.2], [0, -0.1, -2.1], white],
+      ['Ceiling', [4.4, 0.2, 4.2], [0, 4.1, -2.1], white],
+      ['Back', [4.4, 4.4, 0.2], [0, 2.0, -4.1], white],
+      ['Left', [0.2, 4.4, 4.2], [-2.1, 2.0, -2.1], [0.63, 0.065, 0.05]],
+      ['Right', [0.2, 4.4, 4.2], [2.1, 2.0, -2.1], [0.14, 0.45, 0.09]],
+    ];
+    // the renderables lit by the lamp, whose materials `shadows` swaps: (renderable, label, albedo)
+    const lit = [];
+    for (const [label, size, position, color] of slabs) {
+      const slab = new Renderable(new BoxGeometry(...size), litMaterial(label, color, null, specularOf(label)));
+      slab.position.set(...position);
+      slab.gi = { albedo: color };
+      slab.rt = rt(color);
+      scene.add(slab);
+      lit.push([slab, label, color]);
+    }
+    const tallRest = { position: [-0.75, 1.2, -2.6], yaw: 0.33 };
+    const tall = new Renderable(new BoxGeometry(1.2, 2.4, 1.2), litMaterial('Tall', white));
+    tall.position.set(...tallRest.position);
+    tall.rotation.y = tallRest.yaw;
+    tall.gi = { albedo: white };
+    tall.rt = rt(white);
+    scene.add(tall);
+    lit.push([tall, 'Tall', white]);
+    const short = new Renderable(new BoxGeometry(1.2, 1.2, 1.2), litMaterial('Short', white));
+    short.position.set(0.8, 0.6, -1.5);
+    short.rotation.y = -0.3;
+    short.gi = { albedo: white };
+    short.rt = rt(white);
+    scene.add(short);
+    lit.push([short, 'Short', white]);
+    const rugMean = [0, 1, 2].map((c) => (RUG_LEFT[c] + RUG_RIGHT[c]) * 0.5);
+    const rug = new Renderable(new BoxGeometry(2.4, 0.02, 0.8), rugMaterial(true));
+    rug.position.set(0, 0.01, -0.55);
+    rug.gi = { albedo: rugMean };
+    rug.rt = rt(rugMean);
+    scene.add(rug);
+
+    // The fixture: an open-bottomed box round the lamp, its rim 5 cm below it, casting a cone of
+    // 76 degrees as the Rust spot's outer angle (not in the voxels: the lamp's light leaves
+    // through its opening, and its outside is dark).
+    const fixtureColor = [0.05, 0.05, 0.05];
+    const fixture = [
+      [[0.44, 0.04, 0.44], [0, 3.98, -2]],
+      [[0.04, 0.31, 0.44], [-0.2, 3.855, -2]],
+      [[0.04, 0.31, 0.44], [0.2, 3.855, -2]],
+      [[0.44, 0.31, 0.04], [0, 3.855, -2.2]],
+      [[0.44, 0.31, 0.04], [0, 3.855, -1.8]],
+    ];
+    for (const [size, position] of fixture) {
+      const part = new Renderable(new BoxGeometry(...size), litMaterial('Fixture', fixtureColor));
+      part.position.set(...position);
+      // (in the reflections' grid, so the polished floor shows it)
+      part.rt = rt(fixtureColor);
+      scene.add(part);
+    }
+    const lamp = new PointLight(LAMP_RADIUS, LAMP_COLOR, LAMP_INTENSITY);
+    lamp.position.set(...LAMP);
+    lamp.castShadow = true;
+    scene.add(lamp);
+    renderer.enablePointShadows({ resolution: 1024, maxLights: 1, near: 0.02, shadowFar: LAMP_RADIUS });
+    // the room's grid of triangles for the reflections and the hybrid's rays: 96 cells each way
+    // over the box (4.8 cm)
+    if (grid) renderer.enableRtGrid({ grid: { dims: [96, 96, 96], cell: 4.6 / 96, fixedOrigin: [-2.3, -0.3, -4.3] } });
+
+    // ── the camera ────────────────────────────────────────────────────────────────────────────
+    // (name, target, distance, azimuth, elevation), as the Rust example's
+    const CAMERAS = {
+      front: [[0, 2, -2], 8.3, 0, 0],
+      corner: [[1, 0.8, -3], 4.98, -0.777, 0.634],
+      low: [[0, 1.4, -2.5], 7.5, 0, -0.12],
+      floor: [[-0.3, 0.5, -2], 6.2, 0.3, 0.42],
+    };
+    const camera = new Camera(38, 0.1, 100, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 2, -2), renderer.canvas, 8.3).withMousePan();
+    function setCamera(name) {
+      const [t, distance, azimuth, elevation] = CAMERAS[name] ?? CAMERAS.front;
+      controls.setView(new Vector3(...t), distance, azimuth, elevation);
+      config.cam = name in CAMERAS ? name : 'front';
+    }
+
+    // ── what the URL and the panel set ────────────────────────────────────────────────────────
+    // The Rust example's presets but its dragon's: [name, gi, voxels, view, sdf ao, voxel shadows,
+    // direct shadows from the field].
+    const PRESETS = [
+      ['off', 'off', null, 'lit', 0, 'off', false],
+      ['ssgi', 'high', null, 'lit', 0, 'off', false],
+      ['voxel', 'voxel', null, 'lit', 0, 'off', false],
+      ['best', 'voxel+ssgi', null, 'lit', 0, 'off', false],
+      ['indirect', 'voxel+ssgi', null, 'indirect', 0, 'off', false],
+      ['voxels', 'voxel', null, 'voxels', 0, 'off', false],
+      ['phone', 'voxel+ssgi', 'low', 'lit', 0, 'off', false],
+      // the distance field: its AO on the GI and soft shadows for the voxels and the direct light
+      ['sdf', 'voxel+ssgi', null, 'lit', 0.8, 'always', true],
+      ['slice', 'voxel', null, 'sdf', 0, 'off', false],
+      // irradiance probes traced in the distance field, under SSGI
+      ['probes', 'probes+ssgi', null, 'lit', 0, 'off', false],
+      ['probe-view', 'probes+ssgi', null, 'probes', 0, 'off', false],
+    ];
+    const SCREEN_GI = ['low', 'medium', 'high', 'ultra'];
+    const GI_MODES = ['off', ...SCREEN_GI, 'voxel', 'voxel+ssgi', 'probes', 'probes+ssgi', 'rt'];
+    // the URL's gi: `ssgi` is `high`, and a raw '+' arrives as a space
+    const giFromName = (name) => name === 'ssgi' ? 'high' : GI_MODES.find((g) => g === name?.replace(' ', '+')) ?? null;
+    const VIEWS = ['lit', 'indirect', 'voxels', 'sdf', 'probes'];
+    const SDF_SHADOWS = ['off', 'fallback', 'always'];
+    const defaultVoxels = phone ? 'low' : 'medium';
+    const config = {
+      preset: null,
+      gi: 'high',
+      voxels: defaultVoxels,
+      view: 'lit',
+      sdfAo: 0,
+      sdfShadows: 'off',
+      shadows: 'map',
+      slice: 0.6,
+      cam: 'front',
+      animate: flag('animate', false),
+      textured: param('albedo') !== 'constant',
+      rug: param('rug') !== 'off',
+      reflections: true,
+      rtView: ['lit', 'reflection', 'mirror', 'cost'].includes(param('rt_view')) ? param('rt_view') : 'lit',
+      rtTrace: param('rt_trace') === 'voxels' ? 'voxels' : 'grid',
+      rtRes: param('rt_res') === 'quarter' ? 'quarter' : 'half',
+    };
+    const stats = flag('stats', false);
+    // The hybrid's settings (gi=rt): the URL's rtgi_* parameters and setRtgi's keys, by name.
+    const RTGI_KEYS = {
+      res: RT_GI_RESOLUTIONS, denoise: RT_GI_DENOISERS, kernel: RT_GI_KERNELS, hit: RT_GI_HIT_LIGHTINGS,
+      shadows: RT_GI_SHADOWS, mode: RT_GI_MODES, accum: null, view: RT_GI_VIEWS,
+    };
+    const rtgi = { res: 'half', denoise: 'svgf', kernel: '3x3', hit: 'direct', shadows: 'rays', mode: 'hybrid', accum: false, view: 'lit' };
+    // one setting by its key and name; false if either is unknown
+    const setRtgiKey = (key, value) => {
+      if (!(key in RTGI_KEYS)) return false;
+      if (key === 'accum') {
+        rtgi.accum = value === true || value === '1' || value === 'true';
+        return true;
+      }
+      if (!RTGI_KEYS[key].includes(value)) return false;
+      rtgi[key] = value;
+      return true;
+    };
+    for (const key of Object.keys(RTGI_KEYS)) {
+      if (param(`rtgi_${key}`) !== null) setRtgiKey(key, param(`rtgi_${key}`));
+    }
+    // `config` with preset `name` applied (unknown names change nothing)
+    function applyPreset(name) {
+      const p = PRESETS.find(([n]) => n === name);
+      if (!p) return;
+      const [, gi, voxels, view, sdfAo, sdfShadows, directSdf] = p;
+      Object.assign(config, { preset: name, gi, voxels: voxels ?? defaultVoxels, view, sdfAo, sdfShadows, shadows: directSdf ? 'sdf' : 'map' });
+    }
+    // the URL's preset, then its other parameters over it
+    const DEFAULT_PRESET = 'best';
+    const preset = param('preset') ?? (param('gi') === null ? DEFAULT_PRESET : null);
+    if (preset) applyPreset(preset);
+    config.gi = giFromName(param('gi')) ?? config.gi;
+    config.voxels = VoxelGiQuality.fromName(param('voxels')) ?? config.voxels;
+    if (VIEWS.includes(param('view'))) config.view = param('view');
+    if (param('sdf_ao') !== null && Number.isFinite(parseFloat(param('sdf_ao')))) config.sdfAo = Math.min(Math.max(parseFloat(param('sdf_ao')), 0), 1);
+    if (SDF_SHADOWS.includes(param('sdf_shadows'))) config.sdfShadows = param('sdf_shadows');
+    if (param('shadows') !== null) config.shadows = param('shadows') === 'sdf' ? 'sdf' : 'map';
+    if (param('slice') !== null && Number.isFinite(parseFloat(param('slice')))) config.slice = parseFloat(param('slice'));
+    setCamera(param('cam') ?? 'front');
+
+    // Whether anything reads the probes, the distance field, the voxels.
+    const needsProbes = () => config.gi.startsWith('probes') || config.view === 'probes';
+    const needsSdf = () => config.sdfAo > 0 || config.sdfShadows !== 'off' || config.view === 'sdf' || config.shadows === 'sdf' || needsProbes();
+    // (the reflections' hits are lit by the voxels, and so are the hybrid's)
+    const screenGi = () => SCREEN_GI.includes(config.gi);
+    const needsVoxels = () => (config.gi !== 'off' && !screenGi()) || needsSdf() || reflect;
+
+    // single-sampled with the grid, as the Rust example always is: the ray-traced effects read the
+    // GBuffer's normals, which a 4x MSAA resolve averages toward zero at edges (the hybrid's
+    // denoiser then spreads the NaN of their normalize through its history)
+    const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: grid ? 1 : 4 });
+    let enabledVoxels = null;
+    let textured = true;
+    let reflections = null;
+    let rtgiEffect = null;
+    // the field the lit materials are shadowed through (null: the cube map)
+    let materialsSdf = null;
+
+    // Bring the renderer, the chain and the scene to `config`.
+    function apply() {
+      if (needsVoxels()) {
+        if (enabledVoxels !== config.voxels) {
+          renderer.enableVoxelGI({
+            quality: config.voxels,
+            boundsMin: [-2.3, -0.3, -4.3],
+            boundsMax: [2.3, 4.3, 0.3],
+            budgetBytes: phone ? 24 << 20 : 0,
+          });
+          enabledVoxels = config.voxels;
+        }
+      } else if (enabledVoxels !== null) {
+        renderer.disableVoxelGI();
+        enabledVoxels = null;
+      }
+      const gi = renderer.voxelGI;
+      if (gi) {
+        if (needsSdf()) gi.enableSdf();
+        else gi.disableSdf();
+        gi.settings.sdfShadows = config.sdfShadows;
+        // a probe every 8 voxels; phones update a quarter of them a frame
+        if (needsProbes()) gi.enableProbes({ probesPerFrame: phone ? 256 : 0 });
+        else gi.disableProbes();
+      }
+      volume.clearEffects();
+      const indirect = config.view === 'indirect';
+      // the screen-space GI's options, alone or as the voxels' near field
+      const screen = { radiusM: 4 };
+      // (the slice view shows through voxel GI's effect whatever the mode)
+      const screenOn = screenGi() && config.view !== 'sdf';
+      // the hybrid: one ray for each 2 x 2 pixels through the room's grid, the voxels for the hits'
+      // further bounces and past the box; the lamp from the scene's lights, its cube shadow for
+      // rtgi_shadows=maps
+      const rtgiOn = config.gi === 'rt' && gi && renderer.rtGrid && (config.view === 'lit' || indirect);
+      const voxelOn = !screenOn && !rtgiOn && gi && (config.gi !== 'off' || config.view === 'sdf');
+      const effectOn = screenOn || voxelOn || rtgiOn;
+      rtgiEffect = null;
+      if (rtgiOn) {
+        rtgiEffect = RtDiffuseGiEffect.withVolume(gi.volume, renderer.rtGrid.handle, {
+          resolution: rtgi.res, hitLighting: rtgi.hit, shadows: rtgi.shadows, denoise: rtgi.denoise, kernel: rtgi.kernel, maxDistance: 20,
+        });
+        rtgiEffect.mode = rtgi.mode;
+        rtgiEffect.accumulate = rtgi.accum;
+        rtgiEffect.view = indirect ? 'indirect' : rtgi.view;
+        rtgiEffect.setSpotLights(renderer.spotLightsBuffer, renderer.spotShadowAtlas);
+        rtgiEffect.setPointShadows(renderer.cubeMapShadowMap);
+        rtgiEffect.heatScale = 0.5 / exposureFromEV100(5);
+        rtgiEffect.collectStats = stats;
+        volume.addEffect(rtgiEffect);
+      } else if (screenOn) {
+        const effect = new ScreenSpaceGIEffect({ ...screen, quality: config.gi });
+        effect.showIndirect = indirect;
+        volume.addEffect(effect);
+      } else if (voxelOn) {
+        const nearQuality = phone || gi.quality === 'low' ? 'low' : 'high';
+        const nearField = config.gi.endsWith('+ssgi') ? { ...screen, quality: nearQuality } : undefined;
+        const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality, sdfAo: config.sdfAo, nearField });
+        effect.showIndirect = indirect;
+        effect.showVoxels = config.view === 'voxels';
+        effect.setSdf(gi.sdf);
+        effect.showSdfSlice = config.view === 'sdf' ? config.slice : null;
+        // the probes: the far field in the probe modes (and what the debug view shows)
+        effect.setProbes(needsProbes() ? gi.probes : null);
+        effect.showProbes = config.view === 'probes';
+        volume.addEffect(effect);
+      }
+      // the polished floor's reflections, through the room's grid, lit by the voxels
+      reflections = null;
+      if (reflect && config.reflections && gi && renderer.rtGrid) {
+        reflections = new RtReflectionsEffect(gi.volume, renderer.rtGrid.handle, { resolution: config.rtRes, maxDistance: 20 });
+        reflections.view = config.rtView;
+        reflections.traceGrid = config.rtTrace === 'grid';
+        reflections.heatScale = 0.5 / exposureFromEV100(5);
+        reflections.collectStats = stats;
+        volume.addEffect(reflections);
+      }
+      volume.addEffect(new ToneMapEffect({
+        ...toneMapOptionsForSurface(renderer.presentationFormat),
+        // the indirect view alone is 2 stops brighter
+        exposure: exposureFromEV100(5) * (indirect && effectOn ? 4 : 1),
+      }));
+      // the lit materials: shadowed through the field (bound to this one) or by the cube map
+      const sdf = config.shadows === 'sdf' && gi?.sdf ? { volume: gi.volume, sdf: gi.sdf } : null;
+      if ((sdf?.sdf ?? null) !== materialsSdf || config.textured !== textured) {
+        for (const [r, label, albedo] of lit) r.material = litMaterial(label, albedo, sdf, specularOf(label));
+        rug.material = rugMaterial(config.textured, sdf);
+        materialsSdf = sdf?.sdf ?? null;
+        if (config.textured !== textured) {
+          textured = config.textured;
+          // the voxelizer can't see a material change
+          gi?.invalidate();
+        }
+      }
+      rug.visible = config.rug;
+      tall.dynamic = config.animate;
+      if (!config.animate) {
+        tall.position.set(...tallRest.position);
+        tall.rotation.y = tallRest.yaw;
+      }
+      for (const key of ['preset', 'gi', 'voxels', 'view', 'cam', 'sdfAo', 'sdfShadows', 'shadows', 'rtView', 'rtTrace', 'rtRes']) document.getElementById(key).value = config[key];
+      for (const key of ['animate', 'textured', 'rug', 'reflections']) document.getElementById(key).checked = config[key];
+      for (const key of Object.keys(RTGI_KEYS)) {
+        const el = document.getElementById(`rtgi-${key}`);
+        if (key === 'accum') el.checked = rtgi.accum;
+        else el.value = rtgi[key];
+      }
+      // the hybrid's settings, shown while it runs
+      document.getElementById('rtgi-panel').style.display = config.gi === 'rt' ? '' : 'none';
+    }
+    for (const [name] of PRESETS) document.getElementById('preset').add(new Option(name, name));
+    apply();
+
+    // The grid's figures (null without it), the reflections' (null without reflect=1) and the
+    // hybrid's settings with, while it runs, its counters, memory and accumulated frames, as the
+    // Rust example's.
+    const gridInfo = () => {
+      const rtGrid = renderer.rtGrid;
+      if (!rtGrid) return null;
+      const g = rtGrid.stats;
+      return {
+        triangles: g.grid.triangles, references: g.grid.references, big: g.grid.bigTriangles,
+        sources: g.sources, rebuilt: g.rebuilt, rebuilds: g.rebuilds, cpuMs: +g.cpuMs.toFixed(3),
+        mib: +(rtGrid.memoryBytes() / (1 << 20)).toFixed(1),
+      };
+    };
+    const reflectInfo = () => {
+      if (!reflect) return null;
+      const r = reflections?.stats;
+      return {
+        enabled: config.reflections, view: config.rtView, grid: config.rtTrace === 'grid', res: config.rtRes,
+        rays: r?.rays ?? 0, hits: r?.hits ?? 0, cells: r?.cells ?? 0, tests: r?.tests ?? 0, maxCost: r?.maxCost ?? 0,
+      };
+    };
+    const rtgiInfo = () => {
+      const s = rtgiEffect?.stats;
+      return {
+        ...rtgi, on: !!rtgiEffect, accumulated: rtgiEffect?.accumulated ?? 0,
+        mib: +((rtgiEffect?.memoryBytes() ?? 0) / (1 << 20)).toFixed(1),
+        rays: s?.rays ?? 0, hits: s?.hits ?? 0, cost: s?.cost ?? 0, shadowRays: s?.shadowRays ?? 0,
+      };
+    };
+    const info = () => {
+      const gi = renderer.voxelGI;
+      return {
+        ...config,
+        grid: gridInfo(),
+        rtgi: rtgiInfo(),
+        reflect: reflectInfo(),
+        voxelTier: gi?.quality ?? null,
+        dims: gi ? [...gi.volume.dims] : null,
+        mib: gi ? +(gi.memoryBytes() / (1 << 20)).toFixed(1) : 0,
+        sdf: !!gi?.sdf,
+        probes: !!gi?.probes,
+        probeDims: gi?.probes ? [...gi.probes.dims] : null,
+      };
+    };
+    const set = (key) => (value) => { config[key] = value; apply(); };
+    const setPreset = (name) => { applyPreset(name); apply(); };
+    // rt needs the grid, built at load only (gi=rt, rt=1 or reflect=1 in the URL)
+    const setGi = (name) => {
+      const gi = giFromName(name) ?? config.gi;
+      if (gi !== 'rt' || renderer.rtGrid) set('gi')(gi);
+    };
+    // one of the hybrid's settings at run time, by its rtgi_* URL parameter's key and value
+    const setRtgi = (key, value) => {
+      const before = JSON.stringify(rtgi);
+      if (setRtgiKey(key, value) && JSON.stringify(rtgi) !== before) apply();
+    };
+    window.kansei = {
+      info,
+      setPreset, setGi, setRtgi, setVoxels: set('voxels'), setView: set('view'), setAnimate: set('animate'),
+      setTextured: set('textured'), setRug: set('rug'), setSdfAo: set('sdfAo'), setSdfShadows: set('sdfShadows'),
+      setShadows: set('shadows'), setSlice: set('slice'), setCamera,
+      setReflections: set('reflections'), setRtView: set('rtView'), setRtTrace: set('rtTrace'), setRtRes: set('rtRes'),
+      renderer, scene, camera,
+    };
+    document.getElementById('preset').onchange = (e) => setPreset(e.target.value);
+    // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
+    // it, choosing the hybrid reloads the page with gi=rt
+    document.getElementById('gi').onchange = (e) => {
+      if (e.target.value === 'rt' && !renderer.rtGrid) {
+        const params = new URLSearchParams(location.search);
+        params.set('gi', 'rt');
+        params.delete('preset');
+        location.search = params.toString();
+        return;
+      }
+      setGi(e.target.value);
+    };
+    for (const key of Object.keys(RTGI_KEYS)) {
+      const el = document.getElementById(`rtgi-${key}`);
+      el.onchange = () => setRtgi(key, key === 'accum' ? el.checked : el.value);
+    }
+    for (const key of ['voxels', 'view', 'sdfShadows', 'shadows', 'rtView', 'rtTrace', 'rtRes']) document.getElementById(key).onchange = (e) => set(key)(e.target.value);
+    document.getElementById('sdfAo').onchange = (e) => set('sdfAo')(parseFloat(e.target.value));
+    document.getElementById('cam').onchange = (e) => setCamera(e.target.value);
+    for (const key of ['animate', 'textured', 'rug', 'reflections']) document.getElementById(key).onchange = (e) => set(key)(e.target.checked);
+    if (reflect) document.getElementById('reflect-panel').style.display = '';
+    if (reflect && stats) {
+      setInterval(() => {
+        const [g, r] = [gridInfo(), reflectInfo()];
+        document.getElementById('rt-stats').textContent = `grid ${g.triangles} tris, ${g.references} refs, ${g.big} big; rays ${r.rays}, hits ${r.hits}`;
+      }, 500);
+    }
+    if (stats) {
+      setInterval(() => {
+        const i = rtgiInfo();
+        document.getElementById('rtgi-stats').textContent = i.on
+          ? `${i.mib} MiB; ${i.rays} rays, ${i.rays ? (100 * i.hits / i.rays).toFixed(0) : 0}% hit, ${i.rays ? (i.cost / i.rays).toFixed(1) : 0} cells + triangles a ray` + (i.accum ? `, ${i.accumulated} frames` : '')
+          : '';
+      }, 500);
+    }
+    if (!flag('ui', true)) document.getElementById('panel').style.display = 'none';
+    console.log(`Kansei — GI box (TS) ready: ${JSON.stringify(info())}`);
+
+    let time = 0;
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      const dt = Math.min(Math.max(f.dt, 0), 0.1);
+      if (config.animate) {
+        time += dt;
+        // turn, and slide back and forth across the box
+        const [x, y, z] = tallRest.position;
+        tall.position.set(x + 0.45 * Math.sin(time * 0.7), y, z + 0.25 * Math.sin(time * 0.45));
+        tall.rotation.y = tallRest.yaw + time * 0.6;
+      }
+      controls.update(dt);
+      rtgiEffect?.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
+      hud.begin(performance.now());
+      volume.render(scene, camera);
+      hud.end(performance.now());
+    });
+  </script>
+</body>
+
+</html>

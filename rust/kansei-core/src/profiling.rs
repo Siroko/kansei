@@ -158,14 +158,24 @@ struct Profiler {
     cpu_frames: u32,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    // the global `performance`, a page's or a worker's (`web_sys::window()` is a page's only)
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
+}
+
 thread_local! {
     static PROFILER: RefCell<Option<Profiler>> = const { RefCell::new(None) };
 }
 
-fn now_ms() -> f64 {
+/// Milliseconds on a monotonic clock: `performance.now()` in the browser, on the page or in a
+/// worker.
+pub(crate) fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
-        web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())
+        performance_now()
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

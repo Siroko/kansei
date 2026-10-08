@@ -30,7 +30,7 @@
   <body>
     <script type="module">
       import { FontLoader } from '../src/sdf/text/FontLoader'
-      import { Renderer } from '../src/renderers/Renderer'
+      import { Canvas, run } from '../src/web/index'
       import { Material } from '../src/materials/Material'
       import { Renderable } from '../src/objects/Renderable'
       import { Scene } from '../src/objects/Scene'
@@ -52,17 +52,13 @@
       import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
       // ── Renderer ──────────────────────────────────────────
-      const renderer = new Renderer({
+      const canvas = Canvas.fill();
+      const renderer = await canvas.renderer({
         alphaMode: 'premultiplied',
         clearColor: new Vector4(0.02, 0.02, 0.04, 1),
-        width: window.innerWidth,
-        height: window.innerHeight,
-        devicePixelRatio: Math.min(window.devicePixelRatio, 2),
         antialias: true,
         sampleCount: 1,
       });
-      await renderer.initialize();
-      document.body.appendChild(renderer.canvas);
 
       // ── Scene ─────────────────────────────────────────────
       const scene = new Scene();
@@ -220,11 +216,11 @@ struct VertexOut {
 @group(0) @binding(0) var map : texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
-@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
 
-@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+@group(1) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
 
 @vertex
 fn vertex_main(
@@ -346,11 +342,11 @@ struct Prim { primType: u32, param1: f32, param2: f32, localX: f32, localY: f32,
 
 @group(0) @binding(0) var<storage, read_write> prims: array<Prim>;
 
-@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
 
-@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+@group(1) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
 
 @vertex
 fn vertex_main(
@@ -628,18 +624,12 @@ fn fragment_main(fragData: VertexOut) -> @location(0) vec4<f32> {
         await sim.update(dt, mouseVectors.mousePosition, mouseVectors.mouseDirection, mouseVectors.mouseStrength);
 
         renderer.render(scene, camera);
-        requestAnimationFrame(animate);
       }
-      animate();
-
-      // ── Resize ────────────────────────────────────────────
-      function onResize() {
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
-        frameCamera();
-      }
-      window.addEventListener('resize', onResize);
+      run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        if (frame.resized) frameCamera();
+        return animate();
+      });
     </script>
   </body>
 </html>

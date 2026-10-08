@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - motion matching</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #hud {
+      position: fixed; top: 12px; left: 14px; margin: 0; max-width: 90vw;
+      color: #f2f2f2; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-shadow: 0 1px 2px #000, 0 0 6px #000; white-space: pre-wrap; pointer-events: none;
+    }
+  </style>
+</head>
+
+<body>
+  <pre id="hud">Loading…</pre>
+  <script type="module">
+    // Motion matching in TypeScript: a skinned character walking, running, starting, stopping,
+    // turning and strafing under keyboard or gamepad control, over a course of boxes it hurdles,
+    // vaults, mantles and climbs on request, jumping, falling off edges and landing. The runtime
+    // is the pure TS port of the Rust engine's (src/animation/motion_matching, src/collision),
+    // so this page and the Rust demo (rust/kansei-wasm/demos/motion-matching, wasm) can be timed
+    // against each other on the same pack: the HUD shows the character's update per frame, and
+    // both pages expose motionTimings(), benchSearch(step) and benchPose(count) on window.
+    //
+    // No animation data ships with Kansei. The page loads a motion-matching pack (.kmm) from
+    // examples/pack/locomotion.kmm (gitignored; link your packs folder there) or ?pack=<url>,
+    // and a character pack from pack/hero.kmm or ?hero=<url> (hero=none: none). Without a pack
+    // it says how to make one and shows the course alone. Bake packs with rust/kansei-anim-bake;
+    // the Rust demo's README has the details. bundle-examples refuses any .kmm in dist/.
+    //
+    // Keys: WASD / arrows move (relative to the camera), Shift runs, Space traverses what is
+    // ahead or jumps, Q strafes; B the overlay (trajectory, feet, ledge, HUD), K the skeleton,
+    // M the mesh, L foot locking, C the character (with a character pack). Gamepad: left stick,
+    // B or the right trigger runs, A jumps or traverses, the left bumper strafes. Drag orbits,
+    // the wheel zooms.
+    //   pack=<url>, hero=<url>|none, char=hero|mannequin
+    //   gait=0        search every clip instead of idle + walk or idle + run by the pack's tags
+    //   walk=, run=   forward paces (m/s, default 2 and 5); sideways and backward scale with them
+    //   course=0      no boxes
+    //   at=x,z,deg    where the character starts (on whatever is there)
+    //   drive=1       a fixed route instead of the player (the Rust demo's), for side-by-side timing
+    //   view=<deg>    the camera turned round the character from behind it
+    //   ev=<EV100>    exposure (default 14.5)
+    import { Canvas, run, Keys, Gamepad, param, paramOr, flag, setText, fetchBytes } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { Texture } from '../src/buffers/Texture'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { ShadowMap } from '../src/shadows/ShadowMap'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { DebugBoxes, segment } from '../src/debug/DebugBoxes'
+    import { Pose } from '../src/animation/Pose'
+    import { Retarget } from '../src/animation/Retarget'
+    import { BonePalette, skinnedLitMaterial, skinnedLitTexturedMaterial, packSkinnedLitParams } from '../src/animation/Skinning'
+    import { CollisionWorld, Obb } from '../src/collision/CollisionWorld'
+    import {
+      MotionPack, CharacterPack, MotionMatcher, ACTION_TAG, STRIDE, yawOf, defaultSearchFilter, actionKindName,
+      CharacterController, isRefusal,
+    } from '../src/animation/motion_matching/index'
+
+    // ── Engine ──
+    const canvas = Canvas.fill().withMaxPixelRatio(1.5);
+    const renderer = await canvas.renderer();
+    const device = renderer.gpuDevice;
+    const scene = new Scene();
+    const camera = new Camera(45, 0.1, 1200, canvas.aspect);
+
+    const SUN_DIRECTION = [0.45, -0.75, -0.5];
+    const sunLight = new DirectionalLight(SUN_DIRECTION, [1, 1, 1], 1.0);
+    const shadowMap = new ShadowMap(device, { resolution: 2048, maxShadowDistance: 30 });
+    renderer.shadowMap = shadowMap;
+    renderer.shadowsEnabled = true;
+    // Physical units: a clear-day sun (lux) and sky (cd/m²), as the skinning page.
+    const light = { sunDirection: SUN_DIRECTION, sun: [1.0e5, 0.96e5, 0.88e5], sky: [0.55e4, 0.7e4, 1.0e4] };
+
+    // ── The course (the Rust lake world's, rust/kansei-wasm/demos/lake/src/course.rs) ──
+    // (x, base height, z) of a box's bottom centre, its width, height and depth, its heading and colour
+    const COURSE = [
+      // low rails to hurdle, one long and turned
+      [[0, 0, 5], [3, 0.5, 0.25], 0, [0.55, 0.35, 0.2]],
+      [[-6, 0, 4], [4, 0.8, 0.25], 0.5, [0.55, 0.35, 0.2]],
+      [[6.5, 0, 3], [2.5, 1, 0.3], -0.4, [0.55, 0.35, 0.2]],
+      // boxes to vault
+      [[0, 0, 10], [2, 1, 0.8], 0, [0.25, 0.4, 0.55]],
+      [[-9, 0, 9], [2.2, 0.9, 1], 0.8, [0.25, 0.4, 0.55]],
+      // blocks to mantle onto
+      [[7, 0, 9.5], [3, 1.2, 3], 0.3, [0.45, 0.45, 0.4]],
+      [[-3.5, 0, -6], [3, 1.5, 2.5], 0, [0.45, 0.45, 0.4]],
+      [[4, 0, -5], [2.5, 1.35, 2.5], -0.7, [0.45, 0.45, 0.4]],
+      // walls to climb, with room on top
+      [[0, 0, 16], [4, 2, 3], 0, [0.5, 0.3, 0.3]],
+      [[-10, 0, -2], [3, 2.4, 3.5], Math.PI / 2, [0.5, 0.3, 0.3]],
+      // long narrow beams: hurdle across, too narrow to stand along
+      [[10, 0, -3], [0.35, 0.6, 7], 0, [0.3, 0.3, 0.3]],
+      [[-6, 0, 13], [6, 0.7, 0.35], -0.2, [0.3, 0.3, 0.3]],
+      // stacked: mantle onto the first, then onto the second
+      [[12, 0, 12], [3, 1.2, 3], 0.2, [0.45, 0.45, 0.4]],
+      [[12.11, 1.2, 12.54], [1.8, 1.1, 1.8], 0.2, [0.55, 0.5, 0.35]],
+      [[-12, 0, 16], [3.5, 1, 3.5], -0.5, [0.45, 0.45, 0.4]],
+      [[-12.22, 1, 16.39], [1.8, 1.3, 1.8], -0.5, [0.55, 0.5, 0.35]],
+      // a low step onto a platform, and a thin wall at an angle
+      [[0, 0, -10], [5, 0.3, 3], 0, [0.4, 0.42, 0.45]],
+      [[8, 0, 16], [3, 1.1, 0.3], 0.9, [0.55, 0.35, 0.2]],
+      // two platforms with a gap to jump across (a running jump; a walking one falls short)
+      [[-14, 0, 3], [3, 1.2, 6], 0, [0.4, 0.5, 0.45]],
+      [[-14, 0, 9.5], [3, 1.2, 4], 0, [0.4, 0.5, 0.45]],
+    ];
+
+    // The ground and the boxes: the same sun, sky and shadow, in the same units; a metre grid on
+    // the ground (base colour alpha 1), lines along the boxes' edges (alpha 0).
+    const surfaceShader = SHADOW_MAP_WGSL + /* wgsl */`
+      struct Surface { base_color : vec4f, sun_direction : vec4f, sun : vec4f, sky : vec4f }
+      @group(0) @binding(0) var<uniform> surface : Surface;
+      @group(1) @binding(0) var<uniform> view_matrix : mat4x4f;
+      @group(1) @binding(1) var<uniform> projection_matrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normal_matrix : mat4x4f;
+      @group(2) @binding(1) var<uniform> world_matrix : mat4x4f;
+
+      struct VOut { @builtin(position) clip : vec4f, @location(0) world : vec3f, @location(1) normal : vec3f };
+
+      @vertex
+      fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VOut {
+        let world = world_matrix * vec4f(position.xyz, 1.0);
+        return VOut(projection_matrix * view_matrix * world, world.xyz, (normal_matrix * vec4f(normal, 0.0)).xyz);
+      }
+
+      fn line(x : f32, width : f32) -> f32 {
+        let d = abs(fract(x + 0.5) - 0.5);
+        return 1.0 - smoothstep(width, width + 0.01, d);
+      }
+
+      @fragment
+      fn fragment_main(in : VOut) -> @location(0) vec4f {
+        let n = normalize(in.normal);
+        var albedo = surface.base_color.rgb;
+        if (surface.base_color.a > 0.5) {
+          let cell = vec2i(floor(in.world.xz));
+          albedo *= select(1.0, 0.85, (cell.x + cell.y) % 2 == 0);
+          albedo *= 1.0 - 0.35 * max(line(in.world.x * 0.2, 0.004), line(in.world.z * 0.2, 0.004));
+        } else {
+          albedo *= 1.0 - 0.25 * line(in.world.y * 2.0, 0.03);
+        }
+        let l = -normalize(surface.sun_direction.xyz);
+        let shadow = kansei_shadow_map(in.world, n);
+        let lit = albedo / 3.14159265 * surface.sun.rgb * max(dot(n, l), 0.0) * shadow + albedo * surface.sky.rgb * (0.6 + 0.4 * n.y);
+        return vec4f(lit, 1.0);
+      }
+    `;
+    const uniform = (data) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: data,
+    });
+    const surface = (label, color, grid) => new Material(surfaceShader, {
+      label,
+      bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: uniform(packSkinnedLitParams({ baseColor: [...color, grid ? 1 : 0], ...light })) }],
+      cullMode: grid ? 'none' : 'back',
+      mrtOutputCount: 1,
+    });
+    // The sky: a gradient from the horizon up (cd/m²), on a sphere round everything.
+    const sky = new Renderable(new SphereGeometry(900, 24), new Material(/* wgsl */`
+      @group(1) @binding(0) var<uniform> view_matrix : mat4x4f;
+      @group(1) @binding(1) var<uniform> projection_matrix : mat4x4f;
+      @group(2) @binding(1) var<uniform> world_matrix : mat4x4f;
+      struct VOut { @builtin(position) clip : vec4f, @location(0) dir : vec3f };
+      @vertex
+      fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VOut {
+        return VOut(projection_matrix * view_matrix * world_matrix * vec4f(position.xyz, 1.0), position.xyz);
+      }
+      @fragment
+      fn fragment_main(in : VOut) -> @location(0) vec4f {
+        let up = saturate(normalize(in.dir).y);
+        return vec4f(mix(vec3f(9000.0, 9500.0, 10500.0), vec3f(3000.0, 5000.0, 9000.0), sqrt(up)), 1.0);
+      }
+    `, { label: 'Sky', cullMode: 'none', mrtOutputCount: 1 }));
+    sky.castShadow = false;
+    scene.add(sky);
+
+    const world = new CollisionWorld();
+    world.addBox(Obb.fromMinMax([-200, -1, -200], [200, 0, 200]));
+    const ground = new Renderable(new PlaneGeometry(400, 400), surface('Ground', [0.32, 0.32, 0.3], true));
+    ground.rotation.x = -Math.PI / 2;
+    ground.castShadow = false;
+    scene.add(ground);
+    if (flag('course', true)) {
+      for (const [base, size, yaw, color] of COURSE) {
+        const center = [base[0], base[1] + size[1] * 0.5, base[2]];
+        world.addBox(new Obb(center, size.map((s) => s * 0.5), [0, Math.sin(yaw / 2), 0, Math.cos(yaw / 2)]));
+        const box = new Renderable(new BoxGeometry(size[0], size[1], size[2]), surface('Box', color, false));
+        box.position.set(...center);
+        box.rotation.y = yaw;
+        scene.add(box);
+      }
+    }
+
+    // ── The character, from packs outside the repository ──
+    const packUrl = param('pack') ?? 'pack/locomotion.kmm';
+    setText('hud', `Loading motion pack ${packUrl} …`);
+    const loadPack = async (url, read) => read(await fetchBytes(url));
+    let motion, motionError;
+    try {
+      motion = await loadPack(packUrl, (b) => MotionPack.fromBytes(b));
+    } catch (e) {
+      motionError = e;
+    }
+    const heroUrl = param('hero') ?? 'pack/hero.kmm';
+    let hero;
+    if (motion && heroUrl !== 'none') {
+      try {
+        hero = await loadPack(heroUrl, (b) => CharacterPack.fromBytes(b));
+      } catch (e) {
+        console.info(`no character pack: ${e.message}`);
+      }
+    }
+
+    // A pack image as a texture (a 1x1 `fallback` texel when the pack lacks it).
+    async function packTexture(pack, name, srgb, fallback) {
+      const image = pack.image(name);
+      let source;
+      if (image) {
+        source = await createImageBitmap(new Blob([image.bytes], { type: image.mime }));
+      } else {
+        source = document.createElement('canvas');
+        source.width = source.height = 1;
+        const ctx = source.getContext('2d');
+        ctx.fillStyle = `rgba(${fallback.join(',')})`;
+        ctx.fillRect(0, 0, 1, 1);
+      }
+      return Texture.fromImage(source, { label: `Hero/${name}`, srgb, mipmaps: true });
+    }
+
+    // The bodies the character can be shown as: the motion pack's own mesh (on the database's
+    // skeleton) and a character pack's (the pose retargeted onto its skeleton).
+    async function bodies(pack, heroPack) {
+      const db = pack.database;
+      const out = [];
+      const first = pack.meshes[0];
+      if (first) {
+        const palette = new BonePalette(first.mesh.skinJoints.length);
+        palette.update(first.mesh, db.skeleton.restModel());
+        const r = new Renderable(first.mesh.geometry(), skinnedLitMaterial('Character', { baseColor: first.color, ...light }, first.mesh, palette));
+        r.dynamic = true;
+        scene.add(r);
+        out.push({ name: "the pack's mesh", mesh: first.mesh, palette, renderable: r, display: undefined });
+      }
+      if (heroPack) {
+        const mesh = heroPack.meshes[0].mesh;
+        const textures = {
+          baseColor: await packTexture(heroPack, 'base_color', true, [200, 200, 200, 1]),
+          normal: await packTexture(heroPack, 'normal', false, [128, 128, 255, 1]),
+          orm: await packTexture(heroPack, 'orm', false, [255, 160, 0, 1]),
+        };
+        const palette = new BonePalette(mesh.skinJoints.length);
+        palette.update(mesh, heroPack.skeleton.restModel());
+        const r = new Renderable(mesh.geometry(), skinnedLitTexturedMaterial('Hero', { baseColor: heroPack.meshes[0].color, ...light }, mesh, palette, textures));
+        r.dynamic = true;
+        r.visible = false;
+        scene.add(r);
+        const display = { skeleton: heroPack.skeleton, retarget: new Retarget(db.skeleton, heroPack.skeleton, Retarget.UNREAL_KEEP) };
+        out.push({ name: 'hero', mesh, palette, renderable: r, display });
+        console.info(`character pack: ${heroPack.skeleton.length} joints, ${mesh.vertexCount} vertices, ${mesh.indices.length / 3} triangles`);
+      }
+      return out;
+    }
+
+    let character;
+    if (motion) {
+      const db = motion.database;
+      const list = await bodies(motion, hero);
+      if (list.length === 0) {
+        setText('hud', `The motion pack ${packUrl} can't be used: it has no mesh, and there is no character pack to show it on.`);
+      } else {
+        const tags = (motion.metaValue('tags') ?? '').split(',');
+        const bit = (name) => (tags.indexOf(name) < 0 ? 0 : 1 << tags.indexOf(name));
+        const [idle, walk, runBit] = [bit('idle'), bit('walk'), bit('run')];
+        const all = ~ACTION_TAG >>> 0;
+        const gait = flag('gait', true) && walk !== 0 && runBit !== 0;
+        const matcher = new MotionMatcher(db);
+        const controller = new CharacterController(matcher, motion.actions);
+        const joints = Math.max(...list.map((b) => b.display ? b.display.skeleton.length : db.jointCount));
+        character = {
+          db, controller, bodies: list, showing: 0,
+          walkTags: gait ? idle | walk : all, runTags: gait ? idle | runBit : all,
+          bones: new DebugBoxes(scene, joints, [3.0e4, 2.0e4, 0.4e4], true),
+          trajectory: new DebugBoxes(scene, 6, [300, 1600, 3000]),
+          ledge: new DebugBoxes(scene, 2, [3000, 400, 200], true),
+        };
+        character.bones.visible = false;
+        console.info(`motion pack: ${db.clips.length} clips, ${db.frameCount} frames, ${db.jointCount} joints, ${motion.actions.length} action clips`);
+        show(param('char') === 'mannequin' ? 0 : list.length - 1);
+        const at = param('at')?.split(',').map(Number);
+        if (at && at.length >= 2 && at.every(Number.isFinite)) {
+          const y = world.groundHeight([at[0], 0, at[1]], 50, 50) ?? 0;
+          matcher.teleport([at[0], y, at[1]], (at[2] ?? 0) * Math.PI / 180);
+        }
+      }
+    } else {
+      console.warn(`no motion pack: ${motionError?.message}`);
+      setText('hud', [
+        `No motion pack (${motionError?.message ?? 'not linked'}): the pack is not linked.`,
+        '',
+        'This page animates a character from a motion-matching pack (.kmm), and Kansei ships none:',
+        'bake one from your own glTF clips with rust/kansei-anim-bake, then link your packs folder at',
+        '  examples/pack   (ln -s /path/to/private/packs examples/pack; it holds locomotion.kmm)',
+        'or open this page with ?pack=<url>. See rust/kansei-wasm/demos/motion-matching/README.md.',
+      ].join('\n'));
+    }
+
+    /** Show body `which` (its mesh, the pose on its skeleton). */
+    function show(which) {
+      const c = character;
+      c.showing = which % c.bodies.length;
+      c.bodies.forEach((b, i) => {
+        b.renderable.visible = i === c.showing;
+        b.palette.resetMotion();
+      });
+      c.controller.matcher.setDisplay(c.db, c.bodies[c.showing].display);
+    }
+
+    /** The output skeleton's joint named as database joint `j`. */
+    const joint = (j) => character.controller.matcher.outputSkeleton(character.db).find(character.db.skeleton.names[j]) ?? 0;
+
+    // ── Timings (the Rust demo's motion_timings, bench_search and bench_pose, the same way) ──
+    const WINDOW = 3000;
+    const windows = { update: [], search: [], searches: [] };
+    const push = (w, ms) => {
+      w.push(ms);
+      if (w.length > WINDOW) w.shift();
+    };
+    const stats = (w) => {
+      if (w.length === 0) return { mean: 0, p50: 0, p95: 0, max: 0, n: 0 };
+      const sorted = [...w].sort((a, b) => a - b);
+      const at = (q) => sorted[Math.round((sorted.length - 1) * q)];
+      return { mean: sorted.reduce((a, b) => a + b, 0) / sorted.length, p50: at(0.5), p95: at(0.95), max: sorted[sorted.length - 1], n: sorted.length };
+    };
+    // the database's searches timed as they run (each frame's total, and each call)
+    let searchThisFrame = 0;
+    if (character) {
+      const db = character.db;
+      const search = db.search.bind(db);
+      db.search = (query, filter, best) => {
+        const t0 = performance.now();
+        const found = search(query, filter, best);
+        const ms = performance.now() - t0;
+        searchThisFrame += ms;
+        push(windows.searches, ms);
+        return found;
+      };
+    }
+    window.motionTimings = () => ({
+      engine: 'ts',
+      update: stats(windows.update),
+      // per frame: the searches, and the rest (pose sampling, inertialization, FK, IK, collision)
+      search: stats(windows.search),
+      pose: stats(windows.update.map((u, i) => u - windows.search[i])),
+      searchCall: stats(windows.searches),
+    });
+    /** Milliseconds per search over the pack's own frames as queries (every `step`th, nudged), the default filter. */
+    window.benchSearch = (step = 7) => {
+      const db = character.db;
+      const queries = [];
+      for (let f = 0; f < db.frameCount; f += Math.max(step, 1)) {
+        const q = new Float32Array(STRIDE);
+        q.set(db.features(f));
+        q[0] += 0.3;
+        q[20] -= 0.2;
+        queries.push(q);
+      }
+      const filter = defaultSearchFilter();
+      const search = Object.getPrototypeOf(db).search;
+      let checksum = 0;
+      for (const q of queries) checksum += search.call(db, q, filter)?.frame ?? 0;
+      const t0 = performance.now();
+      for (const q of queries) checksum += search.call(db, q, filter)?.frame ?? 0;
+      const ms = (performance.now() - t0) / queries.length;
+      console.info(`benchSearch: ${ms.toFixed(4)} ms per search over ${queries.length} queries (checksum ${checksum})`);
+      return ms;
+    };
+    /** Milliseconds to sample a pose between two frames, run its FK and fill the first body's palette, `count` times. */
+    window.benchPose = (count = 20000) => {
+      const db = character.db;
+      const body = character.bodies[0];
+      const skeleton = body.display?.skeleton ?? db.skeleton;
+      const pose = new Pose([]), retargeted = new Pose([]);
+      const model = [];
+      const frames = Math.max(db.frameCount, 2) - 1;
+      const runPoses = (n) => {
+        for (let i = 0; i < n; i++) {
+          const f = (i * 7) % frames;
+          db.pose(f, f + 1, 0.5, pose);
+          if (body.display) body.display.retarget.apply(pose, retargeted).toModel(skeleton, model);
+          else pose.toModel(skeleton, model);
+          body.palette.update(body.mesh, model);
+        }
+      };
+      runPoses(Math.min(count, 100));
+      const t0 = performance.now();
+      runPoses(count);
+      const ms = (performance.now() - t0) / count;
+      console.info(`benchPose: ${ms.toFixed(4)} ms per pose over ${count}`);
+      return ms;
+    };
+
+    // ── drive=1: the Rust demo's fixed route (rust/kansei-wasm/demos/motion-matching/src/demo.rs) ──
+    // seconds, the direction travelled (degrees about +Y, 0 is +Z; null stands), running, the facing held while strafing
+    const ROUTE = [
+      [2, null, false, null], [4, 0, false, null], [3, -90, false, null], [2, null, false, null],
+      [3, 90, false, null], [4, 90, true, null], [3, 0, true, null], [2.5, null, false, null],
+      [3, 180, true, null], [3, 0, false, null], [3, 90, false, 0], [3, -90, false, 0],
+      [2, 180, false, 0], [2, null, false, null],
+    ];
+    let drive;
+    const driveStep = (now) => {
+      const total = ROUTE.reduce((s, r) => s + r[0], 0);
+      let t = (((now - drive.start) % total) + total) % total;
+      for (const [seconds, direction, running, facing] of ROUTE) {
+        if (t < seconds) {
+          const turn = (deg) => deg * Math.PI / 180 + drive.home[1];
+          return {
+            direction: direction === null ? null : [Math.sin(turn(direction)), 0, Math.cos(turn(direction))],
+            run: running,
+            facing: facing === null ? undefined : turn(facing),
+          };
+        }
+        t -= seconds;
+      }
+      return { direction: null, run: false, facing: undefined };
+    };
+    window.driveRestart = () => {
+      if (!drive || !character) return;
+      drive.start = performance.now() / 1000;
+      character.controller.matcher.teleport(drive.home[0], drive.home[1]);
+    };
+
+    // ── Camera, input, post ──
+    const startAt = character?.controller.matcher.character;
+    const target = new Vector3(startAt?.translation[0] ?? 0, 0.9, startAt?.translation[2] ?? 0);
+    const controls = new CameraControls(camera, target, canvas.element, 4.5);
+    controls.elevation = 0.25;
+    controls.azimuth = Math.PI + (startAt ? yawOf(startAt.rotation) : 0) + paramOr('view', 0) * Math.PI / 180;
+    if (character && flag('drive', false)) drive = { start: performance.now() / 1000, home: [[...startAt.translation], yawOf(startAt.rotation)] };
+    const keys = Keys.listen();
+    const pad = new Gamepad();
+    const scaled = (paces, name) => {
+      const forward = paramOr(name, paces[0]);
+      return paces.map((p) => p * forward / paces[0]);
+    };
+    // walk and run paces (m/s): forward, sideways, backward
+    const speeds = { walk: scaled([2, 1.8, 1.5], 'walk'), run: scaled([5, 3.5, 3], 'run') };
+    // the pace for moving along `direction` (unit, local to the facing: x sideways, y forward)
+    const pace = (paces, direction) => {
+      const along = direction[1] >= 0 ? paces[0] : paces[2];
+      return 1 / Math.max(Math.sqrt((direction[1] / along) ** 2 + (direction[0] / paces[1]) ** 2), 1e-6);
+    };
+    let strafe = false, overlay = true, fps = 60, searches = 0, switches = 0, countedSince = performance.now() / 1000, rates = [0, 0];
+
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: ToneMapper.AcesFitted,
+      exposure: exposureFromEV100(paramOr('ev', 14.5)),
+    });
+    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
+
+    const zero = new Float32Array(16);
+    const fixed = (x, digits = 3) => x.toFixed(digits);
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      const dt = Math.min(Math.max(frame.dt, 1e-4), 1 / 15);
+      const now = performance.now() / 1000;
+      fps = fps * 0.95 + 0.05 / dt;
+
+      // input: keyboard, then the gamepad on top
+      let stick = [keys.axis(['a', 'arrowleft'], ['d', 'arrowright']), keys.axis(['s', 'arrowdown'], ['w', 'arrowup'])];
+      let running = keys.held('shift');
+      const toggles = keys.takePressed();
+      const length = Math.hypot(stick[0], stick[1]);
+      if (length > 1) stick = [stick[0] / length, stick[1] / length];
+      if (pad.poll()) {
+        const [x, y] = pad.leftStick();
+        if (x !== 0 || y !== 0) stick = [x, -y];
+        const [rx] = pad.rightStick();
+        controls.azimuth -= rx * 2.5 * dt;
+        running ||= pad.held(Gamepad.B) || pad.value(Gamepad.RIGHT_TRIGGER) > 0.3;
+        if (pad.pressed(Gamepad.A)) toggles.push(' ');
+        if (pad.pressed(Gamepad.LEFT_BUMPER)) toggles.push('q');
+      }
+      let traverse = false;
+      for (const key of toggles) {
+        if (key === ' ') traverse = true;
+        else if (key === 'q') strafe = !strafe;
+        else if (key === 'b') overlay = !overlay;
+        else if (character && key === 'c') show(character.showing + 1);
+        else if (character && key === 'k') character.bones.visible = !character.bones.visible;
+        else if (character && key === 'm') character.bodies[character.showing].renderable.visible = !character.bodies[character.showing].renderable.visible;
+        else if (character && key === 'l') character.controller.matcher.settings.footLock = !character.controller.matcher.settings.footLock;
+      }
+
+      // the camera's heading on the ground: the stick moves relative to it
+      const azimuth = controls.azimuth;
+      const forward = [-Math.sin(azimuth), 0, -Math.cos(azimuth)];
+      const right = [Math.cos(azimuth), 0, -Math.sin(azimuth)];
+      const step = drive ? driveStep(now) : undefined;
+      if (step) {
+        running = step.run;
+        strafe = step.facing !== undefined;
+      }
+      const c = character;
+      if (c) {
+        const { controller, db } = c;
+        const matcher = controller.matcher;
+        const paces = running ? speeds.run : speeds.walk;
+        // facing the way it moves, the character walks its loops forward; strafing, the pace follows the direction
+        const tilt = Math.hypot(stick[0], stick[1]);
+        const speed = strafe && tilt > 1e-3 ? pace(paces, [stick[0] / tilt, stick[1] / tilt]) : paces[0];
+        let velocity = [0, 1, 2].map((i) => (forward[i] * stick[1] + right[i] * stick[0]) * speed);
+        let facing = strafe ? Math.atan2(forward[0], forward[2]) : undefined;
+        if (step) {
+          // the route's direction, at the pace for it relative to the facing held
+          const d = step.direction;
+          if (d) {
+            const f = step.facing ?? Math.atan2(d[0], d[2]);
+            const front = [Math.sin(f), 0, Math.cos(f)], side = [-Math.cos(f), 0, Math.sin(f)];
+            const p = pace(paces, [d[0] * side[0] + d[2] * side[2], d[0] * front[0] + d[2] * front[2]]);
+            velocity = d.map((x) => x * p);
+          } else {
+            velocity = [0, 0, 0];
+          }
+          facing = step.facing;
+        }
+        matcher.settings.filter.tags = running ? c.runTags : c.walkTags;
+        searchThisFrame = 0;
+        const t0 = performance.now();
+        controller.update(db, world, { velocity: Float32Array.from(velocity), facing }, dt);
+        push(windows.update, performance.now() - t0);
+        push(windows.search, searchThisFrame);
+        // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump
+        if (traverse) controller.requestTraverseOrJump(db, world, 1);
+        // the obstacle last looked at: its ledge, and a post down to the floor
+        const o = controller.lastObstacle;
+        if (overlay && o) {
+          const side = [-o.normal[2], 0, o.normal[0]];
+          c.ledge.setMatrix(0, segment(o.ledge.map((x, i) => x - side[i] * 0.4), o.ledge.map((x, i) => x + side[i] * 0.4), 0.04));
+          c.ledge.setMatrix(1, segment(o.ledge, [o.ledge[0], o.ledge[1] - o.height, o.ledge[2]], 0.02));
+        } else {
+          c.ledge.setMatrix(0, zero);
+          c.ledge.setMatrix(1, zero);
+        }
+        c.ledge.upload(renderer);
+        const search = matcher.lastSearch;
+        searches += search.searched ? 1 : 0;
+        switches += search.switched ? 1 : 0;
+
+        // the body: placed at the character, its palette from the pose
+        const at = matcher.character;
+        const body = c.bodies[c.showing];
+        body.renderable.position.set(at.translation[0], at.translation[1], at.translation[2]);
+        body.renderable.rotation.y = yawOf(at.rotation);
+        body.palette.update(body.mesh, matcher.model);
+        // follow the character's hips
+        const hips = at.transformPoint(matcher.model[joint(db.roles.hips)].translation);
+        controls.follow(new Vector3(at.translation[0], hips[1] * 0.9, at.translation[2]), dt, 8);
+
+        if (overlay) {
+          // the simulation and its predicted samples: flat boxes pointing where they face
+          const s = matcher.simulation;
+          const boxes = [[s.position, s.rotation, 0.16], ...matcher.trajectory.map((t) => [t.translation, t.rotation, 0.1])];
+          boxes.forEach(([p, q, size], k) => {
+            const m = new Float32Array(16);
+            // rotation (q) times scale, then translation
+            const [x, y, z, w] = q;
+            const cols = [
+              [1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)],
+              [2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)],
+              [2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)],
+            ];
+            [size, 0.02, size * 2].forEach((sc, col) => cols[col].forEach((v, row) => m[col * 4 + row] = v * sc));
+            m.set([p[0], p[1] + 0.01, p[2], 1], 12);
+            c.trajectory.setMatrix(k, m);
+          });
+          // each foot's target, raised when not planted
+          matcher.feetLocked().forEach((locked, side) => {
+            const p = at.transformPoint(matcher.model[joint(db.roles.feet[side])].translation);
+            const size = locked ? 0.09 : 0.04;
+            c.trajectory.setMatrix(4 + side, [size, 0, 0, 0, 0, size, 0, 0, 0, 0, size, 0, p[0], at.translation[1] + 0.02, p[2], 1]);
+          });
+        } else {
+          for (let k = 0; k < 6; k++) c.trajectory.setMatrix(k, zero);
+        }
+        c.trajectory.upload(renderer);
+        if (c.bones.visible) {
+          const parents = matcher.outputSkeleton(db).parents;
+          const root = joint(db.roles.root);
+          parents.forEach((p, j) => {
+            c.bones.setMatrix(j, p === null || p === root ? zero
+              : segment(at.transformPoint(matcher.model[p].translation), at.transformPoint(matcher.model[j].translation), 0.015));
+          });
+          c.bones.upload(renderer);
+        }
+      }
+      controls.update(dt);
+
+      // HUD, a few times a second
+      if (now - countedSince > 1) {
+        const span = now - countedSince;
+        rates = [searches / span, switches / span];
+        searches = switches = 0;
+        countedSince = now;
+      }
+      if (c && frame.index % 10 === 0) {
+        if (overlay) {
+          const matcher = c.controller.matcher;
+          const [clip, playhead] = matcher.playing();
+          const info = c.db.clips[clip];
+          const s = matcher.lastSearch;
+          const feet = matcher.feetLocked();
+          const speed = Math.hypot(...matcher.simulation.velocity);
+          const state = c.controller.state;
+          const doing = state.kind === 'traversing' ? ['hurdling', 'vaulting', 'mantling', 'climbing', 'falling', 'landing', 'jumping'][state.action]
+            : state.kind === 'grounded' ? 'on the ground' : state.kind === 'falling' ? `in the air ${state.time.toFixed(1)} s` : state.kind;
+          const last = c.controller.lastResult;
+          const t = window.motionTimings();
+          setText('hud', [
+            `${fps.toFixed(0)} fps   ${running ? 'run' : 'walk'} ${speed.toFixed(1)} m/s${strafe ? '  strafe' : ''}${drive ? '  (drive=1)' : ''}`,
+            `clip   ${info.name}`,
+            `frame  ${playhead.toFixed(0)} / ${info.playable}${info.looping ? ' (loop)' : ''}`,
+            `search ${rates[0].toFixed(0)}/s, switch ${rates[1].toFixed(1)}/s, cost ${s.cost.toFixed(3)}`,
+            `update ${fixed(t.update.mean)} ms mean, ${fixed(t.update.p95)} p95, ${fixed(t.update.max)} max (TS)`,
+            `  search ${fixed(t.search.mean)} ms/frame (${fixed(t.searchCall.mean)} per search), pose and the rest ${fixed(t.pose.mean)}`,
+            `feet   ${feet[0] ? 'L planted' : 'L free'} ${feet[1] ? 'R planted' : 'R free'}  (lock ${matcher.settings.footLock ? 'on' : 'off'})`,
+            `state  ${doing}${last === undefined ? '' : `   last Space: ${isRefusal(last) ? last : actionKindName(last)}`}`,
+            c.bodies.length > 1 ? `character: ${c.bodies[c.showing].name} (C to switch)` : '',
+            '',
+            'WASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe',
+            'drag orbit · B overlay · K skeleton · M mesh · L foot lock',
+          ].join('\n'));
+        } else {
+          setText('hud', '');
+        }
+      }
+
+      shadowMap.render(renderer, scene, camera, sunLight);
+      volume.render(scene, camera);
+    });
+  </script>
+</body>
+
+</html>

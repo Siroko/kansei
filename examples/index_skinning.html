@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - skinning</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #status {
+      position: fixed; left: 12px; top: 12px; color: #ddd; font: 12px/1.4 monospace;
+      background: rgba(0, 0, 0, 0.6); padding: 6px 8px; white-space: pre;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="status">Loading…</div>
+  <script type="module">
+    // Skinning: a ring of tentacles, each a skinned mesh deformed in its material's vertex shader
+    // (SKINNING_WGSL) from a bone palette updated every frame. The rig is procedural: a .glb built
+    // below (an armature node in Z-up centimetres over a chain of joints with a helper node in it,
+    // two influences a vertex as normalized u16 weights, and a cubic-spline animation), read back
+    // by SkinnedGltf. Odd tentacles use skinnedLitMaterial, even ones skinnedLitTexturedMaterial
+    // with generated textures. The sun's shadow map draws them through their own vertex_main, so
+    // their shadows bend too. Lighting is in physical units (lux, cd/m²) through ToneMapEffect.
+    //   n=<count>     tentacles (default 7)
+    //   speed=<x>     animation speed (default 1)
+    //   ev=<EV100>    exposure (default 14.5)
+    //   check=1       run the ported Rust animation tests (CPU) and the skinning shader against
+    //                 the CPU reference (GPU); results in the status box and the console
+    import { Canvas, run, paramOr, flag, setText } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { Texture } from '../src/buffers/Texture'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { Transform, quatExp, quatLog, nlerp, quatFromScaledAngleAxis, quatToScaledAngleAxis, angularVelocity } from '../src/animation/Transform'
+    import { Skeleton } from '../src/animation/Skeleton'
+    import { Pose } from '../src/animation/Pose'
+    import { Clip } from '../src/animation/Clip'
+    import { SkinnedMesh, strongestInfluences } from '../src/animation/SkinnedMesh'
+    import { SkinnedGltf } from '../src/animation/SkinnedGltf'
+    import {
+      SKINNING_WGSL, BonePalette, skinnedLitMaterial, skinnedLitTexturedMaterial, packSkinnedLitParams,
+    } from '../src/animation/Skinning'
+
+    // ── A .glb from code ──
+    // A .glb from its JSON and binary chunk.
+    function glb(json, bin) {
+      const text = new TextEncoder().encode(json);
+      const jsonLength = Math.ceil(text.length / 4) * 4;
+      const binLength = Math.ceil(bin.length / 4) * 4;
+      const total = 12 + 8 + jsonLength + 8 + binLength;
+      const out = new Uint8Array(total);
+      const view = new DataView(out.buffer);
+      view.setUint32(0, 0x46546c67, true);
+      view.setUint32(4, 2, true);
+      view.setUint32(8, total, true);
+      view.setUint32(12, jsonLength, true);
+      view.setUint32(16, 0x4e4f534a, true);
+      out.fill(0x20, 20, 20 + jsonLength);
+      out.set(text, 20);
+      view.setUint32(20 + jsonLength, binLength, true);
+      view.setUint32(24 + jsonLength, 0x004e4942, true);
+      out.set(bin, 28 + jsonLength);
+      return out;
+    }
+
+    // Builds a binary chunk of accessors.
+    class Bin {
+      bytes = []; views = []; accessors = [];
+      // An accessor of `data` (a typed array) with its component type, glTF type, count; its index.
+      add(data, component, type, count, extra = {}) {
+        while (this.bytes.length % 4 !== 0) this.bytes.push(0);
+        const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        this.views.push({ buffer: 0, byteOffset: this.bytes.length, byteLength: bytes.length });
+        for (const b of bytes) this.bytes.push(b);
+        this.accessors.push({ bufferView: this.views.length - 1, componentType: component, type, count, ...extra });
+        return this.accessors.length - 1;
+      }
+      floats(data, type, extra = {}) {
+        const width = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 }[type];
+        return this.add(new Float32Array(data), 5126, type, data.length / width, extra);
+      }
+      json() {
+        return { buffers: [{ byteLength: Math.ceil(this.bytes.length / 4) * 4 }], bufferViews: this.views, accessors: this.accessors };
+      }
+      chunk() { return new Uint8Array(this.bytes); }
+    }
+
+    const rotationX = (a) => [Math.sin(a / 2), 0, 0, Math.cos(a / 2)];
+    const mul = (a, b) => [ // quaternion product a * b (x y z w)
+      a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+      a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+      a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+      a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ];
+    const axisAngle = (axis, a) => [axis[0] * Math.sin(a / 2), axis[1] * Math.sin(a / 2), axis[2] * Math.sin(a / 2), Math.cos(a / 2)];
+
+    // The armature's transform: Z-up to Y-up (-90 degrees about x) at a hundredth scale.
+    const ARMATURE = new Transform([0, 0, 0], rotationX(-Math.PI / 2), [0.01, 0.01, 0.01]);
+
+    // The tentacle: JOINTS joints SEGMENT cm apart up the armature's z (a helper node halfway
+    // between joints 3 and 4), a tapering tube around them, and "Sway", a looping cubic-spline
+    // animation: every joint but the root bends about its x and y, the root twists about z.
+    const JOINTS = 8, SEGMENT = 40, RINGS = 56, SIDES = 18, PERIOD = 2.4;
+    const sway = (k, t) => {
+      const w = 2 * Math.PI * t / PERIOD;
+      if (k === 0) return axisAngle([0, 0, 1], 0.5 * Math.sin(w));
+      const amount = 0.12 + 0.05 * k;
+      return mul(axisAngle([0, 1, 0], amount * 0.6 * Math.cos(w - 0.7 * k)), axisAngle([1, 0, 0], amount * Math.sin(w - 0.9 * k)));
+    };
+    function tentacleGlb() {
+      const bin = new Bin();
+      const length = (JOINTS - 1) * SEGMENT / 100 + 0.35; // world metres, to the tip
+      const radius = (y) => 0.2 * (1 - 0.85 * y / length) + 0.015;
+      const positions = [], normals = [], uvs = [], joints = [], weights = [];
+      const influence = (y) => { // the two joints around height y, blended between bone midpoints
+        const u = y / (SEGMENT / 100) - 0.5;
+        const k = Math.min(Math.max(Math.floor(u), 0), JOINTS - 1);
+        const f = Math.min(Math.max(u - k, 0), 1);
+        const next = Math.min(k + 1, JOINTS - 1);
+        joints.push(k, next, 0, 0);
+        weights.push(Math.round((1 - f) * 65535), Math.round(f * 65535), 0, 0);
+      };
+      for (let i = 0; i <= RINGS; i++) {
+        const y = length * 0.94 * i / RINGS;
+        const r = radius(y);
+        const slope = 0.2 * 0.85 / length; // the taper: normals lean up
+        for (let j = 0; j <= SIDES; j++) {
+          const a = 2 * Math.PI * j / SIDES;
+          const n = [Math.cos(a), slope, Math.sin(a)];
+          const l = Math.hypot(...n);
+          positions.push(r * Math.cos(a), y, r * Math.sin(a));
+          normals.push(n[0] / l, n[1] / l, n[2] / l);
+          uvs.push(j / SIDES, 6 * y / length);
+          influence(y);
+        }
+      }
+      const tip = positions.length / 3;
+      positions.push(0, length, 0); normals.push(0, 1, 0); uvs.push(0.5, 6); influence(length);
+      const indices = [];
+      for (let i = 0; i < RINGS; i++) {
+        for (let j = 0; j < SIDES; j++) {
+          const a = i * (SIDES + 1) + j, b = a + 1, c = a + SIDES + 1, d = c + 1;
+          indices.push(a, c, b, b, c, d);
+        }
+      }
+      for (let j = 0; j < SIDES; j++) indices.push(RINGS * (SIDES + 1) + j, tip, RINGS * (SIDES + 1) + j + 1);
+
+      const p = bin.floats(positions, 'VEC3', { min: [-1, 0, -1], max: [1, length, 1] });
+      const n = bin.floats(normals, 'VEC3');
+      const uv = bin.floats(uvs, 'VEC2');
+      const idx = bin.add(new Uint16Array(indices), 5123, 'SCALAR', indices.length);
+      const j0 = bin.add(new Uint8Array(joints), 5121, 'VEC4', joints.length / 4);
+      const w0 = bin.add(new Uint16Array(weights), 5123, 'VEC4', weights.length / 4, { normalized: true });
+      // Inverse bind matrices: the joints' world transforms at rest, inverted.
+      const ibm = [];
+      for (let k = 0; k < JOINTS; k++) {
+        const world = ARMATURE.mul(new Transform([0, 0, k * SEGMENT]));
+        ibm.push(...world.inverse().toMat4());
+      }
+      const ibmAccessor = bin.floats(ibm, 'MAT4');
+      // Sway, sampled every 0.1 s with tangents by central differences.
+      const KEYS = Math.round(PERIOD * 10) + 1;
+      const times = Array.from({ length: KEYS }, (_, i) => i / 10);
+      const input = bin.floats(times, 'SCALAR', { min: [0], max: [times[KEYS - 1]] });
+      const samplers = [], channels = [];
+      // Nodes: 0 armature, 1 mesh, 2.. joints (with the helper node after them).
+      const jointNode = (k) => 2 + k;
+      const helper = 2 + JOINTS;
+      for (let k = 0; k < JOINTS; k++) {
+        const values = [];
+        for (const t of times) {
+          const h = 1e-3;
+          const q = sway(k, t), qa = sway(k, t - h), qb = sway(k, t + h);
+          const tangent = q.map((_, i) => (qb[i] - qa[i]) / (2 * h));
+          values.push(...tangent, ...q, ...tangent); // in-tangent, value, out-tangent
+        }
+        samplers.push({ input, output: bin.floats(values, 'VEC4'), interpolation: 'CUBICSPLINE' });
+        channels.push({ sampler: k, target: { node: jointNode(k), path: 'rotation' } });
+      }
+      const nodes = [
+        { name: 'Armature', rotation: ARMATURE.rotation, scale: [0.01, 0.01, 0.01], children: [2, 1] },
+        { name: 'TentacleMesh', mesh: 0, skin: 0 },
+      ];
+      for (let k = 0; k < JOINTS; k++) {
+        const node = { name: `joint${k}`, translation: [0, 0, k === 0 ? 0 : k === 4 ? SEGMENT / 2 : SEGMENT] };
+        if (k === 3) node.children = [helper];
+        else if (k + 1 < JOINTS) node.children = [jointNode(k + 1)];
+        nodes.push(node);
+      }
+      nodes.push({ name: 'Helper', translation: [0, 0, SEGMENT / 2], children: [jointNode(4)] });
+      const json = {
+        asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [0] }], nodes,
+        meshes: [{ name: 'Tentacle', primitives: [{ attributes: { POSITION: p, NORMAL: n, TEXCOORD_0: uv, JOINTS_0: j0, WEIGHTS_0: w0 }, indices: idx }] }],
+        skins: [{ joints: Array.from({ length: JOINTS }, (_, k) => jointNode(k)), inverseBindMatrices: ibmAccessor }],
+        animations: [{ name: 'Sway', samplers, channels }],
+        ...bin.json(),
+      };
+      return glb(JSON.stringify(json), bin.chunk());
+    }
+
+    // ── Engine ──
+    const canvas = Canvas.fill().withMaxPixelRatio(1.5);
+    const renderer = await canvas.renderer();
+    const device = renderer.gpuDevice;
+    const scene = new Scene();
+    const camera = new Camera(40, 0.1, 80, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 1.4, 0), renderer.canvas, 11);
+
+    const SUN_DIRECTION = [0.45, -0.75, -0.5];
+    // The renderer renders the shadow map each frame from the sun, which casts shadows.
+    const sunLight = new DirectionalLight(SUN_DIRECTION, [1, 1, 1], 1.0);
+    sunLight.castShadow = true;
+    scene.add(sunLight);
+    renderer.enableShadows({ resolution: 2048, maxShadowDistance: 24 });
+    // Physical units: a clear-day sun (lux) and sky (cd/m²).
+    const light = { sunDirection: SUN_DIRECTION, sun: [1.0e5, 0.96e5, 0.88e5], sky: [0.55e4, 0.7e4, 1.0e4] };
+
+    const gltf = await SkinnedGltf.fromBytes(tentacleGlb(), 60);
+    const mesh = gltf.meshes[0];
+    const clip = gltf.clips[0];
+    clip.looping = true;
+    const geometry = mesh.geometry();
+
+    // Generated textures for the textured tentacles: rings of colour, a ridged normal map, and
+    // occlusion/roughness/metallic (occluded in the grooves, rougher on the rings).
+    function texture(label, srgb, texel) {
+      const size = 256;
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const ctx = c.getContext('2d');
+      const image = ctx.createImageData(size, size);
+      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+        image.data.set(texel(x / size, y / size).map((v) => Math.round(Math.min(Math.max(v, 0), 1) * 255)), 4 * (y * size + x));
+      }
+      ctx.putImageData(image, 0, 0);
+      return Texture.fromImage(c, { label, srgb, mipmaps: true }); // (sRGB images keep one level)
+    }
+    const groove = (v) => Math.sin(v * 2 * Math.PI * 4);
+    const textures = {
+      baseColor: texture('Skin/Color', true, (u, v) => {
+        const band = groove(v) > 0.3 ? 1 : 0;
+        const spot = Math.sin(u * 2 * Math.PI * 3) * Math.sin(v * 2 * Math.PI * 8) > 0.6 ? 1 : 0;
+        return band ? [0.85, 0.55, 0.2, 1] : spot ? [0.95, 0.9, 0.8, 1] : [0.55, 0.12, 0.18, 1];
+      }),
+      normal: texture('Skin/Normal', false, (u, v) => {
+        const slope = Math.cos(v * 2 * Math.PI * 4) * 0.6;
+        const l = Math.hypot(slope, 1);
+        return [0.5, 0.5 + 0.5 * slope / l, 0.5 + 0.5 / l, 1];
+      }),
+      orm: texture('Skin/ORM', false, (u, v) => [0.75 + 0.25 * (groove(v) * 0.5 + 0.5), groove(v) > 0.3 ? 0.65 : 0.35, 0, 1]),
+    };
+
+    // The ring of tentacles: each has its own palette (its own pose) and material; they share
+    // the geometry.
+    const count = Math.max(1, Math.round(paramOr('n', 7)));
+    const tentacles = [];
+    for (let i = 0; i < count; i++) {
+      const palette = new BonePalette(mesh.skinJoints.length);
+      const textured = i % 2 === 0;
+      const params = {
+        baseColor: textured ? [1, 1, 1, 1] : [0.18 + 0.1 * (i % 3), 0.45, 0.6 - 0.1 * (i % 3), 1],
+        ...light,
+      };
+      const material = textured
+        ? skinnedLitTexturedMaterial(`Tentacle${i}`, params, mesh, palette, textures)
+        : skinnedLitMaterial(`Tentacle${i}`, params, mesh, palette);
+      const renderable = new Renderable(geometry, material);
+      renderable.dynamic = true;
+      const a = 2 * Math.PI * i / count;
+      const ring = count === 1 ? 0 : 3;
+      renderable.position.set(ring * Math.cos(a), 0, ring * Math.sin(a));
+      renderable.rotation.y = -a;
+      const s = 0.8 + 0.25 * ((i * 7) % 3);
+      renderable.scale.set(s, s, s);
+      scene.add(renderable);
+      tentacles.push({ palette, renderable, phase: 0.37 * i, rate: 0.85 + 0.1 * (i % 3) });
+    }
+
+    // The ground: the same sun, sky and shadow, in the same units.
+    const groundShader = SHADOW_MAP_WGSL + /* wgsl */`
+      struct Surface { base_color : vec4f, sun_direction : vec4f, sun : vec4f, sky : vec4f }
+      @group(0) @binding(0) var<uniform> surface : Surface;
+      @group(1) @binding(0) var<uniform> view_matrix : mat4x4f;
+      @group(1) @binding(1) var<uniform> projection_matrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normal_matrix : mat4x4f;
+      @group(2) @binding(1) var<uniform> world_matrix : mat4x4f;
+
+      struct VOut { @builtin(position) clip : vec4f, @location(0) world : vec3f, @location(1) normal : vec3f };
+
+      @vertex
+      fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VOut {
+        let world = world_matrix * vec4f(position.xyz, 1.0);
+        return VOut(projection_matrix * view_matrix * world, world.xyz, (normal_matrix * vec4f(normal, 0.0)).xyz);
+      }
+
+      @fragment
+      fn fragment_main(in : VOut) -> @location(0) vec4f {
+        var n = normalize(in.normal);
+        if (n.y < 0.0) { n = -n; }
+        let cell = vec2i(floor(in.world.xz));
+        let albedo = surface.base_color.rgb * select(1.0, 0.8, (cell.x + cell.y) % 2 == 0);
+        let l = -normalize(surface.sun_direction.xyz);
+        let shadow = kansei_shadow_map(in.world, n);
+        let lit = albedo / 3.14159265 * surface.sun.rgb * max(dot(n, l), 0.0) * shadow + albedo * surface.sky.rgb;
+        return vec4f(lit, 1.0);
+      }
+    `;
+    const ground = new Renderable(new PlaneGeometry(40, 40), new Material(groundShader, {
+      label: 'Ground',
+      bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: packedUniform(packSkinnedLitParams({ baseColor: [0.45, 0.42, 0.38, 1], ...light })) }],
+      cullMode: 'none',
+      mrtOutputCount: 1,
+    }));
+    ground.rotation.x = -Math.PI / 2;
+    ground.castShadow = false;
+    scene.add(ground);
+
+    // A uniform buffer of `data`, as skinnedMaterial makes for its params.
+    function packedUniform(data) {
+      return new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_UNIFORM,
+        usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+        buffer: data,
+      });
+    }
+
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: ToneMapper.AcesFitted,
+      exposure: exposureFromEV100(paramOr('ev', 14.5)),
+    });
+    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
+
+    const status = [
+      `${count} skinned tentacles: ${gltf.skeleton.length} joints (${gltf.skeleton.names.join(' ')}),`,
+      `${mesh.vertexCount} vertices, clip "${clip.name}" ${clip.frameCount} frames at ${clip.sampleRate} Hz over ${clip.duration.toFixed(2)} s.`,
+      `Odd ones skinnedLitMaterial, even ones skinnedLitTexturedMaterial; the sun's shadow`,
+      `map draws them through their own vertex_main.`,
+    ];
+    setText('status', status.join('\n'));
+
+    if (flag('check', false)) {
+      const results = await runChecks();
+      status.push('', ...results);
+      setText('status', status.join('\n'));
+    }
+
+    // ── Frame loop ──
+    const speed = paramOr('speed', 1);
+    const pose = Pose.rest(gltf.skeleton);
+    const model = [];
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      controls.update();
+      for (const t of tentacles) {
+        clip.sample(f.time * speed * t.rate + t.phase, pose);
+        pose.toModel(gltf.skeleton, model);
+        t.palette.update(mesh, model);
+      }
+      volume.render(scene, camera);
+    });
+
+    // ── Checks (?check=1) ──
+    // The Rust animation tests (rust/kansei-core/src/animation), ported, and the skinning shader
+    // on this device against SkinnedMesh.skinCpu.
+    async function runChecks() {
+      const failures = [];
+      let passed = 0;
+      const check = (name, ok, detail = '') => {
+        if (ok) passed++;
+        else failures.push(`FAIL ${name} ${detail}`);
+      };
+      const close = (a, b, eps) => a.length === b.length && Array.from(a).every((v, i) => Math.abs(v - b[i]) <= eps);
+      const sameRotation = (a, b, eps) => Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]) > 1 - eps;
+      const matMul = (a, b) => { // column-major 4x4
+        const o = new Float32Array(16);
+        for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) for (let k = 0; k < 4; k++) o[c * 4 + r] += a[k * 4 + r] * b[c * 4 + k];
+        return o;
+      };
+      const rotY = (a) => axisAngle([0, 1, 0], a), rotZ = (a) => axisAngle([0, 0, 1], a);
+
+      // transform.rs
+      {
+        const parent = new Transform([1, 2, -3], mul(rotY(0.7), mul(rotationX(-0.3), rotZ(1.1))), [2, 2, 2]);
+        const child = new Transform([-0.5, 0.25, 4], mul(rotY(-1.2), mul(rotationX(0.4), rotZ(0.2))), [0.5, 0.5, 0.5]);
+        check('composition matches the matrices', close(parent.mul(child).toMat4(), matMul(parent.toMat4(), child.toMat4()), 1e-5));
+        const p = [0.3, -0.7, 1.9];
+        check('composition transforms points', close(parent.mul(child).transformPoint(p), parent.transformPoint(child.transformPoint(p)), 1e-5));
+        const t = new Transform([3, -1, 0.5], mul(rotZ(0.9), rotationX(-0.4)), [1.5, 1.5, 1.5]);
+        const id = t.mul(t.inverse());
+        check('the inverse undoes the transform', close(id.translation, [0, 0, 0], 1e-5) && sameRotation(id.rotation, [0, 0, 0, 1], 1e-6) && close(id.scale, [1, 1, 1], 1e-6));
+        const a = rotY(0.2), b = rotY(0.6).map((v) => -v);
+        check('nlerp takes the shorter arc', sameRotation(nlerp(a, b, 0.5), rotY(0.4), 1e-5));
+        let roundTrip = true;
+        for (const v of [[0.1, -0.2, 0.3], [1.2, 0, 0], [0, 0, 0], [0, 0, -1.5]]) roundTrip &&= close(quatLog(quatExp(v)), v, 1e-5);
+        check('exp and log round trip', roundTrip);
+        check('scaled angle axis', sameRotation(quatFromScaledAngleAxis([0, 2.5, 0]), rotY(2.5), 1e-6) && close(quatToScaledAngleAxis(quatFromScaledAngleAxis([0, 2.5, 0])), [0, 2.5, 0], 1e-5));
+        check('past half a turn the shorter arc goes the other way', close(quatToScaledAngleAxis(rotY(3.5)), [0, 3.5 - 2 * Math.PI, 0], 1e-4));
+        const from = rotationX(0.3), to = mul(rotZ(0.2), from);
+        check('angular velocity', close(angularVelocity(from, to, 0.5), [0, 0, 0.4], 1e-5));
+      }
+
+      // clip.rs
+      {
+        const chain = new Skeleton(['root', 'child'], [null, 0], [Transform.identity(), new Transform([0, 1, 0])]);
+        const poses = Array.from({ length: 11 }, (_, i) => new Pose([new Transform([0, 0, i / 10], rotY(i / 10)), chain.rest[1].clone()]));
+        const walk = Clip.fromPoses('walk', 10, poses);
+        check('clip shape', walk.frameCount === 11 && walk.jointCount === 2 && Math.abs(walk.duration - 1) < 1e-6);
+        const pose = Pose.rest(chain);
+        walk.sample(0.25, pose);
+        check('sampling blends the nearest frames', close(pose.local[0].translation, [0, 0, 0.25], 1e-6) && sameRotation(pose.local[0].rotation, rotY(0.25), 1e-6));
+        walk.sample(3, pose);
+        check('clamped past the end without looping', close(pose.local[0].translation, [0, 0, 1], 1e-6));
+        walk.looping = true;
+        const [a1, b1, t1] = walk.framesAt(1.25);
+        const [a2, , t2] = walk.framesAt(-0.05);
+        check('a looping clip wraps at its last frame', a1 === 2 && b1 === 3 && Math.abs(t1 - 0.5) < 1e-4 && a2 === 9 && Math.abs(t2 - 0.5) < 1e-4);
+        walk.looping = false;
+        const target = new Skeleton(['extra', 'root', 'child'], [null, null, 1], [new Transform([1, 0, 0]), Transform.identity(), Transform.identity()]);
+        const moved = walk.retargetByName(chain, target);
+        check('retargeting matches joints by name', moved.jointCount === 3 && moved.transform(4, 0).equals(target.rest[0])
+          && moved.transform(4, 1).equals(walk.transform(4, 0)) && moved.transform(4, 2).equals(walk.transform(4, 1))
+          && close(walk.track(0)[10].translation, [0, 0, 1], 1e-6));
+      }
+
+      // skin.rs: a bone 1 m long up +y with a child at its tip, and a vertex halfway weighted to both.
+      {
+        const skeleton = new Skeleton(['hip', 'knee'], [null, 0], [Transform.identity(), new Transform([0, 1, 0])]);
+        const bind = skeleton.restModel();
+        const vertex = (p) => [p[0], p[1], p[2], 1, 1, 0, 0, 0, 0];
+        const legMesh = new SkinnedMesh('leg', new Float32Array([...vertex([0.1, 0.5, 0]), ...vertex([0.1, 1.5, 0]), ...vertex([0.1, 1, 0])]),
+          new Uint32Array([0, 1, 2]), new Uint16Array([0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0]),
+          new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 0.5, 0.5, 0, 0]), [0, 1], bind.map((t) => t.inverse().toMat4()));
+        const rest = legMesh.skinCpu(legMesh.palette(skeleton.restModel()));
+        check('the rest pose leaves the mesh as bound', rest.every((v, i) => close(v.position, legMesh.vertices.subarray(9 * i, 9 * i + 3), 1e-6) && close(v.normal, [1, 0, 0], 1e-6)));
+        const pose = Pose.rest(skeleton);
+        pose.local[1].rotation = rotZ(Math.PI / 2);
+        const skinned = legMesh.skinCpu(legMesh.palette(pose.model(skeleton)));
+        check('a bent knee moves its vertices and blends the shared one', close(skinned[0].position, [0.1, 0.5, 0], 1e-6)
+          && close(skinned[1].position, [-0.5, 1.1, 0], 1e-5) && close(skinned[1].normal, [0, 1, 0], 1e-5) && close(skinned[2].position, [0.05, 1.05, 0], 1e-5));
+        let s = strongestInfluences([[3, 0.1], [7, 0.4], [1, 0.05], [9, 0.2], [2, 0.25]]);
+        const four = close(s.joints, [7, 2, 9, 3], 0.5) && Math.abs(s.weights.reduce((x, y) => x + y) - 1) < 1e-6 && Math.abs(s.weights[0] - 0.4 / 0.95) < 1e-6;
+        s = strongestInfluences([[5, 0.25], [2, 0.5], [5, 0.25]]);
+        const merged = close(s.joints.slice(0, 2), [5, 2], 0.5) && close(s.weights, [0.5, 0.5, 0, 0], 1e-9);
+        s = strongestInfluences([]);
+        check('influences keep the four strongest and sum to one', four && merged && close(s.joints, [0, 0, 0, 0], 0.5) && close(s.weights, [1, 0, 0, 0], 0));
+        const words = legMesh.skinWords();
+        const lo = words[10] & 0xffff, hi = words[10] >>> 16;
+        check('packed weights sum to exactly one', words[8] === 1 << 16 && lo + hi === 65535 && Math.abs(lo - hi) <= 1);
+      }
+
+      // tests.rs: the leg .glb (an armature in Z-up centimetres, a helper node between the joints,
+      // two influence sets, LINEAR and STEP keys).
+      {
+        const bin = new Bin();
+        // Unlike the tentacle's ARMATURE, this armature sits 0.5 m up z.
+        const armature = new Transform([0, 0, 0.5], rotationX(-Math.PI / 2), [0.01, 0.01, 0.01]);
+        const hipWorld = armature.mul(new Transform([0, 0, 100]));
+        const kneeWorld = hipWorld.mul(new Transform([0, 0, 100]));
+        const positions = [...hipWorld.translation, ...kneeWorld.translation, kneeWorld.translation[0], kneeWorld.translation[1] + 0.5, kneeWorld.translation[2]];
+        const p = bin.floats(positions, 'VEC3', { min: [-1, -1, -1], max: [3, 3, 3] });
+        const n = bin.floats([1, 0, 0, 1, 0, 0, 1, 0, 0], 'VEC3');
+        const idx = bin.add(new Uint16Array([0, 1, 2]), 5123, 'SCALAR', 3);
+        const j0 = bin.add(new Uint8Array([0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0]), 5121, 'VEC4', 3);
+        const w0 = bin.floats([1, 0, 0, 0, 0.3, 0.3, 0, 0, 1, 0, 0, 0], 'VEC4');
+        const j1 = bin.add(new Uint8Array([0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]), 5121, 'VEC4', 3);
+        const w1 = bin.floats([0, 0, 0, 0, 0.4, 0, 0, 0, 0, 0, 0, 0], 'VEC4');
+        const ibm = bin.floats([...hipWorld.inverse().toMat4(), ...kneeWorld.inverse().toMat4()], 'MAT4');
+        const times = bin.floats([0, 1], 'SCALAR', { min: [0], max: [1] });
+        const kneeRot = bin.floats([0, 0, 0, 1, ...rotationX(Math.PI / 2)], 'VEC4');
+        const hipT = bin.floats([0, 0, 100, 0, 0, 110], 'VEC3');
+        const json = {
+          asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [0] }],
+          nodes: [
+            { name: 'Armature', translation: [0, 0, 0.5], rotation: rotationX(-Math.PI / 2), scale: [0.01, 0.01, 0.01], children: [1, 3] },
+            { name: 'hip', translation: [0, 0, 100], children: [4] },
+            { name: 'knee', translation: [0, 0, 60] },
+            { name: 'LegMesh', mesh: 0, skin: 0 },
+            { name: 'KneeOffset', translation: [0, 0, 40], children: [2] },
+          ],
+          meshes: [{ name: 'Leg', primitives: [{ attributes: { POSITION: p, NORMAL: n, JOINTS_0: j0, WEIGHTS_0: w0, JOINTS_1: j1, WEIGHTS_1: w1 }, indices: idx }] }],
+          skins: [{ joints: [1, 2], inverseBindMatrices: ibm }],
+          animations: [{
+            name: 'Kick',
+            samplers: [{ input: times, output: kneeRot, interpolation: 'LINEAR' }, { input: times, output: hipT, interpolation: 'STEP' }],
+            channels: [{ sampler: 0, target: { node: 2, path: 'rotation' } }, { sampler: 1, target: { node: 1, path: 'translation' } }],
+          }],
+          ...bin.json(),
+        };
+        const leg = await SkinnedGltf.fromBytes(glb(JSON.stringify(json), bin.chunk()), 10);
+        const skeleton = leg.skeleton;
+        check('glTF skeleton', skeleton.names.join() === 'hip,knee' && skeleton.parents[0] === null && skeleton.parents[1] === 0);
+        const rest = skeleton.restModel();
+        const hipAt = armature.transformPoint([0, 0, 100]);
+        check('the armature is folded into the hip', close(rest[0].translation, hipAt, 1e-5) && close(rest[1].translation, [0, 2, 0.5], 1e-5), `${rest[0].translation} ${rest[1].translation}`);
+        const legMesh = leg.meshes[0];
+        check('glTF mesh and skin', legMesh.vertexCount === 3 && close(legMesh.indices, [0, 1, 2], 0) && close(legMesh.skinJoints, [0, 1], 0));
+        check('two influence sets, renormalized', legMesh.joints[4] === 1 && legMesh.joints[5] === 0 && Math.abs(legMesh.weights[4] - 0.7) < 1e-6 && Math.abs(legMesh.weights[5] - 0.3) < 1e-6);
+        const restPalette = legMesh.palette(rest);
+        check('at rest the palette is the identity', Array.from({ length: 2 }, (_, i) => restPalette.subarray(16 * i, 16 * i + 16)).every((m) => close(m, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], 1e-5)));
+        const kick = leg.clips[0];
+        check('glTF clip', kick.name === 'Kick' && kick.frameCount === 11 && kick.jointCount === 2);
+        const pose = Pose.rest(skeleton);
+        kick.sample(0.5, pose);
+        check('linear keys slerp: 45 degrees halfway', sameRotation(pose.local[1].rotation, rotationX(Math.PI / 4), 1e-5));
+        check('step keys hold until the next key', close(pose.local[0].translation, hipAt, 1e-5));
+        kick.framePose(10, pose);
+        check('the step key lands', close(pose.local[0].translation, armature.transformPoint([0, 0, 110]), 1e-5));
+        const model = pose.model(skeleton);
+        const skinned = legMesh.skinCpu(legMesh.palette(model));
+        check('the knee swings the vertex above it', close(model[1].translation, [0, 2.1, 0.5], 1e-5) && close(skinned[2].position, [0, 2.1, 1.0], 1e-5), `${model[1].translation} ${skinned[2].position}`);
+      }
+
+      // The tentacle's cubic-spline clip against the function it was keyed from.
+      {
+        const pose = Pose.rest(gltf.skeleton);
+        clip.sample(0.53, pose);
+        const local = Transform.fromTranslationRotation(pose.local[5].translation, pose.local[5].rotation);
+        const expected = new Transform([0, 0, SEGMENT], sway(5, 0.53));
+        check('cubic-spline keys follow their curve', sameRotation(local.rotation, expected.rotation, 1e-4) && close(local.translation, expected.translation, 1e-4));
+      }
+
+      // gpu_tests.rs: kansei_skin over every vertex of the tentacle, against skinCpu, for this
+      // frame's palette and last frame's.
+      {
+        const palette = new BonePalette(mesh.skinJoints.length);
+        const pose = Pose.rest(gltf.skeleton);
+        clip.sample(0.4, pose);
+        palette.update(mesh, pose.model(gltf.skeleton));
+        clip.sample(1.3, pose);
+        palette.update(mesh, pose.model(gltf.skeleton));
+        const code = SKINNING_WGSL + /* wgsl */`
+          struct In { position: vec4f, normal: vec4f };
+          @group(0) @binding(3) var<storage, read> vertices: array<In>;
+          @group(0) @binding(4) var<storage, read_write> skinned: array<vec4f>;
+          @compute @workgroup_size(64)
+          fn main(@builtin(global_invocation_id) id: vec3u) {
+            let i = id.x;
+            if (i >= arrayLength(&vertices)) { return; }
+            let s = kansei_skin(i, vertices[i].position.xyz, vertices[i].normal.xyz);
+            skinned[3u * i] = vec4f(s.position, 1.0);
+            skinned[3u * i + 1u] = vec4f(s.normal, 0.0);
+            skinned[3u * i + 2u] = vec4f(s.prev_position, 1.0);
+          }
+        `;
+        const n = mesh.vertexCount;
+        const input = new Float32Array(n * 8);
+        for (let v = 0; v < n; v++) {
+          input.set(mesh.vertices.subarray(9 * v, 9 * v + 4), 8 * v);
+          input.set(mesh.vertices.subarray(9 * v + 4, 9 * v + 7), 8 * v + 4);
+        }
+        const buffer = (data, usage) => {
+          const b = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true });
+          new data.constructor(b.getMappedRange()).set(data);
+          b.unmap();
+          return b;
+        };
+        const S = GPUBufferUsage.STORAGE;
+        const out = device.createBuffer({ size: n * 48, usage: S | GPUBufferUsage.COPY_SRC });
+        const read = device.createBuffer({ size: n * 48, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code }), entryPoint: 'main' } });
+        const group = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 1, resource: { buffer: buffer(palette.matrices, S) } },
+            { binding: 2, resource: { buffer: buffer(mesh.skinWords(), S) } },
+            { binding: 3, resource: { buffer: buffer(input, S) } },
+            { binding: 4, resource: { buffer: out } },
+          ],
+        });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, group);
+        pass.dispatchWorkgroups(Math.ceil(n / 64));
+        pass.end();
+        encoder.copyBufferToBuffer(out, 0, read, 0, n * 48);
+        device.queue.submit([encoder.finish()]);
+        await read.mapAsync(GPUMapMode.READ);
+        const gpu = new Float32Array(read.getMappedRange().slice(0));
+        read.unmap();
+        const now = mesh.skinCpu(palette.current());
+        const before = mesh.skinCpu(palette.previous());
+        let worst = 0;
+        for (let v = 0; v < n; v++) {
+          for (let i = 0; i < 3; i++) {
+            worst = Math.max(worst,
+              Math.abs(gpu[12 * v + i] - now[v].position[i]),
+              Math.abs(gpu[12 * v + 4 + i] - now[v].normal[i]),
+              Math.abs(gpu[12 * v + 8 + i] - before[v].position[i]));
+          }
+        }
+        check('the skinning shader matches skinCpu', worst < 1e-4, `(max error ${worst})`);
+        failures.push(`GPU skinning: ${n} vertices, max error ${worst.toExponential(2)}`);
+      }
+
+      const lines = [`checks: ${passed} passed, ${failures.filter((f) => f.startsWith('FAIL')).length} failed`, ...failures];
+      console.log(lines.join('\n'));
+      return lines;
+    }
+  </script>
+</body>
+
+</html>

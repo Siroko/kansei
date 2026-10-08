@@ -1,4 +1,134 @@
+/**
+ * The solver a `FluidSimulation` steps with: Smoothed Particle Hydrodynamics (pressure and near
+ * pressure from the density, viscosity), or Position Based Fluids (a density constraint
+ * projected on the positions; `FluidSimulationOptions.pbf` configures it).
+ */
+export type FluidSolver = 'sph' | 'pbf';
+
+/** The `solver` word in `SimParams`, as the Rust engine packs it (0 = SPH, 1 = PBF). */
+export const SOLVER_WORD: Record<FluidSolver, number> = { sph: 0, pbf: 1 };
+
+/**
+ * Position Based Fluids settings (Macklin & Müller 2013): the particles' positions are
+ * predicted, then projected `iterations` times onto a per-particle density constraint
+ * (`C_i = rho_i / rho_0 - 1`), with the tensile correction `s_corr` against clustering at the
+ * free surface; the velocity is the move over the step, then XSPH viscosity and vorticity
+ * confinement act on it. 3D only. Rust: `simulations::fluid::PbfOptions`.
+ */
+export interface PbfOptions {
+    /** Constraint projections per substep. */
+    iterations: number;
+    /**
+     * Rest density: what the poly6 kernel (unit mass) sums to at a particle at rest. For a
+     * lattice fill that is `latticeDensity(spacing, h)`, which tends to `1 / spacing³` only once
+     * the spacing is well under the smoothing radius.
+     */
+    restDensity: number;
+    /** The constraint's relaxation (CFM): larger is softer and steadier. */
+    relaxation: number;
+    /** Tensile correction `s_corr = -k (W(r) / W(dq))^n`, `dq` as a fraction of the smoothing radius. */
+    scorrK: number;
+    scorrN: number;
+    scorrDq: number;
+    /** XSPH viscosity: how much of the neighbours' mean relative velocity each particle takes. */
+    xsph: number;
+    /** Vorticity confinement strength. */
+    vorticity: number;
+    /** A cap on the particles' speed (simulation units per second; 0: none). */
+    maxSpeed: number;
+}
+
+export const DEFAULT_PBF_OPTIONS: PbfOptions = {
+    iterations: 3,
+    restDensity: 6.4,
+    relaxation: 5.0,
+    scorrK: 0.05,
+    scorrN: 4.0,
+    scorrDq: 0.2,
+    xsph: 0.1,
+    vorticity: 0.0,
+    maxSpeed: 0.0,
+};
+
+/**
+ * `PbfParams` (8 floats; Rust `GpuPbf::new`) for `o` at smoothing radius `h`, into `out`:
+ * `s_corr`'s `W(dq)` is poly6 at `dq·h`, normalised as the shaders' `W`.
+ */
+export function packPbfParams(o: PbfOptions, h: number, out: Float32Array): void {
+    const r = Math.min(Math.max(o.scorrDq, 0), 1) * h;
+    const q = h * h - r * r;
+    const wDq = 315.0 / (64.0 * Math.PI * Math.pow(h, 9)) * q * q * q;
+    out[0] = Math.max(o.restDensity, 1e-3);
+    out[1] = Math.max(o.relaxation, 1e-6);
+    out[2] = o.scorrK;
+    out[3] = o.scorrN;
+    out[4] = Math.max(wDq, 1e-12);
+    out[5] = o.xsph;
+    out[6] = o.vorticity;
+    out[7] = o.maxSpeed;
+}
+
+/**
+ * `count` particles (4 floats each, w = 1) on a cubic lattice through the box `lo`..`hi`, its
+ * spacing chosen so they fill it, each coordinate moved by up to `jitter` / 2 of a spacing (the
+ * same pseudo-random offsets every call) so the lattice does not stay a crystal. When the
+ * rounding leaves the lattice short of `count`, further layers fill in half a cell higher.
+ *
+ * The rows nearest +z come first: a renderer that draws particles in their order, seen from +z,
+ * then draws them roughly front to back, and the depth test spares the shading of those behind.
+ * Rust: `simulations::fluid::fill_box`.
+ */
+export function fillBox(count: number, lo: [number, number, number], hi: [number, number, number], jitter: number): Float32Array {
+    const size = [0, 1, 2].map((i) => hi[i] - lo[i]);
+    const spacing = Math.cbrt(size[0] * size[1] * size[2] / Math.max(count, 1));
+    const cells = size.map((s) => Math.max(Math.floor(s / spacing), 1));
+    let rng = 12345;
+    const offset = () => {
+        rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0;
+        return ((rng >>> 8) / 16777216 - 0.5) * spacing * jitter;
+    };
+    const positions = new Float32Array(count * 4);
+    let k = 0;
+    for (let layer = 0; k < count; layer++) {
+        const lift = layer * spacing * 0.5;
+        for (let z = cells[2] - 1; z >= 0 && k < count; z--) {
+            for (let y = 0; y < cells[1] && k < count; y++) {
+                for (let x = 0; x < cells[0] && k < count; x++, k++) {
+                    // x, y, z in this order: the offsets are drawn as Rust draws them
+                    positions[k * 4] = lo[0] + (x + 0.5) * spacing + offset();
+                    positions[k * 4 + 1] = lo[1] + (y + 0.5) * spacing + lift + offset();
+                    positions[k * 4 + 2] = lo[2] + (z + 0.5) * spacing + offset();
+                    positions[k * 4 + 3] = 1;
+                }
+            }
+        }
+    }
+    return positions;
+}
+
+/**
+ * The density poly6 (smoothing radius `h`, unit mass) sums to at a particle of a cubic lattice
+ * `spacing` apart, itself included: Position Based Fluids' rest density
+ * (`PbfOptions.restDensity`) for a fluid filled on that lattice, so it keeps its volume. About
+ * `1 / spacing³` once `spacing` is well under `h`. Rust: `simulations::fluid::lattice_density`.
+ */
+export function latticeDensity(spacing: number, h: number): number {
+    const n = Math.ceil(h / spacing);
+    const poly6 = 315.0 / (64.0 * Math.PI * Math.pow(h, 9));
+    let rho = 0;
+    for (let i = -n; i <= n; i++) {
+        for (let j = -n; j <= n; j++) {
+            for (let k = -n; k <= n; k++) {
+                const d2 = (i * i + j * j + k * k) * spacing * spacing;
+                if (d2 < h * h) rho += poly6 * Math.pow(h * h - d2, 3);
+            }
+        }
+    }
+    return rho;
+}
+
 export interface FluidSimulationOptions {
+    /** How many particles the buffers hold: the most there can be (see `FluidSimulation.emit`). */
     maxParticles: number;
     dimensions: 2 | 3;
     smoothingRadius: number;
@@ -17,6 +147,15 @@ export interface FluidSimulationOptions {
     mouseForce: number;
     substeps: number;
     worldBoundsPadding: number;
+    /**
+     * How much of the pressure below the rest density acts (a pull between particles): 1 as
+     * computed, less to weaken it. The pull is what strings a sparse free surface into
+     * filaments (SPH's tensile instability); the near pressure still keeps particles apart.
+     */
+    negativePressureScale: number;
+    /** The solver; `pbf` configures Position Based Fluids. */
+    solver: FluidSolver;
+    pbf: PbfOptions;
 }
 
 export const DEFAULT_OPTIONS: FluidSimulationOptions = {
@@ -36,7 +175,29 @@ export const DEFAULT_OPTIONS: FluidSimulationOptions = {
     mouseForce: 1630.0,
     substeps: 3,
     worldBoundsPadding: 0.2,
+    negativePressureScale: 1.0,
+    solver: 'sph',
+    pbf: DEFAULT_PBF_OPTIONS,
 };
+
+/**
+ * `options`, tuned for `baseCount` particles, for `count` particles filling the same volume:
+ * the smoothing radius scales by (count / baseCount)^-1/3 so a neighbourhood holds as many
+ * particles, the near pressure with the radius, and the density target by the count ratio over
+ * the radius. Pressure and time step are left: how stiff a fluid stays stable at a size is for
+ * the caller to tune.
+ */
+export function scaledToCount(options: FluidSimulationOptions, baseCount: number, count: number): FluidSimulationOptions {
+    const ratio = Math.max(count, 1) / Math.max(baseCount, 1);
+    const radius = Math.pow(ratio, -1 / 3);
+    return {
+        ...options,
+        maxParticles: count,
+        smoothingRadius: options.smoothingRadius * radius,
+        nearPressureMultiplier: options.nearPressureMultiplier * radius,
+        densityTarget: options.densityTarget * ratio / radius,
+    };
+}
 
 export interface FluidSimulationPreset extends Partial<FluidSimulationOptions> {
     name: string;
@@ -85,7 +246,7 @@ export const PRESETS: Record<string, FluidSimulationPreset> = {
     },
 };
 
-// SimParams uniform buffer layout (160 bytes = 40 f32s)
+// SimParams uniform buffer layout (192 bytes = 48 f32s; sim-params.wgsl, Rust `ParamOffsets`)
 // Fields marked [u32] must be written via Uint32Array view
 export const PARAMS = {
     dt:                       0,  // f32
@@ -134,13 +295,15 @@ export const PARAMS = {
     spikyPow3Factor:         36,  // f32
     spikyPow2DerivFactor:    37,  // f32
     spikyPow3DerivFactor:    38,  // f32
-    _pad:                    39,  // f32 padding (struct size must be 16-byte multiple)
+    negativePressureScale:   39,  // f32
     // --- 16-byte aligned boundary (offset 160) ---
     gravityCenterX:          40,  // vec3<f32> gravityCenter
     gravityCenterY:          41,
     gravityCenterZ:          42,
     radialGravity:           43,  // f32 (0 or 1)
-    BUFFER_SIZE:             44,  // total f32 count
+    // --- 16-byte aligned boundary (offset 176) ---
+    solver:                  44,  // [u32] 0 = SPH, 1 = PBF (then 3 words of padding)
+    BUFFER_SIZE:             48,  // total f32 count
 } as const;
 
 export function computeKernelFactors2D(h: number) {

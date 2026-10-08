@@ -25,6 +25,8 @@ dist-ssr
 
 # Motion-matching packs are derived from third-party animation: keep them out of the repo
 *.kmm
+# the TS motion-matching page's linked packs folder
+examples/pack
 
 # Rust build output (cargo target dirs and wasm-pack pkg dirs; the site does not use them)
 target/

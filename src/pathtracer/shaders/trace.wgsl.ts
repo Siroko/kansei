@@ -58,7 +58,8 @@ struct TraceParams {
     fogDensity       : f32,       // 0 = no fog, >0 = participating media
     fogAnisotropy    : f32,       // Henyey-Greenstein g (-1..1)
     fogHeightFalloff : f32,       // exponential height decay
-    _pad3            : f32,
+    reference        : u32,       // 1 = camera rays through the BVH, no GBuffer (reference mode)
+    accumFrame       : u32,       // reference mode: frames averaged into prevFrame since the last reset
 }
 
 const LIGHT_DIRECTIONAL = 1u;
@@ -87,6 +88,7 @@ struct LightData {
 @group(0) @binding(12) var          emissiveTex : texture_2d<f32>;
 @group(0) @binding(13) var          restirDirectTex : texture_2d<f32>;
 @group(0) @binding(14) var<storage, read> probeSH : array<vec4f>;
+@group(0) @binding(15) var          prevFrame : texture_2d<f32>;   // reference mode: the running average
 
 // ── Voxel-space indirect helpers ─────────────────────────────────────────
 // Mip-interpolated color sample from the voxel color pyramid.
@@ -404,7 +406,9 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, wo: vec3f,
             total += evaluatePointLight(hitPos, hitNorm, light);
         }
     }
-    return total;
+    // the lights' irradiance through a Lambertian BRDF (albedo / pi; callers apply the albedo),
+    // as the raster lights surfaces
+    return total / PI;
 }
 
 // ── Volumetric fog (voxel-space ray-marched) ─────────────────────────────
@@ -488,7 +492,7 @@ fn computeVoxelFog(rayOrigin: vec3f, rayDir: vec3f, hitDist: f32) -> vec4f {
 }
 
 // ── Multi-bounce path tracer with NEE ─────────────────────────────────
-// Returns irradiance at startPos. At each vertex: NEE for direct light,
+// Returns the light reflected at startPos per unit albedo. At each vertex: NEE for direct light,
 // then stochastic PBR bounce (specular or diffuse based on metallic/Fresnel).
 
 fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32,
@@ -717,6 +721,109 @@ fn traceRefraction(
     return throughput * traceParams.ambientColor;
 }
 
+// ── Reference mode: camera rays through the BVH (the Rust engine's trace_main, pathtracer/shaders/trace.wgsl) ──
+// The primary hit comes from the BVH instead of the GBuffer; returns one frame's HDR radiance.
+fn traceReference(coord: vec2u, uv: vec2f) -> vec3f {
+    let ndcNear = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0, 1.0);
+    let ndcFar  = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 1.0, 1.0);
+    let nearWp = traceParams.invViewProj * ndcNear;
+    let farWp  = traceParams.invViewProj * ndcFar;
+    let nearPos = nearWp.xyz / nearWp.w;
+    let farPos  = farWp.xyz / farWp.w;
+
+    let spp = traceParams.spp;
+    var accumulated = vec3f(0.0);
+
+    for (var s = 0u; s < spp; s++) {
+        initSampler(coord, traceParams.frameIndex, s);
+
+        var primaryRay: Ray;
+        primaryRay.origin = traceParams.cameraPos;
+        primaryRay.dir = normalize(farPos - nearPos);
+
+        let primaryHit = traceBVH(primaryRay);
+        if (!primaryHit.hit) {
+            accumulated += traceParams.ambientColor;
+            continue;
+        }
+
+        let mat = materials[primaryHit.matIndex];
+
+        // Emitters are seen directly
+        if (mat.emissiveIntensity > 0.0) {
+            accumulated += mat.emissive * mat.emissiveIntensity;
+            continue;
+        }
+
+        // Transmissive surfaces through the refraction tracer
+        if (mat.transmission > 0.5) {
+            accumulated += traceRefraction(primaryRay, primaryHit, mat);
+            continue;
+        }
+
+        let viewDir = -primaryRay.dir;
+        let hitNorm = primaryHit.worldNorm;
+        let hitPos = primaryHit.worldPos;
+        let NdotV = max(dot(hitNorm, viewDir), 0.001);
+        let F0 = mix(vec3f(0.04), mat.albedo, mat.metallic);
+        let F = fresnelSchlick(NdotV, F0);
+        let specAvg = (F.r + F.g + F.b) / 3.0;
+
+        // Energy partition: specular vs diffuse
+        let specW = specAvg;
+        let diffW = (1.0 - specAvg) * (1.0 - mat.metallic);
+        let totalW = specW + diffW;
+        let specProb = clamp(specW / max(totalW, 0.001), 0.05, 0.95);
+
+        let r = nextRandom();
+        if (r < specProb) {
+            // ── Specular reflection (GGX) ──
+            let halfVec = sampleGGX(hitNorm, max(mat.roughness, 0.02), nextRandom(), nextRandom());
+            let specDir = reflect(-viewDir, halfVec);
+
+            if (dot(specDir, hitNorm) > 0.0) {
+                var specRay: Ray;
+                specRay.origin = hitPos + hitNorm * 0.001;
+                specRay.dir = specDir;
+                var specHit = traceBVH(specRay);
+
+                // Follow metallic bounces
+                for (var sk = 0u; sk < 4u; sk++) {
+                    if (!specHit.hit) { break; }
+                    let skMat = materials[specHit.matIndex];
+                    if (skMat.metallic > 0.5 && skMat.transmission < 0.5) {
+                        let h2 = sampleGGX(specHit.worldNorm, max(skMat.roughness, 0.02), nextRandom(), nextRandom());
+                        specRay.dir = reflect(specRay.dir, h2);
+                        if (dot(specRay.dir, specHit.worldNorm) <= 0.0) { break; }
+                        specRay.origin = specHit.worldPos + specHit.worldNorm * 0.001;
+                        specHit = traceBVH(specRay);
+                    } else { break; }
+                }
+
+                if (specHit.hit) {
+                    let specMat = materials[specHit.matIndex];
+                    if (specMat.transmission > 0.5) {
+                        accumulated += traceRefraction(specRay, specHit, specMat) * F / specProb;
+                    } else {
+                        accumulated += tracePath(specHit.worldPos, specHit.worldNorm, 0u,
+                            -specRay.dir, specMat.roughness, specMat.metallic, specMat.albedo) * specMat.albedo * F / specProb;
+                    }
+                } else {
+                    accumulated += traceParams.ambientColor * F / specProb;
+                }
+            }
+        } else {
+            // ── Diffuse: multi-bounce path tracing with NEE ──
+            let diffProb = 1.0 - specProb;
+            let kd = (vec3f(1.0) - F) * (1.0 - mat.metallic);
+            accumulated += tracePath(hitPos, hitNorm, 0u,
+                viewDir, mat.roughness, mat.metallic, mat.albedo) * mat.albedo * kd / max(diffProb, 0.01);
+        }
+    }
+
+    return accumulated / f32(spp);
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= traceParams.width || gid.y >= traceParams.height) { return; }
@@ -725,6 +832,19 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     // Map trace-res coord to full-res GBuffer coord via UV
     let uv = (vec2f(coord) + 0.5) / vec2f(f32(traceParams.width), f32(traceParams.height));
+
+    // ── Reference mode: progressive accumulation, a running average since the last reset ──
+    if (traceParams.reference != 0u) {
+        let current = traceReference(coord, uv);
+        if (traceParams.accumFrame > 0u) {
+            let prev = textureLoad(prevFrame, vec2i(coord), 0).rgb;
+            let weight = 1.0 / f32(traceParams.accumFrame + 1u);
+            textureStore(giOutput, coord, vec4f(mix(prev, current, weight), 1.0));
+        } else {
+            textureStore(giOutput, coord, vec4f(current, 1.0));
+        }
+        return;
+    }
 
     // ── Direct voxel visualization mode ─────────────────────────────────
     if (traceParams.showVoxels != 0u) {
@@ -954,7 +1074,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 accumulated += (direct + indirect) * albedo * kd / max(diffProb, 0.01);
             } else if (traceParams.useReSTIR != 0u) {
                 // ReSTIR provides primary-surface direct light; skip first NEE in tracePath
-                let restirDirect = textureLoad(restirDirectTex, vec2i(coord), 0).rgb;
+                // ReSTIR resolves irradiance; / PI as evaluateLighting does
+                let restirDirect = textureLoad(restirDirectTex, vec2i(coord), 0).rgb / PI;
                 let indirect = tracePath(worldPos, worldNormal, 1u,
                     viewDir, roughness, metallic, albedo);
                 accumulated += (restirDirect + indirect) * albedo * kd / max(diffProb, 0.01);

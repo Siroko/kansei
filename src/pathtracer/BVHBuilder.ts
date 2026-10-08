@@ -10,6 +10,7 @@ import { refitLeavesShader, refitInternalShader } from "./shaders/refit.wgsl";
 import { instanceExpandShader } from "./shaders/instance-expand.wgsl";
 import { tlasSortShader, tlasGatherShader } from "./shaders/tlas-sort.wgsl";
 import { tlasBuildShader } from "./shaders/tlas-build.wgsl";
+import { gpuPass } from '../profiling/Profiler';
 
 export interface BLASEntry {
     geometryId: string;
@@ -613,7 +614,7 @@ export class BVHBuilder {
             });
 
             const wg = Math.ceil(group.count / 256);
-            const pass = commandEncoder.beginComputePass({ label: `TLAS/Expand/${g}` });
+            const pass = commandEncoder.beginComputePass({ label: `TLAS/Expand/${g}`, timestampWrites: gpuPass('TLAS/Expand') });
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, bg);
             pass.dispatchWorkgroups(wg);
@@ -794,7 +795,7 @@ export class BVHBuilder {
                 { binding: 3, resource: { buffer: this._tlasSortParamsBuf! } },
             ],
         });
-        const keysPass = commandEncoder.beginComputePass({ label: 'TLAS/Sort/Keys' });
+        const keysPass = commandEncoder.beginComputePass({ label: 'TLAS/Sort/Keys', timestampWrites: gpuPass('TLASBuilder/MortonCodes') });
         keysPass.setPipeline(this._tlasSortKeysPipeline!);
         keysPass.setBindGroup(0, keysBG);
         keysPass.dispatchWorkgroups(wgCount);
@@ -828,19 +829,19 @@ export class BVHBuilder {
                 ],
             });
 
-            const histPass = commandEncoder.beginComputePass({ label: `TLAS/Sort/Hist/${pass}` });
+            const histPass = commandEncoder.beginComputePass({ label: `TLAS/Sort/Hist/${pass}`, timestampWrites: gpuPass('TLAS/Sort/Hist') });
             histPass.setPipeline(this._sortHistogramPipeline!);
             histPass.setBindGroup(0, sortBG);
             histPass.dispatchWorkgroups(wgCount);
             histPass.end();
 
-            const prefixPass = commandEncoder.beginComputePass({ label: `TLAS/Sort/Prefix/${pass}` });
+            const prefixPass = commandEncoder.beginComputePass({ label: `TLAS/Sort/Prefix/${pass}`, timestampWrites: gpuPass('TLAS/Sort/Prefix') });
             prefixPass.setPipeline(this._sortPrefixPipeline!);
             prefixPass.setBindGroup(0, sortBG);
             prefixPass.dispatchWorkgroups(1);
             prefixPass.end();
 
-            const scatterPass = commandEncoder.beginComputePass({ label: `TLAS/Sort/Scatter/${pass}` });
+            const scatterPass = commandEncoder.beginComputePass({ label: `TLAS/Sort/Scatter/${pass}`, timestampWrites: gpuPass('TLAS/Sort/Scatter') });
             scatterPass.setPipeline(this._sortScatterPipeline!);
             scatterPass.setBindGroup(0, sortBG);
             scatterPass.dispatchWorkgroups(wgCount);
@@ -862,7 +863,7 @@ export class BVHBuilder {
                 { binding: 3, resource: { buffer: this._tlasGatherParamsBuf! } },
             ],
         });
-        const gatherPass = commandEncoder.beginComputePass({ label: 'TLAS/Sort/Gather' });
+        const gatherPass = commandEncoder.beginComputePass({ label: 'TLAS/Sort/Gather', timestampWrites: gpuPass('TLAS/Sort/Gather') });
         gatherPass.setPipeline(this._tlasGatherPipeline!);
         gatherPass.setBindGroup(0, gatherBG);
         gatherPass.dispatchWorkgroups(wgCount);
@@ -992,7 +993,7 @@ export class BVHBuilder {
                 ],
             });
             const wg = Math.ceil(levels[leafLevel].count / 256);
-            const pass = commandEncoder.beginComputePass({ label: 'TLAS/BVH4/BuildLeaves' });
+            const pass = commandEncoder.beginComputePass({ label: 'TLAS/BVH4/BuildLeaves', timestampWrites: gpuPass('TLASBuilder/BuildLeaves') });
             pass.setPipeline(this._tlasBuildLeafPipeline!);
             pass.setBindGroup(0, bg);
             pass.dispatchWorkgroups(wg);
@@ -1011,7 +1012,7 @@ export class BVHBuilder {
                 ],
             });
             const wg = Math.ceil(levels[i].count / 256);
-            const pass = commandEncoder.beginComputePass({ label: `TLAS/BVH4/BuildInternal/${i}` });
+            const pass = commandEncoder.beginComputePass({ label: `TLAS/BVH4/BuildInternal/${i}`, timestampWrites: gpuPass('TLAS/BVH4/BuildInternal') });
             pass.setPipeline(this._tlasBuildInternalPipeline!);
             pass.setBindGroup(0, bg);
             pass.dispatchWorkgroups(wg);
@@ -1022,6 +1023,16 @@ export class BVHBuilder {
     /**
      * Pack all PathTracerMaterials into the GPU material buffer.
      */
+    /** The CPU-packed TLAS instances of the last `buildTLAS` (slots expanded on the GPU are not written here). */
+    public get instanceData(): Float32Array {
+        return this._instanceStaging?.subarray(0, this._totalInstances * BVHBuilder.INSTANCE_STRIDE) ?? new Float32Array(0);
+    }
+
+    /** The packed path tracer materials of the last `updateMaterials`. */
+    public get materialData(): Float32Array {
+        return this._materialStaging?.subarray(0, this.materialCount * PathTracerMaterial.GPU_STRIDE / 4) ?? new Float32Array(0);
+    }
+
     public updateMaterials(scene: Scene): void {
         const objects = scene.getOrderedObjects();
         const materials: PathTracerMaterial[] = [];

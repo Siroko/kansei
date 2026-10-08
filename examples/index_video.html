@@ -32,7 +32,7 @@
   </head>
   <body>
     <script type="module">
-import { Renderer } from '../src/renderers/Renderer'
+import { Canvas, run } from '../src/web/index'
 import { Camera } from '../src/cameras/Camera'
 import { CameraControls } from '../src/controls/CameraControls'
 import { Float } from '../src/math/Float'
@@ -49,13 +49,8 @@ import { BufferBase } from '../src/buffers/BufferBase'
 
 const canvasContainer = document.body;
 const camera = new Camera(45, 0.1, 10000, window.innerWidth / window.innerHeight);
-const renderer = new Renderer({
-    width: window.innerWidth,
-    height: window.innerHeight,
-    antialias: true,
-    devicePixelRatio: devicePixelRatio,
-    sampleCount: 4,
-});
+const canvas = Canvas.fill(canvasContainer);
+let renderer;
 
 const layerCount = 250;
 const time = new Float(0);
@@ -109,11 +104,11 @@ const material = new Material(/* wgsl */`
     @group(0) @binding(1) var videoTexture:texture_external;
     @group(0) @binding(2) var texSampler:sampler;
 
-    @group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
-    @group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+    @group(2) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+    @group(2) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
 
-    @group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
-    @group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+    @group(1) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+    @group(1) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
 
     @vertex
     fn vertex_main(
@@ -184,23 +179,25 @@ const geometry = new PlaneGeometry(16, 9, 1, 1);
 const layersInstanced = new InstancedGeometry(geometry, layerCount);
 
 const init = async () => {
-    await renderer.initialize();
-    canvasContainer?.appendChild(renderer.canvas);
+    renderer = await canvas.renderer({
+        antialias: true,
+        sampleCount: 4,
+    });
     
     const layerRenderable = new Renderable(layersInstanced, material);
     scene.add(layerRenderable);
 
 
     
-    window.addEventListener('resize', resize);
-    animate();
+    run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        animate();
+    });
 }
 
 let lastTime = performance.now();
 
 const animate = () => {
-    requestAnimationFrame(animate);
-    
     const currentTime = performance.now();
     const deltaTime = (currentTime - lastTime) * 0.001; // Convert to seconds
     lastTime = currentTime;
@@ -214,12 +211,6 @@ const animate = () => {
         renderer.render(scene, camera);
         videoTexture.update();
     }
-}
-
-const resize = () => {
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
 }
 
 init();

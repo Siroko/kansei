@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { Compute } from '../src/materials/Compute'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
@@ -224,10 +224,10 @@
       }
 
       @group(0) @binding(0) var<uniform> lp : LightParams;
-      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -261,7 +261,7 @@
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
         let albedo = albedoMetal.rgb;
-        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let shadow = kansei_shadow_map(frag.worldPos, frag.worldNormal) * kansei_point_shadow(frag.worldPos);
         let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
         let lighting = albedo * lp.flags.y + albedo * lit;
         return FragmentOutput(
@@ -310,10 +310,10 @@
 
       @group(0) @binding(0) var<uniform> lp                    : LightParams;
       @group(0) @binding(2) var<storage, read> trailTransforms : array<vec4f>;
-      @group(1) @binding(0) var<uniform> normalMatrix          : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix           : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix            : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix          : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix           : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix            : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix      : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -378,7 +378,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow = calcDirectionalShadow(frag.worldPos, frag.worldNormal) * calcPointShadow(frag.worldPos);
+        let shadow = kansei_shadow_map(frag.worldPos, frag.worldNormal) * kansei_point_shadow(frag.worldPos);
         let lit = calcAllLights(lp, frag.worldPos, frag.worldNormal) * shadow;
         let lighting = albedo * lp.flags.y + albedo * lit;
         return FragmentOutput(
@@ -624,42 +624,23 @@
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 1,
+    const canvas = Canvas.fill().withMaxPixelRatio(1);
+    const renderer = await canvas.renderer({
       antialias: true,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
-    // Enable shadows on all lights
-    dirLight.enableShadows(renderer.gpuDevice, { resolution: 1024 });
-    pointLight.enableShadows(renderer.gpuDevice, { resolution: 512, near: 0.1, shadowFar: 50 });
-    areaLight.enableShadows(renderer.gpuDevice, { resolution: 1024, fov: 120 });
+    // The renderer renders its shadow maps each frame from the lights that cast: the 2D map
+    // from the directional or else the area light, the cube map from the point light.
+    const shadowMap = renderer.enableShadows({ resolution: 1024, fov: 120 });
+    const cubeMapShadowMap = renderer.enablePointShadows({ resolution: 512, near: 0.1, shadowFar: 50 });
     const shadowSource = { value: 'area' };
     let fogEffectRef = null; // set after fog is created
-    // Point light cubemap shadow is always active when point shadow source selected
-    renderer.cubeMapShadowMap = pointLight.shadowMap;
     function updateShadowSource() {
-      let sm = null;
-      if (shadowSource.value === 'directional' && dirLight.shadowMap) {
-        sm = dirLight.shadowMap;
-      } else if (shadowSource.value === 'area' && areaLight.shadowMap) {
-        sm = areaLight.shadowMap;
-      }
-      // For point light, we use the cubemap path, not the directional shadow map
-      if (shadowSource.value === 'point') {
-        renderer.shadowMap = null;
-      } else if (sm) {
-        renderer.shadowMap = sm;
-      }
-      if (fogEffectRef) fogEffectRef.shadowMap = sm;
+      dirLight.castShadow = shadowSource.value === 'directional';
+      areaLight.castShadow = shadowSource.value === 'area';
+      pointLight.castShadow = shadowSource.value === 'point';
+      if (fogEffectRef) fogEffectRef.shadowMap = shadowSource.value === 'point' ? null : shadowMap;
     }
-    renderer.shadowsEnabled = true;
     updateShadowSource();
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
@@ -840,7 +821,7 @@
       const SHADOW_BOX_HALF_Y : f32 = ${trailHalfY};
       const SHADOW_NUM_SEGMENTS : u32 = ${NUM_SEGMENTS}u;
 
-      @group(2) @binding(0) var<storage, read> trailTransforms : array<vec4f>;
+      @group(0) @binding(0) var<storage, read> trailTransforms : array<vec4f>;
 
       fn shadowWorldPos(position : vec4f, instanceIdx : u32) -> vec4f {
         let normY = (position.y + SHADOW_BOX_HALF_Y) / (2.0 * SHADOW_BOX_HALF_Y);
@@ -932,7 +913,8 @@
     // ── Post-processing effects ──────────────────────────────────────────
     const fogEffect = new VolumetricFogEffect({
       froxelGrid,
-      shadowMap: areaLight.shadowMap,
+      shadowMap,
+      cubeMapShadowMap,
       baseDensity: 0.02,
       heightFalloff: 0.005,
       anisotropy: 0.6,
@@ -959,7 +941,7 @@
       dof: false,
     };
 
-    const volume = new PostProcessingVolume(renderer, []);
+    const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 });
 
     function rebuildEffectChain() {
       volume.effects = [];
@@ -1129,7 +1111,7 @@
       dirX: dirLight.direction[0],
       dirY: dirLight.direction[1],
       dirZ: dirLight.direction[2],
-      maxShadowDist: dirLight.shadowMap?.maxShadowDistance ?? 0,
+      maxShadowDist: shadowMap.maxShadowDistance,
     };
     dirFolder.addBinding(dirParams, 'enabled').on('change', () => { lightToggles.directional = dirParams.enabled; });
     dirFolder.addBinding(dirParams, 'intensity', { min: 0, max: 20, step: 0.1 }).on('change', () => { dirLight.intensity = dirParams.intensity; });
@@ -1140,7 +1122,7 @@
     dirFolder.addBinding(dirParams, 'dirY', { min: -1, max: 1, step: 0.01, label: 'dir Y' }).on('change', () => { dirLight.direction[1] = dirParams.dirY; });
     dirFolder.addBinding(dirParams, 'dirZ', { min: -1, max: 1, step: 0.01, label: 'dir Z' }).on('change', () => { dirLight.direction[2] = dirParams.dirZ; });
     dirFolder.addBinding(dirParams, 'maxShadowDist', { min: 0, max: 100, step: 1, label: 'shadow dist' }).on('change', () => {
-      if (dirLight.shadowMap) dirLight.shadowMap.maxShadowDistance = dirParams.maxShadowDist;
+      shadowMap.maxShadowDistance = dirParams.maxShadowDist;
     });
 
     // ── Point Light ──
@@ -1179,9 +1161,9 @@
       radius: areaLight.radius,
       sizeW: areaLight.size[0],
       sizeH: areaLight.size[1],
-      shadowFov: areaLight.shadowMap?.fov ?? 120,
-      shadowNear: areaLight.shadowMap?.near ?? 0.1,
-      shadowFar: areaLight.shadowMap?.far || areaLight.radius,
+      shadowFov: shadowMap.fov,
+      shadowNear: shadowMap.near,
+      shadowFar: shadowMap.far || areaLight.radius,
     };
     areaFolder.addBinding(areaParams, 'enabled').on('change', () => { lightToggles.area = areaParams.enabled; });
     areaFolder.addBinding(areaParams, 'intensity', { min: 0, max: 30, step: 0.5 }).on('change', () => { areaLight.intensity = areaParams.intensity; });
@@ -1198,13 +1180,13 @@
     areaFolder.addBinding(areaParams, 'sizeW', { min: 0.1, max: 10, step: 0.1, label: 'width' }).on('change', () => { areaLight.size[0] = areaParams.sizeW; });
     areaFolder.addBinding(areaParams, 'sizeH', { min: 0.1, max: 10, step: 0.1, label: 'height' }).on('change', () => { areaLight.size[1] = areaParams.sizeH; });
     areaFolder.addBinding(areaParams, 'shadowFov', { min: 10, max: 170, step: 1, label: 'shadow fov' }).on('change', () => {
-      if (areaLight.shadowMap) areaLight.shadowMap.fov = areaParams.shadowFov;
+      shadowMap.fov = areaParams.shadowFov;
     });
     areaFolder.addBinding(areaParams, 'shadowNear', { min: 0.01, max: 5, step: 0.01, label: 'shadow near' }).on('change', () => {
-      if (areaLight.shadowMap) areaLight.shadowMap.near = areaParams.shadowNear;
+      shadowMap.near = areaParams.shadowNear;
     });
     areaFolder.addBinding(areaParams, 'shadowFar', { min: 1, max: 50, step: 0.5, label: 'shadow far' }).on('change', () => {
-      if (areaLight.shadowMap) areaLight.shadowMap.far = areaParams.shadowFar;
+      shadowMap.far = areaParams.shadowFar;
     });
 
     // ── Material controls ───────────────────────────────────────────────
@@ -1287,6 +1269,12 @@
     fogFolder.addBinding(fogEffect, 'heightFalloff',   { min: 0, max: 0.5, step: 0.001 });
     fogFolder.addBinding(fogEffect, 'extinctionCoeff', { min: 0, max: 5, step: 0.01, label: 'extinction' });
     fogFolder.addBinding(fogEffect, 'anisotropy',      { min: -1, max: 1, step: 0.01 });
+    fogFolder.addBinding(fogEffect, 'fogHeight',      { min: -10, max: 40, step: 0.1, label: 'fog height' });
+    fogFolder.addBinding(fogEffect, 'startDistance',  { min: 0, max: 50, step: 0.1, label: 'start distance' });
+    fogFolder.addBinding(fogEffect, 'maxDistance',    { min: 0, max: fogEffect.froxelGrid.far, step: 1, label: 'reach (0 = far)' });
+    const fogAmbient = { color: { r: 0, g: 0, b: 0 } };
+    fogFolder.addBinding(fogAmbient, 'color', { color: { type: 'float' }, label: 'ambient' })
+      .on('change', (ev) => { fogEffect.ambient = [ev.value.r, ev.value.g, ev.value.b]; });
 
     // ── Bloom controls ───────────────────────────────────────────────────
     const bloomFolder = pane.addFolder({ title: 'Bloom' });
@@ -1353,32 +1341,13 @@
       areaLight.volumetric = lightToggles.area;
       updateLightParams();
 
-      // Render shadow from selected source
-      if (shadowSource.value === 'area' && areaLight.shadowMap) {
-        areaLight.shadowMap.render(renderer, scene, camera, areaLight);
-      } else if (shadowSource.value === 'directional' && dirLight.shadowMap) {
-        dirLight.shadowMap.render(renderer, scene, camera, dirLight);
-      }
-      // Always render point light cubemap shadow when enabled
-      if (shadowSource.value === 'point' && pointLight.shadowMap) {
-        pointLight.shadowMap.render(renderer, scene, camera, [pointLight]);
-        pointLight.updateModelMatrix();
-        const wm = pointLight.worldMatrix.internalMat4;
-        renderer.setPointShadowParams(wm[12], wm[13], wm[14], pointLight.radius);
-      }
-
       fogEffect.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
 
       volume.render(scene, camera);
-
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
-
-    window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate();
     });
   </script>
 </body>

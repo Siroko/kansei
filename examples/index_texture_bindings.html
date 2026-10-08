@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - texture bindings</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #status {
+      position: fixed; left: 12px; top: 12px; color: #ddd; font: 12px/1.4 monospace;
+      background: rgba(0, 0, 0, 0.6); padding: 6px 8px; white-space: pre;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="status">checking bindings…</div>
+  <script type="module">
+    // Every binding kind a material or compute pass can declare, from left to right: a 3D
+    // texture, a cubemap, a 2D array and an rgba16float storage texture a compute pass writes
+    // each frame (its time comes from an external GPUBuffer). A probe pass then reads each one
+    // back, plus a depth texture through a comparison sampler, and the overlay says PASS or FAIL.
+    import { Canvas, run } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { Compute } from '../src/materials/Compute'
+    import { BindingLayouts } from '../src/materials/Binding'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { Vector3 } from '../src/math/Vector3'
+
+    const status = document.getElementById('status');
+    const canvas = Canvas.fill().withMaxPixelRatio(1);
+    const renderer = await canvas.renderer({
+      antialias: true,
+      sampleCount: 4,
+    });
+    const device = renderer.device;
+
+    const scene = new Scene();
+    const camera = new Camera(40, 0.1, 100, window.innerWidth / window.innerHeight);
+    const controls = new CameraControls(camera, new Vector3(0, 0, 0), renderer.canvas, 9);
+
+    // --- textures ------------------------------------------------------------------------
+    const N = 16;
+    const volumeData = new Uint8Array(N * N * N * 4);
+    for (let z = 0; z < N; z++) for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const i = ((z * N + y) * N + x) * 4;
+      const band = ((x >> 2) + (y >> 2) + (z >> 2)) & 1 ? 255 : 160;
+      volumeData.set([x * 17 * band / 255, y * 17 * band / 255, z * 17 * band / 255, 255], i);
+    }
+    const volume = new Texture({ label: 'Volume', width: N, height: N, depthOrArrayLayers: N, dimension: '3d', levels: [volumeData] });
+
+    // cube faces +X, -X, +Y, -Y, +Z, -Z
+    const faceColours = [[255, 0, 0], [0, 255, 255], [0, 255, 0], [255, 0, 255], [0, 0, 255], [255, 255, 0]];
+    const F = 4;
+    const cubeData = new Uint8Array(6 * F * F * 4);
+    faceColours.forEach((c, face) => {
+      for (let t = 0; t < F * F; t++) cubeData.set([...c, 255], (face * F * F + t) * 4);
+    });
+    const cube = new Texture({ label: 'Cube', width: F, height: F, depthOrArrayLayers: 6, viewDimension: 'cube', levels: [cubeData] });
+
+    const L = 8;
+    const layers = [[230, 60, 40], [60, 200, 80], [50, 90, 230]].map(([r, g, b]) => {
+      const layer = new Uint8Array(L * L * 4);
+      for (let y = 0; y < L; y++) for (let x = 0; x < L; x++) {
+        const k = (x + y) & 1 ? 1 : 0.35;
+        layer.set([r * k, g * k, b * k, 255], (y * L + x) * 4);
+      }
+      return layer;
+    });
+    const layered = Texture.fromRGBALayers('Layers', L, L, layers);
+
+    const S = 256;
+    const storage = Texture.new2D('Storage', S, S, 'rgba16float', GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING);
+
+    // A depth texture cleared to 0.5, read through a comparison sampler by the probe.
+    const depth = new Texture({ label: 'Depth', width: 4, height: 4, format: 'depth32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
+    depth.initialize(device);
+    const clear = device.createCommandEncoder();
+    clear.beginRenderPass({
+      colorAttachments: [],
+      depthStencilAttachment: { view: depth.gpuTexture.createView(), depthClearValue: 0.5, depthLoadOp: 'clear', depthStoreOp: 'store' },
+    }).end();
+    device.queue.submit([clear.finish()]);
+
+    // Time lives in a buffer created outside the engine, bound through ComputeBuffer.fromExternal.
+    const timeBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const time = ComputeBuffer.fromExternal(timeBuffer, 'uniform');
+
+    const linear = new Sampler('linear', 'linear', 'clamp-to-edge');
+    const nearest = new Sampler('nearest', 'nearest', 'repeat');
+    const compare = new Sampler('linear', 'linear', 'clamp-to-edge', 1, { compare: 'less' });
+
+    // --- materials -----------------------------------------------------------------------
+    const header = /* wgsl */`
+      struct VertexOut {
+        @builtin(position) position : vec4f,
+        @location(0) local : vec3f,
+        @location(1) normal : vec3f,
+        @location(2) uv : vec2f,
+      };
+      @group(1) @binding(0) var<uniform> viewMatrix : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix : mat4x4f;
+
+      @vertex
+      fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VertexOut {
+        var out : VertexOut;
+        out.position = projectionMatrix * viewMatrix * worldMatrix * position;
+        out.local = position.xyz;
+        out.normal = normal;
+        out.uv = uv;
+        return out;
+      }
+    `;
+    const material = (body, bindings, extra = {}) => new Material(header + body, {
+      bindings: bindings.map(([value, layout], binding) => ({ binding, visibility: GPUShaderStage.FRAGMENT, value, layout })),
+      ...extra,
+    });
+
+    const volumeMaterial = material(/* wgsl */`
+      @group(0) @binding(0) var tex : texture_3d<f32>;
+      @group(0) @binding(1) var samp : sampler;
+      @fragment fn fragment_main(in : VertexOut) -> @location(0) vec4f {
+        return textureSample(tex, samp, in.local + 0.5);
+      }`, [[volume], [linear]]);
+
+    const cubeMaterial = material(/* wgsl */`
+      @group(0) @binding(0) var tex : texture_cube<f32>;
+      @group(0) @binding(1) var samp : sampler;
+      @fragment fn fragment_main(in : VertexOut) -> @location(0) vec4f {
+        return textureSample(tex, samp, normalize(in.local));
+      }`, [[cube], [linear]]);
+
+    const arrayMaterial = material(/* wgsl */`
+      @group(0) @binding(0) var tex : texture_2d_array<f32>;
+      @group(0) @binding(1) var samp : sampler;
+      @fragment fn fragment_main(in : VertexOut) -> @location(0) vec4f {
+        let layer = min(i32(in.uv.x * 3.0), 2);
+        return textureSample(tex, samp, fract(in.uv * vec2f(3.0, 1.0)), layer);
+      }`, [[layered], [nearest]], { cullMode: 'none' });
+
+    const storageMaterial = material(/* wgsl */`
+      @group(0) @binding(0) var tex : texture_2d<f32>;
+      @group(0) @binding(1) var samp : sampler;
+      @fragment fn fragment_main(in : VertexOut) -> @location(0) vec4f {
+        return vec4f(textureSample(tex, samp, in.uv).rgb, 1.0);
+      }`, [[storage], [linear]], { cullMode: 'none' });
+
+    const place = (geometry, mat, x) => {
+      const renderable = new Renderable(geometry, mat);
+      renderable.position.x = x;
+      scene.add(renderable);
+      return renderable;
+    };
+    const box = place(new BoxGeometry(1.4, 1.4, 1.4), volumeMaterial, -3.3);
+    const sphere = place(new SphereGeometry(0.8, 24), cubeMaterial, -1.1);
+    place(new PlaneGeometry(1.6, 1.6), arrayMaterial, 1.1);
+    place(new PlaneGeometry(1.6, 1.6), storageMaterial, 3.3);
+
+    // --- compute: write the rgba16float storage texture ----------------------------------
+    const write = new Compute(/* wgsl */`
+      @group(0) @binding(0) var out : texture_storage_2d<rgba16float, write>;
+      @group(0) @binding(1) var<uniform> time : vec4f;
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(global_invocation_id) id : vec3u) {
+        let uv = vec2f(id.xy) / ${S}.0;
+        let r = length(uv - 0.5);
+        let wave = 0.5 + 0.5 * sin(r * 40.0 - time.x * 3.0);
+        // values above 1 survive in rgba16float
+        textureStore(out, vec2i(id.xy), vec4f(wave * 2.0 * uv.x, wave * uv.y, 1.0 - wave, 1.0));
+      }`, [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, value: storage, layout: BindingLayouts.storageTexture('write-only') },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, value: time },
+    ]);
+
+    // --- probe: read every binding back ---------------------------------------------------
+    const probeOut = new ComputeBuffer({
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      type: 'storage',
+      buffer: new Float32Array(4 * 5),
+    });
+    const probe = new Compute(/* wgsl */`
+      @group(0) @binding(0) var vol : texture_3d<f32>;
+      @group(0) @binding(1) var cube : texture_cube<f32>;
+      @group(0) @binding(2) var layers : texture_2d_array<f32>;
+      @group(0) @binding(3) var stored : texture_2d<f32>;
+      @group(0) @binding(4) var depth : texture_depth_2d;
+      @group(0) @binding(5) var samp : sampler;
+      @group(0) @binding(6) var cmp : sampler_comparison;
+      @group(0) @binding(7) var<storage, read_write> out : array<vec4f, 5>;
+      @compute @workgroup_size(1)
+      fn main() {
+        out[0] = textureLoad(vol, vec3i(3, 5, 7), 0);
+        out[1] = textureSampleLevel(cube, samp, vec3f(0.0, 1.0, 0.0), 0.0);
+        out[2] = textureLoad(layers, vec2i(1, 0), 2, 0);
+        out[3] = textureLoad(stored, vec2i(${S - 1}, ${S - 1}), 0);
+        out[4] = vec4f(
+          textureSampleCompareLevel(depth, cmp, vec2f(0.5), 0.25),
+          textureSampleCompareLevel(depth, cmp, vec2f(0.5), 0.75),
+          0.0, 0.0);
+      }`, [volume, cube, layered, storage, depth, nearest, compare, probeOut]
+      .map((value, binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, value })));
+
+    const near = (a, b) => a.every((v, i) => Math.abs(v - b[i]) < 0.02);
+    const writeTime = (t) => device.queue.writeBuffer(timeBuffer, 0, new Float32Array([t, 0, 0, 0]));
+
+    writeTime(0);
+    await renderer.compute(write, S / 8, S / 8);
+    await renderer.compute(probe, 1);
+    const r = await renderer.readBackBuffer(probeOut, Float32Array);
+    const texel = (i) => Array.from(r.slice(i * 4, i * 4 + 4));
+    const band = (((3 >> 2) + (5 >> 2) + (7 >> 2)) & 1 ? 255 : 160) / 255;
+    const wave = 0.5 + 0.5 * Math.sin(Math.hypot(255 / 256 - 0.5, 255 / 256 - 0.5) * 40);
+    const checks = [
+      ['3d texel (3,5,7)', near(texel(0), [3 * 17 * band, 5 * 17 * band, 7 * 17 * band, 255].map((v) => Math.floor(v) / 255))],
+      ['cube +Y face', near(texel(1), [0, 1, 0, 1])],
+      ['2d-array layer 2', near(texel(2), [50 / 255, 90 / 255, 230 / 255, 1])],
+      ['rgba16float storage', near(texel(3), [wave * 2 * 255 / 256, wave * 255 / 256, 1 - wave, 1])],
+      ['depth comparison', near(texel(4).slice(0, 2), [1, 0])],
+    ];
+    const pass = checks.every(([, ok]) => ok);
+    const lines = checks.map(([name, ok]) => `${ok ? 'ok  ' : 'FAIL'} ${name}`);
+    status.textContent = `${pass ? 'PASS' : 'FAIL'} texture bindings\n${lines.join('\n')}`;
+    console.log(`[texture-bindings] ${pass ? 'PASS' : 'FAIL'}`, JSON.stringify({ checks, readback: Array.from(r) }));
+
+    const start = performance.now();
+    function frame() {
+      const t = (performance.now() - start) / 1000;
+      writeTime(t);
+      renderer.compute(write, S / 8, S / 8);
+      box.rotation.y = t * 0.5;
+      box.rotation.x = t * 0.3;
+      sphere.rotation.y = t * 0.4;
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      frame();
+    });
+  </script>
+</body>
+
+</html>

@@ -3,7 +3,8 @@
 
 use super::{Binding, Material, MaterialOptions};
 
-/// Writes the GBuffer's four colour targets; see [`Material::standard_lit`].
+/// Writes the GBuffer's four colour targets (`kansei_gbuffer_out`; `kansei_gbuffer_out_specular`
+/// for a surface `rt::RtReflectionsEffect` reflects in); see [`Material::standard_lit`].
 pub const GBUFFER_OUT_WGSL: &str = include_str!("../shaders/gbuffer_out.wgsl");
 
 const STANDARD_LIT_WGSL: &str = include_str!("../shaders/standard_lit.wgsl");

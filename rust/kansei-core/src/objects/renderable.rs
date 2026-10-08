@@ -33,6 +33,13 @@ pub struct Renderable {
     /// volume: it neither bounces nor blocks light there. A `dynamic` renderable is voxelized every
     /// frame; the others again only when they change (transform, visibility, surface).
     pub gi: Option<crate::gi::GiSurface>,
+    /// Its surface in the renderer's ray tracing grid (`Renderer::enable_rt_grid`): its triangles
+    /// are gathered there (instanced ones as culled for the grid's box, cluster LOD ones by
+    /// their cut there) with this albedo and alpha test. `None` (the default) leaves it out.
+    pub rt: Option<crate::rt::RtSurface>,
+    /// Where its instance records put its mesh, for the grid (the material's vertex stage does it
+    /// on screen): needed by instanced renderables, unless their `ClusterLod::transform` says.
+    pub rt_placement: Option<crate::rt::RtPlacement>,
     /// How the path tracer (`pathtracer::BVHBuilder::scene_materials`) sees this renderable;
     /// `None`: `PathTracerMaterial::default()`.
     pub path_tracer_material: Option<crate::pathtracer::PathTracerMaterial>,
@@ -73,6 +80,8 @@ impl Renderable {
             layers: Self::DEFAULT_LAYERS,
             dynamic: false,
             gi: None,
+            rt: None,
+            rt_placement: None,
             path_tracer_material: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }
@@ -92,6 +101,18 @@ impl Renderable {
     /// Put this renderable in voxel GI with `surface` (see `gi`).
     pub fn with_gi(mut self, surface: crate::gi::GiSurface) -> Self {
         self.gi = Some(surface);
+        self
+    }
+
+    /// Put this renderable in the ray tracing grid with `surface` (see `rt`).
+    pub fn with_rt(mut self, surface: crate::rt::RtSurface) -> Self {
+        self.rt = Some(surface);
+        self
+    }
+
+    /// Where its instance records put its mesh in the grid (see `rt_placement`).
+    pub fn with_rt_placement(mut self, placement: crate::rt::RtPlacement) -> Self {
+        self.rt_placement = Some(placement);
         self
     }
 

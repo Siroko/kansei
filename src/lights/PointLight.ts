@@ -14,6 +14,10 @@ class PointLight extends Light {
         this.radius = radius;
     }
 
+    /**
+     * A CubeMapShadowMap of this light's own, which the caller renders each frame (`shadowMap.render`).
+     * Or let the renderer own and render one: `castShadow` and `Renderer.enablePointShadows`.
+     */
     enableShadows(device: GPUDevice, options?: CubeMapShadowMapOptions): CubeMapShadowMap {
         this.shadowMap = new CubeMapShadowMap(device, options);
         return this.shadowMap;

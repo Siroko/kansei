@@ -60,6 +60,22 @@ The `Material` class manages shaders and bindings for rendering.
 - `async initialize(gpuDevice: GPUDevice, vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>, presentationFormat: GPUTextureFormat): Promise<void>`: Initializes the material on the GPU.
 - `async getBindGroup(gpuDevice: GPUDevice, bindingGroupLayoutPosition: number): Promise<GPUBindGroup>`: Gets the bind group for this material.
 
+### Bind groups
+
+Material shaders bind the same groups as the Rust engine (`BindGroupSlot` in `src/renderers/SharedLayouts.ts`), so its material WGSL works unchanged:
+
+```wgsl
+// group 0: the material's own bindings
+@group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;  // camera
+@group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+// @group(1) @binding(2): scene lights (fragment only), @group(1) @binding(3): temporal data
+@group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;  // mesh
+@group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;  // or KanseiMeshTransforms { world, prevWorld }
+// group 3: shadows
+```
+
+Before 0.0.12 the camera was group 2 and the mesh group 1: swap the two in older shaders. A `Renderable.shadowVertexCode` now declares its own bindings (`shadowExtraBGL`) at group 0 instead of group 2.
+
 ## Mesh
 
 The `Mesh` class combines geometry and material to create renderable objects.
