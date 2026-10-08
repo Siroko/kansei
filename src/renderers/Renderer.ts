@@ -23,6 +23,8 @@ import { CULL_VIEW_BYTES, CullPipeline, CullView, cullView, cullViewDraws, drawG
 import { CullViewKind, CullingStats, StatsReadback } from "../culling/CullingStats";
 import { mat4 } from "gl-matrix";
 import { SceneVoxelGi, SceneVoxelGiOptions } from "../gi/SceneVoxelGi";
+import { bakeImpostor } from "../impostors/bakeImpostor";
+import type { Impostor, ImpostorOptions } from "../impostors/Impostor";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -864,6 +866,26 @@ class Renderer {
         });
 
         this._shadowBGDirty = false;
+    }
+
+    /**
+     * Group 3 as the scene passes bind it: the shadow maps and lights enabled, dummies for the
+     * rest (after `initialize`).
+     */
+    public get shadowBindGroup(): GPUBindGroup {
+        this._updateShadowBindGroup();
+        return this._shadowBG!;
+    }
+
+    /**
+     * Bakes an octahedral impostor of the renderables `parts` (the parts of one object), drawn
+     * together with their own materials' GBuffer pipelines (see `Impostor`, `bakeImpostor`). The
+     * lights and shadows bound are the renderer's. Rust: `Renderer::bake_impostor`.
+     */
+    public bakeImpostor(parts: readonly Renderable[], options: ImpostorOptions = {}): Impostor {
+        const device = this.device!;
+        if (!this._lightUniforms.initialized) this._lightUniforms.initialize(device);
+        return bakeImpostor({ device, lightBuffer: this._lightUniforms.gpuBuffer!, shadowBindGroup: this.shadowBindGroup }, parts, options);
     }
 
     /**

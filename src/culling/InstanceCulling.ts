@@ -5,6 +5,7 @@ import type { Geometry } from '../buffers/Geometry';
 import type { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { frustumPlanes } from './Frustum';
 import instanceCullWgsl from '../../rust/kansei-core/src/shaders/instance_cull.wgsl?raw';
+import lodFadeWgsl from '../../rust/kansei-core/src/shaders/lod_fade.wgsl?raw';
 
 /**
  * The cull shader, shared with the Rust engine (`shaders/instance_cull.wgsl`): one thread per
@@ -13,6 +14,13 @@ import instanceCullWgsl from '../../rust/kansei-core/src/shaders/instance_cull.w
  * the frame's views.
  */
 export const INSTANCE_CULL_WGSL: string = instanceCullWgsl;
+
+/**
+ * WGSL for materials of renderables culled with crossfades (`InstanceCulling.withCrossfade`):
+ * `kansei_lod_fade_discard(fade, pixel, frame)`, whether to drop a pixel of an instance fading
+ * between LODs. Rust: `culling::LOD_FADE_WGSL`.
+ */
+export const LOD_FADE_WGSL: string = lodFadeWgsl;
 
 const NO_WORD = 0xffffffff;
 /** Largest f32: a band to infinity (`lod_far.min(f32::MAX)` in Rust). */
@@ -218,6 +226,11 @@ export class InstanceCulling {
      * enough for them (for instances turned about y, equal x and z extents of the widest reach).
      */
     public boundsBox: Vec3 | null = null;
+    /**
+     * Width of the crossfades at the LOD bands' edges, in LOD distance (0: none); see
+     * `withCrossfade`. Turning them on or off changes the compacted instances' layout.
+     */
+    public crossfade: number = 0;
 
     private capacity: number;
     private shared: Shared | null = null;
@@ -295,9 +308,34 @@ export class InstanceCulling {
         return this;
     }
 
-    /** Bytes of a compacted instance. */
+    /**
+     * Dithered crossfades between LODs, over `width` of LOD distance (metres, times the view's
+     * LOD distance scale): each band's edges widen by `width / 2`, and there the instances draw
+     * in both LODs, each keeping a complementary share of the pixels, so an instance moving
+     * across a band's edge dissolves from one LOD into the other instead of snapping, in every
+     * view (the camera, the shadow map), by that view's band. A band from 0 has no near
+     * crossfade, and one to infinity no far one: an impostor LOD fades in from the meshes. Give
+     * every LOD of a set the same width, narrower than its bands.
+     *
+     * Each compacted instance is then followed by its fade, an f32: declare the geometry's
+     * instance buffer `stride + 4` bytes wide with the fade as an attribute at offset `stride`
+     * (`ComputeBuffer.withVertexLayout` over the source), pass it to the fragment shader, and
+     * drop pixels with `LOD_FADE_WGSL`'s `kansei_lod_fade_discard` (in the material's
+     * `shadowFragmentEntry` too, for the shadows to dissolve). An impostor baked from such a LOD
+     * draws it with that layout too: end `ImpostorOptions.instance` with a fade of 1.
+     *
+     * The fade depends only on the distance, so there is no switch to flip back and forth: an
+     * instance moving to and fro across a band's edge dissolves to and fro by as much as it
+     * moves, and one held there stays part dissolved.
+     */
+    withCrossfade(width: number): this {
+        this.crossfade = Math.max(width, 0);
+        return this;
+    }
+
+    /** Bytes of a compacted instance: the source's, and with crossfades its fade. */
     get culledStride(): number {
-        return this.stride;
+        return this.stride + (this.crossfade > 0 ? 4 : 0);
     }
 
     /** The instances a dispatch tests. */
@@ -425,7 +463,7 @@ export class InstanceCulling {
             f[at] = range[0];
             f[at + 1] = Math.min(range[1], F32_MAX);
         };
-        // an empty band is nowhere
+        // an empty band is nowhere, crossfades and all
         const kindBand = (range: LodRange | null): LodRange =>
             range && range[0] >= range[1] ? [F32_MAX, F32_MAX] : range ?? this.lodRange;
         let flags = 0;
@@ -453,7 +491,7 @@ export class InstanceCulling {
         band(this.shadowLodRange ?? this.lodRange, 36);
         band(this.reflectionLodRange ?? this.lodRange, 38);
         u[40] = 0; // occlusionView
-        f[41] = 0; // crossfade
+        f[41] = this.crossfade;
         band(kindBand(this.giLodRange), 42);
         band(kindBand(this.rtLodRange), 44);
         f[46] = 0;
