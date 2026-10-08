@@ -4,7 +4,9 @@ import type { Renderable } from '../objects/Renderable';
 import type { ShadowMap } from '../shadows/ShadowMap';
 import type { CubeMapShadowMap } from '../shadows/CubeMapShadowMap';
 import { gradientSkyLighting } from './ParticleConeShading';
+import { JumpFloodSdf } from './JumpFloodSdf';
 import { GiSurface, MeshVoxelizer, SurfaceSet } from './MeshVoxelizer';
+import { SdfProbeOptions, SdfProbes, defaultSdfProbeOptions, sameSdfProbeOptions } from './SdfProbes';
 import { SceneGiSettings, VoxelInjection, defaultSceneGiSettings } from './VoxelInjection';
 import { Vec3, VoxelGiQuality, VoxelVolume } from './VoxelVolume';
 
@@ -46,7 +48,8 @@ interface VoxelDraw {
  * 3. the volume's mips are rebuilt.
  *
  * Read it with `VoxelGIEffect` (screen-space cones), or with `VOXEL_CONES_WGSL` from any pass or
- * material. Rust: `gi::SceneVoxelGi`.
+ * material. Optionally it keeps a distance field of the voxels (`enableSdf`) and irradiance probes
+ * traced in it (`enableProbes`), updated after the mips. Rust: `gi::SceneVoxelGi`.
  */
 export class SceneVoxelGi {
     public readonly settings: SceneGiSettings;
@@ -58,6 +61,12 @@ export class SceneVoxelGi {
     public readonly injection: VoxelInjection;
     /** The gradient sky (`setSkyGradient`): black until set. */
     private readonly sky: GPUBuffer;
+    /** The sky the volume's light sees past it: `sky`, or the one `useSkyLighting` gave. */
+    private skySource: GPUBuffer;
+    private _sdf: JumpFloodSdf | null = null;
+    private _probes: SdfProbes | null = null;
+    /** The field's static seeds must flood again (it was just made). */
+    private sdfStale = false;
 
     constructor(private readonly device: GPUDevice, options: SceneVoxelGiOptions) {
         this.quality = VoxelGiQuality.fitScene(options.quality ?? 'medium', device.limits, options.boundsMin, options.boundsMax, options.budgetBytes ?? 0);
@@ -69,6 +78,7 @@ export class SceneVoxelGi {
         const black = gradientSkyLighting([0, 0, 0], [0, 0, 0]);
         this.sky = device.createBuffer({ label: 'VoxelGI/SceneSky', size: black.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         device.queue.writeBuffer(this.sky, 0, black);
+        this.skySource = this.sky;
         this.injection = new VoxelInjection(device, this.volume, this.sky);
         this.settings = { ...defaultSceneGiSettings(), bounceSteps: VoxelGiQuality.coneSteps(this.quality) / 2 };
     }
@@ -92,21 +102,97 @@ export class SceneVoxelGi {
     /** Take the sky from `skyLighting` (a `SkyLighting` uniform) instead of the gradient. */
     public useSkyLighting(skyLighting: GPUBuffer): void {
         this.injection.setSky(skyLighting);
+        this.skySource = skyLighting;
     }
 
     /**
-     * Bytes on the GPU: the radiance with its mips (and anisotropic chains) and the surface
-     * buffers.
+     * Bytes on the GPU: the radiance with its mips (and anisotropic chains), the surface buffers,
+     * the distance field and the probes.
      */
     public memoryBytes(): number {
-        return this.volume.layout.radianceBytes() + this.volume.anisotropicBytes() + this.voxelizer.memoryBytes();
+        return this.volume.layout.radianceBytes() + this.volume.anisotropicBytes() + this.voxelizer.memoryBytes()
+            + (this._sdf?.memoryBytes() ?? 0) + (this._probes?.memoryBytes() ?? 0);
+    }
+
+    /**
+     * Keep a distance field of the voxelized surfaces (`JumpFloodSdf`, over the volume's layout):
+     * the static renderables' part floods again when they change, the dynamic ones' every frame
+     * they exist. It shadows the injection (`settings.sdfShadows`), and `VoxelGIEffect.setSdf`
+     * reads it for AO and a debug slice. About 12 bytes a voxel, 20 with dynamic renderables.
+     * Sampling it needs the device's `float32-filterable` (the renderer requests it by default).
+     */
+    public enableSdf(): void {
+        if (this._sdf) return;
+        if (!this.device.features.has('float32-filterable')) {
+            throw new Error("SceneVoxelGi.enableSdf needs the device's 'float32-filterable' (RendererOptions.requireFloat32Filterable)");
+        }
+        this._sdf = new JumpFloodSdf(this.device, this.volume.layout, { kind: 'surfaces' }, this.voxelizer.staticSurfaces);
+        this.sdfStale = true;
+    }
+
+    /** Drop the distance field, and the probes traced in it. */
+    public disableSdf(): void {
+        this.disableProbes();
+        this._sdf?.destroy();
+        this._sdf = null;
+    }
+
+    /**
+     * Keep irradiance probes traced in the distance field (`SdfProbes`; it enables the field):
+     * updated each frame after the volume is lit, following the camera. Read them with
+     * `VoxelGIEffect.setProbes` or a material's `PROBES_WGSL`. Calling it again with other options
+     * builds them anew.
+     */
+    public enableProbes(options: Partial<SdfProbeOptions> = {}): void {
+        this.enableSdf();
+        const full = { ...defaultSdfProbeOptions(), ...options };
+        if (this._probes && sameSdfProbeOptions(this._probes.options, full)) return;
+        this._probes?.destroy();
+        this._probes = new SdfProbes(this.device, this.volume, full);
+    }
+
+    public disableProbes(): void {
+        this._probes?.destroy();
+        this._probes = null;
+    }
+
+    /** The probes, if enabled (change their `options` between frames). */
+    public get probes(): SdfProbes | null {
+        return this._probes;
+    }
+
+    /** The distance field, if enabled. */
+    public get sdf(): JumpFloodSdf | null {
+        return this._sdf;
+    }
+
+    /**
+     * Record the distance field's update (after the voxelization): `staticChanged` when the static
+     * surfaces were voxelized again, `anyDynamic` when dynamic ones are this frame.
+     */
+    private encodeSdf(encoder: GPUCommandEncoder, staticChanged: boolean, anyDynamic: boolean): void {
+        const sdf = this._sdf;
+        if (!sdf) return;
+        let changed = staticChanged || this.sdfStale;
+        this.sdfStale = false;
+        if (changed) sdf.encodeStatic(encoder);
+        if (anyDynamic !== sdf.hasDynamic) {
+            sdf.setDynamicSurfaces(anyDynamic ? this.voxelizer.dynamicSurfaces : null);
+            changed = true;
+        }
+        if (anyDynamic) {
+            sdf.encodeDynamic(encoder);
+            changed = true;
+        }
+        if (changed) sdf.encodeDistance(encoder);
     }
 
     /**
      * Record the frame's voxel GI (the renderer's, after the shadow maps and before the GBuffer):
      * voxelize the visible GI renderables of `scene` (prepared this frame) with their matrices at
-     * `meshOffset` of `meshBindGroup`, light the voxels through `shadowMap` (the directional map
-     * materials sample, or null) and `pointShadows`, rebuild the mips.
+     * `meshOffset` of `meshBindGroup`, update the distance field, light the voxels through
+     * `shadowMap` (the directional map materials sample, or null) and `pointShadows`, rebuild the
+     * mips, then update the probes around `eye` (the camera's position).
      */
     public encode(
         encoder: GPUCommandEncoder,
@@ -115,6 +201,7 @@ export class SceneVoxelGi {
         meshOffset: (renderable: Renderable) => number,
         shadowMap: ShadowMap | null,
         pointShadows: CubeMapShadowMap | null,
+        eye: Vec3 | null,
     ): void {
         if (!this.settings.enabled) return;
         this.injection.syncShadowMaps(shadowMap, pointShadows);
@@ -141,15 +228,19 @@ export class SceneVoxelGi {
         }
         voxelizer.writeDraws(draws.map((d) => d.renderable.gi!));
         const staticChanged = voxelizer.staticChanged(key);
-        if (draws.some((d) => d.renderable.dynamic)) voxelizer.ensureDynamic();
+        const anyDynamic = draws.some((d) => d.renderable.dynamic);
+        if (anyDynamic) voxelizer.ensureDynamic();
 
         if (staticChanged) voxelizer.encodeSet(encoder, SurfaceSet.Static, draws, meshBindGroup);
         if (voxelizer.dynamicSurfaces) voxelizer.encodeSet(encoder, SurfaceSet.Dynamic, draws, meshBindGroup);
-        this.injection.encode(encoder, voxelizer, this.settings);
+        this.encodeSdf(encoder, staticChanged, anyDynamic);
+        this.injection.encode(encoder, voxelizer, this._sdf, this.settings);
         this.volume.buildMips(encoder);
+        if (this._probes && this._sdf) this._probes.encode(encoder, this.volume, this._sdf, voxelizer, this.skySource, eye);
     }
 
     public destroy(): void {
+        this.disableSdf();
         this.voxelizer.destroy();
         this.injection.destroy();
         this.volume.destroy();

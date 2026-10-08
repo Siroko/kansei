@@ -910,7 +910,7 @@ class Renderer {
         this._planShadowViews(stack, camera);
         this._runInstanceCulling(commandRenderEncoder, stack, camera);
         this._encodeShadowPasses(commandRenderEncoder, stack);
-        this._encodeVoxelGI(commandRenderEncoder, stack);
+        this._encodeVoxelGI(commandRenderEncoder, stack, camera);
         this._uploadShadowUniforms();
         this._encodeLightClusters(commandRenderEncoder, camera, this.width, this.height);
         this._updateShadowBindGroup();
@@ -1156,7 +1156,7 @@ class Renderer {
         this._uploadShadowUniforms();
         t?.end();
         t = cpuScope('scene/voxel_gi');
-        this._encodeVoxelGI(commandEncoder, stack);
+        this._encodeVoxelGI(commandEncoder, stack, camera);
         t?.end();
 
         // The light clusters for the camera, over the GBuffer's pixels (the render size).
@@ -1559,9 +1559,10 @@ class Renderer {
      * Voxel GI's frame (`enableVoxelGI`), after the shadow views and before the scene pass, in
      * the Rust renderer's order: the GI renderables voxelized at their scene slots, lit through
      * the shadow maps materials sample (the directional one only while it has a light) and the
-     * spot lights with their atlas, and the mips rebuilt.
+     * spot lights with their atlas, the mips rebuilt, then its distance field and probes (the
+     * probes around `camera`).
      */
-    private _encodeVoxelGI(encoder: GPUCommandEncoder, stack: Scene): void {
+    private _encodeVoxelGI(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
         if (!this._voxelGI) return;
         const spots = this._voxelGISpots;
         if (spots?.gi !== this._voxelGI || spots.atlas !== this._spotShadowAtlas) {
@@ -1571,8 +1572,9 @@ class Renderer {
         }
         const sm = this._shadowMap;
         const shadowMap = sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null;
+        const eye = camera.inverseViewMatrix.internalMat4;
         this._voxelGI.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,
-            shadowMap, this._cubeMapShadowMap);
+            shadowMap, this._cubeMapShadowMap, [eye[12], eye[13], eye[14]]);
     }
 
     /**

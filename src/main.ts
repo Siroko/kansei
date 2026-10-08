@@ -149,7 +149,7 @@ export { ParticleConeShading, PARTICLE_LIGHTING_STRIDE, gradientSkyLighting, def
 export type { ParticleConeSettings } from "./gi/ParticleConeShading";
 export { ParticleGi, ParticleGiSettings } from "./gi/ParticleGi";
 export type { ParticleGiOptions } from "./gi/ParticleGi";
-export { VOXEL_VOLUME_WGSL, VOXEL_CONES_WGSL, PARTICLE_EMISSION_WGSL, SKY_LIGHTING_WGSL, VOXEL_WRITE_WGSL } from "./gi/GiWGSL";
+export { VOXEL_VOLUME_WGSL, VOXEL_CONES_WGSL, PARTICLE_EMISSION_WGSL, SKY_LIGHTING_WGSL, VOXEL_WRITE_WGSL, SDF_WGSL, PROBES_WGSL } from "./gi/GiWGSL";
 export { MeshVoxelizer, SurfaceSet } from "./gi/MeshVoxelizer";
 export type { GiSurface } from "./gi/MeshVoxelizer";
 export { VoxelInjection, defaultSceneGiSettings } from "./gi/VoxelInjection";
@@ -158,6 +158,10 @@ export { SceneVoxelGi } from "./gi/SceneVoxelGi";
 export type { SceneVoxelGiOptions } from "./gi/SceneVoxelGi";
 export { VoxelGIEffect } from "./gi/VoxelGIEffect";
 export type { VoxelGIOptions } from "./gi/VoxelGIEffect";
+export { JumpFloodSdf } from "./gi/JumpFloodSdf";
+export type { SdfSeeds } from "./gi/JumpFloodSdf";
+export { SdfProbes, PROBE_RAYS, defaultSdfProbeOptions } from "./gi/SdfProbes";
+export type { SdfProbeOptions } from "./gi/SdfProbes";
 export {
     Transform, nlerp, quatAbs, quatLog, quatExp, quatToScaledAngleAxis, quatFromScaledAngleAxis, angularVelocity,
     Skeleton, Pose, Clip, SkinnedMesh, MAX_INFLUENCES, strongestInfluences, SkinnedGltf,

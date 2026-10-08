@@ -12,6 +12,7 @@ import {
     ParticleVoxelizer,
 } from './ParticleVoxelizer';
 import { Vec3, VoxelGiQuality, VoxelVolume } from './VoxelVolume';
+import { JumpFloodSdf } from './JumpFloodSdf';
 
 /** What `ParticleGi` builds. Rust: `gi::ParticleGiOptions`. */
 export interface ParticleGiOptions {
@@ -77,6 +78,7 @@ export class ParticleGi {
     public readonly skyBuffer: GPUBuffer;
 
     private readonly device: GPUDevice;
+    private _sdf: JumpFloodSdf | null = null;
 
     /** Particles from `positions` (`array<vec4f>`) and optionally `velocities` (speed emission). */
     constructor(renderer: Renderer, options: ParticleGiOptions, positions: GiBufferSource, velocities?: GiBufferSource) {
@@ -120,6 +122,30 @@ export class ParticleGi {
         this.shading.bind(this.volume, positions, velocities, this.voxelizer.emissionBuffer, skyLighting);
     }
 
+    /**
+     * Keep a distance field of the volume's opaque voxels (the particles' body where it is at
+     * least half opaque, and the boxes), flooded every frame after the splat, for the particles'
+     * sun (`settings.cones.sdfSun`): a sharper soft shadow than the sun cone. Give the particles'
+     * buffers and the sky again, as `useSkyLighting` takes them (`skyBuffer` unless it was
+     * called). The field is `r32float`, which needs the device's `float32-filterable` (the
+     * renderer requests it by default).
+     */
+    public enableSdf(positions: GiBufferSource, velocities: GiBufferSource | undefined, sky: GPUBuffer): void {
+        if (!this._sdf) {
+            if (!this.device.features.has('float32-filterable')) {
+                throw new Error("ParticleGi.enableSdf needs the device's 'float32-filterable' (RendererOptions.requireFloat32Filterable)");
+            }
+            this._sdf = new JumpFloodSdf(this.device, this.volume.layout, { kind: 'opacity', radiance: this.volume.view, threshold: 0.5 });
+            this.shading.setSdf(this._sdf.asTexture());
+        }
+        this.shading.bind(this.volume, positions, velocities, this.voxelizer.emissionBuffer, sky);
+    }
+
+    /** The distance field, if enabled. */
+    public get sdf(): JumpFloodSdf | null {
+        return this._sdf;
+    }
+
     /** See `ParticleConeShading.lightingInstanceBuffer`. */
     public lightingInstanceBuffer(shaderLocation: number): ComputeBuffer {
         return this.shading.lightingInstanceBuffer(shaderLocation);
@@ -143,6 +169,7 @@ export class ParticleGi {
         this.voxelizer.setEmission(this.settings.emission);
         if (this.settings.cones.useVolume) {
             this.voxelizer.encode(encoder, particleCount, this.settings.splat);
+            if (this._sdf && this.settings.cones.sdfSun) this._sdf.encode(encoder);
             this.volume.buildMips(encoder);
         }
         this.shading.encode(encoder, particleCount, this.settings.cones);
