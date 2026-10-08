@@ -5,6 +5,8 @@ import { GBuffer } from "../postprocessing/GBuffer";
 // the stock materials construct Materials only when called, so this cycle is safe
 import { GradientSkyOptions, StandardLitOptions, emissive, gradientSky, standardLit } from "./StandardLit";
 import { basicInstanced, basicLit } from "./Stock";
+import { CLUSTER_VERTEX_ENTRY, InstanceLayout, clusterVertexStage } from "../clusters/vertexStage";
+import { clusterMeshBindGroupLayoutEntries } from "../renderers/SharedLayouts";
 
 /**
  * Configuration of a render material (Rust `MaterialOptions`).
@@ -119,6 +121,15 @@ class Material {
     private _voxelPipelineLayouts: Map<number, GPUPipelineLayout> = new Map();
     // Groups 0-2 only: shadow passes render into textures that group 3 samples.
     private _depthPipelineLayout?: GPUPipelineLayout;
+    // Cluster LOD (`Renderable.clusters`): the generated vertex stage for an instance layout (or
+    // why there is none), its pipelines by pass, and their layouts (group 2 the cluster mesh's).
+    private _clusterStage: { key: string; module: GPUShaderModule | null; error: string | null } | null = null;
+    private _clusterPipelineCache: Map<string, GPURenderPipeline> = new Map();
+    private _clusterDepthPipelineCache: Map<string, GPURenderPipeline> = new Map();
+    private _clusterVelocityPipelineCache: Map<number, GPURenderPipeline> = new Map();
+    private _clusterVoxelPipelineCache: Map<number, GPURenderPipeline> = new Map();
+    private _clusterPipelineLayout?: GPUPipelineLayout;
+    private _clusterDepthPipelineLayout?: GPUPipelineLayout;
 
     private bindableGroup: BindableGroup;
     private depthWriteEnabled: boolean = true;
@@ -199,6 +210,9 @@ class Material {
         return basicInstanced(label, color, options);
     }
 
+    /** The faces its pipelines cull (`MaterialOptions.cullMode`; transparent materials cull none). */
+    public get culledFaces(): GPUCullMode { return this.transparent ? 'none' : this.cullMode; }
+
     /** See `MaterialOptions.mrtOutputCount`. */
     public get mrtOutputCount(): number | undefined { return this.options.mrtOutputCount; }
 
@@ -265,6 +279,7 @@ class Material {
         colorFormats: GPUTextureFormat[],
         sampleCount: number,
         depthFormat: GPUTextureFormat,
+        stage: { layout: GPUPipelineLayout, module: GPUShaderModule, entryPoint: string, label: string } | null = null,
     ): GPURenderPipeline {
         const outputCount = this.options.mrtOutputCount ?? colorFormats.length;
         const targets: GPUColorTargetState[] = colorFormats.map((format, i) => {
@@ -291,17 +306,18 @@ class Material {
             return target;
         });
 
+        const module = stage?.module ?? this.shaderRenderModule!;
         const renderPipelineDescriptor: GPURenderPipelineDescriptor = {
-            layout: this.bindableGroup.pipelineBindGroupLayout!,
-            label: `${this.label}/Pipeline`,
+            layout: stage?.layout ?? this.bindableGroup.pipelineBindGroupLayout!,
+            label: `${this.label}/${stage?.label ?? 'Pipeline'}`,
             multisample: { count: sampleCount },
             vertex: {
-                module: this.shaderRenderModule!,
-                entryPoint: 'vertex_main',
+                module,
+                entryPoint: stage?.entryPoint ?? 'vertex_main',
                 buffers: vertexBuffersDescriptors
             } as GPUVertexState,
             fragment: {
-                module: this.shaderRenderModule!,
+                module,
                 entryPoint: 'fragment_main',
                 targets,
             } as GPUFragmentState,
@@ -383,29 +399,7 @@ class Material {
         const key = `${depthFormat}:${constant}:${slopeScale}:${clamp}:${vertexLayoutKey(vertexBuffersDescriptors)}`;
         let pipeline = this._depthPipelineCache.get(key);
         if (!pipeline) {
-            const entry = this.options.shadowFragmentEntry;
-            pipeline = gpuDevice.createRenderPipeline({
-                label: `${this.label}/DepthPipeline`,
-                layout: this._depthPipelineLayout!,
-                vertex: {
-                    module: this.shaderRenderModule!,
-                    entryPoint: 'vertex_main',
-                    buffers: vertexBuffersDescriptors,
-                },
-                fragment: entry ? { module: this.shaderRenderModule!, entryPoint: entry, targets: [] } : undefined,
-                primitive: {
-                    topology: this.topology,
-                    cullMode: this.cullMode,
-                },
-                depthStencil: {
-                    format: depthFormat,
-                    depthWriteEnabled: true,
-                    depthCompare: 'less-equal',
-                    depthBias: constant,
-                    depthBiasSlopeScale: slopeScale,
-                    depthBiasClamp: clamp,
-                },
-            });
+            pipeline = this._buildDepthPipeline(gpuDevice, this._depthPipelineLayout!, this.shaderRenderModule!, 'vertex_main', vertexBuffersDescriptors, depthFormat, bias, 'DepthPipeline');
             this._depthPipelineCache.set(key, pipeline);
         }
         return pipeline;
@@ -431,35 +425,233 @@ class Material {
         const key = `${sampleCount}:${vertexLayoutKey(vertexBuffersDescriptors)}`;
         let pipeline = this._velocityPipelineCache.get(key);
         if (!pipeline) {
-            const targets: (GPUColorTargetState | null)[] = new Array(GBuffer.VELOCITY_TARGET).fill(null);
-            targets.push({ format: GBuffer.VELOCITY_FORMAT, writeMask: GPUColorWrite.ALL });
-            pipeline = gpuDevice.createRenderPipeline({
-                label: `${this.label}/VelocityPipeline`,
-                layout: this.bindableGroup.pipelineBindGroupLayout!,
-                multisample: { count: sampleCount },
-                vertex: {
-                    module: this.shaderRenderModule!,
-                    entryPoint: 'vertex_main',
-                    buffers: vertexBuffersDescriptors,
-                },
-                fragment: {
-                    module: this.shaderRenderModule!,
-                    entryPoint: 'fragment_main',
-                    targets,
-                },
-                primitive: {
-                    topology: this.topology,
-                    cullMode: this.cullMode,
-                },
-                depthStencil: {
-                    format: GBuffer.DEPTH_FORMAT,
-                    depthWriteEnabled: false,
-                    depthCompare: 'less-equal',
-                    depthBias: -4,
-                    depthBiasSlopeScale: -1,
-                },
-            });
+            pipeline = this._buildVelocityPipeline(gpuDevice, this.bindableGroup.pipelineBindGroupLayout!, this.shaderRenderModule!, 'vertex_main', vertexBuffersDescriptors, sampleCount, 'VelocityPipeline');
             this._velocityPipelineCache.set(key, pipeline);
+        }
+        return pipeline;
+    }
+
+    /** A depth-only pipeline: `entryPoint` of `module` over `vertexBuffersDescriptors`, with `shadowFragmentEntry` if set. */
+    private _buildDepthPipeline(
+        gpuDevice: GPUDevice,
+        layout: GPUPipelineLayout,
+        module: GPUShaderModule,
+        entryPoint: string,
+        vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
+        depthFormat: GPUTextureFormat,
+        bias: DepthBias,
+        label: string,
+    ): GPURenderPipeline {
+        // WebGPU allows a depth bias on triangle topologies only.
+        const triangles = this.topology === 'triangle-list' || this.topology === 'triangle-strip';
+        const entry = this.options.shadowFragmentEntry;
+        return gpuDevice.createRenderPipeline({
+            label: `${this.label}/${label}`,
+            layout,
+            vertex: { module, entryPoint, buffers: vertexBuffersDescriptors },
+            fragment: entry ? { module, entryPoint: entry, targets: [] } : undefined,
+            primitive: {
+                topology: this.topology,
+                cullMode: this.cullMode,
+            },
+            depthStencil: {
+                format: depthFormat,
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                depthBias: triangles ? bias.constant ?? 0 : 0,
+                depthBiasSlopeScale: triangles ? bias.slopeScale ?? 0 : 0,
+                depthBiasClamp: triangles ? bias.clamp ?? 0 : 0,
+            },
+        });
+    }
+
+    /** A velocity-pass pipeline: `entryPoint` of `module`, its `fragment_main` into the velocity target only. */
+    private _buildVelocityPipeline(
+        gpuDevice: GPUDevice,
+        layout: GPUPipelineLayout,
+        module: GPUShaderModule,
+        entryPoint: string,
+        vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
+        sampleCount: number,
+        label: string,
+    ): GPURenderPipeline {
+        const targets: (GPUColorTargetState | null)[] = new Array(GBuffer.VELOCITY_TARGET).fill(null);
+        targets.push({ format: GBuffer.VELOCITY_FORMAT, writeMask: GPUColorWrite.ALL });
+        return gpuDevice.createRenderPipeline({
+            label: `${this.label}/${label}`,
+            layout,
+            multisample: { count: sampleCount },
+            vertex: { module, entryPoint, buffers: vertexBuffersDescriptors },
+            fragment: { module, entryPoint: 'fragment_main', targets },
+            primitive: {
+                topology: this.topology,
+                cullMode: this.cullMode,
+            },
+            depthStencil: {
+                format: GBuffer.DEPTH_FORMAT,
+                depthWriteEnabled: false,
+                depthCompare: 'less-equal',
+                depthBias: -4,
+                depthBiasSlopeScale: -1,
+            },
+        });
+    }
+
+    /**
+     * The generated cluster vertex stage's module for `instances`' records (remade, with every
+     * cluster pipeline, when the layout changes). Throws, saying why it can't be generated.
+     */
+    private _clusterModule(gpuDevice: GPUDevice, instances: InstanceLayout | null): GPUShaderModule {
+        this._ensureSharedResources(gpuDevice);
+        const key = instances ? vertexLayoutKey([instances as GPUVertexBufferLayout]) : '-';
+        if (this._clusterStage?.key !== key) {
+            let module: GPUShaderModule | null = null, error: string | null = null;
+            try {
+                const code = clusterVertexStage(parseIncludes(this.shaderCode), instances);
+                module = gpuDevice.createShaderModule({ label: `${this.label}/ClusterShader`, code });
+            } catch (e) {
+                error = (e as Error).message;
+            }
+            this._clusterStage = { key, module, error };
+            this._clusterPipelineCache.clear();
+            this._clusterDepthPipelineCache.clear();
+            this._clusterVelocityPipelineCache.clear();
+            this._clusterVoxelPipelineCache.clear();
+        }
+        if (!this._clusterStage.module) throw new Error(this._clusterStage.error!);
+        return this._clusterStage.module;
+    }
+
+    /** The cluster pipelines' layout: the material's groups with the cluster mesh group as group 2. */
+    private _clusterLayout(gpuDevice: GPUDevice): GPUPipelineLayout {
+        if (!this._clusterPipelineLayout) {
+            this._clusterPipelineLayout = gpuDevice.createPipelineLayout({
+                label: `${this.label}/ClusterPipelineLayout`,
+                bindGroupLayouts: [
+                    this.bindableGroup.bindGroupLayout!,
+                    this.bindableGroup.cameraBindablesGroupLayout!,
+                    gpuDevice.createBindGroupLayout({ label: 'ClusterMesh BindGroupLayout', entries: clusterMeshBindGroupLayoutEntries() }),
+                    this.bindableGroup.shadowBindablesGroupLayout!,
+                ],
+            });
+        }
+        return this._clusterPipelineLayout;
+    }
+
+    /**
+     * Returns the pipeline that draws this material over a cluster draw (the camera's cut of
+     * `Renderable.clusters`; Rust `get_cluster_pipeline`): its WGSL with the generated vertex
+     * stage (`clusterVertexStage`) for `instances`' records, no vertex buffers, group 2 the
+     * cluster mesh group (`clusterMeshBindGroupLayoutEntries`). Throws, saying why the stage
+     * can't be generated; the renderable then keeps the ordinary path.
+     */
+    public getClusterPipeline(
+        gpuDevice: GPUDevice,
+        instances: InstanceLayout | null,
+        colorFormats: GPUTextureFormat[],
+        sampleCount: number,
+        depthFormat: GPUTextureFormat,
+    ): GPURenderPipeline {
+        const module = this._clusterModule(gpuDevice, instances);
+        const key = `${colorFormats.join(',')}:${sampleCount}:${depthFormat}`;
+        let pipeline = this._clusterPipelineCache.get(key);
+        if (!pipeline) {
+            pipeline = this._buildPipeline(gpuDevice, [], colorFormats, sampleCount, depthFormat,
+                { layout: this._clusterLayout(gpuDevice), module, entryPoint: CLUSTER_VERTEX_ENTRY, label: 'ClusterPipeline' });
+            this._clusterPipelineCache.set(key, pipeline);
+        }
+        return pipeline;
+    }
+
+    /** The cluster pipeline made for a pass of these targets (`getClusterPipeline`), if any. */
+    public clusterPipeline(colorFormats: GPUTextureFormat[], sampleCount: number, depthFormat: GPUTextureFormat): GPURenderPipeline | null {
+        return this._clusterPipelineCache.get(`${colorFormats.join(',')}:${sampleCount}:${depthFormat}`) ?? null;
+    }
+
+    /**
+     * Returns the shadow passes' pipeline over a cluster draw (a shadow view's cut of
+     * `Renderable.clusters`; Rust `get_cluster_depth_pipeline`): `getDepthPipeline`'s, with the
+     * generated vertex stage. Throws as `getClusterPipeline` does.
+     */
+    public getClusterDepthPipeline(
+        gpuDevice: GPUDevice,
+        instances: InstanceLayout | null,
+        depthFormat: GPUTextureFormat,
+        bias: DepthBias = {},
+    ): GPURenderPipeline {
+        const module = this._clusterModule(gpuDevice, instances);
+        const key = `${depthFormat}:${bias.constant ?? 0}:${bias.slopeScale ?? 0}:${bias.clamp ?? 0}`;
+        let pipeline = this._clusterDepthPipelineCache.get(key);
+        if (!pipeline) {
+            if (!this._clusterDepthPipelineLayout) {
+                this._clusterDepthPipelineLayout = gpuDevice.createPipelineLayout({
+                    label: `${this.label}/ClusterDepthPipelineLayout`,
+                    bindGroupLayouts: [
+                        this.bindableGroup.bindGroupLayout!,
+                        this.bindableGroup.cameraBindablesGroupLayout!,
+                        gpuDevice.createBindGroupLayout({ label: 'ClusterMesh BindGroupLayout', entries: clusterMeshBindGroupLayoutEntries() }),
+                    ],
+                });
+            }
+            pipeline = this._buildDepthPipeline(gpuDevice, this._clusterDepthPipelineLayout, module, CLUSTER_VERTEX_ENTRY, [], depthFormat, bias, 'ClusterDepthPipeline');
+            this._clusterDepthPipelineCache.set(key, pipeline);
+        }
+        return pipeline;
+    }
+
+    /**
+     * Returns the velocity pass's pipeline over a cluster draw (the camera's cut of
+     * `Renderable.clusters`; Rust `get_cluster_velocity_pipeline`): `getVelocityPipeline`'s, with
+     * the generated vertex stage. Throws as `getClusterPipeline` does.
+     */
+    public getClusterVelocityPipeline(gpuDevice: GPUDevice, instances: InstanceLayout | null, sampleCount: number = 1): GPURenderPipeline {
+        const module = this._clusterModule(gpuDevice, instances);
+        let pipeline = this._clusterVelocityPipelineCache.get(sampleCount);
+        if (!pipeline) {
+            pipeline = this._buildVelocityPipeline(gpuDevice, this._clusterLayout(gpuDevice), module, CLUSTER_VERTEX_ENTRY, [], sampleCount, 'ClusterVelocityPipeline');
+            this._clusterVelocityPipelineCache.set(sampleCount, pipeline);
+        }
+        return pipeline;
+    }
+
+    /**
+     * Returns the pipeline the voxel clipmap's voxelizer draws this material's cluster cuts with
+     * (a voxel GI view's cut of `Renderable.clusters`; Rust `get_cluster_voxel_pipeline`):
+     * `getVoxelPipeline`'s, with the generated vertex stage and the cluster mesh group as group 2.
+     * Throws as `getClusterPipeline` does.
+     */
+    public getClusterVoxelPipeline(
+        gpuDevice: GPUDevice,
+        voxelizer: number,
+        instances: InstanceLayout | null,
+        voxelBGL: GPUBindGroupLayout,
+        engineFragment: { module: GPUShaderModule, entryPoint: string },
+        target: GPUTextureFormat,
+        sampleCount: number,
+    ): GPURenderPipeline {
+        const module = this._clusterModule(gpuDevice, instances);
+        let pipeline = this._clusterVoxelPipelineCache.get(voxelizer);
+        if (!pipeline) {
+            const layout = gpuDevice.createPipelineLayout({
+                label: `${this.label}/ClusterVoxelPipelineLayout`,
+                bindGroupLayouts: [
+                    this.bindableGroup.bindGroupLayout!,
+                    this.bindableGroup.cameraBindablesGroupLayout!,
+                    gpuDevice.createBindGroupLayout({ label: 'ClusterMesh BindGroupLayout', entries: clusterMeshBindGroupLayoutEntries() }),
+                    voxelBGL,
+                ],
+            });
+            const entry = this.options.voxelFragmentEntry;
+            const fragment = entry ? { module, entryPoint: entry } : engineFragment;
+            pipeline = gpuDevice.createRenderPipeline({
+                label: `${this.label}/ClusterVoxelPipeline`,
+                layout,
+                vertex: { module, entryPoint: CLUSTER_VERTEX_ENTRY, buffers: [] },
+                fragment: { ...fragment, targets: [{ format: target, writeMask: 0 }] },
+                primitive: { topology: this.topology, cullMode: 'none' },
+                multisample: { count: sampleCount },
+            });
+            this._clusterVoxelPipelineCache.set(voxelizer, pipeline);
         }
         return pipeline;
     }

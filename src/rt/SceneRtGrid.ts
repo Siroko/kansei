@@ -4,6 +4,7 @@ import type { Renderable } from '../objects/Renderable';
 import type { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { GatherSource, RtGrid, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, effectiveEpsilon, rtSurfaceWord } from './RtGrid';
 import { RtMesh, boxesMeet, transformBox } from './RtMesh';
+import { CLAIMED_WORD, ClusterView, Cut } from '../clusters/ClusterLod';
 
 type Vec3 = [number, number, number];
 
@@ -11,8 +12,8 @@ type Vec3 = [number, number, number];
 export interface SceneRtGridOptions {
     grid?: RtGridOptions;
     /**
-     * The error budget of the cluster cuts gathered into the grid, in cells (Rust's cluster LOD;
-     * kept for parity, unused until TS has cluster LOD). Default 1.
+     * The error budget of the cluster cuts gathered into the grid (`Renderable.clusters`), in
+     * cells: 1 keeps every error within a cell. Default 1.
      */
     clusterErrorCells?: number;
     /**
@@ -50,13 +51,14 @@ interface SceneMesh {
  * pass after the frame's culling (`grid.bindGroupEntries`).
  *
  * Its box is one more cull view: `InstanceCulling` compacts the instances meeting it (by
- * `rtLodRange`, the camera's bands by default). The gather then reads on the GPU each instanced
- * renderable's culled records (times its mesh, placed by `Renderable.rtPlacement`; all of its
- * records without `instanceCulling`), and each single mesh whose world box meets the grid's (one
+ * `rtLodRange`, the camera's bands by default), and a cluster view cuts cluster LOD renderables
+ * there (orthographic, `clusterErrorCells` cells of error). The gather then reads on the GPU each
+ * clustered renderable's draw list, each instanced renderable's culled records (times its mesh,
+ * placed by `Renderable.rtPlacement` or its cluster LOD's transform; all of its records without
+ * `instanceCulling`), and each single mesh whose world box meets the grid's (one
  * box test per renderable on the CPU). It rebuilds when the box moves, when the static
  * renderables in it change (transform, visibility, surface), on `invalidate`, and every frame
- * while a `dynamic` one is in the scene. Rust: `rt::SceneRtGrid` (whose cluster LOD cuts come with
- * V-5).
+ * while a `dynamic` one is in the scene. Rust: `rt::SceneRtGrid`.
  */
 export class SceneRtGrid {
     public readonly options: { clusterErrorCells: number; rebuildEveryFrame: boolean };
@@ -104,10 +106,35 @@ export class SceneRtGrid {
         return bytes;
     }
 
-    /** Where a renderable's records put its mesh: its `rtPlacement`, or nowhere (a single mesh); null when it is instanced with none. */
+    /**
+     * Where a renderable's records put its mesh: its `rtPlacement`, its cluster LOD's transform, or
+     * nowhere (a single mesh); null when it is instanced and neither says.
+     */
     private static placement(r: Renderable): RtPlacement | null {
         if (r.rtPlacement) return r.rtPlacement;
+        if (r.clusters?.transform) return RtPlacement.instance(r.clusters.transform);
         return r.geometry.isInstancedGeometry ? null : RtPlacement.NONE;
+    }
+
+    /**
+     * The cluster view of the box: orthographic, a pixel a cell, the cut's errors within
+     * `clusterErrorCells`. Rust: `SceneRtGrid::cluster_view`.
+     */
+    clusterView(): ClusterView {
+        const [lo, hi] = this.grid.bounds();
+        return {
+            viewProj: this.cullViewProj(mat4.create()),
+            eye: [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5],
+            pixelsPerUnit: 1 / this.grid.options.cell,
+            near: 0.01,
+            threshold: this.options.clusterErrorCells,
+            orthographic: true,
+        };
+    }
+
+    /** A cut gathered from the box's view grew: rebuild next frame too (its clusters past the old list were missing). */
+    cutGrew(): void {
+        this.force = true;
     }
 
     /**
@@ -151,10 +178,11 @@ export class SceneRtGrid {
     }
 
     /**
-     * Rebuild the grid from `scene`'s renderables with `rt`, as culled for cull view `slot` (the
-     * box), into `encoder` (after the frame's culling); `afterSubmit` reads back what it needed.
+     * Rebuild the grid from `scene`'s renderables with `rt`, as culled and cut (`clusterCut`, the
+     * renderer's: a renderable's cluster cut for the slot, if it has one) for cull view `slot`
+     * (the box), into `encoder` (after the frame's culling); `afterSubmit` reads back what it needed.
      */
-    build(encoder: GPUCommandEncoder, scene: Scene, slot: number): void {
+    build(encoder: GPUCommandEncoder, scene: Scene, slot: number, clusterCut?: (r: Renderable) => { mesh: GPUBuffer; cut: Cut } | null): void {
         const t0 = performance.now();
         this._stats.rebuilds++;
         const [lo, hi] = this.grid.bounds();
@@ -170,17 +198,21 @@ export class SceneRtGrid {
                 continue;
             }
             const geometry = r.geometry;
-            if (!geometry.vertices?.length || !geometry.indices?.length) {
+            // its cut for the box, on the cluster path
+            const clustered = clusterCut?.(r) ?? null;
+            if (!clustered && (!geometry.vertices?.length || !geometry.indices?.length)) {
                 this.warnOnce(r, 'has no CPU geometry');
                 continue;
             }
-            const counts: [number, number] = [geometry.vertices.length, geometry.indices.length];
             let m = this.meshes.get(r);
-            if (!m || m.geometry !== geometry || m.counts[0] !== counts[0] || m.counts[1] !== counts[1]) {
-                m?.buffer.destroy();
-                const mesh = RtMesh.fromGeometry(geometry);
-                m = { geometry, counts, min: mesh.min, max: mesh.max, buffer: mesh.createBuffer(this.device), triangles: mesh.triangleCount };
-                this.meshes.set(r, m);
+            if (!clustered) {
+                const counts: [number, number] = [geometry.vertices!.length, geometry.indices!.length];
+                if (!m || m.geometry !== geometry || m.counts[0] !== counts[0] || m.counts[1] !== counts[1]) {
+                    m?.buffer.destroy();
+                    const mesh = RtMesh.fromGeometry(geometry);
+                    m = { geometry, counts, min: mesh.min, max: mesh.max, buffer: mesh.createBuffer(this.device), triangles: mesh.triangleCount };
+                    this.meshes.set(r, m);
+                }
             }
             const world = r.worldMatrix.internalMat4;
             let records: GatherSource['records'] = null;
@@ -206,14 +238,24 @@ export class SceneRtGrid {
                     records = { buffer, stride };
                     count = { fixed: instanced.instanceCount };
                 }
-            } else {
-                const [a, b] = transformBox(world, m.min, m.max);
+            } else if (!clustered) {
+                const [a, b] = transformBox(world, m!.min, m!.max);
                 if (!boxesMeet(a, b, lo, hi, eps)) continue;
-                reserve += m.triangles;
+                reserve += m!.triangles;
+            }
+            if (clustered) {
+                // the cut's draw list: as many entries as it claimed, at most its length
+                const { mesh, cut } = clustered;
+                sources.push({
+                    mesh, triangles: 0, draws: cut.draws, records, firstRecord: 0,
+                    count: { args: cut.args, word: CLAIMED_WORD, atMost: cut.capacity },
+                    world, placement: placement.wgsl(), surface, id: Math.max(scene.slotOf(r), 0),
+                });
+                continue;
             }
             sources.push({
-                mesh: m.buffer,
-                triangles: m.triangles,
+                mesh: m!.buffer,
+                triangles: m!.triangles,
                 records,
                 firstRecord,
                 count,

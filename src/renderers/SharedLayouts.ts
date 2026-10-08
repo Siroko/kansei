@@ -42,6 +42,16 @@ export function meshBindGroupLayoutEntries(): GPUBindGroupLayoutEntry[] {
     ];
 }
 
+/**
+ * Group 2 of cluster pipelines (`ClusterLod`, `clusterVertexStage`): the mesh matrices as in
+ * `meshBindGroupLayoutEntries`, then the packed cluster mesh, the view's draw list and the
+ * instance records (vertex-stage storage). Rust: `SharedLayouts::cluster_mesh_bgl`.
+ */
+export function clusterMeshBindGroupLayoutEntries(): GPUBindGroupLayoutEntry[] {
+    const storage = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } });
+    return [...meshBindGroupLayoutEntries(), storage(2), storage(3), storage(4)];
+}
+
 /** Size of the shadow uniform at group 3 binding 2 (`KanseiShadowMap` in `shadow_map.wgsl`). */
 export const SHADOW_UNIFORM_BYTES = 96;
 

@@ -196,6 +196,11 @@ export class PlanarReflection {
      */
     public lodDistanceScale: number = 1;
     /**
+     * Scales the cluster LOD budget (`Renderable.clusters`) in the mirrored view: above 1 the
+     * reflection draws coarser cuts than the camera. 1 by default.
+     */
+    public lodErrorScale: number = 1;
+    /**
      * World-space bounds of the reflecting surface (its min and max corners), if known. Materials
      * sample the reflection by screen position, so it is then drawn only where the surface is on
      * screen: its pass is scissored to the surface's rectangle (plus `screenMargin`), its

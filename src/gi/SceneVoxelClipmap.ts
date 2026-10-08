@@ -6,6 +6,7 @@ import type { ShadowMap } from '../shadows/ShadowMap';
 import type { CascadedShadowSource } from '../shadows/ComputeShadows';
 import type { CubeMapShadowMap } from '../shadows/CubeMapShadowMap';
 import { drawGeometry } from '../culling/InstanceCulling';
+import { Cut, drawCut, instanceLayoutOf } from '../clusters/ClusterLod';
 import { transformBox } from '../rt/RtMesh';
 import { ClipmapGiSettings, ClipmapInjection, defaultClipmapGiSettings } from './ClipmapInjection';
 import { ClipmapProbeOptions, ClipmapProbes, defaultClipmapProbeOptions, sameClipmapProbeOptions } from './ClipmapProbes';
@@ -74,6 +75,8 @@ const KEEP_ALIVE = 8;
 interface ClipmapDraw {
     renderable: Renderable;
     pipeline: GPURenderPipeline;
+    /** its cluster cuts' pipeline, with cluster LOD */
+    cluster: GPURenderPipeline | null;
     meshOffset: number;
     bounds: [Vec3, Vec3] | null;
 }
@@ -92,9 +95,8 @@ interface ClipmapDraw {
  *    their emission and a bounce of last frame's light.
  *
  * Instanced renderables with `instanceCulling` are voxelized as culled for each region's own cull
- * view (`giLodRange` picks the LOD they voxelize); renderables with cluster LOD would draw their
- * cut there (`clusterErrorVoxels`), which comes with cluster LOD in the TS engine (V-5): until
- * then they voxelize their mesh.
+ * view (`giLodRange` picks the LOD they voxelize), and renderables with cluster LOD draw their
+ * cut there (`clusterErrorVoxels`; their mesh where the cluster path can't draw them).
  *
  * Read it with `VoxelGIEffect.withClipmap` (screen-space cones), or with `CLIPMAP_WGSL` from any
  * compute pass; `enableProbes` keeps irradiance probes traced through it. Rust:
@@ -269,7 +271,7 @@ export class SceneVoxelClipmap {
 
     /**
      * A cluster cut drawn into job slot `slot`'s view grew: voxelize its region again (once the cut
-     * holds what it needs, a few frames on, the redo is complete). For cluster LOD (V-5).
+     * holds what it needs, a few frames on, the redo is complete).
      */
     public cutGrew(slot: number): void {
         const region = this.slots[slot]?.region;
@@ -290,6 +292,25 @@ export class SceneVoxelClipmap {
     }
 
     /** The world box of `r`'s mesh (null: instanced, drawn indirectly, or no CPU vertices). */
+    /**
+     * The pipeline `r`'s cluster cuts are voxelized with, with cluster LOD; null (with a warning,
+     * once) when the cluster path can't draw it: it is voxelized as a mesh.
+     */
+    private clusterPipeline(r: Renderable): GPURenderPipeline | null {
+        if (!r.clusters || this.meshOnly.has(r)) return null;
+        const v = this.voxelizer;
+        try {
+            return r.material.getClusterVoxelPipeline(this.device, v.id, instanceLayoutOf(r), v.bindGroupLayout, v.fragment, MeshVoxelizer.TARGET_FORMAT, v.sampleCount);
+        } catch (e) {
+            console.warn(`${r.material.label}: voxelized as a mesh, not by its cluster cuts (${(e as Error).message})`);
+            this.meshOnly.add(r);
+            return null;
+        }
+    }
+
+    /** Renderables with cluster LOD whose cuts can't be voxelized (warned once). */
+    private readonly meshOnly = new WeakSet<Renderable>();
+
     private worldBounds(r: Renderable): [Vec3, Vec3] | null {
         const g = r.geometry;
         if (g.isInstancedGeometry || g.indirectArgsBuffer || !g.vertices?.length) return null;
@@ -320,6 +341,7 @@ export class SceneVoxelClipmap {
         shadowMap: ShadowMap | CascadedShadowSource | null,
         pointShadows: CubeMapShadowMap | null,
         eye: Vec3,
+        clusterCut?: (renderable: Renderable, view: number) => Cut | null,
     ): void {
         if (!this.settings.enabled) return;
         const voxelizer = this.voxelizer;
@@ -332,7 +354,7 @@ export class SceneVoxelClipmap {
             if (!r.gi || !r.visible || !r.geometry.initialized) continue;
             const pipeline = r.material.getVoxelPipeline(this.device, voxelizer.id, r.geometry.vertexBuffersDescriptors,
                 voxelizer.bindGroupLayout, voxelizer.fragment, MeshVoxelizer.TARGET_FORMAT, voxelizer.sampleCount);
-            draws.push({ renderable: r, pipeline, meshOffset: meshOffset(r), bounds: this.worldBounds(r) });
+            draws.push({ renderable: r, pipeline, meshOffset: meshOffset(r), bounds: this.worldBounds(r), cluster: this.clusterPipeline(r) });
         }
         draws.sort((a, b) => a.meshOffset - b.meshOffset);
         voxelizer.writeDraws(draws.map((d) => d.renderable.gi as GiSurface));
@@ -347,7 +369,7 @@ export class SceneVoxelClipmap {
             const region = clipRegionBounds(job.region, layout);
             groups.forEach((group, axis) => {
                 const pass = voxelizer.beginPass(encoder, ClipSurfaces.Static, slot, axis);
-                this.drawVoxels(pass, draws, region, layout.levelVoxelSize(job.region.level), jobView(slot), group, meshBindGroup);
+                this.drawVoxels(pass, draws, region, layout.levelVoxelSize(job.region.level), jobView(slot), group, meshBindGroup, clusterCut);
                 pass.end();
             });
         });
@@ -385,8 +407,9 @@ export class SceneVoxelClipmap {
      * group 3:
      * - a mesh whose world box misses the region by more than a voxel and 2 % of its own size is
      *   skipped;
-     * - in a static region, an instanced renderable with `instanceCulling` draws its instances
-     *   culled for the region (cluster LOD would draw its cut there: V-5);
+     * - in a static region, a renderable with cluster LOD draws its cut for the region
+     *   (`clusterCut`), and an instanced renderable with `instanceCulling` its instances culled
+     *   for the region;
      * - a dynamic one draws its instances as they are, unless culling would change their layout
      *   (crossfades): it is left out.
      * Rust: `renderers::renderer::draw_clipmap_voxels`.
@@ -399,6 +422,7 @@ export class SceneVoxelClipmap {
         view: number | null,
         group: GPUBindGroup,
         meshBindGroup: GPUBindGroup,
+        clusterCut?: (renderable: Renderable, view: number) => Cut | null,
     ): void {
         const [regionLo, regionHi] = region;
         const dynamic = view === null;
@@ -412,9 +436,17 @@ export class SceneVoxelClipmap {
                 if (lo.some((v, a) => v - margin > regionHi[a]) || hi.some((v, a) => v + margin < regionLo[a])) return;
             }
             const culling = r.instanceCulling;
+            // its cut for the region, on the cluster path
+            const cut = view !== null && d.cluster ? clusterCut?.(r, view) : null;
+            if (cut?.drawBindGroup) {
+                pass.setPipeline(d.cluster!);
+                pass.setBindGroup(0, r.material.getBindGroup(this.device));
+                pass.setBindGroup(3, group, [this.voxelizer.drawOffset(k)]);
+                drawCut(pass, cut, d.meshOffset);
+                return;
+            }
             let culled = null;
             if (view !== null && culling && r.geometry.isInstancedGeometry) {
-                // (the cluster LOD path draws the renderable's cut for the region here: V-5)
                 culled = culling.view(view);
                 if (!culled) return;
             } else if (dynamic && culling && culling.culledStride !== culling.stride) {

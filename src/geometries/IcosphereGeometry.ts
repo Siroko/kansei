@@ -5,12 +5,13 @@ import { Geometry } from "../buffers/Geometry";
  * `subdivisions` times (20 · 4ⁿ triangles), its vertices pushed out to `radius`. Unlike
  * `SphereGeometry` it has no poles, so it suits displacement and cluster LOD.
  *
- * The same mesh as the Rust engine's `IcosphereGeometry` (`rust/kansei-core/src/geometries/icosphere.rs`).
+ * The same mesh as the Rust engine's `IcosphereGeometry` (`rust/kansei-core/src/geometries/icosphere.rs`),
+ * bit for bit: computed in f32 as glam computes it.
  */
 class IcosphereGeometry extends Geometry {
     constructor(radius: number = 1, subdivisions: number = 2) {
         super();
-        const t = (1 + Math.sqrt(5)) / 2;
+        const t = f(f(1 + f(Math.sqrt(5))) / 2);
         const points: [number, number, number][] = ([
             [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
             [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
@@ -27,7 +28,7 @@ class IcosphereGeometry extends Geometry {
                 let index = midpoints.get(key);
                 if (index === undefined) {
                     const [a, b] = [points[x], points[y]];
-                    points.push(normalize([(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5]));
+                    points.push(normalize([f(f(a[0] + b[0]) * 0.5), f(f(a[1] + b[1]) * 0.5), f(f(a[2] + b[2]) * 0.5)]));
                     index = points.length - 1;
                     midpoints.set(key, index);
                 }
@@ -42,15 +43,19 @@ class IcosphereGeometry extends Geometry {
         }
         const vertices = new Float32Array(points.length * 9);
         points.forEach(([x, y, z], i) => {
-            vertices.set([x * radius, y * radius, z * radius, 1, x, y, z, x * 0.5 + 0.5, y * 0.5 + 0.5], i * 9);
+            const r = f(radius);
+            vertices.set([f(x * r), f(y * r), f(z * r), 1, x, y, z, f(f(x * 0.5) + 0.5), f(f(y * 0.5) + 0.5)], i * 9);
         });
         this.setArrays('IcosphereGeometry', vertices, new Uint32Array(faces.flat()));
     }
 }
 
+const f = Math.fround;
+
+/** glam's `Vec3::normalize` in f32: `v * (1 / |v|)`. */
 function normalize([x, y, z]: [number, number, number]): [number, number, number] {
-    const length = Math.hypot(x, y, z);
-    return [x / length, y / length, z / length];
+    const inv = f(1 / f(Math.sqrt(f(f(f(x * x) + f(y * y)) + f(z * z)))));
+    return [f(x * inv), f(y * inv), f(z * inv)];
 }
 
 export { IcosphereGeometry };
