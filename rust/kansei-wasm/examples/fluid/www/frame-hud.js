@@ -1,5 +1,5 @@
-// A frame-time overlay shared by the Rust fluid example and its TypeScript original
-// (examples/index_fluid.html), so the two can be watched side by side: load either with ?hud=1.
+// A frame-time overlay for the Rust fluid example (load it with ?hud=1); examples/frame-hud.js is
+// the same overlay for its TypeScript original, so the two can be watched side by side.
 //
 // A rendered frame is a call to getCurrentTexture (each page calls it once a frame, whichever
 // engine draws it), so refreshes a frame loop skips are not frames. Over the last two seconds
@@ -59,5 +59,5 @@ export function installFrameHud({ steps = () => NaN } = {}) {
       + `1 / 2 / 3 / 4+ refreshes  ${pct}   cadence changes ${Math.round(100 * s.changeRate)}%\n`
       + `sim steps this frame ${s.steps}   (frames by steps ${stepShare})`;
   }, 250);
-  window.frameHud = { stats, steps };
+  window.frameHud = { stats };
 }

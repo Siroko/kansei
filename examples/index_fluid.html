@@ -549,8 +549,8 @@ fn fragment_main(v: VOut) -> FragOut {
           simAccumulator + Math.min(frameDt, MAX_FRAME_DT) * timing.simTimeScale,
           stepDt * timing.maxSimSteps,
         );
-        const steps = Math.floor(simAccumulator / stepDt + 1e-9);
-        simAccumulator -= steps * stepDt;
+        const steps = Math.floor(simAccumulator / stepDt + 1e-6);
+        simAccumulator = Math.max(0, simAccumulator - steps * stepDt);
         lastSimSteps = steps;
 
         if (steps > 0) {
