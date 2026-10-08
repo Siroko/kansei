@@ -200,7 +200,7 @@ export type { SceneVoxelClipmapOptions } from "./gi/SceneVoxelClipmap";
 export { RtGrid, RtGridHandle, RtPlacement, RT_MAX_CELLS, RT_TRIANGLE_BYTES, resolveRtGridOptions } from "./rt/RtGrid";
 export type { RtGridOptions, RtGridStats, RtSource, RtSurface } from "./rt/RtGrid";
 export type { InstanceTransform } from "./clusters/ClusterLod";
-export { RtMesh, splitLargeTriangles, transformBox } from "./rt/RtMesh";
+export { RtMesh, packOctahedral, splitLargeTriangles, transformBox } from "./rt/RtMesh";
 export { RtScene } from "./rt/RtScene";
 export type { RtInstance } from "./rt/RtScene";
 export { SceneRtGrid } from "./rt/SceneRtGrid";
@@ -211,6 +211,8 @@ export {
 export type { PlanarReflectionOptions, ReflectionFog, ScreenRect } from "./reflections/PlanarReflection";
 export { RtReflectionsEffect } from "./rt/RtReflectionsEffect";
 export type { RtReflectionsOptions, RtReflectionsView, RtReflectionStats, RtTraceResolution } from "./rt/RtReflectionsEffect";
+export { RtDiffuseGiEffect, RT_GI_DENOISERS, RT_GI_HIT_LIGHTINGS, RT_GI_KERNELS, RT_GI_MODES, RT_GI_RESOLUTIONS, RT_GI_SHADOWS, RT_GI_VIEWS } from "./rt/RtDiffuseGiEffect";
+export type { RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView } from "./rt/RtDiffuseGiEffect";
 export { RT_GRID_WGSL, RT_OPAQUE_WGSL, rtGridBindingsWgsl } from "./rt/RtWGSL";
 export {
     Transform, nlerp, quatAbs, quatLog, quatExp, quatToScaledAngleAxis, quatFromScaledAngleAxis, angularVelocity,

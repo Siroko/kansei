@@ -13,15 +13,21 @@ import rtGather from '../../rust/kansei-core/src/rt/shaders/rt_gather.wgsl?raw';
 import rtReflectCommon from '../../rust/kansei-core/src/rt/shaders/rt_reflect_common.wgsl?raw';
 import rtReflectTrace from '../../rust/kansei-core/src/rt/shaders/rt_reflect_trace.wgsl?raw';
 import rtReflectResolve from '../../rust/kansei-core/src/rt/shaders/rt_reflect_resolve.wgsl?raw';
+import rtGiCommon from '../../rust/kansei-core/src/rt/shaders/rt_gi_common.wgsl?raw';
+import rtGiTrace from '../../rust/kansei-core/src/rt/shaders/rt_gi_trace.wgsl?raw';
+import rtGiSvgf from '../../rust/kansei-core/src/rt/shaders/rt_gi_svgf.wgsl?raw';
+import rtGiComposite from '../../rust/kansei-core/src/rt/shaders/rt_gi_composite.wgsl?raw';
+import voxelIrradiance from '../../rust/kansei-core/src/gi/shaders/voxel_irradiance.wgsl?raw';
 import { CLIPMAP_WGSL, SKY_LIGHTING_WGSL, VOXEL_CONES_WGSL } from '../gi/GiWGSL';
+import { COMPUTE_SHADOWS_WGSL } from '../shadows/ComputeShadows';
 
 /**
  * Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
  * `kansei_rt_trace(origin, dir, tMin, tMax, flags)`, the closest hit of a ray among the grid's
  * triangles (`KANSEI_RT_ANY_HIT`: any hit, for shadows; `KANSEI_RT_SOLID`: no alpha test), with
  * `kansei_rt_exit` (where a ray leaves the box), `kansei_rt_contains`, and a hit triangle's
- * `kansei_rt_albedo`, `kansei_rt_uv`, `kansei_rt_source` and `kansei_rt_record`. Declare the
- * buffers with `rtGridBindingsWgsl(group, first)` (bind `RtGrid.bindGroupEntries`), and define
+ * `kansei_rt_albedo`, `kansei_rt_uv`, `kansei_rt_shading_normal` (`RtSurface.smoothNormals`),
+ * `kansei_rt_source` and `kansei_rt_record`. Declare the buffers with `rtGridBindingsWgsl(group, first)` (bind `RtGrid.bindGroupEntries`), and define
  * `fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool`, whether an alpha-tested triangle
  * (`RtSurface.alphaLayer`) is there at `uv` (`RT_OPAQUE_WGSL`: everywhere). Rust: `rt::RT_GRID_WGSL`.
  */
@@ -109,3 +115,57 @@ export function rtReflectTraceWgsl(covered: string, clipmap: boolean = false): s
 
 /** `RtReflectionsEffect`'s resolve. */
 export const RT_REFLECT_RESOLVE_WGSL = `${rtReflectCommon}\n${rtReflectResolve}`;
+
+/**
+ * The diffuse GI's voxel source over a clipmap (`CLIPMAP_WGSL`'s group 0 bindings 50-57): the
+ * reflections' functions and `srcSurfaceCone`, a cone leaving a surface (`clipConeTrace` lifts its
+ * samples off it). Rust: `rt::diffuse::CLIPMAP_SOURCE_WGSL`.
+ */
+const GI_CLIPMAP_SOURCE_WGSL = `${CLIPMAP_SOURCE_WGSL}// a cone leaving a surface (clipConeTrace lifts its samples off it)
+fn srcSurfaceCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
+    return srcCone(origin, dir, n, tanHalf, startDist, maxDist, steps);
+}
+`;
+
+/**
+ * The same over a voxel volume (group 0 bindings 60-62, its anisotropic mips 40-45, after
+ * `voxel_irradiance.wgsl`). Rust: `rt::diffuse::VOLUME_SOURCE_WGSL`.
+ */
+const GI_VOLUME_SOURCE_WGSL = /* wgsl */`
+@group(0) @binding(60) var<uniform> vol : VoxelVolume;
+@group(0) @binding(61) var volTex : texture_3d<f32>;
+@group(0) @binding(62) var volSampler : sampler;
+fn srcVoxelSize(p: vec3f) -> f32 {
+    return vol.voxelSize;
+}
+fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
+    var s = textureSampleLevel(volTex, volSampler, voxelUvw(vol, p + nf * (0.25 * vol.voxelSize)), 0.0);
+    if (s.a < 0.05) { s = textureSampleLevel(volTex, volSampler, voxelUvw(vol, p - nf * (0.25 * vol.voxelSize)), 0.0); }
+    return s.rgb / max(s.a, 0.05) * vol.radianceScale;
+}
+fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
+    return voxelConeTrace(vol, volTex, volSampler, origin, dir, tanHalf, startDist, maxDist, steps);
+}
+// a cone leaving a surface: voxel GI's own, through the anisotropic mips, its samples lifted off
+// the surface (voxel_irradiance.wgsl); the isotropic mips leak through thin walls once it widens
+fn srcSurfaceCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
+    return voxelSurfaceConeTrace(vol, volTex, volSampler, origin, dir, n, tanHalf, startDist, maxDist, steps, 1.0);
+}
+`;
+
+const RT_GI_PARAMS_WGSL = '@group(0) @binding(20) var<uniform> gp : RtGiParams;\n';
+
+/**
+ * `RtDiffuseGiEffect`'s trace over a voxel clipmap (`clipmap`) or volume, with `covered`
+ * (`kansei_rt_covered`). Rust: `rt::diffuse::trace_wgsl(clipmap, covered)`.
+ */
+export function rtGiTraceWgsl(covered: string, clipmap: boolean = false): string {
+    const source = clipmap ? `${CLIPMAP_WGSL}${GI_CLIPMAP_SOURCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${GI_VOLUME_SOURCE_WGSL}`;
+    return `${SKY_LIGHTING_WGSL}\n${COMPUTE_SHADOWS_WGSL}\n${rtGiCommon}\n${RT_GI_PARAMS_WGSL}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${source}\n${rtGiTrace}`;
+}
+
+/** `RtDiffuseGiEffect`'s SVGF: its `temporal`, `variance` and `atrous` entry points. Rust: `rt::diffuse::svgf_wgsl`. */
+export const RT_GI_SVGF_WGSL = `${rtGiCommon}\n${rtGiSvgf}`;
+
+/** `RtDiffuseGiEffect`'s composite. Rust: `rt::diffuse::composite_wgsl`. */
+export const RT_GI_COMPOSITE_WGSL = `${SKY_LIGHTING_WGSL}\n${rtGiCommon}\n${rtGiComposite}`;
