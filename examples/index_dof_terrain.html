@@ -32,10 +32,32 @@
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
     import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
+    import { CinematicDepthOfFieldEffect, DofDebugView } from '../src/postprocessing/effects/CinematicDepthOfFieldEffect'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
 
     // Restored from the first post-processing example (examples/index_postpro.html at 82a6164a), before it became
     // the spheres and volumetric fog scene: a scrolling field of noise-driven columns, made to test depth of field.
+    //
+    // URL parameters (as the Rust depth-of-field example's, where they match):
+    //   dof=simple       the simple DoF (a focus range and a blur in pixels) instead of the cinematic one; dof=0 none
+    //   focal=<mm>       the lens' focal length on the 23.76 mm filmback (default 450); the view's fov frames the picture
+    //   fstop=<N>        f-number (default 1.4)
+    //   focus=<units>    focus distance, view depth (default the view's, 101.5)
+    //   blades=<n>       aperture blades (default 0: round bokeh)
+    //   samples=<n>      gather samples per half-resolution pixel (default 72)
+    //   scatter=0        gather the highlights too instead of scattering them as bokeh sprites
+    //   lights=1         light the tops of some columns, small bright sources that scatter as bokeh
+    //   debug=<1..4>     1 background layer, 2 near layer, 3 near alpha, 4 CoC
+    //   t=<seconds>      fix the scroll at this time, for stills
+    //   view=<JSON>      the opening view ('Copy view' or the V key)
+    const params = new URLSearchParams(window.location.search);
+    const numberParam = (name, fallback) => {
+      const v = parseFloat(params.get(name) ?? '');
+      return Number.isFinite(v) ? v : fallback;
+    };
+    const DOF_MODE = params.get('dof') === 'simple' ? 'simple' : params.get('dof') === '0' ? 'off' : 'cinematic';
+    const LIGHTS = params.has('lights') && params.get('lights') !== '0';
+    const FIXED_TIME = params.has('t') ? numberParam('t', 0) : null;
 
     // ── Scene parameters ──────────────────────────────────────────────────────
     const GRID_SIZE      = 150;   // cubes per side (total = GRID_SIZE²)
@@ -43,6 +65,8 @@
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
     const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
     const SCROLL_SPEED   = 35;   // world-units per second along Z
+    const LIGHT_SHARE    = 0.03;  // with lights=1, the share of columns whose top glows
+    const LIGHT_RADIANCE = 12.0;  // their tops' brightness (the white columns read about 1)
 
     const GRID_HALF      = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
     const GRID_SPAN      = GRID_SIZE * GRID_SPACING;              // total Z extent
@@ -56,6 +80,7 @@
       const LIGHT_POS : vec3f = vec3f(80.0, 150.0, -60.0);
       const AMBIENT   : f32   = 0.12;
       const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
+      const LIGHT_COLOR: vec3f = vec3f(1.0, 0.62, 0.3);
       const MAX_Z     : f32   = ${(GRID_HALF + GRID_SPACING).toFixed(4)};
       const GRID_SPAN : f32   = ${GRID_SPAN.toFixed(4)};
 
@@ -63,6 +88,7 @@
         @builtin(position) position   : vec4f,
         @location(0)       worldPos   : vec3f,
         @location(1)       worldNormal: vec3f,
+        @location(2)       glow       : f32,
       }
 
       // Scroll along Z in world units, kept in [0, GRID_SPAN).
@@ -77,7 +103,7 @@
         @location(0) position : vec4f,
         @location(1) normal   : vec3f,
         @location(2) uv       : vec2f,
-        @location(3) column   : vec4f, // x, start z, height (y scale), unused
+        @location(3) column   : vec4f, // x, start z, height (y scale), glow of the top face
       ) -> VertexOut {
         // A column that scrolls past the front edge wraps to the back of the grid.
         var z = column.y + scrollOffset;
@@ -90,6 +116,7 @@
         // Inverse-transpose of the column's Y scale (the tall, thin noise columns), then the renderable's normalMatrix.
         let columnNormal = normal * vec3f(1.0, 1.0 / column.z, 1.0);
         out.worldNormal = normalize((normalMatrix * vec4f(columnNormal, 0.0)).xyz);
+        out.glow        = select(0.0, column.w, normal.y > 0.5);
         return out;
       }
 
@@ -106,9 +133,10 @@
         let L        = normalize(LIGHT_POS - frag.worldPos);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse;
+        let glow     = LIGHT_COLOR * frag.glow;
         return FragmentOutput(
-          vec4f(BASE_COLOR * lighting, 1.0),
-          vec4f(0.0, 0.0, 0.0, 1.0),
+          vec4f(BASE_COLOR * lighting + glow, 1.0),
+          vec4f(glow, 1.0),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
           vec4f(BASE_COLOR, 0.0)
         );
@@ -174,6 +202,8 @@
         columns[i]     = worldX;
         columns[i + 1] = worldZ;
         columns[i + 2] = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM) * SCALE_Y_STRENGTH + 0.1;
+        // a fixed scatter of glowing tops (hash2 is deterministic), only with lights=1
+        columns[i + 3] = LIGHTS && hash2(col + 0.37, row + 0.71) < LIGHT_SHARE ? LIGHT_RADIANCE : 0;
       }
     }
     const columnBuffer = new ComputeBuffer({
@@ -200,18 +230,51 @@
       kernelSize: 64,
       strength: 0.5
     });
-    const dofEffect = new DepthOfFieldEffect({
+    // The cinematic DoF's circle of confusion follows from a physical lens (thin-lens equation). A 150-unit terrain
+    // seen through a lens that frames it would be nearly all in focus, so the lens is a long one, set apart from the
+    // view's field of view: that gives the shallow focus of a miniature.
+    const cinematicDof = new CinematicDepthOfFieldEffect({
+      lens: {
+        focalLengthMm: numberParam('focal', 450),
+        fStop: numberParam('fstop', 1.4),
+        focusDistanceM: numberParam('focus', 101.5),
+        bladeCount: Math.max(0, Math.round(numberParam('blades', 0))),
+        bladeRotationDeg: 15,
+      },
+      sampleCount: Math.max(1, Math.round(numberParam('samples', 72))),
+      highlights: { enabled: params.get('scatter') !== '0' },
+    });
+    cinematicDof.debugView = Math.round(numberParam('debug', DofDebugView.None));
+    const simpleDof = new DepthOfFieldEffect({
       focusDistance: 101.5,
       focusRange: 15,
       maxBlur: 24
     });
-    const volume = new PostProcessingVolume(renderer, [ssaoEffect, dofEffect]);
+    const effects = [ssaoEffect];
+    if (DOF_MODE === 'cinematic') effects.push(cinematicDof);
+    if (DOF_MODE === 'simple') effects.push(simpleDof);
+    const volume = new PostProcessingVolume(renderer, effects);
 
     // ── Controls ──────────────────────────────────────────────────────────────
-    const pane = new Pane({ title: 'Depth of field' });
-    pane.addBinding(dofEffect, 'focusDistance', { min: 1, max: 150, step: 0.5, label: 'focus distance' });
-    pane.addBinding(dofEffect, 'focusRange', { min: 1, max: 80, step: 0.5, label: 'focus range' });
-    pane.addBinding(dofEffect, 'maxBlur', { min: 0, max: 32, step: 1, label: 'max blur' });
+    const pane = new Pane({ title: DOF_MODE === 'simple' ? 'Depth of field (simple)' : 'Depth of field' });
+    if (DOF_MODE === 'simple') {
+      pane.addBinding(simpleDof, 'focusDistance', { min: 1, max: 150, step: 0.5, label: 'focus distance' });
+      pane.addBinding(simpleDof, 'focusRange', { min: 1, max: 80, step: 0.5, label: 'focus range' });
+      pane.addBinding(simpleDof, 'maxBlur', { min: 0, max: 32, step: 1, label: 'max blur' });
+    } else if (DOF_MODE === 'cinematic') {
+      const lens = cinematicDof.lens;
+      pane.addBinding(lens, 'focusDistanceM', { min: 1, max: 300, step: 0.5, label: 'focus distance' });
+      pane.addBinding(lens, 'fStop', { min: 0.7, max: 22, step: 0.1, label: 'f-stop' });
+      pane.addBinding(lens, 'focalLengthMm', { min: 10, max: 600, step: 1, label: 'focal length (mm)' });
+      pane.addBinding(lens, 'bladeCount', { min: 0, max: 9, step: 1, label: 'blades' });
+      pane.addBinding(lens, 'bladeRotationDeg', { min: 0, max: 90, step: 1, label: 'blade rotation' });
+      pane.addBinding(cinematicDof, 'sampleCount', { min: 8, max: 128, step: 1, label: 'samples' });
+      pane.addBinding(cinematicDof.highlights, 'enabled', { label: 'scatter highlights' });
+      pane.addBinding(cinematicDof, 'debugView', {
+        label: 'debug view',
+        options: { image: 0, background: 1, near: 2, 'near alpha': 3, CoC: 4 },
+      });
+    }
     if (window.innerWidth < 768) pane.expanded = false;
 
     // ── View: the opening camera and DoF, shareable as JSON ──────────────────
@@ -226,7 +289,12 @@
       focusDistance: 101.5,
       focusRange: 15,
       maxBlur: 24,
+      fStop: cinematicDof.lens.fStop,
+      focalLength: cinematicDof.lens.focalLengthMm,
+      blades: cinematicDof.lens.bladeCount,
     };
+    // focus=<units> overrides the view's focus distance
+    if (params.has('focus')) DEFAULT_VIEW.focusDistance = numberParam('focus', DEFAULT_VIEW.focusDistance);
     const DEG = Math.PI / 180;
 
     function currentView() {
@@ -238,9 +306,12 @@
         elevation: +(cc.currentAngles.y * 360).toFixed(2),
         target: [orbitTarget.x, orbitTarget.y, orbitTarget.z].map((v) => +v.toFixed(2)),
         fov: camera.fov,
-        focusDistance: dofEffect.focusDistance,
-        focusRange: dofEffect.focusRange,
-        maxBlur: dofEffect.maxBlur,
+        focusDistance: DOF_MODE === 'simple' ? simpleDof.focusDistance : cinematicDof.lens.focusDistanceM,
+        focusRange: simpleDof.focusRange,
+        maxBlur: simpleDof.maxBlur,
+        fStop: cinematicDof.lens.fStop,
+        focalLength: cinematicDof.lens.focalLengthMm,
+        blades: cinematicDof.lens.bladeCount,
       };
     }
 
@@ -255,14 +326,18 @@
       orbitTarget.set(v.target[0], v.target[1], v.target[2]);
       camera.fov = v.fov;
       camera.updateProjectionMatrix();
-      dofEffect.focusDistance = v.focusDistance;
-      dofEffect.focusRange = v.focusRange;
-      dofEffect.maxBlur = v.maxBlur;
+      simpleDof.focusDistance = v.focusDistance;
+      simpleDof.focusRange = v.focusRange;
+      simpleDof.maxBlur = v.maxBlur;
+      cinematicDof.lens.focusDistanceM = v.focusDistance;
+      cinematicDof.lens.fStop = v.fStop;
+      cinematicDof.lens.focalLengthMm = v.focalLength;
+      cinematicDof.lens.bladeCount = v.blades;
       pane.refresh();
     }
 
     let openingView = { ...DEFAULT_VIEW };
-    const viewParam = new URLSearchParams(window.location.search).get('view');
+    const viewParam = params.get('view');
     if (viewParam) {
       try {
         openingView = { ...DEFAULT_VIEW, ...JSON.parse(viewParam) };
@@ -299,7 +374,9 @@
       lastTime = now;
 
       // Wrapped on the CPU so the offset keeps full float precision on the GPU.
-      scrollOffset.value = (scrollOffset.value + SCROLL_SPEED * dt) % GRID_SPAN;
+      scrollOffset.value = FIXED_TIME === null
+        ? (scrollOffset.value + SCROLL_SPEED * dt) % GRID_SPAN
+        : (SCROLL_SPEED * FIXED_TIME) % GRID_SPAN;
 
       cameraControls.update();
       volume.render(scene, camera);
