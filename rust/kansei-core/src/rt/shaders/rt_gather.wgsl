@@ -103,6 +103,23 @@ fn place(record: u32, a: vec3f, b: vec3f, c: vec3f) -> Placed {
     return p;
 }
 
+// A world normal of the vertex at object position `a` with object normal `n`, as the record's
+// placement and the source's world matrix carry it (rigid or uniformly scaled), packed.
+fn placeNormal(record: u32, a: vec3f, n: vec3f) -> u32 {
+    let p0 = (src.world * vec4f(kansei_rt_place(record, a), 1.0)).xyz;
+    let p1 = (src.world * vec4f(kansei_rt_place(record, a + n * 0.01), 1.0)).xyz;
+    return kansei_rt_pack_normal(normalize(p1 - p0));
+}
+
+// What a triangle's last four words carry: its vertices' uvs, or with KANSEI_RT_SMOOTH their
+// world normals.
+fn extra(record: u32, a: vec3f, b: vec3f, c: vec3f, na: vec3f, nb: vec3f, nc: vec3f, uv: vec3u) -> vec3u {
+    if ((src.surface & KANSEI_RT_SMOOTH) == 0u) {
+        return uv;
+    }
+    return vec3u(placeNormal(record, a, na), placeNormal(record, b, nb), placeNormal(record, c, nc));
+}
+
 fn write(id: u32, p: Placed, uv: vec3u, record: u32) {
     if (id >= grid.triangleCapacity) {
         return;
@@ -118,14 +135,18 @@ var<workgroup> keptBase : u32;
 
 // ---- a mesh, once per record ----
 
-// Mesh vertex `v` (`RtMesh`: x, y, z, then the uv packed as two f16).
+// Mesh vertex `v` (`RtMesh`: x, y, z, the uv packed as two f16, the normal octahedral).
 fn meshPosition(v: u32) -> vec3f {
-    let at = mesh[0] + v * 4u;
+    let at = mesh[0] + v * 5u;
     return vec3f(bitcast<f32>(mesh[at]), bitcast<f32>(mesh[at + 1u]), bitcast<f32>(mesh[at + 2u]));
 }
 
 fn meshUv(v: u32) -> u32 {
-    return mesh[mesh[0] + v * 4u + 3u];
+    return mesh[mesh[0] + v * 5u + 3u];
+}
+
+fn meshNormal(v: u32) -> vec3f {
+    return kansei_rt_unpack_normal(mesh[mesh[0] + v * 5u + 4u]);
 }
 
 @compute @workgroup_size(64)
@@ -144,7 +165,7 @@ fn gather(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_index) la
         let b = mesh[i + 1u];
         let c = mesh[i + 2u];
         p = place(src.firstRecord + slot, meshPosition(a), meshPosition(b), meshPosition(c));
-        uv = vec3u(meshUv(a), meshUv(b), meshUv(c));
+        uv = extra(src.firstRecord + slot, meshPosition(a), meshPosition(b), meshPosition(c), meshNormal(a), meshNormal(b), meshNormal(c), vec3u(meshUv(a), meshUv(b), meshUv(c)));
     }
     var local = 0u;
     if (p.keep) {
@@ -174,6 +195,11 @@ fn clusterVertex(c: u32, local: u32) -> u32 {
 // A mesh vertex (`Vertex`: position 0-3, normal 4-6, uv 7-8).
 fn vertexPosition(v: u32) -> vec3f {
     let at = mesh[0] + v * 9u;
+    return vec3f(bitcast<f32>(mesh[at]), bitcast<f32>(mesh[at + 1u]), bitcast<f32>(mesh[at + 2u]));
+}
+
+fn vertexNormal(v: u32) -> vec3f {
+    let at = mesh[0] + v * 9u + 4u;
     return vec3f(bitcast<f32>(mesh[at]), bitcast<f32>(mesh[at + 1u]), bitcast<f32>(mesh[at + 2u]));
 }
 
@@ -211,7 +237,7 @@ fn gather_clusters(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_
                     let p = place(record, vertexPosition(a), vertexPosition(b), vertexPosition(d));
                     if (p.keep) {
                         placed[count] = p;
-                        uvs[count] = vec3u(vertexUv(a), vertexUv(b), vertexUv(d));
+                        uvs[count] = extra(record, vertexPosition(a), vertexPosition(b), vertexPosition(d), vertexNormal(a), vertexNormal(b), vertexNormal(d), vec3u(vertexUv(a), vertexUv(b), vertexUv(d)));
                         count += 1u;
                     }
                 }

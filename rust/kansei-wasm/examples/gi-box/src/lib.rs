@@ -1061,7 +1061,8 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
     });
     let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None, [0.0; 2])).with_gi(GiSurface::new(albedo));
     dragon.clusters = clusters;
-    dragon.rt = grid.then(|| RtSurface::new(albedo));
+    // its hits shaded with its vertex normals, not its cut's facets
+    dragon.rt = grid.then(|| RtSurface::new(albedo).with_smooth_normals());
     dragon.object.position = rest.0;
     dragon.object.rotation.y = rest.1;
     dragon.visible = false;

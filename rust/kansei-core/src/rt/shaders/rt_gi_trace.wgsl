@@ -66,12 +66,12 @@ fn shadowRay(o: vec3f, d: vec3f, tMax: f32, beyond: bool, cost: ptr<function, u3
     return 1.0;
 }
 
-// The irradiance the renderer's lights put on a surface at p (normal n): directional, point and
-// spot lights, shadowed by rays through the grid (RT_GI_SHADOW_RAY; a spot light's toward a
-// point of its disk) or by the shadow maps.
-fn directLight(p: vec3f, n: vec3f, px: vec2u, dim: u32, cost: ptr<function, u32>) -> vec3f {
+// The irradiance the renderer's lights put on a surface at p (geometric normal ng, shading
+// normal n): directional, point and spot lights, shadowed by rays through the grid
+// (RT_GI_SHADOW_RAY; a spot light's toward a point of its disk) or by the shadow maps.
+fn directLight(p: vec3f, ng: vec3f, n: vec3f, px: vec2u, dim: u32, cost: ptr<function, u32>) -> vec3f {
     var e = vec3f(0.0);
-    let o = p + n * surfaceBias(p);
+    let o = p + ng * surfaceBias(p);
     let rays = (gp.flags & RT_GI_SHADOW_RAY) != 0u;
     for (var i = 0u; i < gp.numDirLights; i++) {
         let dl = dirLights[i];
@@ -139,17 +139,20 @@ fn directLight(p: vec3f, n: vec3f, px: vec2u, dim: u32, cost: ptr<function, u32>
 // voxels' radiance there, or its exact direct light plus the indirect light round it from one
 // voxel cone in a cosine-distributed direction (a sample of the irradiance over pi, which the
 // denoiser averages; one wide cone along the normal loses a third of it through thin walls).
-fn shadeHit(p: vec3f, n: vec3f, triangle: u32, px: vec2u, cost: ptr<function, u32>) -> vec3f {
+// Shaded with the triangle's interpolated vertex normals where it carries them
+// (RtSurface::with_smooth_normals), offset along its geometric normal ng.
+fn shadeHit(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f, px: vec2u, cost: ptr<function, u32>) -> vec3f {
     if ((gp.flags & RT_GI_HIT_DIRECT) == 0u) {
-        return srcHitRadiance(p, n);
+        return srcHitRadiance(p, ng);
     }
+    let n = kansei_rt_shading_normal(triangle, bary, ng);
     let albedo = kansei_rt_albedo(triangle);
-    let e = directLight(p, n, px, 2u, cost);
+    let e = directLight(p, ng, n, px, 2u, cost);
     var indirect = vec3f(0.0);
     if (gp.hitConeSteps > 0u) {
         let size = srcVoxelSize(p);
         let xi = vec2f(giHash(px.x, px.y, gp.frame * 64u + 40u), giHash(px.y, px.x, gp.frame * 64u + 41u));
-        let d = giCosineDir(n, xi);
+        let d = above(giCosineDir(n, xi), ng);
         let c = srcSurfaceCone(p, d, n, gp.hitConeTan, 1.5 * size, gp.maxDistance, gp.hitConeSteps);
         indirect = c.rgb + c.a * skyLight(d);
     }
@@ -193,9 +196,10 @@ fn tracePath(origin: vec3f, n0: vec3f, px: vec2u, cost: ptr<function, u32>, foun
             *found = true;
         }
         let p = o + d * h.t;
-        let nh = h.normal;
+        let ng = h.normal;
+        let nh = kansei_rt_shading_normal(h.triangle, h.bary, ng);
         let albedo = kansei_rt_albedo(h.triangle);
-        radiance += throughput * albedo / RT_GI_PI * directLight(p, nh, px, 8u + 4u * b, cost);
+        radiance += throughput * albedo / RT_GI_PI * directLight(p, ng, nh, px, 8u + 4u * b, cost);
         // cosine sampling: the BRDF times the cosine over the pdf is the albedo
         throughput *= albedo;
         if (b >= 1u) {
@@ -203,10 +207,10 @@ fn tracePath(origin: vec3f, n0: vec3f, px: vec2u, cost: ptr<function, u32>, foun
             if (giHash(px.x, px.y, gp.frame * 64u + b) > q) { break; }
             throughput /= q;
         }
-        o = p + nh * surfaceBias(p);
-        n = nh;
+        o = p + ng * surfaceBias(p);
+        n = ng;
         let xi = vec2f(giHash(px.x, px.y, gp.frame * 64u + 2u * b + 20u), giHash(px.y, px.x, gp.frame * 64u + 2u * b + 21u));
-        d = above(giCosineDir(nh, xi), nh);
+        d = above(giCosineDir(nh, xi), ng);
     }
     return radiance;
 }
@@ -243,7 +247,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         }
         found = hit.found;
         if (hit.found) {
-            radiance = shadeHit(origin + d * hit.t, hit.normal, hit.triangle, px, &cost);
+            radiance = shadeHit(origin + d * hit.t, hit.normal, hit.triangle, hit.bary, px, &cost);
         } else {
             radiance = farField(origin, d, n, exit);
         }

@@ -8,11 +8,14 @@ use crate::geometries::{Geometry, Vertex};
 /// vertices and triangles it has.
 const HEADER_WORDS: usize = 4;
 
-/// A mesh for `RtGrid::gather`: its vertices' positions and uvs, its triangles, and its bounds.
+/// A mesh for `RtGrid::gather`: its vertices' positions, uvs and normals, its triangles, and its
+/// bounds.
 #[derive(Clone, Debug, Default)]
 pub struct RtMesh {
     pub positions: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    /// (what `RtSurface::with_smooth_normals` interpolates at a hit)
+    pub normals: Vec<[f32; 3]>,
     /// Three vertex indices a triangle.
     pub indices: Vec<u32>,
     pub min: Vec3,
@@ -31,7 +34,7 @@ impl RtMesh {
         if positions.is_empty() {
             (min, max) = (Vec3::ZERO, Vec3::ZERO);
         }
-        Self { uvs: geometry.vertices.iter().map(|v| v.uv).collect(), positions, indices: geometry.indices.clone(), min, max }
+        Self { uvs: geometry.vertices.iter().map(|v| v.uv).collect(), normals: geometry.vertices.iter().map(|v| v.normal).collect(), positions, indices: geometry.indices.clone(), min, max }
     }
 
     pub fn triangle_count(&self) -> u32 {
@@ -39,14 +42,16 @@ impl RtMesh {
     }
 
     /// The mesh as the gather reads it: a header (where the vertices and indices start, the
-    /// vertex and triangle counts), the vertices (x, y, z and the uv as two f16), the indices.
+    /// vertex and triangle counts), the vertices (x, y, z, the uv as two f16 and the normal
+    /// octahedral, as two snorm16), the indices.
     pub fn gpu_words(&self) -> Vec<u32> {
         let vertices = HEADER_WORDS;
-        let indices = vertices + self.positions.len() * 4;
+        let indices = vertices + self.positions.len() * 5;
         let mut words = Vec::with_capacity(indices + self.indices.len());
         words.extend([vertices as u32, indices as u32, self.positions.len() as u32, self.triangle_count()]);
-        for (p, uv) in self.positions.iter().zip(&self.uvs) {
-            words.extend([p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), pack_half2(*uv)]);
+        for (k, (p, uv)) in self.positions.iter().zip(&self.uvs).enumerate() {
+            let n = self.normals.get(k).copied().unwrap_or([0.0, 1.0, 0.0]);
+            words.extend([p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), pack_half2(*uv), pack_octahedral(n)]);
         }
         words.extend_from_slice(&self.indices);
         words
@@ -57,6 +62,19 @@ impl RtMesh {
         use wgpu::util::DeviceExt;
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtMesh"), contents: bytemuck::cast_slice(&self.gpu_words()), usage: wgpu::BufferUsages::STORAGE })
     }
+}
+
+/// A unit vector, octahedral, as WGSL's `pack2x16snorm` packs the two coordinates
+/// (`kansei_rt_unpack_normal` reads it).
+fn pack_octahedral(n: [f32; 3]) -> u32 {
+    let v = Vec3::from(n);
+    let v = if v.length_squared() > 0.0 { v / (v.x.abs() + v.y.abs() + v.z.abs()) } else { Vec3::Y };
+    let (mut x, mut y) = (v.x, v.y);
+    if v.z < 0.0 {
+        (x, y) = ((1.0 - v.y.abs()) * v.x.signum(), (1.0 - v.x.abs()) * v.y.signum());
+    }
+    let snorm = |f: f32| ((f.clamp(-1.0, 1.0) * 32767.0).round() as i32 as u32) & 0xffff;
+    snorm(x) | snorm(y) << 16
 }
 
 /// Two f32 as WGSL's `pack2x16float` packs them (round to nearest even).
@@ -145,6 +163,25 @@ pub fn transform_box(m: &Mat4, min: Vec3, max: Vec3) -> (Vec3, Vec3) {
 mod tests {
     use super::*;
     use crate::geometries::{BoxGeometry, PlaneGeometry};
+
+    #[test]
+    fn normals_pack_as_kansei_rt_unpack_normal_reads_them() {
+        // a CPU twin of rt_types.wgsl's kansei_rt_unpack_normal
+        let unpack = |w: u32| {
+            let snorm = |h: u32| ((h & 0xffff) as u16 as i16 as f32 / 32767.0).max(-1.0);
+            let (x, y) = (snorm(w), snorm(w >> 16));
+            let mut v = Vec3::new(x, y, 1.0 - x.abs() - y.abs());
+            if v.z < 0.0 {
+                v = Vec3::new((1.0 - v.y.abs()) * if v.x >= 0.0 { 1.0 } else { -1.0 }, (1.0 - v.x.abs()) * if v.y >= 0.0 { 1.0 } else { -1.0 }, v.z);
+            }
+            v.normalize()
+        };
+        for n in [[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [0.3, -0.5, 0.81], [-0.7, 0.1, -0.7], [1.0, 1.0, 1.0]] {
+            let n = Vec3::from(n).normalize();
+            let back = unpack(pack_octahedral(n.into()));
+            assert!(back.dot(n) > 0.9999, "{n} came back {back}");
+        }
+    }
 
     #[test]
     fn half_bits_round_like_pack2x16float() {

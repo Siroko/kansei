@@ -241,11 +241,22 @@ impl RtPlacement {
 pub struct RtSurface {
     pub albedo: [f32; 3],
     pub alpha_layer: Option<u8>,
+    /// Its triangles carry their vertex normals (in place of their uvs), which
+    /// `kansei_rt_shading_normal` interpolates at a hit: for the rays a curved surface bends or
+    /// mirrors (glass, chrome). Its uvs are then gone: only for surfaces no `kansei_rt_covered`
+    /// samples by uv.
+    pub smooth_normals: bool,
 }
 
 impl RtSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, alpha_layer: None }
+        Self { albedo, alpha_layer: None, smooth_normals: false }
+    }
+
+    /// See `smooth_normals`.
+    pub fn with_smooth_normals(mut self) -> Self {
+        self.smooth_normals = true;
+        self
     }
 
     /// Alpha tested: `kansei_rt_covered(layer, uv)` says where it is there.
@@ -255,7 +266,7 @@ impl RtSurface {
     }
 
     pub(crate) fn surface_word(&self) -> u32 {
-        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8)
+        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8) | if self.smooth_normals { 4 } else { 0 }
     }
 
     pub(crate) fn albedo_word(&self) -> u32 {

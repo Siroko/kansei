@@ -1035,7 +1035,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             triangles += geometry.indices.len() as u64 / 3;
             let mut r = Renderable::new(geometry, ground_material("Terrain", TERRAIN_ALBEDO_WGSL, GRASS, &ambient, wet)).with_gi(GiSurface::new(GRASS));
             r.cast_shadow = true;
-            r.rt = rt.then(|| RtSurface::new(GRASS));
+            // the hits shaded with the height field's vertex normals, not its facets
+            r.rt = rt.then(|| RtSurface::new(GRASS).with_smooth_normals());
             scene.add(SceneNode::Renderable(r));
         }
     }
