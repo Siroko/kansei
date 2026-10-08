@@ -404,7 +404,9 @@ fn evaluateLighting(hitPos: vec3f, hitNorm: vec3f, wo: vec3f,
             total += evaluatePointLight(hitPos, hitNorm, light);
         }
     }
-    return total;
+    // the lights' irradiance through a Lambertian BRDF (albedo / pi; callers apply the albedo),
+    // as the raster lights surfaces
+    return total / PI;
 }
 
 // ── Volumetric fog (voxel-space ray-marched) ─────────────────────────────
@@ -488,7 +490,7 @@ fn computeVoxelFog(rayOrigin: vec3f, rayDir: vec3f, hitDist: f32) -> vec4f {
 }
 
 // ── Multi-bounce path tracer with NEE ─────────────────────────────────
-// Returns irradiance at startPos. At each vertex: NEE for direct light,
+// Returns the light reflected at startPos per unit albedo. At each vertex: NEE for direct light,
 // then stochastic PBR bounce (specular or diffuse based on metallic/Fresnel).
 
 fn tracePath(startPos: vec3f, startNorm: vec3f, skipFirstNEE: u32,
@@ -954,7 +956,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 accumulated += (direct + indirect) * albedo * kd / max(diffProb, 0.01);
             } else if (traceParams.useReSTIR != 0u) {
                 // ReSTIR provides primary-surface direct light; skip first NEE in tracePath
-                let restirDirect = textureLoad(restirDirectTex, vec2i(coord), 0).rgb;
+                // ReSTIR resolves irradiance; / PI as evaluateLighting does
+                let restirDirect = textureLoad(restirDirectTex, vec2i(coord), 0).rgb / PI;
                 let indirect = tracePath(worldPos, worldNormal, 1u,
                     viewDir, roughness, metallic, albedo);
                 accumulated += (restirDirect + indirect) * albedo * kd / max(diffProb, 0.01);

@@ -254,10 +254,12 @@ class FroxelGrid {
             let prevUV = vec2f(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
             let prevLinearD = 2.0 * n * f / ((f + n) - prevNDC.z * (f - n));
             let prevSlice = depthToSlice(prevLinearD, tp.gridNear, tp.gridFar, f32(tp.gridD));
-            let prevUVW = vec3f(prevUV, (prevSlice + 0.5) / f32(tp.gridD));
+            // depthToSlice already puts slice k's centre at k + 0.5
+            let prevUVW = vec3f(prevUV, prevSlice / f32(tp.gridD));
 
-            // Bounds check
-            let valid = all(prevUVW >= vec3f(0.0)) && all(prevUVW <= vec3f(1.0)) && tp.hasPrevFrame != 0u;
+            // Bounds check; behind the previous camera the divide by w mirrors the point
+            let valid = all(prevUVW >= vec3f(0.0)) && all(prevUVW <= vec3f(1.0))
+                     && prevClip.w > 0.0 && tp.hasPrevFrame != 0u;
 
             // Sample history with trilinear filtering
             let history = textureSampleLevel(historyIn, historySamp, prevUVW, 0.0);

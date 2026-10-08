@@ -22,8 +22,12 @@ export interface VolumetricFogOptions {
 }
 
 // Byte sizes per storage-buffer element (must match WGSL struct layout)
-const DIR_LIGHT_STRIDE  = 96;   // vec3f+f32 + vec3f+f32 + mat4x4f
+const DIR_LIGHT_STRIDE  = 32;   // vec3f+u32 + vec3f+f32
 const POINT_LIGHT_STRIDE = 32;  // vec3f+f32 + vec3f+u32
+
+// PointLightData.shadowLayer sentinels (otherwise the light's first cube-atlas layer)
+const NO_SHADOW = 0xffffffff;
+const SHADOW_MAP = 0xfffffffe;  // shadowed by the fog's 2D shadowMap (an AreaLight that owns it)
 
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -117,19 +121,21 @@ class VolumetricFogEffect extends PostProcessingEffect {
         }
 
         struct DirLightData {
-            direction     : vec3f,
-            _pad0         : f32,
-            color         : vec3f,
-            _pad1         : f32,
-            lightViewProj : mat4x4f,
+            direction : vec3f,
+            shadowed  : u32,     // 1 = shadowed by shadowDepthTex through params.shadowViewProj
+            color     : vec3f,
+            _pad      : f32,
         }
 
         struct PointLightData {
-            position  : vec3f,
-            radius    : f32,
-            color     : vec3f,
-            atlasBase : u32,
+            position    : vec3f,
+            radius      : f32,
+            color       : vec3f,
+            shadowLayer : u32,   // first cube-atlas layer, or NO_SHADOW / SHADOW_MAP
         }
+
+        const NO_SHADOW  : u32 = 0xffffffffu;
+        const SHADOW_MAP : u32 = 0xfffffffeu;
 
         @group(0) @binding(0) var scatterExtTex    : texture_storage_3d<rgba16float, write>;
         @group(0) @binding(1) var shadowDepthTex   : texture_depth_2d;
@@ -249,7 +255,10 @@ class VolumetricFogEffect extends PostProcessingEffect {
             // Directional lights
             for (var di = 0u; di < params.numDirLights; di++) {
                 let dl = dirLights[di];
-                let visibility = dirShadowLookup(worldPos, dl.lightViewProj);
+                var visibility = 1.0;
+                if (dl.shadowed != 0u && params.hasShadowMap != 0u) {
+                    visibility = dirShadowLookup(worldPos, params.shadowViewProj);
+                }
                 let phase = henyeyGreenstein(dot(viewDir, -normalize(dl.direction)), params.anisotropy);
                 totalScatter += density * dl.color * visibility * phase;
             }
@@ -261,11 +270,13 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 if (dist > pl.radius) { continue; }
 
                 let attenuation = smoothFalloff(dist, pl.radius);
-                var visibility: f32;
-                if (params.hasShadowMap > 0u) {
-                    visibility = dirShadowLookup(worldPos, params.shadowViewProj);
-                } else {
-                    visibility = samplePointShadow(worldPos, pl.position, pl.radius, pl.atlasBase);
+                var visibility = 1.0;
+                if (pl.shadowLayer == SHADOW_MAP) {
+                    if (params.hasShadowMap != 0u) {
+                        visibility = dirShadowLookup(worldPos, params.shadowViewProj);
+                    }
+                } else if (pl.shadowLayer != NO_SHADOW) {
+                    visibility = samplePointShadow(worldPos, pl.position, pl.radius, pl.shadowLayer);
                 }
                 let phase = henyeyGreenstein(dot(viewDir, normalize(pl.position - worldPos)), params.anisotropy);
                 totalScatter += density * pl.color * attenuation * visibility * phase;
@@ -508,26 +519,34 @@ class VolumetricFogEffect extends PostProcessingEffect {
         this._ensureLightBuffers(this._numDirLights, this._numPointLights);
         if (this._injectBGDirty) this._rebuildInjectBG();
 
-        // Pack DirLightData (96 bytes = 24 floats each)
+        // The 2D shadow map shadows the light that owns it (light.shadowMap), or, when no
+        // light owns it, the first directional light, as in the Rust fog.
+        const sm = this._shadowMap;
+        const smOwned = sm !== null
+            && (dirLights.some(l => l.shadowMap === sm) || areaLights.some(l => l.shadowMap === sm));
+        const firstDir = dirLights[0];
+        const dirShadowed = (l: DirectionalLight) =>
+            sm !== null && (smOwned ? l.shadowMap === sm : l === firstDir);
+
+        // A positional light reads its own cube faces, if the cube map drew it last frame.
+        const cubeLights = this._cubeMapShadowMap?.lights ?? [];
+
+        // Pack DirLightData (32 bytes = 8 floats each)
         if (this._numDirLights > 0) {
-            const data = new Float32Array(this._numDirLights * 24);
+            const data = new Float32Array(this._numDirLights * 8);
+            const uintView = new Uint32Array(data.buffer);
             for (let i = 0; i < this._numDirLights; i++) {
                 const light = volDirLights[i];
                 const ec = light.effectiveColor;
-                const off = i * 24;
+                const off = i * 8;
                 data[off]     = light.direction[0];
                 data[off + 1] = light.direction[1];
                 data[off + 2] = light.direction[2];
-                // off+3 = pad
+                uintView[off + 3] = dirShadowed(light) ? 1 : 0;
                 data[off + 4] = ec[0];
                 data[off + 5] = ec[1];
                 data[off + 6] = ec[2];
                 // off+7 = pad
-                if (this._shadowMap) {
-                    data.set(this._shadowMap.lightViewProjMatrix, off + 8);
-                }
-                // If no shadow map, lightViewProj stays zeroed — dirShadowLookup will
-                // project everything to origin and return 1.0 (outside UV bounds).
             }
             this._device.queue.writeBuffer(this._dirLightsBuffer!, 0, data.buffer as ArrayBuffer);
         }
@@ -552,7 +571,10 @@ class VolumetricFogEffect extends PostProcessingEffect {
                     data[off + 6] = ec[2];
                 }
                 // non-volumetric: color stays (0,0,0) — scatter contribution is zero
-                uintView[off + 7] = i * 6; // atlasBase
+                const cubeIndex = cubeLights.indexOf(light);
+                uintView[off + 7] = cubeIndex >= 0 ? cubeIndex * 6
+                    : (sm !== null && light instanceof AreaLight && light.shadowMap === sm) ? SHADOW_MAP
+                    : NO_SHADOW;
             }
             this._device.queue.writeBuffer(this._pointLightsBuffer!, 0, data.buffer as ArrayBuffer);
         }
