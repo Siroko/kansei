@@ -124,7 +124,7 @@ class ShadowMap {
         if (useShadowFar < camera.far) {
             // Temporary projection with clamped far plane
             const tmpProj = mat4.create();
-            mat4.perspective(tmpProj, camera.fov * Math.PI / 180, camera.aspect, camera.near, useShadowFar);
+            mat4.perspectiveZO(tmpProj, camera.fov * Math.PI / 180, camera.aspect, camera.near, useShadowFar);
             mat4.multiply(vp, tmpProj, camera.viewMatrix.internalMat4);
         } else {
             mat4.multiply(vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
@@ -181,12 +181,7 @@ class ShadowMap {
         // but minZ/maxZ are negative view-space Z coords (objects in
         // front of the light have Z < 0).  Negate & swap so that
         // near = -maxZ (closest) and far = -minZ (farthest).
-        mat4.ortho(this._lightProj, minX, maxX, minY, maxY, -maxZ, -minZ);
-
-        // gl-matrix v3 ortho maps Z to [-1,1]; remap to [0,1] for WebGPU
-        (this._lightProj as unknown as Float32Array)[10] *= 0.5;
-        (this._lightProj as unknown as Float32Array)[14] =
-            (this._lightProj as unknown as Float32Array)[14] * 0.5 + 0.5;
+        mat4.orthoZO(this._lightProj, minX, maxX, minY, maxY, -maxZ, -minZ);
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
@@ -208,15 +203,7 @@ class ShadowMap {
 
         const near = this._near;
         const far = this._far > 0 ? this._far : light.radius;
-        mat4.perspective(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
-
-        // gl-matrix perspective maps Z to [-1,1]; remap to [0,1] for WebGPU.
-        // For perspective P[11]=-1, the correct remap is:
-        //   P'[10] = P[10]*0.5 + P[11]*0.5
-        //   P'[14] = P[14]*0.5
-        const P = this._lightProj as unknown as Float32Array;
-        P[10] = P[10] * 0.5 + P[11] * 0.5;
-        P[14] = P[14] * 0.5;
+        mat4.perspectiveZO(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
@@ -242,11 +229,7 @@ class ShadowMap {
 
         const near = this._near;
         const far = this._far > 0 ? this._far : light.radius;
-        mat4.perspective(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
-
-        const P = this._lightProj as unknown as Float32Array;
-        P[10] = P[10] * 0.5 + P[11] * 0.5;
-        P[14] = P[14] * 0.5;
+        mat4.perspectiveZO(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);

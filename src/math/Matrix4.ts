@@ -71,7 +71,8 @@ class Matrix4 extends BufferBase {
     }
 
     /**
-     * Sets this matrix to a perspective projection matrix.
+     * Sets this matrix to a perspective projection matrix with WebGPU's
+     * [0, 1] depth range (near maps to 0, far to 1).
      * @param fov Field of view in radians.
      * @param aspect Aspect ratio.
      * @param near Near clipping plane.
@@ -79,7 +80,7 @@ class Matrix4 extends BufferBase {
      * @returns This matrix after setting perspective.
      */
     perspective(fov: number, aspect: number, near: number, far: number) {
-        mat4.perspective(this.internalMat4, fov, aspect, near, far);
+        mat4.perspectiveZO(this.internalMat4, fov, aspect, near, far);
         this.updateBuffer();
         return this;
     }
@@ -90,8 +91,9 @@ class Matrix4 extends BufferBase {
         return this;
     }
 
+    /** Sets this matrix to an orthographic projection with WebGPU's [0, 1] depth range. */
     ortho(left: number, right: number, bottom: number, top: number, near: number, far: number): Matrix4 {
-        mat4.ortho(this.internalMat4, left, right, bottom, top, near, far);
+        mat4.orthoZO(this.internalMat4, left, right, bottom, top, near, far);
         this.updateBuffer();
         return this;
     }

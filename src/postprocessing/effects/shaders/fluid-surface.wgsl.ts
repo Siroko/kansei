@@ -79,7 +79,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let maxT = min(tRange.y, length(farWorld - nearWorld) * sceneDepth);
+    // Stop the march at the opaque scene surface (depth 1.0 is sky).
+    let sceneClip = params.invViewProj * vec4<f32>(ndc, sceneDepth, 1.0);
+    let sceneT = select(1e30, distance(sceneClip.xyz / sceneClip.w, rayOrigin), sceneDepth < 1.0);
+    let maxT = min(tRange.y, sceneT);
     let stepSize = (tRange.y - tRange.x) / f32(params.stepCount);
 
     // Jitter start to break banding

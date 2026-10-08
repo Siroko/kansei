@@ -237,7 +237,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 return;
             }
 
-            let ndcZ = ((params.cameraFar + params.cameraNear) * linearD - 2.0 * params.cameraFar * params.cameraNear)
+            let ndcZ = params.cameraFar * (linearD - params.cameraNear)
                      / ((params.cameraFar - params.cameraNear) * linearD);
             let uv = (vec2f(f32(gid.x), f32(gid.y)) + 0.5) / vec2f(f32(params.gridW), f32(params.gridH));
             let ndcX = uv.x * 2.0 - 1.0;
@@ -322,8 +322,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
             let sceneColor = textureLoad(inputTex, coord, 0);
             let depth      = textureLoad(depthTex, coord, 0);
 
-            let linearDepth = 2.0 * cp.cameraNear * cp.cameraFar
-                            / ((cp.cameraFar + cp.cameraNear) - depth * (cp.cameraFar - cp.cameraNear));
+            let linearDepth = cp.cameraNear * cp.cameraFar
+                            / (cp.cameraFar - depth * (cp.cameraFar - cp.cameraNear));
 
             let sliceFloat = depthToSlice(linearDepth, cp.gridNear, cp.gridFar, cp.gridD);
 
