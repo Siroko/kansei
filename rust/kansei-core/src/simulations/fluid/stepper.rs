@@ -107,8 +107,9 @@ pub struct FluidStepper {
 }
 
 impl FluidStepper {
-    /// Steps of `step` real seconds, at most `max_steps` a frame (time beyond is dropped), each
-    /// `step * scale.time` simulated seconds.
+    /// Steps of `step` real seconds, at most `max_steps` a frame (time beyond is dropped, and a
+    /// frame feeds at most a 60 Hz frame's time: see `FixedStep`), each `step * scale.time`
+    /// simulated seconds.
     pub fn new(step: f32, max_steps: u32, scale: WorldScale) -> Self {
         Self { fixed: FixedStep::new(step as f64).with_max_steps(max_steps), scale, rest: None, speed: None }
     }
@@ -236,6 +237,8 @@ mod tests {
         assert!((stepper.step_dt() - 0.05).abs() < 1e-6);
         assert_eq!(stepper.state(), FluidActivity::Running);
         assert_eq!(stepper.advance(1.0 / 60.0), 1);
-        assert_eq!(stepper.advance(0.5), 2, "capped");
+        assert_eq!(stepper.advance(0.5), 1, "a 60 Hz frame's time at most");
+        let mut stepper = FluidStepper::new(1.0 / 240.0, 2, WorldScale { length: 1.0, time: 1.0 });
+        assert_eq!(stepper.advance(1.0 / 60.0), 2, "capped");
     }
 }

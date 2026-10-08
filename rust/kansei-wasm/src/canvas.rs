@@ -1,7 +1,7 @@
 //! The canvas an example draws to: its drawing buffer sized from its CSS box and the device
 //! pixel ratio, kept in step when the page resizes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
@@ -37,6 +37,9 @@ struct Inner {
     box_changed: Rc<Cell<bool>>,
     /// The ratio last measured, to notice a move to a screen with another ratio.
     pixel_ratio: Cell<f64>,
+    /// The device and queue of the renderer made by [`Canvas::renderer`], for the frame loop's
+    /// frames-in-flight cap.
+    gpu: RefCell<Option<(wgpu::Device, wgpu::Queue)>>,
     _observer: Option<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>,
 }
 
@@ -67,6 +70,7 @@ impl Canvas {
                 fixed_size: Cell::new(None),
                 box_changed,
                 pixel_ratio: Cell::new(0.0),
+                gpu: RefCell::new(None),
                 _observer: observer,
             }),
         };
@@ -108,14 +112,20 @@ impl Canvas {
     }
 
     /// A renderer drawing to this canvas, at its size: `config`'s other fields (sample count,
-    /// clear colour, limits, ...) as given.
+    /// clear colour, limits, ...) as given. [`crate::run`] keeps its frames in flight in check.
     #[cfg(target_arch = "wasm32")]
     pub async fn renderer(&self, config: RendererConfig) -> Renderer {
         let (width, height) = self.size();
         let device_pixel_ratio = self.inner.pixel_ratio.get() as f32;
         let mut renderer = Renderer::new(RendererConfig { width, height, device_pixel_ratio, ..config });
         renderer.initialize_with_canvas(self.inner.element.clone()).await;
+        *self.inner.gpu.borrow_mut() = Some((renderer.device().clone(), renderer.queue().clone()));
         renderer
+    }
+
+    /// The device and queue of the renderer [`Canvas::renderer`] made, if it made one.
+    pub(crate) fn gpu(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
+        self.inner.gpu.borrow().clone()
     }
 
     /// Re-measure if the CSS box or the pixel ratio changed; the new drawing-buffer size when it

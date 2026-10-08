@@ -21,7 +21,8 @@
 //! - [`Canvas`] sizes the drawing buffer to the canvas's CSS box times `devicePixelRatio`
 //!   (capped at 2, or `?dpr=` on the page's URL) and follows it when the page resizes.
 //! - [`run`] drives the `requestAnimationFrame` loop and hands each frame its [`Frame`]: time,
-//!   delta time and any new canvas size.
+//!   delta time and any new canvas size. It skips a refresh while the GPU still has a frame
+//!   to finish ([`RunOptions::max_frames_in_flight`], `?inflight=`), so frames do not queue.
 //! - [`param`], [`param_or`] and [`flag`] read the page's query string, percent-decoded.
 //! - [`now`], [`fetch_bytes`] and [`is_phone`] cover timing, loading and picking a tier;
 //!   [`set_text`], [`checkbox`] and [`thousands`] serve a HUD.
@@ -32,11 +33,13 @@
 //! only does anything in `wasm32`.
 
 mod canvas;
+mod frame_gate;
 mod frame_loop;
 mod input;
 mod page;
 
 pub use canvas::Canvas;
-pub use frame_loop::{run, Frame};
+pub use frame_gate::FramesInFlight;
+pub use frame_loop::{run, run_with, Frame, RunOptions, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 pub use input::{Gamepad, Keys};
 pub use page::{checkbox, fetch_bytes, flag, init, is_phone, now, param, param_or, set_text, thousands};
