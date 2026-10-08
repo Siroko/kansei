@@ -23,11 +23,19 @@
             set_stripe_params,
             set_light_direction, set_light_intensity, set_light_color,
             set_dof_focus_distance, set_dof_focus_range, set_dof_max_blur,
-            set_transmission_params
+            set_transmission_params, last_sim_steps
         } from '../pkg/kansei_wasm_fluid.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
 
+        // ?n=<particles>, ?match=ts (the TypeScript original's scene, examples/index_fluid.html),
+        // ?hud=1 (the frame-time overlay that page shares), ?inflight=0/1/2 (frames on the GPU).
+        const query = new URLSearchParams(location.search);
+        const matchTs = query.get('match') === 'ts';
         await init();
+        if (query.get('hud') === '1') {
+            const { installFrameHud } = await import('./frame-hud.js');
+            installFrameHud({ steps: () => last_sim_steps() });
+        }
         await start('kansei');
 
         const pane = new Pane({ title: 'Fluid 3D (WASM)', expanded: false });
@@ -38,8 +46,8 @@
             simTimeScale: 1.9,
             renderFps: 0,
             pressure: 46.5, nearPressure: 20.0, densityTarget: 8.6,
-            viscosity: 1.0, damping: 1.0, gravityY: -9.8,
-            mouseForce: 1600, mouseRadius: 0.1, substeps: 2,
+            viscosity: 1.0, damping: matchTs ? 0.997 : 1.0, gravityY: matchTs ? -12.8 : -9.8,
+            mouseForce: matchTs ? 2500 : 1600, mouseRadius: 0.1, substeps: 2,
             densityScale: 1.1, threshold: 1.09, absorption: 2.5, steps: 128,
             kernelScale: 0.6,
         };

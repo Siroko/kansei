@@ -20,7 +20,7 @@ use kansei_core::simulations::fluid::{
     DensityFieldOptions, FluidDensityField, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions,
     MarchingCubesOptions, RaymarchingRenderable,
 };
-use kansei_wasm::{fetch_bytes, Canvas, Frame};
+use kansei_wasm::{fetch_bytes, param, param_or, Canvas, Frame};
 
 
 // ── Op-art stripe shader (matches engine bind group layout) ──
@@ -86,11 +86,17 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let renderer = canvas.renderer(RendererConfig { sample_count: 4, ..Default::default() }).await;
     let format = renderer.presentation_format();
 
+    // ?n=<particles> (50k by default). ?match=ts takes the TypeScript original's scene
+    // (examples/index_fluid.html: its bounds, spread, gravity, damping and mouse force; the page
+    // sets the last three), to compare the two side by side.
+    let match_ts = param("match").as_deref() == Some("ts");
     // ── Particles ──
     // Spread in an ellipsoid centered on the sim bounds (~70% of bounds extent).
-    let count = 50_000usize;
-    let center = [0.0f32, 11.0, 4.0]; // (min+max)/2 of bounds
-    let half = [22.0f32, 17.0, 10.0]; // ~90% of bounds half-extent (more spread → less pressure)
+    let count = param_or("n", 50_000usize).max(1000);
+    let (bounds_min, bounds_max) = if match_ts { ([-25.0f32, -8.0, -16.0], [25.0f32, 30.0, 16.0]) } else { ([-25.0, -8.0, -8.0], [25.0, 30.0, 16.0]) };
+    let center = [0.0f32, 11.0, (bounds_min[2] + bounds_max[2]) / 2.0]; // (min+max)/2 of bounds
+    // ~90% of bounds half-extent (more spread → less pressure); the original's 88%
+    let half = if match_ts { [22.0f32, 17.0, 14.0] } else { [22.0f32, 17.0, 10.0] };
     let mut positions = vec![0.0f32; count * 4];
     let mut rng: u64 = 12345;
     for i in 0..count {
@@ -119,8 +125,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         mouse_force: 1600.0, substeps: 2, world_bounds_padding: 0.3,
         ..kansei_core::simulations::fluid::DEFAULT_OPTIONS
     }, &positions);
-    sim.world_bounds_min = [-25.0, -8.0, -8.0];
-    sim.world_bounds_max = [25.0, 30.0, 16.0];
+    sim.world_bounds_min = bounds_min;
+    sim.world_bounds_max = bounds_max;
     sim.rebuild_grid();
 
     // ── Density field ──
@@ -320,9 +326,11 @@ impl State {
             fse.sim.set_camera_matrices(&view.to_cols_array(), &proj.to_cols_array(), &inv_view.to_cols_array(), &identity);
             let scale = self.sim_time_scale.clamp(0.1, 4.0);
             let scaled_dt = self.sim_step.step as f32 * scale;
-            for _ in 0..self.sim_step.advance(frame_dt * scale as f64) {
+            let steps = self.sim_step.advance(frame_dt * scale as f64);
+            for _ in 0..steps {
                 fse.step_simulation(scaled_dt, mouse_strength, mouse_ndc, mouse_dir, self.use_batched_sim);
             }
+            LAST_SIM_STEPS.with(|n| n.set(steps));
         }
 
         // ── Render mode 0: Particles (standard engine path via InstancedGeometry) ──
@@ -357,6 +365,7 @@ impl State {
 }
 
 // ── JS interop ──
+thread_local! { static LAST_SIM_STEPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
 thread_local! { static GLOBAL_STATE: RefCell<Option<Rc<RefCell<State>>>> = RefCell::new(None); }
 fn with_state<F: FnOnce(&mut State)>(f: F) { GLOBAL_STATE.with(|gs| { if let Some(ref rc) = *gs.borrow() { f(&mut rc.borrow_mut()); } }); }
 fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
@@ -366,6 +375,9 @@ fn with_fluid<F: FnOnce(&mut FluidSurfaceEffect)>(f: F) {
 }
 
 
+/// The sim steps the last rendered frame ran, for the page's HUD (which asks mid-frame, while
+/// the state is borrowed).
+#[wasm_bindgen] pub fn last_sim_steps() -> u32 { LAST_SIM_STEPS.with(|n| n.get()) }
 #[wasm_bindgen] pub fn set_pressure(v: f32) { with_fluid(|f| f.sim.params.pressure_multiplier = v); }
 #[wasm_bindgen] pub fn set_near_pressure(v: f32) { with_fluid(|f| f.sim.params.near_pressure_multiplier = v); }
 #[wasm_bindgen] pub fn set_density_target(v: f32) { with_fluid(|f| f.sim.params.density_target = v); }
