@@ -5,7 +5,11 @@
 //   camera's motion elsewhere) with a bilinear footprint whose taps are each kept only where last
 //   frame's guide (linear depth, normal) matches this surface, blends this frame's sample in
 //   (1 / frames seen, no less than alphaColor), and keeps the luminance's first two moments for a
-//   variance. Writes this frame's guide for the next one.
+//   variance (in f32: the second overflows f16 past a luminance of 255). Writes this frame's guide
+//   for the next one.
+//
+// The f16 targets and the wavelet's texels carry the standard deviation, not the variance (which
+// would overflow f16 likewise); the passes square it to filter it.
 // - `variance`: where fewer than 4 frames are seen, the variance from the moments of a 7x7
 //   neighbourhood (edge-stopped) instead.
 // - `atrous`: one iteration of the edge-avoiding a-trous wavelet (the 5x5 B3 kernel or the 3x3
@@ -37,7 +41,7 @@ fn viewNormal(n: vec3f) -> vec3f {
 @group(0) @binding(26) var prevMoments : texture_2d<f32>;
 @group(0) @binding(27) var prevGuide : texture_2d<u32>;
 @group(0) @binding(28) var outIntegrated : texture_storage_2d<rgba16float, write>;
-@group(0) @binding(29) var outMoments : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(29) var outMoments : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(30) var outGuide : texture_storage_2d<rg32uint, write>;
 
 @compute @workgroup_size(8, 8)
@@ -103,7 +107,7 @@ fn temporal(@builtin(global_invocation_id) gid : vec3u) {
         m = mix(moments.xy, m, am);
     }
     let variance = max(m.y - m.x * m.x, 0.0);
-    textureStore(outIntegrated, t, vec4f(integrated, variance));
+    textureStore(outIntegrated, t, vec4f(integrated, sqrt(variance)));
     textureStore(outMoments, t, vec4f(m, frames, 0.0));
 }
 
@@ -187,7 +191,7 @@ fn variance(@builtin(global_invocation_id) gid : vec3u) {
     sumM /= max(wsum, 1e-6);
     // fewer frames: a larger variance, so the wavelet blurs more
     let v = max(sumM.y - sumM.x * sumM.x, 0.0) * 4.0 / max(mc.z, 1.0);
-    outPacked[giIndex(t)] = giPack(rawGuide, vec4f(sum, v));
+    outPacked[giIndex(t)] = giPack(rawGuide, vec4f(sum, sqrt(v)));
 }
 
 // ---- a-trous ----
@@ -224,10 +228,11 @@ fn atrous(@builtin(global_invocation_id) gid : vec3u) {
     }
     let last = vec2i(gp.traceSize) - 1;
     // the variance, blurred (the centre and its four neighbours), for the luminance stop
-    var vblur = 0.5 * c.a;
+    var vblur = 0.5 * c.a * c.a;
     for (var k = 0; k < 4; k++) {
         let o = select(vec2i(0, 2 * (k & 1) - 1), vec2i(2 * (k & 1) - 1, 0), k < 2);
-        vblur += 0.125 * unpack2x16float(atrousIn[giIndex(clamp(t + o, vec2i(0), last))].w).y;
+        let sd = unpack2x16float(atrousIn[giIndex(clamp(t + o, vec2i(0), last))].w).y;
+        vblur += 0.125 * sd * sd;
     }
     let invL = 1.0 / (gp.phiColor * sqrt(max(vblur, 0.0)) + 1e-6);
     let invDepth = depthStop(gc.x);
@@ -243,7 +248,7 @@ fn atrous(@builtin(global_invocation_id) gid : vec3u) {
     }
     let h0 = kernel[0] * kernel[0];
     var sum = c.rgb * h0;
-    var sumV = c.a * h0 * h0;
+    var sumV = c.a * c.a * h0 * h0;
     var wsum = h0;
     let step = i32(ap.step);
     for (var y = -radius; y <= radius; y++) {
@@ -258,10 +263,10 @@ fn atrous(@builtin(global_invocation_id) gid : vec3u) {
             let h = kernel[abs(x)] * kernel[abs(y)];
             let w = h * edgeWeight(pc, nvc, gc.yzw, invDepth, lc, invL, q, length(vec2f(f32(x), f32(y))) * f32(step), g, giLuminance(cq.rgb));
             sum += w * cq.rgb;
-            sumV += w * w * cq.a;
+            sumV += w * w * cq.a * cq.a;
             wsum += w;
         }
     }
-    let out = vec4f(sum / wsum, sumV / (wsum * wsum));
+    let out = vec4f(sum / wsum, sqrt(sumV) / wsum);
     atrousStore(t, giPack(pcen, out), out);
 }

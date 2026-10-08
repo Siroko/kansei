@@ -390,14 +390,14 @@ enum Source {
     Volume { view: wgpu::TextureView, anisotropic: Vec<wgpu::TextureView>, uniform: wgpu::Buffer, sampler: wgpu::Sampler },
 }
 
-/// The targets at the trace resolution: 8 bytes a texel for each texture, 16 for each wavelet
-/// buffer.
+/// The targets at the trace resolution: 8 bytes a texel for each texture (16 for the moments),
+/// 16 for each wavelet buffer.
 struct Targets {
     size: (u32, u32),
     trace_size: (u32, u32),
     /// this frame's raw signal
     trace: wgpu::TextureView,
-    /// the temporal pass's output (rgb, variance)
+    /// the temporal pass's output (rgb, the variance's square root)
     integrated: wgpu::Texture,
     integrated_view: wgpu::TextureView,
     /// the wavelet's ping-pong (guide, colour and variance packed): the variance pass writes the
@@ -656,12 +656,12 @@ impl RtDiffuseGiEffect {
         self.stats
     }
 
-    /// Bytes of the effect's targets (about 104 a trace texel, 16 more while accumulating).
+    /// Bytes of the effect's targets (120 a trace texel, 16 more while accumulating).
     pub fn memory_bytes(&self) -> u64 {
         let Some(t) = self.gpu.as_ref().and_then(|g| g.targets.as_ref()) else { return 0 };
         let texels = (t.trace_size.0 * t.trace_size.1) as u64;
-        // trace, integrated, denoised, 2 colour, 2 moments, 2 guides at 8 bytes; 2 ping at 16
-        texels * (9 * 8 + 2 * 16) + t.accum.as_ref().map_or(0, |a| a.size())
+        // trace, integrated, denoised, 2 colour, 2 guides at 8 bytes; 2 moments, 2 ping at 16
+        texels * (7 * 8 + 4 * 16) + t.accum.as_ref().map_or(0, |a| a.size())
     }
 
     fn init_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -706,7 +706,7 @@ impl RtDiffuseGiEffect {
                 entry(26, tex(false)),
                 entry(27, uint),
                 entry(28, storage_tex(f16)),
-                entry(29, storage_tex(f16)),
+                entry(29, storage_tex(wgpu::TextureFormat::Rgba32Float)),
                 entry(30, storage_tex(guide_format)),
             ],
         );
@@ -828,7 +828,8 @@ impl RtDiffuseGiEffect {
             denoised: view(&texture("RtGi/Denoised", f16, none)),
             color_hist_view: [view(&color_hist[0]), view(&color_hist[1])],
             color_hist,
-            moments: [view(&texture("RtGi/Moments", f16, none)), view(&texture("RtGi/Moments", f16, none))],
+            // (f32: the luminance's second moment overflows f16)
+            moments: [view(&texture("RtGi/Moments", wgpu::TextureFormat::Rgba32Float, none)), view(&texture("RtGi/Moments", wgpu::TextureFormat::Rgba32Float, none))],
             guide: [view(&texture("RtGi/Guide", wgpu::TextureFormat::Rg32Uint, none)), view(&texture("RtGi/Guide", wgpu::TextureFormat::Rg32Uint, none))],
             accum: None,
         }

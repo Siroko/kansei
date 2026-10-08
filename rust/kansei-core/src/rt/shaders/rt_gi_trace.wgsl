@@ -42,8 +42,9 @@ fn surfaceBias(p: vec3f) -> f32 {
     return 0.05 * kansei_rt_grid.cell + 2e-4 * distance(gp.invView[3].xyz, p);
 }
 
-// Whether nothing in the grid lies between o and `tMax` along unit `d`; past the grid's box,
-// (`beyond`) the directional shadow map at the point the ray leaves it.
+// Whether nothing in the grid lies between o and `tMax` along unit `d`; with `beyond` (a
+// directional light), past that the shadow map at the point the ray stops: where it leaves the
+// grid's box, or at `tMax` (the near field).
 fn shadowRay(o: vec3f, d: vec3f, tMax: f32, beyond: bool, cost: ptr<function, u32>) -> f32 {
     if (!kansei_rt_contains(o)) {
         return 1.0;
@@ -57,12 +58,9 @@ fn shadowRay(o: vec3f, d: vec3f, tMax: f32, beyond: bool, cost: ptr<function, u3
         return 0.0;
     }
     if (beyond && gp.hasShadowMap != 0u) {
-        let exit = min(kansei_rt_exit(o, d), tMax);
-        if (exit < tMax) {
-            let q = o + d * exit;
-            if (dirShadowCovers(q)) {
-                return dirShadowLookup(q);
-            }
+        let q = o + d * min(kansei_rt_exit(o, d), tMax);
+        if (dirShadowCovers(q)) {
+            return dirShadowLookup(q);
         }
     }
     return 1.0;

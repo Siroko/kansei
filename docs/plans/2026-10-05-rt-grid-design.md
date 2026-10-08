@@ -145,14 +145,16 @@ per scene.
   settings stay put: the ground truth for the hybrid and its denoiser. With the hit cone off the
   converged hybrid equals the one-bounce reference (`tests/rt_diffuse_gi_gpu.rs`).
 - Debug views: indirect, signal, SVGF's variance and history, the rays' cost.
-- Memory: 104 bytes a trace texel (51 MiB at half resolution of 1080p), 16 more while
-  accumulating.
+- Memory: 120 bytes a trace texel (59 MiB at half resolution of 1080p), 16 more while
+  accumulating. The luminance moments are f32 and the f16 targets carry the standard deviation,
+  not the variance: an outdoor signal's luminance runs to thousands, whose square overflows f16.
 
 The scout measured it against a 2-4k spp reference: within 2.5% converged (FLIP 0.039 in
 gi-box, 0.034 in outdoor-gi's forest) where voxel cones score 0.134 and 0.294 (20% too bright
-in the forest, contour bands in the room). SVGF loses 3-8% of the energy and leaves slow
-low-frequency mottling under the canopy (sky through needle gaps), the headroom for a better
-denoiser.
+in the forest, contour bands in the room). SVGF loses about 5% of the energy. The scout's
+forest figures for SVGF (24-25 dB against the converged hybrid, mottling under the canopy) came
+before its moments moved out of f16, whose overflow there turned the luminance stop off;
+measure them again before tuning the denoiser.
 
 Measured at 1920 x 1080 in headless Chrome on this Mac (M4 Pro, GPU shared with other
 sessions), kansei's profiler, variants alternated in one page, medians of 9 one-second windows.

@@ -86,10 +86,10 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         case 1u: { shown = vec4f(indirect, 1.0); }
         case 2u: { shown = vec4f(s.rgb * gp.intensity, 1.0); }
         case 3u: {
-            // the variance the wavelet started from, relative to the signal's luminance squared
+            // the standard deviation the wavelet started from, relative to the signal's luminance
             let i = textureLoad(integratedTex, nearest, 0);
             let l = max(giLuminance(i.rgb), 1e-4);
-            shown = vec4f(giHeat(sqrt(i.a) / l * 0.5) * gp.heatScale, 1.0);
+            shown = vec4f(giHeat(i.a / l * 0.5) * gp.heatScale, 1.0);
         }
         case 4u: { shown = vec4f(giHeat(textureLoad(momentsTex, nearest, 0).z / gp.maxHistory) * gp.heatScale, 1.0); }
         case 5u: { shown = vec4f(giHeat((s.a - 1.0) / 400.0) * gp.heatScale, 1.0); }

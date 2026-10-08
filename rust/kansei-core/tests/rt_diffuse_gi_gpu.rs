@@ -133,7 +133,7 @@ fn the_floor_beside_a_red_wall_is_lit_red_and_the_hybrid_converges() {
     wall.object.set_position(-1.0, 0.7, 0.0);
     scene.add(SceneNode::Renderable(wall));
     // the sun from above and +x: the floor and the wall's +x face lit
-    scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(-0.6, -1.0, -0.2), Vec3::new(1.0, 1.0, 1.0), 3.0))));
+    let sun = scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(-0.6, -1.0, -0.2), Vec3::new(1.0, 1.0, 1.0), 3.0))));
     let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
     let mut camera = camera();
     let output = renderer.device().create_texture(&wgpu::TextureDescriptor {
@@ -208,4 +208,26 @@ fn the_floor_beside_a_red_wall_is_lit_red_and_the_hybrid_converges() {
     eprintln!("SVGF half resolution {ld} against converged {lc}");
     assert!((ld - lc).abs() <= 0.1 * lc, "SVGF keeps the energy within 10%: {ld} vs {lc}");
     assert!(svgf.memory_bytes() > 0 && svgf.memory_bytes() < (W as u64 * H as u64) * 40, "half resolution targets: {} bytes", svgf.memory_bytes());
+
+    // a sun 100 000 times brighter (an outdoor scene's luminance, thousands, with no
+    // pre-exposure): SVGF denoises as it did. (Its luminance's second moment and variance in f16
+    // overflowed there, which turned its luminance stop off: it kept more energy than at low
+    // luminance, and blurred across the light's edges.)
+    if let Some(Light::Directional(l)) = scene.get_light_mut(sun) {
+        l.intensity *= 1.0e5;
+    }
+    let mut warm = effect(RtDiffuseGiOptions::default(), &renderer, &scene);
+    run(&mut renderer, &mut scene, &mut warm, 8);
+    let mut svgf = effect(RtDiffuseGiOptions::default(), &renderer, &scene);
+    let bright = run(&mut renderer, &mut scene, &mut svgf, 48);
+    let mut reference = effect(RtDiffuseGiOptions { resolution: RtGiResolution::Full, denoise: RtGiDenoise::Off, ..Default::default() }, &renderer, &scene);
+    reference.accumulate = true;
+    let converged = run(&mut renderer, &mut scene, &mut reference, 96);
+    let finite = bright.iter().zip(&surface).filter(|(_, m)| **m).all(|(c, _)| c.iter().all(|v| v.is_finite()));
+    let (lb, lc) = (luminance(mean(&bright, &surface)), luminance(mean(&converged, &surface)));
+    eprintln!("bright sun: SVGF {lb} against converged {lc}");
+    assert!(finite, "SVGF's output stays finite at high luminance");
+    assert!(lc > 1000.0, "the bright sun's signal is in the thousands: {lc}");
+    let (low, high) = (ld / luminance(mean(&two, &surface)), lb / lc);
+    assert!((high - low).abs() < 0.015, "SVGF keeps the same share of the energy at any luminance: {high} vs {low}");
 }
