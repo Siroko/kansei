@@ -51,6 +51,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::profiling::now_ms;
+
 /// How `FramePacer` picks its cadence.
 #[derive(Debug, Clone, Copy)]
 pub struct FramePacerOptions {
@@ -747,18 +749,6 @@ impl FrameTimer {
     }
 }
 
-fn now_ms() -> f64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::sync::OnceLock;
-        static START: OnceLock<std::time::Instant> = OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
-    }
-}
 
 /// The most real time one frame feeds a [`FixedStep`]: a 60 Hz frame's.
 pub const MAX_FRAME_DT: f64 = 1.0 / 60.0;
