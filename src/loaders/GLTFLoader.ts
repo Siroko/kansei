@@ -3,6 +3,10 @@ import { Material } from "../materials/Material";
 import { Renderable } from "../objects/Renderable";
 import { Object3D } from "../objects/Object3D";
 import { mat4 } from "gl-matrix";
+import { Texture } from "../buffers/Texture";
+import type { CompressionSupport } from "../renderers/Renderer";
+import { KTX2Loader } from "./KTX2Loader";
+import { isKtx2 } from "./ktx2/Ktx2Container";
 
 interface GLTFAccessor {
     bufferView: number;
@@ -43,18 +47,85 @@ interface GLTFNode {
     scale?: number[];
 }
 
-interface GLTFMaterialInfo {
+interface GLTFImageDef {
+    name?: string;
+    uri?: string;
+    mimeType?: string;
+    bufferView?: number;
+}
+
+interface GLTFTextureDef {
+    source?: number;
+    extensions?: { KHR_texture_basisu?: { source?: number } };
+}
+
+/** A material's `textureInfo` (`baseColorTexture`, `normalTexture`, ...). */
+interface GLTFTextureInfo {
+    index?: number;
+    texCoord?: number;
+}
+
+/** A material's texture: which image to load and how its texels are read. */
+export interface GLTFTextureRef {
+    /** The glTF texture index. */
+    texture: number;
+    /**
+     * The image to load: the `KHR_texture_basisu` KTX2 image when the texture has one,
+     * otherwise the texture's own source.
+     */
+    image: number;
+    /** The texture's PNG/JPEG source when a KTX2 image is preferred over it. */
+    fallbackImage?: number;
+    /** Which UV set it reads. */
+    texCoord: number;
+    /** Colour (base colour, emissive) rather than linear data. */
+    srgb: boolean;
+}
+
+/** Material properties extracted from glTF PBR metallic-roughness. */
+export interface GLTFMaterialInfo {
     name?: string;
     baseColor: [number, number, number, number];
     metallic: number;
     roughness: number;
     doubleSided: boolean;
+    /** sRGB colour (x base colour factor). */
+    baseColorTexture?: GLTFTextureRef;
+    /** Linear: roughness in G, metalness in B. */
+    metallicRoughnessTexture?: GLTFTextureRef;
+    /** Linear tangent-space normals. */
+    normalTexture?: GLTFTextureRef;
+    /** Linear: occlusion in R. */
+    occlusionTexture?: GLTFTextureRef;
+    /** sRGB colour. */
+    emissiveTexture?: GLTFTextureRef;
+}
+
+/** An image of the glTF file, its encoded bytes resolved where the file holds them. */
+export interface GLTFImage {
+    name?: string;
+    /** "image/ktx2", "image/png", "image/jpeg" (from the file, or guessed from the bytes). */
+    mimeType?: string;
+    /** The URI of an image stored outside the file, fetched (beside the file) when first loaded. */
+    uri?: string;
+    /** The encoded image; unset for an external image not read yet. */
+    data?: Uint8Array;
 }
 
 export interface GLTFResult {
     scene: Object3D;
     geometries: Geometry[];
+    /** Each geometry's glTF material index (parallel to `geometries`; unset without a material). */
+    materialIndices: (number | undefined)[];
     materials: GLTFMaterialInfo[];
+    images: GLTFImage[];
+    /**
+     * Decode or transcode a material texture for a device with `support`: KTX2 images (from
+     * `KHR_texture_basisu`) become the best block-compressed format it samples
+     * (`KTX2Loader.transcode`), PNG/JPEG images RGBA8 (one mip). Colour textures load as sRGB,
+     * the rest as linear. External images are fetched beside the glTF file.
+     */
+    loadTexture(texture: GLTFTextureRef, support: CompressionSupport): Promise<Texture>;
 }
 
 const COMPONENT_TYPE_SIZES: Record<number, number> = {
@@ -94,11 +165,7 @@ class GLTFLoader {
 
         await this.loadBuffers();
 
-        const materials = this.parseMaterials();
-        const geometries = this.parseMeshes();
-        const scene = this.buildScene(geometries, defaultMaterial);
-
-        return { scene, geometries, materials };
+        return this.result(defaultMaterial);
     }
 
     /**
@@ -148,23 +215,84 @@ class GLTFLoader {
                     if (!binChunk) throw new Error('GLTFLoader: GLB references binary buffer but no BIN chunk');
                     return binChunk;
                 }
-                const resp = await fetch(this.baseUrl + buf.uri);
+                const resp = await fetch(this.resolveUri(buf.uri));
                 return resp.arrayBuffer();
             })
         );
 
-        const materials = this.parseMaterials();
-        const geometries = this.parseMeshes();
-        const scene = this.buildScene(geometries, defaultMaterial);
+        return this.result(defaultMaterial);
+    }
 
-        return { scene, geometries, materials };
+    private result(defaultMaterial: Material): GLTFResult {
+        const materials = this.parseMaterials();
+        const { geometries, materialIndices } = this.parseMeshes();
+        const scene = this.buildScene(geometries, defaultMaterial);
+        const images = this.parseImages();
+        const baseUrl = this.baseUrl;
+        return {
+            scene,
+            geometries,
+            materialIndices,
+            materials,
+            images,
+            loadTexture: (texture, support) => loadTexture(images, baseUrl, texture, support),
+        };
+    }
+
+    /**
+     * Each image's encoded bytes, read from its buffer view or its data URI; images at external
+     * URIs are fetched by `loadTexture`.
+     */
+    private parseImages(): GLTFImage[] {
+        const defs: GLTFImageDef[] = this.gltf.images || [];
+        return defs.map((img): GLTFImage => {
+            let data: Uint8Array | undefined;
+            let mimeType: string | undefined = img.mimeType;
+            let uri: string | undefined;
+            if (img.bufferView !== undefined) {
+                const view: GLTFBufferView = this.gltf.bufferViews[img.bufferView];
+                const buffer = this.buffers[view.buffer];
+                if (buffer) data = new Uint8Array(buffer, view.byteOffset || 0, view.byteLength);
+            } else if (typeof img.uri === 'string') {
+                if (img.uri.startsWith('data:')) {
+                    data = decodeDataUri(img.uri);
+                    mimeType ??= img.uri.slice(5).split(/[;,]/)[0] || undefined;
+                } else {
+                    uri = img.uri;
+                }
+            }
+            if (!mimeType && data && isKtx2(data)) mimeType = 'image/ktx2';
+            return { name: img.name, mimeType, uri, data };
+        });
+    }
+
+    private textureRef(info: GLTFTextureInfo | undefined, srgb: boolean): GLTFTextureRef | undefined {
+        if (!info || info.index === undefined) return undefined;
+        const texture: GLTFTextureDef | undefined = (this.gltf.textures || [])[info.index];
+        if (!texture) return undefined;
+        const basisu: number | undefined = texture.extensions?.KHR_texture_basisu?.source;
+        const source: number | undefined = texture.source;
+        const image = basisu ?? source;
+        if (image === undefined) return undefined;
+        return {
+            texture: info.index,
+            image,
+            fallbackImage: source !== undefined && source !== image ? source : undefined,
+            texCoord: info.texCoord ?? 0,
+            srgb,
+        };
+    }
+
+    /** A buffer URI: data URIs as they are, others beside the glTF file. */
+    private resolveUri(uri: string): string {
+        return uri.startsWith('data:') ? uri : this.baseUrl + uri;
     }
 
     private async loadBuffers(): Promise<void> {
         const bufferDefs = this.gltf.buffers || [];
         this.buffers = await Promise.all(
             bufferDefs.map(async (buf: any) => {
-                const resp = await fetch(this.baseUrl + buf.uri);
+                const resp = await fetch(this.resolveUri(buf.uri));
                 return resp.arrayBuffer();
             })
         );
@@ -231,22 +359,28 @@ class GLTFLoader {
                 metallic: pbr.metallicFactor ?? 1.0,
                 roughness: pbr.roughnessFactor ?? 1.0,
                 doubleSided: m.doubleSided ?? false,
+                baseColorTexture: this.textureRef(pbr.baseColorTexture, true),
+                metallicRoughnessTexture: this.textureRef(pbr.metallicRoughnessTexture, false),
+                normalTexture: this.textureRef(m.normalTexture, false),
+                occlusionTexture: this.textureRef(m.occlusionTexture, false),
+                emissiveTexture: this.textureRef(m.emissiveTexture, true),
             };
         });
     }
 
-    private parseMeshes(): Geometry[] {
+    private parseMeshes(): { geometries: Geometry[]; materialIndices: (number | undefined)[] } {
         const meshDefs: GLTFMesh[] = this.gltf.meshes || [];
         const geometries: Geometry[] = [];
+        const materialIndices: (number | undefined)[] = [];
 
         for (const meshDef of meshDefs) {
             for (const prim of meshDef.primitives) {
-                const geo = this.parsePrimitive(prim);
-                geometries.push(geo);
+                geometries.push(this.parsePrimitive(prim));
+                materialIndices.push(prim.material);
             }
         }
 
-        return geometries;
+        return { geometries, materialIndices };
     }
 
     private parsePrimitive(prim: GLTFPrimitive): Geometry {
@@ -428,8 +562,46 @@ class GLTFLoader {
     }
 }
 
+/** `texture`'s image from `images`, transcoded (KTX2) or decoded (PNG/JPEG, one RGBA8 mip) in its colour space. */
+async function loadTexture(images: GLTFImage[], baseUrl: string, texture: GLTFTextureRef, support: CompressionSupport): Promise<Texture> {
+    const image = images[texture.image];
+    if (!image) throw new Error(`GLTFLoader: no image ${texture.image}`);
+    const label = image.name ?? `GLTF/Image${texture.image}`;
+    if (!image.data) {
+        if (!image.uri) throw new Error(`GLTFLoader: ${label}: image data not loaded`);
+        const response = await fetch(baseUrl + image.uri);
+        if (!response.ok) throw new Error(`GLTFLoader: ${label}: ${image.uri}: HTTP ${response.status}`);
+        image.data = new Uint8Array(await response.arrayBuffer());
+        if (!image.mimeType && isKtx2(image.data)) image.mimeType = 'image/ktx2';
+    }
+    const bytes = image.data;
+    if (isKtx2(bytes)) {
+        const options = texture.srgb ? KTX2Loader.color() : KTX2Loader.linear();
+        return (await KTX2Loader.transcode(label, bytes, options, support)).toTexture();
+    }
+    const bitmap = await createImageBitmap(new Blob([bytes], image.mimeType ? { type: image.mimeType } : undefined), {
+        colorSpaceConversion: 'none',
+        premultiplyAlpha: 'none',
+    });
+    return Texture.fromImage(bitmap, { label, srgb: texture.srgb });
+}
+
+/** A base64 data URI's bytes (`data:<mime>;base64,<data>`); percent-encoded ones are decoded too. */
+function decodeDataUri(uri: string): Uint8Array {
+    const comma = uri.indexOf(',');
+    const header = uri.slice(5, comma);
+    const payload = uri.slice(comma + 1);
+    if (header.endsWith(';base64')) {
+        const binary = atob(payload.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/'));
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
+    }
+    return new TextEncoder().encode(decodeURIComponent(payload));
+}
+
 function quaternionToEuler(x: number, y: number, z: number, w: number): [number, number, number] {
-    // YXZ order to match Object3D.updateModelMatrix (rotateZ, rotateY, rotateX)
+    // ZYX decomposition: Object3D.updateModelMatrix composes Rz * Ry * Rx (rotateZ, rotateY, rotateX)
     const sinr_cosp = 2 * (w * x + y * z);
     const cosr_cosp = 1 - 2 * (x * x + y * y);
     const rx = Math.atan2(sinr_cosp, cosr_cosp);

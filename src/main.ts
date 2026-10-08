@@ -30,6 +30,16 @@ export type { TextureOptions, TextureSource, TextureLevelData } from "./buffers/
 export { textureFormatBlock, textureFormatSampleType } from "./buffers/TextureFormats";
 export { TextureLoader } from "./loaders/TextureLoader";
 export { GLTFLoader } from "./loaders/GLTFLoader";
+export type { GLTFResult, GLTFMaterialInfo, GLTFTextureRef, GLTFImage } from "./loaders/GLTFLoader";
+export { KTX2Loader, TranscodedTexture } from "./loaders/KTX2Loader";
+export type { Ktx2Options, Ktx2Info } from "./loaders/KTX2Loader";
+export { Ktx2Error, isKtx2, parseKtx2Header } from "./loaders/ktx2/Ktx2Container";
+export type { Ktx2Header, Supercompression } from "./loaders/ktx2/Ktx2Container";
+export {
+    NO_COMPRESSION, selectTarget, targetPreferences, supportsTarget, gpuTargetFormat, isCompressedTarget,
+    targetLevelBytes, targetChainBytes, targetName,
+} from "./loaders/ktx2/Ktx2Select";
+export type { BasisCodec, Channels, GpuTarget } from "./loaders/ktx2/Ktx2Select";
 export { VideoTexture } from "./buffers/VideoTexture";
 export { Sampler } from "./buffers/Sampler";
 export type { SamplerOptions } from "./buffers/Sampler";
