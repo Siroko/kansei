@@ -6,6 +6,7 @@ import { Object3D } from "./Object3D";
 import { PathTracerMaterial } from "../pathtracer/PathTracerMaterial";
 import type { InstanceCulling } from "../culling/InstanceCulling";
 import type { GiSurface } from "../gi/MeshVoxelizer";
+import type { RtPlacement, RtSurface } from "../rt/RtGrid";
 
 /**
  * Represents a 3D renderable object that extends Object3D.
@@ -68,6 +69,15 @@ class Renderable extends Object3D {
      *  null to leave it out of the voxels (the default). Drawn into the voxels through its
      *  material's own `vertex_main` (`Material.getVoxelPipeline`). Rust: `Renderable::gi`. */
     public gi: GiSurface | null = null;
+
+    /** Its surface in the renderer's ray tracing grid (`Renderer.enableRtGrid`): its triangles
+     *  are gathered there (instanced ones as culled for the grid's box) with this albedo and alpha
+     *  test. Null (the default) leaves it out. Rust: `Renderable::rt`. */
+    public rt: RtSurface | null = null;
+
+    /** Where its instance records put its mesh, for the grid (the material's vertex stage does it
+     *  on screen): needed by instanced renderables in the grid. Rust: `Renderable::rt_placement`. */
+    public rtPlacement: RtPlacement | null = null;
 
     /** Path tracer material properties. If null, defaults are derived at BVH build time. */
     public pathTracerMaterial: PathTracerMaterial | null = null;

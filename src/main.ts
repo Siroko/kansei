@@ -166,6 +166,16 @@ export { JumpFloodSdf } from "./gi/JumpFloodSdf";
 export type { SdfSeeds } from "./gi/JumpFloodSdf";
 export { SdfProbes, PROBE_RAYS, defaultSdfProbeOptions } from "./gi/SdfProbes";
 export type { SdfProbeOptions } from "./gi/SdfProbes";
+export { RtGrid, RtGridHandle, RtPlacement, RT_MAX_CELLS, RT_TRIANGLE_BYTES, resolveRtGridOptions } from "./rt/RtGrid";
+export type { RtGridOptions, RtGridStats, RtSource, RtSurface, InstanceTransform } from "./rt/RtGrid";
+export { RtMesh, splitLargeTriangles, transformBox } from "./rt/RtMesh";
+export { RtScene } from "./rt/RtScene";
+export type { RtInstance } from "./rt/RtScene";
+export { SceneRtGrid } from "./rt/SceneRtGrid";
+export type { SceneRtGridOptions, SceneRtGridStats } from "./rt/SceneRtGrid";
+export { RtReflectionsEffect } from "./rt/RtReflectionsEffect";
+export type { RtReflectionsOptions, RtReflectionsView, RtReflectionStats, RtTraceResolution } from "./rt/RtReflectionsEffect";
+export { RT_GRID_WGSL, RT_OPAQUE_WGSL, rtGridBindingsWgsl } from "./rt/RtWGSL";
 export {
     Transform, nlerp, quatAbs, quatLog, quatExp, quatToScaledAngleAxis, quatFromScaledAngleAxis, angularVelocity,
     Skeleton, Pose, Clip, SkinnedMesh, MAX_INFLUENCES, strongestInfluences, SkinnedGltf,
