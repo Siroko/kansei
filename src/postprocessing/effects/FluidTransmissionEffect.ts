@@ -2,6 +2,7 @@ import { Camera } from '../../cameras/Camera';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
 import { shaderCode } from './shaders/fluid-transmission.wgsl';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface FluidTransmissionOptions {
     color?: [number, number, number];
@@ -155,7 +156,7 @@ class FluidTransmissionEffect extends PostProcessingEffect {
         // remaining entries stay zero
         this._device.queue.writeBuffer(this._paramsBuffer!, 0, data.buffer, 0, 144);
 
-        const pass = commandEncoder.beginComputePass({ label: 'FluidTransmission/Composite' });
+        const pass = commandEncoder.beginComputePass({ label: 'FluidTransmission/Composite', timestampWrites: gpuPass('FluidTransmission/Composite') });
         pass.setPipeline(this._pipeline);
         pass.setBindGroup(0, this._bg!);
         pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));

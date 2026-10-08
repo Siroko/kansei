@@ -20,6 +20,7 @@ import { shaderCode as integrateShader } from './shaders/integrate.wgsl';
 import { shaderCode as bodyCollisionShader } from './shaders/body-collision.wgsl';
 import { shaderCode as bodyIntegrateShader } from './shaders/body-integrate.wgsl';
 import { FluidBody, FluidBodyOptions } from './FluidBody';
+import { gpuPass } from '../../profiling/Profiler';
 
 /**
  * Cap on neighbour-grid cells. Large enough that the cell stays equal to the smoothing radius
@@ -585,7 +586,7 @@ class FluidSimulation {
      */
     private encodeStep(commandEncoder: GPUCommandEncoder, device: GPUDevice): void {
         const workgroups = Math.ceil(this.particleCount / 64);
-        const pass = commandEncoder.beginComputePass({ label: 'FluidSim/Substep' });
+        const pass = commandEncoder.beginComputePass({ label: 'FluidSim/Substep', timestampWrites: gpuPass('FluidSim/Substep') });
         this.grid.encode(pass, device);
         FluidSimulation.dispatch(pass, this.densityPass, device, workgroups);
         FluidSimulation.dispatch(pass, this.forcesPass, device, workgroups);

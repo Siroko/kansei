@@ -1,6 +1,7 @@
 import { Camera } from '../../cameras/Camera';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface BloomOptions {
     /** Luminance cutoff for bloom. Default 1.0 */
@@ -316,7 +317,7 @@ class BloomEffect extends PostProcessingEffect {
 
             this._writeParamsTo(this._downsampleParamBuffers[i], w, h, i);
 
-            const pass = commandEncoder.beginComputePass({ label: `Bloom/Down/${i}` });
+            const pass = commandEncoder.beginComputePass({ label: `Bloom/Down/${i}`, timestampWrites: gpuPass('Bloom/Downsample') });
             pass.setPipeline(this._downsamplePipeline!);
             pass.setBindGroup(0, this._downsampleBindGroups[i]!);
             pass.dispatchWorkgroups(wg(w), wg(h));
@@ -330,7 +331,7 @@ class BloomEffect extends PostProcessingEffect {
 
             this._writeParamsTo(this._upsampleParamBuffers[i], w, h, i);
 
-            const pass = commandEncoder.beginComputePass({ label: `Bloom/Up/${i}` });
+            const pass = commandEncoder.beginComputePass({ label: `Bloom/Up/${i}`, timestampWrites: gpuPass('Bloom/Upsample') });
             pass.setPipeline(this._upsamplePipeline!);
             pass.setBindGroup(0, this._upsampleBindGroups[i]!);
             pass.dispatchWorkgroups(wg(w), wg(h));
@@ -340,7 +341,7 @@ class BloomEffect extends PostProcessingEffect {
         // --- Composite ---
         this._writeParamsTo(this._compositeParamBuffer!, width, height, 0);
 
-        const pass = commandEncoder.beginComputePass({ label: 'Bloom/Composite' });
+        const pass = commandEncoder.beginComputePass({ label: 'Bloom/Composite', timestampWrites: gpuPass('Bloom/Composite') });
         pass.setPipeline(this._compositePipeline!);
         pass.setBindGroup(0, this._compositeBindGroup!);
         pass.dispatchWorkgroups(wg(width), wg(height));

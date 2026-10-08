@@ -5,6 +5,7 @@ import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+import { gpuPass } from '../profiling/Profiler';
 
 /** Any light with a world-space position and radius, usable for cubemap shadow rendering. */
 export type PositionalLight = PointLight | AreaLight;
@@ -430,6 +431,8 @@ class CubeMapShadowMap {
                 });
 
                 const pass = commandEncoder.beginRenderPass({
+                    label: 'CubemapShadow',
+                    timestampWrites: gpuPass('CubemapShadow'),
                     colorAttachments: [{
                         view: colorView,
                         clearValue: { r: clearDist, g: 0, b: 0, a: 0 },

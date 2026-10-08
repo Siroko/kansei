@@ -9,6 +9,7 @@ import { GBuffer } from "../postprocessing/GBuffer";
 import { ShadowMap } from "../shadows/ShadowMap";
 import { CubeMapShadowMap } from "../shadows/CubeMapShadowMap";
 import { BindGroupSlot, MESH_TRANSFORMS_BYTES, meshBindGroupLayoutEntries, meshSlotStride } from "./SharedLayouts";
+import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled, takeProfile } from "../profiling/Profiler";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -388,6 +389,32 @@ class Renderer {
     }
 
     /**
+     * Profile frames (see `profiling/Profiler`): each labelled pass's GPU time, from timestamp
+     * queries (where the adapter offers `timestamp-query`), and each labelled section's CPU time.
+     * Off by default; costs a null check per pass and section while off. `render()` and
+     * `PostProcessingVolume.render()` end a profiled frame; other frames call `endProfiledFrame()`.
+     */
+    public setProfiling(enabled: boolean): void {
+        setProfilingEnabled(this.device!, enabled);
+    }
+
+    /**
+     * End a profiled frame of work recorded without `render()` or a `PostProcessingVolume`
+     * (offscreen tools and tests), after its last submit.
+     */
+    public endProfiledFrame(): void {
+        endProfiledFrame();
+    }
+
+    /**
+     * The frames profiled since the last call, averaged per frame (the GPU's arrive a few frames
+     * late); `FrameProfile.report()` formats them.
+     */
+    public takeProfile(): FrameProfile {
+        return takeProfile();
+    }
+
+    /**
      * Forces every cached render bundle to be re-recorded on the next frame. The renderer
      * already re-records a draw set's bundle when what it draws changes (renderables shown,
      * hidden, added, removed, or given another material or geometry); call this after changing
@@ -656,12 +683,15 @@ class Renderer {
             },
         } as GPURenderPassDescriptor;
 
+        renderPassDescriptor.label = 'Renderer/MainPass';
+        renderPassDescriptor.timestampWrites = gpuPass('Renderer/MainPass');
         const passRenderEncoder = commandRenderEncoder.beginRenderPass(renderPassDescriptor);
         for (const set of [DrawSet.Opaque, DrawSet.Transmissive, DrawSet.Transparent]) {
             this._drawSet(passRenderEncoder, this._canvasBundles, set, sets[set], stack, cameraBindGroup, targets);
         }
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
+        endProfiledFrame();
     }
 
     /**
@@ -792,6 +822,8 @@ class Renderer {
      * @param gbuffer - The GBuffer to write colour and depth data into.
      */
     public renderToGBuffer(stack: Scene, camera: Camera, gbuffer: GBuffer): void {
+        const sceneScope = cpuScope('scene');
+        let t = cpuScope('scene/prepare');
         stack.prepare(camera);
         camera.updateViewMatrix();
 
@@ -810,7 +842,10 @@ class Renderer {
             sampleCount: gbuffer.msaaSampleCount,
         };
 
+        t?.end();
+
         // Phase 1 — identical to render(): upload matrices.
+        t = cpuScope('scene/upload');
         this._updateRenderables(stack, camera, (renderable) => {
             // Ensure the material has a pipeline compiled for the GBuffer MRT config.
             this._pipelineFor(renderable, targets);
@@ -822,14 +857,17 @@ class Renderer {
         // Upload shadow uniforms.
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
+        t?.end();
 
         // With transmissive objects the pass splits: opaque, a snapshot of the colour into
         // backgroundTexture, then transmissive and transparent on top.
         const hasTransmissive = stack.transmissive.length > 0;
 
         // Phase 2 — (re-)record the bundles whose draws changed.
+        t = cpuScope('scene/bundles');
         const sets = [stack.opaque, stack.transmissive, stack.transparent];
         this._syncBundles(this._gbufferBundles, sets, stack, cameraBindGroup, targets);
+        t?.end();
         const drawSets = (pass: GPURenderPassEncoder, which: DrawSet[]) => {
             for (const set of which) {
                 this._drawSet(pass, this._gbufferBundles, set, sets[set], stack, cameraBindGroup, targets);
@@ -837,6 +875,7 @@ class Renderer {
         };
 
         // Phase 3 — execute into the GBuffer render pass(es).
+        t = cpuScope('scene/gbuffer');
         const commandEncoder = this.device!.createCommandEncoder();
 
         const clearColor = {
@@ -940,7 +979,7 @@ class Renderer {
 
         if (hasTransmissive) {
             // Pass 1 — opaque objects.
-            const opaquePass = commandEncoder.beginRenderPass(makePassDescriptor(false));
+            const opaquePass = commandEncoder.beginRenderPass({ ...makePassDescriptor(false), label: 'Renderer/GBufferOpaquePass', timestampWrites: gpuPass('Renderer/GBufferOpaquePass') });
             drawSets(opaquePass, [DrawSet.Opaque]);
             opaquePass.end();
 
@@ -953,11 +992,11 @@ class Renderer {
             );
 
             // Pass 2 — transmissive then transparent objects (continues drawing on top of the opaque result).
-            const transmissivePass = commandEncoder.beginRenderPass(makePassDescriptor(true));
+            const transmissivePass = commandEncoder.beginRenderPass({ ...makePassDescriptor(true), label: 'Renderer/GBufferIndirectPass', timestampWrites: gpuPass('Renderer/GBufferIndirectPass') });
             drawSets(transmissivePass, [DrawSet.Transmissive, DrawSet.Transparent]);
             transmissivePass.end();
         } else {
-            const pass = commandEncoder.beginRenderPass(makePassDescriptor(false));
+            const pass = commandEncoder.beginRenderPass({ ...makePassDescriptor(false), label: 'Renderer/GBufferOpaquePass', timestampWrites: gpuPass('Renderer/GBufferOpaquePass') });
             drawSets(pass, [DrawSet.Opaque, DrawSet.Transparent]);
             pass.end();
         }
@@ -966,6 +1005,7 @@ class Renderer {
         if (gbuffer.msaaSampleCount > 1 && gbuffer.depthMSAATexture) {
             this._ensureDepthCopyPipeline();
             const depthCopyPass = commandEncoder.beginRenderPass({
+                label: 'DepthCopy',
                 colorAttachments: [],
                 depthStencilAttachment: {
                     view: gbuffer.depthTexture.createView(),
@@ -973,14 +1013,19 @@ class Renderer {
                     depthLoadOp: 'clear',
                     depthStoreOp: 'store',
                 },
+                timestampWrites: gpuPass('DepthCopy'),
             });
             depthCopyPass.setPipeline(this._depthCopyPipeline!);
             depthCopyPass.setBindGroup(0, this._getDepthCopyBindGroup(gbuffer.depthMSAATexture));
             depthCopyPass.draw(3);
             depthCopyPass.end();
         }
+        t?.end();
 
+        t = cpuScope('scene/submit');
         this.device!.queue.submit([commandEncoder.finish()]);
+        t?.end();
+        sceneScope?.end();
     }
 
     /**
@@ -1203,7 +1248,7 @@ class Renderer {
      */
     public async compute(compute: Compute, workgroupsX: number = 64, workgroupsY: number = 1, workgroupsZ: number = 1): Promise<void> {
         const commandEncoder = this.device!.createCommandEncoder();
-        const passEncoder = commandEncoder.beginComputePass();
+        const passEncoder = commandEncoder.beginComputePass({ label: 'ComputeBatch/Pass', timestampWrites: gpuPass('ComputeBatch/Pass') });
         if (!compute.initialized) {
             compute.initialize(this.device!);
         }
@@ -1232,7 +1277,7 @@ class Renderer {
             if (!pass.compute.initialized) {
                 pass.compute.initialize(this.device!);
             }
-            const passEncoder = commandEncoder.beginComputePass();
+            const passEncoder = commandEncoder.beginComputePass({ label: 'ComputeBatch/Pass', timestampWrites: gpuPass('ComputeBatch/Pass') });
             passEncoder.setBindGroup(0, pass.compute.getBindGroup(this.device!));
             passEncoder.setPipeline(pass.compute.pipeline!);
             passEncoder.dispatchWorkgroups(pass.workgroupsX, pass.workgroupsY ?? 1, pass.workgroupsZ ?? 1);

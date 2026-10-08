@@ -3,6 +3,7 @@ import { FluidSimulation } from './FluidSimulation';
 import { shaderCode as clearShader } from './shaders/density-field-clear.wgsl';
 import { shaderCode as splatShader } from './shaders/density-field-splat.wgsl';
 import { shaderCode as copyShader } from './shaders/density-field-copy.wgsl';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface FluidDensityFieldOptions {
     resolution?: number;
@@ -218,20 +219,20 @@ class FluidDensityField {
 
         const [w, h, d] = this._texDims;
 
-        const clearPass = commandEncoder.beginComputePass({ label: 'DensityField/Clear' });
+        const clearPass = commandEncoder.beginComputePass({ label: 'DensityField/Clear', timestampWrites: gpuPass('DensityField/Clear') });
         clearPass.setPipeline(this._clearPipeline);
         clearPass.setBindGroup(0, this._clearBG);
         clearPass.dispatchWorkgroups(Math.ceil(w / 4), Math.ceil(h / 4), Math.ceil(d / 4));
         clearPass.end();
 
         const particleCount = this._sim.params.maxParticles;
-        const splatPass = commandEncoder.beginComputePass({ label: 'DensityField/Splat' });
+        const splatPass = commandEncoder.beginComputePass({ label: 'DensityField/Splat', timestampWrites: gpuPass('DensityField/Splat') });
         splatPass.setPipeline(this._splatPipeline);
         splatPass.setBindGroup(0, this._splatBG);
         splatPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
         splatPass.end();
 
-        const copyPass = commandEncoder.beginComputePass({ label: 'DensityField/Copy' });
+        const copyPass = commandEncoder.beginComputePass({ label: 'DensityField/Copy', timestampWrites: gpuPass('DensityField/Copy') });
         copyPass.setPipeline(this._copyPipeline);
         copyPass.setBindGroup(0, this._copyBG);
         copyPass.dispatchWorkgroups(Math.ceil(w / 4), Math.ceil(h / 4), Math.ceil(d / 4));
