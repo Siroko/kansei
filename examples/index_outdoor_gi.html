@@ -21,10 +21,22 @@
 
 <body>
   <div id="panel">
-    <label>gi <select id="gi"><option>off</option><option>skyocc</option><option>visibility</option><option>cones</option><option>probes</option></select></label>
+    <label>gi <select id="gi"><option>off</option><option>skyocc</option><option>visibility</option><option>cones</option><option>probes</option><option value="rt">hybrid RT (grid rays + SVGF)</option></select></label>
     <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option></select></label>
     <label>camera <select id="cam"><option>road</option><option>clearing</option><option>forest</option><option>high</option><option>fly</option></select></label>
     <label>sun <input type="range" id="elevation" min="-4" max="60" step="0.5"></label>
+    <div id="rtgi-panel" style="display: none">
+      <b>hybrid RT GI</b>
+      <label>trace <select id="rtgi-res"><option value="half">half (1 ray / 2x2)</option><option value="full">full (1 ray / pixel)</option></select></label>
+      <label>near field (m) <input type="range" id="rtgi-near" min="0" max="32" step="1"></label>
+      <label>denoise <select id="rtgi-denoise"><option value="svgf">SVGF</option><option value="temporal">temporal only</option><option value="off">off (1 spp)</option></select></label>
+      <label>wavelet <select id="rtgi-kernel"><option>3x3</option><option>5x5</option></select></label>
+      <label>hits lit by <select id="rtgi-hit"><option value="direct">direct light + voxel cone</option><option value="voxels">voxels only</option></select></label>
+      <label>hit shadows <select id="rtgi-shadows"><option value="rays">rays</option><option value="maps">shadow maps</option></select></label>
+      <label>mode <select id="rtgi-mode"><option value="hybrid">hybrid</option><option value="reference">reference (path traced)</option></select></label>
+      <label>accumulate <input type="checkbox" id="rtgi-accum"></label>
+      <label>debug view <select id="rtgi-view"><option>lit</option><option>indirect</option><option>signal</option><option>variance</option><option>history</option><option>cost</option></select></label>
+    </div>
   </div>
   <pre id="stats"></pre>
   <script type="module">
@@ -50,11 +62,18 @@
     // (`kansei_clipmap_sky_visibility`); `cones` voxel GI on screen, six cones a pixel through the
     // clipmap (`VoxelGIEffect.withClipmap`); `probes` the same light from the clipmap's irradiance
     // probes (`setClipmapProbes`). With `fog=<density>` the mist's ambient comes from the probes in
-    // the clipmap's modes (`VolumetricFogEffect.setClipmapProbes`). With `reflect=1` the road is wet
+    // the clipmap's modes (`VolumetricFogEffect.setClipmapProbes`). `rt` is the hybrid
+    // (`RtDiffuseGiEffect.withClipmap`): one ray for each 2 x 2 pixels through the grid of the
+    // scene's triangles round the camera (the cards alpha-tested) for 8 m, then the clipmap and the
+    // sky; the hits lit by the sun (shadow rays, the cascades past the grid) and a cone through the
+    // clipmap; denoised by SVGF. With `reflect=1` the road is wet
     // and reflects the forest, traced through a grid of the scene's triangles round the camera
     // (`enableRtGrid`, `RtReflectionsEffect.withClipmap`), the hits lit by the clipmap.
     //
-    // URL parameters, as the Rust example's: gi=off|skyocc|visibility|cones|probes (default cones),
+    // URL parameters, as the Rust example's: gi=off|skyocc|visibility|cones|probes|rt (default
+    // cones; rt builds the grid as rt=1 does, and the panel reloads the page with it when picked
+    // without), rtgi_near=<metres> (8; 0: the whole box), rtgi_res, rtgi_denoise, rtgi_kernel,
+    // rtgi_hit, rtgi_shadows, rtgi_mode, rtgi_accum, rtgi_view (as index_gi_box.html's),
     // view=lit|indirect|voxels, cam=road|clearing|forest|high|fly, elevation=<degrees> (16),
     // bearing=<degrees> (160), ev=<EV100>, fog=<density>, trees=<n> (20000), cards=0 (cone meshes
     // near too), crown_opacity=<0..1> (0.35), levels=<n> (5), res=<voxels> (64), vox=<metres> (0.5),
@@ -102,6 +121,7 @@
     import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, LENS_ATTENUATION_UE4 } from '../src/postprocessing/effects/ToneMapEffect'
     import { RtPlacement } from '../src/rt/RtGrid'
     import { RtReflectionsEffect } from '../src/rt/RtReflectionsEffect'
+    import { RtDiffuseGiEffect, RT_GI_DENOISERS, RT_GI_HIT_LIGHTINGS, RT_GI_KERNELS, RT_GI_MODES, RT_GI_RESOLUTIONS, RT_GI_SHADOWS, RT_GI_VIEWS } from '../src/rt/RtDiffuseGiEffect'
     import { FrameTimer } from '../src/pacing/FrameTimer'
     import { AbBench } from '../src/profiling/AbBench'
     import { installProfileHud } from './profile-hud.js'
@@ -493,9 +513,12 @@
     // the film's sky occlusion, for comparison: the trees seen from above
     const skyOcclusion = renderer.enableSkyOcclusion({ extentM: 320, minHeightM: -10, maxHeightM: 90, volumeSize: [128, 32], layerMask: TREE_LAYER });
     // reflect=1: ray-traced reflections on the wet road (wet=all: everywhere), through a grid of the
-    // scene's triangles round the camera, 64 x 32 x 64 m (rt=1: the grid alone)
+    // scene's triangles round the camera, 64 x 32 x 64 m (rt=1: the grid alone); gi=rt: the hybrid
+    // GI's rays through it
+    const GI_MODES = ['off', 'skyocc', 'visibility', 'cones', 'probes', 'rt'];
+    const giMode = GI_MODES.includes(param('gi')) ? param('gi') : 'cones';
     const reflect = flag('reflect', false);
-    const rt = flag('rt', false) || reflect;
+    const rt = flag('rt', false) || reflect || giMode === 'rt';
     const wet = !reflect ? [0, 0, 0, 0]
       : param('wet') === 'all' ? [paramOr('wet_f0', 0.04), paramOr('wet_f0', 0.04), paramOr('wet_rough', 0.1), 0]
       : [paramOr('wet_f0', 0.04), 0, paramOr('wet_rough', 0.1), 0];
@@ -574,7 +597,8 @@
         triangles += geometry.indices.length / 3;
         const r = new Renderable(geometry, groundMaterial('Terrain', TERRAIN_ALBEDO_WGSL, GRASS));
         r.gi = { albedo: GRASS };
-        r.rt = rt ? { albedo: GRASS } : null;
+        // the hits shaded with the height field's vertex normals, not its facets
+        r.rt = rt ? { albedo: GRASS, smoothNormals: true } : null;
         scene.add(r);
       }
     }
@@ -656,7 +680,7 @@
     // ── the chain: the GI first (it lies on the surfaces under the aerial perspective), the
     // reflections, the atmosphere, the fog, TAA, the display transform ──────────────────────────
     const config = {
-      gi: ['off', 'skyocc', 'visibility', 'cones', 'probes'].includes(param('gi')) ? param('gi') : 'cones',
+      gi: giMode,
       view: ['lit', 'indirect', 'voxels'].includes(param('view')) ? param('view') : 'lit',
       elevation: num('elevation') ?? 16,
       bearing: num('bearing') ?? 160,
@@ -673,6 +697,52 @@
     const giEffect = VoxelGIEffect.withClipmap(gi.clipmap, { intensity: paramOr('intensity', 1) });
     giEffect.setSkyLighting(sky.bindings.skyLighting);
     const effects = [giEffect];
+    // The hybrid's settings (gi=rt): the URL's rtgi_* parameters and setRtgi's keys. An 8 m near
+    // field: half the trace of the whole 64 m box, for some light lost under the canopy past it,
+    // which the clipmap's voxels are too coarse to hold.
+    const RTGI_KEYS = {
+      res: RT_GI_RESOLUTIONS, denoise: RT_GI_DENOISERS, kernel: RT_GI_KERNELS, hit: RT_GI_HIT_LIGHTINGS,
+      shadows: RT_GI_SHADOWS, mode: RT_GI_MODES, accum: null, view: RT_GI_VIEWS, near: null,
+    };
+    const rtgi = { res: 'half', denoise: 'svgf', kernel: '3x3', hit: 'direct', shadows: 'rays', mode: 'hybrid', accum: false, view: 'lit', near: 8 };
+    // one setting by its key and name; false if either is unknown
+    const setRtgiKey = (key, value) => {
+      if (!(key in RTGI_KEYS)) return false;
+      if (key === 'accum') {
+        rtgi.accum = value === true || value === '1' || value === 'true';
+        return true;
+      }
+      if (key === 'near') {
+        const near = parseFloat(value);
+        if (!Number.isFinite(near)) return false;
+        rtgi.near = Math.max(near, 0);
+        return true;
+      }
+      if (!RTGI_KEYS[key].includes(value)) return false;
+      rtgi[key] = value;
+      return true;
+    };
+    for (const key of Object.keys(RTGI_KEYS)) {
+      if (param(`rtgi_${key}`) !== null) setRtgiKey(key, param(`rtgi_${key}`));
+    }
+    // with the grid, the hybrid in voxel GI's place (on in gi=rt): rays through the grid, the cards
+    // alpha-tested, the hits lit by the sun (shadow rays, the cascades past the grid) and the
+    // clipmap, the clipmap and the sky past the grid
+    let hybrid = null;
+    // the needle sprays' alpha, for the alpha tests through the grid
+    let needleAlpha = null;
+    if (rt) {
+      const alpha = device.createTexture({ label: 'NeedleSpray/Alpha', size: [needleW, needleH], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      device.queue.writeTexture({ texture: alpha }, needleData, { bytesPerRow: needleW * 4 }, [needleW, needleH]);
+      needleAlpha = alpha.createView();
+      hybrid = RtDiffuseGiEffect.withClipmap(gi.clipmap, renderer.rtGrid.handle, { coveredWgsl: CARD_COVERED_WGSL });
+      hybrid.setSkyLighting(sky.bindings.skyLighting);
+      hybrid.setAlphaTexture(needleAlpha);
+      hybrid.setCascadedShadowMap(renderer.cascadedShadowMap);
+      hybrid.heatScale = 0.5 / exposureFromEV100(ev(), LENS_ATTENUATION_UE4);
+      hybrid.collectStats = flag('stats', false);
+      effects.push(hybrid);
+    }
     let reflections = null;
     if (reflect) {
       reflections = RtReflectionsEffect.withClipmap(gi.clipmap, renderer.rtGrid.handle, {
@@ -681,9 +751,7 @@
         coveredWgsl: CARD_COVERED_WGSL,
       });
       reflections.setSkyLighting(sky.bindings.skyLighting);
-      const alpha = device.createTexture({ label: 'NeedleSpray/Alpha', size: [needleW, needleH], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-      device.queue.writeTexture({ texture: alpha }, needleData, { bytesPerRow: needleW * 4 }, [needleW, needleH]);
-      reflections.setAlphaTexture(alpha.createView());
+      reflections.setAlphaTexture(needleAlpha);
       reflections.view = ['lit', 'reflection', 'mirror', 'cost'].includes(param('rt_view')) ? param('rt_view') : 'lit';
       reflections.heatScale = 0.5 / exposureFromEV100(ev(), LENS_ATTENUATION_UE4);
       reflections.collectStats = flag('stats', false);
@@ -734,13 +802,14 @@
       camera.resetMotion();
       giEffect.resetHistory();
       voxelsEffect.resetHistory();
+      hybrid?.resetHistory();
       config.cam = name in CAMERAS || name === 'fly' ? name : 'road';
     }
 
     // Bring the clipmap, the materials' ambient and the chain to the GI mode and the view.
     function apply() {
       // the clipmap runs for its GI and its probes; the effect shows the GI on screen
-      const clipmap = ['visibility', 'cones', 'probes'].includes(config.gi);
+      const clipmap = ['visibility', 'cones', 'probes', 'rt'].includes(config.gi);
       const onScreen = config.gi === 'cones' || config.gi === 'probes';
       gi.settings.enabled = clipmap;
       device.queue.writeBuffer(ambientMode, 0, new Uint32Array([{ skyocc: 1, visibility: 2 }[config.gi] ?? 0, 0, 0, 0]));
@@ -753,7 +822,28 @@
       giEffect.setClipmapProbes(config.gi === 'probes' ? probes : null);
       giEffect.showIndirect = config.view === 'indirect';
       giEffect.resetHistory();
+      // the hybrid brought to its settings (its history restarts)
+      if (hybrid) {
+        hybrid.enabled = config.gi === 'rt';
+        hybrid.setResolution(rtgi.res);
+        hybrid.denoise = rtgi.denoise;
+        hybrid.kernel = rtgi.kernel;
+        hybrid.hitLighting = rtgi.hit;
+        hybrid.shadows = rtgi.shadows;
+        hybrid.mode = rtgi.mode;
+        hybrid.accumulate = rtgi.accum;
+        hybrid.nearDistance = rtgi.near;
+        hybrid.view = config.view === 'indirect' ? 'indirect' : rtgi.view;
+        hybrid.resetHistory();
+      }
       for (const key of ['gi', 'view', 'cam', 'elevation']) document.getElementById(key).value = config[key];
+      for (const key of Object.keys(RTGI_KEYS)) {
+        const el = document.getElementById(`rtgi-${key}`);
+        if (key === 'accum') el.checked = rtgi.accum;
+        else el.value = rtgi[key];
+      }
+      // the hybrid's settings, shown while it runs
+      document.getElementById('rtgi-panel').style.display = config.gi === 'rt' && hybrid ? '' : 'none';
     }
     function setElevation(degrees) {
       config.elevation = degrees;
@@ -773,6 +863,15 @@
       const s = grid.stats;
       return { triangles: s.grid.triangles, references: s.grid.references, big: s.grid.bigTriangles, sources: s.sources, rebuilt: s.rebuilt, rebuilds: s.rebuilds, cpuMs: +s.cpuMs.toFixed(3), mib: +(grid.memoryBytes() / (1 << 20)).toFixed(1) };
     };
+    // the hybrid's settings and, with its effect, its counters, memory and accumulated frames (null without it)
+    const rtgiInfo = () => {
+      if (!hybrid) return null;
+      const s = hybrid.stats;
+      return {
+        ...rtgi, on: hybrid.enabled, accumulated: hybrid.accumulated, mib: +(hybrid.memoryBytes() / (1 << 20)).toFixed(1),
+        rays: s?.rays ?? 0, hits: s?.hits ?? 0, cost: s?.cost ?? 0, shadowRays: s?.shadowRays ?? 0,
+      };
+    };
     const info = () => {
       const layout = gi.clipmap.layout;
       const eye = camera.position;
@@ -783,19 +882,39 @@
         frameMs: +(stats?.frameMs ?? 0).toFixed(2), gpuMs: +(stats?.gpuMs ?? 0).toFixed(3), gpuSpanMs: +(stats?.gpuSpanMs ?? 0).toFixed(3),
         voxelizeMs: +(sum('VoxelClipmap/Voxelize') + sum('VoxelClipmap/Dynamic')).toFixed(3),
         injectMs: +sum('VoxelClipmap/Inject').toFixed(3), probesMs: +sum('VoxelClipmap/Probes').toFixed(3), screenMs: +sum('VoxelGI/Screen').toFixed(3),
+        rtgi: rtgiInfo(), rtgiMs: +sum('RtGi/').toFixed(3),
         rt: rtInfo(), rtMs: +(sum('Rt/Gather') + sum('Rt/Grid')).toFixed(3), reflectMs: +(sum('Rt/Trace') + sum('Rt/Resolve')).toFixed(3),
         passes: (stats?.passes ?? []).map(([label, ms]) => [label, +ms.toFixed(3)]),
       };
     };
     const set = (key) => (value) => { config[key] = value; apply(); };
+    // rt only where the page built the grid (gi=rt, rt=1 or reflect=1)
+    const setGi = (name) => { if (GI_MODES.includes(name) && (name !== 'rt' || hybrid)) set('gi')(name); };
+    // one of the hybrid's settings at run time, by its rtgi_* URL parameter's key and value
+    const setRtgi = (key, value) => { if (setRtgiKey(key, value)) apply(); };
     window.kansei = {
-      info, setGi: set('gi'), setView: set('view'), setCamera, setElevation,
+      info, setGi, setRtgi, setView: set('view'), setCamera, setElevation,
       setStats: (on) => renderer.setProfiling(on),
       setReflections: (on) => { if (reflections) { reflections.enabled = on; reflections.resetHistory(); } },
       setReflectionView: (name) => { if (reflections) reflections.view = name; },
       renderer, scene, camera, gi,
     };
-    for (const key of ['gi', 'view']) document.getElementById(key).onchange = (e) => set(key)(e.target.value);
+    // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
+    // it, choosing the hybrid reloads the page with gi=rt
+    document.getElementById('gi').onchange = (e) => {
+      if (e.target.value === 'rt' && !hybrid) {
+        const params = new URLSearchParams(location.search);
+        params.set('gi', 'rt');
+        location.search = params.toString();
+        return;
+      }
+      setGi(e.target.value);
+    };
+    document.getElementById('view').onchange = (e) => set('view')(e.target.value);
+    for (const key of Object.keys(RTGI_KEYS)) {
+      const el = document.getElementById(`rtgi-${key}`);
+      el.onchange = () => setRtgi(key, key === 'accum' ? el.checked : el.value);
+    }
     document.getElementById('cam').onchange = (e) => setCamera(e.target.value);
     document.getElementById('elevation').oninput = (e) => setElevation(parseFloat(e.target.value));
     if (!flag('ui', true)) document.getElementById('panel').style.display = 'none';
@@ -829,6 +948,7 @@
         fog.updateLights(scene.directionalLights, scene.pointLights);
         fog.time = time;
       }
+      hybrid?.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
       sky.update(camera);
       hud.begin(performance.now());
       (config.view === 'voxels' && gi.settings.enabled ? debugVolume : volume).render(scene, camera);
@@ -852,6 +972,7 @@
             `${trees} trees, ${(triangles / 1e6).toFixed(1)} M triangles`,
             `frame ${i.frameMs} ms, GPU ${i.gpuMs} ms of passes (span ${i.gpuSpanMs})`,
             `voxelize ${i.voxelizeMs}  inject ${i.injectMs}  probes ${i.probesMs}  screen ${i.screenMs} ms`,
+            ...(i.rtgi?.on ? [`hybrid GI: ${i.rtgiMs} ms, ${i.rtgi.mib} MiB, near field ${i.rtgi.near ? i.rtgi.near + ' m' : 'the box'}; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '')] : []),
             ...stats.passes.slice(0, 12).map(([label, ms]) => `${label.padEnd(32)} ${ms.toFixed(3)}`),
           ].join('\n'));
         }

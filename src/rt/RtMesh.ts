@@ -8,8 +8,8 @@ const VERTEX_FLOATS = 9;
 const HEADER_WORDS = 4;
 
 /**
- * A mesh for `RtGrid.gather`: its vertices' positions and uvs, its triangles, and its bounds.
- * Rust: `rt::RtMesh`.
+ * A mesh for `RtGrid.gather`: its vertices' positions, uvs and normals, its triangles, and its
+ * bounds. Rust: `rt::RtMesh`.
  */
 export class RtMesh {
     constructor(
@@ -17,6 +17,8 @@ export class RtMesh {
         public readonly positions: Float32Array,
         /** u, v a vertex. */
         public readonly uvs: Float32Array,
+        /** x, y, z a vertex (what `RtSurface.smoothNormals` interpolates at a hit). */
+        public readonly normals: Float32Array,
         /** Three vertex indices a triangle. */
         public readonly indices: Uint32Array,
         public readonly min: Vec3,
@@ -29,6 +31,7 @@ export class RtMesh {
         const count = Math.floor(v.length / VERTEX_FLOATS);
         const positions = new Float32Array(count * 3);
         const uvs = new Float32Array(count * 2);
+        const normals = new Float32Array(count * 3);
         const min: Vec3 = [Infinity, Infinity, Infinity];
         const max: Vec3 = [-Infinity, -Infinity, -Infinity];
         for (let i = 0; i < count; i++) {
@@ -39,6 +42,7 @@ export class RtMesh {
                 min[c] = Math.min(min[c], x);
                 max[c] = Math.max(max[c], x);
             }
+            for (let c = 0; c < 3; c++) normals[i * 3 + c] = v[at + 4 + c];
             uvs[i * 2] = v[at + 7];
             uvs[i * 2 + 1] = v[at + 8];
         }
@@ -46,7 +50,7 @@ export class RtMesh {
             min.fill(0);
             max.fill(0);
         }
-        return new RtMesh(positions, uvs, Uint32Array.from(geometry.indices ?? []), min, max);
+        return new RtMesh(positions, uvs, normals, Uint32Array.from(geometry.indices ?? []), min, max);
     }
 
     get vertexCount(): number {
@@ -59,21 +63,24 @@ export class RtMesh {
 
     /**
      * The mesh as the gather reads it: a header (where the vertices and indices start, the vertex
-     * and triangle counts), the vertices (x, y, z and the uv as two f16), the indices.
+     * and triangle counts), the vertices (x, y, z, the uv as two f16 and the normal octahedral,
+     * as two snorm16), the indices.
      */
     gpuWords(): Uint32Array {
         const n = this.vertexCount;
         const vertices = HEADER_WORDS;
-        const indices = vertices + n * 4;
+        const indices = vertices + n * 5;
         const words = new Uint32Array(indices + this.indices.length);
         const floats = new Float32Array(words.buffer);
         words.set([vertices, indices, n, this.triangleCount]);
         for (let i = 0; i < n; i++) {
-            const at = vertices + i * 4;
+            const at = vertices + i * 5;
             floats[at] = this.positions[i * 3];
             floats[at + 1] = this.positions[i * 3 + 1];
             floats[at + 2] = this.positions[i * 3 + 2];
             words[at + 3] = packHalf2(this.uvs[i * 2], this.uvs[i * 2 + 1]);
+            const k = i * 3;
+            words[at + 4] = k + 2 < this.normals.length ? packOctahedral(this.normals[k], this.normals[k + 1], this.normals[k + 2]) : packOctahedral(0, 1, 0);
         }
         words.set(this.indices, indices);
         return words;
@@ -86,6 +93,27 @@ export class RtMesh {
         device.queue.writeBuffer(buffer, 0, words);
         return buffer;
     }
+}
+
+/**
+ * A unit vector, octahedral, as WGSL's `pack2x16snorm` packs the two coordinates
+ * (`kansei_rt_unpack_normal` reads it). Rust: `rt::mesh::pack_octahedral`.
+ */
+export function packOctahedral(nx: number, ny: number, nz: number): number {
+    const l1 = Math.abs(nx) + Math.abs(ny) + Math.abs(nz);
+    const [vx, vy, vz] = nx * nx + ny * ny + nz * nz > 0 ? [nx / l1, ny / l1, nz / l1] : [0, 1, 0];
+    let [x, y] = [vx, vy];
+    if (vz < 0) {
+        // (signum: 1 for +0, as Rust's)
+        const sign = (f: number) => (f < 0 || Object.is(f, -0) ? -1 : 1);
+        [x, y] = [(1 - Math.abs(vy)) * sign(vx), (1 - Math.abs(vx)) * sign(vy)];
+    }
+    // (rounded half away from zero, as Rust's f32::round)
+    const snorm = (f: number) => {
+        const s = Math.min(Math.max(f, -1), 1) * 32767;
+        return (Math.sign(s) * Math.round(Math.abs(s))) & 0xffff;
+    };
+    return (snorm(x) | (snorm(y) << 16)) >>> 0;
 }
 
 const f32Scratch = new Float32Array(1);

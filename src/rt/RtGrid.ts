@@ -82,10 +82,17 @@ export class RtPlacement {
 export interface RtSurface {
     albedo: Vec3;
     alphaLayer?: number | null;
+    /**
+     * Its triangles carry their vertex normals (in place of their uvs), which
+     * `kansei_rt_shading_normal` interpolates at a hit: for the rays a curved surface bends or
+     * mirrors. Its uvs are then gone: only for surfaces no `kansei_rt_covered` samples by uv.
+     * Rust: `RtSurface::with_smooth_normals`.
+     */
+    smoothNormals?: boolean;
 }
 
 export function rtSurfaceWord(s: RtSurface): number {
-    return s.alphaLayer == null ? 0 : (1 | ((s.alphaLayer & 255) << 8)) >>> 0;
+    return ((s.alphaLayer == null ? 0 : (1 | ((s.alphaLayer & 255) << 8))) | (s.smoothNormals ? 4 : 0)) >>> 0;
 }
 
 export function rtAlbedoWord(s: RtSurface): number {
