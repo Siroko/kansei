@@ -292,6 +292,13 @@ impl Renderer {
         self.initialize_with_target(wgpu::SurfaceTarget::Canvas(canvas)).await;
     }
 
+    /// Initialize from an `OffscreenCanvas` (WASM only): a page's canvas handed to a worker
+    /// with `transferControlToOffscreen`, so the renderer runs off the page's main thread.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn initialize_with_offscreen_canvas(&mut self, canvas: web_sys::OffscreenCanvas) {
+        self.initialize_with_target(wgpu::SurfaceTarget::OffscreenCanvas(canvas)).await;
+    }
+
     /// Initialize the Renderer from a platform surface target.
     /// Handles Instance, Surface, Adapter, Device creation internally.
     ///

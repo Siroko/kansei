@@ -69,8 +69,8 @@ impl Default for RunOptions {
     }
 }
 
-/// Call `frame` on every animation frame from now on, with the frame's timing and any canvas
-/// resize. The closure owns (or shares) the example's state. At most
+/// Call `frame` on every animation frame from now on (the page's `requestAnimationFrame`, or in
+/// a worker the worker's), with the frame's timing and any canvas resize. The closure owns (or shares) the example's state. At most
 /// [`DEFAULT_MAX_FRAMES_IN_FLIGHT`] frames go to the GPU at once (see
 /// [`RunOptions::max_frames_in_flight`]; `?inflight=0` turns the cap off).
 pub fn run(canvas: &Canvas, frame: impl FnMut(&Frame) + 'static) {
@@ -128,9 +128,13 @@ pub fn run_with(canvas: &Canvas, options: RunOptions, mut frame: impl FnMut(&Fra
     request_animation_frame(first.borrow().as_ref().unwrap());
 }
 
+/// The page's `requestAnimationFrame`, or in a worker the worker's (see `js/worker.js`
+/// `requestFrame`: where a browser has none, the page's frames are posted to the worker).
 fn request_animation_frame(callback: &Closure<dyn FnMut()>) {
-    web_sys::window()
-        .expect("no window")
-        .request_animation_frame(callback.as_ref().unchecked_ref())
-        .expect("requestAnimationFrame failed");
+    match web_sys::window() {
+        Some(window) => {
+            window.request_animation_frame(callback.as_ref().unchecked_ref()).expect("requestAnimationFrame failed");
+        }
+        None => crate::worker::request_frame(callback.as_ref().unchecked_ref()),
+    }
 }
