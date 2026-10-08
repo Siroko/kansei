@@ -32,7 +32,6 @@
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { AreaLight } from '../src/lights/AreaLight'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
     import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
     import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
     import { BufferBase } from '../src/buffers/BufferBase'
@@ -108,7 +107,7 @@
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
         let albedo = albedoMetal.rgb;
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
@@ -208,7 +207,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = diffuse * shadow;
@@ -482,10 +481,6 @@
     document.body.appendChild(renderer.canvas);
     renderer.canvas.style.width = '100%';
     renderer.canvas.style.height = '100%';
-    renderer.shadowsEnabled = true;
-
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
-    renderer.shadowMap = shadowMap;
 
     // ── Scene ─────────────────────────────────────────────────────────────
     const scene = new Scene();
