@@ -149,6 +149,8 @@ export { VolumetricCloudsEffect, CloudQuality, defaultCloudLayer, defaultVolumet
 export type { CloudLayer, VolumetricCloudsOptions } from "./postprocessing/effects/VolumetricCloudsEffect";
 export { TemporalAAEffect, defaultTemporalAAOptions } from "./postprocessing/effects/TemporalAAEffect";
 export type { TemporalAAOptions } from "./postprocessing/effects/TemporalAAEffect";
+export { MotionBlurEffect, defaultMotionBlurOptions } from "./postprocessing/effects/MotionBlurEffect";
+export type { MotionBlurOptions } from "./postprocessing/effects/MotionBlurEffect";
 export { hash01 } from "./math/hash01";
 export { DebugBoxes, segment, DEBUG_BOXES_WGSL } from "./debug/DebugBoxes";
 export { Canvas, Frame, run, Keys, Gamepad, deadZone, now, param, paramOr, flag, isPhone, setText, checkbox, thousands, fetchBytes } from "./web";
