@@ -24,8 +24,11 @@
     // (`SKY_ENVIRONMENT_WGSL`). With `fog=`, froxel height fog lit by the same sun and sky lies in
     // front of the atmosphere; with `mist=1`, a local fog volume fills the clearing.
     //
-    // Not here yet, as they come with later ports: the Rust page's volumetric clouds and
-    // screen-space GI.
+    // Volumetric clouds (`VolumetricCloudsEffect`) drift over it, shadow the scene from the sun
+    // (`CLOUD_SHADOW_WGSL`) and occlude and tint the sky lighting and the environment through
+    // their cloud map.
+    //
+    // Not here yet, as it comes with a later port: the Rust page's screen-space GI.
     //
     // URL parameters (all optional):
     //   elevation  sun elevation in degrees (negative: below the horizon); default: a 60 s day
@@ -43,7 +46,13 @@
     //   capturefog=1  with the preset: the sky lighting and the reflections see the sky through its
     //              height fog, as Unreal's sky light captures it (capturefog=ue: the fog below the
     //              horizon too, rather than the lit ground)
+    //   clouds     cloud coverage 0..1 (default 0.45; clouds=0 none); cloudtype: 0 stratus .. 1
+    //              cumulus (0.7); cloudbase: base altitude in m (1500); cloudthick: m (2500)
+    //   cloudshadows=0  the clouds cast no shadows on the scene
+    //   cloudquality=low|medium|high  the clouds' cost preset (default medium)
     //   profile=1  GPU time per pass (examples/profile-hud.js)
+    //   bench=1    with clouds: alternates two cloud qualities (cloudquality and benchquality,
+    //              default low and high) and compares their GPU time (examples/profile-hud.js)
     import { Canvas, run, param } from '../src/web/index'
     import { Camera } from '../src/cameras/Camera'
     import { Scene } from '../src/objects/Scene'
@@ -65,7 +74,8 @@
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
     import { SkyAtmosphere, skyCaptureFogFromHeightFog } from '../src/atmosphere/SkyAtmosphere'
     import { directionFromElevationBearing } from '../src/atmosphere/AtmosphereParams'
-    import { SKY_LIGHTING_WGSL, SKY_ENVIRONMENT_WGSL } from '../src/atmosphere/AtmosphereWGSL'
+    import { SKY_LIGHTING_WGSL, SKY_ENVIRONMENT_WGSL, CLOUD_SHADOW_WGSL } from '../src/atmosphere/AtmosphereWGSL'
+    import { VolumetricCloudsEffect, CloudQuality, defaultCloudLayer } from '../src/postprocessing/effects/VolumetricCloudsEffect'
     import { LIGHTS_WGSL, SHADOW_MAP_WGSL, GBUFFER_OUT_WGSL } from '../src/materials/shaders/SharedWGSL'
     import { FrameTimer } from '../src/pacing/FrameTimer'
     import { AbBench } from '../src/profiling/AbBench'
@@ -77,11 +87,14 @@
 
     // Lambertian surfaces lit by the scene's directional lights (in lux) with the renderer's
     // shadow map, and by the sky: radiance = albedo / pi * (E_sun * cos * shadow + E_sky(n)).
-    // The Rust example's SURFACE_WGSL, without the clouds' shadow.
+    // The Rust example's SURFACE_WGSL.
     const SURFACE_WGSL = /* wgsl */`
       struct MaterialUniforms { albedo: vec4<f32> };
       @group(0) @binding(0) var<uniform> material: MaterialUniforms;
       @group(0) @binding(1) var<uniform> sky: SkyLighting;
+      @group(0) @binding(2) var cloud_shadow_map: texture_2d<f32>;
+      @group(0) @binding(3) var cloud_shadow_sampler: sampler;
+      @group(0) @binding(4) var<uniform> cloud_shadow_params: CloudShadowParams;
       @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
       @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
       @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -108,8 +121,9 @@
           var e = vec3<f32>(0.0);
           for (var i = 0u; i < kansei_lights.num_directional; i++) {
               let l = kansei_lights.directional[i];
-              // the sun (light 0) through its shadow map
-              e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
+              // the sun (light 0) through its shadow map and the clouds
+              let clouds = cloudShadow(cloud_shadow_map, cloud_shadow_sampler, cloud_shadow_params, input.world_position);
+              e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow * clouds, i == 0u);
           }
           let albedo = material.albedo.rgb;
           return kansei_gbuffer_out(albedo / 3.14159265 * (e + skyIrradiance(sky, n)), vec3<f32>(0.0), n, albedo);
@@ -117,13 +131,16 @@
     `;
 
     // Reflective surfaces: the sky's prefiltered environment (split sum) and a GGX sun highlight
-    // over a diffuse base. The Rust example's REFLECTIVE_WGSL, without the clouds' shadow.
+    // over a diffuse base. The Rust example's REFLECTIVE_WGSL.
     const REFLECTIVE_WGSL = /* wgsl */`
       struct Surface { albedo: vec4<f32>, f0_roughness: vec4<f32> };
       @group(0) @binding(0) var<uniform> material: Surface;
       @group(0) @binding(1) var<uniform> sky: SkyLighting;
       @group(0) @binding(2) var env: texture_cube<f32>;
       @group(0) @binding(3) var env_sampler: sampler;
+      @group(0) @binding(4) var cloud_shadow_map: texture_2d<f32>;
+      @group(0) @binding(5) var cloud_shadow_sampler: sampler;
+      @group(0) @binding(6) var<uniform> cloud_shadow_params: CloudShadowParams;
       @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
       @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
       @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
@@ -169,7 +186,8 @@
               let f = f0 + (1.0 - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0);
               let k = roughness * roughness * 0.5;
               let vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
-              color += kansei_lights.directional[i].color * nl * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
+              let clouds = select(1.0, cloudShadow(cloud_shadow_map, cloud_shadow_sampler, cloud_shadow_params, input.world_position), i == 0u);
+              color += kansei_lights.directional[i].color * (nl * clouds) * (material.albedo.rgb / 3.14159265 * (1.0 - f) + d * f * vis);
           }
           return kansei_gbuffer_out(color, vec3<f32>(0.0), n, material.albedo.rgb * (1.0 - spec_brdf));
       }
@@ -221,7 +239,11 @@
     }
 
     const skyLighting = ComputeBuffer.fromExternal(sky.bindings.skyLighting, 'uniform');
-    const surfaceCode = [SKY_LIGHTING_WGSL, LIGHTS_WGSL, SHADOW_MAP_WGSL, GBUFFER_OUT_WGSL, SURFACE_WGSL].join('\n');
+    // the clouds' shadow (CLOUD_SHADOW_WGSL): its map, a linear clamping sampler, its parameters
+    const cloudShadowMap = Texture.fromView('CloudShadow', sky.cloudShadowTexture, sky.bindings.cloudShadow);
+    const cloudShadowSampler = new Sampler('linear', 'linear', 'clamp-to-edge');
+    const cloudShadowParams = ComputeBuffer.fromExternal(sky.bindings.cloudShadowParams, 'uniform');
+    const surfaceCode = [SKY_LIGHTING_WGSL, CLOUD_SHADOW_WGSL, LIGHTS_WGSL, SHADOW_MAP_WGSL, GBUFFER_OUT_WGSL, SURFACE_WGSL].join('\n');
     const surface = (label, albedo) => new Material(surfaceCode, {
       label,
       mrtOutputCount: 4,
@@ -234,6 +256,9 @@
           }),
         },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: skyLighting },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: cloudShadowMap },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, value: cloudShadowSampler },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, value: cloudShadowParams },
       ],
     });
 
@@ -244,7 +269,7 @@
     });
     const environment = Texture.fromView('SkyEnvironment', sky.environmentTexture, sky.bindings.environment, 'cube');
     const environmentSampler = new Sampler('linear', 'linear', 'clamp-to-edge');
-    const reflectiveCode = [SKY_LIGHTING_WGSL, SKY_ENVIRONMENT_WGSL, LIGHTS_WGSL, GBUFFER_OUT_WGSL, REFLECTIVE_WGSL].join('\n');
+    const reflectiveCode = [SKY_LIGHTING_WGSL, SKY_ENVIRONMENT_WGSL, CLOUD_SHADOW_WGSL, LIGHTS_WGSL, GBUFFER_OUT_WGSL, REFLECTIVE_WGSL].join('\n');
     const reflective = (label, albedo, f0, roughness) => new Material(reflectiveCode, {
       label,
       mrtOutputCount: 4,
@@ -253,6 +278,9 @@
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: skyLighting },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: environment },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, value: environmentSampler },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, value: cloudShadowMap },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, value: cloudShadowSampler },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, value: cloudShadowParams },
       ],
     });
 
@@ -321,9 +349,22 @@
     sun.castShadow = true;
     scene.add(sun);
 
-    // the chain: the sky and its aerial perspective, the fog in front of them, the display transform
+    // the chain: the sky and its aerial perspective, the clouds, the fog in front of them, the
+    // display transform
     const effects = [new AtmosphereEffect(sky)];
     let fog = null;
+    const qualities = { low: CloudQuality.Low, medium: CloudQuality.Medium, high: CloudQuality.High };
+    const coverage = num('clouds') ?? 0.45;
+    let clouds = null;
+    if (coverage > 0) {
+      const base = num('cloudbase') ?? 1500;
+      const layer = { ...defaultCloudLayer(), coverage, cloudType: num('cloudtype') ?? 0.7, bottomM: base, topM: base + (num('cloudthick') ?? 2500) };
+      clouds = new VolumetricCloudsEffect(sky, { layer });
+      clouds.castsShadows = param('cloudshadows') !== '0';
+      const quality = qualities[param('cloudquality')];
+      if (quality) clouds.setQuality(quality);
+      effects.push(clouds);
+    }
     if (midsommar) {
       // intro_scene.json's light block, as create_intro_scene.py applies it in Unreal
       sky.params.mieScatteringScale = 0.003996 * 1.7; // haze
@@ -393,7 +434,12 @@
     effects.push(tonemap);
     const volume = new PostProcessingVolume(renderer, effects);
     const camera = new Camera(62, 0.5, 60000, canvas.aspect);
-    const hud = installProfileHud({ renderer, FrameTimer, AbBench });
+    // bench=1: the clouds at two qualities, alternated in this page
+    const benchQualities = [param('cloudquality') ?? 'low', param('benchquality') ?? 'high'];
+    const bench = clouds && benchQualities.every((q) => qualities[q])
+      ? { labels: benchQualities.map((q) => `clouds ${q}`), set: (i) => clouds.setQuality(qualities[benchQualities[i]]) }
+      : undefined;
+    const hud = installProfileHud({ renderer, FrameTimer, AbBench, bench });
 
     run(canvas, (frame) => {
       hud.begin(performance.now());
@@ -417,6 +463,7 @@
         fog.updateLights(scene.directionalLights, scene.pointLights);
         fog.time = t;
       }
+      if (clouds) clouds.time = t;
 
       sky.update(camera);
       volume.render(scene, camera);

@@ -12,7 +12,7 @@ import {
 } from './AtmosphereWGSL';
 
 // A physically based sky after Hillaire 2020, as the Rust engine's `atmosphere/sky_atmosphere.rs`
-// on the same WGSL. The clouds' shadow is not part of it yet.
+// on the same WGSL.
 
 /** Format of every LUT and of the aerial-perspective volumes. */
 export const LUT_FORMAT: GPUTextureFormat = 'rgba16float';
@@ -20,6 +20,10 @@ export const LUT_FORMAT: GPUTextureFormat = 'rgba16float';
 export const SUN_LIMB_DARKENING = 0.6;
 /** The cloud map's size (cloud_map.wgsl): azimuth by zenith angle. */
 export const CLOUD_MAP_SIZE: [number, number] = [128, 64];
+/** The cloud shadow map's texels per side. */
+export const CLOUD_SHADOW_SIZE = 256;
+/** Bytes of the WGSL `CloudShadowParams` (cloud_shadow.wgsl). */
+export const CLOUD_SHADOW_PARAMS_BYTES = 32;
 /** Lowest camera altitude the LUTs are built for, km: below it the horizon maths loses precision. */
 const MIN_CAMERA_ALTITUDE_KM = 0.005;
 /** GGX samples per texel for the environment's rough mips. */
@@ -139,6 +143,19 @@ export interface SkyAtmosphereBindings {
      * reads the map only while it is that fresh, so clouds taken out of the chain leave no trace.
      */
     cloudMapFrame: number;
+    /**
+     * The clouds' shadow on the scene (rgba8unorm, r the cloud layer's transmittance toward the
+     * sun), on a plane under the camera: bind it with a linear clamping sampler and
+     * `cloudShadowParams` and multiply the sun's light by `CLOUD_SHADOW_WGSL`'s `cloudShadow`.
+     * Off (1 everywhere) without clouds.
+     */
+    cloudShadow: GPUTextureView;
+    /** Uniform `CloudShadowParams` for `cloudShadow`. */
+    cloudShadowParams: GPUBuffer;
+    /** As `cloudMapFrame`, for the shadow map. */
+    cloudShadowFrame: number;
+    /** The sun's direction (normalised) at the last update, for the clouds' shadow map. */
+    sunDirection: Vec3;
 }
 
 /**
@@ -204,6 +221,8 @@ export class SkyAtmosphere {
     public readonly aerialPerspectiveTextures: [GPUTexture, GPUTexture];
     /** The sky environment cubemap texture (6 layers, GGX-prefiltered mips). */
     public readonly environmentTexture: GPUTexture;
+    /** The clouds' shadow map (`bindings.cloudShadow`), for binding it in a material (`Texture.fromView`). */
+    public readonly cloudShadowTexture: GPUTexture;
 
     private readonly _device: GPUDevice;
     private readonly _capture: GPUBuffer;
@@ -235,6 +254,8 @@ export class SkyAtmosphere {
     private _builtFor: Float32Array | null = null;
     private readonly _frameData = new Float32Array(SKY_FRAME_BYTES / 4);
     private readonly _captureData = new ArrayBuffer(SKY_CAPTURE_BYTES);
+    /** Whether `cloudShadowParams` holds zeros (shadows off) since the clouds last wrote it. */
+    private _cloudShadowCleared = true;
 
     constructor(device: GPUDevice, options: Partial<SkyAtmosphereOptions> = {}) {
         const o = { ...defaultSkyAtmosphereOptions(), ...options };
@@ -273,7 +294,12 @@ export class SkyAtmosphere {
             format: LUT_FORMAT,
             usage,
         });
-        this._ownedTextures = [...this.lutTextures, ...this.aerialPerspectiveTextures, cloudMap, noClouds, this.environmentTexture];
+        this.cloudShadowTexture = device.createTexture({
+            label: 'SkyAtmosphere/CloudShadow', size: [CLOUD_SHADOW_SIZE, CLOUD_SHADOW_SIZE], format: 'rgba8unorm', usage,
+        });
+        this._ownedTextures = [
+            ...this.lutTextures, ...this.aerialPerspectiveTextures, cloudMap, noClouds, this.environmentTexture, this.cloudShadowTexture,
+        ];
 
         const b: SkyAtmosphereBindings = this.bindings = {
             atmosphere: uniform('SkyAtmosphere/Atmosphere', ATMOSPHERE_BYTES),
@@ -296,6 +322,15 @@ export class SkyAtmosphere {
             skyViewSampler: sampler('SkyAtmosphere/SkyViewSampler', 'repeat'),
             cloudMap: cloudMap.createView(),
             cloudMapFrame: 0,
+            cloudShadow: this.cloudShadowTexture.createView(),
+            // zero: shadows off until the clouds write them
+            cloudShadowParams: device.createBuffer({
+                label: 'SkyAtmosphere/CloudShadowParams',
+                size: CLOUD_SHADOW_PARAMS_BYTES,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            }),
+            cloudShadowFrame: 0,
+            sunDirection: [0, 1, 0],
         };
         this._capture = uniform('SkyAtmosphere/Capture', SKY_CAPTURE_BYTES);
         // the sky's distant light, before the sky lighting that reads it and passes it on
@@ -499,8 +534,16 @@ export class SkyAtmosphere {
         const b = this.bindings;
         const p = this._pipelines;
         // the cloud map (0) if the clouds wrote it this frame or the last, else none (1)
-        const written = b.cloudMapFrame;
-        const clouds = written !== 0 && ((camera.frame - (written - 1)) >>> 0) <= 1 ? 0 : 1;
+        const fresh = (written: number) => written !== 0 && ((camera.frame - (written - 1)) >>> 0) <= 1;
+        const clouds = fresh(b.cloudMapFrame) ? 0 : 1;
+        b.sunDirection = normalizeOr(this.sun.direction, [0, 1, 0]);
+        // no clouds drawn lately: their shadows are off (the clouds copy the parameters in when drawn)
+        if (fresh(b.cloudShadowFrame)) {
+            this._cloudShadowCleared = false;
+        } else if (!this._cloudShadowCleared) {
+            queue.writeBuffer(b.cloudShadowParams, 0, new Float32Array(CLOUD_SHADOW_PARAMS_BYTES / 4));
+            this._cloudShadowCleared = true;
+        }
 
         const atmosphere = atmosphereGpu(this.params);
         if (!this._builtFor || !atmosphere.every((v, i) => v === this._builtFor![i])) {
@@ -569,7 +612,10 @@ export class SkyAtmosphere {
     /** Release the GPU resources (the bindings stop working). */
     public destroy(): void {
         for (const t of this._ownedTextures) t.destroy();
-        for (const buffer of [this.bindings.atmosphere, this.bindings.frame, this.bindings.skyLighting, this._capture, this._distant, ...this._environmentParams]) buffer.destroy();
+        for (const buffer of [
+            this.bindings.atmosphere, this.bindings.frame, this.bindings.skyLighting, this.bindings.cloudShadowParams, this._capture, this._distant,
+            ...this._environmentParams,
+        ]) buffer.destroy();
     }
 }
 

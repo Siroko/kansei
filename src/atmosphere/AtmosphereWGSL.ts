@@ -24,6 +24,10 @@ import skyEnvironment from '../../rust/kansei-core/src/atmosphere/shaders/sky_en
 import skyEnvironmentPass from '../../rust/kansei-core/src/atmosphere/shaders/sky_environment_pass.wgsl?raw';
 import skyComposite from '../../rust/kansei-core/src/atmosphere/shaders/sky_composite.wgsl?raw';
 import heightFog from '../../rust/kansei-core/src/shaders/height_fog.wgsl?raw';
+import cloudShadow from '../../rust/kansei-core/src/atmosphere/shaders/cloud_shadow.wgsl?raw';
+import cloudsNoise from '../../rust/kansei-core/src/atmosphere/shaders/clouds_noise.wgsl?raw';
+import cloudsMarch from '../../rust/kansei-core/src/atmosphere/shaders/clouds_march.wgsl?raw';
+import cloudsComposite from '../../rust/kansei-core/src/atmosphere/shaders/clouds_composite.wgsl?raw';
 
 /**
  * The WGSL `Atmosphere` and `SkyFrame` structs and the atmosphere helpers (medium, phase
@@ -51,6 +55,16 @@ export const SKY_LIGHTING_WGSL: string = skyLighting;
  */
 export const SKY_ENVIRONMENT_WGSL: string = skyEnvironment;
 
+/**
+ * `cloudShadow(map, mapSampler, params, worldPos)`: the cloud layer's transmittance toward the sun
+ * at a point below the clouds, to multiply the sun's direct light by. Bind
+ * `SkyAtmosphere.bindings.cloudShadow` (`texture_2d<f32>`, e.g. `Texture.fromView` with
+ * `SkyAtmosphere.cloudShadowTexture`), a linear clamping sampler and
+ * `bindings.cloudShadowParams` (uniform `CloudShadowParams`). `VolumetricCloudsEffect` writes
+ * them; it is 1 without clouds. Rust: `atmosphere::CLOUD_SHADOW_WGSL`.
+ */
+export const CLOUD_SHADOW_WGSL: string = cloudShadow;
+
 // The passes, in the Rust engine's concatenation order
 
 export const TRANSMITTANCE_SOURCE = assemble([common, transmittanceLut]);
@@ -64,3 +78,10 @@ export const AERIAL_PERSPECTIVE_SOURCE = assemble([common, frame, lookupTransmit
 export const SKY_COMPOSITE_SOURCE = assemble([common, frame, lookupTransmittance, skyLookup, aerialPerspectiveLookup, skyComposite]);
 /** `HeightFogEffect`'s pass (Rust `effects/height_fog.rs`). */
 export const HEIGHT_FOG_SOURCE = assemble([skyLighting, heightFog]);
+/** `VolumetricCloudsEffect`'s passes (Rust `effects/clouds.rs`): the noises, the march (entry points
+ * `main`, `skyMap` and `shadowMap`) and the composite. */
+export const CLOUDS_NOISE_SOURCE = cloudsNoise;
+export const CLOUDS_MARCH_SOURCE = assemble([
+    common, frame, lookupTransmittance, aerialPerspectiveLookup, skyLookup, skyLighting, cloudMap, cloudShadow, cloudsMarch,
+]);
+export const CLOUDS_COMPOSITE_SOURCE = assemble([frame, cloudsComposite]);
