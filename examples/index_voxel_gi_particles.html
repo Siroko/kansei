@@ -383,8 +383,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
 
       // ── panel ─────────────────────────────────────────────────────────────────────────────
       const pourAgain = () => {
-        device.queue.writeBuffer(sim.positionsBufferRef.gpuBuffer, 0, initial);
-        device.queue.writeBuffer(sim.velocitiesBufferRef.gpuBuffer, 0, new Float32Array(count * 4));
+        sim.resetParticles(initial);
         gi.resetHistory();
       };
       const panel = {
@@ -463,7 +462,7 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
 
         writeScene();
         const encoder = renderer.createCommandEncoder('VoxelGIParticles/GI');
-        gi.encode(encoder, count);
+        gi.encode(encoder, sim.particleCount);
         renderer.submit(encoder.finish());
         renderer.render(scene, camera);
 
