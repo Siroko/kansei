@@ -3,7 +3,8 @@ import { Camera } from '../cameras/Camera';
 import { GBuffer } from '../postprocessing/GBuffer';
 import { PostProcessingEffect } from '../postprocessing/PostProcessingEffect';
 import { gpuPass } from '../profiling/Profiler';
-import type { VoxelVolume } from '../gi/VoxelVolume';
+import { VoxelVolume } from '../gi/VoxelVolume';
+import { VoxelClipmap, clipmapEntries, clipmapLayoutEntries } from '../gi/VoxelClipmap';
 import { RtGrid, RtGridHandle } from './RtGrid';
 import { RT_DEFAULT_COVERED_WGSL, RT_REFLECT_RESOLVE_WGSL, rtReflectTraceWgsl } from './RtWGSL';
 
@@ -92,7 +93,8 @@ const enum StatsState { Free, Copied, Mapping }
  * Sharp and glossy reflections, traced through the renderer's ray tracing grid
  * (`Renderer.enableRtGrid`; `SceneRtGrid.handle`) on the surfaces whose material writes an F0
  * (`GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular`), the hits lit by the voxel GI's volume
- * (`SceneVoxelGi.volume`): the light leaving the surface there, the voxels as the surface cache.
+ * (`SceneVoxelGi.volume`) or clipmap (`withClipmap`, `SceneVoxelClipmap.clipmap`): the light
+ * leaving the surface there, the voxels as the surface cache.
  * Rays leaving the grid's box go on as a narrow voxel cone, then the sky (`setSkyLighting`).
  *
  * It traces one pixel of each 2 x 2 (or 4 x 4) block a frame, each in turn, and accumulates them
@@ -102,8 +104,7 @@ const enum StatsState { Free, Copied, Mapping }
  * surfaces, whose rays jitter over their lobe). Put it after the GI and before the tone mapping.
  * Needs a single-sampled GBuffer (its alphas are the F0 and roughness).
  *
- * Rust: `rt::RtReflectionsEffect` (`with_volume`; the clipmap source, `with_clipmap`, comes with
- * the voxel clipmap, G-4).
+ * Rust: `rt::RtReflectionsEffect` (`with_volume`, `with_clipmap`).
  */
 export class RtReflectionsEffect extends PostProcessingEffect {
     public enabled = true;
@@ -125,7 +126,7 @@ export class RtReflectionsEffect extends PostProcessingEffect {
     private _resolution: RtTraceResolution;
     private readonly coveredWgsl: string | null;
     private readonly grid: RtGridHandle;
-    private readonly volume: VoxelVolume;
+    private readonly source: VoxelVolume | VoxelClipmap;
     private skyLighting: GPUBuffer | null = null;
     private alphaTexture: GPUTextureView | null = null;
     private frame = 0;
@@ -136,10 +137,13 @@ export class RtReflectionsEffect extends PostProcessingEffect {
     private gpu: Gpu | null = null;
     private device: GPUDevice | null = null;
 
-    /** Reflections through `grid` (`SceneRtGrid.handle`), lit by `volume` (`SceneVoxelGi.volume`). */
-    constructor(volume: VoxelVolume, grid: RtGridHandle, options: RtReflectionsOptions = {}) {
+    /**
+     * Reflections through `grid` (`SceneRtGrid.handle`), lit by `volume` (`SceneVoxelGi.volume`),
+     * or by a clipmap (as `withClipmap`).
+     */
+    constructor(volume: VoxelVolume | VoxelClipmap, grid: RtGridHandle, options: RtReflectionsOptions = {}) {
         super();
-        this.volume = volume;
+        this.source = volume;
         this.grid = grid;
         this._resolution = options.resolution ?? 'half';
         this.intensity = options.intensity ?? 1;
@@ -150,6 +154,14 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         this.skyScale = options.skyScale ?? 1;
         this.alphaTest = options.alphaTest ?? true;
         this.coveredWgsl = options.coveredWgsl ?? null;
+    }
+
+    /**
+     * Reflections lit by a voxel clipmap (`SceneVoxelClipmap.clipmap`) through `grid`. Rust:
+     * `RtReflectionsEffect::with_clipmap`.
+     */
+    public static withClipmap(clipmap: VoxelClipmap, grid: RtGridHandle, options: RtReflectionsOptions = {}): RtReflectionsEffect {
+        return new RtReflectionsEffect(clipmap, grid, options);
     }
 
     /** The sky past the voxels (a `SkyLighting` uniform); black without one. */
@@ -212,9 +224,10 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         const sampler = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility, sampler: { type: 'filtering' } });
         const bgl = (label: string, entries: GPUBindGroupLayoutEntry[]) => device.createBindGroupLayout({ label, entries });
 
+        const clipmap = this.source instanceof VoxelClipmap;
         const traceBGL = bgl('RtReflections/Trace', [
             uniform(0), depth(1), texture(2, false), texture(3, false), storage(4), uniform(5),
-            uniform(6), texture(7, true, '3d'), sampler(8),
+            ...(clipmap ? clipmapLayoutEntries(visibility) : [uniform(6), texture(7, true, '3d'), sampler(8)]),
         ]);
         const gridBGL = bgl('RtReflections/Grid', [
             ...RtGrid.layoutEntries(0, visibility), texture(3, true), sampler(4),
@@ -238,7 +251,7 @@ export class RtReflectionsEffect extends PostProcessingEffect {
             traceBGL,
             gridBGL,
             resolveBGL,
-            trace: pipeline('RtReflections/Trace', rtReflectTraceWgsl(this.coveredWgsl ?? RT_DEFAULT_COVERED_WGSL), [traceBGL, gridBGL]),
+            trace: pipeline('RtReflections/Trace', rtReflectTraceWgsl(this.coveredWgsl ?? RT_DEFAULT_COVERED_WGSL, clipmap), [traceBGL, gridBGL]),
             resolve: pipeline('RtReflections/Resolve', RT_REFLECT_RESOLVE_WGSL, [resolveBGL]),
             // (a zeroed SkyLighting: black)
             noSky: buffer('RtReflections/NoSky', 256, GPUBufferUsage.UNIFORM),
@@ -355,11 +368,21 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         const traceView = t.trace.createView();
         const group = (label: string, layout: GPUBindGroupLayout, resources: [number, GPUBindingResource][]) =>
             device.createBindGroup({ label, layout, entries: resources.map(([binding, resource]) => ({ binding, resource })) });
-        const trace = group('RtReflections/Trace', gpu.traceBGL, [
-            [0, params], [1, depthView], [2, normalView], [3, albedoView], [4, traceView],
-            [5, { buffer: this.skyLighting ?? gpu.noSky }],
-            [6, { buffer: this.volume.uniform }], [7, this.volume.view], [8, this.volume.sampler],
-        ]);
+        const source = this.source;
+        const trace = device.createBindGroup({
+            label: 'RtReflections/Trace',
+            layout: gpu.traceBGL,
+            entries: [
+                ...([[0, params], [1, depthView], [2, normalView], [3, albedoView], [4, traceView],
+                    [5, { buffer: this.skyLighting ?? gpu.noSky }]] as [number, GPUBindingResource][])
+                    .map(([binding, resource]) => ({ binding, resource })),
+                ...(source instanceof VoxelClipmap ? clipmapEntries(source) : [
+                    { binding: 6, resource: { buffer: source.uniform } },
+                    { binding: 7, resource: source.view },
+                    { binding: 8, resource: source.sampler },
+                ]),
+            ],
+        });
         // the grid's group, made anew when the grid's buffers or the alpha texture change
         const grid = this.grid;
         if (!gpu.gridGroup || gpu.gridGroup.generation !== grid.generation || gpu.gridGroup.alpha !== this.alphaTexture) {
