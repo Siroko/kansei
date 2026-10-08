@@ -1,5 +1,4 @@
 export const shaderCode = /* wgsl */`
-
 const BLOCK_SIZE: u32 = 512u;
 
 @group(0) @binding(0) var<storage, read_write> blockSums: array<u32>;

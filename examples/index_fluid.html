@@ -562,14 +562,14 @@ fn fragment_main(v: VOut) -> FragOut {
           );
         }
 
-        // Density field update — engine handles its own encoder/submit.
-        densityField.update();
-
-        // Marching cubes: rebuild the mesh each frame from the density field.
-        // Skipped in raymarch mode to save GPU time.
+        // Density field, then the marching cubes mesh from it (skipped in raymarch mode to
+        // save GPU time): one encoder, one submit.
+        const surfaceEncoder = renderer.createCommandEncoder('Fluid/Surface');
+        densityField.update(surfaceEncoder);
         if (renderMode.mode === 'mesh') {
-          mc.update(mcExtractBG, densityField);
+          mc.update(mcExtractBG, densityField, surfaceEncoder);
         }
+        renderer.submit(surfaceEncoder.finish());
 
         volume.render(scene, camera);
       }
