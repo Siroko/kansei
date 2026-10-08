@@ -23,6 +23,7 @@
       import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
       import { BufferBase } from '../src/buffers/BufferBase'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { FluidNozzle } from '../src/simulations/fluid/FluidNozzle'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
       import { FluidMarchingCubes } from '../src/simulations/fluid/FluidMarchingCubes'
       import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
@@ -72,8 +73,11 @@
       const sun = new DirectionalLight([0.3, -1.0, 0.5], [1, 1, 1], 2.0);
       scene.add(sun);
 
-      // ?n=<particles> (75k by default); ?hud=1 shows a frame-time overlay (examples/frame-hud.js);
-      // ?profile=1 the GPU time of each pass (examples/profile-hud.js).
+      // ?n=<particles> (75k by default); ?nozzle=1 starts the nozzle pouring, into room for
+      // 1.5 n particles unless ?capacity=<particles> says otherwise (without either there is no
+      // room: spare capacity measured a few percent slower per step at 400k); ?hud=1 shows a
+      // frame-time overlay (examples/frame-hud.js); ?profile=1 the GPU time of each pass
+      // (examples/profile-hud.js).
       const query = new URLSearchParams(location.search);
       let lastSimSteps = 0;
       if (query.get('hud') === '1') {
@@ -85,7 +89,11 @@
       const particleCount = Math.max(1000, parseInt(query.get('n') || '75000', 10) || 75000);
       const center = [0, 11, 0]; // (min+max)/2 of bounds
       const half = [22, 17, 14];  // ~88% of bounds half-extent
-      const positions = new Float32Array(particleCount * 4);
+      const pourAtStart = query.get('nozzle') === '1';
+      const capacity = Math.max(particleCount,
+        parseInt(query.get('capacity') || '', 10) || (pourAtStart ? Math.ceil(particleCount * 1.5) : particleCount));
+      // the buffers hold `capacity` particles; the first `particleCount` are the initial fill
+      const positions = new Float32Array(capacity * 4);
       for (let i = 0; i < particleCount; i++) {
         let ux, uy, uz;
         do {
@@ -99,6 +107,8 @@
         positions[i * 4 + 3] = 1;
       }
 
+      const initialFill = positions.slice(0, particleCount * 4);
+
       const positionsBuffer = new ComputeBuffer({
         type: BufferBase.BUFFER_TYPE_STORAGE,
         usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC,
@@ -111,7 +121,7 @@
 
       // ── Fluid Simulation ──────────────────────────────────
       const simSettings = {
-        maxParticles: particleCount,
+        maxParticles: capacity,
         dimensions: 3,
         smoothingRadius: 1.0,
         pressureMultiplier: 46.5,
@@ -136,7 +146,7 @@
         projectionMatrix: camera.projectionMatrix,
         inverseViewMatrix: camera.inverseViewMatrix,
         worldMatrix: identityMatrix,
-      });
+      }, particleCount);
       sim.worldBoundsMin = [-25, -8, -16];
       sim.worldBoundsMax = [25, 30, 16];
       sim.rebuildGrid();
@@ -385,6 +395,28 @@ fn fragment_main(v: VOut) -> FragOut {
       timingFolder.addBinding(timing, 'simTimeScale', { min: 0.1, max: 4.0, step: 0.05, label: 'sim scale' });
       timingFolder.addBinding(timing, 'maxSimSteps',  { min: 1, max: 8, step: 1, label: 'max steps/frame' });
 
+      // ── Nozzle ──
+      // A stream poured in at runtime (FluidSimulation.emit) into the room the buffers keep
+      // above the initial fill; Reset puts the fill back. The spacing is about the fill's.
+      const nozzleOpts = {
+        on: pourAtStart,
+        speed: 22,
+        radius: 1.6,
+        spacing: 0.62,
+        particles: particleCount,
+      };
+      const nozzle = new FluidNozzle([-20, 22, 0], [1, -0.35, 0.15], nozzleOpts.radius, nozzleOpts.speed, nozzleOpts.spacing);
+      const nozzleFolder = pane.addFolder({ title: capacity > particleCount ? 'Nozzle' : 'Nozzle (?nozzle=1 for room)', expanded: false });
+      nozzleFolder.addBinding(nozzleOpts, 'on', { label: 'pour', disabled: capacity === particleCount }).on('change', () => { if (nozzleOpts.on) nozzle.restart(); });
+      nozzleFolder.addBinding(nozzleOpts, 'speed', { min: 1, max: 60, step: 0.5 }).on('change', () => { nozzle.speed = nozzleOpts.speed; });
+      nozzleFolder.addBinding(nozzleOpts, 'radius', { min: 0.3, max: 4, step: 0.05 }).on('change', () => { nozzle.radius = nozzleOpts.radius; });
+      nozzleFolder.addBinding(nozzleOpts, 'spacing', { min: 0.3, max: 1.5, step: 0.01 }).on('change', () => { nozzle.spacing = nozzleOpts.spacing; });
+      nozzleFolder.addBinding(nozzleOpts, 'particles', { readonly: true, format: (v) => `${v.toFixed(0)} / ${capacity}` });
+      nozzleFolder.addButton({ title: 'Reset fill' }).on('click', () => {
+        sim.resetParticles(initialFill);
+        simStep.reset();
+      });
+
       // ── SPH ──
       const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
       sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
@@ -557,6 +589,9 @@ fn fragment_main(v: VOut) -> FragOut {
         lastSimSteps = steps;
 
         if (steps > 0) {
+          // the frame's flow in one emit, ahead of the steps it joins
+          if (nozzleOpts.on) nozzle.emitInto(sim, steps * stepDt);
+          nozzleOpts.particles = sim.particleCount;
           sim.updateBatched(
             stepDt,
             steps,

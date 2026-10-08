@@ -183,7 +183,7 @@ class FluidDensityField {
         const bMax = this._sim.worldBoundsMax;
 
         u[0] = this._texDims[0]; u[1] = this._texDims[1]; u[2] = this._texDims[2];
-        u[3] = this._sim.params.maxParticles;
+        u[3] = this._sim.particleCount;
         p[4] = bMin[0]; p[5] = bMin[1]; p[6] = bMin[2];
         p[7] = this._sim.params.smoothingRadius;
         p[8] = bMax[0]; p[9] = bMax[1]; p[10] = bMax[2];
@@ -225,7 +225,7 @@ class FluidDensityField {
         clearPass.dispatchWorkgroups(Math.ceil(w / 4), Math.ceil(h / 4), Math.ceil(d / 4));
         clearPass.end();
 
-        const particleCount = this._sim.params.maxParticles;
+        const particleCount = this._sim.particleCount;
         const splatPass = commandEncoder.beginComputePass({ label: 'DensityField/Splat', timestampWrites: gpuPass('DensityField/Splat') });
         splatPass.setPipeline(this._splatPipeline);
         splatPass.setBindGroup(0, this._splatBG);
