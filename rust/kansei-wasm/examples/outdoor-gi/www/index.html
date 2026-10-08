@@ -12,30 +12,35 @@
             font: 11px/1.35 ui-monospace, Menlo, monospace; color: #e8e8e8;
             background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none; white-space: pre;
         }
+        #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #aab; font: 13px/1.5 ui-monospace, Menlo, monospace; pointer-events: none; }
+        #loading[hidden] { display: none; }
     </style>
 </head>
 <body>
     <canvas id="kansei"></canvas>
     <pre id="stats" hidden></pre>
+    <div id="loading" hidden>loading the Raggare intro's forest…</div>
     <script type="module">
-        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution, set_rtgi } from '../pkg/kansei_wasm_outdoor_gi.js';
+        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution, set_rtgi, set_hidden, set_bearing } from '../pkg/kansei_wasm_outdoor_gi.js';
         await init();
+        document.getElementById('loading').hidden = false;
         await start('kansei');
+        document.getElementById('loading').hidden = true;
 
         // for scripted captures: window.kansei.set_gi('off') and so on
-        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution, set_rtgi };
+        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution, set_rtgi, set_hidden, set_bearing };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
-        const p = { gi: s.gi, view: s.view, camera: params.get('cam') || 'road', elevation: s.elevation, stats: s.stats };
+        const p = { gi: s.gi, view: s.view, camera: s.camera, elevation: s.elevation, bearing: s.bearing, stats: s.stats };
         const statsEl = document.getElementById('stats');
 
         const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
-        const pane = new Pane({ title: 'Outdoor GI', expanded: !/Mobi|Android/.test(navigator.userAgent) });
+        const pane = new Pane({ title: 'Outdoor GI: the Raggare forest', expanded: !/Mobi|Android/.test(navigator.userAgent) });
         pane.hidden = params.get('ui') === '0';
         // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
         // it, choosing the hybrid reloads the page with gi=rt
-        const giOptions = { 'off (sky unoccluded)': 'off', 'top-down sky occlusion': 'skyocc', 'clipmap sky visibility (material)': 'visibility', 'clipmap GI, cones per pixel': 'cones', 'clipmap GI, probes': 'probes', 'hybrid RT (grid rays + SVGF)': 'rt' };
+        const giOptions = { 'off (sky unoccluded)': 'off', 'top-down sky occlusion': 'skyocc', 'clipmap sky visibility (material)': 'visibility', 'clipmap GI, cones per pixel': 'cones', 'clipmap GI, probes': 'probes', 'screen-space GI': 'ssgi', 'hybrid RT (grid rays + SVGF)': 'rt' };
         pane.addBinding(p, 'gi', { label: 'GI', options: giOptions }).on('change', () => {
             if (p.gi === 'rt' && !s.rtgi) {
                 params.set('gi', 'rt');
@@ -46,8 +51,10 @@
             showRt();
         });
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels' } }).on('change', () => set_view(p.view));
-        pane.addBinding(p, 'camera', { options: { road: 'road', clearing: 'clearing', forest: 'forest', high: 'high', 'drive along the road': 'fly' } }).on('change', () => set_camera(p.camera));
+        // the film's shots as starting views (orbit from there), the shots in turn, or a drive
+        pane.addBinding(p, 'camera', { options: { 'over the canopy': 'canopy', 'among the trunks': 'trunks', 'up in the branches': 'branches', 'the lake': 'lake', 'by the road': 'headlights', 'into the trees': 'departure', 'it rises': 'rise', "the film's shots": 'film', 'drive along the road': 'drive' } }).on('change', () => set_camera(p.camera));
         pane.addBinding(p, 'elevation', { label: 'sun elevation', min: -2, max: 40, step: 0.5 }).on('change', () => set_elevation(p.elevation));
+        pane.addBinding(p, 'bearing', { label: 'sun bearing', min: 0, max: 360, step: 1 }).on('change', () => set_bearing(p.bearing));
         pane.addBinding(p, 'stats', { label: 'stats' }).on('change', () => { set_stats(p.stats); statsEl.hidden = !p.stats; });
         // the hybrid's settings, shown while it runs
         const rt = { ...(s.rtgi || {}) };
@@ -84,7 +91,7 @@
             const top = i.passes.slice(0, 10).map(([label, ms]) => `  ${label.padEnd(32)} ${ms.toFixed(3)}`).join('\n');
             statsEl.textContent =
                 `GI ${i.gi} / ${i.view}, ${i.levels} levels of ${i.dims ? i.dims.join('x') : '-'} from ${i.voxel} m (${i.mib} MiB)${i.filling ? ', filling' : ''}\n` +
-                `${i.trees} spruces, ${(i.triangles / 1e6).toFixed(1)}M triangles in all LODs\n` +
+                `${i.trees} trees, ${(i.triangles / 1e6).toFixed(1)}M triangles at LOD0, ${i.data_mib} MiB of the Raggare intro's data\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `clipmap: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
                 (i.rtgi && i.rtgi.on ? `hybrid GI: ${i.rtgi_ms.toFixed(3)} ms, ${i.rtgi.mib} MiB, near field ${i.rtgi.near ? i.rtgi.near + ' m' : 'the box'}; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '') + '\n' : '') +

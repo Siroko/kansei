@@ -94,8 +94,9 @@ fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
 `;
 
 /**
- * The voxel source's functions for the trace (`srcVoxelSize`, `srcHitRadiance`, `srcCone`,
- * `srcIrradiance`), over a clipmap (`CLIPMAP_WGSL`'s group 0 bindings 50-57).
+ * The voxel source's functions for the traces (`srcVoxelSize`, `srcHitRadiance`, `srcCone`), over a
+ * clipmap (`CLIPMAP_WGSL`'s group 0 bindings 50-57); the reflections add `srcIrradiance`
+ * (`CLIPMAP_IRRADIANCE_WGSL`).
  */
 const CLIPMAP_SOURCE_WGSL = /* wgsl */`
 fn srcVoxelSize(p: vec3f) -> f32 {
@@ -114,6 +115,13 @@ fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
 fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
     return clipConeTrace(origin, dir, n, tanHalf, srcVoxelSize(origin), startDist, maxDist, steps);
 }
+`;
+
+/**
+ * The reflections' `srcIrradiance` over a clipmap (it reads their parameters, `rp`, which the
+ * diffuse GI's trace doesn't declare).
+ */
+const CLIPMAP_IRRADIANCE_WGSL = /* wgsl */`
 // The irradiance a surface at p (normal n) receives from the voxels and the sky past them, as
 // voxel GI's composite gathers it (its six cones).
 fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
@@ -148,7 +156,7 @@ export function rtGlassWgsl(covered: string, clipmap: boolean = false): string {
 }
 
 function rtTracedWgsl(covered: string, clipmap: boolean, main: string): string {
-    const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${VOLUME_SOURCE_WGSL}`;
+    const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}${CLIPMAP_IRRADIANCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${VOLUME_SOURCE_WGSL}`;
     return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${source}\n${rtReflectHit}\n${main}`;
 }
 

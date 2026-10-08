@@ -183,7 +183,6 @@
         index_helpers (a tour of stock geometries and debug helpers).
         Rows marked `hidden` are off the list by the owner's curation, their pages kept at their URLs, and
         come back by dropping the attribute (an area whose rows are all hidden is hidden with its nav link).
-        Outdoor GI is among them until its visuals improve.
       -->
       <section class="area" id="rendering" aria-labelledby="rendering-title">
         <h2 class="label label-spaced" id="rendering-title">Rendering</h2>
@@ -267,12 +266,14 @@
               <a class="run-rust run-variant" href="/examples/gi-box/?preset=best" data-rust title="Voxel GI + SSGI (Rust / WASM)">Voxel + SSGI</a>
             </span>
           </li>
-          <li hidden>
+          <li>
             <span class="demo-name">Outdoor GI</span>
-            <span class="demo-desc">A forest valley 1.3 km across under a low sun, with voxel GI in a clipmap round the camera</span>
+            <span class="demo-desc">The Raggare intro's forest, its 26 390 procedural spruces and birches, road and terrain fetched from raggare.kansei.graphics, under a low sun: voxel GI in a clipmap round the camera, screen-space GI or the hybrid ray-traced GI</span>
             <span class="run">
-              <a class="run-ts" href="./index_outdoor_gi.html" title="TypeScript">TS</a>
-              <a class="run-rust" href="/examples/outdoor-gi/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-ts" href="./index_outdoor_gi.html" title="Driving along the road (TypeScript)">TS</a>
+              <a class="run-rust" href="/examples/outdoor-gi/" data-rust title="Driving along the road (Rust / WASM)">WASM</a>
+              <a class="run-ts run-variant" href="./index_outdoor_gi.html?cam=departure&amp;gi=rt&amp;view=lit&amp;elevation=2.5&amp;bearing=262" title="Into the trees: the film's shot under a sun 2.5° up, hybrid RT GI (TypeScript)">Into the trees</a>
+              <a class="run-rust run-variant" href="/examples/outdoor-gi/?cam=departure&amp;gi=rt&amp;view=lit&amp;elevation=2.5&amp;bearing=262" data-rust title="Into the trees: the film's shot under a sun 2.5° up, hybrid RT GI (Rust / WASM)">Into the trees</a>
             </span>
           </li>
           <li>
