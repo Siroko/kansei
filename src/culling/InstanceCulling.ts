@@ -4,6 +4,7 @@ import { BufferBase } from '../buffers/BufferBase';
 import type { Geometry } from '../buffers/Geometry';
 import type { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { frustumPlanes } from './Frustum';
+import type { DepthPyramid } from './DepthPyramid';
 import instanceCullWgsl from '../../rust/kansei-core/src/shaders/instance_cull.wgsl?raw';
 import lodFadeWgsl from '../../rust/kansei-core/src/shaders/lod_fade.wgsl?raw';
 
@@ -38,11 +39,15 @@ export const CULL_VIEW_BYTES = 256;
 
 const FLAG_STATS = 1;
 const FLAG_BOX = 2;
+const FLAG_REVERSE_Z = 4;
 const FLAG_CASTS_SHADOW = 8;
+const FLAG_TWO_PHASE = 16;
 const FLAG_VIEW = 32;
 const FLAG_CASTERS_ONLY = 64;
 const FLAG_LAYERED = 128;
 const FLAG_REFLECTION = 256;
+const FLAG_OCCLUSION = 512;
+const FLAG_LINEAR_DEPTH = 1024;
 const FLAG_GI = 2048;
 const FLAG_GI_SURFACE = 4096;
 const FLAG_RT = 8192;
@@ -80,6 +85,19 @@ export interface CullView {
     lodDistanceScale: number;
 }
 
+/**
+ * What occlusion culling projects bounds with: the view, its projection as rasterized (jittered),
+ * and the depth buffer's size in pixels; and whether the depth pyramid holds view distances
+ * (`DepthPyramid.buildLinear`) rather than depths.
+ */
+export interface OcclusionView {
+    view: ArrayLike<number>;
+    proj: ArrayLike<number>;
+    depthSize: [number, number];
+    reverseZ: boolean;
+    linearDepth: boolean;
+}
+
 /** A view of every kind but `castersOnly`'s false, drawing all layers at the camera's LOD scale. */
 export function cullView(viewProj: ArrayLike<number>, options: Partial<Omit<CullView, 'viewProj'>> = {}): CullView {
     return { viewProj, castersOnly: false, reflection: false, gi: false, rt: false, layerMask: null, lodDistanceScale: 1, ...options };
@@ -96,9 +114,10 @@ export function cullViewDraws(view: CullView, castsShadow: boolean, layers: numb
 
 /**
  * Packs `view` into `out` (`CULL_VIEW_BYTES` at `byteOffset`) for the GPU: its frustum, the LOD
- * origin and its flags. `null` packs an unused view (zeros: the shader skips it).
+ * origin and its flags, and for a view culled in two phases this frame what occlusion culling
+ * projects with (`occlusion`). `null` packs an unused view (zeros: the shader skips it).
  */
-export function packCullView(out: ArrayBuffer, byteOffset: number, view: CullView | null, lodOrigin: ArrayLike<number>, stats: boolean): void {
+export function packCullView(out: ArrayBuffer, byteOffset: number, view: CullView | null, lodOrigin: ArrayLike<number>, stats: boolean, occlusion: OcclusionView | null = null): void {
     const f = new Float32Array(out, byteOffset, CULL_VIEW_BYTES / 4);
     const u = new Uint32Array(out, byteOffset, CULL_VIEW_BYTES / 4);
     f.fill(0);
@@ -110,20 +129,30 @@ export function packCullView(out: ArrayBuffer, byteOffset: number, view: CullVie
     if (view.gi) flags |= FLAG_GI;
     if (view.rt) flags |= FLAG_RT;
     if (stats) flags |= FLAG_STATS;
+    if (occlusion) {
+        flags |= FLAG_OCCLUSION;
+        if (occlusion.reverseZ) flags |= FLAG_REVERSE_Z;
+        if (occlusion.linearDepth) flags |= FLAG_LINEAR_DEPTH;
+    }
     const planes = frustumPlanes(view.viewProj);
     for (let k = 0; k < 6; k++) f.set(planes[k], k * 4);
-    // view and proj (occlusion only): identity
-    for (let k = 0; k < 4; k++) {
-        f[24 + k * 5] = 1;
-        f[40 + k * 5] = 1;
+    // view and proj (occlusion only, else identity)
+    if (occlusion) {
+        f.set(occlusion.view, 24);
+        f.set(occlusion.proj, 40);
+    } else {
+        for (let k = 0; k < 4; k++) {
+            f[24 + k * 5] = 1;
+            f[40 + k * 5] = 1;
+        }
     }
     f[56] = lodOrigin[0];
     f[57] = lodOrigin[1];
     f[58] = lodOrigin[2];
     u[59] = flags;
     // depth size (occlusion only)
-    f[60] = 1;
-    f[61] = 1;
+    f[60] = occlusion ? occlusion.depthSize[0] : 1;
+    f[61] = occlusion ? occlusion.depthSize[1] : 1;
     // a band [near, far) at distance x scale is the band [near, far) / scale at x
     f[62] = Math.max(view.lodDistanceScale, 1e-3);
     u[63] = view.layerMask === null ? 0xffffffff : view.layerMask >>> 0;
@@ -141,10 +170,12 @@ interface Chunk {
 }
 
 /**
- * The renderable's culling state for every view: the instances' parameters (a copy per chunk),
- * written only when they change; the indirect draws, `CULL_ARGS_BYTES` apart in one buffer that a
- * frame resets with one clear; and the views' compacted instances, in chunks as large as a storage
- * binding allows (one, but for very many instances and views).
+ * The renderable's culling state for every view: the instances' parameters (a copy per chunk,
+ * then one per view for its occlusion phases, `paramsStride` apart), written only when they
+ * change; the indirect draws, `CULL_ARGS_BYTES` apart in one buffer that a frame resets with one
+ * clear (each view's, then each view's second occlusion phase's); and the views' compacted
+ * instances, in chunks as large as a storage binding allows (one, but for very many instances and
+ * views).
  */
 interface Shared {
     params: GPUBuffer;
@@ -155,6 +186,19 @@ interface Shared {
     chunks: Chunk[];
     /** bytes per compacted instance the buffers were made for */
     outStride: number;
+}
+
+/**
+ * Occlusion culling's per-renderable state for a view culled in two phases: which instances it
+ * saw last frame, the first phase's bind group (the view's region, and `visibility`), and the
+ * second phase's own instances and bind group.
+ */
+interface OcclusionSlot {
+    view: number;
+    visibility: GPUBuffer;
+    early: GPUBindGroup;
+    lateInstances: GPUBuffer;
+    late: GPUBindGroup;
 }
 
 /**
@@ -177,14 +221,28 @@ interface Shared {
  * can have bands of their own (`withShadowLodRange`): a far LOD nearer there than on screen, say.
  * Keep each kind of view's bands of a mesh's LODs adjoining, as the camera's.
  *
- * Tighter bounds (`withBoundsShift`, `withBoundsBox`) cull more, in every view: a tree's sphere
- * round its base reaches a tree's height below the ground and to each side.
+ * Tighter bounds (`withBoundsShift`, `withBoundsBox`) cull more, in every view, and matter most
+ * for occlusion: a tree's sphere round its base reaches a tree's height below the ground and to
+ * each side.
+ *
+ * Occlusion (`withOcclusion(true)`): the camera's view also skips instances hidden behind the
+ * depth of the rest of what it draws, in two phases per frame (see
+ * `Renderer.setOcclusionCulling`). Shadow maps stay frustum-only (an instance hidden from the
+ * camera may still cast a shadow into the picture).
  *
  * ```ts
  * // 32-byte instances: position xyz + height, then yaw, ...; spheres of 0.6 x height
  * lod0.instanceCulling = new InstanceCulling(allTrees, treeCount, 32, 0, 0.6)
  *     .withRadiusScale(12)
  *     .withLodRange(0, 60);
+ *
+ * // the same trees, with a box from the ground to the top of a tree (x its height) and
+ * // occlusion culling for the camera
+ * lod0.instanceCulling = new InstanceCulling(allTrees, treeCount, 32, 0, 0.6)
+ *     .withRadiusScale(12)
+ *     .withBoundsShift([0, 0.5, 0])
+ *     .withBoundsBox([0.25, 0.5, 0.25])
+ *     .withOcclusion(true);
  * ```
  */
 export class InstanceCulling {
@@ -231,9 +289,14 @@ export class InstanceCulling {
      * `withCrossfade`. Turning them on or off changes the compacted instances' layout.
      */
     public crossfade: number = 0;
+    /** Occlusion culling for the main camera, in two phases (off by default). */
+    public occlusion: boolean = false;
 
     private capacity: number;
     private shared: Shared | null = null;
+    private occlusionSlots: OcclusionSlot[] = [];
+    /** the views culled in two phases this frame */
+    private twoPhase: number[] = [];
     private readonly scratch = new ArrayBuffer(CULL_INSTANCES_BYTES);
 
     /**
@@ -308,6 +371,12 @@ export class InstanceCulling {
         return this;
     }
 
+    /** See `occlusion`. */
+    withOcclusion(occlusion: boolean): this {
+        this.occlusion = occlusion;
+        return this;
+    }
+
     /**
      * Dithered crossfades between LODs, over `width` of LOD distance (metres, times the view's
      * LOD distance scale): each band's edges widen by `width / 2`, and there the instances draw
@@ -343,7 +412,10 @@ export class InstanceCulling {
         return Math.min(this.count, this.capacity);
     }
 
-    /** The compacted instances and indirect draw of `view` (0 is the main camera), once culled. */
+    /**
+     * The compacted instances and indirect draw of `view` (0 is the main camera), once culled;
+     * with occlusion, the first phase's.
+     */
     view(view: number): CulledDraw | null {
         const shared = this.shared;
         if (!shared) return null;
@@ -355,6 +427,28 @@ export class InstanceCulling {
             args: shared.args,
             offset: view * CULL_ARGS_BYTES,
         };
+    }
+
+    /**
+     * The second phase's compacted instances and indirect draw in `view`, when this frame culls it
+     * in two phases.
+     */
+    late(view: number): CulledDraw | null {
+        const shared = this.shared;
+        if (!shared || !this.twoPhase.includes(view)) return null;
+        const slot = this.occlusionSlots.find((o) => o.view === view);
+        if (!slot) return null;
+        return { instances: slot.lateInstances, instancesOffset: 0, args: shared.args, offset: (shared.views + view) * CULL_ARGS_BYTES };
+    }
+
+    /** Whether this frame culls `view` in two phases (set by the renderer). */
+    twoPhaseIn(view: number): boolean {
+        return this.twoPhase.includes(view);
+    }
+
+    /** Cull `views` in two phases this frame (those with occlusion state), the others by frustum. */
+    setTwoPhase(views: readonly number[]): void {
+        this.twoPhase = views.filter((v) => this.occlusionSlots.some((o) => o.view === v));
     }
 
     /** Bytes of a view's region of compacted instances. */
@@ -371,19 +465,20 @@ export class InstanceCulling {
         });
     }
 
-    /** A bind group: chunk `chunk`'s parameters, the source, compacted instances `instances`, every draw. */
-    private bindGroup(device: GPUDevice, layout: GPUBindGroupLayout, chunk: number, instances: GPUBuffer): GPUBindGroup {
+    /**
+     * A bind group: parameter copy `chunk`'s parameters, the source, compacted instances
+     * `instances`, every draw, and with occlusion the visibility.
+     */
+    private bindGroup(device: GPUDevice, layout: GPUBindGroupLayout, chunk: number, instances: GPUBuffer, visibility: GPUBuffer | null = null): GPUBindGroup {
         const shared = this.shared!;
-        return device.createBindGroup({
-            label: 'InstanceCulling/BG',
-            layout,
-            entries: [
-                { binding: 0, resource: { buffer: shared.params, offset: chunk * shared.paramsStride, size: CULL_INSTANCES_BYTES } },
-                { binding: 1, resource: { buffer: this.source.gpuBuffer! } },
-                { binding: 2, resource: { buffer: instances } },
-                { binding: 3, resource: { buffer: shared.args } },
-            ],
-        });
+        const entries: GPUBindGroupEntry[] = [
+            { binding: 0, resource: { buffer: shared.params, offset: chunk * shared.paramsStride, size: CULL_INSTANCES_BYTES } },
+            { binding: 1, resource: { buffer: this.source.gpuBuffer! } },
+            { binding: 2, resource: { buffer: instances } },
+            { binding: 3, resource: { buffer: shared.args } },
+        ];
+        if (visibility) entries.push({ binding: 4, resource: { buffer: visibility } });
+        return device.createBindGroup({ label: 'InstanceCulling/BG', layout, entries });
     }
 
     /**
@@ -407,7 +502,7 @@ export class InstanceCulling {
         if (this.count <= this.capacity && shared && shared.views >= count && shared.outStride === this.culledStride) {
             return false;
         }
-        // recreate everything: the draws hold a slot per view
+        // recreate everything: the draws hold a slot per view and the second phase's
         this.destroy();
         this.capacity = Math.max(this.capacity, this.count);
         count = Math.max(count, shared ? shared.views : 0, 1);
@@ -418,7 +513,7 @@ export class InstanceCulling {
         this.shared = {
             params: device.createBuffer({
                 label: 'InstanceCulling/Params',
-                size: chunkCount * paramsStride,
+                size: (chunkCount + count) * paramsStride,
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             }),
             paramsStride,
@@ -426,7 +521,7 @@ export class InstanceCulling {
             // (COPY_SRC: the stats read them back)
             args: device.createBuffer({
                 label: 'InstanceCulling/Args',
-                size: count * CULL_ARGS_BYTES,
+                size: 2 * count * CULL_ARGS_BYTES,
                 usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
             }),
             views: count,
@@ -442,16 +537,55 @@ export class InstanceCulling {
         return true;
     }
 
+    /**
+     * Make sure there is occlusion state for each of `views` (after `ensureViews`); true if any
+     * was created (render bundles that recorded the old draws are stale).
+     */
+    ensureOcclusion(device: GPUDevice, pipeline: CullPipeline, views: readonly number[]): boolean {
+        const shared = this.shared;
+        if (!shared) return false;
+        let created = false;
+        for (const view of views) {
+            if (view >= shared.views || this.occlusionSlots.some((o) => o.view === view)) continue;
+            // one word per instance, zero (nothing seen yet)
+            const visibility = device.createBuffer({
+                label: 'InstanceCulling/Visibility',
+                size: Math.max(this.capacity, 1) * 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            });
+            // the first phase fills the view's region (in its chunk), the second its own buffer;
+            // both read the view's copy of the parameters
+            const chunk = shared.chunks.find((c) => view >= c.firstView && view < c.firstView + c.views)!;
+            const params = shared.chunks.length + view;
+            const early = this.bindGroup(device, pipeline.occlusionLayout, params, chunk.instances, visibility);
+            const lateInstances = this.instancesBuffer(device, 1);
+            const late = this.bindGroup(device, pipeline.occlusionLayout, params, lateInstances, visibility);
+            this.occlusionSlots.push({ view, visibility, early, lateInstances, late });
+            created = true;
+        }
+        // the new views' copies of the parameters
+        if (created) shared.written = null;
+        return created;
+    }
+
+    /**
+     * Forget which instances were visible (a camera cut): the next first phase draws none of
+     * them, and the second tests them all.
+     */
+    resetVisibility(encoder: GPUCommandEncoder): void {
+        for (const o of this.occlusionSlots) encoder.clearBuffer(o.visibility);
+    }
+
     /** The chunks the buffers are split in (one, but for very many instances and views). */
     get chunkCount(): number {
         return this.shared?.chunks.length ?? 0;
     }
 
     /**
-     * Start a frame, before its cull pass (after `ensureViews`): write the instances' parameters
-     * for a renderable with `world` matrix and `indexCount` indices, drawn in shadow maps if
-     * `castsShadow`, on `layers`, if they changed, and clear every view's draw (the cull sets the
-     * index count of those it culls into).
+     * Start a frame, before its cull pass (after `ensureViews` and `setTwoPhase`): write the
+     * instances' parameters for a renderable with `world` matrix and `indexCount` indices, drawn
+     * in shadow maps if `castsShadow`, on `layers`, if they changed, and clear every slot's draw
+     * (the cull sets the index count of those it culls into).
      */
     beginFrame(queue: GPUQueue, encoder: GPUCommandEncoder, world: mat4 | Float32Array, indexCount: number, castsShadow: boolean, layers: number, giSurface: boolean = false, rtSurface: boolean = false): void {
         const shared = this.shared;
@@ -469,6 +603,7 @@ export class InstanceCulling {
         let flags = 0;
         if (this.boundsBox) flags |= FLAG_BOX;
         if (castsShadow) flags |= FLAG_CASTS_SHADOW;
+        if (this.twoPhase.length > 0) flags |= FLAG_TWO_PHASE;
         if (giSurface) flags |= FLAG_GI_SURFACE;
         if (rtSurface) flags |= FLAG_RT_SURFACE;
         f.set(world, 0);
@@ -497,13 +632,21 @@ export class InstanceCulling {
         f[46] = 0;
         f[47] = 0;
         if (!shared.written || !sameWords(shared.written, u)) {
-            // a copy per chunk, each with its first view
+            // a copy per chunk, each with its first view; then one per view culled in two phases,
+            // with the view, its chunk's first view and its second phase's draw
             const words = shared.paramsStride / 4;
-            const bytes = new Uint32Array(shared.chunks.length * words);
+            const bytes = new Uint32Array((shared.chunks.length + shared.views) * words);
             shared.chunks.forEach((chunk, k) => {
                 bytes.set(u, k * words);
                 bytes[k * words + 32] = chunk.firstView;
             });
+            for (const o of this.occlusionSlots) {
+                const at = (shared.chunks.length + o.view) * words;
+                bytes.set(u, at);
+                bytes[at + 32] = shared.chunks.find((c) => o.view >= c.firstView && o.view < c.firstView + c.views)!.firstView;
+                bytes[at + 34] = shared.views + o.view; // lateSlot
+                bytes[at + 40] = o.view; // occlusionView
+            }
             queue.writeBuffer(shared.params, 0, bytes);
             shared.written = u.slice();
         }
@@ -516,7 +659,8 @@ export class InstanceCulling {
 
     /**
      * Cull into every view the renderable is drawn in, a dispatch per chunk (with the cull
-     * pipeline and the views' group 1 set).
+     * pipeline and the views' group 1 set). The views culled in two phases this frame are left to
+     * `dispatchEarly` and `dispatchLate`.
      */
     dispatch(pass: GPUComputePassEncoder): void {
         const shared = this.shared;
@@ -527,8 +671,35 @@ export class InstanceCulling {
         }
     }
 
+    private slot(view: number): OcclusionSlot {
+        const slot = this.occlusionSlots.find((o) => o.view === view);
+        if (!slot) throw new Error('InstanceCulling: ensureOcclusion for the view first');
+        return slot;
+    }
+
+    /** Occlusion's first phase in `view` (with the `early` pipeline and the views' group 1 set). */
+    dispatchEarly(pass: GPUComputePassEncoder, view: number): void {
+        pass.setBindGroup(0, this.slot(view).early);
+        pass.dispatchWorkgroups(this.workgroups(), 1, 1);
+    }
+
+    /**
+     * Occlusion's second phase in `view` (with the `late` pipeline, the views' group 1 and the
+     * view's pyramid's group 2 set).
+     */
+    dispatchLate(pass: GPUComputePassEncoder, view: number): void {
+        pass.setBindGroup(0, this.slot(view).late);
+        pass.dispatchWorkgroups(this.workgroups(), 1, 1);
+    }
+
     /** Frees the GPU buffers (the source stays its owner's); the next frame makes new ones. */
     destroy(): void {
+        for (const o of this.occlusionSlots) {
+            o.visibility.destroy();
+            o.lateInstances.destroy();
+        }
+        this.occlusionSlots = [];
+        this.twoPhase = [];
         if (!this.shared) return;
         this.shared.params.destroy();
         this.shared.args.destroy();
@@ -543,35 +714,57 @@ function sameWords(a: Uint32Array, b: Uint32Array): boolean {
 }
 
 /**
- * The cull compute pipeline, shared by every renderable, and the frame's views, in one buffer
- * (`setViews`, `viewBindGroup`). Raw pipelines with explicit layouts: `Compute` binds group 0
- * only.
+ * The cull compute pipelines, shared by every renderable: frustum and LOD only (`pipeline`), and
+ * occlusion's two phases (`early`, `late`); and the frame's views, in one buffer (`setViews`,
+ * `viewBindGroup`). Raw pipelines with explicit layouts: `Compute` binds group 0 only.
  */
 export class CullPipeline {
     readonly pipeline: GPUComputePipeline;
+    readonly early: GPUComputePipeline;
+    readonly late: GPUComputePipeline;
     /** params, source, compacted instances, indirect draws */
     readonly layout: GPUBindGroupLayout;
+    /** the same, and the visibility */
+    readonly occlusionLayout: GPUBindGroupLayout;
     /** group 1: the views */
     private readonly viewLayout: GPUBindGroupLayout;
+    /** group 2 of `late`: the depth pyramid */
+    readonly pyramidLayout: GPUBindGroupLayout;
     private views: { buffer: GPUBuffer; bindGroup: GPUBindGroup; capacity: number } | null = null;
 
     constructor(private readonly device: GPUDevice) {
         const entry = (binding: number, buffer: GPUBufferBindingLayout): GPUBindGroupLayoutEntry => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer });
-        this.layout = device.createBindGroupLayout({
-            label: 'InstanceCulling/BGL',
-            entries: [
-                entry(0, { type: 'uniform' }),
-                entry(1, { type: 'read-only-storage' }),
-                entry(2, { type: 'storage' }),
-                entry(3, { type: 'storage' }),
-            ],
-        });
+        const entries = [
+            entry(0, { type: 'uniform' }),
+            entry(1, { type: 'read-only-storage' }),
+            entry(2, { type: 'storage' }),
+            entry(3, { type: 'storage' }),
+            entry(4, { type: 'storage' }),
+        ];
+        this.layout = device.createBindGroupLayout({ label: 'InstanceCulling/BGL', entries: entries.slice(0, 4) });
+        this.occlusionLayout = device.createBindGroupLayout({ label: 'InstanceCulling/OcclusionBGL', entries });
         this.viewLayout = device.createBindGroupLayout({ label: 'InstanceCulling/ViewBGL', entries: [entry(0, { type: 'read-only-storage' })] });
+        this.pyramidLayout = device.createBindGroupLayout({
+            label: 'InstanceCulling/PyramidBGL',
+            entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } }],
+        });
         const module = device.createShaderModule({ label: 'InstanceCulling', code: INSTANCE_CULL_WGSL });
-        this.pipeline = device.createComputePipeline({
-            label: 'InstanceCulling/main',
-            layout: device.createPipelineLayout({ label: 'InstanceCulling', bindGroupLayouts: [this.layout, this.viewLayout] }),
-            compute: { module, entryPoint: 'main' },
+        const pipeline = (entryPoint: string, layouts: GPUBindGroupLayout[]) => device.createComputePipeline({
+            label: `InstanceCulling/${entryPoint}`,
+            layout: device.createPipelineLayout({ label: 'InstanceCulling', bindGroupLayouts: layouts }),
+            compute: { module, entryPoint },
+        });
+        this.pipeline = pipeline('main', [this.layout, this.viewLayout]);
+        this.early = pipeline('early', [this.occlusionLayout, this.viewLayout]);
+        this.late = pipeline('late', [this.occlusionLayout, this.viewLayout, this.pyramidLayout]);
+    }
+
+    /** The `late` pipeline's group 2 for a depth pyramid. */
+    pyramidBindGroup(pyramid: DepthPyramid): GPUBindGroup {
+        return this.device.createBindGroup({
+            label: 'InstanceCulling/Pyramid',
+            layout: this.pyramidLayout,
+            entries: [{ binding: 0, resource: pyramid.view }],
         });
     }
 
@@ -596,7 +789,7 @@ export class CullPipeline {
         this.device.queue.writeBuffer(this.views.buffer, 0, views, 0, count * CULL_VIEW_BYTES);
     }
 
-    /** Group 1 of the cull pipeline (after `setViews`). */
+    /** Group 1 of every cull pipeline (after `setViews`). */
     get viewBindGroup(): GPUBindGroup {
         if (!this.views) throw new Error('CullPipeline: setViews first');
         return this.views.bindGroup;

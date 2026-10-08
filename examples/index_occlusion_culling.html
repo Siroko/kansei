@@ -8,30 +8,42 @@
   <style>
     body { margin: 0; background: #000; overflow: hidden; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #eee; }
     #panel { position: fixed; left: 12px; top: 12px; padding: 8px 10px; background: rgba(0, 0, 0, 0.6); border-radius: 4px; }
-    #hud { margin: 0; white-space: pre-wrap; }
+    #hud, #bench { margin: 0; white-space: pre-wrap; }
+    label { margin-right: 14px; }
   </style>
 </head>
 
 <body>
   <div id="panel">
+    <label><input type="checkbox" id="occlusion" checked> occlusion culling (O)</label>
+    <label><input type="checkbox" id="freeze"> freeze culling (F)</label>
     <pre id="hud"></pre>
+    <pre id="bench"></pre>
   </div>
   <script type="module">
     // A dense procedural forest of spruces (60 000 by default, three LODs) on terrain with a ridge
-    // and a hill: the Rust occlusion-culling example's scene. Each LOD is a renderable culled on
-    // the GPU per view by frustum and LOD band (`InstanceCulling`), all three sharing one
-    // instance buffer; with `shadows=1` the sun's shadow map is a view of its own, so trees
-    // behind the camera still cast into the picture. The HUD shows the culling stats of each
-    // view (`Renderer.cullingStats`) and the GPU time.
+    // and a hill: the Rust occlusion-culling example. Each LOD is a renderable culled on the GPU
+    // per view by frustum and LOD band (`InstanceCulling`), all three sharing one instance buffer,
+    // and for the camera also by occlusion (`InstanceCulling.withOcclusion`): two phases against
+    // a depth pyramid. The terrain is an ordinary mesh; it writes the depth the pyramid is built
+    // from, with the trees seen last frame. With `shadows=1` the sun's shadow map is a view of its
+    // own, so trees behind the camera (or hidden from it) still cast into the picture. The HUD
+    // shows the culling stats of each view (`Renderer.cullingStats`) and the GPU time. Keys: O
+    // toggles occlusion culling, F freezes the camera's culling (then move on to see what it
+    // culled), C cycles the camera.
     //
-    // URL parameters: `cam=valley|forest|ridge|high|fly|sky|edge` (C cycles), `trees=<n>`,
-    // `bounds=sphere` (spheres round the trees' bases instead of boxes), `shadows=1`,
+    // URL parameters: `cam=valley|forest|ridge|high|fly|sky|edge` (sky: nothing in view, so
+    // occlusion's overhead alone), `occlusion=0`, `freeze=1`, `trees=<n>`, `bounds=sphere`
+    // (spheres round the trees' bases instead of boxes), `taa=0` (no temporal AA: the GBuffer is
+    // single-sampled either way, as occlusion culling needs), `bench=1` (alternate occlusion on
+    // and off every 3 s, 8 times, and report the mean GPU time and frame interval of each),
+    // `shadows=1`,
     // `skyocc=1` (the trees occlude the sky's light, `Renderer.enableSkyOcclusion`: the sky
     // ambient is dimmed under the canopy; `skyocc=show` shows the sky visibility,
     // `skyocc=rebuild` starts a rebuild every frame, to time a rebuild's first frame),
     // `t=<seconds>` (the fly path's time, frozen), `size=<w>x<h>` (canvas pixels), `dpr=<ratio>`;
     // `profile=1` (each pass's GPU time) through profile-hud.js.
-    import { Canvas, run, param, paramOr, flag, setText, thousands, Keys } from '../src/web/index'
+    import { Canvas, run, param, paramOr, flag, setText, thousands, checkbox, Keys } from '../src/web/index'
     import { Camera } from '../src/cameras/Camera'
     import { Scene } from '../src/objects/Scene'
     import { Renderable } from '../src/objects/Renderable'
@@ -51,7 +63,9 @@
     import { Sampler } from '../src/buffers/Sampler'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { TemporalAAEffect } from '../src/postprocessing/effects/TemporalAAEffect'
     import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
     import { installProfileHud } from './profile-hud.js'
 
     let canvas = Canvas.fill();
@@ -59,6 +73,7 @@
     if (size.length === 2 && size.every((n) => n > 0)) canvas = canvas.withSize(size[0], size[1]);
     const renderer = await canvas.renderer({ sampleCount: 1 });
     renderer.setCullingStats(true);
+    renderer.setOcclusionCulling(flag('occlusion', true));
 
     // The sun: its travel direction and illuminance (lux).
     const SUN_DIR = [0.4, -0.55, 0.7];
@@ -254,7 +269,7 @@
         { shaderLocation: 4, offset: 16, format: 'float32x4' },
       ],
     });
-    // three LODs by distance, each culled per view on the GPU
+    // three LODs by distance, each culled per view on the GPU; with occlusion for the camera
     const lods = [
       [new SpruceGeometry(48, 6, 6).withLabel('Spruce/LOD0'), 0, 80],
       [new SpruceGeometry(20, 2, 5).withLabel('Spruce/LOD1'), 80, 220],
@@ -266,14 +281,18 @@
       r.layers |= TREE_LAYER;
       // a sphere round the base reaching the top (x height), or a box from the ground to the
       // top, as wide as the lowest cone
-      let culling = new InstanceCulling(forest, trees, 32, 0, 1.0).withRadiusScale(12).withLodRange(near, far);
+      let culling = new InstanceCulling(forest, trees, 32, 0, 1.0).withRadiusScale(12).withLodRange(near, far).withOcclusion(true);
       if (!spheres) culling = culling.withBoundsShift([0, 0.5, 0]).withBoundsBox([0.25, 0.5, 0.25]);
       r.instanceCulling = culling;
       scene.add(r);
     }
 
+    // single-sampled (occlusion culling builds its pyramid from that depth), with temporal AA
     const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(11) });
-    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
+    const effects = [];
+    if (flag('taa', true)) effects.push(new TemporalAAEffect({ exposure: tonemap.totalExposure() }));
+    effects.push(tonemap);
+    const volume = new PostProcessingVolume(renderer, effects);
 
     const camera = new Camera(50, 0.3, 3000, canvas.aspect);
 
@@ -307,20 +326,32 @@
 
     let cam = Math.max(CAMS.indexOf(param('cam')), 0);
     const frozenT = Number(param('t') ?? NaN);
+    const occlusionBox = checkbox('occlusion');
+    const freezeBox = checkbox('freeze');
+    occlusionBox.checked = renderer.occlusionCulling;
+    freezeBox.checked = flag('freeze', false);
     const keys = Keys.listen();
     const timer = new FrameTimer(renderer.gpuDevice);
     const hud = installProfileHud({ renderer, FrameTimer });
+    // bench=1: occlusion on (A) and off (B) in turn
+    const bench = flag('bench', false) ? new AbBench(['occlusion on', 'off'], performance.now()) : null;
     console.info(`Kansei — Occlusion culling (TS) ready: ${trees} trees, timestamps ${timer.hasTimestamps}`);
 
     const views = (stats) => stats.views.map(([kind, c]) =>
       `${kind}: ${thousands(c.tested)} tested · ${thousands(c.lodCulled)} outside their LOD band · ` +
-      `${thousands(c.frustumCulled)} outside the frustum · ${thousands(c.drawn)} drawn (${thousands(c.triangles)} triangles)`).join('\n');
+      `${thousands(c.frustumCulled)} outside the frustum · ${kind === 'camera' ? `${thousands(c.occlusionCulled)} occluded · ` : ''}` +
+      `${thousands(c.drawn)} drawn (${thousands(c.triangles)} triangles)`).join('\n');
     let gpuMs = 0, cpuMs = 0, intervalMs = 0;
     run(canvas, (frame) => {
       frame.resize(renderer, camera);
       for (const key of keys.takePressed()) {
+        if (key === 'o') occlusionBox.checked = !occlusionBox.checked;
+        if (key === 'f') freezeBox.checked = !freezeBox.checked;
         if (key === 'c') cam = (cam + 1) % CAMS.length;
       }
+      const phase = bench?.phase(performance.now());
+      renderer.setOcclusionCulling(phase ? phase[0] === 0 : occlusionBox.checked);
+      renderer.setFreezeCulling(freezeBox.checked);
       placeCamera(CAMS[cam], Number.isFinite(frozenT) ? frozenT : frame.time);
 
       if (rebuildSky) skyOcclusion.refresh();
@@ -332,12 +363,19 @@
       hud.end(performance.now());
       cpuMs += (performance.now() - before - cpuMs) * 0.05;
       intervalMs += (frame.dt * 1000 - intervalMs) * 0.05;
-      for (const ms of timer.take()) gpuMs += (ms - gpuMs) * 0.05;
+      const gpu = timer.take();
+      for (const ms of gpu) gpuMs += (ms - gpuMs) * 0.05;
+      const report = bench?.record(gpu, performance.now());
+      if (report) {
+        console.info(report);
+        setText('bench', report);
+      }
 
       if (frame.index % 10 === 0) {
         const stats = renderer.cullingStats;
         setText('hud', [
-          `${thousands(trees)} trees x 3 LODs · camera ${CAMS[cam]} (C)${shadows ? ' · shadows' : ''}${skyOcclusion ? ` · sky occlusion${skyOcc === 'show' ? ' (shown)' : ''}` : ''}`,
+          `${thousands(trees)} trees x 3 LODs · camera ${CAMS[cam]} (C) · occlusion ${renderer.occlusionCulling ? 'on' : 'off'} (O) · ` +
+            `culling ${freezeBox.checked ? 'frozen' : 'live'} (F)${shadows ? ' · shadows' : ''}${skyOcclusion ? ` · sky occlusion${skyOcc === 'show' ? ' (shown)' : ''}` : ''}`,
           stats ? views(stats) : '',
           `${renderer.renderWidth} x ${renderer.renderHeight} rendered · GPU ${gpuMs.toFixed(2)} ms${timer.hasTimestamps ? '' : ' (no timestamps)'}` +
             ` · CPU ${cpuMs.toFixed(2)} ms in render · ${intervalMs.toFixed(1)} ms between frames`,
