@@ -200,11 +200,17 @@ class Matrix4 extends BufferBase {
     }
 
     /**
-     * Extracts Euler angles from this matrix.
+     * Extracts Euler angles from this matrix's rotation, as `Object3D` composes it (Rz * Ry * Rx),
+     * dividing out any scale first.
      * @returns An array containing the Euler angles [rotationX, rotationY, rotationZ].
      */
     extractEulerAngles(): [number, number, number] {
-        const m = this.internalMat4;
+        const a = this.internalMat4;
+        const m = new Float32Array(16);
+        for (let col = 0; col < 3; col++) {
+            const length = Math.hypot(a[col * 4], a[col * 4 + 1], a[col * 4 + 2]) || 1;
+            for (let row = 0; row < 3; row++) m[col * 4 + row] = a[col * 4 + row] / length;
+        }
         let rotationX, rotationY, rotationZ;
 
         if (m[2] < 1) {

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - KTX2 textures</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font: 13px/1.5 ui-monospace, Menlo, monospace; color: #ddd; }
+    #report {
+      position: fixed; left: 12px; top: 10px; margin: 0; padding: 8px 10px; background: rgba(0, 0, 0, 0.6);
+      white-space: pre-wrap; max-width: calc(100vw - 44px);
+    }
+    #report a { color: #9cf; margin-right: 10px; }
+  </style>
+</head>
+
+<body>
+  <pre id="report">loading…</pre>
+  <script type="module">
+    // KTX2 textures (the Rust `ktx2-texture` example): an ETC1S colour texture, a UASTC colour
+    // texture with alpha over a checkerboard and a UASTC normal map lit by a circling light, each
+    // transcoded to the best format this device samples, plus a glTF quad whose base colour comes
+    // through KHR_texture_basisu. The report lists what each became, its GPU memory and how long
+    // the transcode took. `?support=none|bc|astc|etc2` restricts the formats to show the
+    // fallbacks; `?bench=N` transcodes each file N more times and reports the median.
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { KTX2Loader } from '../src/loaders/KTX2Loader'
+    import { GLTFLoader } from '../src/loaders/GLTFLoader'
+    import { NO_COMPRESSION, targetName } from '../src/loaders/ktx2/Ktx2Select'
+    import { Canvas, run, param, paramOr, fetchBytes } from '../src/web/index'
+
+    const report = document.getElementById('report');
+    const links = ['all', 'bc', 'astc', 'etc2', 'none'].map((s) => `<a href="?support=${s}">${s}</a>`).join('');
+
+    try {
+      const canvas = Canvas.fill();
+      const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0.03, 0.03, 0.04, 1) });
+      const device = renderer.device;
+
+      const deviceSupport = renderer.compressionSupport;
+      const only = param('support');
+      const support = only === 'none' ? NO_COMPRESSION
+        : only === 'bc' ? { ...NO_COMPRESSION, bc: deviceSupport.bc }
+        : only === 'astc' ? { ...NO_COMPRESSION, astc: deviceSupport.astc }
+        : only === 'etc2' ? { ...NO_COMPRESSION, etc2: deviceSupport.etc2 }
+        : deviceSupport;
+      const restricted = support !== deviceSupport ? `  (restricted to ${JSON.stringify(support)})` : '';
+      const lines = [`device: texture-compression-bc ${deviceSupport.bc} · -astc ${deviceSupport.astc} · -etc2 ${deviceSupport.etc2}${restricted}`];
+
+      const initStart = performance.now();
+      await KTX2Loader.init();
+      lines.push(`transcoder: Binomial basis_transcoder.wasm v2_50, loaded in ${(performance.now() - initStart).toFixed(1)} ms`);
+
+      // A textured quad: colour over a checkerboard (so alpha shows), or a normal map lit by a light
+      // circling in front of it (params.x = 1). The TS PlaneGeometry puts v = 0 at the bottom, so
+      // params.z = 1 flips it to the image's top-left origin (glTF's and the Rust plane's).
+      const wgsl = /* wgsl */`
+        @group(0) @binding(0) var tex : texture_2d<f32>;
+        @group(0) @binding(1) var tex_sampler : sampler;
+        @group(0) @binding(2) var<uniform> params : vec4f; // x: normal map, y: time, z: flip v
+        @group(1) @binding(0) var<uniform> viewMatrix : mat4x4f;
+        @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+        @group(2) @binding(1) var<uniform> worldMatrix : mat4x4f;
+        struct VOut { @builtin(position) clip : vec4f, @location(0) uv : vec2f };
+        @vertex
+        fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VOut {
+          var out : VOut;
+          out.clip = projectionMatrix * viewMatrix * worldMatrix * position;
+          out.uv = select(uv, vec2f(uv.x, 1.0 - uv.y), params.z > 0.5);
+          return out;
+        }
+        @fragment
+        fn fragment_main(in : VOut) -> @location(0) vec4f {
+          let texel = textureSample(tex, tex_sampler, in.uv);
+          if (params.x > 0.5) {
+            // tangent space = the quad's: +x right, +y up, +z towards the viewer
+            let n = normalize(texel.xyz * 2.0 - 1.0);
+            let t = params.y;
+            let light = normalize(vec3f(cos(t), sin(t), 0.8));
+            let lit = max(dot(n, light), 0.0);
+            return vec4f(vec3f(0.9, 0.85, 0.8) * (0.08 + lit), 1.0);
+          }
+          let cell = floor(in.uv * 16.0);
+          let checker = select(0.2, 0.35, (cell.x + cell.y) % 2.0 == 0.0);
+          return vec4f(mix(vec3f(checker), texel.rgb, texel.a), 1.0);
+        }`;
+
+      const sampler = new Sampler('linear', 'linear', 'repeat', 8);
+      const scene = new Scene();
+      const quad = (texture, geometry, { normalMap = false, flipV = true } = {}) => {
+        const buffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const write = (time) => device.queue.writeBuffer(buffer, 0, new Float32Array([normalMap ? 1 : 0, time, flipV ? 1 : 0, 0]));
+        write(0);
+        const material = new Material(wgsl, {
+          bindings: [texture, sampler, ComputeBuffer.fromExternal(buffer, 'uniform')]
+            .map((value, binding) => ({ binding, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value })),
+          cullMode: 'none',
+        });
+        const renderable = new Renderable(geometry, material);
+        scene.add(renderable);
+        return { renderable, write };
+      };
+
+      const bench = Math.max(0, paramOr('bench', 0) | 0);
+      const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+      const mib = (b) => (b / (1024 * 1024)).toFixed(2);
+      const textures = [
+        ['assets/textures/ktx2/card_etc1s.ktx2', 'ETC1S colour', KTX2Loader.color(), false],
+        ['assets/textures/ktx2/badge_uastc.ktx2', 'UASTC colour + alpha', KTX2Loader.color(), false],
+        ['assets/textures/ktx2/bumps_normal.ktx2', 'UASTC normal map', KTX2Loader.linear(), true],
+      ];
+      const quads = [];
+      const timings = {};
+      for (const [url, label, options, normalMap] of textures) {
+        const bytes = await fetchBytes(url);
+        const t0 = performance.now();
+        const texture = await KTX2Loader.transcode(label, bytes, options, support);
+        const first = performance.now() - t0;
+        const runs = [];
+        for (let i = 0; i < bench; i++) {
+          const t = performance.now();
+          await KTX2Loader.transcode(label, bytes, options, support);
+          runs.push(performance.now() - t);
+        }
+        timings[label] = { target: texture.target, first, runs };
+        const timing = bench ? `transcode ${first.toFixed(2)} ms (median of ${bench}: ${median(runs).toFixed(3)} ms)` : `transcode ${first.toFixed(2)} ms`;
+        lines.push(
+          `${label}: ${texture.codec} ${texture.width}x${texture.height}, ${texture.levels.length} mips, ${(bytes.length / 1024).toFixed(0)} KB file`
+          + ` -> ${texture.format} (${targetName(texture.target)}), ${mib(texture.gpuBytes())} MiB on the GPU vs ${mib(texture.uncompressedBytes())} MiB as RGBA8; ${timing}`,
+        );
+        console.info(texture.summary());
+        quads.push(quad(texture.toTexture(), new PlaneGeometry(1.8, 1.8), { normalMap }));
+      }
+
+      // the same ETC1S card through glTF: KHR_texture_basisu points the base colour at the KTX2 image
+      const gltf = await new GLTFLoader().load('./assets/textures/ktx2/card_basisu.gltf', undefined);
+      const ref = gltf.materials[gltf.materialIndices[0]].baseColorTexture;
+      const gltfTexture = await gltf.loadTexture(ref, support);
+      lines.push(`glTF KHR_texture_basisu: image ${ref.image} "${gltf.images[ref.image].name}" (${gltf.images[ref.image].mimeType}) -> ${gltfTexture.format}, sRGB ${ref.srgb}`);
+      quads.push(quad(gltfTexture, gltf.geometries[0], { flipV: false }));
+      quads.forEach(({ renderable }, i) => { renderable.position.x = (i - (quads.length - 1) / 2) * 2; });
+      const normalQuad = quads[2];
+
+      const camera = new Camera(45, 0.1, 100, canvas.aspect);
+      // back far enough that the quads (4.2 units either side) fit the width
+      const fitCamera = () => {
+        camera.position.set(0, 0, Math.max(5, 4.2 / (Math.tan(22.5 * Math.PI / 180) * camera.aspect)));
+        camera.lookAt(new Vector3(0, 0, 0));
+        camera.updateProjectionMatrix();
+      };
+      fitCamera();
+
+      report.textContent = lines.join('\n');
+      report.insertAdjacentHTML('beforeend', `\nformats: ${links}`);
+      window.ktx2Report = { lines, timings };
+      console.log('[ktx2] ' + JSON.stringify({ lines, timings }));
+
+      run(canvas, (frame) => {
+        if (frame.resized) {
+          frame.resize(renderer, camera);
+          fitCamera();
+        }
+        normalQuad.write(frame.time);
+        renderer.render(scene, camera);
+      });
+    } catch (e) {
+      report.textContent = `failed: ${e}`;
+      console.error(e);
+    }
+  </script>
+</body>
+
+</html>
