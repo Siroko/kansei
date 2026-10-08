@@ -42,6 +42,59 @@ const OPTIONAL_FEATURES: GPUFeatureName[] = [
     'texture-compression-etc2',
 ];
 
+/** The draw sets of a scene pass, in the order they are drawn: `Scene.opaque`, `transmissive`, `transparent`. */
+const DrawSet = { Opaque: 0, Transmissive: 1, Transparent: 2 } as const;
+type DrawSet = typeof DrawSet[keyof typeof DrawSet];
+
+/** The targets of a render pass, which pick each material's pipeline. */
+interface PassTargets {
+    colorFormats: GPUTextureFormat[];
+    depthFormat: GPUTextureFormat;
+    sampleCount: number;
+}
+
+/** A draw set's cached bundle (`null` when it records no draw) and what it recorded (`key`). */
+interface SetBundle {
+    bundle: GPURenderBundle | null;
+    key: unknown[];
+    valid: boolean;
+}
+
+/**
+ * A pass's cached render bundles, one per draw set, and the shared bind groups and targets they
+ * were recorded with (`shared`). A set's bundle is re-recorded only when its own draws change.
+ */
+class PassBundles {
+    readonly sets: SetBundle[] = [0, 1, 2].map(() => ({ bundle: null, key: [], valid: false }));
+    shared: unknown[] = [];
+
+    invalidate(): void {
+        for (const set of this.sets) set.valid = false;
+    }
+}
+
+/**
+ * Whether the cached bundles record `r` when it is visible. Dynamic renderables, and indirect
+ * ones (whose draw counts the GPU writes), are drawn live after the bundle of their set.
+ */
+function isBundled(r: Renderable): boolean {
+    return !r.dynamic && !r.geometry.indirectArgsBuffer;
+}
+
+function sameKey(a: unknown[], b: unknown[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
+
+/** Encoder state already set while recording draws, so repeated state is not set again. */
+interface DrawState {
+    pipeline: GPURenderPipeline | null;
+    materialBindGroup: GPUBindGroup | null;
+    indexBuffer: GPUBuffer | null;
+    vertexBuffer: GPUBuffer | null;
+}
+
 /**
  * Configuration options for the WebGPU renderer.
  * @interface RendererOptions
@@ -124,30 +177,22 @@ class Renderer {
         this.device!.queue.submit(list);
     }
 
-    // Pre-recorded bundle for the standard canvas render pass.
-    private _renderBundle: GPURenderBundle | null = null;
-    private _lastObjectCount: number = -1;
-    // Objects in the order each bundle recorded them. A bundle draws object i
-    // with matrix slot i, and slots are filled in draw order every frame, so a
-    // bundle must be re-recorded whenever that order changes (transparent
-    // objects are re-sorted back-to-front each frame). Stable per-object slots
-    // would avoid the re-record.
-    private _renderBundleOrder: Renderable[] = [];
-    private _gbufferBundleOrder: Renderable[] = [];
+    // Cached render bundles of the canvas pass and of the GBuffer pass: one per draw set,
+    // holding the visible static renderables, each drawn at its scene slot. Dynamic and
+    // indirect renderables are drawn live after their set's bundle.
+    private _canvasBundles = new PassBundles();
+    private _gbufferBundles = new PassBundles();
+    private _bundleKeyScratch: unknown[] = [];
+    private _sharedKeyScratch: unknown[] = [];
+    private _bundleRecords: number = 0;
 
-    // Separate bundle for off-screen GBuffer rendering (rgba16float + depth32float).
-    // When the scene contains transmissive objects, rendering is split into
-    // opaque, transmissive and transparent sub-bundles so the renderer can
-    // snapshot the opaque result into GBuffer.backgroundTexture before drawing
-    // the other two.
-    private _gbufferBundle: GPURenderBundle | null = null;
-    private _gbufferOpaqueBundle: GPURenderBundle | null = null;
-    private _gbufferTransmissiveBundle: GPURenderBundle | null = null;
-    private _gbufferTransparentBundle: GPURenderBundle | null = null;
-    private _gbufferLastObjectCount: number = -1;
-    private _gbufferLastOpaqueCount: number = -1;
-    private _gbufferLastTransmissiveCount: number = -1;
-    private _gbufferLastSampleCount: number = -1;
+    /**
+     * How many render bundles the renderer has recorded so far. A bundle is recorded per draw
+     * set (opaque, transmissive, transparent) of a pass when what it draws changes: a renderable
+     * shown, hidden, added, removed, given another material or geometry, or re-sorted among the
+     * transparent ones.
+     */
+    public get bundleRecordCount(): number { return this._bundleRecords; }
 
     // Depth-copy pipeline: resolves MSAA depth from depthMSAATexture → depthTexture.
     // A fullscreen render pass reads texture_depth_multisampled_2d (sample 0) and
@@ -159,19 +204,20 @@ class Renderer {
     private _depthCopyBGSource: GPUTexture | null = null;
 
     // Shared matrix buffers — all objects' world and normal matrices packed into
-    // two large GPU buffers (one per type) with 256-byte aligned strides. A world
-    // slot holds the world matrix then last frame's (KanseiMeshTransforms).
-    // The renderer uploads all matrices in exactly 2 writeBuffer calls per frame
-    // instead of 2×N individual calls.
+    // two large GPU buffers (one per type) with 256-byte aligned strides, a slot
+    // per renderable at its scene slot (`Scene.slotOf`). A world slot holds the
+    // world matrix then last frame's (KanseiMeshTransforms). The renderer uploads
+    // all matrices in exactly 2 writeBuffer calls per frame instead of 2×N.
     private _matrixAlignment: number = 256;  // meshSlotStride(device)
-    private _prevWorldValid: boolean = false;
     private _worldMatricesBuf: GPUBuffer | null = null;
     private _normalMatricesBuf: GPUBuffer | null = null;
     private _worldMatricesStaging: Float32Array | null = null;
     private _normalMatricesStaging: Float32Array | null = null;
     private _sharedMeshBGLayout: GPUBindGroupLayout | null = null;
     private _sharedMeshBG: GPUBindGroup | null = null;
-    private _sharedMeshObjectCount: number = -1;
+    private _meshSlotCapacity: number = 0;
+    // The renderable each slot was last written for: its world matrix there is the previous one.
+    private _slotOwners: (Renderable | null)[] = [];
 
     // ── Shadow resources ─────────────────────────────────────────────────────
     public shadowsEnabled: boolean = false;
@@ -342,30 +388,32 @@ class Renderer {
     }
 
     /**
-     * Call this whenever the scene composition changes (objects added/removed,
-     * material or pipeline reassigned) to force the render bundle to be rebuilt
-     * on the next frame.
+     * Forces every cached render bundle to be re-recorded on the next frame. The renderer
+     * already re-records a draw set's bundle when what it draws changes (renderables shown,
+     * hidden, added, removed, or given another material or geometry); call this after changing
+     * something a bundle holds that it cannot see, such as a geometry's vertex buffers.
      */
     public invalidateBundle() {
-        this._renderBundle = null;
-        this._gbufferBundle = null;
+        this._canvasBundles.invalidate();
+        this._gbufferBundles.invalidate();
     }
 
     /**
-     * Creates or resizes the shared per-object matrix GPU buffers.
+     * Creates or grows the shared per-object matrix GPU buffers to hold `slotCount` slots.
      *
      * All objects' world and normal matrices are packed into two large GPU
      * buffers (one per type) with 256-byte aligned strides so every object's
      * slice is accessible via a dynamic uniform buffer offset.  This lets the
      * renderer upload ALL matrices in exactly 2 writeBuffer calls per frame.
+     * The buffers only grow, keeping what the slots held.
      */
-    private _ensureSharedMeshResources(objectCount: number) {
-        if (objectCount === this._sharedMeshObjectCount && this._sharedMeshBG !== null) return;
+    private _ensureSharedMeshResources(slotCount: number) {
+        if (slotCount <= this._meshSlotCapacity && this._sharedMeshBG !== null) return;
 
         const alignment = meshSlotStride(this.device!);
         this._matrixAlignment = alignment;
 
-        const bufferSize = Math.max(objectCount * alignment, alignment); // at least one slot
+        const capacity = Math.max(slotCount, 1); // at least one slot
         const floatsPerSlot = alignment / 4; // 64 floats for 256-byte alignment
 
         this._worldMatricesBuf?.destroy();
@@ -373,19 +421,24 @@ class Renderer {
 
         this._worldMatricesBuf = this.device!.createBuffer({
             label: 'WorldMatrices',
-            size: bufferSize,
+            size: capacity * alignment,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this._normalMatricesBuf = this.device!.createBuffer({
             label: 'NormalMatrices',
-            size: bufferSize,
+            size: capacity * alignment,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        // Pre-zero the staging arrays — padding bytes stay zero every frame.
-        this._worldMatricesStaging = new Float32Array(objectCount * floatsPerSlot);
-        this._normalMatricesStaging = new Float32Array(objectCount * floatsPerSlot);
-        this._prevWorldValid = false;
+        // Padding bytes stay zero every frame; the slots keep their matrices (the previous world).
+        const world = new Float32Array(capacity * floatsPerSlot);
+        const normal = new Float32Array(capacity * floatsPerSlot);
+        if (this._worldMatricesStaging) world.set(this._worldMatricesStaging);
+        if (this._normalMatricesStaging) normal.set(this._normalMatricesStaging);
+        this._worldMatricesStaging = world;
+        this._normalMatricesStaging = normal;
+        this._slotOwners.length = capacity;
+        this._slotOwners.fill(null, this._meshSlotCapacity);
 
         // Create the layout once; all subsequent bind groups reuse it.
         if (!this._sharedMeshBGLayout) {
@@ -397,6 +450,7 @@ class Renderer {
 
         // Bind the first slot's normal matrix and world + previous world; the
         // dynamic offset shifts that window to the i-th object's slot at draw time.
+        // A new bind group re-records the cached bundles.
         this._sharedMeshBG = this.device!.createBindGroup({
             label: 'SharedMesh BindGroup',
             layout: this._sharedMeshBGLayout,
@@ -406,27 +460,31 @@ class Renderer {
             ],
         });
 
-        this._sharedMeshObjectCount = objectCount;
-        this._renderBundle = null;     // force bundle rebuild with new bind group
-        this._gbufferBundle = null;
+        this._meshSlotCapacity = capacity;
     }
 
     /**
      * Copies a renderable's matrices into its slot of the staging arrays: the
-     * normal matrix, and the world matrix after the one the slot held last frame
-     * (or the world matrix itself when the buffers were just allocated).
-     * Slots follow the draw order, so a re-sorted object reads another's previous world.
+     * normal matrix, and the world matrix after the one it had there last frame
+     * (or the world matrix itself when the slot was last written for another renderable).
      */
-    private _stageMeshSlot(base: number, renderable: Renderable) {
+    private _stageMeshSlot(slot: number, renderable: Renderable) {
+        const base = slot * (this._matrixAlignment / 4);
         const world = this._worldMatricesStaging!;
-        if (this._prevWorldValid) {
+        if (this._slotOwners[slot] === renderable) {
             world.copyWithin(base + 16, base, base + 16);
-            world.set(renderable.worldMatrix.internalMat4, base);
         } else {
-            world.set(renderable.worldMatrix.internalMat4, base);
             world.set(renderable.worldMatrix.internalMat4, base + 16);
+            this._slotOwners[slot] = renderable;
         }
+        world.set(renderable.worldMatrix.internalMat4, base);
         this._normalMatricesStaging!.set(renderable.normalMatrix.internalMat4, base);
+    }
+
+    /** Uploads every slot's matrices in one write per buffer. */
+    private _uploadMeshSlots() {
+        this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
+        this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
     }
 
     /**
@@ -524,19 +582,18 @@ class Renderer {
         });
 
         this._shadowBGDirty = false;
-        this._renderBundle = null;
-        this._gbufferBundle = null;
     }
 
     /**
      * Renders a stack using the specified camera.
      *
      * Each frame has three phases:
-     *  1. Update — compute all matrices on the CPU, copy them into aligned
-     *     staging arrays, then upload via exactly 2 writeBuffer calls.
-     *  2. Bundle — pre-record all draw commands once into a GPURenderBundle
-     *     (dynamic offsets into the shared buffers are baked per object).
-     *  3. Execute — replay the bundle with a single executeBundles() call.
+     *  1. Update — compute the visible renderables' matrices on the CPU, copy them into
+     *     their scene slots of the staging arrays, then upload via exactly 2 writeBuffer calls.
+     *  2. Bundle — re-record a draw set's bundle (opaque, transmissive, transparent) only when
+     *     the static renderables it draws changed (dynamic offsets into the shared buffers are
+     *     baked per object, at its stable slot).
+     *  3. Execute — replay each set's bundle, then draw its dynamic and indirect renderables live.
      *
      * @param {Scene} stack - The stack to render
      * @param {Camera} camera - The camera to use for rendering
@@ -545,23 +602,15 @@ class Renderer {
         stack.prepare(camera);
         camera.updateViewMatrix();
 
-        const orderedObjects = stack.getOrderedObjects();
         const cameraBindGroup = camera.getBindGroup(this.device!);
+        const targets: PassTargets = {
+            colorFormats: [this.presentationFormat],
+            depthFormat: 'depth24plus',
+            sampleCount: this.sampleCount,
+        };
 
-        // Allocate / resize shared matrix buffers to match the current object count.
-        this._ensureSharedMeshResources(orderedObjects.length);
-
-        const alignment = this._matrixAlignment;
-        const floatsPerSlot = alignment / 4; // stride in the staging Float32Array
-
-        // Phase 1 — update all CPU matrices and write them into the staging arrays.
-        // No per-object writeBuffer calls happen here.
-        for (let i = 0; i < orderedObjects.length; i++) {
-            const renderable = orderedObjects[i];
-
-            if (!renderable.geometry.initialized) {
-                renderable.geometry.initialize(this.device!);
-            }
+        // Phase 1 — update matrices and upload them.
+        this._updateRenderables(stack, camera, (renderable) => {
             if (!renderable.material.initialized) {
                 renderable.material.initialize(
                     this.device!,
@@ -570,50 +619,17 @@ class Renderer {
                     this.sampleCount
                 );
             }
-            if (renderable.geometry.isInstancedGeometry) {
-                const geo = renderable.geometry as InstancedGeometry;
-                for (const extraBuffer of geo.extraBuffers) {
-                    if (!extraBuffer.initialized) extraBuffer.initialize(this.device!);
-                }
-            }
-
-            renderable.updateModelMatrix();
-            renderable.updateNormalMatrix(camera.viewMatrix);
-
-            this._stageMeshSlot(i * floatsPerSlot, renderable);
-
-            // Flush any dirty material-level buffers (textures, material uniforms).
-            renderable.material.getBindGroup(this.device!);
-        }
-
-        this._prevWorldValid = true;
-
-        // Upload ALL matrices to the GPU in exactly 2 writeBuffer calls.
-        if (orderedObjects.length > 0) {
-            this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
-            this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
-        }
+        });
 
         // Upload shadow uniforms.
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
 
-        // Invalidate the bundle if any object had its material swapped this frame.
-        for (const renderable of orderedObjects) {
-            if (renderable.materialDirty) {
-                this._renderBundle = null;
-                renderable.materialDirty = false;
-            }
-        }
+        // Phase 2 — (re-)record the bundles whose draws changed.
+        const sets = [stack.opaque, stack.transmissive, stack.transparent];
+        this._syncBundles(this._canvasBundles, sets, stack, cameraBindGroup, targets);
 
-        // Phase 2 — (re-)record the render bundle when the scene composition changes.
-        const orderChanged = Renderer._syncOrder(this._renderBundleOrder, orderedObjects);
-        if (!this._renderBundle || this._lastObjectCount !== orderedObjects.length || orderChanged) {
-            this._renderBundle = this._buildRenderBundle(orderedObjects, cameraBindGroup);
-            this._lastObjectCount = orderedObjects.length;
-        }
-
-        // Phase 3 — execute the pre-recorded bundle in a fresh render pass.
+        // Phase 3 — execute the bundles and the live draws in a fresh render pass.
         const commandRenderEncoder = this.device!.createCommandEncoder();
         const textureView = this.context!.getCurrentTexture().createView();
 
@@ -641,9 +657,48 @@ class Renderer {
         } as GPURenderPassDescriptor;
 
         const passRenderEncoder = commandRenderEncoder.beginRenderPass(renderPassDescriptor);
-        passRenderEncoder.executeBundles([this._renderBundle!]);
+        for (const set of [DrawSet.Opaque, DrawSet.Transmissive, DrawSet.Transparent]) {
+            this._drawSet(passRenderEncoder, this._canvasBundles, set, sets[set], stack, cameraBindGroup, targets);
+        }
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
+    }
+
+    /**
+     * Phase 1 of a scene pass: initialises the visible renderables' geometry (`prepareMaterial`
+     * readies their material for the pass), updates their matrices, stages them at their scene
+     * slots and uploads every slot.
+     */
+    private _updateRenderables(stack: Scene, camera: Camera, prepareMaterial: (renderable: Renderable) => void) {
+        const orderedObjects = stack.getOrderedObjects();
+        this._ensureSharedMeshResources(stack.slotCapacity);
+
+        for (let i = 0; i < orderedObjects.length; i++) {
+            const renderable = orderedObjects[i];
+
+            if (!renderable.geometry.initialized) {
+                renderable.geometry.initialize(this.device!);
+            }
+            prepareMaterial(renderable);
+            if (renderable.geometry.isInstancedGeometry) {
+                const geo = renderable.geometry as InstancedGeometry;
+                for (const extraBuffer of geo.extraBuffers) {
+                    if (!extraBuffer.initialized) extraBuffer.initialize(this.device!);
+                }
+            }
+
+            renderable.updateModelMatrix();
+            renderable.updateNormalMatrix(camera.viewMatrix);
+
+            this._stageMeshSlot(stack.slotOf(renderable), renderable);
+
+            // Flush any dirty material-level buffers (textures, material uniforms).
+            renderable.material.getBindGroup(this.device!);
+            // A swapped material re-records its set's bundle through the bundle key.
+            renderable.materialDirty = false;
+        }
+
+        this._uploadMeshSlots();
     }
 
     // ── Depth-copy helpers ───────────────────────────────────────────────────
@@ -740,13 +795,7 @@ class Renderer {
         stack.prepare(camera);
         camera.updateViewMatrix();
 
-        const orderedObjects = stack.getOrderedObjects();
         const cameraBindGroup = camera.getBindGroup(this.device!);
-
-        this._ensureSharedMeshResources(orderedObjects.length);
-
-        const alignment = this._matrixAlignment;
-        const floatsPerSlot = alignment / 4;
 
         // MRT format array: one entry per color attachment.
         const mrtFormats: GPUTextureFormat[] = [
@@ -755,103 +804,37 @@ class Renderer {
             'rgba16float',  // @location(2) normal
             'rgba8unorm',   // @location(3) albedo
         ];
+        const targets: PassTargets = {
+            colorFormats: mrtFormats,
+            depthFormat: 'depth32float',
+            sampleCount: gbuffer.msaaSampleCount,
+        };
 
         // Phase 1 — identical to render(): upload matrices.
-        for (let i = 0; i < orderedObjects.length; i++) {
-            const renderable = orderedObjects[i];
-
-            if (!renderable.geometry.initialized) {
-                renderable.geometry.initialize(this.device!);
-            }
+        this._updateRenderables(stack, camera, (renderable) => {
             // Ensure the material has a pipeline compiled for the GBuffer MRT config.
-            renderable.material.getPipelineForConfig(
-                this.device!,
-                renderable.geometry.vertexBuffersDescriptors,
-                'rgba16float',
-                gbuffer.msaaSampleCount,
-                'depth32float',
-                4, // MRT: color + emissive + normal + albedo
-                mrtFormats
-            );
+            this._pipelineFor(renderable, targets);
             // Mark initialized to skip initialize() which would build a
             // canvas-format pipeline that fails for shaders with @location(1).
             renderable.material.initialized = true;
-            if (renderable.geometry.isInstancedGeometry) {
-                const geo = renderable.geometry as InstancedGeometry;
-                for (const extraBuffer of geo.extraBuffers) {
-                    if (!extraBuffer.initialized) extraBuffer.initialize(this.device!);
-                }
-            }
-
-            renderable.updateModelMatrix();
-            renderable.updateNormalMatrix(camera.viewMatrix);
-
-            this._stageMeshSlot(i * floatsPerSlot, renderable);
-
-            renderable.material.getBindGroup(this.device!);
-        }
-        this._prevWorldValid = true;
-
-        if (orderedObjects.length > 0) {
-            this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
-            this.device!.queue.writeBuffer(this._normalMatricesBuf!, 0, this._normalMatricesStaging!.buffer as ArrayBuffer);
-        }
+        });
 
         // Upload shadow uniforms.
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
 
-        const opaqueCount = stack.opaqueCount;
-        const transmissiveCount = stack.transmissiveCount;
-        const hasTransmissive = transmissiveCount > 0;
+        // With transmissive objects the pass splits: opaque, a snapshot of the colour into
+        // backgroundTexture, then transmissive and transparent on top.
+        const hasTransmissive = stack.transmissive.length > 0;
 
-        for (const renderable of orderedObjects) {
-            if (renderable.materialDirty) {
-                this._gbufferBundle = null;
-                this._gbufferOpaqueBundle = null;
-                this._gbufferTransmissiveBundle = null;
-                this._gbufferTransparentBundle = null;
-                renderable.materialDirty = false;
+        // Phase 2 — (re-)record the bundles whose draws changed.
+        const sets = [stack.opaque, stack.transmissive, stack.transparent];
+        this._syncBundles(this._gbufferBundles, sets, stack, cameraBindGroup, targets);
+        const drawSets = (pass: GPURenderPassEncoder, which: DrawSet[]) => {
+            for (const set of which) {
+                this._drawSet(pass, this._gbufferBundles, set, sets[set], stack, cameraBindGroup, targets);
             }
-        }
-
-        // Phase 2 — build GBuffer bundle(s) if stale.
-        const orderChanged = Renderer._syncOrder(this._gbufferBundleOrder, orderedObjects);
-        const bundleStale =
-            orderChanged ||
-            this._gbufferLastObjectCount !== orderedObjects.length ||
-            this._gbufferLastOpaqueCount !== opaqueCount ||
-            this._gbufferLastTransmissiveCount !== transmissiveCount ||
-            this._gbufferLastSampleCount !== gbuffer.msaaSampleCount;
-
-        const transparentStart = opaqueCount + transmissiveCount;
-        if (hasTransmissive) {
-            if (bundleStale || !this._gbufferOpaqueBundle || !this._gbufferTransmissiveBundle || !this._gbufferTransparentBundle) {
-                const opaqueSlice = orderedObjects.slice(0, opaqueCount);
-                const transmissiveSlice = orderedObjects.slice(opaqueCount, transparentStart);
-                this._gbufferOpaqueBundle = this._buildRenderBundle(
-                    opaqueSlice, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, 0
-                );
-                this._gbufferTransmissiveBundle = this._buildRenderBundle(
-                    transmissiveSlice, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, opaqueCount
-                );
-                this._gbufferTransparentBundle = this._buildRenderBundle(
-                    orderedObjects.slice(transparentStart), cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats, transparentStart
-                );
-                this._gbufferBundle = null;
-            }
-        } else if (bundleStale || !this._gbufferBundle) {
-            this._gbufferBundle = this._buildRenderBundle(
-                orderedObjects, cameraBindGroup, 'rgba16float', gbuffer.msaaSampleCount, 'depth32float', 4, mrtFormats
-            );
-            this._gbufferOpaqueBundle = null;
-            this._gbufferTransmissiveBundle = null;
-            this._gbufferTransparentBundle = null;
-        }
-        this._gbufferLastObjectCount = orderedObjects.length;
-        this._gbufferLastOpaqueCount = opaqueCount;
-        this._gbufferLastTransmissiveCount = transmissiveCount;
-        this._gbufferLastSampleCount = gbuffer.msaaSampleCount;
+        };
 
         // Phase 3 — execute into the GBuffer render pass(es).
         const commandEncoder = this.device!.createCommandEncoder();
@@ -958,7 +941,7 @@ class Renderer {
         if (hasTransmissive) {
             // Pass 1 — opaque objects.
             const opaquePass = commandEncoder.beginRenderPass(makePassDescriptor(false));
-            opaquePass.executeBundles([this._gbufferOpaqueBundle!]);
+            drawSets(opaquePass, [DrawSet.Opaque]);
             opaquePass.end();
 
             // Snapshot the opaque-only colour into backgroundTexture so that a
@@ -971,11 +954,11 @@ class Renderer {
 
             // Pass 2 — transmissive then transparent objects (continues drawing on top of the opaque result).
             const transmissivePass = commandEncoder.beginRenderPass(makePassDescriptor(true));
-            transmissivePass.executeBundles([this._gbufferTransmissiveBundle!, this._gbufferTransparentBundle!]);
+            drawSets(transmissivePass, [DrawSet.Transmissive, DrawSet.Transparent]);
             transmissivePass.end();
         } else {
             const pass = commandEncoder.beginRenderPass(makePassDescriptor(false));
-            pass.executeBundles([this._gbufferBundle!]);
+            drawSets(pass, [DrawSet.Opaque, DrawSet.Transparent]);
             pass.end();
         }
 
@@ -1035,128 +1018,178 @@ class Renderer {
         this._pointShadowParams[4] = shadowFar;
     }
 
-    /**
-     * Copies `current` into `recorded` and returns whether they differed, i.e.
-     * whether a bundle recorded in `recorded`'s order now pairs draws with
-     * other objects' matrix slots.
-     */
-    private static _syncOrder(recorded: Renderable[], current: Renderable[]): boolean {
-        let changed = recorded.length !== current.length;
-        if (changed) recorded.length = current.length;
-        for (let i = 0; i < current.length; i++) {
-            if (recorded[i] !== current[i]) {
-                recorded[i] = current[i];
-                changed = true;
-            }
-        }
-        return changed;
+    /** The pipeline of `renderable`'s material for a pass with `targets`. */
+    private _pipelineFor(renderable: Renderable, targets: PassTargets): GPURenderPipeline {
+        const formats = targets.colorFormats;
+        return renderable.material.getPipelineForConfig(
+            this.device!,
+            renderable.geometry.vertexBuffersDescriptors,
+            formats[0],
+            targets.sampleCount,
+            targets.depthFormat,
+            formats.length,
+            formats.length > 1 ? formats : undefined
+        );
     }
 
     /**
-     * Records all draw commands into a GPURenderBundle.
-     *
-     * @param colorFormat       Target colour attachment format. Defaults to the canvas presentation format.
-     * @param sampleCount       MSAA sample count of the render pass. Defaults to the renderer's sampleCount.
-     * @param depthFormat       Depth-stencil format. Defaults to 'depth24plus'.
-     * @param baseObjectIndex   Index offset used when computing per-object dynamic offsets.
-     *                          When the caller passes a sliced subrange (e.g. the
-     *                          transmissive objects from the middle of the ordered list),
-     *                          this keeps the dynamic offsets aligned with the full list.
+     * Re-records the bundle of each of a pass's draw sets whose bundled draws changed since it was
+     * recorded, and all of them when the shared bind groups or the targets did.
      */
-    private _buildRenderBundle(
-        orderedObjects: Renderable[],
+    private _syncBundles(
+        cache: PassBundles,
+        sets: readonly (readonly Renderable[])[],
+        stack: Scene,
         cameraBindGroup: GPUBindGroup,
-        colorFormat: GPUTextureFormat = this._presentationFormat!,
-        sampleCount: number = this.sampleCount,
-        depthFormat: GPUTextureFormat = 'depth24plus',
-        colorTargetCount: number = 1,
-        colorFormats?: GPUTextureFormat[],
-        baseObjectIndex: number = 0,
-    ): GPURenderBundle {
-        const formats: (GPUTextureFormat | null)[] = colorFormats
-            ? [...colorFormats]
-            : Array.from({ length: colorTargetCount }, () => colorFormat);
+        targets: PassTargets,
+    ) {
+        const shared = this._sharedKeyScratch;
+        shared.length = 0;
+        shared.push(cameraBindGroup, this._sharedMeshBG, this._shadowBG, targets.depthFormat, targets.sampleCount, ...targets.colorFormats);
+        if (!sameKey(cache.shared, shared)) {
+            cache.invalidate();
+            this._sharedKeyScratch = cache.shared;
+            cache.shared = shared;
+        }
+
+        for (let set = 0; set < cache.sets.length; set++) {
+            const entry = cache.sets[set];
+            const key = this._bundleKeyScratch;
+            key.length = 0;
+            for (const r of sets[set]) {
+                if (!isBundled(r)) continue;
+                const geo = r.geometry;
+                key.push(r, stack.slotOf(r), r.material, r.material.currentBindGroup, geo, geo.initialized, geo.vertexCount,
+                    geo.isInstancedGeometry ? (geo as InstancedGeometry).instanceCount : 1);
+            }
+            if (entry.valid && sameKey(entry.key, key)) continue;
+            entry.bundle = this._recordBundle(sets[set], stack, cameraBindGroup, targets);
+            this._bundleKeyScratch = entry.key;
+            entry.key = key;
+            entry.valid = true;
+        }
+    }
+
+    /**
+     * Records the draws of the bundled renderables (`isBundled`) among `renderables` into a
+     * GPURenderBundle, each at its scene slot; `null` when there is none to draw.
+     */
+    private _recordBundle(
+        renderables: readonly Renderable[],
+        stack: Scene,
+        cameraBindGroup: GPUBindGroup,
+        targets: PassTargets,
+    ): GPURenderBundle | null {
         const encoder = this.device!.createRenderBundleEncoder({
-            colorFormats: formats,
-            depthStencilFormat: depthFormat,
-            sampleCount,
+            colorFormats: targets.colorFormats,
+            depthStencilFormat: targets.depthFormat,
+            sampleCount: targets.sampleCount,
         });
 
-        let currentPipeline: GPURenderPipeline | null = null;
-        let currentMaterialBindGroup: GPUBindGroup | null = null;
-        let currentIndexBuffer: GPUBuffer | null = null;
-        let currentVertexBuffer: GPUBuffer | null = null;
-
-        const alignment = this._matrixAlignment;
-
-        // Camera bind group is the same for every object — set once.
+        // Camera and shadow bind groups are the same for every object — set once.
         encoder.setBindGroup(BindGroupSlot.Camera, cameraBindGroup);
-
-        // Shadow bind group (Group 3) — same for every object.
         if (this._shadowBG) {
             encoder.setBindGroup(BindGroupSlot.Shadow, this._shadowBG);
         }
 
-        for (let i = 0; i < orderedObjects.length; i++) {
-            const renderable = orderedObjects[i];
-            // For off-screen passes request the pipeline for the specific config.
-            const pipeline = renderable.material.getPipelineForConfig(
-                this.device!,
-                renderable.geometry.vertexBuffersDescriptors,
-                colorFormat,
-                sampleCount,
-                depthFormat,
-                colorTargetCount,
-                colorFormats
-            );
-            if (!pipeline || !renderable.geometry.initialized) continue;
+        const state: DrawState = { pipeline: null, materialBindGroup: null, indexBuffer: null, vertexBuffer: null };
+        let draws = 0;
+        for (const renderable of renderables) {
+            if (isBundled(renderable) && this._encodeDraw(encoder, renderable, stack.slotOf(renderable), targets, state)) draws++;
+        }
+        this._bundleRecords++;
+        return draws > 0 ? encoder.finish() : null;
+    }
 
-            if (pipeline !== currentPipeline) {
-                encoder.setPipeline(pipeline);
-                currentPipeline = pipeline;
-                currentMaterialBindGroup = null;
+    /**
+     * Draws one of a pass's draw sets: its cached bundle, then its visible dynamic and indirect
+     * renderables live, so each frame's draw reads that frame's matrices and draw counts.
+     */
+    private _drawSet(
+        pass: GPURenderPassEncoder,
+        cache: PassBundles,
+        set: DrawSet,
+        renderables: readonly Renderable[],
+        stack: Scene,
+        cameraBindGroup: GPUBindGroup,
+        targets: PassTargets,
+    ) {
+        const bundle = cache.sets[set].bundle;
+        if (bundle) pass.executeBundles([bundle]);
+
+        // Executing a bundle clears the pass's state: bind the shared groups again.
+        let state: DrawState | null = null;
+        for (const renderable of renderables) {
+            if (isBundled(renderable)) continue;
+            if (!state) {
+                pass.setBindGroup(BindGroupSlot.Camera, cameraBindGroup);
+                if (this._shadowBG) pass.setBindGroup(BindGroupSlot.Shadow, this._shadowBG);
+                state = { pipeline: null, materialBindGroup: null, indexBuffer: null, vertexBuffer: null };
             }
+            this._encodeDraw(pass, renderable, stack.slotOf(renderable), targets, state);
+        }
+    }
 
-            if (renderable.geometry.indexBuffer !== currentIndexBuffer) {
-                encoder.setIndexBuffer(renderable.geometry.indexBuffer!, renderable.geometry.indexFormat!);
-                currentIndexBuffer = renderable.geometry.indexBuffer!;
-            }
+    /**
+     * Encodes the draw of `renderable` with its matrices at `slot`, setting only the state that
+     * differs from `state`. Returns false when it cannot be drawn yet.
+     */
+    private _encodeDraw(
+        encoder: GPURenderPassEncoder | GPURenderBundleEncoder,
+        renderable: Renderable,
+        slot: number,
+        targets: PassTargets,
+        state: DrawState,
+    ): boolean {
+        const geometry = renderable.geometry;
+        if (!geometry.initialized) return false;
+        const pipeline = this._pipelineFor(renderable, targets);
 
-            if (renderable.geometry.vertexBuffer !== currentVertexBuffer) {
-                encoder.setVertexBuffer(0, renderable.geometry.vertexBuffer!);
-                currentVertexBuffer = renderable.geometry.vertexBuffer!;
-            }
+        if (pipeline !== state.pipeline) {
+            encoder.setPipeline(pipeline);
+            state.pipeline = pipeline;
+            state.materialBindGroup = null;
+        }
 
-            if (renderable.geometry.isInstancedGeometry) {
-                const geo = renderable.geometry as InstancedGeometry;
-                let idx = 1;
-                for (const extraBuffer of geo.extraBuffers) {
-                    encoder.setVertexBuffer(idx++, extraBuffer.resource.buffer);
-                }
-            }
+        if (geometry.indexBuffer !== state.indexBuffer) {
+            encoder.setIndexBuffer(geometry.indexBuffer!, geometry.indexFormat!);
+            state.indexBuffer = geometry.indexBuffer!;
+        }
 
-            const materialBindGroup = renderable.material.getBindGroup(this.device!);
-            if (materialBindGroup !== currentMaterialBindGroup) {
-                encoder.setBindGroup(0, materialBindGroup);
-                currentMaterialBindGroup = materialBindGroup;
-            }
+        if (geometry.vertexBuffer !== state.vertexBuffer) {
+            encoder.setVertexBuffer(0, geometry.vertexBuffer!);
+            state.vertexBuffer = geometry.vertexBuffer!;
+        }
 
-            // Bake the per-object dynamic offset: both bindings (normalMatrix,
-            // worldMatrix) live in separate buffers but share the same stride.
-            const offset = (baseObjectIndex + i) * alignment;
-            encoder.setBindGroup(BindGroupSlot.Mesh, this._sharedMeshBG!, [offset, offset]);
-
-            if (renderable.geometry.isInstancedGeometry) {
-                const geo = renderable.geometry as InstancedGeometry;
-                encoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
-            } else if (renderable.geometry.indirectArgsBuffer) {
-                encoder.drawIndexedIndirect(renderable.geometry.indirectArgsBuffer, 0);
-            } else {
-                encoder.drawIndexed(renderable.geometry.vertexCount);
+        if (geometry.isInstancedGeometry) {
+            const geo = geometry as InstancedGeometry;
+            let idx = 1;
+            for (const extraBuffer of geo.extraBuffers) {
+                encoder.setVertexBuffer(idx++, extraBuffer.resource.buffer);
             }
         }
 
-        return encoder.finish();
+        // Phase 1 updated it this frame (`_updateRenderables`).
+        const materialBindGroup = renderable.material.currentBindGroup!;
+        if (materialBindGroup !== state.materialBindGroup) {
+            encoder.setBindGroup(BindGroupSlot.Material, materialBindGroup);
+            state.materialBindGroup = materialBindGroup;
+        }
+
+        // Both bindings (normalMatrix, world + previous world) live in separate
+        // buffers but share the same stride.
+        const offset = slot * this._matrixAlignment;
+        encoder.setBindGroup(BindGroupSlot.Mesh, this._sharedMeshBG!, [offset, offset]);
+
+        if (geometry.isInstancedGeometry) {
+            const geo = geometry as InstancedGeometry;
+            encoder.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
+        } else if (geometry.indirectArgsBuffer) {
+            encoder.drawIndexedIndirect(geometry.indirectArgsBuffer, 0);
+        } else {
+            encoder.drawIndexed(geometry.vertexCount);
+        }
+        return true;
     }
 
     /**

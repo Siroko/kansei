@@ -11,8 +11,8 @@ class Geometry {
     /** WebGPU buffer containing index data */
     public indexBuffer?: GPUBuffer;
 
-    /** Format of the index buffer data */
-    public indexFormat: GPUIndexFormat = "uint16";
+    /** Format of the index buffer data: 32-bit unless set otherwise (as the Rust engine draws). */
+    public indexFormat: GPUIndexFormat = "uint32";
 
     /** Collection of vertex buffer layout descriptors */
     public vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null> = [];
