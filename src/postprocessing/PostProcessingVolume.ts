@@ -32,6 +32,11 @@ import { cpuScope, endProfiledFrame, gpuPass } from '../profiling/Profiler';
  *                       the next (ping-pong between outputTexture / pingPongTexture).
  *  3. Blit            — the final texture is rendered to the canvas via a
  *                       fullscreen triangle pass.
+ *
+ * Effects up to the tonemapper work on scene-linear HDR light; `ToneMapEffect` turns it into the
+ * display signal, so it goes last in the HDR chain (after fog, depth of field and bloom), as in
+ * the Rust engine (`postprocessing/mod.rs`). Without it the canvas shows linear HDR as is.
+ * Effects whose `isActive()` is false are skipped.
  */
 class PostProcessingVolume {
     private _gbuffer: GBuffer | null = null;
@@ -53,6 +58,16 @@ class PostProcessingVolume {
     /** Add an effect at the end of the chain. */
     public addEffect(effect: PostProcessingEffect): void {
         this.effects.push(effect);
+    }
+
+    /** Whether any active effect wants a jittered projection (the renderer then jitters the camera). */
+    public get wantsJitter(): boolean {
+        return this.effects.some(e => e.isActive() && e.wantsJitter());
+    }
+
+    /** The GBuffer the scene is rendered into (created by the first `render`). */
+    public get gbuffer(): GBuffer | null {
+        return this._gbuffer;
     }
 
     /** Remove all effects. */
@@ -90,7 +105,8 @@ class PostProcessingVolume {
 
         const postScope = cpuScope('post');
         // Step 2: initialise any uninitialised effects.
-        for (const effect of this.effects) {
+        const active = this.effects.filter(e => e.isActive());
+        for (const effect of active) {
             if (!effect.initialized) {
                 effect.initialize(device, this._gbuffer, camera);
             }
@@ -103,10 +119,10 @@ class PostProcessingVolume {
         let currentSource: GPUTexture = this._gbuffer.colorTexture;
         let pingPongIdx = 0; // 0 → write outputTexture, 1 → write pingPongTexture
 
-        if (this.effects.length > 0) {
+        if (active.length > 0) {
             const commandEncoder = device.createCommandEncoder();
 
-            for (const effect of this.effects) {
+            for (const effect of active) {
                 const outputTex = pingPongIdx === 0
                     ? this._gbuffer.outputTexture
                     : this._gbuffer.pingPongTexture;
@@ -121,7 +137,8 @@ class PostProcessingVolume {
                     camera,
                     w,
                     h,
-                    this._gbuffer.emissiveTexture
+                    this._gbuffer.emissiveTexture,
+                    this._gbuffer
                 );
                 effectScope?.end();
 
