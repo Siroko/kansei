@@ -20,6 +20,8 @@ import cloudMap from '../../rust/kansei-core/src/atmosphere/shaders/cloud_map.wg
 import skyCapture from '../../rust/kansei-core/src/atmosphere/shaders/sky_capture.wgsl?raw';
 import distantSkyLight from '../../rust/kansei-core/src/atmosphere/shaders/distant_sky_light.wgsl?raw';
 import skyLightingPass from '../../rust/kansei-core/src/atmosphere/shaders/sky_lighting_pass.wgsl?raw';
+import skyEnvironment from '../../rust/kansei-core/src/atmosphere/shaders/sky_environment.wgsl?raw';
+import skyEnvironmentPass from '../../rust/kansei-core/src/atmosphere/shaders/sky_environment_pass.wgsl?raw';
 import skyComposite from '../../rust/kansei-core/src/atmosphere/shaders/sky_composite.wgsl?raw';
 import heightFog from '../../rust/kansei-core/src/shaders/height_fog.wgsl?raw';
 
@@ -40,12 +42,22 @@ export const ATMOSPHERE_WGSL: string = assemble([common, frame]);
  */
 export const SKY_LIGHTING_WGSL: string = skyLighting;
 
+/**
+ * `skyEnvironment(env, envSampler, r, roughness)`: the prefiltered sky along a reflection, from
+ * `SkyAtmosphere.bindings.environment` (bind as `texture_cube<f32>`, e.g. `Texture.fromView` with
+ * `SkyAtmosphere.environmentTexture`) and `environmentSampler`; and `skyEnvironmentBrdf(f0,
+ * roughness, nDotV)`, the split sum's analytic environment BRDF to scale it by. Rust:
+ * `atmosphere::SKY_ENVIRONMENT_WGSL`.
+ */
+export const SKY_ENVIRONMENT_WGSL: string = skyEnvironment;
+
 // The passes, in the Rust engine's concatenation order
 
 export const TRANSMITTANCE_SOURCE = assemble([common, transmittanceLut]);
 export const MULTI_SCATTERING_SOURCE = assemble([common, lookupTransmittance, multiScatteringLut]);
 export const SKY_VIEW_SOURCE = assemble([common, frame, lookupTransmittance, lookupMultiScattering, scattering, skyViewLut]);
 export const SKY_LIGHTING_SOURCE = assemble([common, frame, lookupTransmittance, skyLookup, skyLighting, cloudMap, skyCapture, skyLightingPass]);
+export const ENVIRONMENT_SOURCE = assemble([common, frame, skyLookup, skyLighting, cloudMap, skyCapture, skyEnvironmentPass]);
 export const DISTANT_SKY_LIGHT_SOURCE = assemble([common, frame, lookupTransmittance, lookupMultiScattering, distantSkyLight]);
 export const AERIAL_PERSPECTIVE_SOURCE = assemble([common, frame, lookupTransmittance, lookupMultiScattering, scattering, aerialPerspectiveLut]);
 /** `AtmosphereEffect`'s composite: the sky, sun and moon behind the scene, aerial perspective over it. */

@@ -51,6 +51,101 @@ export interface VolumetricFogOptions {
      * lit with no direct light (dusk, overcast). Far fog tends to it. Zero by default.
      */
     ambient?: [number, number, number];
+    /**
+     * Scattering albedo: scattering = density * albedo (extinction = density * extinctionCoeff).
+     * Unreal's volumetric fog maps as albedo = its albedo * its extinction scale,
+     * extinctionCoeff = its extinction scale. Default 1.
+     */
+    albedo?: [number, number, number];
+    /** Scales the sky's light on the fog once a sky is bound (`setSkyLighting`); 1 (the default) is physical. */
+    skyAmbientScale?: number;
+}
+
+/** The shape of a `LocalFogVolume`. */
+export type LocalFogShape = 'ellipsoid' | 'box';
+
+/**
+ * A local fog volume: an ellipsoid or box of mist (over a lake, in a hollow) injected into the
+ * fog's froxels, after Unreal's `LocalFogVolume` (Rust `LocalFogVolume`). In the volume's unit
+ * shape `q`, with `r` = |q| (the largest |q_i| for a box) below 1, the extinction is
+ * `radialExtinction * (1 - r^2) + heightExtinction * exp(-heightFalloff * max(q.y - heightOffset, 0))`,
+ * faded to zero over the outer `edgeFade` of the radius. It scatters the fog's lights and sky
+ * with its own albedo; wind and start distance leave it alone.
+ *
+ * Unreal's `RadialFogExtinction`, `HeightFogExtinction`, `HeightFogFalloff`, `HeightFogOffset`
+ * and `FogAlbedo` carry over; the shapes of the two terms are kansei's own, so the look may need
+ * a trim.
+ */
+export class LocalFogVolume {
+    shape: LocalFogShape = 'ellipsoid';
+    center: [number, number, number];
+    /** Semi-axes of the ellipsoid, or half extents of the box, metres. */
+    radii: [number, number, number];
+    /** Rotation about +Y, radians (as `Object3D.rotation.y`). */
+    yaw = 0;
+    /** Extinction per metre at the centre, falling to zero at the surface. */
+    radialExtinction = 1;
+    /** Extinction per metre at and below `heightOffset`, falling off above it. */
+    heightExtinction = 0;
+    /** Exponential falloff per unit of the volume's half height. */
+    heightFalloff = 1000;
+    /** Height in the unit sphere (-1 bottom, 1 top) below which the height term is at full strength. */
+    heightOffset = 0;
+    albedo: [number, number, number] = [1, 1, 1];
+    /** Fraction of the radius over which the fog fades out at the surface (0: a hard edge). */
+    edgeFade = 0.25;
+
+    /**
+     * An axis-aligned ellipsoid of `radius` across and `halfHeight` up and down, with Unreal's
+     * defaults otherwise: radial extinction 1, no height term, a soft edge.
+     */
+    constructor(center: [number, number, number], radius: number, halfHeight: number) {
+        this.center = [...center];
+        this.radii = [radius, halfHeight, radius];
+    }
+
+    /** A box of `halfExtents`, with radial extinction 1, no height term and a soft edge. */
+    static box(center: [number, number, number], halfExtents: [number, number, number]): LocalFogVolume {
+        const v = new LocalFogVolume(center, 1, 1);
+        v.shape = 'box';
+        v.radii = [...halfExtents];
+        return v;
+    }
+
+    /** Extinction per metre at a world-space point, as the fog shader computes it. */
+    extinctionAt(p: [number, number, number]): number {
+        const inv = this.radii.map((r) => 1 / Math.max(r, 1e-3));
+        const c = Math.cos(this.yaw), s = Math.sin(this.yaw);
+        const d = [p[0] - this.center[0], p[1] - this.center[1], p[2] - this.center[2]];
+        const q = [(c * d[0] - s * d[2]) * inv[0], d[1] * inv[1], (s * d[0] + c * d[2]) * inv[2]];
+        const r = this.shape === 'box' ? Math.max(Math.abs(q[0]), Math.abs(q[1]), Math.abs(q[2])) : Math.hypot(q[0], q[1], q[2]);
+        if (r >= 1) return 0;
+        const fade = Math.min(Math.max(this.edgeFade, 0), 1);
+        let edge = 1;
+        if (fade > 0) {
+            const t = Math.min(Math.max((1 - r) / fade, 0), 1);
+            edge = t * t * (3 - 2 * t);
+        }
+        const radial = Math.max(this.radialExtinction, 0) * (1 - r * r);
+        const height = Math.max(this.heightExtinction, 0) * Math.exp(-this.heightFalloff * Math.max(q[1] - this.heightOffset, 0));
+        return (radial + height) * edge;
+    }
+
+    /** The WGSL `LocalFogVolume` (volumetric_fog_media.wgsl) at float `offset` of `f32`/`u32`. */
+    writeGpu(f32: Float32Array, u32: Uint32Array, offset: number): void {
+        const inv = (r: number) => 1 / Math.max(r, 1e-3);
+        f32.set(this.center, offset);
+        f32[offset + 3] = Math.max(this.radialExtinction, 0);
+        f32.set(this.radii.map(inv), offset + 4);
+        f32[offset + 7] = Math.max(this.heightExtinction, 0);
+        f32.set(this.albedo, offset + 8);
+        f32[offset + 11] = this.heightFalloff;
+        f32[offset + 12] = Math.cos(this.yaw);
+        f32[offset + 13] = Math.sin(this.yaw);
+        f32[offset + 14] = this.heightOffset;
+        f32[offset + 15] = Math.min(Math.max(this.edgeFade, 0), 1);
+        u32.set([this.shape === 'box' ? 1 : 0, 0, 0, 0], offset + 16);
+    }
 }
 
 /** Bytes of the WGSL `FogParams`, `CompositeParams`, `FogMediaParams`. */
@@ -88,14 +183,15 @@ const COMPOSITE_WGSL = assemble([froxelCommon, fogComposite]);
 
 /**
  * Froxel volumetric fog, a port of the Rust `VolumetricFogEffect` on its WGSL: per froxel, a
- * height fog (flat below `fogHeight`, from `startDistance` to the `reach()`), lit by the
- * directional, point and area lights with their shadows (`ComputeShadows`) and by a uniform
- * `ambient` sky; jittered per frame on a temporal grid; integrated front to back and composited
- * over the scene.
+ * height fog (flat below `fogHeight`, from `startDistance` to the `reach()`) plus any
+ * `localVolumes`, lit by the directional, point and area lights with their shadows
+ * (`ComputeShadows`), by a uniform `ambient` sky and by a `SkyAtmosphere`'s sky lighting
+ * (`setSkyLighting`); jittered per frame on a temporal grid; integrated front to back and
+ * composited over the scene.
  *
- * Its spot lights, local fog volumes and sky lighting are bound to stand-ins (none) until those
- * land in the TS engine. The sky occlusion (`setSkyOcclusion`) dims the sky lighting only, so it
- * shows once the fog has a sky.
+ * Its spot lights and clipmap probes are bound to stand-ins (none) until those land in the TS
+ * engine. The sky occlusion (`setSkyOcclusion`) dims the sky lighting only, so it shows once the
+ * fog has a sky (`setSkyLighting`).
  */
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -115,6 +211,15 @@ class VolumetricFogEffect extends PostProcessingEffect {
     maxDistance: number;
     windDir: [number, number, number];
     ambient: [number, number, number];
+    /** Scattering albedo of the height fog: scattering = density * albedo. */
+    albedo: [number, number, number];
+    /** Scales the sky's light on the fog once a sky is bound (`setSkyLighting`); 1 is physical. */
+    skyAmbientScale: number;
+    /**
+     * Local fog volumes injected with the height fog, uploaded every frame (keep it to tens).
+     * Each scatters the fog's lights and sky with its own albedo.
+     */
+    localVolumes: LocalFogVolume[] = [];
     /**
      * Seconds, drives the wind offset. Null: the effect's own clock, from its construction. Rust
      * has no clock and sets `time` per frame.
@@ -127,6 +232,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _cubeMapShadowMap: CubeMapShadowMap | null = null;
     /** The sky occlusion's volume and parameters (`setSkyOcclusion`). */
     private _skyOcclusion: { volume: GPUTextureView; params: GPUBuffer } | null = null;
+    private _skyLighting: GPUBuffer | null = null;
+    /** The injection bind group is stale (a sky or sky occlusion bound, the volume buffer grown). */
     private _injectBGDirty = false;
 
     // Injection pass
@@ -137,10 +244,12 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _fogParamsBuffer: GPUBuffer | null = null;
     private _fogParams = new ArrayBuffer(FOG_PARAMS_BYTES);
 
-    // The media's stand-ins (volumetric_fog_media.wgsl): no local volumes, sky, sky occlusion (until
-    // `setSkyOcclusion`) or clipmap probes
+    // The media (volumetric_fog_media.wgsl): its parameters, the local volumes, and stand-ins for
+    // the sky lighting and the sky occlusion until they are bound, and the clipmap probes
     private _mediaParamsBuffer: GPUBuffer | null = null;
+    private _mediaParams = new ArrayBuffer(MEDIA_PARAMS_BYTES);
     private _volumesBuffer: GPUBuffer | null = null;
+    private _volumesData = new ArrayBuffer(LOCAL_FOG_VOLUME_BYTES);
     private _noSkyLighting: GPUBuffer | null = null;
     private _noOcclusionVolume: GPUTexture | null = null;
     private _noOcclusionParams: GPUBuffer | null = null;
@@ -174,6 +283,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
         this.maxDistance     = options.maxDistance ?? 0;
         this.windDir         = options.windDirection ?? [0, 0, 0];
         this.ambient         = options.ambient ?? [0, 0, 0];
+        this.albedo          = options.albedo ?? [1, 1, 1];
+        this.skyAmbientScale = options.skyAmbientScale ?? 1;
         if (options.cascadedShadowMap) this.setCascadedShadowMap(options.cascadedShadowMap);
         else this.setShadowMap(options.shadowMap ?? null);
         this.setPointShadows(options.cubeMapShadowMap ?? null);
@@ -236,6 +347,18 @@ class VolumetricFogEffect extends PostProcessingEffect {
     }
 
     /**
+     * Light the fog with a sky: `SkyAtmosphere.bindings.skyLighting`. The sky's radiance,
+     * convolved with the fog's phase function, scatters in every froxel (times
+     * `skyAmbientScale`), on top of `ambient`, so the fog takes the sky's colour and stays lit at
+     * dusk. Put the `AtmosphereEffect` before the fog in the chain, so the fog lies in front of
+     * the sky and its aerial perspective. Null unbinds it.
+     */
+    setSkyLighting(skyLighting: GPUBuffer | null): void {
+        this._skyLighting = skyLighting;
+        this._injectBGDirty = true;
+    }
+
+    /**
      * Collect the volumetric lights; call each frame before render(). The directional light the
      * shadow map was rendered from casts shafts through it; a point light the cube map drew reads
      * its faces; an area light scatters as a point light at its position, shadowed by the 2D map
@@ -261,9 +384,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
             minFilter: 'linear',
         });
 
-        // The media: the height fog's albedo 1 and the sky's scale 1, no local volumes, no sky
+        // The media: written every frame (`_uploadMedia`); the sky lighting's stand-in until one is bound
         this._mediaParamsBuffer = buffer('VolumetricFog/MediaParams', MEDIA_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
-        device.queue.writeBuffer(this._mediaParamsBuffer, 0, new Float32Array([1, 1, 1, 1, 0, 0, 0, 0]));
         this._volumesBuffer = buffer('VolumetricFog/LocalVolumes', LOCAL_FOG_VOLUME_BYTES, GPUBufferUsage.STORAGE);
         this._noSkyLighting = buffer('VolumetricFog/NoSkyLighting', SKY_LIGHTING_BYTES, GPUBufferUsage.UNIFORM);
         // no sky occlusion: its parameters zero (off, so skyVisibility is 1) and a 1-texel volume
@@ -344,7 +466,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 { binding: 2, resource: { buffer: this._fogParamsBuffer! } },
                 { binding: 10, resource: { buffer: this._mediaParamsBuffer! } },
                 { binding: 11, resource: { buffer: this._volumesBuffer! } },
-                { binding: 12, resource: { buffer: this._noSkyLighting! } },
+                { binding: 12, resource: { buffer: this._skyLighting ?? this._noSkyLighting! } },
                 { binding: 18, resource: this._skyOcclusion?.volume ?? this._noOcclusionVolume!.createView() },
                 { binding: 19, resource: this._accumSampler! },
                 { binding: 20, resource: { buffer: this._skyOcclusion?.params ?? this._noOcclusionParams! } },
@@ -355,6 +477,35 @@ class VolumetricFogEffect extends PostProcessingEffect {
         });
         this._injectTarget = target;
         this._injectBGDirty = false;
+    }
+
+    /** Upload the media parameters and the local volumes, growing the volume buffer if needed. */
+    private _uploadMedia(): void {
+        const device = this._device!;
+        const count = this.localVolumes.length;
+        const needed = count * LOCAL_FOG_VOLUME_BYTES;
+        if (needed > this._volumesBuffer!.size) {
+            this._volumesBuffer!.destroy();
+            const size = 2 ** Math.ceil(Math.log2(needed));
+            this._volumesBuffer = device.createBuffer({
+                label: 'VolumetricFog/LocalVolumes', size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            this._volumesData = new ArrayBuffer(size);
+            this._injectBGDirty = true;
+        }
+        if (count > 0) {
+            const f32 = new Float32Array(this._volumesData);
+            const u32 = new Uint32Array(this._volumesData);
+            this.localVolumes.forEach((v, i) => v.writeGpu(f32, u32, i * LOCAL_FOG_VOLUME_BYTES / 4));
+            device.queue.writeBuffer(this._volumesBuffer!, 0, this._volumesData, 0, needed);
+        }
+        // FogMediaParams: albedo, skyAmbientScale, numVolumes, hasSkyLighting, hasClipmapProbes
+        const f32 = new Float32Array(this._mediaParams);
+        const u32 = new Uint32Array(this._mediaParams);
+        f32.set(this.albedo, 0);
+        f32[3] = this.skyAmbientScale;
+        u32.set([count, this._skyLighting ? 1 : 0, 0, 0], 4);
+        device.queue.writeBuffer(this._mediaParamsBuffer!, 0, this._mediaParams);
     }
 
     private _buildCompositeBG(input: GPUTexture, depth: GPUTexture, output: GPUTexture): void {
@@ -393,8 +544,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
         const grid = this._froxelGrid;
         const time = this.time ?? (performance.now() - this._startTime) / 1000;
 
-        // the lights, and the bind group when they, a shadow map or the grid changed
-        if (this._shadows.prepare(device) || grid.scatterExtinctionTex !== this._injectTarget || this._injectBGDirty) {
+        // the media, the lights, and the bind group when they, a shadow map, the sky or the grid changed
+        this._uploadMedia();
+        if (this._shadows.prepare(device) || this._injectBGDirty || grid.scatterExtinctionTex !== this._injectTarget) {
             this._rebuildInjectBG();
         }
 
