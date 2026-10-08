@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei – Sky atmosphere</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #label { position: fixed; left: 12px; bottom: 10px; color: #fff8; font: 12px ui-monospace, monospace; }
+  </style>
+</head>
+
+<body>
+  <div id="label"></div>
+  <script type="module">
+    // Sky atmosphere: the TS twin of the Rust `sky-atmosphere` example. A physically based sky
+    // (Hillaire 2020, `SkyAtmosphere` + `AtmosphereEffect`) from noon to the Midsommar intro's
+    // dusk over a clearing in a ring of dark spruce proxies, with hills out to 15 km fading into
+    // the aerial perspective. Surfaces are lit by the sun the sky is rendered with
+    // (`sky.sunIlluminanceAt`) through the renderer's shadow map and by the sky itself (the
+    // `SkyLighting` SH, `SKY_LIGHTING_WGSL`), in lux and cd/m² exposed by EV100.
+    //
+    // Not here yet, as they come with later ports: the Rust page's chrome ball, rough ball and
+    // pond (the sky's environment cubemap), its volumetric clouds, froxel fog and local fog
+    // volume lit by the sky, and screen-space GI.
+    //
+    // URL parameters (all optional):
+    //   elevation  sun elevation in degrees (negative: below the horizon); default: a 60 s day
+    //              cycle between 32.5 and -7.5
+    //   bearing    sun bearing, degrees clockwise from north (default 140, the Midsommar sun)
+    //   look       view bearing (default: the sun's); pitch: view pitch in degrees (default 6)
+    //   height     camera height in metres (default 1.7; above ~30 it sees over the trees)
+    //   ev         EV100 exposure (default: follows the sun)
+    //   haze       Mie scattering x (Unreal's haze); ozone: absorbing layer x; moon=1: add a moon
+    //   preset=midsommar  the Unreal intro's light block: sun -2.5, haze 1.7, ozone 0.8, EV100 3.9,
+    //              analytic height fog past 120 m
+    //   capturefog=1  with the preset: the sky lighting sees the sky through its height fog, as
+    //              Unreal's sky light captures it (capturefog=ue: the fog below the horizon too,
+    //              rather than the lit ground)
+    //   profile=1  GPU time per pass (examples/profile-hud.js)
+    import { Canvas, run, param } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, ToneMapper, exposureFromEV100, toneMapOptionsForSurface, LENS_ATTENUATION_UE4 } from '../src/postprocessing/effects/ToneMapEffect'
+    import { AtmosphereEffect } from '../src/postprocessing/effects/AtmosphereEffect'
+    import { HeightFogEffect, heightFogLayerFromUnreal } from '../src/postprocessing/effects/HeightFogEffect'
+    import { SkyAtmosphere, skyCaptureFogFromHeightFog } from '../src/atmosphere/SkyAtmosphere'
+    import { directionFromElevationBearing } from '../src/atmosphere/AtmosphereParams'
+    import { SKY_LIGHTING_WGSL } from '../src/atmosphere/AtmosphereWGSL'
+    import { LIGHTS_WGSL, SHADOW_MAP_WGSL, GBUFFER_OUT_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { installProfileHud } from './profile-hud.js'
+
+    document.getElementById('label').textContent = location.search.slice(1).replaceAll('&', '  ');
+
+    // Lambertian surfaces lit by the scene's directional lights (in lux) with the renderer's
+    // shadow map, and by the sky: radiance = albedo / pi * (E_sun * cos * shadow + E_sky(n)).
+    // The Rust example's SURFACE_WGSL, without the clouds' shadow.
+    const SURFACE_WGSL = /* wgsl */`
+      struct MaterialUniforms { albedo: vec4<f32> };
+      @group(0) @binding(0) var<uniform> material: MaterialUniforms;
+      @group(0) @binding(1) var<uniform> sky: SkyLighting;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      struct VertexInput { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32> };
+      struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) world_position: vec3<f32>,
+                            @location(1) world_normal: vec3<f32> };
+
+      @vertex
+      fn vertex_main(input: VertexInput) -> VertexOutput {
+          var out: VertexOutput;
+          let world_pos = world_matrix * input.position;
+          out.clip_position = projection_matrix * view_matrix * world_pos;
+          out.world_position = world_pos.xyz;
+          out.world_normal = (normal_matrix * vec4<f32>(input.normal, 0.0)).xyz;
+          return out;
+      }
+
+      @fragment
+      fn fragment_main(input: VertexOutput) -> KanseiGBufferOut {
+          let n = normalize(input.world_normal);
+          let shadow = kansei_shadow_map(input.world_position, n);
+          var e = vec3<f32>(0.0);
+          for (var i = 0u; i < kansei_lights.num_directional; i++) {
+              let l = kansei_lights.directional[i];
+              // the sun (light 0) through its shadow map
+              e += l.color * max(dot(n, -normalize(l.direction)), 0.0) * select(1.0, shadow, i == 0u);
+          }
+          let albedo = material.albedo.rgb;
+          return kansei_gbuffer_out(albedo / 3.14159265 * (e + skyIrradiance(sky, n)), vec3<f32>(0.0), n, albedo);
+      }
+    `;
+
+    /** The query string's number for `name`, if it has one. */
+    const num = (name) => {
+      const v = param(name);
+      const n = v === null ? NaN : parseFloat(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    // preset=midsommar: the Unreal intro's light block (sun 2.5 degrees down, EV100 3.9)
+    const midsommar = param('preset') === 'midsommar';
+    const settings = {
+      elevation: num('elevation') ?? (midsommar ? -2.5 : null),
+      bearing: num('bearing') ?? 140,
+      look: num('look'),
+      pitch: num('pitch') ?? 6,
+      height: num('height') ?? 1.7,
+      ev: num('ev') ?? (midsommar ? 3.9 : null),
+    };
+
+    // EV100 for a sun elevation, keyed to the sky this atmosphere renders (EV100 = log2(L * 100 /
+    // 12.5) puts a luminance L at middle grey): clear daylight 15, twilight at -2.5 degrees ~8.
+    const autoEv100 = (elevation) => {
+      const curve = [[-8, 5], [-4, 7.3], [-2.5, 8.2], [0, 9.8], [2, 11.2], [6, 12.8], [15, 14.3], [40, 15]];
+      if (elevation <= curve[0][0]) return curve[0][1];
+      for (let i = 1; i < curve.length; i++) {
+        const [e0, v0] = curve[i - 1], [e1, v1] = curve[i];
+        if (elevation <= e1) return v0 + (v1 - v0) * (elevation - e0) / (e1 - e0);
+      }
+      return curve[curve.length - 1][1];
+    };
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    renderer.enableShadows({ resolution: 2048 });
+
+    const sky = new SkyAtmosphere(renderer.gpuDevice);
+    sky.sun.illuminance = [100000, 100000, 100000];
+    const haze = num('haze');
+    if (haze !== null) sky.params.mieScatteringScale *= haze;
+    const ozone = num('ozone');
+    if (ozone !== null) sky.params.otherAbsorptionScale *= ozone;
+    if (param('moon') !== null) {
+      sky.moon.direction = directionFromElevationBearing(18, settings.bearing + 150);
+      sky.moon.illuminance = [0.25, 0.25, 0.25];
+    }
+
+    const skyLighting = ComputeBuffer.fromExternal(sky.bindings.skyLighting, 'uniform');
+    const surfaceCode = [SKY_LIGHTING_WGSL, LIGHTS_WGSL, SHADOW_MAP_WGSL, GBUFFER_OUT_WGSL, SURFACE_WGSL].join('\n');
+    const surface = (label, albedo) => new Material(surfaceCode, {
+      label,
+      mrtOutputCount: 4,
+      bindings: [
+        {
+          binding: 0, visibility: GPUShaderStage.FRAGMENT, value: new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_UNIFORM,
+            usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+            buffer: new Float32Array([...albedo, 1]),
+          }),
+        },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: skyLighting },
+      ],
+    });
+
+    const scene = new Scene();
+    // a thin box rather than Rust's PlaneGeometry: the TS plane winds its triangles clockwise
+    // seen from its normal, so back-face culling hides its lit side
+    const ground = new Renderable(new BoxGeometry(40000, 0.02, 40000), surface('Ground', [0.08, 0.1, 0.06]));
+    ground.position.set(0, -0.01, 0);
+    ground.castShadow = false;
+    scene.add(ground);
+
+    // a clearing in a ring of spruce-sized proxies, jittered so the treeline is ragged
+    const hash = (i) => ((Math.imul(i, 2654435761) >>> 8) & 0xffff) / 65535;
+    const spruce = surface('Spruce', [0.04, 0.06, 0.035]);
+    for (let i = 0; i < 220; i++) {
+      const a = i / 220 * Math.PI * 2 + hash(i) * 0.02;
+      const r = 55 + hash(i + 1000) * 70;
+      const h = 12 + hash(i + 2000) * 14;
+      const w = 1.5 + hash(i + 3000) * 2.5;
+      const tree = new Renderable(new BoxGeometry(w, h, w), spruce);
+      tree.position.set(Math.sin(a) * r, h * 0.5, -Math.cos(a) * r);
+      tree.rotation.y = hash(i + 4000) * 3;
+      scene.add(tree);
+    }
+    const stone = new Renderable(new BoxGeometry(2, 1.2, 1.4), surface('Stone', [0.3, 0.3, 0.28]));
+    const d = directionFromElevationBearing(0, settings.look ?? settings.bearing);
+    stone.position.set(d[0] * 9 - 1.5, 0.6, d[2] * 9);
+    stone.rotation.y = 0.6;
+    scene.add(stone);
+
+    // hills from 1.5 to 15 km away, half buried ellipsoids: aerial perspective fades them into the sky
+    const hillMaterial = surface('Hill', [0.05, 0.08, 0.045]);
+    const hillGeometry = new SphereGeometry(1, 4);
+    for (let i = 0; i < 28; i++) {
+      const a = i / 28 * Math.PI * 2 + hash(i + 5000) * 0.2;
+      const r = 1500 * Math.pow(10, hash(i + 6000));
+      const rx = r * (0.12 + hash(i + 7000) * 0.2), ry = r * (0.02 + hash(i + 8000) * 0.03);
+      const hill = new Renderable(hillGeometry, hillMaterial);
+      hill.position.set(Math.sin(a) * r, 0, -Math.cos(a) * r);
+      hill.scale.set(rx, ry, rx * 0.6);
+      hill.rotation.y = a;
+      scene.add(hill);
+    }
+
+    const sun = new DirectionalLight([0, -1, 0], [0, 0, 0], 1);
+    sun.castShadow = true;
+    scene.add(sun);
+
+    // the chain: the sky and its aerial perspective, the far fog in front of them, the display transform
+    const effects = [new AtmosphereEffect(sky)];
+    if (midsommar) {
+      // intro_scene.json's light block, as create_intro_scene.py applies it in Unreal
+      sky.params.mieScatteringScale = 0.003996 * 1.7; // haze
+      sky.params.otherAbsorptionScale = 0.8; // ozone, set absolute by the script
+      // 100 000 lux, light colour (255, 222, 196) in linear
+      sky.sun.illuminance = [100000, 73000, 55200];
+      // far: Unreal's exponential height fog beyond its volumetric fog distance (120 m)
+      const heightFog = new HeightFogEffect(heightFogLayerFromUnreal(0.03, 0.1, 0));
+      heightFog.inscattering = [1.2, 1.45, 1.8];
+      heightFog.skyAmbientScale = 1;
+      heightFog.startDistance = 120;
+      heightFog.setSkyLighting(sky.bindings.skyLighting);
+      // capturefog=1: the sky lighting sees the sky through this fog, as Unreal's real-time
+      // sky-light capture does, from 6 m up; capturefog=ue also hides the lit ground from the
+      // lighting below the horizon (Unreal's capture itself, without Lumen)
+      const capture = param('capturefog');
+      if (capture !== null && capture !== '0') {
+        sky.captureFog = skyCaptureFogFromHeightFog(heightFog, 6);
+        sky.lightingSeesGround = capture !== 'ue';
+      }
+      effects.push(heightFog);
+    }
+    // the display transform: manual exposure (EV100 through Unreal 4's lens, set each frame), ACES
+    // and sRGB encoding, with the Rust example's one stop of compensation
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      exposure: exposureFromEV100(settings.ev ?? autoEv100(settings.elevation ?? 32.5), LENS_ATTENUATION_UE4),
+      exposureCompensation: 1,
+      tonemapper: ToneMapper.AcesFitted,
+    });
+    effects.push(tonemap);
+    const volume = new PostProcessingVolume(renderer, effects);
+    const camera = new Camera(62, 0.5, 60000, canvas.aspect);
+    const hud = installProfileHud({ renderer, FrameTimer, AbBench });
+
+    run(canvas, (frame) => {
+      hud.begin(performance.now());
+      frame.resize(renderer, camera);
+      const t = frame.time;
+      const elevation = settings.elevation ?? 12.5 + 20 * Math.cos(t * Math.PI * 2 / 60);
+      const sunDir = directionFromElevationBearing(elevation, settings.bearing);
+      sky.sun.direction = sunDir;
+
+      const look = directionFromElevationBearing(settings.pitch, settings.look ?? settings.bearing);
+      const eye = [0, settings.height, 0];
+      camera.position.set(eye[0], eye[1], eye[2]);
+      camera.lookAt(new Vector3(eye[0] + look[0], eye[1] + look[1], eye[2] + look[2]));
+
+      // the sun light the sky is rendered with
+      sun.direction = [-sunDir[0], -sunDir[1], -sunDir[2]];
+      sun.color = sky.sunIlluminanceAt(eye);
+      sun.intensity = 1;
+      tonemap.options.exposure = exposureFromEV100(settings.ev ?? autoEv100(elevation), LENS_ATTENUATION_UE4);
+
+      sky.update(camera);
+      volume.render(scene, camera);
+      hud.end(performance.now());
+    });
+  </script>
+</body>
+
+</html>
