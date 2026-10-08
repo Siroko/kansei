@@ -1,8 +1,93 @@
-/** The solver a `FluidSimulation` steps with: Smoothed Particle Hydrodynamics. */
-export type FluidSolver = 'sph';
+/**
+ * The solver a `FluidSimulation` steps with: Smoothed Particle Hydrodynamics (pressure and near
+ * pressure from the density, viscosity), or Position Based Fluids (a density constraint
+ * projected on the positions; `FluidSimulationOptions.pbf` configures it).
+ */
+export type FluidSolver = 'sph' | 'pbf';
 
 /** The `solver` word in `SimParams`, as the Rust engine packs it (0 = SPH, 1 = PBF). */
-export const SOLVER_WORD: Record<FluidSolver, number> = { sph: 0 };
+export const SOLVER_WORD: Record<FluidSolver, number> = { sph: 0, pbf: 1 };
+
+/**
+ * Position Based Fluids settings (Macklin & Müller 2013): the particles' positions are
+ * predicted, then projected `iterations` times onto a per-particle density constraint
+ * (`C_i = rho_i / rho_0 - 1`), with the tensile correction `s_corr` against clustering at the
+ * free surface; the velocity is the move over the step, then XSPH viscosity and vorticity
+ * confinement act on it. 3D only. Rust: `simulations::fluid::PbfOptions`.
+ */
+export interface PbfOptions {
+    /** Constraint projections per substep. */
+    iterations: number;
+    /**
+     * Rest density: what the poly6 kernel (unit mass) sums to at a particle at rest. For a
+     * lattice fill that is `latticeDensity(spacing, h)`, which tends to `1 / spacing³` only once
+     * the spacing is well under the smoothing radius.
+     */
+    restDensity: number;
+    /** The constraint's relaxation (CFM): larger is softer and steadier. */
+    relaxation: number;
+    /** Tensile correction `s_corr = -k (W(r) / W(dq))^n`, `dq` as a fraction of the smoothing radius. */
+    scorrK: number;
+    scorrN: number;
+    scorrDq: number;
+    /** XSPH viscosity: how much of the neighbours' mean relative velocity each particle takes. */
+    xsph: number;
+    /** Vorticity confinement strength. */
+    vorticity: number;
+    /** A cap on the particles' speed (simulation units per second; 0: none). */
+    maxSpeed: number;
+}
+
+export const DEFAULT_PBF_OPTIONS: PbfOptions = {
+    iterations: 3,
+    restDensity: 6.4,
+    relaxation: 5.0,
+    scorrK: 0.05,
+    scorrN: 4.0,
+    scorrDq: 0.2,
+    xsph: 0.1,
+    vorticity: 0.0,
+    maxSpeed: 0.0,
+};
+
+/**
+ * `PbfParams` (8 floats; Rust `GpuPbf::new`) for `o` at smoothing radius `h`, into `out`:
+ * `s_corr`'s `W(dq)` is poly6 at `dq·h`, normalised as the shaders' `W`.
+ */
+export function packPbfParams(o: PbfOptions, h: number, out: Float32Array): void {
+    const r = Math.min(Math.max(o.scorrDq, 0), 1) * h;
+    const q = h * h - r * r;
+    const wDq = 315.0 / (64.0 * Math.PI * Math.pow(h, 9)) * q * q * q;
+    out[0] = Math.max(o.restDensity, 1e-3);
+    out[1] = Math.max(o.relaxation, 1e-6);
+    out[2] = o.scorrK;
+    out[3] = o.scorrN;
+    out[4] = Math.max(wDq, 1e-12);
+    out[5] = o.xsph;
+    out[6] = o.vorticity;
+    out[7] = o.maxSpeed;
+}
+
+/**
+ * The density poly6 (smoothing radius `h`, unit mass) sums to at a particle of a cubic lattice
+ * `spacing` apart, itself included: Position Based Fluids' rest density
+ * (`PbfOptions.restDensity`) for a fluid filled on that lattice, so it keeps its volume. About
+ * `1 / spacing³` once `spacing` is well under `h`. Rust: `simulations::fluid::lattice_density`.
+ */
+export function latticeDensity(spacing: number, h: number): number {
+    const n = Math.ceil(h / spacing);
+    const poly6 = 315.0 / (64.0 * Math.PI * Math.pow(h, 9));
+    let rho = 0;
+    for (let i = -n; i <= n; i++) {
+        for (let j = -n; j <= n; j++) {
+            for (let k = -n; k <= n; k++) {
+                const d2 = (i * i + j * j + k * k) * spacing * spacing;
+                if (d2 < h * h) rho += poly6 * Math.pow(h * h - d2, 3);
+            }
+        }
+    }
+    return rho;
+}
 
 export interface FluidSimulationOptions {
     /** How many particles the buffers hold: the most there can be (see `FluidSimulation.emit`). */
@@ -30,8 +115,9 @@ export interface FluidSimulationOptions {
      * filaments (SPH's tensile instability); the near pressure still keeps particles apart.
      */
     negativePressureScale: number;
-    /** The solver (SPH only for now). */
+    /** The solver; `pbf` configures Position Based Fluids. */
     solver: FluidSolver;
+    pbf: PbfOptions;
 }
 
 export const DEFAULT_OPTIONS: FluidSimulationOptions = {
@@ -53,6 +139,7 @@ export const DEFAULT_OPTIONS: FluidSimulationOptions = {
     worldBoundsPadding: 0.2,
     negativePressureScale: 1.0,
     solver: 'sph',
+    pbf: DEFAULT_PBF_OPTIONS,
 };
 
 /**
