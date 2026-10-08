@@ -74,6 +74,32 @@ class ComputeBuffer extends BufferBase {
     }
 
     /**
+     * The same GPU buffer read as instance data of another layout, `stride` bytes apart with
+     * `attributes` (Rust `ComputeBuffer::with_vertex_layout` on a clone): what a geometry drawing
+     * culled instances with crossfades declares, the compacted instances being 4 bytes wider than
+     * the source (`InstanceCulling.withCrossfade`). Initializing it initializes this buffer.
+     */
+    public withVertexLayout(stride: number, attributes: IComputeBufferAttribute[]): ComputeBuffer {
+        const view = new ComputeBuffer({ type: this.type, usage: this.usage, stride, attributes });
+        view._layoutOf = this;
+        return view;
+    }
+
+    /** The buffer this one reads with another vertex layout (`withVertexLayout`). */
+    private _layoutOf?: ComputeBuffer;
+
+    public initialize(gpuDevice: GPUDevice): void {
+        const owner = this._layoutOf;
+        if (!owner) {
+            super.initialize(gpuDevice);
+            return;
+        }
+        if (!owner.initialized) owner.initialize(gpuDevice);
+        this._resource = owner.gpuBuffer;
+        this.initialized = true;
+    }
+
+    /**
      * Clones the current buffer
      * @returns A new buffer instance with the same data
      */

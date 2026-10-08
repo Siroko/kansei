@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - impostors</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #eee; }
+    #panel { position: fixed; left: 12px; top: 12px; padding: 8px 10px; background: rgba(0, 0, 0, 0.6); border-radius: 4px; }
+    #hud, #bench { margin: 0; white-space: pre-wrap; }
+    label { cursor: pointer; }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <label><input type="checkbox" id="impostors" checked /> impostors (I)</label>
+    <pre id="hud"></pre>
+    <pre id="bench"></pre>
+  </div>
+  <script type="module">
+    // Impostors: a lake ringed by a forest of spruces (40 000 by default), the Rust impostors
+    // example's scene. The spruces have two mesh LODs and, beyond `far` metres, an octahedral
+    // impostor baked at start-up from the nearest LOD (`Renderer.bakeImpostor`): a billboard per
+    // tree whose material (`IMPOSTOR_WGSL`) reads the albedo, normal and depth of the three baked
+    // views nearest its view direction and shades them as the mesh's material does. All three
+    // share one instance buffer, culled per view on the GPU (`InstanceCulling`), and `fade=`
+    // dissolves each LOD into the next (`withCrossfade`, `LOD_FADE_WGSL`). The Rust example also
+    // mirrors the forest in the lake (a planar reflection) and resolves the dither with TAA; the
+    // TS engine has neither yet, so here the lake reflects the sky's gradient only.
+    //
+    // The HUD shows the instances drawn for the camera (`Renderer.cullingStats`), the bake time
+    // and the GPU time. Keys: I toggles the impostors (off: the coarser mesh LOD reaches the
+    // horizon), C cycles the camera.
+    //
+    // URL parameters: `cam=shore|low|high|fly|forest`, `impostors=0`, `trees=<n>`,
+    // `far=<metres>` (where the impostors start), `depth=1` (the impostors write the depth of the
+    // surface they find), `frames=<n>` and `frame=<texels>` (the bake), `fade=<metres>` (dithered
+    // crossfades that wide between the LODs and into the impostors), `showfade=1` (tint the
+    // fading instances: red fading out, blue fading in), `shadows=1` (the sun's shadow map: the
+    // trees and impostors cast through their shadow fragment entries, cut out and dissolving as
+    // on screen; it costs: an impostor's shadow fragment discards, so every map texel its
+    // billboard covers is shaded, tens of milliseconds where hundreds of them fill a 4096 map,
+    // against a millisecond for the mesh LODs), `t=<seconds>` (freeze the `fly` and `forest` paths), `size=<w>x<h>`,
+    // `bench=1` (alternate the impostors on and off every 3 s, 8 times, and report the mean GPU
+    // time and frame interval of each), `bench=fade` (alternate the crossfades, `fade=` or 20 m,
+    // on and off), `bench=bands` (alternate their width between `fade=` and a millimetre),
+    // `dpr=<ratio>`; `profile=1` (each pass's GPU time) through profile-hud.js.
+    import { Canvas, run, param, paramOr, flag, setText, checkbox, thousands, Keys } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { HeightfieldGeometry } from '../src/geometries/HeightfieldGeometry'
+    import { SpruceGeometry } from '../src/geometries/SpruceGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { hash01 } from '../src/math/hash01'
+    import { InstanceCulling, LOD_FADE_WGSL } from '../src/culling/InstanceCulling'
+    import { IMPOSTOR_WGSL, billboardGeometry } from '../src/impostors/Impostor'
+    import { INSTANCE_PLACEMENT_WGSL } from '../src/materials/Stock'
+    import { GBUFFER_OUT_WGSL, LIGHTS_WGSL, MOTION_VECTORS_WGSL, SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
+
+    let canvas = Canvas.fill();
+    const size = (param('size') ?? '').split('x').map(Number);
+    if (size.length === 2 && size.every((n) => n > 0)) canvas = canvas.withSize(size[0], size[1]);
+    const renderer = await canvas.renderer({ sampleCount: 1 });
+    renderer.setCullingStats(true);
+
+    // The sun: its travel direction and illuminance (lux).
+    const SUN_DIR = [0.4, -0.55, 0.7];
+    const SUN = [9000 * Math.PI, 7600 * Math.PI, 6000 * Math.PI];
+    const shadows = flag('shadows', false);
+
+    // The scene's directional light (the sun, shadowed with `shadows=1`), sky and haze, shared by
+    // the meshes and the impostors so they match. Prefixed with LIGHTS_WGSL, GBUFFER_OUT_WGSL and
+    // INSTANCE_PLACEMENT_WGSL (and SHADOW_MAP_WGSL with shadows).
+    const SHADE_WGSL = /* wgsl */`
+      fn eye_of(view: mat4x4<f32>) -> vec3<f32> {
+        let view3 = mat3x3<f32>(view[0].xyz, view[1].xyz, view[2].xyz);
+        return -(transpose(view3) * view[3].xyz);
+      }
+
+      fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, eye: vec3<f32>) -> vec3<f32> {
+        let sky = mix(vec3<f32>(60.0, 55.0, 45.0), vec3<f32>(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5);
+        var sun = vec3<f32>(0.0);
+        for (var i = 0u; i < kansei_lights.num_directional; i++) {
+          let light = kansei_lights.directional[i];
+          sun += light.color / 3.14159265 * max(dot(n, -normalize(light.direction)), 0.0);
+        }
+        ${shadows ? 'sun *= kansei_shadow_map(world, n);' : ''}
+        let lit = albedo * (sky + sun);
+        let haze = 1.0 - exp(-distance(world, eye) * 0.0015);
+        return mix(lit, vec3<f32>(1500.0, 1700.0, 2000.0), haze);
+      }
+    `;
+
+    // The terrain and the spruce meshes: albedo from the material (trunks brown), lit by `shade`.
+    const SURFACE_WGSL = /* wgsl */`
+      struct Surface { base_color: vec4<f32>, params: vec4<f32> };
+      @group(0) @binding(0) var<uniform> surface: Surface;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>, TREE_INPUT };
+      struct VOut {
+        @builtin(position) @invariant clip: vec4<f32>,
+        @location(0) normal: vec3<f32>,
+        @location(1) world: vec3<f32>,
+        @location(2) albedo: vec3<f32>,
+        @location(3) @interpolate(flat) lod_fade: f32,
+      };
+
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+        var world = (world_matrix * vec4<f32>(v.position.xyz, 1.0)).xyz;
+        var n = v.normal;
+        var albedo = surface.base_color.rgb;
+        TREE_PLACE
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * vec4<f32>(world, 1.0);
+        out.normal = n;
+        out.world = world;
+        out.albedo = albedo;
+        out.lod_fade = FADE_VALUE;
+        return out;
+      }
+
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        FADE_DISCARD
+        let n = normalize(in.normal);
+        return kansei_gbuffer_out(FADE_TINT(shade(in.albedo, n, in.world, eye_of(view_matrix))), vec3<f32>(0.0), n, in.albedo);
+      }
+
+      // the shadow map's: the crossfade's pixels only
+      @fragment
+      fn shadow_main(in: VOut) {
+        FADE_DISCARD
+      }
+    `;
+
+    // The impostor: a billboard per spruce, read from the baked atlases, shaded as the meshes.
+    const IMPOSTOR_MATERIAL_WGSL = /* wgsl */`
+      @group(0) @binding(0) var<uniform> impostor: KanseiImpostor;
+      @group(0) @binding(1) var albedo_atlas: texture_2d<f32>;
+      @group(0) @binding(2) var normal_depth_atlas: texture_2d<f32>;
+      @group(0) @binding(3) var atlas_sampler: sampler;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+
+      struct VIn {
+        @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>,
+        @location(3) inst: vec4<f32>, @location(4) extra: vec4<f32>, FADE_INPUT
+      };
+      struct VOut {
+        @builtin(position) clip: vec4<f32>,
+        @location(0) local: vec3<f32>,
+        @location(1) eye: vec3<f32>,
+        @location(2) inst: vec4<f32>,
+        @location(3) extra: vec4<f32>,
+        @location(4) @interpolate(flat) lod_fade: f32,
+      };
+      // KanseiGBufferOut, and with depth=1 the depth of the surface found
+      struct ImpostorOut {
+        @location(0) color: vec4<f32>,
+        @location(1) emissive: vec4<f32>,
+        @location(2) normal: vec4<f32>,
+        @location(3) albedo: vec4<f32>,
+        DEPTH_OUTPUT
+      };
+
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+        // the camera in the tree's own space, the billboard there, then placed as the tree; an
+        // orthographic view (the sun's shadow map) from far along its view direction, its
+        // camera's position being anywhere in the scene
+        var eye_world = eye_of(view_matrix);
+        if (projection_matrix[3][3] == 1.0) {
+          eye_world = v.inst.xyz + vec3<f32>(view_matrix[0].z, view_matrix[1].z, view_matrix[2].z) * 1.0e4;
+        }
+        let eye = kansei_unplace(eye_world, v.inst, v.extra.x);
+        let local = kansei_impostor_corner(impostor, v.position.xy, eye);
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * vec4<f32>(kansei_place(local, v.inst, v.extra.x), 1.0);
+        out.local = local;
+        out.eye = eye;
+        out.inst = v.inst;
+        out.extra = v.extra;
+        out.lod_fade = FADE_VALUE;
+        return out;
+      }
+
+      @fragment
+      fn fragment_main(in: VOut) -> ImpostorOut {
+        FADE_DISCARD
+        let s = kansei_impostor_sample(impostor, albedo_atlas, normal_depth_atlas, atlas_sampler, in.local, in.eye);
+        if (s.alpha < 0.5) {
+          discard;
+        }
+        let world = kansei_place(s.position, in.inst, in.extra.x);
+        let n = kansei_turn(s.normal, in.extra.x);
+        // baked with the tint neutral: this tree's own
+        let albedo = s.albedo * (0.7 + 0.6 * in.extra.y);
+        let base = kansei_gbuffer_out(FADE_TINT(shade(albedo, n, world, eye_of(view_matrix))), vec3<f32>(0.0), normalize(n), albedo);
+        let clip = projection_matrix * view_matrix * vec4<f32>(world, 1.0);
+        return ImpostorOut(base.color, base.emissive, base.normal, base.albedo DEPTH_VALUE);
+      }
+
+      // the shadow map's: the billboard facing the light, cut out by the coverage
+      @fragment
+      fn shadow_main(in: VOut) {
+        FADE_DISCARD
+        let s = kansei_impostor_sample(impostor, albedo_atlas, normal_depth_atlas, atlas_sampler, in.local, in.eye);
+        if (s.alpha < 0.5) {
+          discard;
+        }
+      }
+    `;
+
+    // The sky's colour by direction, for the sky and the lake it shows in.
+    const SKY_COLOR_WGSL = /* wgsl */`
+      fn sky_color(d: vec3<f32>) -> vec3<f32> {
+        return mix(vec3<f32>(1500.0, 1700.0, 2000.0), vec3<f32>(500.0, 800.0, 1500.0), saturate(d.y * 3.0));
+      }
+    `;
+
+    const SKY_WGSL = /* wgsl */`
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      struct VOut { @builtin(position) clip: vec4<f32>, @location(0) dir: vec3<f32> };
+      @vertex
+      fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * vec4<f32>(position.xyz, 1.0);
+        out.dir = position.xyz;
+        return out;
+      }
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        let d = normalize(in.dir);
+        return kansei_gbuffer_out(sky_color(d), vec3<f32>(0.0), -d, vec3<f32>(0.0));
+      }
+    `;
+
+    // The lake: a Fresnel mix of a dark body colour and the sky it reflects.
+    const WATER_WGSL = /* wgsl */`
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+      struct VOut { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32> };
+      @vertex
+      fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+        let world = world_matrix * position;
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * world;
+        out.world = world.xyz;
+        return out;
+      }
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+        let v = normalize(-(transpose(view3) * view_matrix[3].xyz) - in.world);
+        let r = sky_color(reflect(-v, vec3<f32>(0.0, 1.0, 0.0)));
+        let fresnel = 0.02 + 0.98 * pow(1.0 - saturate(v.y), 5.0);
+        return kansei_gbuffer_out(mix(vec3<f32>(20.0, 30.0, 30.0), r, max(fresnel, 0.35)), vec3<f32>(0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
+      }
+    `;
+
+    // `showfade=1`: fading out red, fading in blue.
+    const FADE_TINT_WGSL = /* wgsl */`
+      fn fade_tint(fade: f32, color: vec3<f32>) -> vec3<f32> {
+        if (fade >= 1.0) { return color; }
+        return select(vec3<f32>(6000.0, 300.0, 300.0), vec3<f32>(300.0, 300.0, 6000.0), fade < 0.0);
+      }
+    `;
+
+    /**
+     * The shader with the fade's placeholders filled: the instance attribute, the varying's value,
+     * the discard (and the tint) for instanced renderables when the crossfades (`fade.width`) are on.
+     */
+    function applyFade(fade, shader, instanced) {
+      const on = fade.width > 0 && instanced;
+      const prefix = on ? `${MOTION_VECTORS_WGSL}\n${LOD_FADE_WGSL}\n${FADE_TINT_WGSL}\n` : '';
+      return prefix + shader
+        .replace('FADE_INPUT', on ? '@location(5) lod_fade: f32,' : '')
+        .replaceAll('FADE_VALUE', on ? 'v.lod_fade' : '1.0')
+        .replaceAll('FADE_DISCARD', on ? 'if (kansei_lod_fade_discard(in.lod_fade, in.clip.xy, kansei_camera_temporal.frame)) { discard; }' : '')
+        .replaceAll('FADE_TINT(', on && fade.show ? 'fade_tint(in.lod_fade, ' : '(');
+    }
+
+    const prelude = `${LIGHTS_WGSL}\n${shadows ? SHADOW_MAP_WGSL : ''}\n${GBUFFER_OUT_WGSL}\n${INSTANCE_PLACEMENT_WGSL}\n${SHADE_WGSL}`;
+    const uniform = (values) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: values instanceof Float32Array ? values : new Float32Array(values),
+    });
+
+    function surfaceMaterial(label, base, tree, fade) {
+      const input = tree
+        ? '@location(3) inst: vec4<f32>, @location(4) extra: vec4<f32>,' + (fade.width > 0 ? ' @location(5) lod_fade: f32,' : '')
+        : '';
+      // trunks brown; each tree tinted
+      const place = tree
+        ? `albedo = select(albedo, vec3<f32>(0.09, 0.06, 0.04), length(v.position.xz) < 0.04);
+           albedo *= 0.7 + 0.6 * v.extra.y;
+           world = kansei_place(v.position.xyz, v.inst, v.extra.x);
+           n = kansei_turn(v.normal, v.extra.x);`
+        : '';
+      const fading = tree && fade.width > 0;
+      return new Material(`${prelude}\n${applyFade(fade, SURFACE_WGSL.replace('TREE_INPUT', input).replace('TREE_PLACE', place), tree)}`, {
+        label,
+        mrtOutputCount: 4,
+        shadowFragmentEntry: fading ? 'shadow_main' : undefined,
+        bindings: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: uniform([...base, 1, 0, 0, 0, 0]) }],
+      });
+    }
+
+    /** Half the side of the square the forest covers, in metres. */
+    const EXTENT = 700;
+    /** The lake's radius (roughly: its shore follows the terrain) and level. */
+    const LAKE = 170;
+    const LAKE_LEVEL = 0;
+    const clamp01 = (x) => Math.min(Math.max(x, 0), 1);
+
+    /** Terrain height: a basin holding the lake, rising to hills round it. */
+    function ground(x, z) {
+      const r = Math.hypot(x, z);
+      const basin = -6 + 16 * clamp01((r - LAKE + 40) / 120) ** 2;
+      const hills = 30 * clamp01((r - 350) / 300) * (0.6 + 0.4 * Math.sin(x * 0.004) * Math.cos(z * 0.005));
+      const roll = 2.5 * Math.sin(x * 0.031) * Math.cos(z * 0.027) + 1.5 * Math.sin(x * 0.083 + z * 0.061);
+      return basin + hills + roll * clamp01((r - LAKE) / 60);
+    }
+
+    const scene = new Scene();
+    const sky = new Renderable(new SphereGeometry(2500, 32, 16), new Material(`${GBUFFER_OUT_WGSL}\n${SKY_COLOR_WGSL}\n${SKY_WGSL}`, { label: 'Sky', cullMode: 'none', mrtOutputCount: 4 }));
+    sky.castShadow = false;
+    scene.add(sky);
+    const sun = new DirectionalLight(SUN_DIR, SUN, 1);
+    sun.castShadow = shadows;
+    scene.add(sun);
+    if (shadows) renderer.enableShadows({ resolution: 4096, maxShadowDistance: 200 });
+
+    const benchKind = param('bench');
+    const benchFade = benchKind === 'fade';
+    const fade = {
+      width: paramOr('fade', benchFade || benchKind === 'bands' ? 20 : 0),
+      show: flag('showfade', false),
+    };
+    // bench=fade: a set of LODs without crossfades beside the one with them, drawn in turn
+    const fades = benchFade ? [{ width: 0, show: false }, fade] : [fade];
+    scene.add(new Renderable(new HeightfieldGeometry([-EXTENT, -EXTENT], [EXTENT, EXTENT], [280, 280], ground).withLabel('Terrain'),
+      surfaceMaterial('Terrain', [0.09, 0.1, 0.05], false, fade)));
+
+    // the forest round the lake: base xyz and height, then yaw and tint, 32 bytes a tree
+    const trees = paramOr('trees', 40000);
+    const data = new Float32Array(trees * 8);
+    for (let i = 0, n = 0; n < trees;) {
+      i++;
+      const x = -EXTENT + hash01(i) * 2 * EXTENT;
+      const z = -EXTENT + hash01((i ^ 0x5bd1e995) >>> 0) * 2 * EXTENT;
+      if (ground(x, z) < LAKE_LEVEL + 1) continue;
+      const h = 14 + 12 * hash01(Math.imul(i, 3) + 7);
+      data.set([x, ground(x, z) - 0.3, z, h, hash01(i + 11) * 2 * Math.PI, hash01(i + 23), 0, 0], n * 8);
+      n++;
+    }
+    // one instance buffer for every LOD: their geometries' instance vertex buffer and the
+    // culling's source (VERTEX and STORAGE)
+    const attributes = [
+      { shaderLocation: 3, offset: 0, format: 'float32x4' },
+      { shaderLocation: 4, offset: 16, format: 'float32x4' },
+    ];
+    const forest = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_STORAGE,
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_STORAGE,
+      buffer: data,
+      stride: 32,
+      attributes,
+    });
+    // with crossfades the culled instances carry their fade after the 32 bytes
+    const instances = (fade) => fade.width > 0
+      ? forest.withVertexLayout(36, [...attributes, { shaderLocation: 5, offset: 32, format: 'float32' }])
+      : forest;
+    // a box from the ground to the top of a tree (x its height), as wide as its lowest cone
+    const culling = (near, far, fade) => new InstanceCulling(forest, trees, 32, 0, 1.0)
+      .withRadiusScale(12)
+      .withLodRange(near, far)
+      .withBoundsShift([0, 0.5, 0])
+      .withBoundsBox([0.25, 0.5, 0.25])
+      .withCrossfade(fade.width);
+    const far = paramOr('far', 120);
+    const lodSets = fades.map((fade) => [
+      [new SpruceGeometry(48, 6, 6).withLabel('Spruce/LOD0'), 0, 50],
+      [new SpruceGeometry(16, 2, 5).withLabel('Spruce/LOD1'), 50, far],
+    ].map(([geometry, near, bandFar]) => {
+      const r = new Renderable(new InstancedGeometry(geometry, trees, [instances(fade)]), surfaceMaterial(geometry.label, [0.05, 0.09, 0.05], true, fade));
+      r.instanceCulling = culling(near, bandFar, fade);
+      scene.add(r);
+      return r;
+    }));
+
+    // the impostor, baked from the nearest LOD with a neutral instance (at the origin, height 1,
+    // unturned, the tint that leaves the albedo as it is, and with crossfades all of the fade)
+    const frames = paramOr('frames', 12);
+    const frameSize = paramOr('frame', 128);
+    const before = performance.now();
+    const impostor = renderer.bakeImpostor([lodSets[0][0]], {
+      frames,
+      frameSize,
+      instance: new Float32Array([0, 0, 0, 1, 0, 0.5, 0, 0, 1].slice(0, fades[0].width > 0 ? 9 : 8)),
+    });
+    // the bake's GPU work, finished (it is submitted at once)
+    await renderer.gpuDevice.queue.onSubmittedWorkDone();
+    const bakeMs = performance.now() - before;
+    // depth=1: the impostors write the depth of the surface they find (it costs: see IMPOSTOR_WGSL)
+    const impostorShader = flag('depth', false)
+      ? IMPOSTOR_MATERIAL_WGSL.replace('DEPTH_OUTPUT', '@builtin(frag_depth) depth: f32,').replace('DEPTH_VALUE', ', clip.z / clip.w')
+      : IMPOSTOR_MATERIAL_WGSL.replace('DEPTH_OUTPUT', '').replace('DEPTH_VALUE', '');
+    const atlasSampler = new Sampler('linear', 'linear', 'clamp-to-edge');
+    const sets = fades.map((fade, k) => {
+      const material = new Material(`${IMPOSTOR_WGSL}\n${prelude}\n${applyFade(fade, impostorShader, true)}`, {
+        label: 'Spruce/Impostor',
+        mrtOutputCount: 4,
+        cullMode: 'none',
+        shadowFragmentEntry: 'shadow_main',
+        bindings: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: uniform(impostor.params()) },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: impostor.albedoTexture() },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: impostor.normalDepthTexture() },
+          { binding: 3, visibility: GPUShaderStage.FRAGMENT, value: atlasSampler },
+        ],
+      });
+      const billboards = new Renderable(new InstancedGeometry(billboardGeometry('Spruce/Impostor'), trees, [instances(fade)]), material);
+      billboards.instanceCulling = culling(far, Infinity, fade);
+      scene.add(billboards);
+      return { lods: lodSets[k], impostor: billboards, fade: fade.width };
+    });
+
+    // the lake
+    const lake = new Renderable(new PlaneGeometry(2 * LAKE + 200, 2 * LAKE + 200),
+      new Material(`${GBUFFER_OUT_WGSL}\n${SKY_COLOR_WGSL}\n${WATER_WGSL}`, { label: 'Water', cullMode: 'none', mrtOutputCount: 4 }));
+    lake.rotation.x = -Math.PI / 2;
+    lake.position.set(0, LAKE_LEVEL, 0);
+    lake.castShadow = false;
+    scene.add(lake);
+
+    const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(11) });
+    const volume = new PostProcessingVolume(renderer, [tonemap]);
+
+    const camera = new Camera(45, 0.3, 4000, canvas.aspect);
+
+    const CAMS = ['shore', 'low', 'high', 'fly', 'forest'];
+    function placeCamera(cam, t) {
+      let from, to;
+      switch (cam) {
+        // on the south shore, looking across the lake at the far treeline
+        case 'shore': from = [0, 3, LAKE + 10]; to = [0, 4, -LAKE]; break;
+        // just above the water
+        case 'low': from = [-60, 0.6, 60]; to = [40, 2, -LAKE]; break;
+        case 'high': from = [-300, 160, 320]; to = [0, 0, -80]; break;
+        // a crane over the water by the south shore, rising from 4 m to 36 m and back, looking at
+        // the forest: its trees cross the LODs' bands one way, then back
+        case 'forest': from = [0, 20 - 16 * Math.cos(t * 0.2), LAKE - 30]; to = [0, 8, LAKE + 150]; break;
+        // round the lake, over the water
+        default: {
+          const a = t * 0.04;
+          const r = LAKE * 0.7;
+          from = [r * Math.cos(a), 4, r * Math.sin(a)];
+          to = [r * Math.cos(a + 0.9), 3, r * Math.sin(a + 0.9)];
+        }
+      }
+      camera.position.set(...from);
+      camera.lookAt(new Vector3(...to));
+    }
+
+    /** Draw LOD set `set`, its far band the impostors or the coarse mesh LOD, its crossfades `width` wide. */
+    function setLods(set, impostors, width) {
+      sets.forEach((s, k) => {
+        for (const r of [...s.lods, s.impostor]) {
+          r.visible = k === set && (r !== s.impostor || impostors);
+          if (s.fade > 0) r.instanceCulling.crossfade = width;
+        }
+        s.lods[1].instanceCulling.lodRange[1] = impostors ? far : Infinity;
+      });
+    }
+
+    let cam = Math.max(CAMS.indexOf(param('cam')), 0);
+    const frozenT = Number(param('t') ?? NaN);
+    const toggle = checkbox('impostors');
+    if (toggle) toggle.checked = flag('impostors', true);
+    const keys = Keys.listen();
+    const timer = new FrameTimer(renderer.gpuDevice);
+    const hud = installProfileHud({ renderer, FrameTimer });
+    const benchWhat = { '1': 'impostors', fade: 'crossfades', bands: 'crossfade bands' }[benchKind];
+    const bench = benchWhat ? new AbBench([`${benchWhat} on`, 'off'], performance.now()) : null;
+    console.info(`Kansei — Impostors (TS) ready: ${trees} trees, impostor ${frames}x${frames} frames of ${frameSize} texels baked in ${bakeMs.toFixed(0)} ms`);
+
+    let gpuMs = 0, intervalMs = 0;
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      for (const key of keys.takePressed()) {
+        if (key === 'i' && toggle) toggle.checked = !toggle.checked;
+        if (key === 'c') cam = (cam + 1) % CAMS.length;
+      }
+      // the LOD set drawn (bench=fade alternates the two), whether the far band is impostors,
+      // and the crossfades' width
+      const phase = bench?.phase(performance.now());
+      const on = phase ? phase[0] === 0 : null;
+      const checked = toggle ? toggle.checked : true;
+      const last = sets.length - 1;
+      let set = last, impostors = checked;
+      if (benchWhat === 'impostors' && on !== null) impostors = on;
+      if (benchWhat === 'crossfades' && on !== null) set = on ? 1 : 0;
+      const width = benchWhat === 'crossfade bands' && on === false ? 1e-3 : sets[set].fade;
+      setLods(set, impostors, width);
+
+      placeCamera(CAMS[cam], Number.isFinite(frozenT) ? frozenT : frame.time);
+
+      const start = performance.now();
+      hud.begin(start);
+      timer.begin();
+      volume.render(scene, camera);
+      timer.end();
+      hud.end(performance.now());
+
+      intervalMs += (frame.dt * 1000 - intervalMs) * 0.05;
+      const gpu = timer.take();
+      for (const ms of gpu) gpuMs += (ms - gpuMs) * 0.05;
+      const report = bench?.record(gpu, performance.now());
+      if (report) {
+        console.info(report);
+        setText('bench', report);
+      }
+
+      if (frame.index % 10 === 0) {
+        const stats = renderer.cullingStats;
+        const camStats = stats?.views.find(([kind]) => kind === 'camera')?.[1];
+        const fadeWidth = sets[set].fade;
+        setText('hud', [
+          `${thousands(trees)} spruces · impostors ${impostors ? 'on' : 'off'} beyond ${far} m (I) · ` +
+            `${fadeWidth > 0 ? `crossfades ${fadeWidth} m` : 'no crossfades'} · camera ${CAMS[cam]} (C) · baked in ${bakeMs.toFixed(0)} ms`,
+          camStats ? `drawn: ${thousands(camStats.drawn)} for the camera (meshes and impostors)` : '',
+          `${renderer.renderWidth} x ${renderer.renderHeight} · GPU ${gpuMs.toFixed(2)} ms${timer.hasTimestamps ? '' : ' (no timestamps)'} · ${intervalMs.toFixed(1)} ms between frames`,
+        ].filter(Boolean).join('\n'));
+      }
+    });
+  </script>
+</body>
+
+</html>
