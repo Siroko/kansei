@@ -277,7 +277,7 @@
       }));
     }
     effects.push(tonemap);
-    const volume = new PostProcessingVolume(renderer, effects);
+    const volume = new PostProcessingVolume(renderer, effects, { msaaSampleCount: 4 });
 
     const camera = new Camera(45, 0.1, 400, window.innerWidth / window.innerHeight);
 

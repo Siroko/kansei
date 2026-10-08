@@ -941,7 +941,7 @@
       dof: false,
     };
 
-    const volume = new PostProcessingVolume(renderer, []);
+    const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 });
 
     function rebuildEffectChain() {
       volume.effects = [];

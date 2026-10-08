@@ -751,7 +751,7 @@
       useReSTIR: false,
     });
 
-    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect], { msaaSampleCount: 4 });
 
     // ── GPU BLAS deform + refit shaders ───────────────────────────────────
     const deformShaderCode = /* wgsl */`

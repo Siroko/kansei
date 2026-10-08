@@ -381,7 +381,7 @@ fn fragment_main(v: VOut) -> FragOut {
       const surface = fluidSurface.surfaceRenderable([0.2, 0.3, 0.3, 1.0]);
       surface.scale.set(1 / SIM, 1 / SIM, 1 / SIM);
       scene.add(surface);
-      const volume = new PostProcessingVolume(renderer, [fluidSurface]);
+      const volume = new PostProcessingVolume(renderer, [fluidSurface], { msaaSampleCount: 4 });
 
       // ── A splash: a sphere in the water pushing out for a moment (a capsule's expansion) ──
       let splash = null;

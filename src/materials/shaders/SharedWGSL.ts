@@ -22,6 +22,7 @@ import spotLightTypes from '../../../rust/kansei-core/src/shaders/spot_light_typ
 import spotLights from '../../../rust/kansei-core/src/shaders/spot_lights.wgsl?raw';
 import cascadedShadows from '../../../rust/kansei-core/src/shaders/cascaded_shadows.wgsl?raw';
 import lightClusters from '../../../rust/kansei-core/src/shaders/light_clusters.wgsl?raw';
+import taaResolve from '../../../rust/kansei-core/src/shaders/taa_resolve.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -57,6 +58,13 @@ export const LOCAL_EXPOSURE_WGSL: string = `${tonemapParams}\n${localExposure}`;
 export const BLOOM_DOWNSAMPLE_WGSL: string = bloomDownsample;
 export const BLOOM_UPSAMPLE_WGSL: string = bloomUpsample;
 export const BLOOM_COMPOSITE_WGSL: string = bloomComposite;
+
+/**
+ * `TemporalAAEffect`'s resolve (and temporal upscaler): `TaaParams` (240 bytes) at group 0
+ * binding 7, the frame, depth, velocity and history at bindings 0-3, the output and next
+ * history at 5-6. Rust: `postprocessing/effects/taa.rs`'s `WGSL`.
+ */
+export const TAA_RESOLVE_WGSL: string = taaResolve;
 
 /**
  * The GBuffer's four colour targets for a fragment shader (`KanseiGBufferOut`): return

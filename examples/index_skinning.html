@@ -342,7 +342,7 @@
       tonemapper: ToneMapper.AcesFitted,
       exposure: exposureFromEV100(paramOr('ev', 14.5)),
     });
-    const volume = new PostProcessingVolume(renderer, [tonemap]);
+    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
 
     const status = [
       `${count} skinned tentacles: ${gltf.skeleton.length} joints (${gltf.skeleton.names.join(' ')}),`,
