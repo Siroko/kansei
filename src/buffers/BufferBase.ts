@@ -94,6 +94,16 @@ class BufferBase implements IBindable {
     }
 
     /**
+     * Replace the data (the same size) and upload it at the next update (a material's on its next
+     * bind group).
+     */
+    public setData(data: Float32Array | Uint32Array | Int32Array): void {
+        if (this.buffer && data.byteLength !== this.buffer.byteLength) throw new Error(`setData: ${data.byteLength} bytes for a buffer of ${this.buffer.byteLength}`);
+        this.buffer = data;
+        this.needsUpdate = true;
+    }
+
+    /**
      * Updates the GPU buffer with the current data
      * @param gpuDevice The GPU device to update the buffer on
      */

@@ -11,7 +11,7 @@ struct KanseiStandardSurface {
     emissive  : vec4f,   // rgb emitted radiance (cd/m²)
     skyUp     : vec4f,   // rgb sky radiance from straight up (cd/m²)
     skyDown   : vec4f,   // rgb radiance from straight down (the ground's bounce)
-    params    : vec4f,   // roughness, metallic
+    params    : vec4f,   // roughness, metallic, traced (0 no, 1 reflective, 2 glass), the glass's ior
 }
 
 @group(0) @binding(0) var<uniform> kansei_surface : KanseiStandardSurface;
@@ -93,6 +93,20 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
     out.emissive = vec4f(emissive, 0.0);
     out.normal = vec4f(N * 0.5 + 0.5, 1.0);
     out.albedo = vec4f(base, 1.0);
+    // traced by rt::RtReflectionsEffect, as gbuffer_out.wgsl's kansei_gbuffer_out_specular and
+    // kansei_gbuffer_out_glass write them
+    let traced = kansei_surface.params.z;
+    if (traced > 1.5) {
+        // glass: what the effect refracts replaces the colour; the base colour is the tint
+        out.color = vec4f(emissive, 1.0);
+        out.normal.w = 1.0 / max(kansei_surface.params.w, 1.0);
+        out.albedo = vec4f(clamp(base, vec3f(0.0), vec3f(1.0)), 0.45 - 0.4 * clamp(roughness, 0.0, 1.0));
+    } else if (traced > 0.5) {
+        // reflective: F0 (a metal's brightest channel) and roughness; the diffuse albedo alone
+        let f0 = mix(0.04, max(base.r, max(base.g, base.b)), metallic);
+        out.normal.w = 1.0 - clamp(f0, 0.0, 1.0);
+        out.albedo = vec4f(base * (1.0 - metallic), 1.0 - 0.5 * clamp(roughness, 0.0, 1.0));
+    }
     KANSEI_VELOCITY_FRAGMENT
     return out;
 }

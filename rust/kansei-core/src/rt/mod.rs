@@ -40,7 +40,7 @@ mod scene;
 mod scene_grid;
 
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
-pub use effect::{RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
+pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
 pub use grid::{RtGrid, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
@@ -126,6 +126,8 @@ mod tests {
                 assert_eq!(struct_span(&trace, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
                 assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
             }
+            let glass = validate(&format!("glass (clipmap {clipmap})"), &super::effect::glass_wgsl(clipmap, custom));
+            assert_eq!(struct_span(&glass, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
         }
         let resolve = validate("reflection resolve", &super::effect::resolve_wgsl());
         assert_eq!(struct_span(&resolve, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
@@ -147,6 +149,15 @@ mod tests {
         assert_eq!(struct_span(&svgf, "AtrousParams"), std::mem::size_of::<super::diffuse::AtrousParamsGpu>());
         let composite = validate("gi composite", &super::diffuse::composite_wgsl());
         assert_eq!(struct_span(&composite, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
+    }
+
+    #[test]
+    fn surface_words_carry_their_flags() {
+        assert_eq!(RtSurface::new([1.0; 3]).surface_word(), 0);
+        assert_eq!(RtSurface::new([1.0; 3]).with_smooth_normals().surface_word(), 4);
+        assert_eq!(RtSurface::new([1.0; 3]).with_alpha_layer(2).with_smooth_normals().surface_word(), 1 | 2 << 8 | 4);
+        // glass (KANSEI_RT_GLASS) is smooth too
+        assert_eq!(RtSurface::glass([0.9; 3]).surface_word(), 4 | 8);
     }
 
     #[test]

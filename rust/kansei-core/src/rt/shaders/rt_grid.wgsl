@@ -27,6 +27,8 @@ struct KanseiRtHit {
 const KANSEI_RT_ANY_HIT : u32 = 1u;
 // alpha-tested triangles count as solid (no kansei_rt_covered)
 const KANSEI_RT_SOLID : u32 = 2u;
+// glass triangles (KANSEI_RT_GLASS) are hit; without it rays pass straight through them
+const KANSEI_RT_GLASS_HITS : u32 = 4u;
 const KANSEI_RT_BARY_EPSILON : f32 = 1e-6;
 
 fn kansei_rt_bounds_min() -> vec3f {
@@ -114,15 +116,19 @@ fn kansei_rt_intersect(o: vec3f, d: vec3f, v0: vec3f, e1: vec3f, e2: vec3f, tMin
     return vec3f(t, u, v);
 }
 
-// Test triangle `id`, closer than the hit so far; alpha-tested ones where kansei_rt_covered says.
+// Test triangle `id`, closer than the hit so far; alpha-tested ones where kansei_rt_covered says,
+// glass only with KANSEI_RT_GLASS_HITS.
 fn kansei_rt_test(hit: ptr<function, KanseiRtHit>, o: vec3f, d: vec3f, tMin: f32, id: u32, flags: u32) -> bool {
     let a = kansei_rt_triangles[id * 4u];
+    let surface = bitcast<u32>(a.w);
+    if ((surface & KANSEI_RT_GLASS) != 0u && (flags & KANSEI_RT_GLASS_HITS) == 0u) {
+        return false;
+    }
     let r = kansei_rt_intersect(o, d, a.xyz, kansei_rt_triangles[id * 4u + 1u].xyz, kansei_rt_triangles[id * 4u + 2u].xyz, tMin, (*hit).t);
     (*hit).tests += 1u;
     if (r.x < 0.0) {
         return false;
     }
-    let surface = bitcast<u32>(a.w);
     if ((surface & KANSEI_RT_ALPHA) != 0u && (flags & KANSEI_RT_SOLID) == 0u) {
         if (!kansei_rt_covered((surface >> 8u) & 255u, kansei_rt_uv(id, r.yz))) {
             return false;

@@ -13,6 +13,9 @@ import rtGather from '../../rust/kansei-core/src/rt/shaders/rt_gather.wgsl?raw';
 import rtReflectCommon from '../../rust/kansei-core/src/rt/shaders/rt_reflect_common.wgsl?raw';
 import rtReflectTrace from '../../rust/kansei-core/src/rt/shaders/rt_reflect_trace.wgsl?raw';
 import rtReflectResolve from '../../rust/kansei-core/src/rt/shaders/rt_reflect_resolve.wgsl?raw';
+import rtReflectHit from '../../rust/kansei-core/src/rt/shaders/rt_reflect_hit.wgsl?raw';
+import rtGlass from '../../rust/kansei-core/src/rt/shaders/rt_glass.wgsl?raw';
+import { SPOT_LIGHT_TYPES_WGSL } from '../materials/shaders/SharedWGSL';
 import rtGiCommon from '../../rust/kansei-core/src/rt/shaders/rt_gi_common.wgsl?raw';
 import rtGiTrace from '../../rust/kansei-core/src/rt/shaders/rt_gi_trace.wgsl?raw';
 import rtGiSvgf from '../../rust/kansei-core/src/rt/shaders/rt_gi_svgf.wgsl?raw';
@@ -54,7 +57,10 @@ export function rtGatherWgsl(placement: string): string {
     return `${assemble([rtTypes, rtGather])}\n${placement}`;
 }
 
-/** The voxel source's functions for the reflections' trace over a voxel volume (group 0 bindings 6-8). */
+/**
+ * The voxel source's functions for the reflections' trace over a voxel volume (group 0 bindings
+ * 6-8; its anisotropic mips at 40-45 for `srcIrradiance`, after `voxel_irradiance.wgsl`).
+ */
 const VOLUME_SOURCE_WGSL = /* wgsl */`
 @group(0) @binding(6) var<uniform> vol : VoxelVolume;
 @group(0) @binding(7) var volTex : texture_3d<f32>;
@@ -70,11 +76,26 @@ fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
 fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
     return voxelConeTrace(vol, volTex, volSampler, origin, dir, tanHalf, startDist, maxDist, steps);
 }
+// The irradiance a surface at p (normal n) receives from the voxels and the sky past them, as
+// voxel GI's composite gathers it: its six cones through the anisotropic mips (bindings 40-45,
+// RT_REFLECT_ANISO), else five through the isotropic ones.
+fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
+    if ((rp.flags & RT_REFLECT_ANISO) != 0u) {
+        return voxelIrradiance(vol, volTex, volSampler, sky, rp.skyScale, p, n, 0.0, vol.voxelSize, rp.maxDistance, 32u, 1.0).rgb;
+    }
+    var e = vec3f(0.0);
+    for (var k = 0u; k < VOXEL_HEMISPHERE_CONES; k++) {
+        let cone = voxelHemisphereCone(n, k);
+        let c = voxelConeTrace(vol, volTex, volSampler, p, cone.xyz, VOXEL_HEMISPHERE_TAN, 1.5 * vol.voxelSize, rp.maxDistance, 16u);
+        e += cone.w * (c.rgb + c.a * rp.skyScale * skyRadiance(sky, cone.xyz));
+    }
+    return e;
+}
 `;
 
 /**
- * The voxel source's functions for the trace (`srcVoxelSize`, `srcHitRadiance`, `srcCone`), over a
- * clipmap (`CLIPMAP_WGSL`'s group 0 bindings 50-57).
+ * The voxel source's functions for the trace (`srcVoxelSize`, `srcHitRadiance`, `srcCone`,
+ * `srcIrradiance`), over a clipmap (`CLIPMAP_WGSL`'s group 0 bindings 50-57).
  */
 const CLIPMAP_SOURCE_WGSL = /* wgsl */`
 fn srcVoxelSize(p: vec3f) -> f32 {
@@ -93,6 +114,12 @@ fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
 fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
     return clipConeTrace(origin, dir, n, tanHalf, srcVoxelSize(origin), startDist, maxDist, steps);
 }
+// The irradiance a surface at p (normal n) receives from the voxels and the sky past them, as
+// voxel GI's composite gathers it (its six cones).
+fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
+    let size = srcVoxelSize(p);
+    return clipIrradiance(sky, rp.skyScale, p, n, 0.0, size, 1.5 * size, rp.maxDistance, 16u).rgb;
+}
 `;
 
 /**
@@ -109,8 +136,20 @@ export const RT_DEFAULT_COVERED_WGSL = 'fn kansei_rt_covered(layer: u32, uv: vec
  * (`kansei_rt_covered`). Rust: `rt::effect::trace_wgsl(clipmap, covered)`.
  */
 export function rtReflectTraceWgsl(covered: string, clipmap: boolean = false): string {
-    const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}` : `${VOXEL_CONES_WGSL}${VOLUME_SOURCE_WGSL}`;
-    return `${SKY_LIGHTING_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${source}\n${rtReflectTrace}`;
+    return rtTracedWgsl(covered, clipmap, rtReflectTrace);
+}
+
+/**
+ * `RtReflectionsEffect`'s glass pass, prefixed as the trace. Rust: `rt::effect::glass_wgsl(clipmap,
+ * covered)`.
+ */
+export function rtGlassWgsl(covered: string, clipmap: boolean = false): string {
+    return rtTracedWgsl(covered, clipmap, rtGlass);
+}
+
+function rtTracedWgsl(covered: string, clipmap: boolean, main: string): string {
+    const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${VOLUME_SOURCE_WGSL}`;
+    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${source}\n${rtReflectHit}\n${main}`;
 }
 
 /** `RtReflectionsEffect`'s resolve. */
