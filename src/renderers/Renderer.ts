@@ -21,16 +21,18 @@ import {
 } from "./SharedLayouts";
 import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled, takeProfile } from "../profiling/Profiler";
 import { CULL_VIEW_BYTES, CullPipeline, CullView, OcclusionView, cullView, cullViewDraws, drawGeometry, packCullView } from "../culling/InstanceCulling";
-import { Occlusion, mainOcclusionView } from "../culling/Occlusion";
+import { MainView, Occlusion, mainOcclusionView } from "../culling/Occlusion";
 import type { DepthPyramid } from "../culling/DepthPyramid";
 import { CullViewKind, CullingStats, StatsReadback } from "../culling/CullingStats";
-import { mat4 } from "gl-matrix";
+import { mat4, vec3 } from "gl-matrix";
 import { SceneVoxelGi, SceneVoxelGiOptions } from "../gi/SceneVoxelGi";
 import { SceneVoxelClipmap, SceneVoxelClipmapOptions } from "../gi/SceneVoxelClipmap";
 import { bakeImpostor } from "../impostors/bakeImpostor";
 import type { Impostor, ImpostorOptions } from "../impostors/Impostor";
 import { SceneRtGrid, SceneRtGridOptions } from "../rt/SceneRtGrid";
 import type { PlanarReflection } from "../reflections/PlanarReflection";
+import { ClusterCulling, ClusterDepthDraw, ClusterGpu, ClusterView, Cut, InstanceSource, clusterViewOf, drawCut, instanceLayoutOf, projectionNear } from "../clusters/ClusterLod";
+import { clusterMeshBindGroupLayoutEntries } from "./SharedLayouts";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -406,6 +408,50 @@ class Renderer {
     public get depthPyramid(): DepthPyramid | null {
         return this._occlusion.pyramid(MAIN_VIEW);
     }
+
+    // Cluster LOD (`Renderable.clusters`): the cull's pipelines and views, the error budget in
+    // pixels, this frame's cuts (by renderable, the cull views it has one for), and the
+    // renderables the last frame drew on the camera's cluster path (the bundles recorded them so).
+    private _clusterCulling: ClusterCulling | null = null;
+    private _clusterThreshold: number = 1;
+    private _shadowClusterErrorScale: number = 1;
+    private _clusterCuts = new Map<Renderable, Set<number>>();
+    private _clustered: Renderable[] = [];
+    private _clusterMeshBGL: GPUBindGroupLayout | null = null;
+    private _clusterScratch = { viewProj: mat4.create(), inverse: mat4.create(), cascades: Array.from({ length: MAX_CASCADES }, () => mat4.create()) };
+
+    /**
+     * Cluster LOD's error budget (`Renderable.clusters`), in pixels at the render size: each
+     * cluster drawn is the coarsest whose simplification error the camera sees under it. 1 by
+     * default; 0 draws the full mesh. Rust: `set_cluster_error_threshold`.
+     */
+    public setClusterErrorThreshold(pixels: number): void {
+        this._clusterThreshold = Math.max(pixels, 0);
+    }
+
+    public get clusterErrorThreshold(): number { return this._clusterThreshold; }
+
+    /**
+     * How much coarser than the camera's the shadow maps' cluster cuts are (the directional map,
+     * spot lights and cascades): their budget is the error threshold times this (1 by default).
+     */
+    public setShadowClusterErrorScale(scale: number): void {
+        this._shadowClusterErrorScale = Math.max(scale, 0);
+    }
+
+    public get shadowClusterErrorScale(): number { return this._shadowClusterErrorScale; }
+
+    /** The shadow passes' cluster hook (`ClusterDepthDraw`): `r`'s cut for cull view `view`, if this frame has one. */
+    private _clusterDepthDraw: ClusterDepthDraw = (pass, r, view, depthFormat, bias, offset) => {
+        const cut = this._clusterCut(r, view);
+        if (!cut?.drawBindGroup) return false;
+        const device = this.device!;
+        // (its stage was generated for the camera's pipeline: the renderable is off the cluster path otherwise)
+        const pipeline = r.material.getClusterDepthPipeline(device, instanceLayoutOf(r), depthFormat, bias);
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(BindGroupSlot.Material, r.material.currentBindGroup ?? r.material.getBindGroup(device));
+        return drawCut(pass, cut, offset);
+    };
 
     // Spot lights (group 3 bindings 5-9): the scene's, packed each frame into a fixed-capacity
     // storage buffer (so bind groups never go stale), the shadow atlas once enabled, and the
@@ -1145,6 +1191,7 @@ class Renderer {
                     this.sampleCount
                 );
             }
+            this._prepareClusterPipelines(renderable, targets, false);
         });
 
         // The instances each view draws, then the shadow views and their uniforms, then the
@@ -1153,6 +1200,7 @@ class Renderer {
         this._updatePlanarReflectionCameras(camera);
         this._planShadowViews(stack, camera);
         this._runInstanceCulling(commandRenderEncoder, stack, camera, null);
+        this._runClusterCulling(commandRenderEncoder, stack, camera, this.height);
         this._encodeShadowPasses(commandRenderEncoder, stack);
         this._encodeVoxelGI(commandRenderEncoder, stack, camera);
         this._uploadShadowUniforms();
@@ -1198,6 +1246,7 @@ class Renderer {
         }
         passRenderEncoder.end();
         this.device!.queue.submit([commandRenderEncoder.finish()]);
+        this._clusterCulling?.submitted();
         this._endCulledFrame(camera);
         camera.endFrame();
         endProfiledFrame();
@@ -1387,6 +1436,7 @@ class Renderer {
             if (renderable.material.outputsVelocity && !renderable.material.transparent) {
                 renderable.material.getVelocityPipeline(this.device!, renderable.geometry.vertexBuffersDescriptors);
             }
+            this._prepareClusterPipelines(renderable, targets, true);
             // Mark initialized to skip initialize() which would build a
             // canvas-format pipeline that fails for shaders with @location(1).
             renderable.material.initialized = true;
@@ -1405,6 +1455,7 @@ class Renderer {
         // occlusion needs the GBuffer's single-sampled depth
         const depthSize: [number, number] | null = gbuffer.msaaSampleCount === 1 ? [gbuffer.width, gbuffer.height] : null;
         this._runInstanceCulling(commandEncoder, stack, camera, depthSize);
+        this._runClusterCulling(commandEncoder, stack, camera, gbuffer.height);
         this._runRtGrid(commandEncoder, stack);
         t?.end();
         t = cpuScope('scene/shadows');
@@ -1605,6 +1656,7 @@ class Renderer {
 
         t = cpuScope('scene/submit');
         this.device!.queue.submit([commandEncoder.finish()]);
+        this._clusterCulling?.submitted();
         this._rtGrid?.afterSubmit();
         this._endCulledFrame(camera);
         t?.end();
@@ -1642,6 +1694,13 @@ class Renderer {
         for (const set of [stack.opaque, stack.transmissive]) {
             for (const renderable of set) {
                 if (!renderable.material.outputsVelocity || !renderable.geometry.initialized) continue;
+                // the cut the GBuffer drew, on the cluster path
+                const cut = this._clusterCut(renderable, MAIN_VIEW);
+                if (cut?.drawBindGroup) {
+                    const pipeline = renderable.material.getClusterVelocityPipeline(this.device!, instanceLayoutOf(renderable));
+                    this._encodeCutDraw(pass, renderable, stack.slotOf(renderable), cut, pipeline, state);
+                    continue;
+                }
                 const pipeline = renderable.material.getVelocityPipeline(this.device!, renderable.geometry.vertexBuffersDescriptors);
                 // (both occlusion phases' instances)
                 this._encodeDraw(pass, renderable, stack.slotOf(renderable), null, state, DrawSet.Transparent, pipeline);
@@ -1697,7 +1756,7 @@ class Renderer {
 
         const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
         if (shadowMap?.light) {
-            shadowMap.encode(encoder, objects, this._sharedMeshBG!, meshOffset, SHADOW_VIEW);
+            shadowMap.encode(encoder, objects, this._sharedMeshBG!, meshOffset, SHADOW_VIEW, this._clusterDepthDraw);
         }
 
         const cubeMap = this._ownsCubeMapShadowMap ? this._cubeMapShadowMap : null;
@@ -1711,13 +1770,13 @@ class Renderer {
 
         const atlas = this._spotShadowAtlas;
         if (atlas && this._spotLights.shadows.length > 0) {
-            atlas.encode(encoder, this._spotLights.shadows, objects, this._sharedMeshBG!, meshOffset, this._spotViewBase());
+            atlas.encode(encoder, this._spotLights.shadows, objects, this._sharedMeshBG!, meshOffset, this._spotViewBase(), this._clusterDepthDraw);
         }
 
         // the sun's cascades
         const csm = this._cascadedShadowMap;
         if (csm && csm.slots.length > 0) {
-            csm.encode(encoder, objects, this._sharedMeshBG!, meshOffset, (c) => this._cascadeView(c));
+            csm.encode(encoder, objects, this._sharedMeshBG!, meshOffset, (c) => this._cascadeView(c), this._clusterDepthDraw);
         }
 
         this._encodeSkyOcclusionPass(encoder, objects, meshOffset);
@@ -1752,6 +1811,8 @@ class Renderer {
             const view = this._skyOcclusionView();
             for (const r of objects) {
                 if (!r.castShadow || !r.geometry.initialized || r.shadowVertexCode || (r.layers & sky.options.layerMask) === 0) continue;
+                // its cut for the top-down view, on the cluster path
+                if (r.clusters && this._clusterDepthDraw(pass, r, view, SkyOcclusion.FORMAT, SkyOcclusion.DEPTH_BIAS, meshOffset(r))) continue;
                 const pipeline = r.material.getDepthPipeline(device, r.geometry.vertexBuffersDescriptors, SkyOcclusion.FORMAT, SkyOcclusion.DEPTH_BIAS);
                 pass.setPipeline(pipeline);
                 pass.setBindGroup(0, r.material.getBindGroup(device));
@@ -1927,7 +1988,8 @@ class Renderer {
         for (const r of culled) {
             const culling = r.instanceCulling!;
             staleBundles = culling.ensureViews(device, pipeline.layout, views.length) || staleBundles;
-            const twoPhaseViews = culling.occlusion ? occlusionViews : [];
+            // (cluster LOD has no occlusion phases yet)
+            const twoPhaseViews = culling.occlusion && !r.clusters ? occlusionViews : [];
             staleBundles = culling.ensureOcclusion(device, pipeline, twoPhaseViews) || staleBundles;
             culling.setTwoPhase(twoPhaseViews);
             if (twoPhaseViews.some((v) => culling.twoPhaseIn(v))) {
@@ -1947,7 +2009,7 @@ class Renderer {
             views.forEach((view, slot) => {
                 if (!view || !cullViewDraws(view, r.castShadow, r.layers, r.gi !== null, r.rt !== null) || culling.twoPhaseIn(slot)) return;
                 const draw = culling.view(slot)!;
-                this._cullStats.record(slot, culling.tested, draw.args, draw.offset);
+                this._cullStats.record(slot, culling.tested, draw.args, draw.offset, r.clusters !== null);
             });
         }
         // occlusion's first phase, in each view culled in two phases
@@ -1991,6 +2053,222 @@ class Renderer {
     }
 
     /**
+     * Make `r`'s cluster pipeline for a pass of `targets` (and its velocity pipeline when
+     * `velocity` and its material writes motion vectors), or drop its cluster LOD with a warning
+     * when the cluster path can't draw it: it keeps the ordinary path. Rust:
+     * `prepare_cluster_pipeline`, `prepare_cluster_velocity_pipeline`.
+     */
+    private _prepareClusterPipelines(r: Renderable, targets: PassTargets, velocity: boolean): void {
+        const clusters = r.clusters;
+        if (!clusters) return;
+        const geometry = r.geometry as InstancedGeometry;
+        const extra = geometry.isInstancedGeometry ? geometry.extraBuffers : [];
+        const layout = instanceLayoutOf(r);
+        let problem: string | null = null;
+        if (extra.length > 1) {
+            problem = 'more than one instance buffer';
+        } else if (extra.length === 1 && (!layout || layout.arrayStride % 4 !== 0)) {
+            problem = 'an instance buffer without a vertex layout of whole words';
+        } else if (extra.length === 1 && !r.instanceCulling && (extra[0].usage & GPUBufferUsage.STORAGE) === 0) {
+            problem = 'an instance buffer without STORAGE usage (and no InstanceCulling)';
+        } else {
+            try {
+                const device = this.device!;
+                r.material.getClusterPipeline(device, layout, targets.colorFormats, targets.sampleCount, targets.depthFormat);
+                // (planar reflections draw single-sampled GBuffer targets)
+                if (velocity && targets.sampleCount !== 1 && this._planarReflections.length > 0) {
+                    r.material.getClusterPipeline(device, layout, [...GBuffer.MRT_FORMATS], 1, GBuffer.DEPTH_FORMAT);
+                }
+                if (velocity && r.material.outputsVelocity && !r.material.transparent) r.material.getClusterVelocityPipeline(device, layout);
+            } catch (e) {
+                problem = (e as Error).message;
+            }
+        }
+        if (problem) {
+            console.warn(`${r.material.label}: no cluster LOD (${problem}); drawn as is`);
+            clusters.destroy();
+            r.clusters = null;
+        }
+    }
+
+    /**
+     * Cluster LOD in every view, once the instances are culled (Rust `run_cluster_culling`): each
+     * visible renderable with `clusters` gets its mesh's cut for each cull view it is drawn in
+     * (`_cullViews`: the camera, `height` pixels high, and the shadow views), which those views'
+     * passes draw, in one compute pass of `encoder`. Renderables joining or leaving the camera's
+     * cluster path, or whose camera cut grew, re-record the bundles.
+     */
+    private _runClusterCulling(encoder: GPUCommandEncoder, stack: Scene, camera: Camera, height: number): void {
+        const clustered = stack.getOrderedObjects().filter((r) => r.clusters && r.geometry.initialized);
+        if (clustered.length === 0) {
+            this._clusterCuts.clear();
+            // renderables that left the cluster path are drawn as meshes again
+            if (this._clustered.length > 0) {
+                this._clustered = [];
+                this.invalidateBundle();
+            }
+            return;
+        }
+        const device = this.device!;
+        // the camera's view, or the frozen one
+        const main = this._occlusion.mainView(camera);
+        const views = this._cullViews(main.cull);
+        const lods = this._clusterViews(camera, main, height);
+        // the voxel clipmap's views: a cut there that grew was too small for what it voxelized
+        const gi = this._voxelClipmap;
+        const giViews = gi ? [this._giView(0), this._giView(gi.voxelizer.jobSlots)] : [0, 0];
+        const grownGi: number[] = [];
+        // the ray tracing grid's view: a cut there that grew left clusters out of its build
+        const rtView = this._rtGrid ? this._rtView() : -1;
+        let grownRt = false;
+        const culling = this._clusterCulling ??= new ClusterCulling(device);
+        culling.beginFrame();
+        culling.setViews(lods);
+        const layout = this._clusterMeshBGL ??= device.createBindGroupLayout({ label: 'ClusterMesh BindGroupLayout', entries: clusterMeshBindGroupLayoutEntries() });
+        const matrices = { normal: this._normalMatricesBuf!, world: this._worldMatricesBuf!, worldBytes: MESH_TRANSFORMS_BYTES };
+        let stale = false;
+        const cuts = new Map<Renderable, Set<number>>();
+        const gpus: [ClusterGpu, number][] = [];
+        for (const r of clustered) {
+            const geometry = r.geometry as InstancedGeometry;
+            const instanced = geometry.isInstancedGeometry && geometry.extraBuffers.length > 0;
+            const stride = instanceLayoutOf(r)?.arrayStride ?? 0;
+            const backFacesCulled = r.material.culledFaces === 'back';
+            const world = r.worldMatrix.internalMat4;
+            const slots = new Set<number>();
+            views.forEach((view, slot) => {
+                if (!view || !lods[slot] || !cullViewDraws(view, r.castShadow, r.layers, r.gi !== null, r.rt !== null)) return;
+                let source: InstanceSource;
+                const c = r.instanceCulling;
+                if (!instanced) {
+                    source = { kind: 'none' };
+                } else if (c) {
+                    const draw = c.view(slot);
+                    if (!draw) return;
+                    source = { kind: 'culled', records: draw.instances, firstRecord: draw.instancesOffset / c.culledStride, capacity: c.count, args: draw.args, countWord: draw.offset / 4 + 1 };
+                } else {
+                    const records = geometry.extraBuffers[0].gpuBuffer;
+                    if (!records) return;
+                    source = { kind: 'all', records, count: geometry.instanceCount };
+                }
+                const changed = r.clusters!.prepare(device, culling, layout, matrices, slot, source, stride, world, backFacesCulled);
+                // (only the camera's passes record bundles)
+                stale ||= changed && slot === MAIN_VIEW;
+                if (changed && slot >= giViews[0] && slot < giViews[1] && !r.dynamic) grownGi.push(slot - giViews[0]);
+                grownRt ||= changed && slot === rtView;
+                slots.add(slot);
+                gpus.push([r.clusters!.gpu!, slot]);
+            });
+            cuts.set(r, slots);
+        }
+        culling.encode(encoder, gpus);
+        for (const [gpu, slot] of gpus) this._cullStats.recordClusters(slot, gpu.cut(slot)!.args);
+        // renderables joining or leaving the camera's cluster path are drawn the other way
+        const prepared = clustered.filter((r) => cuts.get(r)!.has(MAIN_VIEW));
+        if (stale || !sameKey(prepared, this._clustered)) this.invalidateBundle();
+        this._clustered = prepared;
+        this._clusterCuts = cuts;
+        for (const slot of grownGi) gi!.cutGrew(slot);
+        if (grownRt) this._rtGrid!.cutGrew();
+    }
+
+    /**
+     * Each cull view's cluster view (`_cullViews` order, `null` where that has none): its
+     * frustum, the eye, its pixels per radian (per metre in the orthographic cascades, sky view
+     * and voxel clipmap regions), and its budget, the error threshold times the view's scale;
+     * `main` the camera's (live, or frozen) `height` pixels high. Rust: `cluster_views`.
+     */
+    private _clusterViews(camera: Camera, main: MainView, height: number): (ClusterView | null)[] {
+        const threshold = this._clusterThreshold;
+        const shadow = threshold * this._shadowClusterErrorScale;
+        const scratch = this._clusterScratch;
+        const inverse = (m: ArrayLike<number>) => Float32Array.from(mat4.invert(scratch.inverse, m as mat4) ?? mat4.create());
+        const views: (ClusterView | null)[] = [{
+            viewProj: main.cull.viewProj,
+            eye: main.lodOrigin,
+            pixelsPerUnit: height / (2 * Math.tan(camera.fov * Math.PI / 360)),
+            near: camera.near,
+            threshold,
+            orthographic: false,
+        }];
+        if (this._ownsShadowMap && this._shadowMap) {
+            const map = this._shadowMap;
+            const proj = map.lightProjectionMatrix;
+            views.push(map.light ? clusterViewOf(map.lightViewProjMatrix, proj, inverse(map.lightViewMatrix), map.resolution, projectionNear(proj), shadow) : null);
+        }
+        const csm = this._cascadedShadowMap;
+        csm?.slots.forEach((slot, c) => {
+            const viewProj = mat4.multiply(scratch.cascades[c], slot.projection, slot.view);
+            views.push(clusterViewOf(viewProj, slot.projection, inverse(slot.view), csm.options.resolution, projectionNear(slot.projection), shadow));
+        });
+        const sky = this._skyOcclusion;
+        if (sky) {
+            const viewProj = sky.cullView();
+            const proj = sky.projectionMatrix;
+            views.push(viewProj ? clusterViewOf(viewProj, proj, inverse(sky.viewMatrix), sky.resolution, projectionNear(proj), threshold * sky.options.lodErrorScale) : null);
+        }
+        const atlas = this._spotShadowAtlas;
+        if (atlas) {
+            const base = views.length;
+            for (let l = 0; l < atlas.layers; l++) views.push(null);
+            for (const slot of this._spotLights.shadows) {
+                views[base + slot.layer] = clusterViewOf(slot.viewProj, slot.projection, inverse(slot.view), atlas.resolution, projectionNear(slot.projection), shadow);
+            }
+        }
+        // the clipmap's regions: orthographic, a pixel a voxel, the cut's errors within its budget
+        // of voxels
+        const gi = this._voxelClipmap;
+        if (gi) {
+            for (let slot = 0; slot < gi.voxelizer.jobSlots; slot++) {
+                const view = gi.giView(slot);
+                if (!view) {
+                    views.push(null);
+                    continue;
+                }
+                const inv = mat4.invert(scratch.inverse, view.viewProj);
+                const centre = inv ? vec3.transformMat4(vec3.create(), [0, 0, 0.5], inv) : vec3.create();
+                views.push({ viewProj: view.viewProj, eye: centre, pixelsPerUnit: 1 / view.voxelSize, near: 0.01, threshold: gi.options.clusterErrorVoxels, orthographic: true });
+            }
+        }
+        // the ray tracing grid's box: orthographic, a pixel a cell
+        if (this._rtGrid) views.push(this._rtGrid.clusterView());
+        // the rendered planar reflections (the camera's near: the mirrored projection's near plane
+        // is the water, which a level view meets far out)
+        for (const r of this._planarReflections) {
+            const c = r.camera;
+            views.push(r.isActive && !r.screenSpace
+                ? clusterViewOf(r.cullViewProj(mat4.create()), c.projectionMatrix.internalMat4, inverse(c.viewMatrix.internalMat4), r.height, camera.near, threshold * r.lodErrorScale)
+                : null);
+        }
+        return views;
+    }
+
+    /** Renderable `r`'s cluster cut for cull view `view` this frame, if it has one. */
+    private _clusterCut(r: Renderable, view: number): Cut | null {
+        if (!this._clusterCuts.get(r)?.has(view)) return null;
+        return r.clusters?.gpu?.cut(view) ?? null;
+    }
+
+    /**
+     * Encodes the draw of `renderable`'s cluster cut `cut` with `pipeline`, its matrices at
+     * `slot` (Rust `draw_cut`), setting only the state that differs from `state`.
+     */
+    private _encodeCutDraw(encoder: GPURenderPassEncoder | GPURenderBundleEncoder, renderable: Renderable, slot: number, cut: Cut, pipeline: GPURenderPipeline, state: DrawState): boolean {
+        if (pipeline !== state.pipeline) {
+            encoder.setPipeline(pipeline);
+            state.pipeline = pipeline;
+            state.materialBindGroup = null;
+        }
+        const materialBindGroup = renderable.material.currentBindGroup!;
+        if (materialBindGroup !== state.materialBindGroup) {
+            encoder.setBindGroup(BindGroupSlot.Material, materialBindGroup);
+            state.materialBindGroup = materialBindGroup;
+        }
+        state.indexBuffer = cut.indices;
+        return drawCut(encoder, cut, slot * this._matrixAlignment);
+    }
+
+    /**
      * Plan the ray tracing grid's frame before the culling, whose view its box is: follow the
      * camera, and whether to rebuild.
      */
@@ -2003,7 +2281,11 @@ class Renderer {
     /** The ray tracing grid's rebuild, after the culling (its view's culled instances). */
     private _runRtGrid(encoder: GPUCommandEncoder, stack: Scene): void {
         if (!this._rtGrid?.rebuilding) return;
-        this._rtGrid.build(encoder, stack, this._rtView());
+        const view = this._rtView();
+        this._rtGrid.build(encoder, stack, view, (r) => {
+            const cut = this._clusterCut(r, view);
+            return cut ? { mesh: r.clusters!.gpu!.mesh, cut } : null;
+        });
     }
 
     /** After the frame's culling is submitted: read its statistics back (when on). */
@@ -2049,7 +2331,7 @@ class Renderer {
     /**
      * The voxel clipmap's frame, after the culling and the shadow maps: the regions planned
      * (`_planVoxelClipmap`) voxelized with the static GI renderables (instanced ones as culled for
-     * each region's view), the dynamic ones into the finest levels, then the levels due lit through
+     * each region's view, clustered ones by their cut there), the dynamic ones into the finest levels, then the levels due lit through
      * the shadow maps (as `_encodeVoxelGI`'s) and the probes updated round `camera`.
      */
     private _encodeVoxelClipmap(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
@@ -2066,7 +2348,7 @@ class Renderer {
             ?? (sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null);
         const eye = camera.inverseViewMatrix.internalMat4;
         gi.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,
-            (slot) => this._giView(slot), shadowMap, this._cubeMapShadowMap, [eye[12], eye[13], eye[14]]);
+            (slot) => this._giView(slot), shadowMap, this._cubeMapShadowMap, [eye[12], eye[13], eye[14]], (r, view) => this._clusterCut(r, view));
     }
 
     /**
@@ -2333,6 +2615,13 @@ class Renderer {
     ): boolean {
         const geometry = renderable.geometry;
         if (!geometry.initialized) return false;
+        // the view's cut, on the cluster path, where the material has a cluster pipeline for the
+        // pass (nothing in the late set: clusters have no occlusion phases yet)
+        if (!pipeline && targets) {
+            const cut = this._clusterCut(renderable, view);
+            const clusterPipeline = cut?.drawBindGroup ? renderable.material.clusterPipeline(targets.colorFormats, targets.sampleCount, targets.depthFormat) : null;
+            if (cut && clusterPipeline) return set !== DrawSet.Late && this._encodeCutDraw(encoder, renderable, slot, cut, clusterPipeline, state);
+        }
         pipeline ??= this._pipelineFor(renderable, targets!);
 
         if (pipeline !== state.pipeline) {

@@ -11,6 +11,7 @@ import { gpuPass } from '../profiling/Profiler';
 import { drawGeometry } from '../culling/InstanceCulling';
 import type { DepthBias, Material } from '../materials/Material';
 import { CAMERA_TEMPORAL_BYTES, LIGHT_UNIFORM_BYTES, MESH_TRANSFORMS_BYTES, cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries, meshSlotStride } from '../renderers/SharedLayouts';
+import type { ClusterDepthDraw } from '../clusters/ClusterLod';
 
 export interface ShadowMapOptions {
     resolution?: number;
@@ -140,6 +141,11 @@ class ShadowMap {
 
     get depthTexture(): GPUTexture { return this._depthTexture; }
     get lightViewProjMatrix(): Float32Array { return this._lightVP; }
+    /** The light's view and projection as `update` placed them (the view-projection's factors). */
+    get lightViewMatrix(): Float32Array { return this._lightView as Float32Array; }
+    get lightProjectionMatrix(): Float32Array { return this._lightProj as Float32Array; }
+    /** Texels per side of the map. */
+    get resolution(): number { return this._resolution; }
     /** The light's view-projection as uploaded by `update` (a 64-byte uniform), for passes that read it on the GPU. */
     get lightViewProjBuffer(): GPUBuffer { return this._lightVPBuffer; }
     get maxShadowDistance(): number { return this._maxShadowDistance; }
@@ -407,6 +413,7 @@ class ShadowMap {
         meshBindGroup: GPUBindGroup,
         meshOffset: (renderable: Renderable, index: number) => number,
         view?: number,
+        clusterDraw?: ClusterDepthDraw,
     ): void {
         const device = this._device;
         const pass = commandEncoder.beginRenderPass({
@@ -435,6 +442,20 @@ class ShadowMap {
             const obj = objects[i];
             if (!obj.castShadow) continue;
             if (!obj.geometry.initialized) continue;
+
+            // its cut for this view, on the cluster path (with the light as the camera)
+            if (clusterDraw && view !== undefined && obj.clusters && !obj.shadowVertexCode) {
+                if (this._lightCameraBG !== activeLightBG) {
+                    pass.setBindGroup(1, this._lightCameraBG);
+                    activeLightBG = this._lightCameraBG;
+                }
+                if (clusterDraw(pass, obj, view, 'depth32float', this._depthBias, meshOffset(obj, i))) {
+                    activePipeline = null;
+                    lastMaterial = null;
+                    currentIndexBuffer = null;
+                    continue;
+                }
+            }
 
             // The material's depth pipeline, or the renderable's own shadowVertexCode pipeline.
             let targetPipeline: GPURenderPipeline;

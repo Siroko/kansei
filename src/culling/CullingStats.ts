@@ -1,5 +1,8 @@
 import { CULL_ARGS_BYTES } from './InstanceCulling';
 
+/** Bytes of a cluster cut's draw (`ClusterLod`'s `CLUSTER_DRAW_ARGS_BYTES`). */
+const CLUSTER_ARGS_BYTES = 48;
+
 /**
  * What became of the instances culled for one view in one frame, summed over the renderables
  * that draw in it (`Renderer.cullingStats`).
@@ -15,13 +18,15 @@ export interface CullStats {
     occlusionCulled: number;
     /** Drawn. */
     drawn: number;
-    /** Triangles drawn: each draw's instances times its mesh's. */
+    /** Triangles drawn: each draw's instances times its mesh's; a cluster cut's, its clusters'. */
     triangles: number;
+    /** Clusters drawn by cluster LOD's cuts (`Renderable.clusters`). */
+    clusters: number;
 }
 
 /** No instances. */
 export function emptyCullStats(): CullStats {
-    return { tested: 0, lodCulled: 0, frustumCulled: 0, occlusionCulled: 0, drawn: 0, triangles: 0 };
+    return { tested: 0, lodCulled: 0, frustumCulled: 0, occlusionCulled: 0, drawn: 0, triangles: 0, clusters: 0 };
 }
 
 /**
@@ -53,12 +58,19 @@ export class CullingStats {
     }
 }
 
+/**
+ * A draw to read: an instance draw (`clustered` when the renderable draws cluster cuts instead,
+ * so its own triangles don't count) or a cluster cut's.
+ */
 interface Entry {
     view: number;
     tested: number;
     args: GPUBuffer;
     offset: number;
+    kind: 'instances' | 'clustered' | 'clusters';
 }
+
+const entryBytes = (kind: Entry['kind']) => kind === 'clusters' ? CLUSTER_ARGS_BYTES : CULL_ARGS_BYTES;
 
 /**
  * Reads the culled draws' counters back asynchronously: at most one copy in flight, collected
@@ -68,7 +80,7 @@ export class StatsReadback {
     enabled = false;
     private kinds: CullViewKind[] = [];
     private entries: Entry[] = [];
-    private pending: { frame: number; kinds: CullViewKind[]; entries: [number, number][]; state: 'mapping' | 'mapped' | 'failed' } | null = null;
+    private pending: { frame: number; kinds: CullViewKind[]; entries: [number, number, Entry['kind']][]; bytes: number; state: 'mapping' | 'mapped' | 'failed' } | null = null;
     private staging: GPUBuffer | null = null;
     private latestStats: CullingStats | null = null;
 
@@ -85,19 +97,25 @@ export class StatsReadback {
         this.pending = null;
         if (pending.state === 'failed') return;
         const staging = this.staging!;
-        const words = new Uint32Array(staging.getMappedRange(0, pending.entries.length * CULL_ARGS_BYTES));
+        const words = new Uint32Array(staging.getMappedRange(0, pending.bytes));
         const views: [CullViewKind, CullStats][] = [];
-        pending.entries.forEach(([view, tested], k) => {
-            // (the draw's index count, then its instance count; the culled counts at words 5-7)
-            const a = words.subarray(k * (CULL_ARGS_BYTES / 4));
-            const stats: CullStats = {
-                tested,
-                drawn: a[1],
-                lodCulled: a[5],
-                frustumCulled: a[6],
-                occlusionCulled: a[7],
-                triangles: Math.floor(a[0] / 3) * a[1],
-            };
+        let at = 0;
+        pending.entries.forEach(([view, tested, entry]) => {
+            const a = words.subarray(at / 4);
+            at += entryBytes(entry);
+            const stats: CullStats = entry === 'clusters'
+                // (the clusters listed, then their triangles)
+                ? { ...emptyCullStats(), clusters: a[7], triangles: a[9] }
+                // (the draw's index count, then its instance count; the culled counts at words 5-7)
+                : {
+                    tested,
+                    drawn: a[1],
+                    lodCulled: a[5],
+                    frustumCulled: a[6],
+                    occlusionCulled: a[7],
+                    triangles: entry === 'clustered' ? 0 : Math.floor(a[0] / 3) * a[1],
+                    clusters: 0,
+                };
             const kind = pending.kinds[view];
             const sum = views.find(([k]) => k === kind);
             if (!sum) {
@@ -111,21 +129,30 @@ export class StatsReadback {
             s.frustumCulled += stats.frustumCulled;
             s.occlusionCulled += stats.occlusionCulled;
             s.triangles += stats.triangles;
+            s.clusters += stats.clusters;
         });
         views.sort((a, b) => pending.kinds.indexOf(a[0]) - pending.kinds.indexOf(b[0]));
         staging.unmap();
         this.latestStats = new CullingStats(pending.frame, views);
     }
 
-    /** A draw culled this frame for view `view`: `tested` instances, counted into `args` at `offset`. */
-    record(view: number, tested: number, args: GPUBuffer, offset: number): void {
-        if (this.enabled) this.entries.push({ view, tested, args, offset });
+    /**
+     * A draw culled this frame for view `view`: `tested` instances, counted into `args` at
+     * `offset`. `clustered`: the renderable draws cluster cuts instead (`recordClusters`).
+     */
+    record(view: number, tested: number, args: GPUBuffer, offset: number, clustered: boolean = false): void {
+        if (this.enabled) this.entries.push({ view, tested, args, offset, kind: clustered ? 'clustered' : 'instances' });
+    }
+
+    /** A cluster cut made this frame for view `view`, its draw in `args`. */
+    recordClusters(view: number, args: GPUBuffer): void {
+        if (this.enabled) this.entries.push({ view, tested: 0, args, offset: 0, kind: 'clusters' });
     }
 
     /** After the frame's culling is submitted: copy its counters for reading, unless a copy is still in flight. */
     endFrame(device: GPUDevice, frame: number): void {
         if (!this.enabled || this.pending || this.entries.length === 0) return;
-        const size = this.entries.length * CULL_ARGS_BYTES;
+        const size = this.entries.reduce((sum, e) => sum + entryBytes(e.kind), 0);
         if (!this.staging || this.staging.size < size) {
             this.staging?.destroy();
             let capacity = CULL_ARGS_BYTES;
@@ -138,12 +165,17 @@ export class StatsReadback {
         }
         const staging = this.staging;
         const encoder = device.createCommandEncoder({ label: 'InstanceCulling/Stats' });
-        this.entries.forEach((entry, k) => encoder.copyBufferToBuffer(entry.args, entry.offset, staging, k * CULL_ARGS_BYTES, CULL_ARGS_BYTES));
+        let at = 0;
+        for (const entry of this.entries) {
+            encoder.copyBufferToBuffer(entry.args, entry.offset, staging, at, entryBytes(entry.kind));
+            at += entryBytes(entry.kind);
+        }
         device.queue.submit([encoder.finish()]);
         const pending = {
             frame,
             kinds: this.kinds,
-            entries: this.entries.map((e): [number, number] => [e.view, e.tested]),
+            entries: this.entries.map((e): [number, number, Entry['kind']] => [e.view, e.tested, e.kind]),
+            bytes: size,
             state: 'mapping' as 'mapping' | 'mapped' | 'failed',
         };
         this.entries.length = 0;

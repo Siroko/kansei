@@ -7,6 +7,7 @@ import { PathTracerMaterial } from "../pathtracer/PathTracerMaterial";
 import type { InstanceCulling } from "../culling/InstanceCulling";
 import type { GiSurface } from "../gi/MeshVoxelizer";
 import type { RtPlacement, RtSurface } from "../rt/RtGrid";
+import type { ClusterLod } from "../clusters/ClusterLod";
 
 /**
  * Represents a 3D renderable object that extends Object3D.
@@ -49,6 +50,12 @@ class Renderable extends Object3D {
      *  shadow map) draws only the instances inside its frustum and LOD band. Null: every instance
      *  everywhere. */
     public instanceCulling: InstanceCulling | null = null;
+
+    /** Cluster LOD (`ClusterLod`): each view draws the cut of the cluster graph it needs instead
+     *  of the geometry, which must be the mesh the graph was built from (impostor bakes, point-light
+     *  shadows and voxel GI still draw it). Null: the geometry everywhere. Rust:
+     *  `Renderable::clusters`. */
+    public clusters: ClusterLod | null = null;
 
     /** Kept for compatibility: shadow maps draw casters through their material's own
      *  `vertex_main` (`Material.getDepthPipeline`, with `shadowFragmentEntry` for alpha-tested

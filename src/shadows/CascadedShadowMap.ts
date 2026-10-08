@@ -7,6 +7,7 @@ import { drawGeometry } from '../culling/InstanceCulling';
 import { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { gpuPass } from '../profiling/Profiler';
 import { BindGroupSlot, CAMERA_TEMPORAL_BYTES, CASCADES_BYTES, LIGHT_UNIFORM_BYTES, cameraBindGroupLayoutEntries } from '../renderers/SharedLayouts';
+import type { ClusterDepthDraw } from '../clusters/ClusterLod';
 
 export const MAX_CASCADES = 4;
 
@@ -279,6 +280,7 @@ class CascadedShadowMap implements CascadedShadowSource {
         meshBindGroup: GPUBindGroup,
         meshOffset: (renderable: Renderable) => number,
         cullView: (cascade: number) => number,
+        clusterDraw?: ClusterDepthDraw,
     ): void {
         const device = this._device;
         for (let c = 0; c < this.slots.length; c++) {
@@ -304,6 +306,13 @@ class CascadedShadowMap implements CascadedShadowSource {
             for (const obj of objects) {
                 const geometry = obj.geometry;
                 if (!obj.castShadow || !geometry.initialized) continue;
+                // its cut for this view, on the cluster path
+                if (clusterDraw && obj.clusters && clusterDraw(pass, obj, view, CascadedShadowMap.FORMAT, CascadedShadowMap.DEPTH_BIAS, meshOffset(obj))) {
+                    pipeline = null;
+                    material = null;
+                    indexBuffer = null;
+                    continue;
+                }
                 if (obj.material !== material || geometry.vertexBuffersDescriptors !== layouts) {
                     if (obj.material !== material) {
                         // the renderer updated it this frame
