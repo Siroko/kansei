@@ -27,6 +27,12 @@ import motionBlurCommon from '../../../rust/kansei-core/src/shaders/motion_blur_
 import motionBlurPrepare from '../../../rust/kansei-core/src/shaders/motion_blur_prepare.wgsl?raw';
 import motionBlurNeighbours from '../../../rust/kansei-core/src/shaders/motion_blur_neighbours.wgsl?raw';
 import motionBlurGather from '../../../rust/kansei-core/src/shaders/motion_blur_gather.wgsl?raw';
+import ssgiCommon from '../../../rust/kansei-core/src/shaders/ssgi_common.wgsl?raw';
+import ssgiNormal from '../../../rust/kansei-core/src/shaders/ssgi_normal.wgsl?raw';
+import ssgiTrace from '../../../rust/kansei-core/src/shaders/ssgi_trace.wgsl?raw';
+import ssgiTemporal from '../../../rust/kansei-core/src/shaders/ssgi_temporal.wgsl?raw';
+import ssgiComposite from '../../../rust/kansei-core/src/shaders/ssgi_composite.wgsl?raw';
+import skyLighting from '../../../rust/kansei-core/src/atmosphere/shaders/sky_lighting.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -78,6 +84,16 @@ export const TAA_RESOLVE_WGSL: string = taaResolve;
 export const MOTION_BLUR_PREPARE_WGSL: string = `${motionBlurCommon}\n${motionBlurPrepare}`;
 export const MOTION_BLUR_NEIGHBOURS_WGSL: string = `${motionBlurCommon}\n${motionBlurNeighbours}`;
 export const MOTION_BLUR_GATHER_WGSL: string = `${motionBlurCommon}\n${motionBlurGather}`;
+
+/**
+ * `ScreenSpaceGIEffect`'s three passes, each with `SsgiParams` (384 bytes) at group 0 binding 0:
+ * the trace (visibility bitmasks), the temporal filter, and the composite (with the
+ * `SkyLighting` uniform at binding 6, for the sky's ambient occlusion). Rust:
+ * `postprocessing/effects/ssgi.rs`'s `trace_source`, `temporal_source` and `composite_source`.
+ */
+export const SSGI_TRACE_WGSL: string = `${ssgiCommon}${ssgiNormal}${ssgiTrace}`;
+export const SSGI_TEMPORAL_WGSL: string = `${ssgiCommon}${ssgiTemporal}`;
+export const SSGI_COMPOSITE_WGSL: string = `${ssgiCommon}${ssgiNormal}${skyLighting}${ssgiComposite}`;
 
 /**
  * The GBuffer's four colour targets for a fragment shader (`KanseiGBufferOut`): return

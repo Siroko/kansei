@@ -151,6 +151,8 @@ export { TemporalAAEffect, defaultTemporalAAOptions } from "./postprocessing/eff
 export type { TemporalAAOptions } from "./postprocessing/effects/TemporalAAEffect";
 export { MotionBlurEffect, defaultMotionBlurOptions } from "./postprocessing/effects/MotionBlurEffect";
 export type { MotionBlurOptions } from "./postprocessing/effects/MotionBlurEffect";
+export { ScreenSpaceGIEffect, GiQuality, defaultScreenSpaceGIOptions, SSGI_PARAMS_BYTES } from "./postprocessing/effects/ScreenSpaceGIEffect";
+export type { ScreenSpaceGIOptions } from "./postprocessing/effects/ScreenSpaceGIEffect";
 export { hash01 } from "./math/hash01";
 export { DebugBoxes, segment, DEBUG_BOXES_WGSL } from "./debug/DebugBoxes";
 export { Canvas, Frame, run, Keys, Gamepad, deadZone, now, param, paramOr, flag, isPhone, setText, checkbox, thousands, fetchBytes } from "./web";

@@ -2,6 +2,7 @@ import { mat4 } from 'gl-matrix';
 import { Camera } from '../cameras/Camera';
 import { GBuffer } from '../postprocessing/GBuffer';
 import { PostProcessingEffect } from '../postprocessing/PostProcessingEffect';
+import { ScreenSpaceGIEffect, ScreenSpaceGIOptions } from '../postprocessing/effects/ScreenSpaceGIEffect';
 import { gpuPass } from '../profiling/Profiler';
 import { SCREEN_COMPOSITE_WGSL, SCREEN_TEMPORAL_WGSL, SCREEN_TRACE_WGSL } from './GiWGSL';
 import { gradientSkyLighting } from './ParticleConeShading';
@@ -10,7 +11,7 @@ import { PROBE_GRID_BYTES, SdfProbes } from './SdfProbes';
 import { noSdfView } from './VoxelInjection';
 import { Vec3, VoxelGiQuality, VoxelVolume } from './VoxelVolume';
 
-/** What `VoxelGIEffect` sets up. Rust: `gi::VoxelGIOptions` (its near field and clipmap options come with SSGI and G-4). */
+/** What `VoxelGIEffect` sets up. Rust: `gi::VoxelGIOptions` (its clipmap options come with G-4). */
 export interface VoxelGIOptions {
     /** Resolution of the trace (`low` a quarter each way, else half) and the cones' steps. Default `medium`. */
     quality?: VoxelGiQuality;
@@ -29,6 +30,12 @@ export interface VoxelGIOptions {
     materialAmbient?: number;
     /** Scale of the sky past the volume. Default 1. */
     skyScale?: number;
+    /**
+     * Screen-space GI in front of the voxels (`gi=voxel+ssgi`): it brings the light of what it
+     * sees occlude each direction within its radius, at full screen detail, and the voxels light
+     * the rest of the hemisphere. Unset: the voxels alone.
+     */
+    nearField?: Partial<ScreenSpaceGIOptions>;
     /**
      * Strength of the distance field's ambient occlusion on the GI (`setSdf`; 0, the default:
      * none): the contact occlusion the coarse cones miss.
@@ -78,9 +85,9 @@ interface Gpu {
  * Add it first in the chain. `enabled = false` skips it at no cost. It adds light only where a
  * material writes the GBuffer's albedo (and normal), and replaces the materials' sky ambient once
  * the sky's lighting is set. With `setProbes` the far field comes from irradiance probes instead of
- * per-pixel cones; with `setSdf` the distance field adds contact AO (`sdfAo`). Rust:
- * `gi::VoxelGIEffect` (the volume source; the screen-space near field comes with SSGI, a clipmap
- * source with G-4).
+ * per-pixel cones; with `setSdf` the distance field adds contact AO (`sdfAo`); with the
+ * `nearField` option screen-space GI goes first and the voxels light what it cannot see. Rust:
+ * `gi::VoxelGIEffect` (the volume source; a clipmap source comes with G-4).
  */
 export class VoxelGIEffect extends PostProcessingEffect {
     public enabled = true;
@@ -118,6 +125,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
     private readonly volume: VoxelVolume;
     private readonly anisotropic: GPUTextureView[];
     private skyLighting: GPUBuffer | null = null;
+    private readonly near: ScreenSpaceGIEffect | null;
     private sdf: GPUTextureView | null = null;
     /** The probes' grid, SH, state and depth buffers (`setProbes`). */
     private probes: GPUBuffer[] | null = null;
@@ -145,6 +153,12 @@ export class VoxelGIEffect extends PostProcessingEffect {
         this.materialAmbient = options.materialAmbient ?? 1;
         this.skyScale = options.skyScale ?? 1;
         this.sdfAo = options.sdfAo ?? 0;
+        this.near = options.nearField ? new ScreenSpaceGIEffect(options.nearField) : null;
+    }
+
+    /** The screen-space GI in front of the voxels, if any (to tune it). */
+    public get nearField(): ScreenSpaceGIEffect | null {
+        return this.near;
     }
 
     /**
@@ -158,7 +172,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
     /**
      * Take the far field from `probes` (`SceneVoxelGi.probes`, over the same volume): each pixel's
      * irradiance from the probes around it, in place of the cones traced per pixel (whose passes
-     * are then skipped). Null goes back to the cones.
+     * are then skipped), still under the near field if there is one. Null goes back to the cones.
      */
     public setProbes(probes: SdfProbes | null): void {
         this.probes = probes ? [probes.gridBuffer, probes.shBuffer, probes.stateBuffer, probes.depthBuffer] : null;
@@ -171,15 +185,17 @@ export class VoxelGIEffect extends PostProcessingEffect {
 
     /**
      * The sky's lighting (a `SkyLighting` uniform): the light past the volume, and the materials'
-     * ambient the GI replaces. Null goes back to `skyGradient`.
+     * ambient the GI replaces. Also the near field's. Null goes back to `skyGradient`.
      */
     public setSkyLighting(skyLighting: GPUBuffer | null): void {
         this.skyLighting = skyLighting;
+        this.near?.setSkyLighting(skyLighting);
     }
 
     /** Drop the accumulated frames; call on camera cuts. */
     public resetHistory(): void {
         this.prevViewProj = null;
+        this.near?.resetHistory();
     }
 
     public isActive(): boolean {
@@ -280,6 +296,8 @@ export class VoxelGIEffect extends PostProcessingEffect {
         const device = this.device!;
         const gpu = this.gpu!;
         if (!gbuffer) throw new Error('VoxelGIEffect reads the GBuffer\'s normals and albedo (render it through a PostProcessingVolume)');
+        // the near field's bounce first (its own trace and history)
+        const near = this.near?.encodeTrace(device, commandEncoder, gbuffer, input, depth, camera, width, height) ?? null;
         const t = this.ensureTargets(device, width, height);
 
         const proj = camera.projectionMatrix.internalMat4;
@@ -292,7 +310,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
         f32.set(mat4.invert(mat4.create(), view), 16);
         f32.set(view, 32);
         f32.set(this.prevViewProj ?? viewProj, 48);
-        f32.set([width, height, t.width, t.height, 1, 1], 64);
+        f32.set([width, height, t.width, t.height, ...(near?.size ?? [1, 1])], 64);
         f32[70] = Math.max(this.startVoxels, 0);
         f32[71] = Math.max(this.maxDistanceM, 0);
         u32[72] = VoxelGiQuality.coneSteps(this.quality);
@@ -307,7 +325,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
             : this.showVoxels ? 2
             : this.showIndirect ? 1 : 0;
         u32[79] = debug;
-        u32[80] = 0;   // no near field
+        u32[80] = near ? 1 : 0;
         f32[81] = Math.max(this.skyScale, 0);
         f32[82] = this.sdf ? Math.min(Math.max(this.sdfAo, 0), 1) : 0;
         f32[83] = this.showSdfSlice ?? 0;
@@ -340,7 +358,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
             [0, params], [1, traceView], [2, history[1 - current]], [3, depthView], [4, history[current]], [5, gpu.sampler],
         ]);
         const composite = group('VoxelGI/CompositeBG', gpu.compositeBGL, [
-            [0, params], [1, input.createView()], [2, depthView], [3, history[current]], [4, gpu.noNear.createView()],
+            [0, params], [1, input.createView()], [2, depthView], [3, history[current]], [4, (near?.texture ?? gpu.noNear).createView()],
             [5, gbuffer.albedoTexture.createView()], [6, normalView], [7, sky], [8, output.createView()],
             [9, { buffer: this.volume.uniform }], [10, this.volume.view], [11, this.volume.sampler], [12, this.sdf ?? gpu.noSdf],
             ...(this.probes ?? gpu.noProbes).map((buffer, i) => [13 + i, { buffer }] as [number, GPUBindingResource]),
@@ -371,6 +389,7 @@ export class VoxelGIEffect extends PostProcessingEffect {
         if (!gpu) return;
         for (const b of [gpu.params, gpu.gradientSky, ...gpu.noProbes]) b.destroy();
         gpu.noNear.destroy();
+        this.near?.destroy();
         if (gpu.targets) for (const t of [gpu.targets.trace, ...gpu.targets.history]) t.destroy();
         this.gpu = null;
         this.initialized = false;
