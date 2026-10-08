@@ -5,6 +5,7 @@ import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
 import { PathTracerMaterial } from "../pathtracer/PathTracerMaterial";
 import type { InstanceCulling } from "../culling/InstanceCulling";
+import type { GiSurface } from "../gi/MeshVoxelizer";
 
 /**
  * Represents a 3D renderable object that extends Object3D.
@@ -62,6 +63,11 @@ class Renderable extends Object3D {
 
     /** Bind group for extra resources used by shadowVertexCode (group 0). */
     public shadowExtraBG: GPUBindGroup | null = null;
+
+    /** Its surface in voxel GI (`Renderer.enableVoxelGI`): what it reflects and emits there, or
+     *  null to leave it out of the voxels (the default). Drawn into the voxels through its
+     *  material's own `vertex_main` (`Material.getVoxelPipeline`). Rust: `Renderable::gi`. */
+    public gi: GiSurface | null = null;
 
     /** Path tracer material properties. If null, defaults are derived at BVH build time. */
     public pathTracerMaterial: PathTracerMaterial | null = null;

@@ -16,6 +16,18 @@ import particleResolve from '../../rust/kansei-core/src/gi/shaders/particle_reso
 import particleCones from '../../rust/kansei-core/src/gi/shaders/particle_cones.wgsl?raw';
 import sdf from '../../rust/kansei-core/src/gi/shaders/sdf.wgsl?raw';
 import skyLighting from '../../rust/kansei-core/src/atmosphere/shaders/sky_lighting.wgsl?raw';
+import voxelWrite from '../../rust/kansei-core/src/gi/shaders/voxel_write.wgsl?raw';
+import voxelFragment from '../../rust/kansei-core/src/gi/shaders/voxel_fragment.wgsl?raw';
+import voxelIrradiance from '../../rust/kansei-core/src/gi/shaders/voxel_irradiance.wgsl?raw';
+import inject from '../../rust/kansei-core/src/gi/shaders/inject.wgsl?raw';
+import screenCommon from '../../rust/kansei-core/src/gi/shaders/screen_common.wgsl?raw';
+import screenNormal from '../../rust/kansei-core/src/gi/shaders/screen_normal.wgsl?raw';
+import screenTrace from '../../rust/kansei-core/src/gi/shaders/screen_trace.wgsl?raw';
+import screenTemporal from '../../rust/kansei-core/src/gi/shaders/screen_temporal.wgsl?raw';
+import screenComposite from '../../rust/kansei-core/src/gi/shaders/screen_composite.wgsl?raw';
+import probeCommon from '../../rust/kansei-core/src/gi/shaders/probe_common.wgsl?raw';
+import probeIrradiance from '../../rust/kansei-core/src/gi/shaders/probe_irradiance.wgsl?raw';
+import { COMPUTE_SHADOWS_WGSL } from '../shadows/ComputeShadows';
 
 /**
  * The WGSL `VoxelVolume` struct and `voxelUvw` / `voxelLinearIndex`: bind `VoxelVolume.uniform`
@@ -45,6 +57,25 @@ export const PARTICLE_EMISSION_WGSL: string = particleEmission;
  */
 export const SKY_LIGHTING_WGSL: string = skyLighting;
 
+/**
+ * For a material's `voxelFragmentEntry` (`MaterialOptions`): the voxelizer's group 3 and
+ * `kansei_voxel_write(fragPos, front, albedo, emission)`, which puts the surface at a fragment
+ * into its voxel. Call it in uniform control flow (it takes derivatives):
+ *
+ * ```wgsl
+ * @fragment
+ * fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
+ *     let albedo = textureSample(base_texture, base_sampler, in.uv).rgb;
+ *     kansei_voxel_write(in.clip, front, albedo, vec3f(0.0));
+ * }
+ * ```
+ *
+ * `kansei_voxel_draw.albedo` and `.emission` hold the renderable's `GiSurface`. Group 3 binds
+ * 100-102 here, apart from the shadow group's, so a material may use both chunks.
+ * Rust: `gi::VOXEL_WRITE_WGSL`.
+ */
+export const VOXEL_WRITE_WGSL: string = voxelWrite;
+
 /** One mip of a 3D chain (`Mip3d`). */
 export const MIP3D_WGSL: string = mip3d;
 /** The six directional mip chains (`AnisotropicMips`). */
@@ -55,3 +86,13 @@ export const SPLAT_WGSL: string = assemble([voxelVolume, particleEmission, parti
 export const RESOLVE_WGSL: string = assemble([voxelVolume, skyLighting, particleResolve]);
 /** `ParticleConeShading`'s gather. */
 export const PARTICLE_CONES_WGSL: string = assemble([voxelVolume, voxelCones, sdf, particleEmission, skyLighting, particleCones]);
+/** `MeshVoxelizer`'s fragment stage for materials without a `voxelFragmentEntry`. */
+export const VOXEL_FRAGMENT_WGSL: string = assemble([voxelWrite, voxelFragment]);
+/** `VoxelInjection`'s pass: the voxelized surfaces into light (Rust `gi::inject::INJECT_WGSL`). */
+export const INJECT_WGSL: string = assemble([voxelVolume, voxelCones, voxelIrradiance, sdf, particleEmission, skyLighting, COMPUTE_SHADOWS_WGSL, inject]);
+/** `VoxelGIEffect`'s trace through a volume (Rust `gi::effect::TRACE_WGSL`). */
+export const SCREEN_TRACE_WGSL: string = assemble([screenCommon, screenNormal, voxelVolume, voxelCones, voxelIrradiance, skyLighting, screenTrace]);
+/** `VoxelGIEffect`'s temporal filter. */
+export const SCREEN_TEMPORAL_WGSL: string = assemble([screenCommon, screenTemporal]);
+/** `VoxelGIEffect`'s composite (`main`, and `main_probes` with probes as the far field). */
+export const SCREEN_COMPOSITE_WGSL: string = assemble([screenCommon, screenNormal, voxelVolume, sdf, probeCommon, probeIrradiance, skyLighting, screenComposite]);

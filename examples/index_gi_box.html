@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - GI box</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    #panel {
+      position: fixed; right: 12px; top: 12px; color: #ddd; font: 12px/1.6 monospace;
+      background: rgba(0, 0, 0, 0.6); padding: 8px 10px; border-radius: 4px;
+    }
+    #panel label { display: flex; justify-content: space-between; gap: 10px; }
+    #panel select { font: inherit; }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <label>gi <select id="gi"><option>off</option><option>voxel</option></select></label>
+    <label>voxels <select id="voxels"><option>low</option><option>medium</option><option>high</option></select></label>
+    <label>view <select id="view"><option>lit</option><option>indirect</option><option>voxels</option></select></label>
+    <label>camera <select id="cam"><option>front</option><option>corner</option><option>low</option><option>floor</option></select></label>
+    <label>animate <input type="checkbox" id="animate"></label>
+    <label>rug texture in voxels <input type="checkbox" id="textured"></label>
+    <label>rug <input type="checkbox" id="rug"></label>
+  </div>
+  <script type="module">
+    // GI box: the Rust `gi-box` example's room (rust/kansei-wasm/examples/gi-box) on the TS engine,
+    // for its voxel GI: a Cornell box (white floor, ceiling and back wall, a red wall on the left,
+    // a green one on the right, two white blocks, a rug half orange and half blue) under one
+    // shadowed downlight. Without GI the scene has direct light only, so the ceiling and the
+    // shadows are black; with voxel GI (`Renderer.enableVoxelGI`, `VoxelGIEffect`) the renderables
+    // are voxelized through their own vertex shaders, lit through the lamp's shadow map with the
+    // bounces adding up over frames, and cones traced per pixel through the voxels bring the
+    // floor's light to the ceiling and the walls' colour onto the floor and the blocks. The rug's
+    // voxels take its texture through its material's voxel entry (`albedo=constant`: its mean
+    // colour instead).
+    //
+    // The TS engine has no spot lights yet: the lamp is a point light with a cube shadow inside a
+    // fixture open at the bottom (a hard-edged cone of 76 degrees, the Rust spot's outer angle), lit
+    // with the falloff the voxel injection uses, so the direct light and the voxels' agree.
+    //
+    // URL parameters, as the Rust example's (its voxel modes): gi=off|voxel (default voxel),
+    // voxels=low|medium|high, view=lit|indirect|voxels, cam=front|corner|low|floor, animate=1,
+    // albedo=constant, rug=off, ui=0, profile=1 (each pass's GPU time; examples/profile-hud.js).
+    // `window.kansei` holds the setters and `info()` for scripted captures.
+    import { Canvas, run, param, flag, isPhone } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PointLight } from '../src/lights/PointLight'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { GBUFFER_OUT_WGSL, SHADOW_MAP_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { VOXEL_WRITE_WGSL } from '../src/gi/GiWGSL'
+    import { VoxelGiQuality } from '../src/gi/VoxelVolume'
+    import { VoxelGIEffect } from '../src/gi/VoxelGIEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
+
+    const phone = isPhone();
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    const hud = installProfileHud({ renderer, FrameTimer, AbBench });
+
+    // ── the lamp: a shadowed point light in a fixture open at the bottom ──────────────────────
+    const LAMP = [0, 3.75, -2];
+    const LAMP_RADIUS = 12;
+    const LAMP_COLOR = [1.0, 0.92, 0.8];
+    // the Rust spot's 1600 cd gives 108 lx on the floor below it; the falloff here keeps 0.46 there
+    const LAMP_INTENSITY = 240;
+
+    // A diffuse surface lit by the lamp (its falloff and cube shadow, as voxel GI's injection
+    // lights the voxels: inject.wgsl), writing the normal and albedo the GI reads (GBuffer targets
+    // 2 and 3, through GBUFFER_OUT_WGSL): its albedo the uniform's colour times, for the rug, a
+    // texture.
+    const SURFACE_WGSL = /* wgsl */`
+      struct Surface { albedo: vec4<f32>, emission: vec4<f32> };
+      @group(0) @binding(0) var<uniform> surface: Surface;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      const LAMP_POSITION = vec3<f32>(${LAMP.join(', ')});
+      const LAMP_RADIUS = ${LAMP_RADIUS.toFixed(1)};
+      const LAMP_COLOR = vec3<f32>(${LAMP_COLOR.map((c) => (c * LAMP_INTENSITY).toFixed(3)).join(', ')});
+
+      struct VIn {
+        @location(0) position: vec4<f32>,
+        @location(1) normal: vec3<f32>,
+        @location(2) uv: vec2<f32>,
+      };
+      struct VOut {
+        @builtin(position) clip: vec4<f32>,
+        @location(0) world: vec3<f32>,
+        @location(1) normal: vec3<f32>,
+        @location(2) uv: vec2<f32>,
+      };
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+        let world = world_matrix * v.position;
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * world;
+        out.world = world.xyz;
+        out.normal = (normal_matrix * vec4<f32>(v.normal, 0.0)).xyz;
+        out.uv = v.uv;
+        return out;
+      }
+
+      fn shade(in: VOut, base: vec3<f32>) -> KanseiGBufferOut {
+        let n = normalize(in.normal);
+        let d = LAMP_POSITION - in.world;
+        let dist = length(d);
+        let falloff = max(1.0 - dist / LAMP_RADIUS, 0.0);
+        let irradiance = LAMP_COLOR * max(dot(n, d / dist), 0.0) * falloff * falloff
+          * kansei_point_shadow(in.world + n * 0.02);   // a little off the surface: no acne at grazing angles
+        let emission = surface.emission.rgb;
+        return kansei_gbuffer_out(base / 3.14159265 * irradiance + emission, emission, n, base);
+      }
+    `;
+    const PLAIN_WGSL = /* wgsl */`
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        return shade(in, surface.albedo.rgb);
+      }
+    `;
+    // The rug: its albedo from a texture, and a voxel entry that gives voxel GI the same texture.
+    const TEXTURED_WGSL = /* wgsl */`
+      @group(0) @binding(1) var rug_texture: texture_2d<f32>;
+      @group(0) @binding(2) var rug_sampler: sampler;
+
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        return shade(in, surface.albedo.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb);
+      }
+
+      // voxel GI's voxelizer: the rug's texture into its voxels
+      @fragment
+      fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
+        kansei_voxel_write(in.clip, front, surface.albedo.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
+      }
+    `;
+
+    const surfaceUniform = (albedo, emission = [0, 0, 0]) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array([...albedo, 1, ...emission, 0]),
+    });
+    const vertexFragment = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    const litMaterial = (label, albedo) => new Material(`${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SURFACE_WGSL}\n${PLAIN_WGSL}`, {
+      label,
+      mrtOutputCount: 4,
+      bindings: [{ binding: 0, visibility: vertexFragment, value: surfaceUniform(albedo) }],
+    });
+
+    // The rug's two halves (linear albedo), split across its width; its texture orange on the left
+    // half, blue on the right, with a thin pale border (the Rust example's bytes, read as unorm).
+    const RUG_LEFT = [0.85, 0.35, 0.05];
+    const RUG_RIGHT = [0.05, 0.25, 0.8];
+    function rugTexture() {
+      const N = 64;
+      const srgb = (c) => Math.round((c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055) * 255);
+      const texels = new Uint8Array(N * N * 4);
+      for (let y = 0; y < N; y++) {
+        for (let x = 0; x < N; x++) {
+          const border = x < 3 || y < 3 || x >= N - 3 || y >= N - 3;
+          const c = border ? [0.8, 0.75, 0.6] : x < N / 2 ? RUG_LEFT : RUG_RIGHT;
+          texels.set([srgb(c[0]), srgb(c[1]), srgb(c[2]), 255], (y * N + x) * 4);
+        }
+      }
+      return Texture.fromRGBA('Rug', N, N, texels);
+    }
+    const rugTex = rugTexture();
+    const rugSampler = new Sampler('linear', 'linear');
+    // `voxelEntry` false voxelizes the rug with its constant `GiSurface` instead
+    const rugMaterial = (voxelEntry) => new Material(`${VOXEL_WRITE_WGSL}\n${GBUFFER_OUT_WGSL}\n${SHADOW_MAP_WGSL}\n${SURFACE_WGSL}\n${TEXTURED_WGSL}`, {
+      label: 'Rug',
+      mrtOutputCount: 4,
+      voxelFragmentEntry: voxelEntry ? 'voxel_main' : undefined,
+      bindings: [
+        { binding: 0, visibility: vertexFragment, value: surfaceUniform([1, 1, 1]) },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: rugTex },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: rugSampler },
+      ],
+    });
+
+    // ── the room ──────────────────────────────────────────────────────────────────────────────
+    const scene = new Scene();
+    const white = [0.73, 0.73, 0.73];
+    const slabs = [
+      ['Floor', [4.4, 0.2, 4.2], [0, -0.1, -2.1], white],
+      ['Ceiling', [4.4, 0.2, 4.2], [0, 4.1, -2.1], white],
+      ['Back', [4.4, 4.4, 0.2], [0, 2.0, -4.1], white],
+      ['Left', [0.2, 4.4, 4.2], [-2.1, 2.0, -2.1], [0.63, 0.065, 0.05]],
+      ['Right', [0.2, 4.4, 4.2], [2.1, 2.0, -2.1], [0.14, 0.45, 0.09]],
+    ];
+    for (const [label, size, position, color] of slabs) {
+      const slab = new Renderable(new BoxGeometry(...size), litMaterial(label, color));
+      slab.position.set(...position);
+      slab.gi = { albedo: color };
+      scene.add(slab);
+    }
+    const tallRest = { position: [-0.75, 1.2, -2.6], yaw: 0.33 };
+    const tall = new Renderable(new BoxGeometry(1.2, 2.4, 1.2), litMaterial('Tall', white));
+    tall.position.set(...tallRest.position);
+    tall.rotation.y = tallRest.yaw;
+    tall.gi = { albedo: white };
+    scene.add(tall);
+    const short = new Renderable(new BoxGeometry(1.2, 1.2, 1.2), litMaterial('Short', white));
+    short.position.set(0.8, 0.6, -1.5);
+    short.rotation.y = -0.3;
+    short.gi = { albedo: white };
+    scene.add(short);
+    const rugMean = [0, 1, 2].map((c) => (RUG_LEFT[c] + RUG_RIGHT[c]) * 0.5);
+    const rug = new Renderable(new BoxGeometry(2.4, 0.02, 0.8), rugMaterial(true));
+    rug.position.set(0, 0.01, -0.55);
+    rug.gi = { albedo: rugMean };
+    scene.add(rug);
+
+    // The fixture: an open-bottomed box round the lamp, its rim 5 cm below it, casting a cone of
+    // 76 degrees as the Rust spot's outer angle (not in the voxels: the lamp's light leaves
+    // through its opening, and its outside is dark).
+    const fixtureColor = [0.05, 0.05, 0.05];
+    const fixture = [
+      [[0.44, 0.04, 0.44], [0, 3.98, -2]],
+      [[0.04, 0.31, 0.44], [-0.2, 3.855, -2]],
+      [[0.04, 0.31, 0.44], [0.2, 3.855, -2]],
+      [[0.44, 0.31, 0.04], [0, 3.855, -2.2]],
+      [[0.44, 0.31, 0.04], [0, 3.855, -1.8]],
+    ];
+    for (const [size, position] of fixture) {
+      const part = new Renderable(new BoxGeometry(...size), litMaterial('Fixture', fixtureColor));
+      part.position.set(...position);
+      scene.add(part);
+    }
+    const lamp = new PointLight(LAMP_RADIUS, LAMP_COLOR, LAMP_INTENSITY);
+    lamp.position.set(...LAMP);
+    lamp.castShadow = true;
+    scene.add(lamp);
+    renderer.enablePointShadows({ resolution: 1024, maxLights: 1, near: 0.02, shadowFar: LAMP_RADIUS });
+
+    // ── the camera ────────────────────────────────────────────────────────────────────────────
+    // (name, target, distance, azimuth, elevation), as the Rust example's
+    const CAMERAS = {
+      front: [[0, 2, -2], 8.3, 0, 0],
+      corner: [[1, 0.8, -3], 4.98, -0.777, 0.634],
+      low: [[0, 1.4, -2.5], 7.5, 0, -0.12],
+      floor: [[-0.3, 0.5, -2], 6.2, 0.3, 0.42],
+    };
+    const camera = new Camera(38, 0.1, 100, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 2, -2), renderer.canvas, 8.3).withMousePan();
+    function setCamera(name) {
+      const [t, distance, azimuth, elevation] = CAMERAS[name] ?? CAMERAS.front;
+      controls.setView(new Vector3(...t), distance, azimuth, elevation);
+      config.cam = name in CAMERAS ? name : 'front';
+    }
+
+    // ── what the URL and the panel set ────────────────────────────────────────────────────────
+    const config = {
+      gi: param('gi') === 'off' ? 'off' : 'voxel',
+      voxels: VoxelGiQuality.fromName(param('voxels')) ?? (phone ? 'low' : 'medium'),
+      view: ['lit', 'indirect', 'voxels'].includes(param('view')) ? param('view') : 'lit',
+      cam: 'front',
+      animate: flag('animate', false),
+      textured: param('albedo') !== 'constant',
+      rug: param('rug') !== 'off',
+    };
+    setCamera(param('cam') ?? 'front');
+
+    const volume = new PostProcessingVolume(renderer, []);
+    let enabledVoxels = null;
+    let textured = true;
+
+    // Bring the renderer, the chain and the scene to `config`.
+    function apply() {
+      if (config.gi === 'voxel') {
+        if (enabledVoxels !== config.voxels) {
+          renderer.enableVoxelGI({
+            quality: config.voxels,
+            boundsMin: [-2.3, -0.3, -4.3],
+            boundsMax: [2.3, 4.3, 0.3],
+            budgetBytes: phone ? 24 << 20 : 0,
+          });
+          enabledVoxels = config.voxels;
+        }
+      } else if (enabledVoxels !== null) {
+        renderer.disableVoxelGI();
+        enabledVoxels = null;
+      }
+      volume.clearEffects();
+      const indirect = config.view === 'indirect';
+      const gi = renderer.voxelGI;
+      if (gi) {
+        const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality });
+        effect.showIndirect = indirect;
+        effect.showVoxels = config.view === 'voxels';
+        volume.addEffect(effect);
+      }
+      volume.addEffect(new ToneMapEffect({
+        ...toneMapOptionsForSurface(renderer.presentationFormat),
+        // the indirect view alone is 2 stops brighter
+        exposure: exposureFromEV100(5) * (indirect && gi ? 4 : 1),
+      }));
+      if (config.textured !== textured) {
+        rug.material = rugMaterial(config.textured);
+        textured = config.textured;
+        // the voxelizer can't see a material change
+        gi?.invalidate();
+      }
+      rug.visible = config.rug;
+      tall.dynamic = config.animate;
+      if (!config.animate) {
+        tall.position.set(...tallRest.position);
+        tall.rotation.y = tallRest.yaw;
+      }
+      for (const key of ['gi', 'voxels', 'view', 'cam']) document.getElementById(key).value = config[key];
+      for (const key of ['animate', 'textured', 'rug']) document.getElementById(key).checked = config[key];
+    }
+    apply();
+
+    const info = () => {
+      const gi = renderer.voxelGI;
+      return {
+        ...config,
+        voxelTier: gi?.quality ?? null,
+        dims: gi ? [...gi.volume.dims] : null,
+        mib: gi ? +(gi.memoryBytes() / (1 << 20)).toFixed(1) : 0,
+      };
+    };
+    const set = (key) => (value) => { config[key] = value; apply(); };
+    window.kansei = {
+      info,
+      setGi: set('gi'), setVoxels: set('voxels'), setView: set('view'), setAnimate: set('animate'),
+      setTextured: set('textured'), setRug: set('rug'), setCamera,
+      renderer, scene, camera,
+    };
+    for (const key of ['gi', 'voxels', 'view']) document.getElementById(key).onchange = (e) => set(key)(e.target.value);
+    document.getElementById('cam').onchange = (e) => setCamera(e.target.value);
+    for (const key of ['animate', 'textured', 'rug']) document.getElementById(key).onchange = (e) => set(key)(e.target.checked);
+    if (!flag('ui', true)) document.getElementById('panel').style.display = 'none';
+    console.log(`Kansei — GI box (TS) ready: ${JSON.stringify(info())}`);
+
+    let time = 0;
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      const dt = Math.min(Math.max(f.dt, 0), 0.1);
+      if (config.animate) {
+        time += dt;
+        // turn, and slide back and forth across the box
+        const [x, y, z] = tallRest.position;
+        tall.position.set(x + 0.45 * Math.sin(time * 0.7), y, z + 0.25 * Math.sin(time * 0.45));
+        tall.rotation.y = tallRest.yaw + time * 0.6;
+      }
+      controls.update(dt);
+      hud.begin(performance.now());
+      volume.render(scene, camera);
+      hud.end(performance.now());
+    });
+  </script>
+</body>
+
+</html>

@@ -18,6 +18,7 @@ import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled,
 import { CULL_VIEW_BYTES, CullPipeline, CullView, cullView, cullViewDraws, drawGeometry, packCullView } from "../culling/InstanceCulling";
 import { CullViewKind, CullingStats, StatsReadback } from "../culling/CullingStats";
 import { mat4 } from "gl-matrix";
+import { SceneVoxelGi, SceneVoxelGiOptions } from "../gi/SceneVoxelGi";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -358,6 +359,38 @@ class Renderer {
         this._shadowBGDirty = true;
         return this._cubeMapShadowMap;
     }
+
+    // Voxel GI of the scene's meshes (`enableVoxelGI`)
+    private _voxelGI: SceneVoxelGi | null = null;
+
+    /**
+     * Voxel GI for the scene's meshes over a box (`SceneVoxelGi`, Rust's `enable_voxel_gi`): every
+     * frame, after the shadow maps, the renderables with a `Renderable.gi` surface are voxelized
+     * (the static ones when they change) and lit by the scene's lights through their shadow maps,
+     * with the bounces adding up over frames. Read the result with `VoxelGIEffect`. Calling it
+     * again replaces the volume.
+     *
+     * ```ts
+     * const gi = renderer.enableVoxelGI({ boundsMin, boundsMax });
+     * const effect = new VoxelGIEffect(gi.volume, { quality: gi.quality });
+     * ```
+     */
+    public enableVoxelGI(options: SceneVoxelGiOptions): SceneVoxelGi {
+        this._voxelGI?.destroy();
+        this._voxelGI = new SceneVoxelGi(this.device!, options);
+        const gi = this._voxelGI;
+        console.info(`voxel GI: ${gi.quality}, [${gi.volume.dims.join(', ')}] voxels, ${(gi.memoryBytes() / (1 << 20)).toFixed(1)} MiB`);
+        return gi;
+    }
+
+    /** Turn voxel GI off and free its volume. */
+    public disableVoxelGI(): void {
+        this._voxelGI?.destroy();
+        this._voxelGI = null;
+    }
+
+    /** The scene's voxel GI, once `enableVoxelGI` has been called. */
+    public get voxelGI(): SceneVoxelGi | null { return this._voxelGI; }
 
     constructor(
         private options: RendererOptions = {}
@@ -801,6 +834,7 @@ class Renderer {
         this._planShadowViews(stack, camera);
         this._runInstanceCulling(commandRenderEncoder, stack, camera);
         this._encodeShadowPasses(commandRenderEncoder, stack);
+        this._encodeVoxelGI(commandRenderEncoder, stack);
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
 
@@ -1044,6 +1078,10 @@ class Renderer {
         this._encodeShadowPasses(commandEncoder, stack);
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
+        t?.end();
+
+        t = cpuScope('scene/voxel_gi');
+        this._encodeVoxelGI(commandEncoder, stack);
         t?.end();
 
         // With transmissive objects the pass splits: opaque, a snapshot of the colour into
@@ -1323,6 +1361,20 @@ class Renderer {
     /** After the frame's culling is submitted: read its statistics back (when on). */
     private _endCulledFrame(camera: Camera): void {
         this._cullStats.endFrame(this.device!, camera.frame);
+    }
+
+    /**
+     * Voxel GI's frame (`enableVoxelGI`), after the shadow views and before the scene pass, in
+     * the Rust renderer's order: the GI renderables voxelized at their scene slots, lit through
+     * the shadow maps materials sample (the directional one only while it has a light), and the
+     * mips rebuilt.
+     */
+    private _encodeVoxelGI(encoder: GPUCommandEncoder, stack: Scene): void {
+        if (!this._voxelGI) return;
+        const sm = this._shadowMap;
+        const shadowMap = sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null;
+        this._voxelGI.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,
+            shadowMap, this._cubeMapShadowMap);
     }
 
     /**

@@ -98,13 +98,16 @@ class ComputeShadows {
      * `castShadow`, else the first. A point light reads its own cube faces if the cube map drew it
      * last frame; an area light that owns the 2D map reads it (`SHADOW_MAP`). `volumetricOnly`
      * keeps the fog's rule: directional lights that aren't `volumetric` are left out, and such
-     * point and area lights scatter nothing. The lights are uploaded again only if they changed.
+     * point and area lights scatter nothing. `areaShadowMap` false leaves area lights without a
+     * shadow (`NO_SHADOW`) for passes that, as `compute_shadows.wgsl` itself, know no
+     * `SHADOW_MAP` case (voxel GI's injection). The lights are uploaded again only if they changed.
      */
     updateLights(
         dirLights: readonly DirectionalLight[],
         pointLights: readonly PointLight[],
         areaLights: readonly AreaLight[] = [],
         volumetricOnly = true,
+        areaShadowMap = true,
     ): void {
         const sm = this._shadowSource ? this._shadowMap : null;
         const owns = (l: DirectionalLight | AreaLight) => sm !== null && (sm.light === l || l.shadowMap === sm);
@@ -133,7 +136,7 @@ class ComputeShadows {
             if (light.volumetric || !volumetricOnly) point.set(light.effectiveColor, i * 8 + 4);
             const cubeIndex = cubeLights.indexOf(light);
             pointU32[i * 8 + 7] = cubeIndex >= 0 ? cubeIndex * 6
-                : (light instanceof AreaLight && owns(light)) ? SHADOW_MAP
+                : (areaShadowMap && light instanceof AreaLight && owns(light)) ? SHADOW_MAP
                 : NO_SHADOW;
         });
 

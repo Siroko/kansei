@@ -43,6 +43,14 @@ export const VoxelGiQuality = {
     fit(q: VoxelGiQuality, limits: GPUSupportedLimits, boundsMin: Vec3, boundsMax: Vec3, budgetBytes: number = 0): VoxelGiQuality {
         return fitWith(q, limits, boundsMin, boundsMax, budgetBytes, ACCUMULATOR_BYTES_PER_VOXEL, false);
     },
+
+    /**
+     * `fit` for a scene's volume (`SceneVoxelGi`): its anisotropic chains and a mesh voxelizer's
+     * surfaces (`SURFACE_WORDS_PER_VOXEL` u32 a voxel) in place of the particle accumulators.
+     */
+    fitScene(q: VoxelGiQuality, limits: GPUSupportedLimits, boundsMin: Vec3, boundsMax: Vec3, budgetBytes: number = 0): VoxelGiQuality {
+        return fitWith(q, limits, boundsMin, boundsMax, budgetBytes, SURFACE_WORDS_PER_VOXEL * 4, true);
+    },
 };
 
 /** `VoxelGiQuality.fit` with `bytesPerVoxel` in one storage binding next to the radiance (and its anisotropic chains). */
@@ -63,6 +71,14 @@ export type Vec3 = [number, number, number];
 
 /** Bytes of the particle accumulators per voxel (four u32). */
 export const ACCUMULATOR_BYTES_PER_VOXEL = 16;
+
+/**
+ * u32 per voxel in a mesh voxelizer's surface buffers: average albedo (rgb8 + count), average
+ * normal (xyz8 + count), average normal folded onto one hemisphere (xyz8 + count: the axis of a
+ * sheet thinner than a voxel, whose two faces' normals cancel), brightest emission (RGB9E5).
+ * Rust: `gi::SURFACE_WORDS_PER_VOXEL`.
+ */
+export const SURFACE_WORDS_PER_VOXEL = 4;
 
 /**
  * Where a volume's voxels lie: cubic voxels over a box, `resolution` across its longest axis,
