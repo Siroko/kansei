@@ -40,6 +40,7 @@ class CubeMapShadowMap {
     private _maxLights: number;
     private _near: number;
     private _shadowFar: number;
+    private _lights: readonly PositionalLight[] = [];
 
     private _distanceTexture: GPUTexture;
     private _scratchDepthTexture: GPUTexture;
@@ -114,6 +115,8 @@ class CubeMapShadowMap {
 
     get distanceTexture(): GPUTexture { return this._distanceTexture; }
     get maxLights(): number { return this._maxLights; }
+    /** The lights the last render() drew, in atlas order: light i owns layers 6i..6i+5. */
+    get lights(): readonly PositionalLight[] { return this._lights; }
 
     private _ensureLightUniformBuffer(faceCount: number): void {
         if (faceCount <= this._lightUniformCapacity && this._lightUniformBG) return;
@@ -329,6 +332,7 @@ class CubeMapShadowMap {
 
     render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PositionalLight[]): void {
         const device = this._device;
+        this._lights = [];
         if (pointLights.length === 0) return;
 
         const objects = scene.getOrderedObjects();
@@ -359,6 +363,7 @@ class CubeMapShadowMap {
 
         const lightCount = Math.min(pointLights.length, this._maxLights);
         const totalFaces = lightCount * 6;
+        this._lights = pointLights.slice(0, lightCount);
 
         // Ensure light uniform buffer is large enough for all faces
         this._ensureLightUniformBuffer(totalFaces);

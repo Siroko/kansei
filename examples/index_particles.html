@@ -933,6 +933,7 @@
     const fogEffect = new VolumetricFogEffect({
       froxelGrid,
       shadowMap: areaLight.shadowMap,
+      cubeMapShadowMap: pointLight.shadowMap,
       baseDensity: 0.02,
       heightFalloff: 0.005,
       anisotropy: 0.6,

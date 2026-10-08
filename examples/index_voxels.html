@@ -50,7 +50,7 @@
     const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 0.0);
     const lightDirUniform = new Vector3(0, -1, 0.0);
 
-    const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 110.0, [3, 3]); // the tracer lights surfaces with albedo / pi
     areaLight.position.set(0, WALL - 0.2, 0);
     areaLight.target.set(0, 0, 0);
 
@@ -411,7 +411,7 @@
     // Light settings
     const alFolder = pane.addFolder({ title: 'Area Light', expanded: false });
     const areaLightParams = { intensity: areaLight.intensity };
-    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 60, step: 0.1 }).on('change', () => {
+    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 200, step: 0.1 }).on('change', () => {
       areaLight.intensity = areaLightParams.intensity;
     });
 
