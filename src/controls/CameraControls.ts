@@ -33,6 +33,13 @@ class CameraControls {
     private enabled: boolean;
     private offset: { x: number; y: number; z: number };
     private offsetEase: { x: number; y: number; z: number };
+    /** Pan from mouse drags (`withMousePan`), added to the target. */
+    private pan: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
+    private mousePan: boolean = false;
+    private panning: boolean = false;
+    private panPoint: { x: number; y: number } = { x: 0, y: 0 };
+    private readonly lookPoint: Vector3 = new Vector3();
+    private contextMenuHandler?: (e: Event) => void;
 
     private time: number;
     private domElement: HTMLElement | Window;
@@ -139,6 +146,7 @@ class CameraControls {
         domElement.removeEventListener('touchstart', this.touchStartHandler as EventListener);
         domElement.removeEventListener('touchend', this.touchEndHandler as EventListener);
         domElement.removeEventListener('touchmove', this.touchMoveHandler as EventListener);
+        if (this.contextMenuHandler) domElement.removeEventListener('contextmenu', this.contextMenuHandler);
 
     }
 
@@ -197,6 +205,13 @@ class CameraControls {
         if (this.enabled) {
             // e.preventDefault();
         }
+        // with mouse pan: the right button, or the left with shift, pans
+        this.panning = this.mousePan && (e.button === 2 || (e.button === 0 && e.shiftKey));
+        if (this.panning) {
+            this.panPoint.x = e.pageX;
+            this.panPoint.y = e.pageY;
+            return;
+        }
         this.down = true;
 
         this.downPoint.x = e.pageX;
@@ -211,6 +226,7 @@ class CameraControls {
         if (this.enabled) {
             // e.preventDefault();
         }
+        this.panning = false;
         this.down = false;
 
         this.prevAngles.x = this.currentAngles.x;
@@ -237,7 +253,12 @@ class CameraControls {
         this.offset.x = normalizedX * scaleOffset;
         this.offset.y = normalizedY * scaleOffset;
 
-        if (this.down) {
+        if (this.panning) {
+            const scale = this.radius * 0.0015;
+            this.panBy((e.pageX - this.panPoint.x) * -scale, (e.pageY - this.panPoint.y) * scale);
+            this.panPoint.x = e.pageX;
+            this.panPoint.y = e.pageY;
+        } else if (this.down) {
             this.displacement.x = (this.downPoint.x - e.pageX) / window.innerWidth;
             this.displacement.y = (this.downPoint.y - e.pageY) / window.innerHeight;
 
@@ -280,6 +301,74 @@ class CameraControls {
     }
 
     /**
+     * Vertical orbit angle in radians, above the target's horizon (within ±0.4π). Setting this
+     * snaps the camera without easing.
+     */
+    public get elevation(): number {
+        return this.currentAngles.y * this.PI * 2;
+    }
+    public set elevation(radians: number) {
+        const fraction = Math.min(this.limits.up, Math.max(this.limits.down, radians / (this.PI * 2)));
+        this.currentAngles.y = fraction;
+        this.prevAngles.y    = fraction;
+        this.finalRadians.y  = fraction * this.PI * 2;
+    }
+
+    /**
+     * Move the target toward `target` over `dt` seconds, closing `1 - e^(-rate dt)` of the gap
+     * (about `rate` per second at small steps, at any frame rate): a camera that trails a
+     * moving character. The target vector given to the constructor moves.
+     */
+    public follow(target: Vector3, dt: number, rate: number): void {
+        const t = 1 - Math.exp(-dt * rate);
+        this.target.set(
+            this.target.x + (target.x - this.target.x) * t,
+            this.target.y + (target.y - this.target.y) * t,
+            this.target.z + (target.z - this.target.z) * t,
+        );
+    }
+
+    /**
+     * Look at `target` from `radius` away, at `azimuth` and `elevation` (radians), dropping any
+     * pan: a camera preset. The camera snaps there on the next `update`.
+     */
+    public setView(target: Vector3, radius: number, azimuth: number, elevation: number): void {
+        this.target.set(target.x, target.y, target.z);
+        this.radius = this.wheelDelta = this.wheelDeltaEase = radius;
+        this.azimuth = azimuth;
+        this.elevation = elevation;
+        this.pan = { x: 0, y: 0, z: 0 };
+    }
+
+    /** The point looked at: the target plus any pan. */
+    public lookTarget(): Vector3 {
+        return new Vector3(this.target.x + this.pan.x, this.target.y + this.pan.y, this.target.z + this.pan.z);
+    }
+
+    /**
+     * Also pan with the mouse: drag with the right button, or with the left while holding shift
+     * (the element's context menu is suppressed for the right drag). Off by default.
+     */
+    public withMousePan(): this {
+        if (!this.mousePan) {
+            this.mousePan = true;
+            this.contextMenuHandler = (e: Event) => e.preventDefault();
+            this.domElement.addEventListener('contextmenu', this.contextMenuHandler);
+        }
+        return this;
+    }
+
+    /** Move the pan by `dx`, `dy` along the camera's right and up axes. */
+    private panBy(dx: number, dy: number): void {
+        const [sa, ca] = [Math.sin(this.finalRadians.x), Math.cos(this.finalRadians.x)];
+        const [se, ce] = [Math.sin(this.finalRadians.y), Math.cos(this.finalRadians.y)];
+        // right = (cos az, 0, -sin az); up = right x forward
+        this.pan.x += dx * ca + dy * -sa * se;
+        this.pan.y += dy * ce;
+        this.pan.z += dx * -sa + dy * -ca * se;
+    }
+
+    /**
      * Updates the camera position and orientation based on time and input.
      * @param t - The time delta for the update.
      */
@@ -292,11 +381,13 @@ class CameraControls {
         this.wheelDeltaEase += (this.wheelDelta - this.wheelDeltaEase) / 10;
         this.radius += (this.wheelDelta - this.radius) / 20;
 
-        this.camera.position.x = (this.target.x + this.offsetEase.x) + (Math.sin(this.finalRadians.x) * Math.cos(this.finalRadians.y) * this.radius);
-        this.camera.position.y = (this.target.y + this.offsetEase.y) + (Math.sin(this.finalRadians.y) * this.radius);
-        this.camera.position.z = (this.target.z + this.offsetEase.z) + (Math.cos(this.finalRadians.x) * Math.cos(this.finalRadians.y) * this.radius);
+        const look = this.lookPoint;
+        look.set(this.target.x + this.pan.x, this.target.y + this.pan.y, this.target.z + this.pan.z);
+        this.camera.position.x = (look.x + this.offsetEase.x) + (Math.sin(this.finalRadians.x) * Math.cos(this.finalRadians.y) * this.radius);
+        this.camera.position.y = (look.y + this.offsetEase.y) + (Math.sin(this.finalRadians.y) * this.radius);
+        this.camera.position.z = (look.z + this.offsetEase.z) + (Math.cos(this.finalRadians.x) * Math.cos(this.finalRadians.y) * this.radius);
 
-        this.camera.lookAt(this.target);
+        this.camera.lookAt(look);
 
         this.mouseX += (this._mouseX - this.mouseX) / 10;
         this.mouseY += (this._mouseY - this.mouseY) / 10;

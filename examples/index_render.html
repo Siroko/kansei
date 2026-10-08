@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Texture } from '../src/buffers/Texture'
     import { Sampler } from '../src/buffers/Sampler'
     import { shaderCode } from './assets/shaders/TexturedCube.js'
@@ -37,16 +37,11 @@
     import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
 
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 1,
+    const canvas = Canvas.fill().withMaxPixelRatio(1);
+    const renderer = await canvas.renderer({
       antialias: true,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas)
 
     const scene = new Scene();
     const camera = new Camera(20, 0.1, 1000, window.innerWidth / window.innerHeight);
@@ -162,10 +157,11 @@
       // volume.render() replaces renderer.render() — runs the full chain:
       //   renderToGBuffer → SSAO → God Rays → DoF → blit to canvas
       volume.render(scene, camera);
-
-      requestAnimationFrame(animate);
     }
-    animate();
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      return animate();
+    });
   </script>
 </body>
 

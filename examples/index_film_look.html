@@ -25,7 +25,7 @@
     //   t=<seconds>     freeze the camera at this point of its walk
     //   dpr=<ratio>     drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
     //   fog=0           no volumetric fog (TS only)
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
@@ -55,14 +55,9 @@
       return Number.isFinite(v) ? v : fallback;
     };
 
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: number('dpr', Math.min(window.devicePixelRatio, 2)),
-    });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
+    // ?dpr= is read by Canvas
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer();
     renderer.shadowsEnabled = true;
 
     const scene = new Scene();
@@ -282,11 +277,6 @@
     const volume = new PostProcessingVolume(renderer, effects);
 
     const camera = new Camera(45, 0.1, 400, window.innerWidth / window.innerHeight);
-    window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
-    });
 
     console.log(`Kansei — Film Look (TS) ready: ${tm}, EV100 ${ev100}, film ${film}, surface ${renderer.presentationFormat}`);
 
@@ -306,9 +296,11 @@
       renderer.setPointShadowParams(shadowLamp.position.x, shadowLamp.position.y, shadowLamp.position.z, shadowLamp.radius);
       fog?.updateLights([fill], lamps);
       volume.render(scene, camera);
-      requestAnimationFrame(frame);
     }
-    requestAnimationFrame(frame);
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      frame(performance.now());
+    });
   </script>
 </body>
 

@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { SphereGeometry } from '../src/geometries/SphereGeometry'
@@ -160,18 +160,11 @@
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 2,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: false,
       sampleCount: 4
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
     renderer.shadowsEnabled = true;
 
     const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
@@ -420,9 +413,11 @@
         cube.rotation.y = t * 1.1;
         cube.rotation.z = t * 0.5;
       }
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate();
+    });
   </script>
 </body>
 

@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { Compute } from '../src/materials/Compute'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
@@ -469,18 +469,11 @@
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 2,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: false,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
 
     // ── Scene ─────────────────────────────────────────────────────────────
     const scene = new Scene();
@@ -1417,15 +1410,10 @@
           console.log('[DIAG] totalInstances:', bvh.totalInstances, 'totalTriangleCount:', bvh.totalTriangleCount, 'totalBVH4Nodes:', bvh.totalBVH4Nodes);
         }
       }
-
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
-
-    window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate();
     });
   </script>
 </body>

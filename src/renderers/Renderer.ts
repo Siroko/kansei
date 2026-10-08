@@ -122,6 +122,12 @@ export interface RendererOptions {
      * Default `true`.
      */
     requireFloat32Filterable?: boolean;
+    /**
+     * Draw to this canvas instead of a new one (`Renderer.canvas`), e.g. a web `Canvas`'s
+     * element, which sizes it: `web/Canvas.renderer` passes it with the drawing-buffer size and
+     * a `devicePixelRatio` of 1.
+     */
+    canvas?: HTMLCanvasElement;
 }
 
 /**
@@ -248,7 +254,7 @@ class Renderer {
     constructor(
         private options: RendererOptions = {}
     ) {
-        this.canvas = document.createElement('canvas');
+        this.canvas = this.options.canvas ?? document.createElement('canvas');
         this.context = this.canvas.getContext('webgpu');
         this.sampleCount = this.options.sampleCount || this.sampleCount;
         this.devicePixelRatio = this.options.devicePixelRatio || this.devicePixelRatio;
@@ -365,8 +371,18 @@ class Renderer {
      * @param {number} height - Canvas height in pixels
      */
     public setSize(width: number, height: number) {
-        this.width = width * this.devicePixelRatio;
-        this.height = height * this.devicePixelRatio;
+        this.resize(width * this.devicePixelRatio, height * this.devicePixelRatio);
+    }
+
+    /**
+     * Sets the drawing-buffer size in pixels (no device pixel ratio applied) and recreates the
+     * size-dependent targets: what `web/run`'s `Frame.resize` calls when the canvas changes size.
+     * @param {number} width - Drawing-buffer width in pixels
+     * @param {number} height - Drawing-buffer height in pixels
+     */
+    public resize(width: number, height: number) {
+        this.width = width;
+        this.height = height;
         this.canvas.width = this.width;
         this.canvas.height = this.height;
 

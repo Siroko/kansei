@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { SphereGeometry } from '../src/geometries/SphereGeometry'
@@ -184,18 +184,11 @@
     }
 
     // ── Renderer ──────────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 2,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: true,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
 
     // ── Shadow receiving on geometry ─────────────────────────────────────
     renderer.shadowsEnabled = true;
@@ -555,9 +548,11 @@
       fogEffect.updateLights(scene.directionalLights, scene.pointLights);
       volume.render(scene, camera);
       hud.end(now);
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate(performance.now());
+    });
   </script>
 </body>
 
