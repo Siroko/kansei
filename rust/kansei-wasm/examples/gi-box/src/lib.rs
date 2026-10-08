@@ -13,6 +13,10 @@
 //! - `gi=voxel+ssgi`: screen-space GI in front for contact detail, the voxels for the rest.
 //! - `gi=probes` and `gi=probes+ssgi`: the voxels' light reaches the screen through irradiance
 //!   probes traced in the voxels' distance field (`SdfProbes`) instead of cones per pixel.
+//! - `gi=rt`: the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels from the surface
+//!   through a grid of the room's triangles, the hits lit by the lamp (shadow rays through the
+//!   grid) and one cone through the voxels for the further bounces, denoised by SVGF; closest to
+//!   the path-traced reference in the contacts and behind the blocks.
 //!
 //! Drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan. The panel
 //! (and `window.kansei`) switches everything at run time.
@@ -20,7 +24,13 @@
 //! URL parameters (a `preset` first, the others over it):
 //! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
 //!   `best`, voxel + SSGI at the device's tier, unless the URL names a preset or a `gi`);
-//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi`;
+//! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi|rt` (`rt`, or `rt=1`,
+//!   builds the grid of triangles at load; the panel reloads the page to switch to it without);
+//! - with `gi=rt`, the hybrid's settings (`RtGi`): `rtgi_res=half|full`,
+//!   `rtgi_denoise=svgf|temporal|off`, `rtgi_kernel=3x3|5x5`, `rtgi_hit=direct|voxels`,
+//!   `rtgi_shadows=rays|maps`, `rtgi_mode=hybrid|reference` (a path tracer through the grid),
+//!   `rtgi_accum=1` (the running mean of the raw signal),
+//!   `rtgi_view=lit|indirect|signal|variance|history|cost`;
 //! - `voxels=low|medium|high`: the volume's resolution (default medium; low on phones, which also
 //!   keep it within 24 MiB);
 //! - `view=indirect` (only the light GI adds, 2 stops brighter), `view=voxels` (with voxel GI:
@@ -62,7 +72,10 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
-use kansei_core::rt::{RtGridOptions, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions};
+use kansei_core::rt::{
+    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGridOptions, RtReflectionsEffect,
+    RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+};
 use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, param_or, Canvas, Frame};
 
 /// A diffuse surface lit by the spot lights only (no ambient), writing the normal and albedo the
@@ -255,6 +268,9 @@ enum Gi {
     VoxelAndScreen,
     Probes,
     ProbesAndScreen,
+    /// Diffuse GI traced through the grid of triangles (`RtDiffuseGiEffect`), the voxels for the
+    /// hits' further bounces.
+    Rt,
 }
 
 impl Gi {
@@ -270,6 +286,7 @@ impl Gi {
             "voxel+ssgi" | "voxel ssgi" => Gi::VoxelAndScreen,
             "probes" => Gi::Probes,
             "probes+ssgi" | "probes ssgi" => Gi::ProbesAndScreen,
+            "rt" => Gi::Rt,
             _ => return None,
         })
     }
@@ -285,11 +302,12 @@ impl Gi {
             Gi::VoxelAndScreen => "voxel+ssgi",
             Gi::Probes => "probes",
             Gi::ProbesAndScreen => "probes+ssgi",
+            Gi::Rt => "rt",
         }
     }
 
     fn voxels(self) -> bool {
-        matches!(self, Gi::Voxel | Gi::VoxelAndScreen | Gi::Probes | Gi::ProbesAndScreen)
+        matches!(self, Gi::Voxel | Gi::VoxelAndScreen | Gi::Probes | Gi::ProbesAndScreen | Gi::Rt)
     }
 
     fn probes(self) -> bool {
@@ -403,7 +421,69 @@ fn floor_specular() -> [f32; 2] {
     [param_or("floor_f0", 0.3), param_or("floor_rough", 0.05)]
 }
 
-/// The room's grid of triangles for the reflections: 96 cells each way over the box (4.8 cm).
+/// The hybrid's settings (`gi=rt`): the URL's `rtgi_*` parameters and `set_rtgi`'s keys.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RtGi {
+    resolution: RtGiResolution,
+    denoise: RtGiDenoise,
+    kernel: RtGiKernel,
+    hit: RtGiHitLighting,
+    shadows: RtGiShadows,
+    mode: RtGiMode,
+    accumulate: bool,
+    view: RtGiView,
+}
+
+impl RtGi {
+    const KEYS: [&'static str; 8] = ["res", "denoise", "kernel", "hit", "shadows", "mode", "accum", "view"];
+
+    fn from_url() -> Self {
+        let mut r = Self::default();
+        for key in Self::KEYS {
+            if let Some(v) = param(&format!("rtgi_{key}")) {
+                r.set(key, &v);
+            }
+        }
+        r
+    }
+
+    /// One setting by its key and name; false if either is unknown.
+    fn set(&mut self, key: &str, v: &str) -> bool {
+        match key {
+            "res" => RtGiResolution::from_name(v).map(|x| self.resolution = x),
+            "denoise" => RtGiDenoise::from_name(v).map(|x| self.denoise = x),
+            "kernel" => RtGiKernel::from_name(v).map(|x| self.kernel = x),
+            "hit" => RtGiHitLighting::from_name(v).map(|x| self.hit = x),
+            "shadows" => RtGiShadows::from_name(v).map(|x| self.shadows = x),
+            "mode" => RtGiMode::from_name(v).map(|x| self.mode = x),
+            "accum" => {
+                self.accumulate = v == "1" || v == "true";
+                Some(())
+            }
+            "view" => RtGiView::from_name(v).map(|x| self.view = x),
+            _ => None,
+        }
+        .is_some()
+    }
+
+    /// The settings as JSON members (for `info`).
+    fn json(&self) -> String {
+        format!(
+            "\"res\":\"{}\",\"denoise\":\"{}\",\"kernel\":\"{}\",\"hit\":\"{}\",\"shadows\":\"{}\",\"mode\":\"{}\",\"accum\":{},\"view\":\"{}\"",
+            self.resolution.name(),
+            self.denoise.name(),
+            self.kernel.name(),
+            self.hit.name(),
+            self.shadows.name(),
+            self.mode.name(),
+            self.accumulate,
+            self.view.name()
+        )
+    }
+}
+
+/// The room's grid of triangles for the reflections and the hybrid's rays: 96 cells each way over
+/// the box (4.8 cm).
 fn rt_grid_options() -> SceneRtGridOptions {
     let cell = 4.6 / 96.0;
     SceneRtGridOptions {
@@ -441,6 +521,9 @@ struct Config {
     reflection_view: RtReflectionsView,
     reflection_grid: bool,
     reflection_quarter: bool,
+    /// The grid of triangles exists (`reflect=1`, `gi=rt` or `rt=1`; set at load).
+    grid: bool,
+    rtgi: RtGi,
 }
 
 impl Config {
@@ -607,6 +690,8 @@ fn config_from_url(phone: bool) -> Config {
         reflection_view: param("rt_view").and_then(|v| reflection_view(&v)).unwrap_or_default(),
         reflection_grid: param("rt_trace").as_deref() != Some("voxels"),
         reflection_quarter: param("rt_res").as_deref() == Some("quarter"),
+        grid: false,
+        rtgi: RtGi::from_url(),
     };
     if let Some(preset) = param("preset").or_else(|| param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
@@ -638,6 +723,7 @@ fn config_from_url(phone: bool) -> Config {
     }
     c.rug = param("rug").as_deref() != Some("off");
     c.textured = param("albedo").as_deref() != Some("constant");
+    c.grid = c.reflect || c.gi == Gi::Rt || flag("rt", false);
     c
 }
 
@@ -651,6 +737,22 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
         Gi::Screen(quality) if config.view != View::Sdf => {
             let mut effect = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { quality, ..screen });
             effect.show_indirect = indirect;
+            effects.push(Box::new(effect));
+        }
+        Gi::Rt if matches!(config.view, View::Lit | View::Indirect) => {
+            // one ray for each 2 x 2 pixels through the room's grid, the voxels for the hits'
+            // further bounces and past the box; the lamp from the renderer's spot lights
+            let scene_gi = renderer.voxel_gi().expect("gi=rt enables voxel GI");
+            let grid = renderer.rt_grid().expect("gi=rt builds the grid");
+            let r = config.rtgi;
+            let options = RtDiffuseGiOptions { resolution: r.resolution, hit_lighting: r.hit, shadows: r.shadows, denoise: r.denoise, kernel: r.kernel, max_distance: 20.0, ..Default::default() };
+            let mut effect = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), options);
+            effect.mode = r.mode;
+            effect.accumulate = r.accumulate;
+            effect.view = if indirect { RtGiView::Indirect } else { r.view };
+            effect.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
+            effect.heat_scale = 0.5 / exposure_from_ev100(5.0);
+            effect.collect_stats = stats;
             effects.push(Box::new(effect));
         }
         _ => {
@@ -817,6 +919,9 @@ impl State {
             }
         }
         self.controls.update(&mut self.camera, dt);
+        if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            gi.update_lights(self.scene.lights());
+        }
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
         if let Some(stats) = &mut self.stats {
             stats.frames += 1;
@@ -839,18 +944,12 @@ impl State {
         self.scene.ordered_indices().filter_map(|i| self.scene.get_renderable(i)).filter(|r| r.visible).map(|r| r.geometry.index_count() as u64 / 3 * r.geometry.instance_count.max(1) as u64).sum()
     }
 
-    /// The grid's and the reflections' figures as JSON (null without `reflect=1`).
-    fn reflect_info(&self) -> String {
+    /// The grid's figures as JSON (null without it).
+    fn grid_info(&self) -> String {
         let Some(rt) = self.renderer.rt_grid() else { return "null".into() };
         let g = rt.stats();
-        let r = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtReflectionsEffect>());
-        let s = r.and_then(|r| r.stats()).unwrap_or_default();
         format!(
-            "{{\"enabled\":{},\"view\":\"{}\",\"grid\":{},\"res\":\"{}\",\"triangles\":{},\"references\":{},\"big\":{},\"sources\":{},\"rebuilt\":{},\"rebuilds\":{},\"cpu_ms\":{:.3},\"mib\":{:.1},\"rays\":{},\"hits\":{},\"cells\":{},\"tests\":{},\"max_cost\":{}}}",
-            self.config.reflections,
-            reflection_view_name(self.config.reflection_view),
-            self.config.reflection_grid,
-            if self.config.reflection_quarter { "quarter" } else { "half" },
+            "{{\"triangles\":{},\"references\":{},\"big\":{},\"sources\":{},\"rebuilt\":{},\"rebuilds\":{},\"cpu_ms\":{:.3},\"mib\":{:.1}}}",
             g.grid.triangles,
             g.grid.references,
             g.grid.big_triangles,
@@ -859,11 +958,44 @@ impl State {
             g.rebuilds,
             g.cpu_ms,
             rt.memory_bytes() as f64 / (1 << 20) as f64,
+        )
+    }
+
+    /// The reflections' figures as JSON (null without `reflect=1`).
+    fn reflect_info(&self) -> String {
+        if !self.config.reflect {
+            return "null".into();
+        }
+        let r = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtReflectionsEffect>());
+        let s = r.and_then(|r| r.stats()).unwrap_or_default();
+        format!(
+            "{{\"enabled\":{},\"view\":\"{}\",\"grid\":{},\"res\":\"{}\",\"rays\":{},\"hits\":{},\"cells\":{},\"tests\":{},\"max_cost\":{}}}",
+            self.config.reflections,
+            reflection_view_name(self.config.reflection_view),
+            self.config.reflection_grid,
+            if self.config.reflection_quarter { "quarter" } else { "half" },
             s.rays,
             s.hits,
             s.cells,
             s.tests,
             s.max_cost
+        )
+    }
+
+    /// The hybrid's settings, and while it runs its counters, memory and accumulated frames.
+    fn rtgi_info(&self) -> String {
+        let e = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtDiffuseGiEffect>());
+        let s = e.and_then(|e| e.stats()).unwrap_or_default();
+        format!(
+            "{{{},\"on\":{},\"accumulated\":{},\"mib\":{:.1},\"rays\":{},\"hits\":{},\"cost\":{},\"shadow_rays\":{}}}",
+            self.config.rtgi.json(),
+            e.is_some(),
+            e.map_or(0, |e| e.accumulated()),
+            e.map_or(0.0, |e| e.memory_bytes() as f64 / (1 << 20) as f64),
+            s.rays,
+            s.hits,
+            s.cost,
+            s.shadow_rays
         )
     }
 
@@ -873,7 +1005,10 @@ impl State {
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"reflect\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            self.grid_info(),
+            self.rtgi_info(),
+            sum("RtGi/"),
             self.reflect_info(),
             sum("Rt/Gather") + sum("Rt/Grid"),
             sum("Rt/Trace") + sum("Rt/Resolve"),
@@ -914,12 +1049,11 @@ impl State {
 /// Add the dragon to the scene (hidden until the config shows it), returning its index.
 const DRAGON_ALBEDO: [f32; 3] = [0.75, 0.62, 0.42];
 
-/// With `reflect`, the dragon goes into the room's grid of triangles too, by the cut of its
-/// cluster LOD at a cell of error (`rt_lod=0`: whole; the full scan's graph takes seconds to
-/// build).
-fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, rest: (Vec3, f32), reflect: bool) -> usize {
+/// With `grid`, the dragon goes into the room's grid of triangles too, by the cut of its cluster
+/// LOD at a cell of error (`rt_lod=0`: whole; the full scan's graph takes seconds to build).
+fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, rest: (Vec3, f32), grid: bool) -> usize {
     let albedo = DRAGON_ALBEDO;
-    let clusters = (reflect && flag("rt_lod", true)).then(|| {
+    let clusters = (grid && flag("rt_lod", true)).then(|| {
         let t = now();
         let mesh = ClusterMesh::build(&geometry, &ClusterOptions::default());
         log::info!("dragon: cluster LOD of {} triangles in {:.0} ms", geometry.index_count() / 3, (now() - t) * 1000.0);
@@ -927,7 +1061,7 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
     });
     let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None, [0.0; 2])).with_gi(GiSurface::new(albedo));
     dragon.clusters = clusters;
-    dragon.rt = reflect.then(|| RtSurface::new(albedo));
+    dragon.rt = grid.then(|| RtSurface::new(albedo));
     dragon.object.position = rest.0;
     dragon.object.rotation.y = rest.1;
     dragon.visible = false;
@@ -941,12 +1075,13 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     renderer.enable_spot_shadows(2048, 1);
     let phone = is_phone();
     let config = config_from_url(phone);
-    // reflect=1: the floor polished, and a grid of the room's triangles for its reflections
-    if config.reflect {
+    // a grid of the room's triangles for the hybrid GI's rays (gi=rt, rt=1) and the reflections
+    // (reflect=1: the floor polished)
+    if config.grid {
         renderer.enable_rt_grid(rt_grid_options());
     }
     let floor_specular = if config.reflect { floor_specular() } else { [0.0; 2] };
-    let rt = |albedo: [f32; 3]| config.reflect.then(|| RtSurface::new(albedo));
+    let rt = |albedo: [f32; 3]| config.grid.then(|| RtSurface::new(albedo));
 
     // the room: 4 m wide, high and deep, open toward the camera (z = 0), walls 0.2 m thick
     let mut scene = Scene::new();
@@ -991,7 +1126,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let dragon_rest = (Vec3::new(-1.15, 0.0, -1.25), 0.5);
     let mut dragons = [None, None];
     if let Some(slot) = config.dragon.slot() {
-        dragons[slot] = load_dragon(config.dragon).await.map(|g| add_dragon(&mut scene, g, dragon_rest, config.reflect));
+        dragons[slot] = load_dragon(config.dragon).await.map(|g| add_dragon(&mut scene, g, dragon_rest, config.grid));
         if let Some(index) = dragons[slot] {
             lit.push((index, "Dragon", DRAGON_ALBEDO));
         }
@@ -1069,8 +1204,25 @@ pub async fn set_preset(name: String) {
 #[wasm_bindgen]
 pub fn set_gi(name: &str) {
     if let Some(gi) = Gi::from_name(name) {
-        with_state(|s| s.apply(Config { gi, ..s.config }));
+        // rt needs the grid, built at load only (gi=rt, rt=1 or reflect=1 in the URL)
+        with_state(|s| {
+            if gi != Gi::Rt || s.config.grid {
+                s.apply(Config { gi, ..s.config });
+            }
+        });
     }
+}
+
+/// One of the hybrid's settings at run time, by its `rtgi_*` URL parameter's key (`res`,
+/// `denoise`, `kernel`, `hit`, `shadows`, `mode`, `accum`, `view`) and value.
+#[wasm_bindgen]
+pub fn set_rtgi(key: &str, value: &str) {
+    with_state(|s| {
+        let mut config = s.config;
+        if config.rtgi.set(key, value) && config != s.config {
+            s.apply(config);
+        }
+    });
 }
 
 /// `voxels=` at run time.
@@ -1105,7 +1257,7 @@ async fn apply_with_dragon(config: Config) {
             if let Some(geometry) = load_dragon(config.dragon).await {
                 with_state(|s| {
                     if s.dragons[slot].is_none() {
-                        let index = add_dragon(&mut s.scene, geometry, s.dragon_rest, s.config.reflect);
+                        let index = add_dragon(&mut s.scene, geometry, s.dragon_rest, s.config.grid);
                         s.dragons[slot] = Some(index);
                         s.lit.push((index, "Dragon", DRAGON_ALBEDO));
                         // its material follows the others' at the next apply

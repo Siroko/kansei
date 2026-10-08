@@ -4,8 +4,9 @@
 //! canopy lets it through, and the sunlit ground and trees light what is in their shade. The GI
 //! modes compare what lights the shade: the materials' own sky light (`gi=off`), dimmed by the
 //! top-down sky occlusion the film uses (`skyocc`) or by the clipmap's sky visibility
-//! (`visibility`, read in the material), or voxel GI on screen from cones per pixel (`cones`) or
-//! the clipmap's probes (`probes`).
+//! (`visibility`, read in the material), voxel GI on screen from cones per pixel (`cones`) or
+//! the clipmap's probes (`probes`), or the hybrid (`rt`, `RtDiffuseGiEffect`): rays through a grid
+//! of the scene's triangles near the camera, the clipmap past them.
 //!
 //! The terrain is tiles of a height field; the spruces (17 576) are instanced, culled on the GPU
 //! per view with dithered crossfades between LODs, as a film's forest is: needle-spray cards with
@@ -36,7 +37,10 @@ use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::shadows::{CascadedShadowOptions, SkyOcclusion, SkyOcclusionOptions, CASCADED_SHADOWS_WGSL, SKY_OCCLUSION_WGSL};
 use kansei_core::buffers::{Sampler, Texture};
-use kansei_core::rt::{RtGridOptions, RtPlacement, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions};
+use kansei_core::rt::{
+    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGridOptions, RtPlacement, RtReflectionsEffect,
+    RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+};
 use kansei_wasm::{flag, now, param, param_or, Canvas, Frame};
 
 /// The road's centre line across the valley: x at z (metres). Kept in step with ROAD_WGSL.
@@ -525,10 +529,13 @@ enum Gi {
     Cones,
     /// Voxel GI on screen from the clipmap's probes: the same light, cheaper and smoother.
     Probes,
+    /// The hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels through the grid of
+    /// triangles near the camera, the hits lit by the sun and the clipmap, the clipmap past them.
+    Rt,
 }
 
 impl Gi {
-    const ALL: [Gi; 5] = [Gi::Off, Gi::SkyOcc, Gi::Visibility, Gi::Cones, Gi::Probes];
+    const ALL: [Gi; 6] = [Gi::Off, Gi::SkyOcc, Gi::Visibility, Gi::Cones, Gi::Probes, Gi::Rt];
 
     fn name(self) -> &'static str {
         match self {
@@ -537,6 +544,7 @@ impl Gi {
             Gi::Visibility => "visibility",
             Gi::Cones => "cones",
             Gi::Probes => "probes",
+            Gi::Rt => "rt",
         }
     }
 
@@ -603,6 +611,96 @@ fn reflection_view_name(view: RtReflectionsView) -> &'static str {
     }
 }
 
+/// The hybrid's settings (`gi=rt`): the URL's `rtgi_*` parameters and `set_rtgi`'s keys.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RtGi {
+    resolution: RtGiResolution,
+    denoise: RtGiDenoise,
+    kernel: RtGiKernel,
+    hit: RtGiHitLighting,
+    shadows: RtGiShadows,
+    mode: RtGiMode,
+    accumulate: bool,
+    view: RtGiView,
+    /// Metres a ray walks the grid before the clipmap takes over (0: the grid's box).
+    near: f32,
+}
+
+impl RtGi {
+    const KEYS: [&'static str; 9] = ["res", "denoise", "kernel", "hit", "shadows", "mode", "accum", "view", "near"];
+
+    fn from_url() -> Self {
+        // an 8 m near field: half the trace of the whole 64 m box, for some light lost under the
+        // canopy past it, which the clipmap's voxels are too coarse to hold
+        let mut r = Self {
+            resolution: RtGiResolution::Half,
+            denoise: RtGiDenoise::Svgf,
+            kernel: RtGiKernel::Three,
+            hit: RtGiHitLighting::Direct,
+            shadows: RtGiShadows::Rays,
+            mode: RtGiMode::Hybrid,
+            accumulate: false,
+            view: RtGiView::Lit,
+            near: 8.0,
+        };
+        for key in Self::KEYS {
+            if let Some(v) = param(&format!("rtgi_{key}")) {
+                r.set(key, &v);
+            }
+        }
+        r
+    }
+
+    /// One setting by its key and name; false if either is unknown.
+    fn set(&mut self, key: &str, v: &str) -> bool {
+        match key {
+            "res" => RtGiResolution::from_name(v).map(|x| self.resolution = x),
+            "denoise" => RtGiDenoise::from_name(v).map(|x| self.denoise = x),
+            "kernel" => RtGiKernel::from_name(v).map(|x| self.kernel = x),
+            "hit" => RtGiHitLighting::from_name(v).map(|x| self.hit = x),
+            "shadows" => RtGiShadows::from_name(v).map(|x| self.shadows = x),
+            "mode" => RtGiMode::from_name(v).map(|x| self.mode = x),
+            "accum" => {
+                self.accumulate = v == "1" || v == "true";
+                Some(())
+            }
+            "view" => RtGiView::from_name(v).map(|x| self.view = x),
+            "near" => v.parse::<f32>().ok().map(|x| self.near = x.max(0.0)),
+            _ => None,
+        }
+        .is_some()
+    }
+
+    /// Bring `e` to these settings (its history restarts).
+    fn apply_to(&self, e: &mut RtDiffuseGiEffect) {
+        e.set_resolution(self.resolution);
+        e.denoise = self.denoise;
+        e.kernel = self.kernel;
+        e.hit_lighting = self.hit;
+        e.shadows = self.shadows;
+        e.mode = self.mode;
+        e.accumulate = self.accumulate;
+        e.near_distance = self.near;
+        e.reset_history();
+    }
+
+    /// The settings as JSON members (for `info`).
+    fn json(&self) -> String {
+        format!(
+            "\"res\":\"{}\",\"denoise\":\"{}\",\"kernel\":\"{}\",\"hit\":\"{}\",\"shadows\":\"{}\",\"mode\":\"{}\",\"accum\":{},\"view\":\"{}\",\"near\":{}",
+            self.resolution.name(),
+            self.denoise.name(),
+            self.kernel.name(),
+            self.hit.name(),
+            self.shadows.name(),
+            self.mode.name(),
+            self.accumulate,
+            self.view.name(),
+            self.near
+        )
+    }
+}
+
 /// Camera presets: name, target, distance, azimuth and elevation (radians).
 const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 4] = [
     ("road", [6.0, 1.6, -10.0], 9.0, 2.6, 0.05),
@@ -644,6 +742,8 @@ struct State {
     trees: usize,
     triangles: u64,
     stats: Option<Stats>,
+    /// The hybrid's settings (its effect exists with the grid: `gi=rt`, `rt=1` or `reflect=1`).
+    rtgi: RtGi,
 }
 
 thread_local! {
@@ -680,7 +780,7 @@ fn auto_ev100(elevation: f32) -> f32 {
 impl State {
     fn apply(&mut self) {
         // the clipmap runs for its GI and its probes; the effect shows the GI on screen
-        let clipmap = matches!(self.gi, Gi::Visibility | Gi::Cones | Gi::Probes);
+        let clipmap = matches!(self.gi, Gi::Visibility | Gi::Cones | Gi::Probes | Gi::Rt);
         let on_screen = matches!(self.gi, Gi::Cones | Gi::Probes);
         if let Some(gi) = self.renderer.voxel_clipmap_mut() {
             gi.settings.enabled = clipmap;
@@ -700,6 +800,12 @@ impl State {
             effect.show_indirect = self.view == View::Indirect;
             effect.reset_history();
         }
+        let (rtgi, indirect) = (self.rtgi, self.view == View::Indirect);
+        if let Some(effect) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            effect.enabled = self.gi == Gi::Rt;
+            rtgi.apply_to(effect);
+            effect.view = if indirect { RtGiView::Indirect } else { rtgi.view };
+        }
     }
 
     fn set_camera(&mut self, name: &str) {
@@ -712,6 +818,9 @@ impl State {
             if let Some(effect) = volume.effect_mut::<VoxelGIEffect>() {
                 effect.reset_history();
             }
+        }
+        if let Some(effect) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            effect.reset_history();
         }
     }
 
@@ -742,6 +851,9 @@ impl State {
         if let Some(fog) = self.volume.effect_mut::<VolumetricFogEffect>() {
             fog.update_lights(self.scene.lights());
             fog.time = self.time;
+        }
+        if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
+            gi.update_lights(self.scene.lights());
         }
         self.sky.update(self.renderer.device(), self.renderer.queue(), &mut self.camera);
         let volume = if self.view == View::Voxels && self.renderer.voxel_clipmap().is_some_and(|g| g.settings.enabled) { &mut self.debug_volume } else { &mut self.volume };
@@ -792,6 +904,24 @@ impl State {
         )
     }
 
+    /// The hybrid's settings, and with its effect its counters, memory and accumulated frames
+    /// (null without the effect).
+    fn rtgi_info(&self) -> String {
+        let Some(e) = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtDiffuseGiEffect>()) else { return "null".into() };
+        let s = e.stats().unwrap_or_default();
+        format!(
+            "{{{},\"on\":{},\"accumulated\":{},\"mib\":{:.1},\"rays\":{},\"hits\":{},\"cost\":{},\"shadow_rays\":{}}}",
+            self.rtgi.json(),
+            e.enabled,
+            e.accumulated(),
+            e.memory_bytes() as f64 / (1 << 20) as f64,
+            s.rays,
+            s.hits,
+            s.cost,
+            s.shadow_rays
+        )
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_clipmap();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
@@ -800,7 +930,9 @@ impl State {
         let eye = self.camera.position();
         let layout = gi.map(|g| *g.clipmap().layout());
         format!(
-            "{{\"rt\":{},\"rt_ms\":{:.3},\"reflect\":{},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"rtgi\":{},\"rtgi_ms\":{:.3},\"rt\":{},\"rt_ms\":{:.3},\"reflect\":{},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"levels\":{},\"dims\":{},\"voxel\":{},\"mib\":{:.1},\"filling\":{},\"trees\":{},\"triangles\":{},\"elevation\":{},\"eye\":[{:.1},{:.1},{:.1}],\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"screen_ms\":{:.3},\"passes\":[{}]}}",
+            self.rtgi_info(),
+            sum("RtGi/"),
             self.rt_info(),
             sum("Rt/Gather") + sum("Rt/Grid"),
             self.reflect_info(),
@@ -849,9 +981,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // rt=1: a ray tracing grid of the scene's triangles round the camera, 64 x 32 x 64 m of 0.5 m
     // cells, its trees by their cluster cut at a cell of error; rt_cell=<m> (the box stays
     // 64 m across), rt_rebuild=1 rebuilds it every frame
-    // reflect=1: ray-traced reflections on the road, wet (wet=all: everywhere), through the grid
+    // reflect=1: ray-traced reflections on the road, wet (wet=all: everywhere), through the grid;
+    // gi=rt: the hybrid GI's rays through it
     let reflect = flag("reflect", false);
-    let rt = flag("rt", false) || reflect;
+    let gi_mode = param("gi").and_then(|g| Gi::from_name(&g)).unwrap_or(Gi::Cones);
+    let rt = flag("rt", false) || reflect || gi_mode == Gi::Rt;
     // the wet surfaces' F0 (the road's, the rest's) and roughness, 0 when dry (the default)
     let wet = match (reflect, param("wet").as_deref()) {
         (false, _) => [0.0; 4],
@@ -1001,6 +1135,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut gi = VoxelGIEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), VoxelGIOptions { intensity: param_or("intensity", 1.0), ..Default::default() });
     gi.set_sky_lighting(Some(&sky.bindings().sky_lighting));
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(gi)];
+    // with the grid, the hybrid in voxel GI's place (on in gi=rt): rays through the grid, the
+    // cards alpha-tested, the hits lit by the sun (shadow rays, the cascades past the grid) and
+    // the clipmap, the clipmap and the sky past the grid
+    if rt {
+        let options = RtDiffuseGiOptions { covered_wgsl: Some(CARD_COVERED_WGSL.into()), ..Default::default() };
+        let mut hybrid = RtDiffuseGiEffect::with_clipmap(renderer.voxel_clipmap().unwrap().clipmap(), renderer.rt_grid().unwrap().handle(), options);
+        hybrid.set_sky_lighting(Some(&sky.bindings().sky_lighting));
+        let mut needles = needle_texture();
+        needles.initialize_with_data(renderer.device(), renderer.queue());
+        hybrid.set_alpha_texture(needles.view());
+        hybrid.set_cascaded_shadow_map(renderer.cascaded_shadow_map());
+        hybrid.heat_scale = exposure_from_ev100_lens(param_or("ev", forest_ev100(elevation)), LENS_ATTENUATION_UE4).recip() * 0.5;
+        hybrid.collect_stats = flag("stats", false);
+        effects.push(Box::new(hybrid));
+    }
     // the reflections: after the GI (they reflect its light), under the aerial perspective
     if reflect {
         let options = RtReflectionsOptions {
@@ -1065,7 +1214,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         volume,
         debug_volume,
         sun_light,
-        gi: param("gi").and_then(|g| Gi::from_name(&g)).unwrap_or(Gi::Cones),
+        gi: gi_mode,
         ambient_mode,
         view: param("view").and_then(|v| View::from_name(&v)).unwrap_or(View::Lit),
         elevation,
@@ -1075,6 +1224,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         trees,
         triangles,
         stats,
+        rtgi: RtGi::from_url(),
     };
     state.set_camera(param("cam").as_deref().unwrap_or("road"));
     state.apply();
@@ -1092,12 +1242,27 @@ pub fn info() -> String {
     with_state(|s| s.info()).unwrap_or_default()
 }
 
-/// `off`, `skyocc`, `visibility`, `cones` or `probes` (`Gi`).
+/// `off`, `skyocc`, `visibility`, `cones`, `probes` or `rt` (`Gi`; `rt` only where the page
+/// built the grid: `gi=rt`, `rt=1` or `reflect=1`).
 #[wasm_bindgen]
 pub fn set_gi(name: &str) {
     with_state(|s| {
         if let Some(gi) = Gi::from_name(name) {
+            if gi == Gi::Rt && s.volume.effect_mut::<RtDiffuseGiEffect>().is_none() {
+                return;
+            }
             s.gi = gi;
+            s.apply();
+        }
+    });
+}
+
+/// One of the hybrid's settings at run time, by its `rtgi_*` URL parameter's key (`res`,
+/// `denoise`, `kernel`, `hit`, `shadows`, `mode`, `accum`, `view`, `near`) and value.
+#[wasm_bindgen]
+pub fn set_rtgi(key: &str, value: &str) {
+    with_state(|s| {
+        if s.rtgi.set(key, value) {
             s.apply();
         }
     });

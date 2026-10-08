@@ -12,6 +12,15 @@ through its material's voxel entry); voxel GI with screen-space GI in front for 
 irradiance probes traced in the voxels' distance field in place of the per-pixel cones. The
 distance field can also add AO to the GI and shadow the voxels and the direct light.
 
+The hybrid (`gi=rt`) traces the GI instead: one ray for each 2 x 2 pixels from the surface
+through a grid of the room's triangles (below), the hits lit by the lamp (shadow rays through the
+grid) and one cone through the voxels for the further bounces, denoised by SVGF and upsampled. It
+comes closest to a path-traced reference: no banding, no light leaking onto the short block's
+front, which faces the open side of the box. Its panel folder switches the resolution, the
+denoiser, the hits' lighting and shadows, a reference path tracer through the grid
+(`mode`, with `accumulate` for a converged image) and debug views (the indirect light, the signal,
+SVGF's variance and history, the rays' cost).
+
 With `reflect=1` the floor is polished and reflects the room: rays traced through a grid of the
 room's triangles (96 cells of 4.8 cm each way, rebuilt on the GPU when something in it moves), the
 hits lit by the voxels, the voxel cone past the grid. The dragon goes into the grid as the cut of
@@ -24,7 +33,9 @@ Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`
 `set_probes`), `ScreenSpaceGIEffect` (`GiQuality`), `gi::SDF_WGSL`, `SpotLight` with
 `lights::SPOT_LIGHTS_WGSL` and `Renderer::enable_spot_shadows`, `materials::GBUFFER_OUT_WGSL`,
 `GLTFLoader::load_glb` / `load_gltf_with_buffers`, `CameraControls::with_mouse_pan`,
-`Renderer::set_profiling` / `take_profile`, `ToneMapEffect`; with `reflect=1`,
+`Renderer::set_profiling` / `take_profile`, `ToneMapEffect`; with `gi=rt`,
+`RtDiffuseGiEffect::with_volume` (`RtDiffuseGiOptions`, `set_spot_lights`, `update_lights`) over the
+grid below; with `reflect=1`,
 `Renderer::enable_rt_grid` (`SceneRtGridOptions`, a fixed box), `Renderable::rt` (`RtSurface`),
 `ClusterLod` on the dragon, `RtReflectionsEffect::with_volume` and `GBUFFER_OUT_WGSL`'s
 `kansei_gbuffer_out_specular` (the floor's F0 and roughness).
@@ -32,7 +43,15 @@ Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`
 | URL parameter | Effect |
 |---|---|
 | `preset=<name>` | `off`, `ssgi`, `voxel`, `best`, `indirect`, `voxels`, `phone`, `dragon`, `sdf`, `sdf-dragon`, `slice`, `probes`, `probe-view` or `probes-dragon` (`PRESETS` in `src/lib.rs`); applied first, the other parameters override it. Default `best` (voxel + SSGI) unless the URL has `gi=` |
-| `gi=<mode>` | `off`; screen-space `low`, `medium`, `high` (or `ssgi`), `ultra`; `voxel`, `voxel+ssgi`, `probes`, `probes+ssgi` |
+| `gi=<mode>` | `off`; screen-space `low`, `medium`, `high` (or `ssgi`), `ultra`; `voxel`, `voxel+ssgi`, `probes`, `probes+ssgi`; `rt` (the hybrid; builds the grid of triangles, as `rt=1` does: the panel offers it only then, and reloads the page with `gi=rt` otherwise) |
+| `rtgi_res=half\|full` | the hybrid's rays: one for each 2 x 2 pixels (default) or one a pixel |
+| `rtgi_denoise=svgf\|temporal\|off` | SVGF (default), its temporal accumulation alone, or the raw 1 spp signal |
+| `rtgi_kernel=3x3\|5x5` | SVGF's wavelet (default 3 x 3, half the cost) |
+| `rtgi_hit=direct\|voxels` | what lights the hits: their direct light plus a voxel cone (default), or the voxels alone |
+| `rtgi_shadows=rays\|maps` | the hits' shadows: rays through the grid (default) or the shadow atlas |
+| `rtgi_mode=hybrid\|reference` | `reference`: a path tracer through the grid (4 bounces), for comparison |
+| `rtgi_accum=1` | show the running mean of the raw signal (restarts when the camera or a setting changes) |
+| `rtgi_view=lit\|indirect\|signal\|variance\|history\|cost` | the hybrid's debug views |
 | `voxels=low\|medium\|high` | voxel volume resolution (default medium; low on phones, which also keep the volume within 24 MiB) |
 | `view=<view>` | `lit` (default), `indirect` (only the light GI adds, 2 stops brighter), `voxels` (the lit voxels), `sdf` (a slice of the distance field), `probes` (the probes, lit by their own irradiance) |
 | `slice=<metres>` | height of the `view=sdf` slice (default 0.6) |
@@ -45,6 +64,7 @@ Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`
 | `albedo=constant` | the rug's voxels take its mean colour instead of its texture |
 | `rug=off` | no rug |
 | `reflect=1` | the polished floor's ray-traced reflections (turns voxel GI's volume on whatever the `gi` mode) |
+| `rt=1` | build the grid of the room's triangles without the reflections (the hybrid can then be picked at run time) |
 | `floor_f0=<0..1>`, `floor_rough=<0..1>` | the floor's F0 (default 0.3) and roughness (default 0.05) |
 | `rt_view=lit\|reflection\|mirror\|cost` | the lit image (default), the light the reflections add, what the rays see, their cost (cells and triangles a ray) |
 | `rt_trace=voxels` | reflections from the voxel cone alone (for comparison) |
