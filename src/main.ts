@@ -127,7 +127,7 @@ export type { ToneMapOptions, ColorGrade, UnrealFilm, LocalExposure } from "./po
 export { hash01 } from "./math/hash01";
 export { DebugBoxes, segment, DEBUG_BOXES_WGSL } from "./debug/DebugBoxes";
 export { Canvas, Frame, run, Keys, Gamepad, deadZone, now, param, paramOr, flag, isPhone, setText, checkbox, thousands, fetchBytes } from "./web";
-export { VoxelVolume, VolumeLayout, VoxelGiQuality, Mip3d } from "./gi/VoxelVolume";
+export { VoxelVolume, VolumeLayout, VoxelGiQuality, Mip3d, SURFACE_WORDS_PER_VOXEL } from "./gi/VoxelVolume";
 export { AnisotropicMips } from "./gi/AnisotropicMips";
 export { ParticleVoxelizer, MAX_GI_BOXES, defaultParticleEmission, defaultParticleSplatSettings } from "./gi/ParticleVoxelizer";
 export type { GiBox, ParticleEmission, ParticleSplatSettings, GiBufferSource } from "./gi/ParticleVoxelizer";
@@ -135,7 +135,15 @@ export { ParticleConeShading, PARTICLE_LIGHTING_STRIDE, gradientSkyLighting, def
 export type { ParticleConeSettings } from "./gi/ParticleConeShading";
 export { ParticleGi, ParticleGiSettings } from "./gi/ParticleGi";
 export type { ParticleGiOptions } from "./gi/ParticleGi";
-export { VOXEL_VOLUME_WGSL, VOXEL_CONES_WGSL, PARTICLE_EMISSION_WGSL, SKY_LIGHTING_WGSL } from "./gi/GiWGSL";
+export { VOXEL_VOLUME_WGSL, VOXEL_CONES_WGSL, PARTICLE_EMISSION_WGSL, SKY_LIGHTING_WGSL, VOXEL_WRITE_WGSL } from "./gi/GiWGSL";
+export { MeshVoxelizer, SurfaceSet } from "./gi/MeshVoxelizer";
+export type { GiSurface } from "./gi/MeshVoxelizer";
+export { VoxelInjection, defaultSceneGiSettings } from "./gi/VoxelInjection";
+export type { SceneGiSettings, SdfShadows } from "./gi/VoxelInjection";
+export { SceneVoxelGi } from "./gi/SceneVoxelGi";
+export type { SceneVoxelGiOptions } from "./gi/SceneVoxelGi";
+export { VoxelGIEffect } from "./gi/VoxelGIEffect";
+export type { VoxelGIOptions } from "./gi/VoxelGIEffect";
 export {
     Transform, nlerp, quatAbs, quatLog, quatExp, quatToScaledAngleAxis, quatFromScaledAngleAxis, angularVelocity,
     Skeleton, Pose, Clip, SkinnedMesh, MAX_INFLUENCES, strongestInfluences, SkinnedGltf,

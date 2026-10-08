@@ -46,6 +46,15 @@ export interface MaterialOptions {
      * output (`getVelocityPipeline`).
      */
     outputsVelocity?: boolean;
+    /**
+     * Fragment entry point for voxel GI's mesh voxelizer (`MeshVoxelizer`), for a surface whose
+     * albedo or emission varies, such as a textured one: it takes the material's vertex outputs
+     * and the `front_facing` builtin and calls `kansei_voxel_write` from `VOXEL_WRITE_WGSL`
+     * (prepend it to the shader) with what the surface reflects and emits there. Group 3 is the
+     * voxelizer's in that pass, so it must not read the shadow group. Unset, the voxelizer uses
+     * the renderable's constant `GiSurface`.
+     */
+    voxelFragmentEntry?: string;
     /** Label of the material's GPU objects. */
     label?: string;
 }
@@ -104,6 +113,9 @@ class Material {
     private _depthPipelineCache: Map<string, GPURenderPipeline> = new Map();
     // Velocity-pass pipelines by vertex layout and sample count.
     private _velocityPipelineCache: Map<string, GPURenderPipeline> = new Map();
+    // Voxelization pipelines by voxelizer and vertex layout, and their layouts by voxelizer.
+    private _voxelPipelineCache: Map<string, GPURenderPipeline> = new Map();
+    private _voxelPipelineLayouts: Map<number, GPUPipelineLayout> = new Map();
     // Groups 0-2 only: shadow passes render into textures that group 3 samples.
     private _depthPipelineLayout?: GPUPipelineLayout;
 
@@ -191,6 +203,9 @@ class Material {
 
     /** See `MaterialOptions.shadowFragmentEntry`. */
     public get shadowFragmentEntry(): string | undefined { return this.options.shadowFragmentEntry; }
+
+    /** See `MaterialOptions.voxelFragmentEntry`. */
+    public get voxelFragmentEntry(): string | undefined { return this.options.voxelFragmentEntry; }
 
     /**
      * Creates a shader module from the provided shader code.
@@ -440,6 +455,67 @@ class Material {
                 },
             });
             this._velocityPipelineCache.set(key, pipeline);
+        }
+        return pipeline;
+    }
+
+    /**
+     * Returns the pipeline voxel GI's mesh voxelizer draws this material with (Rust
+     * `get_voxel_pipeline`): its own `vertex_main`, so instancing and vertex animation voxelize as
+     * they draw, and its `voxelFragmentEntry` or the voxelizer's `engineFragment`; group 3 is the
+     * voxelizer's `voxelBGL`. Every face from every axis (no culling) and no depth, into the
+     * voxelizer's masked-off `target` of `sampleCount` samples.
+     *
+     * @param gpuDevice - The GPU device.
+     * @param voxelizer - The voxelizer's id (`MeshVoxelizer.id`): its pipelines are kept apart.
+     * @param vertexBuffersDescriptors - Vertex buffer layouts of the geometry drawn.
+     * @param voxelBGL - The voxelizer's group 3 layout.
+     * @param engineFragment - The voxelizer's own fragment stage, for materials without an entry.
+     * @param target - The format of the voxelizer's target.
+     * @param sampleCount - Its samples.
+     */
+    public getVoxelPipeline(
+        gpuDevice: GPUDevice,
+        voxelizer: number,
+        vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>,
+        voxelBGL: GPUBindGroupLayout,
+        engineFragment: { module: GPUShaderModule, entryPoint: string },
+        target: GPUTextureFormat,
+        sampleCount: number,
+    ): GPURenderPipeline {
+        this._ensureSharedResources(gpuDevice);
+        const key = `${voxelizer}:${vertexLayoutKey(vertexBuffersDescriptors)}`;
+        let pipeline = this._voxelPipelineCache.get(key);
+        if (!pipeline) {
+            let layout = this._voxelPipelineLayouts.get(voxelizer);
+            if (!layout) {
+                layout = gpuDevice.createPipelineLayout({
+                    label: `${this.label}/VoxelPipelineLayout`,
+                    bindGroupLayouts: [
+                        this.bindableGroup.bindGroupLayout!,
+                        this.bindableGroup.cameraBindablesGroupLayout!,
+                        this.bindableGroup.meshBindablesGroupLayout!,
+                        voxelBGL,
+                    ],
+                });
+                this._voxelPipelineLayouts.set(voxelizer, layout);
+            }
+            const entry = this.options.voxelFragmentEntry;
+            const fragment = entry ? { module: this.shaderRenderModule!, entryPoint: entry } : engineFragment;
+            pipeline = gpuDevice.createRenderPipeline({
+                label: `${this.label}/VoxelPipeline`,
+                layout,
+                vertex: {
+                    module: this.shaderRenderModule!,
+                    entryPoint: 'vertex_main',
+                    buffers: vertexBuffersDescriptors,
+                },
+                fragment: { ...fragment, targets: [{ format: target, writeMask: 0 }] },
+                // every face from every axis: the far side of a closed mesh is a surface too
+                primitive: { topology: this.topology, cullMode: 'none' },
+                multisample: { count: sampleCount },
+            });
+            this._voxelPipelineCache.set(key, pipeline);
         }
         return pipeline;
     }
