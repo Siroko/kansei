@@ -14,6 +14,9 @@ Three milestones, each a PR:
 3. **`RtReflectionsEffect`**: reflections traced through the grid, lit by the voxels, shown in
    outdoor-gi (a wet road) and gi-box (a polished floor).
 
+A fourth use followed from the hybrid RT scout (2026-10-08): **`RtDiffuseGiEffect`**, diffuse GI
+traced through the same grid (section 4).
+
 ## 1. The grid core
 
 A box of `dims` cells of `cell` metres follows the camera (or stays put indoors). Each rebuild:
@@ -111,3 +114,56 @@ alternated in one page (two rounds each, within 3% of each other):
 
 With gi-box's dragon animated the grid rebuilds every frame for 0.27 ms of GPU (gather 0.07,
 count 0.05, scan 0.09, fill 0.06), where the scout's build took 9.4 ms.
+
+## 4. `RtDiffuseGiEffect`: diffuse GI through the grid
+
+An opt-in GI path beside voxel cones (`VoxelGIEffect`) and screen-space GI, on the same scene
+setup (the grid, voxel GI), for the scenes and quality tiers that can afford it: the app picks
+per scene.
+
+- **Primary hit**: the GBuffer (raster). One ray for each 2 x 2 pixels by default
+  (`RtGiResolution::Half`; `Full`: one a pixel), cosine-distributed about the surface's normal:
+  the frame's R2 sample rotated per pixel by interleaved gradient noise.
+- **Trace**: through the grid (`kansei_rt_trace`, alpha-tested cards through `covered_wgsl`),
+  for `near_distance` metres (0: the whole box), then a voxel cone and the sky.
+- **Hit**: albedo / pi times its exact direct light (the scene's directional, point and spot
+  lights, shadowed by rays through the grid, a spot light's toward a point of its disk, the
+  cascades past the box) plus albedo times one voxel cone in a cosine-distributed direction for
+  the further bounces. With a volume the cone is voxel GI's own surface cone through its
+  anisotropic mips: the isotropic mips leak through 20 cm walls once the cone widens, and one wide
+  cone along the normal lost a third of the room's energy. `RtGiHitLighting::Voxels` lights hits
+  by the voxels' radiance alone (cheaper, leaks into contacts).
+- **Denoise**: SVGF (Schied et al. 2017) at the trace resolution: reprojection by motion
+  vectors or the camera with depth and normal tests on a bilinear footprint; luminance moments;
+  a 7 x 7 variance where fewer than 4 frames are seen; five iterations of the a-trous wavelet
+  (3 x 3 by default: half the 5 x 5's cost, and as good here), the first feeding the history.
+- **Composite**: joint-bilateral upsample (the 4 nearest trace texels by depth and normal), the
+  lit colour plus albedo times the signal, the material's own sky ambient taken out as voxel GI
+  does.
+- **Reference**: `RtGiMode::Reference` path-traces the grid (4 vertices, the direct light at each,
+  Russian roulette), and `accumulate` keeps a running mean of the raw signal while the view and
+  settings stay put: the ground truth for the hybrid and its denoiser. With the hit cone off the
+  converged hybrid equals the one-bounce reference (`tests/rt_diffuse_gi_gpu.rs`).
+- Debug views: indirect, signal, SVGF's variance and history, the rays' cost.
+- Memory: 104 bytes a trace texel (51 MiB at half resolution of 1080p), 16 more while
+  accumulating.
+
+The scout measured it against a 2-4k spp reference: within 2.5% converged (FLIP 0.039 in
+gi-box, 0.034 in outdoor-gi's forest) where voxel cones score 0.134 and 0.294 (20% too bright
+in the forest, contour bands in the room). SVGF loses 3-8% of the energy and leaves slow
+low-frequency mottling under the canopy (sky through needle gaps), the headroom for a better
+denoiser.
+
+Measured at 1920 x 1080 in headless Chrome on this Mac (M4 Pro, GPU shared with other
+sessions), kansei's profiler, variants alternated in one page, medians of 9 one-second windows.
+"GI" is the effect's passes (trace, temporal, variance, a-trous, composite); voxel cones' is
+`VoxelGI/Screen`. The voxel GI's own update (1-2 ms) is common to every column.
+
+| Scene | GI off (frame GPU) | Voxel cones | Hybrid, half res, 3 x 3 | Other hybrid settings |
+|---|---|---|---|---|
+| gi-box, `cam=front&dragon=1` (1.3k triangles in the grid) | 0 (2.35 ms) | 1.83 ms | **2.87 ms** (trace 1.70) | 5 x 5: 3.2-4.5 ms; full res: 9.2-11.9 ms |
+| outdoor-gi, `cam=road` (the cards alpha-tested) | 0 (6.14 ms) | 3.41 ms | **4.58 ms** with the default 8 m near field (trace 2.95) | 4 m: 4.36 ms; the whole box: 7.13 ms |
+
+The scout measured the grid's rebuild at 0.35 ms (gi-box animated, every frame) to 0.7 ms
+(outdoor-gi's 64 m box moving with the camera). The 8 m near field halves the outdoor trace for some energy lost under
+the canopy past it (the clipmap's 0.5-2 m voxels stand in for it there).
