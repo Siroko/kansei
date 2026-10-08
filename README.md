@@ -153,26 +153,32 @@ Both engines have these features unless an item says otherwise.
 
 ### Install
 
-The `kansei` package on npm (0.0.11, January 2025) predates almost everything in this README.
-Until a new release, build the package from the repository (Node 24, pnpm):
+```bash
+npm install kansei
+```
+
+`kansei` 0.1.0 is the TypeScript engine described here; it brings `gl-matrix` as a dependency
+and `@webgpu/types` as a peer dependency (npm 7+ and pnpm install it for you). Its declarations
+load the WebGPU types, so TypeScript needs no `"types"` entry for them. Upgrading from 0.0.11?
+Custom shaders change: see the [changelog](CHANGELOG.md#breaking-changes-and-how-to-migrate).
+
+The package is ES modules for a bundler (Vite or any other). The examples below use top-level
+`await`; with Vite, build for a target that has it:
+
+```js
+// vite.config.js
+export default { build: { target: 'es2022' } };
+```
+
+To work on the engine itself, or use what is on `development` before a release, build the
+package from the repository (Node 24, pnpm) and install that folder instead:
 
 ```bash
 git clone https://github.com/Siroko/kansei
 cd kansei
 pnpm install
 pnpm build            # type-checks and writes dist/
-```
-
-Then add it to your app with its peer dependencies:
-
-```bash
-npm install ../kansei gl-matrix @webgpu/types
-```
-
-With TypeScript 5, add the WebGPU types to your `tsconfig.json`:
-
-```json
-{ "compilerOptions": { "types": ["@webgpu/types"] } }
+cd ../your-app && npm install ../kansei
 ```
 
 ### A first scene
