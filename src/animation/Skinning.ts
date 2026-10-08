@@ -24,8 +24,9 @@ export const SKINNING_WGSL: string = skinning;
 /**
  * The sun's shadow for the skinned lit shaders (`kansei_sun_shadow`, 1 lit and 0 shadowed).
  * Rust's is the renderer's cascaded shadow map (`shadows::CASCADED_SHADOWS_WGSL`, group 3
- * bindings 10-12), which the TS engine does not have yet: here it is the directional
- * `ShadowMap` (`SHADOW_MAP_WGSL`, group 3 bindings 0-3), lit everywhere when there is none.
+ * bindings 10-12; TS `Renderer.enableCascadedShadows`). Here it is still the directional
+ * `ShadowMap` (`SHADOW_MAP_WGSL`, group 3 bindings 0-3), lit everywhere when there is none; with
+ * the cascades on, that binding holds their widest cascade.
  */
 const SUN_SHADOW_WGSL = /* wgsl */`${SHADOW_MAP_WGSL}
 fn kansei_sun_shadow(worldPos: vec3f, N: vec3f, pixel: vec2f) -> f32 {

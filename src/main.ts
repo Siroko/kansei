@@ -72,6 +72,8 @@ export { PointLight } from "./lights/PointLight";
 export { LightUniforms, MAX_DIRECTIONAL_LIGHTS, MAX_POINT_LIGHTS } from "./lights/LightUniforms";
 export { ShadowMap } from "./shadows/ShadowMap";
 export { CubeMapShadowMap } from "./shadows/CubeMapShadowMap";
+export { CascadedShadowMap, MAX_CASCADES, cascadeSplits, fitCascades, frustumSliceSphere } from "./shadows/CascadedShadowMap";
+export type { CascadedShadowOptions, CascadeSlot } from "./shadows/CascadedShadowMap";
 export { ComputeShadows, COMPUTE_SHADOWS_WGSL } from "./shadows/ComputeShadows";
 export { SkyOcclusion, SKY_OCCLUSION_WGSL } from "./shadows/SkyOcclusion";
 export type { SkyOcclusionOptions } from "./shadows/SkyOcclusion";

@@ -26,11 +26,12 @@ export function emptyCullStats(): CullStats {
 
 /**
  * A view the renderer culls instances for: the camera, the directional shadow map's light
- * (`Renderer.enableShadows`), a spot light's layer of the shadow atlas, the sky occlusion's
- * top-down view (`Renderer.enableSkyOcclusion`), or the ray tracing grid's box
- * (`Renderer.enableRtGrid`).
+ * (`Renderer.enableShadows`), a cascade of the sun's shadows by index
+ * (`Renderer.enableCascadedShadows`), the sky occlusion's top-down view
+ * (`Renderer.enableSkyOcclusion`), a layer of the spot shadow atlas
+ * (`Renderer.enableSpotShadows`), or the ray tracing grid's box (`Renderer.enableRtGrid`).
  */
-export type CullViewKind = 'camera' | 'shadow' | 'skyOcclusion' | 'spot' | 'rtGrid';
+export type CullViewKind = 'camera' | 'shadow' | `cascade${number}` | 'skyOcclusion' | 'spot' | 'rtGrid';
 
 /** Instance culling statistics of a recent frame, per view. */
 export class CullingStats {

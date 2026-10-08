@@ -9,6 +9,7 @@ import { GBuffer } from "../postprocessing/GBuffer";
 import { ShadowMap, ShadowMapOptions } from "../shadows/ShadowMap";
 import { CubeMapShadowMap, CubeMapShadowMapOptions } from "../shadows/CubeMapShadowMap";
 import { SkyOcclusion, SkyOcclusionOptions } from "../shadows/SkyOcclusion";
+import { CascadedShadowMap, CascadedShadowOptions, MAX_CASCADES } from "../shadows/CascadedShadowMap";
 import { LightUniforms } from "../lights/LightUniforms";
 import { BufferBase } from "../buffers/BufferBase";
 import { SpotShadowAtlas } from "../shadows/SpotShadowAtlas";
@@ -283,6 +284,9 @@ class Renderer {
     private _dummyShadowDepthTex: GPUTexture | null = null;
     private _dummyCubeShadowTex: GPUTexture | null = null;
     private _cubeShadowSampler: GPUSampler | null = null;
+    // The cascaded shadow map (group 3 bindings 10-11, and its widest cascade at binding 0),
+    // once enabled.
+    private _cascadedShadowMap: CascadedShadowMap | null = null;
     // Bindings 5-12: a 1x1 depth array for the atlases not enabled (spot shadows, cascades) and
     // zeroed buffers (clusters off until a frame has spot lights, no cascades).
     private _dummyDepthArrayTex: GPUTexture | null = null;
@@ -299,6 +303,7 @@ class Renderer {
     private _cullViewBytes = new ArrayBuffer(4 * CULL_VIEW_BYTES);
     private _cullStats = new StatsReadback();
     private _viewProjScratch = mat4.create();
+    private _cascadeViewProjs = Array.from({ length: MAX_CASCADES }, () => mat4.create());
 
     /**
      * Read back each view's instance culling statistics (instances tested, outside their LOD band,
@@ -495,6 +500,30 @@ class Renderer {
 
     /** The ray tracing grid, once `enableRtGrid` has been called. */
     public get rtGrid(): SceneRtGrid | null { return this._rtGrid; }
+
+    /**
+     * Enables cascaded shadow maps for the scene's first directional light, when it has
+     * `castShadow` (the sun, or the moon at night; Rust's `enable_cascaded_shadows`): each frame,
+     * stable cascades fitted to the camera are drawn through the casters' own vertex shaders
+     * (`Material.getDepthPipeline`), the instanced ones culled per cascade on the GPU, and
+     * materials that include `CASCADED_SHADOWS_WGSL` sample them with contact-hardening PCSS
+     * (`kansei_sun_shadow`). It replaces `enableShadows`: the widest cascade also serves shaders
+     * that read the single directional map (group 3 binding 0, `kansei_shadow_map`), and a map
+     * from `enableShadows` is not rendered while the cascades are on.
+     */
+    public enableCascadedShadows(options: CascadedShadowOptions = {}): CascadedShadowMap {
+        this._cascadedShadowMap?.destroy();
+        this._cascadedShadowMap = new CascadedShadowMap(this.device!, options);
+        this.shadowsEnabled = true;
+        this._shadowBGDirty = true;
+        return this._cascadedShadowMap;
+    }
+
+    /**
+     * The cascaded shadow map, once `enableCascadedShadows` has been called: the volumetric fog
+     * takes it (`setCascadedShadowMap`) for shafts from its widest cascade.
+     */
+    public get cascadedShadowMap(): CascadedShadowMap | null { return this._cascadedShadowMap; }
 
     constructor(
         private options: RendererOptions = {}
@@ -865,9 +894,10 @@ class Renderer {
         if (!this._shadowBGDirty) return;
         this._ensureShadowResources();
 
-        const depthTex = this._shadowMap
-            ? this._shadowMap.depthTexture
-            : this._dummyShadowDepthTex!;
+        // the cascaded map's widest cascade stands in for the single directional map
+        const csm = this._cascadedShadowMap;
+        const depthView = csm?.farView
+            ?? (this._shadowMap ? this._shadowMap.depthTexture : this._dummyShadowDepthTex!).createView();
 
         const cubeTex = this._cubeMapShadowMap
             ? this._cubeMapShadowMap.distanceTexture
@@ -880,7 +910,7 @@ class Renderer {
             label: 'Shadow BindGroup',
             layout: this._shadowBGL!,
             entries: [
-                { binding: 0, resource: depthTex.createView() },
+                { binding: 0, resource: depthView },
                 { binding: 1, resource: this._shadowComparisonSampler! },
                 { binding: 2, resource: { buffer: this._shadowUniformBuf! } },
                 { binding: 3, resource: cubeTex.createView({ dimension: '2d-array' }) },
@@ -890,8 +920,8 @@ class Renderer {
                 { binding: 7, resource: this._spotShadowSampler! },
                 { binding: 8, resource: { buffer: clusters?.params ?? this._noClusterParamsBuf! } },
                 { binding: 9, resource: { buffer: clusters?.lights ?? this._noClusterLightsBuf! } },
-                { binding: 10, resource: depthArray },
-                { binding: 11, resource: { buffer: this._cascadesBuf! } },
+                { binding: 10, resource: csm?.arrayView ?? depthArray },
+                { binding: 11, resource: { buffer: csm?.uniform ?? this._cascadesBuf! } },
                 { binding: 12, resource: this._spotShadowSampler! },
             ],
         });
@@ -1392,17 +1422,31 @@ class Renderer {
     }
 
     /**
-     * Places the shadow views of a frame before its culling, which culls for them too: the map
-     * the renderer owns follows the first directional light with `castShadow` (else the first
-     * area light with it), or has no light this frame; the scene's spot lights are packed and
-     * uploaded, the first `castShadow` ones taking the spot atlas' layers.
+     * Places the shadow views of a frame before its culling, which culls for them too: the
+     * cascades fit the camera for the scene's first directional light if it has `castShadow`
+     * (Rust's `update_cascaded_shadows`), else are off this frame; the directional map the
+     * renderer owns follows the first directional light with `castShadow` (else the first area
+     * light with it), or has no light this frame (nor while the cascades are on); the scene's
+     * spot lights are packed and uploaded, the first `castShadow` ones taking the spot atlas'
+     * layers.
      */
     private _planShadowViews(stack: Scene, camera: Camera): void {
+        const csm = this._cascadedShadowMap;
+        if (csm) {
+            const sun = stack.directionalLights[0];
+            if (sun?.castShadow) {
+                const eye = camera.inverseViewMatrix.internalMat4;
+                csm.fit(camera, sun.direction);
+                csm.upload(sun.direction, sun.effectiveColor, [eye[12], eye[13], eye[14]]);
+            } else {
+                csm.disable();
+            }
+        }
         this._skyOcclusion?.update(camera);
         this._uploadSpotLights(stack);
         const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
         if (!shadowMap) return;
-        const light = stack.directionalLights.find((l) => l.castShadow)
+        const light = csm ? null : stack.directionalLights.find((l) => l.castShadow)
             ?? stack.areaLights.find((l) => l.castShadow);
         if (light) shadowMap.update(camera, light);
         else shadowMap.light = null;
@@ -1413,10 +1457,10 @@ class Renderer {
      * the matrix upload and the culling, before the scene pass, into the frame's encoder. The
      * directional map (placed by `_planShadowViews`) draws the instances culled for its light,
      * the cube map the point lights with `castShadow` (every instance), each spot atlas layer the
-     * instances culled for its light; each draws the visible `castShadow` renderables at their
-     * scene slots of the shared mesh buffers, with the light as the camera (group 1); then the
-     * sky occlusion's tile while it rebuilds. Maps the caller binds through the setters are left
-     * to the caller.
+     * instances culled for its light, the cascades the instances culled for each cascade; each
+     * draws the visible `castShadow` renderables at their scene slots of the shared mesh buffers,
+     * with the light as the camera (group 1); then the sky occlusion's tile while it rebuilds.
+     * Maps the caller binds through the setters are left to the caller.
      */
     private _encodeShadowPasses(encoder: GPUCommandEncoder, stack: Scene): void {
         const objects = stack.getOrderedObjects();
@@ -1439,6 +1483,12 @@ class Renderer {
         const atlas = this._spotShadowAtlas;
         if (atlas && this._spotLights.shadows.length > 0) {
             atlas.encode(encoder, this._spotLights.shadows, objects, this._sharedMeshBG!, meshOffset, this._spotViewBase());
+        }
+
+        // the sun's cascades
+        const csm = this._cascadedShadowMap;
+        if (csm && csm.slots.length > 0) {
+            csm.encode(encoder, objects, this._sharedMeshBG!, meshOffset, (c) => this._cascadeView(c));
         }
 
         this._encodeSkyOcclusionPass(encoder, objects, meshOffset);
@@ -1487,9 +1537,9 @@ class Renderer {
         sky.build(encoder);
     }
 
-    /** The cull view of the sky occlusion's top-down view: after the directional shadow map's. */
+    /** The cull view of the sky occlusion's top-down view: after the cascades'. */
     private _skyOcclusionView(): number {
-        return SHADOW_VIEW + (this._ownsShadowMap && this._shadowMap ? 1 : 0);
+        return this._cascadeView(this._cascadedShadowMap?.slots.length ?? 0);
     }
 
     /**
@@ -1531,9 +1581,10 @@ class Renderer {
     /**
      * The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then while the renderer
      * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame),
-     * then with sky occlusion `_skyOcclusionView` (`null` unless a tile of its top-down pass is due),
-     * then every layer of the spot shadow atlas from `_spotViewBase()` (`null` when no light uses it),
-     * then with a ray tracing grid its box (`_rtView`).
+     * then this frame's cascades (`_cascadeView`), then with sky occlusion `_skyOcclusionView`
+     * (`null` unless a tile of its top-down pass is due), then every layer of the spot shadow
+     * atlas from `_spotViewBase()` (`null` when no light uses it), then with a ray tracing grid
+     * its box (`_rtView`).
      */
     private _cullViews(camera: Camera): (CullView | null)[] {
         // the unjittered projection: the frustum, not where pixels sample
@@ -1542,6 +1593,10 @@ class Renderer {
             const map = this._shadowMap;
             views.push(map.light ? cullView(map.lightViewProjMatrix, { castersOnly: true }) : null);
         }
+        this._cascadedShadowMap?.slots.forEach((slot, c) => {
+            const viewProj = mat4.multiply(this._cascadeViewProjs[c], slot.projection, slot.view);
+            views.push(cullView(viewProj, { castersOnly: true }));
+        });
         // then the sky occlusion's top-down view (`_skyOcclusionView`), while it is being rebuilt
         const sky = this._skyOcclusion;
         if (sky) {
@@ -1563,10 +1618,16 @@ class Renderer {
         return this._spotViewBase() + (this._spotShadowAtlas?.layers ?? 0);
     }
 
+    /** Cull view of cascade `index`, after the camera and the directional map's. */
+    private _cascadeView(index: number): number {
+        return 1 + (this._ownsShadowMap && this._shadowMap ? 1 : 0) + index;
+    }
+
     /** What each cull view is, in `_cullViews` order (for the stats). */
     private _cullViewKinds(): CullViewKind[] {
         const kinds: CullViewKind[] = ['camera'];
         if (this._ownsShadowMap && this._shadowMap) kinds.push('shadow');
+        this._cascadedShadowMap?.slots.forEach((_, c) => kinds.push(`cascade${c}`));
         if (this._skyOcclusion) kinds.push('skyOcclusion');
         for (let l = 0; l < (this._spotShadowAtlas?.layers ?? 0); l++) kinds.push('spot');
         if (this._rtGrid) kinds.push('rtGrid');
@@ -1640,8 +1701,8 @@ class Renderer {
     /**
      * Voxel GI's frame (`enableVoxelGI`), after the shadow views and before the scene pass, in
      * the Rust renderer's order: the GI renderables voxelized at their scene slots, lit through
-     * the shadow maps materials sample (the directional one only while it has a light) and the
-     * spot lights with their atlas, the mips rebuilt, then its distance field and probes (the
+     * the shadow maps materials sample (the cascades' widest when they are on, else the
+     * directional one while it has a light) and the spot lights with their atlas, the mips rebuilt, then its distance field and probes (the
      * probes around `camera`).
      */
     private _encodeVoxelGI(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
@@ -1653,7 +1714,9 @@ class Renderer {
             this._voxelGISpots = { gi: this._voxelGI, atlas: this._spotShadowAtlas };
         }
         const sm = this._shadowMap;
-        const shadowMap = sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null;
+        // the cascades' widest when they are on (Rust's `sync_voxel_gi_shadows`)
+        const shadowMap = this._cascadedShadowMap
+            ?? (sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null) ? sm : null);
         const eye = camera.inverseViewMatrix.internalMat4;
         this._voxelGI.encode(encoder, stack, this._sharedMeshBG!, (r) => stack.slotOf(r) * this._matrixAlignment,
             shadowMap, this._cubeMapShadowMap, [eye[12], eye[13], eye[14]]);
@@ -1669,8 +1732,18 @@ class Renderer {
         //          + pointLightPos(3) + pointShadowFar(1)
         const staging = new Float32Array(24);
         const sm = this._shadowMap;
-        // A map the renderer owns has nothing to show when no light casts.
-        if (sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null)) {
+        const csm = this._cascadedShadowMap;
+        const far = csm?.farViewProjection();
+        if (csm) {
+            // the widest cascade, for shaders that read the single map (off when no sun casts)
+            if (far) {
+                staging.set(far, 0);
+                staging[16] = 0.0005;  // bias
+                staging[17] = 2 * csm.options.maxDistance / csm.options.resolution;  // normal bias
+                staging[18] = 1.0;     // shadowEnabled
+            }
+        } else if (sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null)) {
+            // A map the renderer owns has nothing to show when no light casts.
             staging.set(sm.lightViewProjMatrix, 0);
             staging[16] = sm.bias;
             staging[17] = sm.normalBias;
