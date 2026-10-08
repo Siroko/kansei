@@ -89,10 +89,25 @@ export interface RtSurface {
      * Rust: `RtSurface::with_smooth_normals`.
      */
     smoothNormals?: boolean;
+    /**
+     * Glass (`rtGlassSurface`): rays pass straight through it (diffuse GI, shadow rays, any trace
+     * without `KANSEI_RT_GLASS_HITS`); `RtReflectionsEffect`'s glass refracts at it. Rust:
+     * `RtSurface::glass`.
+     */
+    glass?: boolean;
+}
+
+/**
+ * The surface of a glass object (the triangles `RtReflectionsEffect` refracts through, with smooth
+ * normals) whose material is `standardLit` with `glass` options: `tint` its albedo, for the rays
+ * that pass through it. Rust: `RtSurface::glass`.
+ */
+export function rtGlassSurface(tint: Vec3): RtSurface {
+    return { albedo: tint, smoothNormals: true, glass: true };
 }
 
 export function rtSurfaceWord(s: RtSurface): number {
-    return ((s.alphaLayer == null ? 0 : (1 | ((s.alphaLayer & 255) << 8))) | (s.smoothNormals ? 4 : 0)) >>> 0;
+    return ((s.alphaLayer == null ? 0 : (1 | ((s.alphaLayer & 255) << 8))) | (s.smoothNormals ? 4 : 0) | (s.glass ? 8 : 0)) >>> 0;
 }
 
 export function rtAlbedoWord(s: RtSurface): number {

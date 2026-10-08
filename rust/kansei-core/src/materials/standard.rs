@@ -20,6 +20,22 @@ pub enum StandardInstancing {
     OffsetHeight,
 }
 
+/// How `rt::RtReflectionsEffect` traces a [`Material::standard_lit`] surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum StandardTraced {
+    /// Not at all (its GBuffer alphas left at 1).
+    #[default]
+    None,
+    /// Reflective: its reflection traced through the grid, by its F0 (0.04 for a dielectric, the
+    /// base colour's brightest channel for a metal) and roughness.
+    Reflective,
+    /// Glass of this index of refraction (1.5 for window glass), drawn by the effect's glass pass
+    /// (`RtReflectionsEffect::set_glass`): the base colour is its tint (the light left after a
+    /// metre inside) and the roughness frosts it. Give its renderable `rt::RtSurface::glass` and
+    /// `cast_shadow = false`, and no `gi`.
+    Glass { ior: f32 },
+}
+
 /// What [`Material::standard_lit`] draws. Radiances are in cd/m² and the lights' colours in the
 /// units the scene's lights use, so the result goes through `ToneMapEffect` like the rest of an
 /// HDR scene.
@@ -43,6 +59,8 @@ pub struct StandardLitOptions {
     /// Also write screen-space motion (GBuffer target 4) for `TemporalAAEffect` and motion blur:
     /// sets `MaterialOptions::outputs_velocity`. Instances must not move between frames.
     pub outputs_velocity: bool,
+    /// Traced by `rt::RtReflectionsEffect`: reflective, or glass.
+    pub traced: StandardTraced,
 }
 
 impl Default for StandardLitOptions {
@@ -56,6 +74,7 @@ impl Default for StandardLitOptions {
             sky_down: [0.0; 3],
             instancing: None,
             outputs_velocity: false,
+            traced: StandardTraced::None,
         }
     }
 }
@@ -66,18 +85,36 @@ impl StandardLitOptions {
         Self { base_color: [0.0; 3], emissive: radiance, ..Default::default() }
     }
 
+    /// A mirror or polished metal of this colour (its reflectance, linear rgb; 0.95 for chrome)
+    /// and GGX roughness, whose reflection `rt::RtReflectionsEffect` traces.
+    pub fn mirror(color: [f32; 3], roughness: f32) -> Self {
+        Self { base_color: color, roughness, metallic: 1.0, traced: StandardTraced::Reflective, ..Default::default() }
+    }
+
+    /// Glass of this tint (the light left after a metre inside, linear rgb; 1 is clear), index of
+    /// refraction and roughness (0 clear, frosted towards 1), drawn by `rt::RtReflectionsEffect`'s
+    /// glass pass (see [`StandardTraced::Glass`]).
+    pub fn glass(tint: [f32; 3], ior: f32, roughness: f32) -> Self {
+        Self { base_color: tint, roughness, traced: StandardTraced::Glass { ior }, ..Default::default() }
+    }
+
     /// The material's group 0 uniform, as `KanseiStandardSurface` lays it out.
     fn uniform(&self) -> [f32; 20] {
         let [r, g, b] = self.base_color;
         let [er, eg, eb] = self.emissive;
         let [ur, ug, ub] = self.sky_up;
         let [dr, dg, db] = self.sky_down;
+        let (traced, ior) = match self.traced {
+            StandardTraced::None => (0.0, 1.0),
+            StandardTraced::Reflective => (1.0, 1.0),
+            StandardTraced::Glass { ior } => (2.0, ior.max(1.0)),
+        };
         [
             r, g, b, 1.0,
             er, eg, eb, 0.0,
             ur, ug, ub, 0.0,
             dr, dg, db, 0.0,
-            self.roughness, self.metallic, 0.0, 0.0,
+            self.roughness, self.metallic, traced, ior,
         ]
     }
 
@@ -131,6 +168,19 @@ impl Material {
         let mut material = Material::new(label, &options.shader(), vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)], material_options);
         material.set_uniform_bindable(0, &format!("{label}/Surface"), &options.uniform());
         material
+    }
+
+    /// Change a `standard_lit` material's surface (colour, roughness, metallic, emission, sky,
+    /// traced) to `options`'; its instancing and velocity stay as it was made.
+    pub fn set_standard_lit(&mut self, renderer: &crate::renderers::Renderer, options: &StandardLitOptions) {
+        match self.bindable_buffer(0) {
+            // drawn already: its uniform written in place (the scene's bundles keep its bind group)
+            Some(buffer) => renderer.raw_queue().write_buffer(&buffer, 0, bytemuck::cast_slice(&options.uniform())),
+            None => {
+                let label = format!("{}/Surface", self.label);
+                self.set_uniform_bindable(0, &label, &options.uniform());
+            }
+        }
     }
 
     /// An unlit material emitting `radiance` (cd/m²) into the GBuffer: lamp heads, windows, a
@@ -205,6 +255,20 @@ mod tests {
                 assert_eq!(struct_size(&module, "KanseiStandardSurface"), std::mem::size_of_val(&options.uniform()));
             }
         }
+    }
+
+    #[test]
+    fn traced_surfaces_tell_the_shader_their_mode_and_ior() {
+        let params = |o: StandardLitOptions| o.uniform()[16..20].to_vec();
+        assert_eq!(params(StandardLitOptions { roughness: 0.6, ..Default::default() }), [0.6, 0.0, 0.0, 1.0]);
+        assert_eq!(params(StandardLitOptions::mirror([0.95; 3], 0.2)), [0.2, 1.0, 1.0, 1.0]);
+        assert_eq!(params(StandardLitOptions::glass([0.9; 3], 1.5, 0.1)), [0.1, 0.0, 2.0, 1.5]);
+        // an index under air's is air's
+        assert_eq!(params(StandardLitOptions::glass([1.0; 3], 0.5, 0.0))[3], 1.0);
+        validate(
+            "gbuffer out glass",
+            &format!("{GBUFFER_OUT_WGSL}\n@fragment fn f() -> KanseiGBufferOut {{ return kansei_gbuffer_out_glass(vec3f(0.0, 1.0, 0.0), vec3f(0.9), 1.5, 0.2); }}"),
+        );
     }
 
     #[test]

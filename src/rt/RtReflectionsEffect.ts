@@ -6,7 +6,10 @@ import { gpuPass } from '../profiling/Profiler';
 import { VoxelVolume } from '../gi/VoxelVolume';
 import { VoxelClipmap, clipmapEntries, clipmapLayoutEntries } from '../gi/VoxelClipmap';
 import { RtGrid, RtGridHandle } from './RtGrid';
-import { RT_DEFAULT_COVERED_WGSL, RT_REFLECT_RESOLVE_WGSL, rtReflectTraceWgsl } from './RtWGSL';
+import { DirectionalLight } from '../lights/DirectionalLight';
+import { PointLight } from '../lights/PointLight';
+import { AreaLight } from '../lights/AreaLight';
+import { RT_DEFAULT_COVERED_WGSL, RT_REFLECT_RESOLVE_WGSL, rtGlassWgsl, rtReflectTraceWgsl } from './RtWGSL';
 
 /** What the reflections trace at: one pixel of each 2 x 2 (`half`) or 4 x 4 (`quarter`) block a frame. Rust: `rt::RtTraceResolution`. */
 export type RtTraceResolution = 'half' | 'quarter';
@@ -56,16 +59,37 @@ export interface RtReflectionStats {
     tests: number;
     /** The most cells and triangles one ray visited. */
     maxCost: number;
+    /** Glass pixels, and the cells and triangles their rays visited. */
+    glassPixels: number;
+    glassCost: number;
+}
+
+/**
+ * Glass (`RtReflectionsEffect.setGlass`): the pixels whose material writes glass (`standardLit`
+ * with `traced: { glass: { ior } }`, or `kansei_gbuffer_out_glass`: its tint, index of refraction
+ * and roughness) show the light it reflects and the light through it, refracted at every surface
+ * of the grid's glass (`rtGlassSurface`) it crosses: true entry and exit, with total internal
+ * reflection. Other rays (diffuse GI, shadows) pass through glass. Rust: `rt::RtGlass`.
+ */
+export interface RtGlass {
+    /** The most surfaces a ray through the glass crosses or reflects off inside. Default 8. */
+    interfaces?: number;
+    /** Paths a frosted (rough) glass pixel traces a frame, averaged with its history; clear glass traces one. Default 4. */
+    samples?: number;
 }
 
 /** Bytes of the WGSL `RtReflectParams` (rt_reflect_common.wgsl; Rust `RtReflectParamsGpu`). */
-export const RT_REFLECT_PARAMS_BYTES = 256;
+export const RT_REFLECT_PARAMS_BYTES = 336;
 
 interface Targets {
     width: number;
     height: number;
     trace: GPUTexture;
     history: [GPUTexture, GPUTexture];
+    /** the input with the glass drawn (what the reflections then composite over) */
+    glassed: GPUTexture;
+    /** frosted glass's history (last frame's and this frame's, by turns) */
+    glassHistory: [GPUTexture, GPUTexture];
 }
 
 interface Gpu {
@@ -74,8 +98,13 @@ interface Gpu {
     gridBGL: GPUBindGroupLayout;
     resolveBGL: GPUBindGroupLayout;
     trace: GPUComputePipeline;
+    glass: GPUComputePipeline;
     resolve: GPUComputePipeline;
     noSky: GPUBuffer;
+    /** no spot lights (a count of 0) */
+    noSpots: GPUBuffer;
+    /** the directional and point lights (`updateLights`; rt_reflect_hit.wgsl's RtReflectLights) */
+    lights: GPUBuffer;
     white: GPUTexture;
     alphaSampler: GPUSampler;
     linear: GPUSampler;
@@ -92,10 +121,14 @@ const enum StatsState { Free, Copied, Mapping }
 /**
  * Sharp and glossy reflections, traced through the renderer's ray tracing grid
  * (`Renderer.enableRtGrid`; `SceneRtGrid.handle`) on the surfaces whose material writes an F0
- * (`GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular`), the hits lit by the voxel GI's volume
- * (`SceneVoxelGi.volume`) or clipmap (`withClipmap`, `SceneVoxelClipmap.clipmap`): the light
- * leaving the surface there, the voxels as the surface cache.
- * Rays leaving the grid's box go on as a narrow voxel cone, then the sky (`setSkyLighting`).
+ * (`standardLit` with `mirrorOptions`, `traced: 'reflective'`, or `GBUFFER_OUT_WGSL`'s
+ * `kansei_gbuffer_out_specular`), and glass (`setGlass`). The hits are lit by the voxel GI's
+ * volume (`SceneVoxelGi.volume`) or clipmap (`withClipmap`, `SceneVoxelClipmap.clipmap`): the
+ * light leaving the surface there, the voxels as the surface cache; with `screenHits`, by the lit
+ * image where the camera sees the same point, and with `setSpotLights`, the hits it doesn't see by
+ * the spot lights (shadow rays through the grid) plus the voxels' irradiance. Rays leaving the
+ * grid's box go on as a narrow voxel cone, then the sky (`setSkyLighting`). It needs the voxel GI
+ * running whatever GI the image shows (`hitIndirect` off where that is none or screen space).
  *
  * It traces one pixel of each 2 x 2 (or 4 x 4) block a frame, each in turn, and accumulates them
  * at full resolution: the frame's traced pixels upsampled by depth and normal, blended with the
@@ -122,8 +155,23 @@ export class RtReflectionsEffect extends PostProcessingEffect {
     public heatScale = 1;
     /** Count the rays' work (`stats`), a few atomics a ray. */
     public collectStats = false;
+    /**
+     * Light the hits by the lit image where the camera sees the same point (sharp, with the direct
+     * light and the GI), the voxels elsewhere; off, always the voxels.
+     */
+    public screenHits = false;
+    /**
+     * The hits the camera doesn't see (with `setSpotLights`) get the voxels' indirect light too;
+     * off where the image shows no voxel or traced GI, so that what the mirror and the glass show matches it.
+     */
+    public hitIndirect = true;
 
     private _resolution: RtTraceResolution;
+    private glass: Required<RtGlass> | null = null;
+    private spotLights: GPUBuffer | null = null;
+    /** the directional and point lights as RtReflectLights holds them (header, then 8 floats a light), and whether they changed */
+    private lights = new Float32Array(4);
+    private lightsDirty = false;
     private readonly coveredWgsl: string | null;
     private readonly grid: RtGridHandle;
     private readonly source: VoxelVolume | VoxelClipmap;
@@ -174,6 +222,53 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         this.alphaTexture = view;
     }
 
+    /**
+     * Light the hits the camera doesn't see by these spot lights (`Renderer.spotLightsBuffer`),
+     * shadowed by rays through the grid, plus the voxels' irradiance, as the hybrid GI lights its
+     * hits; null: by the voxels' radiance there (the surface cache).
+     */
+    public setSpotLights(lights: GPUBuffer | null): void {
+        this.spotLights = lights;
+    }
+
+    /**
+     * Light the hits the camera doesn't see by these directional, point (and area, as point)
+     * lights too, shadowed by rays through the grid, a point light falling off as
+     * (1 - d / radius)^2 (call it when they change, or each frame). Rust: `update_lights`.
+     */
+    public updateLights(dirLights: readonly DirectionalLight[], pointLights: readonly PointLight[], areaLights: readonly AreaLight[] = []): void {
+        const positional: (PointLight | AreaLight)[] = [...pointLights, ...areaLights];
+        const data = new Float32Array(4 + 8 * (dirLights.length + positional.length));
+        const u32 = new Uint32Array(data.buffer);
+        u32[0] = dirLights.length;
+        u32[1] = positional.length;
+        dirLights.forEach((light, i) => {
+            data.set(light.direction, 4 + i * 8);
+            data.set(light.effectiveColor, 8 + i * 8);
+        });
+        positional.forEach((light, i) => {
+            light.updateModelMatrix();
+            const wm = light.worldMatrix.internalMat4;
+            const k = 4 + (dirLights.length + i) * 8;
+            data.set([wm[12], wm[13], wm[14], light.radius], k);
+            data.set(light.effectiveColor, k + 4);
+        });
+        const old = new Uint32Array(this.lights.buffer);
+        if (data.length !== this.lights.length || !u32.every((v, i) => v === old[i])) {
+            this.lights = data;
+            this.lightsDirty = true;
+        }
+    }
+
+    /** Draw glass (or none): see `RtGlass`. */
+    public setGlass(glass: RtGlass | null): void {
+        this.glass = glass ? { interfaces: glass.interfaces ?? 8, samples: glass.samples ?? 4 } : null;
+    }
+
+    public getGlass(): RtGlass | null {
+        return this.glass;
+    }
+
     public get resolution(): RtTraceResolution {
         return this._resolution;
     }
@@ -183,7 +278,7 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         if (resolution === this._resolution) return;
         this._resolution = resolution;
         if (this.gpu?.targets) {
-            for (const t of [this.gpu.targets.trace, ...this.gpu.targets.history]) t.destroy();
+            destroyTargets(this.gpu.targets);
             this.gpu.targets = null;
         }
         this.resetHistory();
@@ -209,7 +304,11 @@ export class RtReflectionsEffect extends PostProcessingEffect {
 
     public initialize(device: GPUDevice, _gbuffer: GBuffer, _camera: Camera): void {
         this.device = device;
-        this.gpu ??= this.initGpu(device);
+        if (!this.gpu) {
+            this.gpu = this.initGpu(device);
+            // (the lights into the new buffer)
+            this.lightsDirty = true;
+        }
         this.initialized = true;
     }
 
@@ -227,7 +326,13 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         const clipmap = this.source instanceof VoxelClipmap;
         const traceBGL = bgl('RtReflections/Trace', [
             uniform(0), depth(1), texture(2, false), texture(3, false), storage(4), uniform(5),
-            ...(clipmap ? clipmapLayoutEntries(visibility) : [uniform(6), texture(7, true, '3d'), sampler(8)]),
+            texture(10, false), { binding: 11, visibility, buffer: { type: 'read-only-storage' } },
+            texture(12, true), storage(13), sampler(14), { binding: 15, visibility, buffer: { type: 'read-only-storage' } },
+            ...(clipmap ? clipmapLayoutEntries(visibility) : [
+                uniform(6), texture(7, true, '3d'), sampler(8),
+                // the anisotropic mips (the volume itself where it has none)
+                ...[40, 41, 42, 43, 44, 45].map((b) => texture(b, true, '3d')),
+            ]),
         ]);
         const gridBGL = bgl('RtReflections/Grid', [
             ...RtGrid.layoutEntries(0, visibility), texture(3, true), sampler(4),
@@ -252,9 +357,12 @@ export class RtReflectionsEffect extends PostProcessingEffect {
             gridBGL,
             resolveBGL,
             trace: pipeline('RtReflections/Trace', rtReflectTraceWgsl(this.coveredWgsl ?? RT_DEFAULT_COVERED_WGSL, clipmap), [traceBGL, gridBGL]),
+            glass: pipeline('RtReflections/Glass', rtGlassWgsl(this.coveredWgsl ?? RT_DEFAULT_COVERED_WGSL, clipmap), [traceBGL, gridBGL]),
             resolve: pipeline('RtReflections/Resolve', RT_REFLECT_RESOLVE_WGSL, [resolveBGL]),
             // (a zeroed SkyLighting: black)
             noSky: buffer('RtReflections/NoSky', 256, GPUBufferUsage.UNIFORM),
+            noSpots: buffer('RtReflections/NoSpots', 256, GPUBufferUsage.STORAGE),
+            lights: lightsBuffer(device, 0),
             white,
             alphaSampler: filtering('RtReflections/Alpha', 'repeat'),
             linear: filtering('RtReflections/Linear', 'clamp-to-edge'),
@@ -268,7 +376,7 @@ export class RtReflectionsEffect extends PostProcessingEffect {
     private ensureTargets(device: GPUDevice, width: number, height: number): Targets {
         const gpu = this.gpu!;
         if (gpu.targets && gpu.targets.width === width && gpu.targets.height === height) return gpu.targets;
-        if (gpu.targets) for (const t of [gpu.targets.trace, ...gpu.targets.history]) t.destroy();
+        if (gpu.targets) destroyTargets(gpu.targets);
         const d = this.downscale();
         const target = (label: string, w: number, h: number) => device.createTexture({
             label,
@@ -281,6 +389,8 @@ export class RtReflectionsEffect extends PostProcessingEffect {
             height,
             trace: target('RtReflections/Trace', Math.ceil(width / d), Math.ceil(height / d)),
             history: [target('RtReflections/HistoryA', width, height), target('RtReflections/HistoryB', width, height)],
+            glassed: target('RtReflections/Glassed', width, height),
+            glassHistory: [target('RtReflections/GlassHistoryA', width, height), target('RtReflections/GlassHistoryB', width, height)],
         };
         this.prevViewProj = null;
         return gpu.targets;
@@ -295,7 +405,7 @@ export class RtReflectionsEffect extends PostProcessingEffect {
                 () => {
                     const w = new Uint32Array(gpu.staging.getMappedRange().slice(0));
                     gpu.staging.unmap();
-                    if (this.collectStats) this._stats = { rays: w[0], hits: w[1], cells: w[2], tests: w[3], maxCost: w[4] };
+                    if (this.collectStats) this._stats = { rays: w[0], hits: w[1], cells: w[2], tests: w[3], maxCost: w[4], glassPixels: w[5], glassCost: w[6] };
                     this.statsState = StatsState.Free;
                 },
                 () => { this.statsState = StatsState.Free; },
@@ -333,11 +443,26 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         const proj = camera.projectionMatrix.internalMat4;
         const view = camera.viewMatrix.internalMat4;
         const viewProj = mat4.multiply(mat4.create(), proj, view);
+        // the directional and point lights, uploaded when they changed (into a larger buffer when
+        // they outgrew it)
+        if (this.lightsDirty) {
+            this.lightsDirty = false;
+            if (gpu.lights.size < this.lights.byteLength) {
+                gpu.lights.destroy();
+                gpu.lights = lightsBuffer(device, (this.lights.length - 4) / 8);
+            }
+            device.queue.writeBuffer(gpu.lights, 0, this.lights);
+        }
         let flags = 0;
         if (this.alphaTest) flags |= 1;
         if (this.collectStats) flags |= 2;
         if (this.prevViewProj) flags |= 4;
         if (this.traceGrid) flags |= 8;
+        if (this.screenHits) flags |= 16;
+        if (this.spotLights || this.lights.length > 4) flags |= 32;
+        if (this.source instanceof VoxelVolume && this.source.anisotropicViews) flags |= 64;
+        if (!this.hitIndirect) flags |= 128;
+        if (this.glass) flags |= 256;
         const data = new ArrayBuffer(RT_REFLECT_PARAMS_BYTES);
         const f32 = new Float32Array(data);
         const u32 = new Uint32Array(data);
@@ -356,6 +481,9 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         f32[60] = Math.max(this.skyScale, 0);
         f32[61] = Math.min(Math.max(this.temporalBlend, 0.01), 1);
         f32[62] = this.heatScale;
+        f32.set(viewProj, 64);
+        u32[80] = this.glass ? Math.max(this.glass.interfaces, 1) : 0;
+        u32[81] = this.glass ? Math.max(this.glass.samples, 1) : 1;
         device.queue.writeBuffer(gpu.params, 0, data);
         const current = this.frame % 2;
         this.frame = (this.frame + 1) >>> 0;
@@ -369,20 +497,29 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         const group = (label: string, layout: GPUBindGroupLayout, resources: [number, GPUBindingResource][]) =>
             device.createBindGroup({ label, layout, entries: resources.map(([binding, resource]) => ({ binding, resource })) });
         const source = this.source;
-        const trace = device.createBindGroup({
-            label: 'RtReflections/Trace',
+        // the glass first (its pass writes `glassed`), then the reflections over it
+        const glassOn = this.glass !== null;
+        const inputView = input.createView();
+        const lit = glassOn ? t.glassed.createView() : inputView;
+        const glassHistory = t.glassHistory.map((h) => h.createView());
+        const traced = (label: string, out: GPUTextureView, screen: GPUTextureView) => device.createBindGroup({
+            label,
             layout: gpu.traceBGL,
             entries: [
-                ...([[0, params], [1, depthView], [2, normalView], [3, albedoView], [4, traceView],
-                    [5, { buffer: this.skyLighting ?? gpu.noSky }]] as [number, GPUBindingResource][])
+                ...([[0, params], [1, depthView], [2, normalView], [3, albedoView], [4, out],
+                    [5, { buffer: this.skyLighting ?? gpu.noSky }], [10, screen], [11, { buffer: this.spotLights ?? gpu.noSpots }],
+                    [12, glassHistory[1 - current]], [13, glassHistory[current]], [14, gpu.linear], [15, { buffer: gpu.lights }]] as [number, GPUBindingResource][])
                     .map(([binding, resource]) => ({ binding, resource })),
                 ...(source instanceof VoxelClipmap ? clipmapEntries(source) : [
                     { binding: 6, resource: { buffer: source.uniform } },
                     { binding: 7, resource: source.view },
                     { binding: 8, resource: source.sampler },
+                    ...[0, 1, 2, 3, 4, 5].map((i) => ({ binding: 40 + i, resource: source.anisotropicViews?.[i] ?? source.view })),
                 ]),
             ],
         });
+        const trace = traced('RtReflections/Trace', traceView, lit);
+        const glass = glassOn ? traced('RtReflections/Glass', t.glassed.createView(), inputView) : null;
         // the grid's group, made anew when the grid's buffers or the alpha texture change
         const grid = this.grid;
         if (!gpu.gridGroup || gpu.gridGroup.generation !== grid.generation || gpu.gridGroup.alpha !== this.alphaTexture) {
@@ -397,12 +534,20 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         }
         const history = t.history.map((h) => h.createView());
         const resolve = group('RtReflections/Resolve', gpu.resolveBGL, [
-            [0, params], [1, depthView], [2, normalView], [3, albedoView], [4, input.createView()], [5, traceView],
+            [0, params], [1, depthView], [2, normalView], [3, albedoView], [4, lit], [5, traceView],
             [6, history[1 - current]], [7, output.createView()], [8, history[current]], [9, gpu.linear],
         ]);
 
         const readStats = this.collectStats && this.statsState === StatsState.Free;
         if (readStats) commandEncoder.clearBuffer(gpu.stats);
+        if (glass) {
+            const pass = commandEncoder.beginComputePass({ label: 'Rt/Glass', timestampWrites: gpuPass('Rt/Glass') });
+            pass.setPipeline(gpu.glass);
+            pass.setBindGroup(0, glass);
+            pass.setBindGroup(1, gpu.gridGroup.group);
+            pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+            pass.end();
+        }
         {
             const pass = commandEncoder.beginComputePass({ label: 'Rt/Trace', timestampWrites: gpuPass('Rt/Trace') });
             pass.setPipeline(gpu.trace);
@@ -427,10 +572,19 @@ export class RtReflectionsEffect extends PostProcessingEffect {
     public destroy(): void {
         const gpu = this.gpu;
         if (!gpu) return;
-        for (const b of [gpu.params, gpu.noSky, gpu.stats, gpu.staging]) b.destroy();
+        for (const b of [gpu.params, gpu.noSky, gpu.noSpots, gpu.lights, gpu.stats, gpu.staging]) b.destroy();
         gpu.white.destroy();
-        if (gpu.targets) for (const t of [gpu.targets.trace, ...gpu.targets.history]) t.destroy();
+        if (gpu.targets) destroyTargets(gpu.targets);
         this.gpu = null;
         this.initialized = false;
     }
+}
+
+/** Room for `n` lights after RtReflectLights' header (at least 8). */
+function lightsBuffer(device: GPUDevice, n: number): GPUBuffer {
+    return device.createBuffer({ label: 'RtReflections/Lights', size: 16 + 32 * Math.max(n, 8), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+}
+
+function destroyTargets(t: Targets): void {
+    for (const x of [t.trace, ...t.history, t.glassed, ...t.glassHistory]) x.destroy();
 }

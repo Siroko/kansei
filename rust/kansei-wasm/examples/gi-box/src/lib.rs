@@ -13,17 +13,24 @@
 //! - `gi=voxel+ssgi`: screen-space GI in front for contact detail, the voxels for the rest.
 //! - `gi=probes` and `gi=probes+ssgi`: the voxels' light reaches the screen through irradiance
 //!   probes traced in the voxels' distance field (`SdfProbes`) instead of cones per pixel.
-//! - `gi=rt`: the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels from the surface
+//! - `gi=rt` (the default): the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels from the surface
 //!   through a grid of the room's triangles, the hits lit by the lamp (shadow rays through the
 //!   grid) and one cone through the voxels for the further bounces, denoised by SVGF; closest to
 //!   the path-traced reference in the contacts and behind the blocks.
+//!
+//! A chrome ball stands on the short block and a glass ball on the rug, ray traced through the
+//! same grid of triangles whatever the GI (`RtReflectionsEffect` with `set_glass`): the chrome
+//! mirrors the room (`StandardLitOptions::mirror`, rough to frosted chrome), the glass refracts
+//! it through both its surfaces (`StandardLitOptions::glass`, `RtSurface::glass`: its index of
+//! refraction, tint and roughness, total internal reflection), and the GI's rays pass through it.
 //!
 //! Drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan. The panel
 //! (and `window.kansei`) switches everything at run time.
 //!
 //! URL parameters (a `preset` first, the others over it):
-//! - `preset=off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
-//!   `best`, voxel + SSGI at the device's tier, unless the URL names a preset or a `gi`);
+//! - `preset=hybrid|off|ssgi|voxel|best|indirect|voxels|phone|dragon|sdf|sdf-dragon|slice|probes|probe-view|probes-dragon` (see `PRESETS`;
+//!   `hybrid`, the hybrid path tracing (`gi=rt`), unless the URL names a preset or a `gi`; `best` is
+//!   voxel + SSGI at the device's tier);
 //! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi|rt` (`rt`, or `rt=1`,
 //!   builds the grid of triangles at load; the panel reloads the page to switch to it without);
 //! - with `gi=rt`, the hybrid's settings (`RtGi`): `rtgi_res=half|full`,
@@ -40,7 +47,13 @@
 //!   (its AO on the GI), `sdf_shadows=off|fallback|always` (the voxels' shadows through it, where
 //!   no map covers them or always), `shadows=map|sdf` (the direct light's shadows through it, by
 //!   the material helper `gi::SDF_WGSL`);
-//! - `cam=front|corner|low|floor`;
+//! - the balls: `mirror=0`, `glass=0` (without either, and without `reflect`, `gi=rt` or `rt=1`, no
+//!   grid of triangles is built), `mirror_rough=0..1`, `glass_ior=` (1.5), `glass_rough=0..1`
+//!   (frosted), `glass_tint=r,g,b` (the light left after a metre inside), `glass_samples=` (paths
+//!   a frosted pixel a frame, 4), `rt_screen=0` (their rays' hits lit by the lamp and the voxels
+//!   even where the camera sees them), `rt_direct=0` (hits the camera doesn't see lit by the
+//!   voxels alone);
+//! - `cam=front|corner|low|floor|glass`;
 //! - `dragon=1|full`: the Stanford dragon (CC-BY-NC-4.0, see `www/assets/license.txt`): `1` the
 //!   decimated `.glb` (19k triangles), `full` the whole scan (871k triangles, 24 MB);
 //! - `animate=1`: the dragon (or, without it, the tall block) turns and slides, re-voxelized each
@@ -59,11 +72,11 @@ use std::rc::Rc;
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
-use kansei_core::geometries::BoxGeometry;
+use kansei_core::geometries::{BoxGeometry, SphereGeometry};
 use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfProbeOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
+use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
@@ -73,8 +86,8 @@ use kansei_core::postprocessing::{
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
 use kansei_core::rt::{
-    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGridOptions, RtReflectionsEffect,
-    RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGlass, RtGridOptions,
+    RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
 };
 use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, param_or, Canvas, Frame};
 
@@ -144,6 +157,23 @@ fn voxel_main(in: VOut, @builtin(front_facing) front: bool) {
     kansei_voxel_write(in.clip, front, surface.albedo.rgb * textureSample(rug_texture, rug_sampler, in.uv).rgb, vec3<f32>(0.0));
 }
 "#;
+
+/// The chrome ball: its reflectance (`StandardLitOptions::mirror`), and the albedo the GI's rays
+/// and voxels see it with (dark: they don't mirror).
+const MIRROR_COLOR: [f32; 3] = [0.95, 0.95, 0.95];
+const MIRROR_GI_ALBEDO: [f32; 3] = [0.02, 0.02, 0.02];
+/// The light the glass leaves after a metre inside (a faint green, as window glass).
+const GLASS_TINT: [f32; 3] = [0.82, 0.93, 0.88];
+const BALL_RADIUS: f32 = 0.4;
+/// The balls' tessellation (the grid traces their triangles, shaded by their vertex normals).
+const BALL_SEGMENTS: u32 = 64;
+const BALL_RINGS: u32 = 48;
+
+/// `r,g,b`
+fn parse_rgb(v: &str) -> Option<[f32; 3]> {
+    let c: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (c.len() == 3).then(|| [c[0], c[1], c[2]])
+}
 
 /// The rug's two halves (linear albedo), split across its width.
 const RUG_LEFT: [f32; 3] = [0.85, 0.35, 0.05];
@@ -521,9 +551,21 @@ struct Config {
     reflection_view: RtReflectionsView,
     reflection_grid: bool,
     reflection_quarter: bool,
-    /// The grid of triangles exists (`reflect=1`, `gi=rt` or `rt=1`; set at load).
+    /// The grid of triangles exists (`reflect=1`, `gi=rt`, `rt=1` or a ball; set at load).
     grid: bool,
     rtgi: RtGi,
+    /// The chrome ball on the short block and the glass ball on the rug (`mirror=`, `glass=`),
+    /// drawn by the reflections effect whatever the GI.
+    mirror: bool,
+    glass: bool,
+    mirror_rough: f32,
+    glass_ior: f32,
+    glass_rough: f32,
+    glass_tint: [f32; 3],
+    glass_samples: u32,
+    /// The balls' (and the floor's) rays' hits lit by the lit image where the camera sees them
+    /// (`rt_screen=`), else by the lamp and the voxels.
+    screen_hits: bool,
 }
 
 impl Config {
@@ -540,7 +582,21 @@ impl Config {
     /// Whether the scene's voxel GI must run: for the voxel modes, the distance field, or the
     /// reflections (it lights their hits).
     fn needs_voxels(&self) -> bool {
-        self.gi.voxels() || self.needs_sdf() || self.reflect
+        self.gi.voxels() || self.needs_sdf() || self.traces()
+    }
+
+    /// Whether the reflections effect runs: the polished floor, the chrome ball, the glass.
+    fn traces(&self) -> bool {
+        self.grid && ((self.reflect && self.reflections) || self.mirror || self.glass)
+    }
+
+    /// The balls' materials.
+    fn mirror_material(&self) -> StandardLitOptions {
+        StandardLitOptions::mirror(MIRROR_COLOR, self.mirror_rough)
+    }
+
+    fn glass_material(&self) -> StandardLitOptions {
+        StandardLitOptions::glass(self.glass_tint, self.glass_ior, self.glass_rough)
     }
 }
 
@@ -562,11 +618,13 @@ const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxel
     Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
 }
 
-const PRESETS: [Preset; 14] = [
+const PRESETS: [Preset; 15] = [
+    // the default: diffuse GI path traced through the grid (one ray for each 2 x 2 pixels, SVGF)
+    preset("hybrid", "Hybrid path tracing (default)", "rt", None, View::Lit, Dragon::Off),
     preset("off", "Off (direct light)", "off", None, View::Lit, Dragon::Off),
     preset("ssgi", "SSGI", "high", None, View::Lit, Dragon::Off),
     preset("voxel", "Voxel", "voxel", None, View::Lit, Dragon::Off),
-    preset("best", "Voxel + SSGI (best)", "voxel+ssgi", None, View::Lit, Dragon::Off),
+    preset("best", "Voxel + SSGI", "voxel+ssgi", None, View::Lit, Dragon::Off),
     preset("indirect", "Indirect only", "voxel+ssgi", None, View::Indirect, Dragon::Off),
     preset("voxels", "Voxels (debug)", "voxel", None, View::Voxels, Dragon::Off),
     preset("phone", "Phone (low)", "voxel+ssgi", Some(VoxelGiQuality::Low), View::Lit, Dragon::Off),
@@ -587,7 +645,7 @@ fn probe_options(phone: bool) -> SdfProbeOptions {
 }
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
-const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 4] = [
+const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 5] = [
     // the box's opening, framed as the Cornell box photographs are
     ("front", [0.0, 2.0, -2.0], 8.3, 0.0, 0.0),
     // inside, from the upper front-left corner toward the short block and the green wall
@@ -596,6 +654,8 @@ const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 4] = [
     ("low", [0.0, 1.4, -2.5], 7.5, 0.0, -0.12),
     // from the front, above, down onto the floor (its reflections with reflect=1)
     ("floor", [-0.3, 0.5, -2.0], 6.2, 0.3, 0.42),
+    // close on the glass ball, the room and (with dragon=1) the dragon behind it
+    ("glass", [-0.1, 0.45, -0.45], 1.8, 0.92, 0.12),
 ];
 
 struct State {
@@ -616,6 +676,9 @@ struct State {
     lit: Vec<(usize, &'static str, [f32; 3])>,
     tall: usize,
     rug: usize,
+    /// The chrome and glass balls (with the grid).
+    mirror: Option<usize>,
+    glass: Option<usize>,
     /// The dragons loaded so far (`Dragon::slot`).
     dragons: [Option<usize>; 2],
     /// (position, yaw) the animated renderables rest at.
@@ -654,7 +717,7 @@ fn default_voxels(phone: bool) -> VoxelGiQuality {
 }
 
 /// The preset of a URL that names neither a preset nor a `gi`.
-const DEFAULT_PRESET: &str = "best";
+const DEFAULT_PRESET: &str = "hybrid";
 
 /// `config` with preset `name` applied (unknown names change nothing).
 fn with_preset(config: Config, name: &str, phone: bool) -> Config {
@@ -692,6 +755,14 @@ fn config_from_url(phone: bool) -> Config {
         reflection_quarter: param("rt_res").as_deref() == Some("quarter"),
         grid: false,
         rtgi: RtGi::from_url(),
+        mirror: flag("mirror", true),
+        glass: flag("glass", true),
+        mirror_rough: param_or("mirror_rough", 0.0f32).clamp(0.0, 1.0),
+        glass_ior: param_or("glass_ior", 1.5f32).max(1.0),
+        glass_rough: param_or("glass_rough", 0.0f32).clamp(0.0, 1.0),
+        glass_tint: param("glass_tint").and_then(|v| parse_rgb(&v)).unwrap_or(GLASS_TINT),
+        glass_samples: param_or("glass_samples", 4u32).clamp(1, 16),
+        screen_hits: flag("rt_screen", true),
     };
     if let Some(preset) = param("preset").or_else(|| param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
@@ -723,7 +794,7 @@ fn config_from_url(phone: bool) -> Config {
     }
     c.rug = param("rug").as_deref() != Some("off");
     c.textured = param("albedo").as_deref() != Some("constant");
-    c.grid = c.reflect || c.gi == Gi::Rt || flag("rt", false);
+    c.grid = c.reflect || c.gi == Gi::Rt || flag("rt", false) || c.mirror || c.glass;
     c
 }
 
@@ -772,8 +843,8 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             effects.push(Box::new(effect));
         }
     }
-    // the polished floor's reflections, through the room's grid, lit by the voxels
-    if let (true, Some(scene_gi), Some(grid)) = (config.reflect && config.reflections, renderer.voxel_gi(), renderer.rt_grid()) {
+    // the polished floor's reflections, the chrome ball and the glass, through the room's grid
+    if let (true, Some(scene_gi), Some(grid)) = (config.traces(), renderer.voxel_gi(), renderer.rt_grid()) {
         let options = RtReflectionsOptions {
             resolution: if config.reflection_quarter { RtTraceResolution::Quarter } else { RtTraceResolution::Half },
             max_distance: 20.0,
@@ -784,6 +855,14 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
         reflections.trace_grid = config.reflection_grid;
         reflections.heat_scale = 0.5 / exposure_from_ev100(5.0);
         reflections.collect_stats = stats;
+        // the hits the camera sees: the lit image there; the others lit by the lamp (shadow rays
+        // through the grid) and the voxels, with no indirect light where the image shows none
+        reflections.screen_hits = config.screen_hits;
+        reflections.hit_indirect = !matches!(config.gi, Gi::Off | Gi::Screen(_));
+        if flag("rt_direct", true) {
+            reflections.set_spot_lights(Some(renderer.spot_lights_buffer()));
+        }
+        reflections.set_glass(config.glass.then_some(RtGlass { samples: config.glass_samples, ..Default::default() }));
         effects.push(Box::new(reflections));
     }
     let mut tone = ToneMapOptions::for_surface(renderer.presentation_format());
@@ -874,6 +953,12 @@ impl State {
         if let Some(r) = self.scene.get_renderable_mut(self.rug) {
             r.visible = config.rug;
         }
+        for (index, on) in [(self.mirror, config.mirror), (self.glass, config.glass)] {
+            if let Some(r) = index.and_then(|i| self.scene.get_renderable_mut(i)) {
+                r.visible = on;
+            }
+        }
+        self.set_ball_materials(config);
         if config.textured != previous.textured {
             // the voxelizer can't see a material change
             if let Some(gi) = self.renderer.voxel_gi_mut() {
@@ -894,6 +979,17 @@ impl State {
             if !r.dynamic {
                 r.object.position = rest.0;
                 r.object.rotation.y = rest.1;
+            }
+        }
+    }
+
+    /// The balls' materials to `config`'s (alone: the effects, and the frosted glass's history, go
+    /// on as they are).
+    fn set_ball_materials(&mut self, config: Config) {
+        self.config = config;
+        for (index, material) in [(self.mirror, config.mirror_material()), (self.glass, config.glass_material())] {
+            if let Some(r) = index.and_then(|i| self.scene.get_renderable_mut(i)) {
+                r.material.set_standard_lit(&self.renderer, &material);
             }
         }
     }
@@ -921,6 +1017,11 @@ impl State {
         self.controls.update(&mut self.camera, dt);
         if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
             gi.update_lights(self.scene.lights());
+        }
+        // (the lamp is a spot light, which the reflections read from the renderer; this hands
+        // them any other)
+        if let Some(reflections) = self.volume.effect_mut::<RtReflectionsEffect>() {
+            reflections.update_lights(self.scene.lights());
         }
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
         if let Some(stats) = &mut self.stats {
@@ -982,6 +1083,20 @@ impl State {
         )
     }
 
+    /// The balls' settings and the glass pass's counters (null without the grid).
+    fn balls_info(&self) -> String {
+        if self.mirror.is_none() {
+            return "null".into();
+        }
+        let r = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtReflectionsEffect>());
+        let s = r.and_then(|r| r.stats()).unwrap_or_default();
+        let c = &self.config;
+        format!(
+            "{{\"mirror\":{},\"glass\":{},\"mirror_rough\":{},\"glass_ior\":{},\"glass_rough\":{},\"glass_tint\":{:?},\"glass_samples\":{},\"screen_hits\":{},\"rays\":{},\"glass_pixels\":{},\"glass_cost\":{}}}",
+            c.mirror, c.glass, c.mirror_rough, c.glass_ior, c.glass_rough, c.glass_tint, c.glass_samples, c.screen_hits, s.rays, s.glass_pixels, s.glass_cost
+        )
+    }
+
     /// The hybrid's settings, and while it runs its counters, memory and accumulated frames.
     fn rtgi_info(&self) -> String {
         let e = self.volume.effects.iter().find_map(|e| e.as_any().downcast_ref::<RtDiffuseGiEffect>());
@@ -1005,13 +1120,15 @@ impl State {
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.grid_info(),
             self.rtgi_info(),
             sum("RtGi/"),
             self.reflect_info(),
+            self.balls_info(),
             sum("Rt/Gather") + sum("Rt/Grid"),
             sum("Rt/Trace") + sum("Rt/Resolve"),
+            sum("Rt/Glass"),
             self.config.gi.name(),
             self.config.view.name(),
             self.config.voxels.name(),
@@ -1123,6 +1240,25 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     rug.object.set_position(0.0, 0.01, -0.55);
     rug.rt = rt(mean);
     let rug = scene.add(SceneNode::Renderable(rug));
+    // with the grid: a chrome ball on the short block and a glass ball on the rug before it
+    let (mut mirror, mut glass) = (None, None);
+    if config.grid {
+        let sphere = || SphereGeometry::new(BALL_RADIUS, BALL_SEGMENTS, BALL_RINGS);
+        // (dark to the GI's rays and the voxels: they don't mirror; its own rays follow its
+        // vertex normals, as the hits on it do)
+        let mut ball = Renderable::new(sphere(), Material::standard_lit("Chrome", &config.mirror_material())).with_gi(GiSurface::new(MIRROR_GI_ALBEDO));
+        ball.rt = Some(RtSurface::new(MIRROR_GI_ALBEDO).with_smooth_normals());
+        ball.object.set_position(0.8, 1.2 + BALL_RADIUS, -1.5);
+        ball.visible = config.mirror;
+        mirror = Some(scene.add(SceneNode::Renderable(ball)));
+        // clear to the shadow maps, the voxels and the GI's rays; refracted by the glass pass
+        let mut ball = Renderable::new(sphere(), Material::standard_lit("Glass", &config.glass_material()));
+        ball.rt = Some(RtSurface::glass(config.glass_tint));
+        ball.cast_shadow = false;
+        ball.object.set_position(-0.1, BALL_RADIUS + 0.025, -0.45);
+        ball.visible = config.glass;
+        glass = Some(scene.add(SceneNode::Renderable(ball)));
+    }
     // the dragon, in the free corner at the front left, when asked for
     let dragon_rest = (Vec3::new(-1.15, 0.0, -1.25), 0.5);
     let mut dragons = [None, None];
@@ -1165,6 +1301,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         lit,
         tall,
         rug,
+        mirror,
+        glass,
         dragons,
         tall_rest,
         dragon_rest,
@@ -1197,7 +1335,13 @@ pub fn presets() -> String {
 /// Apply preset `name` (`PRESETS`): GI mode, voxel tier, view and the dragon together.
 #[wasm_bindgen]
 pub async fn set_preset(name: String) {
-    let Some(config) = with_state(|s| with_preset(s.config, &name, s.phone)) else { return };
+    // (the hybrid needs the grid, built at load: without it the GI stays as it is)
+    let Some(config) = with_state(|s| {
+        let c = with_preset(s.config, &name, s.phone);
+        if c.gi == Gi::Rt && !s.config.grid { Config { gi: s.config.gi, ..c } } else { c }
+    }) else {
+        return;
+    };
     apply_with_dragon(config).await;
 }
 
@@ -1288,7 +1432,7 @@ pub fn set_textured(on: bool) {
     with_state(|s| s.apply(Config { textured: on, ..s.config }));
 }
 
-/// Camera preset `front|corner|low` (`CAMERAS`).
+/// Camera preset `front|corner|low|floor|glass` (`CAMERAS`).
 #[wasm_bindgen]
 pub fn set_camera(name: &str) {
     if let Some(&(_, t, distance, azimuth, elevation)) = CAMERAS.iter().find(|c| c.0 == name) {
@@ -1336,6 +1480,51 @@ pub fn set_stats(on: bool) {
 #[wasm_bindgen]
 pub fn set_reflections(on: bool) {
     with_state(|s| s.apply(Config { reflections: on, ..s.config }));
+}
+
+/// The chrome ball (only where the page built the grid).
+#[wasm_bindgen]
+pub fn set_mirror(on: bool) {
+    with_state(|s| {
+        if s.mirror.is_some() {
+            s.apply(Config { mirror: on, ..s.config });
+        }
+    });
+}
+
+/// The glass ball (only where the page built the grid).
+#[wasm_bindgen]
+pub fn set_glass(on: bool) {
+    with_state(|s| {
+        if s.glass.is_some() {
+            s.apply(Config { glass: on, ..s.config });
+        }
+    });
+}
+
+/// The chrome ball's roughness, 0 (a mirror) to 1.
+#[wasm_bindgen]
+pub fn set_mirror_rough(roughness: f32) {
+    with_state(|s| s.set_ball_materials(Config { mirror_rough: roughness.clamp(0.0, 1.0), ..s.config }));
+}
+
+/// The glass's index of refraction (1: air, 1.5: window glass, 2.4: diamond).
+#[wasm_bindgen]
+pub fn set_glass_ior(ior: f32) {
+    with_state(|s| s.set_ball_materials(Config { glass_ior: ior.max(1.0), ..s.config }));
+}
+
+/// Frosted glass, 0 (clear) to 1.
+#[wasm_bindgen]
+pub fn set_glass_rough(roughness: f32) {
+    with_state(|s| s.set_ball_materials(Config { glass_rough: roughness.clamp(0.0, 1.0), ..s.config }));
+}
+
+/// The rays' hits lit by the lit image where the camera sees them (`rt_screen=`), or always by the
+/// lamp and the voxels.
+#[wasm_bindgen]
+pub fn set_screen_hits(on: bool) {
+    with_state(|s| s.apply(Config { screen_hits: on, ..s.config }));
 }
 
 /// `lit`, `reflection` (the light they add), `mirror` (what the rays see) or `cost`.

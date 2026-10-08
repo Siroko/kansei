@@ -48,6 +48,32 @@ export interface StandardLitOptions {
      * `MaterialOptions.outputsVelocity`. Instances must not move between frames.
      */
     outputsVelocity?: boolean;
+    /**
+     * Traced by `RtReflectionsEffect`: `'reflective'`, its reflection traced through the grid by
+     * its F0 (0.04 for a dielectric, the base colour's brightest channel for a metal) and
+     * roughness; or `{ glass: { ior } }`, glass of that index of refraction drawn by the effect's
+     * glass pass (`setGlass`), the base colour its tint (the light left after a metre inside) and
+     * the roughness frosting it (give its renderable `rtGlassSurface`, `castShadow = false` and no
+     * `gi`). Default none. Rust: `StandardLitOptions::traced` (`StandardTraced`).
+     */
+    traced?: 'reflective' | { glass: { ior: number } };
+}
+
+/**
+ * A mirror or polished metal of this colour (its reflectance, linear rgb; 0.95 for chrome) and GGX
+ * roughness, whose reflection `RtReflectionsEffect` traces. Rust: `StandardLitOptions::mirror`.
+ */
+export function mirrorOptions(color: [number, number, number], roughness: number): StandardLitOptions {
+    return { baseColor: color, roughness, metallic: 1, traced: 'reflective' };
+}
+
+/**
+ * Glass of this tint (the light left after a metre inside, linear rgb; 1 is clear), index of
+ * refraction and roughness (0 clear, frosted towards 1), drawn by `RtReflectionsEffect`'s glass
+ * pass. Rust: `StandardLitOptions::glass`.
+ */
+export function glassOptions(tint: [number, number, number], ior: number, roughness: number): StandardLitOptions {
+    return { baseColor: tint, roughness, traced: { glass: { ior } } };
 }
 
 /** A sky of three radiances for `Material.gradientSky` (cd/m², linear rgb). */
@@ -96,12 +122,14 @@ export function standardLitUniform(options: StandardLitOptions = {}): Float32Arr
     const [er, eg, eb] = options.emissive ?? [0, 0, 0];
     const [ur, ug, ub] = options.skyUp ?? [0, 0, 0];
     const [dr, dg, db] = options.skyDown ?? [0, 0, 0];
+    const traced = options.traced;
+    const [mode, ior] = traced === undefined ? [0, 1] : traced === 'reflective' ? [1, 1] : [2, Math.max(traced.glass.ior, 1)];
     return new Float32Array([
         r, g, b, 1,
         er, eg, eb, 0,
         ur, ug, ub, 0,
         dr, dg, db, 0,
-        options.roughness ?? 0.6, options.metallic ?? 0, 0, 0,
+        options.roughness ?? 0.6, options.metallic ?? 0, mode, ior,
     ]);
 }
 

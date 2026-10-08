@@ -1,7 +1,7 @@
 // rust/kansei-core/src/rt/mesh.rs tests, ported (those of its packing).
 import { assert, assertEq, test } from "../harness";
 import { RtMesh, halfBits, packOctahedral } from "../../src/rt/RtMesh";
-import { rtSurfaceWord } from "../../src/rt/RtGrid";
+import { rtGlassSurface, rtSurfaceWord } from "../../src/rt/RtGrid";
 
 test("normals pack as kansei_rt_unpack_normal reads them", () => {
     // a CPU twin of rt_types.wgsl's kansei_rt_unpack_normal
@@ -52,4 +52,6 @@ test("a smooth surface's word carries KANSEI_RT_SMOOTH", () => {
     assertEq(rtSurfaceWord({ albedo: [1, 1, 1] }), 0);
     assertEq(rtSurfaceWord({ albedo: [1, 1, 1], smoothNormals: true }), 4);
     assertEq(rtSurfaceWord({ albedo: [1, 1, 1], alphaLayer: 2, smoothNormals: true }), 1 | (2 << 8) | 4);
+    // glass (KANSEI_RT_GLASS) is smooth too (Rust: rt::tests::surface_words_carry_their_flags)
+    assertEq(rtSurfaceWord(rtGlassSurface([0.9, 0.9, 0.9])), 4 | 8);
 });

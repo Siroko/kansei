@@ -3,7 +3,8 @@ import type { IBindable } from "../buffers/IBindable";
 import { parseIncludes } from "./shaders/ShaderUtils";
 import { GBuffer } from "../postprocessing/GBuffer";
 // the stock materials construct Materials only when called, so this cycle is safe
-import { GradientSkyOptions, StandardLitOptions, emissive, gradientSky, standardLit } from "./StandardLit";
+import { GradientSkyOptions, StandardLitOptions, emissive, gradientSky, standardLit, standardLitUniform } from "./StandardLit";
+import { BufferBase } from "../buffers/BufferBase";
 import { basicInstanced, basicLit } from "./Stock";
 import { CLUSTER_VERTEX_ENTRY, InstanceLayout, clusterVertexFunction, clusterVertexStage } from "../clusters/vertexStage";
 import { CLUSTER_DEBUG_FRAGMENT_ENTRY, CLUSTER_DEBUG_VERTEX_ENTRY, clusterDebugBindGroupLayoutEntries, clusterDebugWgsl } from "../clusters/ClusterDebug";
@@ -176,6 +177,17 @@ class Material {
      */
     public static standardLit(label: string, options: StandardLitOptions = {}): Material {
         return standardLit(label, options);
+    }
+
+    /**
+     * Change a `standardLit` material's surface (colour, roughness, metallic, emission, sky,
+     * traced) to `options`'; its instancing and velocity stay as it was made. Rust:
+     * `Material::set_standard_lit`.
+     */
+    public setStandardLit(options: StandardLitOptions): void {
+        const uniform = this.bindableGroup.bindables.find((b) => b.binding === 0)?.value as BufferBase | undefined;
+        if (!uniform?.setData) throw new Error(`${this.label}: not a standardLit material`);
+        uniform.setData(standardLitUniform(options));
     }
 
     /**
