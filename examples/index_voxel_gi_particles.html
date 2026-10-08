@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kansei - voxel GI on particles</title>
+    <style>
+      body { margin: 0; padding: 0; overflow: hidden; background-color: black; }
+      canvas { width: 100%; height: 100%; display: block; }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      // Voxel GI on particles (miaumiau.cat p=1476): the engine part of the Rust demo
+      // `rust/kansei-wasm/demos/voxel-gi-particles` with `scene=cornell`, on the TS engine. An SPH
+      // fluid dam-breaks in an open-topped Cornell room under a sun and a blue sky. Each frame its
+      // particles splat into a voxel volume with the walls as analytic boxes (`ParticleGi`), each
+      // particle cone traces its light from the volume, and the walls trace five cones of it.
+      //
+      // URL parameters, as the Rust demo's: gi=off, view=indirect, quality=low|medium|high,
+      // particles=<n> (default 32768, half on phones), stats=1 (frame interval in the console),
+      // profile=1 (time each pass: `window.kansei.profileReport()`), ui=0 (no panel).
+      // `window.kansei` holds the GI, the fluid and `info()` for scripted captures.
+      import { Renderer } from '../src/renderers/Renderer'
+      import { Scene } from '../src/objects/Scene'
+      import { Camera } from '../src/cameras/Camera'
+      import { CameraControls } from '../src/controls/CameraControls'
+      import { MouseVectors } from '../src/controls/MouseVectors'
+      import { Vector3 } from '../src/math/Vector3'
+      import { Vector4 } from '../src/math/Vector4'
+      import { Matrix4 } from '../src/math/Matrix4'
+      import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { BufferBase } from '../src/buffers/BufferBase'
+      import { Sampler } from '../src/buffers/Sampler'
+      import { Material } from '../src/materials/Material'
+      import { BindingLayouts } from '../src/materials/Binding'
+      import { Renderable } from '../src/objects/Renderable'
+      import { BoxGeometry } from '../src/geometries/BoxGeometry'
+      import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+      import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+      import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { ParticleGi } from '../src/gi/ParticleGi'
+      import { VoxelGiQuality } from '../src/gi/VoxelVolume'
+      import { VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL } from '../src/gi/GiWGSL'
+      import { assemble } from '../src/materials/shaders/ShaderUtils'
+      import { FixedStep } from '../src/pacing/FixedStep'
+
+      const query = new URLSearchParams(location.search);
+      const flag = (name, fallback) => {
+        const v = query.get(name);
+        if (v === null) return fallback;
+        return !['0', 'false', 'no', 'off'].includes(v.toLowerCase());
+      };
+      const isPhone = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+        || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+      const clearColor = new Vector4(0.32, 0.42, 0.6, 1);
+      const renderer = new Renderer({
+        clearColor,
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+        sampleCount: 4,
+      });
+      await renderer.initialize();
+      document.body.appendChild(renderer.canvas);
+      const device = renderer.gpuDevice;
+
+      const quality = VoxelGiQuality.fromName(query.get('quality')) ?? (isPhone ? 'low' : 'medium');
+      const defaultCount = isPhone ? 16384 : 32768;
+      const count = Math.min(Math.max(parseInt(query.get('particles') || `${defaultCount}`, 10) || defaultCount, 1024), 262144);
+      const giOn = flag('gi', true);
+      const indirect = query.get('view') === 'indirect';
+
+      // ── the room: its inside (the fluid's bounds) and its walls, outside it ───────────────
+      const roomMin = [-14, 0, -7];
+      const roomMax = [14, 22, 7];
+      const wall = 2;
+      const [x0, y0, z0] = roomMin;
+      const [x1, y1, z1] = roomMax;
+      const white = [0.75, 0.75, 0.75];
+      const walls = [
+        { label: 'Floor', min: [x0 - wall, y0 - wall, z0 - wall], max: [x1 + wall, y0, z1], albedo: white, normal: [0, 1, 0] },
+        { label: 'Back', min: [x0 - wall, y0, z0 - wall], max: [x1 + wall, y1, z0], albedo: white, normal: [0, 0, 1] },
+        { label: 'Left', min: [x0 - wall, y0, z0], max: [x0, y1, z1], albedo: [0.75, 0.08, 0.06], normal: [1, 0, 0] },
+        { label: 'Right', min: [x1, y0, z0], max: [x1 + wall, y1, z1], albedo: [0.1, 0.6, 0.12], normal: [-1, 0, 0] },
+      ];
+
+      // ── the fluid: a dam filling the room's left half (Rust `fill_box`) ───────────────────
+      function fillBox(n, lo, hi, jitter) {
+        const size = [0, 1, 2].map((i) => hi[i] - lo[i]);
+        const spacing = Math.cbrt(size[0] * size[1] * size[2] / Math.max(n, 1));
+        const cells = size.map((s) => Math.max(Math.floor(s / spacing), 1));
+        let rng = 12345;
+        const offset = () => {
+          rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0;
+          return ((rng >>> 8) / 16777216 - 0.5) * spacing * jitter;
+        };
+        const out = new Float32Array(n * 4);
+        let k = 0;
+        for (let layer = 0; k < n; layer++) {
+          for (let z = cells[2] - 1; z >= 0 && k < n; z--) {
+            for (let y = 0; y < cells[1] && k < n; y++) {
+              for (let x = 0; x < cells[0] && k < n; x++, k++) {
+                const lift = layer * spacing * 0.5;
+                out[k * 4] = lo[0] + (x + 0.5) * spacing + offset();
+                out[k * 4 + 1] = lo[1] + (y + 0.5) * spacing + lift + offset();
+                out[k * 4 + 2] = lo[2] + (z + 0.5) * spacing + offset();
+                out[k * 4 + 3] = 1;
+              }
+            }
+          }
+        }
+        return out;
+      }
+      const initial = fillBox(count, [x0 + 0.5, y0 + 0.5, z0 + 0.5], [-1, 16, z1 - 0.5], 0.3);
+      const positionsBuffer = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_STORAGE,
+        usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_COPY_SRC | BufferBase.BUFFER_USAGE_COPY_DST,
+        buffer: initial.slice(),
+        shaderLocation: 3,
+        offset: 0,
+        stride: 16,
+        format: 'float32x4',
+      });
+
+      const aspect = () => window.innerWidth / window.innerHeight;
+      const camera = new Camera(40, 0.5, 600, aspect());
+      const sim = new FluidSimulation(renderer, {
+        maxParticles: count,
+        dimensions: 3,
+        smoothingRadius: 1.0,
+        pressureMultiplier: 46.5,
+        nearPressureMultiplier: 20.0,
+        densityTarget: 8.6,
+        viscosity: 1.0,
+        damping: 1.0,
+        gravity: [0, -9.8, 0],
+        mouseForce: 1600,
+        substeps: 2,
+        worldBoundsPadding: 0.3,
+      });
+      sim.initialize(positionsBuffer, positionsBuffer.clone(), {
+        viewMatrix: camera.viewMatrix,
+        projectionMatrix: camera.projectionMatrix,
+        inverseViewMatrix: camera.inverseViewMatrix,
+        worldMatrix: new Matrix4(),
+      });
+      sim.worldBoundsMin = [...roomMin];
+      sim.worldBoundsMax = [...roomMax];
+      sim.rebuildGrid();
+
+      // ── the GI: over the room and its walls, up to the open top ───────────────────────────
+      const gi = new ParticleGi(renderer, {
+        quality,
+        boundsMin: [x0 - wall, y0 - wall, z0 - wall],
+        boundsMax: [x1 + wall, y1, z1],
+        capacity: count,
+        radianceScale: 1,
+        budgetBytes: isPhone ? 24 << 20 : 0,
+      }, sim.positionsBufferRef, sim.velocitiesBufferRef);
+      gi.settings.splat.extinction = 0.6;
+      gi.settings.cones.useVolume = giOn;
+
+      // toward the sun at `elevation` degrees up, `bearing` degrees from +z (the open front)
+      // toward +x (Rust `direction_from_elevation_bearing(elevation, 180 - bearing)`)
+      const sunDirection = (elevation, bearing) => {
+        const e = elevation * Math.PI / 180;
+        const b = (180 - bearing) * Math.PI / 180;
+        return [Math.sin(b) * Math.cos(e), Math.sin(e), -Math.cos(b) * Math.cos(e)];
+      };
+      const GLOW = [24.0, 8.8, 2.0];
+      const sunOpts = { elevation: 40, bearing: 70 };
+      const sunIlluminance = [2.6, 2.45, 2.2];
+      gi.setSkyGradient([0.25, 0.35, 0.55], [0.04, 0.04, 0.04]);
+      gi.settings.setSun(sunDirection(sunOpts.elevation, sunOpts.bearing), sunIlluminance);
+      gi.settings.splat.boxSkyScale = 1;
+      gi.settings.emission = { color: GLOW.map((c) => c * 0.25), share: 0.03, speedColor: [0, 0, 0], seed: 0x9e3779b9 };
+      gi.setBoxes(walls.map((w) => ({ min: w.min, max: w.max, albedo: w.albedo, normal: w.normal })));
+      const layout = gi.volume.layout;
+      const info = () => `voxel GI ${gi.quality} (cornell): [${layout.dims.join(', ')}] voxels of ${layout.voxelSize.toFixed(2)} m, `
+        + `${(gi.volume.memoryBytes() / (1 << 20)).toFixed(1)} MiB, ${count} particles`;
+      console.info(info());
+
+      // ── light shared by the materials (demo-local, as the Rust demo's SceneParams) ─────────
+      const SCENE_WGSL = /* wgsl */`
+struct SceneParams {
+    toSun          : vec3f,
+    exposure       : f32,
+    sunIlluminance : vec3f,
+    giOn           : f32,
+    view           : f32,    // 1: indirect light only
+    sunConeTan     : f32,
+    coneSteps      : f32,
+    boxSkyScale    : f32,
+}
+
+const PI: f32 = 3.14159265;
+
+fn tonemap(s: SceneParams, c: vec3f) -> vec3f {
+    let k = select(1.0, 2.0, s.view > 0.5);
+    return 1.0 - exp(-c * s.exposure * k);
+}
+`;
+      const sceneParams = { exposure: 1.2, view: indirect ? 1 : 0 };
+      const sceneBuffer = device.createBuffer({ label: 'VoxelGIParticles/Scene', size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const writeScene = () => {
+        const s = new Float32Array(12);
+        s.set(gi.settings.cones.toSun, 0);
+        s[3] = sceneParams.exposure;
+        s.set(sunIlluminance, 4);
+        s[7] = gi.settings.cones.useVolume ? 1 : 0;
+        s[8] = sceneParams.view;
+        s[9] = gi.settings.cones.sunConeTan;
+        s[10] = gi.settings.cones.maxSteps;
+        s[11] = gi.settings.splat.boxSkyScale;
+        device.queue.writeBuffer(sceneBuffer, 0, s);
+      };
+
+      // The walls: lit by the sun and the sky (the gradient the particles' cones escape to), and
+      // with voxel GI on, shadowed by the fluid (a sun cone) and lit by the volume (five cones over
+      // the hemisphere: the other walls' bounce, the fluid's glow, the sky it leaves).
+      const wallShader = assemble([VOXEL_CONES_WGSL, SKY_LIGHTING_WGSL, SCENE_WGSL, /* wgsl */`
+@group(0) @binding(0) var<uniform> albedo: vec4f;
+@group(0) @binding(1) var<uniform> scene: SceneParams;
+@group(0) @binding(2) var<uniform> vol: VoxelVolume;
+@group(0) @binding(3) var radiance: texture_3d<f32>;
+@group(0) @binding(4) var linearClamp: sampler;
+@group(0) @binding(5) var<uniform> sky: SkyLighting;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+struct VOut {
+    @builtin(position) clip: vec4f,
+    @location(0) world: vec3f,
+    @location(1) normal: vec3f,
+};
+
+@vertex
+fn vertex_main(@location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f) -> VOut {
+    let world = world_matrix * vec4f(position.xyz, 1.0);
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.normal = (world_matrix * vec4f(normal, 0.0)).xyz;
+    return out;
+}
+
+// irradiance over the hemisphere around n from VOXEL_CONES_WGSL's five cones, the sky past them
+fn hemisphere(o: vec3f, n: vec3f, start: f32) -> vec3f {
+    var sum = vec3f(0.0);
+    for (var k = 0u; k < VOXEL_HEMISPHERE_CONES; k++) {
+        let cone = voxelHemisphereCone(n, k);
+        let c = voxelConeTrace(vol, radiance, linearClamp, o, cone.xyz, VOXEL_HEMISPHERE_TAN, start, 1e4, u32(scene.coneSteps));
+        sum += cone.w * (c.rgb + c.a * skyRadiance(sky, cone.xyz));
+    }
+    return sum;
+}
+
+@fragment
+fn fragment_main(in: VOut) -> @location(0) vec4f {
+    let n = normalize(in.normal);
+    let l = normalize(scene.toSun);
+    var sunVis = 1.0;
+    var irradiance = scene.boxSkyScale * skyIrradiance(sky, n);
+    if (scene.giOn > 0.5) {
+        // start out of the wall's own voxels
+        let o = in.world + n * vol.voxelSize;
+        sunVis = voxelConeTrace(vol, radiance, linearClamp, o, l, scene.sunConeTan, 0.5 * vol.voxelSize, 1e4, u32(scene.coneSteps)).a;
+        irradiance = hemisphere(o, n, vol.voxelSize);
+    }
+    let direct = scene.sunIlluminance * max(dot(n, l), 0.0) * sunVis;
+    var color = albedo.rgb / PI * (direct + irradiance);
+    if (scene.view > 0.5) {
+        color = albedo.rgb / PI * irradiance;
+    }
+    return vec4f(tonemap(scene, color), 1.0);
+}
+`]);
+
+      // The particles: camera-facing discs lit by what the GI gathered for them (instance
+      // attributes 4 and 5: incoming light and sun visibility, emission).
+      const particleShader = assemble([SCENE_WGSL, /* wgsl */`
+struct Particles { albedo: vec4f, size: f32, _p0: f32, _p1: f32, _p2: f32 };
+@group(0) @binding(0) var<uniform> particles: Particles;
+@group(0) @binding(1) var<uniform> scene: SceneParams;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+
+struct VIn {
+    @location(0) position: vec4f,
+    @location(1) normal: vec3f,
+    @location(2) uv: vec2f,
+    @location(3) center: vec4f,
+    @location(4) lighting: vec4f,
+    @location(5) emission: vec4f,
+};
+struct VOut {
+    @builtin(position) clip: vec4f,
+    @location(0) corner: vec2f,
+    @location(1) lighting: vec4f,
+    @location(2) emission: vec3f,
+};
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let right = vec3f(view_matrix[0][0], view_matrix[1][0], view_matrix[2][0]);
+    let up = vec3f(view_matrix[0][1], view_matrix[1][1], view_matrix[2][1]);
+    let world = v.center.xyz + (right * v.position.x + up * v.position.y) * particles.size;
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * vec4f(world, 1.0);
+    out.corner = v.position.xy * 2.0;
+    out.lighting = v.lighting;
+    out.emission = v.emission.rgb;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: VOut) -> @location(0) vec4f {
+    let r2 = dot(in.corner, in.corner);
+    if (r2 > 1.0) { discard; }
+    // the sphere's normal, from view space
+    let right = vec3f(view_matrix[0][0], view_matrix[1][0], view_matrix[2][0]);
+    let up = vec3f(view_matrix[0][1], view_matrix[1][1], view_matrix[2][1]);
+    let back = vec3f(view_matrix[0][2], view_matrix[1][2], view_matrix[2][2]);
+    let n = normalize(right * in.corner.x + up * in.corner.y + back * sqrt(1.0 - r2));
+    let albedo = particles.albedo.rgb;
+    let direct = scene.sunIlluminance * max(dot(n, normalize(scene.toSun)), 0.0) * in.lighting.a;
+    var color = albedo * (in.lighting.rgb + direct / PI) + in.emission;
+    if (scene.view > 0.5) {
+        color = albedo * in.lighting.rgb;
+    }
+    return vec4f(tonemap(scene, color), 1.0);
+}
+`]);
+
+      const both = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+      const sceneUniform = () => ComputeBuffer.fromExternal(sceneBuffer, 'uniform');
+      const linearClamp = new Sampler('linear', 'linear', 'clamp-to-edge', 1, { mipmapFilter: 'linear' });
+      const scene = new Scene();
+      for (const w of walls) {
+        const material = new Material(wallShader, {
+          bindings: [
+            { binding: 0, visibility: both, value: new Vector4(...w.albedo, 1) },
+            { binding: 1, visibility: both, value: sceneUniform() },
+            { binding: 2, visibility: both, value: ComputeBuffer.fromExternal(gi.volume.uniform, 'uniform') },
+            { binding: 3, visibility: both, value: gi.volume.asTexture(), layout: BindingLayouts.texture3d() },
+            { binding: 4, visibility: both, value: linearClamp },
+            { binding: 5, visibility: GPUShaderStage.FRAGMENT, value: ComputeBuffer.fromExternal(gi.skyBuffer, 'uniform') },
+          ],
+        });
+        const size = [0, 1, 2].map((i) => w.max[i] - w.min[i]);
+        const slab = new Renderable(new BoxGeometry(size[0], size[1], size[2]), material);
+        slab.position.set(...[0, 1, 2].map((i) => (w.min[i] + w.max[i]) * 0.5));
+        scene.add(slab);
+      }
+
+      const particleUniform = new Float32Array([0.85, 0.88, 0.92, 1, 0.45, 0, 0, 0]);
+      const particleParams = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_UNIFORM,
+        usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+        buffer: particleUniform,
+      });
+      const particleMaterial = new Material(particleShader, {
+        bindings: [
+          { binding: 0, visibility: both, value: particleParams },
+          { binding: 1, visibility: both, value: sceneUniform() },
+        ],
+        cullMode: 'none',
+      });
+      const instances = new InstancedGeometry(new PlaneGeometry(1, 1), count, [positionsBuffer, gi.lightingInstanceBuffer(4)]);
+      scene.add(new Renderable(instances, particleMaterial));
+
+      // ── camera: far enough that the room fits across a portrait screen too ────────────────
+      const fit = Math.max(1.6 / aspect(), 1);
+      const controls = new CameraControls(camera, new Vector3(0, 8, 0), renderer.canvas, 58 * fit, { invertWheel: true });
+      controls.elevation = 0.45;
+      controls.azimuth = 0.18;
+      const mouse = new MouseVectors();
+
+      // ── panel ─────────────────────────────────────────────────────────────────────────────
+      const pourAgain = () => {
+        sim.resetParticles(initial);
+        gi.resetHistory();
+      };
+      const panel = {
+        gi: giOn,
+        indirect,
+        extinction: gi.settings.splat.extinction,
+        aperture: 90,
+        sunCone: Math.atan(gi.settings.cones.sunConeTan) * 2 * 180 / Math.PI,
+        temporalBlend: gi.settings.cones.temporalBlend,
+        glowShare: gi.settings.emission.share,
+        glow: 0.25,
+        particleSize: particleUniform[4],
+        elevation: sunOpts.elevation,
+        bearing: sunOpts.bearing,
+        exposure: sceneParams.exposure,
+        frame: '',
+      };
+      if (flag('ui', true)) {
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Voxel GI on particles', expanded: !isPhone });
+        pane.addBinding({ volume: info().replace(': ', ':\n') }, 'volume', { readonly: true, multiline: true, rows: 3 });
+        pane.addBinding(panel, 'frame', { readonly: true, label: 'frame ms' });
+        pane.addBinding(panel, 'gi', { label: 'voxel GI' }).on('change', (e) => { gi.settings.cones.useVolume = e.value; gi.resetHistory(); });
+        pane.addBinding(panel, 'indirect', { label: 'indirect only' }).on('change', (e) => { sceneParams.view = e.value ? 1 : 0; });
+        pane.addBinding(panel, 'extinction', { min: 0.05, max: 3, step: 0.05 }).on('change', (e) => { gi.settings.splat.extinction = e.value; });
+        pane.addBinding(panel, 'aperture', { min: 30, max: 120, step: 1, label: 'cone aperture' }).on('change', (e) => {
+          gi.settings.cones.diffuseConeTan = Math.tan(e.value * Math.PI / 360);
+        });
+        pane.addBinding(panel, 'sunCone', { min: 1, max: 40, step: 0.5, label: 'sun cone' }).on('change', (e) => {
+          gi.settings.cones.sunConeTan = Math.tan(e.value * Math.PI / 360);
+        });
+        pane.addBinding(panel, 'temporalBlend', { min: 0.02, max: 1, step: 0.01, label: 'temporal blend' }).on('change', (e) => { gi.settings.cones.temporalBlend = e.value; });
+        pane.addBinding(panel, 'glowShare', { min: 0, max: 0.5, step: 0.005, label: 'glow share' }).on('change', (e) => { gi.settings.emission.share = e.value; });
+        pane.addBinding(panel, 'glow', { min: 0, max: 2, step: 0.01, label: 'glow' }).on('change', (e) => { gi.settings.emission.color = GLOW.map((c) => c * e.value); });
+        pane.addBinding(panel, 'particleSize', { min: 0.1, max: 1.2, step: 0.01, label: 'particle size' }).on('change', (e) => {
+          particleUniform[4] = e.value;
+          particleParams.needsUpdate = true;
+        });
+        const syncSun = () => gi.settings.setSun(sunDirection(panel.elevation, panel.bearing), sunIlluminance);
+        pane.addBinding(panel, 'elevation', { min: 2, max: 90, step: 1, label: 'sun elevation' }).on('change', syncSun);
+        pane.addBinding(panel, 'bearing', { min: -180, max: 180, step: 1, label: 'sun bearing' }).on('change', syncSun);
+        pane.addBinding(panel, 'exposure', { min: 0.1, max: 4, step: 0.05 }).on('change', (e) => { sceneParams.exposure = e.value; });
+        pane.addButton({ title: 'Pour again' }).on('click', pourAgain);
+      }
+
+      // ── frame loop: the fluid at a fixed step (at most 3 a frame), the GI, then the scene ──
+      const simStep = new FixedStep(1 / 60).withMaxSteps(3);
+      let last = performance.now();
+      let frameMs = 16.7;
+      const stats = flag('stats', false) ? { start: performance.now(), frames: 0 } : undefined;
+      let paused = false;
+      if (flag('profile', false)) renderer.setProfiling(true);
+      window.kansei = { gi, sim, info, pourAgain, setPaused: (p) => { paused = p; }, profileReport: () => renderer.takeProfile().report() };
+
+      function frame() {
+        requestAnimationFrame(frame);
+        const now = performance.now();
+        const dt = Math.min(Math.max((now - last) / 1000, 0), 0.1);
+        last = now;
+        frameMs = frameMs * 0.95 + dt * 1000 * 0.05;
+        panel.frame = frameMs.toFixed(2);
+
+        controls.update(now / 1000);
+        mouse.update(Math.max(dt, 1e-3));
+        camera.updateProjectionMatrix();
+
+        let steps = 0;
+        if (paused) {
+          simStep.reset();
+        } else {
+          steps = simStep.advance(dt);
+        }
+        if (steps > 0) {
+          sim.updateBatched(simStep.step, steps, mouse.mousePosition, mouse.mouseDirection, Math.min(mouse.mouseStrength, 1));
+        }
+
+        writeScene();
+        const encoder = renderer.createCommandEncoder('VoxelGIParticles/GI');
+        gi.encode(encoder, sim.particleCount);
+        renderer.submit(encoder.finish());
+        renderer.render(scene, camera);
+
+        if (stats && ++stats.frames === 240) {
+          console.info(`frame interval ${((performance.now() - stats.start) / 240).toFixed(2)} ms`);
+          stats.start = performance.now();
+          stats.frames = 0;
+        }
+      }
+      frame();
+
+      window.addEventListener('resize', () => {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.aspect = aspect();
+        camera.updateProjectionMatrix();
+      });
+    </script>
+  </body>
+</html>
