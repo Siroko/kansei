@@ -1,10 +1,22 @@
-//! The page around the canvas: logging, the clock, the query string and fetching files.
+//! The page around the canvas: logging, the clock, the query string and fetching files. In a
+//! worker ([`crate::launch`]) each reads the page it was launched from.
 
 use std::str::FromStr;
 use std::sync::Once;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
+use crate::worker;
+
+#[wasm_bindgen]
+extern "C" {
+    // the global `performance` and `fetch`, a page's or a worker's
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
+    #[wasm_bindgen(js_name = fetch)]
+    fn global_fetch(url: &str) -> js_sys::Promise;
+}
 
 /// Route Rust panics and `log` output to the browser console. [`crate::Canvas::find`] calls it,
 /// so an example only needs it to log before that; calling it again does nothing.
@@ -16,16 +28,17 @@ pub fn init() {
     });
 }
 
-/// Seconds since the page started (`performance.now()`), at sub-millisecond resolution.
+/// Seconds since the page started (`performance.now()`; in a worker, since the worker
+/// started), at sub-millisecond resolution.
 pub fn now() -> f64 {
-    web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now() / 1000.0)
+    performance_now() / 1000.0
 }
 
 /// The query string's value for `name`, percent-decoded (`?gi=voxel%2Bssgi` reads
 /// `voxel+ssgi`; a literal `+` reads as a space, as in any form-encoded URL). `None` when the
 /// page's URL has no `name`.
 pub fn param(name: &str) -> Option<String> {
-    let search = web_sys::window()?.location().search().ok()?;
+    let search = if worker::in_worker() { worker::page_search() } else { web_sys::window()?.location().search().ok()? };
     web_sys::UrlSearchParams::new_with_str(&search).ok()?.get(name)
 }
 
@@ -48,18 +61,27 @@ pub fn flag(name: &str, default: bool) -> bool {
 /// Whether the browser says it is a phone or tablet (by its user agent), for examples that pick
 /// a lighter quality tier there.
 pub fn is_phone() -> bool {
-    let agent = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
+    // the global navigator: a page's or a worker's
+    let agent = js_sys::Reflect::get(&js_sys::global(), &"navigator".into())
+        .and_then(|n| js_sys::Reflect::get(&n, &"userAgent".into()))
+        .ok()
+        .and_then(|a| a.as_string())
+        .unwrap_or_default();
     ["Mobi", "Android", "iPhone", "iPad"].iter().any(|k| agent.contains(k))
 }
 
-/// Show `text` in the page element with id `id` (a HUD), if there is one.
+/// Show `text` in the page element with id `id` (a HUD), if there is one. From a worker the
+/// text is posted to the page.
 pub fn set_text(id: &str, text: &str) {
-    if let Some(element) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
+    if worker::in_worker() {
+        worker::post_text(id, text);
+    } else if let Some(element) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
         element.set_text_content(Some(text));
     }
 }
 
-/// The page's checkbox with id `id`, if there is one (a HUD's toggles).
+/// The page's checkbox with id `id`, if there is one (a HUD's toggles). `None` in a worker: a
+/// page that runs its example in one sends its toggles as calls.
 pub fn checkbox(id: &str) -> Option<web_sys::HtmlInputElement> {
     web_sys::window()?.document()?.get_element_by_id(id)?.dyn_into().ok()
 }
@@ -77,10 +99,11 @@ pub fn thousands(n: impl Into<u64>) -> String {
     out
 }
 
-/// Fetch `url` (relative to the page) as bytes; an HTTP error status is an error too.
+/// Fetch `url` (relative to the page, in a worker too) as bytes; an HTTP error status is an
+/// error too.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
-    let window = web_sys::window().ok_or("no window")?;
-    let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await?.dyn_into()?;
+    let resolved = if worker::in_worker() { worker::page_url(url) } else { url.to_string() };
+    let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(global_fetch(&resolved)).await?.dyn_into()?;
     if !response.ok() {
         return Err(format!("{url}: HTTP {}", response.status()).into());
     }

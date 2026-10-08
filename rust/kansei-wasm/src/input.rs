@@ -25,10 +25,11 @@ struct KeyState {
 pub struct Keys(Rc<RefCell<KeyState>>);
 
 impl Keys {
-    /// Listen to the window's key events from now on.
+    /// Listen to the window's key events from now on (in a worker, the page's, forwarded).
     pub fn listen() -> Self {
         let keys = Self::default();
-        if let Some(window) = web_sys::window() {
+        {
+            let window = crate::worker::global();
             let down = keys.0.clone();
             let on_down = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
                 if typed_into_a_field(&e) {
@@ -102,7 +103,7 @@ fn typed_into_a_field(e: &web_sys::KeyboardEvent) -> bool {
 
 /// The first connected gamepad in the standard mapping, read once a frame with
 /// [`Gamepad::poll`]: its sticks past a dead zone, its buttons held, and those pressed since the
-/// poll before.
+/// poll before. Workers have no gamepads: in one, it reads none.
 #[derive(Default)]
 pub struct Gamepad {
     connected: bool,

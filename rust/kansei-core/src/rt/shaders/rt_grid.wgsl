@@ -85,6 +85,18 @@ fn kansei_rt_uv(id: u32, bary: vec2f) -> vec2f {
     return unpack2x16float(w.x) * (1.0 - bary.x - bary.y) + unpack2x16float(w.y) * bary.x + unpack2x16float(w.z) * bary.y;
 }
 
+// The normal to shade a hit with: its triangle's vertex normals interpolated where it carries
+// them (KANSEI_RT_SMOOTH), else the geometric one; on the side `ng` (the hit's normal) faces.
+fn kansei_rt_shading_normal(id: u32, bary: vec2f, ng: vec3f) -> vec3f {
+    let surface = bitcast<u32>(kansei_rt_triangles[id * 4u].w);
+    if ((surface & KANSEI_RT_SMOOTH) == 0u) {
+        return ng;
+    }
+    let w = bitcast<vec4u>(kansei_rt_triangles[id * 4u + 3u]);
+    let n = normalize(kansei_rt_unpack_normal(w.x) * (1.0 - bary.x - bary.y) + kansei_rt_unpack_normal(w.y) * bary.x + kansei_rt_unpack_normal(w.z) * bary.y);
+    return select(-n, n, dot(n, ng) >= 0.0);
+}
+
 // Moller-Trumbore, both sides: (t, u, v), t < 0 for a miss.
 fn kansei_rt_intersect(o: vec3f, d: vec3f, v0: vec3f, e1: vec3f, e2: vec3f, tMin: f32, tMax: f32) -> vec3f {
     let p = cross(d, e2);

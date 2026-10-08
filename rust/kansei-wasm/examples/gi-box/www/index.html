@@ -30,13 +30,13 @@
         import init, {
             start, info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate,
             set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice,
-            set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution,
+            set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi,
         } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_preset('best') and so on
-        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution };
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -69,18 +69,28 @@
         const sync = () => {
             s = read();
             Object.assign(p, { gi: s.gi, voxels: s.voxels, view: s.view, dragon: s.dragon, animate: s.animate, rug: s.rug, textured: s.textured, sdfAo: s.sdf_ao, sdfShadows: s.sdf_shadows, shadows: s.shadows, slice: s.slice });
+            Object.assign(rt, s.rtgi);
             pane.refresh();
             showCredit();
+            showRt();
         };
         const presetOptions = Object.fromEntries([['(custom)', ''], ...JSON.parse(presets()).map(([name, label]) => [label, name])]);
         pane.addBinding(p, 'preset', { options: presetOptions }).on('change', async () => {
             if (p.preset) { await set_preset(p.preset); sync(); }
         });
         const custom = (f) => (e) => { if (e.last !== false) { p.preset = ''; } f(e); sync(); };
-        pane.addBinding(p, 'gi', {
-            label: 'GI',
-            options: { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi', probes: 'probes', 'probes + SSGI': 'probes+ssgi' },
-        }).on('change', custom(() => set_gi(p.gi)));
+        // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
+        // it, choosing the hybrid reloads the page with gi=rt
+        const giOptions = { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi', probes: 'probes', 'probes + SSGI': 'probes+ssgi', 'hybrid RT (grid rays + SVGF)': 'rt' };
+        pane.addBinding(p, 'gi', { label: 'GI', options: giOptions }).on('change', custom(() => {
+            if (p.gi === 'rt' && !s.grid) {
+                params.set('gi', 'rt');
+                params.delete('preset');
+                location.search = params.toString();
+                return;
+            }
+            set_gi(p.gi);
+        }));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf', 'probes (debug)': 'probes' } }).on('change', custom(() => set_view(p.view)));
         pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor' } }).on('change', () => set_camera(p.camera));
@@ -91,9 +101,24 @@
         sdf.addBinding(p, 'slice', { label: 'slice height', min: 0, max: 4, step: 0.05 }).on('change', () => set_slice(p.slice));
         const scene = pane.addFolder({ title: 'Scene' });
         scene.addBinding(p, 'dragon', { options: { off: 'off', '19k triangles': 'light', '871k triangles': 'full' } }).on('change', async () => { p.preset = ''; await set_dragon(p.dragon); sync(); });
-        scene.addBinding(p, 'animate').on('change', custom(() => set_animate(p.animate)));
+        // animation changes nothing else: no preset reset, no refresh of the others
+        scene.addBinding(p, 'animate').on('change', () => set_animate(p.animate));
         scene.addBinding(p, 'rug').on('change', custom(() => set_rug(p.rug)));
         scene.addBinding(p, 'textured', { label: 'rug voxels textured' }).on('change', custom(() => set_textured(p.textured)));
+        // the hybrid's settings, shown while it runs
+        const rt = { ...s.rtgi };
+        const rtFolder = pane.addFolder({ title: 'Hybrid RT GI', expanded: true });
+        const rtgi = (key, value) => { set_rtgi(key, String(value)); sync(); };
+        rtFolder.addBinding(rt, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full' } }).on('change', () => rtgi('res', rt.res));
+        rtFolder.addBinding(rt, 'denoise', { options: { SVGF: 'svgf', 'temporal only': 'temporal', 'off (1 spp)': 'off' } }).on('change', () => rtgi('denoise', rt.denoise));
+        rtFolder.addBinding(rt, 'kernel', { label: 'wavelet', options: { '3x3': '3x3', '5x5': '5x5' } }).on('change', () => rtgi('kernel', rt.kernel));
+        rtFolder.addBinding(rt, 'hit', { label: 'hits lit by', options: { 'direct light + voxel cone': 'direct', 'voxels only': 'voxels' } }).on('change', () => rtgi('hit', rt.hit));
+        rtFolder.addBinding(rt, 'shadows', { label: 'hit shadows', options: { rays: 'rays', 'shadow maps': 'maps' } }).on('change', () => rtgi('shadows', rt.shadows));
+        rtFolder.addBinding(rt, 'mode', { options: { hybrid: 'hybrid', 'reference (path traced)': 'reference' } }).on('change', () => rtgi('mode', rt.mode));
+        rtFolder.addBinding(rt, 'accum', { label: 'accumulate' }).on('change', () => rtgi('accum', rt.accum));
+        rtFolder.addBinding(rt, 'view', { label: 'debug view', options: { lit: 'lit', indirect: 'indirect', signal: 'signal', variance: 'variance', history: 'history', cost: 'cost' } }).on('change', () => rtgi('view', rt.view));
+        const showRt = () => { rtFolder.hidden = p.gi !== 'rt'; };
+        showRt();
         // reflect=1: the polished floor's ray-traced reflections
         if (s.reflect) {
             const r = { on: s.reflect.enabled, view: s.reflect.view, rays: s.reflect.grid ? 'grid' : 'voxels', res: s.reflect.res };
@@ -116,8 +141,9 @@
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `voxel GI: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, mips ${i.mips_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
                 `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' +
-                (i.reflect ? `rt grid: ${i.reflect.triangles} triangles, ${i.reflect.references} refs, ${i.reflect.big} big, ${i.reflect.mib} MiB; ${i.reflect.rebuilt ? 'rebuilt' : 'kept'} (${i.reflect.rebuilds}), GPU ${i.rt_ms.toFixed(3)} ms\n` +
-                    `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
+                (i.grid ? `rt grid: ${i.grid.triangles} triangles, ${i.grid.references} refs, ${i.grid.big} big, ${i.grid.mib} MiB; ${i.grid.rebuilt ? 'rebuilt' : 'kept'} (${i.grid.rebuilds}), GPU ${i.rt_ms.toFixed(3)} ms\n` : '') +
+                (i.rtgi.on ? `hybrid GI: ${i.rtgi_ms.toFixed(3)} ms, ${i.rtgi.mib} MiB; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '') + '\n' : '') +
+                (i.reflect ? `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
         }, 500);
     </script>
 </body>
