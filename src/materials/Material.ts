@@ -252,6 +252,14 @@ class Material {
         this.bindableGroup.getBindGroup(gpuDevice);
         return this.bindableGroup.bindGroup!;
     }
+
+    /**
+     * The bind group `getBindGroup` last returned, without updating its resources (a material
+     * with an external texture gets a new one each time `getBindGroup` is called).
+     */
+    public get currentBindGroup(): GPUBindGroup | undefined {
+        return this.bindableGroup.bindGroup;
+    }
 }
 
 export { Material }

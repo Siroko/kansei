@@ -17,6 +17,8 @@
     transparent boxes orbiting each other, so their back-to-front order
     flips every half turn. All four must draw every frame.
     `?transmissive=0` makes the sphere opaque for comparison.
+    `?check=1` also checks the draw path (stable slots, per-set bundles,
+    `visible`, `dynamic`), logs PASS/FAIL lines and sets the page title.
   -->
   <script type="module">
     import { Renderer } from '../src/renderers/Renderer'
@@ -119,13 +121,69 @@
 
     const volume = new PostProcessingVolume(renderer, []);
 
+    // The boxes at orbit angle `a`: the red one is in front for a in (0, π).
+    const place = (a) => {
+      redBox.position.set(Math.cos(a) * 2.2, 0.5, Math.sin(a) * 2.2);
+      blueBox.position.set(-Math.cos(a) * 2.2, 0.5, -Math.sin(a) * 2.2);
+    };
+
+    if (params.has('check')) {
+      const results = [];
+      const expect = (name, ok) => results.push(`${ok ? 'PASS' : 'FAIL'} ${name}`);
+      const frame = () => volume.render(scene, camera);
+      const records = () => renderer.bundleRecordCount;
+      const all = [floor, sphere, redBox, blueBox];
+
+      place(Math.PI / 2);
+      frame();
+      const slots = all.map((r) => scene.slotOf(r));
+      expect('every renderable has its own slot', new Set(slots).size === 4 && slots.every((s) => s >= 0));
+      let n = records();
+      frame();
+      expect('an unchanged frame records no bundle', records() === n);
+
+      n = records();
+      place(Math.PI * 1.5);
+      frame();
+      expect('re-sorting the transparent boxes re-records only their bundle', records() === n + 1);
+      expect('re-sorting keeps every slot', all.every((r, i) => scene.slotOf(r) === slots[i]));
+
+      n = records();
+      floor.visible = false;
+      frame();
+      expect('hiding the floor re-records only the opaque bundle', records() === n + 1);
+      expect('a hidden renderable keeps its slot', scene.slotOf(floor) === slots[0]);
+      expect('a hidden renderable is not drawn', !scene.getOrderedObjects().includes(floor));
+      floor.visible = true;
+      frame();
+
+      n = records();
+      redBox.dynamic = true;
+      frame();
+      expect('making a box dynamic re-records only the transparent bundle', records() === n + 1);
+      n = records();
+      redBox.visible = false;
+      frame();
+      redBox.visible = true;
+      frame();
+      expect('hiding and showing a dynamic box records no bundle', records() === n);
+
+      scene.children.splice(scene.children.indexOf(blueBox), 1);
+      frame();
+      expect('a removed renderable frees its slot', scene.slotOf(blueBox) === -1);
+      scene.add(blueBox);
+      frame();
+      expect('an added renderable takes the freed slot', scene.slotOf(blueBox) === slots[3]);
+
+      console.log(results.join('\n'));
+      document.title = results.every((r) => r.startsWith('PASS')) ? 'PASS' : 'FAIL';
+    }
+
     // `?t=<seconds>` freezes the orbit at that time.
     const frozen = params.has('t') ? parseFloat(params.get('t')) : null;
     function animate(now) {
       const t = frozen ?? now * 0.001;
-      const a = t * 0.8;
-      redBox.position.set(Math.cos(a) * 2.2, 0.5, Math.sin(a) * 2.2);
-      blueBox.position.set(-Math.cos(a) * 2.2, 0.5, -Math.sin(a) * 2.2);
+      place(t * 0.8);
       volume.render(scene, camera);
       requestAnimationFrame(animate);
     }

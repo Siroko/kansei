@@ -22,6 +22,25 @@ class Renderable extends Object3D {
     /** Controls draw order within the same transparency group. Higher values draw later (on top). */
     public renderOrder: number = 0;
 
+    /** Layer mask of a new renderable: bit 0. */
+    static readonly DEFAULT_LAYERS = 1;
+
+    /** Whether it is drawn (and casts shadows). Hiding or showing it re-records only the cached
+     *  render bundle of its own draw set (opaque, transmissive or transparent); it keeps its
+     *  matrix slot while hidden. */
+    public visible: boolean = true;
+
+    /** Bitmask of the layers this renderable is on (bit 0 by default). Secondary views such as
+     *  planar reflections draw only renderables whose layers intersect their mask. */
+    public layers: number = Renderable.DEFAULT_LAYERS;
+
+    /** Its transform changes every frame, so it is drawn directly in the pass each frame rather
+     *  than recorded into the cached render bundles (false by default). Mark anything the app
+     *  moves while it is on screen: Safari's WebGPU can draw a bundled object with the matrices
+     *  it had when the bundle was recorded, and bundles are re-recorded only when what they hold
+     *  changes. */
+    public dynamic: boolean = false;
+
     /** Custom WGSL snippet for shadow vertex transform.
      *  Must declare: fn shadowWorldPos(position: vec4f, instanceIdx: u32) -> vec4f
      *  returning the world-space position. It can read `worldMatrix` (group 2, as in
