@@ -169,3 +169,12 @@ export {
     BonePalette, skinBuffer, skinnedMaterial, skinnedLitMaterial, skinnedLitTexturedMaterial, packSkinnedLitParams,
 } from "./animation/index";
 export type { SkinnedLitParams, SkinTextures } from "./animation/index";
+export {
+    negexp, halflifeToDamping, damperExact, springDamperExact, decaySpringDamperExact,
+    springDamperExactQuat, decaySpringDamperExactQuat, springCharacterUpdate,
+    Inertializer, poseVelocities, twoJointIK, FootLock, Retarget, TranslationMode, Ramp, Placement, RootWarp,
+    FORWARD, yawOf, yawRotation, wrapAngle,
+} from "./animation/index";
+export type { Root } from "./animation/index";
+export { Obb, TriangleMesh, CollisionWorld, ALL_LAYERS, rayCapsule, raySphere, rayTriangle, closestPointTriangle } from "./collision/index";
+export type { Triangle, Shape, Collider, Hit, CastResult } from "./collision/index";

@@ -11,6 +11,9 @@
  *   materials through their `vertex_main`, so they see the skinned mesh too; the palette also
  *   holds last frame's matrices, for motion vectors. Mark skinned renderables `dynamic` and
  *   update their `BonePalette` each frame.
+ * - The toolkit motion matching builds on: critically damped springs (`Springs`),
+ *   inertialized transitions (`Inertializer`), two-joint IK and foot locking (`twoJointIK`,
+ *   `FootLock`), retargeting by joint name (`Retarget`) and root-motion warping (`RootWarp`).
  */
 export { Transform, nlerp, quatAbs, quatLog, quatExp, quatToScaledAngleAxis, quatFromScaledAngleAxis, angularVelocity } from "./Transform";
 export { Skeleton } from "./Skeleton";
@@ -23,3 +26,13 @@ export {
     BonePalette, skinBuffer, skinnedMaterial, skinnedLitMaterial, skinnedLitTexturedMaterial, packSkinnedLitParams,
 } from "./Skinning";
 export type { SkinnedLitParams, SkinTextures } from "./Skinning";
+export {
+    negexp, halflifeToDamping, damperExact, springDamperExact, decaySpringDamperExact,
+    springDamperExactQuat, decaySpringDamperExactQuat, springCharacterUpdate,
+} from "./Springs";
+export { Inertializer, poseVelocities } from "./Inertialization";
+export { twoJointIK, FootLock } from "./IK";
+export { Retarget, TranslationMode } from "./Retarget";
+export { Ramp, Placement, RootWarp } from "./Warping";
+export type { Root } from "./Warping";
+export { FORWARD, yawOf, yawRotation, wrapAngle } from "./motion_matching/Heading";
