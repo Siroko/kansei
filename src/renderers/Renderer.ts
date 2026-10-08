@@ -20,7 +20,9 @@ import {
     meshBindGroupLayoutEntries, meshSlotStride, shadowBindGroupLayoutEntries,
 } from "./SharedLayouts";
 import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled, takeProfile } from "../profiling/Profiler";
-import { CULL_VIEW_BYTES, CullPipeline, CullView, cullView, cullViewDraws, drawGeometry, packCullView } from "../culling/InstanceCulling";
+import { CULL_VIEW_BYTES, CullPipeline, CullView, OcclusionView, cullView, cullViewDraws, drawGeometry, packCullView } from "../culling/InstanceCulling";
+import { Occlusion, mainOcclusionView } from "../culling/Occlusion";
+import type { DepthPyramid } from "../culling/DepthPyramid";
 import { CullViewKind, CullingStats, StatsReadback } from "../culling/CullingStats";
 import { mat4 } from "gl-matrix";
 import { SceneVoxelGi, SceneVoxelGiOptions } from "../gi/SceneVoxelGi";
@@ -60,8 +62,12 @@ const OPTIONAL_FEATURES: GPUFeatureName[] = [
     'texture-compression-etc2',
 ];
 
-/** The draw sets of a scene pass, in the order they are drawn: `Scene.opaque`, `transmissive`, `transparent`. */
-const DrawSet = { Opaque: 0, Transmissive: 1, Transparent: 2 } as const;
+/**
+ * The draw sets of a scene pass: `Scene.opaque`, `transmissive`, `transparent`; and with occlusion
+ * culling `Late`, the second phase of the opaque renderables culled in two phases. `Opaque` draws
+ * the first phase's instances, the transmissive and transparent sets both phases'.
+ */
+const DrawSet = { Opaque: 0, Transmissive: 1, Transparent: 2, Late: 3 } as const;
 type DrawSet = typeof DrawSet[keyof typeof DrawSet];
 
 /** The targets of a render pass, which pick each material's pipeline. */
@@ -83,7 +89,7 @@ interface SetBundle {
  * were recorded with (`shared`). A set's bundle is re-recorded only when its own draws change.
  */
 class PassBundles {
-    readonly sets: SetBundle[] = [0, 1, 2].map(() => ({ bundle: null, key: [], valid: false }));
+    readonly sets: SetBundle[] = [0, 1, 2, 3].map(() => ({ bundle: null, key: [], valid: false }));
     shared: unknown[] = [];
 
     invalidate(): void {
@@ -326,7 +332,6 @@ class Renderer {
     private _cullPipeline: CullPipeline | null = null;
     private _cullViewBytes = new ArrayBuffer(4 * CULL_VIEW_BYTES);
     private _cullStats = new StatsReadback();
-    private _viewProjScratch = mat4.create();
     private _cascadeViewProjs = Array.from({ length: MAX_CASCADES }, () => mat4.create());
 
     /**
@@ -340,6 +345,64 @@ class Renderer {
     /** The latest instance culling statistics while `setCullingStats` is on, or null. */
     public get cullingStats(): CullingStats | null {
         return this._cullStats.latest;
+    }
+
+    // Occlusion culling: its state (switch, history reset, frozen view, depth pyramids), and the
+    // renderables the camera culls in two phases this frame.
+    private _occlusion = new Occlusion();
+    private _twoPhase: Renderable[] = [];
+
+    /**
+     * Occlusion culling for renderables whose `InstanceCulling` has `occlusion` (on by default;
+     * those renderables opt in). It applies to the camera in `renderToGBuffer` with a
+     * single-sampled GBuffer (`PostProcessingVolume` without `msaaSampleCount`); `render` and
+     * shadow maps cull by frustum and LOD only.
+     *
+     * Each frame runs in two phases. The first draws, with the rest of the opaque scene, the
+     * instances in view that the camera saw last frame; a depth pyramid is built from that depth;
+     * the second tests every instance in view against it and draws the visible ones the first
+     * left out (disoccluded, or new in view) in a second GBuffer pass, followed by the
+     * transparent renderables (which do not occlude). Everything visible is drawn the frame it
+     * appears, whatever the camera does; the history only decides which phase draws it. The
+     * occluders are everything opaque drawn in the first phase: renderables without culling
+     * (terrain, large meshes), frustum-culled instances, and the instances seen last frame.
+     *
+     * It pays where much instanced geometry is hidden and costly to draw. The second phase costs
+     * a pyramid build, a second cull and a second GBuffer pass that loads and stores every
+     * target: about 1 ms at 1440 x 810 on an Apple GPU, whose tile-based rendering already drops
+     * hidden pixels cheaply. Measure a scene before enabling it (`setCullingStats`, and the
+     * occlusion-culling example's `bench=1`). Rust: `Renderer::set_occlusion_culling`.
+     */
+    public setOcclusionCulling(enabled: boolean): void {
+        if (enabled !== this._occlusion.enabled) this._occlusion.requestReset();
+        this._occlusion.enabled = enabled;
+    }
+
+    public get occlusionCulling(): boolean {
+        return this._occlusion.enabled;
+    }
+
+    /**
+     * Forget which instances the camera saw (the renderer does on a camera cut, when the camera's
+     * `resetMotion` was called): the next frame's first phase draws none of them, and the second
+     * tests them all against the depth of the rest of the scene.
+     */
+    public resetOcclusionHistory(): void {
+        this._occlusion.requestReset();
+    }
+
+    /**
+     * Debugging: freeze the camera's culling where it is. Until unfrozen, the camera's view draws
+     * the instances it drew when frozen (culled by that frustum, LOD origin and, with occlusion,
+     * that visibility), wherever the camera moves: fly round to see what is culled.
+     */
+    public setFreezeCulling(frozen: boolean): void {
+        this._occlusion.freeze = frozen;
+    }
+
+    /** The depth pyramid occlusion culling built from the depth of its first phase, once built. */
+    public get depthPyramid(): DepthPyramid | null {
+        return this._occlusion.pyramid(MAIN_VIEW);
     }
 
     // Spot lights (group 3 bindings 5-9): the scene's, packed each frame into a fixed-capacity
@@ -1015,7 +1078,7 @@ class Renderer {
         // light clusters for the camera.
         const commandRenderEncoder = this.device!.createCommandEncoder();
         this._planShadowViews(stack, camera);
-        this._runInstanceCulling(commandRenderEncoder, stack, camera);
+        this._runInstanceCulling(commandRenderEncoder, stack, camera, null);
         this._encodeShadowPasses(commandRenderEncoder, stack);
         this._encodeVoxelGI(commandRenderEncoder, stack, camera);
         this._uploadShadowUniforms();
@@ -1262,7 +1325,9 @@ class Renderer {
         this._planShadowViews(stack, camera);
         // the ray tracing grid's box is a view the culling serves
         this._planRtGrid(stack, camera);
-        this._runInstanceCulling(commandEncoder, stack, camera);
+        // occlusion needs the GBuffer's single-sampled depth
+        const depthSize: [number, number] | null = gbuffer.msaaSampleCount === 1 ? [gbuffer.width, gbuffer.height] : null;
+        this._runInstanceCulling(commandEncoder, stack, camera, depthSize);
         this._runRtGrid(commandEncoder, stack);
         t?.end();
         t = cpuScope('scene/shadows');
@@ -1283,9 +1348,12 @@ class Renderer {
         // backgroundTexture, then transmissive and transparent on top.
         const hasTransmissive = stack.transmissive.length > 0;
 
-        // Phase 2 — (re-)record the bundles whose draws changed.
+        // Phase 2 — (re-)record the bundles whose draws changed (with occlusion culling, also the
+        // second phase's).
         t = cpuScope('scene/bundles');
-        const sets = [stack.opaque, stack.transmissive, stack.transparent];
+        const twoPhase = this._twoPhase.length > 0;
+        const late = twoPhase ? stack.opaque.filter((r) => r.instanceCulling?.twoPhaseIn(MAIN_VIEW)) : [];
+        const sets = [stack.opaque, stack.transmissive, stack.transparent, late];
         this._syncBundles(this._gbufferBundles, sets, stack, cameraBindGroup, targets);
         t?.end();
         const drawSets = (pass: GPURenderPassEncoder, which: DrawSet[]) => {
@@ -1396,12 +1464,22 @@ class Renderer {
             };
         };
 
-        if (hasTransmissive) {
-            // Pass 1 — opaque objects.
-            const opaquePass = commandEncoder.beginRenderPass({ ...makePassDescriptor(false), label: 'Renderer/GBufferOpaquePass', timestampWrites: gpuPass('Renderer/GBufferOpaquePass') });
-            drawSets(opaquePass, [DrawSet.Opaque]);
-            opaquePass.end();
+        // Pass 1 — opaque objects (with occlusion culling, the first phase's instances), and the
+        // transparent ones when nothing follows.
+        const opaquePass = commandEncoder.beginRenderPass({ ...makePassDescriptor(false), label: 'Renderer/GBufferOpaquePass', timestampWrites: gpuPass('Renderer/GBufferOpaquePass') });
+        drawSets(opaquePass, hasTransmissive || twoPhase ? [DrawSet.Opaque] : [DrawSet.Opaque, DrawSet.Transparent]);
+        opaquePass.end();
 
+        // Occlusion's second phase: cull against the pyramid of the first phase's depth, then draw
+        // what it found visible, and the transparent objects unless transmissive ones follow.
+        if (twoPhase) {
+            this._runLateCulling(commandEncoder, gbuffer);
+            const latePass = commandEncoder.beginRenderPass({ ...makePassDescriptor(true), label: 'Renderer/GBufferLatePass', timestampWrites: gpuPass('Renderer/GBufferLatePass') });
+            drawSets(latePass, hasTransmissive ? [DrawSet.Late] : [DrawSet.Late, DrawSet.Transparent]);
+            latePass.end();
+        }
+
+        if (hasTransmissive) {
             // Snapshot the opaque-only colour into backgroundTexture so that a
             // downstream transmission effect can sample the undistorted background.
             commandEncoder.copyTextureToTexture(
@@ -1414,10 +1492,6 @@ class Renderer {
             const transmissivePass = commandEncoder.beginRenderPass({ ...makePassDescriptor(true), label: 'Renderer/GBufferIndirectPass', timestampWrites: gpuPass('Renderer/GBufferIndirectPass') });
             drawSets(transmissivePass, [DrawSet.Transmissive, DrawSet.Transparent]);
             transmissivePass.end();
-        } else {
-            const pass = commandEncoder.beginRenderPass({ ...makePassDescriptor(false), label: 'Renderer/GBufferOpaquePass', timestampWrites: gpuPass('Renderer/GBufferOpaquePass') });
-            drawSets(pass, [DrawSet.Opaque, DrawSet.Transparent]);
-            pass.end();
         }
 
         // Depth-copy pass: resolve MSAA depth → non-MSAA depthTexture for compute shaders.
@@ -1485,7 +1559,8 @@ class Renderer {
             for (const renderable of set) {
                 if (!renderable.material.outputsVelocity || !renderable.geometry.initialized) continue;
                 const pipeline = renderable.material.getVelocityPipeline(this.device!, renderable.geometry.vertexBuffersDescriptors);
-                this._encodeDraw(pass, renderable, stack.slotOf(renderable), null, state, pipeline);
+                // (both occlusion phases' instances)
+                this._encodeDraw(pass, renderable, stack.slotOf(renderable), null, state, DrawSet.Transparent, pipeline);
             }
         }
         pass.end();
@@ -1654,11 +1729,10 @@ class Renderer {
      * then this frame's cascades (`_cascadeView`), then with sky occlusion `_skyOcclusionView`
      * (`null` unless a tile of its top-down pass is due), then every layer of the spot shadow
      * atlas from `_spotViewBase()` (`null` when no light uses it), then with a ray tracing grid
-     * its box (`_rtView`).
+     * its box (`_rtView`). `main` is the camera's (`Occlusion.mainView`: live, or frozen).
      */
-    private _cullViews(camera: Camera): (CullView | null)[] {
-        // the unjittered projection: the frustum, not where pixels sample
-        const views: (CullView | null)[] = [cullView(camera.viewProjection(this._viewProjScratch))];
+    private _cullViews(main: CullView): (CullView | null)[] {
+        const views: (CullView | null)[] = [main];
         if (this._ownsShadowMap && this._shadowMap) {
             const map = this._shadowMap;
             views.push(map.light ? cullView(map.lightViewProjMatrix, { castersOnly: true }) : null);
@@ -1708,26 +1782,44 @@ class Renderer {
      * Culls every visible renderable with `instanceCulling` for every view that draws it, into
      * `encoder` (after the frame's uploads and `_planShadowViews`, before its shadow and main
      * passes): the frame's views in one write, then one compute pass, a dispatch per renderable
-     * (per chunk of views). Buffers made for more views re-record the cached bundles.
+     * (per chunk of views). Buffers made for more views re-record the cached bundles. Renderables
+     * with `occlusion` get the first phase here in the camera's view when the frame can build a
+     * depth pyramid (`depthSize`, the GBuffer's); their second phase is in `_runLateCulling`.
      */
-    private _runInstanceCulling(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
+    private _runInstanceCulling(encoder: GPUCommandEncoder, stack: Scene, camera: Camera, depthSize: [number, number] | null): void {
         this._cullStats.beginFrame(this._cullViewKinds());
+        this._twoPhase = [];
         const culled = stack.getOrderedObjects().filter((r) => r.instanceCulling && r.geometry.initialized && r.geometry.isInstancedGeometry);
         if (culled.length === 0) return;
         const device = this.device!;
-        const views = this._cullViews(camera);
+        // the camera's view, or the frozen one; distances are measured from it in every view
+        const main = this._occlusion.mainView(camera);
+        const views = this._cullViews(main.cull);
         const pipeline = this._cullPipeline ??= new CullPipeline(device);
-        // the frame's views, in one write; distances are measured from the camera in every view
+        // the views culled in two phases, with what their occlusion test projects with
+        const occlusion: [number, OcclusionView][] = depthSize && this._occlusion.enabled ? [[MAIN_VIEW, mainOcclusionView(main, depthSize)]] : [];
+        const occlusionViews = occlusion.map(([view]) => view);
+        const reset = this._occlusion.takeReset(camera.previousViewProjection() === null);
+        // the frame's views, in one write (those culled in two phases with what occlusion projects
+        // with)
         if (this._cullViewBytes.byteLength < views.length * CULL_VIEW_BYTES) this._cullViewBytes = new ArrayBuffer(views.length * CULL_VIEW_BYTES);
-        const eye = camera.inverseViewMatrix.internalMat4;
-        const lodOrigin = [eye[12], eye[13], eye[14]];
-        views.forEach((view, k) => packCullView(this._cullViewBytes, k * CULL_VIEW_BYTES, view, lodOrigin, this._cullStats.enabled));
+        views.forEach((view, k) => packCullView(this._cullViewBytes, k * CULL_VIEW_BYTES, view, main.lodOrigin, this._cullStats.enabled,
+            occlusion.find(([v]) => v === k)?.[1] ?? null));
         pipeline.setViews(this._cullViewBytes, views.length);
 
         let staleBundles = false;
+        const twoPhaseAny: Renderable[] = [];
         for (const r of culled) {
             const culling = r.instanceCulling!;
             staleBundles = culling.ensureViews(device, pipeline.layout, views.length) || staleBundles;
+            const twoPhaseViews = culling.occlusion ? occlusionViews : [];
+            staleBundles = culling.ensureOcclusion(device, pipeline, twoPhaseViews) || staleBundles;
+            culling.setTwoPhase(twoPhaseViews);
+            if (twoPhaseViews.some((v) => culling.twoPhaseIn(v))) {
+                if (reset) culling.resetVisibility(encoder);
+                twoPhaseAny.push(r);
+            }
+            if (culling.twoPhaseIn(MAIN_VIEW)) this._twoPhase.push(r);
             culling.beginFrame(device.queue, encoder, r.worldMatrix.internalMat4, r.geometry.vertexCount, r.castShadow, r.layers, r.gi !== null, r.rt !== null);
         }
         const pass = encoder.beginComputePass({ label: 'Renderer/InstanceCulling', timestampWrites: gpuPass('Renderer/InstanceCulling') });
@@ -1738,13 +1830,49 @@ class Renderer {
             const culling = r.instanceCulling!;
             culling.dispatch(pass);
             views.forEach((view, slot) => {
-                if (!view || !cullViewDraws(view, r.castShadow, r.layers, r.gi !== null, r.rt !== null)) return;
+                if (!view || !cullViewDraws(view, r.castShadow, r.layers, r.gi !== null, r.rt !== null) || culling.twoPhaseIn(slot)) return;
                 const draw = culling.view(slot)!;
                 this._cullStats.record(slot, culling.tested, draw.args, draw.offset);
             });
         }
+        // occlusion's first phase, in each view culled in two phases
+        if (twoPhaseAny.length > 0) {
+            pass.setPipeline(pipeline.early);
+            pass.setBindGroup(1, pipeline.viewBindGroup);
+            for (const view of occlusionViews) {
+                for (const r of twoPhaseAny) {
+                    const culling = r.instanceCulling!;
+                    const v = views[view];
+                    if (!culling.twoPhaseIn(view) || !v || !cullViewDraws(v, r.castShadow, r.layers, r.gi !== null, r.rt !== null)) continue;
+                    culling.dispatchEarly(pass, view);
+                    // (tested once, by the first phase)
+                    const early = culling.view(view)!;
+                    const late = culling.late(view)!;
+                    this._cullStats.record(view, culling.tested, early.args, early.offset);
+                    this._cullStats.record(view, 0, late.args, late.offset);
+                }
+            }
+        }
         pass.end();
         if (staleBundles) this.invalidateBundle();
+    }
+
+    /**
+     * Occlusion's second phase, once the first phase's opaque depth is in `gbuffer`: build the
+     * depth pyramid from it and cull the two-phase renderables against it (not while frozen,
+     * when the second phase draws nothing).
+     */
+    private _runLateCulling(encoder: GPUCommandEncoder, gbuffer: GBuffer): void {
+        if (this._twoPhase.length === 0 || this._occlusion.frozen) return;
+        const pipeline = this._cullPipeline!;
+        const { pyramid, bindGroup } = this._occlusion.pyramidFor(MAIN_VIEW, this.device!, [gbuffer.width, gbuffer.height], pipeline);
+        pyramid.build(encoder, gbuffer.depthTexture.createView());
+        const pass = encoder.beginComputePass({ label: 'Renderer/OcclusionCulling', timestampWrites: gpuPass('Renderer/OcclusionCulling') });
+        pass.setPipeline(pipeline.late);
+        pass.setBindGroup(1, pipeline.viewBindGroup);
+        pass.setBindGroup(2, bindGroup);
+        for (const r of this._twoPhase) r.instanceCulling!.dispatchLate(pass, MAIN_VIEW);
+        pass.end();
     }
 
     /**
@@ -1878,7 +2006,7 @@ class Renderer {
             cache.shared = shared;
         }
 
-        for (let set = 0; set < cache.sets.length; set++) {
+        for (let set = 0; set < sets.length; set++) {
             const entry = cache.sets[set];
             const key = this._bundleKeyScratch;
             key.length = 0;
@@ -1886,10 +2014,11 @@ class Renderer {
                 if (!isBundled(r)) continue;
                 const geo = r.geometry;
                 key.push(r, stack.slotOf(r), r.material, r.material.currentBindGroup, geo, geo.initialized, geo.vertexCount,
-                    geo.isInstancedGeometry ? (geo as InstancedGeometry).instanceCount : 1, r.instanceCulling);
+                    geo.isInstancedGeometry ? (geo as InstancedGeometry).instanceCount : 1, r.instanceCulling,
+                    r.instanceCulling?.twoPhaseIn(MAIN_VIEW) ?? false);
             }
             if (entry.valid && sameKey(entry.key, key)) continue;
-            entry.bundle = this._recordBundle(sets[set], stack, cameraBindGroup, targets);
+            entry.bundle = this._recordBundle(set as DrawSet, sets[set], stack, cameraBindGroup, targets);
             this._bundleKeyScratch = entry.key;
             entry.key = key;
             entry.valid = true;
@@ -1897,10 +2026,11 @@ class Renderer {
     }
 
     /**
-     * Records the draws of the bundled renderables (`isBundled`) among `renderables` into a
-     * GPURenderBundle, each at its scene slot; `null` when there is none to draw.
+     * Records the draws of the bundled renderables (`isBundled`) among `renderables`, draw set
+     * `set`, into a GPURenderBundle, each at its scene slot; `null` when there is none to draw.
      */
     private _recordBundle(
+        set: DrawSet,
         renderables: readonly Renderable[],
         stack: Scene,
         cameraBindGroup: GPUBindGroup,
@@ -1921,7 +2051,7 @@ class Renderer {
         const state: DrawState = { pipeline: null, materialBindGroup: null, indexBuffer: null, vertexBuffer: null };
         let draws = 0;
         for (const renderable of renderables) {
-            if (isBundled(renderable) && this._encodeDraw(encoder, renderable, stack.slotOf(renderable), targets, state)) draws++;
+            if (isBundled(renderable) && this._encodeDraw(encoder, renderable, stack.slotOf(renderable), targets, state, set)) draws++;
         }
         this._bundleRecords++;
         return draws > 0 ? encoder.finish() : null;
@@ -1952,14 +2082,16 @@ class Renderer {
                 if (this._shadowBG) pass.setBindGroup(BindGroupSlot.Shadow, this._shadowBG);
                 state = { pipeline: null, materialBindGroup: null, indexBuffer: null, vertexBuffer: null };
             }
-            this._encodeDraw(pass, renderable, stack.slotOf(renderable), targets, state);
+            this._encodeDraw(pass, renderable, stack.slotOf(renderable), targets, state, set);
         }
     }
 
     /**
      * Encodes the draw of `renderable` with its matrices at `slot`, setting only the state that
-     * differs from `state`: with its material's pipeline for `targets`, or with `pipeline`.
-     * Returns false when it cannot be drawn yet.
+     * differs from `state`: with its material's pipeline for `targets`, or with `pipeline`. Draw
+     * set `set` picks the instances culled for the camera it draws: with occlusion culling the
+     * first phase's in `Opaque`, the second's in `Late`, both in the others. Returns false when it
+     * cannot be drawn yet.
      */
     private _encodeDraw(
         encoder: GPURenderPassEncoder | GPURenderBundleEncoder,
@@ -1967,6 +2099,7 @@ class Renderer {
         slot: number,
         targets: PassTargets | null,
         state: DrawState,
+        set: DrawSet,
         pipeline?: GPURenderPipeline,
     ): boolean {
         const geometry = renderable.geometry;
@@ -2001,8 +2134,12 @@ class Renderer {
         const offset = slot * this._matrixAlignment;
         encoder.setBindGroup(BindGroupSlot.Mesh, this._sharedMeshBG!, [offset, offset]);
 
-        // The instances culled for the camera, if culled (indirect: the count changes, the bundle not).
-        drawGeometry(encoder, geometry, renderable.instanceCulling?.view(MAIN_VIEW) ?? null);
+        // The instances culled for the camera, if culled (indirect: the count changes, the bundle
+        // not); with occlusion culling, the phases of `set`.
+        const culling = renderable.instanceCulling;
+        if (set !== DrawSet.Late) drawGeometry(encoder, geometry, culling?.view(MAIN_VIEW) ?? null);
+        const late = set !== DrawSet.Opaque ? culling?.late(MAIN_VIEW) : null;
+        if (late) drawGeometry(encoder, geometry, late);
         return true;
     }
 
