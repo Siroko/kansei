@@ -28,6 +28,7 @@ The GI modes (`gi=`) compare what lights the shade:
 | `visibility` | that sky light dimmed by the sky visibility the clipmap's probes measure, in the material (`kansei_clipmap_sky_visibility`) |
 | `cones` | voxel GI on screen, six cones a pixel through the clipmap: the sky past the canopy and the bounces |
 | `probes` | the same light from the clipmap's irradiance probes, cheaper and smoother |
+| `rt` | the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels through the grid of the scene's triangles round the camera (below; cards alpha-tested), for 8 m, then the clipmap and the sky; the hits lit by the sun (shadow rays, the cascades past the grid) and a cone through the clipmap; denoised by SVGF. Closest to a path-traced reference: the cones are about 20% too bright under the canopy |
 
 The voxel clipmap:
 - 5 levels of 64 × 32 × 64 voxels, from 0.5 m voxels over 32 m to 8 m voxels over 512 m.
@@ -58,13 +59,17 @@ Engine API:
 - `Renderer::enable_rt_grid` (`SceneRtGridOptions`), `Renderable::rt` (`RtSurface`) and
   `rt_placement` (`RtPlacement::Wgsl`: the spruces' records widen them by their tint, which
   `InstanceTransform` can't say).
+- `RtDiffuseGiEffect::with_clipmap` (`RtDiffuseGiOptions::covered_wgsl`, `near_distance`;
+  `set_alpha_texture`, `set_cascaded_shadow_map`, `set_sky_lighting`, `update_lights`).
 - `RtReflectionsEffect::with_clipmap` (`RtReflectionsOptions::covered_wgsl`: the cards' alpha
   test, `set_alpha_texture`) and `GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular` (the wet
   road's F0 and roughness).
 
 | URL parameter | Effect |
 |---|---|
-| `gi=off\|skyocc\|visibility\|cones\|probes` | what lights the shade (default `cones`) |
+| `gi=off\|skyocc\|visibility\|cones\|probes\|rt` | what lights the shade (default `cones`); `rt` builds the grid (as `rt=1` does), and the panel reloads the page with it when picked without |
+| `rtgi_near=<metres>` | how far the hybrid's rays walk the grid before the clipmap takes over (default 8; 0: the whole 64 m box, about 1.5 times the cost) |
+| `rtgi_res`, `rtgi_denoise`, `rtgi_kernel`, `rtgi_hit`, `rtgi_shadows`, `rtgi_mode`, `rtgi_accum`, `rtgi_view` | the hybrid's other settings, as in gi-box's README (`set_rtgi(key, value)` at run time) |
 | `view=lit\|indirect\|voxels` | the lit image (default); only the light the GI adds; the clipmap's voxels and their light |
 | `cam=road\|clearing\|forest\|high\|fly` | starting camera (default `road`); `fly` drives along the road at 12 m/s, so the clipmap's windows move |
 | `elevation=<degrees>` | the sun's elevation (default 16; the exposure follows) |
@@ -100,6 +105,7 @@ Engine API:
 
 Controls: drag to orbit, wheel or pinch to zoom, right-drag or shift-drag to pan. A Tweakpane
 panel (loaded from jsDelivr) switches the GI mode, the view, the camera and the sun's
-elevation. `window.kansei` exposes the setters and `info()` for scripted captures.
+elevation, and with the grid the hybrid's settings. `window.kansei` exposes the setters and
+`info()` for scripted captures.
 
 Build: `wasm-pack build --target web --release` here, serve this folder, open `www/`.

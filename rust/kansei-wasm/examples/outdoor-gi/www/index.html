@@ -18,12 +18,12 @@
     <canvas id="kansei"></canvas>
     <pre id="stats" hidden></pre>
     <script type="module">
-        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution } from '../pkg/kansei_wasm_outdoor_gi.js';
+        import init, { start, info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution, set_rtgi } from '../pkg/kansei_wasm_outdoor_gi.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_gi('off') and so on
-        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution };
+        window.kansei = { info, set_gi, set_view, set_camera, set_elevation, set_stats, set_reflections, set_reflection_view, set_reflection_alpha, set_reflection_grid, set_reflection_resolution, set_rtgi };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -33,14 +33,39 @@
         const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
         const pane = new Pane({ title: 'Outdoor GI', expanded: !/Mobi|Android/.test(navigator.userAgent) });
         pane.hidden = params.get('ui') === '0';
-        pane.addBinding(p, 'gi', {
-            label: 'GI',
-            options: { 'off (sky unoccluded)': 'off', 'top-down sky occlusion': 'skyocc', 'clipmap sky visibility (material)': 'visibility', 'clipmap GI, cones per pixel': 'cones', 'clipmap GI, probes': 'probes' },
-        }).on('change', () => set_gi(p.gi));
+        // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
+        // it, choosing the hybrid reloads the page with gi=rt
+        const giOptions = { 'off (sky unoccluded)': 'off', 'top-down sky occlusion': 'skyocc', 'clipmap sky visibility (material)': 'visibility', 'clipmap GI, cones per pixel': 'cones', 'clipmap GI, probes': 'probes', 'hybrid RT (grid rays + SVGF)': 'rt' };
+        pane.addBinding(p, 'gi', { label: 'GI', options: giOptions }).on('change', () => {
+            if (p.gi === 'rt' && !s.rtgi) {
+                params.set('gi', 'rt');
+                location.search = params.toString();
+                return;
+            }
+            set_gi(p.gi);
+            showRt();
+        });
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels' } }).on('change', () => set_view(p.view));
         pane.addBinding(p, 'camera', { options: { road: 'road', clearing: 'clearing', forest: 'forest', high: 'high', 'drive along the road': 'fly' } }).on('change', () => set_camera(p.camera));
         pane.addBinding(p, 'elevation', { label: 'sun elevation', min: -2, max: 40, step: 0.5 }).on('change', () => set_elevation(p.elevation));
         pane.addBinding(p, 'stats', { label: 'stats' }).on('change', () => { set_stats(p.stats); statsEl.hidden = !p.stats; });
+        // the hybrid's settings, shown while it runs
+        const rt = { ...(s.rtgi || {}) };
+        const rtFolder = pane.addFolder({ title: 'Hybrid RT GI', expanded: true });
+        const showRt = () => { rtFolder.hidden = p.gi !== 'rt' || !s.rtgi; };
+        if (s.rtgi) {
+            const rtgi = (key, value) => set_rtgi(key, String(value));
+            rtFolder.addBinding(rt, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full' } }).on('change', () => rtgi('res', rt.res));
+            rtFolder.addBinding(rt, 'near', { label: 'near field (m)', min: 0, max: 32, step: 1 }).on('change', (e) => { if (e.last !== false) rtgi('near', rt.near); });
+            rtFolder.addBinding(rt, 'denoise', { options: { SVGF: 'svgf', 'temporal only': 'temporal', 'off (1 spp)': 'off' } }).on('change', () => rtgi('denoise', rt.denoise));
+            rtFolder.addBinding(rt, 'kernel', { label: 'wavelet', options: { '3x3': '3x3', '5x5': '5x5' } }).on('change', () => rtgi('kernel', rt.kernel));
+            rtFolder.addBinding(rt, 'hit', { label: 'hits lit by', options: { 'direct light + voxel cone': 'direct', 'voxels only': 'voxels' } }).on('change', () => rtgi('hit', rt.hit));
+            rtFolder.addBinding(rt, 'shadows', { label: 'hit shadows', options: { rays: 'rays', 'shadow maps': 'maps' } }).on('change', () => rtgi('shadows', rt.shadows));
+            rtFolder.addBinding(rt, 'mode', { options: { hybrid: 'hybrid', 'reference (path traced)': 'reference' } }).on('change', () => rtgi('mode', rt.mode));
+            rtFolder.addBinding(rt, 'accum', { label: 'accumulate' }).on('change', () => rtgi('accum', rt.accum));
+            rtFolder.addBinding(rt, 'view', { label: 'debug view', options: { lit: 'lit', indirect: 'indirect', signal: 'signal', variance: 'variance', history: 'history', cost: 'cost' } }).on('change', () => rtgi('view', rt.view));
+        }
+        showRt();
         // reflect=1: the wet road's ray-traced reflections
         if (s.reflect) {
             const r = { on: s.reflect.enabled, view: s.reflect.view, rays: s.reflect.grid ? 'grid' : 'voxels', alpha: s.reflect.alpha, res: s.reflect.res };
@@ -62,6 +87,7 @@
                 `${i.trees} spruces, ${(i.triangles / 1e6).toFixed(1)}M triangles in all LODs\n` +
                 `frame ${i.frame_ms.toFixed(2)} ms, GPU passes ${i.gpu_ms.toFixed(2)} ms (span ${i.gpu_span_ms.toFixed(2)})\n` +
                 `clipmap: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
+                (i.rtgi && i.rtgi.on ? `hybrid GI: ${i.rtgi_ms.toFixed(3)} ms, ${i.rtgi.mib} MiB, near field ${i.rtgi.near ? i.rtgi.near + ' m' : 'the box'}; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '') + '\n' : '') +
                 (i.rt ? `rt grid: ${i.rt.triangles} triangles, ${i.rt.references} refs, ${i.rt.sources} sources, ${i.rt.mib} MiB; ${i.rt.rebuilt ? 'rebuilt' : 'kept'} (${i.rt.rebuilds}), CPU ${i.rt.cpu_ms.toFixed(2)} ms, GPU ${i.rt_ms.toFixed(3)} ms\n` : '') +
                 (i.reflect ? `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
         }, 500);

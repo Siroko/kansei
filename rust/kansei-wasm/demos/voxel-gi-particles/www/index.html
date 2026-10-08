@@ -12,22 +12,18 @@
 <body>
     <canvas id="kansei"></canvas>
     <script type="module">
-        import init, {
-            start, info, set_gi, set_view, set_extinction, set_cone_aperture, set_sun_cone,
-            set_emissive_share, set_emissive_intensity, set_speed_glow, set_temporal_blend,
-            set_particle_size, set_sun, set_exposure, set_panel, set_reflectivity, set_ao,
-            set_rt, set_rt_mix, set_rt_bounces, set_paused, reset, profile_report, set_layers,
-            set_dof, set_dof_focus, set_dof_fstop, set_dof_taa, focus_at,
-        } from '../pkg/kansei_wasm_voxel_gi_particles.js';
+        import init, * as wasm from '../pkg/kansei_wasm_voxel_gi_particles.js';
         await init();
-        await start('kansei');
+        // the demo runs here or (?worker=1) in a worker on an OffscreenCanvas; its exports are
+        // called through `kansei`, each returning a promise (kansei_wasm's `launch`)
+        const kansei = await wasm.launch(wasm, { module: new URL('../pkg/kansei_wasm_voxel_gi_particles.js', import.meta.url).href });
+        const info = async () => JSON.parse(await kansei.info());
 
-        // for scripted captures and timing: window.kansei.set_gi(false) and so on; frame by hand,
-        // then window.kansei.camera() gives the orbit to paste into set_camera or the default
-        const wasm = await import('../pkg/kansei_wasm_voxel_gi_particles.js');
-        window.kansei = { ...wasm, camera: () => JSON.parse(wasm.camera()) };
+        // for scripted captures and timing: await window.kansei.set_gi(false) and so on; frame by
+        // hand, then await window.kansei.camera() gives the orbit to paste into set_camera or the default
+        window.kansei = Object.assign(Object.create(kansei), { camera: async () => JSON.parse(await kansei.camera()) });
         const params = new URLSearchParams(location.search);
-        const state = JSON.parse(info());
+        const state = await info();
         const lightbox = state.scene === 'lightbox';
         const p = {
             scene: state.scene,
@@ -67,48 +63,48 @@
             location.search = params.toString();
         };
         pane.addBinding(p, 'scene', { options: { lightbox: 'lightbox', 'Cornell room': 'cornell' } }).on('change', () => reload('scene', p.scene));
-        pane.addBinding(p, 'gi', { label: 'voxel GI' }).on('change', () => set_gi(p.gi));
-        pane.addBinding(p, 'indirect', { label: 'indirect only' }).on('change', () => set_view(p.indirect ? 1 : 0));
+        pane.addBinding(p, 'gi', { label: 'voxel GI' }).on('change', () => kansei.set_gi(p.gi));
+        pane.addBinding(p, 'indirect', { label: 'indirect only' }).on('change', () => kansei.set_view(p.indirect ? 1 : 0));
         pane.addBinding(p, 'quality', { options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', () => reload('quality', p.quality));
         if (lightbox) {
             const rt = pane.addFolder({ title: 'Ray traced' });
-            rt.addBinding(p, 'rt', { label: 'mirror and glass' }).on('change', () => set_rt(p.rt));
-            const mix = () => set_rt_mix(p.mirrorShare, p.glassShare);
+            rt.addBinding(p, 'rt', { label: 'mirror and glass' }).on('change', () => kansei.set_rt(p.rt));
+            const mix = () => kansei.set_rt_mix(p.mirrorShare, p.glassShare);
             rt.addBinding(p, 'mirrorShare', { label: 'mirrors', min: 0, max: 1, step: 0.01 }).on('change', mix);
             rt.addBinding(p, 'glassShare', { label: 'glass', min: 0, max: 1, step: 0.01 }).on('change', mix);
-            rt.addBinding(p, 'bounces', { options: { 1: 1, 2: 2 } }).on('change', () => set_rt_bounces(p.bounces));
+            rt.addBinding(p, 'bounces', { options: { 1: 1, 2: 2 } }).on('change', () => kansei.set_rt_bounces(p.bounces));
         }
         const gi = pane.addFolder({ title: 'Volume and cones' });
-        gi.addBinding(p, 'extinction', { min: 0, max: 3, step: 0.05 }).on('change', () => set_extinction(p.extinction));
-        gi.addBinding(p, 'coneAperture', { label: 'cone aperture', min: 30, max: 120, step: 1 }).on('change', () => set_cone_aperture(p.coneAperture));
-        gi.addBinding(p, 'sunCone', { label: lightbox ? 'panel cone' : 'sun cone', min: 1, max: lightbox ? 90 : 30, step: 0.1 }).on('change', () => set_sun_cone(p.sunCone));
-        gi.addBinding(p, 'temporalBlend', { label: 'temporal blend', min: 0.02, max: 1, step: 0.01 }).on('change', () => set_temporal_blend(p.temporalBlend));
+        gi.addBinding(p, 'extinction', { min: 0, max: 3, step: 0.05 }).on('change', () => kansei.set_extinction(p.extinction));
+        gi.addBinding(p, 'coneAperture', { label: 'cone aperture', min: 30, max: 120, step: 1 }).on('change', () => kansei.set_cone_aperture(p.coneAperture));
+        gi.addBinding(p, 'sunCone', { label: lightbox ? 'panel cone' : 'sun cone', min: 1, max: lightbox ? 90 : 30, step: 0.1 }).on('change', () => kansei.set_sun_cone(p.sunCone));
+        gi.addBinding(p, 'temporalBlend', { label: 'temporal blend', min: 0.02, max: 1, step: 0.01 }).on('change', () => kansei.set_temporal_blend(p.temporalBlend));
         if (lightbox) {
-            gi.addBinding(p, 'ao', { label: 'wall occlusion', min: 0, max: 1, step: 0.01 }).on('change', () => set_ao(p.ao));
+            gi.addBinding(p, 'ao', { label: 'wall occlusion', min: 0, max: 1, step: 0.01 }).on('change', () => kansei.set_ao(p.ao));
         }
         const glow = pane.addFolder({ title: 'Emission' });
-        glow.addBinding(p, 'emissiveShare', { label: 'glowing share', min: 0, max: 0.5, step: 0.005 }).on('change', () => set_emissive_share(p.emissiveShare));
-        glow.addBinding(p, 'emissiveIntensity', { label: 'glow', min: 0, max: 60, step: 0.1 }).on('change', () => set_emissive_intensity(p.emissiveIntensity));
-        glow.addBinding(p, 'speedGlow', { label: 'speed glow', min: 0, max: 2, step: 0.01 }).on('change', () => set_speed_glow(p.speedGlow));
+        glow.addBinding(p, 'emissiveShare', { label: 'glowing share', min: 0, max: 0.5, step: 0.005 }).on('change', () => kansei.set_emissive_share(p.emissiveShare));
+        glow.addBinding(p, 'emissiveIntensity', { label: 'glow', min: 0, max: 60, step: 0.1 }).on('change', () => kansei.set_emissive_intensity(p.emissiveIntensity));
+        glow.addBinding(p, 'speedGlow', { label: 'speed glow', min: 0, max: 2, step: 0.01 }).on('change', () => kansei.set_speed_glow(p.speedGlow));
         // the lens sees the room as a 1:100 tabletop model (DOF_MODEL_SCALE)
         const dof = pane.addFolder({ title: 'Depth of field', expanded: p.dof });
-        dof.addBinding(p, 'dof', { label: 'on' }).on('change', () => set_dof(p.dof));
+        dof.addBinding(p, 'dof', { label: 'on' }).on('change', () => kansei.set_dof(p.dof));
         dof.addBinding(p, 'autofocus', { label: 'autofocus' }).on('change', () => {
-            set_dof_focus(p.autofocus ? 0 : p.focus);
+            kansei.set_dof_focus(p.autofocus ? 0 : p.focus);
             focus.disabled = p.autofocus;
         });
         const focus = dof.addBinding(p, 'focus', { label: 'focus (m)', min: 5, max: 120, step: 0.1, disabled: p.autofocus })
-            .on('change', () => { if (!p.autofocus) set_dof_focus(p.focus); });
+            .on('change', () => { if (!p.autofocus) kansei.set_dof_focus(p.focus); });
         // the autofocus distance, as the lens follows it
-        setInterval(() => { if (p.dof && p.autofocus) { p.focus = JSON.parse(info()).focus_m; focus.refresh(); } }, 250);
+        setInterval(async () => { if (p.dof && p.autofocus) { p.focus = (await info()).focus_m; focus.refresh(); } }, 250);
         // double-click: focus on that point (autofocus off), read back a frame or two later
         const autofocus = dof.children[1];
         document.getElementById('kansei').addEventListener('dblclick', (e) => {
             if (!p.dof) return;
             const r = e.currentTarget.getBoundingClientRect();
-            focus_at((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
-            setTimeout(() => {
-                const s = JSON.parse(info());
+            kansei.focus_at((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+            setTimeout(async () => {
+                const s = await info();
                 if (s.focus === null) return; // sky: nothing to focus on
                 p.focus = s.focus;
                 p.autofocus = false;
@@ -117,23 +113,23 @@
                 focus.refresh();
             }, 200);
         });
-        dof.addBinding(p, 'taa', { label: 'TAA' }).on('change', () => set_dof_taa(p.taa));
-        dof.addBinding(p, 'fstop', { label: 'f-stop', min: 0.2, max: 8, step: 0.05 }).on('change', () => set_dof_fstop(p.fstop));
+        dof.addBinding(p, 'taa', { label: 'TAA' }).on('change', () => kansei.set_dof_taa(p.taa));
+        dof.addBinding(p, 'fstop', { label: 'f-stop', min: 0.2, max: 8, step: 0.05 }).on('change', () => kansei.set_dof_fstop(p.fstop));
         const look = pane.addFolder({ title: 'Scene', expanded: false });
-        look.addBinding(p, 'particleSize', { label: 'particle size', min: 0.1, max: lightbox ? 0.8 : 1.5, step: 0.01 }).on('change', () => set_particle_size(p.particleSize));
+        look.addBinding(p, 'particleSize', { label: 'particle size', min: 0.1, max: lightbox ? 0.8 : 1.5, step: 0.01 }).on('change', () => kansei.set_particle_size(p.particleSize));
         if (lightbox) {
-            look.addBinding(p, 'panel', { label: 'ceiling light', min: 0, max: 3, step: 0.05 }).on('change', () => set_panel(p.panel));
-            look.addBinding(p, 'reflectivity', { label: 'floor reflection', min: 0, max: 1, step: 0.01 }).on('change', () => set_reflectivity(p.reflectivity));
+            look.addBinding(p, 'panel', { label: 'ceiling light', min: 0, max: 3, step: 0.05 }).on('change', () => kansei.set_panel(p.panel));
+            look.addBinding(p, 'reflectivity', { label: 'floor reflection', min: 0, max: 1, step: 0.01 }).on('change', () => kansei.set_reflectivity(p.reflectivity));
         } else {
-            const sun = () => set_sun(p.sunElevation, p.sunBearing);
+            const sun = () => kansei.set_sun(p.sunElevation, p.sunBearing);
             look.addBinding(p, 'sunElevation', { label: 'sun elevation', min: 5, max: 90, step: 1 }).on('change', sun);
             look.addBinding(p, 'sunBearing', { label: 'sun bearing', min: -180, max: 180, step: 1 }).on('change', sun);
         }
-        look.addBinding(p, 'exposure', { min: 0.1, max: 4, step: 0.05 }).on('change', () => set_exposure(p.exposure));
-        look.addButton({ title: 'Pour again' }).on('click', () => reset());
+        look.addBinding(p, 'exposure', { min: 0.1, max: 4, step: 0.05 }).on('change', () => kansei.set_exposure(p.exposure));
+        look.addButton({ title: 'Pour again' }).on('click', () => kansei.reset());
         pane.addBinding(p, 'stats', { readonly: true, multiline: true, rows: 3, label: 'volume' });
-        setInterval(() => {
-            const s = JSON.parse(info());
+        setInterval(async () => {
+            const s = await info();
             // the focus slider follows the autofocus
             if (p.autofocus) p.focus = s.focus_m;
             p.stats = `${s.quality} ${s.dims.join('x')} @ ${s.voxel_m} m\n${s.mib} MiB, ${s.particles} particles\n${s.frame_ms} ms`;
