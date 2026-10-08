@@ -139,6 +139,8 @@ class ShadowMap {
 
     get depthTexture(): GPUTexture { return this._depthTexture; }
     get lightViewProjMatrix(): Float32Array { return this._lightVP; }
+    /** The light's view-projection as uploaded by `update` (a 64-byte uniform), for passes that read it on the GPU. */
+    get lightViewProjBuffer(): GPUBuffer { return this._lightVPBuffer; }
     get maxShadowDistance(): number { return this._maxShadowDistance; }
     set maxShadowDistance(v: number) { this._maxShadowDistance = v; }
     /** Field-of-view in degrees (perspective shadow maps). */
