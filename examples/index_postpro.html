@@ -408,6 +408,12 @@
     fogFolder.addBinding(fogEffect, 'heightFalloff',  { min: 0, max: 0.5, step: 0.001 });
     fogFolder.addBinding(fogEffect, 'extinctionCoeff', { min: 0, max: 5, step: 0.01, label: 'extinction' });
     fogFolder.addBinding(fogEffect, 'anisotropy',     { min: -1, max: 1, step: 0.01 });
+    fogFolder.addBinding(fogEffect, 'fogHeight',      { min: -10, max: 40, step: 0.1, label: 'fog height' });
+    fogFolder.addBinding(fogEffect, 'startDistance',  { min: 0, max: 50, step: 0.1, label: 'start distance' });
+    fogFolder.addBinding(fogEffect, 'maxDistance',    { min: 0, max: fogEffect.froxelGrid.far, step: 1, label: 'reach (0 = far)' });
+    const fogAmbient = { color: { r: 0, g: 0, b: 0 } };
+    fogFolder.addBinding(fogAmbient, 'color', { color: { type: 'float' }, label: 'ambient' })
+      .on('change', (ev) => { fogEffect.ambient = [ev.value.r, ev.value.g, ev.value.b]; });
     fogFolder.addBinding(params, 'lightX', { min: -1, max: 1, step: 0.01, label: 'light X' }).on('change', syncLightDir);
     fogFolder.addBinding(params, 'lightY', { min: -1, max: 1, step: 0.01, label: 'light Y' }).on('change', syncLightDir);
     fogFolder.addBinding(params, 'lightZ', { min: -1, max: 1, step: 0.01, label: 'light Z' }).on('change', syncLightDir);

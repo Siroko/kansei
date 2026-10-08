@@ -5,600 +5,359 @@ import { AreaLight } from '../../lights/AreaLight';
 import { FroxelGrid } from '../../froxels/FroxelGrid';
 import { ShadowMap } from '../../shadows/ShadowMap';
 import { CubeMapShadowMap } from '../../shadows/CubeMapShadowMap';
-import type { PositionalLight } from '../../shadows/CubeMapShadowMap';
+import { COMPUTE_SHADOWS_WGSL, ComputeShadows, SHADOW_MAP } from '../../shadows/ComputeShadows';
+import type { CascadedShadowSource } from '../../shadows/ComputeShadows';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { assemble } from '../../materials/shaders/ShaderUtils';
 import { mat4 } from 'gl-matrix';
 import { gpuPass } from '../../profiling/Profiler';
+import froxelCommon from '../../../rust/kansei-core/src/shaders/froxel_common.wgsl?raw';
+import fogInject from '../../../rust/kansei-core/src/shaders/volumetric_fog_inject.wgsl?raw';
+import skyLighting from '../../../rust/kansei-core/src/atmosphere/shaders/sky_lighting.wgsl?raw';
+import skyOcclusion from '../../../rust/kansei-core/src/shaders/sky_occlusion.wgsl?raw';
+import clipmapProbes from '../../../rust/kansei-core/src/gi/shaders/clipmap_probes.wgsl?raw';
+import fogMedia from '../../../rust/kansei-core/src/shaders/volumetric_fog_media.wgsl?raw';
+import fogSpot from '../../../rust/kansei-core/src/shaders/volumetric_fog_spot.wgsl?raw';
+import fogComposite from '../../../rust/kansei-core/src/shaders/volumetric_fog_composite.wgsl?raw';
 
 export interface VolumetricFogOptions {
     froxelGrid: FroxelGrid;
+    /** The directional shadow map (`Renderer.shadowMap`) the fog's shafts come through. */
     shadowMap?: ShadowMap;
+    /** A cascaded shadow map whose widest cascade shadows the fog, instead of `shadowMap`. */
+    cascadedShadowMap?: CascadedShadowSource;
+    /** The point lights' cube shadows (`Renderer.cubeMapShadowMap`). */
     cubeMapShadowMap?: CubeMapShadowMap;
+    /** Scattering density at `fogHeight` (per metre). */
     baseDensity?: number;
+    /** Exponential falloff of density with height above `fogHeight` (per metre). */
     heightFalloff?: number;
+    /** Height below which density stays at `baseDensity`. */
+    fogHeight?: number;
+    /** Extinction = density * extinctionCoeff (1 = no absorption). */
     extinctionCoeff?: number;
+    /** Henyey-Greenstein g: 0 isotropic, > 0 forward scattering. */
     anisotropy?: number;
+    /** View distance before which there is no fog (UE's fog start distance). */
+    startDistance?: number;
+    /** View depth past which the froxels hold no fog, at most the grid's `far`; 0: the grid's `far`. */
+    maxDistance?: number;
+    /** Density field drift, in metres per second of `time`. */
     windDirection?: [number, number, number];
+    /**
+     * Radiance of a uniform sky around the fog (scatters as density * ambient): set it so fog stays
+     * lit with no direct light (dusk, overcast). Far fog tends to it. Zero by default.
+     */
+    ambient?: [number, number, number];
 }
 
-// Byte sizes per storage-buffer element (must match WGSL struct layout)
-const DIR_LIGHT_STRIDE  = 32;   // vec3f+u32 + vec3f+f32
-const POINT_LIGHT_STRIDE = 32;  // vec3f+f32 + vec3f+u32
+/** Bytes of the WGSL `FogParams`, `CompositeParams`, `FogMediaParams`. */
+const FOG_PARAMS_BYTES = 208;
+const COMPOSITE_PARAMS_BYTES = 32;
+const MEDIA_PARAMS_BYTES = 32;
+/** Bytes of a `LocalFogVolume`, the `SkyLighting` uniform and a `ClipProbeGrid`. */
+const LOCAL_FOG_VOLUME_BYTES = 80;
+const SKY_LIGHTING_BYTES = 240;
+const CLIP_PROBE_GRID_BYTES = 128;
 
-// PointLightData.shadowLayer sentinels (otherwise the light's first cube-atlas layer)
-const NO_SHADOW = 0xffffffff;
-const SHADOW_MAP = 0xfffffffe;  // shadowed by the fog's 2D shadowMap (an AreaLight that owns it)
+/** `text` with `from` replaced once; throws when the shared WGSL no longer has `from`. */
+function patch(text: string, from: string, to: string): string {
+    if (!text.includes(from)) throw new Error(`VolumetricFogEffect: the injection WGSL changed, no "${from}"`);
+    return text.replace(from, to);
+}
 
+/**
+ * The Rust fog's injection (`volumetric_fog.rs`'s `INJECT_WGSL`), plus the TS area light that
+ * owns the 2D shadow map: its `PointLightData.shadowLayer` is `SHADOW_MAP`, read through the
+ * directional map's binding.
+ */
+const INJECT_WGSL = patch(
+    assemble([
+        froxelCommon, fogInject, skyLighting, skyOcclusion, clipmapProbes, fogMedia,
+        COMPUTE_SHADOWS_WGSL, fogSpot,
+        `const SHADOW_MAP : u32 = ${SHADOW_MAP}u;`,
+    ]),
+    'if (pl.shadowLayer != NO_SHADOW && params.hasPointShadows != 0u) {',
+    'if (pl.shadowLayer == SHADOW_MAP) {\n'
+    + '            if (params.hasShadowMap != 0u) { visibility = dirShadowLookup(worldPos); }\n'
+    + '        } else if (pl.shadowLayer != NO_SHADOW && params.hasPointShadows != 0u) {',
+);
+const COMPOSITE_WGSL = assemble([froxelCommon, fogComposite]);
+
+/**
+ * Froxel volumetric fog, a port of the Rust `VolumetricFogEffect` on its WGSL: per froxel, a
+ * height fog (flat below `fogHeight`, from `startDistance` to the `reach()`), lit by the
+ * directional, point and area lights with their shadows (`ComputeShadows`) and by a uniform
+ * `ambient` sky; jittered per frame on a temporal grid; integrated front to back and composited
+ * over the scene.
+ *
+ * Its spot lights, local fog volumes and sky lighting are bound to stand-ins (none) until those
+ * land in the TS engine.
+ */
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
     private _froxelGrid: FroxelGrid;
-    private _shadowMap: ShadowMap | null;
-    private _cubeMapShadowMap: CubeMapShadowMap | null;
+    private _shadows = new ComputeShadows();
 
     baseDensity: number;
     heightFalloff: number;
+    fogHeight: number;
     extinctionCoeff: number;
     anisotropy: number;
-
-    /** Update the shadow map reference (triggers bind-group rebuild). */
-    set shadowMap(sm: ShadowMap | null) {
-        this._shadowMap = sm;
-        this._injectBGDirty = true;
-    }
-    get shadowMap(): ShadowMap | null { return this._shadowMap; }
+    startDistance: number;
+    /**
+     * View depth past which the froxels hold no fog (Unreal's `VolumetricFogDistance`): at most
+     * the grid's `far`, 0 for the grid's `far`. Change it any frame; the grid stays.
+     */
+    maxDistance: number;
     windDir: [number, number, number];
+    ambient: [number, number, number];
+    /**
+     * Seconds, drives the wind offset. Null: the effect's own clock, from its construction. Rust
+     * has no clock and sets `time` per frame.
+     */
+    time: number | null = null;
+
+    /** Temporal jitter index of the injection (1..=1024), advanced every frame. */
+    private _frame = 1;
+    private _shadowMap: ShadowMap | null = null;
+    private _cubeMapShadowMap: CubeMapShadowMap | null = null;
 
     // Injection pass
     private _injectPipeline: GPUComputePipeline | null = null;
     private _injectBGL: GPUBindGroupLayout | null = null;
     private _injectBG: GPUBindGroup | null = null;
+    private _injectTarget: GPUTexture | null = null;
     private _fogParamsBuffer: GPUBuffer | null = null;
+    private _fogParams = new ArrayBuffer(FOG_PARAMS_BYTES);
 
-    // Light storage buffers
-    private _dirLightsBuffer: GPUBuffer | null = null;
-    private _pointLightsBuffer: GPUBuffer | null = null;
-    private _dirLightsCapacity = 0;
-    private _pointLightsCapacity = 0;
-    private _numDirLights = 0;
-    private _numPointLights = 0;
-    private _injectBGDirty = true;
-
-    // Point shadow atlas
-    private _pointShadowAtlasView: GPUTextureView | null = null;
-    private _dummyPointShadowTex: GPUTexture | null = null;
-
-    // Dummy directional shadow depth (used when no ShadowMap is provided)
-    private _dummyDirShadowTex: GPUTexture | null = null;
+    // The media's stand-ins (volumetric_fog_media.wgsl): no local volumes, sky, sky occlusion or
+    // clipmap probes
+    private _mediaParamsBuffer: GPUBuffer | null = null;
+    private _volumesBuffer: GPUBuffer | null = null;
+    private _noSkyLighting: GPUBuffer | null = null;
+    private _noOcclusionVolume: GPUTexture | null = null;
+    private _noOcclusionParams: GPUBuffer | null = null;
+    private _noClipProbeGrid: GPUBuffer | null = null;
+    private _noClipProbes: GPUBuffer | null = null;
 
     // Composite pass
     private _compositePipeline: GPUComputePipeline | null = null;
     private _compositeBG: GPUBindGroup | null = null;
     private _compositeParamsBuffer: GPUBuffer | null = null;
     private _accumSampler: GPUSampler | null = null;
+    private _noShafts: GPUTexture | null = null;
     private _currentInput: GPUTexture | null = null;
     private _currentDepth: GPUTexture | null = null;
     private _currentOutput: GPUTexture | null = null;
+    private _currentAccum: GPUTexture | null = null;
 
     private _startTime = performance.now();
+    private _vp = mat4.create();
     private _invVP = mat4.create();
 
     constructor(options: VolumetricFogOptions) {
         super();
         this._froxelGrid     = options.froxelGrid;
-        this._shadowMap      = options.shadowMap ?? null;
-        this._cubeMapShadowMap = options.cubeMapShadowMap ?? null;
         this.baseDensity     = options.baseDensity ?? 0.02;
         this.heightFalloff   = options.heightFalloff ?? 0.1;
+        this.fogHeight       = options.fogHeight ?? 0;
         this.extinctionCoeff = options.extinctionCoeff ?? 1.0;
         this.anisotropy      = options.anisotropy ?? 0.6;
+        this.startDistance   = options.startDistance ?? 0;
+        this.maxDistance     = options.maxDistance ?? 0;
         this.windDir         = options.windDirection ?? [0, 0, 0];
+        this.ambient         = options.ambient ?? [0, 0, 0];
+        if (options.cascadedShadowMap) this.setCascadedShadowMap(options.cascadedShadowMap);
+        else this.setShadowMap(options.shadowMap ?? null);
+        this.setPointShadows(options.cubeMapShadowMap ?? null);
     }
 
-    // ── Injection shader (multi-light) ─────────────────────────────────────
+    /** The froxel grid the fog is injected into. */
+    get froxelGrid(): FroxelGrid { return this._froxelGrid; }
 
-    private static _INJECT_SHADER = FroxelGrid.WGSL_HELPERS + /* wgsl */`
+    /**
+     * The view depth the froxels hold fog to: `maxDistance`, or the grid's `far` when it is 0 or
+     * beyond it.
+     */
+    reach(): number {
+        const far = this._froxelGrid.far;
+        return this.maxDistance > 0 ? Math.min(this.maxDistance, far) : far;
+    }
 
-        struct FogParams {
-            invViewProj     : mat4x4f,
-            cameraPos       : vec3f,
-            baseDensity     : f32,
-            windOffset      : vec3f,
-            heightFalloff   : f32,
-            gridNear        : f32,
-            gridFar         : f32,
-            time            : f32,
-            gridW           : u32,
-            gridH           : u32,
-            gridD           : u32,
-            cameraNear      : f32,
-            cameraFar       : f32,
-            extinctionCoeff : f32,
-            anisotropy      : f32,
-            numDirLights    : u32,
-            numPointLights  : u32,
-            shadowViewProj  : mat4x4f,
-            hasShadowMap    : u32,
-        }
+    /** Drop the temporal history; call on camera cuts. No-op without a temporal grid. */
+    resetHistory(): void {
+        this._froxelGrid.resetHistory();
+    }
 
-        struct DirLightData {
-            direction : vec3f,
-            shadowed  : u32,     // 1 = shadowed by shadowDepthTex through params.shadowViewProj
-            color     : vec3f,
-            _pad      : f32,
-        }
+    /** The directional shadow map the shafts come through (`setShadowMap`). */
+    get shadowMap(): ShadowMap | null { return this._shadowMap; }
+    set shadowMap(sm: ShadowMap | null) { this.setShadowMap(sm); }
 
-        struct PointLightData {
-            position    : vec3f,
-            radius      : f32,
-            color       : vec3f,
-            shadowLayer : u32,   // first cube-atlas layer, or NO_SHADOW / SHADOW_MAP
-        }
+    /**
+     * Use a directional shadow map (`Renderer.shadowMap`) for light shafts. The light's
+     * view-projection is read from the map's own uniform buffer, so it is always the one the map
+     * was last rendered with.
+     */
+    setShadowMap(shadowMap: ShadowMap | null): void {
+        this._shadowMap = shadowMap;
+        this._shadows.setShadowMap(shadowMap);
+    }
 
-        const NO_SHADOW  : u32 = 0xffffffffu;
-        const SHADOW_MAP : u32 = 0xfffffffeu;
+    /** Shafts from a cascaded shadow map's widest cascade. Use instead of `setShadowMap`. */
+    setCascadedShadowMap(csm: CascadedShadowSource | null): void {
+        this._shadowMap = null;
+        this._shadows.setCascadedShadowMap(csm);
+    }
 
-        @group(0) @binding(0) var scatterExtTex    : texture_storage_3d<rgba16float, write>;
-        @group(0) @binding(1) var shadowDepthTex   : texture_depth_2d;
-        @group(0) @binding(2) var<uniform> params  : FogParams;
-        @group(0) @binding(3) var<storage, read> dirLights : array<DirLightData>;
-        @group(0) @binding(4) var<storage, read> ptLights  : array<PointLightData>;
-        @group(0) @binding(5) var pointShadowAtlas : texture_2d_array<f32>;
+    /** The point lights' cube shadows (`Renderer.cubeMapShadowMap`). */
+    get cubeMapShadowMap(): CubeMapShadowMap | null { return this._cubeMapShadowMap; }
+    setPointShadows(cube: CubeMapShadowMap | null): void {
+        this._cubeMapShadowMap = cube;
+        this._shadows.setPointShadows(cube);
+    }
 
-        fn henyeyGreenstein(cosTheta: f32, g: f32) -> f32 {
-            let g2 = g * g;
-            return (1.0 - g2) / (4.0 * 3.14159265 * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
-        }
-
-        fn smoothFalloff(dist: f32, radius: f32) -> f32 {
-            let r = clamp(dist / radius, 0.0, 1.0);
-            let f = 1.0 - r * r;
-            return f * f;
-        }
-
-        fn dirShadowLookup(worldPos: vec3f, lvp: mat4x4f) -> f32 {
-            let lightClip = lvp * vec4f(worldPos, 1.0);
-            let lightNDC  = lightClip.xyz / lightClip.w;
-            let shadowUV  = vec2f(lightNDC.x * 0.5 + 0.5, 1.0 - (lightNDC.y * 0.5 + 0.5));
-
-            if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0) {
-                return 1.0;
-            }
-
-            let shadowDim = textureDimensions(shadowDepthTex, 0);
-            let coordF = shadowUV * vec2f(shadowDim) - 0.5;
-            let base = vec2i(floor(coordF));
-            var pcf = 0.0;
-            for (var dy = 0; dy <= 1; dy++) {
-                for (var dx = 0; dx <= 1; dx++) {
-                    let sc = clamp(base + vec2i(dx, dy), vec2i(0), vec2i(shadowDim) - 1);
-                    let sd = textureLoad(shadowDepthTex, sc, 0);
-                    pcf += select(0.0, 1.0, lightNDC.z <= sd + 0.005);
-                }
-            }
-            return pcf * 0.25;
-        }
-
-        fn samplePointShadow(worldPos: vec3f, lightPos: vec3f, radius: f32, atlasBase: u32) -> f32 {
-            let dir = worldPos - lightPos;
-            let dist = length(dir);
-            let ad = abs(dir);
-
-            var faceIdx: u32;
-            var faceUV: vec2f;
-            var ma: f32;
-
-            // Face UV mapping matches lookAt conventions with WebGPU Y-down framebuffer
-            if (ad.x >= ad.y && ad.x >= ad.z) {
-                ma = ad.x;
-                if (dir.x > 0.0) {
-                    faceIdx = 0u;
-                    faceUV = vec2f(-dir.z, dir.y);
-                } else {
-                    faceIdx = 1u;
-                    faceUV = vec2f(dir.z, dir.y);
-                }
-            } else if (ad.y >= ad.x && ad.y >= ad.z) {
-                ma = ad.y;
-                if (dir.y > 0.0) {
-                    faceIdx = 2u;
-                    faceUV = vec2f(dir.x, -dir.z);
-                } else {
-                    faceIdx = 3u;
-                    faceUV = vec2f(dir.x, dir.z);
-                }
-            } else {
-                ma = ad.z;
-                if (dir.z > 0.0) {
-                    faceIdx = 4u;
-                    faceUV = vec2f(dir.x, dir.y);
-                } else {
-                    faceIdx = 5u;
-                    faceUV = vec2f(-dir.x, dir.y);
-                }
-            }
-
-            let uv = faceUV / (2.0 * ma) + 0.5;
-            let layer = i32(atlasBase + faceIdx);
-            let texDim = textureDimensions(pointShadowAtlas, 0);
-            let tc = clamp(vec2i(uv * vec2f(texDim)), vec2i(0), vec2i(texDim) - 1);
-            let storedDist = textureLoad(pointShadowAtlas, tc, layer, 0).r;
-            let bias = 0.05 + dist * 0.002;
-            return select(0.0, 1.0, dist <= storedDist + bias);
-        }
-
-        @compute @workgroup_size(4, 4, 4)
-        fn main(@builtin(global_invocation_id) gid : vec3u) {
-            if (gid.x >= params.gridW || gid.y >= params.gridH || gid.z >= params.gridD) { return; }
-
-            let linearD = sliceDepth(f32(gid.z) + 0.5, params.gridNear, params.gridFar, f32(params.gridD));
-
-            if (linearD < params.cameraNear) {
-                textureStore(scatterExtTex, gid, vec4f(0.0));
-                return;
-            }
-
-            let ndcZ = params.cameraFar * (linearD - params.cameraNear)
-                     / ((params.cameraFar - params.cameraNear) * linearD);
-            let uv = (vec2f(f32(gid.x), f32(gid.y)) + 0.5) / vec2f(f32(params.gridW), f32(params.gridH));
-            let ndcX = uv.x * 2.0 - 1.0;
-            let ndcY = (1.0 - uv.y) * 2.0 - 1.0;
-            let world = params.invViewProj * vec4f(ndcX, ndcY, ndcZ, 1.0);
-            let worldPos = world.xyz / world.w;
-
-            let samplePos = worldPos + params.windOffset;
-            let density = params.baseDensity * exp(-params.heightFalloff * max(samplePos.y, 0.0));
-            let extinction = density * params.extinctionCoeff;
-
-            let viewDir = normalize(worldPos - params.cameraPos);
-            var totalScatter = vec3f(0.0);
-
-            // Directional lights
-            for (var di = 0u; di < params.numDirLights; di++) {
-                let dl = dirLights[di];
-                var visibility = 1.0;
-                if (dl.shadowed != 0u && params.hasShadowMap != 0u) {
-                    visibility = dirShadowLookup(worldPos, params.shadowViewProj);
-                }
-                let phase = henyeyGreenstein(dot(viewDir, -normalize(dl.direction)), params.anisotropy);
-                totalScatter += density * dl.color * visibility * phase;
-            }
-
-            // Point lights
-            for (var pi = 0u; pi < params.numPointLights; pi++) {
-                let pl = ptLights[pi];
-                let dist = length(pl.position - worldPos);
-                if (dist > pl.radius) { continue; }
-
-                let attenuation = smoothFalloff(dist, pl.radius);
-                var visibility = 1.0;
-                if (pl.shadowLayer == SHADOW_MAP) {
-                    if (params.hasShadowMap != 0u) {
-                        visibility = dirShadowLookup(worldPos, params.shadowViewProj);
-                    }
-                } else if (pl.shadowLayer != NO_SHADOW) {
-                    visibility = samplePointShadow(worldPos, pl.position, pl.radius, pl.shadowLayer);
-                }
-                let phase = henyeyGreenstein(dot(viewDir, normalize(pl.position - worldPos)), params.anisotropy);
-                totalScatter += density * pl.color * attenuation * visibility * phase;
-            }
-
-            textureStore(scatterExtTex, gid, vec4f(totalScatter, extinction));
-        }
-    `;
-
-    // ── Composite shader (unchanged) ──────────────────────────────────────
-
-    private static _COMPOSITE_SHADER = FroxelGrid.WGSL_HELPERS + /* wgsl */`
-
-        struct CompositeParams {
-            cameraNear   : f32,
-            cameraFar    : f32,
-            gridNear     : f32,
-            gridFar      : f32,
-            gridD        : f32,
-            screenWidth  : f32,
-            screenHeight : f32,
-            _pad         : f32,
-        }
-
-        @group(0) @binding(0) var inputTex     : texture_2d<f32>;
-        @group(0) @binding(1) var depthTex     : texture_depth_2d;
-        @group(0) @binding(2) var outputTex    : texture_storage_2d<rgba16float, write>;
-        @group(0) @binding(3) var accumTex     : texture_3d<f32>;
-        @group(0) @binding(4) var accumSampler : sampler;
-        @group(0) @binding(5) var<uniform> cp  : CompositeParams;
-
-        fn screenHash(p: vec2f) -> f32 {
-            var p3 = fract(vec3f(p.xyx) * 0.1031);
-            p3 += dot(p3, p3.yzx + 33.33);
-            return fract((p3.x + p3.y) * p3.z);
-        }
-
-        @compute @workgroup_size(8, 8)
-        fn main(@builtin(global_invocation_id) gid : vec3u) {
-            let coord = gid.xy;
-            if (f32(coord.x) >= cp.screenWidth || f32(coord.y) >= cp.screenHeight) { return; }
-
-            let sceneColor = textureLoad(inputTex, coord, 0);
-            let depth      = textureLoad(depthTex, coord, 0);
-
-            let linearDepth = cp.cameraNear * cp.cameraFar
-                            / (cp.cameraFar - depth * (cp.cameraFar - cp.cameraNear));
-
-            let sliceFloat = depthToSlice(linearDepth, cp.gridNear, cp.gridFar, cp.gridD);
-
-            let jitter = screenHash(vec2f(coord)) - 0.5;
-            let jitteredSlice = clamp((sliceFloat + jitter) / cp.gridD, 0.0, 1.0);
-
-            let uv = vec2f(f32(coord.x) / cp.screenWidth, f32(coord.y) / cp.screenHeight);
-            let gridUV = vec3f(uv.x, uv.y, jitteredSlice);
-
-            let fogData = textureSampleLevel(accumTex, accumSampler, gridUV, 0.0);
-            let accLight      = fogData.rgb;
-            let transmittance = fogData.a;
-
-            let finalColor = sceneColor.rgb * transmittance + accLight;
-            textureStore(outputTex, coord, vec4f(finalColor, sceneColor.a));
-        }
-    `;
+    /**
+     * Collect the volumetric lights; call each frame before render(). The directional light the
+     * shadow map was rendered from casts shafts through it; a point light the cube map drew reads
+     * its faces; an area light scatters as a point light at its position, shadowed by the 2D map
+     * when it owns it (`ComputeShadows.updateLights`).
+     */
+    updateLights(dirLights: readonly DirectionalLight[], pointLights: readonly PointLight[], areaLights: readonly AreaLight[] = []): void {
+        this._shadows.updateLights(dirLights, pointLights, areaLights, true);
+    }
 
     // ── PostProcessingEffect interface ────────────────────────────────────
 
     initialize(device: GPUDevice, gbuffer: GBuffer, _camera: Camera): void {
         this._device = device;
+        const buffer = (label: string, size: number, usage: number) =>
+            device.createBuffer({ label, size, usage: usage | GPUBufferUsage.COPY_DST });
+        const compute = GPUShaderStage.COMPUTE;
 
-        this._fogParamsBuffer = device.createBuffer({
-            label: 'VolumetricFog/FogParams',
-            size: 224,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        this._compositeParamsBuffer = device.createBuffer({
-            label: 'VolumetricFog/CompositeParams',
-            size: 32,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
+        this._fogParamsBuffer = buffer('VolumetricFog/Params', FOG_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
+        this._compositeParamsBuffer = buffer('VolumetricFog/CompositeParams', COMPOSITE_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
         this._accumSampler = device.createSampler({
             label: 'VolumetricFog/AccumSampler',
             magFilter: 'linear',
             minFilter: 'linear',
         });
 
-        // Initial light storage buffers (minimum 1 element each)
-        this._ensureLightBuffers(1, 1);
-
-        // Dummy directional shadow depth texture (fallback when no ShadowMap active)
-        this._dummyDirShadowTex = device.createTexture({
-            label: 'VolumetricFog/DummyDirShadow',
+        // The media: the height fog's albedo 1 and the sky's scale 1, no local volumes, no sky
+        this._mediaParamsBuffer = buffer('VolumetricFog/MediaParams', MEDIA_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
+        device.queue.writeBuffer(this._mediaParamsBuffer, 0, new Float32Array([1, 1, 1, 1, 0, 0, 0, 0]));
+        this._volumesBuffer = buffer('VolumetricFog/LocalVolumes', LOCAL_FOG_VOLUME_BYTES, GPUBufferUsage.STORAGE);
+        this._noSkyLighting = buffer('VolumetricFog/NoSkyLighting', SKY_LIGHTING_BYTES, GPUBufferUsage.UNIFORM);
+        // no sky occlusion: its parameters zero (off, so skyVisibility is 1) and a 1-texel volume
+        this._noOcclusionParams = buffer('VolumetricFog/NoSkyOcclusion', 32, GPUBufferUsage.UNIFORM);
+        this._noOcclusionVolume = device.createTexture({
+            label: 'VolumetricFog/NoSkyOcclusionVolume',
+            size: [1, 1, 1],
+            dimension: '3d',
+            format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this._noClipProbeGrid = buffer('VolumetricFog/NoClipProbeGrid', CLIP_PROBE_GRID_BYTES, GPUBufferUsage.UNIFORM);
+        this._noClipProbes = buffer('VolumetricFog/NoClipProbes', 64, GPUBufferUsage.STORAGE);
+        // no raymarched spot shafts
+        this._noShafts = device.createTexture({
+            label: 'VolumetricFog/NoShafts',
             size: [1, 1],
-            format: 'depth32float',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+            format: 'rgba16float',
+            usage: GPUTextureUsage.TEXTURE_BINDING,
         });
 
-        // Point shadow atlas view
-        if (this._cubeMapShadowMap) {
-            this._pointShadowAtlasView = this._cubeMapShadowMap.distanceTexture.createView({
-                dimension: '2d-array',
-            });
-        } else {
-            this._dummyPointShadowTex = device.createTexture({
-                label: 'VolumetricFog/DummyPointShadow',
-                size: [1, 1, 6],
-                format: 'r32float',
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-            });
-            // Fill with large distance so samplePointShadow returns 1.0 (no occlusion)
-            const maxDist = new Float32Array(6).fill(1e10);
-            device.queue.writeTexture(
-                { texture: this._dummyPointShadowTex },
-                maxDist,
-                { bytesPerRow: 4, rowsPerImage: 1 },
-                [1, 1, 6],
-            );
-            this._pointShadowAtlasView = this._dummyPointShadowTex.createView({
-                dimension: '2d-array',
-            });
-        }
-
-        // ── Injection pipeline ──
-        const injectModule = device.createShaderModule({
-            label: 'VolumetricFog/InjectShader',
-            code: VolumetricFogEffect._INJECT_SHADER,
-        });
-
+        // ── Injection pipeline: its own bindings 0, 2, 10-12, 18-22, the lights at 1, 3-9 ──
         this._injectBGL = device.createBindGroupLayout({
-            label: 'VolumetricFog/Inject BGL',
+            label: 'VolumetricFog/InjectBGL',
             entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-                { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d-array' } },
+                { binding: 0, visibility: compute, storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
+                { binding: 2, visibility: compute, buffer: { type: 'uniform' } },
+                { binding: 10, visibility: compute, buffer: { type: 'uniform' } },
+                { binding: 11, visibility: compute, buffer: { type: 'read-only-storage' } },
+                { binding: 12, visibility: compute, buffer: { type: 'uniform' } },
+                // the sky occlusion (volumetric_fog_media.wgsl)
+                { binding: 18, visibility: compute, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 19, visibility: compute, sampler: { type: 'filtering' } },
+                { binding: 20, visibility: compute, buffer: { type: 'uniform' } },
+                // a clipmap's probes (volumetric_fog_media.wgsl)
+                { binding: 21, visibility: compute, buffer: { type: 'uniform' } },
+                { binding: 22, visibility: compute, buffer: { type: 'read-only-storage' } },
+                ...ComputeShadows.layoutEntries(),
             ],
         });
-
         this._injectPipeline = device.createComputePipeline({
-            label: 'VolumetricFog/InjectPipeline',
+            label: 'VolumetricFog/Inject',
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._injectBGL] }),
-            compute: { module: injectModule, entryPoint: 'main' },
+            compute: { module: device.createShaderModule({ label: 'VolumetricFog/Inject', code: INJECT_WGSL }), entryPoint: 'main' },
         });
-
-        this._rebuildInjectBG();
 
         // ── Composite pipeline ──
-        const compositeModule = device.createShaderModule({
-            label: 'VolumetricFog/CompositeShader',
-            code: VolumetricFogEffect._COMPOSITE_SHADER,
-        });
-
         const compositeBGL = device.createBindGroupLayout({
-            label: 'VolumetricFog/Composite BGL',
+            label: 'VolumetricFog/CompositeBGL',
             entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
-                { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+                { binding: 0, visibility: compute, texture: { sampleType: 'unfilterable-float' } },
+                { binding: 1, visibility: compute, texture: { sampleType: 'depth' } },
+                { binding: 2, visibility: compute, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+                { binding: 3, visibility: compute, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 4, visibility: compute, sampler: { type: 'filtering' } },
+                { binding: 5, visibility: compute, buffer: { type: 'uniform' } },
+                { binding: 6, visibility: compute, texture: { sampleType: 'unfilterable-float' } },
             ],
         });
-
         this._compositePipeline = device.createComputePipeline({
-            label: 'VolumetricFog/CompositePipeline',
+            label: 'VolumetricFog/Composite',
             layout: device.createPipelineLayout({ bindGroupLayouts: [compositeBGL] }),
-            compute: { module: compositeModule, entryPoint: 'main' },
+            compute: { module: device.createShaderModule({ label: 'VolumetricFog/Composite', code: COMPOSITE_WGSL }), entryPoint: 'main' },
         });
 
         this._buildCompositeBG(gbuffer.colorTexture, gbuffer.depthTexture, gbuffer.outputTexture);
         this.initialized = true;
     }
 
-    private _ensureLightBuffers(dirCount: number, pointCount: number): void {
-        const device = this._device!;
-        const dirSize  = Math.max(dirCount, 1) * DIR_LIGHT_STRIDE;
-        const pointSize = Math.max(pointCount, 1) * POINT_LIGHT_STRIDE;
-
-        if (dirSize > this._dirLightsCapacity) {
-            this._dirLightsBuffer?.destroy();
-            this._dirLightsBuffer = device.createBuffer({
-                label: 'VolumetricFog/DirLights',
-                size: dirSize,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            });
-            this._dirLightsCapacity = dirSize;
-            this._injectBGDirty = true;
-        }
-
-        if (pointSize > this._pointLightsCapacity) {
-            this._pointLightsBuffer?.destroy();
-            this._pointLightsBuffer = device.createBuffer({
-                label: 'VolumetricFog/PointLights',
-                size: pointSize,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            });
-            this._pointLightsCapacity = pointSize;
-            this._injectBGDirty = true;
-        }
-    }
-
     private _rebuildInjectBG(): void {
-        if (!this._injectBGL || !this._device) return;
-        this._injectBG = this._device.createBindGroup({
-            label: 'VolumetricFog/Inject BG',
-            layout: this._injectBGL,
+        const device = this._device!;
+        const target = this._froxelGrid.scatterExtinctionTex;
+        this._injectBG = device.createBindGroup({
+            label: 'VolumetricFog/InjectBG',
+            layout: this._injectBGL!,
             entries: [
-                { binding: 0, resource: this._froxelGrid.scatterExtinctionTex.createView() },
-                { binding: 1, resource: (this._shadowMap?.depthTexture ?? this._dummyDirShadowTex!).createView() },
+                { binding: 0, resource: target.createView() },
                 { binding: 2, resource: { buffer: this._fogParamsBuffer! } },
-                { binding: 3, resource: { buffer: this._dirLightsBuffer! } },
-                { binding: 4, resource: { buffer: this._pointLightsBuffer! } },
-                { binding: 5, resource: this._pointShadowAtlasView! },
+                { binding: 10, resource: { buffer: this._mediaParamsBuffer! } },
+                { binding: 11, resource: { buffer: this._volumesBuffer! } },
+                { binding: 12, resource: { buffer: this._noSkyLighting! } },
+                { binding: 18, resource: this._noOcclusionVolume!.createView() },
+                { binding: 19, resource: this._accumSampler! },
+                { binding: 20, resource: { buffer: this._noOcclusionParams! } },
+                { binding: 21, resource: { buffer: this._noClipProbeGrid! } },
+                { binding: 22, resource: { buffer: this._noClipProbes! } },
+                ...this._shadows.entries(),
             ],
         });
-        this._injectBGDirty = false;
-    }
-
-    /**
-     * Pack light data into storage buffers. Call each frame before render().
-     */
-    updateLights(dirLights: readonly DirectionalLight[], pointLights: readonly PointLight[], areaLights: readonly AreaLight[] = []): void {
-        if (!this._device) return;
-
-        // Filter volumetric directional lights
-        const volDirLights: DirectionalLight[] = [];
-        for (let i = 0; i < dirLights.length; i++) {
-            if (dirLights[i].volumetric) volDirLights.push(dirLights[i]);
-        }
-        this._numDirLights = volDirLights.length;
-        // Merge point lights and area lights (area lights treated as positional for fog)
-        const allPositional: PositionalLight[] = [...pointLights, ...areaLights];
-        this._numPointLights = allPositional.length;
-
-        this._ensureLightBuffers(this._numDirLights, this._numPointLights);
-        if (this._injectBGDirty) this._rebuildInjectBG();
-
-        // The 2D shadow map shadows the light it was rendered from (sm.light, as for the
-        // renderer's own map) or that owns it (light.shadowMap), or, when neither is known, the
-        // first directional light, as in the Rust fog.
-        const sm = this._shadowMap;
-        const owns = (l: DirectionalLight | AreaLight) => sm !== null && (sm.light === l || l.shadowMap === sm);
-        const smOwned = dirLights.some(owns) || areaLights.some(owns);
-        const firstDir = dirLights[0];
-        const dirShadowed = (l: DirectionalLight) =>
-            sm !== null && (smOwned ? owns(l) : l === firstDir);
-
-        // A positional light reads its own cube faces, if the cube map drew it last frame.
-        const cubeLights = this._cubeMapShadowMap?.lights ?? [];
-
-        // Pack DirLightData (32 bytes = 8 floats each)
-        if (this._numDirLights > 0) {
-            const data = new Float32Array(this._numDirLights * 8);
-            const uintView = new Uint32Array(data.buffer);
-            for (let i = 0; i < this._numDirLights; i++) {
-                const light = volDirLights[i];
-                const ec = light.effectiveColor;
-                const off = i * 8;
-                data[off]     = light.direction[0];
-                data[off + 1] = light.direction[1];
-                data[off + 2] = light.direction[2];
-                uintView[off + 3] = dirShadowed(light) ? 1 : 0;
-                data[off + 4] = ec[0];
-                data[off + 5] = ec[1];
-                data[off + 6] = ec[2];
-                // off+7 = pad
-            }
-            this._device.queue.writeBuffer(this._dirLightsBuffer!, 0, data.buffer as ArrayBuffer);
-        }
-
-        // Pack PointLightData (32 bytes = 8 floats each) — includes area lights as positional
-        if (this._numPointLights > 0) {
-            const data = new Float32Array(this._numPointLights * 8);
-            const uintView = new Uint32Array(data.buffer);
-            for (let i = 0; i < this._numPointLights; i++) {
-                const light = allPositional[i];
-                light.updateModelMatrix();
-                const wm = light.worldMatrix.internalMat4;
-                const off = i * 8;
-                data[off]     = wm[12];  // world X
-                data[off + 1] = wm[13];  // world Y
-                data[off + 2] = wm[14];  // world Z
-                data[off + 3] = light.radius;
-                if (light.volumetric) {
-                    const ec = light.effectiveColor;
-                    data[off + 4] = ec[0];
-                    data[off + 5] = ec[1];
-                    data[off + 6] = ec[2];
-                }
-                // non-volumetric: color stays (0,0,0) — scatter contribution is zero
-                const cubeIndex = cubeLights.indexOf(light);
-                uintView[off + 7] = cubeIndex >= 0 ? cubeIndex * 6
-                    : (light instanceof AreaLight && owns(light)) ? SHADOW_MAP
-                    : NO_SHADOW;
-            }
-            this._device.queue.writeBuffer(this._pointLightsBuffer!, 0, data.buffer as ArrayBuffer);
-        }
+        this._injectTarget = target;
     }
 
     private _buildCompositeBG(input: GPUTexture, depth: GPUTexture, output: GPUTexture): void {
-        const bgl = this._compositePipeline!.getBindGroupLayout(0);
+        const accum = this._froxelGrid.accumTex;
         this._compositeBG = this._device!.createBindGroup({
-            label: 'VolumetricFog/Composite BG',
-            layout: bgl,
+            label: 'VolumetricFog/CompositeBG',
+            layout: this._compositePipeline!.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: input.createView() },
                 { binding: 1, resource: depth.createView() },
                 { binding: 2, resource: output.createView() },
-                { binding: 3, resource: this._froxelGrid.accumTex.createView() },
+                { binding: 3, resource: accum.createView() },
                 { binding: 4, resource: this._accumSampler! },
                 { binding: 5, resource: { buffer: this._compositeParamsBuffer! } },
+                { binding: 6, resource: this._noShafts!.createView() },
             ],
         });
         this._currentInput  = input;
         this._currentDepth  = depth;
         this._currentOutput = output;
+        this._currentAccum  = accum;
     }
 
     render(
@@ -614,62 +373,62 @@ class VolumetricFogEffect extends PostProcessingEffect {
 
         const device = this._device!;
         const grid = this._froxelGrid;
-        const time = (performance.now() - this._startTime) / 1000;
+        const time = this.time ?? (performance.now() - this._startTime) / 1000;
 
-        // ── Update fog params ──
-        const vp = mat4.create();
-        mat4.multiply(vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
-        mat4.invert(this._invVP, vp);
-
-        const iv = camera.inverseViewMatrix.internalMat4;
-
-        const fogParams = new Float32Array(56); // 224 bytes
-        fogParams.set(this._invVP as unknown as Float32Array, 0);                  // invViewProj
-        fogParams[16] = iv[12]; fogParams[17] = iv[13]; fogParams[18] = iv[14];    // cameraPos
-        fogParams[19] = this.baseDensity;
-        fogParams[20] = this.windDir[0] * time;
-        fogParams[21] = this.windDir[1] * time;
-        fogParams[22] = this.windDir[2] * time;
-        fogParams[23] = this.heightFalloff;
-        fogParams[24] = grid.near;                                                 // gridNear
-        fogParams[25] = grid.far;                                                  // gridFar
-        fogParams[26] = time;
-        new Uint32Array(fogParams.buffer, 108, 1)[0] = grid.gridW;                 // gridW
-        new Uint32Array(fogParams.buffer, 112, 1)[0] = grid.gridH;                 // gridH
-        new Uint32Array(fogParams.buffer, 116, 1)[0] = grid.gridD;                 // gridD
-        fogParams[30] = camera.near;                                               // cameraNear
-        fogParams[31] = camera.far;                                                // cameraFar
-        fogParams[32] = this.extinctionCoeff;
-        fogParams[33] = this.anisotropy;
-        new Uint32Array(fogParams.buffer, 136, 1)[0] = this._numDirLights;
-        new Uint32Array(fogParams.buffer, 140, 1)[0] = this._numPointLights;
-        // shadowViewProj: mat4x4f @ byte 144 (float index 36)
-        if (this._shadowMap) {
-            fogParams.set(this._shadowMap.lightViewProjMatrix, 36);
-            new Uint32Array(fogParams.buffer, 208, 1)[0] = 1;                     // hasShadowMap
+        // the lights, and the bind group when they, a shadow map or the grid changed
+        if (this._shadows.prepare(device) || grid.scatterExtinctionTex !== this._injectTarget) {
+            this._rebuildInjectBG();
         }
 
-        device.queue.writeBuffer(this._fogParamsBuffer!, 0, fogParams.buffer as ArrayBuffer);
+        mat4.multiply(this._vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
+        mat4.invert(this._invVP, this._vp);
+        const iv = camera.inverseViewMatrix.internalMat4;
 
-        // ── Update composite params ──
-        const compositeParams = new Float32Array(8);
-        compositeParams[0] = camera.near;
-        compositeParams[1] = camera.far;
-        compositeParams[2] = grid.near;
-        compositeParams[3] = grid.far;
-        compositeParams[4] = grid.gridD;
-        compositeParams[5] = width;
-        compositeParams[6] = height;
-        device.queue.writeBuffer(this._compositeParamsBuffer!, 0, compositeParams.buffer as ArrayBuffer);
+        // ── FogParams ──
+        const f32 = new Float32Array(this._fogParams);
+        const u32 = new Uint32Array(this._fogParams);
+        f32.set(this._invVP, 0);
+        f32.set([iv[12], iv[13], iv[14]], 16);
+        f32[19] = this.baseDensity;
+        f32.set(this.windDir.map((w) => w * time), 20);
+        f32[23] = this.heightFalloff;
+        f32.set(this.ambient, 24);
+        f32[27] = this.fogHeight;
+        f32[28] = grid.near;
+        f32[29] = grid.far;
+        f32[30] = camera.near;
+        f32[31] = camera.far;
+        u32[32] = grid.gridW;
+        u32[33] = grid.gridH;
+        u32[34] = grid.gridD;
+        u32[35] = this._shadows.dirCount;
+        u32[36] = this._shadows.pointCount;
+        u32[37] = this._shadows.hasShadowMap ? 1 : 0;
+        u32[38] = this._shadows.hasPointShadows ? 1 : 0;
+        f32[39] = this.extinctionCoeff;
+        f32[40] = this.anisotropy;
+        f32[41] = this.startDistance;
+        u32[42] = grid.isTemporal ? this._frame : 0;
+        u32[43] = 0;                       // skipSpots: no raymarched spot shafts
+        f32.set([0, 0, 0, 1], 44);         // clipPlane: keep all the fog
+        f32[48] = this.reach();
+        this._frame = this._frame % 1024 + 1;
+        device.queue.writeBuffer(this._fogParamsBuffer!, 0, this._fogParams);
 
-        // Rebuild composite bind group on texture change (ping-pong)
-        if (input !== this._currentInput || depth !== this._currentDepth || output !== this._currentOutput) {
+        // ── CompositeParams ──
+        device.queue.writeBuffer(this._compositeParamsBuffer!, 0, new Float32Array([
+            camera.near, camera.far, grid.near, grid.far, grid.gridD, width, height, 0,
+        ]));
+
+        // Rebuild composite bind group on texture change (ping-pong, or a resized grid)
+        if (input !== this._currentInput || depth !== this._currentDepth || output !== this._currentOutput
+            || grid.accumTex !== this._currentAccum) {
             this._buildCompositeBG(input, depth, output);
         }
 
-        // ── Pass 1: Fog injection ──
+        // ── 1. inject density and lighting into the froxels ──
         const injectPass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Inject', timestampWrites: gpuPass('VolumetricFog/Inject') });
-        injectPass.setPipeline(this._injectPipeline!);
+        injectPass.setPipeline(this._injectPipeline);
         injectPass.setBindGroup(0, this._injectBG!);
         injectPass.dispatchWorkgroups(
             Math.ceil(grid.gridW / 4),
@@ -678,21 +437,19 @@ class VolumetricFogEffect extends PostProcessingEffect {
         );
         injectPass.end();
 
-        // ── Pass 2: Temporal reprojection blend ──
+        // ── 2. temporal reprojection (no-op unless temporal), 3. front-to-back accumulation ──
         grid.temporalBlend(
             commandEncoder,
-            this._invVP as unknown as Float32Array,
-            vp as unknown as Float32Array,
+            this._invVP as Float32Array,
+            this._vp as Float32Array,
             camera.near,
             camera.far
         );
-
-        // ── Pass 3: Front-to-back accumulation ──
         grid.accumulate(commandEncoder);
 
-        // ── Pass 4: Composite fog onto scene ──
+        // ── 4. composite over the scene ──
         const compositePass = commandEncoder.beginComputePass({ label: 'VolumetricFog/Composite', timestampWrites: gpuPass('VolumetricFog/Composite') });
-        compositePass.setPipeline(this._compositePipeline!);
+        compositePass.setPipeline(this._compositePipeline);
         compositePass.setBindGroup(0, this._compositeBG!);
         compositePass.dispatchWorkgroups(
             Math.ceil(width / 8),
@@ -706,20 +463,22 @@ class VolumetricFogEffect extends PostProcessingEffect {
     }
 
     destroy(): void {
-        this._fogParamsBuffer?.destroy();
-        this._compositeParamsBuffer?.destroy();
-        this._dirLightsBuffer?.destroy();
-        this._pointLightsBuffer?.destroy();
-        this._dummyPointShadowTex?.destroy();
-        this._dummyDirShadowTex?.destroy();
+        for (const b of [
+            this._fogParamsBuffer, this._compositeParamsBuffer, this._mediaParamsBuffer, this._volumesBuffer,
+            this._noSkyLighting, this._noOcclusionParams, this._noClipProbeGrid, this._noClipProbes,
+        ]) b?.destroy();
+        this._noOcclusionVolume?.destroy();
+        this._noShafts?.destroy();
+        this._shadows.destroy();
         this._fogParamsBuffer = null;
         this._compositeParamsBuffer = null;
-        this._dirLightsBuffer = null;
-        this._pointLightsBuffer = null;
         this._injectPipeline = null;
         this._compositePipeline = null;
         this._injectBG = null;
+        this._injectTarget = null;
         this._compositeBG = null;
+        this._currentInput = null;
+        this._currentAccum = null;
     }
 }
 

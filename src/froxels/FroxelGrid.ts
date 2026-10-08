@@ -1,4 +1,11 @@
 import { gpuPass } from '../profiling/Profiler';
+import { assemble } from '../materials/shaders/ShaderUtils';
+import froxelCommon from '../../rust/kansei-core/src/shaders/froxel_common.wgsl?raw';
+import froxelAccumulate from '../../rust/kansei-core/src/shaders/froxel_accumulate.wgsl?raw';
+import froxelTemporal from '../../rust/kansei-core/src/shaders/froxel_temporal.wgsl?raw';
+
+/** Bytes of the WGSL `TemporalParams` (`froxel_temporal.wgsl`). */
+const TEMPORAL_PARAMS_BYTES = 176;
 
 export interface FroxelGridOptions {
     gridW?: number;  // default 160
@@ -39,29 +46,12 @@ class FroxelGrid {
     private _hasPrevFrame = false;
 
     /**
-     * WGSL helper functions for exponential depth slicing and coordinate conversion.
-     * Inject into consumer shaders via string concatenation.
+     * WGSL helpers for exponential depth slicing and froxel <-> world conversion, in the camera's
+     * [0,1] depth convention (`sliceDepth`, `depthToSlice`, `linearToNdcDepth`,
+     * `ndcToLinearDepth`, `froxelToWorld`). Prepend to consumer shaders that read the grid. Rust:
+     * `froxels::FROXEL_WGSL_HELPERS` (`froxel_common.wgsl`).
      */
-    static readonly WGSL_HELPERS = /* wgsl */`
-        fn sliceDepth(i: f32, near: f32, far: f32, numSlices: f32) -> f32 {
-            return near * pow(far / near, i / numSlices);
-        }
-
-        fn depthToSlice(linearDepth: f32, near: f32, far: f32, numSlices: f32) -> f32 {
-            return numSlices * log(linearDepth / near) / log(far / near);
-        }
-
-        fn froxelToWorld(coord: vec3f, invViewProj: mat4x4f, near: f32, far: f32, gridSize: vec3f) -> vec3f {
-            let uv = (coord.xy + 0.5) / gridSize.xy;
-            let linearD = sliceDepth(coord.z + 0.5, near, far, gridSize.z);
-            // Reverse perspective: linear depth -> NDC Z (WebGPU [0,1] range)
-            let ndcZ = far * (linearD - near) / (linearD * (far - near));
-            let ndcX = uv.x * 2.0 - 1.0;
-            let ndcY = (1.0 - uv.y) * 2.0 - 1.0;
-            let world = invViewProj * vec4f(ndcX, ndcY, ndcZ, 1.0);
-            return world.xyz / world.w;
-        }
-    `;
+    static readonly WGSL_HELPERS: string = froxelCommon;
 
     constructor(device: GPUDevice, options?: FroxelGridOptions) {
         this._device = device;
@@ -96,6 +86,18 @@ class FroxelGrid {
     get gridD(): number { return this._gridD; }
     get near(): number { return this._near; }
     get far(): number { return this._far; }
+    /** Whether injected froxels blend with reprojected history (`temporal`). */
+    get isTemporal(): boolean { return this._temporal; }
+    /** Weight of the current frame when `temporal` is on. */
+    get blendFactor(): number { return this._blendFactor; }
+
+    /**
+     * Forget the temporal history, so the next frame uses only its own injection. Call on a
+     * camera cut, or reprojection smears the previous shot's fog into the new one.
+     */
+    resetHistory(): void {
+        this._hasPrevFrame = false;
+    }
 
     private _createTextures(): void {
         const texUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
@@ -130,51 +132,7 @@ class FroxelGrid {
     }
 
     private _createAccumPipeline(): void {
-        const shaderCode = FroxelGrid.WGSL_HELPERS + /* wgsl */`
-
-            struct GridParams {
-                near  : f32,
-                far   : f32,
-                gridW : u32,
-                gridH : u32,
-                gridD : u32,
-                _pad0 : f32,
-                _pad1 : f32,
-                _pad2 : f32,
-            }
-
-            @group(0) @binding(0) var scatterExtTex : texture_3d<f32>;
-            @group(0) @binding(1) var accumOut       : texture_storage_3d<rgba16float, write>;
-            @group(0) @binding(2) var<uniform> gp    : GridParams;
-
-            @compute @workgroup_size(8, 8)
-            fn main(@builtin(global_invocation_id) gid : vec3u) {
-                let x = gid.x;
-                let y = gid.y;
-                if (x >= gp.gridW || y >= gp.gridH) { return; }
-
-                var transmittance = 1.0;
-                var accLight = vec3f(0.0);
-
-                for (var z = 0u; z < gp.gridD; z++) {
-                    let data = textureLoad(scatterExtTex, vec3u(x, y, z), 0);
-                    let scatter    = data.rgb;
-                    let extinction = data.a;
-
-                    let d0 = sliceDepth(f32(z), gp.near, gp.far, f32(gp.gridD));
-                    let d1 = sliceDepth(f32(z + 1u), gp.near, gp.far, f32(gp.gridD));
-                    let thickness = d1 - d0;
-
-                    let sliceT = exp(-extinction * thickness);
-
-                    // Integrate in-scattered light over this slice
-                    accLight += transmittance * scatter * (1.0 - sliceT) / max(extinction, 0.0001);
-                    transmittance *= sliceT;
-
-                    textureStore(accumOut, vec3u(x, y, z), vec4f(accLight, transmittance));
-                }
-            }
-        `;
+        const shaderCode = assemble([froxelCommon, froxelAccumulate]);
 
         const module = this._device.createShaderModule({
             label: 'FroxelGrid/AccumShader',
@@ -209,70 +167,7 @@ class FroxelGrid {
 
     // ── Temporal blend shader ──────────────────────────────────────────────
 
-    private static _TEMPORAL_SHADER = FroxelGrid.WGSL_HELPERS + /* wgsl */`
-
-        struct TemporalParams {
-            currentInvVP : mat4x4f,
-            prevVP       : mat4x4f,
-            gridNear     : f32,
-            gridFar      : f32,
-            cameraNear   : f32,
-            cameraFar    : f32,
-            gridW        : u32,
-            gridH        : u32,
-            gridD        : u32,
-            blendFactor  : f32,
-            hasPrevFrame : u32,
-        }
-
-        @group(0) @binding(0) var currentTex  : texture_3d<f32>;
-        @group(0) @binding(1) var historyIn   : texture_3d<f32>;
-        @group(0) @binding(2) var historySamp  : sampler;
-        @group(0) @binding(3) var historyOut  : texture_storage_3d<rgba16float, write>;
-        @group(0) @binding(4) var<uniform> tp : TemporalParams;
-
-        @compute @workgroup_size(4, 4, 4)
-        fn main(@builtin(global_invocation_id) gid : vec3u) {
-            if (gid.x >= tp.gridW || gid.y >= tp.gridH || gid.z >= tp.gridD) { return; }
-
-            let current = textureLoad(currentTex, gid, 0);
-
-            // Compute world position of this froxel
-            let linearD = sliceDepth(f32(gid.z) + 0.5, tp.gridNear, tp.gridFar, f32(tp.gridD));
-            let n = tp.cameraNear;
-            let f = tp.cameraFar;
-            let ndcZ = f * (linearD - n) / ((f - n) * linearD);
-            let uv = (vec2f(f32(gid.x), f32(gid.y)) + 0.5) / vec2f(f32(tp.gridW), f32(tp.gridH));
-            let ndcX = uv.x * 2.0 - 1.0;
-            let ndcY = (1.0 - uv.y) * 2.0 - 1.0;
-            let world = tp.currentInvVP * vec4f(ndcX, ndcY, ndcZ, 1.0);
-            let worldPos = world.xyz / world.w;
-
-            // Reproject into previous frame's clip space
-            let prevClip = tp.prevVP * vec4f(worldPos, 1.0);
-            let prevNDC = prevClip.xyz / prevClip.w;
-
-            // Convert to froxel UVW in previous frame
-            let prevUV = vec2f(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
-            let prevLinearD = n * f / (f - prevNDC.z * (f - n));
-            let prevSlice = depthToSlice(prevLinearD, tp.gridNear, tp.gridFar, f32(tp.gridD));
-            // depthToSlice already puts slice k's centre at k + 0.5
-            let prevUVW = vec3f(prevUV, prevSlice / f32(tp.gridD));
-
-            // Bounds check; behind the previous camera the divide by w mirrors the point
-            let valid = all(prevUVW >= vec3f(0.0)) && all(prevUVW <= vec3f(1.0))
-                     && prevClip.w > 0.0 && tp.hasPrevFrame != 0u;
-
-            // Sample history with trilinear filtering
-            let history = textureSampleLevel(historyIn, historySamp, prevUVW, 0.0);
-
-            // Exponential blend: 100% current when invalid/first frame
-            let alpha = select(1.0, tp.blendFactor, valid);
-            let result = mix(history, current, alpha);
-
-            textureStore(historyOut, gid, result);
-        }
-    `;
+    private static _TEMPORAL_SHADER = assemble([froxelCommon, froxelTemporal]);
 
     private _createTemporalResources(): void {
         const device = this._device;
@@ -299,7 +194,7 @@ class FroxelGrid {
 
         this._temporalParamsBuffer = device.createBuffer({
             label: 'FroxelGrid/TemporalParams',
-            size: 256,
+            size: TEMPORAL_PARAMS_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -398,8 +293,7 @@ class FroxelGrid {
         const readIdx = this._frameIdx;
         const writeIdx = 1 - this._frameIdx;
 
-        // Upload temporal params (256 bytes)
-        const buf = new ArrayBuffer(256);
+        const buf = new ArrayBuffer(TEMPORAL_PARAMS_BYTES);
         const f32 = new Float32Array(buf);
         const u32 = new Uint32Array(buf);
 

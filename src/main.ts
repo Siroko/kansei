@@ -69,6 +69,8 @@ export { DirectionalLight } from "./lights/DirectionalLight";
 export { PointLight } from "./lights/PointLight";
 export { ShadowMap } from "./shadows/ShadowMap";
 export { CubeMapShadowMap } from "./shadows/CubeMapShadowMap";
+export { ComputeShadows, COMPUTE_SHADOWS_WGSL } from "./shadows/ComputeShadows";
+export type { CascadedShadowSource } from "./shadows/ComputeShadows";
 export { PathTracerMaterial } from "./pathtracer/PathTracerMaterial";
 export { BVHBuilder } from "./pathtracer/BVHBuilder";
 export { PathTracerEffect } from "./pathtracer/PathTracerEffect";
