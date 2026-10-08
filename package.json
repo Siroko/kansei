@@ -1,7 +1,26 @@
 {
   "name": "kansei",
   "private": false,
-  "version": "0.0.11",
+  "version": "0.1.0",
+  "description": "A WebGPU engine in TypeScript: deferred and forward rendering, shadows, voxel and ray-traced GI, post-processing, GPU fluids, cluster LOD, animation and KTX2 textures, sharing its WGSL with the Rust engine in the same repository.",
+  "keywords": [
+    "webgpu",
+    "wgsl",
+    "3d",
+    "rendering",
+    "engine",
+    "global-illumination",
+    "ray-tracing",
+    "gpu",
+    "compute",
+    "ktx2"
+  ],
+  "license": "MIT",
+  "author": "Felix Martinez",
+  "homepage": "https://kansei.graphics",
+  "bugs": {
+    "url": "https://github.com/Siroko/kansei/issues"
+  },
   "type": "module",
   "repository": {
     "type": "git",
@@ -15,20 +34,19 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "prepare": "husky install",
-    "prepublishOnly": "npm run build",
     "copy-examples": "cp -r examples dist/examples && rm -rf dist/examples/pack",
     "update-imports": "node scripts/bundle-examples-update-imports.cjs",
     "copy-site": "cp -R site/. dist/",
     "copy-wasm-examples": "bash scripts/fetch-wasm-examples.sh",
     "check-no-packs": "bash scripts/check-no-packs.sh",
-    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site && npm run copy-wasm-examples && npm run check-no-packs"
+    "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site && npm run copy-wasm-examples && npm run check-no-packs",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": "24.x"
   },
   "peerDependencies": {
-    "@webgpu/types": "^0.1.48",
-    "gl-matrix": "^3.4.3"
+    "@webgpu/types": "^0.1.48"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.5.0",
@@ -56,9 +74,22 @@
     ],
     "**/*": "prettier --write --ignore-unknown"
   },
-  "main": "dist/main.js",
-  "types": "dist/main.d.ts",
+  "main": "./dist/main.js",
+  "module": "./dist/main.js",
+  "types": "./dist/main.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/main.d.ts",
+      "import": "./dist/main.js",
+      "default": "./dist/main.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist"
-  ]
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "gl-matrix": "^3.4.3"
+  }
 }
