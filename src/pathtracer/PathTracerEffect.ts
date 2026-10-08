@@ -69,6 +69,13 @@ export interface PathTracerOptions {
     fogAnisotropy?: number;
     /** Exponential height falloff for fog density. Default: 0.1 */
     fogHeightFalloff?: number;
+    /**
+     * Reference mode (the Rust engine's path tracer): camera rays through the BVH instead of
+     * GBuffer primary hits, averaged progressively over frames while nothing changes, written as
+     * HDR radiance for a `ToneMapEffect` after this effect. The denoisers, ReSTIR, probes and voxels
+     * are skipped. Default: false
+     */
+    reference?: boolean;
 }
 
 /** GPU-packed light data — 64 bytes, matches LightData WGSL struct. */
@@ -106,6 +113,16 @@ export class PathTracerEffect extends PostProcessingEffect {
     private _fogDensity: number;
     private _fogAnisotropy: number;
     private _fogHeightFalloff: number;
+    private _reference: boolean;
+
+    // Reference mode: running average ping-pong (rgba16float, trace size), frames averaged since
+    // the last reset, and what the last frame was traced with (reset when it changes)
+    private _accumTexA: GPUTexture | null = null;
+    private _accumTexB: GPUTexture | null = null;
+    private _accumPing: boolean = true;
+    private _accumFrame: number = 0;
+    private _accumSnapshot: Uint32Array = new Uint32Array(0);
+    private _lightData: Float32Array = new Float32Array(MAX_LIGHTS * LIGHT_STRIDE_FLOATS);
 
     // Voxel grid
     private _voxelGrid: GPUBuffer | null = null;
@@ -234,6 +251,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         this._fogDensity = options.fogDensity ?? 0;
         this._fogAnisotropy = options.fogAnisotropy ?? 0.6;
         this._fogHeightFalloff = options.fogHeightFalloff ?? 0.1;
+        this._reference = options.reference ?? false;
     }
 
     /** Access the BVH builder for external configuration. */
@@ -249,15 +267,15 @@ export class PathTracerEffect extends PostProcessingEffect {
 
     /** Samples per pixel per frame. */
     get spp(): number { return this._spp; }
-    set spp(v: number) { this._spp = Math.max(1, Math.round(v)); }
+    set spp(v: number) { this._spp = Math.max(1, Math.round(v)); this.resetAccumulation(); }
 
     /** Use blue noise sampling (vs white noise). */
     get useBlueNoise(): boolean { return this._useBlueNoise; }
-    set useBlueNoise(v: boolean) { this._useBlueNoise = v; }
+    set useBlueNoise(v: boolean) { this._useBlueNoise = v; this.resetAccumulation(); }
 
     /** Use fixed seed (no temporal animation). */
     get fixedSeed(): boolean { return this._fixedSeed; }
-    set fixedSeed(v: boolean) { this._fixedSeed = v; }
+    set fixedSeed(v: boolean) { this._fixedSeed = v; this.resetAccumulation(); }
 
     /** GI trace resolution scale. */
     get traceScale(): number { return this._traceScale; }
@@ -276,11 +294,11 @@ export class PathTracerEffect extends PostProcessingEffect {
 
     /** Maximum path bounces for indirect illumination. */
     get maxBounces(): number { return this._maxBounces; }
-    set maxBounces(v: number) { this._maxBounces = Math.max(0, Math.round(v)); }
+    set maxBounces(v: number) { this._maxBounces = Math.max(0, Math.round(v)); this.resetAccumulation(); }
 
     /** Ambient/sky color added when bounce rays miss geometry. */
     get ambientColor(): [number, number, number] { return this._ambientColor; }
-    set ambientColor(v: [number, number, number]) { this._ambientColor = v; }
+    set ambientColor(v: [number, number, number]) { this._ambientColor = v; this.resetAccumulation(); }
 
     /** Enable SVGF variance-guided spatial denoising. */
     get useSVGF(): boolean { return this._useSVGF; }
@@ -343,6 +361,24 @@ export class PathTracerEffect extends PostProcessingEffect {
     /** Exponential height falloff for fog density. */
     get fogHeightFalloff(): number { return this._fogHeightFalloff; }
     set fogHeightFalloff(v: number) { this._fogHeightFalloff = Math.max(0, v); }
+
+    /** Reference mode: camera rays, progressive accumulation, HDR output (see `PathTracerOptions.reference`). */
+    get reference(): boolean { return this._reference; }
+    set reference(v: boolean) {
+        if (v !== this._reference) { this._reference = v; this.resetAccumulation(); }
+    }
+
+    /** Reference mode: frames averaged since the accumulation last restarted. */
+    get accumulatedFrames(): number { return this._accumFrame; }
+
+    /**
+     * Restart the reference mode's accumulation. The effect restarts it by itself when the camera,
+     * the lights, the path tracer materials, a CPU-side instance transform or the size change; call
+     * this after changes it cannot see (GPU-driven instances, dynamic BLAS, geometry).
+     */
+    resetAccumulation(): void {
+        this._accumFrame = 0;
+    }
 
     /** Current probe grid dimensions and total count. */
     get probeCount(): number {
@@ -431,6 +467,13 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Build probe grid on first frame or when spacing changes
         if (this._probeSpacing !== this._lastProbeSpacing) {
             this._computeProbeGrid();
+        }
+
+        if (this._reference) {
+            this._renderReference(commandEncoder, input, depth, output, camera, vp, iv, width, height, lightCount);
+            mat4.copy(this._prevViewProj, vp);
+            this._frameIndex++;
+            return;
         }
 
         // ── Pass 0: Irradiance probe update ──
@@ -556,6 +599,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 12, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // emissive
                 { binding: 13, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // restirDirect
                 { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },            // probeSH
+                { binding: 15, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },                  // prevFrame (reference)
             ],
         });
 
@@ -911,6 +955,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 12, visibility: V, texture: { sampleType: 'float' } },         // emissive
                 { binding: 13, visibility: V, texture: { sampleType: 'float' } },         // restirDirect
                 { binding: 14, visibility: V, buffer: { type: 'read-only-storage' } },   // probeSH
+                { binding: 15, visibility: V, texture: { sampleType: 'float' } },         // prevFrame (reference)
             ],
         });
 
@@ -1203,6 +1248,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 12, resource: this._gbuffer!.emissiveTexture.createView() },
                 { binding: 13, resource: restirTex.createView() },
                 { binding: 14, resource: { buffer: probeSHBuf } },
+                { binding: 15, resource: this._restirDummyTex!.createView() },
             ],
         });
 
@@ -1356,6 +1402,10 @@ export class PathTracerEffect extends PostProcessingEffect {
     }
 
     private _destroyTextures(): void {
+        this._accumTexA?.destroy();
+        this._accumTexB?.destroy();
+        this._accumTexA = null;
+        this._accumTexB = null;
         this._giTexture?.destroy();
         this._historyTexA?.destroy();
         this._historyTexB?.destroy();
@@ -1394,7 +1444,8 @@ export class PathTracerEffect extends PostProcessingEffect {
      */
     private _packLights(device: GPUDevice): number {
         const scene = this._scene;
-        const lightData = new Float32Array(MAX_LIGHTS * LIGHT_STRIDE_FLOATS);
+        const lightData = this._lightData;
+        lightData.fill(0);
         const lightU32 = new Uint32Array(lightData.buffer);
         let idx = 0;
 
@@ -1460,6 +1511,75 @@ export class PathTracerEffect extends PostProcessingEffect {
         return idx;
     }
 
+    // ── Reference mode ────────────────────────────────────────────────────
+
+    /**
+     * Camera rays into a running average (the Rust engine's `PathTracer::trace` and
+     * `PathTracerEffect`'s reset on a changed view-projection), shown in HDR through the composite.
+     */
+    private _renderReference(
+        commandEncoder: GPUCommandEncoder,
+        input: GPUTexture,
+        depth: GPUTexture,
+        output: GPUTexture,
+        camera: Camera,
+        vp: mat4,
+        invView: mat4,
+        width: number,
+        height: number,
+        lightCount: number,
+    ): void {
+        const device = this._device!;
+        const tw = this._traceWidth(width);
+        const th = this._traceHeight(height);
+
+        if (!this._accumTexA || this._accumTexA.width !== tw || this._accumTexA.height !== th) {
+            this._accumTexA?.destroy();
+            this._accumTexB?.destroy();
+            const desc = (label: string): GPUTextureDescriptor => ({
+                label,
+                size: [tw, th],
+                format: 'rgba16float',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+            });
+            this._accumTexA = device.createTexture(desc('PathTracer/AccumA'));
+            this._accumTexB = device.createTexture(desc('PathTracer/AccumB'));
+            this._accumFrame = 0;
+        }
+
+        if (this._referenceInputsChanged(vp)) this._accumFrame = 0;
+
+        const prev = this._accumPing ? this._accumTexA : this._accumTexB!;
+        const next = this._accumPing ? this._accumTexB! : this._accumTexA;
+        this._dispatchTrace(commandEncoder, depth, camera, tw, th, invView, lightCount, { output: next, prev });
+        this._dispatchComposite(commandEncoder, input, output, width, height, next);
+        this._accumPing = !this._accumPing;
+        this._accumFrame++;
+    }
+
+    /**
+     * Whether the view-projection, the lights, the path tracer materials or the CPU-packed
+     * instance transforms differ from the last reference frame's (each is packed every frame).
+     */
+    private _referenceInputsChanged(vp: mat4): boolean {
+        const builder = this._bvhBuilder!;
+        const parts = [vp as unknown as Float32Array, this._lightData, builder.materialData, builder.instanceData]
+            .map((p) => new Uint32Array(p.buffer, p.byteOffset, p.length));
+        let length = 0;
+        for (const p of parts) length += p.length;
+        let snap = this._accumSnapshot;
+        let changed = snap.length !== length;
+        if (changed) snap = this._accumSnapshot = new Uint32Array(length);
+        let o = 0;
+        for (const p of parts) {
+            for (let i = 0; i < p.length; i++, o++) {
+                // bit patterns: the packed data holds u32 fields too
+                if (snap[o] !== p[i]) { changed = true; snap[o] = p[i]; }
+            }
+        }
+        return changed;
+    }
+
     // ── Dispatch helpers ──────────────────────────────────────────────────
 
     private _dispatchTrace(
@@ -1470,6 +1590,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         height: number,
         invView: mat4,
         lightCount: number,
+        reference: { output: GPUTexture; prev: GPUTexture } | null = null,
     ): void {
         const device = this._device!;
         const builder = this._bvhBuilder!;
@@ -1510,6 +1631,8 @@ export class PathTracerEffect extends PostProcessingEffect {
         params[43] = 0; // fogDensity — disabled for BVH mode (use VolumetricFogEffect)
         params[44] = 0;
         params[45] = 0;
+        paramsU32[46] = reference ? 1 : 0;
+        paramsU32[47] = this._accumFrame;
 
         device.queue.writeBuffer(this._traceParamsBuf!, 0, params);
 
@@ -1528,7 +1651,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 0, resource: depth.createView() },
                 { binding: 1, resource: this._gbuffer!.normalTexture.createView() },
                 { binding: 2, resource: this._gbuffer!.albedoTexture.createView() },
-                { binding: 3, resource: this._giTexture!.createView() },
+                { binding: 3, resource: (reference?.output ?? this._giTexture!).createView() },
                 { binding: 4, resource: { buffer: this._traceParamsBuf! } },
                 { binding: 5, resource: { buffer: builder.triangleBuffer! } },
                 { binding: 6, resource: { buffer: builder.bvh4NodeBuffer! } },
@@ -1540,6 +1663,7 @@ export class PathTracerEffect extends PostProcessingEffect {
                 { binding: 12, resource: this._gbuffer!.emissiveTexture.createView() },
                 { binding: 13, resource: restirTex.createView() },
                 { binding: 14, resource: { buffer: probeSHBuf } },
+                { binding: 15, resource: (reference?.prev ?? this._restirDummyTex!).createView() },
             ],
         });
 
@@ -1664,11 +1788,15 @@ export class PathTracerEffect extends PostProcessingEffect {
         output: GPUTexture,
         width: number,
         height: number,
+        reference: GPUTexture | null = null,
     ): void {
         const device = this._device!;
-        const denoisedGI = this._lastDenoisedTex ?? this._giTexture!;
+        const denoisedGI = reference ?? this._lastDenoisedTex ?? this._giTexture!;
 
-        const params = new Uint32Array([width, height, this._rasterDirect ? 1 : 0, 0]);
+        // reference: the traced radiance alone, in HDR, for a ToneMapEffect after this effect
+        const params = new Uint32Array(reference
+            ? [width, height, 0, 1]
+            : [width, height, this._rasterDirect ? 1 : 0, 0]);
         device.queue.writeBuffer(this._compositeParamsBuf!, 0, params);
 
         const compositeBG = device.createBindGroup({
