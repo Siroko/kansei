@@ -13,12 +13,7 @@ import {
     computeKernelFactors3D,
 } from './FluidSimulationParams';
 
-import { shaderCode as gridClearShader } from './shaders/grid-clear.wgsl';
-import { shaderCode as gridAssignShader } from './shaders/grid-assign.wgsl';
-import { shaderCode as prefixSumLocalShader } from './shaders/prefix-sum-local.wgsl';
-import { shaderCode as prefixSumTopShader } from './shaders/prefix-sum-top.wgsl';
-import { shaderCode as prefixSumDistributeShader } from './shaders/prefix-sum-distribute.wgsl';
-import { shaderCode as scatterShader } from './shaders/scatter.wgsl';
+import { GridLayout, NeighbourGrid, gridLayoutCovering, gridLayoutTotalCells } from '../grid/NeighbourGrid';
 import { shaderCode as densityShader } from './shaders/density.wgsl';
 import { shaderCode as forcesShader } from './shaders/forces.wgsl';
 import { shaderCode as integrateShader } from './shaders/integrate.wgsl';
@@ -26,13 +21,23 @@ import { shaderCode as bodyCollisionShader } from './shaders/body-collision.wgsl
 import { shaderCode as bodyIntegrateShader } from './shaders/body-integrate.wgsl';
 import { FluidBody, FluidBodyOptions } from './FluidBody';
 
-const MAX_GRID_CELLS = 262144; // 256K
-const PREFIX_SUM_BLOCK_SIZE = 512;
+/**
+ * Cap on neighbour-grid cells. Large enough that the cell stays equal to the smoothing radius
+ * for the tanks we use; `fitGrid` still widens the cell if a scene would exceed it.
+ */
+const MAX_GRID_CELLS = 2_097_152;
 const MAX_BODIES = 64;
 const MAX_PRIMITIVES = 256;
 const BODY_STATE_FLOATS = 24;
 const PRIMITIVE_FLOATS = 6;
 
+/**
+ * SPH fluid on a `NeighbourGrid`, the same design as the Rust engine's
+ * (`rust/kansei-core/src/simulations/fluid/simulation.rs`): each substep is one compute pass
+ * holding the grid's counting sort (which also copies the positions and velocities into cell
+ * order), then density and forces, one thread per *sorted* slot reading those copies
+ * contiguously, then integration (and the bodies, if any) in the particles' own order.
+ */
 class FluidSimulation {
     public params: FluidSimulationOptions;
 
@@ -46,13 +51,10 @@ class FluidSimulation {
 
     // Internal simulation buffers
     private velocitiesBuffer!: ComputeBuffer;
+    /** Density and near density per particle, in *sorted* (cell) order. */
     private densitiesBuffer!: ComputeBuffer;
-    private cellIndicesBuffer!: ComputeBuffer;
-    private cellCountsBuffer!: ComputeBuffer;
-    private cellOffsetsBuffer!: ComputeBuffer;
-    private scatterCountersBuffer!: ComputeBuffer;
-    private sortedIndicesBuffer!: ComputeBuffer;
-    private blockSumsBuffer!: ComputeBuffer;
+    /** The neighbour grid, also sorting the positions and velocities into cell order. */
+    private grid!: NeighbourGrid;
 
     // External buffers (passed in)
     private positionsBuffer!: ComputeBuffer;
@@ -64,14 +66,7 @@ class FluidSimulation {
     private inverseViewMatrix: IBindable;
     private worldMatrix: IBindable;
 
-    // Compute passes
-    private gridClearCountsPass!: Compute;
-    private gridClearScatterPass!: Compute;
-    private gridAssignPass!: Compute;
-    private prefixSumLocalPass!: Compute;
-    private prefixSumTopPass!: Compute;
-    private prefixSumDistributePass!: Compute;
-    private scatterPass!: Compute;
+    // The solver's passes (the grid's are its own)
     private densityPass!: Compute;
     private forcesPass!: Compute;
     private integratePass!: Compute;
@@ -94,10 +89,13 @@ class FluidSimulation {
     private bodyCollisionPass!: Compute;
     private bodyIntegratePass!: Compute;
 
-    // Grid dimensions
-    private gridDims: [number, number, number] = [1, 1, 1];
-    private gridOrigin: [number, number, number] = [0, 0, 0];
-    private totalCells: number = 1;
+    /**
+     * The neighbour grid's cells: the smoothing radius wide, coarsened only if the bounds would
+     * otherwise need more than `MAX_GRID_CELLS` cells.
+     */
+    private layout: GridLayout = { origin: [0, 0, 0], cellSize: 1, dims: [1, 1, 1] };
+    /** The smoothing radius, dimensions and bounds `layout` was fitted to. */
+    private layoutKey = '';
     public worldBoundsMin: [number, number, number] = [0, 0, 0];
     public worldBoundsMax: [number, number, number] = [0, 0, 0];
 
@@ -166,26 +164,28 @@ class FluidSimulation {
 
         this.worldBoundsMin = [minX - padX, minY - padY, minZ - padZ];
         this.worldBoundsMax = [maxX + padX, maxY + padY, maxZ + padZ];
+        this.fitGrid();
+    }
 
-        const cs = this.params.smoothingRadius;
-        const gx = Math.ceil((this.worldBoundsMax[0] - this.worldBoundsMin[0]) / cs);
-        const gy = Math.ceil((this.worldBoundsMax[1] - this.worldBoundsMin[1]) / cs);
-        const gz = this.params.dimensions === 3
-            ? Math.ceil((this.worldBoundsMax[2] - this.worldBoundsMin[2]) / cs)
-            : 1;
+    /** What the grid's layout depends on: the smoothing radius, the dimensions and the bounds. */
+    private gridKey(): string {
+        return [this.params.smoothingRadius, this.params.dimensions, ...this.worldBoundsMin, ...this.worldBoundsMax].join(',');
+    }
 
-        // Clamp to max grid cells
-        const maxPerAxis2D = Math.floor(Math.sqrt(MAX_GRID_CELLS));
-        const maxPerAxis3D = Math.floor(Math.cbrt(MAX_GRID_CELLS));
-        const maxPerAxis = this.params.dimensions === 3 ? maxPerAxis3D : maxPerAxis2D;
-
-        this.gridDims = [
-            Math.min(Math.max(gx, 1), maxPerAxis),
-            Math.min(Math.max(gy, 1), maxPerAxis),
-            Math.min(Math.max(gz, 1), this.params.dimensions === 3 ? maxPerAxis : 1),
-        ];
-        this.totalCells = this.gridDims[0] * this.gridDims[1] * this.gridDims[2];
-        this.gridOrigin = [...this.worldBoundsMin];
+    /**
+     * Size the neighbour grid to the world bounds. Cells are `smoothingRadius` wide (the
+     * neighbour search only visits ±1 cell, so they must not be smaller) and are coarsened
+     * uniformly if the bounds need more than `MAX_GRID_CELLS`. Clamping each axis to the cube
+     * root of the cap instead (the old behaviour) folded every particle beyond 64 cells on an
+     * axis into the edge cell: thousands of neighbours per particle there.
+     */
+    private fitGrid(): void {
+        const max: [number, number, number] = [...this.worldBoundsMax];
+        if (this.params.dimensions === 2) {
+            max[2] = this.worldBoundsMin[2];
+        }
+        this.layout = gridLayoutCovering(this.worldBoundsMin, max, this.params.smoothingRadius, MAX_GRID_CELLS);
+        this.layoutKey = this.gridKey();
     }
 
     private createBuffers(): void {
@@ -207,55 +207,20 @@ class FluidSimulation {
             buffer: new Float32Array(N * 4),
         });
 
-        // Densities (vec2 per particle — density + nearDensity)
+        // Densities (vec2 per particle — density + nearDensity), in sorted order: see density.wgsl
         this.densitiesBuffer = new ComputeBuffer({
             type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_SRC,
             buffer: new Float32Array(N * 2),
         });
 
-        // Cell indices (u32 per particle)
-        this.cellIndicesBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(N),
+        this.grid = new NeighbourGrid({
+            capacity: N,
+            layout: this.layout,
+            positions: this.positionsBuffer,
+            sortedCopies: [this.positionsBuffer, this.velocitiesBuffer],
         });
-
-        // Cell counts (u32 per cell)
-        this.cellCountsBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(this.totalCells),
-        });
-
-        // Cell offsets (prefix sum output)
-        this.cellOffsetsBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(this.totalCells),
-        });
-
-        // Scatter counters
-        this.scatterCountersBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(this.totalCells),
-        });
-
-        // Sorted indices (u32 per particle)
-        this.sortedIndicesBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(N),
-        });
-
-        // Block sums for prefix sum
-        const numBlocks = Math.ceil(this.totalCells / PREFIX_SUM_BLOCK_SIZE);
-        this.blockSumsBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(Math.max(numBlocks, 1)),
-        });
+        this.grid.setCount(N);
     }
 
     private createBodyBuffers(): void {
@@ -302,65 +267,29 @@ class FluidSimulation {
 
     private createComputePasses(): void {
         const C = GPUShaderStage.COMPUTE;
+        const sortedPositions = this.grid.sorted(0);
+        const sortedVelocities = this.grid.sorted(1);
 
-        this.gridClearCountsPass = new Compute(gridClearShader, [
-            { binding: 0, visibility: C, value: this.cellCountsBuffer },
-        ]);
-
-        this.gridClearScatterPass = new Compute(gridClearShader, [
-            { binding: 0, visibility: C, value: this.scatterCountersBuffer },
-        ]);
-
-        this.gridAssignPass = new Compute(gridAssignShader, [
-            { binding: 0, visibility: C, value: this.positionsBuffer },
-            { binding: 1, visibility: C, value: this.cellIndicesBuffer },
-            { binding: 2, visibility: C, value: this.cellCountsBuffer },
+        this.densityPass = new Compute(densityShader, [
+            { binding: 0, visibility: C, value: sortedPositions },
+            { binding: 1, visibility: C, value: this.grid.cellOffsets },
+            { binding: 2, visibility: C, value: this.densitiesBuffer },
             { binding: 3, visibility: C, value: this.paramsBuffer },
         ]);
 
-        this.prefixSumLocalPass = new Compute(prefixSumLocalShader, [
-            { binding: 0, visibility: C, value: this.cellCountsBuffer },
-            { binding: 1, visibility: C, value: this.cellOffsetsBuffer },
-            { binding: 2, visibility: C, value: this.blockSumsBuffer },
-        ]);
-
-        this.prefixSumTopPass = new Compute(prefixSumTopShader, [
-            { binding: 0, visibility: C, value: this.blockSumsBuffer },
-        ]);
-
-        this.prefixSumDistributePass = new Compute(prefixSumDistributeShader, [
-            { binding: 0, visibility: C, value: this.blockSumsBuffer },
-            { binding: 1, visibility: C, value: this.cellOffsetsBuffer },
-        ]);
-
-        this.scatterPass = new Compute(scatterShader, [
-            { binding: 0, visibility: C, value: this.cellIndicesBuffer },
-            { binding: 1, visibility: C, value: this.cellOffsetsBuffer },
-            { binding: 2, visibility: C, value: this.scatterCountersBuffer },
-            { binding: 3, visibility: C, value: this.sortedIndicesBuffer },
-            { binding: 4, visibility: C, value: this.paramsBuffer },
-        ]);
-
-        this.densityPass = new Compute(densityShader, [
-            { binding: 0, visibility: C, value: this.positionsBuffer },
-            { binding: 1, visibility: C, value: this.cellOffsetsBuffer },
-            { binding: 2, visibility: C, value: this.sortedIndicesBuffer },
-            { binding: 3, visibility: C, value: this.densitiesBuffer },
-            { binding: 4, visibility: C, value: this.paramsBuffer },
-        ]);
-
         this.forcesPass = new Compute(forcesShader, [
-            { binding: 0, visibility: C, value: this.positionsBuffer },
-            { binding: 1, visibility: C, value: this.velocitiesBuffer },
+            { binding: 0, visibility: C, value: sortedPositions },
+            { binding: 1, visibility: C, value: sortedVelocities },
             { binding: 2, visibility: C, value: this.densitiesBuffer },
             { binding: 3, visibility: C, value: this.originalPositionsBuffer },
-            { binding: 4, visibility: C, value: this.cellOffsetsBuffer },
-            { binding: 5, visibility: C, value: this.sortedIndicesBuffer },
+            { binding: 4, visibility: C, value: this.grid.cellOffsets },
+            { binding: 5, visibility: C, value: this.grid.sortedIndices },
             { binding: 6, visibility: C, value: this.paramsBuffer },
             { binding: 7, visibility: C, value: this.viewMatrix },
             { binding: 8, visibility: C, value: this.projectionMatrix },
             { binding: 9, visibility: C, value: this.inverseViewMatrix },
             { binding: 10, visibility: C, value: this.worldMatrix },
+            { binding: 11, visibility: C, value: this.velocitiesBuffer },
         ]);
 
         this.integratePass = new Compute(integrateShader, [
@@ -421,14 +350,15 @@ class FluidSimulation {
         f[PARAMS.mousePosY] = mousePosition?.y ?? 0;
         f[PARAMS.mouseDirX] = mouseDirection?.x ?? 0;
         f[PARAMS.mouseDirY] = mouseDirection?.y ?? 0;
-        u[PARAMS.gridDimsX] = this.gridDims[0];
-        u[PARAMS.gridDimsY] = this.gridDims[1];
-        u[PARAMS.gridDimsZ] = this.gridDims[2];
-        f[PARAMS.cellSize] = p.smoothingRadius;
-        f[PARAMS.gridOriginX] = this.gridOrigin[0];
-        f[PARAMS.gridOriginY] = this.gridOrigin[1];
-        f[PARAMS.gridOriginZ] = this.gridOrigin[2];
-        u[PARAMS.totalCells] = this.totalCells;
+        const grid = this.layout;
+        u[PARAMS.gridDimsX] = grid.dims[0];
+        u[PARAMS.gridDimsY] = grid.dims[1];
+        u[PARAMS.gridDimsZ] = grid.dims[2];
+        f[PARAMS.cellSize] = grid.cellSize;
+        f[PARAMS.gridOriginX] = grid.origin[0];
+        f[PARAMS.gridOriginY] = grid.origin[1];
+        f[PARAMS.gridOriginZ] = grid.origin[2];
+        u[PARAMS.totalCells] = gridLayoutTotalCells(grid);
         f[PARAMS.worldBoundsMinX] = this.worldBoundsMin[0];
         f[PARAMS.worldBoundsMinY] = this.worldBoundsMin[1];
         f[PARAMS.worldBoundsMinZ] = this.worldBoundsMin[2];
@@ -578,56 +508,14 @@ class FluidSimulation {
     }
 
     /**
-     * Rebuild the spatial grid from current worldBoundsMin/Max.
-     * Call after changing bounds at runtime.
+     * Rebuild the spatial grid from current worldBoundsMin/Max. A step also does this itself when
+     * the bounds, the smoothing radius or the dimensions changed since the grid was fitted.
      */
     public rebuildGrid(): void {
-        const cs = this.params.smoothingRadius;
-        const gx = Math.ceil((this.worldBoundsMax[0] - this.worldBoundsMin[0]) / cs);
-        const gy = Math.ceil((this.worldBoundsMax[1] - this.worldBoundsMin[1]) / cs);
-        const gz = this.params.dimensions === 3
-            ? Math.ceil((this.worldBoundsMax[2] - this.worldBoundsMin[2]) / cs)
-            : 1;
-
-        const maxPerAxis2D = Math.floor(Math.sqrt(MAX_GRID_CELLS));
-        const maxPerAxis3D = Math.floor(Math.cbrt(MAX_GRID_CELLS));
-        const maxPerAxis = this.params.dimensions === 3 ? maxPerAxis3D : maxPerAxis2D;
-
-        this.gridDims = [
-            Math.min(Math.max(gx, 1), maxPerAxis),
-            Math.min(Math.max(gy, 1), maxPerAxis),
-            Math.min(Math.max(gz, 1), this.params.dimensions === 3 ? maxPerAxis : 1),
-        ];
-        this.totalCells = this.gridDims[0] * this.gridDims[1] * this.gridDims[2];
-        this.gridOrigin = [...this.worldBoundsMin];
-
-        // Reallocate grid-sized buffers
-        this.cellCountsBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(this.totalCells),
-        });
-        this.cellOffsetsBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(this.totalCells),
-        });
-        this.scatterCountersBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(this.totalCells),
-        });
-        const numBlocks = Math.ceil(this.totalCells / PREFIX_SUM_BLOCK_SIZE);
-        this.blockSumsBuffer = new ComputeBuffer({
-            type: BufferBase.BUFFER_TYPE_STORAGE,
-            usage: BufferBase.BUFFER_USAGE_STORAGE,
-            buffer: new Float32Array(Math.max(numBlocks, 1)),
-        });
-
-        // Recreate compute passes with new buffers
-        this.createComputePasses();
-        if (this.bodies.length > 0) {
-            this.createBodyComputePasses();
+        this.fitGrid();
+        // new per-cell buffers: the solver's passes again
+        if (this.grid.setLayout(this.layout)) {
+            this.createComputePasses();
         }
     }
 
@@ -639,53 +527,74 @@ class FluidSimulation {
         return this.paramsBuffer;
     }
 
+    /**
+     * The neighbour grid of the last substep, for passes that walk it (bind its `paramsBuffer`
+     * with `neighbourGridWgsl`). Its `sorted(0)` holds the positions in cell order (as they were
+     * before that substep's integration) and `sorted(1)` the velocities. `rebuildGrid` replaces
+     * its per-cell buffers when the number of cells changes.
+     */
+    public get neighbourGrid(): NeighbourGrid {
+        return this.grid;
+    }
+
     public get cellOffsetsBufferRef(): ComputeBuffer {
-        return this.cellOffsetsBuffer;
+        return this.grid.cellOffsets;
     }
 
     public get sortedIndicesBufferRef(): ComputeBuffer {
-        return this.sortedIndicesBuffer;
+        return this.grid.sortedIndices;
+    }
+
+    /** The positions in cell order: slot `k` is particle `sortedIndicesBufferRef[k]`. */
+    public get sortedPositionsBufferRef(): ComputeBuffer {
+        return this.grid.sorted(0);
     }
 
     public get gridDimsRef(): [number, number, number] {
-        return this.gridDims;
+        return this.layout.dims;
     }
 
     public get gridOriginRef(): [number, number, number] {
-        return this.gridOrigin;
+        return this.layout.origin;
     }
 
-    /** Build the list of compute passes that make up one full SPH iteration.
-     *  Shared by `update()` and `updateBatched()`. */
-    private _buildSimPasses(): { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[] {
-        const N = this.particleCount;
-        const particleWorkgroups  = Math.ceil(N / 64);
-        const gridWorkgroups      = Math.ceil(this.totalCells / 256);
-        const prefixSumWorkgroups = Math.ceil(this.totalCells / PREFIX_SUM_BLOCK_SIZE);
-        const passes: { compute: Compute, workgroupsX: number, workgroupsY?: number, workgroupsZ?: number }[] = [
-            // Grid build
-            { compute: this.gridClearCountsPass,    workgroupsX: gridWorkgroups },
-            { compute: this.gridClearScatterPass,   workgroupsX: gridWorkgroups },
-            { compute: this.gridAssignPass,         workgroupsX: particleWorkgroups },
-            // Prefix sum
-            { compute: this.prefixSumLocalPass,      workgroupsX: Math.max(prefixSumWorkgroups, 1) },
-            { compute: this.prefixSumTopPass,        workgroupsX: 1 },
-            { compute: this.prefixSumDistributePass, workgroupsX: Math.max(prefixSumWorkgroups, 1) },
-            // Scatter
-            { compute: this.scatterPass,             workgroupsX: particleWorkgroups },
-            // SPH
-            { compute: this.densityPass,             workgroupsX: particleWorkgroups },
-            { compute: this.forcesPass,              workgroupsX: particleWorkgroups },
-            { compute: this.integratePass,           workgroupsX: particleWorkgroups },
-        ];
-        // Body passes (only if bodies exist)
-        if (this.bodies.length > 0) {
-            passes.push(
-                { compute: this.bodyCollisionPass,   workgroupsX: particleWorkgroups },
-                { compute: this.bodyIntegratePass,    workgroupsX: 1 },
-            );
+    /** The grid's cell width: the smoothing radius, unless the bounds needed wider cells. */
+    public get cellSize(): number {
+        return this.layout.cellSize;
+    }
+
+    /** Refit the grid if what it depends on changed, and initialise the passes on first use. */
+    private prepareStep(device: GPUDevice): void {
+        if (this.gridKey() !== this.layoutKey) {
+            this.rebuildGrid();
         }
-        return passes;
+        for (const compute of [this.densityPass, this.forcesPass, this.integratePass, this.bodyCollisionPass, this.bodyIntegratePass]) {
+            if (!compute.initialized) compute.initialize(device);
+        }
+    }
+
+    private static dispatch(pass: GPUComputePassEncoder, compute: Compute, device: GPUDevice, workgroups: number): void {
+        pass.setPipeline(compute.pipeline!);
+        pass.setBindGroup(0, compute.getBindGroup(device));
+        pass.dispatchWorkgroups(workgroups);
+    }
+
+    /**
+     * One SPH iteration as one compute pass: the neighbour grid (clear, assign, prefix sum,
+     * scatter with the cell-ordered copies), density, forces, integration, then the bodies.
+     */
+    private encodeStep(commandEncoder: GPUCommandEncoder, device: GPUDevice): void {
+        const workgroups = Math.ceil(this.particleCount / 64);
+        const pass = commandEncoder.beginComputePass({ label: 'FluidSim/Substep' });
+        this.grid.encode(pass, device);
+        FluidSimulation.dispatch(pass, this.densityPass, device, workgroups);
+        FluidSimulation.dispatch(pass, this.forcesPass, device, workgroups);
+        FluidSimulation.dispatch(pass, this.integratePass, device, workgroups);
+        if (this.bodies.length > 0) {
+            FluidSimulation.dispatch(pass, this.bodyCollisionPass, device, workgroups);
+            FluidSimulation.dispatch(pass, this.bodyIntegratePass, device, 1);
+        }
+        pass.end();
     }
 
     /**
@@ -701,10 +610,14 @@ class FluidSimulation {
         mouseDirection?: { x: number; y: number },
         mouseStrength: number = 0
     ): Promise<void> {
-        const passes = this._buildSimPasses();
+        const device = this.renderer.gpuDevice;
+        this.prepareStep(device);
         for (let s = 0; s < this.params.substeps; s++) {
             this.packParams(dt, mouseStrength, mousePosition, mouseDirection);
-            await this.renderer.computeBatch(passes);
+            const commandEncoder = this.renderer.createCommandEncoder('FluidSim');
+            this.encodeStep(commandEncoder, device);
+            this.renderer.submit(commandEncoder.finish());
+            await device.queue.onSubmittedWorkDone();
         }
     }
 
@@ -736,29 +649,17 @@ class FluidSimulation {
         mouseStrength: number = 0
     ): void {
         if (steps <= 0) return;
+        const device = this.renderer.gpuDevice;
+        this.prepareStep(device);
         this.packParams(stepDt, mouseStrength, mousePosition, mouseDirection);
 
-        const passes = this._buildSimPasses();
-        const device = this.renderer.gpuDevice;
-        const commandEncoder = this.renderer.createCommandEncoder('FluidSim/Batched');
-
-        // Initialise compute passes on first use so we can skip the check
-        // inside the hot inner loop.
-        for (const p of passes) {
-            if (!p.compute.initialized) p.compute.initialize(device);
-        }
-
         // Each iteration of the outer loop is one `update()`-equivalent:
-        // `substeps` inner SPH iterations, all integrating with the same dt.
+        // `substeps` inner SPH iterations, all integrating with the same dt,
+        // each one compute pass.
+        const commandEncoder = this.renderer.createCommandEncoder('FluidSim/Batched');
         const totalIters = steps * this.params.substeps;
         for (let i = 0; i < totalIters; i++) {
-            for (const pass of passes) {
-                const passEncoder = commandEncoder.beginComputePass();
-                passEncoder.setBindGroup(0, pass.compute.getBindGroup(device));
-                passEncoder.setPipeline(pass.compute.pipeline!);
-                passEncoder.dispatchWorkgroups(pass.workgroupsX, pass.workgroupsY ?? 1, pass.workgroupsZ ?? 1);
-                passEncoder.end();
-            }
+            this.encodeStep(commandEncoder, device);
         }
 
         // Single submit, no CPU-GPU sync. Pacing is left to the browser —
