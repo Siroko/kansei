@@ -34,6 +34,11 @@
       <a href="https://kansei.graphics/examples/fluid/"><b>Fluid</b></a><br>
       <sub>A 3D particle fluid splashing in a box, meshed with marching cubes and refracting the room</sub>
     </td>
+    <td width="50%" valign="top">
+      <a href="https://kansei.graphics/examples/outdoor-gi/?cam=departure&amp;gi=rt&amp;view=lit&amp;elevation=2.5&amp;bearing=262"><img src="docs/media/readme/outdoor-gi.jpg" alt="Outdoor GI" width="100%"></a><br>
+      <a href="https://kansei.graphics/examples/outdoor-gi/?cam=departure&amp;gi=rt&amp;view=lit&amp;elevation=2.5&amp;bearing=262"><b>Outdoor GI</b></a><br>
+      <sub>The Raggare intro's forest under a low sun, lit by hybrid ray-traced GI over a voxel clipmap</sub>
+    </td>
   </tr>
 </table>
 

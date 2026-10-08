@@ -68,8 +68,8 @@
     // are wet and reflect the forest, traced through the grid (`RtReflectionsEffect.withClipmap`).
     //
     // URL parameters, as the Rust example's (its README lists them): gi=, rtgi_near and the other
-    // rtgi_* settings, view=lit|indirect|voxels, cam=canopy|trunks|branches|lake|headlights|
-    // departure|rise|film|drive, elevation=, bearing=, ev=, fog=, lod=, shadow_lod=, shadow_res=,
+    // rtgi_* settings, view=lit|indirect|voxels, cam=drive (the default)|canopy|trunks|branches|
+    // lake|headlights|departure|rise|film, elevation=, bearing=, ev=, fog=, lod=, shadow_lod=, shadow_res=,
     // card_error=, impostor_shadows=0, hide=<labels>, levels=, res=, vox=, lit=, probes=,
     // coneshadows=, bounce=, shadowsteps=, intensity=, shadow_far=, ssgi_radius=, reflect=1 (wet=all,
     // wet_f0, wet_rough, rt_view, rt_trace=voxels, rt_alpha=0, rt_res=quarter), rt=1, rt_cell=,
@@ -960,7 +960,7 @@
     if (!flag('ui', true)) document.getElementById('panel').style.display = 'none';
     document.getElementById('loading').remove();
 
-    setCamera(param('cam') ?? 'departure');
+    setCamera(param('cam') ?? 'drive');
     apply();
     const hud = installProfileHud({ renderer, FrameTimer, AbBench });
     console.log(`Kansei — Outdoor GI (TS) ready: ${JSON.stringify(info())}`);

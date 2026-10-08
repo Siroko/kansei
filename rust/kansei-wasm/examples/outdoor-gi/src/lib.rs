@@ -815,7 +815,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         rtgi: RtGi::from_url(),
     };
     drop(data);
-    state.set_camera(param("cam").as_deref().unwrap_or("departure"));
+    state.set_camera(param("cam").as_deref().unwrap_or("drive"));
     state.apply();
     log::info!("Kansei — Outdoor GI (WASM) ready: {}", state.info());
 
@@ -869,7 +869,7 @@ pub fn set_view(name: &str) {
 }
 
 /// A shot of the film as a starting view (`canopy`, `trunks`, `branches`, `lake`, `headlights`,
-/// `departure`, `rise`), `film` (the shots in turn) or `drive` (along the road).
+/// `departure`, `rise`), `film` (the shots in turn) or `drive` (along the road, the default).
 #[wasm_bindgen]
 pub fn set_camera(name: &str) {
     with_state(|s| s.set_camera(name));

@@ -52,8 +52,8 @@ The GI modes (`gi=`) compare what lights the shade:
 | `ssgi` | screen-space GI (`ScreenSpaceGIEffect`): the bounces between what is on screen, the sky taken out where it is hidden |
 | `rt` (default) | the hybrid (`RtDiffuseGiEffect`): one ray for each 2 x 2 pixels through the grid of the scene's triangles round the camera (below; the foliage alpha-tested), for 8 m, then the clipmap and the sky; the hits lit by the sun (shadow rays, the cascades past the grid) and a cone through the clipmap; denoised by SVGF. Closest to a path-traced reference: the cones are too bright under the canopy |
 
-GPU time at 1920 x 1080 (device pixel ratio 1) on an Apple M4 Pro, Chrome, the default view
-(`cam=departure`), passes summed by the profiler (`stats=1`), October 2026:
+GPU time at 1920 x 1080 (device pixel ratio 1) on an Apple M4 Pro, Chrome, the film's shot by
+the road (`cam=departure`), passes summed by the profiler (`stats=1`), October 2026:
 
 | `gi=` | Rust / WASM | TS |
 |---|---|---|
@@ -104,7 +104,7 @@ Engine API:
 | `rtgi_near=<metres>` | how far the hybrid's rays walk the grid before the clipmap takes over (default 8; 0: the whole 64 m box, about 1.5 times the cost) |
 | `rtgi_res`, `rtgi_denoise`, `rtgi_kernel`, `rtgi_hit`, `rtgi_shadows`, `rtgi_mode`, `rtgi_accum`, `rtgi_view` | the hybrid's other settings, as in gi-box's README (`set_rtgi(key, value)` at run time) |
 | `view=lit\|indirect\|voxels` | the lit image (default); only the light the GI adds; the clipmap's voxels and their light |
-| `cam=canopy\|trunks\|branches\|lake\|headlights\|departure\|rise\|film\|drive` | a shot of the film as the starting view, halfway through it, on its lens (default `departure`), then orbit controls; `film` plays the shots in turn on the film's timeline; `drive` drives along the road at 12 m/s, so the clipmap's windows move |
+| `cam=drive\|canopy\|trunks\|branches\|lake\|headlights\|departure\|rise\|film` | `drive` (the default) drives along the road at 12 m/s, so the clipmap's windows move; or a shot of the film as the starting view, halfway through it, on its lens, then orbit controls; `film` plays the shots in turn on the film's timeline. The examples index's *Into the trees* is `cam=departure&elevation=2.5&bearing=262` |
 | `elevation=<degrees>` | the sun's elevation (default 14; the exposure follows) |
 | `bearing=<degrees>` | the sun's bearing (default 110) |
 | `ev=<EV100>` | exposure (default: the sun's, opened up 2.3 stops for the forest's shade) |
