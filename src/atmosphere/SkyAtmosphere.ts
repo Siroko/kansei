@@ -7,12 +7,12 @@ import {
     earthAtmosphere, moonLight, sunLight, transmittanceToSpace,
 } from './AtmosphereParams';
 import {
-    AERIAL_PERSPECTIVE_SOURCE, DISTANT_SKY_LIGHT_SOURCE, MULTI_SCATTERING_SOURCE, SKY_LIGHTING_SOURCE, SKY_VIEW_SOURCE,
+    AERIAL_PERSPECTIVE_SOURCE, DISTANT_SKY_LIGHT_SOURCE, ENVIRONMENT_SOURCE, MULTI_SCATTERING_SOURCE, SKY_LIGHTING_SOURCE, SKY_VIEW_SOURCE,
     TRANSMITTANCE_SOURCE,
 } from './AtmosphereWGSL';
 
 // A physically based sky after Hillaire 2020, as the Rust engine's `atmosphere/sky_atmosphere.rs`
-// on the same WGSL. The environment cubemap and the clouds' shadow are not part of it yet.
+// on the same WGSL. The clouds' shadow is not part of it yet.
 
 /** Format of every LUT and of the aerial-perspective volumes. */
 export const LUT_FORMAT: GPUTextureFormat = 'rgba16float';
@@ -22,6 +22,8 @@ export const SUN_LIMB_DARKENING = 0.6;
 export const CLOUD_MAP_SIZE: [number, number] = [128, 64];
 /** Lowest camera altitude the LUTs are built for, km: below it the horizon maths loses precision. */
 const MIN_CAMERA_ALTITUDE_KM = 0.005;
+/** GGX samples per texel for the environment's rough mips. */
+const ENVIRONMENT_SAMPLES = 96;
 
 /** Bytes of the WGSL `SkyFrame` (frame.wgsl), `SkyLighting` (sky_lighting.wgsl) and `SkyCapture` (sky_capture.wgsl). */
 export const SKY_FRAME_BYTES = 208;
@@ -40,6 +42,8 @@ export interface SkyAtmosphereOptions {
     aerialPerspectiveSize: [number, number, number];
     /** Distance covered by the aerial-perspective volume, km (farther surfaces use its last slice). */
     aerialPerspectiveDistanceKm: number;
+    /** Face size of the sky environment cubemap; its mips are GGX-prefiltered (roughness 0 to 1). */
+    environmentSize: number;
 }
 
 export function defaultSkyAtmosphereOptions(): SkyAtmosphereOptions {
@@ -49,15 +53,17 @@ export function defaultSkyAtmosphereOptions(): SkyAtmosphereOptions {
         skyViewSize: [256, 128],
         aerialPerspectiveSize: [32, 32, 32],
         aerialPerspectiveDistanceKm: 32,
+        environmentSize: 64,
     };
 }
 
 /**
- * The scene's exponential height fog as the sky lighting captures it (`SkyAtmosphere.captureFog`):
- * composited at infinite distance over the sky and the clouds, as seen from `captureHeightM`, as
- * Unreal's real-time sky-light capture does with its ExponentialHeightFog. Seen from low down it
- * covers the horizon and, opaque below it, the ground; the sky lighting still sees the lit ground
- * below the horizon unless `SkyAtmosphere.lightingSeesGround` is off.
+ * The scene's exponential height fog as the sky lighting and the environment cubemap capture it
+ * (`SkyAtmosphere.captureFog`): composited at infinite distance over the sky and the clouds, as
+ * seen from `captureHeightM`, as Unreal's real-time sky-light capture does with its
+ * ExponentialHeightFog. Seen from low down it covers the horizon and, opaque below it, the
+ * ground, so the reflections take the fog's colour where the fog is; the sky lighting still sees
+ * the lit ground below the horizon unless `SkyAtmosphere.lightingSeesGround` is off.
  */
 export interface SkyCaptureFog {
     /** The fog's layers (as `HeightFogEffect.layers`); the second is off while its density is 0. */
@@ -87,9 +93,10 @@ export function skyCaptureFogFromHeightFog(fog: HeightFogEffect, captureHeightM:
 }
 
 /**
- * What the sky lighting sees below the horizon: `'ground'`, a Lambertian ground of
- * `skyLightGroundAlbedo` lit by the sky and the lights, behind the air (under a capture fog the
- * fog, when `lightingSeesGround` is off); or a radiance whatever the fog (Unreal's
+ * What the sky lighting and the environment cubemap see below the horizon: `'ground'`, a
+ * Lambertian ground of `skyLightGroundAlbedo` lit by the sky and the lights, behind the air
+ * (under a capture fog the environment sees the fog, which is opaque below the horizon, and so
+ * does the sky lighting when `lightingSeesGround` is off); or a radiance whatever the fog (Unreal's
  * `bLowerHemisphereIsBlack` with its `LowerHemisphereColor`; black is `{ color: [0, 0, 0] }`).
  */
 export type SkyLowerHemisphere = 'ground' | { color: Vec3 };
@@ -111,13 +118,20 @@ export interface SkyAtmosphereBindings {
      * the moon at the camera, rewritten by every update. Usable as a uniform or a storage buffer.
      */
     skyLighting: GPUBuffer;
+    /**
+     * The sky around the camera as a cube (no sun disk), mip m prefiltered for GGX roughness
+     * m / (mips - 1): sample it with `environmentSampler` and `SKY_ENVIRONMENT_WGSL`.
+     */
+    environment: GPUTextureView;
+    /** Trilinear, for the environment cubemap's mips. */
+    environmentSampler: GPUSampler;
     /** Linear, clamping: for the transmittance and multiple-scattering LUTs. */
     lutSampler: GPUSampler;
     /** Linear, repeating in u (the azimuth): for the sky-view LUT. */
     skyViewSampler: GPUSampler;
     /**
      * The clouds around the camera (rgba16float, azimuth by zenith angle; rgb their light, a their
-     * opacity), read by the sky lighting. Empty (a clear sky) until clouds write it.
+     * opacity), read by the sky lighting and the environment cubemap. Empty (a clear sky) until clouds write it.
      */
     cloudMap: GPUTextureView;
     /**
@@ -137,7 +151,9 @@ export interface SkyAtmosphereBindings {
  *   camera and the transmittance in front of every surface, every frame;
  * - **sky lighting**: the sky's radiance as order-2 spherical harmonics (with light bounced off
  *   the ground below the horizon), the sun and the moon at the camera, and the sky's distant
- *   light, every frame, for materials and media (`SKY_LIGHTING_WGSL`).
+ *   light, every frame, for materials and media (`SKY_LIGHTING_WGSL`);
+ * - **environment** (64x64 cube): the sky as a GGX-prefiltered cubemap, every frame, for the
+ *   specular reflection of the sky (`SKY_ENVIRONMENT_WGSL`).
  *
  * The first two depend only on `params` and are rebuilt when they change. The sun can be
  * anywhere, including below the horizon at dusk, where the sky is lit only by the light scattered
@@ -172,12 +188,12 @@ export class SkyAtmosphere {
      * (Unreal's real-time sky-light capture); null captures the sky alone.
      */
     public captureFog: SkyCaptureFog | null = null;
-    /** What the sky lighting sees below the horizon. */
+    /** What the sky lighting and the environment see below the horizon. */
     public lowerHemisphere: SkyLowerHemisphere = 'ground';
     /**
      * Under a capture fog, whether the sky lighting sees the lit ground below the horizon (the
      * default), as Unreal lights its scene with Lumen; when off, it sees the fog there, as
-     * Unreal's SkyLight captures it.
+     * Unreal's SkyLight captures it. The environment always sees the fog there.
      */
     public lightingSeesGround = true;
 
@@ -186,6 +202,8 @@ export class SkyAtmosphere {
     public readonly lutTextures: [GPUTexture, GPUTexture, GPUTexture];
     /** The aerial-perspective volumes: scattering, transmittance (3D). */
     public readonly aerialPerspectiveTextures: [GPUTexture, GPUTexture];
+    /** The sky environment cubemap texture (6 layers, GGX-prefiltered mips). */
+    public readonly environmentTexture: GPUTexture;
 
     private readonly _device: GPUDevice;
     private readonly _capture: GPUBuffer;
@@ -200,7 +218,14 @@ export class SkyAtmosphere {
         skyLighting: GPUComputePipeline;
         // with the cloud map, and without it (no clouds wrote it last frame)
         skyLightingBGs: [GPUBindGroup, GPUBindGroup];
+        environment: GPUComputePipeline;
+        // the rough mips, a workgroup per texel
+        environmentRough: GPUComputePipeline;
+        // per mip: with the cloud map, and without it
+        environmentBGs: [GPUBindGroup, GPUBindGroup][];
     };
+    /** Each environment mip's `EnvPass` (roughness, samples), written once. */
+    private readonly _environmentParams: GPUBuffer[];
     private readonly _transmittanceSize: [number, number];
     private readonly _multiScatteringSize: number;
     private readonly _skyViewSize: [number, number];
@@ -239,7 +264,16 @@ export class SkyAtmosphere {
         const cloudMap = lut2d('SkyAtmosphere/CloudMap', CLOUD_MAP_SIZE);
         // bound in place of the cloud map while no clouds write it
         const noClouds = lut2d('SkyAtmosphere/NoClouds', [1, 1]);
-        this._ownedTextures = [...this.lutTextures, ...this.aerialPerspectiveTextures, cloudMap, noClouds];
+        const envSize = Math.max(Math.floor(o.environmentSize), 1);
+        const envMips = Math.floor(Math.log2(envSize)) + 1;
+        this.environmentTexture = device.createTexture({
+            label: 'SkyAtmosphere/Environment',
+            size: [envSize, envSize, 6],
+            mipLevelCount: envMips,
+            format: LUT_FORMAT,
+            usage,
+        });
+        this._ownedTextures = [...this.lutTextures, ...this.aerialPerspectiveTextures, cloudMap, noClouds, this.environmentTexture];
 
         const b: SkyAtmosphereBindings = this.bindings = {
             atmosphere: uniform('SkyAtmosphere/Atmosphere', ATMOSPHERE_BYTES),
@@ -253,6 +287,10 @@ export class SkyAtmosphere {
                 label: 'SkyAtmosphere/SkyLighting',
                 size: SKY_LIGHTING_BYTES,
                 usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_SRC,
+            }),
+            environment: this.environmentTexture.createView({ label: 'SkyAtmosphere/EnvironmentCube', dimension: 'cube' }),
+            environmentSampler: device.createSampler({
+                label: 'SkyAtmosphere/EnvironmentSampler', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
             }),
             lutSampler: sampler('SkyAtmosphere/LutSampler', 'clamp-to-edge'),
             skyViewSampler: sampler('SkyAtmosphere/SkyViewSampler', 'repeat'),
@@ -298,7 +336,40 @@ export class SkyAtmosphere {
             uniformEntry(0), uniformEntry(1), textureEntry(2), textureEntry(3), samplerEntry(4), samplerEntry(5),
             storageBufferEntry(6), textureEntry(7), uniformEntry(8), uniformEntry(9),
         ]);
+        const environmentEntries = [
+            uniformEntry(0), uniformEntry(1), textureEntry(2), samplerEntry(3), uniformEntry(4),
+            storageEntry(5, '2d-array'), uniformEntry(6), textureEntry(7), uniformEntry(8),
+        ];
+        // the mirror mip (`main`) and the rough mips (`rough`), from one module
+        const environmentLayout = device.createBindGroupLayout({ label: 'SkyAtmosphere/EnvironmentBGL', entries: environmentEntries });
+        const environmentModule = device.createShaderModule({ label: 'SkyAtmosphere/Environment', code: ENVIRONMENT_SOURCE });
+        const environmentPipelineLayout = device.createPipelineLayout({ label: 'SkyAtmosphere/Environment', bindGroupLayouts: [environmentLayout] });
+        const [environment, environmentRough] = ['main', 'rough'].map((entryPoint) => device.createComputePipeline({
+            label: `SkyAtmosphere/Environment/${entryPoint}`,
+            layout: environmentPipelineLayout,
+            compute: { module: environmentModule, entryPoint },
+        }));
         const noCloudsView = noClouds.createView();
+        // each mip has its own parameters, written once: a shared buffer rewritten per dispatch
+        // would hold only the last write by the time the passes run
+        this._environmentParams = Array.from({ length: envMips }, (_, mip) => {
+            const roughness = envMips > 1 ? mip / (envMips - 1) : 0;
+            const params = device.createBuffer({ label: 'SkyAtmosphere/EnvironmentMipParams', size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true });
+            const range = params.getMappedRange();
+            new Float32Array(range, 0, 1)[0] = roughness;
+            new Uint32Array(range, 4, 3).set([ENVIRONMENT_SAMPLES, 0, 0]);
+            params.unmap();
+            return params;
+        });
+        const environmentBGs = this._environmentParams.map((params, mip) => {
+            const target = this.environmentTexture.createView({
+                label: 'SkyAtmosphere/EnvironmentMip', dimension: '2d-array', baseMipLevel: mip, mipLevelCount: 1,
+            });
+            return [b.cloudMap, noCloudsView].map((clouds) => group('SkyAtmosphere/EnvironmentBG', environmentLayout, [
+                buf(b.atmosphere), buf(b.frame), b.skyView, b.skyViewSampler, buf(b.skyLighting),
+                target, buf(params), clouds, buf(this._capture),
+            ])) as [GPUBindGroup, GPUBindGroup];
+        });
 
         this._pipelines = {
             transmittance: transmittance.pipeline,
@@ -320,6 +391,9 @@ export class SkyAtmosphere {
                 buf(b.atmosphere), buf(b.frame), b.transmittance, b.skyView, b.lutSampler, b.skyViewSampler,
                 buf(b.skyLighting), clouds, buf(this._capture), buf(this._distant),
             ])) as [GPUBindGroup, GPUBindGroup],
+            environment,
+            environmentRough,
+            environmentBGs,
         };
 
         this._transmittanceSize = o.transmittanceSize;
@@ -416,8 +490,8 @@ export class SkyAtmosphere {
 
     /**
      * Record this frame's passes: the transmittance and multiple-scattering LUTs when the
-     * atmosphere changed, then the sky-view LUT, the aerial perspective, the distant sky light and
-     * the sky lighting for the camera. Uses the camera's current view and projection matrices, so
+     * atmosphere changed, then the sky-view LUT, the aerial perspective, the distant sky light, the
+     * sky lighting and the environment cubemap for the camera. Uses the camera's current view and projection matrices, so
      * place the camera first.
      */
     public encode(encoder: GPUCommandEncoder, camera: Camera): void {
@@ -460,6 +534,19 @@ export class SkyAtmosphere {
         pass.setPipeline(p.skyLighting);
         pass.setBindGroup(0, p.skyLightingBGs[clouds]);
         pass.dispatchWorkgroups(1);
+        p.environmentBGs.forEach((bgs, mip) => {
+            const size = Math.max(this.environmentTexture.width >> mip, 1);
+            pass.setBindGroup(0, bgs[clouds]);
+            if (mip === 0) {
+                // the mirror: a copy of the sky, an invocation per texel
+                pass.setPipeline(p.environment);
+                pass.dispatchWorkgroups(Math.ceil(size / 8), Math.ceil(size / 8), 6);
+            } else {
+                // GGX-prefiltered: a workgroup per texel shares its samples
+                pass.setPipeline(p.environmentRough);
+                pass.dispatchWorkgroups(size, size, 6);
+            }
+        });
         pass.end();
     }
 
@@ -482,7 +569,7 @@ export class SkyAtmosphere {
     /** Release the GPU resources (the bindings stop working). */
     public destroy(): void {
         for (const t of this._ownedTextures) t.destroy();
-        for (const buffer of [this.bindings.atmosphere, this.bindings.frame, this.bindings.skyLighting, this._capture, this._distant]) buffer.destroy();
+        for (const buffer of [this.bindings.atmosphere, this.bindings.frame, this.bindings.skyLighting, this._capture, this._distant, ...this._environmentParams]) buffer.destroy();
     }
 }
 

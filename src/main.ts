@@ -108,8 +108,8 @@ export type { FluidRaymarchOptions } from "./postprocessing/effects/FluidRaymarc
 export { AreaLight } from "./lights/AreaLight";
 export { FroxelGrid } from "./froxels/FroxelGrid";
 export type { FroxelGridOptions } from "./froxels/FroxelGrid";
-export { VolumetricFogEffect } from "./postprocessing/effects/VolumetricFogEffect";
-export type { VolumetricFogOptions } from "./postprocessing/effects/VolumetricFogEffect";
+export { VolumetricFogEffect, LocalFogVolume } from "./postprocessing/effects/VolumetricFogEffect";
+export type { VolumetricFogOptions, LocalFogShape } from "./postprocessing/effects/VolumetricFogEffect";
 export { NeighbourGrid, neighbourGridWgsl, gridLayoutCovering, gridLayoutTotalCells } from "./simulations/grid/NeighbourGrid";
 export type { GridLayout, NeighbourGridOptions } from "./simulations/grid/NeighbourGrid";
 export { BloomEffect } from "./postprocessing/effects/BloomEffect";
@@ -134,7 +134,7 @@ export { SkyAtmosphere, defaultSkyAtmosphereOptions, skyCaptureFogFromHeightFog 
 export type { SkyAtmosphereOptions, SkyAtmosphereBindings, SkyCaptureFog, SkyLowerHemisphere } from "./atmosphere/SkyAtmosphere";
 export { earthAtmosphere, sunLight, moonLight, directionFromElevationBearing, transmittanceToSpace } from "./atmosphere/AtmosphereParams";
 export type { AtmosphereParams, CelestialLight } from "./atmosphere/AtmosphereParams";
-export { ATMOSPHERE_WGSL } from "./atmosphere/AtmosphereWGSL";
+export { ATMOSPHERE_WGSL, SKY_ENVIRONMENT_WGSL } from "./atmosphere/AtmosphereWGSL";
 export { AtmosphereEffect } from "./postprocessing/effects/AtmosphereEffect";
 export { HeightFogEffect, heightFogLayerFromUnreal, heightFogOpticalDepth } from "./postprocessing/effects/HeightFogEffect";
 export type { HeightFogLayer } from "./postprocessing/effects/HeightFogEffect";
