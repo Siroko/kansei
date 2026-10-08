@@ -46,7 +46,6 @@
     //   blades=<n>       aperture blades (default 0: round bokeh)
     //   samples=<n>      gather samples per half-resolution pixel (default 72)
     //   scatter=0        gather the highlights too instead of scattering them as bokeh sprites
-    //   lights=1         light the tops of some columns, small bright sources that scatter as bokeh
     //   debug=<1..4>     1 background layer, 2 near layer, 3 near alpha, 4 CoC
     //   t=<seconds>      fix the scroll at this time, for stills
     //   view=<JSON>      the opening view ('Copy view' or the V key)
@@ -56,7 +55,6 @@
       return Number.isFinite(v) ? v : fallback;
     };
     const DOF_MODE = params.get('dof') === 'simple' ? 'simple' : params.get('dof') === '0' ? 'off' : 'cinematic';
-    const LIGHTS = params.has('lights') && params.get('lights') !== '0';
     const FIXED_TIME = params.has('t') ? numberParam('t', 0) : null;
 
     // ── Scene parameters ──────────────────────────────────────────────────────
@@ -65,7 +63,7 @@
     const NOISE_ZOOM     = 0.07;  // noise frequency — lower = broader hills
     const SCALE_Y_STRENGTH = 60;   // max Y scale applied to each cube
     const SCROLL_SPEED   = 35;   // world-units per second along Z
-    const LIGHT_SHARE    = 0.03;  // with lights=1, the share of columns whose top glows
+    const LIGHT_SHARE    = 0.03;  // the share of columns whose top glows, small bright sources that scatter as bokeh
     const LIGHT_RADIANCE = 12.0;  // their tops' brightness (the white columns read about 1)
 
     const GRID_HALF      = (GRID_SIZE - 1) * GRID_SPACING * 0.5; // centre grid at 0,0
@@ -195,8 +193,8 @@
         columns[i]     = worldX;
         columns[i + 1] = worldZ;
         columns[i + 2] = fbm(worldX * NOISE_ZOOM, worldZ * NOISE_ZOOM) * SCALE_Y_STRENGTH + 0.1;
-        // a fixed scatter of glowing tops (hash2 is deterministic), only with lights=1
-        columns[i + 3] = LIGHTS && hash2(col + 0.37, row + 0.71) < LIGHT_SHARE ? LIGHT_RADIANCE : 0;
+        // a fixed scatter of glowing tops (hash2 is deterministic)
+        columns[i + 3] = hash2(col + 0.37, row + 0.71) < LIGHT_SHARE ? LIGHT_RADIANCE : 0;
       }
     }
     const columnBuffer = new ComputeBuffer({
