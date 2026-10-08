@@ -26,6 +26,9 @@
     //
     // URL parameters: `cam=valley|forest|ridge|high|fly|sky|edge` (C cycles), `trees=<n>`,
     // `bounds=sphere` (spheres round the trees' bases instead of boxes), `shadows=1`,
+    // `skyocc=1` (the trees occlude the sky's light, `Renderer.enableSkyOcclusion`: the sky
+    // ambient is dimmed under the canopy; `skyocc=show` shows the sky visibility,
+    // `skyocc=rebuild` starts a rebuild every frame, to time a rebuild's first frame),
     // `t=<seconds>` (the fly path's time, frozen), `size=<w>x<h>` (canvas pixels), `dpr=<ratio>`;
     // `profile=1` (each pass's GPU time) through profile-hud.js.
     import { Canvas, run, param, paramOr, flag, setText, thousands, Keys } from '../src/web/index'
@@ -43,6 +46,9 @@
     import { Vector3 } from '../src/math/Vector3'
     import { hash01 } from '../src/math/hash01'
     import { InstanceCulling } from '../src/culling/InstanceCulling'
+    import { SKY_OCCLUSION_WGSL } from '../src/shadows/SkyOcclusion'
+    import { Texture } from '../src/buffers/Texture'
+    import { Sampler } from '../src/buffers/Sampler'
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { FrameTimer } from '../src/pacing/FrameTimer'
@@ -58,14 +64,34 @@
     const SUN_DIR = [0.4, -0.55, 0.7];
     const SUN = [9000 * Math.PI, 7600 * Math.PI, 6000 * Math.PI];
     const shadows = flag('shadows', false);
+    // `skyocc=`: off, on (or rebuilding every frame), or showing the sky visibility
+    const skyOcc = { '1': 'on', rebuild: 'on', show: 'show' }[param('skyocc')] ?? 'off';
+    const rebuildSky = param('skyocc') === 'rebuild';
+    // The layer the trees are on (as well as the default one), the only one occluding the sky:
+    // the terrain is solid ground, not canopy.
+    const TREE_LAYER = 1 << 1;
+    // the ground and the trees' tops (up to 26 m over the hill's 57 m) lie in the volume; the
+    // top-down view draws coarser LODs (the last one reaches any distance)
+    const skyOcclusion = skyOcc === 'off' ? null : renderer.enableSkyOcclusion({
+      minHeightM: -10,
+      maxHeightM: 90,
+      volumeSize: [128, 32],
+      lodDistanceScale: 4,
+      layerMask: TREE_LAYER,
+    });
 
     // A diffuse surface lit by the sun (shadowed with `shadows=1`) and a sky hemisphere, in haze.
-    // TREE_* place a unit tree: instance vec4 (xyz base, w height), vec4 (yaw, tint, -, -).
+    // TREE_* place a unit tree: instance vec4 (xyz base, w height), vec4 (yaw, tint, -, -). With
+    // `skyocc=` it binds the sky occlusion and dims the sky's light by it.
     const surfaceShader = (tree) => /* wgsl */`
       #include <shadows>
+      ${skyOcclusion ? SKY_OCCLUSION_WGSL : ''}
 
       struct Surface { baseColor : vec4f, params : vec4f }
       @group(0) @binding(0) var<uniform> surface : Surface;
+      ${skyOcclusion ? `@group(0) @binding(1) var skyVolume : texture_3d<f32>;
+      @group(0) @binding(2) var skySampler : sampler;
+      @group(0) @binding(3) var<uniform> skyOcclusion : SkyOcclusionParams;` : ''}
       @group(1) @binding(0) var<uniform> viewMatrix : mat4x4f;
       @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
       @group(2) @binding(0) var<uniform> normalMatrix : mat4x4f;
@@ -112,10 +138,12 @@
       @fragment
       fn fragment_main(in : VOut) -> GBufferOut {
         let n = normalize(in.normal);
-        let sky = mix(vec3f(60.0, 55.0, 45.0), vec3f(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5);
+        let visibility = ${skyOcclusion ? 'skyVisibility(skyVolume, skySampler, skyOcclusion, in.world)' : '1.0'};
+        let sky = mix(vec3f(60.0, 55.0, 45.0), vec3f(900.0, 1100.0, 1500.0), n.y * 0.5 + 0.5) * visibility;
         let base = surface.baseColor.rgb * (0.7 + 0.6 * in.tint);
         let sun = SUN / 3.14159265 * max(dot(n, -normalize(SUN_DIR)), 0.0) * kansei_shadow_map(in.world, n);
-        let lit = base * (sky + sun);
+        var lit = base * (sky + sun);
+        ${skyOcc === 'show' ? 'lit = vec3f(visibility * 2000.0);' : ''}
         let view3 = mat3x3f(viewMatrix[0].xyz, viewMatrix[1].xyz, viewMatrix[2].xyz);
         let eye = -(transpose(view3) * viewMatrix[3].xyz);
         let haze = 1.0 - exp(-distance(in.world, eye) * 0.0025);
@@ -162,8 +190,13 @@
       usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
       buffer: new Float32Array(values),
     });
+    const skyBindings = skyOcclusion ? [
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: Texture.fromView('SkyOcclusion', skyOcclusion.volumeTexture, skyOcclusion.volume) },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, value: ComputeBuffer.fromExternal(skyOcclusion.params, BufferBase.BUFFER_TYPE_UNIFORM) },
+    ] : [];
     const surfaceMaterial = (base, tree) => new Material(surfaceShader(tree), {
-      bindings: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: uniform([...base, 1, 0, 0, 0, 0]) }],
+      bindings: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, value: uniform([...base, 1, 0, 0, 0, 0]) }, ...skyBindings],
     });
 
     /** Half the side of the square the forest covers, in metres. */
@@ -230,6 +263,7 @@
     const spheres = param('bounds') === 'sphere';
     for (const [geometry, near, far] of lods) {
       const r = new Renderable(new InstancedGeometry(geometry, trees, [forest]), surfaceMaterial([0.05, 0.09, 0.05], true));
+      r.layers |= TREE_LAYER;
       // a sphere round the base reaching the top (x height), or a box from the ground to the
       // top, as wide as the lowest cone
       let culling = new InstanceCulling(forest, trees, 32, 0, 1.0).withRadiusScale(12).withLodRange(near, far);
@@ -289,6 +323,7 @@
       }
       placeCamera(CAMS[cam], Number.isFinite(frozenT) ? frozenT : frame.time);
 
+      if (rebuildSky) skyOcclusion.refresh();
       const before = performance.now();
       hud.begin(before);
       timer.begin();
@@ -302,7 +337,7 @@
       if (frame.index % 10 === 0) {
         const stats = renderer.cullingStats;
         setText('hud', [
-          `${thousands(trees)} trees x 3 LODs · camera ${CAMS[cam]} (C)${shadows ? ' · shadows' : ''}`,
+          `${thousands(trees)} trees x 3 LODs · camera ${CAMS[cam]} (C)${shadows ? ' · shadows' : ''}${skyOcclusion ? ` · sky occlusion${skyOcc === 'show' ? ' (shown)' : ''}` : ''}`,
           stats ? views(stats) : '',
           `${renderer.renderWidth} x ${renderer.renderHeight} rendered · GPU ${gpuMs.toFixed(2)} ms${timer.hasTimestamps ? '' : ' (no timestamps)'}` +
             ` · CPU ${cpuMs.toFixed(2)} ms in render · ${intervalMs.toFixed(1)} ms between frames`,

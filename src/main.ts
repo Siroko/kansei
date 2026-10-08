@@ -73,6 +73,8 @@ export { LightUniforms, MAX_DIRECTIONAL_LIGHTS, MAX_POINT_LIGHTS } from "./light
 export { ShadowMap } from "./shadows/ShadowMap";
 export { CubeMapShadowMap } from "./shadows/CubeMapShadowMap";
 export { ComputeShadows, COMPUTE_SHADOWS_WGSL } from "./shadows/ComputeShadows";
+export { SkyOcclusion, SKY_OCCLUSION_WGSL } from "./shadows/SkyOcclusion";
+export type { SkyOcclusionOptions } from "./shadows/SkyOcclusion";
 export type { CascadedShadowSource } from "./shadows/ComputeShadows";
 export { PathTracerMaterial } from "./pathtracer/PathTracerMaterial";
 export { BVHBuilder } from "./pathtracer/BVHBuilder";

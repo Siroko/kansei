@@ -5,6 +5,7 @@ import { AreaLight } from '../../lights/AreaLight';
 import { FroxelGrid } from '../../froxels/FroxelGrid';
 import { ShadowMap } from '../../shadows/ShadowMap';
 import { CubeMapShadowMap } from '../../shadows/CubeMapShadowMap';
+import type { SkyOcclusion } from '../../shadows/SkyOcclusion';
 import { COMPUTE_SHADOWS_WGSL, ComputeShadows, SHADOW_MAP } from '../../shadows/ComputeShadows';
 import type { CascadedShadowSource } from '../../shadows/ComputeShadows';
 import { GBuffer } from '../GBuffer';
@@ -93,7 +94,8 @@ const COMPOSITE_WGSL = assemble([froxelCommon, fogComposite]);
  * over the scene.
  *
  * Its spot lights, local fog volumes and sky lighting are bound to stand-ins (none) until those
- * land in the TS engine.
+ * land in the TS engine. The sky occlusion (`setSkyOcclusion`) dims the sky lighting only, so it
+ * shows once the fog has a sky.
  */
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -123,6 +125,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _frame = 1;
     private _shadowMap: ShadowMap | null = null;
     private _cubeMapShadowMap: CubeMapShadowMap | null = null;
+    /** The sky occlusion's volume and parameters (`setSkyOcclusion`). */
+    private _skyOcclusion: { volume: GPUTextureView; params: GPUBuffer } | null = null;
+    private _injectBGDirty = false;
 
     // Injection pass
     private _injectPipeline: GPUComputePipeline | null = null;
@@ -132,8 +137,8 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _fogParamsBuffer: GPUBuffer | null = null;
     private _fogParams = new ArrayBuffer(FOG_PARAMS_BYTES);
 
-    // The media's stand-ins (volumetric_fog_media.wgsl): no local volumes, sky, sky occlusion or
-    // clipmap probes
+    // The media's stand-ins (volumetric_fog_media.wgsl): no local volumes, sky, sky occlusion (until
+    // `setSkyOcclusion`) or clipmap probes
     private _mediaParamsBuffer: GPUBuffer | null = null;
     private _volumesBuffer: GPUBuffer | null = null;
     private _noSkyLighting: GPUBuffer | null = null;
@@ -216,6 +221,18 @@ class VolumetricFogEffect extends PostProcessingEffect {
     setPointShadows(cube: CubeMapShadowMap | null): void {
         this._cubeMapShadowMap = cube;
         this._shadows.setPointShadows(cube);
+    }
+
+    /**
+     * Dim the sky's light on the fog by how much of the sky each froxel sees
+     * (`Renderer.skyOcclusion`, `SKY_OCCLUSION_WGSL`'s `skyVisibility`), as Unreal's Lumen occludes
+     * the sky light its volumetric fog receives: under the canopy, and where the trees round a
+     * clearing hide the horizon. The fog's other lights are not affected. Rust:
+     * `set_sky_occlusion`.
+     */
+    setSkyOcclusion(skyOcclusion: SkyOcclusion | null): void {
+        this._skyOcclusion = skyOcclusion ? { volume: skyOcclusion.volume, params: skyOcclusion.params } : null;
+        this._injectBGDirty = true;
     }
 
     /**
@@ -328,15 +345,16 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 { binding: 10, resource: { buffer: this._mediaParamsBuffer! } },
                 { binding: 11, resource: { buffer: this._volumesBuffer! } },
                 { binding: 12, resource: { buffer: this._noSkyLighting! } },
-                { binding: 18, resource: this._noOcclusionVolume!.createView() },
+                { binding: 18, resource: this._skyOcclusion?.volume ?? this._noOcclusionVolume!.createView() },
                 { binding: 19, resource: this._accumSampler! },
-                { binding: 20, resource: { buffer: this._noOcclusionParams! } },
+                { binding: 20, resource: { buffer: this._skyOcclusion?.params ?? this._noOcclusionParams! } },
                 { binding: 21, resource: { buffer: this._noClipProbeGrid! } },
                 { binding: 22, resource: { buffer: this._noClipProbes! } },
                 ...this._shadows.entries(),
             ],
         });
         this._injectTarget = target;
+        this._injectBGDirty = false;
     }
 
     private _buildCompositeBG(input: GPUTexture, depth: GPUTexture, output: GPUTexture): void {
@@ -376,7 +394,7 @@ class VolumetricFogEffect extends PostProcessingEffect {
         const time = this.time ?? (performance.now() - this._startTime) / 1000;
 
         // the lights, and the bind group when they, a shadow map or the grid changed
-        if (this._shadows.prepare(device) || grid.scatterExtinctionTex !== this._injectTarget) {
+        if (this._shadows.prepare(device) || grid.scatterExtinctionTex !== this._injectTarget || this._injectBGDirty) {
             this._rebuildInjectBG();
         }
 
