@@ -25,10 +25,11 @@ export function emptyCullStats(): CullStats {
 }
 
 /**
- * A view the renderer culls instances for: the camera, or the directional shadow map's light
- * (`Renderer.enableShadows`).
+ * A view the renderer culls instances for: the camera, the directional shadow map's light
+ * (`Renderer.enableShadows`), or the sky occlusion's top-down view
+ * (`Renderer.enableSkyOcclusion`).
  */
-export type CullViewKind = 'camera' | 'shadow';
+export type CullViewKind = 'camera' | 'shadow' | 'skyOcclusion';
 
 /** Instance culling statistics of a recent frame, per view. */
 export class CullingStats {

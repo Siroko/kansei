@@ -8,6 +8,7 @@ import { Scene } from "../objects/Scene";
 import { GBuffer } from "../postprocessing/GBuffer";
 import { ShadowMap, ShadowMapOptions } from "../shadows/ShadowMap";
 import { CubeMapShadowMap, CubeMapShadowMapOptions } from "../shadows/CubeMapShadowMap";
+import { SkyOcclusion, SkyOcclusionOptions } from "../shadows/SkyOcclusion";
 import { LightUniforms } from "../lights/LightUniforms";
 import { BufferBase } from "../buffers/BufferBase";
 import {
@@ -285,6 +286,7 @@ class Renderer {
     private _clusterLightsBuf: GPUBuffer | null = null;
     private _cascadesBuf: GPUBuffer | null = null;
     private _shadowBGDirty: boolean = true;
+    private _skyOcclusion: SkyOcclusion | null = null;
 
     // GPU instance culling (renderables with `instanceCulling`): the cull pipeline, the frame's
     // views packed for the GPU, and the culling statistics.
@@ -391,6 +393,22 @@ class Renderer {
 
     /** The scene's voxel GI, once `enableVoxelGI` has been called. */
     public get voxelGI(): SceneVoxelGi | null { return this._voxelGI; }
+
+    /**
+     * Sky occlusion around the camera: how much of the sky each point sees past the canopy
+     * (`SkyOcclusion`), for materials to dim their sky ambient light by with
+     * `SKY_OCCLUSION_WGSL`. The shadow casters on its layers are drawn from straight above when
+     * the camera has moved far enough, culled on the GPU; call `SkyOcclusion.refresh` (through
+     * `skyOcclusion`) after changing the scene under it. Rust: `enable_sky_occlusion`.
+     */
+    public enableSkyOcclusion(options: SkyOcclusionOptions = {}): SkyOcclusion {
+        this._skyOcclusion?.destroy();
+        this._skyOcclusion = new SkyOcclusion(this.device!, options);
+        return this._skyOcclusion;
+    }
+
+    /** The sky occlusion, once `enableSkyOcclusion` has been called. */
+    public get skyOcclusion(): SkyOcclusion | null { return this._skyOcclusion; }
 
     constructor(
         private options: RendererOptions = {}
@@ -1259,6 +1277,7 @@ class Renderer {
      * the first area light with it), or has no light this frame.
      */
     private _planShadowViews(stack: Scene, camera: Camera): void {
+        this._skyOcclusion?.update(camera);
         const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
         if (!shadowMap) return;
         const light = stack.directionalLights.find((l) => l.castShadow)
@@ -1292,11 +1311,62 @@ class Renderer {
             const wm = first.worldMatrix.internalMat4;
             this.setPointShadowParams(wm[12], wm[13], wm[14], first.radius);
         }
+
+        this._encodeSkyOcclusionPass(encoder, objects, meshOffset);
+    }
+
+    /**
+     * While the sky occlusion is being rebuilt: a tile of the top-down pass a frame (the visible
+     * shadow casters on its layers seen from above, through their materials' depth pipelines,
+     * culled to that tile), then its pyramid and its volume's slabs (`SkyOcclusion.build`). Rust:
+     * `run_sky_occlusion_pass`. Renderables with `shadowVertexCode` are left out: their material's
+     * own vertex stage is not what they cast with.
+     */
+    private _encodeSkyOcclusionPass(encoder: GPUCommandEncoder, objects: readonly Renderable[], meshOffset: (r: Renderable) => number): void {
+        const sky = this._skyOcclusion;
+        if (!sky?.building) return;
+        const scissor = sky.tileScissor();
+        if (scissor) {
+            const device = this.device!;
+            const pass = encoder.beginRenderPass({
+                label: 'Renderer/SkyOcclusionPass',
+                timestampWrites: gpuPass('Renderer/SkyOcclusionPass'),
+                colorAttachments: [],
+                depthStencilAttachment: {
+                    view: sky.depthView,
+                    depthClearValue: 1.0,
+                    depthLoadOp: sky.firstTile ? 'clear' : 'load',
+                    depthStoreOp: 'store',
+                },
+            });
+            pass.setScissorRect(...scissor);
+            pass.setBindGroup(1, sky.cameraBindGroup);
+            const view = this._skyOcclusionView();
+            for (const r of objects) {
+                if (!r.castShadow || !r.geometry.initialized || r.shadowVertexCode || (r.layers & sky.options.layerMask) === 0) continue;
+                const pipeline = r.material.getDepthPipeline(device, r.geometry.vertexBuffersDescriptors, SkyOcclusion.FORMAT, SkyOcclusion.DEPTH_BIAS);
+                pass.setPipeline(pipeline);
+                pass.setBindGroup(0, r.material.getBindGroup(device));
+                const offset = meshOffset(r);
+                pass.setBindGroup(2, this._sharedMeshBG!, [offset, offset]);
+                pass.setVertexBuffer(0, r.geometry.vertexBuffer!);
+                pass.setIndexBuffer(r.geometry.indexBuffer!, r.geometry.indexFormat!);
+                drawGeometry(pass, r.geometry, r.instanceCulling?.view(view) ?? null);
+            }
+            pass.end();
+        }
+        sky.build(encoder);
+    }
+
+    /** The cull view of the sky occlusion's top-down view: after the directional shadow map's. */
+    private _skyOcclusionView(): number {
+        return SHADOW_VIEW + (this._ownsShadowMap && this._shadowMap ? 1 : 0);
     }
 
     /**
      * The views instance culling runs for, at fixed indices: `MAIN_VIEW`, then while the renderer
-     * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame).
+     * owns the directional shadow map `SHADOW_VIEW` (`null` when no light casts this frame),
+     * then with sky occlusion `_skyOcclusionView` (`null` unless a tile of its top-down pass is due).
      */
     private _cullViews(camera: Camera): (CullView | null)[] {
         // the unjittered projection: the frustum, not where pixels sample
@@ -1305,6 +1375,12 @@ class Renderer {
             const map = this._shadowMap;
             views.push(map.light ? cullView(map.lightViewProjMatrix, { castersOnly: true }) : null);
         }
+        // then the sky occlusion's top-down view (`_skyOcclusionView`), while it is being rebuilt
+        const sky = this._skyOcclusion;
+        if (sky) {
+            const viewProj = sky.cullView();
+            views.push(viewProj ? cullView(viewProj, { castersOnly: true, layerMask: sky.options.layerMask, lodDistanceScale: sky.options.lodDistanceScale }) : null);
+        }
         return views;
     }
 
@@ -1312,6 +1388,7 @@ class Renderer {
     private _cullViewKinds(): CullViewKind[] {
         const kinds: CullViewKind[] = ['camera'];
         if (this._ownsShadowMap && this._shadowMap) kinds.push('shadow');
+        if (this._skyOcclusion) kinds.push('skyOcclusion');
         return kinds;
     }
 
