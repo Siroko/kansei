@@ -27,8 +27,8 @@
       import { DEFAULT_PBF_OPTIONS, latticeDensity } from '../src/simulations/fluid/FluidSimulationParams'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
       import { FluidMarchingCubes } from '../src/simulations/fluid/FluidMarchingCubes'
-      import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
-      import { FluidTransmissionEffect } from '../src/postprocessing/effects/FluidTransmissionEffect'
+      import { FluidSurfaceEffect, FluidMask } from '../src/postprocessing/effects/FluidSurfaceEffect'
+      import { FluidRaymarchEffect } from '../src/postprocessing/effects/FluidRaymarchEffect'
       import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
       import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
       import { Material } from '../src/materials/Material'
@@ -175,7 +175,8 @@
       // Fluid mesh material: writes base colour + world-space normal to the GBuffer.
       // It is marked `transmissive: true` so the renderer splits the GBuffer pass,
       // snapshots the opaque-only colour into GBuffer.backgroundTexture, and then
-      // draws the mesh — so FluidTransmissionEffect can refract the background.
+      // draws the mesh — so FluidSurfaceEffect can refract the background. Its emissive alpha
+      // of 1 marks the fluid's pixels (FluidMask.EmissiveAlpha): the dome writes normals too.
       const fluidMeshShader = /* wgsl */`
 @group(0) @binding(0) var<uniform> fluidColor: vec4<f32>;
 @group(2) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
@@ -218,7 +219,7 @@ fn fragment_main(v: VOut) -> FragOut {
     let lit = fluidColor.rgb * (0.2 + ndotl * 0.8);
     var out: FragOut;
     out.color = vec4<f32>(lit, 1.0);
-    out.emissive = vec4<f32>(0.0);
+    out.emissive = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     out.normal = vec4<f32>(n, 1.0);
     out.albedo = vec4<f32>(fluidColor.rgb, 1.0);
     return out;
@@ -236,18 +237,22 @@ fn fragment_main(v: VOut) -> FragOut {
       scene.add(fluidMesh);
 
       // ── Post-processing chain ──
-      // Mesh mode:     [FluidTransmissionEffect, DepthOfFieldEffect]
-      // Raymarch mode: [FluidSurfaceEffect,      DepthOfFieldEffect]
-      const transmissionEffect = new FluidTransmissionEffect({
-        color: [0.77, 0.96, 1.0],
+      // Mesh mode:     [FluidSurfaceEffect,  DepthOfFieldEffect]
+      // Raymarch mode: [FluidRaymarchEffect, DepthOfFieldEffect]
+      const fluidSurface = new FluidSurfaceEffect({
+        color: [0.77, 0.96, 1.0, 1.0],
         ior: 1.41,
         chromaticAberration: 0.05,
         tintStrength: 0.30,
         fresnelPower: 2.3,
         roughness: 0.28,
         thickness: 2.4,
+        // the sun's key light: specular and rim
+        lightDirection: [0.3, -1.0, 0.5],
+        lightIntensity: 2.0,
+        mask: FluidMask.EmissiveAlpha,
       });
-      const surfaceEffect = new FluidSurfaceEffect({
+      const raymarchEffect = new FluidRaymarchEffect({
         densityField,
         fluidColor: [0.77, 0.96, 1.0],
         densityScale: 1.1,
@@ -260,7 +265,7 @@ fn fragment_main(v: VOut) -> FragOut {
         focusRange: 37,
         maxBlur: 7,
       });
-      const volume = new PostProcessingVolume(renderer, [transmissionEffect, dofEffect]);
+      const volume = new PostProcessingVolume(renderer, [fluidSurface, dofEffect]);
 
       // ── Render mode switcher ──
       // 'mesh'      — GPU-built marching cubes mesh rendered as a standard Renderable
@@ -318,7 +323,7 @@ fn fragment_main(v: VOut) -> FragOut {
     var out: FragOut;
     out.color = vec4<f32>(lit, 1.0);
     out.emissive = vec4<f32>(0.0);
-    // normal.w = 0 → dome is NOT transmissive (FluidTransmissionEffect ignores it)
+    // emissive alpha 0: not the fluid (FluidSurfaceEffect's mask)
     out.normal = vec4<f32>(n, 0.0);
     out.albedo = vec4<f32>(base, 1.0);
     return out;
@@ -356,7 +361,7 @@ fn fragment_main(v: VOut) -> FragOut {
       // doesn't dispatch their compute passes at all (no ping-pong, no work).
       const dofOpts = { enabled: true };
       const rebuildEffectChain = () => {
-        const base = renderMode.mode === 'raymarch' ? surfaceEffect : transmissionEffect;
+        const base = renderMode.mode === 'raymarch' ? raymarchEffect : fluidSurface;
         volume.effects = dofOpts.enabled ? [base, dofEffect] : [base];
       };
 
@@ -474,17 +479,18 @@ fn fragment_main(v: VOut) -> FragOut {
         sun.direction[0] = lt.dirX / len;
         sun.direction[1] = lt.dirY / len;
         sun.direction[2] = lt.dirZ / len;
+        fluidSurface.lightDirection = [sun.direction[0], sun.direction[1], sun.direction[2]];
       };
       lightFolder.addBinding(lt, 'dirX', { min: -1, max: 1, step: 0.01, label: 'dir X' }).on('change', syncLightDir);
       lightFolder.addBinding(lt, 'dirY', { min: -1, max: 1, step: 0.01, label: 'dir Y' }).on('change', syncLightDir);
       lightFolder.addBinding(lt, 'dirZ', { min: -1, max: 1, step: 0.01, label: 'dir Z' }).on('change', syncLightDir);
-      lightFolder.addBinding(lt, 'intensity', { min: 0, max: 10, step: 0.1 }).on('change', () => { sun.intensity = lt.intensity; });
-      lightFolder.addBinding(lt, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', () => { sun.color[0] = lt.r; });
-      lightFolder.addBinding(lt, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', () => { sun.color[1] = lt.g; });
-      lightFolder.addBinding(lt, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', () => { sun.color[2] = lt.b; });
+      lightFolder.addBinding(lt, 'intensity', { min: 0, max: 10, step: 0.1 }).on('change', () => { sun.intensity = lt.intensity; fluidSurface.lightIntensity = lt.intensity; });
+      lightFolder.addBinding(lt, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', () => { sun.color[0] = lt.r; fluidSurface.lightColor[0] = lt.r; });
+      lightFolder.addBinding(lt, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', () => { sun.color[1] = lt.g; fluidSurface.lightColor[1] = lt.g; });
+      lightFolder.addBinding(lt, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', () => { sun.color[2] = lt.b; fluidSurface.lightColor[2] = lt.b; });
 
-      // ── Transmission (mesh mode) ──
-      const txFolder = pane.addFolder({ title: 'Transmission', expanded: false });
+      // ── Surface (mesh mode) ──
+      const txFolder = pane.addFolder({ title: 'Surface (Mesh)', expanded: false });
       const tx = {
         ior: 1.41,
         chromaticAberration: 0.05,
@@ -495,13 +501,13 @@ fn fragment_main(v: VOut) -> FragOut {
         color: { r: 0.77, g: 0.96, b: 1.0 },
       };
       const syncTx = () => {
-        transmissionEffect.ior = tx.ior;
-        transmissionEffect.chromaticAberration = tx.chromaticAberration;
-        transmissionEffect.tintStrength = tx.tintStrength;
-        transmissionEffect.fresnelPower = tx.fresnelPower;
-        transmissionEffect.roughness = tx.roughness;
-        transmissionEffect.thickness = tx.thickness;
-        transmissionEffect.color = [tx.color.r, tx.color.g, tx.color.b];
+        fluidSurface.ior = tx.ior;
+        fluidSurface.chromaticAberration = tx.chromaticAberration;
+        fluidSurface.tintStrength = tx.tintStrength;
+        fluidSurface.fresnelPower = tx.fresnelPower;
+        fluidSurface.roughness = tx.roughness;
+        fluidSurface.thickness = tx.thickness;
+        fluidSurface.color = [tx.color.r, tx.color.g, tx.color.b, 1];
         fluidColorU.x = tx.color.r;
         fluidColorU.y = tx.color.g;
         fluidColorU.z = tx.color.b;
@@ -517,14 +523,14 @@ fn fragment_main(v: VOut) -> FragOut {
       // ── Surface (raymarch mode) ──
       const surfaceFolder = pane.addFolder({ title: 'Surface (Raymarch)', expanded: false });
       const colorObj = { r: 0.77, g: 0.96, b: 1.0 };
-      const syncColor = () => { surfaceEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
+      const syncColor = () => { raymarchEffect.fluidColor = [colorObj.r, colorObj.g, colorObj.b]; };
       surfaceFolder.addBinding(colorObj, 'r', { min: 0, max: 1, step: 0.01, label: 'color R' }).on('change', syncColor);
       surfaceFolder.addBinding(colorObj, 'g', { min: 0, max: 1, step: 0.01, label: 'color G' }).on('change', syncColor);
       surfaceFolder.addBinding(colorObj, 'b', { min: 0, max: 1, step: 0.01, label: 'color B' }).on('change', syncColor);
-      surfaceFolder.addBinding(surfaceEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
-      surfaceFolder.addBinding(surfaceEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
-      surfaceFolder.addBinding(surfaceEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
-      surfaceFolder.addBinding(surfaceEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
+      surfaceFolder.addBinding(raymarchEffect, 'densityScale', { min: 0.1, max: 10.0, step: 0.1, label: 'density scale' });
+      surfaceFolder.addBinding(raymarchEffect, 'densityThreshold', { min: 0.01, max: 5.0, step: 0.01, label: 'threshold' });
+      surfaceFolder.addBinding(raymarchEffect, 'absorption', { min: 0.0, max: 10.0, step: 0.1 });
+      surfaceFolder.addBinding(raymarchEffect, 'stepCount', { min: 16, max: 128, step: 1, label: 'steps' });
 
       // ── Depth of Field ──
       const dofFolder = pane.addFolder({ title: 'Depth of Field', expanded: false });
