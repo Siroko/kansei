@@ -30,7 +30,6 @@ shadowFragmentEntry cuts its holes out of its shadow.</div>
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
     import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { Vector3 } from '../src/math/Vector3'
     import { Vector4 } from '../src/math/Vector4'
@@ -42,10 +41,11 @@ shadowFragmentEntry cuts its holes out of its shadow.</div>
     const camera = new Camera(40, 0.1, 60, window.innerWidth / window.innerHeight);
     const controls = new CameraControls(camera, new Vector3(0, 0, 1), renderer.canvas, 22);
 
+    // The renderer renders the shadow map from the first directional light that casts shadows.
     const dirLight = new DirectionalLight([0.3, -1.0, 0.6], [1, 1, 1], 1.0);
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048, maxShadowDistance: 40 });
-    renderer.shadowMap = shadowMap;
-    renderer.shadowsEnabled = true;
+    dirLight.castShadow = true;
+    scene.add(dirLight);
+    renderer.enableShadows({ resolution: 2048, maxShadowDistance: 40 });
 
     // One shader for every surface; `vertex_main` differs only in where an instance sits.
     const shader = (vertexMain) => /* wgsl */`
@@ -148,7 +148,6 @@ shadowFragmentEntry cuts its holes out of its shadow.</div>
     run(canvas, (f) => {
       f.resize(renderer, camera);
       controls.update();
-      shadowMap.render(renderer, scene, camera, dirLight);
       renderer.render(scene, camera);
     });
   </script>

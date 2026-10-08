@@ -1,6 +1,6 @@
 import { IBindable } from "../buffers/IBindable";
 import { BindingLayout, bindingLayoutFromType } from "./Binding";
-import { cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries } from "../renderers/SharedLayouts";
+import { cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries, shadowBindGroupLayoutEntries } from "../renderers/SharedLayouts";
 
 /**
  * Represents a descriptor for a bind group, which includes binding, visibility, and value.
@@ -58,18 +58,10 @@ class BindableGroup {
             entries: meshBindGroupLayoutEntries(),
         });
 
-        // Group 3: shadows, fragment-only as in the Rust engine. Vertex stages must not read it:
-        // depth pipelines (Material.getDepthPipeline) leave it out, since shadow passes render
-        // into the textures it samples.
+        // Group 3: shadows and lights, fragment-only (see shadowBindGroupLayoutEntries).
         this.shadowBindablesGroupLayout = gpuDevice.createBindGroupLayout({
             label: 'Shadow BindGroupLayout',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-                { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float', viewDimension: '2d-array' } },
-                { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
-            ],
+            entries: shadowBindGroupLayoutEntries(),
         });
     }
 

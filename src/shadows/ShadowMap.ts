@@ -3,6 +3,7 @@ import { Camera } from '../cameras/Camera';
 import { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+import type { Renderable } from '../objects/Renderable';
 import { DirectionalLight } from '../lights/DirectionalLight';
 import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
@@ -36,6 +37,16 @@ class ShadowMap {
     private _lightVP = new Float32Array(16);
 
     private _depthBias: DepthBias;
+
+    /** Depth bias materials subtract when they compare against the map (`kansei_shadow.bias`). */
+    public bias = 0.001;
+    /** World-space offset along the surface normal before the lookup (`kansei_shadow.normalBias`). */
+    public normalBias = 0.02;
+    /**
+     * The light the map was last rendered from (`update`): null before that, or when it was
+     * rendered from a bare direction.
+     */
+    public light: DirectionalLight | AreaLight | PointLight | null = null;
     private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
     // Casters draw through their material's depth pipeline (Material.getDepthPipeline), as the
@@ -359,14 +370,11 @@ class ShadowMap {
         return pipeline;
     }
 
-    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
-        const device = this._device;
-
-        scene.prepare(camera);
-        camera.updateViewMatrix();
-        const objects = scene.getOrderedObjects();
-        if (objects.length === 0) return;
-
+    /**
+     * Computes the light's view-projection for `camera` (a directional light's covers the camera
+     * frustum; an area or point light's is a perspective from the light) and uploads it.
+     */
+    update(camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
         if (lightDirOrLight instanceof AreaLight) {
             this._computeAreaLightVP(lightDirOrLight);
         } else if (lightDirOrLight instanceof PointLight) {
@@ -377,29 +385,25 @@ class ShadowMap {
                 : lightDirOrLight.direction;
             this._computeLightVP(camera, lightDir);
         }
-        device.queue.writeBuffer(this._lightVPBuffer, 0, this._lightVP.buffer as ArrayBuffer);
-        device.queue.writeBuffer(this._lightCameraBuffers[0], 0, this._lightView as Float32Array);
-        device.queue.writeBuffer(this._lightCameraBuffers[1], 0, this._lightProj as Float32Array);
+        this.light = Array.isArray(lightDirOrLight) ? null : lightDirOrLight;
+        const queue = this._device.queue;
+        queue.writeBuffer(this._lightVPBuffer, 0, this._lightVP.buffer as ArrayBuffer);
+        queue.writeBuffer(this._lightCameraBuffers[0], 0, this._lightView as Float32Array);
+        queue.writeBuffer(this._lightCameraBuffers[1], 0, this._lightProj as Float32Array);
+    }
 
-        this._ensureMeshBuffers(objects.length);
-
-        const stride = meshSlotStride(device);
-        const floatsPerSlot = stride / 4;
-
-        for (let i = 0; i < objects.length; i++) {
-            const obj = objects[i];
-            if (!obj.geometry.initialized) obj.geometry.initialize(device);
-            obj.updateModelMatrix();
-            // World, then the previous world (the same: shadows have no motion), then the normal matrix.
-            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
-            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot + 16);
-            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
-        }
-
-        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
-        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
-
-        const commandEncoder = device.createCommandEncoder({ label: 'ShadowMap' });
+    /**
+     * Encodes the shadow pass: clears the map and draws the `castShadow` renderables among
+     * `objects` from the light (`update`), each with its matrices in `meshBindGroup` (group 2) at
+     * `meshOffset(renderable, index)`.
+     */
+    encode(
+        commandEncoder: GPUCommandEncoder,
+        objects: readonly Renderable[],
+        meshBindGroup: GPUBindGroup,
+        meshOffset: (renderable: Renderable, index: number) => number,
+    ): void {
+        const device = this._device;
         const pass = commandEncoder.beginRenderPass({
             label: 'Renderer/ShadowPass',
             timestampWrites: gpuPass('Renderer/ShadowPass'),
@@ -460,8 +464,8 @@ class ShadowMap {
                 activeLightBG = lightBG;
             }
 
-            const offset = i * stride;
-            pass.setBindGroup(2, this._meshBG!, [offset, offset]);
+            const offset = meshOffset(obj, i);
+            pass.setBindGroup(2, meshBindGroup, [offset, offset]);
             pass.setBindGroup(0, groupZero);
 
             if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
@@ -489,6 +493,41 @@ class ShadowMap {
         }
 
         pass.end();
+    }
+
+    /**
+     * Renders the map from `lightDirOrLight` now, with matrix buffers of its own: for a map the
+     * caller drives. A map from `Renderer.enableShadows` is rendered by the renderer each frame.
+     */
+    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
+        const device = this._device;
+
+        scene.prepare(camera);
+        camera.updateViewMatrix();
+        const objects = scene.getOrderedObjects();
+        if (objects.length === 0) return;
+
+        this.update(camera, lightDirOrLight, target);
+        this._ensureMeshBuffers(objects.length);
+
+        const stride = meshSlotStride(device);
+        const floatsPerSlot = stride / 4;
+
+        for (let i = 0; i < objects.length; i++) {
+            const obj = objects[i];
+            if (!obj.geometry.initialized) obj.geometry.initialize(device);
+            obj.updateModelMatrix();
+            // World, then the previous world (the same: shadows have no motion), then the normal matrix.
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot + 16);
+            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
+        }
+
+        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
+        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
+
+        const commandEncoder = device.createCommandEncoder({ label: 'ShadowMap' });
+        this.encode(commandEncoder, objects, this._meshBG!, (_, i) => i * stride);
         device.queue.submit([commandEncoder.finish()]);
     }
 

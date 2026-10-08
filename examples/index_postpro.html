@@ -31,8 +31,6 @@
     import { SSAOEffect } from '../src/postprocessing/effects/SSAOEffect'
     import { DepthOfFieldEffect } from '../src/postprocessing/effects/DepthOfFieldEffect'
     import { GodRaysEffect } from '../src/postprocessing/effects/GodRaysEffect'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
-    import { CubeMapShadowMap } from '../src/shadows/CubeMapShadowMap'
     import { FroxelGrid } from '../src/froxels/FroxelGrid'
     import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
     import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
@@ -58,6 +56,7 @@
     // ── Scene lights ──────────────────────────────────────────────────────
     const dirLight = new DirectionalLight([0.5, -0.2, 0.5], [1.0, 0.95, 0.85], 1.0);
     dirLight.volumetric = true;
+    dirLight.castShadow = true;
 
     // ── Lambert shader (white base colour, single directional light) ──────
     // Uses the same lightDir as the volumetric fog so shading is consistent.
@@ -190,12 +189,12 @@
       sampleCount: 1
     });
 
-    // ── Shadow receiving on geometry ─────────────────────────────────────
-    renderer.shadowsEnabled = true;
+    // ── Shadows: the renderer renders them each frame from the lights that cast ──
+    // (dirLight; the point lights while volumetric), for the geometry and the fog
+    const shadowMap = renderer.enableShadows({ resolution: 2048 });
+    const cubeMapShadowMap = renderer.enablePointShadows({ resolution: 512 });
 
     // ── Volumetric fog resources ──────────────────────────────────────────
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
-    renderer.shadowMap = shadowMap;
     const froxelGrid = new FroxelGrid(renderer.gpuDevice, {
       gridW: 160, gridH: 90, gridD: 128,
       near: 0.5, far: 300,
@@ -203,7 +202,6 @@
       blendFactor: 0.05,
     });
 
-    const cubeMapShadowMap = new CubeMapShadowMap(renderer.gpuDevice, { resolution: 512 });
 
     // ── Camera & controls ─────────────────────────────────────────────────────
     const scene  = new Scene();
@@ -477,7 +475,7 @@
       color: { r: ptLight1.color[0], g: ptLight1.color[1], b: ptLight1.color[2] },
     };
     const ptFolder1 = pane.addFolder({ title: 'Point Light 1' });
-    ptFolder1.addBinding(ptLight1Params, 'volumetric').on('change', (ev) => { ptLight1.volumetric = ev.value; });
+    ptFolder1.addBinding(ptLight1Params, 'volumetric').on('change', (ev) => { ptLight1.volumetric = ptLight1.castShadow = ev.value; });
     ptFolder1.addBinding(ptLight1Params, 'x', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.x = ev.value; });
     ptFolder1.addBinding(ptLight1Params, 'y', { min: 0, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.y = ev.value; });
     ptFolder1.addBinding(ptLight1Params, 'z', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight1.position.z = ev.value; });
@@ -493,7 +491,7 @@
       color: { r: ptLight2.color[0], g: ptLight2.color[1], b: ptLight2.color[2] },
     };
     const ptFolder2 = pane.addFolder({ title: 'Point Light 2' });
-    ptFolder2.addBinding(ptLight2Params, 'volumetric').on('change', (ev) => { ptLight2.volumetric = ev.value; });
+    ptFolder2.addBinding(ptLight2Params, 'volumetric').on('change', (ev) => { ptLight2.volumetric = ptLight2.castShadow = ev.value; });
     ptFolder2.addBinding(ptLight2Params, 'x', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.x = ev.value; });
     ptFolder2.addBinding(ptLight2Params, 'y', { min: 0, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.y = ev.value; });
     ptFolder2.addBinding(ptLight2Params, 'z', { min: -80, max: 80, step: 0.5 }).on('change', (ev) => { ptLight2.position.z = ev.value; });
@@ -539,12 +537,6 @@
       }
 
       cameraControls.update();
-      shadowMap.render(renderer, scene, camera, dirLight);
-      // Only render cubemap shadows for volumetric point lights
-      const volPtLights = scene.pointLights.filter(l => l.volumetric);
-      if (volPtLights.length > 0) {
-        cubeMapShadowMap.render(renderer, scene, camera, volPtLights);
-      }
       fogEffect.updateLights(scene.directionalLights, scene.pointLights);
       volume.render(scene, camera);
       hud.end(now);

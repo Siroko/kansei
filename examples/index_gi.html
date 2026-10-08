@@ -32,7 +32,6 @@
     import { ToneMapEffect, ToneMapper, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { AreaLight } from '../src/lights/AreaLight'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
     import { Float } from '../src/math/Float'
     import { GLTFLoader } from '../src/loaders/GLTFLoader'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
@@ -170,15 +169,15 @@
       antialias: false,
       sampleCount: 4
     });
-    renderer.shadowsEnabled = true;
-
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
-    renderer.shadowMap = shadowMap;
+    // The renderer renders the shadow map each frame from dirLight (castShadow, in the scene).
+    renderer.enableShadows({ resolution: 2048 });
 
     // ── Scene ─────────────────────────────────────────────────────────────
     const scene = new Scene();
     const camera = new Camera(50, 0.1, 100, window.innerWidth / window.innerHeight);
     scene.add(areaLight);
+    dirLight.castShadow = true;
+    scene.add(dirLight);
 
     const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
 
@@ -428,7 +427,6 @@
     // ── Render loop ───────────────────────────────────────────────────────
     function animate() {
       cameraControls.update();
-      shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
       if (sceneParams.animateCube) {
         const t = performance.now() * 0.001;

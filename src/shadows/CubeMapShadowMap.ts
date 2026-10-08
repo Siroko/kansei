@@ -5,6 +5,8 @@ import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+import type { Renderable } from '../objects/Renderable';
+import { meshBindGroupLayoutEntries } from '../renderers/SharedLayouts';
 import { gpuPass } from '../profiling/Profiler';
 
 /** Any light with a world-space position and radius, usable for cubemap shadow rendering. */
@@ -115,10 +117,7 @@ class CubeMapShadowMap {
 
         this._meshBGL = device.createBindGroupLayout({
             label: 'CubeMapShadow/Mesh BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-                { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-            ],
+            entries: meshBindGroupLayoutEntries(),
         });
     }
 
@@ -338,41 +337,17 @@ class CubeMapShadowMap {
         return pipeline;
     }
 
-    render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PositionalLight[]): void {
-        const device = this._device;
-        this._lights = [];
-        if (pointLights.length === 0) return;
-
-        const objects = scene.getOrderedObjects();
-        if (objects.length === 0) return;
-
-        // Ensure pipeline (lazy — needs vertex layout from first geometry)
-        if (!objects[0].geometry.initialized) {
-            objects[0].geometry.initialize(device);
-        }
-        this._ensurePipeline(objects[0].geometry.vertexBuffersDescriptors);
-
-        const alignment = this._uniformAlignment;
-        const floatsPerSlot = alignment / 4;
-
-        this._ensureMeshBuffers(objects.length);
-
-        // Upload all object world matrices once
-        for (let i = 0; i < objects.length; i++) {
-            const obj = objects[i];
-            if (!obj.geometry.initialized) obj.geometry.initialize(device);
-            obj.updateModelMatrix();
-            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
-            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
-        }
-
-        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
-        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
-
+    /**
+     * Uploads the face view-projections of the first `maxLights` of `pointLights`, which become
+     * `lights` (light i owns layers 6i..6i+5). Returns how many it took.
+     */
+    update(pointLights: readonly PositionalLight[]): number {
         const lightCount = Math.min(pointLights.length, this._maxLights);
-        const totalFaces = lightCount * 6;
         this._lights = pointLights.slice(0, lightCount);
+        if (lightCount === 0) return 0;
 
+        const totalFaces = lightCount * 6;
+        const floatsPerSlot = this._uniformAlignment / 4;
         // Ensure light uniform buffer is large enough for all faces
         this._ensureLightUniformBuffer(totalFaces);
 
@@ -410,19 +385,39 @@ class CubeMapShadowMap {
             }
         }
 
-        device.queue.writeBuffer(this._lightUniformBuffer!, 0, uniformStaging.buffer as ArrayBuffer);
+        this._device.queue.writeBuffer(this._lightUniformBuffer!, 0, uniformStaging.buffer as ArrayBuffer);
+        return lightCount;
+    }
 
-        // Record all face render passes into one command encoder
-        const commandEncoder = device.createCommandEncoder({ label: 'CubeMapShadow' });
+    /**
+     * Encodes the six face passes of every light in `lights` (`update`), each drawing the
+     * `castShadow` renderables among `objects` with their matrices in `meshBindGroup` (group 2)
+     * at `meshOffset(renderable, index)`.
+     */
+    encode(
+        commandEncoder: GPUCommandEncoder,
+        objects: readonly Renderable[],
+        meshBindGroup: GPUBindGroup,
+        meshOffset: (renderable: Renderable, index: number) => number,
+    ): void {
+        const device = this._device;
+        const lights = this._lights;
+        if (lights.length === 0 || objects.length === 0) return;
+
+        // Ensure pipeline (lazy — needs the vertex layout of a geometry)
+        if (!objects[0].geometry.initialized) {
+            objects[0].geometry.initialize(device);
+        }
+        this._ensurePipeline(objects[0].geometry.vertexBuffersDescriptors);
+
         const scratchDepthView = this._scratchDepthTexture.createView();
 
-        for (let li = 0; li < lightCount; li++) {
-            const light = pointLights[li];
-            const clearDist = Math.max(this._shadowFar, light.radius);
+        for (let li = 0; li < lights.length; li++) {
+            const clearDist = Math.max(this._shadowFar, lights[li].radius);
 
             for (let face = 0; face < 6; face++) {
                 const faceSlot = li * 6 + face;
-                const lightOffset = faceSlot * alignment;
+                const lightOffset = faceSlot * this._uniformAlignment;
 
                 const colorView = this._distanceTexture.createView({
                     dimension: '2d',
@@ -476,8 +471,8 @@ class CubeMapShadowMap {
                         currentIndexBuffer = null;
                     }
 
-                    const offset = i * alignment;
-                    pass.setBindGroup(2, this._meshBG!, [offset, offset]);
+                    const offset = meshOffset(obj, i);
+                    pass.setBindGroup(2, meshBindGroup, [offset, offset]);
                     pass.setBindGroup(0, obj.shadowVertexCode && obj.shadowExtraBG ? obj.shadowExtraBG : this._emptyBG);
 
                     if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
@@ -505,7 +500,43 @@ class CubeMapShadowMap {
                 pass.end();
             }
         }
+    }
 
+    /**
+     * Renders the faces of the first `maxLights` of `pointLights` now, with matrix buffers of its
+     * own: for a map the caller drives. A map from `Renderer.enablePointShadows` is rendered by
+     * the renderer each frame.
+     */
+    render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PositionalLight[]): void {
+        const device = this._device;
+        this._lights = [];
+        if (pointLights.length === 0) return;
+
+        const objects = scene.getOrderedObjects();
+        if (objects.length === 0) return;
+
+        const alignment = this._uniformAlignment;
+        const floatsPerSlot = alignment / 4;
+
+        this._ensureMeshBuffers(objects.length);
+
+        // Upload all object world matrices once
+        for (let i = 0; i < objects.length; i++) {
+            const obj = objects[i];
+            if (!obj.geometry.initialized) obj.geometry.initialize(device);
+            obj.updateModelMatrix();
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
+            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
+        }
+
+        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
+        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
+
+        this.update(pointLights);
+
+        // Record all face render passes into one command encoder
+        const commandEncoder = device.createCommandEncoder({ label: 'CubeMapShadow' });
+        this.encode(commandEncoder, objects, this._meshBG!, (_, i) => i * alignment);
         device.queue.submit([commandEncoder.finish()]);
     }
 

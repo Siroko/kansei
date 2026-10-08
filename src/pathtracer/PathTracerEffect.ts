@@ -1435,7 +1435,8 @@ export class PathTracerEffect extends PostProcessingEffect {
     // ── Light packing ─────────────────────────────────────────────────────
 
     /**
-     * Pack all scene lights into the lights storage buffer.
+     * Pack the scene lights that emit (intensity not 0) into the lights storage buffer: a dark
+     * light would only take light samples (a directional light kept for its shadow map).
      * LightData layout (64 bytes = 16 floats):
      *   [0-2]  position.xyz   [3]  lightType (as float, bitcast to u32)
      *   [4-6]  color.rgb      [7]  intensity
@@ -1452,6 +1453,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Directional lights (type = 1)
         for (const dl of scene.directionalLights) {
             if (idx >= MAX_LIGHTS) break;
+            if (dl.intensity === 0) continue;
             const off = idx * LIGHT_STRIDE_FLOATS;
             lightData[off + 0] = dl.direction[0];
             lightData[off + 1] = dl.direction[1];
@@ -1468,6 +1470,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Area lights (type = 2)
         for (const al of scene.areaLights) {
             if (idx >= MAX_LIGHTS) break;
+            if (al.intensity === 0) continue;
             const off = idx * LIGHT_STRIDE_FLOATS;
             lightData[off + 0] = al.position.x;
             lightData[off + 1] = al.position.y;
@@ -1494,6 +1497,7 @@ export class PathTracerEffect extends PostProcessingEffect {
         // Point lights (type = 3)
         for (const pl of scene.pointLights) {
             if (idx >= MAX_LIGHTS) break;
+            if (pl.intensity === 0) continue;
             const off = idx * LIGHT_STRIDE_FLOATS;
             lightData[off + 0] = pl.position.x;
             lightData[off + 1] = pl.position.y;

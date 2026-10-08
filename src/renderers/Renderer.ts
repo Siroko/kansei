@@ -6,9 +6,12 @@ import { Compute } from "../materials/Compute";
 import { Renderable } from "../objects/Renderable";
 import { Scene } from "../objects/Scene";
 import { GBuffer } from "../postprocessing/GBuffer";
-import { ShadowMap } from "../shadows/ShadowMap";
-import { CubeMapShadowMap } from "../shadows/CubeMapShadowMap";
-import { BindGroupSlot, MESH_TRANSFORMS_BYTES, meshBindGroupLayoutEntries, meshSlotStride } from "./SharedLayouts";
+import { ShadowMap, ShadowMapOptions } from "../shadows/ShadowMap";
+import { CubeMapShadowMap, CubeMapShadowMapOptions } from "../shadows/CubeMapShadowMap";
+import {
+    BindGroupSlot, CASCADES_BYTES, CLUSTER_PARAMS_BYTES, MESH_TRANSFORMS_BYTES, SHADOW_UNIFORM_BYTES, SPOT_LIGHTS_BUFFER_BYTES,
+    meshBindGroupLayoutEntries, meshSlotStride, shadowBindGroupLayoutEntries,
+} from "./SharedLayouts";
 import { FrameProfile, cpuScope, endProfiledFrame, gpuPass, setProfilingEnabled, takeProfile } from "../profiling/Profiler";
 
 /**
@@ -226,9 +229,18 @@ class Renderer {
     // The renderable each slot was last written for: its world matrix there is the previous one.
     private _slotOwners: (Renderable | null)[] = [];
 
-    // ── Shadow resources ─────────────────────────────────────────────────────
+    // ── Shadow resources (group 3, see SharedLayouts.shadowBindGroupLayoutEntries) ──
+    /**
+     * Whether materials sample the directional shadow map (`kansei_shadow_map`). `enableShadows`
+     * turns it on; turning it off leaves the map rendering for effects that read it (the fog).
+     */
     public shadowsEnabled: boolean = false;
     private _shadowMap: ShadowMap | null = null;
+    private _cubeMapShadowMap: CubeMapShadowMap | null = null;
+    // Whether the renderer renders the maps each frame (enableShadows, enablePointShadows), or
+    // the caller does (the shadowMap and cubeMapShadowMap setters).
+    private _ownsShadowMap: boolean = false;
+    private _ownsCubeMapShadowMap: boolean = false;
     private _shadowBGL: GPUBindGroupLayout | null = null;
     private _shadowBG: GPUBindGroup | null = null;
     private _shadowUniformBuf: GPUBuffer | null = null;
@@ -236,19 +248,68 @@ class Renderer {
     private _dummyShadowDepthTex: GPUTexture | null = null;
     private _dummyCubeShadowTex: GPUTexture | null = null;
     private _cubeShadowSampler: GPUSampler | null = null;
-    private _cubeMapShadowMap: CubeMapShadowMap | null = null;
+    // Bindings 5-12 (spot lights, light clusters, cascades) until those features land: a 1x1
+    // depth array for the atlases and zeroed buffers (no spot lights, clusters off, no cascades).
+    private _dummyDepthArrayTex: GPUTexture | null = null;
+    private _spotLightsBuf: GPUBuffer | null = null;
+    private _spotShadowSampler: GPUSampler | null = null;
+    private _clusterParamsBuf: GPUBuffer | null = null;
+    private _clusterLightsBuf: GPUBuffer | null = null;
+    private _cascadesBuf: GPUBuffer | null = null;
     private _shadowBGDirty: boolean = true;
 
+    /** The directional shadow map materials sample (group 3 binding 0), or null. */
     public get shadowMap(): ShadowMap | null { return this._shadowMap; }
+    /** Binds a shadow map the caller renders each frame (`ShadowMap.render`); see `enableShadows`. */
     public set shadowMap(value: ShadowMap | null) {
+        if (this._ownsShadowMap && value !== this._shadowMap) this._shadowMap?.destroy();
         this._shadowMap = value;
+        this._ownsShadowMap = false;
         this._shadowBGDirty = true;
     }
 
+    /** The point-light cube shadow materials sample (group 3 binding 3), or null. */
     public get cubeMapShadowMap(): CubeMapShadowMap | null { return this._cubeMapShadowMap; }
+    /**
+     * Binds a cube shadow map the caller renders each frame (`CubeMapShadowMap.render`, then
+     * `setPointShadowParams`); see `enablePointShadows`.
+     */
     public set cubeMapShadowMap(value: CubeMapShadowMap | null) {
+        if (this._ownsCubeMapShadowMap && value !== this._cubeMapShadowMap) this._cubeMapShadowMap?.destroy();
         this._cubeMapShadowMap = value;
+        this._ownsCubeMapShadowMap = false;
         this._shadowBGDirty = true;
+    }
+
+    /**
+     * Enables the directional shadow map (Rust's `enable_shadows`): each frame, before the scene
+     * pass, the renderer renders it from the scene's first directional light with `castShadow`
+     * (failing that, its first area light with `castShadow`, as a perspective map) over the
+     * camera's view, drawing the `castShadow` renderables through their materials' depth
+     * pipelines, and materials sample it through `kansei_shadow_map`. Returns the map, whose
+     * options (`maxShadowDistance`, `bias`, ...) stay adjustable.
+     */
+    public enableShadows(options: ShadowMapOptions = {}): ShadowMap {
+        if (this._ownsShadowMap) this._shadowMap?.destroy();
+        this._shadowMap = new ShadowMap(this.device!, options);
+        this._ownsShadowMap = true;
+        this.shadowsEnabled = true;
+        this._shadowBGDirty = true;
+        return this._shadowMap;
+    }
+
+    /**
+     * Enables point-light cube shadows (Rust's `enable_point_shadows`): each frame, before the
+     * scene pass, the renderer renders the faces of the scene's point lights with `castShadow`
+     * (up to `maxLights`), and materials sample the first one's through `kansei_point_shadow`.
+     * Effects such as the fog read every light's faces (`CubeMapShadowMap.lights`).
+     */
+    public enablePointShadows(options: CubeMapShadowMapOptions = {}): CubeMapShadowMap {
+        if (this._ownsCubeMapShadowMap) this._cubeMapShadowMap?.destroy();
+        this._cubeMapShadowMap = new CubeMapShadowMap(this.device!, options);
+        this._ownsCubeMapShadowMap = true;
+        this._shadowBGDirty = true;
+        return this._cubeMapShadowMap;
     }
 
     constructor(
@@ -531,8 +592,8 @@ class Renderer {
     }
 
     /**
-     * Creates the shadow GPU resources (dummy depth texture, comparison sampler,
-     * uniform buffer, bind group layout) on first use.
+     * Creates the shadow GPU resources (the group 3 layout, its uniform buffer and samplers, and
+     * the dummies bound for what is not enabled) on first use.
      */
     private _ensureShadowResources(): void {
         if (this._shadowBGL) return;
@@ -555,7 +616,7 @@ class Renderer {
         // + pointLightPos(12) + pointShadowFar(4) = 96 bytes
         this._shadowUniformBuf = this.device!.createBuffer({
             label: 'Shadow/Uniforms',
-            size: 96,
+            size: SHADOW_UNIFORM_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -583,22 +644,36 @@ class Renderer {
             minFilter: 'nearest',
         });
 
+        this._dummyDepthArrayTex = this.device!.createTexture({
+            label: 'Shadow/DummyDepthArray',
+            size: [1, 1, 1],
+            format: 'depth32float',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        const zeroed = (label: string, size: number, usage: GPUBufferUsageFlags) =>
+            this.device!.createBuffer({ label, size, usage: usage | GPUBufferUsage.COPY_DST });
+        this._spotLightsBuf = zeroed('Shadow/SpotLights', SPOT_LIGHTS_BUFFER_BYTES, GPUBufferUsage.STORAGE);
+        this._clusterParamsBuf = zeroed('Shadow/NoLightClusters', CLUSTER_PARAMS_BYTES, GPUBufferUsage.UNIFORM);
+        this._clusterLightsBuf = zeroed('Shadow/NoClusterLights', 16, GPUBufferUsage.STORAGE);
+        this._cascadesBuf = zeroed('Shadow/NoCascades', CASCADES_BYTES, GPUBufferUsage.UNIFORM);
+        this._spotShadowSampler = this.device!.createSampler({
+            label: 'Shadow/SpotSampler',
+            compare: 'less-equal',
+            magFilter: 'linear',
+            minFilter: 'linear',
+        });
+
         this._shadowBGL = this.device!.createBindGroupLayout({
             label: 'Shadow BindGroupLayout',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
-                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-                { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float', viewDimension: '2d-array' } },
-                { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
-            ],
+            entries: shadowBindGroupLayoutEntries(),
         });
 
         this._shadowBGDirty = true;
     }
 
     /**
-     * Creates or recreates the shadow bind group when the shadow map texture changes.
+     * Creates or recreates the shadow bind group (group 3) when a shadow map changes, with the
+     * dummies standing in for what is not enabled.
      */
     private _updateShadowBindGroup(): void {
         if (!this._shadowBGDirty) return;
@@ -611,6 +686,7 @@ class Renderer {
         const cubeTex = this._cubeMapShadowMap
             ? this._cubeMapShadowMap.distanceTexture
             : this._dummyCubeShadowTex!;
+        const depthArray = this._dummyDepthArrayTex!.createView({ dimension: '2d-array' });
 
         this._shadowBG = this.device!.createBindGroup({
             label: 'Shadow BindGroup',
@@ -621,6 +697,14 @@ class Renderer {
                 { binding: 2, resource: { buffer: this._shadowUniformBuf! } },
                 { binding: 3, resource: cubeTex.createView({ dimension: '2d-array' }) },
                 { binding: 4, resource: this._cubeShadowSampler! },
+                { binding: 5, resource: depthArray },
+                { binding: 6, resource: { buffer: this._spotLightsBuf! } },
+                { binding: 7, resource: this._spotShadowSampler! },
+                { binding: 8, resource: { buffer: this._clusterParamsBuf! } },
+                { binding: 9, resource: { buffer: this._clusterLightsBuf! } },
+                { binding: 10, resource: depthArray },
+                { binding: 11, resource: { buffer: this._cascadesBuf! } },
+                { binding: 12, resource: this._spotShadowSampler! },
             ],
         });
 
@@ -633,6 +717,7 @@ class Renderer {
      * Each frame has three phases:
      *  1. Update — compute the visible renderables' matrices on the CPU, copy them into
      *     their scene slots of the staging arrays, then upload via exactly 2 writeBuffer calls.
+     *     Then the shadow maps the renderer owns are rendered (`_encodeShadowPasses`).
      *  2. Bundle — re-record a draw set's bundle (opaque, transmissive, transparent) only when
      *     the static renderables it draws changed (dynamic offsets into the shared buffers are
      *     baked per object, at its stable slot).
@@ -664,7 +749,9 @@ class Renderer {
             }
         });
 
-        // Upload shadow uniforms.
+        // Shadow views, then their uniforms.
+        const commandRenderEncoder = this.device!.createCommandEncoder();
+        this._encodeShadowPasses(commandRenderEncoder, stack, camera);
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
 
@@ -673,7 +760,6 @@ class Renderer {
         this._syncBundles(this._canvasBundles, sets, stack, cameraBindGroup, targets);
 
         // Phase 3 — execute the bundles and the live draws in a fresh render pass.
-        const commandRenderEncoder = this.device!.createCommandEncoder();
         const textureView = this.context!.getCurrentTexture().createView();
 
         const renderPassDescriptor = {
@@ -829,7 +915,7 @@ class Renderer {
      * Renders the scene into a GBuffer for post-processing.
      *
      * This is a drop-in replacement for render() when a PostProcessingVolume is in use.
-     * It performs the same three-phase matrix-upload / bundle-record / execute loop but
+     * It performs the same three-phase matrix-upload (then shadow views) / bundle-record / execute loop but
      * targets the GBuffer's rgba16float colour texture and depth32float depth texture at
      * sampleCount=1 (no MSAA — post-processing handles aliasing via FXAA etc.).
      *
@@ -869,8 +955,12 @@ class Renderer {
             // canvas-format pipeline that fails for shaders with @location(1).
             renderable.material.initialized = true;
         });
+        t?.end();
 
-        // Upload shadow uniforms.
+        // Shadow views, then their uniforms.
+        t = cpuScope('scene/shadows');
+        const commandEncoder = this.device!.createCommandEncoder();
+        this._encodeShadowPasses(commandEncoder, stack, camera);
         this._uploadShadowUniforms();
         this._updateShadowBindGroup();
         t?.end();
@@ -892,7 +982,6 @@ class Renderer {
 
         // Phase 3 — execute into the GBuffer render pass(es).
         t = cpuScope('scene/gbuffer');
-        const commandEncoder = this.device!.createCommandEncoder();
 
         const clearColor = {
             r: this.options.clearColor?.x || 0.0,
@@ -1045,32 +1134,73 @@ class Renderer {
     }
 
     /**
-     * Uploads shadow uniform data (light VP matrix, bias values, enabled flag)
-     * to the GPU buffer every frame.
+     * The shadow views of a frame, in the Rust renderer's order (`renderer.rs` `render`): after
+     * the matrix upload, before the scene pass, into the frame's encoder. The directional map
+     * follows the first directional light with `castShadow` (else the first area light with
+     * it), the cube map the point lights with it; each draws the visible `castShadow`
+     * renderables at their scene slots of the shared mesh buffers, with the light as the camera
+     * (group 1). Maps the caller binds through the setters are left to the caller.
+     */
+    private _encodeShadowPasses(encoder: GPUCommandEncoder, stack: Scene, camera: Camera): void {
+        const objects = stack.getOrderedObjects();
+        const meshOffset = (r: Renderable) => stack.slotOf(r) * this._matrixAlignment;
+
+        const shadowMap = this._ownsShadowMap ? this._shadowMap : null;
+        if (shadowMap) {
+            const light = stack.directionalLights.find((l) => l.castShadow)
+                ?? stack.areaLights.find((l) => l.castShadow);
+            if (light) {
+                shadowMap.update(camera, light);
+                shadowMap.encode(encoder, objects, this._sharedMeshBG!, meshOffset);
+            } else {
+                shadowMap.light = null;
+            }
+        }
+
+        const cubeMap = this._ownsCubeMapShadowMap ? this._cubeMapShadowMap : null;
+        if (cubeMap && cubeMap.update(stack.pointLights.filter((l) => l.castShadow)) > 0) {
+            cubeMap.encode(encoder, objects, this._sharedMeshBG!, meshOffset);
+            // Materials sample the first light's faces (kansei_point_shadow).
+            const first = cubeMap.lights[0];
+            const wm = first.worldMatrix.internalMat4;
+            this.setPointShadowParams(wm[12], wm[13], wm[14], first.radius);
+        }
+    }
+
+    /**
+     * Uploads the shadow uniform (group 3 binding 2): the directional map's view-projection and
+     * biases while materials sample it, and the point shadow's light.
      */
     private _uploadShadowUniforms(): void {
         this._ensureShadowResources();
         // 24 floats: mat4(16) + bias(1) + normalBias(1) + shadowEnabled(1) + pointShadowEnabled(1)
         //          + pointLightPos(3) + pointShadowFar(1)
         const staging = new Float32Array(24);
-        if (this._shadowMap && this.shadowsEnabled) {
-            staging.set(this._shadowMap.lightViewProjMatrix, 0);
-            staging[16] = 0.001;  // bias
-            staging[17] = 0.02;   // normalBias
+        const sm = this._shadowMap;
+        // A map the renderer owns has nothing to show when no light casts.
+        if (sm && this.shadowsEnabled && (!this._ownsShadowMap || sm.light !== null)) {
+            staging.set(sm.lightViewProjMatrix, 0);
+            staging[16] = sm.bias;
+            staging[17] = sm.normalBias;
             staging[18] = 1.0;    // shadowEnabled
         } else {
             staging[18] = 0.0;    // shadowEnabled = off
         }
-        // Point shadow: [enabled, posX, posY, posZ, shadowFar] — must be set each frame
+        // Point shadow: [enabled, posX, posY, posZ, shadowFar] — set each frame
         staging.set(this._pointShadowParams, 19);
         this.device!.queue.writeBuffer(this._shadowUniformBuf!, 0, staging);
-        // Reset — caller must call setPointShadowParams every frame it wants point shadow
+        // Reset: the renderer sets it again for its own cube map, a caller-driven one every frame
         this._pointShadowParams.fill(0);
     }
 
     /** Point shadow params: [enabled, posX, posY, posZ, shadowFar]. Reset after each upload. */
     private _pointShadowParams = new Float32Array(5);
 
+    /**
+     * Sets the point light whose cube shadow materials sample this frame (`kansei_point_shadow`).
+     * Only for a cube map the caller renders (the `cubeMapShadowMap` setter); the renderer sets
+     * it for its own (`enablePointShadows`).
+     */
     public setPointShadowParams(posX: number, posY: number, posZ: number, shadowFar: number): void {
         this._pointShadowParams[0] = 1.0;  // enabled
         this._pointShadowParams[1] = posX;
