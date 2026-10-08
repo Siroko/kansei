@@ -1,4 +1,20 @@
 import { IBindable } from "./IBindable";
+import type { BindingLayout } from "../materials/Binding";
+
+/** Sampler settings beyond filters, address mode and anisotropy. */
+export interface SamplerOptions {
+    /** Makes a comparison sampler (`sampler_comparison`), as shadow maps read depth. */
+    compare?: GPUCompareFunction;
+    /** Defaults to the minification filter. */
+    mipmapFilter?: GPUMipmapFilterMode;
+    lodMinClamp?: number;
+    lodMaxClamp?: number;
+    /**
+     * The binding type. Defaults to `comparison` with `compare`, otherwise `filtering`; use
+     * `non-filtering` beside an `unfilterable-float` texture.
+     */
+    bindingType?: GPUSamplerBindingType;
+}
 
 /**
  * A wrapper class for GPU sampler bindings that implements the IBindable interface.
@@ -22,13 +38,16 @@ class Sampler implements IBindable {
      * Creates a new Sampler instance.
      * @param magFilter - The magnification filter mode to use when sampling the texture
      * @param minFilter - The minification filter mode to use when sampling the texture
-     * @param repeatMode - The address mode determining how texture coordinates outside [0, 1] are handled
+     * @param repeatMode - The address mode determining how texture coordinates outside [0, 1] are handled, on all three axes
+     * @param maxAnisotropy - Anisotropic filtering clamp (needs linear filters)
+     * @param options - Comparison, mip filter, LOD clamps and binding type
      */
     constructor(
         private magFilter: GPUFilterMode,
         private minFilter: GPUFilterMode,
         private repeatMode: GPUAddressMode = 'repeat',
-        private maxAnisotropy: number = 1
+        private maxAnisotropy: number = 1,
+        private options: SamplerOptions = {}
     ) {
         this.uuid = crypto.randomUUID();
     }
@@ -55,10 +74,14 @@ class Sampler implements IBindable {
         const sampler = gpuDevice.createSampler({
             magFilter: this.magFilter,
             minFilter: this.minFilter,
-            mipmapFilter: this.minFilter,
+            mipmapFilter: this.options.mipmapFilter ?? this.minFilter,
             addressModeU: this.repeatMode,
             addressModeV: this.repeatMode,
+            addressModeW: this.repeatMode,
             maxAnisotropy: this.maxAnisotropy > 1 ? this.maxAnisotropy : undefined,
+            compare: this.options.compare,
+            lodMinClamp: this.options.lodMinClamp,
+            lodMaxClamp: this.options.lodMaxClamp,
         });
 
         this.sampler = sampler;
@@ -72,6 +95,12 @@ class Sampler implements IBindable {
      */
     get resource(): GPUBindingResource {
         return this.sampler!;
+    }
+
+    public getBindingLayout(_gpuDevice: GPUDevice, requested?: BindingLayout): BindingLayout {
+        if (requested) return requested;
+        const type = this.options.bindingType ?? (this.options.compare ? 'comparison' : 'filtering');
+        return { sampler: { type } };
     }
 }
 

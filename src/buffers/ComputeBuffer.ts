@@ -58,6 +58,22 @@ class ComputeBuffer extends BufferBase {
     }
 
     /**
+     * Wrap a buffer created elsewhere (another system's output, an indirect-args buffer) so it
+     * binds like any other buffer, as `type` (`storage`, `read-only-storage` or `uniform`) over
+     * `size` bytes from `offset` (the rest of the buffer when `size` is unset). Nothing is
+     * uploaded: its owner writes it.
+     */
+    public static fromExternal(buffer: GPUBuffer, type: string, range: { offset?: number; size?: number } = {}): ComputeBuffer {
+        const wrapped = new ComputeBuffer({ type, usage: buffer.usage });
+        wrapped._resource = buffer;
+        if (range.offset !== undefined || range.size !== undefined) {
+            wrapped.bindingRange = { offset: range.offset ?? 0, size: range.size };
+        }
+        wrapped.initialized = true;
+        return wrapped;
+    }
+
+    /**
      * Clones the current buffer
      * @returns A new buffer instance with the same data
      */

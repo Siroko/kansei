@@ -1,9 +1,18 @@
+import type { BindingLayout } from "../materials/Binding";
+
 /**
  * Interface for GPU-bindable resources that can be used in a WebGPU binding layout
  */
 export interface IBindable {
     /** Optional type identifier for the bindable resource */
     type?: string;
+
+    /**
+     * The bind group layout entry this resource binds with. `requested` is the binding's explicit
+     * `BindGroupDescriptor.layout`, if any, which the resource completes (a texture fills in its
+     * view dimension and format). Without this method the layout comes from `type`.
+     */
+    getBindingLayout?(gpuDevice: GPUDevice, requested?: BindingLayout): BindingLayout;
 
     /** Indicates whether the resource has been initialized */
     initialized: boolean;
