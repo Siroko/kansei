@@ -5,6 +5,9 @@ import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+import type { Renderable } from '../objects/Renderable';
+import { meshBindGroupLayoutEntries } from '../renderers/SharedLayouts';
+import { gpuPass } from '../profiling/Profiler';
 
 /** Any light with a world-space position and radius, usable for cubemap shadow rendering. */
 export type PositionalLight = PointLight | AreaLight;
@@ -40,6 +43,7 @@ class CubeMapShadowMap {
     private _maxLights: number;
     private _near: number;
     private _shadowFar: number;
+    private _lights: readonly PositionalLight[] = [];
 
     private _distanceTexture: GPUTexture;
     private _scratchDepthTexture: GPUTexture;
@@ -47,7 +51,9 @@ class CubeMapShadowMap {
     private _pipeline: GPURenderPipeline | null = null;
     private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
-    // Light VP + light position uniform (group 0, dynamic offset)
+    // Shadow passes bind like the Rust engine's depth pipelines: group 0 the renderable's
+    // shadowExtraBG (empty without one), group 1 the light (its "camera"), group 2 the mesh.
+    // Light VP + light position uniform (group 1, dynamic offset)
     // One slot per face per light, aligned to minUniformBufferOffsetAlignment
     private _lightUniformBuffer: GPUBuffer | null = null;
     private _lightUniformBGL: GPUBindGroupLayout;
@@ -55,8 +61,10 @@ class CubeMapShadowMap {
     private _lightUniformCapacity = 0; // max face slots allocated
     private _uniformAlignment: number;
 
-    // Own mesh matrix buffers (group 1, dynamic offset)
+    // Own mesh matrix buffers (group 2, dynamic offset)
     private _meshBGL: GPUBindGroupLayout;
+    private _emptyBGL: GPUBindGroupLayout;
+    private _emptyBG: GPUBindGroup;
     private _worldMatBuf: GPUBuffer | null = null;
     private _normalMatBuf: GPUBuffer | null = null;
     private _meshBG: GPUBindGroup | null = null;
@@ -103,17 +111,20 @@ class CubeMapShadowMap {
             }],
         });
 
+        // Group 0 of the pipelines without a shadowExtraBGL.
+        this._emptyBGL = device.createBindGroupLayout({ label: 'EmptyBGL', entries: [] });
+        this._emptyBG = device.createBindGroup({ layout: this._emptyBGL, entries: [] });
+
         this._meshBGL = device.createBindGroupLayout({
             label: 'CubeMapShadow/Mesh BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-                { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-            ],
+            entries: meshBindGroupLayoutEntries(),
         });
     }
 
     get distanceTexture(): GPUTexture { return this._distanceTexture; }
     get maxLights(): number { return this._maxLights; }
+    /** The lights the last render() drew, in atlas order: light i owns layers 6i..6i+5. */
+    get lights(): readonly PositionalLight[] { return this._lights; }
 
     private _ensureLightUniformBuffer(faceCount: number): void {
         if (faceCount <= this._lightUniformCapacity && this._lightUniformBG) return;
@@ -179,9 +190,9 @@ class CubeMapShadowMap {
                 _pad          : f32,
             }
 
-            @group(0) @binding(0) var<uniform> light       : LightUniform;
-            @group(1) @binding(0) var<uniform> normalMatrix : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix  : mat4x4f;
+            @group(1) @binding(0) var<uniform> light       : LightUniform;
+            @group(2) @binding(0) var<uniform> normalMatrix : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix  : mat4x4f;
 
             struct VSOut {
                 @builtin(position) position : vec4f,
@@ -214,7 +225,7 @@ class CubeMapShadowMap {
 
         const pipelineLayout = this._device.createPipelineLayout({
             label: 'CubeMapShadow/PipelineLayout',
-            bindGroupLayouts: [this._lightUniformBGL, this._meshBGL],
+            bindGroupLayouts: [this._emptyBGL, this._lightUniformBGL, this._meshBGL],
         });
 
         this._pipeline = this._device.createRenderPipeline({
@@ -257,9 +268,9 @@ class CubeMapShadowMap {
                 _pad          : f32,
             }
 
-            @group(0) @binding(0) var<uniform> light       : LightUniform;
-            @group(1) @binding(0) var<uniform> normalMatrix : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix  : mat4x4f;
+            @group(1) @binding(0) var<uniform> light       : LightUniform;
+            @group(2) @binding(0) var<uniform> normalMatrix : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix  : mat4x4f;
 
             ${shadowVertexCode}
 
@@ -293,8 +304,7 @@ class CubeMapShadowMap {
             code: shaderCode,
         });
 
-        const layouts: GPUBindGroupLayout[] = [this._lightUniformBGL, this._meshBGL];
-        if (extraBGL) layouts.push(extraBGL);
+        const layouts: GPUBindGroupLayout[] = [extraBGL ?? this._emptyBGL, this._lightUniformBGL, this._meshBGL];
 
         pipeline = this._device.createRenderPipeline({
             label: 'CubeMapShadow/CustomPipeline',
@@ -327,39 +337,17 @@ class CubeMapShadowMap {
         return pipeline;
     }
 
-    render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PositionalLight[]): void {
-        const device = this._device;
-        if (pointLights.length === 0) return;
-
-        const objects = scene.getOrderedObjects();
-        if (objects.length === 0) return;
-
-        // Ensure pipeline (lazy — needs vertex layout from first geometry)
-        if (!objects[0].geometry.initialized) {
-            objects[0].geometry.initialize(device);
-        }
-        this._ensurePipeline(objects[0].geometry.vertexBuffersDescriptors);
-
-        const alignment = this._uniformAlignment;
-        const floatsPerSlot = alignment / 4;
-
-        this._ensureMeshBuffers(objects.length);
-
-        // Upload all object world matrices once
-        for (let i = 0; i < objects.length; i++) {
-            const obj = objects[i];
-            if (!obj.geometry.initialized) obj.geometry.initialize(device);
-            obj.updateModelMatrix();
-            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
-            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
-        }
-
-        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
-        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
-
+    /**
+     * Uploads the face view-projections of the first `maxLights` of `pointLights`, which become
+     * `lights` (light i owns layers 6i..6i+5). Returns how many it took.
+     */
+    update(pointLights: readonly PositionalLight[]): number {
         const lightCount = Math.min(pointLights.length, this._maxLights);
-        const totalFaces = lightCount * 6;
+        this._lights = pointLights.slice(0, lightCount);
+        if (lightCount === 0) return 0;
 
+        const totalFaces = lightCount * 6;
+        const floatsPerSlot = this._uniformAlignment / 4;
         // Ensure light uniform buffer is large enough for all faces
         this._ensureLightUniformBuffer(totalFaces);
 
@@ -375,11 +363,8 @@ class CubeMapShadowMap {
             // Shadow far plane is decoupled from light radius so distant
             // occluders outside the attenuation volume are still captured.
             const shadowFar = Math.max(this._shadowFar, light.radius);
-            mat4.perspective(this._projMat, Math.PI / 2, 1.0, this._near, shadowFar);
-            // Remap Z from [-1,1] to [0,1] for WebGPU
-            (this._projMat as unknown as Float32Array)[10] *= 0.5;
-            (this._projMat as unknown as Float32Array)[14] =
-                (this._projMat as unknown as Float32Array)[14] * 0.5 + 0.5;
+            // WebGPU depth is [0,1]; the faces depth-test 'less', so depth must grow with distance
+            mat4.perspectiveZO(this._projMat, Math.PI / 2, 1.0, this._near, shadowFar);
 
             for (let face = 0; face < 6; face++) {
                 const dir = FACE_DIRS[face];
@@ -400,19 +385,39 @@ class CubeMapShadowMap {
             }
         }
 
-        device.queue.writeBuffer(this._lightUniformBuffer!, 0, uniformStaging.buffer as ArrayBuffer);
+        this._device.queue.writeBuffer(this._lightUniformBuffer!, 0, uniformStaging.buffer as ArrayBuffer);
+        return lightCount;
+    }
 
-        // Record all face render passes into one command encoder
-        const commandEncoder = device.createCommandEncoder({ label: 'CubeMapShadow' });
+    /**
+     * Encodes the six face passes of every light in `lights` (`update`), each drawing the
+     * `castShadow` renderables among `objects` with their matrices in `meshBindGroup` (group 2)
+     * at `meshOffset(renderable, index)`.
+     */
+    encode(
+        commandEncoder: GPUCommandEncoder,
+        objects: readonly Renderable[],
+        meshBindGroup: GPUBindGroup,
+        meshOffset: (renderable: Renderable, index: number) => number,
+    ): void {
+        const device = this._device;
+        const lights = this._lights;
+        if (lights.length === 0 || objects.length === 0) return;
+
+        // Ensure pipeline (lazy — needs the vertex layout of a geometry)
+        if (!objects[0].geometry.initialized) {
+            objects[0].geometry.initialize(device);
+        }
+        this._ensurePipeline(objects[0].geometry.vertexBuffersDescriptors);
+
         const scratchDepthView = this._scratchDepthTexture.createView();
 
-        for (let li = 0; li < lightCount; li++) {
-            const light = pointLights[li];
-            const clearDist = Math.max(this._shadowFar, light.radius);
+        for (let li = 0; li < lights.length; li++) {
+            const clearDist = Math.max(this._shadowFar, lights[li].radius);
 
             for (let face = 0; face < 6; face++) {
                 const faceSlot = li * 6 + face;
-                const lightOffset = faceSlot * alignment;
+                const lightOffset = faceSlot * this._uniformAlignment;
 
                 const colorView = this._distanceTexture.createView({
                     dimension: '2d',
@@ -421,6 +426,8 @@ class CubeMapShadowMap {
                 });
 
                 const pass = commandEncoder.beginRenderPass({
+                    label: 'CubemapShadow',
+                    timestampWrites: gpuPass('CubemapShadow'),
                     colorAttachments: [{
                         view: colorView,
                         clearValue: { r: clearDist, g: 0, b: 0, a: 0 },
@@ -435,7 +442,7 @@ class CubeMapShadowMap {
                     },
                 });
 
-                pass.setBindGroup(0, this._lightUniformBG!, [lightOffset]);
+                pass.setBindGroup(1, this._lightUniformBG!, [lightOffset]);
 
                 let activePipeline: GPURenderPipeline | null = null;
                 let currentVertexBuffer: GPUBuffer | null = null;
@@ -464,12 +471,9 @@ class CubeMapShadowMap {
                         currentIndexBuffer = null;
                     }
 
-                    const offset = i * alignment;
-                    pass.setBindGroup(1, this._meshBG!, [offset, offset]);
-
-                    if (obj.shadowExtraBG) {
-                        pass.setBindGroup(2, obj.shadowExtraBG);
-                    }
+                    const offset = meshOffset(obj, i);
+                    pass.setBindGroup(2, meshBindGroup, [offset, offset]);
+                    pass.setBindGroup(0, obj.shadowVertexCode && obj.shadowExtraBG ? obj.shadowExtraBG : this._emptyBG);
 
                     if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                         pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);
@@ -496,7 +500,43 @@ class CubeMapShadowMap {
                 pass.end();
             }
         }
+    }
 
+    /**
+     * Renders the faces of the first `maxLights` of `pointLights` now, with matrix buffers of its
+     * own: for a map the caller drives. A map from `Renderer.enablePointShadows` is rendered by
+     * the renderer each frame.
+     */
+    render(_renderer: Renderer, scene: Scene, _camera: Camera, pointLights: readonly PositionalLight[]): void {
+        const device = this._device;
+        this._lights = [];
+        if (pointLights.length === 0) return;
+
+        const objects = scene.getOrderedObjects();
+        if (objects.length === 0) return;
+
+        const alignment = this._uniformAlignment;
+        const floatsPerSlot = alignment / 4;
+
+        this._ensureMeshBuffers(objects.length);
+
+        // Upload all object world matrices once
+        for (let i = 0; i < objects.length; i++) {
+            const obj = objects[i];
+            if (!obj.geometry.initialized) obj.geometry.initialize(device);
+            obj.updateModelMatrix();
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
+            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
+        }
+
+        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
+        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
+
+        this.update(pointLights);
+
+        // Record all face render passes into one command encoder
+        const commandEncoder = device.createCommandEncoder({ label: 'CubeMapShadow' });
+        this.encode(commandEncoder, objects, this._meshBG!, (_, i) => i * alignment);
         device.queue.submit([commandEncoder.finish()]);
     }
 

@@ -58,6 +58,48 @@ class ComputeBuffer extends BufferBase {
     }
 
     /**
+     * Wrap a buffer created elsewhere (another system's output, an indirect-args buffer) so it
+     * binds like any other buffer, as `type` (`storage`, `read-only-storage` or `uniform`) over
+     * `size` bytes from `offset` (the rest of the buffer when `size` is unset). Nothing is
+     * uploaded: its owner writes it.
+     */
+    public static fromExternal(buffer: GPUBuffer, type: string, range: { offset?: number; size?: number } = {}): ComputeBuffer {
+        const wrapped = new ComputeBuffer({ type, usage: buffer.usage });
+        wrapped._resource = buffer;
+        if (range.offset !== undefined || range.size !== undefined) {
+            wrapped.bindingRange = { offset: range.offset ?? 0, size: range.size };
+        }
+        wrapped.initialized = true;
+        return wrapped;
+    }
+
+    /**
+     * The same GPU buffer read as instance data of another layout, `stride` bytes apart with
+     * `attributes` (Rust `ComputeBuffer::with_vertex_layout` on a clone): what a geometry drawing
+     * culled instances with crossfades declares, the compacted instances being 4 bytes wider than
+     * the source (`InstanceCulling.withCrossfade`). Initializing it initializes this buffer.
+     */
+    public withVertexLayout(stride: number, attributes: IComputeBufferAttribute[]): ComputeBuffer {
+        const view = new ComputeBuffer({ type: this.type, usage: this.usage, stride, attributes });
+        view._layoutOf = this;
+        return view;
+    }
+
+    /** The buffer this one reads with another vertex layout (`withVertexLayout`). */
+    private _layoutOf?: ComputeBuffer;
+
+    public initialize(gpuDevice: GPUDevice): void {
+        const owner = this._layoutOf;
+        if (!owner) {
+            super.initialize(gpuDevice);
+            return;
+        }
+        if (!owner.initialized) owner.initialize(gpuDevice);
+        this._resource = owner.gpuBuffer;
+        this.initialized = true;
+    }
+
+    /**
      * Clones the current buffer
      * @returns A new buffer instance with the same data
      */

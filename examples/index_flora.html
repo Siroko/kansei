@@ -15,7 +15,7 @@
   </head>
   <body>
     <script type="module">
-      import { Renderer } from '../src/renderers/Renderer'
+      import { Canvas, run } from '../src/web/index'
       import { shaderCode as shaderVelocities } from './assets/shaders/ComputeVelocities.js'
       import { shaderCode as shaderPositions } from './assets/shaders/ComputePositions.js'
       import { renderCode } from './assets/shaders/RenderShaderTest.js'
@@ -38,22 +38,12 @@
       let computeParticles = true;
       let mouseVectors = new MouseVectors();
       
-      const renderer = new Renderer({
+      const canvas = Canvas.fill();
+      const renderer = await canvas.renderer({
         clearColor: new Vector4(0.1, 0.1, 0.1, 1.0),
-        width: window.innerWidth,
-        height: window.innerHeight,
-        devicePixelRatio: Math.min(window.devicePixelRatio, 2) ,
         antialias: true,
         sampleCount: 1
       });
-      await renderer.initialize();
-      
-      document.body.appendChild(renderer.canvas);
-      renderer.canvas.style.position = 'absolute';
-      renderer.canvas.style.top = '0';
-      renderer.canvas.style.left = '0';
-      renderer.canvas.style.height = '100%';
-      // renderer.domElement.style.imageRendering = 'pixelated';
 
       const numParticles = 300000;
 
@@ -185,21 +175,16 @@
           await renderer.compute(computePositions, Math.ceil(numParticles / 64));
         }
         renderer.render(scene, camera);
-
-        requestAnimationFrame(animate);
       }
-      animate();
+      run(canvas, (frame) => {
+        frame.resize(renderer, camera);
+        return animate();
+      });
 
       document.addEventListener('keydown', (event) => {
         if(event.key === 'c') {
           computeParticles = !computeParticles;
         }
-      });
-
-      window.addEventListener('resize', () => {
-        renderer.setSize(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
       });
     </script>
   </body>

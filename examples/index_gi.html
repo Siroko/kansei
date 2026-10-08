@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
     import { SphereGeometry } from '../src/geometries/SphereGeometry'
@@ -29,12 +29,16 @@
     import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
     import { PathTracerEffect } from '../src/pathtracer/PathTracerEffect'
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
+    import { ToneMapEffect, ToneMapper, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { AreaLight } from '../src/lights/AreaLight'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
     import { Float } from '../src/math/Float'
     import { GLTFLoader } from '../src/loaders/GLTFLoader'
     import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+    // ?reference=1 starts in reference mode: camera rays through the BVH, averaged over frames
+    // while nothing moves, shown through ToneMapEffect (the Rust `pathtracer` example's path)
+    const startReference = new URLSearchParams(location.search).get('reference') === '1';
 
     // ── Cornell box dimensions ────────────────────────────────────────────
     const WALL = 10;    // wall size
@@ -48,7 +52,7 @@
     const lightDirUniform = new Vector3(0, -1, 0.0);
 
     // Area light — drives all path tracer GI
-    const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 110.0, [3, 3]); // the tracer lights surfaces with albedo / pi
     areaLight.position.set(0, WALL - 0.2, 0);
     areaLight.target.set(0, 0, 0); // faces down toward floor center
 
@@ -63,10 +67,10 @@
       }
 
       @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
-      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -98,7 +102,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
@@ -160,27 +164,20 @@
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 2,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: false,
       sampleCount: 4
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
-    renderer.shadowsEnabled = true;
-
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
-    renderer.shadowMap = shadowMap;
+    // The renderer renders the shadow map each frame from dirLight (castShadow, in the scene).
+    renderer.enableShadows({ resolution: 2048 });
 
     // ── Scene ─────────────────────────────────────────────────────────────
     const scene = new Scene();
     const camera = new Camera(50, 0.1, 100, window.innerWidth / window.innerHeight);
     scene.add(areaLight);
+    dirLight.castShadow = true;
+    scene.add(dirLight);
 
     const cameraControls = new CameraControls(camera, new Vector3(0, HALF, 0), null, 18);
 
@@ -287,7 +284,7 @@
       ],
     });
     const sphere = new Renderable(sphereGeo, glassRasterMat);
-    sphere.position.set(0, 1.5, 8);
+    sphere.position.set(0, 4, 8);
     const glassMat = new PathTracerMaterial();
     glassMat.albedo = [1, 1, 1];
     glassMat.roughness = 0.0;
@@ -352,12 +349,33 @@
       rasterDirect: false,
       useReSTIR: false,
       restirMaxHistory: 20,
+      reference: startReference,
     });
 
-    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+    // Reference mode writes HDR radiance: a neutral curve a stop down, as the Rust example. The
+    // hybrid mode tonemaps in its composite, so the tone map runs only in reference mode.
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      tonemapper: ToneMapper.KhronosNeutral,
+      exposureCompensation: -1.0,
+    });
+    tonemap.isActive = () => pathTracerEffect.reference;
+
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect, tonemap], { msaaSampleCount: 4 });
 
     // ── Tweakpane ─────────────────────────────────────────────────────────
     const pane = new Pane({ title: 'GI Controls' });
+
+    const refFolder = pane.addFolder({ title: 'Reference' });
+    refFolder.addBinding(pathTracerEffect, 'reference', { label: 'camera rays' }).on('change', (ev) => {
+      sceneParams.animateCube = !ev.value;
+      pane.refresh();
+    });
+    const refInfo = { frames: '0' };
+    const refMonitor = refFolder.addBinding(refInfo, 'frames', { readonly: true, label: 'accumulated' });
+    setInterval(() => { refInfo.frames = String(pathTracerEffect.accumulatedFrames); refMonitor.refresh(); }, 250);
+    refFolder.addButton({ title: 'Reset accumulation' }).on('click', () => pathTracerEffect.resetAccumulation());
+    refFolder.addBinding(tonemap.options, 'exposureCompensation', { min: -4, max: 4, step: 0.1, label: 'exposure (EV)' });
 
     const ptFolder = pane.addFolder({ title: 'Path Tracer' });
     ptFolder.addBinding(pathTracerEffect, 'temporalBlend', { min: 0.01, max: 1.0, step: 0.01 });
@@ -391,7 +409,7 @@
       targetZ: areaLight.target.z,
     };
     const alFolder = pane.addFolder({ title: 'Area Light (GI)' });
-    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 60, step: 0.1 }).on('change', () => {
+    alFolder.addBinding(areaLightParams, 'intensity', { min: 0, max: 200, step: 0.1 }).on('change', () => {
       areaLight.intensity = areaLightParams.intensity;
     });
     const updateTarget = () => {
@@ -401,14 +419,14 @@
     alFolder.addBinding(areaLightParams, 'targetY', { min: -10, max: 10, step: 0.1, label: 'target Y' }).on('change', updateTarget);
     alFolder.addBinding(areaLightParams, 'targetZ', { min: -10, max: 10, step: 0.1, label: 'target Z' }).on('change', updateTarget);
 
-    const sceneParams = { animateCube: true };
+    // a moving cube restarts the reference accumulation every frame, so it holds still there
+    const sceneParams = { animateCube: !startReference };
     const sceneFolder = pane.addFolder({ title: 'Scene' });
     sceneFolder.addBinding(sceneParams, 'animateCube', { label: 'Animate Cube' });
 
     // ── Render loop ───────────────────────────────────────────────────────
     function animate() {
       cameraControls.update();
-      shadowMap.render(renderer, scene, camera, dirLight);
       volume.render(scene, camera);
       if (sceneParams.animateCube) {
         const t = performance.now() * 0.001;
@@ -420,9 +438,11 @@
         cube.rotation.y = t * 1.1;
         cube.rotation.z = t * 0.5;
       }
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate();
+    });
   </script>
 </body>
 

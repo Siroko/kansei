@@ -113,6 +113,36 @@ material.set_bindable(1, texture.into_texture());
 On WASM, images at external URIs are fetched by the caller and passed to
 `GLTFResult::set_image_data`.
 
+## Loading in the TypeScript engine
+
+`src/loaders/KTX2Loader.ts` mirrors `loaders::ktx2` with the same container parsing, target
+preferences and fallbacks (`ktx2/Ktx2Container.ts`, `ktx2/Ktx2Select.ts`):
+
+```ts
+import { KTX2Loader } from 'kansei';
+
+const texture = await KTX2Loader.transcode('Car/BaseColor', bytes, KTX2Loader.color(), renderer.compressionSupport);
+console.info(texture.summary());
+// bind texture.toTexture() in a material
+```
+
+- `KTX2Loader.inspect`, `chooseTarget`, `transcodeLevels` and `transcodeLevel` match their Rust
+  namesakes. They return promises because the transcoder is loaded with the first file;
+  `KTX2Loader.init()` loads it earlier.
+- `GLTFLoader` fills each material's `baseColorTexture`, `metallicRoughnessTexture`,
+  `normalTexture`, `occlusionTexture` and `emissiveTexture` (`KHR_texture_basisu` as in Rust),
+  lists the file's `images` and `materialIndices` (each geometry's material), and
+  `result.loadTexture(ref, support)` gives a `Texture`. It fetches external images from beside
+  the glTF file and decodes PNG/JPEG with `createImageBitmap`.
+- The transcoder is not the Rust one. The TS engine runs Binomial's official WebAssembly build
+  (`src/loaders/ktx2/basis/`, tag v2_50, the tag the Rust fixtures were checked against). The
+  library build inlines it into `loaders/ktx2/BasisModule.js` (1.45 MB, 630 KB gzipped), which
+  only pages that load a KTX2 file download. Its output matches the Rust transcoder byte for
+  byte except in two places, which Binomial's build options turn off: opaque ETC1S to ASTC
+  4x4 uses a lower-quality endpoint table, and ETC1S cannot become EAC R11/RG11 (see
+  `src/loaders/ktx2/basis/README.md`). `examples/index_ktx2.html` mirrors the Rust
+  `ktx2-texture` example (with `?support=` and `?bench=N`).
+
 ## The transcoder
 
 Transcoding uses the pure-Rust [`basisu`](https://crates.io/crates/basisu) crate (Apache-2.0), a

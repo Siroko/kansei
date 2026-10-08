@@ -4,6 +4,10 @@ import { Material } from "../materials/Material";
 import { BindableGroup } from "../materials/BindableGroup";
 import { Object3D } from "./Object3D";
 import { PathTracerMaterial } from "../pathtracer/PathTracerMaterial";
+import type { InstanceCulling } from "../culling/InstanceCulling";
+import type { GiSurface } from "../gi/MeshVoxelizer";
+import type { RtPlacement, RtSurface } from "../rt/RtGrid";
+import type { ClusterLod } from "../clusters/ClusterLod";
 
 /**
  * Represents a 3D renderable object that extends Object3D.
@@ -22,16 +26,65 @@ class Renderable extends Object3D {
     /** Controls draw order within the same transparency group. Higher values draw later (on top). */
     public renderOrder: number = 0;
 
-    /** Custom WGSL snippet for shadow vertex transform.
+    /** Layer mask of a new renderable: bit 0. */
+    static readonly DEFAULT_LAYERS = 1;
+
+    /** Whether it is drawn (and casts shadows). Hiding or showing it re-records only the cached
+     *  render bundle of its own draw set (opaque, transmissive or transparent); it keeps its
+     *  matrix slot while hidden. */
+    public visible: boolean = true;
+
+    /** Bitmask of the layers this renderable is on (bit 0 by default). Secondary views such as
+     *  planar reflections draw only renderables whose layers intersect their mask. */
+    public layers: number = Renderable.DEFAULT_LAYERS;
+
+    /** Its transform changes every frame, so it is drawn directly in the pass each frame rather
+     *  than recorded into the cached render bundles (false by default). Mark anything the app
+     *  moves while it is on screen: Safari's WebGPU can draw a bundled object with the matrices
+     *  it had when the bundle was recorded, and bundles are re-recorded only when what they hold
+     *  changes. */
+    public dynamic: boolean = false;
+
+    /** Per-view GPU culling of its instances (an `InstancedGeometry` whose first instance buffer
+     *  is the culling's source): each view the renderer draws it in (the camera, the directional
+     *  shadow map) draws only the instances inside its frustum and LOD band. Null: every instance
+     *  everywhere. */
+    public instanceCulling: InstanceCulling | null = null;
+
+    /** Cluster LOD (`ClusterLod`): each view draws the cut of the cluster graph it needs instead
+     *  of the geometry, which must be the mesh the graph was built from (impostor bakes, point-light
+     *  shadows and voxel GI still draw it). Null: the geometry everywhere. Rust:
+     *  `Renderable::clusters`. */
+    public clusters: ClusterLod | null = null;
+
+    /** Kept for compatibility: shadow maps draw casters through their material's own
+     *  `vertex_main` (`Material.getDepthPipeline`, with `shadowFragmentEntry` for alpha-tested
+     *  ones), so instancing and vertex animation already cast matching shadows. When set, the
+     *  directional/area `ShadowMap` uses this snippet instead.
      *  Must declare: fn shadowWorldPos(position: vec4f, instanceIdx: u32) -> vec4f
-     *  returning the world-space position.  May include @group(2) bindings. */
+     *  returning the world-space position. It can read `worldMatrix` (group 2, as in
+     *  materials) and its own @group(0) bindings (shadowExtraBGL). */
     public shadowVertexCode: string | null = null;
 
-    /** Bind group layout for extra resources used by shadowVertexCode (group 2). */
+    /** Bind group layout for extra resources used by shadowVertexCode (group 0). */
     public shadowExtraBGL: GPUBindGroupLayout | null = null;
 
-    /** Bind group for extra resources used by shadowVertexCode (group 2). */
+    /** Bind group for extra resources used by shadowVertexCode (group 0). */
     public shadowExtraBG: GPUBindGroup | null = null;
+
+    /** Its surface in voxel GI (`Renderer.enableVoxelGI`): what it reflects and emits there, or
+     *  null to leave it out of the voxels (the default). Drawn into the voxels through its
+     *  material's own `vertex_main` (`Material.getVoxelPipeline`). Rust: `Renderable::gi`. */
+    public gi: GiSurface | null = null;
+
+    /** Its surface in the renderer's ray tracing grid (`Renderer.enableRtGrid`): its triangles
+     *  are gathered there (instanced ones as culled for the grid's box) with this albedo and alpha
+     *  test. Null (the default) leaves it out. Rust: `Renderable::rt`. */
+    public rt: RtSurface | null = null;
+
+    /** Where its instance records put its mesh, for the grid (the material's vertex stage does it
+     *  on screen): needed by instanced renderables in the grid. Rust: `Renderable::rt_placement`. */
+    public rtPlacement: RtPlacement | null = null;
 
     /** Path tracer material properties. If null, defaults are derived at BVH build time. */
     public pathTracerMaterial: PathTracerMaterial | null = null;

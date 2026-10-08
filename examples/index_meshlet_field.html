@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei - meshlet field</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; font: 12px/1.45 ui-monospace, Menlo, monospace; color: #e8eef5; }
+    #panel { position: fixed; left: 12px; top: 12px; width: 330px; max-height: calc(100vh - 24px); overflow: auto; padding: 10px 12px; background: rgba(8, 12, 18, 0.8); border-radius: 6px; box-sizing: border-box; }
+    #panel h1 { font-size: 13px; margin: 0 0 6px; }
+    #panel fieldset { border: 0; padding: 0; margin: 8px 0; }
+    #panel legend { color: #8fa3b8; margin-bottom: 2px; }
+    #panel label { display: inline-block; margin: 1px 8px 1px 0; cursor: pointer; }
+    #panel input[type=range] { width: 100%; }
+    #hud, #levels { margin: 0; white-space: pre-wrap; }
+    #levels { margin-top: 6px; }
+    .bar { display: inline-block; height: 8px; vertical-align: middle; border-radius: 1px; }
+    #chart { display: block; width: 100%; height: 150px; margin-top: 6px; }
+    .key { display: inline-block; width: 12px; height: 2px; vertical-align: middle; margin: 0 4px 0 0; }
+    #chartKey { color: #b8c4d0; }
+    @media (max-width: 640px) { #panel { width: calc(100vw - 24px); max-height: 50vh; } }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <h1>Meshlet field</h1>
+    <pre id="hud"></pre>
+    <fieldset id="modes"><legend>draw</legend></fieldset>
+    <fieldset id="views"><legend>colour (cluster LOD)</legend></fieldset>
+    <fieldset>
+      <legend>rocks: <span id="rocksValue"></span></legend>
+      <input type="range" id="rocks" min="0" max="1" step="0.001" />
+      <label><input type="checkbox" id="grow" checked /> grow the field</label>
+      <label><input type="checkbox" id="edges" /> edges</label>
+    </fieldset>
+    <div id="chartKey"><span class="key" style="background:#d95926"></span>full mesh (what it would draw) <span class="key" style="background:#3987e5"></span>cluster LOD (drawn)</div>
+    <canvas id="chart" role="img" aria-label="Triangles drawn against rocks in the field, full mesh and cluster LOD"></canvas>
+    <pre id="levels"></pre>
+  </div>
+  <script type="module">
+    // A dense field: thousands of instanced rocks of 81 920 triangles each (sixteen thousand by
+    // default, stretching to the horizon), drawn with cluster LOD (`Renderable.clusters`): each
+    // rock's cut picked per cluster on the GPU for the camera, so the triangles drawn stay about
+    // flat while the field grows. "grow the field"
+    // adds rocks nearest first (each `InstanceCulling.count`) from 64 to all of them; the chart
+    // plots the triangles drawn as it grows against what the full mesh would draw for the same
+    // rocks (the rocks drawn times the mesh's triangles). "full mesh" draws the meshes as they are
+    // instead (A/B: the HUD keeps each mode's GPU time). The colours are the cluster debug view's
+    // (`Renderer.setClusterDebug`): `instance` and `level` show the LOD rings by distance.
+    //
+    // URL parameters: `max=<rocks>` (16 384), `rocks=<count>` (start there, no growing), `sub=<subdivisions>`
+    // (6), `tau=<pixels>` (the error budget, 1), `mode=clusters|full`, `view=material|instance|level|
+    // error|cluster`, `edges=1`, `t=<seconds>` (the camera's turn, frozen), `size=<w>x<h>`.
+    import { Canvas, run, param, paramOr, flag, setText, thousands } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { GBUFFER_OUT_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { IcosphereGeometry } from '../src/geometries/IcosphereGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { hash01 } from '../src/math/hash01'
+    import { InstanceCulling } from '../src/culling/InstanceCulling'
+    import { ClusterMesh } from '../src/clusters/ClusterMesh'
+    import { ClusterLod } from '../src/clusters/ClusterLod'
+    import { ClusterDebug } from '../src/clusters/ClusterDebug'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+
+    let canvas = Canvas.fill();
+    const size = (param('size') ?? '').split('x').map(Number);
+    if (size.length === 2 && size.every((n) => n > 0)) canvas = canvas.withSize(size[0], size[1]);
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0.5, 0.6, 0.74, 1) });
+    renderer.setClusterErrorThreshold(paramOr('tau', 1));
+    renderer.setCullingStats(true);
+
+    // Rocks placed by records of position + scale, then yaw (8 floats), lit by a low sun.
+    const ROCK_WGSL = /* wgsl */`
+      struct Surface { color: vec4<f32> };
+      @group(0) @binding(0) var<uniform> surface: Surface;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+      struct VIn { @location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(3) place: vec4<f32>, @location(4) yaw: f32 };
+      struct VOut { @builtin(position) @invariant clip: vec4<f32>, @location(0) normal: vec3<f32> };
+      fn turn(v: vec3<f32>, a: f32) -> vec3<f32> {
+          return vec3<f32>(cos(a) * v.x + sin(a) * v.z, v.y, -sin(a) * v.x + cos(a) * v.z);
+      }
+      @vertex
+      fn vertex_main(v: VIn) -> VOut {
+          var out: VOut;
+          let world = world_matrix * vec4<f32>(turn(v.position.xyz * v.place.w, v.yaw) + v.place.xyz, 1.0);
+          out.clip = projection_matrix * view_matrix * world;
+          out.normal = (world_matrix * vec4<f32>(turn(v.normal, v.yaw), 0.0)).xyz;
+          return out;
+      }
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+          let n = normalize(in.normal);
+          let sun = normalize(vec3<f32>(0.4, 0.6, 0.3));
+          let light = vec3<f32>(1.0, 0.95, 0.85) * max(dot(n, sun), 0.0) * 3.0 + vec3<f32>(0.25, 0.3, 0.4) * (0.6 + 0.4 * n.y);
+          return kansei_gbuffer_out(surface.color.rgb * light, vec3<f32>(0.0), n, surface.color.rgb);
+      }
+    `;
+
+    /** A noisy icosphere of `subdivisions`, about a metre across. */
+    function rock(subdivisions) {
+      const geometry = new IcosphereGeometry(1, subdivisions).withLabel('Rock');
+      const v = geometry.vertices;
+      const height = (x, y, z) => 1 + 0.12 * Math.sin(5 * x) * Math.cos(4 * y) + 0.06 * Math.sin(13 * z + 2 * x) + 0.008 * Math.sin(37 * y) * Math.cos(31 * x);
+      for (let o = 0; o < v.length; o += 9) {
+        const [x, y, z] = [v[o + 4], v[o + 5], v[o + 6]];
+        const h = height(x, y, z);
+        v.set([x * h, y * h * 0.7, z * h], o);
+      }
+      // normals from the displaced faces
+      const n = new Float32Array(v.length / 9 * 3), ix = geometry.indices;
+      for (let t = 0; t < ix.length; t += 3) {
+        const [a, b, c] = [ix[t] * 9, ix[t + 1] * 9, ix[t + 2] * 9];
+        const e1 = [v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]], e2 = [v[c] - v[a], v[c + 1] - v[a + 1], v[c + 2] - v[a + 2]];
+        const f = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        for (const i of [ix[t], ix[t + 1], ix[t + 2]]) for (let k = 0; k < 3; k++) n[i * 3 + k] += f[k];
+      }
+      for (let i = 0; i < n.length / 3; i++) {
+        const l = Math.hypot(n[3 * i], n[3 * i + 1], n[3 * i + 2]) || 1;
+        v.set([n[3 * i] / l, n[3 * i + 1] / l, n[3 * i + 2] / l], i * 9 + 4);
+      }
+      return geometry;
+    }
+
+    const geometry = rock(paramOr('sub', 6));
+    const triangles = geometry.indices.length / 3;
+    const before = performance.now();
+    const mesh = ClusterMesh.build(geometry);
+    const buildMs = performance.now() - before;
+
+    // The field: a jittered grid, nearest the centre first, so the first `count` records are a disc.
+    const SPACING = 4;
+    const max = paramOr('max', 16384);
+    const side = Math.ceil(Math.sqrt(max * 4 / Math.PI)) + 2;
+    const spots = [];
+    for (let j = 0; j < side; j++) for (let i = 0; i < side; i++) {
+      const k = j * side + i;
+      const x = (i - side / 2 + 0.2 + 0.6 * hash01(k)) * SPACING;
+      const z = (j - side / 2 + 0.2 + 0.6 * hash01(k + 7919)) * SPACING;
+      // (clear of the camera's spot)
+      if (Math.hypot(x, z) > 3) spots.push([x, z, k]);
+    }
+    spots.sort((a, b) => Math.hypot(a[0], a[1]) - Math.hypot(b[0], b[1]));
+    const data = new Float32Array(max * 8);
+    let reach = 0;
+    for (let r = 0; r < max; r++) {
+      const [x, z, k] = spots[r];
+      data.set([x, 0.2, z, 0.7 + 0.6 * hash01(k + 104729), hash01(k + 3) * 2 * Math.PI, 0, 0, 0], r * 8);
+      reach = Math.hypot(x, z);
+    }
+    const source = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_STORAGE,
+      usage: BufferBase.BUFFER_USAGE_VERTEX | BufferBase.BUFFER_USAGE_STORAGE,
+      buffer: data,
+      stride: 32,
+      attributes: [
+        { shaderLocation: 3, offset: 0, format: 'float32x4' },
+        { shaderLocation: 4, offset: 16, format: 'float32' },
+      ],
+    });
+
+    const material = () => new Material(`${GBUFFER_OUT_WGSL}\n${ROCK_WGSL}`, {
+      label: 'Rock',
+      bindings: [{
+        binding: 0, visibility: GPUShaderStage.FRAGMENT, value: new ComputeBuffer({
+          type: BufferBase.BUFFER_TYPE_UNIFORM,
+          usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+          buffer: new Float32Array([0.42, 0.4, 0.37, 1]),
+        }),
+      }],
+      mrtOutputCount: 4,
+    });
+
+    const scene = new Scene();
+    const ground = new Renderable(new PlaneGeometry(reach * 2.4, reach * 2.4),
+      Material.standardLit('Ground', { baseColor: [0.2, 0.22, 0.16], roughness: 0.9, skyUp: [1.6, 1.6, 1.6], skyDown: [1.6, 1.6, 1.6] }));
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    // the same records drawn two ways: cluster LOD, and the full mesh
+    const MODES = ['clusters', 'full'];
+    const fields = MODES.map((m) => {
+      const r = new Renderable(new InstancedGeometry(geometry, max, [source]), material());
+      r.instanceCulling = new InstanceCulling(source, max, 32, 0, 1.2).withRadiusScale(12);
+      if (m === 'clusters') r.clusters = new ClusterLod(mesh).withTransform({ kind: 'placement', position: 0, scale: 12, yaw: 16, yawScale: 1 });
+      scene.add(r);
+      return r;
+    });
+
+    const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(1) });
+    const volume = new PostProcessingVolume(renderer, [tonemap]);
+    const camera = new Camera(50, 0.1, 2000, canvas.aspect);
+
+    // the panel
+    const radios = (id, names, initial, onChange) => {
+      const box = document.getElementById(id);
+      for (const name of names) {
+        const label = document.createElement('label');
+        label.innerHTML = `<input type="radio" name="${id}" value="${name}" ${name === initial ? 'checked' : ''}/> ${name === 'full' ? 'full mesh' : name === 'clusters' ? 'cluster LOD' : name}`;
+        label.querySelector('input').addEventListener('change', () => onChange(name));
+        box.appendChild(label);
+      }
+    };
+    let mode = MODES.includes(param('mode')) ? param('mode') : 'clusters';
+    function setMode(m) {
+      mode = m;
+      fields.forEach((r, k) => { r.visible = MODES[k] === m; });
+    }
+    setMode(mode);
+    radios('modes', MODES, mode, setMode);
+
+    const VIEWS = ['material', 'instance', 'level', 'error', 'cluster'];
+    const debug = new ClusterDebug({ mode: 'instance', edges: flag('edges', false) });
+    let view = VIEWS.includes(param('view')) ? param('view') : 'level';
+    function setView(name) {
+      view = name;
+      if (name === 'material') {
+        renderer.setClusterDebug(null);
+      } else {
+        debug.mode = name;
+        renderer.setClusterDebug(debug);
+      }
+    }
+    setView(view);
+    radios('views', VIEWS, view, setView);
+    const edges = document.getElementById('edges');
+    edges.checked = debug.edges;
+    edges.addEventListener('change', () => { debug.edges = edges.checked; });
+
+    // rocks: a log slider from 64 to all of them
+    const MIN_ROCKS = Math.min(64, max);
+    const rocksSlider = document.getElementById('rocks');
+    const grow = document.getElementById('grow');
+    let rocks = max;
+    function setRocks(count) {
+      rocks = Math.max(1, Math.min(max, Math.round(count)));
+      for (const r of fields) r.instanceCulling.count = rocks;
+      rocksSlider.value = String(Math.log(rocks / MIN_ROCKS) / Math.log(max / MIN_ROCKS));
+      setText('rocksValue', `${thousands(rocks)} (${thousands(rocks * triangles)} triangles)`);
+    }
+    rocksSlider.addEventListener('input', () => { grow.checked = false; setRocks(MIN_ROCKS * (max / MIN_ROCKS) ** Number(rocksSlider.value)); });
+    const start = Number(param('rocks') ?? NaN);
+    if (Number.isFinite(start)) grow.checked = false;
+    setRocks(Number.isFinite(start) ? start : MIN_ROCKS);
+    let growT = 0;
+    const GROW_SECONDS = 30;
+
+    // the chart: triangles drawn against rocks, both log scales
+    const samples = [];
+    const chart = document.getElementById('chart');
+    function drawChart() {
+      const dpr = devicePixelRatio || 1;
+      const w = chart.clientWidth, h = chart.clientHeight;
+      if (chart.width !== Math.round(w * dpr)) { chart.width = Math.round(w * dpr); chart.height = Math.round(h * dpr); }
+      const g = chart.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+      const left = 44, right = 6, top = 6, bottom = 18;
+      const x = (n) => left + (w - left - right) * Math.log(n / MIN_ROCKS) / Math.log(max / MIN_ROCKS);
+      const lo = 1e4, hi = Math.max(1e7, MIN_ROCKS, ...samples.map((s) => s.full)) * 1.2;
+      const y = (t) => top + (h - top - bottom) * (1 - Math.log(Math.max(t, lo) / lo) / Math.log(hi / lo));
+      // recessive grid and axes
+      g.strokeStyle = 'rgba(255,255,255,0.08)';
+      g.fillStyle = '#8fa3b8';
+      g.font = '10px ui-monospace, Menlo, monospace';
+      g.lineWidth = 1;
+      for (let t = lo; t <= hi; t *= 10) {
+        g.beginPath(); g.moveTo(left, y(t)); g.lineTo(w - right, y(t)); g.stroke();
+        g.fillText(t >= 1e9 ? `${t / 1e9}G` : t >= 1e6 ? `${t / 1e6}M` : `${t / 1e3}k`, 4, y(t) + 3);
+      }
+      for (let n = MIN_ROCKS; n <= max; n *= 4) g.fillText(thousands(n), Math.min(x(n), w - right - 30), h - 4);
+      const line = (key, colour) => {
+        const points = samples.filter((s) => s[key] > 0);
+        if (points.length === 0) return;
+        g.strokeStyle = colour;
+        g.lineWidth = 2;
+        g.lineJoin = 'round';
+        g.beginPath();
+        points.forEach((s, i) => (i ? g.lineTo(x(s.rocks), y(s[key])) : g.moveTo(x(s.rocks), y(s[key]))));
+        g.stroke();
+      };
+      line('full', '#d95926');
+      line('drawn', '#3987e5');
+    }
+
+    /** A slow turn about the centre, low over the rocks, looking to the horizon. */
+    function placeCamera(t) {
+      const a = t * 0.05;
+      camera.position.set(0, 2.6, 0);
+      camera.lookAt(new Vector3(Math.sin(a) * 40, -1.5, Math.cos(a) * 40));
+    }
+
+    const timer = new FrameTimer(renderer.gpuDevice);
+    const gpuMs = { clusters: 0, full: 0 };
+    let intervalMs = 0;
+    console.info(`Kansei — meshlet field ready: up to ${max} rocks of ${triangles} triangles, ${mesh.clusters.length} clusters over ${mesh.levels().length} levels built in ${buildMs.toFixed(0)} ms`);
+
+    const frozenT = Number(param('t') ?? NaN);
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      placeCamera(Number.isFinite(frozenT) ? frozenT : frame.time);
+      if (grow.checked && rocks < max) {
+        growT = Math.min(growT + frame.dt, GROW_SECONDS);
+        setRocks(MIN_ROCKS * (max / MIN_ROCKS) ** (growT / GROW_SECONDS));
+      }
+
+      timer.begin();
+      volume.render(scene, camera);
+      timer.end();
+      for (const ms of timer.take()) gpuMs[mode] += (ms - gpuMs[mode]) * 0.05;
+      intervalMs += (frame.dt * 1000 - intervalMs) * 0.05;
+
+      if (frame.index % 10 === 0) {
+        const stats = renderer.cullingStats?.camera();
+        if (stats) {
+          const full = stats.drawn * triangles;
+          // (the stats read back a few frames late: a sample is the count that drew them)
+          if (mode === 'clusters' && stats.drawn > 0) {
+            const last = samples[samples.length - 1];
+            if (!last || rocks > last.rocks) samples.push({ rocks, drawn: stats.triangles, full });
+            else if (rocks === last.rocks) Object.assign(last, { drawn: stats.triangles, full });
+            drawChart();
+          }
+          const [w, h] = renderer.renderSize;
+          setText('hud', [
+            `${thousands(triangles)} triangles a rock · ${thousands(mesh.clusters.length)} clusters · graph built in ${buildMs.toFixed(0)} ms`,
+            `camera: ${thousands(stats.drawn)} of ${thousands(rocks)} rocks drawn`,
+            mode === 'clusters'
+              ? `${thousands(stats.clusters)} clusters · ${thousands(stats.triangles)} triangles\nthe full mesh would draw ${thousands(full)} (${(full / Math.max(stats.triangles, 1)).toFixed(0)} x)`
+              : `${thousands(stats.triangles)} triangles (full mesh)`,
+            `${w} x ${h} · ${intervalMs.toFixed(1)} ms between frames`,
+            `GPU: cluster LOD ${gpuMs.clusters ? gpuMs.clusters.toFixed(2) : '-'} ms · full mesh ${gpuMs.full ? gpuMs.full.toFixed(2) : '-'} ms${timer.hasTimestamps ? '' : ' (no timestamps)'}`,
+          ].join('\n'));
+        }
+        const levels = mode === 'clusters' && view !== 'material' ? debug.levels : null;
+        if (levels) {
+          const most = Math.max(...levels.map((l) => l.triangles), 1);
+          document.getElementById('levels').innerHTML = 'the camera\'s cut by level: clusters, triangles\n' + levels.map((l, k) =>
+            `${String(k).padStart(2)} ${String(thousands(l.clusters)).padStart(7)} ${String(thousands(l.triangles)).padStart(10)} <span class="bar" style="width:${Math.round(80 * l.triangles / most)}px;background:#3987e5"></span>`).join('\n');
+        } else {
+          document.getElementById('levels').textContent = '';
+        }
+      }
+    });
+  </script>
+</body>
+
+</html>

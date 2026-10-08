@@ -171,6 +171,26 @@ URL parameters:
   `lake_regions()`) come from the lake crate and are in this module too: see the
   [lake's README](../lake/README.md).
 
+## Timing against the TS port
+
+The TS engine has a pure TypeScript port of this runtime (`src/animation/motion_matching`,
+`src/collision`) and a page like this one on it, `examples/index_motion_matching.html` (packs in
+the gitignored `examples/pack/`, or `?pack=<url>`). Both pages time the same things the same way
+(`src/timing.rs` here), for the same pack:
+
+- the HUD's `update` line: the character's update per frame (search, pose, inertialization,
+  foot locking, collision), mean, 95th percentile and largest over the last 3000 frames;
+  `window.motionTimings()` returns them as JSON (the TS page also splits off the searches);
+- `window.benchSearch(step)`: milliseconds per `Database::search` over every `step`th frame's
+  features, nudged, as queries;
+- `window.benchPose(count)`: milliseconds to sample a pose between two frames, run its forward
+  kinematics and fill the first body's bone palette, `count` times.
+
+Run both with `drive=1` (the same route, `driveRestart()` starts it over) and `lake=0` here (the TS
+page has the course and no lake), alternating the two pages: other sessions share the machine.
+Serve them cross-origin isolated (COOP `same-origin`, COEP `credentialless`), or Chrome rounds
+`performance.now()` to 0.1 ms.
+
 ## Generated animation (Kimodo)
 
 `www/kimodo.html` plays packs of generated clips: NVIDIA Kimodo, baked by

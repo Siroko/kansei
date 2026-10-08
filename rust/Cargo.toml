@@ -9,6 +9,7 @@ members = [
 ]
 exclude = [
     "vendor/basisu",
+    "tools/meshopt-fixture",
     "kansei-wasm/examples/hello-scene",
     "kansei-wasm/examples/instancing",
     "kansei-wasm/examples/pathtracer",

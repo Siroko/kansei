@@ -34,3 +34,20 @@ export const replaceInclude = (includePath: string): string => {
 
     return parseIncludes(chunk);
 }
+
+/**
+ * Builds a shader the way the Rust engine does: the parts joined in order, then each
+ * placeholder replaced everywhere, in the order given (as `.replace("KANSEI_*", ...)`), so
+ * list a placeholder before any placeholder it starts with.
+ *
+ * @param {string[]} parts - The WGSL chunks, e.g. `[LIGHTS_WGSL, SHADOW_MAP_WGSL, body]`.
+ * @param {Record<string, string>} replacements - Placeholder to text.
+ * @returns {string} - The assembled shader.
+ */
+export const assemble = (parts: string[], replacements: Record<string, string> = {}): string => {
+    let source = parts.join('\n');
+    for (const [placeholder, text] of Object.entries(replacements)) {
+        source = source.split(placeholder).join(text);
+    }
+    return source;
+}

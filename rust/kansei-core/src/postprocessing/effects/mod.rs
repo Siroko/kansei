@@ -7,6 +7,7 @@ mod dof;
 mod fluid_surface;
 mod height_fog;
 mod motion_blur;
+mod ssao;
 mod ssgi;
 mod taa;
 mod tonemap;
@@ -20,6 +21,7 @@ pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
 pub use fluid_surface::{FluidMask, FluidSurfaceEffect, FluidSurfaceOptions};
 pub use height_fog::{HeightFogEffect, HeightFogLayer};
 pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
+pub use ssao::{SSAOEffect, SSAOOptions};
 pub use ssgi::{GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions};
 pub use taa::{TemporalAAEffect, TemporalAAOptions};
 pub use tonemap::{

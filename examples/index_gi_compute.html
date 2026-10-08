@@ -17,7 +17,7 @@
 
 <body>
   <script type="module">
-    import { Renderer } from '../src/renderers/Renderer'
+    import { Canvas, run } from '../src/web/index'
     import { Material } from '../src/materials/Material'
     import { Compute } from '../src/materials/Compute'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
@@ -32,7 +32,6 @@
     import { PathTracerMaterial } from '../src/pathtracer/PathTracerMaterial'
     import { DirectionalLight } from '../src/lights/DirectionalLight'
     import { AreaLight } from '../src/lights/AreaLight'
-    import { ShadowMap } from '../src/shadows/ShadowMap'
     import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
     import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
     import { BufferBase } from '../src/buffers/BufferBase'
@@ -47,7 +46,7 @@
     const dirLight = new DirectionalLight([0.0, -1.0, 0.2], [1.0, 1.0, 1.0], 0.0);
     const lightDirUniform = new Vector3(0, -1, 0.0);
 
-    const areaLight = new AreaLight([1.0, 0.95, 0.8], 35.0, [3, 3]);
+    const areaLight = new AreaLight([1.0, 0.95, 0.8], 110.0, [3, 3]); // the tracer lights surfaces with albedo / pi
     areaLight.position.set(0, WALL - 0.2, 0);
     areaLight.target.set(0, 0, 0);
 
@@ -69,10 +68,10 @@
       }
 
       @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
-      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -108,7 +107,7 @@
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
         let albedo = albedoMetal.rgb;
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = AMBIENT + (1.0 - AMBIENT) * diffuse * shadow;
@@ -134,10 +133,10 @@
 
       @group(0) @binding(0) var<uniform> lightDirection      : vec3f;
       @group(0) @binding(2) var<storage, read> trailTransforms : array<vec4f>;
-      @group(1) @binding(0) var<uniform> normalMatrix         : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix          : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix           : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix     : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix         : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix          : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix           : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix     : mat4x4f;
 
       @vertex
       fn vertex_main(
@@ -208,7 +207,7 @@
 
       @fragment
       fn fragment_main(frag : VertexOut) -> FragmentOutput {
-        let shadow   = calcDirectionalShadow(frag.worldPos, frag.worldNormal);
+        let shadow   = kansei_shadow_map(frag.worldPos, frag.worldNormal);
         let L        = -normalize(lightDirection);
         let diffuse  = max(dot(frag.worldNormal, L), 0.0);
         let lighting = diffuse * shadow;
@@ -470,22 +469,11 @@
     `;
 
     // ── Renderer ──────────────────────────────────────────────────────────
-    const renderer = new Renderer({
-      width: window.innerWidth,
-      height: window.innerHeight,
-      devicePixelRatio: 2,
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({
       antialias: false,
       sampleCount: 1
     });
-    await renderer.initialize();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.canvas);
-    renderer.canvas.style.width = '100%';
-    renderer.canvas.style.height = '100%';
-    renderer.shadowsEnabled = true;
-
-    const shadowMap = new ShadowMap(renderer.gpuDevice, { resolution: 2048 });
-    renderer.shadowMap = shadowMap;
 
     // ── Scene ─────────────────────────────────────────────────────────────
     const scene = new Scene();
@@ -763,7 +751,7 @@
       useReSTIR: false,
     });
 
-    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect], { msaaSampleCount: 4 });
 
     // ── GPU BLAS deform + refit shaders ───────────────────────────────────
     const deformShaderCode = /* wgsl */`
@@ -1186,7 +1174,7 @@
     // ── Lighting controls ────────────────────────────────────────────────
     const lightFolder = pane.addFolder({ title: 'Lighting' });
     const lightParams = { intensity: areaLight.intensity };
-    lightFolder.addBinding(lightParams, 'intensity', { min: 0, max: 100, step: 0.5, label: 'light intensity' }).on('change', () => {
+    lightFolder.addBinding(lightParams, 'intensity', { min: 0, max: 300, step: 0.5, label: 'light intensity' }).on('change', () => {
       areaLight.intensity = lightParams.intensity;
     });
     const ambientParams = { color: { r: 0, g: 0, b: 0 } };
@@ -1422,15 +1410,10 @@
           console.log('[DIAG] totalInstances:', bvh.totalInstances, 'totalTriangleCount:', bvh.totalTriangleCount, 'totalBVH4Nodes:', bvh.totalBVH4Nodes);
         }
       }
-
-      requestAnimationFrame(animate);
     }
-    requestAnimationFrame(animate);
-
-    window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate();
     });
   </script>
 </body>

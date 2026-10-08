@@ -5,6 +5,7 @@ import { shaderCode as classicExtractShader } from './shaders/marching-cubes-cla
 import { shaderCode as finalizeShader } from './shaders/marching-cubes-finalize.wgsl';
 import { EDGE_TABLE, TRI_TABLE } from './marching-cubes-tables';
 import { FluidDensityField } from './FluidDensityField';
+import { gpuPass } from '../../profiling/Profiler';
 
 export interface MarchingCubesOptions {
     maxTriangles?: number;
@@ -237,13 +238,13 @@ export class FluidMarchingCubes {
         paramsF32[11] = 0.0;
         this._device.queue.writeBuffer(this._paramsBuffer, 0, paramsF32);
 
-        const resetPass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Reset' });
+        const resetPass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Reset', timestampWrites: gpuPass('FluidMarchingCubes/Reset') });
         resetPass.setPipeline(this._resetPipeline);
         resetPass.setBindGroup(0, this._resetBG);
         resetPass.dispatchWorkgroups(1, 1, 1);
         resetPass.end();
 
-        const extractPass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Extract' });
+        const extractPass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Extract', timestampWrites: gpuPass('FluidMarchingCubes/Extract') });
         const pipeline = this._useClassic ? this._classicExtractPipeline : this._extractPipeline;
         extractPass.setPipeline(pipeline);
         extractPass.setBindGroup(0, extractBindGroup);
@@ -254,7 +255,7 @@ export class FluidMarchingCubes {
         );
         extractPass.end();
 
-        const finalizePass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Finalize' });
+        const finalizePass = commandEncoder.beginComputePass({ label: 'FluidMarchingCubes/Finalize', timestampWrites: gpuPass('FluidMarchingCubes/Finalize') });
         finalizePass.setPipeline(this._finalizePipeline);
         finalizePass.setBindGroup(0, this._finalizeBG);
         finalizePass.dispatchWorkgroups(1, 1, 1);

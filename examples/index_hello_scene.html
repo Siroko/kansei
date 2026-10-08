@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei – Hello scene</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { touch-action: none; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Hello scene: the smallest complete Kansei scene, the TS twin of the Rust `hello-scene`
+    // example. A floor, a spinning box and a sphere in the stock lit material
+    // (`Material.basicLit`), a sun and two point lights packed by the renderer into the camera
+    // group (`LIGHTS_WGSL`), shadows from the sun and one lamp, and an orbit camera. Drag to
+    // orbit, wheel or pinch to zoom.
+    //
+    // URL parameters: `shadows=0` (no shadow maps), `post=1` (render through a post-processing
+    // volume: bloom on the bright box, then a colour grade), and, TS only, `standard=1` (the
+    // same scene in `Material.standardLit` under a `Material.gradientSky`, with `Material.emissive`
+    // lamp heads, through a `ToneMapEffect`).
+    import { Canvas, run, flag } from '../src/web/index'
+    import { Camera } from '../src/cameras/Camera'
+    import { CameraControls } from '../src/controls/CameraControls'
+    import { Scene } from '../src/objects/Scene'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { PointLight } from '../src/lights/PointLight'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
+    import { ColorGradingEffect } from '../src/postprocessing/effects/ColorGradingEffect'
+    import { ToneMapEffect } from '../src/postprocessing/effects/ToneMapEffect'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+
+    const shadows = flag('shadows', true);
+    const standard = flag('standard', false);
+    const post = flag('post', false) || standard;
+
+    const canvas = Canvas.fill();
+    // the post-processing volume draws into its own GBuffer
+    const renderer = await canvas.renderer({ sampleCount: post ? 1 : 4, clearColor: new Vector4(0.02, 0.02, 0.04, 1) });
+    if (shadows) {
+      renderer.enableShadows({ resolution: 2048 });
+      renderer.enablePointShadows({ resolution: 512, maxLights: 1 });
+    }
+
+    // The scene's surfaces: Blinn-Phong forward, or the standard lit material into the GBuffer
+    const surface = (label, color, specular) => standard
+      ? Material.standardLit(label, {
+          baseColor: color.slice(0, 3),
+          roughness: 1 - specular[3],
+          skyUp: [0.1, 0.12, 0.18],
+          skyDown: [0.04, 0.04, 0.04],
+        })
+      : Material.basicLit(label, color, specular);
+
+    const scene = new Scene();
+    const floor = new Renderable(new PlaneGeometry(20, 20), surface('Floor', [0.6, 0.6, 0.6, 1], [0.2, 0.2, 0.2, 0.1]));
+    floor.rotation.x = -Math.PI / 2;
+    floor.castShadow = false;
+    scene.add(floor);
+
+    // bright enough (above 1) for the bloom to catch it with `post=1`
+    const cube = new Renderable(new BoxGeometry(1.6, 1.6, 1.6), surface('Box', [1.6, 0.35, 0.2, 1], [0.5, 0.5, 0.5, 0.4]));
+    cube.position.set(-1.2, 0.8, 0);
+    scene.add(cube);
+
+    const sphere = new Renderable(new SphereGeometry(1, 5), surface('Sphere', [0.2, 0.4, 0.9, 1], [0.8, 0.8, 0.8, 0.6]));
+    sphere.position.set(1.4, 1, 0.4);
+    scene.add(sphere);
+
+    const sun = new DirectionalLight([-0.4, -1, -0.5], [0.75, 0.72, 0.65], 1);
+    sun.castShadow = shadows;
+    scene.add(sun);
+    const lamp = new PointLight(14, [0.7, 0.5, 0.3], 2);
+    lamp.position.set(-3, 3.5, 2.5);
+    lamp.castShadow = shadows;
+    scene.add(lamp);
+    const fill = new PointLight(12, [0.25, 0.4, 0.75], 1.5);
+    fill.position.set(3.5, 2, -2.5);
+    scene.add(fill);
+
+    if (standard) {
+      // the lamps' heads, and a sky dome around everything
+      for (const light of [lamp, fill]) {
+        const head = new Renderable(new SphereGeometry(0.12, 3), Material.emissive(`${light === lamp ? 'Lamp' : 'Fill'}/Head`, light.effectiveColor.map((c) => c * 4)));
+        head.position.set(light.position.x, light.position.y, light.position.z);
+        head.castShadow = false;
+        scene.add(head);
+      }
+      const sky = new Renderable(new SphereGeometry(60, 4), Material.gradientSky('Sky', {
+        zenith: [0.12, 0.2, 0.42], horizon: [0.42, 0.42, 0.46], ground: [0.05, 0.05, 0.05],
+      }));
+      sky.castShadow = false;
+      scene.add(sky);
+    }
+
+    const camera = new Camera(45, 0.1, 100, canvas.aspect);
+    const controls = new CameraControls(camera, new Vector3(0, 0.8, 0), renderer.canvas, 11);
+    controls.azimuth = 0;
+    controls.elevation = 0.35;
+
+    const volume = !post ? null : new PostProcessingVolume(renderer, standard
+      ? [new ToneMapEffect({ exposure: 2 })]
+      : [
+          new BloomEffect({ threshold: 0.9, intensity: 0.6 }),
+          new ColorGradingEffect({ contrast: 1.15, temperature: 0.1 }),
+        ], { msaaSampleCount: 4 });
+
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      cube.rotation.y = frame.time * 0.6;
+      controls.update(frame.dt);
+      if (volume) volume.render(scene, camera); else renderer.render(scene, camera);
+    });
+  </script>
+</body>
+
+</html>

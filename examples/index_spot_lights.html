@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei — Spot Lights</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Spot lights: a car's dipped headlights, two shadowed 22 000 cd spot lights (10° inner and
+    // 30° outer cone, 70 m range), shine into an instanced forest at night. The trunks shadow the
+    // beams on the ground (the spot shadow atlas, PCSS by each light's source radius) and in the
+    // volumetric fog (the spot lights scattered in their cones, through the same atlas); they are
+    // culled per view on the GPU, so trunks outside the picture still shadow the beams in it.
+    // Surfaces (Material.standardLit) are lit by the scene's spot lights through the clustered
+    // light lists. Exposure is EV100 3.9.
+    // The TS counterpart of rust/kansei-wasm/examples/spot-lights, with its URL parameters:
+    //   cam=behind|top|wall  high behind the car, above the canopy, or a corridor to a pale wall
+    //                        (default: low in the forest, facing the lamps)
+    //   drive=1        the car creeps forward and back
+    //   t=<seconds>    freeze the car, and the camera that follows it, at that time
+    //   shadows=0      no spot shadow maps
+    //   fog=0          no volumetric fog
+    //   shafts=<steps> the beams raymarched per pixel with that many samples per light, instead of
+    //                  in the fog's froxels: the trunks' shadows stay sharp in the beams
+    //   cull=main      cull the trunks on the CPU against the camera only: trunks leaving the frame
+    //                  stop shadowing the beams, the bug per-view GPU culling avoids
+    //   lamps=<n>      n small unshadowed downlights in random colours over the forest (default 0)
+    //   clusters=0     no clustered light culling: every light shades every pixel
+    //   casters=<n>    n more renderables, one draw each, to measure per-draw CPU cost
+    //   stats=1        log every 240 frames the interval between frames and the renderer's profile
+    //   bench=1        alternate clustered and unclustered shading, comparing their GPU time
+    //   profile=1      the renderer's profile in an overlay (examples/profile-hud.js)
+    //   dpr=<ratio>    drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
+    import { Canvas, run, param, paramOr, flag } from '../src/web/index'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { hash01 } from '../src/math/hash01'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { SpotLight } from '../src/lights/SpotLight'
+    import { InstanceCulling } from '../src/culling/InstanceCulling'
+    import { frustumPlanes } from '../src/culling/Frustum'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
+
+    const DEG = Math.PI / 180;
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+    const shadows = flag('shadows', true);
+    if (shadows) renderer.enableSpotShadows(1024, 2);
+
+    // GGX surface lit by the spot lights plus a dim hemispherical night sky (0.25 cd/m² above, the
+    // ground bouncing a tenth of it): the stock standard material, instanced for the trunks (a
+    // vec4 per trunk: xyz offset, w height scale).
+    const litMaterial = (label, baseColor, roughness, instanced = false) => Material.standardLit(label, {
+      baseColor,
+      roughness,
+      skyUp: [0.15, 0.2, 0.3],
+      skyDown: [0.02, 0.025, 0.03],
+      instancing: instanced ? 'offsetHeight' : undefined,
+    });
+
+    const scene = new Scene();
+
+    const ground = new Renderable(new PlaneGeometry(200, 200), litMaterial('Ground', [0.12, 0.11, 0.09], 0.9));
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    // the forest: one instanced draw of unit trunks, everywhere but a small clearing around the
+    // car, which stands at the forest edge with its lights into the trees
+    const cam = param('cam') ?? '';
+    // `cam=wall`: a corridor to a pale wall 20 m ahead, and a row of poles right by the lamps
+    // that the camera (between them and the wall) doesn't see; their shadows on the wall show
+    // that shadow casters are culled per light, not to the camera
+    const wallTest = cam === 'wall';
+    const trunks = [];
+    for (let i = 0; i < 1400; i++) {
+      const x = -45 + hash01(i) * 90;
+      const z = -90 + hash01(i + 13) * 110;
+      if ((Math.abs(x - 1.75) < 3.5 && z > -9) || (wallTest && Math.abs(x - 1.75) < 9 && z > -21)) continue;
+      const h = 9 + hash01(i + 29) * 8;
+      trunks.push(x, h * 0.5, z, h);
+    }
+    if (wallTest) {
+      for (let k = 0; k < 6; k++) trunks.push(-1 + k * 1.1, 1.5, -5, 3);
+      const wall = new Renderable(new BoxGeometry(16, 6, 0.3), litMaterial('Wall', [0.6, 0.6, 0.6], 0.9));
+      wall.position.set(1.75, 3, -20);
+      scene.add(wall);
+    }
+    const count = trunks.length / 4;
+    const instanceData = new Float32Array(trunks);
+    const trunkInstances = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: instanceData,
+      shaderLocation: 3,
+      offset: 0,
+      stride: 16,
+      format: 'float32x4',
+    });
+    const forest = new Renderable(new InstancedGeometry(new BoxGeometry(0.35, 1, 0.35), count, [trunkInstances]),
+      litMaterial('Trunks', [0.22, 0.18, 0.15], 0.8, true));
+    // all trunks, culled on the GPU per view: the camera, and each shadowed spot light's own
+    // frustum; the culling sphere sits at the trunk's middle (y = h/2) with radius h/2 plus a
+    // margin, scaled by h. `cull=main` instead culls on the CPU against the camera only (as an
+    // app would): the bug this avoids, where trunks leaving the frame stop casting shadows
+    const cpuCull = param('cull') === 'main';
+    if (!cpuCull) forest.instanceCulling = InstanceCulling.forVec4Instances(trunkInstances, count, 0.55);
+    scene.add(forest);
+    const allTrunks = new Float32Array(trunks);
+    const viewProj = new Float32Array(16);
+    function cullOnCpu() {
+      camera.updateViewMatrix();
+      const planes = frustumPlanes(camera.viewProjection(viewProj));
+      let visible = 0;
+      for (let i = 0; i < count; i++) {
+        const [x, y, z, h] = allTrunks.subarray(i * 4, i * 4 + 4);
+        if (planes.every((p) => p[0] * x + p[1] * y + p[2] * z + p[3] >= -h * 0.55)) instanceData.set([x, y, z, h], 4 * visible++);
+      }
+      trunkInstances.update(renderer.gpuDevice);
+      forest.geometry.instanceCount = visible;
+    }
+
+    // the car: a dark body, two lens emitters (4000 cd/m², the intro's headlight_lens) and two
+    // 22 000 cd dipped beams, 10° inner / 30° outer, 70 m; both shadowed
+    const body = new Renderable(new BoxGeometry(1.8, 1.1, 4.4), litMaterial('Car', [0.05, 0.05, 0.06], 0.3));
+    scene.add(body);
+    const lensMaterial = Material.emissive('Lens', [4000, 3800, 3400]);
+    const lensGeometry = new BoxGeometry(0.3, 0.15, 0.04);
+    const lenses = [];
+    const beams = [];
+    for (let k = 0; k < 2; k++) {
+      const lens = new Renderable(lensGeometry, lensMaterial);
+      lens.castShadow = false;
+      scene.add(lens);
+      lenses.push(lens);
+      const beam = new SpotLight([0, 0, -1], [1, 0.95, 0.85], 22000, 70, 10 * DEG, 30 * DEG);
+      beam.castShadow = true;
+      beam.sourceRadius = 0.08;
+      scene.add(beam);
+      beams.push(beam);
+    }
+    const aim = new Vector3();
+    // Car position along Z: parked at the forest edge, or creeping forward and back with `drive=1`.
+    const drive = flag('drive', false);
+    const carZ = (t) => drive ? 2 * Math.sin(t * 0.3) : 0;
+    function placeCar(z) {
+      body.position.set(1.75, 0.75, z);
+      [-0.62, 0.62].forEach((side, k) => {
+        const lamp = [1.75 + side, 0.7, z - 2.3];
+        lenses[k].position.set(lamp[0], lamp[1], lamp[2] - 0.02);
+        beams[k].position.set(...lamp);
+        // dipped beams: aimed at the ground 25 m ahead, spreading slightly apart
+        aim.set(lamp[0] + side * 2, 0, lamp[2] - 25);
+        beams[k].lookAt(aim);
+      });
+    }
+
+    // `lamps=N`: N small unshadowed downlights over the forest, in random colours (clustered
+    // light culling keeps them cheap; `clusters=0` shades every pixel with every light)
+    const lamps = paramOr('lamps', 0);
+    for (let i = 0; i < lamps; i++) {
+      const hue = hash01(i + 509) * 6;
+      const clamp01 = (v) => Math.min(Math.max(v, 0), 1);
+      const color = [clamp01(Math.abs(hue - 3) - 1), clamp01(2 - Math.abs(hue - 2)), clamp01(2 - Math.abs(hue - 4))];
+      const lamp = new SpotLight([0, -1, 0], color, 800, 7, 25 * DEG, 50 * DEG);
+      lamp.position.set(-30 + hash01(i + 501) * 60, 2.5 + hash01(i + 503) * 2, -70 + hash01(i + 507) * 75);
+      lamp.volumetricScale = 0;
+      scene.add(lamp);
+    }
+    renderer.setClusteredLights(flag('clusters', true));
+
+    // `casters=N`: N more renderables (one draw each), to measure per-draw CPU cost
+    const extra = paramOr('casters', 0);
+    if (extra > 0) {
+      const postGeometry = new BoxGeometry(0.2, 2, 0.2);
+      const postMaterial = litMaterial('Post', [0.3, 0.3, 0.3], 0.8);
+      for (let i = 0; i < extra; i++) {
+        const post = new Renderable(postGeometry, postMaterial);
+        post.position.set(-3 + (i % 10) * 0.9, 1, -12 - Math.floor(i / 10) * 1.5);
+        scene.add(post);
+      }
+    }
+
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      exposure: exposureFromEV100(3.9),
+      vignette: 0.5,
+      grain: 0.22,
+      chromaticAberration: 0.25,
+    });
+    const bloom = new BloomEffect({ threshold: 0.0, intensity: 0.05, exposure: tonemap.totalExposure() });
+    // the fog scatters the spot lights in their cones, shadowed by their atlas; `shafts=N`
+    // raymarches the beams per pixel instead
+    const shaftSteps = paramOr('shafts', 0);
+    const fog = flag('fog', true) ? new VolumetricFogEffect({
+      froxelGrid: new FroxelGrid(renderer.gpuDevice, { near: 0.5, far: 150, gridD: 96, temporal: true }),
+      baseDensity: 0.015,
+      heightFalloff: 0.05,
+      anisotropy: 0.3,
+      ambient: [0.25, 0.32, 0.45],
+      spotScattering: shaftSteps > 0 ? { kind: 'raymarched', steps: shaftSteps } : { kind: 'froxels' },
+    }) : null;
+    fog?.setSpotLights(renderer.spotLightsBuffer, renderer.spotShadowAtlas);
+    const volume = new PostProcessingVolume(renderer, fog ? [fog, bloom, tonemap] : [bloom, tonemap], { msaaSampleCount: 4 });
+
+    const camera = new Camera(40, 0.1, 400, canvas.aspect);
+
+    console.log(`Kansei — Spot Lights (TS) ready: ${count} instanced trunks, shadows ${shadows}`);
+
+    const frozen = paramOr('t', NaN);
+    const target = new Vector3();
+    // `stats=1`: the renderer's profile (each pass's GPU time, the frame's CPU sections) and the
+    // frame interval (GPU-bound without vsync), over windows of 240 frames
+    const stats = flag('stats', false) ? { frames: 0, start: performance.now() } : null;
+    if (stats) renderer.setProfiling(true);
+    const clustered = renderer.clusteredLights;
+    const hud = installProfileHud({
+      renderer, FrameTimer, AbBench,
+      bench: { labels: ['clusters', 'no clusters'], set: (v) => renderer.setClusteredLights(clustered && v === 0) },
+    });
+
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      const now = performance.now();
+      hud.begin(now);
+      const t = Number.isFinite(frozen) ? frozen : frame.time;
+      if (fog) fog.time = frame.time;
+      const z = carZ(t);
+      placeCar(z);
+      switch (cam) {
+        // high behind the car, looking down the beams into the forest
+        case 'behind': camera.position.set(1.75, 5, z + 10); target.set(1.75, 1, z - 20); break;
+        // facing the wall, with the poles behind the camera
+        case 'wall': camera.position.set(1.75, 2.2, z - 9); target.set(1.75, 2, z - 20); break;
+        // above the canopy, looking down on the beams through the trees
+        case 'top': camera.position.set(-10, 24, z + 6); target.set(2, 0, z - 16); break;
+        // low, facing the lamps from inside the forest: glare, beams and the trunks' shadows
+        // radiating from the car
+        default: camera.position.set(-1, 1.8, z - 25); target.set(1.75, 1.2, z);
+      }
+      camera.lookAt(target);
+      if (cpuCull && trunkInstances.initialized) cullOnCpu();
+      volume.render(scene, camera);
+      hud.end(performance.now());
+      if (stats && ++stats.frames === 240) {
+        const end = performance.now();
+        console.info(`${((end - stats.start) / 240).toFixed(2)} ms between frames\n${renderer.takeProfile().report()}`);
+        stats.frames = 0;
+        stats.start = end;
+      }
+    });
+  </script>
+</body>
+
+</html>

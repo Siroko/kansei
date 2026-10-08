@@ -3,7 +3,7 @@ struct CompositeParams {
     width        : u32,
     height       : u32,
     rasterDirect : u32,
-    _pad         : u32,
+    hdrOut       : u32,   // 1 = write the HDR radiance as is (for a ToneMapEffect after it), 0 = Reinhard
 }
 
 @group(0) @binding(0) var inputTex    : texture_2d<f32>;
@@ -34,7 +34,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         hdr = indirect;
     }
 
-    let final_color = hdr / (hdr + vec3f(1.0));
+    let final_color = select(hdr / (hdr + vec3f(1.0)), hdr, params.hdrOut != 0u);
 
     textureStore(outputTex, coord, vec4f(final_color, 1.0));
 }

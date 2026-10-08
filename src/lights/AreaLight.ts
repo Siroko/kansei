@@ -37,6 +37,10 @@ class AreaLight extends Light {
         return [dx / len, dy / len, dz / len];
     }
 
+    /**
+     * A ShadowMap of this light's own, which the caller renders each frame (`shadowMap.render`).
+     * Or let the renderer own and render one: `castShadow` and `Renderer.enableShadows`.
+     */
     enableShadows(device: GPUDevice, options?: ShadowMapOptions): ShadowMap {
         this.shadowMap = new ShadowMap(device, options);
         return this.shadowMap;

@@ -3,9 +3,15 @@ import { Camera } from '../cameras/Camera';
 import { InstancedGeometry } from '../geometries/InstancedGeometry';
 import { Renderer } from '../renderers/Renderer';
 import { Scene } from '../objects/Scene';
+import type { Renderable } from '../objects/Renderable';
 import { DirectionalLight } from '../lights/DirectionalLight';
 import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
+import { gpuPass } from '../profiling/Profiler';
+import { drawGeometry } from '../culling/InstanceCulling';
+import type { DepthBias, Material } from '../materials/Material';
+import { CAMERA_TEMPORAL_BYTES, LIGHT_UNIFORM_BYTES, MESH_TRANSFORMS_BYTES, cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries, meshSlotStride } from '../renderers/SharedLayouts';
+import type { ClusterDepthDraw } from '../clusters/ClusterLod';
 
 export interface ShadowMapOptions {
     resolution?: number;
@@ -18,6 +24,8 @@ export interface ShadowMapOptions {
     near?: number;
     /** Far plane for perspective shadow maps (area lights). 0 = use light radius. */
     far?: number;
+    /** Depth bias of the casters' depth pipelines (`Material.getDepthPipeline`); none by default. */
+    depthBias?: DepthBias;
 }
 
 class ShadowMap {
@@ -30,16 +38,35 @@ class ShadowMap {
     private _depthTexture: GPUTexture;
     private _lightVP = new Float32Array(16);
 
-    private _pipeline: GPURenderPipeline | null = null;
+    private _depthBias: DepthBias;
+
+    /** Depth bias materials subtract when they compare against the map (`kansei_shadow.bias`). */
+    public bias = 0.001;
+    /** World-space offset along the surface normal before the lookup (`kansei_shadow.normalBias`). */
+    public normalBias = 0.02;
+    /**
+     * The light the map was last rendered from (`update`): null before that, or when it was
+     * rendered from a bare direction.
+     */
+    public light: DirectionalLight | AreaLight | PointLight | null = null;
     private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
-    // Light VP uniform (group 0)
+    // Casters draw through their material's depth pipeline (Material.getDepthPipeline), as the
+    // Rust engine's shadow passes do: group 0 the material's, group 1 a camera group holding the
+    // light's view and projection, group 2 the mesh.
+    private _lightCameraBuffers: GPUBuffer[];
+    private _lightCameraBG: GPUBindGroup;
+
+    // Renderables with shadowVertexCode keep their own pipelines: group 0 their shadowExtraBG
+    // (empty without one), group 1 the light's view-projection, group 2 the mesh.
     private _lightVPBuffer: GPUBuffer;
     private _lightVPBGL: GPUBindGroupLayout;
     private _lightVPBG: GPUBindGroup;
 
-    // Own mesh matrix buffers (group 1, same layout as Renderer's shared mesh)
+    // Own mesh matrix buffers (group 2, same layout as Renderer's shared mesh)
     private _meshBGL: GPUBindGroupLayout;
+    private _emptyBGL: GPUBindGroupLayout;
+    private _emptyBG: GPUBindGroup;
     private _worldMatBuf: GPUBuffer | null = null;
     private _normalMatBuf: GPUBuffer | null = null;
     private _meshBG: GPUBindGroup | null = null;
@@ -60,6 +87,7 @@ class ShadowMap {
         this._fov = options?.fov ?? 90;
         this._near = options?.near ?? 0.1;
         this._far = options?.far ?? 0;
+        this._depthBias = options?.depthBias ?? {};
 
         this._depthTexture = device.createTexture({
             label: 'ShadowMap/Depth',
@@ -89,17 +117,37 @@ class ShadowMap {
             entries: [{ binding: 0, resource: { buffer: this._lightVPBuffer } }],
         });
 
+        // View, projection, scene lights (unused) and temporal data (unused), as Camera binds them.
+        this._lightCameraBuffers = [64, 64, LIGHT_UNIFORM_BYTES, CAMERA_TEMPORAL_BYTES].map((size, i) => device.createBuffer({
+            label: `ShadowMap/LightCamera${i}`,
+            size,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        }));
+        this._lightCameraBG = device.createBindGroup({
+            label: 'ShadowMap/LightCamera BG',
+            layout: device.createBindGroupLayout({ label: 'ShadowMap/LightCamera BGL', entries: cameraBindGroupLayoutEntries() }),
+            entries: this._lightCameraBuffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+        });
+
+        // Group 0 of the pipelines without a shadowExtraBGL.
+        this._emptyBGL = device.createBindGroupLayout({ label: 'EmptyBGL', entries: [] });
+        this._emptyBG = device.createBindGroup({ layout: this._emptyBGL, entries: [] });
+
         this._meshBGL = device.createBindGroupLayout({
             label: 'ShadowMap/Mesh BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-                { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-            ],
+            entries: meshBindGroupLayoutEntries(),
         });
     }
 
     get depthTexture(): GPUTexture { return this._depthTexture; }
     get lightViewProjMatrix(): Float32Array { return this._lightVP; }
+    /** The light's view and projection as `update` placed them (the view-projection's factors). */
+    get lightViewMatrix(): Float32Array { return this._lightView as Float32Array; }
+    get lightProjectionMatrix(): Float32Array { return this._lightProj as Float32Array; }
+    /** Texels per side of the map. */
+    get resolution(): number { return this._resolution; }
+    /** The light's view-projection as uploaded by `update` (a 64-byte uniform), for passes that read it on the GPU. */
+    get lightViewProjBuffer(): GPUBuffer { return this._lightVPBuffer; }
     get maxShadowDistance(): number { return this._maxShadowDistance; }
     set maxShadowDistance(v: number) { this._maxShadowDistance = v; }
     /** Field-of-view in degrees (perspective shadow maps). */
@@ -124,7 +172,7 @@ class ShadowMap {
         if (useShadowFar < camera.far) {
             // Temporary projection with clamped far plane
             const tmpProj = mat4.create();
-            mat4.perspective(tmpProj, camera.fov * Math.PI / 180, camera.aspect, camera.near, useShadowFar);
+            mat4.perspectiveZO(tmpProj, camera.fov * Math.PI / 180, camera.aspect, camera.near, useShadowFar);
             mat4.multiply(vp, tmpProj, camera.viewMatrix.internalMat4);
         } else {
             mat4.multiply(vp, camera.projectionMatrix.internalMat4, camera.viewMatrix.internalMat4);
@@ -181,12 +229,7 @@ class ShadowMap {
         // but minZ/maxZ are negative view-space Z coords (objects in
         // front of the light have Z < 0).  Negate & swap so that
         // near = -maxZ (closest) and far = -minZ (farthest).
-        mat4.ortho(this._lightProj, minX, maxX, minY, maxY, -maxZ, -minZ);
-
-        // gl-matrix v3 ortho maps Z to [-1,1]; remap to [0,1] for WebGPU
-        (this._lightProj as unknown as Float32Array)[10] *= 0.5;
-        (this._lightProj as unknown as Float32Array)[14] =
-            (this._lightProj as unknown as Float32Array)[14] * 0.5 + 0.5;
+        mat4.orthoZO(this._lightProj, minX, maxX, minY, maxY, -maxZ, -minZ);
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
@@ -208,15 +251,7 @@ class ShadowMap {
 
         const near = this._near;
         const far = this._far > 0 ? this._far : light.radius;
-        mat4.perspective(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
-
-        // gl-matrix perspective maps Z to [-1,1]; remap to [0,1] for WebGPU.
-        // For perspective P[11]=-1, the correct remap is:
-        //   P'[10] = P[10]*0.5 + P[11]*0.5
-        //   P'[14] = P[14]*0.5
-        const P = this._lightProj as unknown as Float32Array;
-        P[10] = P[10] * 0.5 + P[11] * 0.5;
-        P[14] = P[14] * 0.5;
+        mat4.perspectiveZO(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
@@ -242,11 +277,7 @@ class ShadowMap {
 
         const near = this._near;
         const far = this._far > 0 ? this._far : light.radius;
-        mat4.perspective(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
-
-        const P = this._lightProj as unknown as Float32Array;
-        P[10] = P[10] * 0.5 + P[11] * 0.5;
-        P[14] = P[14] * 0.5;
+        mat4.perspectiveZO(this._lightProj, this._fov * Math.PI / 180, 1.0, near, far);
 
         mat4.multiply(this._lightVPMat, this._lightProj, this._lightView);
         this._lightVP.set(this._lightVPMat as unknown as Float32Array);
@@ -255,9 +286,9 @@ class ShadowMap {
     private _ensureMeshBuffers(objectCount: number): void {
         if (objectCount <= this._objectCapacity && this._meshBG) return;
 
-        const alignment = this._device.limits.minUniformBufferOffsetAlignment ?? 256;
-        const bufferSize = Math.max(objectCount * alignment, alignment);
-        const floatsPerSlot = alignment / 4;
+        const stride = meshSlotStride(this._device);
+        const bufferSize = Math.max(objectCount, 1) * stride;
+        const floatsPerSlot = stride / 4;
 
         this._worldMatBuf?.destroy();
         this._normalMatBuf?.destroy();
@@ -281,59 +312,11 @@ class ShadowMap {
             layout: this._meshBGL,
             entries: [
                 { binding: 0, resource: { buffer: this._normalMatBuf, size: 64 } },
-                { binding: 1, resource: { buffer: this._worldMatBuf, size: 64 } },
+                { binding: 1, resource: { buffer: this._worldMatBuf, size: MESH_TRANSFORMS_BYTES } },
             ],
         });
 
         this._objectCapacity = objectCount;
-    }
-
-    private _ensurePipeline(vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>): void {
-        if (this._pipeline) return;
-
-        const shaderCode = /* wgsl */`
-            @group(0) @binding(0) var<uniform> lightViewProj : mat4x4f;
-            @group(1) @binding(0) var<uniform> normalMatrix  : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix   : mat4x4f;
-
-            @vertex
-            fn shadow_vs(
-                @location(0) position : vec4f,
-                @location(1) normal   : vec3f,
-                @location(2) uv       : vec2f,
-            ) -> @builtin(position) vec4f {
-                return lightViewProj * worldMatrix * position;
-            }
-        `;
-
-        const module = this._device.createShaderModule({
-            label: 'ShadowMap/Shader',
-            code: shaderCode,
-        });
-
-        const pipelineLayout = this._device.createPipelineLayout({
-            label: 'ShadowMap/PipelineLayout',
-            bindGroupLayouts: [this._lightVPBGL, this._meshBGL],
-        });
-
-        this._pipeline = this._device.createRenderPipeline({
-            label: 'ShadowMap/Pipeline',
-            layout: pipelineLayout,
-            vertex: {
-                module,
-                entryPoint: 'shadow_vs',
-                buffers: vertexBuffersDescriptors,
-            },
-            depthStencil: {
-                format: 'depth32float',
-                depthWriteEnabled: true,
-                depthCompare: 'less',
-            },
-            primitive: {
-                topology: 'triangle-list',
-                cullMode: 'back',
-            },
-        });
     }
 
     private _getOrCreateCustomPipeline(
@@ -345,9 +328,9 @@ class ShadowMap {
         if (pipeline) return pipeline;
 
         const shaderCode = /* wgsl */`
-            @group(0) @binding(0) var<uniform> lightViewProj : mat4x4f;
-            @group(1) @binding(0) var<uniform> normalMatrix  : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix   : mat4x4f;
+            @group(1) @binding(0) var<uniform> lightViewProj : mat4x4f;
+            @group(2) @binding(0) var<uniform> normalMatrix  : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix   : mat4x4f;
 
             ${shadowVertexCode}
 
@@ -368,8 +351,7 @@ class ShadowMap {
             code: shaderCode,
         });
 
-        const layouts: GPUBindGroupLayout[] = [this._lightVPBGL, this._meshBGL];
-        if (extraBGL) layouts.push(extraBGL);
+        const layouts: GPUBindGroupLayout[] = [extraBGL ?? this._emptyBGL, this._lightVPBGL, this._meshBGL];
 
         pipeline = this._device.createRenderPipeline({
             label: 'ShadowMap/CustomPipeline',
@@ -397,14 +379,11 @@ class ShadowMap {
         return pipeline;
     }
 
-    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
-        const device = this._device;
-
-        scene.prepare(camera);
-        camera.updateViewMatrix();
-        const objects = scene.getOrderedObjects();
-        if (objects.length === 0) return;
-
+    /**
+     * Computes the light's view-projection for `camera` (a directional light's covers the camera
+     * frustum; an area or point light's is a perspective from the light) and uploads it.
+     */
+    update(camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
         if (lightDirOrLight instanceof AreaLight) {
             this._computeAreaLightVP(lightDirOrLight);
         } else if (lightDirOrLight instanceof PointLight) {
@@ -415,32 +394,31 @@ class ShadowMap {
                 : lightDirOrLight.direction;
             this._computeLightVP(camera, lightDir);
         }
-        device.queue.writeBuffer(this._lightVPBuffer, 0, this._lightVP.buffer as ArrayBuffer);
+        this.light = Array.isArray(lightDirOrLight) ? null : lightDirOrLight;
+        const queue = this._device.queue;
+        queue.writeBuffer(this._lightVPBuffer, 0, this._lightVP.buffer as ArrayBuffer);
+        queue.writeBuffer(this._lightCameraBuffers[0], 0, this._lightView as Float32Array);
+        queue.writeBuffer(this._lightCameraBuffers[1], 0, this._lightProj as Float32Array);
+    }
 
-        // Ensure pipeline (lazy — needs vertex layout from first geometry)
-        if (!objects[0].geometry.initialized) {
-            objects[0].geometry.initialize(device);
-        }
-        this._ensurePipeline(objects[0].geometry.vertexBuffersDescriptors);
-
-        this._ensureMeshBuffers(objects.length);
-
-        const alignment = device.limits.minUniformBufferOffsetAlignment ?? 256;
-        const floatsPerSlot = alignment / 4;
-
-        for (let i = 0; i < objects.length; i++) {
-            const obj = objects[i];
-            if (!obj.geometry.initialized) obj.geometry.initialize(device);
-            obj.updateModelMatrix();
-            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
-            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
-        }
-
-        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
-        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
-
-        const commandEncoder = device.createCommandEncoder({ label: 'ShadowMap' });
+    /**
+     * Encodes the shadow pass: clears the map and draws the `castShadow` renderables among
+     * `objects` from the light (`update`), each with its matrices in `meshBindGroup` (group 2) at
+     * `meshOffset(renderable, index)`. Renderables with `instanceCulling` draw the instances culled
+     * for the renderer's cull view `view` when it is given, else every instance.
+     */
+    encode(
+        commandEncoder: GPUCommandEncoder,
+        objects: readonly Renderable[],
+        meshBindGroup: GPUBindGroup,
+        meshOffset: (renderable: Renderable, index: number) => number,
+        view?: number,
+        clusterDraw?: ClusterDepthDraw,
+    ): void {
+        const device = this._device;
         const pass = commandEncoder.beginRenderPass({
+            label: 'Renderer/ShadowPass',
+            timestampWrites: gpuPass('Renderer/ShadowPass'),
             colorAttachments: [],
             depthStencilAttachment: {
                 view: this._depthTexture.createView(),
@@ -450,42 +428,71 @@ class ShadowMap {
             },
         });
 
-        pass.setBindGroup(0, this._lightVPBG);
-
         let activePipeline: GPURenderPipeline | null = null;
+        let activeLightBG: GPUBindGroup | null = null;
         let currentVertexBuffer: GPUBuffer | null = null;
         let currentIndexBuffer: GPUBuffer | null = null;
+        // Neighbours usually share a material: look its pipeline and bind group up once for them.
+        let lastMaterial: Material | null = null;
+        let lastLayouts: Iterable<GPUVertexBufferLayout | null> | null = null;
+        let lastDepthPipeline: GPURenderPipeline | null = null;
+        let lastMaterialBG: GPUBindGroup | null = null;
 
         for (let i = 0; i < objects.length; i++) {
             const obj = objects[i];
             if (!obj.castShadow) continue;
             if (!obj.geometry.initialized) continue;
 
-            // Select default or custom shadow pipeline
+            // its cut for this view, on the cluster path (with the light as the camera)
+            if (clusterDraw && view !== undefined && obj.clusters && !obj.shadowVertexCode) {
+                if (this._lightCameraBG !== activeLightBG) {
+                    pass.setBindGroup(1, this._lightCameraBG);
+                    activeLightBG = this._lightCameraBG;
+                }
+                if (clusterDraw(pass, obj, view, 'depth32float', this._depthBias, meshOffset(obj, i))) {
+                    activePipeline = null;
+                    lastMaterial = null;
+                    currentIndexBuffer = null;
+                    continue;
+                }
+            }
+
+            // The material's depth pipeline, or the renderable's own shadowVertexCode pipeline.
             let targetPipeline: GPURenderPipeline;
+            let lightBG: GPUBindGroup;
+            let groupZero: GPUBindGroup;
             if (obj.shadowVertexCode) {
                 targetPipeline = this._getOrCreateCustomPipeline(
                     obj.shadowVertexCode,
                     obj.geometry.vertexBuffersDescriptors,
                     obj.shadowExtraBGL,
                 );
+                lightBG = this._lightVPBG;
+                groupZero = obj.shadowExtraBG ?? this._emptyBG;
             } else {
-                targetPipeline = this._pipeline!;
+                if (obj.material !== lastMaterial || obj.geometry.vertexBuffersDescriptors !== lastLayouts) {
+                    if (obj.material !== lastMaterial) lastMaterialBG = obj.material.getBindGroup(device);
+                    lastMaterial = obj.material;
+                    lastLayouts = obj.geometry.vertexBuffersDescriptors;
+                    lastDepthPipeline = obj.material.getDepthPipeline(device, lastLayouts, 'depth32float', this._depthBias);
+                }
+                targetPipeline = lastDepthPipeline!;
+                lightBG = this._lightCameraBG;
+                groupZero = lastMaterialBG!;
             }
 
             if (targetPipeline !== activePipeline) {
                 pass.setPipeline(targetPipeline);
                 activePipeline = targetPipeline;
-                currentVertexBuffer = null;
-                currentIndexBuffer = null;
+            }
+            if (lightBG !== activeLightBG) {
+                pass.setBindGroup(1, lightBG);
+                activeLightBG = lightBG;
             }
 
-            const offset = i * alignment;
-            pass.setBindGroup(1, this._meshBG!, [offset, offset]);
-
-            if (obj.shadowExtraBG) {
-                pass.setBindGroup(2, obj.shadowExtraBG);
-            }
+            const offset = meshOffset(obj, i);
+            pass.setBindGroup(2, meshBindGroup, [offset, offset]);
+            pass.setBindGroup(0, groupZero);
 
             if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                 pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);
@@ -497,28 +504,59 @@ class ShadowMap {
             }
 
             if (obj.geometry.isInstancedGeometry) {
-                const geo = obj.geometry as InstancedGeometry;
-                let idx = 1;
-                for (const extraBuf of geo.extraBuffers) {
+                for (const extraBuf of (obj.geometry as InstancedGeometry).extraBuffers) {
                     if (!extraBuf.initialized) extraBuf.initialize(device);
-                    pass.setVertexBuffer(idx++, extraBuf.resource.buffer);
                 }
-                pass.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
-            } else {
-                pass.drawIndexed(obj.geometry.vertexCount);
             }
+            // culled against this light's frustum, not the camera's
+            drawGeometry(pass, obj.geometry, view === undefined ? null : obj.instanceCulling?.view(view) ?? null);
         }
 
         pass.end();
+    }
+
+    /**
+     * Renders the map from `lightDirOrLight` now, with matrix buffers of its own: for a map the
+     * caller drives. A map from `Renderer.enableShadows` is rendered by the renderer each frame.
+     */
+    render(_renderer: Renderer, scene: Scene, camera: Camera, lightDirOrLight: DirectionalLight | AreaLight | PointLight | [number, number, number], target?: [number, number, number]): void {
+        const device = this._device;
+
+        scene.prepare(camera);
+        camera.updateViewMatrix();
+        const objects = scene.getOrderedObjects();
+        if (objects.length === 0) return;
+
+        this.update(camera, lightDirOrLight, target);
+        this._ensureMeshBuffers(objects.length);
+
+        const stride = meshSlotStride(device);
+        const floatsPerSlot = stride / 4;
+
+        for (let i = 0; i < objects.length; i++) {
+            const obj = objects[i];
+            if (!obj.geometry.initialized) obj.geometry.initialize(device);
+            obj.updateModelMatrix();
+            // World, then the previous world (the same: shadows have no motion), then the normal matrix.
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot + 16);
+            this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
+        }
+
+        device.queue.writeBuffer(this._worldMatBuf!, 0, this._worldStaging!.buffer as ArrayBuffer);
+        device.queue.writeBuffer(this._normalMatBuf!, 0, this._normalStaging!.buffer as ArrayBuffer);
+
+        const commandEncoder = device.createCommandEncoder({ label: 'ShadowMap' });
+        this.encode(commandEncoder, objects, this._meshBG!, (_, i) => i * stride);
         device.queue.submit([commandEncoder.finish()]);
     }
 
     destroy(): void {
         this._depthTexture?.destroy();
         this._lightVPBuffer?.destroy();
+        for (const buffer of this._lightCameraBuffers) buffer.destroy();
         this._worldMatBuf?.destroy();
         this._normalMatBuf?.destroy();
-        this._pipeline = null;
         this._customPipelines.clear();
     }
 }

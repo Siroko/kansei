@@ -25,6 +25,8 @@ class InstancedGeometry extends Geometry {
         this.vertexCount = this.geometry.vertexCount;
         this.vertices = this.geometry.vertices;
         this.indices = this.geometry.indices;
+        this.indexFormat = this.geometry.indexFormat;
+        this.label = this.geometry.label;
     }
 
     /**

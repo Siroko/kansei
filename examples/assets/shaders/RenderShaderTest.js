@@ -6,11 +6,11 @@ struct VertexOut {
     @location(3) viewPosition : vec4<f32>,
 };
 
-@group(1) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
-@group(1) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normalMatrix:mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix:mat4x4<f32>;
 
-@group(2) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
-@group(2) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
+@group(1) @binding(0) var<uniform> viewMatrix:mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix:mat4x4<f32>;
 
 @vertex
 fn vertex_main(

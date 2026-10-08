@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transparent and transmissive</title>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <!--
+    Regression page for transparent objects in a scene that also has a
+    transmissive one: an opaque floor, one transmissive sphere and two
+    transparent boxes orbiting each other, so their back-to-front order
+    flips every half turn. All four must draw every frame.
+    `?transmissive=0` makes the sphere opaque for comparison.
+    `?check=1` also checks the draw path (stable slots, per-set bundles,
+    `visible`, `dynamic`), logs PASS/FAIL lines and sets the page title.
+  -->
+  <script type="module">
+    import { Canvas, run } from '../src/web/index'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+
+    const params = new URLSearchParams(location.search);
+    const transmissive = params.get('transmissive') !== '0';
+
+    const shader = /* wgsl */`
+      struct VertexOut {
+        @builtin(position) position    : vec4f,
+        @location(0)       worldNormal : vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> baseColor        : vec4f;
+      @group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldMatrix * position;
+        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        return out;
+      }
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let L = normalize(vec3f(0.4, 1.0, 0.6));
+        let lighting = 0.3 + 0.7 * max(dot(frag.worldNormal, L), 0.0);
+        return FragmentOutput(
+          vec4f(baseColor.rgb * lighting, baseColor.a),
+          vec4f(0.0, 0.0, 0.0, 1.0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 0.0),
+          vec4f(baseColor.rgb, 1.0)
+        );
+      }
+    `;
+
+    const makeMaterial = (color, options = {}) => new Material(shader, {
+      bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: color }],
+      ...options,
+    });
+
+    const canvas = Canvas.fill().withMaxPixelRatio(1);
+    const renderer = await canvas.renderer({
+      antialias: true,
+      sampleCount: 1,
+    });
+
+    const scene = new Scene();
+    const camera = new Camera(60, 0.1, 100, window.innerWidth / window.innerHeight);
+    camera.position.set(0, 3, 9);
+    camera.lookAt(new Vector3(0, 0.5, 0));
+
+    const floor = new Renderable(new BoxGeometry(12, 0.2, 12), makeMaterial(new Vector4(0.6, 0.6, 0.6, 1.0)));
+    floor.position.set(0, -1, 0);
+    scene.add(floor);
+
+    const sphere = new Renderable(
+      new SphereGeometry(1, 32),
+      makeMaterial(new Vector4(0.9, 0.8, 0.2, 1.0), { transmissive }),
+    );
+    sphere.position.set(0, 0.5, 0);
+    scene.add(sphere);
+
+    const boxGeometry = new BoxGeometry(1.2, 1.2, 1.2);
+    const redBox = new Renderable(boxGeometry, makeMaterial(new Vector4(1.0, 0.1, 0.1, 0.5), { transparent: true }));
+    const blueBox = new Renderable(boxGeometry, makeMaterial(new Vector4(0.1, 0.3, 1.0, 0.5), { transparent: true }));
+    scene.add(redBox);
+    scene.add(blueBox);
+
+    const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 });
+
+    // The boxes at orbit angle `a`: the red one is in front for a in (0, π).
+    const place = (a) => {
+      redBox.position.set(Math.cos(a) * 2.2, 0.5, Math.sin(a) * 2.2);
+      blueBox.position.set(-Math.cos(a) * 2.2, 0.5, -Math.sin(a) * 2.2);
+    };
+
+    if (params.has('check')) {
+      const results = [];
+      const expect = (name, ok) => results.push(`${ok ? 'PASS' : 'FAIL'} ${name}`);
+      const frame = () => volume.render(scene, camera);
+      const records = () => renderer.bundleRecordCount;
+      const all = [floor, sphere, redBox, blueBox];
+
+      place(Math.PI / 2);
+      frame();
+      const slots = all.map((r) => scene.slotOf(r));
+      expect('every renderable has its own slot', new Set(slots).size === 4 && slots.every((s) => s >= 0));
+      let n = records();
+      frame();
+      expect('an unchanged frame records no bundle', records() === n);
+
+      n = records();
+      place(Math.PI * 1.5);
+      frame();
+      expect('re-sorting the transparent boxes re-records only their bundle', records() === n + 1);
+      expect('re-sorting keeps every slot', all.every((r, i) => scene.slotOf(r) === slots[i]));
+
+      n = records();
+      floor.visible = false;
+      frame();
+      expect('hiding the floor re-records only the opaque bundle', records() === n + 1);
+      expect('a hidden renderable keeps its slot', scene.slotOf(floor) === slots[0]);
+      expect('a hidden renderable is not drawn', !scene.getOrderedObjects().includes(floor));
+      floor.visible = true;
+      frame();
+
+      n = records();
+      redBox.dynamic = true;
+      frame();
+      expect('making a box dynamic re-records only the transparent bundle', records() === n + 1);
+      n = records();
+      redBox.visible = false;
+      frame();
+      redBox.visible = true;
+      frame();
+      expect('hiding and showing a dynamic box records no bundle', records() === n);
+
+      scene.children.splice(scene.children.indexOf(blueBox), 1);
+      frame();
+      expect('a removed renderable frees its slot', scene.slotOf(blueBox) === -1);
+      scene.add(blueBox);
+      frame();
+      expect('an added renderable takes the freed slot', scene.slotOf(blueBox) === slots[3]);
+
+      console.log(results.join('\n'));
+      document.title = results.every((r) => r.startsWith('PASS')) ? 'PASS' : 'FAIL';
+    }
+
+    // `?t=<seconds>` freezes the orbit at that time.
+    const frozen = params.has('t') ? parseFloat(params.get('t')) : null;
+    function animate(now) {
+      const t = frozen ?? now * 0.001;
+      place(t * 0.8);
+      volume.render(scene, camera);
+    }
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      animate(performance.now());
+    });
+  </script>
+</body>
+
+</html>

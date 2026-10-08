@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kansei - Lake</title>
+    <style>
+      body { margin: 0; padding: 0; overflow: hidden; background-color: black; }
+      canvas { width: 100%; height: 100%; }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      // A lake in a box, after the Rust engine's `lake` demo (rust/kansei-wasm/demos/lake) at half
+      // its size: water held by a PlanarContainerShape (walls a shore's width outside a wobbly
+      // outline, the bed shaped by the distance to it), filled on a lattice at rest density, stirred
+      // by a turning mill wheel whose paddles are FluidColliders (FluidCapsule.rigid), and drawn
+      // from a surface field (FluidDensityField's particleRadius) through FluidSurfaceEffect.
+      //
+      // The world is in metres; the fluid runs 11 units a metre with time √11 as fast (the Rust
+      // lake's WorldScale), so the surface renderable is scaled back by 1/11.
+      //
+      // The water rests (FluidStepper.withRest): out of view for 1.5 s it is culled (not stepped or
+      // drawn), and in view, settled (every particle under 5 cm/s for a second) with nothing
+      // stirring it, it sleeps (not stepped, its last surface drawn). The turning mill and a splash
+      // keep it awake; the panel shows its state.
+      //
+      // ?res=<voxels> along the field's longest side (192); ?mill=0 starts with the mill stopped;
+      // ?solver=pbf starts on Position Based Fluids instead of SPH; ?rest=0 steps it every frame;
+      // ?hud=1 frame-time overlay; ?profile=1 GPU time per pass (examples/profile-hud.js).
+      import { Renderer } from '../src/renderers/Renderer'
+      import { Scene } from '../src/objects/Scene'
+      import { Object3D } from '../src/objects/Object3D'
+      import { Camera } from '../src/cameras/Camera'
+      import { CameraControls } from '../src/controls/CameraControls'
+      import { Vector3 } from '../src/math/Vector3'
+      import { Vector4 } from '../src/math/Vector4'
+      import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+      import { BufferBase } from '../src/buffers/BufferBase'
+      import { Geometry } from '../src/buffers/Geometry'
+      import { BoxGeometry } from '../src/geometries/BoxGeometry'
+      import { Material } from '../src/materials/Material'
+      import { Renderable } from '../src/objects/Renderable'
+      import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
+      import { DEFAULT_PBF_OPTIONS, latticeDensity } from '../src/simulations/fluid/FluidSimulationParams'
+      import { FluidStepper, WorldScale } from '../src/simulations/fluid/FluidStepper'
+      import { FluidActivity } from '../src/simulations/fluid/FluidActivity'
+      import { frustumPlanes, aabbInFrustum } from '../src/culling/Frustum'
+      import { Matrix4 } from '../src/math/Matrix4'
+      import { PlanarContainerShape, FluidContainer } from '../src/simulations/fluid/FluidContainer'
+      import { FluidCapsule, FluidColliders } from '../src/simulations/fluid/FluidColliders'
+      import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
+      import { FluidMarchingCubes } from '../src/simulations/fluid/FluidMarchingCubes'
+      import { FluidSurfaceEffect, FluidMask } from '../src/postprocessing/effects/FluidSurfaceEffect'
+      import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+      import { FrameTimer } from '../src/pacing/FrameTimer'
+      import { AbBench } from '../src/profiling/AbBench'
+      import { installProfileHud } from './profile-hud.js'
+      import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js'
+
+      const query = new URLSearchParams(location.search);
+
+      // ── The lake (metres) ─────────────────────────────────
+      /** 11 units a metre, time √11 as fast: gravity acts at its real pace. */
+      const SCALE = WorldScale.withRealGravity(11);
+      const SIM = SCALE.length;
+      /** Its half-size along x and z, the still water's height and the bed's depth in the middle,
+       *  reached this far in from the outline. */
+      const HALF = [2.6, 1.7];
+      const WATER = -0.1;
+      const DEPTH = 0.6;
+      const SHELF = 1.3;
+      /** The shore: the walls stand this far outside the outline, on a low bank. */
+      const SHORE = 0.6;
+      const BANK = 0.1;
+      const BANK_OUT = 0.8;
+      /** The particles' lattice spacing at rest density (simulation units, the Rust lake's). */
+      const SPACING = 0.537;
+      const SUN_DIR = (() => { const d = [-0.4, -0.8, -0.45]; const l = Math.hypot(...d); return d.map(v => v / l); })();
+      const SUN = [1.0, 0.95, 0.85];
+      const SKY = [0.55, 0.7, 0.9];
+
+      const smoothstep = (e0, e1, x) => { const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1); return t * t * (3 - 2 * t); };
+      const outline = Array.from({ length: 256 }, (_, k) => {
+        const a = k / 256 * Math.PI * 2;
+        const r = 1 + 0.11 * Math.sin(2 * a + 0.6) + 0.07 * Math.sin(3 * a + 2.1) + 0.04 * Math.sin(5 * a + 0.3);
+        return [HALF[0] * r * Math.cos(a), HALF[1] * r * Math.sin(a)];
+      });
+      /** The ground's height at signed distance `d` from the waterline (negative in the lake). */
+      const height = (d) => {
+        if (d < 0) { const t = Math.min(-d / SHELF, 1); return -DEPTH * (1 - (1 - t) * (1 - t)); }
+        if (d < SHORE) return BANK * smoothstep(0, SHORE, d);
+        return BANK * (1 - smoothstep(SHORE, SHORE + BANK_OUT, d));
+      };
+      // the terrain on a grid over the lake and its banks, smoothed; the container (in simulation
+      // units) has its walls a shore's width outside the waterline and the terrain as its floor
+      const terrain = PlanarContainerShape.fromOutline(outline, 0.05, SHORE + BANK_OUT + 0.5, (_x, _z, d) => height(d));
+      terrain.smoothFloor(4);
+      const shape = PlanarContainerShape.fromOutline(outline, 0.05, SHORE, (x, z) => terrain.floor(x, z)).scaled(SIM);
+
+      // ── Renderer, scene, camera ───────────────────────────
+      const renderer = new Renderer({
+        clearColor: new Vector4(...SKY, 1),
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: 1,
+        sampleCount: 4,
+      });
+      await renderer.initialize();
+      document.body.appendChild(renderer.canvas);
+
+      const scene = new Scene();
+      const camera = new Camera(45, 0.05, 200, window.innerWidth / window.innerHeight);
+      const cameraControls = new CameraControls(camera, new Vector3(0, -0.1, 0), window, 7.5, { invertWheel: true });
+      // ?view=<x>,<y>,<z>,<radius>,<azimuth>,<elevation> for another view
+      const view = (query.get('view') || '0,-0.1,0,6,0.5,0.45').split(',').map(Number);
+      cameraControls.setView(new Vector3(view[0], view[1], view[2]), view[3], view[4], view[5]);
+
+      if (query.get('hud') === '1') {
+        const { installFrameHud } = await import('./frame-hud.js');
+        installFrameHud({ steps: () => lastSteps });
+      }
+
+      // ── Materials ─────────────────────────────────────────
+      const CAMERA_MESH_WGSL = /* wgsl */`
+@group(1) @binding(0) var<uniform> viewMatrix: mat4x4<f32>;
+@group(1) @binding(1) var<uniform> projectionMatrix: mat4x4<f32>;
+@group(2) @binding(0) var<uniform> normalMatrix: mat4x4<f32>;
+@group(2) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32> };
+struct FragOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @location(2) normal: vec4<f32>, @location(3) albedo: vec4<f32> };
+@vertex
+fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+    let wp = (worldMatrix * vec4<f32>(position.xyz, 1.0)).xyz;
+    var out: VOut;
+    out.pos = projectionMatrix * viewMatrix * vec4<f32>(wp, 1.0);
+    out.world = wp;
+    out.normal = normalize((normalMatrix * vec4<f32>(normal, 0.0)).xyz);
+    return out;
+}
+// sun and sky; emissive alpha 0: not the fluid (FluidMask.EmissiveAlpha)
+fn shade(base: vec3<f32>, n: vec3<f32>, sunDir: vec3<f32>, sun: vec3<f32>, sky: vec3<f32>) -> FragOut {
+    let lit = base * (sun * max(dot(n, -sunDir), 0.0) + sky * (0.35 + 0.15 * n.y));
+    return FragOut(vec4<f32>(lit, 1.0), vec4<f32>(0.0), vec4<f32>(n, 0.0), vec4<f32>(base, 1.0));
+}
+`;
+      // the bed and the bank: grey ground, wet silt under the water, darker with depth
+      const terrainShader = CAMERA_MESH_WGSL + /* wgsl */`
+@group(0) @binding(0) var<uniform> ground: vec4<f32>;  // rgb, w = the still water's height
+@group(0) @binding(1) var<uniform> sunDir: vec4<f32>;
+@group(0) @binding(2) var<uniform> sun: vec4<f32>;
+@group(0) @binding(3) var<uniform> sky: vec4<f32>;
+@fragment
+fn fragment_main(v: VOut) -> FragOut {
+    let depth = ground.w - v.world.y;
+    let wet = smoothstep(-0.03, 0.02, depth);
+    let silt = vec3<f32>(0.42, 0.38, 0.3) * (1.0 - 0.45 * smoothstep(0.0, 0.6, depth));
+    // a 25 cm grid, for scale
+    let g = abs(fract(v.world.xz * 4.0 + 0.5) - 0.5);
+    let line = 1.0 - 0.25 * (1.0 - smoothstep(0.0, 0.03, min(g.x, g.y)));
+    let base = mix(ground.rgb, silt, wet) * line;
+    return shade(base, normalize(v.normal), sunDir.xyz, sun.rgb, sky.rgb);
+}
+`;
+      const propShader = CAMERA_MESH_WGSL + /* wgsl */`
+@group(0) @binding(0) var<uniform> color: vec4<f32>;
+@group(0) @binding(1) var<uniform> sunDir: vec4<f32>;
+@group(0) @binding(2) var<uniform> sun: vec4<f32>;
+@group(0) @binding(3) var<uniform> sky: vec4<f32>;
+@fragment
+fn fragment_main(v: VOut) -> FragOut {
+    return shade(color.rgb, normalize(v.normal), sunDir.xyz, sun.rgb, sky.rgb);
+}
+`;
+      const F = GPUShaderStage.FRAGMENT;
+      const sunDirU = new Vector4(...SUN_DIR, 0);
+      const sunU = new Vector4(...SUN, 0);
+      const skyU = new Vector4(...SKY, 0);
+      const lightBindings = [
+        { binding: 1, visibility: F, value: sunDirU },
+        { binding: 2, visibility: F, value: sunU },
+        { binding: 3, visibility: F, value: skyU },
+      ];
+      const propMaterial = (rgb) => new Material(propShader, {
+        bindings: [{ binding: 0, visibility: F, value: new Vector4(...rgb, 1) }, ...lightBindings],
+      });
+
+      // ── The terrain: a heightfield over the grid ──────────
+      {
+        const [min, max] = terrain.bounds();
+        const step = 0.05;
+        const cells = [Math.ceil((max[0] - min[0]) / step), Math.ceil((max[1] - min[1]) / step)];
+        const row = cells[0] + 1;
+        const vertices = new Float32Array(row * (cells[1] + 1) * 9);
+        const floor = (x, z) => terrain.floor(x, z);
+        let v = 0;
+        for (let j = 0; j <= cells[1]; j++) {
+          for (let i = 0; i <= cells[0]; i++) {
+            const x = min[0] + i * step, z = min[1] + j * step, e = 0.05;
+            const n = [floor(x - e, z) - floor(x + e, z), 2 * e, floor(x, z - e) - floor(x, z + e)];
+            const l = Math.hypot(...n);
+            vertices.set([x, floor(x, z), z, 1, n[0] / l, n[1] / l, n[2] / l, i / cells[0], j / cells[1]], v);
+            v += 9;
+          }
+        }
+        const indices = new Uint32Array(cells[0] * cells[1] * 6);
+        let k = 0;
+        for (let j = 0; j < cells[1]; j++) {
+          for (let i = 0; i < cells[0]; i++) {
+            const a = j * row + i, b = a + 1, c = a + row + 1, d = a + row;
+            // (x, z) → (x, z + 1) → (x + 1, z + 1): counter-clockwise seen from +y
+            indices.set([a, d, c, a, c, b], k);
+            k += 6;
+          }
+        }
+        const geometry = new Geometry();
+        geometry.vertices = vertices;
+        geometry.indices = indices;
+        geometry.vertexCount = indices.length;
+        const material = new Material(terrainShader, {
+          bindings: [{ binding: 0, visibility: F, value: new Vector4(0.36, 0.36, 0.33, WATER) }, ...lightBindings],
+        });
+        const r = new Renderable(geometry, material);
+        r.castShadow = false;
+        scene.add(r);
+      }
+
+      // ── The mill: a paddle wheel turning on a frame on the bed ──
+      // Where it stands (from the lake's middle, radians from +x toward +z, this far in from the
+      // waterline), its axle's height, wheel radius and width, paddles, and the paddles' colliders
+      // (two capsules across each, at these radii). The lowest collider clears the bed by 10 cm or
+      // more: water squeezed between a collider and the floor jitters and never settles.
+      const MILL = { angle: 1.9, inside: 0.95, axle: 0.2, radius: 0.5, width: 0.4, paddles: 8, rings: [0.3, 0.44], capsule: 0.07, hub: 0.12, thickness: 0.07, legs: [0.36, 0.33] };
+      const fromWaterline = (angle, offset) => {
+        // along the ray from the middle at `angle`, `offset` past the waterline (negative: inside)
+        const dir = [Math.cos(angle), Math.sin(angle)];
+        let lo = 0, hi = 3 * Math.max(...HALF);
+        for (let it = 0; it < 40; it++) {
+          const m = (lo + hi) / 2;
+          if (terrain.distance(dir[0] * m, dir[1] * m) < offset) lo = m; else hi = m;
+        }
+        return [dir[0] * lo, dir[1] * lo];
+      };
+      const [mx, mz] = fromWaterline(MILL.angle, -MILL.inside);
+      const [ox, oz] = fromWaterline(MILL.angle, 0);
+      const center = [mx, MILL.axle, mz];
+      // the axle points out from the lake's middle, so the paddles push the water along the shore;
+      // local +x is the axle: a yaw `a` turns +x to (cos a, 0, -sin a)
+      const axleLen = Math.hypot(ox - mx, oz - mz);
+      const axle = [(ox - mx) / axleLen, 0, (oz - mz) / axleLen];
+      const yaw = Math.atan2(-axle[2], axle[0]);
+      const rotX = (p, a) => [p[0], p[1] * Math.cos(a) - p[2] * Math.sin(a), p[1] * Math.sin(a) + p[2] * Math.cos(a)];
+      const rotY = (p, a) => [p[0] * Math.cos(a) + p[2] * Math.sin(a), p[1], -p[0] * Math.sin(a) + p[2] * Math.cos(a)];
+      const toWorld = (p) => { const q = rotY(p, yaw); return [q[0] + center[0], q[1] + center[1], q[2] + center[2]]; };
+
+      const wheel = new Object3D();
+      wheel.position.set(...center);
+      wheel.rotation.y = yaw;
+      const blue = propMaterial([0.2, 0.35, 0.7]);
+      const dark = propMaterial([0.15, 0.15, 0.17]);
+      const grey = propMaterial([0.5, 0.5, 0.48]);
+      const box = (w, h, d, material, parent) => { const r = new Renderable(new BoxGeometry(w, h, d), material); parent.add(r); return r; };
+      box(2 * (MILL.legs[0] + 0.07), 0.07, 0.07, dark, wheel);
+      box(MILL.width + 0.06, 2 * MILL.hub, 2 * MILL.hub, dark, wheel);
+      for (let k = 0; k < MILL.paddles; k++) {
+        const a = k / MILL.paddles * Math.PI * 2;
+        const p = box(MILL.width, MILL.radius - MILL.hub, MILL.thickness, blue, wheel);
+        p.position.set(...rotX([0, (MILL.hub + MILL.radius) * 0.5, 0], a));
+        p.rotation.x = a;
+      }
+      scene.add(wheel);
+
+      // the frame: two posts either end of the axle, from the bed up to it; their colliders stop
+      // short of the bed
+      const legs = [];
+      for (const side of [-1, 1]) {
+        const top = toWorld([side * MILL.legs[0], 0, 0]);
+        for (const across of [-1, 1]) {
+          const f = toWorld([side * MILL.legs[0], 0, across * MILL.legs[1]]);
+          const foot = [f[0], terrain.floor(f[0], f[2]) - 0.05, f[2]];
+          const d = [top[0] - foot[0], top[1] - foot[1], top[2] - foot[2]];
+          const len = Math.hypot(...d);
+          const post = box(0.06, len, 0.06, grey, scene);
+          post.position.set((top[0] + foot[0]) / 2, (top[1] + foot[1]) / 2, (top[2] + foot[2]) / 2);
+          // +y onto d: rotation.x tilts it, rotation.y turns it (Ry · Rx)
+          post.rotation.x = Math.acos(d[1] / len);
+          post.rotation.y = Math.atan2(d[0], d[2]);
+          const lerp = (t) => foot.map((v, i) => v + (top[i] - v) * t);
+          legs.push([lerp(0.35), top]);
+        }
+      }
+
+      const mill = { on: query.get('mill') !== '0', rpm: 16, angle: 0 };
+      const millOmega = () => mill.on ? mill.rpm * Math.PI * 2 / 60 : 0;
+      /** The mill's colliders in the world: the paddles turning with the wheel, the legs still. */
+      const millCapsules = () => {
+        const w = millOmega();
+        const spin = [axle[0] * w, axle[1] * w, axle[2] * w];
+        const capsules = [];
+        for (let k = 0; k < MILL.paddles; k++) {
+          const a = k / MILL.paddles * Math.PI * 2 + mill.angle;
+          for (const r of MILL.rings) {
+            const p = (x) => toWorld(rotX([x, r, 0], a));
+            capsules.push(FluidCapsule.rigid(p(-MILL.width * 0.5), p(MILL.width * 0.5), MILL.capsule, center, [0, 0, 0], spin));
+          }
+        }
+        for (const [a, b] of legs) capsules.push(new FluidCapsule(a, b, 0.04));
+        return capsules;
+      };
+
+      // ── The water ─────────────────────────────────────────
+      // a lattice at rest density from the bed up to the still water, in the waterline
+      const initial = shape.lattice(SPACING, WATER * SIM, (d) => d < 0);
+      const count = initial.length / 4;
+      const [lo, hi] = shape.bounds();
+      const positionsBuffer = new ComputeBuffer({
+        type: BufferBase.BUFFER_TYPE_STORAGE,
+        usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_SRC,
+        buffer: initial.slice(),
+      });
+      // the fluid clock's tuning at h = 1, less viscous: the Rust lake's
+      const sim = new FluidSimulation(renderer, {
+        maxParticles: count,
+        dimensions: 3,
+        smoothingRadius: 1.0,
+        pressureMultiplier: 46.5,
+        nearPressureMultiplier: 20.0,
+        densityTarget: 8.6,
+        viscosity: 0.15,
+        damping: 1.0,
+        gravity: [0, -9.8, 0],
+        substeps: 4,
+        negativePressureScale: 0.6,
+        mouseForce: 0,
+        // Position Based Fluids, when chosen: at rest, the density its kernel sums to on the fill's
+        // lattice, so the water keeps its volume, and no faster than 12 m/s
+        solver: query.get('solver') === 'pbf' ? 'pbf' : 'sph',
+        pbf: { ...DEFAULT_PBF_OPTIONS, restDensity: latticeDensity(SPACING, 1.0), maxSpeed: SCALE.speedToSim(12) },
+      });
+      sim.initialize(positionsBuffer, positionsBuffer.clone());
+      sim.worldBoundsMin = [lo[0], (-DEPTH - 0.1) * SIM, lo[1]];
+      sim.worldBoundsMax = [hi[0], 1.3 * SIM, hi[1]];
+      sim.rebuildGrid();
+      const container = new FluidContainer(sim, shape, { margin: 0.1, restitution: 0.05, friction: 0.002 });
+      const colliders = new FluidColliders(sim, 40, { restitution: 0.3, drag: 0.6 });
+      // rest by the Rust lake's settings (speeds in m/s)
+      const stepper = new FluidStepper(1 / 60, 2, SCALE).withRest(sim, { cullAfter: 1.5, settleSpeed: 0.05, settleAfter: 1.0 });
+      stepper.restEnabled = query.get('rest') !== '0';
+      console.log(`lake: ${count} particles`);
+
+      // its surface: a surface field (the distance to the weighted mean of the particles within
+      // `kernel` units, less a particle radius) polygonised at its iso level of 1
+      const surfaceSettings = { kernel: 1.5, particleRadius: 0.55, iso: 1.0 };
+      const kernelScale = (kernel) => 1 / (Math.pow(SPACING, -3) * 0.638 * kernel ** 3);
+      const densityField = new FluidDensityField(renderer, sim, {
+        resolution: Math.min(Math.max(parseInt(query.get('res') || '192', 10) || 192, 32), 384),
+        kernelScale: kernelScale(surfaceSettings.kernel),
+        particleRadius: surfaceSettings.particleRadius,
+        splatRadius: surfaceSettings.kernel,
+      });
+      const marchingCubes = new FluidMarchingCubes(renderer, { maxTriangles: 600_000, isoLevel: surfaceSettings.iso, useClassic: true });
+      const fluidSurface = new FluidSurfaceEffect({
+        source: { densityField, marchingCubes },
+        mask: FluidMask.EmissiveAlpha,
+        ior: 1.33,
+        chromaticAberration: 0.02,
+        tintStrength: 0.75,
+        fresnelPower: 5.0,
+        roughness: 0.12,
+        thickness: 1.2,
+        color: [0.35, 0.55, 0.6, 1.0],
+        lightDirection: SUN_DIR,
+        lightIntensity: 1.0,
+        lightColor: SUN,
+        rim: 0,
+        skyColor: SKY,
+        skyReflection: 1.0,
+      });
+      // the mesh is in simulation units
+      const surface = fluidSurface.surfaceRenderable([0.2, 0.3, 0.3, 1.0]);
+      surface.scale.set(1 / SIM, 1 / SIM, 1 / SIM);
+      scene.add(surface);
+      const volume = new PostProcessingVolume(renderer, [fluidSurface], { msaaSampleCount: 4 });
+
+      // ── A splash: a sphere in the water pushing out for a moment (a capsule's expansion) ──
+      let splash = null;
+      const drop = () => {
+        const [x, z] = fromWaterline(Math.random() * Math.PI * 2, -0.5 - Math.random() * 0.4);
+        splash = { at: [x, WATER, z], time: 0 };
+      };
+
+      // ── Panel ─────────────────────────────────────────────
+      const pane = new Pane({ title: 'Lake', expanded: false });
+      const info = { particles: count, state: FluidActivity.Running, speed: 0 };
+      pane.addBinding(info, 'particles', { readonly: true, format: (v) => v.toFixed(0) });
+      pane.addBinding(info, 'state', { readonly: true });
+      pane.addBinding(info, 'speed', { readonly: true, label: 'max speed (m/s)', format: (v) => v.toFixed(3) });
+      const rest = { rest: stepper.restEnabled };
+      pane.addBinding(rest, 'rest').on('change', () => { stepper.restEnabled = rest.rest; });
+      const millFolder = pane.addFolder({ title: 'Mill' });
+      millFolder.addBinding(mill, 'on');
+      millFolder.addBinding(mill, 'rpm', { min: 0, max: 40, step: 0.5 });
+      const waterFolder = pane.addFolder({ title: 'Water', expanded: false });
+      const solver = { solver: sim.params.solver };
+      waterFolder.addBinding(solver, 'solver', { options: { SPH: 'sph', PBF: 'pbf' } }).on('change', () => { sim.params.solver = solver.solver; stepper.wake(); });
+      const timing = { time: SCALE.time };
+      waterFolder.addBinding(timing, 'time', { min: 0.5, max: 6, step: 0.05, label: 'time scale' }).on('change', () => { stepper.setTimeScale(timing.time); stepper.wake(); });
+      waterFolder.addBinding(surfaceSettings, 'particleRadius', { min: 0.1, max: 1.2, step: 0.01, label: 'particle radius' }).on('change', () => { densityField.particleRadius = surfaceSettings.particleRadius; stepper.wake(); });
+      waterFolder.addBinding(surfaceSettings, 'kernel', { min: 0.8, max: 3, step: 0.05 }).on('change', () => {
+        densityField.splatRadius = surfaceSettings.kernel;
+        densityField.kernelScale = kernelScale(surfaceSettings.kernel);
+        stepper.wake();
+      });
+      waterFolder.addBinding(surfaceSettings, 'iso', { min: 0.5, max: 1.5, step: 0.01 }).on('change', () => { marchingCubes.isoLevel = surfaceSettings.iso; stepper.wake(); });
+      pane.addButton({ title: 'Splash' }).on('click', drop);
+      pane.addButton({ title: 'Reset' }).on('click', () => { sim.resetParticles(initial); stepper.reset(); stepper.wake(); });
+
+      // ── Loop ──────────────────────────────────────────────
+      const hud = installProfileHud({ renderer, FrameTimer, AbBench });
+      let lastSteps = 0;
+      const viewProj = new Matrix4();
+      // the water's box (the bounds the particles are kept in), in metres
+      const [boxMin, boxMax] = sim.bounds().map((p) => SCALE.pointToWorld(p));
+      let last = performance.now();
+      function animate() {
+        requestAnimationFrame(animate);
+        const now = performance.now();
+        hud.begin(now);
+        const dt = Math.min(Math.max((now - last) / 1000, 1 / 1000), 0.1);
+        last = now;
+        cameraControls.update(now / 1000);
+
+        mill.angle = (mill.angle + millOmega() * dt) % (Math.PI * 2);
+        wheel.rotation.x = mill.angle;
+
+        // rest when out of view or settled; the turning mill or a splash keep it awake
+        camera.updateViewMatrix();
+        viewProj.multiply(camera.projectionMatrix, camera.viewMatrix);
+        const inView = aabbInFrustum(frustumPlanes(viewProj), boxMin, boxMax);
+        const disturbed = (mill.on && mill.rpm > 0) || splash !== null;
+        fluidSurface.setActivity(stepper.updateRest(dt, inView, disturbed));
+        info.state = stepper.state;
+        info.speed = stepper.speed?.max ?? 0;
+
+        const steps = stepper.advance(dt);
+        lastSteps = steps;
+        if (steps > 0) {
+          const capsules = millCapsules();
+          if (splash) {
+            // 0.3 m across, pushing out at 1.5 m/s for 0.12 s
+            const c = new FluidCapsule(splash.at, splash.at, 0.15);
+            c.expansion = 1.5;
+            capsules.push(c);
+            splash.time += dt;
+            if (splash.time > 0.12) splash = null;
+          }
+          // world (m, m/s) to simulation units
+          colliders.set(capsules.map((c) => c.scaled(SIM, SIM / SCALE.time)));
+          // the colliders first, so the walls and the floor have the last word
+          sim.updateBatched(stepper.stepDt, steps, undefined, undefined, 0, [colliders, container]);
+        }
+        stepper.stepped(sim, steps);
+        // the effect extracts the surface (drawn from the next frame on) and composites it
+        volume.render(scene, camera);
+        hud.end(now);
+      }
+      animate();
+
+      window.addEventListener('resize', () => {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      });
+    </script>
+  </body>
+</html>

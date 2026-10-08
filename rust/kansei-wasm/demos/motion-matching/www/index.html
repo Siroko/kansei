@@ -27,7 +27,7 @@
     <div id="prompt"></div>
     <script type="module">
         // the lake panel's exports come from the lake example's crate (kansei-wasm-lake), in this module too
-        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, lake_regions, mill_settings, cannon_fire, drive_restart } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start, lake_settings, lake_set, lake_reset, lake_surface, lake_surface_preset, lake_fill, lake_regions, mill_settings, cannon_fire, drive_restart, motion_timings, bench_search, bench_pose } from '../pkg/kansei_wasm_motion_matching.js';
         import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js';
         await init();
         // the cannon's prompt fires while pressed (the keyboard's E and the gamepad's X work too)
@@ -37,6 +37,10 @@
         await start('kansei');
         // drive=1: start the scripted route over (to line up recordings of two packs)
         window.driveRestart = drive_restart;
+        // timings to compare with the TS port (examples/index_motion_matching.html, same names)
+        window.motionTimings = () => JSON.parse(motion_timings() || '{}');
+        window.benchSearch = (step = 7) => bench_search(step);
+        window.benchPose = (count = 20000) => bench_pose(count);
         // debug=1: the lake's particles by region, read back from the GPU (await lakeRegions())
         if (['1', 'true', 'on', 'yes'].includes(new URLSearchParams(location.search).get('debug'))) window.lakeRegions = lake_regions;
 

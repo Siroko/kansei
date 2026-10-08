@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei — Volumetric Fog</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Froxel volumetric fog: a grove of pillars under a low sun (shadowed, so its light comes
+    // through in shafts), a warm lamp with cube shadows and a cool one without, and a dim ambient
+    // sky term, rendered through the GBuffer path with VolumetricFogEffect. The TS counterpart of
+    // the Rust example rust/kansei-wasm/examples/volumetric-fog, with the same scene and fog.
+    //   t=<seconds>     freeze the camera at this point of its orbit (TS only)
+    //   dpr=<ratio>     drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
+    import { Canvas, run, paramOr } from '../src/web/index'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { DirectionalLight } from '../src/lights/DirectionalLight'
+    import { PointLight } from '../src/lights/PointLight'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ clearColor: new Vector4(0.01, 0.012, 0.02, 1.0) });
+    const shadowMap = renderer.enableShadows({ resolution: 2048 });
+    const cubeShadows = renderer.enablePointShadows({ resolution: 512, maxLights: 1 });
+
+    const scene = new Scene();
+
+    // ── Lights: a low sun, shadowed; a warm lamp in the clearing with cube shadows, a cool one without ──
+    const sun = new DirectionalLight([-0.8, -0.35, -0.45], [1.0, 0.85, 0.65], 1.6);
+    sun.castShadow = true;
+    scene.add(sun);
+    const lamp = new PointLight(14, [1.0, 0.55, 0.25], 6.0);
+    lamp.position.set(0, 1.6, 0);
+    lamp.castShadow = true;
+    scene.add(lamp);
+    const coolLamp = new PointLight(12, [0.3, 0.55, 1.0], 4.0);
+    coolLamp.position.set(9, 2.5, -8);
+    scene.add(coolLamp);
+    const lamps = [lamp, coolLamp];
+
+    // The scene lights as the lit material reads them (colour times intensity)
+    const lightData = new Float32Array(4 + 4 + lamps.length * 8);
+    lightData.set([...sun.direction, 0, ...sun.effectiveColor, 0], 0);
+    lamps.forEach((l, i) => lightData.set([l.position.x, l.position.y, l.position.z, l.radius, ...l.effectiveColor, 0], 8 + i * 8));
+    const lightUniform = new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: lightData,
+    });
+
+    // Rust's basic_lit: ambient 0.08, Lambert plus Blinn-Phong under the scene's lights, the
+    // directional shadow on the sun and the cube shadow on the lamp it was rendered from
+    const litShader = /* wgsl */`
+      @group(1) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+
+      struct VertexOut {
+        @builtin(position) position : vec4f,
+        @location(0) worldPos : vec3f,
+        @location(1) normal   : vec3f,
+      }
+
+      @vertex
+      fn vertex_main(@location(0) position : vec4f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VertexOut {
+        let world = worldMatrix * vec4f(position.xyz, 1.0);
+        var out : VertexOut;
+        out.position = projectionMatrix * viewMatrix * world;
+        out.worldPos = world.xyz;
+        out.normal = (normalMatrix * vec4f(normal, 0.0)).xyz;
+        return out;
+      }
+
+      struct GBufferOut {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      #include <shadows>
+
+      struct Surface { color : vec4f, specular : vec4f }
+      struct Lamp { position : vec3f, radius : f32, color : vec3f, _pad : f32 }
+      struct Lights { direction : vec4f, color : vec4f, point : array<Lamp, ${lamps.length}> }
+      @group(0) @binding(0) var<uniform> surface : Surface;
+      @group(0) @binding(1) var<uniform> lights  : Lights;
+
+      @fragment
+      fn fragment_main(in : VertexOut) -> GBufferOut {
+        let n = normalize(in.normal);
+        let view3 = mat3x3f(viewMatrix[0].xyz, viewMatrix[1].xyz, viewMatrix[2].xyz);
+        let cameraPos = -(transpose(view3) * viewMatrix[3].xyz);
+        let V = normalize(cameraPos - in.worldPos);
+        let shininess = surface.specular.a * 256.0;
+        let dirShadow = kansei_shadow_map(in.worldPos, n);
+        let pointShadow = kansei_point_shadow(in.worldPos);
+
+        let L = normalize(-lights.direction.xyz);
+        var diffuse = lights.color.rgb * max(dot(n, L), 0.0) * dirShadow;
+        var specular = lights.color.rgb * surface.specular.rgb * pow(max(dot(n, normalize(L + V)), 0.0), shininess) * dirShadow;
+        for (var i = 0u; i < ${lamps.length}u; i++) {
+          let lamp = lights.point[i];
+          let toLight = lamp.position - in.worldPos;
+          let d = length(toLight);
+          let Lp = toLight / d;
+          let f = max(1.0 - d / lamp.radius, 0.0);
+          let shadow = select(1.0, pointShadow, kansei_is_point_shadow_light(lamp.position));
+          let atten = f * f * shadow;
+          diffuse += lamp.color * max(dot(n, Lp), 0.0) * atten;
+          specular += lamp.color * surface.specular.rgb * pow(max(dot(n, normalize(Lp + V)), 0.0), shininess) * atten;
+        }
+        let color = surface.color.rgb * (vec3f(0.08) + diffuse) + specular;
+        return GBufferOut(vec4f(color, 1.0), vec4f(0.0), vec4f(n * 0.5 + 0.5, 1.0), vec4f(surface.color.rgb, 1.0));
+      }
+    `;
+
+    const uniform = (values) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: new Float32Array(values),
+    });
+    const fragmentUniform = (binding, value) => ({ binding, visibility: GPUShaderStage.FRAGMENT, value });
+    const basicLit = (color, specular, cullMode = 'back') => new Material(litShader, {
+      cullMode,
+      bindings: [fragmentUniform(0, uniform([...color, ...specular])), fragmentUniform(1, lightUniform)],
+    });
+
+    const floor = new Renderable(new PlaneGeometry(60, 60), basicLit([0.35, 0.35, 0.33, 1.0], [0.05, 0.05, 0.05, 0.05]));
+    floor.rotation.x = -Math.PI / 2;
+    floor.castShadow = false;
+    scene.add(floor);
+
+    // a loose grid of pillars, jittered so the shafts don't line up
+    const pillarMaterial = basicLit([0.3, 0.27, 0.24, 1.0], [0.05, 0.05, 0.05, 0.1]);
+    for (let i = 0; i < 9; i++) {
+      for (let j = 0; j < 9; j++) {
+        const h = (i * 7 + j * 13) % 5;
+        const x = (i - 4) * 3.2 + (j % 3) * 0.6;
+        const z = (j - 4) * 3.2 + (i % 2) * 0.9;
+        if (Math.abs(x) < 2 && Math.abs(z) < 2) continue; // a clearing in the middle
+        const height = 6 + h;
+        const pillar = new Renderable(new BoxGeometry(0.45, height, 0.45), pillarMaterial);
+        pillar.position.set(x, height * 0.5, z);
+        scene.add(pillar);
+      }
+    }
+
+    // ── The fog: the Rust example's ──
+    const fog = new VolumetricFogEffect({
+      froxelGrid: new FroxelGrid(renderer.gpuDevice, { far: 80, temporal: true }),
+      shadowMap,
+      cubeMapShadowMap: cubeShadows,
+      baseDensity: 0.1,
+      heightFalloff: 0.12,
+      anisotropy: 0.55,
+      windDirection: [0.6, 0, 0.2],
+      ambient: [0.012, 0.016, 0.03],
+    });
+    const volume = new PostProcessingVolume(renderer, [fog], { msaaSampleCount: 4 });
+
+    const camera = new Camera(50, 0.1, 200, window.innerWidth / window.innerHeight);
+
+    console.log('Kansei — Volumetric Fog (TS) ready');
+
+    const frozen = paramOr('t', NaN);
+    const target = new Vector3(0, 3, 0);
+    const start = performance.now();
+    run(canvas, (f) => {
+      f.resize(renderer, camera);
+      const t = Number.isFinite(frozen) ? frozen : (performance.now() - start) / 1000;
+      fog.time = t;
+
+      // start on the far side of the grove from the sun, looking into the shafts
+      const angle = -2.08 + t * 0.06;
+      camera.position.set(Math.sin(angle) * 22, 4, Math.cos(angle) * 22);
+      camera.lookAt(target);
+
+      fog.updateLights(scene.directionalLights, scene.pointLights);
+      volume.render(scene, camera);
+    });
+  </script>
+</body>
+
+</html>

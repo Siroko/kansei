@@ -1,0 +1,13 @@
+[package]
+name = "kansei-meshopt-fixture"
+version = "0.1.0"
+edition = "2021"
+description = "Writes optimesh's outputs on a test rock for the TS cluster LOD port's differential tests"
+publish = false
+
+[workspace]
+
+[dependencies]
+kansei-core = { path = "../../kansei-core" }
+glam = "0.29"
+optimesh = "1.1"
