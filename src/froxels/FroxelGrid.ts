@@ -239,7 +239,7 @@ class FroxelGrid {
             let linearD = sliceDepth(f32(gid.z) + 0.5, tp.gridNear, tp.gridFar, f32(tp.gridD));
             let n = tp.cameraNear;
             let f = tp.cameraFar;
-            let ndcZ = ((f + n) * linearD - 2.0 * f * n) / ((f - n) * linearD);
+            let ndcZ = f * (linearD - n) / ((f - n) * linearD);
             let uv = (vec2f(f32(gid.x), f32(gid.y)) + 0.5) / vec2f(f32(tp.gridW), f32(tp.gridH));
             let ndcX = uv.x * 2.0 - 1.0;
             let ndcY = (1.0 - uv.y) * 2.0 - 1.0;
@@ -252,7 +252,7 @@ class FroxelGrid {
 
             // Convert to froxel UVW in previous frame
             let prevUV = vec2f(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
-            let prevLinearD = 2.0 * n * f / ((f + n) - prevNDC.z * (f - n));
+            let prevLinearD = n * f / (f - prevNDC.z * (f - n));
             let prevSlice = depthToSlice(prevLinearD, tp.gridNear, tp.gridFar, f32(tp.gridD));
             // depthToSlice already puts slice k's centre at k + 0.5
             let prevUVW = vec3f(prevUV, prevSlice / f32(tp.gridD));

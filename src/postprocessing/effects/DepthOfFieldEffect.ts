@@ -96,9 +96,8 @@ class DepthOfFieldEffect extends PostProcessingEffect {
         }
 
         fn linearDepth(d: f32, n: f32, f: f32) -> f32 {
-            // gl-matrix v3 perspectiveNO maps Z to [-1,1]; WebGPU depth buffer
-            // stores the [0,1] portion after clip. Correct inverse for this range:
-            return (2.0 * n * f) / ((f + n) - d * (f - n));
+            // Inverse of the [0,1] (ZO) perspective depth.
+            return (n * f) / (f - d * (f - n));
         }
 
         fn computeCoC(d: f32, p: DoFParams) -> f32 {
