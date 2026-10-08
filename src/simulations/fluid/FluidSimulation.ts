@@ -6,12 +6,15 @@ import { Matrix4 } from '../../math/Matrix4';
 import { IBindable } from '../../buffers/IBindable';
 import {
     FluidSimulationOptions,
+    PbfOptions,
     DEFAULT_OPTIONS,
+    DEFAULT_PBF_OPTIONS,
     PARAMS,
     PRESETS,
     SOLVER_WORD,
     computeKernelFactors2D,
     computeKernelFactors3D,
+    packPbfParams,
 } from './FluidSimulationParams';
 
 import { GridLayout, NeighbourGrid, gridLayoutCovering, gridLayoutTotalCells } from '../grid/NeighbourGrid';
@@ -21,6 +24,7 @@ import { shaderCode as integrateShader } from './shaders/integrate.wgsl';
 import { shaderCode as bodyCollisionShader } from './shaders/body-collision.wgsl';
 import { shaderCode as bodyIntegrateShader } from './shaders/body-integrate.wgsl';
 import { simParamsStruct } from './shaders/sim-params.wgsl';
+import { pbfShaders, PBF_PARAMS_FLOATS } from './shaders/pbf.wgsl';
 import { FluidBody, FluidBodyOptions } from './FluidBody';
 import { gpuPass } from '../../profiling/Profiler';
 
@@ -58,12 +62,15 @@ class ComputeSubstepPass implements FluidSubstepPass {
 }
 
 /**
- * SPH fluid on a `NeighbourGrid`, the same design as the Rust engine's
+ * SPH or Position Based Fluids on a `NeighbourGrid`, the same design as the Rust engine's
  * (`rust/kansei-core/src/simulations/fluid/simulation.rs`): each substep is one compute pass
  * holding the grid's counting sort (which also copies the positions and velocities into cell
  * order), then density and forces, one thread per *sorted* slot reading those copies
  * contiguously, then integration (and the bodies, if any) in the particles' own order, then
- * any `FluidSubstepPass`es.
+ * any `FluidSubstepPass`es. With `params.solver = 'pbf'` the substep instead predicts the
+ * positions (and runs the substep passes on the prediction), sorts them into the grid, projects
+ * them onto the density constraint, runs the bodies and substep passes again, and derives the
+ * velocities (see `PbfOptions`).
  *
  * The particle buffers hold `capacity` (`params.maxParticles`) particles, of which the first
  * `particleCount` are live: every pass (the solver, the neighbour grid, the substep passes, the
@@ -123,6 +130,9 @@ class FluidSimulation {
     private bodyCollisionPass!: Compute;
     private bodyIntegratePass!: Compute;
 
+    /** Position Based Fluids' buffers and passes, made on its first step. */
+    private pbf: PbfPasses | null = null;
+
     /**
      * The neighbour grid's cells: the smoothing radius wide, coarsened only if the bounds would
      * otherwise need more than `MAX_GRID_CELLS` cells.
@@ -135,7 +145,7 @@ class FluidSimulation {
 
     constructor(renderer: Renderer, options?: Partial<FluidSimulationOptions>) {
         this.renderer = renderer;
-        this.params = { ...DEFAULT_OPTIONS, ...options };
+        this.params = { ...DEFAULT_OPTIONS, ...options, pbf: { ...DEFAULT_PBF_OPTIONS, ...options?.pbf } };
 
         // Default identity matrices (overridden in initialize if camera provided)
         this.viewMatrix = new Matrix4();
@@ -565,9 +575,10 @@ class FluidSimulation {
      */
     public rebuildGrid(): void {
         this.fitGrid();
-        // new per-cell buffers: the solver's passes again
+        // new per-cell buffers: the solver's passes again (PBF's on its next step)
         if (this.grid.setLayout(this.layout)) {
             this.createComputePasses();
+            this.pbf = null;
         }
     }
 
@@ -704,13 +715,27 @@ class FluidSimulation {
         return this.layout.cellSize;
     }
 
-    /** Refit the grid if what it depends on changed, and initialise the passes on first use. */
+    /**
+     * Refit the grid if what it depends on changed, initialise the passes on first use (PBF's
+     * buffers and passes too, when it steps), and pack PBF's options.
+     */
     private prepareStep(device: GPUDevice): void {
         if (this.gridKey() !== this.layoutKey) {
             this.rebuildGrid();
         }
         for (const compute of [this.densityPass, this.forcesPass, this.integratePass, this.bodyCollisionPass, this.bodyIntegratePass]) {
             if (!compute.initialized) compute.initialize(device);
+        }
+        if (this.params.solver === 'pbf') {
+            if (!this.pbf) {
+                this.pbf = new PbfPasses(this._capacity, {
+                    positions: this.positionsBuffer,
+                    velocities: this.velocitiesBuffer,
+                    params: this.paramsBuffer,
+                    grid: this.grid,
+                });
+            }
+            this.pbf.prepare(device, this.params.pbf, this.params.smoothingRadius);
         }
     }
 
@@ -721,23 +746,51 @@ class FluidSimulation {
     }
 
     /**
-     * One SPH iteration as one compute pass: the neighbour grid (clear, assign, prefix sum,
-     * scatter with the cell-ordered copies), density, forces, integration, then the bodies.
+     * One substep as one compute pass: the neighbour grid (clear, assign, prefix sum, scatter
+     * with the cell-ordered copies), then SPH (density, forces, integration) or PBF (predict
+     * before the grid, then the projections, unsort, velocity, gather, vorticity, XSPH), with
+     * the bodies and `extra` after the integration (PBF: after the projection, and `extra` also
+     * after the prediction).
      */
     private encodeStep(commandEncoder: GPUCommandEncoder, device: GPUDevice, extra: readonly FluidSubstepPass[]): void {
         const n = this._particleCount;
         const workgroups = Math.ceil(n / 64);
+        const pbf = this.params.solver === 'pbf' ? this.pbf : null;
         const pass = commandEncoder.beginComputePass({ label: 'FluidSim/Substep', timestampWrites: gpuPass('FluidSim/Substep') });
+        if (pbf) {
+            // predict, and keep the prediction in the container and out of the colliders
+            FluidSimulation.dispatch(pass, pbf.predict, device, workgroups);
+            for (const p of extra) {
+                p.dispatch(pass, n, device);
+            }
+        }
         this.grid.encode(pass, device);
-        FluidSimulation.dispatch(pass, this.densityPass, device, workgroups);
-        FluidSimulation.dispatch(pass, this.forcesPass, device, workgroups);
-        FluidSimulation.dispatch(pass, this.integratePass, device, workgroups);
+        if (pbf) {
+            for (let k = 0; k < Math.max(this.params.pbf.iterations, 1); k++) {
+                FluidSimulation.dispatch(pass, pbf.lambda, device, workgroups);
+                FluidSimulation.dispatch(pass, pbf.delta, device, workgroups);
+                FluidSimulation.dispatch(pass, pbf.apply, device, workgroups);
+            }
+            FluidSimulation.dispatch(pass, pbf.unsort, device, workgroups);
+        } else {
+            FluidSimulation.dispatch(pass, this.densityPass, device, workgroups);
+            FluidSimulation.dispatch(pass, this.forcesPass, device, workgroups);
+            FluidSimulation.dispatch(pass, this.integratePass, device, workgroups);
+        }
         if (this.bodies.length > 0) {
             FluidSimulation.dispatch(pass, this.bodyCollisionPass, device, workgroups);
             FluidSimulation.dispatch(pass, this.bodyIntegratePass, device, 1);
         }
         for (const p of extra) {
             p.dispatch(pass, n, device);
+        }
+        if (pbf) {
+            FluidSimulation.dispatch(pass, pbf.velocity, device, workgroups);
+            FluidSimulation.dispatch(pass, pbf.gather, device, workgroups);
+            if (this.params.pbf.vorticity > 0) {
+                FluidSimulation.dispatch(pass, pbf.vorticity, device, workgroups);
+            }
+            FluidSimulation.dispatch(pass, pbf.xsph, device, workgroups);
         }
         pass.end();
     }
@@ -816,6 +869,66 @@ class FluidSimulation {
         // vsync cadence, and the subsequent render commands implicitly
         // serialise behind these compute passes via WebGPU's queue order.
         this.renderer.submit(commandEncoder.finish());
+    }
+}
+
+/**
+ * Position Based Fluids' buffers and passes on a simulation's buffers (see
+ * `shaders/pbf.wgsl.ts`; Rust `PbfPasses`): the predicted step's start, the multipliers, the
+ * position corrections and the vorticity, one per particle of the capacity.
+ */
+class PbfPasses {
+    public readonly predict: Compute;
+    public readonly lambda: Compute;
+    public readonly delta: Compute;
+    public readonly apply: Compute;
+    public readonly unsort: Compute;
+    public readonly velocity: Compute;
+    public readonly gather: Compute;
+    public readonly vorticity: Compute;
+    public readonly xsph: Compute;
+    private readonly paramsF32 = new Float32Array(PBF_PARAMS_FLOATS);
+    private readonly params: ComputeBuffer;
+
+    constructor(capacity: number, sim: { positions: ComputeBuffer; velocities: ComputeBuffer; params: ComputeBuffer; grid: NeighbourGrid }) {
+        const n = Math.max(capacity, 1);
+        const storage = (floats: number) => new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_STORAGE,
+            usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_COPY_DST,
+            buffer: new Float32Array(n * floats),
+        });
+        const previous = storage(4);
+        const lambdas = storage(1);
+        const deltas = storage(4);
+        const omega = storage(4);
+        this.params = new ComputeBuffer({
+            type: BufferBase.BUFFER_TYPE_UNIFORM,
+            usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+            buffer: this.paramsF32,
+        });
+        const { positions: pos, velocities: vel, params: sp, grid } = sim;
+        const [spos, svel, co, si] = [grid.sorted(0), grid.sorted(1), grid.cellOffsets, grid.sortedIndices];
+        // bound in order, from binding 0
+        const pass = (code: string, values: IBindable[]) =>
+            new Compute(code, values.map((value, binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, value })));
+        this.predict = pass(pbfShaders.predict, [pos, vel, previous, sp]);
+        this.lambda = pass(pbfShaders.lambda, [spos, co, lambdas, sp, this.params]);
+        this.delta = pass(pbfShaders.delta, [spos, co, lambdas, deltas, sp, this.params]);
+        this.apply = pass(pbfShaders.apply, [spos, deltas, sp]);
+        this.unsort = pass(pbfShaders.unsort, [spos, si, pos, sp]);
+        this.velocity = pass(pbfShaders.velocity, [pos, previous, vel, sp, this.params]);
+        this.gather = pass(pbfShaders.gather, [pos, vel, si, spos, svel, sp]);
+        this.vorticity = pass(pbfShaders.vorticity, [spos, svel, co, omega, sp]);
+        this.xsph = pass(pbfShaders.xsph, [spos, svel, co, omega, si, vel, sp, this.params]);
+    }
+
+    /** Initialise the passes on first use and pack `options` (uploaded when a pass next binds them). */
+    public prepare(device: GPUDevice, options: PbfOptions, smoothingRadius: number): void {
+        for (const compute of [this.predict, this.lambda, this.delta, this.apply, this.unsort, this.velocity, this.gather, this.vorticity, this.xsph]) {
+            if (!compute.initialized) compute.initialize(device);
+        }
+        packPbfParams(options, smoothingRadius, this.paramsF32);
+        this.params.needsUpdate = true;
     }
 }
 

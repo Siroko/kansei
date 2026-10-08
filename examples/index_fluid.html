@@ -24,6 +24,7 @@
       import { BufferBase } from '../src/buffers/BufferBase'
       import { FluidSimulation } from '../src/simulations/fluid/FluidSimulation'
       import { FluidNozzle } from '../src/simulations/fluid/FluidNozzle'
+      import { DEFAULT_PBF_OPTIONS, latticeDensity } from '../src/simulations/fluid/FluidSimulationParams'
       import { FluidDensityField } from '../src/simulations/fluid/FluidDensityField'
       import { FluidMarchingCubes } from '../src/simulations/fluid/FluidMarchingCubes'
       import { FluidSurfaceEffect } from '../src/postprocessing/effects/FluidSurfaceEffect'
@@ -73,7 +74,7 @@
       // 1.5 n particles unless ?capacity=<particles> says otherwise (without either there is no
       // room: spare capacity measured a few percent slower per step at 400k); ?hud=1 shows a
       // frame-time overlay (examples/frame-hud.js); ?profile=1 the GPU time of each pass
-      // (examples/profile-hud.js).
+      // (examples/profile-hud.js); ?solver=pbf starts on Position Based Fluids instead of SPH.
       const query = new URLSearchParams(location.search);
       let lastSimSteps = 0;
       if (query.get('hud') === '1') {
@@ -133,6 +134,10 @@
         mouseForce: 2500.0,
         substeps: 2,
         worldBoundsPadding: 0.3,
+        solver: query.get('solver') === 'pbf' ? 'pbf' : 'sph',
+        // Position Based Fluids keeps the fluid at the density of a lattice at the nozzle's
+        // spacing, so what it pours joins at rest
+        pbf: { ...DEFAULT_PBF_OPTIONS, restDensity: latticeDensity(0.62, 1.0) },
       };
 
       const sim = new FluidSimulation(renderer, simSettings);
@@ -413,13 +418,34 @@ fn fragment_main(v: VOut) -> FragOut {
         simStep.reset();
       });
 
-      // ── SPH ──
-      const sphFolder = pane.addFolder({ title: 'SPH', expanded: false });
+      // ── Solver ──
+      // SPH, or Position Based Fluids on the same particles, grid and nozzle (the mouse pushes
+      // SPH only: PBF runs no forces pass)
+      const solverFolder = pane.addFolder({ title: 'Solver', expanded: false });
+      solverFolder.addBinding(simSettings, 'solver', { options: { SPH: 'sph', PBF: 'pbf' } }).on('change', () => {
+        sim.params.solver = simSettings.solver;
+        sphFolder.hidden = simSettings.solver !== 'sph';
+        pbfFolder.hidden = simSettings.solver !== 'pbf';
+      });
+      // both solvers damp the velocity
+      solverFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
+      const sphFolder = solverFolder.addFolder({ title: 'SPH' });
       sphFolder.addBinding(simSettings, 'pressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'pressure' }).on('change', () => { sim.params.pressureMultiplier = simSettings.pressureMultiplier; });
       sphFolder.addBinding(simSettings, 'nearPressureMultiplier', { min: 0, max: 100, step: 0.5, label: 'near pressure' }).on('change', () => { sim.params.nearPressureMultiplier = simSettings.nearPressureMultiplier; });
       sphFolder.addBinding(simSettings, 'densityTarget', { min: 0, max: 20, step: 0.1, label: 'density target' }).on('change', () => { sim.params.densityTarget = simSettings.densityTarget; });
       sphFolder.addBinding(simSettings, 'viscosity', { min: 0, max: 1, step: 0.01 }).on('change', () => { sim.params.viscosity = simSettings.viscosity; });
-      sphFolder.addBinding(simSettings, 'damping', { min: 0.9, max: 1.0, step: 0.001 }).on('change', () => { sim.params.damping = simSettings.damping; });
+      const pbfFolder = solverFolder.addFolder({ title: 'PBF' });
+      const pbfOpts = sim.params.pbf;
+      pbfFolder.addBinding(pbfOpts, 'iterations', { min: 1, max: 12, step: 1 });
+      pbfFolder.addBinding(pbfOpts, 'restDensity', { min: 1, max: 12, step: 0.05, label: 'rest density' });
+      pbfFolder.addBinding(pbfOpts, 'relaxation', { min: 0.1, max: 50, step: 0.1 });
+      pbfFolder.addBinding(pbfOpts, 'scorrK', { min: 0, max: 0.5, step: 0.005, label: 'scorr k' });
+      pbfFolder.addBinding(pbfOpts, 'scorrN', { min: 1, max: 8, step: 0.5, label: 'scorr n' });
+      pbfFolder.addBinding(pbfOpts, 'xsph', { min: 0, max: 0.5, step: 0.005 });
+      pbfFolder.addBinding(pbfOpts, 'vorticity', { min: 0, max: 2, step: 0.01 });
+      pbfFolder.addBinding(pbfOpts, 'maxSpeed', { min: 0, max: 100, step: 1, label: 'max speed' });
+      sphFolder.hidden = simSettings.solver !== 'sph';
+      pbfFolder.hidden = simSettings.solver !== 'pbf';
 
       // ── Forces ──
       const forcesFolder = pane.addFolder({ title: 'Forces', expanded: false });
