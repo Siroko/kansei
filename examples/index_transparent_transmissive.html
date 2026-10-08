@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transparent and transmissive</title>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+
+<body>
+  <!--
+    Regression page for transparent objects in a scene that also has a
+    transmissive one: an opaque floor, one transmissive sphere and two
+    transparent boxes orbiting each other, so their back-to-front order
+    flips every half turn. All four must draw every frame.
+    `?transmissive=0` makes the sphere opaque for comparison.
+  -->
+  <script type="module">
+    import { Renderer } from '../src/renderers/Renderer'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+
+    const params = new URLSearchParams(location.search);
+    const transmissive = params.get('transmissive') !== '0';
+
+    const shader = /* wgsl */`
+      struct VertexOut {
+        @builtin(position) position    : vec4f,
+        @location(0)       worldNormal : vec3f,
+      }
+
+      @group(0) @binding(0) var<uniform> baseColor        : vec4f;
+      @group(1) @binding(0) var<uniform> normalMatrix     : mat4x4f;
+      @group(1) @binding(1) var<uniform> worldMatrix      : mat4x4f;
+      @group(2) @binding(0) var<uniform> viewMatrix       : mat4x4f;
+      @group(2) @binding(1) var<uniform> projectionMatrix : mat4x4f;
+
+      @vertex
+      fn vertex_main(
+        @location(0) position : vec4f,
+        @location(1) normal   : vec3f,
+        @location(2) uv       : vec2f,
+      ) -> VertexOut {
+        var out : VertexOut;
+        out.position    = projectionMatrix * viewMatrix * worldMatrix * position;
+        out.worldNormal = normalize((normalMatrix * vec4f(normal, 0.0)).xyz);
+        return out;
+      }
+
+      struct FragmentOutput {
+        @location(0) color    : vec4f,
+        @location(1) emissive : vec4f,
+        @location(2) normal   : vec4f,
+        @location(3) albedo   : vec4f,
+      }
+
+      @fragment
+      fn fragment_main(frag : VertexOut) -> FragmentOutput {
+        let L = normalize(vec3f(0.4, 1.0, 0.6));
+        let lighting = 0.3 + 0.7 * max(dot(frag.worldNormal, L), 0.0);
+        return FragmentOutput(
+          vec4f(baseColor.rgb * lighting, baseColor.a),
+          vec4f(0.0, 0.0, 0.0, 1.0),
+          vec4f(frag.worldNormal * 0.5 + 0.5, 0.0),
+          vec4f(baseColor.rgb, 1.0)
+        );
+      }
+    `;
+
+    const makeMaterial = (color, options = {}) => new Material(shader, {
+      bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: color }],
+      ...options,
+    });
+
+    const renderer = new Renderer({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: 1,
+      antialias: true,
+      sampleCount: 1,
+    });
+    await renderer.initialize();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.canvas);
+    renderer.canvas.style.width = '100%';
+    renderer.canvas.style.height = '100%';
+
+    const scene = new Scene();
+    const camera = new Camera(60, 0.1, 100, window.innerWidth / window.innerHeight);
+    camera.position.set(0, 3, 9);
+    camera.lookAt(new Vector3(0, 0.5, 0));
+
+    const floor = new Renderable(new BoxGeometry(12, 0.2, 12), makeMaterial(new Vector4(0.6, 0.6, 0.6, 1.0)));
+    floor.position.set(0, -1, 0);
+    scene.add(floor);
+
+    const sphere = new Renderable(
+      new SphereGeometry(1, 32),
+      makeMaterial(new Vector4(0.9, 0.8, 0.2, 1.0), { transmissive }),
+    );
+    sphere.position.set(0, 0.5, 0);
+    scene.add(sphere);
+
+    const boxGeometry = new BoxGeometry(1.2, 1.2, 1.2);
+    const redBox = new Renderable(boxGeometry, makeMaterial(new Vector4(1.0, 0.1, 0.1, 0.5), { transparent: true }));
+    const blueBox = new Renderable(boxGeometry, makeMaterial(new Vector4(0.1, 0.3, 1.0, 0.5), { transparent: true }));
+    scene.add(redBox);
+    scene.add(blueBox);
+
+    const volume = new PostProcessingVolume(renderer, []);
+
+    // `?t=<seconds>` freezes the orbit at that time.
+    const frozen = params.has('t') ? parseFloat(params.get('t')) : null;
+    function animate(now) {
+      const t = frozen ?? now * 0.001;
+      const a = t * 0.8;
+      redBox.position.set(Math.cos(a) * 2.2, 0.5, Math.sin(a) * 2.2);
+      blueBox.position.set(-Math.cos(a) * 2.2, 0.5, -Math.sin(a) * 2.2);
+      volume.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+
+</html>
