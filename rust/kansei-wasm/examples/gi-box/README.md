@@ -21,6 +21,16 @@ denoiser, the hits' lighting and shadows, a reference path tracer through the gr
 (`mode`, with `accumulate` for a converged image) and debug views (the indirect light, the signal,
 SVGF's variance and history, the rays' cost).
 
+A chrome ball stands on the short block and a glass ball on the rug, ray traced through a grid of
+the room's triangles (below) whatever the GI: the chrome (`StandardLitOptions::mirror`) mirrors the
+room, sharp or rough; the glass (`StandardLitOptions::glass`, `RtSurface::glass`) reflects it by
+the exact dielectric Fresnel and refracts it through both of its surfaces, with total internal
+reflection, its tint absorbing inside, frosted when rough. Their rays' hits take the lit image where
+the camera sees the same point, and elsewhere the lamp (shadow rays through the grid) plus the
+voxels' irradiance, so the room in them carries the GI on screen. The GI's own rays and the shadow
+maps see through the glass; the chrome is dark to them. The panel's "Mirror & glass" folder turns
+each on and off and sets the chrome's roughness and the glass's index of refraction and roughness.
+
 With `reflect=1` the floor is polished and reflects the room: rays traced through a grid of the
 room's triangles (96 cells of 4.8 cm each way, rebuilt on the GPU when something in it moves), the
 hits lit by the voxels, the voxel cone past the grid. The dragon goes into the grid as the cut of
@@ -38,7 +48,10 @@ Engine API: `Renderer::enable_voxel_gi` (`SceneVoxelGiOptions`, `VoxelGiQuality`
 grid below; with `reflect=1`,
 `Renderer::enable_rt_grid` (`SceneRtGridOptions`, a fixed box), `Renderable::rt` (`RtSurface`),
 `ClusterLod` on the dragon, `RtReflectionsEffect::with_volume` and `GBUFFER_OUT_WGSL`'s
-`kansei_gbuffer_out_specular` (the floor's F0 and roughness).
+`kansei_gbuffer_out_specular` (the floor's F0 and roughness); for the balls,
+`Material::standard_lit` with `StandardLitOptions::mirror` and `StandardLitOptions::glass`
+(`set_standard_lit` for the panel's changes), `RtSurface::glass`, and `RtReflectionsEffect`'s
+`set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`.
 
 | URL parameter | Effect |
 |---|---|
@@ -58,7 +71,15 @@ grid below; with `reflect=1`,
 | `sdf_ao=<0..1>` | strength of the distance field's AO on the GI (default 0) |
 | `sdf_shadows=off\|fallback\|always` | the voxels' shadows through the distance field: never (default), where no shadow map covers them, or always |
 | `shadows=map\|sdf` | the direct light's shadows from the shadow atlas (default) or the distance field |
-| `cam=front\|corner\|low\|floor` | starting camera (default front; `floor` looks down onto the floor) |
+| `cam=front\|corner\|low\|floor\|glass` | starting camera (default front; `floor` looks down onto the floor, `glass` close on the glass ball) |
+| `mirror=0`, `glass=0` | no chrome ball, no glass ball (without both, `reflect`, `gi=rt` and `rt=1`, no grid is built and voxel GI runs only for its modes) |
+| `mirror_rough=<0..1>` | the chrome's roughness (default 0, a mirror) |
+| `glass_ior=<ior>` | the glass's index of refraction (default 1.5) |
+| `glass_rough=<0..1>` | frosted glass (default 0, clear) |
+| `glass_tint=<r,g,b>` | the light the glass leaves after a metre inside (default `0.82,0.93,0.88`, a faint green) |
+| `glass_samples=<n>` | paths a frosted glass pixel traces a frame (default 4) |
+| `rt_screen=0` | the balls' and the floor's rays' hits lit by the lamp and the voxels even where the camera sees them |
+| `rt_direct=0` | the hits the camera doesn't see lit by the voxels' radiance alone |
 | `dragon=1\|full` | add the Stanford dragon: `1` (or `light`) the 19k-triangle `.glb`, `full` the 871k-triangle scan (24 MB) |
 | `animate=1` | the dragon (or, without it, the tall block) turns and slides, revoxelized each frame |
 | `albedo=constant` | the rug's voxels take its mean colour instead of its texture |

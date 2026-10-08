@@ -26,10 +26,20 @@
     <label>sdf ao <input type="range" id="sdfAo" min="0" max="1" step="0.05"></label>
     <label>voxel shadows <select id="sdfShadows"><option>off</option><option>fallback</option><option>always</option></select></label>
     <label>shadows <select id="shadows"><option>map</option><option>sdf</option></select></label>
-    <label>camera <select id="cam"><option>front</option><option>corner</option><option>low</option><option>floor</option></select></label>
+    <label>camera <select id="cam"><option>front</option><option>corner</option><option>low</option><option>floor</option><option>glass</option></select></label>
     <label>animate <input type="checkbox" id="animate"></label>
     <label>rug texture in voxels <input type="checkbox" id="textured"></label>
     <label>rug <input type="checkbox" id="rug"></label>
+    <div id="balls-panel" style="display: none">
+      <b>mirror &amp; glass (ray traced)</b>
+      <label>chrome ball <input type="checkbox" id="mirror"></label>
+      <label>chrome roughness <input type="range" id="mirrorRough" min="0" max="1" step="0.01"></label>
+      <label>glass ball <input type="checkbox" id="glass"></label>
+      <label>glass IOR <input type="range" id="glassIor" min="1" max="2.4" step="0.01"></label>
+      <label>glass roughness <input type="range" id="glassRough" min="0" max="1" step="0.01"></label>
+      <label>hits from screen <input type="checkbox" id="screenHits"></label>
+      <div id="balls-stats"></div>
+    </div>
     <div id="rtgi-panel" style="display: none">
       <b>hybrid RT GI</b>
       <label>trace <select id="rtgi-res"><option value="half">half (1 ray / 2x2)</option><option value="full">full (1 ray / pixel)</option></select></label>
@@ -79,8 +89,16 @@
     // shadows, a reference path tracer through the grid (`mode`, with `accumulate` for a converged
     // image) and debug views.
     //
-    // With `reflect=1` the floor is polished and its reflections are traced through a grid of the
-    // room's triangles (`Renderer.enableRtGrid`, `RtReflectionsEffect`), the hits lit by the voxels.
+    // A chrome ball stands on the short block and a glass ball on the rug, ray traced through a
+    // grid of the room's triangles (`Renderer.enableRtGrid`) whatever the GI, by
+    // `RtReflectionsEffect` with `setGlass`: the chrome (`standardLit` with `mirrorOptions`)
+    // mirrors the room, sharp or rough; the glass (`glassOptions`, `rtGlassSurface`) reflects it
+    // by the exact dielectric Fresnel and refracts it through both of its surfaces, with total
+    // internal reflection, its tint absorbing inside, frosted when rough. Their rays' hits take
+    // the lit image where the camera sees the same point, elsewhere the lamp (shadow rays through
+    // the grid) and the voxels' irradiance. The GI's rays and the shadow map see through the glass.
+    //
+    // With `reflect=1` the floor is polished and its reflections are traced through the same grid.
     //
     // The TS engine has no spot lights yet: the lamp is a point light with a cube shadow inside a
     // fixture open at the bottom (a hard-edged cone of 76 degrees, the Rust spot's outer angle), lit
@@ -96,7 +114,10 @@
     // rtgi_view=lit|indirect|signal|variance|history|cost,
     // voxels=low|medium|high, view=lit|indirect|voxels|sdf|probes, slice=<metres> (the sdf view's
     // height, default 0.6), sdf_ao=0..1, sdf_shadows=off|fallback|always, shadows=map|sdf,
-    // cam=front|corner|low|floor, animate=1, albedo=constant, rug=off, ui=0, profile=1 (each
+    // mirror=0, glass=0 (without both, reflect, gi=rt and rt=1, no grid), mirror_rough=0..1,
+    // glass_ior (1.5), glass_rough=0..1, glass_tint=r,g,b (0.82,0.93,0.88), glass_samples (4),
+    // rt_screen=0 (hits lit by the voxels even where the camera sees them),
+    // cam=front|corner|low|floor|glass, animate=1, albedo=constant, rug=off, ui=0, profile=1 (each
     // pass's GPU time; examples/profile-hud.js). Any use of the distance field turns voxel GI's
     // volume on whatever the gi mode. reflect=1 with floor_f0 (0.3), floor_rough (0.05),
     // rt_view=lit|reflection|mirror|cost, rt_trace=voxels (the voxel cone alone), rt_res=quarter,
@@ -113,6 +134,9 @@
     import { Texture } from '../src/buffers/Texture'
     import { Sampler } from '../src/buffers/Sampler'
     import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { glassOptions, mirrorOptions } from '../src/materials/StandardLit'
+    import { rtGlassSurface } from '../src/rt/RtGrid'
     import { PointLight } from '../src/lights/PointLight'
     import { Vector3 } from '../src/math/Vector3'
     import { Vector4 } from '../src/math/Vector4'
@@ -294,9 +318,11 @@
 
     // ── the room ──────────────────────────────────────────────────────────────────────────────
     // reflect=1 (set at load): the floor polished, and every surface in the grid of triangles its
-    // reflections trace; the grid is also the hybrid GI's (gi=rt, rt=1)
+    // reflections trace; the grid is also the balls' (mirror=, glass=) and the hybrid GI's (gi=rt,
+    // rt=1)
     const reflect = flag('reflect', false);
-    const grid = reflect || param('gi') === 'rt' || flag('rt', false);
+    const balls = flag('mirror', true) || flag('glass', true);
+    const grid = reflect || balls || param('gi') === 'rt' || flag('rt', false);
     const floorSpecular = reflect ? [paramOr('floor_f0', 0.3), paramOr('floor_rough', 0.05)] : [0, 0];
     const specularOf = (label) => label === 'Floor' ? floorSpecular : [0, 0];
     const rt = (albedo) => grid ? { albedo } : null;
@@ -341,6 +367,48 @@
     rug.rt = rt(rugMean);
     scene.add(rug);
 
+    // With the grid: a chrome ball on the short block and a glass ball on the rug before it, ray
+    // traced by the reflections effect whatever the GI.
+    const MIRROR_COLOR = [0.95, 0.95, 0.95];
+    // (dark to the GI's rays and the voxels: they don't mirror)
+    const MIRROR_GI_ALBEDO = [0.02, 0.02, 0.02];
+    // the light the glass leaves after a metre inside (a faint green, as window glass)
+    const GLASS_TINT = [0.82, 0.93, 0.88];
+    const BALL_RADIUS = 0.4;
+    const parseRgb = (v) => {
+      const c = (v ?? '').split(',').map(parseFloat);
+      return c.length === 3 && c.every(Number.isFinite) ? c : null;
+    };
+    const clamp01 = (x) => Math.min(Math.max(x, 0), 1);
+    const ballConfig = {
+      mirror: flag('mirror', true),
+      glass: flag('glass', true),
+      mirrorRough: clamp01(paramOr('mirror_rough', 0)),
+      glassIor: Math.max(paramOr('glass_ior', 1.5), 1),
+      glassRough: clamp01(paramOr('glass_rough', 0)),
+      glassTint: parseRgb(param('glass_tint')) ?? GLASS_TINT,
+      glassSamples: Math.min(Math.max(Math.round(paramOr('glass_samples', 4)), 1), 16),
+      screenHits: flag('rt_screen', true),
+    };
+    const mirrorMaterial = () => mirrorOptions(MIRROR_COLOR, ballConfig.mirrorRough);
+    const glassMaterial = () => glassOptions(ballConfig.glassTint, ballConfig.glassIor, ballConfig.glassRough);
+    let mirrorBall = null;
+    let glassBall = null;
+    if (grid) {
+      // 96 x 48 (the Rust example's are 64 x 48), shaded by their vertex normals in the grid
+      mirrorBall = new Renderable(new SphereGeometry(BALL_RADIUS, 46), Material.standardLit('Chrome', mirrorMaterial()));
+      mirrorBall.gi = { albedo: MIRROR_GI_ALBEDO };
+      mirrorBall.rt = { albedo: MIRROR_GI_ALBEDO, smoothNormals: true };
+      mirrorBall.position.set(0.8, 1.2 + BALL_RADIUS, -1.5);
+      scene.add(mirrorBall);
+      // clear to the shadow map, the voxels and the GI's rays; refracted by the glass pass
+      glassBall = new Renderable(new SphereGeometry(BALL_RADIUS, 46), Material.standardLit('Glass', glassMaterial()));
+      glassBall.rt = rtGlassSurface(ballConfig.glassTint);
+      glassBall.castShadow = false;
+      glassBall.position.set(-0.1, BALL_RADIUS + 0.025, -0.45);
+      scene.add(glassBall);
+    }
+
     // The fixture: an open-bottomed box round the lamp, its rim 5 cm below it, casting a cone of
     // 76 degrees as the Rust spot's outer angle (not in the voxels: the lamp's light leaves
     // through its opening, and its outside is dark).
@@ -375,6 +443,8 @@
       corner: [[1, 0.8, -3], 4.98, -0.777, 0.634],
       low: [[0, 1.4, -2.5], 7.5, 0, -0.12],
       floor: [[-0.3, 0.5, -2], 6.2, 0.3, 0.42],
+      // close on the glass ball
+      glass: [[-0.1, 0.45, -0.45], 1.8, 0.92, 0.12],
     };
     const camera = new Camera(38, 0.1, 100, canvas.aspect);
     const controls = new CameraControls(camera, new Vector3(0, 2, -2), renderer.canvas, 8.3).withMousePan();
@@ -473,7 +543,9 @@
     const needsSdf = () => config.sdfAo > 0 || config.sdfShadows !== 'off' || config.view === 'sdf' || config.shadows === 'sdf' || needsProbes();
     // (the reflections' hits are lit by the voxels, and so are the hybrid's)
     const screenGi = () => SCREEN_GI.includes(config.gi);
-    const needsVoxels = () => (config.gi !== 'off' && !screenGi()) || needsSdf() || reflect;
+    // whether the reflections effect runs: the polished floor, the chrome ball, the glass
+    const traces = () => !!renderer.rtGrid && ((reflect && config.reflections) || (!!mirrorBall && (ballConfig.mirror || ballConfig.glass)));
+    const needsVoxels = () => (config.gi !== 'off' && !screenGi()) || needsSdf() || traces();
 
     // single-sampled with the grid, as the Rust example always is: the ray-traced effects read the
     // GBuffer's normals, which a 4x MSAA resolve averages toward zero at edges (the hybrid's
@@ -553,15 +625,25 @@
         effect.showProbes = config.view === 'probes';
         volume.addEffect(effect);
       }
-      // the polished floor's reflections, through the room's grid, lit by the voxels
+      // the polished floor's reflections, the chrome ball and the glass, through the room's grid
       reflections = null;
-      if (reflect && config.reflections && gi && renderer.rtGrid) {
+      if (traces() && gi) {
         reflections = new RtReflectionsEffect(gi.volume, renderer.rtGrid.handle, { resolution: config.rtRes, maxDistance: 20 });
         reflections.view = config.rtView;
         reflections.traceGrid = config.rtTrace === 'grid';
         reflections.heatScale = 0.5 / exposureFromEV100(5);
         reflections.collectStats = stats;
+        // the hits the camera sees: the lit image there; the others lit by the lamp (shadow rays
+        // through the grid, the fixture in it: updateLights each frame) and the voxels, with no
+        // indirect light where the image shows none
+        reflections.hitIndirect = config.gi !== 'off' && !screenGi();
+        reflections.screenHits = ballConfig.screenHits;
+        reflections.setGlass(glassBall && ballConfig.glass ? { samples: ballConfig.glassSamples } : null);
         volume.addEffect(reflections);
+      }
+      if (mirrorBall) {
+        mirrorBall.visible = ballConfig.mirror;
+        glassBall.visible = ballConfig.glass;
       }
       volume.addEffect(new ToneMapEffect({
         ...toneMapOptionsForSurface(renderer.presentationFormat),
@@ -593,6 +675,8 @@
         if (key === 'accum') el.checked = rtgi.accum;
         else el.value = rtgi[key];
       }
+      for (const key of ['mirror', 'glass', 'screenHits']) document.getElementById(key).checked = ballConfig[key];
+      for (const key of ['mirrorRough', 'glassIor', 'glassRough']) document.getElementById(key).value = ballConfig[key];
       // the hybrid's settings, shown while it runs
       document.getElementById('rtgi-panel').style.display = config.gi === 'rt' ? '' : 'none';
     }
@@ -620,6 +704,12 @@
         rays: r?.rays ?? 0, hits: r?.hits ?? 0, cells: r?.cells ?? 0, tests: r?.tests ?? 0, maxCost: r?.maxCost ?? 0,
       };
     };
+    // the balls' settings and the glass pass's counters (null without the grid)
+    const ballsInfo = () => {
+      if (!mirrorBall) return null;
+      const r = reflections?.stats;
+      return { ...ballConfig, rays: r?.rays ?? 0, glassPixels: r?.glassPixels ?? 0, glassCost: r?.glassCost ?? 0 };
+    };
     const rtgiInfo = () => {
       const s = rtgiEffect?.stats;
       return {
@@ -635,6 +725,7 @@
         grid: gridInfo(),
         rtgi: rtgiInfo(),
         reflect: reflectInfo(),
+        balls: ballsInfo(),
         voxelTier: gi?.quality ?? null,
         dims: gi ? [...gi.volume.dims] : null,
         mib: gi ? +(gi.memoryBytes() / (1 << 20)).toFixed(1) : 0,
@@ -645,7 +736,19 @@
     };
     const set = (key) => (value) => { config[key] = value; apply(); };
     const setPreset = (name) => { applyPreset(name); apply(); };
-    // rt needs the grid, built at load only (gi=rt, rt=1 or reflect=1 in the URL)
+    // the balls' settings (only where the page built the grid)
+    const setBall = (key) => (value) => {
+      if (!mirrorBall) return;
+      ballConfig[key] = value;
+      if (['mirrorRough', 'glassIor', 'glassRough'].includes(key)) {
+        // the materials alone: the effects (and the frosted glass's history) go on
+        mirrorBall.material.setStandardLit(mirrorMaterial());
+        glassBall.material.setStandardLit(glassMaterial());
+      } else {
+        apply();
+      }
+    };
+    // rt needs the grid, built at load only (the balls, gi=rt, rt=1 or reflect=1 in the URL)
     const setGi = (name) => {
       const gi = giFromName(name) ?? config.gi;
       if (gi !== 'rt' || renderer.rtGrid) set('gi')(gi);
@@ -661,10 +764,13 @@
       setTextured: set('textured'), setRug: set('rug'), setSdfAo: set('sdfAo'), setSdfShadows: set('sdfShadows'),
       setShadows: set('shadows'), setSlice: set('slice'), setCamera,
       setReflections: set('reflections'), setRtView: set('rtView'), setRtTrace: set('rtTrace'), setRtRes: set('rtRes'),
+      setMirror: setBall('mirror'), setGlass: setBall('glass'), setScreenHits: setBall('screenHits'),
+      setMirrorRough: (x) => setBall('mirrorRough')(clamp01(x)), setGlassIor: (x) => setBall('glassIor')(Math.max(x, 1)),
+      setGlassRough: (x) => setBall('glassRough')(clamp01(x)),
       renderer, scene, camera,
     };
     document.getElementById('preset').onchange = (e) => setPreset(e.target.value);
-    // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
+    // the hybrid traces the grid of triangles, built at load (the balls, gi=rt, rt=1 or reflect=1): without
     // it, choosing the hybrid reloads the page with gi=rt
     document.getElementById('gi').onchange = (e) => {
       if (e.target.value === 'rt' && !renderer.rtGrid) {
@@ -685,6 +791,17 @@
     document.getElementById('cam').onchange = (e) => setCamera(e.target.value);
     for (const key of ['animate', 'textured', 'rug', 'reflections']) document.getElementById(key).onchange = (e) => set(key)(e.target.checked);
     if (reflect) document.getElementById('reflect-panel').style.display = '';
+    if (mirrorBall) {
+      document.getElementById('balls-panel').style.display = '';
+      for (const key of ['mirror', 'glass', 'screenHits']) document.getElementById(key).onchange = (e) => setBall(key)(e.target.checked);
+      for (const key of ['mirrorRough', 'glassIor', 'glassRough']) document.getElementById(key).oninput = (e) => setBall(key)(parseFloat(e.target.value));
+    }
+    if (mirrorBall && stats) {
+      setInterval(() => {
+        const b = ballsInfo();
+        document.getElementById('balls-stats').textContent = `glass ${b.glassPixels} px, ${b.glassPixels ? (b.glassCost / b.glassPixels).toFixed(1) : 0} cells + triangles a pixel; ${b.rays} reflection rays`;
+      }, 500);
+    }
     if (reflect && stats) {
       setInterval(() => {
         const [g, r] = [gridInfo(), reflectInfo()];
@@ -715,6 +832,7 @@
       }
       controls.update(dt);
       rtgiEffect?.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
+      reflections?.updateLights(scene.directionalLights, scene.pointLights, scene.areaLights);
       hud.begin(performance.now());
       volume.render(scene, camera);
       hud.end(performance.now());

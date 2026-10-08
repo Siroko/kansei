@@ -31,12 +31,13 @@
             start, info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate,
             set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice,
             set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi,
+            set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits,
         } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_preset('best') and so on
-        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi };
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi, set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -79,8 +80,8 @@
             if (p.preset) { await set_preset(p.preset); sync(); }
         });
         const custom = (f) => (e) => { if (e.last !== false) { p.preset = ''; } f(e); sync(); };
-        // the hybrid traces the grid of triangles, built at load (gi=rt, rt=1 or reflect=1): without
-        // it, choosing the hybrid reloads the page with gi=rt
+        // the hybrid traces the grid of triangles, built at load (with the balls, gi=rt, rt=1 or
+        // reflect=1): without it, choosing the hybrid reloads the page with gi=rt
         const giOptions = { off: 'off', 'SSGI low': 'low', 'SSGI medium': 'medium', 'SSGI high': 'high', 'SSGI ultra': 'ultra', voxel: 'voxel', 'voxel + SSGI': 'voxel+ssgi', probes: 'probes', 'probes + SSGI': 'probes+ssgi', 'hybrid RT (grid rays + SVGF)': 'rt' };
         pane.addBinding(p, 'gi', { label: 'GI', options: giOptions }).on('change', custom(() => {
             if (p.gi === 'rt' && !s.grid) {
@@ -93,7 +94,7 @@
         }));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf', 'probes (debug)': 'probes' } }).on('change', custom(() => set_view(p.view)));
-        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor' } }).on('change', () => set_camera(p.camera));
+        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor', 'through the glass ball': 'glass' } }).on('change', () => set_camera(p.camera));
         const sdf = pane.addFolder({ title: 'Distance field' });
         sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
         sdf.addBinding(p, 'sdfShadows', { label: 'voxel shadows', options: { 'shadow maps': 'off', 'field where no map': 'fallback', 'field always': 'always' } }).on('change', custom(() => set_sdf_shadows(p.sdfShadows)));
@@ -119,6 +120,17 @@
         rtFolder.addBinding(rt, 'view', { label: 'debug view', options: { lit: 'lit', indirect: 'indirect', signal: 'signal', variance: 'variance', history: 'history', cost: 'cost' } }).on('change', () => rtgi('view', rt.view));
         const showRt = () => { rtFolder.hidden = p.gi !== 'rt'; };
         showRt();
+        // the chrome and glass balls, ray traced whatever the GI
+        if (s.balls) {
+            const b = { mirror: s.balls.mirror, mrough: s.balls.mirror_rough, glass: s.balls.glass, ior: s.balls.glass_ior, grough: s.balls.glass_rough, screen: s.balls.screen_hits };
+            const folder = pane.addFolder({ title: 'Mirror & glass (ray traced)' });
+            folder.addBinding(b, 'mirror', { label: 'chrome ball' }).on('change', () => set_mirror(b.mirror));
+            folder.addBinding(b, 'mrough', { label: 'chrome roughness', min: 0, max: 1, step: 0.01 }).on('change', () => set_mirror_rough(b.mrough));
+            folder.addBinding(b, 'glass', { label: 'glass ball' }).on('change', () => set_glass(b.glass));
+            folder.addBinding(b, 'ior', { label: 'glass IOR', min: 1, max: 2.4, step: 0.01 }).on('change', () => set_glass_ior(b.ior));
+            folder.addBinding(b, 'grough', { label: 'glass roughness', min: 0, max: 1, step: 0.01 }).on('change', () => set_glass_rough(b.grough));
+            folder.addBinding(b, 'screen', { label: 'hits from screen' }).on('change', () => set_screen_hits(b.screen));
+        }
         // reflect=1: the polished floor's ray-traced reflections
         if (s.reflect) {
             const r = { on: s.reflect.enabled, view: s.reflect.view, rays: s.reflect.grid ? 'grid' : 'voxels', res: s.reflect.res };
@@ -143,6 +155,7 @@
                 `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' +
                 (i.grid ? `rt grid: ${i.grid.triangles} triangles, ${i.grid.references} refs, ${i.grid.big} big, ${i.grid.mib} MiB; ${i.grid.rebuilt ? 'rebuilt' : 'kept'} (${i.grid.rebuilds}), GPU ${i.rt_ms.toFixed(3)} ms\n` : '') +
                 (i.rtgi.on ? `hybrid GI: ${i.rtgi_ms.toFixed(3)} ms, ${i.rtgi.mib} MiB; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '') + '\n' : '') +
+                (i.balls ? `mirror & glass: glass ${i.glass_ms.toFixed(3)} ms, ${i.balls.glass_pixels} pixels, ${i.balls.glass_pixels ? (i.balls.glass_cost / i.balls.glass_pixels).toFixed(1) : 0} cells + triangles a pixel; reflections ${i.reflect_ms.toFixed(3)} ms, ${i.balls.rays} rays\n` : '') +
                 (i.reflect ? `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
         }, 500);
     </script>

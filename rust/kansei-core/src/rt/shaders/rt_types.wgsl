@@ -33,6 +33,8 @@ struct KanseiRtGrid {
 const KANSEI_RT_ALPHA : u32 = 1u;
 // its last four words hold its vertices' world normals, not their uvs (RtSurface::smooth_normals)
 const KANSEI_RT_SMOOTH : u32 = 4u;
+// glass (RtSurface::glass): rays pass through it unless they ask for it (KANSEI_RT_GLASS_HITS)
+const KANSEI_RT_GLASS : u32 = 8u;
 
 // A unit normal, octahedral, two snorm16 (RtMesh's packing).
 fn kansei_rt_pack_normal(n: vec3f) -> u32 {

@@ -2,7 +2,8 @@
 // (`MaterialOptions::mrt_output_count = Some(4)`): the shaded colour, the emitted part of it, the
 // world normal and the albedo, which screen-space and voxel GI read. Prepend
 // `materials::GBUFFER_OUT_WGSL` and return `kansei_gbuffer_out(..)` from the fragment shader
-// (`kansei_gbuffer_out_specular(..)` for one that reflects).
+// (`kansei_gbuffer_out_specular(..)` for one that reflects, `kansei_gbuffer_out_glass(..)` for
+// glass).
 
 struct KanseiGBufferOut {
     @location(0) color    : vec4f,   // shaded radiance (HDR)
@@ -30,5 +31,17 @@ fn kansei_gbuffer_out_specular(color: vec3f, emissive: vec3f, N: vec3f, albedo: 
     var out = kansei_gbuffer_out(color, emissive, N, albedo);
     out.normal.w = 1.0 - clamp(f0, 0.0, 1.0);
     out.albedo.a = 1.0 - 0.5 * clamp(roughness, 0.0, 1.0);
+    return out;
+}
+
+// `kansei_gbuffer_out` for glass, which rt::RtReflectionsEffect draws (with `set_glass`): the
+// light it reflects and refracts through the scene replaces the colour. Its `tint` (the light left
+// after a metre inside, linear rgb) is the albedo; the albedo's alpha marks glass, 0.45 - 0.4 x
+// `roughness` (frosted, 0 clear to 1), below the 0.5 to 1 a reflective surface writes; the normal's
+// alpha holds 1 / `ior`. Glass has no diffuse light of its own: the GI composites over it go under.
+fn kansei_gbuffer_out_glass(N: vec3f, tint: vec3f, ior: f32, roughness: f32) -> KanseiGBufferOut {
+    var out = kansei_gbuffer_out(vec3f(0.0), vec3f(0.0), N, clamp(tint, vec3f(0.0), vec3f(1.0)));
+    out.normal.w = 1.0 / max(ior, 1.0);
+    out.albedo.a = 0.45 - 0.4 * clamp(roughness, 0.0, 1.0);
     return out;
 }

@@ -9,6 +9,7 @@ use bytemuck::{Pod, Zeroable};
 use super::grid::{RtGrid, RtGridHandle};
 use crate::cameras::Camera;
 use crate::gi::{VoxelClipmap, VoxelVolume};
+use crate::lights::Light;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
@@ -31,6 +32,12 @@ fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
 fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
     return clipConeTrace(origin, dir, n, tanHalf, srcVoxelSize(origin), startDist, maxDist, steps);
 }
+// The irradiance a surface at p (normal n) receives from the voxels and the sky past them, as
+// voxel GI's composite gathers it (its six cones).
+fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
+    let size = srcVoxelSize(p);
+    return clipIrradiance(sky, rp.skyScale, p, n, 0.0, size, 1.5 * size, rp.maxDistance, 16u).rgb;
+}
 "#;
 
 /// The same over a voxel volume (group 0 bindings 6-8).
@@ -49,6 +56,21 @@ fn srcHitRadiance(p: vec3f, nf: vec3f) -> vec3f {
 fn srcCone(origin: vec3f, dir: vec3f, n: vec3f, tanHalf: f32, startDist: f32, maxDist: f32, steps: u32) -> vec4f {
     return voxelConeTrace(vol, volTex, volSampler, origin, dir, tanHalf, startDist, maxDist, steps);
 }
+// The irradiance a surface at p (normal n) receives from the voxels and the sky past them, as
+// voxel GI's composite gathers it: its six cones through the anisotropic mips (bindings 40-45,
+// RT_REFLECT_ANISO), else five through the isotropic ones.
+fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
+    if ((rp.flags & RT_REFLECT_ANISO) != 0u) {
+        return voxelIrradiance(vol, volTex, volSampler, sky, rp.skyScale, p, n, 0.0, vol.voxelSize, rp.maxDistance, 32u, 1.0).rgb;
+    }
+    var e = vec3f(0.0);
+    for (var k = 0u; k < VOXEL_HEMISPHERE_CONES; k++) {
+        let cone = voxelHemisphereCone(n, k);
+        let c = voxelConeTrace(vol, volTex, volSampler, p, cone.xyz, VOXEL_HEMISPHERE_TAN, 1.5 * vol.voxelSize, rp.maxDistance, 16u);
+        e += cone.w * (c.rgb + c.a * rp.skyScale * skyRadiance(sky, cone.xyz));
+    }
+    return e;
+}
 "#;
 
 /// The alpha test's texture and sampler (group 1 bindings 3 and 4), and the default
@@ -60,17 +82,27 @@ const COMMON_WGSL: &str = include_str!("shaders/rt_reflect_common.wgsl");
 
 /// The trace's WGSL over a clipmap or a volume, with `covered` (`kansei_rt_covered`).
 pub(crate) fn trace_wgsl(clipmap: bool, covered: &str) -> String {
+    traced_wgsl(clipmap, covered, include_str!("shaders/rt_reflect_trace.wgsl"))
+}
+
+/// The glass pass's WGSL, prefixed as the trace.
+pub(crate) fn glass_wgsl(clipmap: bool, covered: &str) -> String {
+    traced_wgsl(clipmap, covered, include_str!("shaders/rt_glass.wgsl"))
+}
+
+fn traced_wgsl(clipmap: bool, covered: &str, main: &str) -> String {
     let source = if clipmap {
         format!("{}{CLIPMAP_SOURCE_WGSL}", crate::gi::CLIPMAP_WGSL)
     } else {
-        format!("{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL)
+        format!("{}{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL, include_str!("../gi/shaders/voxel_irradiance.wgsl"))
     };
     format!(
-        "{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}",
+        "{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}\n{main}",
         crate::atmosphere::SKY_LIGHTING_WGSL,
+        include_str!("../shaders/spot_light_types.wgsl"),
         super::RT_GRID_WGSL,
         RtGrid::bindings_wgsl(1, 0),
-        include_str!("shaders/rt_reflect_trace.wgsl")
+        include_str!("shaders/rt_reflect_hit.wgsl"),
     )
 }
 
@@ -141,6 +173,26 @@ impl Default for RtReflectionsOptions {
     }
 }
 
+/// Glass (`RtReflectionsEffect::set_glass`): the pixels whose material writes glass
+/// (`StandardLitOptions::glass`, or GBUFFER_OUT_WGSL's `kansei_gbuffer_out_glass`: its tint, index
+/// of refraction and roughness) show the light it reflects and the light through it, refracted at
+/// every surface of the grid's glass (`RtSurface::glass`) it crosses: true entry and exit, with
+/// total internal reflection. Other rays (diffuse GI, shadows) pass through glass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RtGlass {
+    /// The most surfaces a ray through the glass crosses or reflects off inside.
+    pub interfaces: u32,
+    /// Paths a frosted (rough) glass pixel traces a frame, averaged with the pixel's history
+    /// (reprojected by the surface); clear glass traces one.
+    pub samples: u32,
+}
+
+impl Default for RtGlass {
+    fn default() -> Self {
+        Self { interfaces: 8, samples: 4 }
+    }
+}
+
 /// The trace's counters of a recent frame (`RtReflectionsEffect::collect_stats`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RtReflectionStats {
@@ -152,6 +204,9 @@ pub struct RtReflectionStats {
     pub tests: u32,
     /// The most cells and triangles one ray visited.
     pub max_cost: u32,
+    /// Glass pixels, and the cells and triangles their rays visited.
+    pub glass_pixels: u32,
+    pub glass_cost: u32,
 }
 
 /// The WGSL `RtReflectParams` (rt_reflect_common.wgsl).
@@ -175,17 +230,25 @@ pub(crate) struct RtReflectParamsGpu {
     blend: f32,
     heat_scale: f32,
     _pad: u32,
+    view_proj: [f32; 16],
+    glass_interfaces: u32,
+    glass_samples: u32,
+    _pad2: [u32; 2],
 }
 
 enum Source {
     Clipmap { uniform: wgpu::Buffer, levels: Vec<wgpu::TextureView>, sampler: wgpu::Sampler },
-    Volume { view: wgpu::TextureView, uniform: wgpu::Buffer, sampler: wgpu::Sampler },
+    Volume { view: wgpu::TextureView, anisotropic: Option<Vec<wgpu::TextureView>>, uniform: wgpu::Buffer, sampler: wgpu::Sampler },
 }
 
 struct Targets {
     size: (u32, u32),
     trace: wgpu::TextureView,
     history: [wgpu::TextureView; 2],
+    /// the input with the glass drawn (what the reflections then composite over)
+    glassed: wgpu::TextureView,
+    /// frosted glass's history (last frame's and this frame's, by turns)
+    glass_history: [wgpu::TextureView; 2],
 }
 
 struct Gpu {
@@ -194,8 +257,13 @@ struct Gpu {
     grid_bgl: wgpu::BindGroupLayout,
     resolve_bgl: wgpu::BindGroupLayout,
     trace: wgpu::ComputePipeline,
+    glass: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
     no_sky: wgpu::Buffer,
+    /// no spot lights (a count of 0)
+    no_spots: wgpu::Buffer,
+    /// the directional and point lights (`update_lights`; rt_reflect_hit.wgsl's RtReflectLights)
+    lights: wgpu::Buffer,
     white: wgpu::TextureView,
     alpha_sampler: wgpu::Sampler,
     linear: wgpu::Sampler,
@@ -208,10 +276,14 @@ struct Gpu {
 
 /// Sharp and glossy reflections, traced through the renderer's ray tracing grid
 /// (`Renderer::enable_rt_grid`; `SceneRtGrid::handle`) on the surfaces whose material writes an
-/// F0 (GBUFFER_OUT_WGSL's `kansei_gbuffer_out_specular`), the hits lit by the voxel GI's clipmap
-/// or volume (`with_clipmap`, `with_volume`): the light leaving the surface there, the voxels as
-/// the surface cache. Rays leaving the grid's box go on as a narrow voxel cone, then the sky
-/// (`set_sky_lighting`).
+/// F0 (`StandardLitOptions::mirror`, `StandardTraced::Reflective`, or GBUFFER_OUT_WGSL's
+/// `kansei_gbuffer_out_specular`), and glass (`set_glass`). The hits are lit by the voxel GI's
+/// clipmap or volume (`with_clipmap`, `with_volume`): the light leaving the surface there, the
+/// voxels as the surface cache; with `screen_hits`, by the lit image where the camera sees the
+/// same point, and with `set_spot_lights`, the hits it doesn't see by the spot lights (shadow rays
+/// through the grid) plus the voxels' irradiance. Rays leaving the grid's box go on as a narrow
+/// voxel cone, then the sky (`set_sky_lighting`). It needs the voxel GI running whatever GI the
+/// image shows (`hit_indirect` off where that is none or screen space).
 ///
 /// It traces one pixel of each 2 x 2 (or 4 x 4) block a frame, each in turn, and accumulates them
 /// at full resolution: the frame's traced pixels upsampled by depth and normal, blended with the
@@ -236,6 +308,20 @@ pub struct RtReflectionsEffect {
     pub heat_scale: f32,
     /// Count the rays' work (`stats`), a few atomics a ray.
     pub collect_stats: bool,
+    /// Light the hits by the lit image where the camera sees the same point (sharp, with the
+    /// direct light), the voxels elsewhere; off, always the voxels.
+    pub screen_hits: bool,
+    /// The hits the camera doesn't see (with `set_spot_lights`) get the voxels' indirect light too;
+    /// off where the image shows no GI, so that what the mirror and the glass show matches it.
+    pub hit_indirect: bool,
+    /// Glass drawn before the reflections (`set_glass`).
+    glass: Option<RtGlass>,
+    /// The spot lights the hits the camera doesn't see are lit by (`set_spot_lights`).
+    spot_lights: Option<wgpu::Buffer>,
+    /// The directional and point lights they are lit by (`update_lights`): how many directional
+    /// ones, then (a, b) per light as RtReflectLight holds them, and whether they changed.
+    lights: (u32, Vec<[f32; 8]>),
+    lights_dirty: bool,
     resolution: RtTraceResolution,
     covered_wgsl: Option<String>,
     grid: RtGridHandle,
@@ -265,7 +351,8 @@ impl RtReflectionsEffect {
 
     /// Reflections lit by a voxel volume (`SceneVoxelGi::volume`).
     pub fn with_volume(volume: &VoxelVolume, grid: RtGridHandle, options: RtReflectionsOptions) -> Self {
-        Self::from_source(Source::Volume { view: volume.view().clone(), uniform: volume.uniform().clone(), sampler: volume.sampler().clone() }, grid, options)
+        let anisotropic = volume.anisotropic_views().map(|v| v.to_vec());
+        Self::from_source(Source::Volume { view: volume.view().clone(), anisotropic, uniform: volume.uniform().clone(), sampler: volume.sampler().clone() }, grid, options)
     }
 
     fn from_source(source: Source, grid: RtGridHandle, o: RtReflectionsOptions) -> Self {
@@ -282,6 +369,12 @@ impl RtReflectionsEffect {
             trace_grid: true,
             heat_scale: 1.0,
             collect_stats: false,
+            screen_hits: false,
+            hit_indirect: true,
+            glass: None,
+            spot_lights: None,
+            lights: (0, Vec::new()),
+            lights_dirty: false,
             resolution: o.resolution,
             covered_wgsl: o.covered_wgsl,
             grid,
@@ -307,6 +400,52 @@ impl RtReflectionsEffect {
     /// The texture `kansei_rt_covered` reads (`kansei_rt_alpha_texture`).
     pub fn set_alpha_texture(&mut self, view: Option<&wgpu::TextureView>) {
         self.alpha_texture = view.cloned();
+    }
+
+    /// Light the hits the camera doesn't see by these spot lights (`Renderer::spot_lights_buffer`),
+    /// shadowed by rays through the grid, plus a voxel cone along the normal, as the hybrid GI
+    /// lights its hits; None: by the voxels' radiance there (the surface cache).
+    pub fn set_spot_lights(&mut self, lights: Option<&wgpu::Buffer>) {
+        self.spot_lights = lights.cloned();
+    }
+
+    /// Light the hits the camera doesn't see by these directional, point (and area, as point)
+    /// lights too, shadowed by rays through the grid, a point light falling off as
+    /// (1 - d / radius)^2 (`Scene::lights`; call it when they change, or each frame).
+    pub fn update_lights<'a>(&mut self, lights: impl IntoIterator<Item = &'a Light>) {
+        let (mut dir, mut point) = (Vec::new(), Vec::new());
+        for light in lights {
+            match light {
+                Light::Directional(l) => {
+                    let c = l.effective_color();
+                    dir.push([l.direction.x, l.direction.y, l.direction.z, 0.0, c.x, c.y, c.z, 0.0]);
+                }
+                Light::Point(l) => {
+                    let c = l.effective_color();
+                    point.push([l.position.x, l.position.y, l.position.z, l.radius, c.x, c.y, c.z, 0.0]);
+                }
+                Light::Area(l) => {
+                    let c = l.effective_color();
+                    point.push([l.position.x, l.position.y, l.position.z, l.radius, c.x, c.y, c.z, 0.0]);
+                }
+                Light::Spot(_) => {}
+            }
+        }
+        let num_dir = dir.len() as u32;
+        dir.extend(point);
+        if (num_dir, &dir) != (self.lights.0, &self.lights.1) {
+            self.lights = (num_dir, dir);
+            self.lights_dirty = true;
+        }
+    }
+
+    /// Draw glass (or none): see `RtGlass`.
+    pub fn set_glass(&mut self, glass: Option<RtGlass>) {
+        self.glass = glass;
+    }
+
+    pub fn glass(&self) -> Option<RtGlass> {
+        self.glass
     }
 
     /// Trace at another resolution (the targets are made anew).
@@ -344,12 +483,14 @@ impl RtReflectionsEffect {
         let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
         let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
-        let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform)];
+        let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }), entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering), entry(15, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None })];
         let clipmap = matches!(self.source, Source::Clipmap { .. });
         if clipmap {
             trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
         } else {
             trace_entries.extend([entry(6, uniform), entry(7, texture(true, wgpu::TextureViewDimension::D3)), entry(8, filtering)]);
+            // the anisotropic mips (the volume itself where it has none)
+            trace_entries.extend((40..46).map(|b| entry(b, texture(true, wgpu::TextureViewDimension::D3))));
         }
         let trace_bgl = layout("RtReflections/Trace", &trace_entries);
         let mut grid_entries = RtGrid::layout_entries(0, compute).to_vec();
@@ -381,6 +522,7 @@ impl RtReflectionsEffect {
         };
         let covered = self.covered_wgsl.clone().unwrap_or_else(|| DEFAULT_COVERED_WGSL.into());
         let trace = pipeline("RtReflections/Trace", trace_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
+        let glass = pipeline("RtReflections/Glass", glass_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
         let resolve = pipeline("RtReflections/Resolve", resolve_wgsl(), &[&resolve_bgl]);
         use wgpu::util::DeviceExt;
         let white = device
@@ -408,8 +550,11 @@ impl RtReflectionsEffect {
             grid_bgl,
             resolve_bgl,
             trace,
+            glass,
             resolve,
             no_sky: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSky"), contents: &[0u8; 256], usage: wgpu::BufferUsages::UNIFORM }),
+            no_spots: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSpots"), contents: &[0u8; 256], usage: wgpu::BufferUsages::STORAGE }),
+            lights: lights_buffer(device, 0),
             white,
             alpha_sampler: sampler("RtReflections/Alpha", wgpu::AddressMode::Repeat),
             linear: sampler("RtReflections/Linear", wgpu::AddressMode::ClampToEdge),
@@ -418,6 +563,8 @@ impl RtReflectionsEffect {
             grid_group: None,
             targets: None,
         });
+        // (the lights into the new buffer)
+        self.lights_dirty = true;
     }
 }
 
@@ -467,6 +614,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
                 size: (width, height),
                 trace: texture("RtReflections/Trace", tw, th),
                 history: [texture("RtReflections/History", width, height), texture("RtReflections/History", width, height)],
+                glassed: texture("RtReflections/Glassed", width, height),
+                glass_history: [texture("RtReflections/GlassHistory", width, height), texture("RtReflections/GlassHistory", width, height)],
             });
             self.prev_view_proj = None;
         }
@@ -479,8 +628,20 @@ impl PostProcessingEffect for RtReflectionsEffect {
         let proj = camera.projection_matrix.to_glam();
         let view = camera.view_matrix.to_glam();
         let view_proj = proj * view;
+        // the directional and point lights, uploaded when they changed (into a larger buffer when
+        // they outgrew it)
+        if std::mem::take(&mut self.lights_dirty) {
+            let mut words: Vec<f32> = vec![f32::from_bits(self.lights.0), f32::from_bits(self.lights.1.len() as u32 - self.lights.0), 0.0, 0.0];
+            words.extend(self.lights.1.iter().flatten());
+            let bytes: &[u8] = bytemuck::cast_slice(&words);
+            if gpu.lights.size() < bytes.len() as u64 {
+                gpu.lights = lights_buffer(device, self.lights.1.len());
+            }
+            queue.write_buffer(&gpu.lights, 0, bytes);
+        }
+        let direct = self.spot_lights.is_some() || !self.lights.1.is_empty();
         let mut flags = 0;
-        for (on, flag) in [(self.alpha_test, 1), (self.collect_stats, 2), (self.prev_view_proj.is_some(), 4), (self.trace_grid, 8)] {
+        for (on, flag) in [(self.alpha_test, 1), (self.collect_stats, 2), (self.prev_view_proj.is_some(), 4), (self.trace_grid, 8), (self.screen_hits, 16), (direct, 32), (matches!(&self.source, Source::Volume { anisotropic: Some(_), .. }), 64), (!self.hit_indirect, 128), (self.glass.is_some(), 256)] {
             if on {
                 flags |= flag;
             }
@@ -503,6 +664,10 @@ impl PostProcessingEffect for RtReflectionsEffect {
             blend: self.temporal_blend.clamp(0.01, 1.0),
             heat_scale: self.heat_scale,
             _pad: 0,
+            view_proj: view_proj.to_cols_array(),
+            glass_interfaces: self.glass.map_or(0, |g| g.interfaces.max(1)),
+            glass_samples: self.glass.map_or(1, |g| g.samples.max(1)),
+            _pad2: [0; 2],
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let current = (self.frame % 2) as usize;
@@ -510,13 +675,17 @@ impl PostProcessingEffect for RtReflectionsEffect {
         self.prev_view_proj = Some(view_proj);
         let t = gpu.targets.as_ref().unwrap();
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.no_sky);
+        // the glass first (its pass writes `glassed`), then the reflections over it
+        let glass_on = self.glass.is_some();
+        let lit = if glass_on { &t.glassed } else { input };
         let mut entries = vec![
             wgpu::BindGroupEntry { binding: 0, resource: buf(&gpu.params) },
             wgpu::BindGroupEntry { binding: 1, resource: tex(depth) },
             wgpu::BindGroupEntry { binding: 2, resource: tex(&gbuffer.normal_view) },
             wgpu::BindGroupEntry { binding: 3, resource: tex(&gbuffer.albedo_view) },
-            wgpu::BindGroupEntry { binding: 4, resource: tex(&t.trace) },
             wgpu::BindGroupEntry { binding: 5, resource: buf(sky) },
+            wgpu::BindGroupEntry { binding: 11, resource: buf(self.spot_lights.as_ref().unwrap_or(&gpu.no_spots)) },
+            wgpu::BindGroupEntry { binding: 15, resource: buf(&gpu.lights) },
         ];
         match &self.source {
             Source::Clipmap { uniform, levels, sampler } => {
@@ -524,13 +693,24 @@ impl PostProcessingEffect for RtReflectionsEffect {
                 entries.extend(levels.iter().enumerate().map(|(k, v)| wgpu::BindGroupEntry { binding: 51 + k as u32, resource: tex(v) }));
                 entries.push(wgpu::BindGroupEntry { binding: 57, resource: wgpu::BindingResource::Sampler(sampler) });
             }
-            Source::Volume { view, uniform, sampler } => {
+            Source::Volume { view, anisotropic, uniform, sampler } => {
                 entries.push(wgpu::BindGroupEntry { binding: 6, resource: buf(uniform) });
                 entries.push(wgpu::BindGroupEntry { binding: 7, resource: tex(view) });
                 entries.push(wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(sampler) });
+                entries.extend((0..6).map(|i| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(anisotropic.as_ref().map_or(view, |a| &a[i])) }));
             }
         }
-        let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("RtReflections/Trace"), layout: &gpu.trace_bgl, entries: &entries });
+        let group = |label, out: &wgpu::TextureView, screen: &wgpu::TextureView| {
+            let mut e = entries.clone();
+            e.push(wgpu::BindGroupEntry { binding: 4, resource: tex(out) });
+            e.push(wgpu::BindGroupEntry { binding: 10, resource: tex(screen) });
+            e.push(wgpu::BindGroupEntry { binding: 12, resource: tex(&t.glass_history[1 - current]) });
+            e.push(wgpu::BindGroupEntry { binding: 13, resource: tex(&t.glass_history[current]) });
+            e.push(wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&gpu.linear) });
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout: &gpu.trace_bgl, entries: &e })
+        };
+        let trace_group = group("RtReflections/Trace", &t.trace, lit);
+        let glass_group = glass_on.then(|| group("RtReflections/Glass", &t.glassed, input));
         // the grid's group, made anew when the grid's buffers or the alpha texture change
         let (buffers, generation) = self.grid.buffers();
         if gpu.grid_group.as_ref().is_none_or(|(g, alpha, _)| *g != generation || *alpha != self.alpha_texture) {
@@ -557,7 +737,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
                 wgpu::BindGroupEntry { binding: 1, resource: tex(depth) },
                 wgpu::BindGroupEntry { binding: 2, resource: tex(&gbuffer.normal_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: tex(&gbuffer.albedo_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: tex(input) },
+                wgpu::BindGroupEntry { binding: 4, resource: tex(lit) },
                 wgpu::BindGroupEntry { binding: 5, resource: tex(&t.trace) },
                 wgpu::BindGroupEntry { binding: 6, resource: tex(&t.history[1 - current]) },
                 wgpu::BindGroupEntry { binding: 7, resource: tex(output) },
@@ -568,6 +748,14 @@ impl PostProcessingEffect for RtReflectionsEffect {
         let read_stats = self.collect_stats && !self.copied && self.mapping.is_none();
         if read_stats {
             encoder.clear_buffer(&gpu.stats, 0, None);
+        }
+        if let Some(glass_group) = &glass_group {
+            let stamp = crate::profiling::gpu_pass("Rt/Glass");
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Rt/Glass"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
+            pass.set_pipeline(&gpu.glass);
+            pass.set_bind_group(0, glass_group, &[]);
+            pass.set_bind_group(1, &gpu.grid_group.as_ref().unwrap().2, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         }
         {
             let stamp = crate::profiling::gpu_pass("Rt/Trace");
@@ -603,6 +791,11 @@ impl PostProcessingEffect for RtReflectionsEffect {
     }
 }
 
+/// Room for `n` lights after RtReflectLights' header (at least 8).
+fn lights_buffer(device: &wgpu::Device, n: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtReflections/Lights"), size: 16 + 32 * n.max(8) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+}
+
 fn tex(view: &wgpu::TextureView) -> wgpu::BindingResource<'_> {
     wgpu::BindingResource::TextureView(view)
 }
@@ -627,7 +820,7 @@ impl RtReflectionsEffect {
                 {
                     let bytes = gpu.staging.slice(..).get_mapped_range();
                     let w: &[u32] = bytemuck::cast_slice(&bytes);
-                    self.stats = Some(RtReflectionStats { rays: w[0], hits: w[1], cells: w[2], tests: w[3], max_cost: w[4] });
+                    self.stats = Some(RtReflectionStats { rays: w[0], hits: w[1], cells: w[2], tests: w[3], max_cost: w[4], glass_pixels: w[5], glass_cost: w[6] });
                 }
                 gpu.staging.unmap();
             }

@@ -246,11 +246,21 @@ pub struct RtSurface {
     /// mirrors (glass, chrome). Its uvs are then gone: only for surfaces no `kansei_rt_covered`
     /// samples by uv.
     pub smooth_normals: bool,
+    /// Glass (`RtSurface::glass`): rays pass straight through it (diffuse GI, shadow rays, any
+    /// trace without `KANSEI_RT_GLASS_HITS`); `RtReflectionsEffect`'s glass refracts at it.
+    pub glass: bool,
 }
 
 impl RtSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, alpha_layer: None, smooth_normals: false }
+        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false }
+    }
+
+    /// The surface of a glass object (the triangles `RtReflectionsEffect` refracts through, with
+    /// smooth normals) whose material is `StandardLitOptions::glass`: `tint` its albedo, for the
+    /// rays that pass through it.
+    pub fn glass(tint: [f32; 3]) -> Self {
+        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true }
     }
 
     /// See `smooth_normals`.
@@ -266,7 +276,7 @@ impl RtSurface {
     }
 
     pub(crate) fn surface_word(&self) -> u32 {
-        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8) | if self.smooth_normals { 4 } else { 0 }
+        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8) | if self.smooth_normals { 4 } else { 0 } | if self.glass { 8 } else { 0 }
     }
 
     pub(crate) fn albedo_word(&self) -> u32 {
