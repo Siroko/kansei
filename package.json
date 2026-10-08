@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc && vite build",
+    "test": "node scripts/run-tests.mjs",
     "preview": "vite preview",
     "lint": "eslint .",
     "format": "prettier --write .",
