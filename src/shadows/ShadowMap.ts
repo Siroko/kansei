@@ -7,6 +7,8 @@ import { DirectionalLight } from '../lights/DirectionalLight';
 import { PointLight } from '../lights/PointLight';
 import { AreaLight } from '../lights/AreaLight';
 import { gpuPass } from '../profiling/Profiler';
+import type { DepthBias, Material } from '../materials/Material';
+import { CAMERA_TEMPORAL_BYTES, LIGHT_UNIFORM_BYTES, MESH_TRANSFORMS_BYTES, cameraBindGroupLayoutEntries, meshBindGroupLayoutEntries, meshSlotStride } from '../renderers/SharedLayouts';
 
 export interface ShadowMapOptions {
     resolution?: number;
@@ -19,6 +21,8 @@ export interface ShadowMapOptions {
     near?: number;
     /** Far plane for perspective shadow maps (area lights). 0 = use light radius. */
     far?: number;
+    /** Depth bias of the casters' depth pipelines (`Material.getDepthPipeline`); none by default. */
+    depthBias?: DepthBias;
 }
 
 class ShadowMap {
@@ -31,12 +35,17 @@ class ShadowMap {
     private _depthTexture: GPUTexture;
     private _lightVP = new Float32Array(16);
 
-    private _pipeline: GPURenderPipeline | null = null;
+    private _depthBias: DepthBias;
     private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
-    // Shadow passes bind like the Rust engine's depth pipelines: group 0 the renderable's
-    // shadowExtraBG (empty without one), group 1 the light (its "camera"), group 2 the mesh.
-    // Light VP uniform (group 1)
+    // Casters draw through their material's depth pipeline (Material.getDepthPipeline), as the
+    // Rust engine's shadow passes do: group 0 the material's, group 1 a camera group holding the
+    // light's view and projection, group 2 the mesh.
+    private _lightCameraBuffers: GPUBuffer[];
+    private _lightCameraBG: GPUBindGroup;
+
+    // Renderables with shadowVertexCode keep their own pipelines: group 0 their shadowExtraBG
+    // (empty without one), group 1 the light's view-projection, group 2 the mesh.
     private _lightVPBuffer: GPUBuffer;
     private _lightVPBGL: GPUBindGroupLayout;
     private _lightVPBG: GPUBindGroup;
@@ -65,6 +74,7 @@ class ShadowMap {
         this._fov = options?.fov ?? 90;
         this._near = options?.near ?? 0.1;
         this._far = options?.far ?? 0;
+        this._depthBias = options?.depthBias ?? {};
 
         this._depthTexture = device.createTexture({
             label: 'ShadowMap/Depth',
@@ -94,16 +104,25 @@ class ShadowMap {
             entries: [{ binding: 0, resource: { buffer: this._lightVPBuffer } }],
         });
 
+        // View, projection, scene lights (unused) and temporal data (unused), as Camera binds them.
+        this._lightCameraBuffers = [64, 64, LIGHT_UNIFORM_BYTES, CAMERA_TEMPORAL_BYTES].map((size, i) => device.createBuffer({
+            label: `ShadowMap/LightCamera${i}`,
+            size,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        }));
+        this._lightCameraBG = device.createBindGroup({
+            label: 'ShadowMap/LightCamera BG',
+            layout: device.createBindGroupLayout({ label: 'ShadowMap/LightCamera BGL', entries: cameraBindGroupLayoutEntries() }),
+            entries: this._lightCameraBuffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+        });
+
         // Group 0 of the pipelines without a shadowExtraBGL.
         this._emptyBGL = device.createBindGroupLayout({ label: 'EmptyBGL', entries: [] });
         this._emptyBG = device.createBindGroup({ layout: this._emptyBGL, entries: [] });
 
         this._meshBGL = device.createBindGroupLayout({
             label: 'ShadowMap/Mesh BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-                { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-            ],
+            entries: meshBindGroupLayoutEntries(),
         });
     }
 
@@ -247,9 +266,9 @@ class ShadowMap {
     private _ensureMeshBuffers(objectCount: number): void {
         if (objectCount <= this._objectCapacity && this._meshBG) return;
 
-        const alignment = this._device.limits.minUniformBufferOffsetAlignment ?? 256;
-        const bufferSize = Math.max(objectCount * alignment, alignment);
-        const floatsPerSlot = alignment / 4;
+        const stride = meshSlotStride(this._device);
+        const bufferSize = Math.max(objectCount, 1) * stride;
+        const floatsPerSlot = stride / 4;
 
         this._worldMatBuf?.destroy();
         this._normalMatBuf?.destroy();
@@ -273,59 +292,11 @@ class ShadowMap {
             layout: this._meshBGL,
             entries: [
                 { binding: 0, resource: { buffer: this._normalMatBuf, size: 64 } },
-                { binding: 1, resource: { buffer: this._worldMatBuf, size: 64 } },
+                { binding: 1, resource: { buffer: this._worldMatBuf, size: MESH_TRANSFORMS_BYTES } },
             ],
         });
 
         this._objectCapacity = objectCount;
-    }
-
-    private _ensurePipeline(vertexBuffersDescriptors: Iterable<GPUVertexBufferLayout | null>): void {
-        if (this._pipeline) return;
-
-        const shaderCode = /* wgsl */`
-            @group(1) @binding(0) var<uniform> lightViewProj : mat4x4f;
-            @group(2) @binding(0) var<uniform> normalMatrix  : mat4x4f;
-            @group(2) @binding(1) var<uniform> worldMatrix   : mat4x4f;
-
-            @vertex
-            fn shadow_vs(
-                @location(0) position : vec4f,
-                @location(1) normal   : vec3f,
-                @location(2) uv       : vec2f,
-            ) -> @builtin(position) vec4f {
-                return lightViewProj * worldMatrix * position;
-            }
-        `;
-
-        const module = this._device.createShaderModule({
-            label: 'ShadowMap/Shader',
-            code: shaderCode,
-        });
-
-        const pipelineLayout = this._device.createPipelineLayout({
-            label: 'ShadowMap/PipelineLayout',
-            bindGroupLayouts: [this._emptyBGL, this._lightVPBGL, this._meshBGL],
-        });
-
-        this._pipeline = this._device.createRenderPipeline({
-            label: 'ShadowMap/Pipeline',
-            layout: pipelineLayout,
-            vertex: {
-                module,
-                entryPoint: 'shadow_vs',
-                buffers: vertexBuffersDescriptors,
-            },
-            depthStencil: {
-                format: 'depth32float',
-                depthWriteEnabled: true,
-                depthCompare: 'less',
-            },
-            primitive: {
-                topology: 'triangle-list',
-                cullMode: 'back',
-            },
-        });
     }
 
     private _getOrCreateCustomPipeline(
@@ -407,23 +378,21 @@ class ShadowMap {
             this._computeLightVP(camera, lightDir);
         }
         device.queue.writeBuffer(this._lightVPBuffer, 0, this._lightVP.buffer as ArrayBuffer);
-
-        // Ensure pipeline (lazy — needs vertex layout from first geometry)
-        if (!objects[0].geometry.initialized) {
-            objects[0].geometry.initialize(device);
-        }
-        this._ensurePipeline(objects[0].geometry.vertexBuffersDescriptors);
+        device.queue.writeBuffer(this._lightCameraBuffers[0], 0, this._lightView as Float32Array);
+        device.queue.writeBuffer(this._lightCameraBuffers[1], 0, this._lightProj as Float32Array);
 
         this._ensureMeshBuffers(objects.length);
 
-        const alignment = device.limits.minUniformBufferOffsetAlignment ?? 256;
-        const floatsPerSlot = alignment / 4;
+        const stride = meshSlotStride(device);
+        const floatsPerSlot = stride / 4;
 
         for (let i = 0; i < objects.length; i++) {
             const obj = objects[i];
             if (!obj.geometry.initialized) obj.geometry.initialize(device);
             obj.updateModelMatrix();
+            // World, then the previous world (the same: shadows have no motion), then the normal matrix.
             this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot);
+            this._worldStaging!.set(obj.worldMatrix.internalMat4, i * floatsPerSlot + 16);
             this._normalStaging!.set(obj.normalMatrix.internalMat4, i * floatsPerSlot);
         }
 
@@ -443,39 +412,57 @@ class ShadowMap {
             },
         });
 
-        pass.setBindGroup(1, this._lightVPBG);
-
         let activePipeline: GPURenderPipeline | null = null;
+        let activeLightBG: GPUBindGroup | null = null;
         let currentVertexBuffer: GPUBuffer | null = null;
         let currentIndexBuffer: GPUBuffer | null = null;
+        // Neighbours usually share a material: look its pipeline and bind group up once for them.
+        let lastMaterial: Material | null = null;
+        let lastLayouts: Iterable<GPUVertexBufferLayout | null> | null = null;
+        let lastDepthPipeline: GPURenderPipeline | null = null;
+        let lastMaterialBG: GPUBindGroup | null = null;
 
         for (let i = 0; i < objects.length; i++) {
             const obj = objects[i];
             if (!obj.castShadow) continue;
             if (!obj.geometry.initialized) continue;
 
-            // Select default or custom shadow pipeline
+            // The material's depth pipeline, or the renderable's own shadowVertexCode pipeline.
             let targetPipeline: GPURenderPipeline;
+            let lightBG: GPUBindGroup;
+            let groupZero: GPUBindGroup;
             if (obj.shadowVertexCode) {
                 targetPipeline = this._getOrCreateCustomPipeline(
                     obj.shadowVertexCode,
                     obj.geometry.vertexBuffersDescriptors,
                     obj.shadowExtraBGL,
                 );
+                lightBG = this._lightVPBG;
+                groupZero = obj.shadowExtraBG ?? this._emptyBG;
             } else {
-                targetPipeline = this._pipeline!;
+                if (obj.material !== lastMaterial || obj.geometry.vertexBuffersDescriptors !== lastLayouts) {
+                    if (obj.material !== lastMaterial) lastMaterialBG = obj.material.getBindGroup(device);
+                    lastMaterial = obj.material;
+                    lastLayouts = obj.geometry.vertexBuffersDescriptors;
+                    lastDepthPipeline = obj.material.getDepthPipeline(device, lastLayouts, 'depth32float', this._depthBias);
+                }
+                targetPipeline = lastDepthPipeline!;
+                lightBG = this._lightCameraBG;
+                groupZero = lastMaterialBG!;
             }
 
             if (targetPipeline !== activePipeline) {
                 pass.setPipeline(targetPipeline);
                 activePipeline = targetPipeline;
-                currentVertexBuffer = null;
-                currentIndexBuffer = null;
+            }
+            if (lightBG !== activeLightBG) {
+                pass.setBindGroup(1, lightBG);
+                activeLightBG = lightBG;
             }
 
-            const offset = i * alignment;
+            const offset = i * stride;
             pass.setBindGroup(2, this._meshBG!, [offset, offset]);
-            pass.setBindGroup(0, obj.shadowVertexCode && obj.shadowExtraBG ? obj.shadowExtraBG : this._emptyBG);
+            pass.setBindGroup(0, groupZero);
 
             if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                 pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);
@@ -494,6 +481,8 @@ class ShadowMap {
                     pass.setVertexBuffer(idx++, extraBuf.resource.buffer);
                 }
                 pass.drawIndexed(geo.vertexCount, geo.instanceCount, 0, 0, 0);
+            } else if (obj.geometry.indirectArgsBuffer) {
+                pass.drawIndexedIndirect(obj.geometry.indirectArgsBuffer, 0);
             } else {
                 pass.drawIndexed(obj.geometry.vertexCount);
             }
@@ -506,9 +495,9 @@ class ShadowMap {
     destroy(): void {
         this._depthTexture?.destroy();
         this._lightVPBuffer?.destroy();
+        for (const buffer of this._lightCameraBuffers) buffer.destroy();
         this._worldMatBuf?.destroy();
         this._normalMatBuf?.destroy();
-        this._pipeline = null;
         this._customPipelines.clear();
     }
 }

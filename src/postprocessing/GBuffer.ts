@@ -32,6 +32,13 @@
  *                   sample it to do screen-space refraction (e.g. the fluid surface).
  */
 class GBuffer {
+    /** Format of the scene depth (Rust `GBuffer::DEPTH_FORMAT`). */
+    static readonly DEPTH_FORMAT: GPUTextureFormat = 'depth32float';
+    /** Format of screen-space motion, written by materials with `outputsVelocity` in the velocity pass (Rust `GBuffer::VELOCITY_FORMAT`). */
+    static readonly VELOCITY_FORMAT: GPUTextureFormat = 'rg16float';
+    /** The colour target index of velocity in the velocity pass, after the four MRT targets: the shader writes it at @location(4) (Rust `GBuffer::VELOCITY_TARGET`). */
+    static readonly VELOCITY_TARGET = 4;
+
     public colorTexture!: GPUTexture;
     public depthTexture!: GPUTexture;
     public emissiveTexture!: GPUTexture;

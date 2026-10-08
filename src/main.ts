@@ -47,7 +47,7 @@ export { Compute } from "./materials/Compute";
 export { ComputeBuffer } from "./buffers/ComputeBuffer";
 export { SphereGeometry } from "./geometries/SphereGeometry";
 export { ShaderChunks } from "./materials/shaders/ShaderChunks";
-export { SHADOW_MAP_WGSL, LIGHTS_WGSL, TONEMAP_WGSL, LOCAL_EXPOSURE_WGSL } from "./materials/shaders/SharedWGSL";
+export { SHADOW_MAP_WGSL, LIGHTS_WGSL, TONEMAP_WGSL, LOCAL_EXPOSURE_WGSL, GBUFFER_OUT_WGSL } from "./materials/shaders/SharedWGSL";
 export { assemble } from "./materials/shaders/ShaderUtils";
 export { MouseVectors } from "./controls/MouseVectors";
 export { TextGeometry } from "./geometries/TextGeometry";

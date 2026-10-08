@@ -41,7 +41,10 @@ class Renderable extends Object3D {
      *  changes. */
     public dynamic: boolean = false;
 
-    /** Custom WGSL snippet for shadow vertex transform.
+    /** Kept for compatibility: shadow maps draw casters through their material's own
+     *  `vertex_main` (`Material.getDepthPipeline`, with `shadowFragmentEntry` for alpha-tested
+     *  ones), so instancing and vertex animation already cast matching shadows. When set, the
+     *  directional/area `ShadowMap` uses this snippet instead.
      *  Must declare: fn shadowWorldPos(position: vec4f, instanceIdx: u32) -> vec4f
      *  returning the world-space position. It can read `worldMatrix` (group 2, as in
      *  materials) and its own @group(0) bindings (shadowExtraBGL). */
