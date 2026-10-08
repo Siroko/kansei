@@ -52,8 +52,8 @@
     // (data=<base URL> for another copy): its terrain, splat and road, its 26 390 spruces and
     // birches and its verge, with the CC0 ground and asphalt scans (ambientCG). The trees, the
     // ground cover and the materials are the film renderer's own procedural ones, shared with the
-    // Rust example: the generators in ./outdoor-gi/*.js (ports of its tree_*.rs and cover_*.rs)
-    // and the WGSL in ./outdoor-gi/*.wgsl. Per species three LODs, culled on the GPU per view with
+    // Rust example: the generators in ./forest/*.js (ports of its tree_*.rs and cover_*.rs)
+    // and the WGSL in ./forest/*.wgsl. Per species three LODs, culled on the GPU per view with
     // dithered crossfades, the spruces' foliage as card clusters near the camera and an impostor
     // baked from LOD0 far off, their bands set each frame for the lens.
     //
@@ -116,10 +116,10 @@
     import { FrameTimer } from '../src/pacing/FrameTimer'
     import { AbBench } from '../src/profiling/AbBench'
     import { installProfileHud } from './profile-hud.js'
-    import { mipChain } from './outdoor-gi/canvas.js'
-    import * as treeTextures from './outdoor-gi/tree_textures.js'
-    import * as treeMeshes from './outdoor-gi/tree_meshes.js'
-    import * as cover from './outdoor-gi/cover.js'
+    import { mipChain } from './forest/canvas.js'
+    import * as treeTextures from './forest/tree_textures.js'
+    import * as treeMeshes from './forest/tree_meshes.js'
+    import * as cover from './forest/cover.js'
 
     // ── the Raggare intro's data, from raggare.kansei.graphics (CORS open) ────────────────────
     const base = (() => {
@@ -129,7 +129,7 @@
     // The road's scanned surfaces (textures/road/<name>_{color,nra}.ktx2), in road.wgsl's order.
     const ROAD_SURFACES = ['base', 'var', 'patch', 'edge'];
     // The materials' WGSL, shared with the Rust example.
-    const wgsl = (name) => fetch(new URL(`./outdoor-gi/${name}.wgsl`, import.meta.url)).then((r) => r.text());
+    const wgsl = (name) => fetch(new URL(`./forest/${name}.wgsl`, import.meta.url)).then((r) => r.text());
     const [WGSL, data] = await Promise.all([
       Promise.all(['ambient', 'forest', 'terrain', 'road', 'water', 'tree', 'tree_impostor', 'cover'].map(wgsl))
         .then(([ambient, forest, terrain, road, water, tree, treeImpostor, coverWgsl]) => ({ ambient, forest, terrain, road, water, tree, treeImpostor, cover: coverWgsl })),

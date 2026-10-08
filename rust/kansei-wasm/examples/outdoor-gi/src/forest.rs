@@ -1,6 +1,6 @@
 //! The Raggare intro's forest on Kansei: its terrain, road, lake, spruces and birches and ground
 //! cover, from the intro's served data (`data.rs`) and its procedural trees, cover and materials
-//! (`tree_*.rs`, `cover_*.rs`, examples/outdoor-gi/*.wgsl), lit by the sun and the sky for the GI
+//! (`tree_*.rs`, `cover_*.rs`, examples/forest/*.wgsl), lit by the sun and the sky for the GI
 //! modes to compare. The trees follow the film's layers: per species three LODs, the spruces'
 //! foliage as card clusters near the camera, and an impostor baked from LOD0 far off, their bands
 //! set each frame for the lens (`TreeLayer::update`).
@@ -28,15 +28,15 @@ use crate::data::{Heightfield, SceneData, ROAD_SURFACES};
 use crate::tree_meshes::{self, Mesh, TreeMesh, SPRUCE_EDGE_STYLE, SPRUCE_STYLES};
 use crate::{cover_meshes, cover_textures, tree_textures};
 
-// The materials' WGSL, shared with the TS page (examples/outdoor-gi/).
-const AMBIENT_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/ambient.wgsl");
-const FOREST_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/forest.wgsl");
-const TERRAIN_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/terrain.wgsl");
-const ROAD_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/road.wgsl");
-const WATER_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/water.wgsl");
-const TREE_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/tree.wgsl");
-const TREE_IMPOSTOR_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/tree_impostor.wgsl");
-const COVER_WGSL: &str = include_str!("../../../../../examples/outdoor-gi/cover.wgsl");
+// The materials' WGSL, shared with the TS page (examples/forest/).
+const AMBIENT_WGSL: &str = include_str!("../../../../../examples/forest/ambient.wgsl");
+const FOREST_WGSL: &str = include_str!("../../../../../examples/forest/forest.wgsl");
+const TERRAIN_WGSL: &str = include_str!("../../../../../examples/forest/terrain.wgsl");
+const ROAD_WGSL: &str = include_str!("../../../../../examples/forest/road.wgsl");
+const WATER_WGSL: &str = include_str!("../../../../../examples/forest/water.wgsl");
+const TREE_WGSL: &str = include_str!("../../../../../examples/forest/tree.wgsl");
+const TREE_IMPOSTOR_WGSL: &str = include_str!("../../../../../examples/forest/tree_impostor.wgsl");
+const COVER_WGSL: &str = include_str!("../../../../../examples/forest/cover.wgsl");
 
 /// The layer the trees are on besides the default one: the canopy the sky occlusion sees.
 pub const TREE_LAYER: u32 = 1 << 1;

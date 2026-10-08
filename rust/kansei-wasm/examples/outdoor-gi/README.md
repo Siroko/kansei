@@ -17,8 +17,8 @@ The scene is the film's, its renderer's own procedural trees and materials on it
   - the trees (`tree_meshes.rs`, `tree_textures.rs`, `canvas.rs`): Norway spruces in three crown
     styles and silver birches, three LODs each, and their foliage atlas and bark painted on the CPU;
   - the ground cover (`cover_meshes.rs`, `cover_textures.rs`);
-  - the materials, in `examples/outdoor-gi/*.wgsl` at the repository's root, shared with the TS
-    page (`examples/index_outdoor_gi.html`, whose `outdoor-gi/*.js` port the generators): the
+  - the materials, in `examples/forest/*.wgsl` at the repository's root, shared with the TS
+    page (`examples/index_outdoor_gi.html`, whose `forest/*.js` port the generators): the
     terrain's height-blended scans, the road's asphalts, lines, repairs and cracks, the trees and
     the cover, lit here by the sun (cascades) and the sky and written to the GBuffer and the GI's
     voxels in place of the film's dusk and headlights.

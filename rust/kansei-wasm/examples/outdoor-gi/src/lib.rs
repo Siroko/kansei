@@ -12,7 +12,7 @@
 //! The scene is the film's, loaded at start from where raggare.kansei.graphics serves it
 //! (`data.rs`): its terrain, splat and road, its 26 390 spruces and birches and its verge, with
 //! the CC0 ground and asphalt scans. The trees, the ground cover and the materials are the film
-//! renderer's own procedural ones (`tree_*.rs`, `cover_*.rs`, examples/outdoor-gi/*.wgsl, shared
+//! renderer's own procedural ones (`tree_*.rs`, `cover_*.rs`, examples/forest/*.wgsl, shared
 //! with the TS page): per species three LODs, culled on the GPU per view with dithered crossfades,
 //! the spruces' foliage as card clusters near the camera and an impostor far off (`forest.rs`).
 //! The clipmap voxelizes them through its own cull view. With `reflect=1` the road and the lake
