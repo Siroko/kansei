@@ -48,7 +48,9 @@ class CubeMapShadowMap {
     private _pipeline: GPURenderPipeline | null = null;
     private _customPipelines: Map<string, GPURenderPipeline> = new Map();
 
-    // Light VP + light position uniform (group 0, dynamic offset)
+    // Shadow passes bind like the Rust engine's depth pipelines: group 0 the renderable's
+    // shadowExtraBG (empty without one), group 1 the light (its "camera"), group 2 the mesh.
+    // Light VP + light position uniform (group 1, dynamic offset)
     // One slot per face per light, aligned to minUniformBufferOffsetAlignment
     private _lightUniformBuffer: GPUBuffer | null = null;
     private _lightUniformBGL: GPUBindGroupLayout;
@@ -56,8 +58,10 @@ class CubeMapShadowMap {
     private _lightUniformCapacity = 0; // max face slots allocated
     private _uniformAlignment: number;
 
-    // Own mesh matrix buffers (group 1, dynamic offset)
+    // Own mesh matrix buffers (group 2, dynamic offset)
     private _meshBGL: GPUBindGroupLayout;
+    private _emptyBGL: GPUBindGroupLayout;
+    private _emptyBG: GPUBindGroup;
     private _worldMatBuf: GPUBuffer | null = null;
     private _normalMatBuf: GPUBuffer | null = null;
     private _meshBG: GPUBindGroup | null = null;
@@ -103,6 +107,10 @@ class CubeMapShadowMap {
                 buffer: { type: 'uniform', hasDynamicOffset: true },
             }],
         });
+
+        // Group 0 of the pipelines without a shadowExtraBGL.
+        this._emptyBGL = device.createBindGroupLayout({ label: 'EmptyBGL', entries: [] });
+        this._emptyBG = device.createBindGroup({ layout: this._emptyBGL, entries: [] });
 
         this._meshBGL = device.createBindGroupLayout({
             label: 'CubeMapShadow/Mesh BGL',
@@ -182,9 +190,9 @@ class CubeMapShadowMap {
                 _pad          : f32,
             }
 
-            @group(0) @binding(0) var<uniform> light       : LightUniform;
-            @group(1) @binding(0) var<uniform> normalMatrix : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix  : mat4x4f;
+            @group(1) @binding(0) var<uniform> light       : LightUniform;
+            @group(2) @binding(0) var<uniform> normalMatrix : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix  : mat4x4f;
 
             struct VSOut {
                 @builtin(position) position : vec4f,
@@ -217,7 +225,7 @@ class CubeMapShadowMap {
 
         const pipelineLayout = this._device.createPipelineLayout({
             label: 'CubeMapShadow/PipelineLayout',
-            bindGroupLayouts: [this._lightUniformBGL, this._meshBGL],
+            bindGroupLayouts: [this._emptyBGL, this._lightUniformBGL, this._meshBGL],
         });
 
         this._pipeline = this._device.createRenderPipeline({
@@ -260,9 +268,9 @@ class CubeMapShadowMap {
                 _pad          : f32,
             }
 
-            @group(0) @binding(0) var<uniform> light       : LightUniform;
-            @group(1) @binding(0) var<uniform> normalMatrix : mat4x4f;
-            @group(1) @binding(1) var<uniform> worldMatrix  : mat4x4f;
+            @group(1) @binding(0) var<uniform> light       : LightUniform;
+            @group(2) @binding(0) var<uniform> normalMatrix : mat4x4f;
+            @group(2) @binding(1) var<uniform> worldMatrix  : mat4x4f;
 
             ${shadowVertexCode}
 
@@ -296,8 +304,7 @@ class CubeMapShadowMap {
             code: shaderCode,
         });
 
-        const layouts: GPUBindGroupLayout[] = [this._lightUniformBGL, this._meshBGL];
-        if (extraBGL) layouts.push(extraBGL);
+        const layouts: GPUBindGroupLayout[] = [extraBGL ?? this._emptyBGL, this._lightUniformBGL, this._meshBGL];
 
         pipeline = this._device.createRenderPipeline({
             label: 'CubeMapShadow/CustomPipeline',
@@ -437,7 +444,7 @@ class CubeMapShadowMap {
                     },
                 });
 
-                pass.setBindGroup(0, this._lightUniformBG!, [lightOffset]);
+                pass.setBindGroup(1, this._lightUniformBG!, [lightOffset]);
 
                 let activePipeline: GPURenderPipeline | null = null;
                 let currentVertexBuffer: GPUBuffer | null = null;
@@ -467,11 +474,8 @@ class CubeMapShadowMap {
                     }
 
                     const offset = i * alignment;
-                    pass.setBindGroup(1, this._meshBG!, [offset, offset]);
-
-                    if (obj.shadowExtraBG) {
-                        pass.setBindGroup(2, obj.shadowExtraBG);
-                    }
+                    pass.setBindGroup(2, this._meshBG!, [offset, offset]);
+                    pass.setBindGroup(0, obj.shadowVertexCode && obj.shadowExtraBG ? obj.shadowExtraBG : this._emptyBG);
 
                     if (obj.geometry.vertexBuffer !== currentVertexBuffer) {
                         pass.setVertexBuffer(0, obj.geometry.vertexBuffer!);

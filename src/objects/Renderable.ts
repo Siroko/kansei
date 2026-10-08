@@ -24,13 +24,14 @@ class Renderable extends Object3D {
 
     /** Custom WGSL snippet for shadow vertex transform.
      *  Must declare: fn shadowWorldPos(position: vec4f, instanceIdx: u32) -> vec4f
-     *  returning the world-space position.  May include @group(2) bindings. */
+     *  returning the world-space position. It can read `worldMatrix` (group 2, as in
+     *  materials) and its own @group(0) bindings (shadowExtraBGL). */
     public shadowVertexCode: string | null = null;
 
-    /** Bind group layout for extra resources used by shadowVertexCode (group 2). */
+    /** Bind group layout for extra resources used by shadowVertexCode (group 0). */
     public shadowExtraBGL: GPUBindGroupLayout | null = null;
 
-    /** Bind group for extra resources used by shadowVertexCode (group 2). */
+    /** Bind group for extra resources used by shadowVertexCode (group 0). */
     public shadowExtraBG: GPUBindGroup | null = null;
 
     /** Path tracer material properties. If null, defaults are derived at BVH build time. */

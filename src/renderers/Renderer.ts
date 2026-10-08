@@ -8,6 +8,7 @@ import { Scene } from "../objects/Scene";
 import { GBuffer } from "../postprocessing/GBuffer";
 import { ShadowMap } from "../shadows/ShadowMap";
 import { CubeMapShadowMap } from "../shadows/CubeMapShadowMap";
+import { BindGroupSlot, MESH_TRANSFORMS_BYTES, meshBindGroupLayoutEntries, meshSlotStride } from "./SharedLayouts";
 
 /**
  * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
@@ -106,7 +107,7 @@ class Renderer {
     public get sharedMeshBindGroup(): GPUBindGroup | null { return this._sharedMeshBG; }
     /** Layout used for the shared mesh bind group. */
     public get sharedMeshBindGroupLayout(): GPUBindGroupLayout | null { return this._sharedMeshBGLayout; }
-    /** Alignment stride for the shared matrix buffers (device minimum, typically 256). */
+    /** Bytes between two objects' slots in the shared matrix buffers (the 128-byte mesh window rounded up to the device's offset alignment, typically 256). */
     public get matrixAlignment(): number { return this._matrixAlignment; }
 
     /**
@@ -158,10 +159,12 @@ class Renderer {
     private _depthCopyBGSource: GPUTexture | null = null;
 
     // Shared matrix buffers — all objects' world and normal matrices packed into
-    // two large GPU buffers (one per type) with 256-byte aligned strides.
+    // two large GPU buffers (one per type) with 256-byte aligned strides. A world
+    // slot holds the world matrix then last frame's (KanseiMeshTransforms).
     // The renderer uploads all matrices in exactly 2 writeBuffer calls per frame
     // instead of 2×N individual calls.
-    private _matrixAlignment: number = 256;  // device.limits.minUniformBufferOffsetAlignment
+    private _matrixAlignment: number = 256;  // meshSlotStride(device)
+    private _prevWorldValid: boolean = false;
     private _worldMatricesBuf: GPUBuffer | null = null;
     private _normalMatricesBuf: GPUBuffer | null = null;
     private _worldMatricesStaging: Float32Array | null = null;
@@ -359,7 +362,7 @@ class Renderer {
     private _ensureSharedMeshResources(objectCount: number) {
         if (objectCount === this._sharedMeshObjectCount && this._sharedMeshBG !== null) return;
 
-        const alignment = this.device!.limits.minUniformBufferOffsetAlignment as number ?? 256;
+        const alignment = meshSlotStride(this.device!);
         this._matrixAlignment = alignment;
 
         const bufferSize = Math.max(objectCount * alignment, alignment); // at least one slot
@@ -382,32 +385,48 @@ class Renderer {
         // Pre-zero the staging arrays — padding bytes stay zero every frame.
         this._worldMatricesStaging = new Float32Array(objectCount * floatsPerSlot);
         this._normalMatricesStaging = new Float32Array(objectCount * floatsPerSlot);
+        this._prevWorldValid = false;
 
         // Create the layout once; all subsequent bind groups reuse it.
         if (!this._sharedMeshBGLayout) {
             this._sharedMeshBGLayout = this.device!.createBindGroupLayout({
                 label: 'SharedMesh BindGroupLayout',
-                entries: [
-                    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-                    { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } },
-                ],
+                entries: meshBindGroupLayoutEntries(),
             });
         }
 
-        // Bind each buffer's first 64 bytes; the dynamic offset shifts that
-        // window to the i-th object's slot at draw time.
+        // Bind the first slot's normal matrix and world + previous world; the
+        // dynamic offset shifts that window to the i-th object's slot at draw time.
         this._sharedMeshBG = this.device!.createBindGroup({
             label: 'SharedMesh BindGroup',
             layout: this._sharedMeshBGLayout,
             entries: [
                 { binding: 0, resource: { buffer: this._normalMatricesBuf, size: 64 } },
-                { binding: 1, resource: { buffer: this._worldMatricesBuf,  size: 64 } },
+                { binding: 1, resource: { buffer: this._worldMatricesBuf,  size: MESH_TRANSFORMS_BYTES } },
             ],
         });
 
         this._sharedMeshObjectCount = objectCount;
         this._renderBundle = null;     // force bundle rebuild with new bind group
         this._gbufferBundle = null;
+    }
+
+    /**
+     * Copies a renderable's matrices into its slot of the staging arrays: the
+     * normal matrix, and the world matrix after the one the slot held last frame
+     * (or the world matrix itself when the buffers were just allocated).
+     * Slots follow the draw order, so a re-sorted object reads another's previous world.
+     */
+    private _stageMeshSlot(base: number, renderable: Renderable) {
+        const world = this._worldMatricesStaging!;
+        if (this._prevWorldValid) {
+            world.copyWithin(base + 16, base, base + 16);
+            world.set(renderable.worldMatrix.internalMat4, base);
+        } else {
+            world.set(renderable.worldMatrix.internalMat4, base);
+            world.set(renderable.worldMatrix.internalMat4, base + 16);
+        }
+        this._normalMatricesStaging!.set(renderable.normalMatrix.internalMat4, base);
     }
 
     /**
@@ -561,14 +580,13 @@ class Renderer {
             renderable.updateModelMatrix();
             renderable.updateNormalMatrix(camera.viewMatrix);
 
-            // Copy the 16-float matrices into their aligned slots in the staging arrays.
-            // internalMat4 is the live Float32Array — no intermediate copy needed.
-            this._worldMatricesStaging!.set(renderable.worldMatrix.internalMat4,  i * floatsPerSlot);
-            this._normalMatricesStaging!.set(renderable.normalMatrix.internalMat4, i * floatsPerSlot);
+            this._stageMeshSlot(i * floatsPerSlot, renderable);
 
             // Flush any dirty material-level buffers (textures, material uniforms).
             renderable.material.getBindGroup(this.device!);
         }
+
+        this._prevWorldValid = true;
 
         // Upload ALL matrices to the GPU in exactly 2 writeBuffer calls.
         if (orderedObjects.length > 0) {
@@ -768,11 +786,11 @@ class Renderer {
             renderable.updateModelMatrix();
             renderable.updateNormalMatrix(camera.viewMatrix);
 
-            this._worldMatricesStaging!.set(renderable.worldMatrix.internalMat4,  i * floatsPerSlot);
-            this._normalMatricesStaging!.set(renderable.normalMatrix.internalMat4, i * floatsPerSlot);
+            this._stageMeshSlot(i * floatsPerSlot, renderable);
 
             renderable.material.getBindGroup(this.device!);
         }
+        this._prevWorldValid = true;
 
         if (orderedObjects.length > 0) {
             this.device!.queue.writeBuffer(this._worldMatricesBuf!,  0, this._worldMatricesStaging!.buffer as ArrayBuffer);
@@ -1072,11 +1090,11 @@ class Renderer {
         const alignment = this._matrixAlignment;
 
         // Camera bind group is the same for every object — set once.
-        encoder.setBindGroup(2, cameraBindGroup);
+        encoder.setBindGroup(BindGroupSlot.Camera, cameraBindGroup);
 
         // Shadow bind group (Group 3) — same for every object.
         if (this._shadowBG) {
-            encoder.setBindGroup(3, this._shadowBG);
+            encoder.setBindGroup(BindGroupSlot.Shadow, this._shadowBG);
         }
 
         for (let i = 0; i < orderedObjects.length; i++) {
@@ -1126,7 +1144,7 @@ class Renderer {
             // Bake the per-object dynamic offset: both bindings (normalMatrix,
             // worldMatrix) live in separate buffers but share the same stride.
             const offset = (baseObjectIndex + i) * alignment;
-            encoder.setBindGroup(1, this._sharedMeshBG!, [offset, offset]);
+            encoder.setBindGroup(BindGroupSlot.Mesh, this._sharedMeshBG!, [offset, offset]);
 
             if (renderable.geometry.isInstancedGeometry) {
                 const geo = renderable.geometry as InstancedGeometry;

@@ -74,10 +74,10 @@
       }
 
       @group(0) @binding(0) var<uniform> lightDirection    : vec3f;
-      @group(1) @binding(0) var<uniform> normalMatrix      : mat4x4f;
-      @group(1) @binding(1) var<uniform> worldMatrix       : mat4x4f;
-      @group(2) @binding(0) var<uniform> viewMatrix        : mat4x4f;
-      @group(2) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
+      @group(2) @binding(0) var<uniform> normalMatrix      : mat4x4f;
+      @group(2) @binding(1) var<uniform> worldMatrix       : mat4x4f;
+      @group(1) @binding(0) var<uniform> viewMatrix        : mat4x4f;
+      @group(1) @binding(1) var<uniform> projectionMatrix  : mat4x4f;
 
       @vertex
       fn vertex_main(
