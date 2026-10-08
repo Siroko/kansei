@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kansei — Planar Reflection</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+
+<body>
+  <script type="module">
+    // Planar reflection: the Midsommar lake shot in miniature. A still lake at dusk mirrors the far
+    // shore's treeline, a red cottage with lit windows and the sky, through a PlanarReflection
+    // (mirrored camera, oblique clip plane at the water, the water itself left out by its layer).
+    // The water material adds Fresnel, wind ripples that displace the lookup and a roughness that
+    // picks the reflection's mips. A lamp on the far bank throws a beam through the mist, and the
+    // volumetric fog is composited into the reflection too (`VolumetricFogEffect.reflectionFog`),
+    // so the lake mirrors the beam's glow.
+    // The TS counterpart of rust/kansei-wasm/examples/planar-reflection, with its URL parameters:
+    //   ripples=<strength>  wind ripples (default 0.03; 0: a mirror)
+    //   occlusion=1         the treeline occlusion-culled for the camera (the mirror culls by
+    //                       frustum only: occlusion culling in reflections is not in the TS engine
+    //                       yet); the culling stats logged every 120 frames
+    //   rough=<0..1>        the water's roughness, which picks the reflection's mip (default 0.05)
+    //   fogrefl=0           no fog in the reflection: the water fogs the reflected path with a
+    //                       flat colour instead
+    //   screen=1            the reflection from the screen (`PlanarReflection.screenSpace`)
+    //                       instead of the mirrored view
+    //   t=<seconds>         freeze the camera's pan at that time (the ripples and the fog keep moving)
+    //   profile=1           the renderer's profile in an overlay (examples/profile-hud.js)
+    //   bench=1             alternate the rendered and the screen-space reflection, comparing their
+    //                       GPU time
+    //   dpr=<ratio>         drawing-buffer pixels per CSS pixel (default: the screen's, at most 2)
+    import { Canvas, run, param, paramOr, flag } from '../src/web/index'
+    import { Material } from '../src/materials/Material'
+    import { BoxGeometry } from '../src/geometries/BoxGeometry'
+    import { PlaneGeometry } from '../src/geometries/PlaneGeometry'
+    import { SphereGeometry } from '../src/geometries/SphereGeometry'
+    import { InstancedGeometry } from '../src/geometries/InstancedGeometry'
+    import { Renderable } from '../src/objects/Renderable'
+    import { Scene } from '../src/objects/Scene'
+    import { Camera } from '../src/cameras/Camera'
+    import { Vector3 } from '../src/math/Vector3'
+    import { Vector4 } from '../src/math/Vector4'
+    import { hash01 } from '../src/math/hash01'
+    import { ComputeBuffer } from '../src/buffers/ComputeBuffer'
+    import { BufferBase } from '../src/buffers/BufferBase'
+    import { Sampler } from '../src/buffers/Sampler'
+    import { SpotLight } from '../src/lights/SpotLight'
+    import { InstanceCulling } from '../src/culling/InstanceCulling'
+    import { GBUFFER_OUT_WGSL } from '../src/materials/shaders/SharedWGSL'
+    import { PlanarReflection, PLANAR_REFLECTION_WGSL } from '../src/reflections/PlanarReflection'
+    import { PostProcessingVolume } from '../src/postprocessing/PostProcessingVolume'
+    import { FroxelGrid } from '../src/froxels/FroxelGrid'
+    import { VolumetricFogEffect } from '../src/postprocessing/effects/VolumetricFogEffect'
+    import { BloomEffect } from '../src/postprocessing/effects/BloomEffect'
+    import { ToneMapEffect, exposureFromEV100, toneMapOptionsForSurface } from '../src/postprocessing/effects/ToneMapEffect'
+    import { FrameTimer } from '../src/pacing/FrameTimer'
+    import { AbBench } from '../src/profiling/AbBench'
+    import { installProfileHud } from './profile-hud.js'
+
+    const DEG = Math.PI / 180;
+    const WATER_LAYER = 2;
+    const LAKE_LEVEL = 0;
+
+    // The dusk sky's radiance from straight up and the ground's bounce from straight down (cd/m²):
+    // 40 cd/m² from above and the west, a dark ground.
+    const SKY_UP = [22, 26, 36];
+    const SKY_DOWN = [0.4, 0.45, 0.5];
+
+    // The cottage: diffuse under the dusk sky (the hemisphere of the stock material), and its
+    // windows, a band of emission around the box's middle (|local y| < emissive.w).
+    // Prefixed with GBUFFER_OUT_WGSL.
+    const COTTAGE_WGSL = /* wgsl */`
+      struct Cottage { base_color: vec4<f32>, emissive: vec4<f32>, sky_up: vec4<f32>, sky_down: vec4<f32> };
+      @group(0) @binding(0) var<uniform> cottage: Cottage;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(0) var<uniform> normal_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      struct VOut { @builtin(position) clip: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) local_y: f32 };
+
+      @vertex
+      fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * world_matrix * vec4<f32>(position.xyz, 1.0);
+        out.normal = (normal_matrix * vec4<f32>(normal, 0.0)).xyz;
+        out.local_y = position.y;
+        return out;
+      }
+
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        let n = normalize(in.normal);
+        let sky = mix(cottage.sky_down.rgb, cottage.sky_up.rgb, n.y * 0.5 + 0.5);
+        let window = select(0.0, 1.0, abs(in.local_y) < cottage.emissive.w);
+        let emissive = cottage.emissive.rgb * window;
+        return kansei_gbuffer_out(cottage.base_color.rgb * sky + emissive, emissive, n, cottage.base_color.rgb);
+      }
+    `;
+
+    // Dusk sky dome: horizon glow toward the (set) sun in the north-west, deep blue overhead.
+    // Prefixed with GBUFFER_OUT_WGSL.
+    const SKY_WGSL = /* wgsl */`
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+      struct VOut { @builtin(position) clip: vec4<f32>, @location(0) dir: vec3<f32> };
+      @vertex
+      fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * world_matrix * position;
+        out.dir = position.xyz;
+        return out;
+      }
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        let d = normalize(in.dir);
+        let up = saturate(d.y);
+        let glow = pow(saturate(dot(d, normalize(vec3<f32>(-0.6, 0.0, -0.8))) * 0.5 + 0.5), 6.0);
+        let horizon = mix(vec3<f32>(60.0, 62.0, 70.0), vec3<f32>(240.0, 150.0, 90.0), glow);
+        let zenith = vec3<f32>(18.0, 28.0, 55.0);
+        return kansei_gbuffer_out(mix(horizon, zenith, pow(up, 0.45)), vec3<f32>(0.0), -d, vec3<f32>(0.0));
+      }
+    `;
+
+    // The lake: Fresnel mix of a dark body colour and the planar reflection, displaced by wind
+    // ripples and fogged over the reflected path. Prefixed with PLANAR_REFLECTION_WGSL and
+    // GBUFFER_OUT_WGSL.
+    const WATER_WGSL = /* wgsl */`
+      struct Water { params: vec4<f32>, fog: vec4<f32>, body: vec4<f32> };  // params: time, ripples, roughness, -
+      @group(0) @binding(0) var<uniform> water: Water;
+      @group(0) @binding(1) var reflection_tex: texture_2d<f32>;
+      @group(0) @binding(2) var reflection_sampler: sampler;
+      @group(1) @binding(0) var<uniform> view_matrix: mat4x4<f32>;
+      @group(1) @binding(1) var<uniform> projection_matrix: mat4x4<f32>;
+      @group(2) @binding(1) var<uniform> world_matrix: mat4x4<f32>;
+
+      struct VOut { @builtin(position) pixel: vec4<f32>, @location(0) world: vec3<f32>, @location(1) clip: vec4<f32> };
+
+      @vertex
+      fn vertex_main(@location(0) position: vec4<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>) -> VOut {
+        let world = world_matrix * position;
+        var out: VOut;
+        out.clip = projection_matrix * view_matrix * world;
+        out.pixel = out.clip;
+        out.world = world.xyz;
+        return out;
+      }
+
+      // gradient of a few travelling sine waves: faint wind ripples
+      fn ripple_slope(p: vec2<f32>, t: f32) -> vec2<f32> {
+        var g = vec2<f32>(0.0);
+        let dirs = array<vec2<f32>, 4>(vec2<f32>(0.8, 0.6), vec2<f32>(-0.3, 0.95), vec2<f32>(0.99, -0.14), vec2<f32>(-0.7, -0.7));
+        let freq = array<f32, 4>(1.3, 2.1, 3.7, 5.3);
+        for (var i = 0; i < 4; i++) {
+          let k = freq[i];
+          g += dirs[i] * cos(dot(dirs[i], p) * k + t * sqrt(9.81 * k)) * (0.35 / k);
+        }
+        return g;
+      }
+
+      @fragment
+      fn fragment_main(in: VOut) -> KanseiGBufferOut {
+        let up = vec3<f32>(0.0, 1.0, 0.0);
+        let slope = ripple_slope(in.world.xz, water.params.x) * water.params.y;
+        let n = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+        let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+        let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
+        let to_eye = camera_pos - in.world;
+        let v = normalize(to_eye);
+
+        let uv = kansei_screen_uv(in.clip);
+        let offset = kansei_reflection_offset(view_matrix, up, n, 0.6);
+        let r = kansei_planar_reflection(reflection_tex, reflection_sampler, uv, offset, water.params.z);
+        // fog over the part of the path beyond the water (the main fog covers camera -> water)
+        let beyond = max(r.a - length(to_eye), 0.0);
+        let t = exp(-water.fog.w * beyond);
+        let reflected = r.rgb * t + water.fog.rgb * (1.0 - t);
+
+        let fresnel = 0.02 + 0.98 * pow(1.0 - saturate(dot(n, v)), 5.0);
+        return kansei_gbuffer_out(mix(water.body.rgb, reflected, fresnel), vec3<f32>(0.0), n, vec3<f32>(0.0));
+      }
+    `;
+
+    const uniform = (values) => new ComputeBuffer({
+      type: BufferBase.BUFFER_TYPE_UNIFORM,
+      usage: BufferBase.BUFFER_USAGE_UNIFORM | BufferBase.BUFFER_USAGE_COPY_DST,
+      buffer: values instanceof Float32Array ? values : new Float32Array(values),
+    });
+
+    // A diffuse surface under the dusk sky (the stock standard material), instanced for the
+    // treeline (vec4 per instance: xyz offset, w height scale).
+    const surfaceMaterial = (label, baseColor, instanced = false) => Material.standardLit(label, {
+      baseColor,
+      roughness: 0.9,
+      skyUp: SKY_UP,
+      skyDown: SKY_DOWN,
+      instancing: instanced ? 'offsetHeight' : undefined,
+    });
+
+    // The cottage, with windows glowing at `window` (cd/m²) where |local y| < `band`.
+    function cottageMaterial(label, base, window, band) {
+      const data = [...base, 1, ...window, band, ...SKY_UP, 0, ...SKY_DOWN, 0];
+      return new Material(`${GBUFFER_OUT_WGSL}\n${COTTAGE_WGSL}`, {
+        label,
+        mrtOutputCount: 4,
+        bindings: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, value: uniform(data) }],
+      });
+    }
+
+    const canvas = Canvas.fill();
+    const renderer = await canvas.renderer({ sampleCount: 1, clearColor: new Vector4(0, 0, 0, 1) });
+
+    const scene = new Scene();
+    const sky = new Renderable(new SphereGeometry(900, 48, 24),
+      new Material(`${GBUFFER_OUT_WGSL}\n${SKY_WGSL}`, { label: 'Sky', cullMode: 'none', mrtOutputCount: 4 }));
+    sky.castShadow = false;
+    scene.add(sky);
+
+    // far shore: a bank rising out of the lake 120-400 m away, with a treeline on it
+    const bank = new Renderable(new BoxGeometry(1600, 6, 300), surfaceMaterial('Bank', [0.05, 0.06, 0.04]));
+    bank.position.set(0, 1, -270);
+    scene.add(bank);
+    const trees = [];
+    for (let i = 0; i < 1600; i++) {
+      const x = -700 + hash01(i) * 1400;
+      const z = -125 - hash01(i + 5) * 200;
+      const h = 12 + hash01(i + 11) * 14;
+      trees.push(x, 4 + h * 0.5, z, h);
+    }
+    // spruce-like silhouettes: narrow tall boxes (a stand-in; the app has real trees), culled on
+    // the GPU for the camera and, separately, for the mirrored view
+    const treeCount = trees.length / 4;
+    const treeInstances = new ComputeBuffer({
+      usage: BufferBase.BUFFER_USAGE_STORAGE | BufferBase.BUFFER_USAGE_VERTEX,
+      type: ComputeBuffer.BUFFER_TYPE_STORAGE,
+      buffer: new Float32Array(trees),
+      shaderLocation: 3,
+      offset: 0,
+      stride: 16,
+      format: 'float32x4',
+    });
+    const treeline = new Renderable(new InstancedGeometry(new BoxGeometry(2.6, 1, 2.6), treeCount, [treeInstances]),
+      surfaceMaterial('Trees', [0.03, 0.04, 0.03], true));
+    const occlusion = flag('occlusion', false);
+    treeline.instanceCulling = InstanceCulling.forVec4Instances(treeInstances, treeCount, 0.6).withOcclusion(occlusion);
+    scene.add(treeline);
+
+    // the red cottage on the shore, windows glowing at 160 cd/m² (the intro's window_glow)
+    const cottage = new Renderable(new BoxGeometry(9, 5, 6), cottageMaterial('Cottage', [0.35, 0.05, 0.03], [160, 110, 60], 0.6));
+    cottage.position.set(-18, 6.5, -128);
+    scene.add(cottage);
+    const roof = new Renderable(new BoxGeometry(9.6, 1.2, 6.6), surfaceMaterial('Roof', [0.04, 0.04, 0.04]));
+    roof.position.set(-18, 9.6, -128);
+    scene.add(roof);
+
+    // near shore under the camera, so the lake has an edge
+    const nearBank = new Renderable(new BoxGeometry(1600, 4, 60), surfaceMaterial('NearBank', [0.04, 0.05, 0.03]));
+    nearBank.position.set(0, -1.2, 44);
+    scene.add(nearBank);
+
+    // a searchlight on the far bank beside the cottage (5e7 cd), its beam rising across the lake
+    // through the mist
+    const lampPos = [-32, 11, -126];
+    const lamp = new SpotLight([0, 0, -1], [1, 0.82, 0.6], 5.0e7, 300, 3 * DEG, 7 * DEG);
+    lamp.position.set(...lampPos);
+    lamp.lookAt(new Vector3(40, 45, -50));
+    lamp.volumetricScale = 1;
+    scene.add(lamp);
+
+    renderer.setOcclusionCulling(occlusion);
+    renderer.setCullingStats(occlusion);
+    const screenSpace = flag('screen', false);
+    const ripples = paramOr('ripples', 0.03);
+    const roughness = paramOr('rough', 0.05);
+    // the fog in the reflection (fogrefl=0 leaves it out, and the water fogs the reflected path
+    // with a flat colour instead)
+    const fogInReflection = flag('fogrefl', true);
+    // time, ripples, roughness, - | fog colour, fog density | deep body colour
+    const waterFog = fogInReflection ? 0 : 0.0012;
+    const waterParams = uniform([0, ripples, roughness, 0, 45, 48, 58, waterFog, 0.2, 0.3, 0.3, 1]);
+
+    const fog = new VolumetricFogEffect({
+      froxelGrid: new FroxelGrid(renderer.gpuDevice, { near: 1, far: 800, temporal: true }),
+      baseDensity: 0.0012,
+      heightFalloff: 0.04,
+      anisotropy: 0.3,
+      ambient: [38, 40, 50],
+    });
+    fog.setSpotLights(renderer.spotLightsBuffer, renderer.spotShadowAtlas);
+
+    // The reflection: half the canvas's resolution, everything but the water, with the fog's
+    // mirrored froxels composited in unless `fogrefl=0`.
+    function lakeReflection([width, height]) {
+      const reflection = new PlanarReflection(renderer, new Vector3(0, LAKE_LEVEL, 0), new Vector3(0, 1, 0), {
+        width: Math.max(width >> 1, 1),
+        height: Math.max(height >> 1, 1),
+        layerMask: ~WATER_LAYER,
+      });
+      reflection.screenSpace = screenSpace;
+      if (fogInReflection) reflection.setFog(fog.reflectionFog(renderer.gpuDevice, reflection));
+      return reflection;
+    }
+    let reflection = lakeReflection(canvas.size);
+    const reflectionIndex = renderer.addPlanarReflection(reflection);
+
+    const waterMaterial = new Material(`${PLANAR_REFLECTION_WGSL}\n${GBUFFER_OUT_WGSL}\n${WATER_WGSL}`, {
+      label: 'Water',
+      cullMode: 'none',
+      mrtOutputCount: 4,
+      bindings: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, value: waterParams },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, value: reflection.materialTexture() },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, value: new Sampler('linear', 'linear', 'clamp-to-edge') },
+      ],
+    });
+    const lake = new Renderable(new PlaneGeometry(1600, 400), waterMaterial);
+    lake.rotation.x = -Math.PI / 2;
+    lake.position.set(0, LAKE_LEVEL, -100);
+    lake.layers = WATER_LAYER;
+    lake.castShadow = false;
+    scene.add(lake);
+
+    const tonemap = new ToneMapEffect({
+      ...toneMapOptionsForSurface(renderer.presentationFormat),
+      exposure: exposureFromEV100(6.5),
+      vignette: 0.5,
+      grain: 0.22,
+    });
+    const bloom = new BloomEffect({ threshold: 0.0, intensity: 0.04, exposure: tonemap.totalExposure() });
+    const volume = new PostProcessingVolume(renderer, [fog, bloom, tonemap]);
+
+    const camera = new Camera(28, 0.5, 2000, canvas.aspect);
+    camera.updateProjectionMatrix();
+
+    console.log(`Kansei — Planar Reflection (TS) ready: ripples ${ripples}, roughness ${roughness}${screenSpace ? ', screen-space' : ''}`);
+
+    // `bench=1`: the rendered mirror against the screen-space reflection
+    const hud = installProfileHud({
+      renderer, FrameTimer, AbBench,
+      bench: { labels: ['rendered', 'screen-space'], set: (v) => { reflection.screenSpace = v === 1; } },
+    });
+
+    const frozen = paramOr('t', NaN);
+    const target = new Vector3();
+    run(canvas, (frame) => {
+      frame.resize(renderer, camera);
+      if (frame.resized) {
+        // the reflection's target follows the canvas: a new one, wired to the fog and the water
+        const screen = reflection.screenSpace;
+        reflection = lakeReflection(frame.resized);
+        reflection.screenSpace = screen;
+        waterMaterial.setBindable(1, reflection.materialTexture());
+        renderer.setPlanarReflection(reflectionIndex, reflection);
+      }
+      const now = performance.now();
+      hud.begin(now);
+      const t = Number.isFinite(frozen) ? frozen : frame.time;
+      fog.time = frame.time;
+      waterParams.buffer[0] = frame.time;
+      waterParams.needsUpdate = true;
+
+      // low over the near shore, panning slowly along the far treeline
+      const yaw = -0.25 + 0.12 * Math.sin(t * 0.05);
+      camera.position.set(6, 2.2, 16);
+      target.set(6 + Math.sin(yaw) * 100, 3, 16 - Math.cos(yaw) * 100);
+      camera.lookAt(target);
+
+      volume.render(scene, camera);
+      hud.end(performance.now());
+      if (occlusion && camera.frame % 120 === 0) {
+        const stats = renderer.cullingStats;
+        if (stats) console.info('culling:', stats.views.map(([kind, s]) => `${kind}: ${s.drawn} of ${s.tested} drawn`).join(', '));
+      }
+    });
+  </script>
+</body>
+
+</html>

@@ -196,6 +196,10 @@ export { RtScene } from "./rt/RtScene";
 export type { RtInstance } from "./rt/RtScene";
 export { SceneRtGrid } from "./rt/SceneRtGrid";
 export type { SceneRtGridOptions, SceneRtGridStats } from "./rt/SceneRtGrid";
+export {
+    PlanarReflection, PLANAR_REFLECTION_WGSL, reflectionMatrix, obliqueNearPlane, mirroredView, screenRect, crop, flipX,
+} from "./reflections/PlanarReflection";
+export type { PlanarReflectionOptions, ReflectionFog, ScreenRect } from "./reflections/PlanarReflection";
 export { RtReflectionsEffect } from "./rt/RtReflectionsEffect";
 export type { RtReflectionsOptions, RtReflectionsView, RtReflectionStats, RtTraceResolution } from "./rt/RtReflectionsEffect";
 export { RT_GRID_WGSL, RT_OPAQUE_WGSL, rtGridBindingsWgsl } from "./rt/RtWGSL";

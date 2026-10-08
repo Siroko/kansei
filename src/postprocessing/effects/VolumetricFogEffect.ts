@@ -15,6 +15,8 @@ import { PostProcessingEffect } from '../PostProcessingEffect';
 import { assemble } from '../../materials/shaders/ShaderUtils';
 import { mat4 } from 'gl-matrix';
 import { gpuPass } from '../../profiling/Profiler';
+import { REFLECTION_FOG_PARAMS_BYTES, flipX, mirroredView } from '../../reflections/PlanarReflection';
+import type { PlanarReflection, ReflectionFog } from '../../reflections/PlanarReflection';
 import froxelCommon from '../../../rust/kansei-core/src/shaders/froxel_common.wgsl?raw';
 import fogInject from '../../../rust/kansei-core/src/shaders/volumetric_fog_inject.wgsl?raw';
 import skyLighting from '../../../rust/kansei-core/src/atmosphere/shaders/sky_lighting.wgsl?raw';
@@ -238,6 +240,22 @@ interface ShaftsGpu {
 }
 
 /**
+ * The fog as a planar reflection sees it: a second froxel grid, built from the mirrored camera
+ * with the fog below the mirror left out.
+ */
+interface ReflectionGpu {
+    grid: FroxelGrid;
+    fogParams: GPUBuffer;
+    injectBG: GPUBindGroup | null;
+    /**
+     * The volume's lookup parameters, staged here each frame and copied into the shared buffer
+     * after the volume is built, so the reflection reads parameters and volume from one frame.
+     */
+    staging: GPUBuffer;
+    shared: ReflectionFog;
+}
+
+/**
  * Froxel volumetric fog, a port of the Rust `VolumetricFogEffect` on its WGSL: per froxel, a
  * height fog (flat below `fogHeight`, from `startDistance` to the `reach()`) plus any
  * `localVolumes`, lit by the directional, point and area lights with their shadows
@@ -248,7 +266,8 @@ interface ShaftsGpu {
  * The renderer's spot lights (`setSpotLights`) scatter in their cones, in the froxels or
  * raymarched per pixel (`spotScattering`). The sky occlusion (`setSkyOcclusion`) dims the sky
  * lighting only, so it shows once the fog has a sky (`setSkyLighting`); a voxel clipmap's probes
- * (`setClipmapProbes`) replace that ambient where they reach.
+ * (`setClipmapProbes`) replace that ambient where they reach. A planar reflection can see the fog
+ * too (`reflectionFog`).
  */
 class VolumetricFogEffect extends PostProcessingEffect {
     private _device: GPUDevice | null = null;
@@ -331,6 +350,10 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _currentOutput: GPUTexture | null = null;
     private _currentAccum: GPUTexture | null = null;
 
+    // The fog as a planar reflection sees it (`reflectionFog`), and the mirror plane
+    private _reflection: ReflectionGpu | null = null;
+    private _reflectionPlane: { n: [number, number, number]; d: number } | null = null;
+
     private _startTime = performance.now();
     private _vp = mat4.create();
     private _invVP = mat4.create();
@@ -367,11 +390,53 @@ class VolumetricFogEffect extends PostProcessingEffect {
         return this.maxDistance > 0 ? Math.min(this.maxDistance, far) : far;
     }
 
-    /** Drop the temporal history (the grid's and the shafts'); call on camera cuts. */
+    /** Drop the temporal history (the grid's, the shafts' and the reflection's); call on camera cuts. */
     resetHistory(): void {
         this._froxelGrid.resetHistory();
+        this._reflection?.grid.resetHistory();
         if (this._shafts) this._shafts.prevViewProj = null;
     }
+
+    /**
+     * The fog as `reflection` sees it, for `PlanarReflection.setFog`: every frame the effect also
+     * builds a froxel volume from the camera mirrored in the reflection's plane, with the same
+     * grid, lights and media but only the fog above the plane, and the reflection composites it
+     * over what it saw. A lake then mirrors the glow of beams and lamps in the mist (the main fog
+     * already covers the camera's path to the water). It costs about one more injection, and
+     * nothing while the reflection is disabled (`PlanarReflection.enabled`) or the camera is under
+     * its plane. Call again if the plane moves. Rust: `reflection_fog`.
+     *
+     * ```ts
+     * reflection.setFog(fog.reflectionFog(renderer.gpuDevice, reflection));
+     * renderer.addPlanarReflection(reflection);
+     * ```
+     */
+    reflectionFog(device: GPUDevice, reflection: PlanarReflection): ReflectionFog {
+        this._reflectionPlane = reflection.plane();
+        if (!this._reflection) {
+            const g = this._froxelGrid;
+            const grid = new FroxelGrid(device, {
+                gridW: g.gridW, gridH: g.gridH, gridD: g.gridD, near: g.near, far: g.far, temporal: g.isTemporal, blendFactor: g.blendFactor,
+            });
+            const buffer = (label: string, size: number, usage: GPUBufferUsageFlags) => device.createBuffer({ label, size, usage });
+            this._reflection = {
+                grid,
+                fogParams: buffer('VolumetricFog/ReflectionParams', FOG_PARAMS_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
+                injectBG: null,
+                staging: buffer('VolumetricFog/ReflectionFogStaging', REFLECTION_FOG_PARAMS_BYTES, GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST),
+                shared: {
+                    volume: grid.accumTex,
+                    params: buffer('VolumetricFog/ReflectionFogParams', REFLECTION_FOG_PARAMS_BYTES, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
+                    drawn: { value: true },
+                },
+            };
+            this._injectBGDirty = true;
+        }
+        return this._reflection.shared;
+    }
+
+    /** The froxel grid the reflection fog is built in (after `reflectionFog`). */
+    get reflectionFroxelGrid(): FroxelGrid | null { return this._reflection?.grid ?? null; }
 
     /** The directional shadow map the shafts come through (`setShadowMap`). */
     get shadowMap(): ShadowMap | null { return this._shadowMap; }
@@ -597,12 +662,12 @@ class VolumetricFogEffect extends PostProcessingEffect {
     private _rebuildInjectBG(): void {
         const device = this._device!;
         const target = this._froxelGrid.scatterExtinctionTex;
-        this._injectBG = device.createBindGroup({
-            label: 'VolumetricFog/InjectBG',
+        const group = (label: string, output: GPUTexture, params: GPUBuffer) => device.createBindGroup({
+            label,
             layout: this._injectBGL!,
             entries: [
-                { binding: 0, resource: target.createView() },
-                { binding: 2, resource: { buffer: this._fogParamsBuffer! } },
+                { binding: 0, resource: output.createView() },
+                { binding: 2, resource: { buffer: params } },
                 { binding: 10, resource: { buffer: this._mediaParamsBuffer! } },
                 { binding: 11, resource: { buffer: this._volumesBuffer! } },
                 { binding: 12, resource: { buffer: this._skyLighting ?? this._noSkyLighting! } },
@@ -614,6 +679,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
                 ...this._shadows.entries(),
             ],
         });
+        this._injectBG = group('VolumetricFog/InjectBG', target, this._fogParamsBuffer!);
+        const r = this._reflection;
+        if (r) r.injectBG = group('VolumetricFog/ReflectionInjectBG', r.grid.scatterExtinctionTex, r.fogParams);
         this._injectTarget = target;
         this._injectBGDirty = false;
     }
@@ -754,6 +822,9 @@ class VolumetricFogEffect extends PostProcessingEffect {
         );
         grid.accumulate(commandEncoder);
 
+        // the same from the camera mirrored in the reflection's plane, above the plane only
+        this._renderReflectionFog(commandEncoder, camera);
+
         // ── 4. the spot lights' shafts, raymarched per pixel at half resolution ──
         const shafts = raymarchSteps > 0
             ? this._renderShafts(commandEncoder, depth, camera, width, height, raymarchSteps)
@@ -775,6 +846,51 @@ class VolumetricFogEffect extends PostProcessingEffect {
             Math.ceil(height / 8)
         );
         compositePass.end();
+    }
+
+    /**
+     * The reflection's fog (`reflectionFog`): this frame's parameters from the camera mirrored in
+     * the plane, with the fog below it clipped and the spots kept in the grid; the injection,
+     * temporal pass and accumulation into the reflection's grid while the reflection is drawn and
+     * the camera above its plane; then the lookup parameters, staged and copied after the volume.
+     */
+    private _renderReflectionFog(encoder: GPUCommandEncoder, camera: Camera): void {
+        const r = this._reflection, plane = this._reflectionPlane;
+        if (!r || !plane || !r.injectBG) return;
+        const { n, d } = plane;
+        const iv = camera.inverseViewMatrix.internalMat4;
+        // skipped whenever the reflection is not drawn (disabled, or the camera under its plane)
+        const above = n[0] * iv[12] + n[1] * iv[13] + n[2] * iv[14] + d > 0 && r.shared.drawn.value;
+        const view = mirroredView(camera.viewMatrix.internalMat4, n, d);
+        const mvp = mat4.multiply(mat4.create(), flipX(), mat4.multiply(mat4.create(), camera.projectionMatrix.internalMat4, view));
+        const minv = mat4.invert(mat4.create(), mvp);
+        const mcam = mat4.invert(mat4.create(), view);
+        const mirrored = this._fogParams.slice(0);
+        const f32 = new Float32Array(mirrored);
+        f32.set(minv, 0);
+        f32.set([mcam[12], mcam[13], mcam[14]], 16);
+        new Uint32Array(mirrored)[43] = 0; // skipSpots: the reflection keeps the spots in its grid
+        f32.set([n[0], n[1], n[2], d], 44); // clipPlane: only the fog above the mirror
+        const device = this._device!;
+        device.queue.writeBuffer(r.fogParams, 0, mirrored);
+        const grid = r.grid;
+        if (above) {
+            const pass = encoder.beginComputePass({ label: 'VolumetricFog/ReflectionInject', timestampWrites: gpuPass('VolumetricFog/ReflectionInject') });
+            pass.setPipeline(this._injectPipeline!);
+            pass.setBindGroup(0, r.injectBG);
+            pass.dispatchWorkgroups(Math.ceil(grid.gridW / 4), Math.ceil(grid.gridH / 4), Math.ceil(grid.gridD / 4));
+            pass.end();
+            grid.temporalBlend(encoder, minv as Float32Array, mvp as Float32Array, camera.near, camera.far);
+            grid.accumulate(encoder);
+        }
+        // ReflectionFogParams: viewProj, gridNear, gridFar, gridD, enabled
+        const lookup = new ArrayBuffer(REFLECTION_FOG_PARAMS_BYTES);
+        const l32 = new Float32Array(lookup);
+        l32.set(mvp, 0);
+        l32.set([grid.near, grid.far, grid.gridD], 16);
+        new Uint32Array(lookup)[19] = above ? 1 : 0;
+        device.queue.writeBuffer(r.staging, 0, lookup);
+        encoder.copyBufferToBuffer(r.staging, 0, r.shared.params, 0, REFLECTION_FOG_PARAMS_BYTES);
     }
 
     /**
@@ -908,6 +1024,12 @@ class VolumetricFogEffect extends PostProcessingEffect {
         this._shafts = null;
         this._currentShafts = null;
         this._shadows.destroy();
+        const r = this._reflection;
+        if (r) {
+            r.grid.destroy();
+            for (const b of [r.fogParams, r.staging, r.shared.params]) b.destroy();
+        }
+        this._reflection = null;
         this._fogParamsBuffer = null;
         this._compositeParamsBuffer = null;
         this._injectPipeline = null;

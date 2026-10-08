@@ -29,9 +29,10 @@ export function emptyCullStats(): CullStats {
  * (`Renderer.enableShadows`), a cascade of the sun's shadows by index
  * (`Renderer.enableCascadedShadows`), the sky occlusion's top-down view
  * (`Renderer.enableSkyOcclusion`), a layer of the spot shadow atlas
- * (`Renderer.enableSpotShadows`), or the ray tracing grid's box (`Renderer.enableRtGrid`).
+ * (`Renderer.enableSpotShadows`), the ray tracing grid's box (`Renderer.enableRtGrid`), or a
+ * planar reflection by index (`Renderer.addPlanarReflection`).
  */
-export type CullViewKind = 'camera' | 'shadow' | `cascade${number}` | 'skyOcclusion' | 'spot' | `voxelGi${number}` | 'rtGrid';
+export type CullViewKind = 'camera' | 'shadow' | `cascade${number}` | 'skyOcclusion' | 'spot' | `voxelGi${number}` | 'rtGrid' | `reflection${number}`;
 
 /** Instance culling statistics of a recent frame, per view. */
 export class CullingStats {
