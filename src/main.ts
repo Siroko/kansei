@@ -47,7 +47,7 @@ export { Compute } from "./materials/Compute";
 export { ComputeBuffer } from "./buffers/ComputeBuffer";
 export { SphereGeometry } from "./geometries/SphereGeometry";
 export { ShaderChunks } from "./materials/shaders/ShaderChunks";
-export { SHADOW_MAP_WGSL, LIGHTS_WGSL, TONEMAP_WGSL, LOCAL_EXPOSURE_WGSL, GBUFFER_OUT_WGSL, MOTION_VECTORS_WGSL, SPOT_LIGHT_TYPES_WGSL, SPOT_LIGHTS_WGSL, CASCADED_SHADOWS_WGSL, BASIC_LIT_WGSL, BASIC_INSTANCED_WGSL, PARTICLE_BILLBOARD_WGSL } from "./materials/shaders/SharedWGSL";
+export { SHADOW_MAP_WGSL, LIGHTS_WGSL, TONEMAP_WGSL, TAA_RESOLVE_WGSL, LOCAL_EXPOSURE_WGSL, GBUFFER_OUT_WGSL, MOTION_VECTORS_WGSL, SPOT_LIGHT_TYPES_WGSL, SPOT_LIGHTS_WGSL, CASCADED_SHADOWS_WGSL, BASIC_LIT_WGSL, BASIC_INSTANCED_WGSL, PARTICLE_BILLBOARD_WGSL } from "./materials/shaders/SharedWGSL";
 export { INSTANCE_PLACEMENT_WGSL } from "./materials/Stock";
 export type { StandardLitOptions, StandardInstancing, GradientSkyOptions } from "./materials/StandardLit";
 export { assemble } from "./materials/shaders/ShaderUtils";
@@ -60,7 +60,8 @@ export type { ArFont, FontImage, FontGlyph, FontVariant, FontMetrics, FontKernPa
 export { Float } from "./math/Float";
 export { GBuffer } from "./postprocessing/GBuffer";
 export { PostProcessingEffect } from "./postprocessing/PostProcessingEffect";
-export { PostProcessingVolume } from "./postprocessing/PostProcessingVolume";
+export { PostProcessingVolume, halton, jitterPhases } from "./postprocessing/PostProcessingVolume";
+export type { PostProcessingVolumeOptions } from "./postprocessing/PostProcessingVolume";
 export { SSAOEffect } from "./postprocessing/effects/SSAOEffect";
 export { DepthOfFieldEffect } from "./postprocessing/effects/DepthOfFieldEffect";
 export { CinematicDepthOfFieldEffect, CameraLens, DofDebugView } from "./postprocessing/effects/CinematicDepthOfFieldEffect";
@@ -146,6 +147,8 @@ export { HeightFogEffect, heightFogLayerFromUnreal, heightFogOpticalDepth } from
 export type { HeightFogLayer } from "./postprocessing/effects/HeightFogEffect";
 export { VolumetricCloudsEffect, CloudQuality, defaultCloudLayer, defaultVolumetricCloudsOptions } from "./postprocessing/effects/VolumetricCloudsEffect";
 export type { CloudLayer, VolumetricCloudsOptions } from "./postprocessing/effects/VolumetricCloudsEffect";
+export { TemporalAAEffect, defaultTemporalAAOptions } from "./postprocessing/effects/TemporalAAEffect";
+export type { TemporalAAOptions } from "./postprocessing/effects/TemporalAAEffect";
 export { hash01 } from "./math/hash01";
 export { DebugBoxes, segment, DEBUG_BOXES_WGSL } from "./debug/DebugBoxes";
 export { Canvas, Frame, run, Keys, Gamepad, deadZone, now, param, paramOr, flag, isPhone, setText, checkbox, thousands, fetchBytes } from "./web";

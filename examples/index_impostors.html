@@ -458,7 +458,7 @@
     scene.add(lake);
 
     const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(11) });
-    const volume = new PostProcessingVolume(renderer, [tonemap]);
+    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
 
     const camera = new Camera(45, 0.3, 4000, canvas.aspect);
 

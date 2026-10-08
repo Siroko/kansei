@@ -273,7 +273,7 @@
     }
 
     const tonemap = new ToneMapEffect({ ...toneMapOptionsForSurface(renderer.presentationFormat), exposure: exposureFromEV100(11) });
-    const volume = new PostProcessingVolume(renderer, [tonemap]);
+    const volume = new PostProcessingVolume(renderer, [tonemap], { msaaSampleCount: 4 });
 
     const camera = new Camera(50, 0.3, 3000, canvas.aspect);
 

@@ -418,7 +418,7 @@
     // (the reflections' hits are lit by the voxels)
     const needsVoxels = () => config.gi !== 'off' || needsSdf() || reflect;
 
-    const volume = new PostProcessingVolume(renderer, []);
+    const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 });
     let enabledVoxels = null;
     let textured = true;
     let reflections = null;

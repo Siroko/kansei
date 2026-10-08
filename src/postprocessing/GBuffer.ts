@@ -30,6 +30,13 @@
  *                   A copy of colorTexture taken AFTER opaque objects are drawn but
  *                   BEFORE transmissive objects. Transmission post-processing effects
  *                   sample it to do screen-space refraction (e.g. the fluid surface).
+ *
+ * velocityTexture   rg16float    RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC
+ *                   Screen-space motion (uv, current minus previous) of the opaque materials
+ *                   with `outputsVelocity`, drawn by the renderer's velocity pass after the
+ *                   GBuffer pass; `NO_VELOCITY` elsewhere (TAA and motion blur reproject those
+ *                   pixels by depth). Single-sample whatever `msaaSampleCount` is: the pass
+ *                   depth-tests against `depthTexture`.
  */
 class GBuffer {
     /** Format of the scene depth (Rust `GBuffer::DEPTH_FORMAT`). */
@@ -38,6 +45,8 @@ class GBuffer {
     static readonly VELOCITY_FORMAT: GPUTextureFormat = 'rg16float';
     /** The colour target index of velocity in the velocity pass, after the four MRT targets: the shader writes it at @location(4) (Rust `GBuffer::VELOCITY_TARGET`). */
     static readonly VELOCITY_TARGET = 4;
+    /** What the velocity texture is cleared to: no motion vector drawn here (an impossible velocity, far outside the screen; Rust `GBuffer::NO_VELOCITY`). */
+    static readonly NO_VELOCITY = 1.0e4;
 
     public colorTexture!: GPUTexture;
     public depthTexture!: GPUTexture;
@@ -50,6 +59,7 @@ class GBuffer {
     public normalMSAATexture: GPUTexture | null = null;
     public albedoMSAATexture: GPUTexture | null = null;
     public backgroundTexture!: GPUTexture;
+    public velocityTexture!: GPUTexture;
     public outputTexture!: GPUTexture;
     public pingPongTexture!: GPUTexture;
     public width: number;
@@ -181,6 +191,13 @@ class GBuffer {
                 GPUTextureUsage.COPY_DST,
         });
 
+        this.velocityTexture = this.device.createTexture({
+            label: 'GBuffer/Velocity',
+            size: [width, height],
+            format: GBuffer.VELOCITY_FORMAT,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+        });
+
         const effectUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
 
         this.outputTexture = this.device.createTexture({
@@ -216,6 +233,7 @@ class GBuffer {
         this.depthMSAATexture?.destroy();
         this.depthMSAATexture = null;
         this.backgroundTexture?.destroy();
+        this.velocityTexture?.destroy();
         this.outputTexture?.destroy();
         this.pingPongTexture?.destroy();
     }

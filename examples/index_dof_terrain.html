@@ -246,7 +246,7 @@
     const effects = [ssaoEffect];
     if (DOF_MODE === 'cinematic') effects.push(cinematicDof);
     if (DOF_MODE === 'simple') effects.push(simpleDof);
-    const volume = new PostProcessingVolume(renderer, effects);
+    const volume = new PostProcessingVolume(renderer, effects, { msaaSampleCount: 4 });
 
     // ── Controls ──────────────────────────────────────────────────────────────
     const pane = new Pane({ title: DOF_MODE === 'simple' ? 'Depth of field (simple)' : 'Depth of field' });

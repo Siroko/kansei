@@ -361,7 +361,7 @@
     });
     tonemap.isActive = () => pathTracerEffect.reference;
 
-    const volume = new PostProcessingVolume(renderer, [pathTracerEffect, tonemap]);
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect, tonemap], { msaaSampleCount: 4 });
 
     // ── Tweakpane ─────────────────────────────────────────────────────────
     const pane = new Pane({ title: 'GI Controls' });

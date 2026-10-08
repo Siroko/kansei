@@ -175,16 +175,40 @@ class Renderer {
     private width: number = 320;
     private height: number = 240;
     private clearColor: Vector4 = new Vector4(0, 0, 0, 0);
+    private _renderScale: number = 1;
 
     // ── Public read-only accessors ──────────────────────────────────────────
     /** The initialised GPU device. Undefined before initialize() resolves. */
     public get gpuDevice(): GPUDevice { return this.device!; }
     /** Canvas colour format negotiated with the platform. */
     public get presentationFormat(): GPUTextureFormat { return this._presentationFormat!; }
-    /** Render width in physical pixels (includes devicePixelRatio). */
+    /** Canvas (display) width in physical pixels (includes devicePixelRatio). */
     public get renderWidth(): number { return this.width; }
-    /** Render height in physical pixels (includes devicePixelRatio). */
+    /** Canvas (display) height in physical pixels (includes devicePixelRatio). */
     public get renderHeight(): number { return this.height; }
+
+    /**
+     * Render the scene at `scale` times the canvas size (clamped to 0.25..1) through a
+     * `PostProcessingVolume` (Rust `set_render_scale`). The GBuffer and every scene pass run at
+     * `renderSize`; the chain's upscaler (`TemporalAAEffect`) reconstructs the canvas size from
+     * the jittered frames, and the effects after it run at the canvas size. Without an upscaler
+     * in the chain the blit stretches the image to the canvas. `render()` ignores it.
+     */
+    public setRenderScale(scale: number): void {
+        this._renderScale = Number.isFinite(scale) ? Math.min(Math.max(scale, 0.25), 1) : 1;
+    }
+
+    /** See `setRenderScale`. */
+    public get renderScale(): number { return this._renderScale; }
+
+    /**
+     * The size a `PostProcessingVolume` renders the scene at: the canvas size times the render
+     * scale, rounded, at least 1 x 1.
+     */
+    public get renderSize(): [number, number] {
+        const scaled = (n: number) => Math.max(Math.round(n * this._renderScale), 1);
+        return [scaled(this.width), scaled(this.height)];
+    }
     /** The shared per-object mesh bind group (normal + world matrices, dynamic offsets). */
     public get sharedMeshBindGroup(): GPUBindGroup | null { return this._sharedMeshBG; }
     /** Layout used for the shared mesh bind group. */
@@ -1182,8 +1206,9 @@ class Renderer {
      *
      * This is a drop-in replacement for render() when a PostProcessingVolume is in use.
      * It performs the same three-phase matrix-upload (then shadow views) / bundle-record / execute loop but
-     * targets the GBuffer's rgba16float colour texture and depth32float depth texture at
-     * sampleCount=1 (no MSAA — post-processing handles aliasing via FXAA etc.).
+     * targets the GBuffer's four MRT targets and depth32float depth at the GBuffer's sample
+     * count (1 unless the volume asked for MSAA; temporal AA handles aliasing then), then draws
+     * the velocity pass into `GBuffer.velocityTexture`.
      *
      * It does not end the camera's frame: `PostProcessingVolume.render` calls `camera.endFrame()`
      * after its effects, which may read this frame's and last frame's view; call it yourself when
@@ -1221,6 +1246,9 @@ class Renderer {
         this._updateRenderables(stack, camera, (renderable) => {
             // Ensure the material has a pipeline compiled for the GBuffer MRT config.
             this._pipelineFor(renderable, targets);
+            if (renderable.material.outputsVelocity && !renderable.material.transparent) {
+                renderable.material.getVelocityPipeline(this.device!, renderable.geometry.vertexBuffersDescriptors);
+            }
             // Mark initialized to skip initialize() which would build a
             // canvas-format pipeline that fails for shaders with @location(1).
             renderable.material.initialized = true;
@@ -1411,6 +1439,10 @@ class Renderer {
             depthCopyPass.draw(3);
             depthCopyPass.end();
         }
+
+        // Motion vectors of the materials that write them, against the GBuffer depth; the rest
+        // of the velocity texture keeps NO_VELOCITY.
+        this._drawVelocity(commandEncoder, stack, cameraBindGroup, gbuffer);
         t?.end();
 
         t = cpuScope('scene/submit');
@@ -1419,6 +1451,44 @@ class Renderer {
         this._endCulledFrame(camera);
         t?.end();
         sceneScope?.end();
+    }
+
+    /**
+     * The velocity pass (Rust `draw_velocity`): clears the GBuffer's velocity texture to
+     * `GBuffer.NO_VELOCITY`, then redraws the visible non-transparent renderables whose material
+     * has `outputsVelocity` with its velocity pipeline (the same shader, only @location(4) kept),
+     * depth-tested against the GBuffer's single-sample depth. Drawn live, at their scene slots.
+     */
+    private _drawVelocity(encoder: GPUCommandEncoder, stack: Scene, cameraBindGroup: GPUBindGroup, gbuffer: GBuffer): void {
+        const noVelocity = GBuffer.NO_VELOCITY;
+        const colorAttachments: (GPURenderPassColorAttachment | null)[] = new Array(GBuffer.VELOCITY_TARGET).fill(null);
+        colorAttachments.push({
+            view: gbuffer.velocityTexture.createView(),
+            clearValue: { r: noVelocity, g: noVelocity, b: 0, a: 0 },
+            loadOp: 'clear',
+            storeOp: 'store',
+        });
+        const pass = encoder.beginRenderPass({
+            label: 'Renderer/VelocityPass',
+            colorAttachments,
+            depthStencilAttachment: {
+                view: gbuffer.depthTexture.createView(),
+                depthLoadOp: 'load',
+                depthStoreOp: 'store',
+            },
+            timestampWrites: gpuPass('Renderer/VelocityPass'),
+        });
+        pass.setBindGroup(BindGroupSlot.Camera, cameraBindGroup);
+        if (this._shadowBG) pass.setBindGroup(BindGroupSlot.Shadow, this._shadowBG);
+        const state: DrawState = { pipeline: null, materialBindGroup: null, indexBuffer: null, vertexBuffer: null };
+        for (const set of [stack.opaque, stack.transmissive]) {
+            for (const renderable of set) {
+                if (!renderable.material.outputsVelocity || !renderable.geometry.initialized) continue;
+                const pipeline = renderable.material.getVelocityPipeline(this.device!, renderable.geometry.vertexBuffersDescriptors);
+                this._encodeDraw(pass, renderable, stack.slotOf(renderable), null, state, pipeline);
+            }
+        }
+        pass.end();
     }
 
     /**
@@ -1888,18 +1958,20 @@ class Renderer {
 
     /**
      * Encodes the draw of `renderable` with its matrices at `slot`, setting only the state that
-     * differs from `state`. Returns false when it cannot be drawn yet.
+     * differs from `state`: with its material's pipeline for `targets`, or with `pipeline`.
+     * Returns false when it cannot be drawn yet.
      */
     private _encodeDraw(
         encoder: GPURenderPassEncoder | GPURenderBundleEncoder,
         renderable: Renderable,
         slot: number,
-        targets: PassTargets,
+        targets: PassTargets | null,
         state: DrawState,
+        pipeline?: GPURenderPipeline,
     ): boolean {
         const geometry = renderable.geometry;
         if (!geometry.initialized) return false;
-        const pipeline = this._pipelineFor(renderable, targets);
+        pipeline ??= this._pipelineFor(renderable, targets!);
 
         if (pipeline !== state.pipeline) {
             encoder.setPipeline(pipeline);

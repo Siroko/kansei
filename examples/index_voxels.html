@@ -309,7 +309,7 @@
       voxelResolution: 128,
     });
 
-    const volume = new PostProcessingVolume(renderer, [pathTracerEffect]);
+    const volume = new PostProcessingVolume(renderer, [pathTracerEffect], { msaaSampleCount: 4 });
 
     // ── Mode management ──────────────────────────────────────────────────
     const MODES = {

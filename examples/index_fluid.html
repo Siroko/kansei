@@ -265,7 +265,7 @@ fn fragment_main(v: VOut) -> FragOut {
         focusRange: 37,
         maxBlur: 7,
       });
-      const volume = new PostProcessingVolume(renderer, [fluidSurface, dofEffect]);
+      const volume = new PostProcessingVolume(renderer, [fluidSurface, dofEffect], { msaaSampleCount: 4 });
 
       // ── Render mode switcher ──
       // 'mesh'      — GPU-built marching cubes mesh rendered as a standard Renderable

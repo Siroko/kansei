@@ -112,7 +112,7 @@
     scene.add(redBox);
     scene.add(blueBox);
 
-    const volume = new PostProcessingVolume(renderer, []);
+    const volume = new PostProcessingVolume(renderer, [], { msaaSampleCount: 4 });
 
     // The boxes at orbit angle `a`: the red one is in front for a in (0, π).
     const place = (a) => {

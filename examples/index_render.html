@@ -107,7 +107,7 @@
         focusRange: 5,
         maxBlur: 16
       }),
-    ]);
+    ], { msaaSampleCount: 4 });
 
     // Flowmap-style nested trig: sin(cos(sin(cos(...)))) seeded per-cube
     function flowOffset(t, seed1, seed2, seed3) {
