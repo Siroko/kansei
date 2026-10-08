@@ -2,6 +2,7 @@ import type { Scene } from '../objects/Scene';
 import type { InstancedGeometry } from '../geometries/InstancedGeometry';
 import type { Renderable } from '../objects/Renderable';
 import type { ShadowMap } from '../shadows/ShadowMap';
+import type { CascadedShadowSource } from '../shadows/ComputeShadows';
 import type { CubeMapShadowMap } from '../shadows/CubeMapShadowMap';
 import { gradientSkyLighting } from './ParticleConeShading';
 import { JumpFloodSdf } from './JumpFloodSdf';
@@ -191,15 +192,16 @@ export class SceneVoxelGi {
      * Record the frame's voxel GI (the renderer's, after the shadow maps and before the GBuffer):
      * voxelize the visible GI renderables of `scene` (prepared this frame) with their matrices at
      * `meshOffset` of `meshBindGroup`, update the distance field, light the voxels through
-     * `shadowMap` (the directional map materials sample, or null) and `pointShadows`, rebuild the
-     * mips, then update the probes around `eye` (the camera's position).
+     * `shadowMap` (the directional map materials sample, a cascaded map's widest cascade, or
+     * null) and `pointShadows`, rebuild the mips, then update the probes around `eye` (the
+     * camera's position).
      */
     public encode(
         encoder: GPUCommandEncoder,
         scene: Scene,
         meshBindGroup: GPUBindGroup,
         meshOffset: (renderable: Renderable) => number,
-        shadowMap: ShadowMap | null,
+        shadowMap: ShadowMap | CascadedShadowSource | null,
         pointShadows: CubeMapShadowMap | null,
         eye: Vec3 | null,
     ): void {

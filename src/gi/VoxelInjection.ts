@@ -1,4 +1,4 @@
-import { ComputeShadows } from '../shadows/ComputeShadows';
+import { ComputeShadows, CascadedShadowSource } from '../shadows/ComputeShadows';
 import type { ShadowMap } from '../shadows/ShadowMap';
 import type { CubeMapShadowMap } from '../shadows/CubeMapShadowMap';
 import type { DirectionalLight } from '../lights/DirectionalLight';
@@ -99,7 +99,7 @@ export class VoxelInjection {
     private boundDynamic = false;
     /** The distance field `group` binds. */
     private boundSdf: JumpFloodSdf | null = null;
-    private shadowMap: ShadowMap | null = null;
+    private shadowMap: ShadowMap | CascadedShadowSource | null = null;
     private pointShadows: CubeMapShadowMap | null = null;
 
     constructor(private readonly device: GPUDevice, private readonly volume: VoxelVolume, private sky: GPUBuffer) {
@@ -148,10 +148,12 @@ export class VoxelInjection {
      * Read the renderer's shadow maps: the directional map materials sample (null when shadows
      * are off) and the point lights' cube map. Only a change rebinds.
      */
-    public syncShadowMaps(shadowMap: ShadowMap | null, pointShadows: CubeMapShadowMap | null): void {
+    public syncShadowMaps(shadowMap: ShadowMap | CascadedShadowSource | null, pointShadows: CubeMapShadowMap | null): void {
         if (shadowMap !== this.shadowMap) {
             this.shadowMap = shadowMap;
-            this.shadows.setShadowMap(shadowMap);
+            // a cascaded map lights the voxels through its widest cascade
+            if (shadowMap && 'farView' in shadowMap) this.shadows.setCascadedShadowMap(shadowMap);
+            else this.shadows.setShadowMap(shadowMap);
         }
         if (pointShadows !== this.pointShadows) {
             this.pointShadows = pointShadows;
