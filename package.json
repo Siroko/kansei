@@ -42,8 +42,12 @@
     "bundle-examples": "npm run build && npm run copy-examples && npm run update-imports && npm run copy-site && npm run copy-wasm-examples && npm run check-no-packs",
     "prepack": "npm run build"
   },
-  "engines": {
-    "node": "24.x"
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "24.x",
+      "onFail": "warn"
+    }
   },
   "peerDependencies": {
     "@webgpu/types": "^0.1.48"
