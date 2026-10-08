@@ -4,8 +4,9 @@
 // A rendered frame is a call to getCurrentTexture (each page calls it once a frame, whichever
 // engine draws it), so refreshes a frame loop skips are not frames. Over the last two seconds
 // it shows the frame rate, the median and p95 interval between frames, the share of intervals
-// that span 1, 2, 3 and 4 or more display refreshes (?hz=, 120 by default), and the sim steps
-// each frame ran (from the page's `steps` callback, read when the frame starts drawing).
+// that span 1, 2, 3 and 4 or more display refreshes (?hz=, 120 by default), the sim steps
+// each frame ran (from the page's `steps` callback, read when the frame starts drawing), and how
+// often a frame's interval spans another number of refreshes than the one before.
 
 export function installFrameHud({ steps = () => NaN } = {}) {
   const hz = Number(new URLSearchParams(location.search).get('hz')) || 120;
@@ -26,6 +27,11 @@ export function installFrameHud({ steps = () => NaN } = {}) {
     const at = (p) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : NaN);
     const refreshes = [0, 0, 0, 0];
     for (const v of intervals) refreshes[Math.min(4, Math.max(1, Math.round(v / refresh))) - 1]++;
+    // the share of frames whose interval spans another number of refreshes than the one before
+    let changes = 0;
+    for (let i = 1; i < intervals.length; i++) {
+      if (Math.round(intervals[i] / refresh) !== Math.round(intervals[i - 1] / refresh)) changes++;
+    }
     const stepCounts = {};
     for (const [, s] of frames) stepCounts[s] = (stepCounts[s] || 0) + 1;
     const span = frames.length > 1 ? (frames[frames.length - 1][0] - frames[0][0]) / 1000 : 0;
@@ -34,6 +40,7 @@ export function installFrameHud({ steps = () => NaN } = {}) {
       medianMs: at(0.5),
       p95Ms: at(0.95),
       refreshShare: refreshes.map((n) => (intervals.length ? n / intervals.length : 0)),
+      changeRate: intervals.length > 1 ? changes / (intervals.length - 1) : 0,
       steps: frames.length ? frames[frames.length - 1][1] : NaN,
       stepCounts,
     };
@@ -49,7 +56,7 @@ export function installFrameHud({ steps = () => NaN } = {}) {
     const stepShare = Object.entries(s.stepCounts).map(([k, n]) => `${k}:${n}`).join(' ');
     box.textContent = `${s.fps.toFixed(1)} fps  (last 2 s, ${hz} Hz)\n`
       + `interval median ${s.medianMs.toFixed(1)} ms  p95 ${s.p95Ms.toFixed(1)} ms\n`
-      + `1 / 2 / 3 / 4+ refreshes  ${pct}\n`
+      + `1 / 2 / 3 / 4+ refreshes  ${pct}   cadence changes ${Math.round(100 * s.changeRate)}%\n`
       + `sim steps this frame ${s.steps}   (frames by steps ${stepShare})`;
   }, 250);
   window.frameHud = { stats };

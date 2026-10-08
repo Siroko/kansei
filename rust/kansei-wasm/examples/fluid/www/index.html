@@ -127,8 +127,14 @@
         planet.addBinding(pl, 'cz', { min: -20, max: 20, step: 0.5, label: 'center Z' }).on('change', syncPlanet);
 
         const bounds = pane.addFolder({ title: 'Bounds', expanded: false });
-        const b = { minX: -25, minY: -8, minZ: -8, maxX: 25, maxY: 30, maxZ: 16 };
+        const b = { minX: -25, minY: -8, minZ: matchTs ? -16 : -8, maxX: 25, maxY: 30, maxZ: 16 };
         const syncBounds = () => set_bounds(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
+        // ?bounds=minX,minY,minZ,maxX,maxY,maxZ: as if set in the panel
+        const boundsParam = (query.get('bounds') || '').split(',').map(Number);
+        if (boundsParam.length === 6 && boundsParam.every(Number.isFinite)) {
+            [b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ] = boundsParam;
+            syncBounds();
+        }
         bounds.addBinding(b, 'minX', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'minY', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
         bounds.addBinding(b, 'minZ', { min: -50, max: 0, step: 0.5 }).on('change', syncBounds);
