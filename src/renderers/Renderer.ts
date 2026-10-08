@@ -10,6 +10,38 @@ import { ShadowMap } from "../shadows/ShadowMap";
 import { CubeMapShadowMap } from "../shadows/CubeMapShadowMap";
 
 /**
+ * Device limits the renderer requests from the adapter (Rust's `RequiredLimits`).
+ * - `'default'`: WebGPU's default limits, which every adapter supports (for example 16 sampled
+ *   textures and 8 storage buffers per shader stage), plus the adapter's
+ *   `maxStorageBufferBindingSize`, which TS examples have always relied on.
+ * - `'adapter'`: everything the adapter supports. Query what was granted with `Renderer.limits`.
+ * - an object: exactly these limits (WebGPU's defaults for any left out); device creation fails
+ *   if the adapter cannot meet them.
+ */
+export type RequiredLimits = 'default' | 'adapter' | Record<string, number>;
+
+/**
+ * The block-compressed texture formats a device can sample, from its enabled features
+ * (Rust's `loaders::ktx2::CompressionSupport`; ASTC HDR has no WebGPU feature).
+ */
+export interface CompressionSupport {
+    /** `texture-compression-bc`: BC1-7 (desktop GPUs, Apple Silicon). */
+    bc: boolean;
+    /** `texture-compression-astc`: ASTC LDR (Apple, most mobile). */
+    astc: boolean;
+    /** `texture-compression-etc2`: ETC2/EAC (mobile, Apple). */
+    etc2: boolean;
+}
+
+/** Features requested only where the adapter offers them, so devices without them still initialize. */
+const OPTIONAL_FEATURES: GPUFeatureName[] = [
+    'timestamp-query',
+    'texture-compression-bc',
+    'texture-compression-astc',
+    'texture-compression-etc2',
+];
+
+/**
  * Configuration options for the WebGPU renderer.
  * @interface RendererOptions
  * @property {boolean} [antialias] - Enable antialiasing
@@ -26,6 +58,15 @@ export interface RendererOptions {
     height?: number;
     sampleCount?: number;
     devicePixelRatio?: number;
+    /** Device limits to request (see `RequiredLimits`; `'default'` unless raised). */
+    requiredLimits?: RequiredLimits;
+    /**
+     * Require `float32-filterable` (linear sampling of r32float/rg32float/rgba32float textures,
+     * which the voxel GI distance field needs), as the Rust renderer does. Initialization fails
+     * with a clear error on adapters without it; pass `false` to run there without it.
+     * Default `true`.
+     */
+    requireFloat32Filterable?: boolean;
 }
 
 /**
@@ -174,13 +215,71 @@ class Renderer {
             throw new Error("No WebGPU adapter found");
         }
 
-        const maxStorage = adapter.limits.maxStorageBufferBindingSize;
-        return adapter.requestDevice({
-            requiredLimits: {
-                maxStorageBufferBindingSize: maxStorage,
-            },
+        const requiredFeatures: GPUFeatureName[] = OPTIONAL_FEATURES.filter((f) => adapter.features.has(f));
+        if (adapter.features.has('float32-filterable')) {
+            requiredFeatures.push('float32-filterable');
+        } else if (this.options.requireFloat32Filterable ?? true) {
+            throw new Error(
+                "This GPU does not support 'float32-filterable'; " +
+                "create the Renderer with { requireFloat32Filterable: false } to run without it " +
+                "(features that filter 32-bit float textures, such as the voxel GI distance field, will not work)"
+            );
+        }
+
+        const device = await adapter.requestDevice({
+            label: 'Kansei Device',
+            requiredFeatures,
+            requiredLimits: Renderer.resolveLimits(this.options.requiredLimits ?? 'default', adapter.limits),
         });
+        const c = Renderer.compressionSupportOf(device);
+        // Same lines as the Rust renderer's device log (WebGPU has no ASTC HDR feature).
+        console.info(`texture compression: CompressionSupport { bc: ${c.bc}, astc: ${c.astc}, etc2: ${c.etc2}, astc_hdr: false }`);
+        const limits = device.limits;
+        console.info(
+            `device limits: ${limits.maxSampledTexturesPerShaderStage} sampled textures, ` +
+            `${limits.maxSamplersPerShaderStage} samplers, ` +
+            `${limits.maxStorageBuffersPerShaderStage} storage buffers per shader stage; ` +
+            `textures up to ${limits.maxTextureDimension2D}`
+        );
+        return device;
     }
+
+    /** The limits to request from an adapter with `adapter` limits under `policy`. */
+    private static resolveLimits(policy: RequiredLimits, adapter: GPUSupportedLimits): Record<string, number> {
+        if (policy === 'default') {
+            return { maxStorageBufferBindingSize: adapter.maxStorageBufferBindingSize };
+        }
+        if (policy === 'adapter') {
+            // GPUSupportedLimits exposes its values as prototype getters, so copy them by name.
+            const all: Record<string, number> = {};
+            for (const key in adapter) {
+                const value = (adapter as unknown as Record<string, unknown>)[key];
+                if (typeof value === 'number') all[key] = value;
+            }
+            return all;
+        }
+        return policy;
+    }
+
+    private static compressionSupportOf(device: GPUDevice): CompressionSupport {
+        return {
+            bc: device.features.has('texture-compression-bc'),
+            astc: device.features.has('texture-compression-astc'),
+            etc2: device.features.has('texture-compression-etc2'),
+        };
+    }
+
+    /** The limits the device was created with (see `RendererOptions.requiredLimits`). */
+    public get limits(): GPUSupportedLimits { return this.device!.limits; }
+
+    /** The features the device was created with (`timestamp-query`, `float32-filterable`, ...). */
+    public get features(): GPUSupportedFeatures { return this.device!.features; }
+
+    /**
+     * The block-compressed texture formats the device can sample, which decide what KTX2
+     * textures transcode to.
+     */
+    public get compressionSupport(): CompressionSupport { return Renderer.compressionSupportOf(this.device!); }
 
     /**
      * Initializes the WebGPU device and context.
