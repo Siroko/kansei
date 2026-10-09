@@ -21,7 +21,7 @@ use kansei_core::renderers::Renderer;
 use kansei_core::rt::RtSurface;
 use kansei_core::simulations::fluid::{
     lattice_density, DensityFieldOptions, FluidActivity, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer, FluidContainerOptions, FluidDensityField,
-    FluidMarchingCubes, FluidSimulation, FluidSimulationOptions, FluidSleepOptions, FluidStepper, FluidSubstepPass, MarchingCubesOptions, PbfOptions, PlanarContainerShape,
+    FluidMarchingCubes, FluidSimulation, FluidSimulationOptions, FluidSleepOptions, FluidSolver, FluidStepper, FluidSubstepPass, MarchingCubesOptions, PbfOptions, PlanarContainerShape,
     WorldScale, DEFAULT_OPTIONS,
 };
 
@@ -120,6 +120,15 @@ pub struct Pond {
     /// The waterline's bounds (x, z): legs within `WAKE_DISTANCE` of them push the water.
     near: ([f32; 2], [f32; 2]),
     count: u32,
+    /// The full fill, lowest particles first (a partial fill is its first part: lower water).
+    fill: Vec<f32>,
+    /// The water's surface renderable (hidden with the effect).
+    surface: usize,
+    /// Stepped at all (off: frozen, its last surface drawn); a landing's push; wake next update.
+    simulate: bool,
+    show: bool,
+    splash_push: f32,
+    poke: bool,
 }
 
 impl Pond {
@@ -172,7 +181,12 @@ impl Pond {
         let (lo, hi) = shape.bounds();
         // (none inside the plinth)
         let keep = (PLINTH_RADIUS + 0.05) * SIM_SCALE;
-        let particles: Vec<f32> = shape.lattice(SPACING, WATER * SIM_SCALE, |d| d < 0.0).chunks_exact(4).filter(|p| p[0] * p[0] + p[2] * p[2] > keep * keep).flatten().copied().collect();
+        let mut cells: Vec<&[f32]> = Vec::new();
+        let lattice = shape.lattice(SPACING, WATER * SIM_SCALE, |d| d < 0.0);
+        cells.extend(lattice.chunks_exact(4).filter(|p| p[0] * p[0] + p[2] * p[2] > keep * keep));
+        // lowest first, so a partial fill (`reset`) is shallower water
+        cells.sort_by(|a, b| a[1].total_cmp(&b[1]));
+        let particles: Vec<f32> = cells.into_iter().flatten().copied().collect();
         let count = (particles.len() / 4) as u32;
         log::info!("pond: {count} particles");
         // the lake's tuning (see `kansei_wasm_lake::lake`)
@@ -248,11 +262,12 @@ impl Pond {
         let mut r = surface.surface_renderable([0.2, 0.3, 0.3, 1.0]);
         let s = 1.0 / SIM_SCALE;
         r.object.scale = kansei_core::math::Vec3::new(s, s, s);
-        scene.add(SceneNode::Renderable(r));
+        let surface_index = scene.add(SceneNode::Renderable(r));
         let stepper = FluidStepper::new(STEP, MAX_STEPS, SCALE).with_rest(&surface.sim, FluidSleepOptions { cull_after: 1.5, settle_speed: SETTLE_SPEED, settle_after: 1.0 });
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        (Self { container, colliders, plinth, stepper, previous: Vec::new(), splash: None, near: (bmin, bmax), count }, surface)
+        let pond = Self { container, colliders, plinth, stepper, previous: Vec::new(), splash: None, near: (bmin, bmax), count, fill: particles, surface: surface_index, simulate: true, show: true, splash_push: SPLASH_PUSH, poke: false };
+        (pond, surface)
     }
 
     pub fn particles(&self) -> u32 {
@@ -267,6 +282,62 @@ impl Pond {
 
     pub fn state(&self) -> FluidActivity {
         self.stepper.state()
+    }
+
+    /// The state for the page: `state`'s name, or frozen or hidden by the settings.
+    pub fn state_name(&self) -> &'static str {
+        match (self.show, self.simulate) {
+            (false, _) => "hidden",
+            (true, false) => "frozen",
+            _ => self.state().name(),
+        }
+    }
+
+    /// The page's water settings (`settings::Settings`' `fluid*`): all live but `fluid_fill`
+    /// (`reset`). A change wakes the water to show it.
+    pub fn apply(&mut self, scene: &mut Scene, surface: &mut FluidSurfaceEffect, s: &super::settings::Settings) {
+        self.simulate = s.fluid;
+        self.show = s.fluid_show;
+        if let Some(r) = scene.get_renderable_mut(self.surface) {
+            r.visible = s.fluid_show;
+        }
+        let sim = &mut surface.sim;
+        let p = &mut sim.params;
+        p.solver = if s.fluid_solver == "pbf" { FluidSolver::Pbf } else { FluidSolver::Sph };
+        p.substeps = s.fluid_substeps.round().clamp(1.0, 12.0) as u32;
+        p.viscosity = s.fluid_viscosity.max(0.0);
+        p.pressure_multiplier = s.fluid_pressure.max(0.0);
+        p.near_pressure_multiplier = s.fluid_near.max(0.0);
+        p.negative_pressure_scale = s.fluid_cohesion.clamp(0.0, 1.0);
+        p.damping = s.fluid_damping.clamp(0.0, 1.0);
+        // the scale's length over time squared is 1: m/s² as they are
+        p.gravity = [0.0, -s.fluid_gravity, 0.0];
+        p.pbf.iterations = s.fluid_pbf_iter.round().clamp(1.0, 10.0) as u32;
+        p.pbf.xsph = s.fluid_xsph.clamp(0.0, 1.0);
+        self.stepper.set_time_scale(sim, SCALE.time * s.fluid_speed.clamp(0.05, 4.0));
+        self.stepper.set_rest_enabled(s.fluid_rest);
+        self.colliders.options = FluidCollidersOptions { restitution: s.fluid_bounce.clamp(0.0, 1.0), drag: s.fluid_push.clamp(0.0, 1.0) };
+        self.colliders.upload_uniform();
+        self.splash_push = s.fluid_splash.max(0.0);
+        surface.marching_cubes.set_use_classic(s.fluid_mesh != "voxels");
+        let o = &mut surface.options;
+        o.ior = s.fluid_ior;
+        o.tint_strength = s.fluid_tint;
+        o.roughness = s.fluid_rough;
+        o.thickness = s.fluid_thickness;
+        o.sky_reflection = s.fluid_reflect;
+        o.chromatic_aberration = s.fluid_chromatic;
+        self.poke = true;
+    }
+
+    /// Fill the pond again, still: `fraction` of the full fill (its lowest particles).
+    pub fn reset(&mut self, surface: &mut FluidSurfaceEffect, fraction: f32) {
+        let n = ((self.fill.len() / 4) as f32 * fraction.clamp(0.05, 1.0)) as usize;
+        surface.sim.reset_particles(&self.fill[..n * 4]);
+        self.count = surface.sim.particle_count();
+        self.previous.clear();
+        self.splash = None;
+        self.poke = true;
     }
 
     pub fn set_rest(&mut self, rest: bool) {
@@ -306,16 +377,21 @@ impl Pond {
                 let c = ((at + GVec3::Y * 0.1) * SIM_SCALE).to_array();
                 let up = [0.0, scale.speed_to_sim(speed * 0.4), 0.0];
                 let radius = SPLASH_RADIUS * (age / SPLASH_TIME).clamp(0.2, 1.0);
-                capsules.push(FluidCapsule { expansion: scale.speed_to_sim(speed * SPLASH_PUSH), ..FluidCapsule::new(c, c, radius * SIM_SCALE, up, up) });
+                capsules.push(FluidCapsule { expansion: scale.speed_to_sim(speed * self.splash_push), ..FluidCapsule::new(c, c, radius * SIM_SCALE, up, up) });
                 self.splash = Some((at, speed, age + dt));
             } else {
                 self.splash = None;
             }
         }
-        let disturbed = !capsules.is_empty();
+        let disturbed = !capsules.is_empty() || std::mem::take(&mut self.poke);
         self.colliders.set(&capsules);
         let (min, max) = surface.sim.bounds(0.0);
         let in_view = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), min / SIM_SCALE, max / SIM_SCALE);
+        if !self.simulate || !self.show {
+            // frozen: its last surface, no steps; hidden: nothing at all
+            surface.set_activity(if in_view && self.show { FluidActivity::Asleep } else { FluidActivity::Culled });
+            return;
+        }
         let state = self.stepper.update_rest(&surface.sim, dt, in_view, disturbed);
         surface.set_activity(state);
         let steps = self.stepper.advance(dt);

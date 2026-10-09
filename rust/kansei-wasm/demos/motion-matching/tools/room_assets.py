@@ -120,12 +120,18 @@ def model(name, cache):
         fetch(inc["url"], os.path.join(base, rel))
     assert len(gltf["buffers"]) == 1, name
     bin_data = bytearray(open(os.path.join(base, gltf["buffers"][0]["uri"]), "rb").read())
+    # each image's kind by the slot that uses it (not its name: "arm" is also modern_arm_chair's)
+    kinds = {}
+    for m in gltf.get("materials", []):
+        pbr = m.get("pbrMetallicRoughness", {})
+        for slot, kind in ((pbr.get("baseColorTexture"), "color"), (m.get("normalTexture"), "normal"), (pbr.get("metallicRoughnessTexture"), "data"), (m.get("occlusionTexture"), "data")):
+            if slot is not None:
+                kinds[gltf["textures"][slot["index"]]["source"]] = kind
     images = []
     with tempfile.TemporaryDirectory() as tmp:
         for i, image in enumerate(gltf["images"]):
             uri = image["uri"]
-            lower = uri.lower()
-            kind = "normal" if "nor" in lower else "data" if any(k in lower for k in ("arm", "rough", "metal", "_ao")) else "color"
+            kind = kinds.get(i, "color")
             size = color_size if kind == "color" else data_size
             src = Image.open(os.path.join(base, uri))
             mode = "RGBA" if kind == "color" and src.mode in ("RGBA", "LA", "P") else "RGB"

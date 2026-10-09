@@ -58,6 +58,10 @@ macro_rules! settings {
             /// The defaults, with any setting the URL names.
             pub fn from_url() -> Self {
                 let mut s = Self::default();
+                // the old name of `fluid_rest`
+                if let Some(v) = param("rest") {
+                    s.set("fluid_rest", &v);
+                }
                 $(
                     if let Some(v) = param(stringify!($name)) {
                         s.set(stringify!($name), &v);
@@ -129,6 +133,32 @@ settings! {
     dust_opacity: f32 = 0.7;
     dust_mix: f32 = 0.3;
     dust_speed: f32 = 0.06;
+    // the pond's water (see `Pond::apply`; `fluid_fill` takes a reset)
+    fluid: bool = true;
+    fluid_show: bool = true;
+    fluid_rest: bool = true;
+    fluid_solver: String = "sph".into();
+    fluid_fill: f32 = 1.0;
+    fluid_speed: f32 = 1.0;
+    fluid_substeps: f32 = 4.0;
+    fluid_viscosity: f32 = 0.15;
+    fluid_pressure: f32 = 46.5;
+    fluid_near: f32 = 20.0;
+    fluid_cohesion: f32 = 0.6;
+    fluid_damping: f32 = 1.0;
+    fluid_gravity: f32 = 9.8;
+    fluid_pbf_iter: f32 = 3.0;
+    fluid_xsph: f32 = 0.1;
+    fluid_push: f32 = 0.6;
+    fluid_bounce: f32 = 0.3;
+    fluid_splash: f32 = 1.2;
+    fluid_mesh: String = "smooth".into();
+    fluid_ior: f32 = 1.33;
+    fluid_tint: f32 = 0.6;
+    fluid_rough: f32 = 0.08;
+    fluid_thickness: f32 = 1.2;
+    fluid_reflect: f32 = 0.6;
+    fluid_chromatic: f32 = 0.02;
     // materials
     mirror_rough: f32 = 0.0;
     mirror2_rough: f32 = 0.1;

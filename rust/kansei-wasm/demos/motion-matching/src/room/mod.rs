@@ -495,8 +495,8 @@ impl RoomState {
     fn status(&self) -> String {
         let s = &self.settings;
         let pond = self.pond.as_ref().map_or(String::new(), |p| {
-            let speed = p.speed().filter(|_| p.state().name() == "running").map_or(String::new(), |(max, above)| format!(" (fastest {max:.2} m/s, {above} over {:.2})", pond::SETTLE_SPEED));
-            format!("\npond   {} particles, {}{speed}", p.particles(), p.state().name())
+            let speed = p.speed().filter(|_| p.state_name() == "running").map_or(String::new(), |(max, above)| format!(" (fastest {max:.2} m/s, {above} over {:.2})", pond::SETTLE_SPEED));
+            format!("\npond   {} particles, {}{speed}", p.particles(), p.state_name())
         });
         format!(
             "room   GI {} · shadows {} · floor {} · fog {} · dust {} · camera {}{}\n",
@@ -649,6 +649,22 @@ impl RoomState {
             r.material.set_standard_lit(&self.renderer, &StandardLitOptions::glass(GLASS_TINT, s.glass_ior, s.glass_rough));
         }
 
+        // the water
+        let fluid = |s: &Settings| {
+            let j = s.json();
+            j.split(",\"").filter(|f| f.starts_with("fluid") && !f.starts_with("fluid_fill")).collect::<Vec<_>>().join(",")
+        };
+        if let (Some(pond), true) = (&mut self.pond, changed(fluid)) {
+            if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
+                pond.apply(&mut self.scene, surface, &s);
+            }
+        }
+        if let (Some(pond), true) = (&mut self.pond, old.as_ref().is_some_and(|o| o.fluid_fill != s.fluid_fill)) {
+            if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
+                pond.reset(surface, s.fluid_fill);
+            }
+        }
+
         // the air
         if let Some(e) = self.volume.effect_mut::<Switch<VolumetricFogEffect>>() {
             e.on = s.fog > 0.0;
@@ -787,9 +803,7 @@ where
     let mut layout = layout::build(&mut scene, &assets, with_pond.then(Pond::terrain_bounds), &settings.floor, settings.floor_rough, deferred);
     let (pond, surface) = match with_pond {
         true => {
-            let (mut p, s) = Pond::new(&renderer, &mut scene, &mut layout.collision, &assets, deferred);
-            // `rest=0`: the water never rests (always stepped and drawn)
-            p.set_rest(kansei_wasm::flag("rest", true));
+            let (p, s) = Pond::new(&renderer, &mut scene, &mut layout.collision, &assets, deferred);
             (Some(p), Some(s))
         }
         false => (None, None),
@@ -900,6 +914,17 @@ pub fn room_set(key: &str, value: &str) -> bool {
         ok
     })
     .unwrap_or(false)
+}
+
+/// Fill the pond again, still (`fluid_fill` of it).
+#[wasm_bindgen]
+pub fn room_pond_reset() {
+    with_room(|s| {
+        let fill = s.settings.fluid_fill;
+        if let (Some(pond), Some(surface)) = (&mut s.pond, s.volume.effect_mut::<FluidSurfaceEffect>()) {
+            pond.reset(surface, fill);
+        }
+    });
 }
 
 /// Whether the furniture meant for parkour is traversable as meant (`layout::check_traversals`),

@@ -39,7 +39,7 @@
     <script type="module">
         // the room page of the motion-matching module (`start_room`); the character's exports are
         // the same as www/index.html's
-        import init, { start_room, room_info, room_set, room_settings, room_views, room_check, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start_room, room_info, room_set, room_settings, room_views, room_check, room_pond_reset, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
         await init();
         await start_room('kansei');
         // for scripted captures: room.info() (with stats, each pass's GPU time), room.set('gi', 'voxel')
@@ -149,6 +149,40 @@
         bind(air, 'dust_opacity', { label: 'opacity', min: 0, max: 1, step: 0.01 });
         bind(air, 'dust_mix', { label: 'fibres & flecks', min: 0, max: 1, step: 0.01 });
         bind(air, 'dust_speed', { label: 'drift (m/s)', min: 0, max: 0.5, step: 0.005 });
+
+        // the pond: all live but the fill (Reset pond); its surface is marching cubes over a
+        // splatted field (the engine has no ray-marched surface or foam)
+        const water = pane.addFolder({ title: 'Fluid (the pond)', expanded: false });
+        bind(water, 'fluid', { label: 'simulate' });
+        bind(water, 'fluid_show', { label: 'show water' });
+        bind(water, 'fluid_rest', { label: 'sleep when still' });
+        bind(water, 'fluid_solver', { label: 'solver', options: { SPH: 'sph', 'position based (PBF)': 'pbf' } });
+        bind(water, 'fluid_fill', { label: 'fill (resets)', min: 0.2, max: 1, step: 0.05 });
+        water.addButton({ title: 'Reset pond' }).on('click', () => room_pond_reset());
+        bind(water, 'fluid_speed', { label: 'time scale', min: 0.1, max: 3, step: 0.05 });
+        bind(water, 'fluid_substeps', { label: 'substeps', min: 1, max: 12, step: 1 });
+        bind(water, 'fluid_gravity', { label: 'gravity (m/s²)', min: 0, max: 30, step: 0.1 });
+        bind(water, 'fluid_damping', { label: 'damping', min: 0.9, max: 1, step: 0.001 });
+        const sph = water.addFolder({ title: 'SPH', expanded: false });
+        bind(sph, 'fluid_viscosity', { label: 'viscosity', min: 0, max: 2, step: 0.01 });
+        bind(sph, 'fluid_pressure', { label: 'pressure', min: 1, max: 150, step: 0.5 });
+        bind(sph, 'fluid_near', { label: 'near pressure', min: 0, max: 80, step: 0.5 });
+        bind(sph, 'fluid_cohesion', { label: 'cohesion', min: 0, max: 1, step: 0.01 });
+        const pbf = water.addFolder({ title: 'PBF', expanded: false });
+        bind(pbf, 'fluid_pbf_iter', { label: 'iterations', min: 1, max: 10, step: 1 });
+        bind(pbf, 'fluid_xsph', { label: 'XSPH viscosity', min: 0, max: 1, step: 0.01 });
+        const wade = water.addFolder({ title: 'The character', expanded: false });
+        bind(wade, 'fluid_push', { label: 'drag (legs)', min: 0, max: 1, step: 0.01 });
+        bind(wade, 'fluid_bounce', { label: 'bounce (legs)', min: 0, max: 1, step: 0.01 });
+        bind(wade, 'fluid_splash', { label: 'landing splash', min: 0, max: 4, step: 0.05 });
+        const look = water.addFolder({ title: 'Surface', expanded: false });
+        bind(look, 'fluid_mesh', { label: 'mesh', options: { 'smooth (marching cubes)': 'smooth', voxels: 'voxels' } });
+        bind(look, 'fluid_ior', { label: 'IOR', min: 1, max: 2, step: 0.01 });
+        bind(look, 'fluid_tint', { label: 'tint', min: 0, max: 2, step: 0.01 });
+        bind(look, 'fluid_thickness', { label: 'absorption depth', min: 0.1, max: 6, step: 0.05 });
+        bind(look, 'fluid_rough', { label: 'roughness', min: 0, max: 1, step: 0.01 });
+        bind(look, 'fluid_reflect', { label: 'reflection', min: 0, max: 1, step: 0.01 });
+        bind(look, 'fluid_chromatic', { label: 'dispersion', min: 0, max: 0.2, step: 0.005 });
 
         const dof = pane.addFolder({ title: 'Depth of field', expanded: false });
         dof.addBinding(presets, 'dof', { label: 'preset', options: { ...options(Object.keys(DOFS)), custom: 'custom' } }).on('change', (ev) => applyPreset(DOFS, ev.value));
