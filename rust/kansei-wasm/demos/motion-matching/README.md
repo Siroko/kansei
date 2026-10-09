@@ -156,6 +156,8 @@ URL parameters:
   turn and a stop at a run, pivots, strafes, walking backwards), round and round: two packs get the
   same input, to record them side by side. `drive_restart()` (on `window` as `driveRestart`) starts
   it over.
+- `circle=<radius>` runs round a circle of that radius (metres; negative turns right) at the run
+  pace instead, as the foot-slide course does (see [Foot slide](#foot-slide)).
 - `play=<pattern>` plays the pack's clips whose names start with the pattern (`*` any run of
   characters, e.g. `play=Parkour/*_00`; several patterns separated by commas) one after another, as they are, each from the start point:
   for clips the search never picks (generated ones, see
@@ -170,6 +172,30 @@ URL parameters:
 - The lake's exports (the P panel's, `cannon_prompt()`, `cannon_fire(down)`, `lake_fill()`,
   `lake_regions()`) come from the lake crate and are in this module too: see the
   [lake's README](../lake/README.md).
+
+## Foot slide
+
+Foot locking (L) pins a planted foot where it touched down and bends the leg to it with two-joint
+IK: on its ankle while the heel is down, on its ball once the heel lifts (a running foot lands
+on its ball and rolls off it). A foot counts as planted while the pack's contacts say so: its
+ankle or its ball low and under 1 m/s in the clip (`ContactThresholds`; packs baked before that
+rule get their contacts found again on load). The pin lets go when the contact ends or the
+animated foot strays 0.3 m from it, and pins again where the animation has the foot while the
+contact lasts.
+
+To measure it, headless, on a pack:
+
+```sh
+cd rust
+cargo run -p kansei-core --release --example foot_slide -- <pack.kmm> [hero=<character.kmm>]
+```
+
+It plays a scripted course (straight walk and run, run circles of 2, 3.5 and 5 m and walk circles
+of 1.5 and 3 m both ways, starts and stops, 180° turns; `animation::motion_matching::foot_slide`)
+and prints each scenario's planted-foot slide (cm per second planted, cm per plant) and how far
+the character faces from the simulation. `circle=<radius>` on this page runs the same circles,
+to watch them. The tightest circles and 180° turns still slide where the database has no clip
+for the turn: the character follows the simulation through clips that turn less.
 
 ## Timing against the TS port
 

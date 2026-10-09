@@ -311,3 +311,82 @@ fn a_display_skeleton_shows_the_pose_with_its_own_proportions() {
     matcher.set_display(&db, None);
     assert!((matcher.model()[1].translation.y - 1.0).abs() < 0.1);
 }
+
+#[test]
+fn a_foot_on_its_ball_is_planted_while_its_ankle_moves() {
+    // feet straight under the root, each with a ball 0.15 m ahead: the translations place them
+    let t = |x: f32, y: f32, z: f32| Transform::from_translation_rotation(Vec3::new(x, y, z), Quat::IDENTITY);
+    let skeleton = Skeleton::new(
+        ["root", "hips", "foot_l", "ball_l", "foot_r", "ball_r"].map(String::from).to_vec(),
+        vec![None, Some(0), Some(0), Some(2), Some(0), Some(4)],
+        vec![t(0.0, 0.0, 0.0), t(0.0, 1.0, 0.0), t(0.1, 0.1, 0.0), t(0.0, -0.07, 0.15), t(-0.1, 0.1, 0.0), t(0.0, -0.07, 0.15)],
+    );
+    let roles = JointRoles::find(&skeleton, "root", "hips", "foot_l", "foot_r").unwrap();
+    // standing still; frames 10-19 the left ankle circles 4 cm round its rest, fast (1.5 m/s),
+    // its ball still; frames 20-29 both swing high
+    let poses: Vec<Pose> = (0..40)
+        .map(|f| {
+            let mut pose = Pose::rest(&skeleton);
+            if (10..20).contains(&f) {
+                let a = f as f32 * 1.25;
+                let ankle = Vec3::new(0.1, 0.1, 0.0) + Vec3::new(0.0, a.sin(), a.cos()) * 0.04;
+                pose.local[2].translation = ankle;
+                pose.local[3].translation = Vec3::new(0.1, 0.03, 0.15) - ankle;
+            } else if (20..30).contains(&f) {
+                pose.local[2].translation.y += 0.3;
+                pose.local[4].translation.y += 0.3;
+            }
+            pose
+        })
+        .collect();
+    let mut builder = DatabaseBuilder::new(skeleton, roles, RATE);
+    builder.add_clip(&Clip::from_poses("tap", RATE, &poses), false, 1).unwrap();
+    let mut db = builder.build();
+    let left = |db: &Database| (0..db.frame_count()).map(|f| db.contacts(f)[0]).collect::<Vec<_>>();
+    assert!(left(&db)[11..19].iter().all(|&c| c), "{:?}", left(&db));
+    assert!(left(&db)[21..29].iter().all(|&c| !c), "{:?}", left(&db));
+    // the ankle alone would have it lifted
+    assert!(db.denormalize(db.features(14))[6..9].iter().map(|v| v * v).sum::<f32>().sqrt() > 1.0);
+    // found again from the poses, the same
+    let baked = db.contacts.clone();
+    db.detect_contacts(&ContactThresholds::default());
+    assert_eq!(db.contacts, baked);
+}
+
+#[test]
+fn a_pack_from_before_the_ball_contacts_gets_them_found_again() {
+    let db = database();
+    let mut stale = db.clone();
+    stale.contacts.iter_mut().for_each(|c| *c = 0);
+    let bytes = MotionPack { database: stale.clone(), meshes: Vec::new(), actions: Vec::new(), meta: Vec::new() }.to_bytes();
+    // a pack that says how its contacts were found keeps them
+    assert_eq!(MotionPack::from_bytes(&bytes).unwrap().database.contacts, stale.contacts);
+    // one without the CRUL section gets them from the poses
+    let at = bytes.windows(4).position(|w| w == b"CRUL").unwrap();
+    let length = u64::from_le_bytes(bytes[at + 4..at + 12].try_into().unwrap()) as usize;
+    let old = [&bytes[..at], &bytes[at + 12 + length..]].concat();
+    assert_eq!(MotionPack::from_bytes(&old).unwrap().database.contacts, db.contacts);
+}
+
+#[test]
+fn foot_locking_keeps_planted_feet_from_sliding() {
+    use super::foot_slide::{measure, Move, Scenario};
+    let db = database();
+    let walk = Scenario { name: "walk", motion: Move::Straight { speed: 1.5 }, run: false, settle: 2.0, seconds: 4.0 };
+    let slide = |lock: bool| {
+        let settings = MotionMatchingSettings { foot_lock: lock, ..Default::default() };
+        measure(&db, &db, MotionMatcher::new(&db, settings, Vec3::ZERO, 0.0), &walk)
+    };
+    let (free, locked) = (slide(false), slide(true));
+    assert!(free.planted > 0.2, "{free:?}");
+    // the synthetic legs swing without planting: their feet slide unless locked
+    assert!(free.cm_per_second > 5.0, "{free:?}");
+    assert!(locked.cm_per_second < 0.3 * free.cm_per_second, "{locked:?} vs {free:?}");
+    assert!(locked.yaw_gap < 1.0, "{locked:?}");
+    // a circle's heading turns at speed / radius, to the left (toward +x from +z) for `left`
+    let quarter = std::f32::consts::FRAC_PI_4;
+    let v = Move::Circle { radius: 2.0, speed: 4.0, left: true }.velocity(quarter);
+    assert!(v.abs_diff_eq(Vec3::new(4.0, 0.0, 0.0), 1e-4), "{v}");
+    let v = Move::Circle { radius: 2.0, speed: 4.0, left: false }.velocity(quarter);
+    assert!(v.abs_diff_eq(Vec3::new(-4.0, 0.0, 0.0), 1e-4), "{v}");
+}

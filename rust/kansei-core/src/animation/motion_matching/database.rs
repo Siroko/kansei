@@ -71,8 +71,10 @@ impl FeatureWeights {
     }
 }
 
-/// When a foot is planted: its joint below `height` metres above the ground and slower than
-/// `speed` metres per second, for at least `min_frames` frames in a row.
+/// When a foot is planted: its ankle or its ball (the foot joint's first child) below `height`
+/// metres above where it is at rest and slower than `speed` metres per second, for at least
+/// `min_frames` frames in a row. A running foot lands on its ball and rolls off it: its ankle is
+/// never still long enough on its own.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContactThresholds {
     pub height: f32,
@@ -82,7 +84,7 @@ pub struct ContactThresholds {
 
 impl Default for ContactThresholds {
     fn default() -> Self {
-        Self { height: 0.15, speed: 0.25, min_frames: 3 }
+        Self { height: 0.15, speed: 1.0, min_frames: 3 }
     }
 }
 
@@ -194,6 +196,59 @@ pub fn wrap_angle(a: f32) -> f32 {
     if a <= -std::f32::consts::PI { a + std::f32::consts::TAU } else { a }
 }
 
+/// The joints foot contacts are read from: left ankle, left ball, right ankle, right ball (a foot
+/// with no child is its own ball).
+fn contact_joints(skeleton: &Skeleton, roles: &JointRoles) -> [usize; 4] {
+    let ball = |foot: usize| skeleton.parents.iter().position(|p| *p == Some(foot)).unwrap_or(foot);
+    [roles.feet[0], ball(roles.feet[0]), roles.feet[1], ball(roles.feet[1])]
+}
+
+/// The velocity of `positions` (per frame of a clip of `n` frames) at frame `f`, by central
+/// differences: one-sided at a clip's ends, around the seam of a loop (the frame before its first
+/// is its second-to-last a cycle back, the frame after its last is its second a cycle on; `cycle`
+/// is the root's move over one).
+fn clip_velocity(f: usize, n: usize, looping: bool, cycle: &Transform, rate: f32, positions: &dyn Fn(usize) -> Vec3) -> Vec3 {
+    let (before, after, span) = match (looping, f) {
+        (true, 0) => (cycle.inverse().transform_point(positions(n - 2)), positions(1), 2.0),
+        (true, f) if f == n - 1 => (positions(n - 2), cycle.transform_point(positions(1)), 2.0),
+        (false, 0) => (positions(0), positions(1), 1.0),
+        (false, f) if f == n - 1 => (positions(n - 2), positions(n - 1), 1.0),
+        (_, f) => (positions(f - 1), positions(f + 1), 2.0),
+    };
+    (after - before) * rate / span
+}
+
+/// A clip's foot contacts (per frame, bit 0 left planted, bit 1 right) from its `contact_joints`
+/// positions and its root's height per frame (`ContactThresholds`).
+fn plant(points: &[[Vec3; 4]], ground: &[f32], rest: [f32; 4], looping: bool, cycle: &Transform, rate: f32, thresholds: &ContactThresholds) -> Vec<u8> {
+    let n = points.len();
+    let mut planted = vec![[false; 2]; n];
+    for side in 0..2 {
+        for f in 0..n {
+            planted[f][side] = (2 * side..2 * side + 2).any(|k| {
+                let v = clip_velocity(f, n, looping, cycle, rate, &|i| points[i][k]);
+                points[f][k].y - ground[f] < rest[k] + thresholds.height && v.length() < thresholds.speed
+            });
+        }
+        // contacts: in runs of at least min_frames
+        let mut f = 0;
+        while f < n {
+            if planted[f][side] {
+                let run = (f..n).take_while(|&k| planted[k][side]).count();
+                if run < thresholds.min_frames {
+                    for k in f..f + run {
+                        planted[k][side] = false;
+                    }
+                }
+                f += run;
+            } else {
+                f += 1;
+            }
+        }
+    }
+    planted.iter().map(|p| p[0] as u8 | (p[1] as u8) << 1).collect()
+}
+
 /// Collects clips on one skeleton and builds their `Database`.
 pub struct DatabaseBuilder {
     skeleton: Skeleton,
@@ -245,9 +300,10 @@ impl DatabaseBuilder {
         let mut roots = Vec::new();
         let mut contacts = Vec::new();
         let mut raw: Vec<[f32; FEATURES]> = Vec::new();
-        let rest_feet = {
+        let contact_joints = contact_joints(&self.skeleton, &roles);
+        let rest_points = {
             let rest = self.skeleton.rest_model();
-            [rest[roles.feet[0]].translation.y, rest[roles.feet[1]].translation.y]
+            contact_joints.map(|j| rest[j].translation.y)
         };
 
         for (clip, looping, tags) in &self.clips {
@@ -261,6 +317,7 @@ impl DatabaseBuilder {
             let mut model = Vec::new();
             let mut root = Vec::with_capacity(n);
             let mut feet = Vec::with_capacity(n);
+            let mut points = Vec::with_capacity(n);
             let mut hips = Vec::with_capacity(n);
             for f in 0..n {
                 clip.frame_pose(f, &mut pose);
@@ -275,49 +332,16 @@ impl DatabaseBuilder {
                 translations.push(pose.local.iter().map(|t| t.translation).collect::<Vec<_>>());
                 scales.push(pose.local.iter().map(|t| t.scale).collect::<Vec<_>>());
                 feet.push([model[roles.feet[0]].translation, model[roles.feet[1]].translation]);
+                points.push(contact_joints.map(|j| model[j].translation));
                 hips.push(model[roles.hips].translation);
             }
 
-            // velocities by central differences: one-sided at a clip's ends, around the seam of a
-            // loop (the frame before its first is its second-to-last a cycle back, the frame after
-            // its last is its second a cycle on)
             let period = if *looping { n - 1 } else { n };
+            // velocities by central differences (see `clip_velocity`)
             let cycle = root[n - 1].mul(&root[0].inverse());
-            let velocity = |f: usize, positions: &dyn Fn(usize) -> Vec3| -> Vec3 {
-                let (before, after, span) = match (*looping, f) {
-                    (true, 0) => (cycle.inverse().transform_point(positions(n - 2)), positions(1), 2.0),
-                    (true, f) if f == n - 1 => (positions(n - 2), cycle.transform_point(positions(1)), 2.0),
-                    (false, 0) => (positions(0), positions(1), 1.0),
-                    (false, f) if f == n - 1 => (positions(n - 2), positions(n - 1), 1.0),
-                    (_, f) => (positions(f - 1), positions(f + 1), 2.0),
-                };
-                (after - before) * rate / span
-            };
-
-            // contacts: low and slow, in runs of at least min_frames
-            let mut planted = vec![[false; 2]; n];
-            for side in 0..2 {
-                for f in 0..n {
-                    let v = velocity(f, &|k| feet[k][side]);
-                    let height = feet[f][side].y - root[f].translation.y;
-                    planted[f][side] = height < rest_feet[side] + self.contacts.height && v.length() < self.contacts.speed;
-                }
-                let mut f = 0;
-                while f < n {
-                    if planted[f][side] {
-                        let run = (f..n).take_while(|&k| planted[k][side]).count();
-                        if run < self.contacts.min_frames {
-                            for k in f..f + run {
-                                planted[k][side] = false;
-                            }
-                        }
-                        f += run;
-                    } else {
-                        f += 1;
-                    }
-                }
-            }
-            contacts.extend(planted.iter().map(|p| p[0] as u8 | (p[1] as u8) << 1));
+            let velocity = |f: usize, positions: &dyn Fn(usize) -> Vec3| -> Vec3 { clip_velocity(f, n, *looping, &cycle, rate, positions) };
+            let ground: Vec<f32> = root.iter().map(|r| r.translation.y).collect();
+            contacts.extend(plant(&points, &ground, rest_points, *looping, &cycle, rate, &self.contacts));
 
             // the root at any frame ahead: loops continue cycle after cycle, other clips go on
             // at their last frame's velocity and turn rate
@@ -443,6 +467,36 @@ impl Database {
     pub fn contacts(&self, frame: usize) -> [bool; 2] {
         let c = self.contacts[frame];
         [c & 1 != 0, c & 2 != 0]
+    }
+
+    /// Find the feet's contacts again from the poses, with `thresholds` (packs baked before
+    /// contacts read the balls of the feet as well as the ankles get them that way).
+    pub fn detect_contacts(&mut self, thresholds: &ContactThresholds) {
+        let joints = contact_joints(&self.skeleton, &self.roles);
+        let rest = {
+            let rest = self.skeleton.rest_model();
+            joints.map(|j| rest[j].translation.y)
+        };
+        // each contact joint's chain of ancestors, root first
+        let chains = joints.map(|j| {
+            let mut chain = vec![j];
+            while let Some(p) = self.skeleton.parents[*chain.last().unwrap()] {
+                chain.push(p);
+            }
+            chain.reverse();
+            chain
+        });
+        let mut contacts = Vec::with_capacity(self.frame_count());
+        for clip in &self.clips {
+            let (n, start) = (clip.frames, clip.start);
+            let points: Vec<[Vec3; 4]> = (start..start + n)
+                .map(|f| chains.each_ref().map(|chain| chain.iter().fold(self.roots[f], |t, &j| t.mul(&self.transform(f, j))).translation))
+                .collect();
+            let ground: Vec<f32> = self.roots[start..start + n].iter().map(|r| r.translation.y).collect();
+            let cycle = self.roots[start + n - 1].mul(&self.roots[start].inverse());
+            contacts.extend(plant(&points, &ground, rest, clip.looping, &cycle, self.sample_rate, thresholds));
+        }
+        self.contacts = contacts;
     }
 
     /// The character root at `frame`, in its clip's space.
