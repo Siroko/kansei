@@ -19,6 +19,8 @@
 //!   searches, root motion, inertialized transitions, the animated character kept near the
 //!   simulation, and foot locking with two-joint IK.
 //! - `pack` stores a database with its skinned meshes in one binary file (`.kmm`).
+//! - `foot_slide` measures how far planted feet slide, over a scripted course (the
+//!   `foot_slide` example runs it on a pack).
 
 mod controller;
 mod database;
