@@ -22,10 +22,12 @@
 //! mirrors show it. Without a pack a capsule stands in for it.
 //!
 //! URL parameters (with the lake page's character ones: `pack`, `hero`, `char`, `gait`, `walk`,
-//! `run`, `at`, `drive`, `play`, `view`): `gi=rt|voxel|ssgi|off`, `fog=0`, `dust=<count>` (0:
-//! none; default 32768), `pond=0`, `dragon=0`, `taa=0`, `cam=outside`, `ev=<EV100>` (exposure,
-//! default 4.0), `rt_body=0` (the character out of the grid), `stats=1` (each pass's GPU time on
-//! the page, `room_info()` as JSON), `profile=1` (the profile in the console every 3 s).
+//! `run`, `at`, `drive`, `play`, `view`): `gi=rt|voxel|ssgi|off`, `cam=outside|dragon|mirror|
+//! parkour|living` (a fixed view), `fog=<extinction per metre>` (0: none), `dust=<count>` (0:
+//! none; default 32768) and `dust_size`, `dust_bright`, `dust_opacity`, `dust_speed`, `pond=0`,
+//! `rest=0`, `dragon=0`, `taa=0`, `ev=<EV100>` (exposure, default 4.0), `rt_body=0` (the character
+//! out of the grid), `stats=1` (each pass's GPU time and the CPU sections on the page, and in
+//! `room_info()`), `profile=1` (the profile in the console every 3 s).
 
 mod dust;
 mod layout;
@@ -105,6 +107,8 @@ struct Stats {
     frame_ms: f64,
     /// (label, ms per frame), most expensive first
     passes: Vec<(&'static str, f64)>,
+    /// (label, ms per frame) of the CPU sections, most expensive first
+    cpu: Vec<(&'static str, f64)>,
     gpu_ms: f64,
     gpu_span_ms: f64,
 }
@@ -248,8 +252,8 @@ const VIEWS: [(&str, [f32; 3], f32, f32, f32); 5] = [
     ("outside", [0.0, 1.5, 0.0], 52.0, 0.65, 0.42),
     // the glass dragon on its plinth, the big mirror behind it
     ("dragon", [0.0, 1.3, 0.0], 6.5, 0.25, 0.12),
-    // the big mirror on the north wall, from across the pond
-    ("mirror", [0.0, 2.2, -19.0], 17.0, -0.25, 0.05),
+    // the big mirror on the north wall at an angle, the pond and the dragon in it
+    ("mirror", [0.0, 2.2, -19.5], 14.8, 0.42, 0.09),
     // the crates and platforms in the north-east corner
     ("parkour", [12.0, 1.0, -12.0], 12.0, -0.7, 0.3),
     // the living corner and its lamp
@@ -264,7 +268,10 @@ impl RoomState {
         self.time += dt;
         let RoomState { renderer, scene, controls, player, collision, .. } = self;
         player.follow = self.view.is_none();
-        let out = player.update(now, dt, scene, renderer, controls, collision);
+        let out = {
+            let _t = kansei_core::profiling::cpu_scope("Room/Character");
+            player.update(now, dt, scene, renderer, controls, collision)
+        };
         for key in &out.keys {
             match key.as_str() {
                 "o" => self.set_view(if self.view.is_some() { None } else { Some("outside") }),
@@ -285,7 +292,8 @@ impl RoomState {
         self.controls.update(&mut self.camera, dt);
 
         // the character's capsules in the grid, the water, the dust
-        if let (Some(proxy), Some(c)) = (&self.proxy, &self.player.character) {
+        let _t = kansei_core::profiling::cpu_scope("Room/World");
+        if let (Some(proxy), Some(c)) = (&mut self.proxy, &self.player.character) {
             let visible = self.scene.get_renderable(c.bodies[c.showing].index).is_some_and(|r| r.visible);
             proxy.update(&mut self.scene, c, visible);
         }
@@ -313,6 +321,8 @@ impl RoomState {
             fog.effect.time = self.time;
         }
 
+        drop(_t);
+
         // HUD, a few times a second
         if self.player.frame.is_multiple_of(10) {
             let room = self.status();
@@ -335,12 +345,19 @@ impl RoomState {
                 let profile = self.renderer.take_profile();
                 if profile.gpu_frames > 0 {
                     stats.passes = profile.top_passes(usize::MAX);
+                    let mut cpu = profile.cpu.clone();
+                    cpu.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    stats.cpu = cpu;
                     stats.gpu_ms = profile.gpu_ms;
                     stats.gpu_span_ms = profile.gpu_span_ms;
                 }
                 let (w, h) = (self.renderer.width(), self.renderer.height());
                 let mut text = format!("{w} x {h}   frame {:.2} ms   GPU {:.2} ms (span {:.2})\n", stats.frame_ms, stats.gpu_ms, stats.gpu_span_ms);
                 for (label, ms) in stats.passes.iter().take(24) {
+                    text.push_str(&format!("{ms:6.2}  {label}\n"));
+                }
+                text.push_str("CPU\n");
+                for (label, ms) in stats.cpu.iter().take(8) {
                     text.push_str(&format!("{ms:6.2}  {label}\n"));
                 }
                 set_text("stats", &text);
@@ -403,9 +420,10 @@ impl RoomState {
     /// The state as JSON: the settings and (with stats) the frame and each pass's GPU time.
     fn info(&self) -> String {
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
+        let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"gi\":\"{}\",\"fog\":{},\"dust\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"grid_triangles\":{},\"grid_rebuilds\":{},\"size\":{:?},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"gi\":\"{}\",\"fog\":{},\"dust\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"grid_triangles\":{},\"grid_rebuilds\":{},\"size\":{:?},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.gi.name(),
             self.fog,
             self.dust.as_ref().map_or(0, |d| if d_visible(&self.scene, d) { d.count() } else { 0 }),
@@ -419,6 +437,7 @@ impl RoomState {
             self.stats.as_ref().map_or(0.0, |s| s.gpu_ms),
             self.stats.as_ref().map_or(0.0, |s| s.gpu_span_ms),
             passes.join(","),
+            cpu.join(","),
         )
     }
 }

@@ -35,6 +35,11 @@ pub fn pace(paces: [f32; 3], direction: [f32; 2]) -> f32 {
 pub trait BodyLook {
     fn plain(&self, label: &str, color: [f32; 4], mesh: &SkinnedMesh, palette: &BonePalette) -> Material;
     fn textured(&self, label: &str, color: [f32; 4], mesh: &SkinnedMesh, palette: &BonePalette, textures: SkinTextures) -> Material;
+    /// What the debug overlay's radiances (set for the lake's daylight) are scaled by: the page's
+    /// exposure relative to the lake's.
+    fn overlay_scale(&self) -> f32 {
+        1.0
+    }
 }
 
 /// The lake's look: lit by its sun (cascade-shadowed) and sky (`animation::skinned_lit_material`).
@@ -131,17 +136,18 @@ impl Character {
             return Err("the pack has no mesh, and there is no character pack to show it on".into());
         }
         let joints = bodies.iter().map(|b| b.display.as_ref().map_or(db.joint_count(), |d| d.0.len())).max().unwrap_or(0);
-        let bones = DebugBoxes::new(renderer, scene, "Bones", joints, [30000.0, 20000.0, 4000.0], true);
+        let glow = |c: [f32; 3]| c.map(|v| v * look.overlay_scale());
+        let bones = DebugBoxes::new(renderer, scene, "Bones", joints, glow([30000.0, 20000.0, 4000.0]), true);
         bones.set_visible(scene, false);
         // the simulation now and its 3 predicted samples, and each foot's target
-        let trajectory = DebugBoxes::new(renderer, scene, "Trajectory", 6, [300.0, 1600.0, 3000.0], false);
+        let trajectory = DebugBoxes::new(renderer, scene, "Trajectory", 6, glow([300.0, 1600.0, 3000.0]), false);
         let bit = |name: &str| tags.iter().position(|t| t == name).map_or(0, |b| 1u32 << b);
         let (idle, walk, run) = (bit("idle"), bit("walk"), bit("run"));
         let (walk_tags, run_tags) = if gait && walk != 0 && run != 0 { (idle | walk, idle | run) } else { (!ACTION_TAG, !ACTION_TAG) };
         let matcher = MotionMatcher::new(&db, MotionMatchingSettings::default(), GVec3::ZERO, 0.0);
         log::info!("{} action clips", actions.len());
         let controller = CharacterController::new(matcher, actions);
-        let ledge = DebugBoxes::new(renderer, scene, "Ledge", 2, [3000.0, 400.0, 200.0], true);
+        let ledge = DebugBoxes::new(renderer, scene, "Ledge", 2, glow([3000.0, 400.0, 200.0]), true);
         log::info!("motion pack: {} clips, {} frames, {} joints", db.clips.len(), db.frame_count(), db.joint_count());
         Ok(Self { db, controller, bodies, ledge, showing: 0, bones, trajectory, walk_tags, run_tags })
     }

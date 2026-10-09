@@ -32,7 +32,7 @@ pub const START_HEADING: f32 = std::f32::consts::PI;
 /// and the radius of its PCSS emitter (m), which softens the shadows as an area light's are.
 const PANEL: f32 = 7.0;
 const PANEL_INTENSITY: f32 = 14000.0;
-const PANEL_SOURCE_RADIUS: f32 = 1.8;
+const PANEL_SOURCE_RADIUS: f32 = 0.9;
 /// The panel's radiance (cd/m²): a Lambertian emitter of its area with the spot's intensity.
 const PANEL_RADIANCE: f32 = PANEL_INTENSITY / (PANEL * PANEL);
 /// The lamps' warm white, their intensity (cd) and their shades' radiance (cd/m²).
@@ -264,7 +264,7 @@ pub fn build(scene: &mut Scene, pond_hole: Option<([f32; 2], [f32; 2])>) -> Layo
 
     // two mirrors: a large one on the north wall, a brushed one on the east wall
     mirror(scene, [0.0, 2.6, -h + 0.04], [9.0, 4.2], 0.0, 0.0);
-    mirror(scene, [h - 0.04, 2.2, -1.0], [5.0, 3.4], -FRAC_PI_2, 0.18);
+    mirror(scene, [h - 0.04, 2.2, -1.0], [5.0, 3.4], -FRAC_PI_2, 0.1);
 
     // the living corner (south-east): two sofas face each other over a coffee table, on a rug
     sofa(scene, &mut collision, [13.0, 10.0], 0.0, [0.1, 0.18, 0.4]);

@@ -16,6 +16,11 @@ the clip tools.
 `www/kimodo.html` is a second page on the same module, for packs of generated clips (see
 [Generated animation (Kimodo)](#generated-animation-kimodo)).
 
+`www/room.html` is a third, the same character in a room lit by ray-traced global illumination,
+with mirrors, a glass dragon in a pond, furniture to vault and climb, fog and dust (see
+[The room](#the-room)). The character and its controls are shared by the pages (`src/character.rs`,
+`src/player.rs`); the room is `src/room/`.
+
 ## A pack
 
 Bake one from glTF clips and a skinned mesh with [`kansei-anim-bake`](../../../kansei-anim-bake/README.md).
@@ -111,12 +116,111 @@ character is in it:
   of it: E, the gamepad's X, or a click on its prompt; R (Y) by it drains the lake.
 - **The mill** (`at=18,2.6,110` looks along the shore at it) turns in the north shallows.
 
+## The room
+
+`www/room.html` (`start_room`) puts the character in a 40 x 40 m room, 9 m high (`src/room/`). It
+loads the same packs as `www/index.html` (`www/pack/`, `pack=`, `hero=`). Without one a capsule
+stands in for the character (drawn by the same skinned material, and in the mirrors) under the
+HUD's "no motion pack" message, and the room renders as it does with one.
+
+- **The light.** A 7 x 7 m panel in the ceiling lights the room from above. Kansei's Rust
+  renderer doesn't rasterize area lights (`Light::Area` reaches only the ray tracer, as a point),
+  so the panel is an emissive plane with a spot light under it: straight down, its cone covering
+  the floor, and a PCSS emitter 0.9 m across, so its shadows are contact-hardening as an area
+  light's are (`layout.rs`). Three floor lamps are warm, shadowed downlights under glowing shades.
+  The four spot lights light everything through `SPOT_LIGHTS_WGSL`: the surfaces, the GI's hits,
+  the reflections' hits, the fog and the dust.
+- **One-sided walls.** The walls, the floor and the ceiling are planes facing in, their back
+  faces culled, so from outside (O, or `cam=outside`) the camera looks through them into the
+  room. The grid of triangles the rays trace hits a triangle from either side, so the GI's rays
+  and the mirrors' from inside meet the walls as they should. They cast no shadows (the lights
+  are inside), and thick boxes outside them keep the character in.
+- **The GI.** The hybrid by default (`RtDiffuseGiEffect`: a ray for each 2 x 2 pixels through a
+  grid of the room's triangles, 30 cm cells, the hits lit by the spot lights with shadow rays and a
+  voxel cone, SVGF 3 x 3), over voxel GI's volume of the room. G (or `gi=`) switches to voxel
+  cones, screen space or none.
+- **Mirrors and glass.** A mirror on the north wall and a brushed one (roughness 0.1) on the east
+  wall, and a glass Stanford dragon (index of refraction 1.5, in the grid by its cluster LOD's
+  cut, with its vertex normals), through `RtReflectionsEffect` and its glass pass. Glass casts no
+  shadow and the GI's rays pass through it. In a mirror, glass shows only where the camera sees the
+  same point (the effect steps through glass it can't take from the screen).
+- **The character in the mirrors.** Its skinned mesh can't go into the grid (the grid takes
+  geometry as built, not as skinned), so capsules on its bones stand in for it there
+  (`look::Proxy`): renderables no camera draws (`HIDDEN_WGSL`), moved when a bone has moved
+  3 cm. Walking, they rebuild the grid every frame (about 0.8 ms); standing, never. `rt_body=0`
+  leaves them out.
+- **The pond.** In the middle, the lake's SPH water (`kansei_wasm_lake::lake`'s scale and tuning)
+  round a stone plinth, the dragon's island. The character wades in as it does in the lake, and the
+  water rests (culled out of view, asleep when settled). The plinth is a still capsule collider,
+  not part of the container's floor: as a floor that steep it kept the water churning.
+- **Furniture.** Sofas, a coffee table, a dining table and chairs, shelves, a sideboard, an island,
+  crates, blocks, a two-block stack, a 2.2 m platform behind a step, two ledges with a gap, a bench.
+  The solid ones are boxes in the collision world, so Space vaults, hurdles, mantles and climbs
+  them as on the course. `room_check()` on the page probes each piece as the traversal does and
+  says whether it gets the traversal meant (vault: the crate, the sideboard, the island, the
+  dining table; hurdle: the rail, the bench, a sofa's back; mantle: the block, the stack, its top,
+  the ledges; climb: the platform from its step).
+- **Fog and dust.** A faint haze fills the room (a box `LocalFogVolume`, none outside), lit by the
+  four lights through their shadow maps; F turns it off. 32768 dust motes drift in a slow curl
+  flow round the camera (a compute shader), pushed aside by the character's legs and body, drawn as
+  soft billboards a pixel or two across and lit by the same lights and shadow maps (scattering
+  forward), so they catch the light in the beams and vanish in shadow; the fog veils them as it
+  does the rest. N turns them off.
+
+The dragon is the GI box's (`www/assets/` links to `examples/gi-box/www/assets/`): "Stanford
+Dragon (Vrip)" by 3D graphics 101, CC-BY-NC-4.0, credited on the page (`license.txt`).
+
+The character's body is drawn by `look::RoomLit` into the GBuffer (its normal and albedo for the
+GI and the reflections), lit by the spot lights; the overlay's markers are dimmed to the room's
+exposure.
+
+Keys, on top of the shared ones: O inside / outside, G the GI, F the fog, N the dust.
+
+URL parameters, on top of the character's (`pack`, `hero`, `char`, `gait`, `walk`, `run`, `at`,
+`drive`, `play`, `view`, `taa`):
+- `gi=rt|voxel|ssgi|off` (default `rt`);
+- `cam=outside|dragon|mirror|parkour|living` starts at a fixed view (O, or any other name, follows
+  the character);
+- `fog=<extinction per metre>` (default 0.004), `fog=0` none;
+- `dust=<count>` (default 32768, 0 none), `dust_size=` (m), `dust_bright=`, `dust_opacity=`,
+  `dust_speed=` (m/s);
+- `pond=0`, `rest=0` (the water never rests), `dragon=0`, `rt_body=0`;
+- `ev=<EV100>` (exposure, default 4);
+- `stats=1`: each pass's GPU time and the CPU sections on the page, and in `room.info()`;
+  `profile=1`: the profile in the console every 3 s.
+
+On `window.room`: `info()`, `set(key, value)` (`gi`, `fog`, `dust`, `outside`, `cam`) and
+`check()`.
+
+### What a frame costs
+
+1080p (`dpr=1`), M4 Pro, headless Chrome without vsync (`stats=1`), the GASP pack's character;
+other sessions share the GPU, so a pass's time varies by tens of percent between runs:
+
+| | GPU, passes | GPU, span | frame interval |
+|---|---|---|---|
+| hybrid GI, fog, dust, the water asleep, standing | 11.7-12.3 ms | 12.8-13.2 ms | 15 ms |
+| the same, walking (the capsules rebuild the grid) | 12.3 ms | 13.5 ms | 15 ms |
+| the water running (`rest=0`) | 17.8 ms | 18.2 ms | 19 ms |
+| voxel GI / screen-space GI / no GI | 8.0 / 6.9 / 6.4 ms | 9.4 / 8.2 / 7.8 ms | 13 ms |
+
+- The hybrid's trace dominates: `RtGi/Trace` 2.6-4.7 ms (more while the grid is rebuilt the same
+  frame), its SVGF and composite about 1.4 ms more. Then the glass pass (`Rt/Glass`, 1.1-1.4 ms,
+  the dragon), the grid's rebuild while the character moves (`Rt/Gather`, 0.75-1.3 ms), TAA
+  (0.6 ms), the mirrors' rays (`Rt/Trace` + `Rt/Resolve`, 0.6 ms).
+- The water, while it runs: `FluidSim/Substep` 3.8 ms and the surface's extraction and mesh about
+  2.5 ms more; it goes back to sleep once it settles after the character leaves it.
+- The fog costs about 0.3 ms, the dust 0.01 ms of compute and a share of the GBuffer pass.
+- On the CPU: the character's update (search, pose, IK, collision) 2.9-3.4 ms, the renderer
+  about 1 ms. The frame interval stays near 13 ms even with no GI (6.4 ms of GPU) in this
+  setup: there is headroom on the GPU.
+
 ## Build and run
 
 ```sh
 cd rust/kansei-wasm/demos/motion-matching
 wasm-pack build --target web --release
-python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html)
+python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html)
 ```
 
 The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on the CPU.

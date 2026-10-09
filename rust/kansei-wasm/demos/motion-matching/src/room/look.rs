@@ -158,6 +158,11 @@ impl BodyLook for RoomLit {
         material.set_bindable(6, kansei_core::buffers::Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
         material
     }
+
+    /// The room is exposed about 10 stops brighter than the lake's daylight.
+    fn overlay_scale(&self) -> f32 {
+        1.0 / 1024.0
+    }
 }
 
 /// The colour of the stand-in and of the capsules that stand for the character in the grid.
@@ -237,14 +242,23 @@ fn bone_radius(name: &str) -> Option<f32> {
     })
 }
 
-/// The character in the ray tracing grid: a capsule along each of its bones (a unit cylinder
-/// with domed ends, scaled), moved with the pose each frame. They are in the grid only (see
-/// `HIDDEN_WGSL`), so the mirrors and the GI's rays see the character's shape; the camera and the
-/// shadow maps see its real mesh.
+/// The character in the ray tracing grid: a capsule along each of its bones (a cylinder, scaled),
+/// moved with the pose. They are in the grid only (see `HIDDEN_WGSL`), so the mirrors and the GI's
+/// rays see the character's shape; the camera and the shadow maps see its real mesh.
+///
+/// Moving them rebuilds the grid (about 2 ms of GPU at 1080p), so they are static renderables
+/// (the grid rebuilds only when one changes, not every frame as for a `dynamic` one) and move only
+/// once a bone has moved `MOVE` from where they stand: a character standing still costs nothing.
 pub struct Proxy {
     /// (joint, radius, renderable) for each bone that has a capsule.
     capsules: Vec<(usize, f32, usize)>,
+    /// The bones' ends where the capsules were last put, and whether they were shown.
+    placed: Vec<(GVec3, GVec3)>,
+    shown: bool,
 }
+
+/// How far a bone moves (m) before the capsules follow.
+const MOVE: f32 = 0.03;
 
 impl Proxy {
     pub fn new(scene: &mut Scene, character: &Character) -> Self {
@@ -256,20 +270,26 @@ impl Proxy {
             let mut material = Material::new("Room/BodyProxy", HIDDEN_WGSL, Vec::new(), MaterialOptions::default());
             material.options.cull_mode = kansei_core::materials::CullMode::None;
             let mut r = Renderable::new(unit_capsule(), material);
-            r.dynamic = true;
             r.cast_shadow = false;
             r.rt = Some(RtSurface::new(STAND_IN_COLOR).with_smooth_normals());
             capsules.push((joint, radius, scene.add(SceneNode::Renderable(r))));
         }
         log::info!("room: {} capsules stand for the character in the grid", capsules.len());
-        Self { capsules }
+        Self { capsules, placed: Vec::new(), shown: false }
     }
 
-    /// Put the capsules on the character's bones as posed now (hidden with the body: `visible`).
-    pub fn update(&self, scene: &mut Scene, character: &Character, visible: bool) {
+    /// Put the capsules on the character's bones as posed now, once one has moved `MOVE` (hidden
+    /// with the body: `visible`).
+    pub fn update(&mut self, scene: &mut Scene, character: &Character, visible: bool) {
         let bones = character.bones_world();
-        for &(joint, radius, index) in &self.capsules {
-            let Some(&(_, a, b)) = bones.iter().find(|(j, _, _)| *j == joint) else { continue };
+        let ends: Vec<(GVec3, GVec3)> = self.capsules.iter().map(|&(joint, _, _)| bones.iter().find(|(j, _, _)| *j == joint).map_or((GVec3::ZERO, GVec3::ZERO), |&(_, a, b)| (a, b))).collect();
+        let moved = self.placed.len() != ends.len() || ends.iter().zip(&self.placed).any(|((a, b), (pa, pb))| a.distance(*pa) > MOVE || b.distance(*pb) > MOVE);
+        if !moved && visible == self.shown {
+            return;
+        }
+        self.placed = ends.clone();
+        self.shown = visible;
+        for (&(_, radius, index), &(a, b)) in self.capsules.iter().zip(&ends) {
             let Some(r) = scene.get_renderable_mut(index) else { continue };
             let along = b - a;
             let length = along.length();
