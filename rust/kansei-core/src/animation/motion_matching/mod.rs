@@ -22,6 +22,7 @@
 
 mod controller;
 mod database;
+pub mod foot_slide;
 pub mod pack;
 mod search;
 pub mod traversal;

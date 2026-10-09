@@ -3,7 +3,8 @@
 //! The foot lock follows Daniel Holden's "Inverse Kinematics & Foot Locking"
 //! (<https://theorangeduck.com/page/inverse-kinematics-foot-locking>): while the animation says a
 //! foot is planted, pin it where it touched down; release it when the contact ends or the
-//! animated foot strays past a radius, and let the difference fade with a spring.
+//! animated foot strays past a radius, and let the difference fade with a spring. A foot rolling
+//! onto its ball is pinned there, so the heel can lift.
 
 use glam::{Quat, Vec3};
 
@@ -54,14 +55,28 @@ pub fn two_joint_ik(skeleton: &Skeleton, pose: &mut Pose, model: &mut [Transform
     model[end] = end_parent.mul(&pose.local[end]);
 }
 
+/// A foot as the animation places it: its ankle and ball (world), and how far each is above
+/// where it is at rest.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FootPose {
+    pub ankle: Vec3,
+    pub ball: Vec3,
+    pub ankle_lift: f32,
+    pub ball_lift: f32,
+}
+
+/// The heel counts as up (a planted foot pivots on its ball) once the ankle is this much higher
+/// above its rest height than the ball is, and down again under `HEEL_DOWN`.
+pub const HEEL_UP: f32 = 0.02;
+pub const HEEL_DOWN: f32 = 0.01;
+
 /// A foot pinned to where it touched down while it is planted.
 #[derive(Debug, Clone, Default)]
 pub struct FootLock {
     locked: bool,
-    /// Where the foot is pinned while locked.
+    /// Where the pivot is pinned while locked: the ankle, or the ball once the heel is up.
     position: Vec3,
-    /// Last frame's contact, to lock on a new one only.
-    contact: bool,
+    on_ball: bool,
     /// Added to the output, fading: it keeps the output continuous when the lock lets go.
     offset: Vec3,
     offset_velocity: Vec3,
@@ -69,22 +84,39 @@ pub struct FootLock {
 
 impl FootLock {
     /// The foot's target this frame (world space) from where the animation puts it and whether
-    /// it is planted. A new contact pins the foot there; the pin lets go when the contact ends or
-    /// the animated foot strays past `unlock_radius`, and the output then fades back onto the
-    /// animation with `halflife`.
+    /// it is planted. A contact pins the foot there; the pin lets go when the contact ends or the
+    /// animated foot strays past `unlock_radius`, and the output then fades back onto the
+    /// animation with `halflife` (pinned again where the animation has the foot while the contact
+    /// lasts: a foot that strayed still stops sliding).
     pub fn update(&mut self, animated: Vec3, contact: bool, unlock_radius: f32, halflife: f32, dt: f32) -> Vec3 {
-        if self.locked && (!contact || animated.distance(self.position) > unlock_radius) {
+        self.update_foot(&FootPose { ankle: animated, ball: animated, ankle_lift: 0.0, ball_lift: 0.0 }, contact, unlock_radius, halflife, dt)
+    }
+
+    /// `update` for a foot that rolls: the ankle's target, pinning the ankle while the heel is
+    /// down and the ball once it lifts (a running foot lands on its ball and rolls off it), the
+    /// foot keeping its animated rotation about the pin. Switching pivots re-pins the new one
+    /// where the output has it, so the foot does not jump.
+    pub fn update_foot(&mut self, foot: &FootPose, contact: bool, unlock_radius: f32, halflife: f32, dt: f32) -> Vec3 {
+        let toe = foot.ball - foot.ankle;
+        let heel_up = foot.ankle_lift - foot.ball_lift;
+        let on_ball = heel_up > if self.on_ball { HEEL_DOWN } else { HEEL_UP };
+        if self.locked && on_ball != self.on_ball {
+            self.position += if on_ball { toe } else { -toe };
+        }
+        self.on_ball = on_ball;
+        let pivot = if on_ball { foot.ball } else { foot.ankle };
+        let pinned = |position: Vec3| if on_ball { position - toe } else { position };
+        if self.locked && (!contact || pivot.distance(self.position) > unlock_radius) {
             self.locked = false;
             // the output was the pin: carry the difference over, to fade
-            self.offset += self.position - animated;
+            self.offset += pinned(self.position) - foot.ankle;
         }
-        if !self.locked && contact && !self.contact {
+        if !self.locked && contact {
             self.locked = true;
-            self.position = animated;
+            self.position = pivot;
         }
-        self.contact = contact;
         decay_spring_damper_exact(&mut self.offset, &mut self.offset_velocity, halflife, dt);
-        (if self.locked { self.position } else { animated }) + self.offset
+        (if self.locked { pinned(self.position) } else { foot.ankle }) + self.offset
     }
 
     pub fn is_locked(&self) -> bool {
@@ -151,14 +183,46 @@ mod tests {
         // the animated foot slides 10 cm while planted: the output stays
         let still = lock.update(Vec3::new(0.4, 0.0, 0.0), true, 0.2, 0.1, dt);
         assert_eq!(still, planted);
-        // past the radius it lets go, starting from where it was, then catches up
+        // past the radius it lets go, starting from where it was, and is pinned again where the
+        // animation has it, the output fading over
         let released = lock.update(Vec3::new(0.6, 0.0, 0.0), true, 0.2, 0.1, dt);
-        assert!(!lock.is_locked());
+        assert!(lock.is_locked());
         assert!(released.distance(planted) < 0.05, "{released}");
         let mut out = released;
         for _ in 0..60 {
-            out = lock.update(Vec3::new(0.6, 0.1, 0.0), false, 0.2, 0.1, dt);
+            out = lock.update(Vec3::new(0.65, 0.0, 0.0), true, 0.2, 0.1, dt);
         }
-        assert!(out.distance(Vec3::new(0.6, 0.1, 0.0)) < 1e-3, "{out}");
+        assert!(out.distance(Vec3::new(0.6, 0.0, 0.0)) < 1e-3, "{out}");
+        // lifted, it follows the animation
+        for _ in 0..60 {
+            out = lock.update(Vec3::new(0.9, 0.1, 0.0), false, 0.2, 0.1, dt);
+        }
+        assert!(out.distance(Vec3::new(0.9, 0.1, 0.0)) < 1e-3, "{out}");
+    }
+
+    #[test]
+    fn a_rolling_foot_stays_on_its_ball_once_the_heel_lifts() {
+        let mut lock = FootLock::default();
+        let dt = 1.0 / 60.0;
+        let foot = |ankle: Vec3, ball: Vec3, ankle_lift: f32| FootPose { ankle, ball, ankle_lift, ball_lift: 0.0 };
+        // flat on the ground, the ball 0.15 m ahead of the ankle: the ankle is pinned
+        let flat = foot(Vec3::new(0.0, 0.1, 0.0), Vec3::new(0.0, 0.03, 0.15), 0.0);
+        assert_eq!(lock.update_foot(&flat, true, 0.2, 0.1, dt), flat.ankle);
+        // the heel rises 4 cm while the animated foot slides 2 cm: the pin moves to the ball
+        // where the output has it, the ankle staying put
+        let slide = |z: f32| Vec3::new(0.0, 0.0, z);
+        let rolled = foot(Vec3::new(0.0, 0.14, 0.02) + slide(0.02), flat.ball + slide(0.02), 0.04);
+        let target = lock.update_foot(&rolled, true, 0.2, 0.1, dt);
+        assert!(target.distance(flat.ankle) < 1e-5, "{target}");
+        let ball = target + (rolled.ball - rolled.ankle);
+        // it rolls further and slides on: the ball stays, the ankle above it where the roll puts it
+        let further = foot(Vec3::new(0.0, 0.17, 0.05) + slide(0.06), flat.ball + slide(0.06), 0.07);
+        let target = lock.update_foot(&further, true, 0.2, 0.1, dt);
+        assert!(lock.is_locked());
+        assert!((target + (further.ball - further.ankle)).distance(ball) < 1e-5, "{target}");
+        // heel down again: back on the ankle, without a jump
+        let down = FootPose { ankle_lift: 0.0, ..further };
+        let again = lock.update_foot(&down, true, 0.2, 0.1, dt);
+        assert!(again.distance(target) < 1e-5, "{again} vs {target}");
     }
 }
