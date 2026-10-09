@@ -101,6 +101,8 @@ settings! {
     // global illumination, shadows, reflections
     gi: String = "rt".into();
     rtgi_res: String = "half".into();
+    gi_shadows: String = "maps".into();
+    gi_near: f32 = 0.0;
     shadows: String = "rt".into();
     shadow_res: String = "half".into();
     contact: bool = true;

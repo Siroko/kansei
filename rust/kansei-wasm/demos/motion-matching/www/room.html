@@ -138,6 +138,8 @@
         bind(rt, 'contact_length', { label: 'contact length (m)', min: 0.02, max: 1.0, step: 0.01 });
         bind(rt, 'gi', { label: 'GI', options: { 'hybrid RT': 'rt', 'voxel cones': 'voxel', 'screen space': 'ssgi', 'off': 'off' } });
         bind(rt, 'rtgi_res', { label: 'GI rays', options: { 'half (1 per 2x2)': 'half', 'full': 'full' } });
+        bind(rt, 'gi_shadows', { label: 'GI hits shadowed by', options: { rays: 'rays', 'shadow maps': 'maps' } });
+        bind(rt, 'gi_near', { label: 'GI grid reach (m, 0: all)', min: 0, max: 40, step: 0.5 });
         bind(rt, 'reflections', { label: 'RT reflections' });
         bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
         bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });

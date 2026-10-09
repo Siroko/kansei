@@ -57,7 +57,7 @@ use kansei_core::postprocessing::effects::{
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::rt::{
-    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiResolution, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions, RtShadowsEffect, RtShadowsView, RtSurface,
+    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiResolution, RtGiShadows, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions, RtShadowsEffect, RtShadowsView, RtSurface,
     RtTraceResolution, SceneRtGridOptions,
 };
 use kansei_core::shadows::CascadedShadowOptions;
@@ -274,7 +274,7 @@ async fn add_dragon(scene: &mut Scene) -> Option<usize> {
 
 /// Fixed views (`cam=<name>`): (name, target, distance, azimuth, elevation); the camera stands at
 /// the target plus (sin, cos) of the azimuth times the distance.
-const VIEWS: [(&str, [f32; 3], f32, f32, f32); 9] = [
+const VIEWS: [(&str, [f32; 3], f32, f32, f32); 12] = [
     // from the south-east, above the walls' tops, looking in through them and the ceiling
     ("outside", [0.0, 1.5, 0.0], 52.0, 0.65, 0.42),
     // the whole room from its south-east, the windows and the sun opposite
@@ -293,6 +293,11 @@ const VIEWS: [(&str, [f32; 3], f32, f32, f32); 9] = [
     ("dining", [-13.0, 1.0, 13.0], 6.5, 0.7, 0.25),
     // the library: shelves, the reading chair
     ("library", [-13.0, 1.2, -16.0], 7.0, 0.6, 0.18),
+    // close-ups of the shadows: the dining chairs' legs on the floor, the character's feet where
+    // it starts, the plinth in the water
+    ("contact", [-13.0, 0.3, 13.0], 3.6, 0.9, 0.35),
+    ("feet", [START[0], 0.3, START[2]], 2.8, 0.5, 0.3),
+    ("plinth", [0.0, 0.5, 0.0], 4.2, 0.6, 0.2),
 ];
 
 /// Without a character: the pond from beside the stand-in, a little off its axis.
@@ -638,6 +643,11 @@ impl RoomState {
         if let Some(e) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
             e.enabled = gi == "rt";
             e.set_resolution(if s.rtgi_res == "full" { RtGiResolution::Full } else { RtGiResolution::Half });
+            // the light at the rays' hits shadowed by more rays, or by the maps (the sun's
+            // cascades and the skylight's; the lamps' then unshadowed); past `gi_near` metres the
+            // voxel cone takes over (0: the whole grid)
+            e.shadows = if s.gi_shadows == "maps" { RtGiShadows::Maps } else { RtGiShadows::Rays };
+            e.near_distance = s.gi_near.max(0.0);
         }
         if let Some(e) = self.volume.effect_mut::<VoxelGIEffect>() {
             e.enabled = gi == "voxel";
