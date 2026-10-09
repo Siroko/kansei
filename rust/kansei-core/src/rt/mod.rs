@@ -31,6 +31,9 @@
 //!   2 x 2) from the GBuffer's surfaces, the hits lit by their exact direct light and one voxel
 //!   cone, the voxels past the grid's box, denoised by SVGF; an opt-in GI path beside voxel cones
 //!   (`gi::VoxelGIEffect`) and screen-space GI, with a reference path tracer through the grid.
+//! - [`RtShadowsEffect`] lights the surfaces that ask for it (`RT_SHADOWS_GBUFFER_WGSL`) by the
+//!   sun and the spot lights with ray-traced shadows: shadow rays through the grid toward a point
+//!   of each emitter (soft penumbrae, sharp contacts), screen-space contact rays, denoised.
 
 mod diffuse;
 mod effect;
@@ -38,6 +41,7 @@ mod grid;
 mod mesh;
 mod scene;
 mod scene_grid;
+mod shadows;
 
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
@@ -45,6 +49,7 @@ pub use grid::{RtGrid, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, Rt
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
+pub use shadows::{RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
 
 /// Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
 /// `kansei_rt_trace(origin, dir, t_min, t_max, flags)`, the closest hit of a ray among the grid's
