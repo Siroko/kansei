@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Motion Matching Room</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+        #hud, #hud-room {
+            position: fixed; left: 14px; margin: 0; max-width: 90vw;
+            color: #f2f2f2; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+            text-shadow: 0 1px 2px #000, 0 0 6px #000; white-space: pre-wrap; pointer-events: none;
+        }
+        #hud { top: 12px; }
+        #hud-room { bottom: 28px; }
+        #stats {
+            position: fixed; right: 8px; top: 8px; margin: 0; padding: 6px 8px;
+            font: 11px/1.35 ui-monospace, Menlo, monospace; color: #e8e8e8;
+            background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none; white-space: pre;
+        }
+        #stats:empty { display: none; }
+        #credit { position: fixed; left: 14px; bottom: 6px; font: 10px sans-serif; color: #999; }
+        #credit a { color: #bbb; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei" tabindex="0"></canvas>
+    <pre id="hud"></pre>
+    <pre id="hud-room"></pre>
+    <pre id="stats"></pre>
+    <div id="credit">
+        Dragon: "<a href="https://sketchfab.com/3d-models/stanford-dragon-vrip-b602a35846e74533b1d9f06034a3b730">Stanford Dragon (Vrip)</a>"
+        by <a href="https://sketchfab.com/3dgraphics">3D graphics 101</a>,
+        <a href="http://creativecommons.org/licenses/by-nc/4.0/">CC-BY-NC-4.0</a>
+    </div>
+    <script type="module">
+        // the room page of the motion-matching module (`start_room`); the character's exports are
+        // the same as www/index.html's
+        import init, { start_room, room_info, room_set, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
+        await init();
+        await start_room('kansei');
+        // for scripted captures: room.info() (with ?stats=1, each pass's GPU time), room.set('gi', 'voxel')
+        window.room = { info: () => JSON.parse(room_info() || '{}'), set: (key, value) => room_set(key, String(value)) };
+        window.driveRestart = drive_restart;
+        window.motionTimings = () => JSON.parse(motion_timings() || '{}');
+        if (new URLSearchParams(location.search).get('dragon') === '0') document.getElementById('credit').hidden = true;
+    </script>
+</body>
+</html>
