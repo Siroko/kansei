@@ -597,6 +597,17 @@ pub fn room_info() -> String {
     with_room(|s| s.info()).unwrap_or_default()
 }
 
+/// Whether the furniture meant for parkour is traversable as meant (`layout::check_traversals`),
+/// as JSON: `[[name, null or what went wrong], ...]`.
+#[wasm_bindgen]
+pub fn room_check() -> String {
+    let rows: Vec<String> = layout::check_traversals()
+        .into_iter()
+        .map(|(name, r)| format!("[\"{name}\",{}]", r.err().map_or("null".to_string(), |e| format!("\"{e}\""))))
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
 /// Switch the GI (`gi`: `rt`, `voxel`, `ssgi`, `off`), the fog, the dust, the outside camera
 /// (`outside`) or a fixed view (`cam`: `outside`, `dragon`, `mirror`, `parkour`, `living`; any other
 /// name follows the character).

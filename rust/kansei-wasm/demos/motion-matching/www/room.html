@@ -37,11 +37,11 @@
     <script type="module">
         // the room page of the motion-matching module (`start_room`); the character's exports are
         // the same as www/index.html's
-        import init, { start_room, room_info, room_set, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start_room, room_info, room_set, room_check, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
         await init();
         await start_room('kansei');
         // for scripted captures: room.info() (with ?stats=1, each pass's GPU time), room.set('gi', 'voxel')
-        window.room = { info: () => JSON.parse(room_info() || '{}'), set: (key, value) => room_set(key, String(value)) };
+        window.room = { info: () => JSON.parse(room_info() || '{}'), set: (key, value) => room_set(key, String(value)), check: () => JSON.parse(room_check()) };
         window.driveRestart = drive_restart;
         window.motionTimings = () => JSON.parse(motion_timings() || '{}');
         if (new URLSearchParams(location.search).get('dragon') === '0') document.getElementById('credit').hidden = true;

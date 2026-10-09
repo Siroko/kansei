@@ -321,3 +321,43 @@ pub fn build(scene: &mut Scene, pond_hole: Option<([f32; 2], [f32; 2])>) -> Layo
 
     Layout { collision }
 }
+
+/// The furniture meant for parkour as the character's traversal sees it: from feet in front of each
+/// piece, walking at it, the probe (`traversal::detect_obstacle`) finds it and picks the kind of
+/// traversal (`traversal_kind`, the default rules). Each piece's name and whether it got the kind
+/// meant, or what it got: `room_check()` on the page.
+pub fn check_traversals() -> Vec<(&'static str, Result<(), String>)> {
+    use kansei_core::animation::motion_matching::traversal::{detect_obstacle, traversal_kind, ActionKind, DetectionSettings, TraversalRules};
+    let layout = build(&mut Scene::new(), None);
+    let world = &layout.collision;
+    let cases: [(&str, [f32; 3], [f32; 3], ActionKind); 12] = [
+        ("crate", [9.5, 0.0, -5.6], [0.0, 0.0, -1.0], ActionKind::Vault),
+        ("rail", [13.5, 0.0, -3.8], [0.0, 0.0, -1.0], ActionKind::Hurdle),
+        ("block", [14.5, 0.0, -6.9], [0.0, 0.0, -1.0], ActionKind::Mantle),
+        ("stack", [10.5, 0.0, -11.6], [0.0, 0.0, -1.0], ActionKind::Mantle),
+        ("stack's top", [10.6, 1.2, -13.0], [0.0, 0.0, -1.0], ActionKind::Mantle),
+        ("platform, from the step", [16.0, 0.3, -13.0], [0.0, 0.0, -1.0], ActionKind::Climb),
+        ("ledge", [6.5, 0.0, -7.6], [0.0, 0.0, -1.0], ActionKind::Mantle),
+        ("sideboard", [-12.0, 0.0, -12.4], [0.0, 0.0, -1.0], ActionKind::Vault),
+        ("island", [-11.4, 0.0, -6.0], [0.0, 0.0, -1.0], ActionKind::Vault),
+        ("bench", [0.0, 0.0, 10.2], [0.0, 0.0, -1.0], ActionKind::Hurdle),
+        ("dining table", [-13.0, 0.0, 11.0], [0.0, 0.0, 1.0], ActionKind::Vault),
+        ("sofa's back", [13.0, 0.0, 8.3], [0.0, 0.0, 1.0], ActionKind::Hurdle),
+    ];
+    let (settings, rules) = (DetectionSettings::default(), TraversalRules::default());
+    cases
+        .into_iter()
+        .map(|(name, feet, direction, want)| {
+            let feet = GVec3::from(feet);
+            let got = match detect_obstacle(world, feet, GVec3::from(direction), 2.0, &settings) {
+                None => Err("nothing found".to_string()),
+                Some(o) => traversal_kind(world, &o, feet, &rules, u32::MAX).map_err(|e| format!("{} (height {:.2}, depth {:?}, half width {:.2})", e.describe(), o.height, o.depth, o.half_width)),
+            };
+            (name, match got {
+                Ok(kind) if kind == want => Ok(()),
+                Ok(kind) => Err(format!("{} where {} was meant", kind.name(), want.name())),
+                Err(e) => Err(e),
+            })
+        })
+        .collect()
+}
