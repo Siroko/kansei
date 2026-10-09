@@ -16,6 +16,12 @@ the clip tools.
 `www/kimodo.html` is a second page on the same module, for packs of generated clips (see
 [Generated animation (Kimodo)](#generated-animation-kimodo)).
 
+`www/room.html` is a third, the same character in a furnished room lit by ray-traced direct
+light and global illumination, with mirrors, a glass dragon in a pond, furniture to vault and
+climb, fog and dust (see
+[The room](#the-room)). The character and its controls are shared by the pages (`src/character.rs`,
+`src/player.rs`); the room is `src/room/`.
+
 ## A pack
 
 Bake one from glTF clips and a skinned mesh with [`kansei-anim-bake`](../../../kansei-anim-bake/README.md).
@@ -111,12 +117,162 @@ character is in it:
   of it: E, the gamepad's X, or a click on its prompt; R (Y) by it drains the lake.
 - **The mill** (`at=18,2.6,110` looks along the shore at it) turns in the north shallows.
 
+## The room
+
+`www/room.html` (`start_room`) puts the character in a 40 x 40 m room, 9 m high (`src/room/`). It
+loads the same packs as `www/index.html` (`www/pack/`, `pack=`, `hero=`). Without one a capsule
+stands in for the character (drawn by the same skinned material, in the mirrors and the shadows)
+under the HUD's "no motion pack" message, and the room renders as it does with one.
+
+- **The room.** A white marble floor of 1.8 m slabs (each its own piece of the stone, turned and
+  offset, with seams) or a lacquered oak herringbone (`floor=wood`), plaster walls (a terracotta
+  one to the south, grey limewash to the north), three tall steel-framed windows to the west with
+  deep reveals, a 6 x 12 m skylight in a concrete ceiling crossed by oak beams and a steel grid,
+  four concrete columns, oak baseboards (`layout.rs`). Surfaces are box-mapped PBR (`pbr.rs`:
+  colour, normal, occlusion/roughness/metallic) with a slow noise over metres against the
+  tiling.
+- **The light.** A low sun (9000 lx at 24°, 3600 K) through the windows, the skylight (a cool
+  7500 K spot light whose emitter is the 6 x 12 m opening, 32000 cd), four warm 2700 K lamps
+  under glowing shades (three floor lamps and the dining table's pendant), and the sky the
+  windows show, which also lights the rays leaving through them (`SkyLighting`, its SH built on
+  the CPU from the gradient). Exposure EV100 9, AgX.
+- **Ray-traced direct light** (`kansei_core::rt::RtShadowsEffect`, new with this page). Surfaces
+  that leave their direct light to it (`kansei_gbuffer_out_rt_lit`: the emissive alpha holds their
+  roughness) are lit by the sun and every spot light with shadow rays through the grid of
+  triangles: toward a point of the sun's disk (`sun_soft`, 1.2° by default), of a spot light's disk
+  or of a rectangle (the skylight, `set_rect_emitter`), so penumbras widen with distance from the
+  occluder as an area light's do. One ray per light per 2 x 2 pixels (`shadow_res=full` for every
+  pixel), accumulated over frames and filtered (an à-trous wavelet with depth and normal stops),
+  upsampled by depth and normal; then Lambert plus a GGX specular toward the emitter's point
+  nearest the reflected ray (on surfaces the traced reflections don't cover). Short screen-space
+  rays (`contact_length`, 25 cm) add the contacts the 30 cm grid misses: chair legs, the feet.
+  `shadows=maps` goes back to shadow maps (cascades and the spot lights' PCSS atlas) in the
+  materials. Its debug views (`rt_view=visibility|direct|mask`) show one light's visibility, the
+  direct light alone and which pixels it lights.
+- **The GI.** The hybrid by default (`RtDiffuseGiEffect`: a ray for each 2 x 2 pixels through the
+  grid, the hits lit by the lights, shadowed by the maps, `gi_shadows=rays` for rays, and a voxel
+  cone, SVGF 3 x 3), over voxel GI's volume of the room. G (or `gi=`) switches to voxel cones,
+  screen space or none. The room's materials add no sky ambient of their own, so the effects take
+  none out (`ambient: 0`).
+- **Reflections and glass.** The marble, the lacquered wood, a mirror on the north wall and a
+  brushed one (roughness 0.1) on the east wall reflect through `RtReflectionsEffect`, and the glass
+  Stanford dragon (index of refraction 1.5) through its glass pass. Only glossy pixels (roughness
+  under 0.45) take traced reflections: a rough lobe's few rays come out as speckle, and its blur is
+  what the lights' GGX and the GI give anyway.
+- **Furniture** from Poly Haven, CC0: a sofa with throw pillows, two lounge chairs, an arm chair,
+  an ottoman, a coffee table, a cabinet, a round dining table with four chairs, a vase, steel and
+  wooden shelves with books, plants, a picture frame, a pendant lamp. Each model is drawn as it
+  comes, and traced as a simplified stand-in (`assets.rs`: welded, simplified to 1.5 cm, at most
+  1500 triangles, in the grid only): the chairs alone put thousands of triangles in a 30 cm cell,
+  which made the rays' traversal five to eight times slower (the room's grid went from 196k
+  triangles to 24k). The solid pieces are boxes in the collision world.
+- **Parkour.** A crate, a rail, a sideboard, an island, dark marble blocks, a two-block stack, a 2.2 m platform behind a
+  step, two ledges with a gap, a bench: Space vaults, hurdles, mantles and climbs them as on the
+  course. `room_check()` probes each piece as the traversal does and says whether it gets the
+  traversal meant (vault: the crate, the sideboard, the island; hurdle: the rail, the bench;
+  mantle: the block, the stack, its top, the ledge; climb: the platform from its step). All ten
+  pass.
+- **One-sided walls.** The walls, the floor and the ceiling face in and discard their back faces,
+  so from outside (O, or `cam=outside`) the camera looks through them into the room. The grid hits
+  a triangle from either side, so the rays from inside meet the walls as they should. Thick boxes
+  outside keep the character in.
+- **The character in the rays.** Its skinned mesh can't go into the grid, so capsules on its bones
+  stand in for it there (`look::Proxy`, `look::grid_only`): renderables no camera draws, moved
+  when a bone has moved 3 cm. They cast its ray-traced shadow and show it in the mirrors. Walking,
+  they rebuild the grid every frame (about 0.9 ms); standing, never. `rt_body=0` leaves them out.
+- **The pond.** A rectangular reflecting pool with a black marble bed round the marble plinth, the
+  lake's SPH water at its scale and tuning, 180k particles. The character wades in as it does in
+  the lake, and the water rests: culled out of view, asleep once its fastest particle is under
+  0.15 m/s. The plinth is a still capsule collider, not part of the container's floor (as a floor
+  that steep it kept the water churning).
+- **Fog and dust.** A faint haze fills the room (a box `LocalFogVolume`), lit by the sun through
+  the cascades and the skylight through its map, so the windows throw shafts. 32768 dust motes
+  drift in a slow curl flow round the camera (a compute shader), pushed by the character, drawn
+  from a sprite atlas a compute shader makes at startup (soft motes, fibres, flecks and bokeh
+  discs, with mips), tumbling, lit by the sun and the spot lights through their shadows so they
+  sparkle in the beams, and blurred into bokeh by the depth of field.
+- **Post.** TAA, depth of field focused on the character (or the screen's centre, or a distance),
+  bloom, AgX tone mapping with white balance, contrast, saturation, lift/gain, vignette, grain and
+  chromatic aberration, motion blur off by default.
+
+The panel (Tweakpane, P hides it, collapsed on small screens) holds every setting, its starting
+values from the URL: presets for the look (golden hour, midday, overcast, night lamps, gallery),
+the camera, the depth of field and the post-processing (neutral, warm cinematic, cool moody,
+filmic contrast, bleach bypass, vintage); a preset sets several controls and editing one makes it
+"custom". Its folders: Scene (floor, roughness, mirrors, the dragon's glass), Lights, Shadows / GI
+/ reflections, Fog and dust, Fluid (the pond: simulate, show, sleep, SPH or PBF, the fill with a
+Reset button, time scale, substeps, the solvers' parameters, gravity, the legs' push, the
+surface's look; all live but the fill), Depth of field, Post-processing, Resolution (the canvas
+height, native to 540p, the pixel ratio and the scene's scale, TAA upscaling; kept in the URL)
+and Stats. `src/room/settings.rs` lists them all with their defaults: each is also a URL
+parameter of the same name (`?floor=wood&gi=voxel&ev=8.5`), and `room.set(name, value)` sets one
+live. `cam=` names a view: `outside`, `hall`, `dragon`, `mirror`, `windows`, `parkour`, `living`,
+`dining`, `library`, and the shadow close-ups `contact`, `feet`, `plinth` (any other follows the
+character). `panel=0` and `hud=0` start without the panel and the text, for captures; `pond=0`,
+`dragon=0`, `rt_body=0` leave those out; `stats=1` shows each pass's GPU time and the CPU sections
+(also in `room.info()`), `profile=1` logs the profile every 3 s.
+
+Keys, on top of the shared ones: O inside / outside, G the GI, T the shadows, F the fog, N the dust,
+P the panel. On `window.room`: `info()`, `settings()`, `set(name, value)` and `check()`.
+
+### The assets
+
+`www/assets/room/` (25 MB: 10 surfaces, 18 models) is made by `tools/room_assets.py`, which
+downloads them and encodes every texture to KTX2 (Basis Universal: colour as ETC1S, normals and
+occlusion/roughness/metallic as UASTC) with `rust/tools/ktx2`; the models become .glb files whose
+textures use `KHR_texture_basisu`. Each texture is uploaded once and shared by the materials that
+use it (`assets.rs`). All CC0:
+
+- surfaces from [ambientCG](https://ambientcg.com): Marble012 (the floor), WoodFloor016 (the
+  herringbone), Plaster001, Concrete031 (the columns), Concrete046 (the ceiling), Wood049 (oak),
+  Carpet012, Marble016 (the pond's bed, the blocks), Gravel043, Metal032;
+- models from [Poly Haven](https://polyhaven.com): sofa_02, mid_century_lounge_chair,
+  modern_arm_chair_01, Ottoman_01, modern_coffee_table_01, modern_wooden_cabinet,
+  wooden_display_shelves_01, steel_frame_shelves_03, round_wooden_table_01, dining_chair_02,
+  potted_plant_02, potted_plant_04, ceramic_vase_01, ceramic_vase_03, throw_pillows_01,
+  hanging_picture_frame_02, book_encyclopedia_set_01, modern_ceiling_lamp_01.
+
+The dragon is the GI box's (`www/assets/` links to `examples/gi-box/www/assets/`): "Stanford
+Dragon (Vrip)" by 3D graphics 101, CC-BY-NC-4.0. The page credits all three.
+
+### What a frame costs
+
+1080p (`dpr=1`), M4 Pro, headless Chrome without vsync (`stats=1`), the defaults (hybrid GI,
+ray-traced shadows and reflections, fog, dust, depth of field, TAA, bloom), the water asleep,
+measured with the GPU otherwise idle (other sessions sharing it doubled every pass):
+
+| | frame interval | GPU span |
+|---|---|---|
+| `hall` / `living` / `dining` / `mirror`, no pack | 16.7 / 15.9 / 16.4 / 15.9 ms | 16.3 / 14.9 / 15.8 / 15.1 ms |
+| `dragon` (the glass fills the screen) | 20.6 ms | 20.1 ms |
+| `outside` | 14.7 ms | 13.1 ms |
+| GASP character in `hall`, standing / walking | 17.1 / 18.5 ms | 16.5 / 17.6 ms |
+| the follow camera, walking | 20.3 ms | 19.8 ms |
+| `hall`, GI hits shadowed by rays (`gi_shadows=rays`) | 20.1 ms | 19.8 ms |
+| `hall`, shadow maps (`shadows=maps`) | 16.9 ms | 16.2 ms |
+| `hall`, voxel GI / screen-space GI / no GI | 14.7 / 14.3 / 11.7 ms | 14.0 / 13.3 / 11.0 ms |
+| `hall`, the water running (`fluid_rest=0`) | 21.2 ms | 20.7 ms |
+| `hall`, every ray at full resolution | 31.0 ms | 30.5 ms |
+| `hall` at 720p | 10.8 ms | 10.2 ms |
+
+By effect in `hall` (GPU): the hybrid GI 4.6 ms (its trace 3.0), the renderer's passes 2.2 (the
+GBuffer, the cascades, the skylight's shadow map, velocity), the ray-traced direct light 2.1
+(trace 0.7-1.4, temporal and wavelet 0.6, composite 0.8), the reflections 1.4, the glass 1.3, depth
+of field 0.7, TAA 0.6, voxel GI's upkeep 0.5, fog 0.5, bloom 0.3, the dust 0.01 of compute. On the
+CPU the character takes about 2.4 ms and the renderer about 2.
+
+What it took to get there, from a first pass at 92 ms: the furniture's stand-ins in the grid (the
+GI's trace 22 to 3 ms, the reflections' 31 to 1.5), the lamps without shadow maps when the
+shadows are ray traced (they had redrawn the room four more times a frame, 3 ms), the GI's hits
+shadowed by the maps (6.2 to 3.0 ms), and a shallower pond that sleeps. The Resolution folder's
+scene scale (0.75: 15.2 ms in `hall`) or 900p (16.4 ms) buy the rest on slower GPUs.
+
 ## Build and run
 
 ```sh
 cd rust/kansei-wasm/demos/motion-matching
 wasm-pack build --target web --release
-python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html)
+python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html)
 ```
 
 The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on the CPU.

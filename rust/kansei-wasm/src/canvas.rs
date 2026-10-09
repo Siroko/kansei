@@ -44,8 +44,11 @@ struct Inner {
     /// The `<canvas>`, or in a worker its stand-in.
     element: HtmlCanvasElement,
     max_pixel_ratio: Cell<f32>,
-    /// `?dpr=`, read once.
-    pixel_ratio_param: Option<f64>,
+    /// `?dpr=` (read once), or `set_pixel_ratio`'s.
+    pixel_ratio_param: Cell<Option<f64>>,
+    /// A drawing-buffer height whatever the ratio, the width by the box's aspect
+    /// (`set_render_height`).
+    render_height: Cell<Option<u32>>,
     /// A drawing-buffer size that ignores the page (`with_size`).
     fixed_size: Cell<Option<(u32, u32)>>,
     /// Set by the resize observer; the frame loop re-measures on the next frame.
@@ -99,7 +102,8 @@ impl Canvas {
                 target,
                 element,
                 max_pixel_ratio: Cell::new(DEFAULT_MAX_PIXEL_RATIO),
-                pixel_ratio_param: crate::param("dpr").and_then(|v| v.parse::<f64>().ok()).filter(|r| *r > 0.0),
+                pixel_ratio_param: Cell::new(crate::param("dpr").and_then(|v| v.parse::<f64>().ok()).filter(|r| *r > 0.0)),
+                render_height: Cell::new(None),
                 fixed_size: Cell::new(None),
                 box_changed,
                 pixel_ratio: Cell::new(0.0),
@@ -127,6 +131,21 @@ impl Canvas {
         self.inner.fixed_size.set(Some(size));
         self.set_size(size);
         self
+    }
+
+    /// Fix the device pixel ratio at `ratio` from the next frame (as `?dpr=` does), or with
+    /// `None` follow the screen's again (capped as `with_max_pixel_ratio` says).
+    pub fn set_pixel_ratio(&self, ratio: Option<f64>) {
+        self.inner.pixel_ratio_param.set(ratio.filter(|r| r.is_finite() && *r > 0.0));
+        self.inner.box_changed.set(true);
+    }
+
+    /// Draw `height` pixels high from the next frame, as wide as the CSS box's aspect asks,
+    /// whatever the pixel ratio (the box stretches it to the window): a fixed render resolution
+    /// such as 1080p on any screen. `None` goes back to the box times the pixel ratio.
+    pub fn set_render_height(&self, height: Option<u32>) {
+        self.inner.render_height.set(height.filter(|h| *h > 0));
+        self.inner.box_changed.set(true);
     }
 
     /// The `<canvas>` element, for input listeners (`CameraControls::from_canvas`, ...).
@@ -191,7 +210,7 @@ impl Canvas {
     }
 
     fn pixel_ratio(&self) -> f64 {
-        if let Some(ratio) = self.inner.pixel_ratio_param {
+        if let Some(ratio) = self.inner.pixel_ratio_param.get() {
             return ratio.clamp(0.1, 4.0);
         }
         let device = match self.inner.target {
@@ -210,8 +229,13 @@ impl Canvas {
             return;
         }
         let element = &self.inner.element;
-        let width = (element.client_width().max(1) as f64 * ratio).round() as u32;
-        let height = (element.client_height().max(1) as f64 * ratio).round() as u32;
+        let (box_w, box_h) = (element.client_width().max(1) as f64, element.client_height().max(1) as f64);
+        if let Some(height) = self.inner.render_height.get() {
+            self.set_size((((box_w / box_h) * height as f64).round().max(1.0) as u32, height));
+            return;
+        }
+        let width = (box_w * ratio).round() as u32;
+        let height = (box_h * ratio).round() as u32;
         self.set_size((width, height));
     }
 
