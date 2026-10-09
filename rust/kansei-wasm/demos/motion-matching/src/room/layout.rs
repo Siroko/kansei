@@ -1,9 +1,9 @@
 //! The room: 40 x 40 m and 9 m high. A marble or oak herringbone floor, plaster walls (a
-//! terracotta one to the south, board-formed concrete behind the big mirror to the north), three
+//! terracotta one to the south, grey limewash behind the big mirror to the north), three
 //! tall steel-framed windows to the west that the low sun comes through, a skylight in the
 //! concrete ceiling over the pond with oak beams crossing it, four concrete columns, and the
 //! furniture (CC0 models, `assets`): a living corner, a dining table under a pendant, a library,
-//! and blocks of concrete and oak to vault, mantle and climb. Everything solid is in the collision
+//! and blocks of dark marble and oak to vault, mantle and climb. Everything solid is in the collision
 //! world, voxel GI and the ray tracing grid.
 //!
 //! One-sided: the shell (walls, floor, ceiling) is drawn with back faces discarded on screen, so
@@ -385,8 +385,10 @@ pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f
     // the shell: floor, walls, ceiling, and thick colliders outside the walls
     floor(&mut b, pond_hole, floor_name, floor_roughness);
     let wall = surface(PLASTER, 2.0, [1.0, 0.0], false, deferred);
-    let concrete = surface([1.0, 1.0, 1.0], 2.5, [1.0, 0.0], false, deferred);
-    b.shell("WallNorth", [2.0 * h, top], [0.0, top * 0.5, -h], [0.0, 0.0], "concrete", concrete, mean("concrete", [1.0; 3]));
+    // (the concrete scan's stains repeat across a wall: concrete only at column size)
+    let concrete = surface([1.0, 1.0, 1.0], 1.2, [1.0, 0.0], false, deferred);
+    let limewash = [0.7, 0.68, 0.64];
+    b.shell("WallNorth", [2.0 * h, top], [0.0, top * 0.5, -h], [0.0, 0.0], "plaster", surface(limewash, 2.0, [1.0, 0.0], false, deferred), mean("plaster", limewash));
     b.shell("WallSouth", [2.0 * h, top], [0.0, top * 0.5, h], [0.0, PI], "plaster", surface(TERRACOTTA, 2.0, [1.0, 0.0], false, deferred), mean("plaster", TERRACOTTA));
     b.shell("WallEast", [2.0 * h, top], [h, top * 0.5, 0.0], [0.0, -FRAC_PI_2], "plaster", wall, mean("plaster", PLASTER));
     west_wall(&mut b);
@@ -476,15 +478,16 @@ pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f
     // platform to climb, two ledges with a gap to jump; a sideboard and an island (north-west); a
     // bench on the pond's south shore
     let white = [1.0, 1.0, 1.0];
+    let stone = [2.6, 2.6, 2.6];
     b.block("Crate", [9.5, 0.0, -7.0], [2.0, 1.0, 0.8], 0.0, "oak", white);
     b.block("Rail", [13.5, 0.0, -5.0], [3.0, 0.55, 0.25], 0.3, "oak", white);
-    b.block("Block", [14.5, 0.0, -9.5], [2.5, 1.3, 2.5], -0.4, "concrete", white);
-    b.block("Stack", [10.5, 0.0, -14.0], [3.0, 1.2, 3.0], 0.2, "concrete", white);
+    b.block("Block", [14.5, 0.0, -9.5], [2.5, 1.3, 2.5], -0.4, "blackmarble", stone);
+    b.block("Stack", [10.5, 0.0, -14.0], [3.0, 1.2, 3.0], 0.2, "blackmarble", stone);
     b.block("Stack", [10.61, 1.2, -14.54], [1.8, 1.1, 1.8], 0.2, "oak", white);
-    b.block("Platform", [16.0, 0.0, -16.0], [4.0, 2.2, 3.5], 0.0, "concrete", white);
-    b.block("Step", [16.0, 0.0, -12.6], [4.0, 0.3, 2.0], 0.0, "concrete", [0.8, 0.8, 0.8]);
-    b.block("Ledge", [6.5, 0.0, -16.0], [3.0, 1.2, 4.0], 0.0, "concrete", [0.9, 0.9, 0.9]);
-    b.block("Ledge", [6.5, 0.0, -10.5], [3.0, 1.2, 3.5], 0.0, "concrete", [0.9, 0.9, 0.9]);
+    b.block("Platform", [16.0, 0.0, -16.0], [4.0, 2.2, 3.5], 0.0, "blackmarble", stone);
+    b.block("Step", [16.0, 0.0, -12.6], [4.0, 0.3, 2.0], 0.0, "blackmarble", [2.2, 2.2, 2.2]);
+    b.block("Ledge", [6.5, 0.0, -16.0], [3.0, 1.2, 4.0], 0.0, "blackmarble", stone);
+    b.block("Ledge", [6.5, 0.0, -10.5], [3.0, 1.2, 3.5], 0.0, "blackmarble", stone);
     b.block("Sideboard", [-12.0, 0.0, -14.0], [2.6, 1.25, 0.9], 0.0, "oak", white);
     b.block("Island", [-11.0, 0.0, -7.5], [2.4, 1.0, 0.9], 0.35, "marble", [0.95, 0.95, 0.95]);
     b.block("Bench", [0.0, 0.0, 8.8], [3.2, 0.45, 0.5], 0.0, "oak", white);
