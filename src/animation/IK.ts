@@ -10,7 +10,8 @@ import { Transform } from "./Transform";
  * The foot lock follows Daniel Holden's "Inverse Kinematics & Foot Locking"
  * (<https://theorangeduck.com/page/inverse-kinematics-foot-locking>): while the animation says a
  * foot is planted, pin it where it touched down; release it when the contact ends or the
- * animated foot strays past a radius, and let the difference fade with a spring.
+ * animated foot strays past a radius, and let the difference fade with a spring. A foot rolling
+ * onto its ball is pinned there, so the heel can lift.
  */
 
 /** A unit vector perpendicular to `v` (glam's `any_orthonormal_vector`). */
@@ -82,36 +83,67 @@ function twoJointIK(skeleton: Skeleton, pose: Pose, model: Transform[], upper: n
     model[end] = endParent.mul(pose.local[end]);
 }
 
+/** A foot as the animation places it: its ankle and ball (world), and how far each is above where it is at rest. */
+interface FootPose {
+    ankle: vec3;
+    ball: vec3;
+    ankleLift: number;
+    ballLift: number;
+}
+
+/**
+ * The heel counts as up (a planted foot pivots on its ball) once the ankle is this much higher
+ * above its rest height than the ball is, and down again under `HEEL_DOWN`.
+ */
+const HEEL_UP = 0.02;
+const HEEL_DOWN = 0.01;
+
 /** A foot pinned to where it touched down while it is planted. */
 class FootLock {
     private locked = false;
-    /** Where the foot is pinned while locked. */
+    /** Where the pivot is pinned while locked: the ankle, or the ball once the heel is up. */
     private position = vec3.create();
-    /** Last frame's contact, to lock on a new one only. */
-    private contact = false;
+    private onBall = false;
     /** Added to the output, fading: it keeps the output continuous when the lock lets go. */
     private offset = vec3.create();
     private offsetVelocity = vec3.create();
 
     /**
      * The foot's target this frame (world space) from where the animation puts it and whether
-     * it is planted. A new contact pins the foot there; the pin lets go when the contact ends or
-     * the animated foot strays past `unlockRadius`, and the output then fades back onto the
-     * animation with `halflife`.
+     * it is planted. A contact pins the foot there; the pin lets go when the contact ends or the
+     * animated foot strays past `unlockRadius`, and the output then fades back onto the
+     * animation with `halflife` (pinned again where the animation has the foot while the contact
+     * lasts: a foot that strayed still stops sliding).
      */
     public update(animated: vec3, contact: boolean, unlockRadius: number, halflife: number, dt: number): vec3 {
-        if (this.locked && (!contact || vec3.distance(animated, this.position) > unlockRadius)) {
+        return this.updateFoot({ ankle: animated, ball: animated, ankleLift: 0, ballLift: 0 }, contact, unlockRadius, halflife, dt);
+    }
+
+    /**
+     * `update` for a foot that rolls: the ankle's target, pinning the ankle while the heel is
+     * down and the ball once it lifts (a running foot lands on its ball and rolls off it), the
+     * foot keeping its animated rotation about the pin. Switching pivots re-pins the new one
+     * where the output has it, so the foot does not jump.
+     */
+    public updateFoot(foot: FootPose, contact: boolean, unlockRadius: number, halflife: number, dt: number): vec3 {
+        const toe = vec3.subtract(vec3.create(), foot.ball, foot.ankle);
+        const heelUp = foot.ankleLift - foot.ballLift;
+        const onBall = heelUp > (this.onBall ? HEEL_DOWN : HEEL_UP);
+        if (this.locked && onBall !== this.onBall) vec3.scaleAndAdd(this.position, this.position, toe, onBall ? 1 : -1);
+        this.onBall = onBall;
+        const pivot = onBall ? foot.ball : foot.ankle;
+        const pinned = (position: vec3): vec3 => onBall ? vec3.subtract(vec3.create(), position, toe) : vec3.clone(position);
+        if (this.locked && (!contact || vec3.distance(pivot, this.position) > unlockRadius)) {
             this.locked = false;
             // the output was the pin: carry the difference over, to fade
-            vec3.add(this.offset, this.offset, vec3.subtract(vec3.create(), this.position, animated));
+            vec3.add(this.offset, this.offset, vec3.subtract(vec3.create(), pinned(this.position), foot.ankle));
         }
-        if (!this.locked && contact && !this.contact) {
+        if (!this.locked && contact) {
             this.locked = true;
-            vec3.copy(this.position, animated);
+            vec3.copy(this.position, pivot);
         }
-        this.contact = contact;
         decaySpringDamperExact(this.offset, this.offsetVelocity, halflife, dt);
-        return vec3.add(vec3.create(), this.locked ? this.position : animated, this.offset);
+        return vec3.add(vec3.create(), this.locked ? pinned(this.position) : foot.ankle, this.offset);
     }
 
     public isLocked(): boolean {
@@ -121,11 +153,12 @@ class FootLock {
     /** Release the foot and forget its history (after a teleport). */
     public reset(): void {
         this.locked = false;
-        this.contact = false;
+        this.onBall = false;
         vec3.zero(this.position);
         vec3.zero(this.offset);
         vec3.zero(this.offsetVelocity);
     }
 }
 
-export { twoJointIK, FootLock, anyOrthonormal };
+export { twoJointIK, FootLock, anyOrthonormal, HEEL_UP, HEEL_DOWN };
+export type { FootPose };

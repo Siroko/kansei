@@ -31,7 +31,8 @@ export {
     springDamperExactQuat, decaySpringDamperExactQuat, springCharacterUpdate,
 } from "./Springs";
 export { Inertializer, poseVelocities } from "./Inertialization";
-export { twoJointIK, FootLock } from "./IK";
+export { twoJointIK, FootLock, HEEL_UP, HEEL_DOWN } from "./IK";
+export type { FootPose } from "./IK";
 export { Retarget, TranslationMode } from "./Retarget";
 export { Ramp, Placement, RootWarp } from "./Warping";
 export type { Root } from "./Warping";

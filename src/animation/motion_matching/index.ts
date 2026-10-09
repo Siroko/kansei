@@ -21,6 +21,7 @@
  *   searches, root motion, inertialized transitions, the animated character kept near the
  *   simulation, and foot locking with two-joint IK.
  * - `MotionPack` and `CharacterPack` read (and write) `.kmm` packs. None ships with Kansei.
+ * - `FootSlide` measures how far planted feet slide, over a scripted course (`measureFootSlide`).
  * - `CharacterController` (`Traversal`) keeps a matcher out of a `CollisionWorld`, on its ground,
  *   falling and landing, and hurdles, vaults, mantles, climbs or jumps on request.
  */
@@ -36,6 +37,8 @@ export type { MotionMatchingSettings, MotionInput, Simulation, SearchInfo, RootP
 export { ActionKind, ActionClip, actionKindName, actionKindFromName, crosses } from "./ActionClip";
 export type { ActionClipFields } from "./ActionClip";
 export { MotionPack, CharacterPack, PackError } from "./Pack";
+export { FootSlide, moveVelocity, footSlideCourse, measureFootSlide } from "./FootSlide";
+export type { FootSlideReport, Move, Scenario } from "./FootSlide";
 export type { PackMesh, PackImage } from "./Pack";
 export {
     detectObstacle, defaultDetectionSettings, Refusal, isRefusal, defaultTraversalRules, standsAt, traversalKind, planTraversal, planJump,

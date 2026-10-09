@@ -9,8 +9,9 @@ import { SkinnedMesh } from "../../src/animation/SkinnedMesh";
 import { Transform } from "../../src/animation/Transform";
 import {
     ActionClip, ActionKind, CharacterPack, Database, DatabaseBuilder, FEATURES, MotionMatcher, MotionPack, STRIDE, SearchFilter,
-    defaultMotionMatchingSettings, defaultSearchFilter, findJointRoles, yawOf,
+    defaultContactThresholds, defaultMotionMatchingSettings, defaultSearchFilter, findJointRoles, measureFootSlide, moveVelocity, yawOf,
 } from "../../src/animation/motion_matching/index";
+import type { Scenario } from "../../src/animation/motion_matching/index";
 
 const RATE = 30;
 const v = (x: number, y: number, z: number) => vec3.fromValues(x, y, z);
@@ -324,4 +325,79 @@ test("a display skeleton shows the pose with its own proportions", () => {
     matcher.setDisplay(db);
     model = matcher.model;
     assert(Math.abs(model[1].translation[1] - 1) < 0.1);
+});
+
+test("a foot on its ball is planted while its ankle moves", () => {
+    // feet straight under the root, each with a ball 0.15 m ahead: the translations place them
+    const t = (x: number, y: number, z: number) => Transform.fromTranslationRotation(v(x, y, z), quat.create());
+    const skeleton = new Skeleton(
+        ["root", "hips", "foot_l", "ball_l", "foot_r", "ball_r"],
+        [null, 0, 0, 2, 0, 4],
+        [t(0, 0, 0), t(0, 1, 0), t(0.1, 0.1, 0), t(0, -0.07, 0.15), t(-0.1, 0.1, 0), t(0, -0.07, 0.15)],
+    );
+    const roles = findJointRoles(skeleton, "root", "hips", "foot_l", "foot_r");
+    // standing still; frames 10-19 the left ankle circles 4 cm round its rest, fast (1.5 m/s),
+    // its ball still; frames 20-29 both swing high
+    const poses: Pose[] = [];
+    for (let f = 0; f < 40; f++) {
+        const pose = Pose.rest(skeleton);
+        if (f >= 10 && f < 20) {
+            const a = f * 1.25;
+            const ankle = v(0.1, 0.1 + Math.sin(a) * 0.04, Math.cos(a) * 0.04);
+            pose.local[2].translation = ankle;
+            pose.local[3].translation = vec3.subtract(vec3.create(), v(0.1, 0.03, 0.15), ankle);
+        } else if (f >= 20 && f < 30) {
+            pose.local[2].translation[1] += 0.3;
+            pose.local[4].translation[1] += 0.3;
+        }
+        poses.push(pose);
+    }
+    const builder = new DatabaseBuilder(skeleton, roles, RATE);
+    builder.addClip(Clip.fromPoses("tap", RATE, poses), false, 1);
+    const db = builder.build();
+    const left = (db: Database) => Array.from({ length: db.frameCount }, (_, f) => db.contacts(f)[0]);
+    assert(left(db).slice(11, 19).every((c) => c), `${left(db)}`);
+    assert(left(db).slice(21, 29).every((c) => !c), `${left(db)}`);
+    // the ankle alone would have it lifted
+    assert(Math.hypot(...raw(db, 14).slice(6, 9)) > 1, `${raw(db, 14).slice(6, 9)}`);
+    // found again from the poses, the same
+    const baked = db.contactBits.slice();
+    db.detectContacts(defaultContactThresholds());
+    assertEq(Array.from(db.contactBits), Array.from(baked));
+});
+
+test("a pack from before the ball contacts gets them found again", () => {
+    const db = database();
+    const baked = Array.from(db.contactBits);
+    const stale = database();
+    stale.contactBits.fill(0);
+    const bytes = new MotionPack(stale, [], [], []).toBytes();
+    // a pack that says how its contacts were found keeps them
+    assertEq(Array.from(MotionPack.fromBytes(bytes).database.contactBits), Array.from(stale.contactBits));
+    // one without the CRUL section gets them from the poses
+    const tag = Array.from("CRUL", (c) => c.charCodeAt(0));
+    const at = bytes.findIndex((_, i) => tag.every((c, k) => bytes[i + k] === c));
+    const length = Number(new DataView(bytes.buffer, bytes.byteOffset + at + 4, 8).getBigUint64(0, true));
+    const old = new Uint8Array([...bytes.subarray(0, at), ...bytes.subarray(at + 12 + length)]);
+    assertEq(Array.from(MotionPack.fromBytes(old).database.contactBits), baked);
+});
+
+test("foot locking keeps planted feet from sliding", () => {
+    const db = database();
+    const walk: Scenario = { name: "walk", move: { kind: "straight", speed: 1.5 }, run: false, settle: 2, seconds: 4 };
+    const slide = (lock: boolean) => {
+        const settings = { ...defaultMotionMatchingSettings(), footLock: lock };
+        return measureFootSlide(db, db, new MotionMatcher(db, settings, vec3.create(), 0), walk);
+    };
+    const free = slide(false), locked = slide(true);
+    assert(free.planted > 0.2, JSON.stringify(free));
+    // the synthetic legs swing without planting: their feet slide unless locked
+    assert(free.cmPerSecond > 5, JSON.stringify(free));
+    assert(locked.cmPerSecond < 0.3 * free.cmPerSecond, `${JSON.stringify(locked)} vs ${JSON.stringify(free)}`);
+    assert(locked.yawGap < 1, JSON.stringify(locked));
+    // a circle's heading turns at speed / radius, to the left (toward +x from +z) for `left`
+    const quarter = Math.PI / 4;
+    const close = (a: vec3, b: vec3) => vec3.distance(a, b) < 1e-4;
+    assert(close(moveVelocity({ kind: "circle", radius: 2, speed: 4, left: true }, quarter), v(4, 0, 0)));
+    assert(close(moveVelocity({ kind: "circle", radius: 2, speed: 4, left: false }, quarter), v(-4, 0, 0)));
 });

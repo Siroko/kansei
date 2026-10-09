@@ -3,7 +3,7 @@ import { Skeleton } from "../Skeleton";
 import { SkinnedMesh } from "../SkinnedMesh";
 import { Transform } from "../Transform";
 import { ActionClip, ActionKind } from "./ActionClip";
-import { ClipInfo, Database, FEATURES, FeatureWeights, JointRoles, STRIDE, Vec3Tracks } from "./Database";
+import { ClipInfo, Database, FEATURES, defaultContactThresholds, FeatureWeights, JointRoles, STRIDE, Vec3Tracks } from "./Database";
 
 /**
  * `.kmm`: a motion-matching database and its skinned meshes in one little-endian binary file;
@@ -13,7 +13,7 @@ import { ClipInfo, Database, FEATURES, FeatureWeights, JointRoles, STRIDE, Vec3T
  * `KMMP`, a u32 version, then sections: a 4-byte tag, a u64 length and the payload. Readers skip
  * tags they don't know. Sections: `SKEL` skeleton, `ROLE` joint roles, rate and feature weights,
  * `CLIP` clips, `ROTS` quantized rotations, `TRAN`/`SCAL` translation and scale tracks, `ROOT`
- * character root per frame, `CONT` foot contacts, `FEAT` feature normalization and rows, `MESH`
+ * character root per frame, `CONT` foot contacts (`CRUL`: how they were found), `FEAT` feature normalization and rows, `MESH`
  * (repeated) skinned meshes with a colour, `IMAG` (repeated) named images (encoded bytes, e.g.
  * WebP), `ACTS` action clips (traversals, falls, landings: what `ActionClip.analyze` found),
  * `META` key/value strings (source, licence).
@@ -24,6 +24,12 @@ import { ClipInfo, Database, FEATURES, FeatureWeights, JointRoles, STRIDE, Vec3T
 
 const MAGIC = "KMMP";
 const VERSION = 1;
+/**
+ * How the contacts in `CONT` were found (`ContactThresholds`): packs without a `CRUL` section
+ * (rule 0) found them on the ankles alone, too strictly to see a running foot planted, and get
+ * them found again on load.
+ */
+const CONTACT_RULE = 1;
 
 /** A skinned mesh of a pack and the colour to draw it with. */
 interface PackMesh {
@@ -96,6 +102,7 @@ class MotionPack {
             w.u32(db.contactBits.length);
             w.bytes(db.contactBits);
         });
+        out.section("CRUL", (w) => w.u32(CONTACT_RULE));
         out.section("FEAT", (w) => {
             w.f32s(db.featureOffset);
             w.f32s(db.featureScale);
@@ -129,6 +136,7 @@ class MotionPack {
         let translations: Vec3Tracks | undefined, scales: Vec3Tracks | undefined;
         let roots: { translations: Float32Array, rotations: Float32Array } | undefined;
         let contacts = new Uint8Array(0);
+        let contactRule = 0;
         let features: [Float32Array, Float32Array, Float32Array] | undefined;
         const meshes: PackMesh[] = [];
         const actions: ActionClip[] = [];
@@ -163,6 +171,7 @@ class MotionPack {
                     break;
                 }
                 case "CONT": contacts = r.take(r.u32()).slice(); break;
+                case "CRUL": contactRule = r.u32(); break;
                 case "FEAT": {
                     const offset = r.f32s(FEATURES), scale = r.f32s(FEATURES);
                     const frames = r.u32();
@@ -209,6 +218,8 @@ class MotionPack {
         }
         const database = new Database(skeleton, jointRoles, sampleRate, weights, clips, rotations, translations, scales,
             roots ?? { translations: new Float32Array(0), rotations: new Float32Array(0) }, contacts, features[0], features[1], features[2]);
+        // baked when contacts read the ankles alone, at a quarter of today's speed
+        if (contactRule !== CONTACT_RULE) database.detectContacts(defaultContactThresholds());
         return new MotionPack(database, meshes, actions, meta);
     }
 }
@@ -569,5 +580,5 @@ class Writer {
     }
 }
 
-export { MotionPack, CharacterPack, PackError, MAGIC, VERSION };
+export { MotionPack, CharacterPack, PackError, MAGIC, VERSION, CONTACT_RULE };
 export type { PackMesh, PackImage };
