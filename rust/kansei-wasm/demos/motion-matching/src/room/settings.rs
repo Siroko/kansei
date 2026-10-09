@@ -136,7 +136,7 @@ settings! {
     glass_rough: f32 = 0.0;
     // the post-processing
     tonemap: String = "agx".into();
-    ev: f32 = 7.2;
+    ev: f32 = 9.0;
     exposure_comp: f32 = 0.0;
     local_exposure: bool = false;
     white_temp: f32 = 6500.0;

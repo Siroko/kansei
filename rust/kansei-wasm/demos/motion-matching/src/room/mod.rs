@@ -179,6 +179,8 @@ impl<E: PostProcessingEffect + 'static> PostProcessingEffect for Switch<E> {
 /// three GI effects (one enabled), the reflections and the glass, the fog, TAA, motion blur, the
 /// depth of field, bloom and the tone map. `apply` sets them all to the settings.
 fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer) -> Vec<Box<dyn PostProcessingEffect>> {
+    // (the sky lighting lights only the rays that leave through the windows and the skylight: the
+    // room's materials add no sky ambient of their own for the GI to take out, so `ambient` 0)
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     if let Some(surface) = surface {
         effects.push(Box::new(surface));
@@ -189,15 +191,15 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     // the skylight is the first spot light: its emitter is the opening
     shadows.set_rect_emitter(0, layout::SKYLIGHT[0] * 2.0, layout::SKYLIGHT[1] * 2.0);
     effects.push(Box::new(Switch { effect: shadows, on: true }));
-    let mut hybrid = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), RtDiffuseGiOptions { max_distance: 60.0, ..Default::default() });
+    let mut hybrid = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), RtDiffuseGiOptions { max_distance: 60.0, ambient: 0.0, ..Default::default() });
     hybrid.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
     hybrid.set_cascaded_shadow_map(renderer.cascaded_shadow_map());
     hybrid.set_sky_lighting(Some(sky));
     effects.push(Box::new(hybrid));
-    let mut voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), ..Default::default() });
+    let mut voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), material_ambient: 0.0, ..Default::default() });
     voxel.set_sky_lighting(Some(sky));
     effects.push(Box::new(voxel));
-    let mut ssgi = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { radius_m: 6.0, ..Default::default() });
+    let mut ssgi = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { radius_m: 6.0, ambient_occlusion: 0.0, ..Default::default() });
     ssgi.set_sky_lighting(Some(sky));
     effects.push(Box::new(ssgi));
     // the mirrors, the floor and the dragon's glass
@@ -272,7 +274,7 @@ const VIEWS: [(&str, [f32; 3], f32, f32, f32); 9] = [
     // from the south-east, above the walls' tops, looking in through them and the ceiling
     ("outside", [0.0, 1.5, 0.0], 52.0, 0.65, 0.42),
     // the whole room from its south-east, the windows and the sun opposite
-    ("hall", [-2.0, 2.2, -2.0], 26.0, 0.78, 0.16),
+    ("hall", [-2.0, 2.2, -2.0], 26.0, 0.62, 0.16),
     // the glass dragon on its plinth, the big mirror behind it
     ("dragon", [0.0, 1.3, 0.0], 6.5, 0.25, 0.12),
     // the big mirror on the north wall at an angle, the pond and the dragon in it
@@ -492,7 +494,10 @@ impl RoomState {
     /// The HUD's lines about the room.
     fn status(&self) -> String {
         let s = &self.settings;
-        let pond = self.pond.as_ref().map_or(String::new(), |p| format!("\npond   {} particles, {}", p.particles(), p.state().name()));
+        let pond = self.pond.as_ref().map_or(String::new(), |p| {
+            let speed = p.speed().filter(|_| p.state().name() == "running").map_or(String::new(), |(max, above)| format!(" (fastest {max:.2} m/s, {above} over {:.2})", pond::SETTLE_SPEED));
+            format!("\npond   {} particles, {}{speed}", p.particles(), p.state().name())
+        });
         format!(
             "room   GI {} · shadows {} · floor {} · fog {} · dust {} · camera {}{}\n",
             s.gi,

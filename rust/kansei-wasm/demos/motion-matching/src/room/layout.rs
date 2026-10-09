@@ -24,6 +24,7 @@ use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::rt::RtSurface;
 
 use super::assets::Assets;
+use super::look;
 use super::pbr::{self, PbrParams};
 
 /// Half the room's width and depth, and its height (m).
@@ -99,9 +100,11 @@ pub fn surface(tint: [f32; 3], size: f32, roughness: [f32; 2], reflective: bool,
 }
 
 /// The floor's surface for `floor` ("marble": slabs of 1.2 m, each its own piece of the stone, or
-/// "wood": the herringbone as it is), its roughness scaled by `roughness`.
+/// "wood": the herringbone, lacquered: its scan's roughness a third), its roughness scaled by
+/// `roughness`.
 pub fn floor_params(floor: &str, roughness: f32, deferred: bool) -> PbrParams {
-    let mut p = surface([1.0, 1.0, 1.0], if floor == "wood" { 2.0 } else { 2.4 }, [roughness, 0.0], true, deferred);
+    let (size, rough) = if floor == "wood" { (2.0, [roughness * 0.35, 0.04 * roughness]) } else { (2.4, [roughness, 0.0]) };
+    let mut p = surface([1.0, 1.0, 1.0], size, rough, true, deferred);
     p.flags[0] = 1.0;
     if floor != "wood" {
         p.pattern = [1.0, 1.8, 1.0, 0.0];
@@ -201,12 +204,19 @@ impl Builder<'_> {
             params.flags[1] = 1.0;
             let material = pbr::material(name, m.maps.maps(name), &params, m.double_sided);
             let mut r = Renderable::new(Geometry::new(name, part.geometry.vertices.clone(), part.geometry.indices.clone()), material).with_gi(GiSurface::new(albedo));
-            r.rt = (grid && !m.cutout).then(|| RtSurface::new(albedo));
             r.object.set_position(at[0], lift, at[1]);
             r.object.rotation.y = yaw;
             r.object.scale = Vec3::new(scale, scale, scale);
             let index = self.scene.add(SceneNode::Renderable(r));
             self.surfaces.push(Surface { index, params, floor: false });
+        }
+        // the grid traces its simplified stand-in, not the parts
+        if let Some(geometry) = model.grid.as_ref().filter(|_| grid) {
+            let mut r = look::grid_only(Geometry::new(name, geometry.vertices.clone(), geometry.indices.clone()), RtSurface::new(albedo));
+            r.object.set_position(at[0], lift, at[1]);
+            r.object.rotation.y = yaw;
+            r.object.scale = Vec3::new(scale, scale, scale);
+            self.scene.add(SceneNode::Renderable(r));
         }
         let (lo, hi) = (model.min * scale, model.max * scale);
         let local = GVec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);

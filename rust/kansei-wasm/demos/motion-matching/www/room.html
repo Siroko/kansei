@@ -60,7 +60,7 @@
         const set = (key, value) => room_set(key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
 
         const LOOKS = {
-            'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 7.2, floor: 'marble' },
+            'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 9.0, floor: 'marble' },
             'midday': { sun: true, sun_lux: 40000, sun_elev: 58, sun_azim: 10, sun_temp: 5600, sky: true, sky_cd: 60000, sky_temp: 6800, sky_radiance: 7000, lamps: false, fog: 0.002, ev: 8.0 },
             'overcast': { sun: false, sky: true, sky_cd: 52000, sky_temp: 7200, sky_radiance: 4500, lamps: true, lamp_cd: 600, lamp_temp: 2900, fog: 0.005, ev: 6.0 },
             'night lamps': { sun: false, sky: true, sky_cd: 1500, sky_temp: 9000, sky_radiance: 25, lamps: true, lamp_cd: 1400, lamp_temp: 2500, fog: 0.006, ev: 1.6, floor: 'wood' },
@@ -136,7 +136,7 @@
         bind(rt, 'gi', { label: 'GI', options: { 'hybrid RT': 'rt', 'voxel cones': 'voxel', 'screen space': 'ssgi', 'off': 'off' } });
         bind(rt, 'rtgi_res', { label: 'GI rays', options: { 'half (1 per 2x2)': 'half', 'full': 'full' } });
         bind(rt, 'reflections', { label: 'RT reflections' });
-        bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct' } });
+        bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
         bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });
 
         const air = pane.addFolder({ title: 'Fog and dust', expanded: false });

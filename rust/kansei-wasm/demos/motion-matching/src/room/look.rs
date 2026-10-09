@@ -224,6 +224,17 @@ fn fragment_main() -> @location(0) vec4f {
 }
 "#;
 
+/// A renderable only the ray tracing grid sees (`HIDDEN_WGSL`): no camera, no shadow map, no voxel
+/// GI.
+pub fn grid_only(geometry: Geometry, surface: RtSurface) -> Renderable {
+    let mut material = Material::new("Room/GridOnly", HIDDEN_WGSL, Vec::new(), MaterialOptions::default());
+    material.options.cull_mode = kansei_core::materials::CullMode::None;
+    let mut r = Renderable::new(geometry, material);
+    r.cast_shadow = false;
+    r.rt = Some(surface);
+    r
+}
+
 /// How thick each bone's capsule is, by the joint's name (Unreal's and most rigs' names): the
 /// trunk and the head thick, the limbs thinner, the fingers and toes left out.
 fn bone_radius(name: &str) -> Option<f32> {
@@ -281,11 +292,7 @@ impl Proxy {
         let mut capsules = Vec::new();
         for (joint, _, _) in character.bones_world() {
             let Some(radius) = bone_radius(character.joint_name(joint)) else { continue };
-            let mut material = Material::new("Room/BodyProxy", HIDDEN_WGSL, Vec::new(), MaterialOptions::default());
-            material.options.cull_mode = kansei_core::materials::CullMode::None;
-            let mut r = Renderable::new(unit_capsule(), material);
-            r.cast_shadow = false;
-            r.rt = Some(RtSurface::new(STAND_IN_COLOR).with_smooth_normals());
+            let r = grid_only(unit_capsule(), RtSurface::new(STAND_IN_COLOR).with_smooth_normals());
             capsules.push((joint, radius, scene.add(SceneNode::Renderable(r))));
         }
         log::info!("room: {} capsules stand for the character in the grid", capsules.len());

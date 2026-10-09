@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use glam::{Mat4, Vec3 as GVec3};
 
 use kansei_core::buffers::Texture;
-use kansei_core::geometries::Geometry;
+use kansei_core::geometries::{Geometry, Vertex};
 use kansei_core::loaders::ktx2::CompressionSupport;
 use kansei_core::loaders::{GLTFLoader, GLTFResult};
 use kansei_core::renderers::Renderer;
+
+use optimesh::simplifier::{simplify, simplify_sloppy, SimplifyTarget, VertexData, SIMPLIFY_ERROR_ABSOLUTE, SIMPLIFY_PRUNE};
 
 use super::pbr::PbrMaps;
 use crate::fetch_bytes;
@@ -89,10 +91,12 @@ pub struct ModelMaterial {
     pub cutout: bool,
 }
 
-/// A model: its parts, its materials and its bounds (model space, after the parts' transforms).
+/// A model: its parts, its materials, its stand-in in the ray tracing grid and its bounds (model
+/// space, after the parts' transforms).
 pub struct Model {
     pub parts: Vec<ModelPart>,
     pub materials: Vec<ModelMaterial>,
+    pub grid: Option<Geometry>,
     pub min: GVec3,
     pub max: GVec3,
 }
@@ -127,7 +131,7 @@ fn model(renderer: &Renderer, name: &str, bytes: &[u8]) -> Result<Model, String>
         })
         .collect::<Vec<_>>();
     let (mut min, mut max) = (GVec3::splat(f32::MAX), GVec3::splat(f32::MIN));
-    let parts = result
+    let parts: Vec<ModelPart> = result
         .renderables
         .iter()
         .map(|part| {
@@ -141,7 +145,72 @@ fn model(renderer: &Renderer, name: &str, bytes: &[u8]) -> Result<Model, String>
             ModelPart { geometry, material: part.material_index.min(materials.len().saturating_sub(1)) }
         })
         .collect();
-    Ok(Model { parts, materials, min, max })
+    let solid: Vec<&Geometry> = parts.iter().filter(|p| !materials[p.material].cutout).map(|p| &p.geometry).collect();
+    let grid = grid_stand_in(name, &solid);
+    Ok(Model { parts, materials, grid, min, max })
+}
+
+/// How far (m) the grid's stand-in of a model strays from its surface, and the most triangles it
+/// keeps.
+const GRID_ERROR: f32 = 0.015;
+const GRID_TRIANGLES: usize = 1500;
+
+/// A model's solid parts as one mesh for the ray tracing grid: welded, simplified to `GRID_ERROR`
+/// (small pieces pruned) and at most `GRID_TRIANGLES`. The grid's cost is the triangles a ray
+/// meets in each 30 cm cell: Poly Haven's chairs put thousands there, which the rays' shadows,
+/// bounces and reflections can't tell from a few hundred.
+fn grid_stand_in(name: &str, parts: &[&Geometry]) -> Option<Geometry> {
+    let mut positions: Vec<f32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut welded: HashMap<[i32; 3], u32> = HashMap::new();
+    for g in parts {
+        let remap: Vec<u32> = g
+            .vertices
+            .iter()
+            .map(|v| {
+                let key = [0, 1, 2].map(|i| (v.position[i] * 1000.0).round() as i32);
+                *welded.entry(key).or_insert_with(|| {
+                    positions.extend_from_slice(&v.position[..3]);
+                    (positions.len() / 3 - 1) as u32
+                })
+            })
+            .collect();
+        for t in g.indices.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|i| remap[t[i] as usize]);
+            if a != b && b != c && a != c {
+                indices.extend_from_slice(&[a, b, c]);
+            }
+        }
+    }
+    if indices.is_empty() {
+        return None;
+    }
+    let vertices = VertexData { positions: &positions, count: positions.len() / 3, stride: 12 };
+    let mut out = vec![0u32; indices.len()];
+    let (mut count, _) = simplify(&mut out, &indices, &vertices, &SimplifyTarget { target_index_count: 0, target_error: GRID_ERROR, options: SIMPLIFY_ERROR_ABSOLUTE | SIMPLIFY_PRUNE });
+    out.truncate(count);
+    if count > GRID_TRIANGLES * 3 {
+        let source = out.clone();
+        let mut sloppy = vec![0u32; source.len()];
+        count = simplify_sloppy(&mut sloppy, &source, &vertices, None, GRID_TRIANGLES * 3, f32::MAX).0;
+        sloppy.truncate(count);
+        out = sloppy;
+    }
+    // only the vertices kept
+    let mut used: HashMap<u32, u32> = HashMap::new();
+    let mut kept: Vec<Vertex> = Vec::new();
+    let out: Vec<u32> = out
+        .iter()
+        .map(|&i| {
+            *used.entry(i).or_insert_with(|| {
+                let p = &positions[i as usize * 3..i as usize * 3 + 3];
+                kept.push(Vertex { position: [p[0], p[1], p[2], 1.0], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0] });
+                (kept.len() - 1) as u32
+            })
+        })
+        .collect();
+    log::info!("room: {name} in the grid as {} of {} triangles", out.len() / 3, indices.len() / 3);
+    Some(Geometry::new(&format!("{name}/Grid"), kept, out))
 }
 
 impl Assets {

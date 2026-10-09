@@ -198,12 +198,15 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferO
     let diffuse = s.albedo * (1.0 - s.metallic);
     let f0 = mix(0.04, max(s.albedo.r, max(s.albedo.g, s.albedo.b)), s.metallic);
     let fill = diffuse * pbr.ambient.rgb * s.occlusion + pbr.emissive.rgb;
+    // traced reflections only where the surface is glossy: a rough lobe's few rays a pixel come out
+    // as speckle, and its blur is what the lights' GGX (and the GI) give anyway
+    let reflective = pbr.surface.w > 0.5 && s.roughness < 0.45;
     if (pbr.ambient.w > 0.5) {
         // direct light from rt::RtShadowsEffect (its roughness and F0 in the GBuffer)
-        return kansei_gbuffer_out_rt_lit(fill, pbr.emissive.rgb, s.n, diffuse, s.roughness, f0, pbr.surface.w > 0.5);
+        return kansei_gbuffer_out_rt_lit(fill, pbr.emissive.rgb, s.n, diffuse, s.roughness, f0, reflective);
     }
     let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill;
-    if (pbr.surface.w > 0.5) {
+    if (reflective) {
         return kansei_gbuffer_out_specular(lit, pbr.emissive.rgb, s.n, diffuse, f0, s.roughness);
     }
     return kansei_gbuffer_out(lit, pbr.emissive.rgb, s.n, diffuse);

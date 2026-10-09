@@ -35,7 +35,7 @@ const HALF: [f32; 2] = [4.2, 6.0];
 /// The still water's height, a little under the floor's; the bed's depth and shelf; the shore
 /// strip the container's walls stand on, and the low bank down to the floor (as the lake's).
 const WATER: f32 = -0.1;
-const DEPTH: f32 = 0.6;
+const DEPTH: f32 = 0.4;
 const SHELF: f32 = 0.6;
 const SHORE: f32 = 1.2;
 /// The plinth: its radius, its top's height, and the stone's colour.
@@ -48,7 +48,9 @@ const SPLASH_TIME: f32 = 0.12;
 const SPLASH_PUSH: f32 = 1.2;
 const COLLIDERS: usize = 16;
 const WAKE_DISTANCE: f32 = 2.0;
-const SETTLE_SPEED: f32 = 0.05;
+/// The fastest a particle may move (m/s) for the water to sleep: the last few that creep along the
+/// bed for a minute after the fill move nothing the surface shows.
+pub const SETTLE_SPEED: f32 = 0.15;
 /// Lattice spacing of the particles at rest density (simulation units).
 const SPACING: f32 = 0.537;
 
@@ -255,6 +257,12 @@ impl Pond {
 
     pub fn particles(&self) -> u32 {
         self.count
+    }
+
+    /// The fastest particle (m/s) and how many move faster than the water settles at, as last
+    /// read (while it runs).
+    pub fn speed(&self) -> Option<(f32, u32)> {
+        self.stepper.speed().map(|s| (s.max, s.above))
     }
 
     pub fn state(&self) -> FluidActivity {
