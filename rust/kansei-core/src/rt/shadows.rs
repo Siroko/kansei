@@ -40,6 +40,8 @@ pub enum RtShadowsView {
     Visibility,
     /// The direct light alone.
     Direct,
+    /// Which pixels it lights (red), the GBuffer's emissive alpha (green), surfaces (blue).
+    Mask,
 }
 
 /// The WGSL `RtShadowParams`.

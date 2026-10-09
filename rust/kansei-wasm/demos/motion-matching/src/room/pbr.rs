@@ -9,7 +9,6 @@
 //! slabs (marble) gives each slab its own offset and turn into the texture, with thin seams.
 
 use kansei_core::buffers::{Sampler, Texture};
-use kansei_core::cameras::MOTION_VECTORS_WGSL;
 use kansei_core::lights::{LIGHTS_WGSL, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::ktx2::{self, CompressionSupport, Ktx2Options};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
@@ -33,16 +32,48 @@ pub struct PbrParams {
     pub ambient: [f32; 4],
     /// rgb: emitted radiance (cd/m²); w: the macro variation's strength.
     pub emissive: [f32; 4],
+    /// x: one-sided (1: the camera sees only its front, the shadow maps both sides); y: specular
+    /// strength on the forward path; zw unused.
+    pub flags: [f32; 4],
 }
 
 impl Default for PbrParams {
     fn default() -> Self {
-        Self { tint: [1.0, 1.0, 1.0, 1.0], surface: [2.0, 1.0, 0.0, 0.0], pattern: [0.0, 1.2, 1.0, 0.0], ambient: [0.0, 0.0, 0.0, 0.0], emissive: [0.0, 0.0, 0.0, 0.0] }
+        Self { tint: [1.0, 1.0, 1.0, 1.0], surface: [2.0, 1.0, 0.0, 0.0], pattern: [0.0, 1.2, 1.0, 0.0], ambient: [0.0, 0.0, 0.0, 0.0], emissive: [0.0, 0.0, 0.0, 0.0], flags: [0.0, 1.0, 0.0, 0.0] }
     }
 }
 
+/// The direct light on a surface from the scene's lights, with their shadow maps: `pbr_direct`.
+/// Prefixed with the light, shadow and spot light chunks (see `LIT_WGSL`).
+pub const DIRECT_WGSL: &str = r#"
+// the sun through the cascades, the point lights, the spot lights with their shadow maps
+fn pbr_direct(world: vec3f, n: vec3f, v: vec3f, base: vec3f, roughness: f32, metallic: f32, pixel: vec2f) -> vec3f {
+    var radiance = vec3f(0.0);
+    let cascades = kansei_cascades.count > 0u;
+    for (var i = 0u; i < kansei_lights.num_directional; i++) {
+        let light = kansei_lights.directional[i];
+        let l = -normalize(light.direction);
+        let isSun = cascades && dot(normalize(light.direction), normalize(kansei_cascades.lightDirection)) > 0.9999;
+        let shadow = select(1.0, kansei_sun_shadow(world, n, pixel), isSun);
+        radiance += kansei_brdf(n, v, l, base, roughness, metallic) * light.color * shadow;
+    }
+    for (var i = 0u; i < kansei_lights.num_point; i++) {
+        let light = kansei_lights.point[i];
+        let l = normalize(light.position - world);
+        radiance += kansei_brdf(n, v, l, base, roughness, metallic) * light.color * kansei_point_falloff(light, world);
+    }
+    return radiance + kansei_spot_lights_radiance(world, n, v, base, roughness, metallic, pixel);
+}
+
+"#;
+
+/// The light chunks a forward-lit room material starts with, and `pbr_direct`.
+pub fn lit_wgsl() -> String {
+    format!("{LIGHTS_WGSL}\n{SHADOW_MAP_WGSL}\n{CASCADED_SHADOWS_WGSL}\n{SPOT_LIGHTS_WGSL}\n{DIRECT_WGSL}")
+}
+
 const PBR_WGSL: &str = r#"
-struct Pbr { tint: vec4f, surface: vec4f, pattern: vec4f, ambient: vec4f, emissive: vec4f };
+struct Pbr { tint: vec4f, surface: vec4f, pattern: vec4f, ambient: vec4f, emissive: vec4f, flags: vec4f };
 @group(0) @binding(0) var<uniform> pbr: Pbr;
 @group(0) @binding(1) var color_map: texture_2d<f32>;
 @group(0) @binding(2) var normal_map: texture_2d<f32>;
@@ -136,7 +167,7 @@ fn pbr_sample(in: VOut, front: bool) -> PbrSample {
         if (turn > 2.5) { l = vec2f(-l.y, l.x); }
         uv = ((l + 0.5) * pbr.pattern.y) / pbr.surface.x + pbr_hash2(cell) * 7.0;
         let edge = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y)) * pbr.pattern.y;
-        let width = 0.0015 + length(fwidth(plane)) * 0.5;
+        let width = 0.001 + length(fwidth(plane)) * 0.5;
         seam = 1.0 - smoothstep(width, width * 2.0, edge);
     }
     let color = textureSampleGrad(color_map, maps, uv, duv1, duv2);
@@ -145,7 +176,7 @@ fn pbr_sample(in: VOut, front: bool) -> PbrSample {
     var s: PbrSample;
     // slow variation over metres
     let macro_v = pbr_noise(plane * 0.23) - 0.5;
-    s.albedo = color.rgb * pbr.tint.rgb * (1.0 + macro_v * pbr.emissive.w * 0.35) * (1.0 - seam * 0.5);
+    s.albedo = color.rgb * pbr.tint.rgb * (1.0 + macro_v * pbr.emissive.w * 0.35) * (1.0 - seam * 0.3);
     s.alpha = color.a;
     s.n = pbr_mapped_normal(n, dpdx(in.world), dpdy(in.world), duv1, duv2, normalize(m));
     s.occlusion = orm.r;
@@ -156,27 +187,9 @@ fn pbr_sample(in: VOut, front: bool) -> PbrSample {
     return s;
 }
 
-// the sun through the cascades, the point lights, the spot lights with their shadow maps
-fn pbr_direct(world: vec3f, n: vec3f, v: vec3f, base: vec3f, roughness: f32, metallic: f32, pixel: vec2f) -> vec3f {
-    var radiance = vec3f(0.0);
-    let cascades = kansei_cascades.count > 0u;
-    for (var i = 0u; i < kansei_lights.num_directional; i++) {
-        let light = kansei_lights.directional[i];
-        let l = -normalize(light.direction);
-        let isSun = cascades && dot(normalize(light.direction), normalize(kansei_cascades.lightDirection)) > 0.9999;
-        let shadow = select(1.0, kansei_sun_shadow(world, n, pixel), isSun);
-        radiance += kansei_brdf(n, v, l, base, roughness, metallic) * light.color * shadow;
-    }
-    for (var i = 0u; i < kansei_lights.num_point; i++) {
-        let light = kansei_lights.point[i];
-        let l = normalize(light.position - world);
-        radiance += kansei_brdf(n, v, l, base, roughness, metallic) * light.color * kansei_point_falloff(light, world);
-    }
-    return radiance + kansei_spot_lights_radiance(world, n, v, base, roughness, metallic, pixel);
-}
-
 @fragment
 fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferOut {
+    if (pbr.flags.x > 0.5 && !front) { discard; }
     let s = pbr_sample(in, front);
     if (pbr.pattern.w > 0.0 && s.alpha < pbr.pattern.w) { discard; }
     let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
@@ -226,16 +239,17 @@ impl PbrMaps {
 
 /// The shader: the light and GBuffer chunks, then the material.
 fn shader() -> String {
-    format!("{LIGHTS_WGSL}\n{SHADOW_MAP_WGSL}\n{CASCADED_SHADOWS_WGSL}\n{SPOT_LIGHTS_WGSL}\n{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{PBR_WGSL}")
+    format!("{}\n{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{PBR_WGSL}", lit_wgsl())
 }
 
-/// A PBR material of `maps` drawn as `params` says (`double_sided` for leaves and cards).
+/// A PBR material of `maps` drawn as `params` says (`double_sided` for leaves and cards; a
+/// one-sided one, `flags.x`, is drawn with both sides too, its back faces discarded on screen).
 pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bool) -> Material {
-    let _ = MOTION_VECTORS_WGSL;
     let cutout = params.pattern[3] > 0.0;
+    let one_sided = params.flags[0] > 0.5;
     let options = MaterialOptions {
         mrt_output_count: Some(4),
-        cull_mode: if double_sided { CullMode::None } else { CullMode::Back },
+        cull_mode: if double_sided || one_sided { CullMode::None } else { CullMode::Back },
         shadow_fragment_entry: cutout.then_some("shadow_main"),
         ..Default::default()
     };

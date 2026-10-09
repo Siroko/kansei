@@ -15,8 +15,6 @@ use glam::{Mat4, Vec3 as GVec3};
 use kansei_core::collision::{CollisionWorld, Shape, TriangleMesh};
 use kansei_core::geometries::{CylinderGeometry, Geometry, Vertex};
 use kansei_core::gi::GiSurface;
-use kansei_core::lights::SPOT_LIGHTS_WGSL;
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{FluidSurfaceEffect, FluidSurfaceOptions};
 use kansei_core::renderers::Renderer;
@@ -33,22 +31,17 @@ const SIM_SCALE: f32 = SCALE.length;
 const STEP: f32 = 1.0 / 60.0;
 const MAX_STEPS: u32 = 2;
 /// The outline's half-size along x and z (round the room's centre).
-const HALF: [f32; 2] = [5.6, 4.4];
+const HALF: [f32; 2] = [4.2, 6.0];
 /// The still water's height, a little under the floor's; the bed's depth and shelf; the shore
 /// strip the container's walls stand on, and the low bank down to the floor (as the lake's).
 const WATER: f32 = -0.1;
 const DEPTH: f32 = 0.6;
-const SHELF: f32 = 2.4;
+const SHELF: f32 = 0.6;
 const SHORE: f32 = 1.2;
-const BANK: f32 = 0.1;
-const BANK_OUT: f32 = 1.6;
 /// The plinth: its radius, its top's height, and the stone's colour.
 pub const PLINTH_RADIUS: f32 = 1.35;
 pub const PLINTH_TOP: f32 = 0.5;
-const STONE: [f32; 3] = [0.38, 0.36, 0.33];
-/// The bed's dry colour (the room's floor) and its silt under water.
-const DRY: [f32; 3] = [0.42, 0.3, 0.2];
-const SILT: [f32; 3] = [0.2, 0.17, 0.12];
+const STONE: [f32; 3] = [0.75, 0.75, 0.74];
 /// A landing's splash, as the lake's.
 const SPLASH_RADIUS: f32 = 0.3;
 const SPLASH_TIME: f32 = 0.12;
@@ -64,60 +57,30 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The waterline: a wobbly ellipse round the centre.
+/// The waterline: a long pool under the skylight, its corners rounded.
 fn outline() -> Vec<[f32; 2]> {
     (0..256)
         .map(|k| {
             let a = k as f32 / 256.0 * std::f32::consts::TAU;
-            let r = 1.0 + 0.08 * (2.0 * a + 0.9).sin() + 0.06 * (3.0 * a + 2.1).sin() + 0.03 * (5.0 * a + 0.3).sin();
-            [HALF[0] * r * a.cos(), HALF[1] * r * a.sin()]
+            // a superellipse (|x / a|^4 + |z / b|^4 = 1): a rectangle with rounded corners
+            let (c, s) = (a.cos(), a.sin());
+            [HALF[0] * c.signum() * c.abs().sqrt(), HALF[1] * s.signum() * s.abs().sqrt()]
         })
         .collect()
 }
 
 /// The ground's height at signed distance `d` from the waterline (negative in the pond).
 fn height(_x: f32, _z: f32, d: f32) -> f32 {
+    // a pool's: its floor flat, its sides a short slope, its coping flush with the room's floor
     if d < 0.0 {
-        let t = (-d / SHELF).min(1.0);
-        -DEPTH * (1.0 - (1.0 - t) * (1.0 - t))
-    } else if d < SHORE {
-        BANK * smoothstep(0.0, SHORE, d)
+        -DEPTH * smoothstep(0.0, SHELF, -d)
     } else {
-        BANK * (1.0 - smoothstep(SHORE, SHORE + BANK_OUT, d))
+        0.0
     }
 }
 
-/// The bed: the floor's colour turning to wet silt under the still water (`surface.dry.w`), lit
-/// by the spot lights into the GBuffer.
-const TERRAIN_WGSL: &str = r#"
-struct Surface { dry: vec4f, silt: vec4f, ambient: vec4f };
-@group(0) @binding(0) var<uniform> surface: Surface;
-@group(1) @binding(0) var<uniform> view_matrix: mat4x4f;
-@group(1) @binding(1) var<uniform> projection_matrix: mat4x4f;
-@group(2) @binding(1) var<uniform> world_matrix: mat4x4f;
-struct VOut { @builtin(position) clip: vec4f, @location(0) world: vec3f, @location(1) normal: vec3f };
-@vertex
-fn vertex_main(@location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f) -> VOut {
-    let world = world_matrix * position;
-    var out: VOut;
-    out.clip = projection_matrix * view_matrix * world;
-    out.world = world.xyz;
-    out.normal = normal;
-    return out;
-}
-@fragment
-fn fragment_main(in: VOut) -> KanseiGBufferOut {
-    let n = normalize(in.normal);
-    let under = in.world.y - surface.dry.w;
-    let wet = smoothstep(0.08, 0.02, under);
-    let base = mix(surface.dry.rgb, mix(surface.silt.rgb, surface.silt.rgb * 0.6, smoothstep(0.0, -0.5, under)), wet);
-    let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
-    let eye = -(transpose(view3) * view_matrix[3].xyz);
-    let v = normalize(eye - in.world);
-    let lit = kansei_spot_lights_radiance(in.world, n, v, base, mix(0.7, 0.35, wet), 0.0, in.clip.xy) + base * surface.ambient.rgb;
-    return kansei_gbuffer_out(lit, vec3f(0.0), n, base);
-}
-"#;
+/// How far the black stone coping reaches past the waterline (m): the terrain's edge.
+const COPING: f32 = 1.6;
 
 /// A grid of vertices over `[min, max]` (x, z), `cells` across, at `height(x, z)`, with normals
 /// from the heights around; triangles wound counter-clockwise seen from above.
@@ -160,15 +123,15 @@ pub struct Pond {
 impl Pond {
     /// The rectangle (x, z min and max) the pond's terrain covers: the floor stays out of it.
     pub fn terrain_bounds() -> ([f32; 2], [f32; 2]) {
-        let shape = PlanarContainerShape::from_outline(&outline(), 0.1, SHORE + BANK_OUT + 0.5, height);
+        let shape = PlanarContainerShape::from_outline(&outline(), 0.1, COPING, height);
         shape.bounds()
     }
 
     /// Build the pond into `scene` and `world`: its bed, the plinth, and the water's surface
     /// effect for the post-processing chain (its renderable added).
-    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld) -> (Self, FluidSurfaceEffect) {
+    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, assets: &super::assets::Assets, deferred: bool) -> (Self, FluidSurfaceEffect) {
         let outline = outline();
-        let mut terrain = PlanarContainerShape::from_outline(&outline, 0.1, SHORE + BANK_OUT + 0.5, height);
+        let mut terrain = PlanarContainerShape::from_outline(&outline, 0.1, COPING, height);
         terrain.smooth_floor(4);
         let (min, max) = terrain.bounds();
         let ground = |x: f32, z: f32| terrain.floor(x, z);
@@ -177,10 +140,13 @@ impl Pond {
         let cells = |step: f32| [((max[0] - min[0]) / step).ceil() as usize, ((max[1] - min[1]) / step).ceil() as usize];
         let (positions, normals, indices) = heightfield(min, max, cells(0.15), &ground);
         let vertices = positions.iter().zip(&normals).map(|(p, n)| Vertex { position: [p.x, p.y, p.z, 1.0], normal: *n, uv: [p.x, p.z] }).collect();
-        let mut material = Material::new("Pond/Bed", &format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{TERRAIN_WGSL}"), vec![Binding::uniform(0, ShaderStages::FRAGMENT)], MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
-        material.set_uniform_bindable(0, "Pond/Bed", &[DRY[0], DRY[1], DRY[2], WATER, SILT[0], SILT[1], SILT[2], 0.0, 0.3f32, 0.3, 0.32, 0.0]);
-        let mut r = Renderable::new(Geometry::new("Pond/Bed", vertices, indices), material).with_gi(GiSurface::new([0.3, 0.24, 0.17]));
-        r.rt = Some(RtSurface::new([0.3, 0.24, 0.17]));
+        // black marble, polished, lit by the lights itself (the water refracts the image from before
+        // the effects, so the bed can't leave its light to RtShadowsEffect)
+        let mut bed = super::layout::surface([1.0, 1.0, 1.0], 2.0, [0.6, 0.0], true, false);
+        bed.flags[0] = 1.0;
+        let material = super::pbr::material("Pond/Bed", assets.surface("blackmarble", "Pond/Bed"), &bed, false);
+        let mut r = Renderable::new(Geometry::new("Pond/Bed", vertices, indices), material).with_gi(GiSurface::new([0.05, 0.05, 0.05]));
+        r.rt = Some(RtSurface::new([0.05, 0.05, 0.05]));
         r.cast_shadow = false;
         scene.add(SceneNode::Renderable(r));
         let (positions, _, indices) = heightfield(min, max, cells(0.4), &ground);
@@ -192,7 +158,7 @@ impl Pond {
         let place = Mat4::from_translation(GVec3::new(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0));
         let corners: Vec<GVec3> = drum.vertices.iter().map(|v| GVec3::new(v.position[0], v.position[1], v.position[2])).collect();
         world.add(Shape::Mesh(TriangleMesh::from_indexed(&corners, &drum.indices, place)), 1);
-        let stone = super::layout::matte("Plinth", STONE, 0.8);
+        let stone = super::pbr::material("Plinth", assets.surface("marble", "Plinth"), &super::layout::surface([1.0; 3], 1.5, [1.0, 0.0], true, deferred), false);
         let mut r = Renderable::new(drum, stone).with_gi(GiSurface::new(STONE));
         r.rt = Some(RtSurface::new(STONE));
         r.object.set_position(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0);
@@ -289,12 +255,6 @@ impl Pond {
 
     pub fn particles(&self) -> u32 {
         self.count
-    }
-
-    /// The last speed read (m/s): the fastest particle, and how many moved faster than the speed
-    /// the water sleeps under.
-    pub fn speed(&self) -> (f32, u32) {
-        self.stepper.speed().map_or((0.0, 0), |s| (s.max, s.above))
     }
 
     pub fn state(&self) -> FluidActivity {

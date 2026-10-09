@@ -7,7 +7,6 @@ use glam::{Mat4, Quat, Vec3 as GVec3};
 use kansei_core::animation::{skin_buffer, skinned_material, BonePalette, SkinTextures, SkinnedMesh, PALETTE_BINDING, SKINNING_WGSL, SKIN_BINDING};
 use kansei_core::cameras::MOTION_VECTORS_WGSL;
 use kansei_core::geometries::{CylinderGeometry, Geometry, SphereGeometry};
-use kansei_core::lights::SPOT_LIGHTS_WGSL;
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::rt::RtSurface;
@@ -15,7 +14,9 @@ use kansei_core::rt::RtSurface;
 use crate::character::{BodyLook, Character};
 
 /// The bodies' uniform: albedo (or the tint of a textured one's colour) and the light the room
-/// gives every surface where the GI is off (cd/m², a little; the GI adds the real bounce).
+/// gives every surface where the GI is off (cd/m², a little; the GI adds the real bounce); its w is
+/// 1 when `RtShadowsEffect` adds the direct light (ray-traced shadows), 0 when the material does
+/// (the shadow maps).
 const SURFACE_WGSL: &str = r#"
 struct RoomSkin { base_color: vec4f, ambient: vec4f };
 @group(0) @binding(0) var<uniform> surface: RoomSkin;
@@ -56,16 +57,20 @@ fn vertex_main(v: VIn) -> VOut {
     return out;
 }
 
-// lit by the spot lights (PCSS-shadowed) and the ambient, into the GBuffer
+// lit by the sun and the spot lights (their shadow maps) and the ambient, into the GBuffer; or,
+// deferred, the ambient alone, its roughness marked for RtShadowsEffect (rt_shadows_gbuffer.wgsl)
 fn shade(in: VOut, n: vec3f, albedo: vec3f, roughness: f32, metallic: f32, occlusion: f32) -> FOut {
     let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let eye = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(eye - in.world);
-    let radiance = kansei_spot_lights_radiance(in.world, n, v, albedo, roughness, metallic, in.clip.xy)
-        + albedo * (1.0 - metallic) * surface.ambient.rgb * occlusion;
+    let deferred = surface.ambient.w > 0.5;
+    var radiance = albedo * (1.0 - metallic) * surface.ambient.rgb * occlusion;
+    if (!deferred) {
+        radiance += pbr_direct(in.world, n, v, albedo, roughness, metallic, in.clip.xy);
+    }
     var out: FOut;
     out.color = vec4f(radiance, 1.0);
-    out.emissive = vec4f(0.0);
+    out.emissive = vec4f(0.0, 0.0, 0.0, select(0.0, 0.05 + 0.4 * clamp(roughness, 0.0, 1.0), deferred));
     out.normal = vec4f(n * 0.5 + 0.5, 1.0);
     out.albedo = vec4f(albedo * (1.0 - metallic) * occlusion, 1.0);
     out.velocity = kansei_motion_vector(in.curr, in.prev);
@@ -114,22 +119,31 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> FOut {
 "#;
 
 /// The ambient the bodies' uniform carries (cd/m²): a faint fill where nothing else lights them.
-const AMBIENT: [f32; 4] = [0.6, 0.6, 0.65, 0.0];
+const AMBIENT: [f32; 3] = [0.6, 0.6, 0.65];
 
 fn shader(body: &str) -> String {
-    format!("{SKINNING_WGSL}\n{MOTION_VECTORS_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SURFACE_WGSL}\n{body}")
+    format!("{SKINNING_WGSL}\n{MOTION_VECTORS_WGSL}\n{}\n{SURFACE_WGSL}\n{body}", super::pbr::lit_wgsl())
 }
 
 fn options() -> MaterialOptions {
     MaterialOptions { mrt_output_count: Some(4), outputs_velocity: true, ..Default::default() }
 }
 
-/// The room's look for the character's bodies.
-pub struct RoomLit;
+/// The room's look for the character's bodies: `deferred` leaves their direct light to
+/// `RtShadowsEffect`.
+pub struct RoomLit {
+    pub deferred: bool,
+}
+
+impl RoomLit {
+    fn uniform(&self, color: [f32; 4]) -> [f32; 8] {
+        [color[0], color[1], color[2], 1.0, AMBIENT[0], AMBIENT[1], AMBIENT[2], self.deferred as u32 as f32]
+    }
+}
 
 impl BodyLook for RoomLit {
     fn plain(&self, label: &str, color: [f32; 4], mesh: &SkinnedMesh, palette: &BonePalette) -> Material {
-        let uniform = [color[0], color[1], color[2], 1.0, AMBIENT[0], AMBIENT[1], AMBIENT[2], AMBIENT[3]];
+        let uniform = self.uniform(color);
         skinned_material(label, &shader(PLAIN_WGSL), &uniform, mesh, palette, options())
     }
 
@@ -148,7 +162,7 @@ impl BodyLook for RoomLit {
             ],
             options(),
         );
-        let uniform = [color[0], color[1], color[2], 1.0, AMBIENT[0], AMBIENT[1], AMBIENT[2], AMBIENT[3]];
+        let uniform = self.uniform(color);
         material.set_uniform_bindable(0, &format!("{label}/Params"), &uniform);
         material.set_bindable(PALETTE_BINDING, palette.buffer(&format!("{label}/Palette")));
         material.set_bindable(SKIN_BINDING, skin_buffer(&format!("{label}/Skin"), mesh));
@@ -170,7 +184,7 @@ pub const STAND_IN_COLOR: [f32; 3] = [0.55, 0.5, 0.45];
 
 /// Without a pack: a capsule 1.8 m tall where the character would stand, drawn by the same
 /// skinned material (one joint, at rest) and in the grid as it is, so it shows in the mirrors.
-pub fn stand_in(scene: &mut Scene, at: GVec3) -> usize {
+pub fn stand_in(scene: &mut Scene, at: GVec3, deferred: bool) -> usize {
     let (radius, height) = (0.28, 1.8);
     // a sphere stretched into a capsule: its upper and lower halves moved apart
     let sphere = SphereGeometry::new(radius, 24, 16);
@@ -191,7 +205,7 @@ pub fn stand_in(scene: &mut Scene, at: GVec3) -> usize {
     };
     let palette = BonePalette::new(1);
     let color = STAND_IN_COLOR;
-    let mut r = Renderable::new(mesh.geometry(), RoomLit.plain("StandIn", [color[0], color[1], color[2], 1.0], &mesh, &palette));
+    let mut r = Renderable::new(mesh.geometry(), RoomLit { deferred }.plain("StandIn", [color[0], color[1], color[2], 1.0], &mesh, &palette));
     r.object.set_position(at.x, at.y, at.z);
     r.rt = Some(RtSurface::new(color).with_smooth_normals());
     scene.add(SceneNode::Renderable(r))

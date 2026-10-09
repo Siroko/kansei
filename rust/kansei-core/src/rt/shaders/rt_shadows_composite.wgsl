@@ -93,6 +93,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let color = textureLoad(inputTex, px, 0);
     let depth = textureLoad(depthTex, px, 0);
     let ea = textureLoad(emissiveTex, px, 0).a;
+    if (sp.view == 3u) {
+        // the mask: red where the effect lights, the emissive alpha in green, depth in blue
+        textureStore(outputTex, px, vec4f(select(0.0, 1.0, shLitHere(ea)), ea, select(0.0, 1.0, depth < 1.0), 1.0));
+        return;
+    }
     if (depth >= 1.0 || !shLitHere(ea)) {
         textureStore(outputTex, px, select(color, vec4f(0.0, 0.0, 0.0, color.a), sp.view == 2u));
         return;

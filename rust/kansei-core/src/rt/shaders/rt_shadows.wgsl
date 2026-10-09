@@ -26,7 +26,7 @@ struct RtShadowParams {
     contactThickness : f32,   // how thick a depth sample is taken to be (m)
     temporalAlpha: f32,
     maxDistance  : f32,       // metres a ray toward the sun looks
-    view         : u32,       // 0 lit, 1 visibility, 2 direct light alone
+    view         : u32,       // 0 lit, 1 visibility, 2 direct light alone, 3 the mask
     debugLight   : u32,       // the light the visibility view shows
     stepWidth    : u32,       // this a-trous pass's step (texels)
     lastStep     : u32,
