@@ -195,7 +195,11 @@ settings! {
     blades: f32 = 6.0;
     blade_rot: f32 = 0.0;
     max_coc: f32 = 0.02;
-    // the page
+    // the page: the canvas's height in pixels ("native": the window's times the pixel ratio),
+    // the pixel ratio (0: the screen's, at most 2) and the scene's share of the canvas
+    resolution: String = "native".into();
+    dpr: f32 = 0.0;
+    render_scale: f32 = 1.0;
     stats: bool = false;
 }
 

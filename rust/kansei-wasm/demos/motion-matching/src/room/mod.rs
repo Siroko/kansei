@@ -90,6 +90,7 @@ struct Stats {
 const GLASS_TINT: [f32; 3] = [0.95, 0.98, 0.97];
 
 struct RoomState {
+    canvas: Canvas,
     renderer: Renderer,
     scene: Scene,
     camera: Camera,
@@ -160,6 +161,9 @@ impl<E: PostProcessingEffect + 'static> PostProcessingEffect for Switch<E> {
     }
     fn wants_jitter(&self) -> bool {
         self.on && self.effect.wants_jitter()
+    }
+    fn upscales_to_display(&self) -> bool {
+        self.on && self.effect.upscales_to_display()
     }
     fn destroy(&mut self) {
         self.effect.destroy();
@@ -429,7 +433,9 @@ impl RoomState {
                 cpu.sort_by(|a, b| b.1.total_cmp(&a.1));
                 stats.cpu = cpu;
                 let (w, h) = (self.renderer.width(), self.renderer.height());
-                let mut text = format!("{w} x {h}   frame {:.2} ms   GPU {:.2} ms (span {:.2})\n", stats.frame_ms, stats.gpu_ms, stats.gpu_span_ms);
+                let (rw, rh) = self.renderer.render_size();
+                let scaled = if (rw, rh) != (w, h) { format!(" (scene {rw} x {rh})") } else { String::new() };
+                let mut text = format!("{w} x {h}{scaled}   frame {:.2} ms   GPU {:.2} ms (span {:.2})\n", stats.frame_ms, stats.gpu_ms, stats.gpu_span_ms);
                 for (label, ms) in stats.passes.iter().take(24) {
                     text.push_str(&format!("{ms:6.2}  {label}\n"));
                 }
@@ -589,6 +595,10 @@ impl RoomState {
             if let Some(Light::Spot(l)) = self.scene.get_light_mut(lamp) {
                 l.color = Vec3::new(lamp_color[0], lamp_color[1], lamp_color[2]);
                 l.intensity = if s.lamps { s.lamp_cd } else { 0.0 };
+                // ray traced, the lamps need no shadow map (only the fog and the GI's hits read
+                // them, and the skylight's is the one that shows there): four fewer redraws of
+                // the room a frame
+                l.cast_shadow = !deferred;
             }
         }
         let shade = lamp_color.map(|c| c * layout::SHADE_RADIANCE * if s.lamps { s.lamp_cd / layout::LAMP_CD } else { 0.02 });
@@ -723,6 +733,14 @@ impl RoomState {
             e.effect.exposure = total;
         }
 
+        // the resolution: the canvas's height (or the screen's pixels times the ratio), the
+        // scene's share of it (TAA upscales)
+        if changed(|s| format!("{} {}", s.resolution, s.dpr)) {
+            self.canvas.set_render_height(s.resolution.trim_end_matches('p').parse::<u32>().ok());
+            self.canvas.set_pixel_ratio((s.dpr > 0.0).then_some(s.dpr as f64));
+        }
+        self.renderer.set_render_scale(s.render_scale);
+
         // the camera, the stats
         if changed(|s| s.cam.clone()) {
             let cam = s.cam.clone();
@@ -848,6 +866,7 @@ where
     let mut player = Player::new(character);
     player.follow = true;
     let mut state = RoomState {
+        canvas: canvas.clone(),
         renderer,
         scene,
         camera,
