@@ -28,6 +28,7 @@ exclude = [
     "kansei-wasm/examples/impostors",
     "kansei-wasm/examples/cluster-lod",
     "kansei-wasm/examples/ktx2-texture",
+    "kansei-wasm/demos/caustics-box",
     "kansei-wasm/demos/fluid_clock",
     "kansei-wasm/demos/joydivision",
     "kansei-wasm/demos/lake",

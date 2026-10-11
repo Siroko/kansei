@@ -59,8 +59,10 @@ for src in "${dirs[@]}"; do
     start=$SECONDS
     rm -rf "$dest"
     mkdir -p "$dest"
-    # the page and its files; never a pkg/ committed or left in www/, nor linked private packs
-    rsync -a --exclude 'pkg/' --exclude 'pack/' --exclude '*.kmm' --exclude 'make_assets.py' "$src/www/" "$dest/"
+    # the page and its files; never a pkg/ committed or left in www/, nor linked private packs,
+    # nor symbolic links (a local page's links to another example's assets, which the published
+    # page fetches from that example's folder: caustics-box's dragon from gi-box's)
+    rsync -a --no-links --exclude 'pkg/' --exclude 'pack/' --exclude '*.kmm' --exclude 'make_assets.py' "$src/www/" "$dest/"
     (cd "$src" && wasm-pack --log-level warn build --target web --release --no-pack --out-dir "$dest/pkg")
     rm -f "$dest/pkg/.gitignore" "$dest/pkg"/*.d.ts
     # served as <name>/index.html with pkg/ beside it: pages written for www/ import ../pkg/.

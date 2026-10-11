@@ -107,7 +107,8 @@ struct ParamsGpu {
     flags: u32,
     focus_gain: f32,
     focus_sharpen: f32,
-    _pad: [f32; 2],
+    water_span: u32,
+    _pad: f32,
 }
 
 /// The WGSL `CausticTask`.
@@ -250,6 +251,16 @@ pub struct RtCausticsEffect {
     /// caustics are a game's net of lines over the direct light reaching what lies under it
     /// (`kansei_rt_caustics_focus`, `kansei_water_caustic_lines`): crisp, animated, cheap.
     pub water_photons: bool,
+    /// The net of caustic lines on what lies under the water, this strong (0 to 1), whatever
+    /// `water_photons` says; `None` (the default): the water's ripples' (`RtCausticWater::ripples`)
+    /// without photons through it, none with them. With `water_photons`, the photons bring the
+    /// focus of the water's real waves (keep `RtCausticWater::ripples` low for them: the photons
+    /// are too few for small ripples' fine focus) and the lines the shimmer of a pool's bed.
+    pub water_lines: Option<f32>,
+    /// The texels of the water's height field its normal is taken over for the photons (1: its
+    /// neighbours'): wider smooths away the bumps of a surface made of particles, whose focus
+    /// would speckle the bed, keeping the waves'.
+    pub water_span: u32,
     /// Photons leave a spot light's emitter (`set_rect_emitter`, its disk) as it is; off, from its
     /// centre (sharper caustics, less physical).
     pub area_emitters: bool,
@@ -303,6 +314,8 @@ impl RtCausticsEffect {
             blend: options.blend,
             interval: 1,
             water_photons: false,
+            water_lines: None,
+            water_span: 1,
             area_emitters: false,
             focus_gain: 1.0,
             focus_sharpen: 1.0,
@@ -645,7 +658,8 @@ impl PostProcessingEffect for RtCausticsEffect {
             flags: self.water_photons as u32,
             focus_gain: self.focus_gain.max(0.0),
             focus_sharpen: self.focus_sharpen.clamp(0.1, 1.0),
-            _pad: [0.0; 2],
+            water_span: self.water_span.clamp(1, 8),
+            _pad: 0.0,
         };
         let lookup = LookupGpu {
             map_min: self.options.min,
@@ -653,11 +667,12 @@ impl PostProcessingEffect for RtCausticsEffect {
             enabled: self.enabled as u32,
             height_tolerance: self.options.height_tolerance,
             intensity: self.intensity.max(0.0),
-            focus: (water.is_some() && !self.water_photons) as u32,
+            focus: (water.is_some() && (self.water_lines.is_some() || !self.water_photons)) as u32,
             water_min: water.map_or([0.0; 2], |w| w.min),
             water_size: water.map_or([1.0; 2], |w| w.size),
             water_level: water.map_or(-1e9, |w| w.level),
-            ripples: water.map_or(0.0, |w| w.ripples),
+            // (the lines' strength)
+            ripples: self.water_lines.or(water.map(|w| w.ripples)).unwrap_or(0.0),
             time: self.time,
             ior: water.map_or(1.33, |w| w.ior),
         };

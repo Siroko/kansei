@@ -22,7 +22,7 @@ mod stepper;
 mod heightfield;
 
 pub use params::{FluidSimulationOptions, FluidSolver, PbfOptions, DEFAULT_OPTIONS};
-pub use simulation::{FluidSimulation, FluidSubstepPass};
+pub use simulation::{FluidSimulation, FluidSubstepPass, SIM_PARAMS_WGSL};
 pub use container::{signed_distance, FluidContainer, FluidContainerOptions, PlanarContainerShape};
 pub use activity::{FluidActivity, FluidSleep, FluidSleepOptions, FluidSpeed, FluidSpeedProbe};
 pub use colliders::{FluidCapsule, FluidColliders, FluidCollidersOptions};

@@ -1,0 +1,24 @@
+[package]
+name = "kansei-wasm-caustics-box"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kansei-core = { path = "../../../kansei-core" }
+kansei-wasm = { path = "../.." }
+wgpu = { version = "24", features = ["webgpu"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "PointerEvent", "MouseEvent", "WheelEvent", "Event", "EventTarget", "AddEventListenerOptions", "Element", "HtmlElement"] }
+log = "0.4"
+
+[workspace]
+
+[dev-dependencies]
+# validates the demo's WGSL in its unit tests (the same naga as wgpu 24)
+naga = { version = "24", features = ["wgsl-in"] }

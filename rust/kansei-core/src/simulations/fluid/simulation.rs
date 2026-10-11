@@ -10,7 +10,9 @@ const MAX_GRID_CELLS: u32 = 2_097_152;
 /// WGSL as `__NEIGHBOR_WG__` so the dispatch count and the shader cannot disagree.
 const NEIGHBOR_WG: u32 = 64;
 
-pub(crate) const SIM_PARAMS_WGSL: &str = include_str!("shaders/sim-params.wgsl");
+/// The WGSL `SimParams` the simulation's passes read (binding 2 of a [`FluidSubstepPass`]'s
+/// pipeline, [`FluidSimulation::substep_pipeline`]): include it in a substep pass of your own.
+pub const SIM_PARAMS_WGSL: &str = include_str!("shaders/sim-params.wgsl");
 const DENSITY_WGSL: &str = include_str!("shaders/density.wgsl");
 const FORCES_WGSL: &str = include_str!("shaders/forces.wgsl");
 const INTEGRATE_WGSL: &str = include_str!("shaders/integrate.wgsl");

@@ -42,6 +42,8 @@ struct CausticsParams {
     // physical)
     focusGain       : f32,
     focusSharpen    : f32,
+    // the texels the water's normal is taken over (1: its neighbours)
+    waterSpan       : u32,
 }
 
 // A light's photons: kind 0 a directional light (parallel, from the plane origin + u e1 + v e2,
@@ -112,13 +114,24 @@ fn waterHeight(c: vec2i, fallback: f32) -> f32 {
     return select(h, fallback, h < -1e8);
 }
 
-// The water's surface normal at world xz: its height field's slope, and the ripples.
+// The water's surface normal at world xz: its height field's slope (central differences `waterSpan`
+// texels apart, averaged across them over three rows: smoothed for a wider span), and the ripples.
 fn waterNormal(xz: vec2f) -> vec3f {
     let c = vec2i(round((xz - cp.waterMin) / cp.waterSize * vec2f(cp.waterDims)));
     let h = waterHeight(c, 0.0);
     let s = cp.waterSize / vec2f(cp.waterDims);
-    let gx = (waterHeight(c + vec2i(1, 0), h) - waterHeight(c - vec2i(1, 0), h)) / (2.0 * s.x);
-    let gz = (waterHeight(c + vec2i(0, 1), h) - waterHeight(c - vec2i(0, 1), h)) / (2.0 * s.y);
+    let k = i32(max(cp.waterSpan, 1u));
+    var gx = 0.0;
+    var gz = 0.0;
+    for (var j = -1; j <= 1; j++) {
+        // (one row for a span of 1, as the plain central difference)
+        if (k == 1 && j != 0) { continue; }
+        gx += waterHeight(c + vec2i(k, j * k), h) - waterHeight(c - vec2i(k, -j * k), h);
+        gz += waterHeight(c + vec2i(j * k, k), h) - waterHeight(c - vec2i(-j * k, k), h);
+    }
+    let rows = select(3.0, 1.0, k == 1);
+    gx /= 2.0 * f32(k) * s.x * rows;
+    gz /= 2.0 * f32(k) * s.y * rows;
     let r = kansei_water_ripples(xz, cp.time) * cp.ripples;
     return normalize(vec3f(-gx - r.x, 1.0, -gz - r.y));
 }

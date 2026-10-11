@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Caustics</title>
+    <style>
+        body { margin: 0; background: #fff; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; outline: none; }
+        #hud {
+            position: fixed; left: 14px; top: 12px; margin: 0; max-width: 70vw;
+            color: #333; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+            text-shadow: 0 0 4px #fff, 0 0 8px #fff; white-space: pre-wrap; pointer-events: none;
+        }
+        #stats {
+            position: fixed; right: 8px; bottom: 8px; margin: 0; padding: 6px 8px;
+            font: 11px/1.35 ui-monospace, Menlo, monospace; color: #e8e8e8;
+            background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none; white-space: pre;
+        }
+        #stats:empty { display: none; }
+        #credit { position: fixed; left: 14px; bottom: 6px; font: 10px sans-serif; color: #888; }
+        #credit a { color: #777; }
+        .tp-dfwv { width: 300px !important; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei" tabindex="0"></canvas>
+    <pre id="hud"></pre>
+    <pre id="stats"></pre>
+    <div id="credit" hidden>
+        Dragon: "<a href="https://sketchfab.com/3d-models/stanford-dragon-vrip-b602a35846e74533b1d9f06034a3b730">Stanford Dragon (Vrip)</a>"
+        by <a href="https://sketchfab.com/3dgraphics">3D graphics 101</a>,
+        <a href="http://creativecommons.org/licenses/by-nc/4.0/">CC-BY-NC-4.0</a>.
+    </div>
+    <script type="module">
+        import init, { start, caustics_info, caustics_set, caustics_settings, caustics_quality, caustics_reset, caustics_home } from '../pkg/kansei_wasm_caustics_box.js';
+        await init();
+        const params = new URLSearchParams(location.search);
+        const scene = params.get('scene') === 'dragon' ? 'dragon' : 'box';
+        document.getElementById('credit').hidden = scene !== 'dragon';
+        await start('kansei');
+        // for scripted captures: caustics.info() (with stats, each pass's GPU time), caustics.set('gi', 'ssao')
+        window.caustics = {
+            info: () => JSON.parse(caustics_info() || '{}'),
+            settings: () => JSON.parse(caustics_settings() || '{}'),
+            set: (key, value) => caustics_set(key, String(value)),
+            reset: caustics_reset,
+            home: caustics_home,
+        };
+
+        // ---- the panel: every setting, live (P hides it). The URL's parameters are the starting
+        // values; the quality preset sets several at once, and editing one of them makes it custom.
+        const p = JSON.parse(caustics_settings());
+        const set = (key, value) => caustics_set(key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
+        // the quality preset's settings (game or high, for the scene: settings::Settings::apply_quality)
+        const QUALITY_KEYS = new Set(JSON.parse(caustics_quality(params.get('quality') || 'game')));
+        Object.assign(p, JSON.parse(caustics_settings()));
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Caustics (P to hide)', expanded: window.innerWidth > 720 });
+        // for clean captures: ?panel=0 starts with the panel hidden, ?hud=0 without the text
+        pane.hidden = params.get('panel') === '0';
+        if (params.get('hud') === '0') document.getElementById('hud').style.display = 'none';
+        window.addEventListener('keydown', (e) => {
+            if (e.target.closest && e.target.closest('.tp-dfwv')) return;
+            if (e.key.toLowerCase() === 'p' && !e.repeat) pane.hidden = !pane.hidden;
+            if (e.key.toLowerCase() === 'r' && !e.repeat) caustics_reset();
+            if (e.key.toLowerCase() === 'h' && !e.repeat) caustics_home();
+        });
+        const presets = { quality: params.get('quality') || 'game' };
+        const applyQuality = (name) => {
+            if (name === 'custom') return;
+            caustics_quality(name);
+            Object.assign(p, JSON.parse(caustics_settings()));
+            pane.refresh();
+        };
+        // a control; editing one of a preset's makes it custom. A slider's range grows to take
+        // the URL's value (Tweakpane would clamp it and send the clamped one).
+        const bind = (folder, key, opts = {}, preset = null) => {
+            if (typeof p[key] === 'number') {
+                if (opts.max !== undefined && p[key] > opts.max) opts = { ...opts, max: p[key] };
+                if (opts.min !== undefined && p[key] < opts.min) opts = { ...opts, min: p[key] };
+            }
+            return folder.addBinding(p, key, opts).on('change', (ev) => {
+                set(key, ev.value);
+                if (preset && ev.last !== false && presets[preset] !== 'custom') { presets[preset] = 'custom'; pane.refresh(); }
+            });
+        };
+        // sent only when a slider is let go (the water is filled again, or its surface made anew)
+        const bindOnRelease = (folder, key, opts = {}) => folder.addBinding(p, key, opts).on('change', (ev) => { if (ev.last !== false) set(key, ev.value); });
+        const reloadWith = (key, value) => {
+            const url = new URL(location.href);
+            url.searchParams.set(key, String(value));
+            location.href = url.toString();
+        };
+
+        const top = pane.addFolder({ title: 'Scene' });
+        top.addBinding({ scene }, 'scene', { options: { 'box of water': 'box', 'glass dragon': 'dragon' } }).on('change', (ev) => {
+            const url = new URL(location.href);
+            url.searchParams.set('scene', ev.value);
+            url.searchParams.delete('drag');
+            location.href = url.toString();
+        });
+        top.addBinding(presets, 'quality', { options: { game: 'game', high: 'high', custom: 'custom' } }).on('change', (ev) => applyQuality(ev.value));
+        bind(top, 'drag', { label: 'left drag', options: { 'push the water': 'push', orbit: 'orbit', 'move the light': 'light' } });
+        if (scene === 'box') {
+            bind(top, 'push_strength', { label: 'push strength', min: 0, max: 1, step: 0.01 });
+            bind(top, 'push_radius', { label: 'push radius (m)', min: 0.05, max: 0.8, step: 0.01 });
+            bind(top, 'push_max_speed', { label: 'push top speed (m/s)', min: 0.5, max: 10, step: 0.1 });
+            top.addButton({ title: 'Fill again (R)' }).on('click', () => caustics_reset());
+        }
+        top.addButton({ title: 'Camera home (H)' }).on('click', () => caustics_home());
+
+        const studio = pane.addFolder({ title: 'Studio & light' });
+        bind(studio, 'floor', { options: { white: 'white', grey: 'grey' } });
+        bind(studio, 'floor_rough', { label: 'floor roughness (<0.6 reflects)', min: 0.05, max: 1, step: 0.01 });
+        bind(studio, 'bg_white', { label: 'white background' });
+        bind(studio, 'bg', { label: 'background (1: seamless)', min: 0, max: 3, step: 0.01 });
+        bind(studio, 'horizon', { label: 'fade the horizon' });
+        bind(studio, 'light_type', { label: 'key light', options: { sun: 'sun', spot: 'spot' } });
+        bind(studio, 'light_azim', { label: 'azimuth (°)', min: -180, max: 180, step: 0.5 });
+        bind(studio, 'light_elev', { label: 'elevation (°)', min: 5, max: 89, step: 0.5 });
+        bind(studio, 'light_dist', { label: 'spot distance (m)', min: 1, max: 20, step: 0.1 });
+        bind(studio, 'light_lux', { label: 'illuminance (lux)', min: 0, max: 120000, step: 500 });
+        bind(studio, 'light_temp', { label: 'colour (K)', min: 2000, max: 10000, step: 50 });
+        bind(studio, 'light_size', { label: 'size (° across: softness)', min: 0, max: 30, step: 0.1 });
+        bind(studio, 'sky_radiance', { label: 'white sky (cd/m²)', min: 0, max: 8000, step: 25 });
+        // (the shift drag moves the light too: the panel follows it)
+        setInterval(() => {
+            if (pane.hidden) return;
+            const s = JSON.parse(caustics_settings());
+            if (s.light_azim !== p.light_azim || s.light_elev !== p.light_elev) { p.light_azim = s.light_azim; p.light_elev = s.light_elev; pane.refresh(); }
+        }, 250);
+
+        const shading = pane.addFolder({ title: 'Shadows, AO, GI', expanded: false });
+        bind(shading, 'gi', { label: 'ambient', options: { 'hybrid RT GI (AO + bounce)': 'rt', 'SSAO + flat sky': 'ssao', 'flat sky': 'off' } });
+        bind(shading, 'gi_res', { label: 'GI rays', options: { 'half (1 per 2x2)': 'half', full: 'full' } }, 'quality');
+        bind(shading, 'ssao_radius', { label: 'SSAO radius (m)', min: 0.05, max: 2, step: 0.01 });
+        bind(shading, 'ssao_strength', { label: 'SSAO strength', min: 0, max: 2, step: 0.01 });
+        bind(shading, 'shadow_res', { label: 'shadow rays', options: { 'half (1 per 2x2)': 'half', full: 'full' } }, 'quality');
+        bind(shading, 'contact', { label: 'contact shadows' });
+        bind(shading, 'contact_length', { label: 'contact length (m)', min: 0.02, max: 1, step: 0.01 });
+
+        const caustics = pane.addFolder({ title: 'Caustics' });
+        bind(caustics, 'caustics', { label: 'on' });
+        bind(caustics, 'caustics_intensity', { label: 'intensity', min: 0, max: 4, step: 0.05 });
+        bind(caustics, 'caustics_photons', { label: 'photons (a side)', min: 16, max: 768, step: 8 }, 'quality');
+        bind(caustics, 'caustics_every', { label: 'update every N frames', min: 1, max: 8, step: 1 }, 'quality');
+        bind(caustics, 'caustics_blend', { label: 'blend (a frame)', min: 0.02, max: 1, step: 0.01 }, 'quality');
+        bind(caustics, 'caustics_view', { label: 'show caustics only' });
+        if (scene === 'box') {
+            bind(caustics, 'caustics_water_photons', { label: 'water by photons (its waves)' });
+            bind(caustics, 'caustics_lines', { label: 'water caustic lines', min: 0, max: 1, step: 0.01 });
+            bind(caustics, 'caustics_smooth', { label: 'water photons: smooth (texels)', min: 1, max: 8, step: 1 });
+        }
+        bind(caustics, 'caustics_area', { label: 'from the light\'s size' }, 'quality');
+        bind(caustics, 'caustics_glass_gain', { label: 'glass gain (1 physical)', min: 0, max: 8, step: 0.1 }, 'quality');
+        bind(caustics, 'caustics_sharpen', { label: 'splat width (1 physical)', min: 0.1, max: 1, step: 0.05 }, 'quality');
+
+        const glass = pane.addFolder({ title: 'Glass', expanded: scene === 'dragon' });
+        bind(glass, 'glass_ior', { label: 'IOR', min: 1, max: 2.4, step: 0.01 });
+        bind(glass, 'glass_tint', { label: 'tint (aqua)', min: 0, max: 1, step: 0.01 });
+        bind(glass, 'glass_rough', { label: 'frost', min: 0, max: 0.6, step: 0.01 });
+        bind(glass, 'glass_checker', { label: 'half the pixels a frame' }, 'quality');
+        bind(glass, 'glass_refl_shared', { label: 'reflections at half res' }, 'quality');
+        if (scene === 'box') bind(glass, 'sphere', { label: 'glass sphere in the water' });
+        else {
+            glass.addBinding(p, 'dragon', { label: 'mesh (reloads)', options: { 'full scan (871k triangles)': 'full', 'decimated (19k)': 'light' } }).on('change', (ev) => reloadWith('dragon', ev.value));
+            glass.addBinding(p, 'dragon_lod', { label: 'cluster LOD (reloads)' }).on('change', (ev) => reloadWith('dragon_lod', ev.value ? 1 : 0));
+        }
+
+        if (scene === 'box') {
+            const water = pane.addFolder({ title: 'Fluid', expanded: false });
+            bind(water, 'fluid', { label: 'simulate' });
+            bind(water, 'fluid_show', { label: 'show water' });
+            bind(water, 'fluid_rest', { label: 'sleep when still' });
+            bind(water, 'fluid_solver', { label: 'solver', options: { SPH: 'sph', 'position based (PBF)': 'pbf' } });
+            bind(water, 'fluid_speed', { label: 'time scale', min: 0.1, max: 3, step: 0.05 });
+            bind(water, 'fluid_substeps', { label: 'substeps', min: 1, max: 12, step: 1 });
+            bind(water, 'fluid_gravity', { label: 'gravity (m/s²)', min: 0, max: 30, step: 0.1 });
+            bind(water, 'fluid_viscosity', { label: 'viscosity (SPH)', min: 0, max: 2, step: 0.01 });
+            bind(water, 'fluid_pressure', { label: 'pressure (SPH)', min: 1, max: 150, step: 0.5 });
+            bind(water, 'fluid_near', { label: 'near pressure (SPH)', min: 0, max: 80, step: 0.5 });
+            bind(water, 'fluid_cohesion', { label: 'cohesion (SPH)', min: 0, max: 1, step: 0.01 });
+            bind(water, 'fluid_pbf_iter', { label: 'iterations (PBF)', min: 1, max: 10, step: 1 });
+            bind(water, 'fluid_xsph', { label: 'XSPH viscosity (PBF)', min: 0, max: 1, step: 0.01 });
+            bind(water, 'fluid_damping', { label: 'damping', min: 0.9, max: 1, step: 0.001 });
+            const box = water.addFolder({ title: 'box & resolution', expanded: true });
+            bindOnRelease(box, 'box_w', { label: 'width x (m)', min: 0.5, max: 6, step: 0.05 });
+            bindOnRelease(box, 'box_d', { label: 'depth z (m)', min: 0.5, max: 6, step: 0.05 });
+            bindOnRelease(box, 'box_h', { label: 'wall height (m)', min: 0.2, max: 1.5, step: 0.01 });
+            bindOnRelease(box, 'fluid_depth', { label: 'water depth (m)', min: 0.05, max: 1.2, step: 0.01 });
+            bind(box, 'fluid_bounds_show', { label: 'show bounds' });
+            box.addBinding({ scale: Number(params.get('scale') || 16) }, 'scale', { label: 'particles a metre / 0.537 (reloads)', min: 6, max: 30, step: 1 }).on('change', (ev) => { if (ev.last !== false) reloadWith('scale', ev.value); });
+            bindOnRelease(box, 'fluid_res', { label: 'field voxels (longest side)', min: 64, max: 384, step: 16 });
+            bindOnRelease(box, 'fluid_mc_max', { label: 'marching cubes max triangles', min: 50000, max: 2000000, step: 50000 });
+            bindOnRelease(box, 'fluid_rt_spacing', { label: 'RT heightfield mesh spacing (m)', min: 0.03, max: 0.3, step: 0.005 });
+            bind(box, 'fluid_drop', { label: 'droplet radius (m)', min: 0.005, max: 0.1, step: 0.001 });
+            bind(box, 'fluid_splat', { label: 'splat radius, smoothing (m)', min: 0.02, max: 0.3, step: 0.005 });
+            const built = { surface: '' };
+            box.addBinding(built, 'surface', { label: 'built', readonly: true, multiline: true, rows: 5, interval: 1000 });
+            setInterval(() => {
+                if (pane.hidden || water.expanded === false) return;
+                const f = window.caustics.info().fluid;
+                if (!f) return;
+                built.surface = `${f.particles.toLocaleString()} particles (room for ${f.capacity.toLocaleString()}), ${f.spacing_cm.toFixed(1)} cm apart\n${f.dims.join('×')} voxels, ${f.cell_cm.map((c) => c.toFixed(1)).join('×')} cm\nRT mesh ${f.rt_mesh.join('×')}, ${f.rt_spacing_cm.toFixed(0)} cm\ndrop ${f.drop_cm.toFixed(1)}, splat ${f.splat_cm.toFixed(1)} cm`;
+            }, 1000);
+            const look = water.addFolder({ title: 'surface', expanded: false });
+            bind(look, 'fluid_render', { label: 'drawn as', options: { 'ray-traced glass': 'rt', 'screen space': 'screen' } });
+            bind(look, 'fluid_ior', { label: 'IOR', min: 1, max: 2, step: 0.01 });
+            bind(look, 'fluid_tint', { label: 'tint', min: 0, max: 2, step: 0.01 });
+            bind(look, 'fluid_rough', { label: 'roughness', min: 0, max: 1, step: 0.01 });
+            bind(look, 'fluid_ripples', { label: 'wind ripples', min: 0, max: 2, step: 0.05 });
+        }
+
+        const post = pane.addFolder({ title: 'Camera & post', expanded: false });
+        bind(post, 'auto_ev', { label: 'auto exposure (white floor)' });
+        bind(post, 'ev', { label: 'EV100 (auto off)', min: 6, max: 17, step: 0.1 });
+        bind(post, 'exposure_comp', { label: 'compensation', min: -3, max: 3, step: 0.05 });
+        bind(post, 'tonemap', { label: 'tone map', options: { AgX: 'agx', 'AgX punchy': 'agx_punchy', ACES: 'aces', 'Khronos neutral': 'neutral', none: 'none' } });
+        bind(post, 'bloom');
+        bind(post, 'bloom_intensity', { label: 'bloom intensity', min: 0, max: 0.4, step: 0.005 });
+        bind(post, 'vignette', { min: 0, max: 1, step: 0.01 });
+        bind(post, 'taa', { label: 'TAA' });
+        const keepInUrl = (key) => (ev) => {
+            const url = new URL(location.href);
+            url.searchParams.set(key, String(ev.value));
+            history.replaceState(null, '', url);
+        };
+        bind(post, 'resolution', { label: 'canvas', options: { native: 'native', '2160p': '2160', '1440p': '1440', '1080p': '1080', '900p': '900', '720p': '720' } }).on('change', keepInUrl('resolution'));
+        bind(post, 'dpr', { label: 'pixel ratio (0: screen)', min: 0, max: 3, step: 0.25 }).on('change', keepInUrl('dpr'));
+        bind(post, 'render_scale', { label: 'scene scale (0: auto; TAA upscales)', min: 0, max: 1, step: 0.05 }).on('change', keepInUrl('render_scale'));
+
+        const debug = pane.addFolder({ title: 'Stats', expanded: false });
+        bind(debug, 'stats', { label: 'GPU / CPU times' });
+        bind(debug, 'perf', { label: 'performance overlay (`)' });
+        window.addEventListener('keydown', (e) => {
+            if (e.key === '`') setTimeout(() => { if (window.kanseiPerf && p.perf !== window.kanseiPerf.visible) { p.perf = window.kanseiPerf.visible; pane.refresh(); } });
+        });
+
+        // the URL's own parameters over the preset it names
+        for (const k of QUALITY_KEYS) if (params.has(k)) { set(k, params.get(k)); presets.quality = 'custom'; }
+        Object.assign(p, JSON.parse(caustics_settings()));
+        pane.refresh();
+    </script>
+</body>
+</html>
