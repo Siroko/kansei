@@ -186,11 +186,15 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   0.15 m/s. The plinth is a still capsule collider, not part of the container's floor (as a floor
   that steep it kept the water churning).
 - **Fog and dust.** A faint haze fills the room (a box `LocalFogVolume`), lit by the sun through
-  the cascades and the skylight through its map, so the windows throw shafts. 32768 dust motes
-  drift in a slow curl flow round the camera (a compute shader), pushed by the character, drawn
+  the cascades and the skylight through its map, so the windows throw shafts. 65536 dust motes
+  fill the room and drift in a slow curl flow (a compute shader), pushed by the character, drawn
   from a sprite atlas a compute shader makes at startup (soft motes, fibres, flecks and bokeh
-  discs, with mips), tumbling, lit by the sun and the spot lights through their shadows so they
-  sparkle in the beams, and blurred into bokeh by the depth of field.
+  discs, with mips), tumbling, blurred into bokeh by the depth of field. They are lit only by
+  direct light through its shadows, so they show in the shafts and vanish in shade: the sun's
+  through the windows and through the skylight (the brightest, looking toward the sun), and the
+  core of each spot light's cone (the skylight's column, the lamps' pools; a wide spot lighting
+  every mote read as snow). `dust_bright` (2.5) is radiance per lux before the phase function,
+  calibrated at EV 9; `dust_count=` sets how many.
 - **Post.** TAA, depth of field focused on the character (or the screen's centre, or a distance),
   bloom, AgX tone mapping with white balance, contrast, saturation, lift/gain, vignette, grain and
   chromatic aberration, motion blur off by default.
@@ -258,7 +262,7 @@ measured with the GPU otherwise idle (other sessions sharing it doubled every pa
 By effect in `hall` (GPU): the hybrid GI 4.6 ms (its trace 3.0), the renderer's passes 2.2 (the
 GBuffer, the cascades, the skylight's shadow map, velocity), the ray-traced direct light 2.1
 (trace 0.7-1.4, temporal and wavelet 0.6, composite 0.8), the reflections 1.4, the glass 1.3, depth
-of field 0.7, TAA 0.6, voxel GI's upkeep 0.5, fog 0.5, bloom 0.3, the dust 0.01 of compute. On the
+of field 0.7, TAA 0.6, voxel GI's upkeep 0.5, fog 0.5, bloom 0.3, the dust 0.01 of compute and a few tenths of a millisecond to draw. On the
 CPU the character takes about 2.4 ms and the renderer about 2.
 
 What it took to get there, from a first pass at 92 ms: the furniture's stand-ins in the grid (the

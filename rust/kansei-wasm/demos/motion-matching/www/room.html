@@ -95,12 +95,18 @@
             for (const [k, v] of Object.entries(values)) { p[k] = v; set(k, v); }
             pane.refresh();
         };
-        // a control of a preset's folder: editing it makes that preset custom
-        const bind = (folder, key, opts = {}, preset = null) =>
-            folder.addBinding(p, key, opts).on('change', (ev) => {
+        // a control of a preset's folder: editing it makes that preset custom. A slider's range
+        // grows to take the URL's value (Tweakpane would clamp it and send the clamped one).
+        const bind = (folder, key, opts = {}, preset = null) => {
+            if (typeof p[key] === 'number') {
+                if (opts.max !== undefined && p[key] > opts.max) opts = { ...opts, max: p[key] };
+                if (opts.min !== undefined && p[key] < opts.min) opts = { ...opts, min: p[key] };
+            }
+            return folder.addBinding(p, key, opts).on('change', (ev) => {
                 set(key, ev.value);
                 if (preset && ev.last !== false && presets[preset] !== 'custom') { presets[preset] = 'custom'; pane.refresh(); }
             });
+        };
         const options = (names) => Object.fromEntries(names.map((n) => [n, n]));
 
         const top = pane.addFolder({ title: 'Presets' });
@@ -150,7 +156,7 @@
         bind(air, 'dust');
         bind(air, 'dust_amount', { label: 'dust amount', min: 0, max: 1, step: 0.01 });
         bind(air, 'dust_size', { label: 'mote size (m)', min: 0.001, max: 0.03, step: 0.0005 });
-        bind(air, 'dust_bright', { label: 'brightness', min: 0, max: 0.02, step: 0.0001 });
+        bind(air, 'dust_bright', { label: 'brightness', min: 0, max: 6, step: 0.05 });
         bind(air, 'dust_opacity', { label: 'opacity', min: 0, max: 1, step: 0.01 });
         bind(air, 'dust_mix', { label: 'fibres & flecks', min: 0, max: 1, step: 0.01 });
         bind(air, 'dust_speed', { label: 'drift (m/s)', min: 0, max: 0.5, step: 0.005 });

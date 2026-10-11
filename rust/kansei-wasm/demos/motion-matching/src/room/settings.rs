@@ -130,8 +130,8 @@ settings! {
     fog_aniso: f32 = 0.55;
     dust: bool = true;
     dust_amount: f32 = 1.0;
-    dust_size: f32 = 0.005;
-    dust_bright: f32 = 0.0016;
+    dust_size: f32 = 0.008;
+    dust_bright: f32 = 2.5;
     dust_opacity: f32 = 0.7;
     dust_mix: f32 = 0.3;
     dust_speed: f32 = 0.06;

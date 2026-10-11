@@ -1,8 +1,8 @@
 //! Dust: motes drifting in the room's air, stepped by a compute shader and drawn as small soft
 //! sprites. They drift in a slow divergence-free flow (the curl of a few sine potentials) and the
-//! character's legs and body push them aside. They live in a box round the camera (clamped to the
-//! room), wrapping round its sides and fading near them, so the ones near the eye stay dense
-//! wherever it goes.
+//! character's legs and body push them aside. They fill the whole room, wrapping round its sides
+//! and fading at the walls: the light they show is in the sun's shafts from the windows and the
+//! skylight's column, wherever the camera is (a box round the camera missed both from most views).
 //!
 //! Their sprites come from an atlas a compute shader draws once at start (seeded, so the same every
 //! time), with its mips: soft round motes, thin curled fibres, irregular flecks, and bokeh discs
@@ -26,9 +26,8 @@ use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 
 use super::layout::{HALF, HEIGHT};
 
-/// The box round the camera the motes live in: half its width and depth (m); it is the room's
-/// height.
-const BOX_HALF: f32 = 11.0;
+/// The box the motes live in: half its width and depth (m; the room's), and its height.
+const BOX_HALF: f32 = HALF;
 /// The character's capsules the motes feel.
 const CAPSULES: usize = 8;
 /// The atlas: 4 x 4 sprites of 64 texels.
@@ -229,8 +228,8 @@ fn vertex_main(@location(0) position: vec4f, @location(1) normal: vec3f, @locati
     let edge = max(rel.x, rel.z);
     let view = view_matrix * vec4f(p, 1.0);
     let z = -view.z;
-    // dimmer far off
-    out.fade = select(0.0, smoothstep(1.0, 0.75, edge), inside) * (0.5 + fract(seed * 13.7)) * smoothstep(22.0, 6.0, z);
+    // dimmer far off (past the far side of the room's shafts from most views)
+    out.fade = select(0.0, smoothstep(1.0, 0.95, edge), inside) * (0.5 + fract(seed * 13.7)) * smoothstep(40.0, 14.0, z);
     let pixel = z * 2.0 / (projection_matrix[1][1] * dust.half.w);
     var size = max(dust.center.w * (0.6 + 0.8 * fract(seed * 5.1)), 1.5 * pixel);
     // the sprite: a mote, or (by the mix) a fibre or a fleck
@@ -281,7 +280,8 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
         let lit = kansei_sun_shadow(in.world, l, in.clip.xy);
         let cosTheta = dot(-l, -toEye);
         let phase = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosTheta, 1.5);
-        light += d.color * lit * (0.25 + phase);
+        // a broad share besides the forward lobe: the sun's shafts read from the side too
+        light += d.color * lit * (0.6 + phase);
     }
     for (var k = 0u; k < kansei_spot_lights.count; k++) {
         let l = kansei_spot_lights.lights[k];
@@ -294,16 +294,21 @@ fn fragment_main(in: VOut) -> @location(0) vec4f {
                 lit = textureSampleCompareLevel(kansei_spot_shadow_atlas, kansei_spot_shadow_sampler, c.xy, l.shadowLayer, c.z - 0.0005);
             }
         }
+        // only the cone's core (half its outer angle, fading in from 0.3 of it): a shaft under the
+        // skylight's opening and the lamps' pools, not a room of motes lit by a wide spot
+        let outer = acos(clamp(l.cosOuter, -1.0, 1.0));
+        let shaft = smoothstep(cos(outer * 0.5), cos(outer * 0.3), dot(-s.toLight, normalize(l.direction)));
         // forward scattering (Henyey-Greenstein, g = 0.6): bright looking into a beam
         let cosTheta = dot(-s.toLight, -toEye);
         let phase = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosTheta, 1.5);
-        light += s.illuminance * lit * (0.25 + phase);
+        light += s.illuminance * lit * shaft * (0.15 + phase);
     }
     let radiance = light * dust.room.z * sprite.rgb;
-    // nearly additive: a tiny alpha, the colour scaled up to match
+    // nearly additive: blended by a tiny alpha (alpha * a) the colour divided by it, so a mote
+    // adds radiance * a and darkens what is behind it by only 2% of its coverage
     let a = sprite.a * in.fade * dust.room.w;
     let alpha = 0.02;
-    return vec4f(radiance * a / alpha, alpha * a);
+    return vec4f(radiance / alpha, alpha * a);
 }
 "#;
 
@@ -324,7 +329,9 @@ struct StepParams {
     capsules: [Capsule; CAPSULES],
 }
 
-/// How the motes look: radius (m; at least 1.5 px), brightness (radiance per lux), opacity, the
+/// How the motes look: radius (m; at least 1.5 px), brightness (radiance per lux of the light
+/// reaching them, before the phase function: about 2.5 puts a mote in the sun a few times brighter
+/// than the room's white walls at EV 9), opacity, the
 /// flow's speed (m/s), the share of fibres and flecks, the share of the motes drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DustLook {
@@ -338,7 +345,7 @@ pub struct DustLook {
 
 impl Default for DustLook {
     fn default() -> Self {
-        Self { size: 0.005, brightness: 0.0016, opacity: 0.7, speed: 0.06, mix: 0.3, amount: 1.0 }
+        Self { size: 0.008, brightness: 2.5, opacity: 0.7, speed: 0.06, mix: 0.3, amount: 1.0 }
     }
 }
 
@@ -489,7 +496,9 @@ impl Dust {
             return;
         }
         self.time += dt;
-        let center = glam::Vec3::new(eye.x.clamp(-HALF + BOX_HALF * 0.5, HALF - BOX_HALF * 0.5), HEIGHT * 0.5, eye.z.clamp(-HALF + BOX_HALF * 0.5, HALF - BOX_HALF * 0.5));
+        // the box: the room (round the camera, clamped to the room, were it smaller)
+        let reach = (HALF - BOX_HALF).max(0.0);
+        let center = glam::Vec3::new(eye.x.clamp(-reach, reach), HEIGHT * 0.5, eye.z.clamp(-reach, reach));
         let half = [BOX_HALF, HEIGHT * 0.5, BOX_HALF];
         let capsules = &capsules[..capsules.len().min(CAPSULES)];
         if self.previous.len() != capsules.len() {

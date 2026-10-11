@@ -858,8 +858,8 @@ where
     let proxy = character.as_ref().filter(|_| kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&mut scene, c));
 
     let volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting));
-    let dust_count: u32 = param_or("dust_count", 32768);
-    let dust = (dust_count > 0).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::from(START)));
+    let dust_count: u32 = param_or("dust_count", 65536);
+    let dust = (dust_count > 0).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::ZERO));
 
     let mut camera = Camera::new(45.0, 0.1, 700.0, canvas.aspect());
     camera.update_projection_matrix();
