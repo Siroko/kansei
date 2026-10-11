@@ -184,11 +184,15 @@ settings! {
     caustics_every: f32 = 2.0;
     caustics_intensity: f32 = 1.0;
     caustics_view: bool = false;
-    // the water's caustics from photons (else its ripples' focus), the lights' emitters' size
+    // the water's caustics from photons (else a net of caustic lines), the lights' emitters' size
     caustics_water_photons: bool = false;
     caustics_area: bool = false;
+    // the light through the glass scaled, its splats narrowed (`RtCausticsEffect::focus_gain`,
+    // `focus_sharpen`; 1 and 1 physical)
+    caustics_glass_gain: f32 = 3.0;
+    caustics_sharpen: f32 = 0.5;
     display_spot: bool = true;
-    display_cd: f32 = 60000.0;
+    display_cd: f32 = 1_500_000.0;
     // materials
     mirror_rough: f32 = 0.0;
     mirror2_rough: f32 = 0.1;
@@ -239,9 +243,10 @@ settings! {
 
 impl Settings {
     /// The quality preset (the panel's): `game` (the default) traces half the glass's pixels a frame
-    /// and its reflections with the other surfaces', the water's caustics as its ripples' focus,
-    /// the photons from the lights' centres, the map fed every other frame; `high` traces every glass pixel and its reflection,
-    /// the water's caustics by photons through it, from the lights' emitters, 4x the photons.
+    /// and its reflections with the other surfaces', the water's caustics as a net of lines, the
+    /// glass's 3x as bright and half as wide, the photons from the lights' centres, the map fed
+    /// every other frame; `high` traces every glass pixel and its reflection, the caustics as
+    /// physical (the water's by photons through it), from the lights' emitters, 4x the photons.
     pub fn apply_quality(&mut self, quality: &str) {
         let high = quality == "high";
         self.glass_checker = !high;
@@ -250,6 +255,8 @@ impl Settings {
         self.caustics_area = high;
         self.caustics_photons = if high { 256.0 } else { 128.0 };
         self.caustics_every = if high { 1.0 } else { 2.0 };
+        self.caustics_glass_gain = if high { 1.0 } else { 3.0 };
+        self.caustics_sharpen = if high { 1.0 } else { 0.5 };
     }
 }
 

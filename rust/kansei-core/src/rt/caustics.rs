@@ -105,6 +105,9 @@ struct ParamsGpu {
     glass_absorb: [f32; 3],
     /// 1: photons through the water too (`water_photons`)
     flags: u32,
+    focus_gain: f32,
+    focus_sharpen: f32,
+    _pad: [f32; 2],
 }
 
 /// The WGSL `CausticTask`.
@@ -229,7 +232,7 @@ struct Gpu {
 /// reflections. A light's photons that hit no glass cost a ray each; directional lights cost one
 /// more, toward the light, from each photon that does.
 pub struct RtCausticsEffect {
-    pub enabled: bool,
+    enabled: bool,
     pub view: RtCausticsView,
     /// Scale of the light the caustics add and take (1 is physical).
     pub intensity: f32,
@@ -244,12 +247,17 @@ pub struct RtCausticsEffect {
     /// The water's caustics from photons through its surface (its height field and ripples, the
     /// lights' emitters as they are): physical, faint under a large emitter, and as noisy as the
     /// photons are few. Off (the default), photons go through the glass alone, and the water's
-    /// caustics are its ripples' focus of the direct light reaching what lies under it (from
-    /// straight above, `kansei_rt_caustics_focus`): sharp, animated, nearly free.
+    /// caustics are a game's net of lines over the direct light reaching what lies under it
+    /// (`kansei_rt_caustics_focus`, `kansei_water_caustic_lines`): crisp, animated, cheap.
     pub water_photons: bool,
     /// Photons leave a spot light's emitter (`set_rect_emitter`, its disk) as it is; off, from its
     /// centre (sharper caustics, less physical).
     pub area_emitters: bool,
+    /// The light the glass brings (its photons through it) times this, and their splats this
+    /// much narrower (1 and 1: physical; the shadow the glass leaves stays as it is): a game's
+    /// caustics, bright, crisp lines and spots where a physical glass's light spreads faint.
+    pub focus_gain: f32,
+    pub focus_sharpen: f32,
     options: RtCausticsOptions,
     map_dims: [u32; 2],
     grid: RtGridHandle,
@@ -296,6 +304,8 @@ impl RtCausticsEffect {
             interval: 1,
             water_photons: false,
             area_emitters: false,
+            focus_gain: 1.0,
+            focus_sharpen: 1.0,
             options,
             map_dims,
             grid,
@@ -370,6 +380,20 @@ impl RtCausticsEffect {
                 Light::Point(_) | Light::Area(_) => {}
             }
         }
+    }
+
+    /// Turn it on or off (`is_active`). Off, what reads its map (`map`'s lookup,
+    /// `RtReflectionsEffect::set_caustics`) sees no caustics either: an inactive effect isn't
+    /// rendered, so the lookup is cleared here.
+    pub fn set_enabled(&mut self, queue: &wgpu::Queue, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            queue.write_buffer(&self.lookup, 0, bytemuck::bytes_of(&LookupGpu::default()));
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// The map (rgb: the irradiance the caustics add, lux, signed; a: the height the photons
@@ -619,6 +643,9 @@ impl PostProcessingEffect for RtCausticsEffect {
             photons,
             glass_absorb: absorb(self.glass.1),
             flags: self.water_photons as u32,
+            focus_gain: self.focus_gain.max(0.0),
+            focus_sharpen: self.focus_sharpen.clamp(0.1, 1.0),
+            _pad: [0.0; 2],
         };
         let lookup = LookupGpu {
             map_min: self.options.min,

@@ -36,8 +36,12 @@ struct CausticsParams {
     waterAbsorb     : vec3f,
     photons         : u32,
     glassAbsorb     : vec3f,
-    // 1: photons through the water too (else the water's caustics are its ripples' focus)
+    // 1: photons through the water too (else the water's caustics are a net of lines)
     flags           : u32,
+    // the light through the glass times focusGain, its splats focusSharpen as wide (1, 1:
+    // physical)
+    focusGain       : f32,
+    focusSharpen    : f32,
 }
 
 // A light's photons: kind 0 a directional light (parallel, from the plane origin + u e1 + v e2,
@@ -233,7 +237,7 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
         }
         if (!isGlass(hit.triangle)) {
             if (hit.normal.y > 0.2) {
-                deposit(h, flux * throughput * hit.normal.y, apart + spread * travelled);
+                deposit(h, flux * throughput * hit.normal.y * cp.focusGain, (apart + spread * travelled) * cp.focusSharpen);
             }
             return;
         }

@@ -134,8 +134,10 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
 - **The light.** A low sun (9000 lx at 24°, 3600 K) through the windows, the skylight (a cool
   7500 K spot light whose emitter is the 6 x 12 m opening, 32000 cd), four warm 2700 K lamps
   under glowing shades (three floor lamps and the dining table's pendant), a narrow display spot
-  hung from the central beam over the dragon (60000 cd, 18°, a 3 cm emitter: sharp shadows and
-  caustics; `display_spot`, `display_cd`), and the sky the
+  on the dragon from a beam 12 m behind it (1.5 Mcd, 11°, about 7000 lx on the plinth: a
+  theatre's follow spot, else its pool and the dragon's caustics drown in the skylight's; a 3 cm
+  emitter: sharp shadows and caustics; `display_spot`, `display_cd`), low enough that the dragon's
+  light falls forward on the plinth's top, and the sky the
   windows show, which also lights the rays leaving through them (`SkyLighting`, its SH built on
   the CPU from the gradient). Exposure EV100 9, AgX.
 - **Ray-traced direct light** (`kansei_core::rt::RtShadowsEffect`, new with this page). Surfaces
@@ -205,15 +207,21 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   photons taken straight on take it away where the direct light lands, so the map holds what the
   glass changes: the light it focuses on the plinth and the shadow it leaves. It is blended over
   frames (`caustics_blend`) and added to the surfaces under it that face up (on screen, and at the
-  reflections' and the glass's hits). The water's caustics are its ripples' focus of the light on
-  what lies under it, from their curvature (the refraction's Jacobian, `kansei_rt_caustics_focus`):
-  sharp, animated and nearly free; `caustics_water_photons` sends photons through the water
-  instead, which under the skylight's 6 x 12 m emitter blur to almost nothing (physically). The
-  map costs 0.3-0.5 ms (fed every other frame, `caustics_every`; four times as seldom with the pond
-  out of view).
+  reflections' and the glass's hits). Physical, the glass's light is a faint dappling (10-30% over
+  the spot's own): `game` takes it 3x as bright with its splats half as wide
+  (`caustics_glass_gain`, `caustics_sharpen`; `RtCausticsEffect::focus_gain`, `focus_sharpen`).
+  The water's caustics are a game's pool's (`kansei_water_caustic_lines`, `kansei_rt_caustics_focus`):
+  a net of bright curved lines over what lies under the water, two animated cellular layers bent
+  by slow waves, the light between them at 0.45 and on them up to 4x (the mean about kept); its
+  ripples' own focus (the refraction's Jacobian, `kansei_water_focus`) was too soft to read on the
+  pale bed. `caustics_water_photons` sends photons through the water instead, which under the
+  skylight's 6 x 12 m emitter blur to almost nothing (physically). `cam=caustics` looks down on
+  the plinth's top and the bed with both. The map costs 0.5 ms (fed every other frame,
+  `caustics_every`; four times as seldom with the pond out of view), the lines up to 0.7 in the
+  glass pass where the bed fills the screen.
 - **Glass and water quality** (the panel's preset, `quality=`). `game` (the default): the
-  checkerboard, the glass's reflections at half resolution, the water's caustics from its ripples,
-  photons from the lights' centres. `high`: every glass pixel and its own reflection, photons
+  checkerboard, the glass's reflections at half resolution, the water's caustic lines, the glass's
+  caustics 3x and sharper, photons from the lights' centres. `high`: every glass pixel and its own reflection, photons
   through the water from the lights' emitters, four times the photons.
 - **Furniture** from Poly Haven, CC0: a sofa with throw pillows, two lounge chairs, an arm chair,
   an ottoman, a coffee table, a cabinet, a round dining table with four chairs, a vase, steel and
@@ -278,7 +286,7 @@ height, native to 540p, the pixel ratio and the scene's scale, TAA upscaling; ke
 and Stats. `src/room/settings.rs` lists them all with their defaults: each is also a URL
 parameter of the same name (`?floor=wood&gi=voxel&ev=8.5`), and `room.set(name, value)` sets one
 live. `cam=` names a view: `outside`, `hall`, `dragon`, `mirror`, `windows`, `parkour`, `living`,
-`dining`, `library`, and the shadow close-ups `contact`, `feet`, `plinth` (any other follows the
+`dining`, `library`, the shadow close-ups `contact`, `feet`, `plinth`, and `caustics` (any other follows the
 character). `panel=0` and `hud=0` start without the panel and the text, for captures; `refl_screen=0` lights every reflected hit by the traced path (no lit-image lookups) and `refl_indirect=` scales the voxels' light at those hits with the hybrid GI on; `vox_sky=0` leaves the window sky out of the voxel volume; `pond=0`,
 `dragon=0`, `rt_body=0` leave those out; `stats=1` shows each pass's GPU time and the CPU sections
 (also in `room.info()`), `profile=1` logs the profile every 3 s.
@@ -342,7 +350,9 @@ the water's reflection in the reflections' trace (up to 1.5 ms where the water f
 its refraction in the glass pass (0.5 ms in `dragon`), the display spot's light. `quality=high`
 (every glass pixel, its own reflection, photons through the water) lands at 34 ms in `dragon`
 (the glass pass 16.8 ms, the photons 1.8 against `game`'s 22 ms and 4.7); the first version,
-before the approximations, had the glass pass at 34 ms there.
+before the approximations, had the glass pass at 34 ms there. The water's caustic lines, the glass's gain and the
+follow spot (later, caustics on / off in one page): `dragon` 21.9 / 21.4 ms, `plinth` 24.3-25.4
+/ 24.7, `caustics` 25.9 / 24.7, `hall` 17.5 / 17.2.
 
 By effect in `hall` (GPU): the hybrid GI 4.6 ms (its trace 3.0), the renderer's passes 2.2 (the
 GBuffer, the cascades, the skylight's shadow map, velocity), the ray-traced direct light 2.1

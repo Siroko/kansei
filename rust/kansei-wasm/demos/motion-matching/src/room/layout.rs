@@ -64,12 +64,16 @@ pub const SHADE_RADIANCE: f32 = 900.0;
 pub const SUN_DIR: [f32; 3] = [0.86, -0.4, 0.32];
 pub const SUN_COLOR: [f32; 3] = [1.0, 0.74, 0.5];
 pub const LAMP_COLOR: [f32; 3] = [1.0, 0.68, 0.4];
-/// The display spot over the dragon: hung under the beam that crosses the room's centre, its
-/// intensity (cd), its narrow cone (inner and outer half-angles, degrees) over the plinth and a
-/// ring of water, a small emitter (sharp shadows and caustics), a neutral warm white.
-pub const DISPLAY_AT: [f32; 3] = [0.0, HEIGHT - 0.62, 0.0];
-pub const DISPLAY_CD: f32 = 60000.0;
-const DISPLAY_CONE: [f32; 2] = [12.0, 18.0];
+/// The display spot on the dragon: hung under a beam well past it (seen from the room's entrance),
+/// aimed at its middle, low enough that the light it focuses and its shadow fall forward, over the
+/// plinth's top onto the pond's bed in front; its intensity (cd), its narrow cone (inner and outer
+/// half-angles, degrees) over the dragon and the plinth, a small emitter (sharp shadows and
+/// caustics), a neutral warm white. A theatre's follow spot (about 7000 lux on the plinth, the
+/// sun's on the floor): dimmer, its pool and the dragon's caustics drown in the skylight's.
+pub const DISPLAY_AT: [f32; 3] = [0.0, HEIGHT - 0.62, -12.0];
+pub const DISPLAY_AIM: [f32; 3] = [0.0, 1.0, 0.0];
+pub const DISPLAY_CD: f32 = 1_500_000.0;
+const DISPLAY_CONE: [f32; 2] = [7.0, 11.0];
 pub const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
 
 /// A PBR surface in the room, for the page to change (deferred lighting, roughness, floors).
@@ -536,8 +540,9 @@ pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f
     lamps.push(l);
     shades.push(s);
 
-    // the display spot over the dragon, and its can under the beam
-    let mut spot = SpotLight::new(Vec3::new(DISPLAY_AT[0], DISPLAY_AT[1], DISPLAY_AT[2]), Vec3::new(0.0, -1.0, 0.0), Vec3::new(DISPLAY_COLOR[0], DISPLAY_COLOR[1], DISPLAY_COLOR[2]), DISPLAY_CD, 20.0, DISPLAY_CONE[0].to_radians(), DISPLAY_CONE[1].to_radians());
+    // the display spot on the dragon, and its can under the beam
+    let aim = (GVec3::from(DISPLAY_AIM) - GVec3::from(DISPLAY_AT)).normalize();
+    let mut spot = SpotLight::new(Vec3::new(DISPLAY_AT[0], DISPLAY_AT[1], DISPLAY_AT[2]), Vec3::new(aim.x, aim.y, aim.z), Vec3::new(DISPLAY_COLOR[0], DISPLAY_COLOR[1], DISPLAY_COLOR[2]), DISPLAY_CD, 40.0, DISPLAY_CONE[0].to_radians(), DISPLAY_CONE[1].to_radians());
     spot.cast_shadow = true;
     spot.source_radius = 0.03;
     spot.volumetric_scale = 1.0;

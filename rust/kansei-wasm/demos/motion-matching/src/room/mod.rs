@@ -298,7 +298,7 @@ async fn add_dragon(scene: &mut Scene) -> Option<(usize, (GVec3, GVec3))> {
 
 /// Fixed views (`cam=<name>`): (name, target, distance, azimuth, elevation); the camera stands at
 /// the target plus (sin, cos) of the azimuth times the distance.
-const VIEWS: [(&str, [f32; 3], f32, f32, f32); 12] = [
+const VIEWS: [(&str, [f32; 3], f32, f32, f32); 13] = [
     // from the south-east, above the walls' tops, looking in through them and the ceiling
     ("outside", [0.0, 1.5, 0.0], 52.0, 0.65, 0.42),
     // the whole room from its south-east, the windows and the sun opposite
@@ -322,6 +322,9 @@ const VIEWS: [(&str, [f32; 3], f32, f32, f32); 12] = [
     ("contact", [-13.0, 0.3, 13.0], 3.6, 0.9, 0.35),
     ("feet", [START[0], 0.3, START[2]], 2.8, 0.5, 0.3),
     ("plinth", [0.0, 0.5, 0.0], 4.2, 0.6, 0.2),
+    // the caustics: the plinth's top and the pond's bed in front of it from above, the display
+    // spot's light through the dragon falling toward the camera
+    ("caustics", [0.0, 0.3, 1.0], 5.0, 0.15, 0.75),
 ];
 
 /// Without a character: the pond from beside the stand-in, a little off its axis.
@@ -751,13 +754,16 @@ impl RoomState {
             e.effect.set_glass(Some(RtGlass { reflections_in_trace: s.glass_refl_shared, checkerboard: s.glass_checker, ..Default::default() }));
         }
         if let Some(e) = self.volume.effect_mut::<Switch<RtCausticsEffect>>() {
-            e.on = s.caustics;
+            // (off, the reflections' and the water's lookups of it too)
+            e.effect.set_enabled(self.renderer.queue(), s.caustics);
             e.effect.photons = s.caustics_photons.round().clamp(8.0, 1024.0) as u32;
             e.effect.blend = s.caustics_blend.clamp(0.01, 1.0);
             e.effect.intensity = s.caustics_intensity.max(0.0);
             e.effect.view = if s.caustics_view { RtCausticsView::Caustics } else { RtCausticsView::Lit };
             e.effect.water_photons = s.caustics_water_photons;
             e.effect.area_emitters = s.caustics_area;
+            e.effect.focus_gain = s.caustics_glass_gain.max(0.0);
+            e.effect.focus_sharpen = s.caustics_sharpen.clamp(0.1, 1.0);
             e.effect.set_glass(s.glass_ior, GLASS_TINT);
         }
         for (k, &mirror) in self.layout.mirrors.iter().enumerate() {

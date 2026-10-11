@@ -62,8 +62,8 @@
         // the glass and the water: 'game' (the default) trades exactness for speed where it barely
         // shows; 'high' is the physical path (settings::Settings::apply_quality)
         const QUALITIES = {
-            'game': { glass_checker: true, glass_refl_shared: true, caustics_water_photons: false, caustics_area: false, caustics_photons: 128, caustics_every: 2 },
-            'high': { glass_checker: false, glass_refl_shared: false, caustics_water_photons: true, caustics_area: true, caustics_photons: 256, caustics_every: 1 },
+            'game': { glass_checker: true, glass_refl_shared: true, caustics_water_photons: false, caustics_area: false, caustics_photons: 128, caustics_every: 2, caustics_glass_gain: 3, caustics_sharpen: 0.5 },
+            'high': { glass_checker: false, glass_refl_shared: false, caustics_water_photons: true, caustics_area: true, caustics_photons: 256, caustics_every: 1, caustics_glass_gain: 1, caustics_sharpen: 1 },
         };
         const LOOKS = {
             'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 9.0, floor: 'marble' },
@@ -143,7 +143,7 @@
         bind(lights, 'lamp_cd', { label: 'lamp (cd)', min: 0, max: 5000, step: 10 }, 'look');
         bind(lights, 'lamp_temp', { label: 'lamp (K)', min: 1800, max: 6500, step: 50 }, 'look');
         bind(lights, 'display_spot', { label: 'dragon spot' });
-        bind(lights, 'display_cd', { label: 'dragon spot (cd)', min: 0, max: 200000, step: 1000 });
+        bind(lights, 'display_cd', { label: 'dragon spot (cd)', min: 0, max: 4000000, step: 10000 });
 
         const rt = pane.addFolder({ title: 'Shadows, GI, reflections', expanded: false });
         bind(rt, 'shadows', { options: { 'ray traced': 'rt', 'shadow maps': 'maps' } });
@@ -170,6 +170,8 @@
         bind(rt, 'caustics_view', { label: 'show caustics only' });
         bind(rt, 'caustics_water_photons', { label: 'water caustics by photons' }, 'quality');
         bind(rt, 'caustics_area', { label: 'caustics from the emitters\' area' }, 'quality');
+        bind(rt, 'caustics_glass_gain', { label: 'glass caustics gain (1 physical)', min: 0, max: 8, step: 0.1 }, 'quality');
+        bind(rt, 'caustics_sharpen', { label: 'glass caustics splat width (1 physical)', min: 0.1, max: 1, step: 0.05 }, 'quality');
         bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
         bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });
 
