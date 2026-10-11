@@ -132,6 +132,8 @@ pub struct Material {
     /// Voxel GI's cluster voxelization pipelines (`get_cluster_voxel_pipeline`) by voxelizer.
     pub(crate) cluster_voxel_pipeline_cache: HashMap<u64, wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
+    /// Its program's key and where it is shared (`SharedLayouts::programs`), once initialized.
+    program: Option<(u64, std::sync::Arc<crate::renderers::MaterialPrograms>)>,
     pub initialized: bool,
 }
 
@@ -161,45 +163,89 @@ impl Material {
             cluster_velocity_pipeline: None,
             cluster_voxel_pipeline_cache: HashMap::new(),
             bind_group: None,
+            program: None,
             initialized: false,
         }
     }
 
-    /// Ensure shader module and layouts are created once.
+    /// Ensure shader module and layouts are created once: those of every material with the same
+    /// WGSL, bindings and options (`SharedLayouts::programs`).
     fn ensure_shared(&mut self, device: &wgpu::Device, shared: &SharedLayouts) {
         if self.shader_module.is_some() {
             return;
         }
 
         let processed_code = self.processed_code();
-
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&format!("{}/Shader", self.label)),
-            source: wgpu::ShaderSource::Wgsl(processed_code.as_str().into()),
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            processed_code.hash(&mut h);
+            self.bindings_key().hash(&mut h);
+            h.finish()
+        };
+        let label = &self.label;
+        let bindings = &self.bindings;
+        let program = shared.programs.program(key, || {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("{label}/Shader")),
+                source: wgpu::ShaderSource::Wgsl(processed_code.as_str().into()),
+            });
+            let material_bgl = BindGroupBuilder::create_layout(device, &format!("{label}/MaterialBGL"), bindings);
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{label}/PipelineLayout")),
+                bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl, &shared.shadow_bgl],
+                push_constant_ranges: &[],
+            });
+            let depth_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{label}/DepthPipelineLayout")),
+                bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl],
+                push_constant_ranges: &[],
+            });
+            crate::renderers::MaterialProgram { module, material_bgl, pipeline_layout, depth_pipeline_layout }
         });
 
-        let material_bgl = BindGroupBuilder::create_layout(
-            device,
-            &format!("{}/MaterialBGL", self.label),
-            &self.bindings,
-        );
+        self.shader_module = Some(program.module);
+        self.material_bgl = Some(program.material_bgl);
+        self.pipeline_layout = Some(program.pipeline_layout);
+        self.depth_pipeline_layout = Some(program.depth_pipeline_layout);
+        self.program = Some((key, shared.programs.clone()));
+    }
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("{}/PipelineLayout", self.label)),
-            bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl, &shared.shadow_bgl],
-            push_constant_ranges: &[],
-        });
+    /// The bindings' layout as text, for the program's key.
+    fn bindings_key(&self) -> String {
+        use super::binding::BindingType;
+        self.bindings
+            .iter()
+            .map(|b| {
+                let ty = match &b.ty {
+                    BindingType::UniformBuffer => "u".to_string(),
+                    BindingType::StorageBuffer { read_only } => format!("s{read_only}"),
+                    BindingType::Texture { sample_type, view_dimension } => format!("t{sample_type:?}{view_dimension:?}"),
+                    BindingType::StorageTexture { format, view_dimension } => format!("st{format:?}{view_dimension:?}"),
+                    BindingType::Sampler { filtering } => format!("p{filtering}"),
+                };
+                format!("{}:{}:{ty};", b.index, b.visibility.bits())
+            })
+            .collect()
+    }
 
-        let depth_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("{}/DepthPipelineLayout", self.label)),
-            bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl],
-            push_constant_ranges: &[],
-        });
+    /// The options a pipeline is made with, as text (with what else makes it, its key among the
+    /// program's shared pipelines).
+    fn options_key(&self) -> String {
+        let o = &self.options;
+        format!(
+            "{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{:?}",
+            o.transparent, o.depth_write, o.depth_compare, o.cull_mode, o.topology, o.outputs_emissive, o.mrt_output_count, o.shadow_fragment_entry, o.outputs_velocity, o.voxel_fragment_entry
+        )
+    }
 
-        self.shader_module = Some(module);
-        self.material_bgl = Some(material_bgl);
-        self.pipeline_layout = Some(pipeline_layout);
-        self.depth_pipeline_layout = Some(depth_pipeline_layout);
+    /// The pipeline `what` describes, shared with the materials of the same program, or made by
+    /// `make` (before the material is initialized: its own).
+    fn shared_pipeline(&self, what: String, make: impl FnOnce() -> wgpu::RenderPipeline) -> wgpu::RenderPipeline {
+        match &self.program {
+            Some((key, programs)) => programs.pipeline(*key, format!("{what}|{}", self.options_key()), make),
+            None => make(),
+        }
     }
 
     /// Initialize GPU resources. Called by Renderer during first render.
@@ -228,7 +274,7 @@ impl Material {
         };
 
         if !self.pipeline_cache.contains_key(&key) {
-            let pipeline = self.create_pipeline(device, self.pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap(), "vertex_main", vertex_layouts, color_formats, depth_format, sample_count, "Pipeline");
+            let pipeline = self.shared_pipeline(format!("main {key:?} {vertex_layouts:?}"), || self.create_pipeline(device, self.pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap(), "vertex_main", vertex_layouts, color_formats, depth_format, sample_count, "Pipeline"));
             self.pipeline_cache.insert(key.clone(), pipeline);
         }
 
@@ -432,7 +478,7 @@ impl Material {
         let key = DepthPipelineKey::new(depth_format, vertex_layouts.len(), bias);
         if !self.depth_pipeline_cache.contains_key(&key) {
             let (layout, module) = (self.depth_pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap());
-            let pipeline = self.create_depth_pipeline(device, layout, module, "vertex_main", vertex_layouts, depth_format, bias, "DepthPipeline");
+            let pipeline = self.shared_pipeline(format!("depth {key:?} {vertex_layouts:?}"), || self.create_depth_pipeline(device, layout, module, "vertex_main", vertex_layouts, depth_format, bias, "DepthPipeline"));
             self.depth_pipeline_cache.insert(key.clone(), pipeline);
         }
         self.depth_pipeline_cache.get(&key).unwrap()
@@ -484,7 +530,7 @@ impl Material {
         let key = vertex_layouts.len();
         if !self.velocity_pipeline_cache.contains_key(&key) {
             let (layout, module) = (self.pipeline_layout.as_ref().unwrap(), self.shader_module.as_ref().unwrap());
-            let pipeline = self.create_velocity_pipeline(device, layout, module, "vertex_main", vertex_layouts, "VelocityPipeline");
+            let pipeline = self.shared_pipeline(format!("velocity {vertex_layouts:?}"), || self.create_velocity_pipeline(device, layout, module, "vertex_main", vertex_layouts, "VelocityPipeline"));
             self.velocity_pipeline_cache.insert(key, pipeline);
         }
         self.velocity_pipeline_cache.get(&key).unwrap()
@@ -569,22 +615,26 @@ impl Material {
         let key = (voxelizer, vertex_layouts.len());
         if !self.voxel_pipeline_cache.contains_key(&key) {
             let material_bgl = self.material_bgl.as_ref().unwrap();
-            let layout = self.voxel_pipeline_layouts.entry(voxelizer).or_insert_with(|| {
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some(&format!("{}/VoxelPipelineLayout", self.label)),
-                    bind_group_layouts: &[material_bgl, &shared.camera_bgl, &shared.mesh_bgl, voxel_bgl],
-                    push_constant_ranges: &[],
+            let layout = self
+                .voxel_pipeline_layouts
+                .entry(voxelizer)
+                .or_insert_with(|| {
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some(&format!("{}/VoxelPipelineLayout", self.label)),
+                        bind_group_layouts: &[material_bgl, &shared.camera_bgl, &shared.mesh_bgl, voxel_bgl],
+                        push_constant_ranges: &[],
+                    })
                 })
-            });
+                .clone();
             let module = self.shader_module.as_ref().unwrap();
             let (fragment_module, entry) = match self.options.voxel_fragment_entry {
                 Some(entry) => (module, entry),
                 None => engine_fragment,
             };
             let targets = [Some(wgpu::ColorTargetState { format: target, blend: None, write_mask: wgpu::ColorWrites::empty() })];
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            let pipeline = self.shared_pipeline(format!("voxel {voxelizer} {vertex_layouts:?} {target:?} {sample_count}"), || device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("{}/VoxelPipeline", self.label)),
-                layout: Some(layout),
+                layout: Some(&layout),
                 vertex: wgpu::VertexState { module, entry_point: Some("vertex_main"), buffers: vertex_layouts, compilation_options: Default::default() },
                 fragment: Some(wgpu::FragmentState { module: fragment_module, entry_point: Some(entry), targets: &targets, compilation_options: Default::default() }),
                 // every face from every axis: the far side of a closed mesh is a surface too
@@ -593,7 +643,7 @@ impl Material {
                 multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
                 multiview: None,
                 cache: None,
-            });
+            }));
             self.voxel_pipeline_cache.insert(key, pipeline);
         }
         &self.voxel_pipeline_cache[&key]

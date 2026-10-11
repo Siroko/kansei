@@ -148,6 +148,17 @@ struct Builder<'a> {
     assets: &'a Assets,
     deferred: bool,
     surfaces: Vec<Surface>,
+    /// The boxes and panels of one label and surface, each placed in the world, drawn as one
+    /// mesh (`flush`): the window frames' 24 bars are a draw a pass, not 24.
+    batches: Vec<Batch>,
+}
+
+struct Batch {
+    label: String,
+    name: String,
+    params: PbrParams,
+    albedo: [f32; 3],
+    parts: Vec<(Geometry, glam::Mat4)>,
 }
 
 impl Builder<'_> {
@@ -176,27 +187,56 @@ impl Builder<'_> {
         }
     }
 
-    /// A box of `size` centred at `center`, turned by `yaw`, in the collision world when `collide`.
+    /// `geometry` placed by `world` into the batch of `label`, `name` and `params` (`flush`).
+    fn batch(&mut self, label: &str, geometry: Geometry, name: &str, params: PbrParams, albedo: [f32; 3], world: glam::Mat4) {
+        let same = |b: &&mut Batch| b.label == label && b.name == name && bytemuck::bytes_of(&b.params) == bytemuck::bytes_of(&params);
+        match self.batches.iter_mut().find(|b| same(b)) {
+            Some(b) => b.parts.push((geometry, world)),
+            None => self.batches.push(Batch { label: label.into(), name: name.into(), params, albedo, parts: vec![(geometry, world)] }),
+        }
+    }
+
+    /// Each batch as one renderable, its parts' vertices in the world (the surfaces are box-mapped
+    /// by world position, so they look as they did one by one).
+    fn flush(&mut self) {
+        for b in std::mem::take(&mut self.batches) {
+            let parts: Vec<(&Geometry, glam::Mat4)> = b.parts.iter().map(|(g, m)| (g, *m)).collect();
+            let geometry = Geometry::merged(&b.label, &parts);
+            self.add(&b.label, geometry, &b.name, b.params, b.albedo, [0.0; 3], 0.0, true);
+        }
+    }
+
+    /// A box of `size` centred at `center`, turned by `yaw` (batched), in the collision world when
+    /// `collide`.
     #[allow(clippy::too_many_arguments)]
-    fn solid(&mut self, label: &str, size: [f32; 3], center: [f32; 3], yaw: f32, name: &str, params: PbrParams, albedo: [f32; 3], collide: bool) -> usize {
+    fn solid(&mut self, label: &str, size: [f32; 3], center: [f32; 3], yaw: f32, name: &str, params: PbrParams, albedo: [f32; 3], collide: bool) {
         if collide {
             self.collision.add_box(Obb::new(GVec3::from(center), GVec3::from(size) * 0.5, Quat::from_rotation_y(yaw)));
         }
-        self.add(label, BoxGeometry::new(size[0], size[1], size[2]), name, params, albedo, center, yaw, true)
+        let world = glam::Mat4::from_translation(GVec3::from(center)) * glam::Mat4::from_rotation_y(yaw);
+        self.batch(label, BoxGeometry::new(size[0], size[1], size[2]), name, params, albedo, world);
     }
 
     /// A box standing on `base` (x, height of its bottom, z), as the course's: `size` wide, high
     /// and deep, turned by `yaw`, in the collision world.
-    fn block(&mut self, label: &str, base: [f32; 3], size: [f32; 3], yaw: f32, name: &str, tint: [f32; 3]) -> usize {
+    fn block(&mut self, label: &str, base: [f32; 3], size: [f32; 3], yaw: f32, name: &str, tint: [f32; 3]) {
         let albedo = mean(name, tint);
         let params = surface(tint, 1.6, [1.0, 0.0], false, self.deferred);
         self.solid(label, size, [base[0], base[1] + size[1] * 0.5, base[2]], yaw, name, params, albedo, true)
     }
 
     /// A one-sided plane `size` (width, height) at `center`, its front toward the room (turned by
-    /// `rotation`, radians about x and y).
+    /// `rotation`, radians about x and y), batched.
     #[allow(clippy::too_many_arguments)]
-    fn shell(&mut self, label: &str, size: [f32; 2], center: [f32; 3], rotation: [f32; 2], name: &str, mut params: PbrParams, albedo: [f32; 3]) -> usize {
+    fn shell(&mut self, label: &str, size: [f32; 2], center: [f32; 3], rotation: [f32; 2], name: &str, mut params: PbrParams, albedo: [f32; 3]) {
+        params.flags[0] = 1.0;
+        let world = glam::Mat4::from_translation(GVec3::from(center)) * glam::Mat4::from_rotation_y(rotation[1]) * glam::Mat4::from_rotation_x(rotation[0]);
+        self.batch(label, PlaneGeometry::new(size[0], size[1]), name, params, albedo, world);
+    }
+
+    /// A shell plane of its own (a renderable the page changes: the floor's quads).
+    #[allow(clippy::too_many_arguments)]
+    fn shell_alone(&mut self, label: &str, size: [f32; 2], center: [f32; 3], rotation: [f32; 2], name: &str, mut params: PbrParams, albedo: [f32; 3]) -> usize {
         params.flags[0] = 1.0;
         let index = self.add(label, PlaneGeometry::new(size[0], size[1]), name, params, albedo, center, 0.0, true);
         if let Some(r) = self.scene.get_renderable_mut(index) {
@@ -216,6 +256,8 @@ impl Builder<'_> {
     fn model(&mut self, name: &str, at: [f32; 2], y: f32, yaw: f32, scale: f32, collide: bool, grid: bool, albedo: [f32; 3]) -> Option<(GVec3, GVec3)> {
         let model = self.assets.models.get(name)?;
         let lift = y - model.min.y * scale;
+        // the solid parts cast their shadow as one simplified mesh, on the first of them
+        let mut shadow = model.shadow.as_ref();
         for part in &model.parts {
             let m = &model.materials[part.material];
             let mut params = PbrParams {
@@ -232,6 +274,10 @@ impl Builder<'_> {
             r.object.set_position(at[0], lift, at[1]);
             r.object.rotation.y = yaw;
             r.object.scale = Vec3::new(scale, scale, scale);
+            if !m.cutout && model.shadow.is_some() {
+                r.shadow_geometry = shadow.take().map(|g| Geometry::new(&g.label, g.vertices.clone(), g.indices.clone()));
+                r.cast_shadow = r.shadow_geometry.is_some();
+            }
             let index = self.scene.add(SceneNode::Renderable(r));
             self.surfaces.push(Surface { index, params, floor: false });
         }
@@ -282,7 +328,7 @@ fn floor(b: &mut Builder, hole: Option<([f32; 2], [f32; 2])>, name: &str, roughn
     };
     for (a, c) in quads {
         let params = floor_params(name, roughness, b.deferred);
-        let index = b.shell("Floor", [c[0] - a[0], c[1] - a[1]], [(a[0] + c[0]) * 0.5, 0.0, (a[1] + c[1]) * 0.5], [-std::f32::consts::FRAC_PI_2, 0.0], name, params, mean(name, [1.0; 3]));
+        let index = b.shell_alone("Floor", [c[0] - a[0], c[1] - a[1]], [(a[0] + c[0]) * 0.5, 0.0, (a[1] + c[1]) * 0.5], [-std::f32::consts::FRAC_PI_2, 0.0], name, params, mean(name, [1.0; 3]));
         b.surfaces.last_mut().unwrap().floor = true;
         if let Some(r) = b.scene.get_renderable_mut(index) {
             r.cast_shadow = false;
@@ -423,7 +469,7 @@ fn ceiling(b: &mut Builder) {
 /// `deferred` leaves the direct light to `RtShadowsEffect`.
 pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f32; 2])>, floor_name: &str, floor_roughness: f32, deferred: bool) -> Layout {
     use std::f32::consts::{FRAC_PI_2, PI};
-    let mut b = Builder { scene, collision: CollisionWorld::new(), assets, deferred, surfaces: Vec::new() };
+    let mut b = Builder { scene, collision: CollisionWorld::new(), assets, deferred, surfaces: Vec::new(), batches: Vec::new() };
     let (h, top) = (HALF, HEIGHT);
 
     // the shell: floor, walls, ceiling, and thick colliders outside the walls
@@ -549,6 +595,7 @@ pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f
     let display = b.scene.add(SceneNode::Light(Light::Spot(spot)));
     let can = surface(STEEL, 0.5, [0.5, 0.0], false, b.deferred);
     b.solid("DisplaySpot", [0.16, 0.24, 0.16], [DISPLAY_AT[0], DISPLAY_AT[1] + 0.13, DISPLAY_AT[2]], 0.0, "metal", can, STEEL, false);
+    b.flush();
     Layout { collision: b.collision, surfaces: b.surfaces, lights: Lights { sun, skylight, lamps, shades, display }, mirrors }
 }
 

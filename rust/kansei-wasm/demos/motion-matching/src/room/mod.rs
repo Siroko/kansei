@@ -134,11 +134,13 @@ const BOUNDS_MIN: [f32; 3] = [-HALF - 0.5, -1.0, -HALF - 0.5];
 const BOUNDS_MAX: [f32; 3] = [HALF + 0.5, HEIGHT + 1.5, HALF + 0.5];
 
 /// The grid of the room's triangles: 30 cm cells over the room (140 x 36 x 140, within the grid's
-/// million cells), fixed.
-fn grid_options() -> SceneRtGridOptions {
+/// million cells), fixed; the dragon's cut in it within `lod_cm` of its surface (a cell's error
+/// would trace a 2.6 m dragon as a lump through the glass).
+fn grid_options(lod_cm: f32) -> SceneRtGridOptions {
+    let cell = 0.3;
     SceneRtGridOptions {
-        grid: RtGridOptions { dims: [140, 36, 140], cell: 0.3, fixed_origin: Some(glam::Vec3::new(-21.0, -1.2, -21.0)), ..Default::default() },
-        cluster_error_cells: 1.0,
+        grid: RtGridOptions { dims: [140, 36, 140], cell, fixed_origin: Some(glam::Vec3::new(-21.0, -1.2, -21.0)), ..Default::default() },
+        cluster_error_cells: (lod_cm.max(0.0) * 0.01 / cell).max(1e-4),
         rebuild_every_frame: false,
     }
 }
@@ -716,6 +718,9 @@ impl RoomState {
         let probes = gi.starts_with("probes");
         let near = gi.ends_with("+ssgi");
         if let Some(scene_gi) = self.renderer.voxel_gi_mut() {
+            // the probes blend the volume's light over tens of frames: lit every third frame, it
+            // costs a third (the cone modes read it every frame)
+            scene_gi.lighting_interval = if probes { 3 } else { 1 };
             let wanted = probes.then_some((s.probe_spacing.clamp(2.0, 24.0), s.probes_per_frame.max(0.0)));
             if wanted != self.probes_applied {
                 match wanted {
@@ -866,6 +871,9 @@ impl RoomState {
             let cam = s.cam.clone();
             self.set_view(&cam);
         }
+        if changed(|s| format!("{}", s.lod_px)) {
+            self.renderer.set_cluster_error_threshold(s.lod_px.max(0.0));
+        }
         if changed(|s| format!("{}", s.perf)) {
             kansei_wasm::perf::set_visible(s.perf);
         }
@@ -885,7 +893,7 @@ impl RoomState {
         let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
+            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"dragon\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.settings.json(),
             self.view.unwrap_or("follow"),
             self.player.character.is_some(),
@@ -897,6 +905,11 @@ impl RoomState {
             self.proxy.as_ref().map_or(Vec::new(), |p| p.triangles(&self.scene)),
             grid.map_or(0, |g| g.grid.triangles),
             grid.map_or(0, |g| g.rebuilds),
+            // its mesh's triangles, its cut's on screen and in every view (the grid's...)
+            self.dragon.and_then(|i| self.scene.get_renderable(i)).map_or("null".into(), |r| {
+                let (camera, all) = self.renderer.cluster_triangles(r).unwrap_or((0, 0));
+                format!("{{\"mesh\":{},\"camera\":{camera},\"all\":{all}}}", r.geometry.index_count() / 3)
+            }),
             self.volume.effect::<Switch<RtCausticsEffect>>().map_or(0, |e| e.effect.photons_sent().0),
             self.volume.effect::<Switch<RtCausticsEffect>>().map_or(0, |e| e.effect.photons_sent().1),
             self.renderer.width(),
@@ -941,8 +954,8 @@ where
     renderer.enable_spot_shadows(2048, 6);
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
     renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: BOUNDS_MIN, bounds_max: BOUNDS_MAX, radiance_scale: 1.0, budget_bytes: 0 });
-    renderer.enable_rt_grid(grid_options());
     let mut settings = Settings::from_url();
+    renderer.enable_rt_grid(grid_options(settings.grid_lod_cm));
     let deferred = settings.shadows == "rt";
 
     set_text("hud", "Loading the room …");

@@ -167,7 +167,11 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   above the ceiling, where they see the sky; at the default backface limit (0.25) the lookups
   reached them through the one-voxel shell and lit a band along the top of the walls. Those
   probes see the shell's back faces, so the room drops them at 0.1. The room's materials add no
-  sky ambient of their own, so the effects take none out (`ambient: 0`).
+  sky ambient of their own, so the effects take none out (`ambient: 0`). In the probe modes the
+  volume is lit every third frame (`SceneVoxelGi::lighting_interval`: the probes blend its light
+  over tens of frames anyway) and the probes are looked up at half resolution and upsampled
+  (`Probes/Apply`; their update is `Probes/Update`): the GI's passes 2.0-2.5 to 1.1 ms with
+  `probes`, 3.8-4.1 to 3.0-3.2 with `probes+ssgi` (the screen-space trace 1.2 of it).
 - **Reflections and glass.** The marble, the lacquered wood, a mirror on the north wall and a
   brushed one (roughness 0.1) on the east wall reflect through `RtReflectionsEffect`, and the glass
   Stanford dragon (index of refraction 1.5) through its glass pass. Only glossy pixels (roughness
@@ -304,7 +308,7 @@ parameter of the same name (`?floor=wood&gi=voxel&ev=8.5`), and `room.set(name, 
 live. `cam=` names a view: `outside`, `hall`, `dragon`, `mirror`, `windows`, `parkour`, `living`,
 `dining`, `library`, the shadow close-ups `contact`, `feet`, `plinth`, and `caustics` (any other follows the
 character). `panel=0` and `hud=0` start without the panel and the text, for captures; `refl_screen=0` lights every reflected hit by the traced path (no lit-image lookups) and `refl_indirect=` scales the voxels' light at those hits with the hybrid GI on; `vox_sky=0` leaves the window sky out of the voxel volume; `pond=0`,
-`dragon=0`, `rt_body=0` leave those out; `perf=1` (or the backquote key, or Stats → performance overlay) shows kansei_wasm's performance overlay (fps, CPU and GPU ms with graphs, draws, triangles, pipelines, GPU memory; click it for every pass); `stats=1` shows each pass's GPU time and the CPU sections
+`dragon=0`, `rt_body=0` leave those out; `lod_px=` is the dragon's cluster LOD error on screen (pixels, 1 by default; 0 the whole mesh) and `grid_lod_cm=` its cut's in the grid the glass refracts through (3 cm: about 3 900 of its 19 300 triangles); `perf=1` (or the backquote key, or Stats → performance overlay) shows kansei_wasm's performance overlay (fps, CPU and GPU ms with graphs, draws, triangles, pipelines, GPU memory; click it for every pass, the draws and triangles by pass and by material, memory by label and pipelines by material; `kanseiPerf.report()` gives them as data); `stats=1` shows each pass's GPU time and the CPU sections
 (also in `room.info()`), `profile=1` logs the profile every 3 s.
 
 Keys, on top of the shared ones: O inside / outside, G the GI, T the shadows, F the fog, N the dust,
@@ -381,6 +385,22 @@ GI's trace 22 to 3 ms, the reflections' 31 to 1.5), the lamps without shadow map
 shadows are ray traced (they had redrawn the room four more times a frame, 3 ms), the GI's hits
 shadowed by the maps (6.2 to 3.0 ms), and a shallower pond that sleeps. The Resolution folder's
 scene scale (0.75: 15.2 ms in `hall`) or 900p (16.4 ms) buy the rest on slower GPUs.
+
+Then the draws. The overlay's breakdown showed 2251 draws and 4.0 million triangles a frame, 85%
+of the draws and 82% of the triangles in the shadow maps: the sun's four cascades and two spot
+lights each redrew every caster (317 draws, 550 000 triangles), and Poly Haven's book set, 68 000
+triangles in 40 meshes, four on the shelves, was 1120 of the draws and 1.9 million of the
+triangles on its own (the dragon is 19 300 triangles, drawn once, casting no shadow map). Every
+part was its own material with its own shader and pipelines: 1411 pipelines. Now each model is a
+mesh per material, the architecture's boxes and panels a mesh per surface (`Builder::batch`), the
+furniture casts its shadows as a simplified copy (`Renderable::shadow_geometry`, within 6 mm),
+each shadow map draws only the static casters in its frustum, and materials with the same WGSL
+share their program and pipelines (`SharedLayouts::programs`): 315 draws, 0.92 million triangles
+(the GBuffer's 0.7 million of them) and 130 pipelines, `hall` 18.2-18.5 to 14.7-15.9 ms and the
+user's view (`gi=probes+ssgi`) 12.0-15.4 to 10.2-10.5. Cluster LOD for the dense furniture was
+slower (17.7 against 13.2 ms: 300 more cull dispatches a frame, 93 MB of cut buffers), so the
+camera draws the full meshes. The dragon in the grid at a cell's error was 300 triangles, a lump
+through the glass: within 3 cm it is 3 900, 0.5-0.7 ms more glass.
 
 ## Build and run
 

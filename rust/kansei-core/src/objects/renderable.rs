@@ -48,6 +48,11 @@ pub struct Renderable {
     /// How the path tracer (`pathtracer::BVHBuilder::scene_materials`) sees this renderable;
     /// `None`: `PathTracerMaterial::default()`.
     pub path_tracer_material: Option<crate::pathtracer::PathTracerMaterial>,
+    /// A cheaper mesh the shadow maps draw in its place (cascades, spot and point lights, the sky
+    /// occlusion map), through the same material: a game's shadow LOD, a dense model simplified to
+    /// what its shadow shows. `None` (the default) casts the geometry. Not for instanced or cluster
+    /// renderables, which cast their own cuts.
+    pub shadow_geometry: Option<Geometry>,
     /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
     pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
@@ -89,6 +94,7 @@ impl Renderable {
             rt_placement: None,
             rt_mesh: None,
             path_tracer_material: None,
+            shadow_geometry: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }
     }

@@ -205,12 +205,14 @@ pub struct ModelMaterial {
     pub cutout: bool,
 }
 
-/// A model: its parts, its materials, its stand-in in the ray tracing grid and its bounds (model
-/// space, after the parts' transforms).
+/// A model: its parts (one mesh for each material), its materials, its stand-in in the ray
+/// tracing grid, the mesh its solid parts cast their shadows with, and its bounds (model space,
+/// after the parts' transforms).
 pub struct Model {
     pub parts: Vec<ModelPart>,
     pub materials: Vec<ModelMaterial>,
     pub grid: Option<Geometry>,
+    pub shadow: Option<Geometry>,
     pub min: GVec3,
     pub max: GVec3,
 }
@@ -259,9 +261,36 @@ fn model(renderer: &Renderer, name: &str, bytes: &[u8]) -> Result<Model, String>
             ModelPart { geometry, material: part.material_index.min(materials.len().saturating_sub(1)) }
         })
         .collect();
+    // a glTF's nodes as one mesh for each material: a draw each, not one a node (Poly Haven's
+    // book set is 40 nodes of one material)
+    let parts: Vec<ModelPart> = (0..materials.len().max(1))
+        .filter_map(|material| {
+            let same: Vec<(&Geometry, Mat4)> = parts.iter().filter(|p| p.material == material).map(|p| (&p.geometry, Mat4::IDENTITY)).collect();
+            (!same.is_empty()).then(|| ModelPart { geometry: Geometry::merged(&format!("{name}/Part"), &same), material })
+        })
+        .collect();
     let solid: Vec<&Geometry> = parts.iter().filter(|p| !materials[p.material].cutout).map(|p| &p.geometry).collect();
     let grid = grid_stand_in(name, &solid);
-    Ok(Model { parts, materials, grid, min, max })
+    let shadow = shadow_caster(name, &solid);
+    Ok(Model { parts, materials, grid, shadow, min, max })
+}
+
+/// How far (m) the mesh a model's shadow is cast with strays from its surface (a shadow map's
+/// texel is a centimetre or more), and the most triangles it keeps.
+const SHADOW_ERROR: f32 = 0.006;
+const SHADOW_TRIANGLES: usize = 6000;
+
+/// A model's solid parts as one mesh for its shadow (`Renderable::shadow_geometry`): welded and
+/// simplified to `SHADOW_ERROR`, at most `SHADOW_TRIANGLES`. Each shadow map draws every caster in
+/// its view: the full meshes in four cascades and the spot lights cost millions of triangles a
+/// frame that the shadows can't show.
+fn shadow_caster(name: &str, parts: &[&Geometry]) -> Option<Geometry> {
+    let sources: Vec<(&[Vertex], &[u32])> = parts.iter().map(|g| (g.vertices.as_slice(), g.indices.as_slice())).collect();
+    let (kept, indices) = simplify_welded(&sources, 0, SHADOW_ERROR, SHADOW_TRIANGLES)?;
+    let vertices = kept.iter().map(|&(part, v)| parts[part].vertices[v]).collect();
+    let total: usize = parts.iter().map(|g| g.indices.len() / 3).sum();
+    log::info!("room: {name} casts its shadow as {} of {total} triangles", indices.len() / 3);
+    Some(Geometry::new(&format!("{name}/Shadow"), vertices, indices))
 }
 
 /// How far (m) the grid's stand-in of a model strays from its surface, and the most triangles it

@@ -257,6 +257,11 @@ settings! {
     dpr: f32 = 0.0;
     render_scale: f32 = 1.0;
     stats: bool = false;
+    // the dragon's detail: its cluster LOD cut's error on screen (pixels; 0: the whole mesh) and
+    // in the ray tracing grid the glass refracts through (cm, at the start only: 3 keeps 3 900 of
+    // its 19 300 triangles there for 0.7 ms more glass; a cell's 30 cm kept 300)
+    lod_px: f32 = 1.0;
+    grid_lod_cm: f32 = 3.0;
     // the performance overlay (kansei_wasm::perf; also the ` key)
     perf: bool = false;
 }

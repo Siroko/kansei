@@ -53,6 +53,14 @@ impl GBuffer {
     /// velocity, far outside the screen).
     pub const NO_VELOCITY: f32 = 1.0e4;
 
+    /// Free its textures now (on the web, dropping them leaves their memory to the collector).
+    /// Nothing may draw with it after.
+    pub fn destroy(&self) {
+        for texture in [&self.color_texture, &self.background_texture, &self.background_depth_texture, &self.emissive_texture, &self.normal_texture, &self.albedo_texture, &self.depth_texture, &self.velocity_texture, &self.output_texture, &self.ping_pong_texture].into_iter().chain(&self._msaa_textures) {
+            texture.destroy();
+        }
+    }
+
     pub fn new(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> Self {
         let mk = |label: &str, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages, sc: u32| {
             let tex = device.create_texture(&wgpu::TextureDescriptor {

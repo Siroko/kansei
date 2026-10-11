@@ -27,6 +27,8 @@ extern "C" {
     fn js_frame(cpu_ms: f64);
     #[wasm_bindgen(js_name = perfProfile)]
     fn js_profile(json: &str);
+    #[wasm_bindgen(js_name = perfClusters)]
+    fn js_clusters(camera: u32, all: u32);
 }
 
 /// How often [`profile`] takes the renderer's profile while the overlay shows (ms).
@@ -61,8 +63,8 @@ pub(crate) fn frame_end(start: Option<f64>) {
     }
 }
 
-/// Give the overlay `renderer`'s GPU passes and CPU sections: call it once a frame, after
-/// rendering. While the overlay shows it turns profiling on (`Renderer::set_profiling`) and takes
+/// Give the overlay `renderer`'s GPU passes and CPU sections, and its cluster LOD cuts'
+/// triangles: call it once a frame, after rendering. While the overlay shows it turns profiling on (`Renderer::set_profiling`) and takes
 /// the profile twice a second; when it hides, it turns profiling off again if it turned it on.
 /// An example that takes the profile itself (a HUD of its own) shares it: each take averages the
 /// frames since the one before.
@@ -78,6 +80,9 @@ pub fn profile(renderer: &mut Renderer) {
         renderer.set_profiling(true);
         PROFILING.set(true);
     }
+    // the cluster LOD cuts' triangles (indirect draws: the overlay can't count them itself)
+    let (camera, all) = renderer.cluster_triangles_total();
+    js_clusters(camera, all);
     let now = crate::now() * 1000.0;
     if now - LAST_PROFILE.get() < PROFILE_EVERY_MS {
         return;

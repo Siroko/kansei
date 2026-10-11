@@ -12,6 +12,10 @@ use crate::renderers::GBuffer;
 pub struct PostProcessingVolume {
     pub effects: Vec<Box<dyn PostProcessingEffect>>,
     gbuffer: Option<GBuffer>,
+    /// GBuffers a resize replaced, and the frames until they are destroyed (after the frames in
+    /// flight that drew with them): on the web a dropped texture's memory waits for the
+    /// collector, a window drag's worth of them hundreds of megabytes.
+    retired: Vec<(GBuffer, u32)>,
     /// Ping-pong textures at the display size, for the effects after an upscaler.
     display_targets: Option<DisplayTargets>,
     blit_pipeline: Option<wgpu::RenderPipeline>,
@@ -53,6 +57,7 @@ impl PostProcessingVolume {
         Self {
             effects,
             gbuffer: None,
+            retired: Vec::new(),
             display_targets: None,
             blit_pipeline: None,
             blit_sampler: None,
@@ -92,7 +97,9 @@ impl PostProcessingVolume {
                 .map(|g| g.width != width || g.height != height)
                 .unwrap_or(false)
         {
-            self.gbuffer = Some(GBuffer::new(&self.device, width, height, 1));
+            if let Some(old) = self.gbuffer.replace(GBuffer::new(&self.device, width, height, 1)) {
+                self.retired.push((old, 3));
+            }
             for effect in &mut self.effects {
                 effect.resize(width, height, self.gbuffer.as_ref().unwrap());
             }
@@ -232,6 +239,13 @@ impl PostProcessingVolume {
         height: u32,
     ) {
         let _post = crate::profiling::cpu_scope("post");
+        self.retired.retain_mut(|(gbuffer, frames)| {
+            *frames -= 1;
+            if *frames == 0 {
+                gbuffer.destroy();
+            }
+            *frames > 0
+        });
         if self.gbuffer.is_none() {
             self.ensure_gbuffer(width, height);
         }

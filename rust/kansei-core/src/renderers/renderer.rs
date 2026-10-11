@@ -585,6 +585,9 @@ impl Renderer {
         if !r.geometry.initialized {
             r.geometry.initialize(device);
         }
+        if let Some(g) = r.shadow_geometry.as_mut().filter(|g| !g.initialized) {
+            g.initialize(device);
+        }
         for cb in &mut r.geometry.instance_buffers {
             cb.ensure_ready(device, queue);
         }
@@ -598,6 +601,23 @@ impl Renderer {
     /// Cluster LOD's error budget (`Renderable::clusters`), in pixels at the render size: each
     /// cluster drawn is the coarsest whose simplification error the camera sees under it. 1 by
     /// default; 0 draws the full mesh.
+    /// The triangles `r`'s cluster LOD cuts (`Renderable::clusters`) drew in the camera's view
+    /// and in all its views together (the camera's, the shadow maps', the grid's...), as the cull's
+    /// counts last read back (a few frames late); `None` before a reading or without clusters.
+    pub fn cluster_triangles(&self, r: &crate::objects::Renderable) -> Option<(u32, u32)> {
+        let id = r.clusters.as_ref()?.gpu.as_ref()?.id;
+        let counts = self.cluster_culling.as_ref()?.counts();
+        let mine: Vec<(u32, u32)> = counts.iter().filter(|((c, _), _)| *c == id).map(|((_, view), (_, triangles))| (*view, *triangles)).collect();
+        (!mine.is_empty()).then(|| (mine.iter().filter(|(v, _)| *v as usize == MAIN_VIEW).map(|(_, t)| t).sum(), mine.iter().map(|(_, t)| t).sum()))
+    }
+
+    /// Every cluster LOD cut's triangles as `cluster_triangles` gives them: (the camera's view,
+    /// all views).
+    pub fn cluster_triangles_total(&self) -> (u32, u32) {
+        let Some(culling) = self.cluster_culling.as_ref() else { return (0, 0) };
+        culling.counts().iter().fold((0, 0), |(main, all), ((_, view), (_, t))| (main + if *view as usize == MAIN_VIEW { *t } else { 0 }, all + t))
+    }
+
     pub fn set_cluster_error_threshold(&mut self, pixels: f32) {
         self.cluster_threshold = pixels.max(0.0);
     }
@@ -1515,14 +1535,15 @@ impl Renderer {
                     pass.set_bind_group(0, bg, &[]);
                 }
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
-                draw_geometry(&mut pass, r, view);
+                draw_caster(&mut pass, r, view);
             }
         }
         sky.build(device, queue, &mut encoder);
         queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// Render each cascade: every visible shadow caster, culled to the cascade.
+    /// Render each cascade: every visible shadow caster, culled to the cascade (instances on the
+    /// GPU, static renderables by their bounding sphere: `outside_shadow_frustum`).
     fn run_cascade_shadow_pass(&mut self, scene: &Scene) {
         let Some(csm) = self.cascaded_shadows.as_ref() else { return };
         if csm.slots.is_empty() {
@@ -1534,6 +1555,7 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/CascadedShadows") });
         for cascade in 0..csm.slots.len() {
             let view = self.cascade_view(cascade);
+            let view_proj = csm.slots[cascade].projection * csm.slots[cascade].view;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/CascadePass"),
                 color_attachments: &[],
@@ -1547,7 +1569,7 @@ impl Renderer {
             pass.set_bind_group(1, csm.camera(cascade).bind_group().unwrap(), &[]);
             for scene_idx in scene.ordered_indices() {
                 let Some(r) = scene.get_renderable(scene_idx) else { continue };
-                if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                if !r.visible || !r.cast_shadow || !r.geometry.initialized || outside_shadow_frustum(r, view_proj) {
                     continue;
                 }
                 let key = crate::materials::DepthPipelineKey::new(
@@ -1567,7 +1589,7 @@ impl Renderer {
                     pass.set_bind_group(0, bg, &[]);
                 }
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
-                draw_geometry(&mut pass, r, view);
+                draw_caster(&mut pass, r, view);
             }
         }
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
@@ -1933,7 +1955,7 @@ impl Renderer {
             }
         }
         gi.encode_sdf(device, &mut encoder, static_changed, any_dynamic);
-        gi.encode_lighting(device, queue, &mut encoder);
+        gi.encode_lighting(device, queue, &mut encoder, static_changed);
         let eye = camera.inverse_view_matrix.to_glam().w_axis;
         gi.encode_probes(device, queue, &mut encoder, Some([eye.x, eye.y, eye.z]));
         queue.submit(std::iter::once(encoder.finish()));
@@ -2136,9 +2158,10 @@ impl Renderer {
                 timestamp_writes: crate::profiling::gpu_pass("Renderer/SpotShadowPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             pass.set_bind_group(1, atlas.camera(slot.layer).bind_group().unwrap(), &[]);
+            let view_proj = slot.projection * slot.view;
             for scene_idx in scene.ordered_indices() {
                 let Some(r) = scene.get_renderable(scene_idx) else { continue };
-                if !r.visible || !r.cast_shadow || !r.geometry.initialized {
+                if !r.visible || !r.cast_shadow || !r.geometry.initialized || outside_shadow_frustum(r, view_proj) {
                     continue;
                 }
                 let key = crate::materials::DepthPipelineKey::new(
@@ -2159,7 +2182,7 @@ impl Renderer {
                 }
                 pass.set_bind_group(2, mesh_bg, &[offset, offset]);
                 // culled against this light's frustum, not the camera's
-                draw_geometry(&mut pass, r, spot_view(slot.layer));
+                draw_caster(&mut pass, r, spot_view(slot.layer));
             }
         }
         queue.submit(std::iter::once(encoder.finish()));
@@ -2706,15 +2729,10 @@ impl Renderer {
 
                         let offset = mesh_offset(scene_idx, csm_alignment);
                         pass.set_bind_group(1, csm.mesh_bg(), &[offset, offset]);
-                        pass.set_vertex_buffer(
-                            0,
-                            r.geometry.active_vertex_buffer().unwrap().slice(..),
-                        );
-                        pass.set_index_buffer(
-                            r.geometry.active_index_buffer().unwrap().slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
+                        let g = caster(r);
+                        pass.set_vertex_buffer(0, g.active_vertex_buffer().unwrap().slice(..));
+                        pass.set_index_buffer(g.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..g.index_count(), 0, 0..1);
                     }
                 }
             }
@@ -2773,6 +2791,9 @@ impl Renderer {
                 let r = scene.get_renderable_mut(idx).expect("ordered scene index should exist");
                 if !r.geometry.initialized {
                     r.geometry.initialize(device);
+                }
+                if let Some(g) = r.shadow_geometry.as_mut().filter(|g| !g.initialized) {
+                    g.initialize(device);
                 }
                 for cb in &mut r.geometry.instance_buffers {
                     cb.ensure_ready(device, queue);
@@ -2888,9 +2909,10 @@ impl Renderer {
                             let offset = mesh_offset(scene_idx, alignment);
                             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
 
-                            pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
-                            pass.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
+                            let g = caster(r);
+                            pass.set_vertex_buffer(0, g.active_vertex_buffer().unwrap().slice(..));
+                            pass.set_index_buffer(g.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..g.index_count(), 0, 0..1);
                         }
                     }
                     self.queue.as_ref().unwrap().submit(std::iter::once(shadow_encoder.finish()));
@@ -3220,9 +3242,10 @@ impl Renderer {
 
                             let offset = mesh_offset(scene_idx, alignment);
                             pass.set_bind_group(2, self.mesh_bind_group.as_ref().unwrap(), &[offset, offset]);
-                            pass.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
-                            pass.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..r.geometry.index_count(), 0, 0..1);
+                            let g = caster(r);
+                            pass.set_vertex_buffer(0, g.active_vertex_buffer().unwrap().slice(..));
+                            pass.set_index_buffer(g.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..g.index_count(), 0, 0..1);
                         }
                     }
                     self.queue.as_ref().unwrap().submit(std::iter::once(shadow_encoder.finish()));
@@ -3917,6 +3940,45 @@ fn draw_cut<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::obje
 
 /// Bind a renderable's vertex and index buffers and draw it for cull view `view`: its culled,
 /// compacted instances (indirect) when it has `InstanceCulling`, otherwise its geometry as is.
+/// Whether static renderable `r` lies wholly outside the frustum of the shadow view `view_proj`
+/// (its near plane aside: a caster between the light and the frustum still shadows it), by its
+/// geometry's bounding sphere: the shadow passes skip it. Instanced renderables (culled per view on
+/// the GPU), cluster ones (cut per view), dynamic ones (a skinned or vertex-animated mesh strays
+/// from its CPU vertices) and those a compute pass writes are never skipped.
+fn outside_shadow_frustum(r: &crate::objects::Renderable, view_proj: glam::Mat4) -> bool {
+    if r.dynamic || r.clusters.is_some() || r.geometry.is_instanced() || r.geometry.is_indirect() {
+        return false;
+    }
+    let Some((centre, radius)) = r.geometry.bounding_sphere() else { return false };
+    let world = r.object.world_matrix.to_glam();
+    let scale = world.x_axis.truncate().length().max(world.y_axis.truncate().length()).max(world.z_axis.truncate().length());
+    let p = world.transform_point3(centre).extend(1.0);
+    let radius = radius * scale;
+    let (x, y, z, w) = (view_proj.row(0), view_proj.row(1), view_proj.row(2), view_proj.row(3));
+    // left, right, bottom, top and far (depth 0..1: far is w - z)
+    [w + x, w - x, w + y, w - y, w - z].iter().any(|plane| plane.dot(p) < -radius * plane.truncate().length())
+}
+
+/// The mesh `r` casts its shadow with: its `shadow_geometry` (uploaded, and `r` plain), or its
+/// geometry.
+fn caster(r: &crate::objects::Renderable) -> &crate::geometries::Geometry {
+    match &r.shadow_geometry {
+        Some(g) if g.initialized && !r.geometry.is_instanced() && !r.geometry.is_indirect() => g,
+        _ => &r.geometry,
+    }
+}
+
+/// Draw `r` into a shadow map (view `view`): its `caster` mesh, or its geometry as culled there.
+fn draw_caster<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
+    let g = caster(r);
+    if std::ptr::eq(g, &r.geometry) {
+        return draw_geometry(enc, r, view);
+    }
+    enc.set_vertex_buffer(0, g.active_vertex_buffer().unwrap().slice(..));
+    enc.set_index_buffer(g.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+    enc.draw_indexed(0..g.index_count(), 0, 0..1);
+}
+
 fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
     bind_and_draw(enc, r, r.instance_culling.as_ref().and_then(|c| c.view(view)));
 }

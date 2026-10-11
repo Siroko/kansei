@@ -69,6 +69,8 @@ pub struct Geometry {
     /// Bump after changing `vertices` in place (same counts): the consumers of the CPU geometry
     /// that cache it (the ray tracing grid) read it again.
     pub revision: u32,
+    /// `bounding_sphere`'s, with the revision and vertex count it was worked out for.
+    sphere: std::sync::Mutex<Option<(u32, usize, glam::Vec3, f32)>>,
 }
 
 // SAFETY: wgpu::Buffer is internally Arc-based and Send+Sync.
@@ -120,6 +122,7 @@ impl Geometry {
             instance_count: 1,
             instance_buffers: Vec::new(),
             revision: 0,
+            sphere: std::sync::Mutex::new(None),
         }
     }
 
@@ -169,6 +172,26 @@ impl Geometry {
         points.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)))
     }
 
+    /// A sphere round the CPU vertices (the bounds' centre and the farthest vertex from it),
+    /// worked out again only when `revision` or the vertex count change; `None` for none (a
+    /// geometry a compute pass writes).
+    pub fn bounding_sphere(&self) -> Option<(glam::Vec3, f32)> {
+        if self.vertices.is_empty() {
+            return None;
+        }
+        let mut cached = self.sphere.lock().unwrap();
+        if let Some((revision, count, centre, radius)) = *cached {
+            if revision == self.revision && count == self.vertices.len() {
+                return Some((centre, radius));
+            }
+        }
+        let (lo, hi) = self.bounds();
+        let centre = (lo + hi) * 0.5;
+        let radius = self.vertices.iter().map(|v| glam::Vec3::from_slice(&v.position[..3]).distance_squared(centre)).fold(0.0f32, f32::max).sqrt();
+        *cached = Some((self.revision, self.vertices.len(), centre, radius));
+        Some((centre, radius))
+    }
+
     /// Scale the vertices uniformly to fit inside a box of `size` (use `f32::INFINITY` for an
     /// axis that may be any size) and move them so the bottom centre of their bounds sits at the
     /// origin: a model ready to stand on the ground.
@@ -201,6 +224,7 @@ impl Geometry {
             instance_count: 1,
             instance_buffers: Vec::new(),
             revision: 0,
+            sphere: std::sync::Mutex::new(None),
         }
     }
 
