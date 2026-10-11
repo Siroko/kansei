@@ -197,12 +197,17 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   outside keep the character in.
 - **The character in the rays.** The grid takes geometry as built, not as the vertex shader skins
   it, so a low-poly copy of the body shown stands in for it there (`look::Proxy`, `grid_only`):
-  each body's mesh (the hero's, or the pack's mannequin) welded and simplified to 1500 triangles
+  each body's mesh (the hero's, or the pack's mannequin) simplified to 1500 triangles
   (`proxy_tris=` another count), keeping original vertices so their joints and weights still
   apply, and skinned on the CPU with the shown body's palette whenever a bone has moved 3 cm
   (`Geometry::revision` tells the grid). C switches the copy with the body. The hero's copy
-  carries its uvs and the base colour's layer, so the mirrors show its jacket and jeans; the
-  mannequin's is one colour with smooth normals. They cast the ray-traced shadow, show in the
+  carries its uvs and the base colour's layer, so the mirrors show its jacket, face and jeans: it
+  is simplified with its uv seams kept (`assets::simplify_seamed`; welded by position, the
+  triangles along the seams read the texture across the atlas and the mirrored face and jacket
+  came out mangled), letting a seam move only where the uvs on both sides agree, which reaches
+  1500 at the same cost (kept fixed, the seams stop it at about 2250, 1.5 ms more). The
+  mannequin's is welded, one colour with smooth normals. `proxy_view=1` draws the copy for the
+  camera beside the body, textured as the rays see it. They cast the ray-traced shadow, show in the
   mirrors and the glass, and occlude the GI's rays. Walking, the grid rebuilds every frame
   (about 0.8-1.6 ms); standing, never. `rt_body=0` leaves the copy out.
 - **The pond.** A rectangular reflecting pool with a black marble bed round the marble plinth, the

@@ -380,7 +380,7 @@ impl RoomState {
         // the character's capsules in the grid, the water, the dust, the lens
         if let (Some(proxy), Some(c)) = (&mut self.proxy, &self.player.character) {
             let visible = self.scene.get_renderable(c.bodies[c.showing].index).is_some_and(|r| r.visible);
-            proxy.update(&mut self.scene, c, visible);
+            proxy.update(self.renderer.queue(), &mut self.scene, c, visible);
         }
         let view_proj = self.camera.view_projection().to_glam();
         if let Some(pond) = &mut self.pond {
@@ -906,7 +906,7 @@ where
     } else {
         bodies.push(look::stand_in(&mut scene, GVec3::from(START), deferred));
     }
-    let proxy = character.as_ref().filter(|_| kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&mut scene, c));
+    let proxy = character.as_ref().filter(|_| kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred));
 
     let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting));
     // the albedo the reflections' hits read: the surfaces' colour maps and the hero's

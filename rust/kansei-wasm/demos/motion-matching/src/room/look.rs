@@ -239,15 +239,19 @@ pub fn grid_only(geometry: Geometry, surface: RtSurface) -> Renderable {
 /// pack's mesh, whichever C shows), skinned on the CPU with the same pose. It is in the grid
 /// only (`grid_only`), so the mirrors, the glass, the ray-traced shadows and the GI's rays see the
 /// character's own silhouette; the camera and the shadow maps see its real mesh. The grid takes
-/// geometry as built, not as the vertex shader skins it, hence the copy: each body's mesh welded
-/// and simplified to about `PROXY_TRIANGLES` (`assets::simplify_welded`, which keeps original
-/// vertices, so their joints and weights still apply).
+/// geometry as built, not as the vertex shader skins it, hence the copy: each body's mesh
+/// simplified to about `PROXY_TRIANGLES`, the textured hero's with its uv seams kept
+/// (`assets::simplify_seamed`), the plain mannequin's welded (`assets::simplify_welded`); both keep
+/// original vertices, so their joints and weights still apply.
 ///
 /// Posing it rebuilds the grid (about 1 ms of GPU at 1080p), so it is a static renderable whose
 /// vertices move (`Geometry::revision`) only once a bone has moved `MOVE` from where it was last
 /// posed: a character standing still costs nothing.
 pub struct Proxy {
     bodies: Vec<ProxyBody>,
+    /// `proxy_view=1`: each copy also drawn for the camera beside the body (`VIEW_OFFSET` to one
+    /// side), textured as the rays see it, to compare the two.
+    view: bool,
     /// The bones' ends when last posed, and the body then shown (none: hidden).
     placed: Vec<(GVec3, GVec3)>,
     shown: Option<usize>,
@@ -257,7 +261,12 @@ pub struct Proxy {
 struct ProxyBody {
     index: usize,
     source: Vec<usize>,
+    /// The camera's copy (`proxy_view`): its renderable and vertex buffer.
+    view: Option<(usize, wgpu::Buffer)>,
 }
+
+/// How far (m) beside the body (along its -x) `proxy_view` draws its copy.
+const VIEW_OFFSET: f32 = 0.9;
 
 /// How far a bone moves (m) before the copy is posed again.
 const MOVE: f32 = 0.03;
@@ -271,14 +280,20 @@ fn proxy_albedo(name: &str) -> [f32; 3] {
 }
 
 impl Proxy {
-    pub fn new(scene: &mut Scene, character: &Character) -> Self {
+    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool) -> Self {
+        let view = kansei_wasm::flag("proxy_view", false);
         // `proxy_tris=` another count
         let target: usize = kansei_wasm::param_or("proxy_tris", PROXY_TRIANGLES);
         let mut bodies = Vec::new();
         for body in &character.bodies {
             let mesh = &body.mesh;
-            let Some((kept, indices)) = super::assets::simplify_welded(&[(mesh.vertices.as_slice(), mesh.indices.as_slice())], target, PROXY_ERROR, target) else { continue };
-            let source: Vec<usize> = kept.iter().map(|&(_, v)| v).collect();
+            // a textured body keeps its uv seams; a plain one is welded (its normals smoothed)
+            let simplified = if body.base_color.is_some() {
+                super::assets::simplify_seamed(&mesh.vertices, &mesh.indices, target, PROXY_ERROR)
+            } else {
+                super::assets::simplify_welded(&[(mesh.vertices.as_slice(), mesh.indices.as_slice())], target, PROXY_ERROR, target).map(|(kept, indices)| (kept.iter().map(|&(_, v)| v).collect(), indices))
+            };
+            let Some((source, indices)) = simplified else { continue };
             let vertices = source.iter().map(|&v| mesh.vertices[v]).collect();
             log::info!("room: {} in the grid as {} of {} triangles", body.name, indices.len() / 3, mesh.indices.len() / 3);
             // textured (its uvs; flat-shaded then), or one colour with smooth normals
@@ -288,9 +303,31 @@ impl Proxy {
             };
             let mut r = grid_only(Geometry::new(&format!("{}/Grid", body.name), vertices, indices), surface);
             r.visible = false;
-            bodies.push(ProxyBody { index: scene.add(SceneNode::Renderable(r)), source });
+            let indices = r.geometry.indices.clone();
+            let index = scene.add(SceneNode::Renderable(r));
+            let view = view.then(|| {
+                use wgpu::util::DeviceExt;
+                let vertices: Vec<kansei_core::geometries::Vertex> = source.iter().map(|&v| mesh.vertices[v]).collect();
+                let buffer = renderer.device().create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Room/ProxyView"), contents: bytemuck::cast_slice(&vertices), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST });
+                let color = match &body.base_color {
+                    Some((img, _)) => kansei_core::buffers::Texture::from_image("Room/ProxyView", img, true),
+                    None => {
+                        let c = proxy_albedo(body.name).map(|v| (v.powf(1.0 / 2.2) * 255.0) as u8);
+                        kansei_core::buffers::Texture::from_rgba("Room/ProxyView", 1, 1, &[c[0], c[1], c[2], 255])
+                    }
+                };
+                let flat = super::pbr::PbrMaps::flat([255; 4], 150, 0);
+                let mut params = super::layout::surface([1.0; 3], 1.0, [1.0, 0.0], false, deferred);
+                params.tint[3] = 0.0;
+                let material = super::pbr::material("Room/ProxyView", super::pbr::PbrMaps { color, ..flat }, &params, true);
+                let mut r = Renderable::new(Geometry::from_gpu_vertices("Room/ProxyView", buffer.clone(), indices), material);
+                r.cast_shadow = false;
+                r.visible = false;
+                (scene.add(SceneNode::Renderable(r)), buffer)
+            });
+            bodies.push(ProxyBody { index, source, view });
         }
-        Self { bodies, placed: Vec::new(), shown: None }
+        Self { bodies, view, placed: Vec::new(), shown: None }
     }
 
     /// The triangles of each body's copy.
@@ -300,10 +337,10 @@ impl Proxy {
 
     /// Pose the copy of the body shown as the character stands now, once a bone has moved `MOVE`
     /// or another body shows (hidden with the body: `visible`).
-    pub fn update(&mut self, scene: &mut Scene, character: &Character, visible: bool) {
+    pub fn update(&mut self, queue: &wgpu::Queue, scene: &mut Scene, character: &Character, visible: bool) {
         let ends: Vec<(GVec3, GVec3)> = character.bones_world().into_iter().map(|(_, a, b)| (a, b)).collect();
         let shown = visible.then_some(character.showing).filter(|&k| k < self.bodies.len());
-        let moved = self.placed.len() != ends.len() || ends.iter().zip(&self.placed).any(|((a, b), (pa, pb))| a.distance(*pa) > MOVE || b.distance(*pb) > MOVE);
+        let moved = self.view || self.placed.len() != ends.len() || ends.iter().zip(&self.placed).any(|((a, b), (pa, pb))| a.distance(*pa) > MOVE || b.distance(*pb) > MOVE);
         if !moved && shown == self.shown {
             return;
         }
@@ -312,6 +349,11 @@ impl Proxy {
         let at = character.controller.matcher.character();
         let place = Mat4::from_translation(at.translation) * Mat4::from_rotation_y(kansei_core::animation::motion_matching::yaw_of(at.rotation));
         for (k, proxy) in self.bodies.iter().enumerate() {
+            if let Some((view, _)) = &proxy.view {
+                if let Some(r) = scene.get_renderable_mut(*view) {
+                    r.visible = shown == Some(k);
+                }
+            }
             let Some(r) = scene.get_renderable_mut(proxy.index) else { continue };
             r.visible = shown == Some(k);
             if !r.visible {
@@ -329,6 +371,11 @@ impl Proxy {
                 vertex.normal = n.to_array();
             }
             r.geometry.revision = r.geometry.revision.wrapping_add(1);
+            if let Some((_, buffer)) = &proxy.view {
+                let right = place.transform_vector3(GVec3::X) * VIEW_OFFSET;
+                let moved: Vec<kansei_core::geometries::Vertex> = r.geometry.vertices.iter().map(|v| kansei_core::geometries::Vertex { position: [v.position[0] + right.x, v.position[1] + right.y, v.position[2] + right.z, 1.0], ..*v }).collect();
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&moved));
+            }
         }
     }
 }

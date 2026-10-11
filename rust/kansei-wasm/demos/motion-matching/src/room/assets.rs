@@ -12,7 +12,7 @@ use kansei_core::loaders::ktx2::CompressionSupport;
 use kansei_core::loaders::{GLTFLoader, GLTFResult};
 use kansei_core::renderers::Renderer;
 
-use optimesh::simplifier::{simplify, simplify_sloppy, SimplifyTarget, VertexData, SIMPLIFY_ERROR_ABSOLUTE, SIMPLIFY_PRUNE};
+use optimesh::simplifier::{simplify, simplify_sloppy, simplify_with_attributes, Attributes, SimplifyTarget, VertexData, SIMPLIFY_ERROR_ABSOLUTE, SIMPLIFY_PERMISSIVE, SIMPLIFY_PRUNE};
 
 use super::pbr::PbrMaps;
 use crate::fetch_bytes;
@@ -332,6 +332,60 @@ pub fn simplify_welded(meshes: &[(&[Vertex], &[u32])], target_triangles: usize, 
     // only the vertices kept
     let mut used: HashMap<u32, u32> = HashMap::new();
     let mut kept: Vec<(usize, usize)> = Vec::new();
+    let out = out
+        .iter()
+        .map(|&i| {
+            *used.entry(i).or_insert_with(|| {
+                kept.push(origin[i as usize]);
+                (kept.len() - 1) as u32
+            })
+        })
+        .collect();
+    Some((kept, out))
+}
+
+/// A textured mesh simplified for the ray tracing grid with its uvs intact (a copy welded by
+/// position swaps uvs across the uv seams: the triangles there sample the texture across the
+/// atlas, which mangled the hero's face and jacket in the mirrors). Welded only where vertices
+/// share both position and uv (a hard edge's split normals), so the simplifier sees the seams
+/// (vertices sharing a position, not a uv) and keeps every triangle on one uv island. Seams that
+/// stay in place hold the hero at about 2250 of its 100k triangles, 1.5 ms more of tracing than
+/// 1500; permissive collapse lets a seam move where the uvs on both sides agree, weighed by the
+/// uvs (and a little the normals) in the error, which reaches the target with the texture intact.
+/// Toward `target_triangles` within `error` metres; the vertices kept (indices into `vertices`)
+/// and the triangles over them.
+pub fn simplify_seamed(vertices: &[Vertex], indices: &[u32], target_triangles: usize, error: f32) -> Option<(Vec<usize>, Vec<u32>)> {
+    let mut welded: HashMap<[i32; 5], u32> = HashMap::new();
+    let mut origin: Vec<usize> = Vec::new();
+    let remap: Vec<u32> = vertices
+        .iter()
+        .enumerate()
+        .map(|(k, v)| {
+            let p = [0, 1, 2].map(|i| (v.position[i] * 1000.0).round() as i32);
+            let uv = v.uv.map(|c| (c * 8192.0).round() as i32);
+            *welded.entry([p[0], p[1], p[2], uv[0], uv[1]]).or_insert_with(|| {
+                origin.push(k);
+                (origin.len() - 1) as u32
+            })
+        })
+        .collect();
+    let compact: Vec<Vertex> = origin.iter().map(|&k| vertices[k]).collect();
+    let indices: Vec<u32> = indices.chunks_exact(3).map(|t| t.iter().map(|&i| remap[i as usize]).collect::<Vec<_>>()).filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]).flatten().collect();
+    const FLOATS: usize = std::mem::size_of::<Vertex>() / 4;
+    let flat: &[f32] = bytemuck::cast_slice(&compact);
+    let data = VertexData { positions: flat, count: compact.len(), stride: FLOATS * 4 };
+    // normal (3) and uv (2), after the position's four floats
+    let weights = [0.05, 0.05, 0.05, 2.0, 2.0];
+    let attributes = Attributes { data: &flat[4..], stride: FLOATS * 4, weights: &weights, count: 5 };
+    let mut out = vec![0u32; indices.len()];
+    let target = SimplifyTarget { target_index_count: (target_triangles * 3).min(indices.len()), target_error: error, options: SIMPLIFY_ERROR_ABSOLUTE | SIMPLIFY_PRUNE | SIMPLIFY_PERMISSIVE };
+    let (count, _) = simplify_with_attributes(&mut out, &indices, &data, &attributes, None, &target);
+    out.truncate(count);
+    if out.is_empty() {
+        return None;
+    }
+    let mut used: HashMap<u32, u32> = HashMap::new();
+    let mut kept: Vec<usize> = Vec::new();
     let out = out
         .iter()
         .map(|&i| {
