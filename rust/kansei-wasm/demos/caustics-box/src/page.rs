@@ -1,7 +1,7 @@
 //! The page itself (`start` and the exports the panel calls): the renderer, the chain, the two
 //! scenes, the pointer and the settings applied.
 
-use crate::{input, settings, studio, water};
+use crate::{ao, input, settings, studio, water};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use kansei_core::materials::{Material, MaterialOptions, StandardLitOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
-    exposure_from_ev100, BloomEffect, BloomOptions, FluidSurfaceEffect, HeightFogEffect, HeightFogLayer, SSAOEffect, SSAOOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, ToneMapper,
+    exposure_from_ev100, BloomEffect, BloomOptions, FluidSurfaceEffect, HeightFogEffect, HeightFogLayer, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, ToneMapper,
 };
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
@@ -115,16 +115,14 @@ impl<E: PostProcessingEffect + 'static> PostProcessingEffect for Switch<E> {
     }
 }
 
-/// The chain: the water's surface (the box), SSAO (when chosen), the ray-traced direct light and
+/// The chain: the water's surface (the box), the ray-traced direct light and
 /// shadows, the hybrid RT GI, the caustics over `caustics_rect` (x, z), the reflections and the
-/// glass, TAA, bloom and the tone map. `apply` sets them to the settings.
+/// glass, the ambient occlusion, the horizon's fade, TAA, bloom and the tone map. `apply` sets them to the settings.
 fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, caustics_rect: ([f32; 2], [f32; 2])) -> Vec<Box<dyn PostProcessingEffect>> {
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     if let Some(surface) = surface {
         effects.push(Box::new(surface));
     }
-    // (over the flat ambient only: the direct light comes after it)
-    effects.push(Box::new(Switch { effect: SSAOEffect::new(SSAOOptions::default()), on: false }));
     let scene_gi = renderer.voxel_gi().expect("the studio enables voxel GI");
     let grid = renderer.rt_grid().expect("the studio builds the grid");
     effects.push(Box::new(RtShadowsEffect::new(grid.handle())));
@@ -147,6 +145,8 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     reflections.set_caustics(Some((&caustics_map.0, &caustics_map.1)));
     reflections.set_sky_lighting(Some(sky));
     effects.push(Box::new(reflections));
+    // the game's contact darkening over the lit image (`ao`)
+    effects.push(Box::new(ao::AoEffect::new()));
     // the far floor faded into the backdrop: the studio's horizon gone (a uniform layer from
     // `HORIZON_START` on, its colour the backdrop's, set by `apply`)
     let mut horizon = HeightFogEffect::new(HeightFogLayer { density: HORIZON_DENSITY, height_falloff: 1e-4, height: 0.0 });
@@ -501,10 +501,14 @@ impl State {
             // (the sun's angular radius)
             e.sun_angle = (s.light_size.clamp(0.0, 40.0) * 0.5).to_radians();
         }
-        if let Some(e) = self.volume.effect_mut::<Switch<SSAOEffect>>() {
-            e.on = s.gi == "ssao";
-            e.effect.options.radius = s.ssao_radius.max(0.01);
-            e.effect.options.strength = s.ssao_strength.clamp(0.0, 2.0);
+        if let Some(e) = self.volume.effect_mut::<ao::AoEffect>() {
+            e.enabled = s.ao;
+            e.radius = s.ao_radius.clamp(0.02, 4.0);
+            e.intensity = s.ao_intensity.clamp(0.0, 4.0);
+            e.falloff = s.ao_falloff.clamp(0.0, 8.0);
+            e.samples = s.ao_samples.round().clamp(1.0, 32.0) as u32;
+            e.debug = s.ao_view;
+            e.white = Studio::white(&s);
         }
         if let Some(e) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
             e.enabled = s.gi == "rt";

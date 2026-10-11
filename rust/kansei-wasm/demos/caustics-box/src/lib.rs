@@ -11,11 +11,14 @@
 //! Both share the studio (`studio`: the floor, a backdrop as bright as the lit floor far off, the
 //! key light as a sun or a spot) and the chain: ray-traced direct light and soft shadows
 //! (`RtShadowsEffect`), the hybrid RT GI under the white sky for the bounce and the occlusion (or
-//! SSAO, or a flat ambient), the caustics (`RtCausticsEffect`), the reflections and the glass
+//! or a flat ambient), a game's contact ambient occlusion over the lit image (`ao`), the caustics (`RtCausticsEffect`), the reflections and the glass
 //! (`RtReflectionsEffect`), TAA, bloom and AgX. Every setting is a URL parameter and a control in
 //! the page's panel (`settings`); `?perf=1` or the backquote key shows the performance overlay.
 
-// (the page runs in the browser only: natively, `cargo test` builds the push pass's shader test)
+// (the page runs in the browser only: natively, `cargo test` builds the push and AO passes' shader
+// tests)
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod ao;
 #[cfg(target_arch = "wasm32")]
 mod input;
 #[cfg(target_arch = "wasm32")]

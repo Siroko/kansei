@@ -39,7 +39,7 @@
         const scene = params.get('scene') === 'dragon' ? 'dragon' : 'box';
         document.getElementById('credit').hidden = scene !== 'dragon';
         await start('kansei');
-        // for scripted captures: caustics.info() (with stats, each pass's GPU time), caustics.set('gi', 'ssao')
+        // for scripted captures: caustics.info() (with stats, each pass's GPU time), caustics.set('ao_view', 1)
         window.caustics = {
             info: () => JSON.parse(caustics_info() || '{}'),
             settings: () => JSON.parse(caustics_settings() || '{}'),
@@ -126,7 +126,7 @@
         bind(studio, 'light_lux', { label: 'illuminance (lux)', min: 0, max: 120000, step: 500 });
         bind(studio, 'light_temp', { label: 'colour (K)', min: 2000, max: 10000, step: 50 });
         bind(studio, 'light_size', { label: 'size (° across: softness)', min: 0, max: 30, step: 0.1 });
-        bind(studio, 'sky_radiance', { label: 'white sky (cd/m²)', min: 0, max: 8000, step: 25 });
+        bind(studio, 'sky_radiance', { label: 'fill: white sky (cd/m²)', min: 0, max: 8000, step: 25 });
         // (the shift drag moves the light too: the panel follows it)
         setInterval(() => {
             if (pane.hidden) return;
@@ -134,11 +134,15 @@
             if (s.light_azim !== p.light_azim || s.light_elev !== p.light_elev) { p.light_azim = s.light_azim; p.light_elev = s.light_elev; pane.refresh(); }
         }, 250);
 
-        const shading = pane.addFolder({ title: 'Shadows, AO, GI', expanded: false });
-        bind(shading, 'gi', { label: 'ambient', options: { 'hybrid RT GI (AO + bounce)': 'rt', 'SSAO + flat sky': 'ssao', 'flat sky': 'off' } });
+        const shading = pane.addFolder({ title: 'AO, shadows, GI', expanded: true });
+        bind(shading, 'ao', { label: 'ambient occlusion' });
+        bind(shading, 'ao_radius', { label: 'AO radius (m)', min: 0.05, max: 2, step: 0.01 });
+        bind(shading, 'ao_intensity', { label: 'AO intensity', min: 0, max: 8, step: 0.1 });
+        bind(shading, 'ao_falloff', { label: 'AO falloff (contact tightness)', min: 0, max: 6, step: 0.1 });
+        bind(shading, 'ao_samples', { label: 'AO samples', min: 4, max: 32, step: 1 });
+        bind(shading, 'ao_view', { label: 'AO only (debug)' });
+        bind(shading, 'gi', { label: 'ambient', options: { 'hybrid RT GI (bounce + sky occlusion)': 'rt', 'flat sky': 'off' } });
         bind(shading, 'gi_res', { label: 'GI rays', options: { 'half (1 per 2x2)': 'half', full: 'full' } }, 'quality');
-        bind(shading, 'ssao_radius', { label: 'SSAO radius (m)', min: 0.05, max: 2, step: 0.01 });
-        bind(shading, 'ssao_strength', { label: 'SSAO strength', min: 0, max: 2, step: 0.01 });
         bind(shading, 'shadow_res', { label: 'shadow rays', options: { 'half (1 per 2x2)': 'half', full: 'full' } }, 'quality');
         bind(shading, 'contact', { label: 'contact shadows' });
         bind(shading, 'contact_length', { label: 'contact length (m)', min: 0.02, max: 1, step: 0.01 });

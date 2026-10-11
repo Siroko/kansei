@@ -134,12 +134,19 @@ settings! {
     light_temp: f32 = 6500.0;
     light_size: f32 = 2.0;
     sky_radiance: f32 = 1800.0;
-    // ambient occlusion and bounce: the hybrid RT GI under the white sky, screen-space AO over a
-    // flat ambient, or the flat ambient alone; RT shadows' contact rays
+    // the ambient: the hybrid RT GI under the white sky (its occlusion and the floor's bounce) or
+    // the flat sky alone; its rays half or full resolution
     gi: String = "rt".into();
     gi_res: String = "half".into();
-    ssao_radius: f32 = 0.35;
-    ssao_strength: f32 = 1.0;
+    // ambient occlusion (`ao`): a game's contact darkening over the lit image, its reach (m),
+    // strength (an exponent on the unoccluded share), tightness round contacts (an exponent on
+    // the near samples' weight), samples a pixel, the occlusion alone
+    ao: bool = true;
+    ao_radius: f32 = 0.8;
+    ao_intensity: f32 = 3.0;
+    ao_falloff: f32 = 1.0;
+    ao_samples: f32 = 12.0;
+    ao_view: bool = false;
     contact: bool = true;
     contact_length: f32 = 0.2;
     shadow_res: String = "half".into();

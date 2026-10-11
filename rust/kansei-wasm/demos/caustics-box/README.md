@@ -52,8 +52,16 @@ them from the gi-box example's folder beside its own.
   so the horizon disappears; auto exposure (`auto_ev`) puts the lit white floor at display white
   under the Khronos neutral tone map. Its surfaces are deferred: `RtShadowsEffect` adds the key
   light with ray-traced soft shadows (a sun's angular size, a spot's disk, `light_size`), the
-  hybrid RT GI (`RtDiffuseGiEffect`) the white sky's light, its occlusion and the floor's bounce
-  (or SSAO over a flat sky, or the flat sky alone: `gi=rt|ssao|off`).
+  hybrid RT GI (`RtDiffuseGiEffect`) the white sky's light (`sky_radiance`, the fill), its
+  occlusion and the floor's bounce (or the flat sky alone: `gi=rt|off`).
+- **Ambient occlusion** (`ao.rs`, `ao.wgsl`): the white sky's fill is about a sixth of the floor's
+  light under the key, so its physical occlusion (the RT GI's) barely shows (1/255 on average
+  against the flat sky), and the engine's `SSAOEffect` runs before the direct light is added. This
+  is a game's AO multiplied into the lit image after the lighting, the glass and the reflections:
+  points in the hemisphere round the GBuffer's normal (`ao_samples`, rotated per pixel and frame
+  for TAA), out to `ao_radius`, the near ones weighed up by `ao_falloff`, the unoccluded share to
+  the power `ao_intensity`; the sky, glass and the water pass through. `ao_view` shows it alone.
+  About 0.6-0.9 ms at 1600 x 813.
 - **The water** (`water.rs`): about 41k particles 3.4 cm apart (`scale=16`, simulation units a
   metre) in the tank's bounds, the lake demo's tuning at a 16th of its size (time √16 times
   faster, so it moves as water does). Its surface is marching cubes over a surface field, drawn as
