@@ -2566,6 +2566,11 @@ impl Renderer {
         crate::profiling::set_enabled(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), enabled);
     }
 
+    /// Whether frames are profiled (`set_profiling`).
+    pub fn profiling(&self) -> bool {
+        crate::profiling::is_enabled()
+    }
+
     /// End a profiled frame of work recorded without a surface (offscreen tools and tests: the
     /// surface's frames end their own).
     #[doc(hidden)]

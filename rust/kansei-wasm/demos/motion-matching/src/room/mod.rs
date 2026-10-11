@@ -469,7 +469,7 @@ impl RoomState {
         // HUD, a few times a second
         if self.player.frame.is_multiple_of(10) {
             let room = self.status();
-            let hint = " · O inside / outside · G GI · T shadows · F fog · N dust · P panel";
+            let hint = " · O inside / outside · G GI · T shadows · F fog · N dust · P panel · ` perf";
             match self.player.hud(&room, hint) {
                 Some(text) => set_text("hud", &text),
                 // no pack: the page's message stays, the room's lines under it
@@ -478,6 +478,8 @@ impl RoomState {
         }
 
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
+        // the performance overlay's passes (while it shows)
+        kansei_wasm::perf::profile(&mut self.renderer);
         if let Some(stats) = &mut self.stats {
             stats.frames += 1;
             let ms = now * 1000.0;
@@ -863,6 +865,9 @@ impl RoomState {
         if changed(|s| s.cam.clone()) {
             let cam = s.cam.clone();
             self.set_view(&cam);
+        }
+        if changed(|s| format!("{}", s.perf)) {
+            kansei_wasm::perf::set_visible(s.perf);
         }
         if changed(|s| format!("{}", s.stats)) {
             self.renderer.set_profiling(s.stats);

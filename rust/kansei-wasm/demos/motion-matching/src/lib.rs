@@ -127,6 +127,7 @@ impl State {
         }
 
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
+        kansei_wasm::perf::profile(&mut self.renderer);
         if self.profile_since > 0.0 && now - self.profile_since > 3.0 {
             self.profile_since = now;
             log::info!("profile ({:.1} ms/frame)\n{}", 1000.0 / self.player.fps, self.renderer.take_profile().report());

@@ -304,7 +304,7 @@ parameter of the same name (`?floor=wood&gi=voxel&ev=8.5`), and `room.set(name, 
 live. `cam=` names a view: `outside`, `hall`, `dragon`, `mirror`, `windows`, `parkour`, `living`,
 `dining`, `library`, the shadow close-ups `contact`, `feet`, `plinth`, and `caustics` (any other follows the
 character). `panel=0` and `hud=0` start without the panel and the text, for captures; `refl_screen=0` lights every reflected hit by the traced path (no lit-image lookups) and `refl_indirect=` scales the voxels' light at those hits with the hybrid GI on; `vox_sky=0` leaves the window sky out of the voxel volume; `pond=0`,
-`dragon=0`, `rt_body=0` leave those out; `stats=1` shows each pass's GPU time and the CPU sections
+`dragon=0`, `rt_body=0` leave those out; `perf=1` (or the backquote key, or Stats → performance overlay) shows kansei_wasm's performance overlay (fps, CPU and GPU ms with graphs, draws, triangles, pipelines, GPU memory; click it for every pass); `stats=1` shows each pass's GPU time and the CPU sections
 (also in `room.info()`), `profile=1` logs the profile every 3 s.
 
 Keys, on top of the shared ones: O inside / outside, G the GI, T the shadows, F the fog, N the dust,

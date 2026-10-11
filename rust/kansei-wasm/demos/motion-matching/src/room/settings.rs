@@ -257,6 +257,8 @@ settings! {
     dpr: f32 = 0.0;
     render_scale: f32 = 1.0;
     stats: bool = false;
+    // the performance overlay (kansei_wasm::perf; also the ` key)
+    perf: bool = false;
 }
 
 impl Settings {

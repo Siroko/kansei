@@ -291,6 +291,11 @@
 
         const debug = pane.addFolder({ title: 'Stats', expanded: false });
         bind(debug, 'stats', { label: 'GPU / CPU times' });
+        bind(debug, 'perf', { label: 'performance overlay (`)' });
+        // (the ` key toggles it too: the checkbox follows)
+        window.addEventListener('keydown', (e) => {
+            if (e.key === '`') setTimeout(() => { if (window.kanseiPerf && p.perf !== window.kanseiPerf.visible) { p.perf = window.kanseiPerf.visible; pane.refresh(); } });
+        });
         debug.addButton({ title: 'check the parkour pieces' }).on('click', () => console.table(window.room.check()));
 
         // the presets the URL names start the page (its own parameters over them)
