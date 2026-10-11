@@ -159,6 +159,7 @@ impl Pond {
         let mut r = Renderable::new(Geometry::new("Pond/Bed", vertices, indices), material).with_gi(GiSurface::new([0.05, 0.05, 0.05]));
         r.rt = Some(RtSurface::new([0.05, 0.05, 0.05]));
         r.cast_shadow = false;
+        super::layout::texture_rt(&mut r, "blackmarble", &bed, assets.surfaces.contains_key("blackmarble"));
         scene.add(SceneNode::Renderable(r));
         let (positions, _, indices) = heightfield(min, max, cells(0.4), &ground);
         world.add(Shape::Mesh(TriangleMesh::from_indexed(&positions, &indices, Mat4::IDENTITY)), 1);
@@ -169,10 +170,12 @@ impl Pond {
         let place = Mat4::from_translation(GVec3::new(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0));
         let corners: Vec<GVec3> = drum.vertices.iter().map(|v| GVec3::new(v.position[0], v.position[1], v.position[2])).collect();
         world.add(Shape::Mesh(TriangleMesh::from_indexed(&corners, &drum.indices, place)), 1);
-        let stone = super::pbr::material("Plinth", assets.surface("marble", "Plinth"), &super::layout::surface([1.0; 3], 1.5, [1.0, 0.0], true, deferred), false);
+        let stone_params = super::layout::surface([1.0; 3], 1.5, [1.0, 0.0], true, deferred);
+        let stone = super::pbr::material("Plinth", assets.surface("marble", "Plinth"), &stone_params, false);
         let mut r = Renderable::new(drum, stone).with_gi(GiSurface::new(STONE));
         r.rt = Some(RtSurface::new(STONE));
         r.object.set_position(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0);
+        super::layout::texture_rt(&mut r, "marble", &stone_params, assets.surfaces.contains_key("marble"));
         scene.add(SceneNode::Renderable(r));
 
         // the container in simulation space: walls a shore's width outside the waterline, the bed
@@ -338,10 +341,6 @@ impl Pond {
         self.previous.clear();
         self.splash = None;
         self.poke = true;
-    }
-
-    pub fn set_rest(&mut self, rest: bool) {
-        self.stepper.set_rest_enabled(rest);
     }
 
     /// Step the water by `dt` with the legs in it (world capsules) and a landing's splash, unless

@@ -76,6 +76,25 @@ fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
 /// The alpha test's texture and sampler (group 1 bindings 3 and 4), and the default
 /// `kansei_rt_covered`: the texture's alpha at the uv, at least a half.
 const ALPHA_BINDINGS_WGSL: &str = "@group(1) @binding(3) var kansei_rt_alpha_texture : texture_2d<f32>;\n@group(1) @binding(4) var kansei_rt_alpha_sampler : sampler;\n";
+/// The reflections' textured albedo (`set_albedo_texture`, `RtSurface::with_albedo_layer`):
+/// rt_reflect_hit.wgsl's `kansei_rt_hit_albedo`, the triangle's albedo times its layer's texel
+/// over the layer's mean (its last mip), so the albedo word keeps the level (the GI's hits, which
+/// read no texture, see the same) and the texture brings the detail; sampled two mips down (a
+/// hit's footprint in a mirror is many texels).
+const ALBEDO_WGSL: &str = "@group(1) @binding(6) var kansei_rt_albedo_texture : texture_2d_array<f32>;
+fn kansei_rt_hit_albedo(triangle: u32, bary: vec2f) -> vec3f {
+    let base = kansei_rt_albedo(triangle);
+    let surface = bitcast<u32>(kansei_rt_triangles[triangle * 4u].w);
+    if ((surface & KANSEI_RT_ALBEDO_TEX) == 0u || (surface & KANSEI_RT_SMOOTH) != 0u) {
+        return base;
+    }
+    let uv = kansei_rt_uv(triangle, bary);
+    let layer = (surface >> 16u) & 255u;
+    let texel = textureSampleLevel(kansei_rt_albedo_texture, kansei_rt_alpha_sampler, uv, layer, 2.0).rgb;
+    let mean = textureSampleLevel(kansei_rt_albedo_texture, kansei_rt_alpha_sampler, vec2f(0.5), layer, f32(textureNumLevels(kansei_rt_albedo_texture) - 1u)).rgb;
+    return base * texel / max(mean, vec3f(1e-3));
+}
+";
 const DEFAULT_COVERED_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {\n    return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;\n}\n";
 
 const COMMON_WGSL: &str = include_str!("shaders/rt_reflect_common.wgsl");
@@ -97,7 +116,7 @@ fn traced_wgsl(clipmap: bool, covered: &str, main: &str) -> String {
         format!("{}{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL, include_str!("../gi/shaders/voxel_irradiance.wgsl"))
     };
     format!(
-        "{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}\n{main}",
+        "{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{ALBEDO_WGSL}{covered}\n{source}\n{}\n{main}",
         crate::atmosphere::SKY_LIGHTING_WGSL,
         include_str!("../shaders/spot_light_types.wgsl"),
         super::RT_GRID_WGSL,
@@ -233,7 +252,8 @@ pub(crate) struct RtReflectParamsGpu {
     view_proj: [f32; 16],
     glass_interfaces: u32,
     glass_samples: u32,
-    _pad2: [u32; 2],
+    indirect_scale: f32,
+    _pad2: u32,
 }
 
 enum Source {
@@ -265,12 +285,13 @@ struct Gpu {
     /// the directional and point lights (`update_lights`; rt_reflect_hit.wgsl's RtReflectLights)
     lights: wgpu::Buffer,
     white: wgpu::TextureView,
+    white_array: wgpu::TextureView,
     alpha_sampler: wgpu::Sampler,
     linear: wgpu::Sampler,
     stats: wgpu::Buffer,
     staging: wgpu::Buffer,
     /// the grid's group, with the grid generation and the alpha texture it was made with
-    grid_group: Option<(u64, Option<wgpu::TextureView>, wgpu::BindGroup)>,
+    grid_group: Option<(u64, (Option<wgpu::TextureView>, Option<wgpu::TextureView>), wgpu::BindGroup)>,
     targets: Option<Targets>,
 }
 
@@ -314,6 +335,10 @@ pub struct RtReflectionsEffect {
     /// The hits the camera doesn't see (with `set_spot_lights`) get the voxels' indirect light too;
     /// off where the image shows no GI, so that what the mirror and the glass show matches it.
     pub hit_indirect: bool,
+    /// Scale of that indirect light (1: the voxels' irradiance as it is): where the image's GI is
+    /// another estimate (`RtDiffuseGiEffect`'s rays), the factor that brings the hits to it, so
+    /// the hits the camera doesn't see match the ones it does.
+    pub hit_indirect_scale: f32,
     /// Glass drawn before the reflections (`set_glass`).
     glass: Option<RtGlass>,
     /// The spot lights the hits the camera doesn't see are lit by (`set_spot_lights`).
@@ -328,6 +353,7 @@ pub struct RtReflectionsEffect {
     source: Source,
     sky_lighting: Option<wgpu::Buffer>,
     alpha_texture: Option<wgpu::TextureView>,
+    albedo_texture: Option<wgpu::TextureView>,
     frame: u32,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
@@ -371,6 +397,7 @@ impl RtReflectionsEffect {
             collect_stats: false,
             screen_hits: false,
             hit_indirect: true,
+            hit_indirect_scale: 1.0,
             glass: None,
             spot_lights: None,
             lights: (0, Vec::new()),
@@ -381,6 +408,7 @@ impl RtReflectionsEffect {
             source,
             sky_lighting: None,
             alpha_texture: None,
+            albedo_texture: None,
             frame: 0,
             prev_view_proj: None,
             last_camera_frame: None,
@@ -395,6 +423,15 @@ impl RtReflectionsEffect {
     /// uniform); black without one.
     pub fn set_sky_lighting(&mut self, sky: Option<&wgpu::Buffer>) {
         self.sky_lighting = sky.cloned();
+    }
+
+    /// The albedo of the hits the camera doesn't see on surfaces with
+    /// `RtSurface::with_albedo_layer`: a 2D array view with its mips down to 1 texel, one layer a
+    /// surface, read by the triangles' uvs (with the alpha sampler: linear, repeating) two mips
+    /// down; a hit's albedo is the surface's times the texel over the layer's mean. None: their
+    /// albedo alone.
+    pub fn set_albedo_texture(&mut self, view: Option<&wgpu::TextureView>) {
+        self.albedo_texture = view.cloned();
     }
 
     /// The texture `kansei_rt_covered` reads (`kansei_rt_alpha_texture`).
@@ -498,6 +535,7 @@ impl RtReflectionsEffect {
             entry(3, texture(true, d2)),
             entry(4, filtering),
             entry(5, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }),
+            entry(6, texture(true, wgpu::TextureViewDimension::D2Array)),
         ]);
         let grid_bgl = layout("RtReflections/Grid", &grid_entries);
         let resolve_bgl = layout(
@@ -542,6 +580,23 @@ impl RtReflectionsEffect {
                 &[255; 4],
             )
             .create_view(&Default::default());
+        let white_array = device
+            .create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("RtReflections/WhiteArray"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &[255; 4],
+            )
+            .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         let sampler = |label, address| device.create_sampler(&wgpu::SamplerDescriptor { label: Some(label), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: address, address_mode_v: address, ..Default::default() });
         self.gpu = Some(Gpu {
@@ -556,6 +611,7 @@ impl RtReflectionsEffect {
             no_spots: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSpots"), contents: &[0u8; 256], usage: wgpu::BufferUsages::STORAGE }),
             lights: lights_buffer(device, 0),
             white,
+            white_array,
             alpha_sampler: sampler("RtReflections/Alpha", wgpu::AddressMode::Repeat),
             linear: sampler("RtReflections/Linear", wgpu::AddressMode::ClampToEdge),
             stats: buffer("RtReflections/Stats", 32, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC),
@@ -667,7 +723,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
             view_proj: view_proj.to_cols_array(),
             glass_interfaces: self.glass.map_or(0, |g| g.interfaces.max(1)),
             glass_samples: self.glass.map_or(1, |g| g.samples.max(1)),
-            _pad2: [0; 2],
+            indirect_scale: self.hit_indirect_scale.max(0.0),
+            _pad2: 0,
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let current = (self.frame % 2) as usize;
@@ -713,8 +770,10 @@ impl PostProcessingEffect for RtReflectionsEffect {
         let glass_group = glass_on.then(|| group("RtReflections/Glass", &t.glassed, input));
         // the grid's group, made anew when the grid's buffers or the alpha texture change
         let (buffers, generation) = self.grid.buffers();
-        if gpu.grid_group.as_ref().is_none_or(|(g, alpha, _)| *g != generation || *alpha != self.alpha_texture) {
+        let textures = (self.alpha_texture.clone(), self.albedo_texture.clone());
+        if gpu.grid_group.as_ref().is_none_or(|(g, t, _)| *g != generation || *t != textures) {
             let alpha = self.alpha_texture.as_ref().unwrap_or(&gpu.white);
+            let albedo = self.albedo_texture.as_ref().unwrap_or(&gpu.white_array);
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("RtReflections/Grid"),
                 layout: &gpu.grid_bgl,
@@ -725,9 +784,10 @@ impl PostProcessingEffect for RtReflectionsEffect {
                     wgpu::BindGroupEntry { binding: 3, resource: tex(alpha) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&gpu.alpha_sampler) },
                     wgpu::BindGroupEntry { binding: 5, resource: buf(&gpu.stats) },
+                    wgpu::BindGroupEntry { binding: 6, resource: tex(albedo) },
                 ],
             });
-            gpu.grid_group = Some((generation, self.alpha_texture.clone(), group));
+            gpu.grid_group = Some((generation, textures, group));
         }
         let resolve_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RtReflections/Resolve"),

@@ -112,6 +112,8 @@ settings! {
     sun_soft: f32 = 1.2;
     shadow_steps: f32 = 2.0;
     reflections: bool = true;
+    refl_indirect: f32 = 1.0;
+    refl_screen: bool = true;
     rt_view: String = "lit".into();
     debug_light: f32 = 0.0;
     // the lights

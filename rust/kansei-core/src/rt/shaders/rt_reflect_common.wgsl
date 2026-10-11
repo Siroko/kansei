@@ -24,7 +24,7 @@ struct RtReflectParams {
     viewProj     : mat4x4f,   // world -> this frame's clip space (the hits looked up on screen)
     glassInterfaces : u32,    // the most surfaces a ray through the glass crosses or reflects off
     glassSamples : u32,       // paths a frosted glass pixel a frame (averaged, then over frames)
-    _pad2        : u32,
+    indirectScale : f32,      // scale of the voxels' irradiance at the hits the camera doesn't see
     _pad3        : u32,
 }
 

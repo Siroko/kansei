@@ -150,7 +150,17 @@ impl Builder<'_> {
         r.object.rotation.y = yaw;
         let index = self.scene.add(SceneNode::Renderable(r));
         self.surfaces.push(Surface { index, params, floor: false });
+        self.texture_rt(index, name, &params);
         index
+    }
+
+    /// In the grid, `name`'s albedo layer at the box-mapped uvs of renderable `index` as placed
+    /// now (the reflections' hits then show the texture; see `texture_rt`).
+    fn texture_rt(&mut self, index: usize, name: &str, params: &PbrParams) {
+        let has = self.assets.surfaces.contains_key(name);
+        if let Some(r) = self.scene.get_renderable_mut(index) {
+            texture_rt(r, name, params, has);
+        }
     }
 
     /// A box of `size` centred at `center`, turned by `yaw`, in the collision world when `collide`.
@@ -180,6 +190,8 @@ impl Builder<'_> {
             r.object.rotation.x = rotation[0];
             r.object.rotation.y = rotation[1];
         }
+        // (its uvs again, turned)
+        self.texture_rt(index, name, &params);
         index
     }
 
@@ -227,6 +239,25 @@ impl Builder<'_> {
         }
         Some((centre, half))
     }
+}
+
+/// A box-mapped surface `r` in the grid (with its `RtSurface`) reads `name`'s albedo layer at the
+/// uvs the box mapping gives it as `r` is placed (`has`: the surface's maps loaded). The grid's
+/// albedo stays the surface's mean: the reflections' hits scale it by the texture over the
+/// layer's mean, and the GI's hits (which read no texture) see the same mean.
+pub fn texture_rt(r: &mut Renderable, name: &str, params: &PbrParams, has: bool) {
+    let (Some(rt), Some(layer)) = (r.rt.as_mut(), super::assets::surface_layer(name).filter(|_| has)) else { return };
+    if params.tint[3] < 0.5 {
+        return;
+    }
+    rt.albedo_layer = Some(layer);
+    let o = &r.object;
+    let world = glam::Mat4::from_translation(o.position.to_glam())
+        * glam::Mat4::from_rotation_z(o.rotation.z)
+        * glam::Mat4::from_rotation_y(o.rotation.y)
+        * glam::Mat4::from_rotation_x(o.rotation.x)
+        * glam::Mat4::from_scale(o.scale.to_glam());
+    pbr::set_box_uvs(&mut r.geometry, world, params.surface[0]);
 }
 
 /// The floor, around the rectangle `hole` (x, z min and max) the pond's terrain fills.

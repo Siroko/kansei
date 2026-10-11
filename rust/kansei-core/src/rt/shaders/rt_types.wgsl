@@ -35,6 +35,9 @@ const KANSEI_RT_ALPHA : u32 = 1u;
 const KANSEI_RT_SMOOTH : u32 = 4u;
 // glass (RtSurface::glass): rays pass through it unless they ask for it (KANSEI_RT_GLASS_HITS)
 const KANSEI_RT_GLASS : u32 = 8u;
+// its albedo is also a layer (bits 16-23) of the texture array kansei_rt_hit_albedo samples by uv
+// (RtSurface::with_albedo_layer), times the albedo word
+const KANSEI_RT_ALBEDO_TEX : u32 = 16u;
 
 // A unit normal, octahedral, two snorm16 (RtMesh's packing).
 fn kansei_rt_pack_normal(n: vec3f) -> u32 {

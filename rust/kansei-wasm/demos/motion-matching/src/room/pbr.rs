@@ -9,6 +9,7 @@
 //! slabs (marble) gives each slab its own offset and turn into the texture, with thin seams.
 
 use kansei_core::buffers::{Sampler, Texture};
+use kansei_core::geometries::Geometry;
 use kansei_core::lights::{LIGHTS_WGSL, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::ktx2::{self, CompressionSupport, Ktx2Options};
 use kansei_core::materials::{Binding, CullMode, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
@@ -274,4 +275,26 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
     material.set_bindable(3, maps.orm);
     material.set_bindable(4, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
     material
+}
+
+/// The uvs `PBR_WGSL`'s box mapping gives `geometry` placed by `world` (`size` metres a repeat),
+/// written into its vertices: the shader works them out from the world position and never reads
+/// a box-mapped mesh's uvs, but the ray tracing grid reads them, for the reflections' hits that
+/// sample the albedo (`RtSurface::with_albedo_layer`). The marble's slab turns are left out.
+pub fn set_box_uvs(geometry: &mut Geometry, world: glam::Mat4, size: f32) {
+    let normals = world.inverse().transpose();
+    for v in &mut geometry.vertices {
+        let p = world.transform_point3(glam::Vec3::new(v.position[0], v.position[1], v.position[2]));
+        let n = normals.transform_vector3(glam::Vec3::from(v.normal));
+        let a = n.abs();
+        let plane = if a.y >= a.x && a.y >= a.z {
+            glam::Vec2::new(p.x, p.z)
+        } else if a.x >= a.z {
+            glam::Vec2::new(p.z * n.x.signum(), -p.y)
+        } else {
+            glam::Vec2::new(-p.x * n.z.signum(), -p.y)
+        };
+        v.uv = (plane / size).to_array();
+    }
+    geometry.revision = geometry.revision.wrapping_add(1);
 }

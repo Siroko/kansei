@@ -208,7 +208,7 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     let mut voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), material_ambient: 0.0, ..Default::default() });
     voxel.set_sky_lighting(Some(sky));
     effects.push(Box::new(voxel));
-    let mut near_voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), material_ambient: 0.0, near_field: Some(near.clone()), ..Default::default() });
+    let mut near_voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), material_ambient: 0.0, near_field: Some(near), ..Default::default() });
     near_voxel.set_sky_lighting(Some(sky));
     effects.push(Box::new(Switch { effect: near_voxel, on: false }));
     let mut ssgi = ScreenSpaceGIEffect::new(near);
@@ -578,6 +578,7 @@ impl RoomState {
                     r.material_dirty = true;
                     r.gi = Some(kansei_core::gi::GiSurface::new(layout::mean(&s.floor, [1.0; 3])));
                     r.rt = Some(RtSurface::new(layout::mean(&s.floor, [1.0; 3])));
+                    layout::texture_rt(r, &s.floor, &params, self.assets.surfaces.contains_key(s.floor.as_str()));
                 } else if let Some(buffer) = r.material.bindable_buffer(0) {
                     queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
                 }
@@ -696,6 +697,10 @@ impl RoomState {
         if let Some(e) = self.volume.effect_mut::<Switch<RtReflectionsEffect>>() {
             e.on = s.reflections;
             e.effect.hit_indirect = gi != "off";
+            e.effect.screen_hits = s.refl_screen;
+            // the voxels' irradiance at the hits the camera doesn't see, brought to the hybrid
+            // RT GI's level (`refl_indirect`) so a mirror's far floor matches the floor in view
+            e.effect.hit_indirect_scale = if gi == "rt" { s.refl_indirect } else { 1.0 };
         }
         for (k, &mirror) in self.layout.mirrors.iter().enumerate() {
             let roughness = if k == 0 { s.mirror_rough } else { s.mirror2_rough };
@@ -810,11 +815,12 @@ impl RoomState {
         let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"grid_triangles\":{},\"grid_rebuilds\":{},\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
+            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.settings.json(),
             self.view.unwrap_or("follow"),
             self.player.character.is_some(),
             self.pond.as_ref().map_or(0, Pond::particles),
+            self.proxy.as_ref().map_or(Vec::new(), |p| p.triangles(&self.scene)),
             grid.map_or(0, |g| g.grid.triangles),
             grid.map_or(0, |g| g.rebuilds),
             self.renderer.width(),
@@ -882,8 +888,10 @@ where
     let sky_lighting = renderer.device().create_buffer(&wgpu::BufferDescriptor { label: Some("Room/SkyLighting"), size: 240, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     // the sky the voxel volume's light (its bounce cones, the probes) sees past it: through the
     // windows and the skylight
-    if let Some(gi) = renderer.voxel_gi_mut() {
-        gi.use_sky_lighting(&sky_lighting);
+    if kansei_wasm::flag("vox_sky", true) {
+        if let Some(gi) = renderer.voxel_gi_mut() {
+            gi.use_sky_lighting(&sky_lighting);
+        }
     }
 
     // the character (or, without a pack, a capsule standing in for it), facing the pond
@@ -900,7 +908,35 @@ where
     }
     let proxy = character.as_ref().filter(|_| kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&mut scene, c));
 
-    let volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting));
+    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting));
+    // the albedo the reflections' hits read: the surfaces' colour maps and the hero's
+    let hero = character.as_ref().and_then(|c| c.bodies.iter().find_map(|b| b.base_color.as_ref())).map(|(img, _)| {
+        let mut t = kansei_core::buffers::Texture::from_image("Room/HeroAlbedo", img, true);
+        t.initialize_with_data(renderer.device(), renderer.queue());
+        t
+    });
+    let extra: Vec<&wgpu::TextureView> = hero.iter().filter_map(|t| t.view()).collect();
+    let (albedo_texture, albedo) = assets::albedo_array(&renderer, &assets, &extra);
+    if let Some(e) = volume.effect_mut::<Switch<RtReflectionsEffect>>() {
+        e.effect.set_albedo_texture(Some(&albedo));
+    }
+    // the surfaces' albedo in the grid and voxel GI: their textures' measured means (times their
+    // tints), in place of the guesses `layout::mean` made before the textures were drawn
+    let means = assets::albedo_means(&renderer, &albedo_texture).await;
+    let indices: Vec<usize> = scene.ordered_indices().collect();
+    for idx in indices {
+        let Some(r) = scene.get_renderable_mut(idx) else { continue };
+        let Some(layer) = r.rt.and_then(|rt| rt.albedo_layer).map(usize::from).filter(|&l| l < assets::SURFACES.len()) else { continue };
+        let guess = layout::mean(assets::SURFACES[layer], [1.0; 3]);
+        let scale: [f32; 3] = std::array::from_fn(|c| means[layer][c] / guess[c].max(1e-3));
+        if let Some(rt) = r.rt.as_mut() {
+            rt.albedo = std::array::from_fn(|c| (rt.albedo[c] * scale[c]).min(1.0));
+        }
+        if let Some(gi) = r.gi.as_mut() {
+            gi.albedo = std::array::from_fn(|c| (gi.albedo[c] * scale[c]).min(1.0));
+        }
+    }
+    log::info!("room: albedo means {:?}", assets::SURFACES.iter().zip(&means).map(|(n, m)| format!("{n} {:.2} {:.2} {:.2}", m[0], m[1], m[2])).collect::<Vec<_>>());
     let dust_count: u32 = param_or("dust_count", 65536);
     let dust = (dust_count > 0).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::ZERO));
 

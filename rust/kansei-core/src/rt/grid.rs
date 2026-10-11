@@ -249,18 +249,22 @@ pub struct RtSurface {
     /// Glass (`RtSurface::glass`): rays pass straight through it (diffuse GI, shadow rays, any
     /// trace without `KANSEI_RT_GLASS_HITS`); `RtReflectionsEffect`'s glass refracts at it.
     pub glass: bool,
+    /// A layer of the albedo texture array the reflections' hits read by uv
+    /// (`RtReflectionsEffect::set_albedo_texture`), times `albedo`: a textured surface in a
+    /// mirror. Needs the triangles' uvs (not `smooth_normals`).
+    pub albedo_layer: Option<u8>,
 }
 
 impl RtSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false }
+        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false, albedo_layer: None }
     }
 
     /// The surface of a glass object (the triangles `RtReflectionsEffect` refracts through, with
     /// smooth normals) whose material is `StandardLitOptions::glass`: `tint` its albedo, for the
     /// rays that pass through it.
     pub fn glass(tint: [f32; 3]) -> Self {
-        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true }
+        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true, albedo_layer: None }
     }
 
     /// See `smooth_normals`.
@@ -275,8 +279,17 @@ impl RtSurface {
         self
     }
 
+    /// See `albedo_layer`.
+    pub fn with_albedo_layer(mut self, layer: u8) -> Self {
+        self.albedo_layer = Some(layer);
+        self
+    }
+
     pub(crate) fn surface_word(&self) -> u32 {
-        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8) | if self.smooth_normals { 4 } else { 0 } | if self.glass { 8 } else { 0 }
+        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8)
+            | if self.smooth_normals { 4 } else { 0 }
+            | if self.glass { 8 } else { 0 }
+            | self.albedo_layer.filter(|_| !self.smooth_normals).map_or(0, |layer| 16 | (layer as u32) << 16)
     }
 
     pub(crate) fn albedo_word(&self) -> u32 {

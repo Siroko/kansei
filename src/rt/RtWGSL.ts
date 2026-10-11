@@ -155,9 +155,15 @@ export function rtGlassWgsl(covered: string, clipmap: boolean = false): string {
     return rtTracedWgsl(covered, clipmap, rtGlass);
 }
 
+/**
+ * rt_reflect_hit.wgsl's albedo at a hit: the triangle's albedo word (the Rust effect also reads a
+ * texture array for surfaces with an albedo layer, `RtReflectionsEffect::set_albedo_texture`).
+ */
+const RT_FLAT_ALBEDO_WGSL = 'fn kansei_rt_hit_albedo(triangle: u32, bary: vec2f) -> vec3f {\n    return kansei_rt_albedo(triangle);\n}\n';
+
 function rtTracedWgsl(covered: string, clipmap: boolean, main: string): string {
     const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}${CLIPMAP_IRRADIANCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${VOLUME_SOURCE_WGSL}`;
-    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${source}\n${rtReflectHit}\n${main}`;
+    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${RT_FLAT_ALBEDO_WGSL}${covered}\n${source}\n${rtReflectHit}\n${main}`;
 }
 
 /** `RtReflectionsEffect`'s resolve. */

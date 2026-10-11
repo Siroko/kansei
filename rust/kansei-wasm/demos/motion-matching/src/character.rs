@@ -69,6 +69,9 @@ pub struct Body {
     pub palette: BonePalette,
     pub index: usize,
     pub display: Option<(Skeleton, Retarget)>,
+    /// Its base colour texture, 256 texels a side, and that texture's mean (linear rgb) times its
+    /// colour factor, for the copies of it that rays see (the room's grid); none for a plain one.
+    pub base_color: Option<(image::RgbaImage, [f32; 3])>,
 }
 
 /// A character pack as a body: its textured mesh, hidden until shown.
@@ -81,6 +84,11 @@ fn hero_body(scene: &mut Scene, pack: CharacterPack, db: &Database, look: &dyn B
         };
         Ok(Texture::from_image(name, &image, srgb))
     };
+    let small = match pack.image("base_color") {
+        Some(i) => Some(image::load_from_memory(&i.bytes).map_err(|e| format!("texture base_color: {e}"))?.to_rgba8()),
+        None => None,
+    }
+    .map(|full| image::imageops::resize(&full, 256, 256, image::imageops::FilterType::Triangle));
     let textures = SkinTextures { base_color: texture("base_color", true, [200, 200, 200, 255])?, normal: texture("normal", false, [128, 128, 255, 255])?, orm: texture("orm", false, [255, 160, 0, 255])? };
     let first = pack.meshes.into_iter().next().ok_or("the character pack has no mesh")?;
     let mesh = first.mesh;
@@ -92,7 +100,17 @@ fn hero_body(scene: &mut Scene, pack: CharacterPack, db: &Database, look: &dyn B
     r.visible = false;
     let index = scene.add(SceneNode::Renderable(r));
     log::info!("character pack: {} joints, {} vertices, {} triangles", pack.skeleton.len(), mesh.vertices.len(), mesh.indices.len() / 3);
-    Ok(Body { name: "hero", mesh, palette, index, display: Some((pack.skeleton, retarget)) })
+    let linear = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let base_color = small.map(|img| {
+        let n = (img.width() * img.height()).max(1) as f32;
+        let sum = img.pixels().fold([0.0f32; 3], |acc, p| [acc[0] + linear(p[0]), acc[1] + linear(p[1]), acc[2] + linear(p[2])]);
+        let mean = [0, 1, 2].map(|i| sum[i] / n * first.color[i]);
+        (img, mean)
+    });
+    Ok(Body { name: "hero", mesh, palette, index, display: Some((pack.skeleton, retarget)), base_color })
 }
 
 /// The character: its database, matcher, bodies, and the debug markers.
@@ -124,7 +142,7 @@ impl Character {
             let mut r = Renderable::new(mesh.geometry(), look.plain("Character", first.color, &mesh, &palette));
             r.dynamic = true;
             let index = scene.add(SceneNode::Renderable(r));
-            bodies.push(Body { name: "the pack's mesh", mesh, palette, index, display: None });
+            bodies.push(Body { name: "the pack's mesh", mesh, palette, index, display: None, base_color: None });
         }
         if let Some(pack) = hero {
             match hero_body(scene, pack, &db, look) {

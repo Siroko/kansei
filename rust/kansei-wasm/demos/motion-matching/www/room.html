@@ -149,6 +149,7 @@
         bind(rt, 'gi_shadows', { label: 'GI hits shadowed by', options: { rays: 'rays', 'shadow maps': 'maps' } });
         bind(rt, 'gi_near', { label: 'GI grid reach (m, 0: all)', min: 0, max: 40, step: 0.5 });
         bind(rt, 'reflections', { label: 'RT reflections' });
+        bind(rt, 'refl_indirect', { label: 'reflected GI (hybrid)', min: 0, max: 2, step: 0.05 });
         bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
         bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });
 

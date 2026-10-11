@@ -66,6 +66,9 @@ pub struct Geometry {
     pub instance_count: u32,
     /// Per-instance vertex buffers (empty for non-instanced geometry).
     pub instance_buffers: Vec<ComputeBuffer>,
+    /// Bump after changing `vertices` in place (same counts): the consumers of the CPU geometry
+    /// that cache it (the ray tracing grid) read it again.
+    pub revision: u32,
 }
 
 // SAFETY: wgpu::Buffer is internally Arc-based and Send+Sync.
@@ -116,6 +119,7 @@ impl Geometry {
             ext_indirect_buffer: None,
             instance_count: 1,
             instance_buffers: Vec::new(),
+            revision: 0,
         }
     }
 
@@ -196,6 +200,7 @@ impl Geometry {
             ext_indirect_buffer: None,
             instance_count: 1,
             instance_buffers: Vec::new(),
+            revision: 0,
         }
     }
 

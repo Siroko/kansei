@@ -2,11 +2,11 @@
 //! the reflections see their normal and albedo) lit by the room's spot lights and their shadows,
 //! a stand-in when there is no pack, and the capsules that stand for it in the ray tracing grid.
 
-use glam::{Mat4, Quat, Vec3 as GVec3};
+use glam::{Mat4, Vec3 as GVec3};
 
 use kansei_core::animation::{skin_buffer, skinned_material, BonePalette, SkinTextures, SkinnedMesh, PALETTE_BINDING, SKINNING_WGSL, SKIN_BINDING};
 use kansei_core::cameras::MOTION_VECTORS_WGSL;
-use kansei_core::geometries::{CylinderGeometry, Geometry, SphereGeometry};
+use kansei_core::geometries::{Geometry, SphereGeometry};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::rt::RtSurface;
@@ -235,103 +235,101 @@ pub fn grid_only(geometry: Geometry, surface: RtSurface) -> Renderable {
     r
 }
 
-/// How thick each bone's capsule is, by the joint's name (Unreal's and most rigs' names): the
-/// trunk and the head thick, the limbs thinner, the fingers and toes left out.
-fn bone_radius(name: &str) -> Option<f32> {
-    let n = name.to_ascii_lowercase();
-    let has = |parts: &[&str]| parts.iter().any(|p| n.contains(p));
-    if has(&["finger", "thumb", "index", "middle", "ring", "pinky", "toe", "ball", "twist", "ik_", "_ik", "eye", "jaw", "ear"]) {
-        return None;
-    }
-    Some(if has(&["head"]) {
-        0.11
-    } else if has(&["neck"]) {
-        0.06
-    } else if has(&["spine", "chest", "pelvis", "hips", "torso", "abdomen"]) {
-        0.14
-    } else if has(&["clavicle", "shoulder"]) {
-        0.06
-    } else if has(&["thigh", "upleg", "upperleg"]) {
-        0.085
-    } else if has(&["calf", "shin", "leg", "knee"]) {
-        0.06
-    } else if has(&["upperarm", "uparm", "arm"]) {
-        0.05
-    } else if has(&["forearm", "lowerarm"]) {
-        0.045
-    } else if has(&["hand", "wrist"]) {
-        0.04
-    } else {
-        // the feet and anything else
-        0.05
-    })
-}
-
-/// The character in the ray tracing grid: a capsule along each of its bones (a cylinder, scaled),
-/// moved with the pose. They are in the grid only (see `HIDDEN_WGSL`), so the mirrors and the GI's
-/// rays see the character's shape; the camera and the shadow maps see its real mesh.
+/// The character in the ray tracing grid: a low-poly copy of the body shown (the hero's or the
+/// pack's mesh, whichever C shows), skinned on the CPU with the same pose. It is in the grid
+/// only (`grid_only`), so the mirrors, the glass, the ray-traced shadows and the GI's rays see the
+/// character's own silhouette; the camera and the shadow maps see its real mesh. The grid takes
+/// geometry as built, not as the vertex shader skins it, hence the copy: each body's mesh welded
+/// and simplified to about `PROXY_TRIANGLES` (`assets::simplify_welded`, which keeps original
+/// vertices, so their joints and weights still apply).
 ///
-/// Moving them rebuilds the grid (about 2 ms of GPU at 1080p), so they are static renderables
-/// (the grid rebuilds only when one changes, not every frame as for a `dynamic` one) and move only
-/// once a bone has moved `MOVE` from where they stand: a character standing still costs nothing.
+/// Posing it rebuilds the grid (about 1 ms of GPU at 1080p), so it is a static renderable whose
+/// vertices move (`Geometry::revision`) only once a bone has moved `MOVE` from where it was last
+/// posed: a character standing still costs nothing.
 pub struct Proxy {
-    /// (joint, radius, renderable) for each bone that has a capsule.
-    capsules: Vec<(usize, f32, usize)>,
-    /// The bones' ends where the capsules were last put, and whether they were shown.
+    bodies: Vec<ProxyBody>,
+    /// The bones' ends when last posed, and the body then shown (none: hidden).
     placed: Vec<(GVec3, GVec3)>,
-    shown: bool,
+    shown: Option<usize>,
 }
 
-/// How far a bone moves (m) before the capsules follow.
+/// One body's copy: its renderable and, for each of its vertices, the mesh vertex it is.
+struct ProxyBody {
+    index: usize,
+    source: Vec<usize>,
+}
+
+/// How far a bone moves (m) before the copy is posed again.
 const MOVE: f32 = 0.03;
+/// The triangles a body's copy is simplified to, and how far (m) it may stray to get there.
+pub const PROXY_TRIANGLES: usize = 1500;
+const PROXY_ERROR: f32 = 0.02;
+
+/// The albedo the rays see on a body's copy without a base colour texture (the pack's mannequin).
+fn proxy_albedo(name: &str) -> [f32; 3] {
+    if name == "hero" { [0.12, 0.1, 0.09] } else { [0.45, 0.45, 0.45] }
+}
 
 impl Proxy {
     pub fn new(scene: &mut Scene, character: &Character) -> Self {
-        // one unit capsule shape: a cylinder of radius 1 and length 1 along y, from 0 to 1, with
-        // half spheres at its ends (scaled by the bone's length, they flatten: fine at this size)
-        let mut capsules = Vec::new();
-        for (joint, _, _) in character.bones_world() {
-            let Some(radius) = bone_radius(character.joint_name(joint)) else { continue };
-            let r = grid_only(unit_capsule(), RtSurface::new(STAND_IN_COLOR).with_smooth_normals());
-            capsules.push((joint, radius, scene.add(SceneNode::Renderable(r))));
+        // `proxy_tris=` another count
+        let target: usize = kansei_wasm::param_or("proxy_tris", PROXY_TRIANGLES);
+        let mut bodies = Vec::new();
+        for body in &character.bodies {
+            let mesh = &body.mesh;
+            let Some((kept, indices)) = super::assets::simplify_welded(&[(mesh.vertices.as_slice(), mesh.indices.as_slice())], target, PROXY_ERROR, target) else { continue };
+            let source: Vec<usize> = kept.iter().map(|&(_, v)| v).collect();
+            let vertices = source.iter().map(|&v| mesh.vertices[v]).collect();
+            log::info!("room: {} in the grid as {} of {} triangles", body.name, indices.len() / 3, mesh.indices.len() / 3);
+            // textured (its uvs; flat-shaded then), or one colour with smooth normals
+            let surface = match &body.base_color {
+                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(super::assets::HERO_LAYER),
+                None => RtSurface::new(proxy_albedo(body.name)).with_smooth_normals(),
+            };
+            let mut r = grid_only(Geometry::new(&format!("{}/Grid", body.name), vertices, indices), surface);
+            r.visible = false;
+            bodies.push(ProxyBody { index: scene.add(SceneNode::Renderable(r)), source });
         }
-        log::info!("room: {} capsules stand for the character in the grid", capsules.len());
-        Self { capsules, placed: Vec::new(), shown: false }
+        Self { bodies, placed: Vec::new(), shown: None }
     }
 
-    /// Put the capsules on the character's bones as posed now, once one has moved `MOVE` (hidden
-    /// with the body: `visible`).
+    /// The triangles of each body's copy.
+    pub fn triangles(&self, scene: &Scene) -> Vec<u32> {
+        self.bodies.iter().filter_map(|b| scene.get_renderable(b.index)).map(|r| r.geometry.index_count() / 3).collect()
+    }
+
+    /// Pose the copy of the body shown as the character stands now, once a bone has moved `MOVE`
+    /// or another body shows (hidden with the body: `visible`).
     pub fn update(&mut self, scene: &mut Scene, character: &Character, visible: bool) {
-        let bones = character.bones_world();
-        let ends: Vec<(GVec3, GVec3)> = self.capsules.iter().map(|&(joint, _, _)| bones.iter().find(|(j, _, _)| *j == joint).map_or((GVec3::ZERO, GVec3::ZERO), |&(_, a, b)| (a, b))).collect();
+        let ends: Vec<(GVec3, GVec3)> = character.bones_world().into_iter().map(|(_, a, b)| (a, b)).collect();
+        let shown = visible.then_some(character.showing).filter(|&k| k < self.bodies.len());
         let moved = self.placed.len() != ends.len() || ends.iter().zip(&self.placed).any(|((a, b), (pa, pb))| a.distance(*pa) > MOVE || b.distance(*pb) > MOVE);
-        if !moved && visible == self.shown {
+        if !moved && shown == self.shown {
             return;
         }
-        self.placed = ends.clone();
-        self.shown = visible;
-        for (&(_, radius, index), &(a, b)) in self.capsules.iter().zip(&ends) {
-            let Some(r) = scene.get_renderable_mut(index) else { continue };
-            let along = b - a;
-            let length = along.length();
-            r.visible = visible && length > 0.02;
+        self.placed = ends;
+        self.shown = shown;
+        let at = character.controller.matcher.character();
+        let place = Mat4::from_translation(at.translation) * Mat4::from_rotation_y(kansei_core::animation::motion_matching::yaw_of(at.rotation));
+        for (k, proxy) in self.bodies.iter().enumerate() {
+            let Some(r) = scene.get_renderable_mut(proxy.index) else { continue };
+            r.visible = shown == Some(k);
             if !r.visible {
                 continue;
             }
-            // (Object3D turns by z * y * x)
-            let (z, y, x) = Quat::from_rotation_arc(GVec3::Y, along / length).to_euler(glam::EulerRot::ZYX);
-            r.object.set_position(a.x, a.y, a.z);
-            r.object.rotation = kansei_core::math::Vec3::new(x, y, z);
-            r.object.scale = kansei_core::math::Vec3::new(radius, length, radius);
+            let body = &character.bodies[k];
+            let palette = body.palette.current();
+            for (vertex, &v) in r.geometry.vertices.iter_mut().zip(&proxy.source) {
+                let m = body.mesh.joints[v].iter().zip(&body.mesh.weights[v]).fold(Mat4::ZERO, |acc, (&j, &w)| acc + palette[j as usize] * w);
+                let m = place * m;
+                let bind = body.mesh.vertices[v];
+                let p = m.transform_point3(GVec3::new(bind.position[0], bind.position[1], bind.position[2]));
+                let n = m.transform_vector3(GVec3::from(bind.normal)).normalize_or_zero();
+                vertex.position = [p.x, p.y, p.z, 1.0];
+                vertex.normal = n.to_array();
+            }
+            r.geometry.revision = r.geometry.revision.wrapping_add(1);
         }
     }
 }
 
-/// A cylinder of radius 1 from y = 0 to 1, capped (the capsules' shape before scaling).
-fn unit_capsule() -> Geometry {
-    let mut g = CylinderGeometry::new(1.0, 1.0, 1.0, 10, 1);
-    for v in &mut g.vertices {
-        v.position[1] += 0.5;
-    }
-    g
-}

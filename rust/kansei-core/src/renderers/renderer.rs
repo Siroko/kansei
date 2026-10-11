@@ -1698,7 +1698,7 @@ impl Renderer {
             key.push(idx as u32);
             key.extend(r.world_matrix.as_slice().iter().map(|f| f.to_bits()));
             key.extend(surface.albedo.iter().map(|f| f.to_bits()));
-            key.extend([surface.surface_word(), r.geometry.index_count(), r.geometry.instance_count, r.rt_placement.as_ref().map_or(0, |p| p.wgsl().len() as u32)]);
+            key.extend([surface.surface_word(), r.geometry.index_count(), r.geometry.instance_count, r.geometry.revision, r.rt_placement.as_ref().map_or(0, |p| p.wgsl().len() as u32)]);
         }
         let eye = camera.inverse_view_matrix.to_glam().w_axis.truncate();
         rt.plan(self.device.as_ref().unwrap(), eye, key, any_dynamic);

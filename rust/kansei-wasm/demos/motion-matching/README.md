@@ -168,7 +168,16 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   brushed one (roughness 0.1) on the east wall reflect through `RtReflectionsEffect`, and the glass
   Stanford dragon (index of refraction 1.5) through its glass pass. Only glossy pixels (roughness
   under 0.45) take traced reflections: a rough lobe's few rays come out as speckle, and its blur is
-  what the lights' GGX and the GI give anyway.
+  what the lights' GGX and the GI give anyway. A reflected point the camera also sees takes the
+  lit image there (sharp, with every light and the GI); the effect checks it is the same surface
+  (position and normal), and where something thin in front hides it (a leg over the floor) it
+  takes the same surface a few pixels aside, so the floor in the mirror doesn't streak behind
+  each leg. The other hits are lit by the lights (shadow rays) and voxel GI, textured: the
+  surfaces' colour maps and the hero's base colour are drawn into a 256-texel array
+  (`assets::albedo_array`), each surface's grid triangles carry their box-mapped uvs and a layer
+  (`RtSurface::with_albedo_layer`), and `RtReflectionsEffect::set_albedo_texture` reads it, a
+  hit's albedo the surface's mean times the texel over the layer's mean. The surfaces' means are
+  measured from the textures at start, for the grid and voxel GI alike.
 - **Furniture** from Poly Haven, CC0: a sofa with throw pillows, two lounge chairs, an arm chair,
   an ottoman, a coffee table, a cabinet, a round dining table with four chairs, a vase, steel and
   wooden shelves with books, plants, a picture frame, a pendant lamp. Each model is drawn as it
@@ -186,10 +195,16 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   so from outside (O, or `cam=outside`) the camera looks through them into the room. The grid hits
   a triangle from either side, so the rays from inside meet the walls as they should. Thick boxes
   outside keep the character in.
-- **The character in the rays.** Its skinned mesh can't go into the grid, so capsules on its bones
-  stand in for it there (`look::Proxy`, `look::grid_only`): renderables no camera draws, moved
-  when a bone has moved 3 cm. They cast its ray-traced shadow and show it in the mirrors. Walking,
-  they rebuild the grid every frame (about 0.9 ms); standing, never. `rt_body=0` leaves them out.
+- **The character in the rays.** The grid takes geometry as built, not as the vertex shader skins
+  it, so a low-poly copy of the body shown stands in for it there (`look::Proxy`, `grid_only`):
+  each body's mesh (the hero's, or the pack's mannequin) welded and simplified to 1500 triangles
+  (`proxy_tris=` another count), keeping original vertices so their joints and weights still
+  apply, and skinned on the CPU with the shown body's palette whenever a bone has moved 3 cm
+  (`Geometry::revision` tells the grid). C switches the copy with the body. The hero's copy
+  carries its uvs and the base colour's layer, so the mirrors show its jacket and jeans; the
+  mannequin's is one colour with smooth normals. They cast the ray-traced shadow, show in the
+  mirrors and the glass, and occlude the GI's rays. Walking, the grid rebuilds every frame
+  (about 0.8-1.6 ms); standing, never. `rt_body=0` leaves the copy out.
 - **The pond.** A rectangular reflecting pool with a black marble bed round the marble plinth, the
   lake's SPH water at its scale and tuning, 180k particles. The character wades in as it does in
   the lake, and the water rests: culled out of view, asleep once its fastest particle is under
@@ -222,7 +237,7 @@ and Stats. `src/room/settings.rs` lists them all with their defaults: each is al
 parameter of the same name (`?floor=wood&gi=voxel&ev=8.5`), and `room.set(name, value)` sets one
 live. `cam=` names a view: `outside`, `hall`, `dragon`, `mirror`, `windows`, `parkour`, `living`,
 `dining`, `library`, and the shadow close-ups `contact`, `feet`, `plinth` (any other follows the
-character). `panel=0` and `hud=0` start without the panel and the text, for captures; `pond=0`,
+character). `panel=0` and `hud=0` start without the panel and the text, for captures; `refl_screen=0` lights every reflected hit by the traced path (no lit-image lookups) and `refl_indirect=` scales the voxels' light at those hits with the hybrid GI on; `vox_sky=0` leaves the window sky out of the voxel volume; `pond=0`,
 `dragon=0`, `rt_body=0` leave those out; `stats=1` shows each pass's GPU time and the CPU sections
 (also in `room.info()`), `profile=1` logs the profile every 3 s.
 
@@ -268,6 +283,7 @@ measured with the GPU otherwise idle (other sessions sharing it doubled every pa
 | `hall`, interleaved in one page with the GPU shared (every pass about 1.5x): rt / voxel / voxel+ssgi / probes / probes+ssgi / ssgi / off | 26.5-27.1 / 24.0-25.4 / 25.8-26.1 / 22.4-23.7 / 24.1-25.1 / 24.3-25.1 / 21.0-23.0 ms | |
 | `hall`, the water running (`fluid_rest=0`) | 21.2 ms | 20.7 ms |
 | `hall`, every ray at full resolution | 31.0 ms | 30.5 ms |
+| GASP hero beside the north mirror (`at=-2,-17,230`): capsules / 1500-triangle copy / 3000 | 17.0 / 17.9 / 19.1 ms | |
 | `hall` at 720p | 10.8 ms | 10.2 ms |
 
 By effect in `hall` (GPU): the hybrid GI 4.6 ms (its trace 3.0), the renderer's passes 2.2 (the
