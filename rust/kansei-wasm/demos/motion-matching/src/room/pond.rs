@@ -6,9 +6,16 @@
 //! container's floor, a step that steep kept the water churning: it never settled).
 //!
 //! The bed is drawn into the GBuffer (wet below the waterline) and lit by the room's spot lights,
-//! for the GI and the reflections; the water's surface refracts it and reflects the room
-//! (`FluidSurfaceEffect`, screen space). Like the lake, the water rests when it can: culled out of
-//! view, asleep once settled with no legs near it.
+//! for the GI and the reflections. The water's surface (the marching-cubes mesh) is drawn as glass
+//! (`FluidSurfaceEffect::surface_renderable_glass`): `RtReflectionsEffect`'s glass pass refracts
+//! through it to the bed, the plinth and the legs in the grid (Beer-Lambert in the water) and
+//! reflects the room off it, with small wind ripples on its normal. The water is in the grid too,
+//! as glass (`FluidHeightfield`'s coarse mesh of the surface, 30 cm apart: the grid's cost is
+//! triangles a cell), so the mirrors and the glass dragon show it, and the caustics' photons
+//! refract at it (`RtCausticsEffect`, the fine height field and the same ripples). `fluid_render
+//! = screen` draws it the old way, refracting the image on screen (`FluidSurfaceEffect`'s
+//! composite). Like the lake, the water rests when it can: culled out of view, asleep once settled
+//! with no legs near it.
 
 use glam::{Mat4, Vec3 as GVec3};
 
@@ -16,12 +23,13 @@ use kansei_core::collision::{CollisionWorld, Shape, TriangleMesh};
 use kansei_core::geometries::{CylinderGeometry, Geometry, Vertex};
 use kansei_core::gi::GiSurface;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::postprocessing::effects::{FluidSurfaceEffect, FluidSurfaceOptions};
+use kansei_core::postprocessing::effects::{FluidGlassSurface, FluidSurfaceEffect, FluidSurfaceOptions};
 use kansei_core::renderers::Renderer;
-use kansei_core::rt::RtSurface;
+use kansei_core::rt::{RtCausticWater, RtSurface};
 use kansei_core::simulations::fluid::{
     lattice_density, DensityFieldOptions, FluidActivity, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer, FluidContainerOptions, FluidDensityField,
-    FluidMarchingCubes, FluidSimulation, FluidSimulationOptions, FluidSleepOptions, FluidSolver, FluidStepper, FluidSubstepPass, MarchingCubesOptions, PbfOptions, PlanarContainerShape,
+    FluidHeightfield, FluidHeightfieldOptions, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions, FluidSleepOptions, FluidSolver, FluidStepper, FluidSubstepPass, MarchingCubesOptions, PbfOptions,
+    PlanarContainerShape,
     WorldScale, DEFAULT_OPTIONS,
 };
 
@@ -53,6 +61,23 @@ const WAKE_DISTANCE: f32 = 2.0;
 pub const SETTLE_SPEED: f32 = 0.15;
 /// Lattice spacing of the particles at rest density (simulation units).
 const SPACING: f32 = 0.537;
+/// The water's light left after a metre through it, at `fluid_tint` 1 (none at 0): deeper than
+/// clear water's, so the 40 cm pond reads turquoise as a deeper pool would.
+const WATER_TINT: [f32; 3] = [0.12, 0.45, 0.5];
+/// Metres between the vertices of the water's mesh in the ray tracing grid, and the frames between
+/// its updates while the water moves.
+const GRID_SPACING: f32 = 0.3;
+const GRID_EVERY: u32 = 4;
+
+/// The bed's stones (`settings::Settings::fluid_bed`) and their roughness scale, the first shown at
+/// first.
+const BEDS: [(&str, f32); 3] = [("marble", 0.7), ("gravel", 1.0), ("blackmarble", 0.6)];
+
+/// The water's tint after a metre at `strength` (`fluid_tint`: 0 clear, 1 `WATER_TINT`).
+fn water_tint(strength: f32) -> [f32; 3] {
+    let k = strength.clamp(0.0, 1.5);
+    WATER_TINT.map(|t| (1.0 - k * (1.0 - t)).clamp(0.02, 1.0))
+}
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -122,8 +147,17 @@ pub struct Pond {
     count: u32,
     /// The full fill, lowest particles first (a partial fill is its first part: lower water).
     fill: Vec<f32>,
-    /// The water's surface renderable (hidden with the effect).
+    /// The water's surface renderables: the screen-space composite's and the glass one (hidden
+    /// with the effect), and its copy in the ray tracing grid.
     surface: usize,
+    glass_surface: usize,
+    grid_water: usize,
+    /// Drawn as ray-traced glass (`fluid_render`), and the glass's look.
+    rt: bool,
+    glass: FluidGlassSurface,
+    frames: u32,
+    /// The beds (stone, renderable): the one `fluid_bed` names shown.
+    beds: Vec<(&'static str, usize)>,
     /// Stepped at all (off: frozen, its last surface drawn); a landing's push; wake next update.
     simulate: bool,
     show: bool,
@@ -140,7 +174,7 @@ impl Pond {
 
     /// Build the pond into `scene` and `world`: its bed, the plinth, and the water's surface
     /// effect for the post-processing chain (its renderable added).
-    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, assets: &super::assets::Assets, deferred: bool) -> (Self, FluidSurfaceEffect) {
+    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, assets: &super::assets::Assets) -> (Self, FluidSurfaceEffect) {
         let outline = outline();
         let mut terrain = PlanarContainerShape::from_outline(&outline, 0.1, COPING, height);
         terrain.smooth_floor(4);
@@ -150,17 +184,23 @@ impl Pond {
         // the bed: a fine mesh to draw (and trace), a coarser one to walk on
         let cells = |step: f32| [((max[0] - min[0]) / step).ceil() as usize, ((max[1] - min[1]) / step).ceil() as usize];
         let (positions, normals, indices) = heightfield(min, max, cells(0.15), &ground);
-        let vertices = positions.iter().zip(&normals).map(|(p, n)| Vertex { position: [p.x, p.y, p.z, 1.0], normal: *n, uv: [p.x, p.z] }).collect();
-        // black marble, polished, lit by the lights itself (the water refracts the image from before
-        // the effects, so the bed can't leave its light to RtShadowsEffect)
-        let mut bed = super::layout::surface([1.0, 1.0, 1.0], 2.0, [0.6, 0.0], true, false);
-        bed.flags[0] = 1.0;
-        let material = super::pbr::material("Pond/Bed", assets.surface("blackmarble", "Pond/Bed"), &bed, false);
-        let mut r = Renderable::new(Geometry::new("Pond/Bed", vertices, indices), material).with_gi(GiSurface::new([0.05, 0.05, 0.05]));
-        r.rt = Some(RtSurface::new([0.05, 0.05, 0.05]));
-        r.cast_shadow = false;
-        super::layout::texture_rt(&mut r, "blackmarble", &bed, assets.surfaces.contains_key("blackmarble"));
-        scene.add(SceneNode::Renderable(r));
+        let vertices: Vec<Vertex> = positions.iter().zip(&normals).map(|(p, n)| Vertex { position: [p.x, p.y, p.z, 1.0], normal: *n, uv: [p.x, p.z] }).collect();
+        // the bed's stones (`fluid_bed`, one shown): pale marble (where the caustics show), gravel,
+        // polished black marble (a reflecting pool); lit by the lights themselves (the water's
+        // glass pass takes them from the background image)
+        let mut beds = Vec::new();
+        for (name, polish) in BEDS {
+            let mut bed = super::layout::surface([1.0, 1.0, 1.0], 2.0, [polish, 0.0], polish < 0.9, false);
+            bed.flags[0] = 1.0;
+            let albedo = super::layout::mean(name, [1.0; 3]);
+            let material = super::pbr::material("Pond/Bed", assets.surface(name, "Pond/Bed"), &bed, false);
+            let mut r = Renderable::new(Geometry::new("Pond/Bed", vertices.clone(), indices.clone()), material).with_gi(GiSurface::new(albedo));
+            r.rt = Some(RtSurface::new(albedo).with_self_lit());
+            r.cast_shadow = false;
+            r.visible = name == BEDS[0].0;
+            super::layout::texture_rt(&mut r, name, &bed, assets.surfaces.contains_key(name));
+            beds.push((name, scene.add(SceneNode::Renderable(r))));
+        }
         let (positions, _, indices) = heightfield(min, max, cells(0.4), &ground);
         world.add(Shape::Mesh(TriangleMesh::from_indexed(&positions, &indices, Mat4::IDENTITY)), 1);
 
@@ -170,10 +210,12 @@ impl Pond {
         let place = Mat4::from_translation(GVec3::new(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0));
         let corners: Vec<GVec3> = drum.vertices.iter().map(|v| GVec3::new(v.position[0], v.position[1], v.position[2])).collect();
         world.add(Shape::Mesh(TriangleMesh::from_indexed(&corners, &drum.indices, place)), 1);
-        let stone_params = super::layout::surface([1.0; 3], 1.5, [1.0, 0.0], true, deferred);
+        // lit by the lights itself, as the bed: below the waterline the glass pass reads it from the
+        // background image (`RtSurface::with_self_lit`)
+        let stone_params = super::layout::surface([1.0; 3], 1.5, [1.0, 0.0], true, false);
         let stone = super::pbr::material("Plinth", assets.surface("marble", "Plinth"), &stone_params, false);
         let mut r = Renderable::new(drum, stone).with_gi(GiSurface::new(STONE));
-        r.rt = Some(RtSurface::new(STONE));
+        r.rt = Some(RtSurface::new(STONE).with_self_lit());
         r.object.set_position(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0);
         super::layout::texture_rt(&mut r, "marble", &stone_params, assets.surfaces.contains_key("marble"));
         scene.add(SceneNode::Renderable(r));
@@ -265,11 +307,48 @@ impl Pond {
         let mut r = surface.surface_renderable([0.2, 0.3, 0.3, 1.0]);
         let s = 1.0 / SIM_SCALE;
         r.object.scale = kansei_core::math::Vec3::new(s, s, s);
+        r.visible = false;
         let surface_index = scene.add(SceneNode::Renderable(r));
+        // the same mesh as glass, and the surface as a height field (for the caustics) and a
+        // coarse mesh in the grid
+        let glass = FluidGlassSurface { tint: water_tint(0.6), ior: 1.33, roughness: 0.0, ripples: 1.0, time: 0.0 };
+        let mut r = surface.surface_renderable_glass(&glass);
+        r.object.scale = kansei_core::math::Vec3::new(s, s, s);
+        let glass_surface = scene.add(SceneNode::Renderable(r));
+        let (sim_min, sim_max) = (surface.sim.world_bounds_min, surface.sim.world_bounds_max);
+        let heightfield = FluidHeightfield::new(renderer.device(), renderer.queue(), &surface.density_field, sim_min, sim_max, FluidHeightfieldOptions { iso: 1.0, world_scale: s, rt_spacing: GRID_SPACING });
+        // (a triangle for the renderer to draw, out of view; the grid takes `rt_mesh`)
+        let placeholder = Geometry::new("Pond/WaterGrid", vec![Vertex { position: [0.0, 0.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], uv: [0.0; 2] }; 3], vec![0, 1, 2]);
+        let mut r = super::look::grid_only(placeholder, RtSurface::glass(glass.tint).with_approximate());
+        r.rt_mesh = Some(heightfield.rt_mesh().clone());
+        let grid_water = scene.add(SceneNode::Renderable(r));
+        surface.heightfield = Some(heightfield);
+        surface.composite = false;
         let stepper = FluidStepper::new(STEP, MAX_STEPS, SCALE).with_rest(&surface.sim, FluidSleepOptions { cull_after: 1.5, settle_speed: SETTLE_SPEED, settle_after: 1.0 });
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        let pond = Self { container, colliders, plinth, stepper, previous: Vec::new(), splash: None, near: (bmin, bmax), count, fill: particles, surface: surface_index, simulate: true, show: true, splash_push: SPLASH_PUSH, poke: false };
+        let pond = Self {
+            container,
+            colliders,
+            plinth,
+            stepper,
+            previous: Vec::new(),
+            splash: None,
+            near: (bmin, bmax),
+            count,
+            fill: particles,
+            surface: surface_index,
+            glass_surface,
+            grid_water,
+            rt: true,
+            glass,
+            frames: 0,
+            beds,
+            simulate: true,
+            show: true,
+            splash_push: SPLASH_PUSH,
+            poke: false,
+        };
         (pond, surface)
     }
 
@@ -301,8 +380,22 @@ impl Pond {
     pub fn apply(&mut self, scene: &mut Scene, surface: &mut FluidSurfaceEffect, s: &super::settings::Settings) {
         self.simulate = s.fluid;
         self.show = s.fluid_show;
-        if let Some(r) = scene.get_renderable_mut(self.surface) {
-            r.visible = s.fluid_show;
+        self.rt = s.fluid_render != "screen";
+        for (index, shown) in [(self.surface, !self.rt), (self.glass_surface, self.rt), (self.grid_water, self.rt)] {
+            if let Some(r) = scene.get_renderable_mut(index) {
+                r.visible = s.fluid_show && shown;
+            }
+        }
+        surface.composite = !self.rt;
+        let bed = if self.beds.iter().any(|(n, _)| *n == s.fluid_bed) { s.fluid_bed.as_str() } else { BEDS[0].0 };
+        for &(name, index) in &self.beds {
+            if let Some(r) = scene.get_renderable_mut(index) {
+                r.visible = name == bed;
+            }
+        }
+        self.glass = FluidGlassSurface { tint: water_tint(s.fluid_tint), ior: s.fluid_ior.max(1.0), roughness: s.fluid_rough.clamp(0.0, 1.0), ripples: s.fluid_ripples.max(0.0), time: self.glass.time };
+        if let Some(r) = scene.get_renderable_mut(self.grid_water) {
+            r.rt = Some(RtSurface::glass(self.glass.tint).with_approximate());
         }
         let sim = &mut surface.sim;
         let p = &mut sim.params;
@@ -325,7 +418,8 @@ impl Pond {
         surface.marching_cubes.set_use_classic(s.fluid_mesh != "voxels");
         let o = &mut surface.options;
         o.ior = s.fluid_ior;
-        o.tint_strength = s.fluid_tint;
+        // (the screen-space look's tint, as it was at its default)
+        o.tint_strength = s.fluid_tint * 0.6;
         o.roughness = s.fluid_rough;
         o.thickness = s.fluid_thickness;
         o.sky_reflection = s.fluid_reflect;
@@ -341,6 +435,35 @@ impl Pond {
         self.previous.clear();
         self.splash = None;
         self.poke = true;
+    }
+
+    /// The water for the caustics (`RtCausticsEffect::set_water`), drawn as ray-traced glass and
+    /// shown; and the box it fills.
+    pub fn caustic_water(&self, surface: &FluidSurfaceEffect) -> Option<RtCausticWater> {
+        let heightfield = surface.heightfield.as_ref().filter(|_| self.rt && self.show)?;
+        let (min, size) = heightfield.rect();
+        Some(RtCausticWater { heights: heightfield.height_view().clone(), min, size, dims: heightfield.height_dims(), source: self.grid_water as u32, ior: self.glass.ior, tint: self.glass.tint, ripples: self.glass.ripples, level: WATER })
+    }
+
+    pub fn water_box() -> (GVec3, GVec3) {
+        (GVec3::new(-HALF[0], -DEPTH - 0.05, -HALF[1]), GVec3::new(HALF[0], WATER + 0.15, HALF[1]))
+    }
+
+    /// The glass's uniform for this frame (the ripples' time `time`), and the grid's copy read
+    /// again when the surface was extracted.
+    pub fn update_surface(&mut self, scene: &mut Scene, queue: &wgpu::Queue, surface: &FluidSurfaceEffect, time: f32) {
+        self.glass.time = time;
+        if let Some(buffer) = scene.get_renderable(self.glass_surface).and_then(|r| r.material.bindable_buffer(0)) {
+            queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&self.glass.uniform()));
+        }
+        // (every few frames while the water moves: each time the whole grid is rebuilt; the
+        // caustics' photons refract at the height field, which follows every frame)
+        self.frames = self.frames.wrapping_add(1);
+        if surface.extract && surface.active && self.rt && self.frames.is_multiple_of(GRID_EVERY) {
+            if let Some(r) = scene.get_renderable_mut(self.grid_water) {
+                r.geometry.revision = r.geometry.revision.wrapping_add(1);
+            }
+        }
     }
 
     /// Step the water by `dt` with the legs in it (world capsules) and a landing's splash, unless

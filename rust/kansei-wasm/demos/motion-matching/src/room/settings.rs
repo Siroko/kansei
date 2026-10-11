@@ -62,6 +62,10 @@ macro_rules! settings {
                 if let Some(v) = param("rest") {
                     s.set("fluid_rest", &v);
                 }
+                // `quality=high`: the physical paths (`game`, the default: the approximations)
+                if let Some(v) = param("quality") {
+                    s.apply_quality(&v);
+                }
                 $(
                     if let Some(v) = param(stringify!($name)) {
                         s.set(stringify!($name), &v);
@@ -113,6 +117,7 @@ settings! {
     shadow_steps: f32 = 2.0;
     reflections: bool = true;
     refl_indirect: f32 = 1.0;
+    refl_intensity: f32 = 1.0;
     refl_screen: bool = true;
     rt_view: String = "lit".into();
     debug_light: f32 = 0.0;
@@ -160,16 +165,39 @@ settings! {
     fluid_splash: f32 = 1.2;
     fluid_mesh: String = "smooth".into();
     fluid_ior: f32 = 1.33;
-    fluid_tint: f32 = 0.6;
+    fluid_tint: f32 = 1.0;
     fluid_rough: f32 = 0.08;
     fluid_thickness: f32 = 1.2;
     fluid_reflect: f32 = 0.6;
     fluid_chromatic: f32 = 0.02;
+    // drawn as ray-traced glass ("rt": refracted and reflected through the grid, in it for the
+    // mirrors) or the screen-space composite ("screen"); the small wind ripples on it
+    fluid_render: String = "rt".into();
+    fluid_bed: String = "marble".into();
+    fluid_ripples: f32 = 1.0;
+    // the caustics of the glass and the water (`RtCausticsEffect`): photons a light (a side), the
+    // weight of a frame, the light's scale; the display spot over the dragon
+    caustics: bool = true;
+    caustics_photons: f32 = 128.0;
+    caustics_blend: f32 = 0.1;
+    // frames between the caustics' updates (four times that with the pond out of view)
+    caustics_every: f32 = 2.0;
+    caustics_intensity: f32 = 1.0;
+    caustics_view: bool = false;
+    // the water's caustics from photons (else its ripples' focus), the lights' emitters' size
+    caustics_water_photons: bool = false;
+    caustics_area: bool = false;
+    display_spot: bool = true;
+    display_cd: f32 = 60000.0;
     // materials
     mirror_rough: f32 = 0.0;
     mirror2_rough: f32 = 0.1;
     glass_ior: f32 = 1.5;
     glass_rough: f32 = 0.0;
+    // the glass pass (the dragon, the water) traces half its pixels a frame; the glass's
+    // reflections traced with the other surfaces' (half resolution, accumulated)
+    glass_checker: bool = true;
+    glass_refl_shared: bool = true;
     // the post-processing
     tonemap: String = "agx".into();
     ev: f32 = 9.0;
@@ -207,6 +235,22 @@ settings! {
     dpr: f32 = 0.0;
     render_scale: f32 = 1.0;
     stats: bool = false;
+}
+
+impl Settings {
+    /// The quality preset (the panel's): `game` (the default) traces half the glass's pixels a frame
+    /// and its reflections with the other surfaces', the water's caustics as its ripples' focus,
+    /// the photons from the lights' centres, the map fed every other frame; `high` traces every glass pixel and its reflection,
+    /// the water's caustics by photons through it, from the lights' emitters, 4x the photons.
+    pub fn apply_quality(&mut self, quality: &str) {
+        let high = quality == "high";
+        self.glass_checker = !high;
+        self.glass_refl_shared = !high;
+        self.caustics_water_photons = high;
+        self.caustics_area = high;
+        self.caustics_photons = if high { 256.0 } else { 128.0 };
+        self.caustics_every = if high { 1.0 } else { 2.0 };
+    }
 }
 
 /// A colour temperature (K) as linear rgb with its largest channel 1 (Tanner Helland's fit, then

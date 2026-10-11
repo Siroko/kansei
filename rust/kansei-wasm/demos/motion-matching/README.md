@@ -133,7 +133,9 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   tiling.
 - **The light.** A low sun (9000 lx at 24°, 3600 K) through the windows, the skylight (a cool
   7500 K spot light whose emitter is the 6 x 12 m opening, 32000 cd), four warm 2700 K lamps
-  under glowing shades (three floor lamps and the dining table's pendant), and the sky the
+  under glowing shades (three floor lamps and the dining table's pendant), a narrow display spot
+  hung from the central beam over the dragon (60000 cd, 18°, a 3 cm emitter: sharp shadows and
+  caustics; `display_spot`, `display_cd`), and the sky the
   windows show, which also lights the rays leaving through them (`SkyLighting`, its SH built on
   the CPU from the gradient). Exposure EV100 9, AgX.
 - **Ray-traced direct light** (`kansei_core::rt::RtShadowsEffect`, new with this page). Surfaces
@@ -178,6 +180,41 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   (`RtSurface::with_albedo_layer`), and `RtReflectionsEffect::set_albedo_texture` reads it, a
   hit's albedo the surface's mean times the texel over the layer's mean. The surfaces' means are
   measured from the textures at start, for the grid and voxel GI alike.
+- **The water, ray traced** (`fluid_render=rt`, the default; `screen` draws it with the old
+  screen-space composite). The pond's surface (its marching-cubes mesh) goes into the GBuffer as
+  glass (`FluidSurfaceEffect::surface_renderable_glass`, index of refraction 1.33, a turquoise tint
+  a metre, small wind ripples on its normal, `fluid_ripples`), and the glass pass refracts through
+  it like the dragon: Beer-Lambert in the water to the bed, the plinth or the legs in the grid.
+  What it finds there lights itself (the bed and the plinth, `RtSurface::with_self_lit`), so the
+  pass reads it from the GBuffer's background image (the scene before the water was drawn) plus a
+  wide voxel cone for its indirect light, not tracing its lights. The water is in the grid too, as
+  glass: `FluidHeightfield` finds the top of the fluid in each column of its density field (spray
+  left out) and writes a mesh 30 cm apart over it (`Renderable::rt_mesh`), coarse because the
+  grid's cost is triangles a cell, marked `RtSurface::with_approximate` so the glass pass doesn't
+  bend twice at it; the mirrors show the water through it, and the caustics' photons refract at
+  the fine height field. Its reflection is traced with the other surfaces' (`RtGlass::
+  reflections_in_trace`: half resolution, accumulated), and the glass pass traces half the glass
+  pixels a frame (`RtGlass::checkerboard`, the others from the traced ones beside them):
+  together they took the glass pass from 34 to 4.6 ms in `dragon`. The bed is pale marble
+  (`fluid_bed`: `gravel`, or `blackmarble` for the reflecting pool it was), where the caustics
+  show.
+- **Caustics** (`kansei_core::rt::RtCausticsEffect`, new with this page; `caustics`). Every frame
+  each light (the sun, the spot lights) sends a grid of photons (`caustics_photons` a side) at the
+  dragon; those that hit glass first are refracted through it (Fresnel, absorption, total internal
+  reflection) and add their light where they land on a 3 cm map over the pond, and the same
+  photons taken straight on take it away where the direct light lands, so the map holds what the
+  glass changes: the light it focuses on the plinth and the shadow it leaves. It is blended over
+  frames (`caustics_blend`) and added to the surfaces under it that face up (on screen, and at the
+  reflections' and the glass's hits). The water's caustics are its ripples' focus of the light on
+  what lies under it, from their curvature (the refraction's Jacobian, `kansei_rt_caustics_focus`):
+  sharp, animated and nearly free; `caustics_water_photons` sends photons through the water
+  instead, which under the skylight's 6 x 12 m emitter blur to almost nothing (physically). The
+  map costs 0.3-0.5 ms (fed every other frame, `caustics_every`; four times as seldom with the pond
+  out of view).
+- **Glass and water quality** (the panel's preset, `quality=`). `game` (the default): the
+  checkerboard, the glass's reflections at half resolution, the water's caustics from its ripples,
+  photons from the lights' centres. `high`: every glass pixel and its own reflection, photons
+  through the water from the lights' emitters, four times the photons.
 - **Furniture** from Poly Haven, CC0: a sofa with throw pillows, two lounge chairs, an arm chair,
   an ottoman, a coffee table, a cabinet, a round dining table with four chairs, a vase, steel and
   wooden shelves with books, plants, a picture frame, a pendant lamp. Each model is drawn as it
@@ -210,7 +247,7 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   camera beside the body, textured as the rays see it. They cast the ray-traced shadow, show in the
   mirrors and the glass, and occlude the GI's rays. Walking, the grid rebuilds every frame
   (about 0.8-1.6 ms); standing, never. `rt_body=0` leaves the copy out.
-- **The pond.** A rectangular reflecting pool with a black marble bed round the marble plinth, the
+- **The pond.** A rectangular pool with a pale marble bed round the marble plinth, the
   lake's SPH water at its scale and tuning, 180k particles. The character wades in as it does in
   the lake, and the water rests: culled out of view, asleep once its fastest particle is under
   0.15 m/s. The plinth is a still capsule collider, not part of the container's floor (as a floor
@@ -290,6 +327,22 @@ measured with the GPU otherwise idle (other sessions sharing it doubled every pa
 | `hall`, every ray at full resolution | 31.0 ms | 30.5 ms |
 | GASP hero beside the north mirror (`at=-2,-17,230`): capsules / 1500-triangle copy / 3000 | 17.0 / 17.9 / 19.1 ms | |
 | `hall` at 720p | 10.8 ms | 10.2 ms |
+
+The ray-traced water and the caustics (`game` quality, the defaults), against the build before
+them (screen-space water, no caustics, black bed), each camera preset in one session, frame
+interval in ms, no pack:
+
+| | outside | hall | dragon | mirror | windows | parkour | living | dining | library | contact | feet | plinth |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| before | 14.1 | 16.7 | 19.1 | 14.9 | 14.8 | 14.1 | 15.0 | 15.7 | 14.1 | 17.8 | 18.9 | 22.3 |
+| after | 14.5 | 17.6 | 21.8 | 15.8 | 14.9 | 15.4 | 15.9 | 16.4 | 15.2 | 19.1 | 19.6 | 24.5 |
+
+What it adds: the caustics 0.3-0.5 ms (the photons every other frame, the composite every frame),
+the water's reflection in the reflections' trace (up to 1.5 ms where the water fills the screen),
+its refraction in the glass pass (0.5 ms in `dragon`), the display spot's light. `quality=high`
+(every glass pixel, its own reflection, photons through the water) lands at 34 ms in `dragon`
+(the glass pass 16.8 ms, the photons 1.8 against `game`'s 22 ms and 4.7); the first version,
+before the approximations, had the glass pass at 34 ms there.
 
 By effect in `hall` (GPU): the hybrid GI 4.6 ms (its trace 3.0), the renderer's passes 2.2 (the
 GBuffer, the cascades, the skylight's shadow map, velocity), the ray-traced direct light 2.1

@@ -59,6 +59,12 @@
         const p = JSON.parse(room_settings());
         const set = (key, value) => room_set(key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
 
+        // the glass and the water: 'game' (the default) trades exactness for speed where it barely
+        // shows; 'high' is the physical path (settings::Settings::apply_quality)
+        const QUALITIES = {
+            'game': { glass_checker: true, glass_refl_shared: true, caustics_water_photons: false, caustics_area: false, caustics_photons: 128, caustics_every: 2 },
+            'high': { glass_checker: false, glass_refl_shared: false, caustics_water_photons: true, caustics_area: true, caustics_photons: 256, caustics_every: 1 },
+        };
         const LOOKS = {
             'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 9.0, floor: 'marble' },
             'midday': { sun: true, sun_lux: 40000, sun_elev: 58, sun_azim: 10, sun_temp: 5600, sky: true, sky_cd: 60000, sky_temp: 6800, sky_radiance: 7000, lamps: false, fog: 0.002, ev: 8.0 },
@@ -88,7 +94,7 @@
         pane.hidden = params.get('panel') === '0';
         if (params.get('hud') === '0') for (const id of ['hud', 'hud-room']) document.getElementById(id).style.display = 'none';
         window.addEventListener('keydown', (e) => { if (e.key.toLowerCase() === 'p' && !e.repeat) pane.hidden = !pane.hidden; });
-        const presets = { look: params.get('look') || 'golden hour', post: params.get('post') || 'warm cinematic', dof: params.get('dof_preset') || 'subtle' };
+        const presets = { look: params.get('look') || 'golden hour', post: params.get('post') || 'warm cinematic', dof: params.get('dof_preset') || 'subtle', quality: params.get('quality') || 'game' };
         const applyPreset = (table, name) => {
             const values = table[name];
             if (!values) return;
@@ -111,6 +117,7 @@
 
         const top = pane.addFolder({ title: 'Presets' });
         top.addBinding(presets, 'look', { options: { ...options(Object.keys(LOOKS)), custom: 'custom' } }).on('change', (ev) => applyPreset(LOOKS, ev.value));
+        top.addBinding(presets, 'quality', { label: 'glass & water', options: { ...options(Object.keys(QUALITIES)), custom: 'custom' } }).on('change', (ev) => applyPreset(QUALITIES, ev.value));
         top.addBinding(p, 'cam', { label: 'camera', options: options(JSON.parse(room_views())) }).on('change', (ev) => set('cam', ev.value));
 
         const scene = pane.addFolder({ title: 'Scene', expanded: false });
@@ -135,6 +142,8 @@
         bind(lights, 'lamps', {}, 'look');
         bind(lights, 'lamp_cd', { label: 'lamp (cd)', min: 0, max: 5000, step: 10 }, 'look');
         bind(lights, 'lamp_temp', { label: 'lamp (K)', min: 1800, max: 6500, step: 50 }, 'look');
+        bind(lights, 'display_spot', { label: 'dragon spot' });
+        bind(lights, 'display_cd', { label: 'dragon spot (cd)', min: 0, max: 200000, step: 1000 });
 
         const rt = pane.addFolder({ title: 'Shadows, GI, reflections', expanded: false });
         bind(rt, 'shadows', { options: { 'ray traced': 'rt', 'shadow maps': 'maps' } });
@@ -150,6 +159,17 @@
         bind(rt, 'gi_near', { label: 'GI grid reach (m, 0: all)', min: 0, max: 40, step: 0.5 });
         bind(rt, 'reflections', { label: 'RT reflections' });
         bind(rt, 'refl_indirect', { label: 'reflected GI (hybrid)', min: 0, max: 2, step: 0.05 });
+        bind(rt, 'glass_checker', { label: 'glass & water: half the pixels a frame' }, 'quality');
+        bind(rt, 'glass_refl_shared', { label: 'glass reflections at half res' }, 'quality');
+        // the glass dragon's and the water's caustics: photons from each light through the RT grid
+        bind(rt, 'caustics');
+        bind(rt, 'caustics_photons', { label: 'caustic photons (a side, per light)', min: 16, max: 512, step: 8 }, 'quality');
+        bind(rt, 'caustics_blend', { label: 'caustics blend (a frame)', min: 0.02, max: 1, step: 0.01 });
+        bind(rt, 'caustics_every', { label: 'caustics: update every N frames', min: 1, max: 8, step: 1 }, 'quality');
+        bind(rt, 'caustics_intensity', { label: 'caustics intensity', min: 0, max: 4, step: 0.05 });
+        bind(rt, 'caustics_view', { label: 'show caustics only' });
+        bind(rt, 'caustics_water_photons', { label: 'water caustics by photons' }, 'quality');
+        bind(rt, 'caustics_area', { label: 'caustics from the emitters\' area' }, 'quality');
         bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
         bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });
 
@@ -190,13 +210,16 @@
         bind(wade, 'fluid_bounce', { label: 'bounce (legs)', min: 0, max: 1, step: 0.01 });
         bind(wade, 'fluid_splash', { label: 'landing splash', min: 0, max: 4, step: 0.05 });
         const look = water.addFolder({ title: 'Surface', expanded: false });
+        bind(look, 'fluid_render', { label: 'drawn as', options: { 'ray-traced glass': 'rt', 'screen space': 'screen' } });
+        bind(look, 'fluid_ripples', { label: 'ripples', min: 0, max: 3, step: 0.05 });
+        bind(look, 'fluid_bed', { label: 'bed', options: { 'pale marble': 'marble', gravel: 'gravel', 'black marble (reflecting pool)': 'blackmarble' } });
         bind(look, 'fluid_mesh', { label: 'mesh', options: { 'smooth (marching cubes)': 'smooth', voxels: 'voxels' } });
         bind(look, 'fluid_ior', { label: 'IOR', min: 1, max: 2, step: 0.01 });
         bind(look, 'fluid_tint', { label: 'tint', min: 0, max: 2, step: 0.01 });
-        bind(look, 'fluid_thickness', { label: 'absorption depth', min: 0.1, max: 6, step: 0.05 });
+        bind(look, 'fluid_thickness', { label: 'absorption depth (screen)', min: 0.1, max: 6, step: 0.05 });
         bind(look, 'fluid_rough', { label: 'roughness', min: 0, max: 1, step: 0.01 });
-        bind(look, 'fluid_reflect', { label: 'reflection', min: 0, max: 1, step: 0.01 });
-        bind(look, 'fluid_chromatic', { label: 'dispersion', min: 0, max: 0.2, step: 0.005 });
+        bind(look, 'fluid_reflect', { label: 'sky reflection (screen)', min: 0, max: 1, step: 0.01 });
+        bind(look, 'fluid_chromatic', { label: 'dispersion (screen)', min: 0, max: 0.2, step: 0.005 });
 
         const dof = pane.addFolder({ title: 'Depth of field', expanded: false });
         dof.addBinding(presets, 'dof', { label: 'preset', options: { ...options(Object.keys(DOFS)), custom: 'custom' } }).on('change', (ev) => applyPreset(DOFS, ev.value));
@@ -250,7 +273,7 @@
 
         // the presets the URL names start the page (its own parameters over them)
         const explicit = new Set(params.keys());
-        for (const [table, name] of [[LOOKS, presets.look], [POSTS, presets.post], [DOFS, presets.dof]]) {
+        for (const [table, name] of [[LOOKS, presets.look], [POSTS, presets.post], [DOFS, presets.dof], [QUALITIES, presets.quality]]) {
             for (const [k, v] of Object.entries(table[name] || {})) {
                 if (!explicit.has(k)) { p[k] = v; set(k, v); }
             }

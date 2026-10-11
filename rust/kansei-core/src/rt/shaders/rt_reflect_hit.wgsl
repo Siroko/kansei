@@ -44,7 +44,8 @@ fn rtLit(o: vec3f, to: vec3f) -> f32 {
 }
 
 // The light leaving a hit the camera doesn't see (a Lambertian surface of `albedo`, the
-// includer's kansei_rt_hit_albedo: the triangle's, or its texture's where it has one):
+// includer's kansei_rt_hit_albedo: the triangle's, or its texture's where it has one; plus the
+// includer's kansei_rt_hit_caustics):
 // the lights' direct light, shadowed by rays through the grid, plus the irradiance the voxels hold
 // round it (srcIrradiance, voxel GI's own hemisphere of cones).
 fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
@@ -83,7 +84,10 @@ fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
     if ((rp.flags & RT_REFLECT_NO_INDIRECT) == 0u) {
         e += srcIrradiance(o, n) * rp.indirectScale;
     }
-    return albedo / 3.14159265 * e;
+    // the light glass and water focus there (and take away), from the includer: none, or a caustics
+    // map (RtCausticsEffect)
+    e += kansei_rt_hit_caustics(p, n);
+    return albedo / 3.14159265 * max(e, vec3f(0.0));
 }
 
 fn rtHash(p: vec2u, frame: u32) -> vec2f {
@@ -144,6 +148,11 @@ fn rtScreenAt(q: vec2u, p: vec3f, n: vec3f, tolerance: f32) -> vec4f {
 // stand in: a hidden strip lit by the traced fallback instead (another estimate of the indirect
 // light) shows in a mirror as a streak behind each leg.
 fn rtScreenRadiance(p: vec3f, n: vec3f) -> vec4f {
+    return rtScreenRadianceAt(p, n, true);
+}
+
+// The same, beside thin occluders only with `search`.
+fn rtScreenRadianceAt(p: vec3f, n: vec3f, search: bool) -> vec4f {
     let eye = rp.invView[3].xyz;
     if (dot(n, eye - p) <= 0.0) {
         return vec4f(0.0);
@@ -159,7 +168,7 @@ fn rtScreenRadiance(p: vec3f, n: vec3f) -> vec4f {
     let px = vec2u(uv * rp.fullSize);
     let tolerance = max(1.5 * kansei_rt_grid.cell, 0.01 * distance(eye, p));
     let direct = rtScreenAt(px, p, n, tolerance);
-    if (direct.a > 0.5) {
+    if (direct.a > 0.5 || !search) {
         return direct;
     }
     // hidden by something nearer? then the same surface a few pixels either side
@@ -192,15 +201,30 @@ fn rtScreenRadiance(p: vec3f, n: vec3f) -> vec4f {
     return vec4f(0.0);
 }
 
+// Light the hits the camera doesn't see from the voxels' surface cache alone (srcHitRadiance), not
+// the lights: for a ray whose light counts for little (a weak Fresnel reflection, set by the glass
+// pass around its reflection ray).
+var<private> rtCheapHits : bool = false;
+
 // A hit at p on `triangle` (geometric normal ng facing the ray's origin, barycentrics bary).
 fn rtHitRadiance(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f) -> vec3f {
     if ((rp.flags & RT_REFLECT_SCREEN) != 0u) {
-        let s = rtScreenRadiance(p, ng);
+        let s = rtScreenRadianceAt(p, ng, false);
         if (s.a > 0.5) {
             return s.rgb;
         }
+        // a surface that lights itself, seen only through the refractive pass (water): the
+        // includer's background image (none in TS); then the screen beside thin occluders
+        let b = kansei_rt_hit_background(p, ng, triangle, bary);
+        if (b.a > 0.5) {
+            return b.rgb;
+        }
+        let beside = rtScreenRadianceAt(p, ng, true);
+        if (beside.a > 0.5) {
+            return beside.rgb;
+        }
     }
-    if ((rp.flags & RT_REFLECT_DIRECT) != 0u) {
+    if ((rp.flags & RT_REFLECT_DIRECT) != 0u && !rtCheapHits) {
         return rtLitHit(p, ng, kansei_rt_shading_normal(triangle, bary, ng), kansei_rt_hit_albedo(triangle, bary));
     }
     return srcHitRadiance(p, ng);
@@ -239,11 +263,15 @@ fn rtSceneRay(origin: vec3f, d: vec3f, n: vec3f, tanHalf: f32, traceFlags: u32) 
         }
         let p = o + d * hit.t;
         if (glass && rtIsGlass(hit.triangle)) {
-            let s = rtScreenRadiance(p, hit.normal);
-            if (s.a > 0.5) {
-                out.radiance = s.rgb;
-                out.found = true;
-                return out;
+            // (not the coarse copy of the surface the ray left, RtSurface::with_approximate)
+            let copy = (bitcast<u32>(kansei_rt_triangles[hit.triangle * 4u].w) & KANSEI_RT_APPROXIMATE) != 0u && distance(p, origin) < 0.3;
+            if (!copy) {
+                let s = rtScreenRadiance(p, hit.normal);
+                if (s.a > 0.5) {
+                    out.radiance = s.rgb;
+                    out.found = true;
+                    return out;
+                }
             }
             o = p + d * (0.05 * kansei_rt_grid.cell);
             continue;

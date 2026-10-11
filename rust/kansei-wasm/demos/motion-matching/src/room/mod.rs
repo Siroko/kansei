@@ -57,8 +57,8 @@ use kansei_core::postprocessing::effects::{
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::rt::{
-    RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiResolution, RtGiShadows, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions, RtShadowsEffect, RtShadowsView, RtSurface,
-    RtTraceResolution, SceneRtGridOptions,
+    RtCausticsEffect, RtCausticsOptions, RtCausticsView, RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiResolution, RtGiShadows, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions,
+    RtShadowsEffect, RtShadowsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
 };
 use kansei_core::shadows::CascadedShadowOptions;
 use kansei_wasm::{param, param_or, set_text, Canvas, Frame};
@@ -105,6 +105,8 @@ struct RoomState {
     dust: Option<Dust>,
     proxy: Option<Proxy>,
     dragon: Option<usize>,
+    /// The box the dragon fills (the caustics aim their photons at it and the water).
+    dragon_box: Option<(GVec3, GVec3)>,
     /// The character's bodies or the stand-in (for the deferred switch).
     bodies: Vec<usize>,
     sky: usize,
@@ -194,8 +196,9 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     let scene_gi = renderer.voxel_gi().expect("the room enables voxel GI");
     let grid = renderer.rt_grid().expect("the room builds the grid");
     let mut shadows = RtShadowsEffect::new(grid.handle());
-    // the skylight is the first spot light: its emitter is the opening
-    shadows.set_rect_emitter(0, layout::SKYLIGHT[0] * 2.0, layout::SKYLIGHT[1] * 2.0);
+    // the skylight is the first spot light: its emitter is the opening (the rectangle's width lies
+    // along z for a light pointing down, `set_rect_emitter`'s axes)
+    shadows.set_rect_emitter(0, layout::SKYLIGHT[1] * 2.0, layout::SKYLIGHT[0] * 2.0);
     effects.push(Box::new(Switch { effect: shadows, on: true }));
     let mut hybrid = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), RtDiffuseGiOptions { max_distance: 60.0, ambient: 0.0, ..Default::default() });
     hybrid.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
@@ -214,11 +217,22 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     let mut ssgi = ScreenSpaceGIEffect::new(near);
     ssgi.set_sky_lighting(Some(sky));
     effects.push(Box::new(ssgi));
+    // the dragon's and the water's caustics, over the pond's terrain (its bed, the plinth, the
+    // coping and the floor at its edge), 3 cm texels; the skylight emits from its opening
+    let (lo, hi) = Pond::terrain_bounds();
+    let mut caustics = RtCausticsEffect::new(renderer.device(), grid.handle(), RtCausticsOptions { min: lo, max: hi, texel: 0.03, ..Default::default() });
+    caustics.set_rect_emitter(0, layout::SKYLIGHT[1] * 2.0, layout::SKYLIGHT[0] * 2.0);
+    let (map, lookup) = caustics.map();
+    let caustics_map = (map.clone(), lookup.clone());
+    effects.push(Box::new(Switch { effect: caustics, on: true }));
     // the mirrors, the floor and the dragon's glass
     let mut reflections = RtReflectionsEffect::with_volume(scene_gi.volume(), grid.handle(), RtReflectionsOptions { resolution: RtTraceResolution::Half, max_distance: 60.0, ..Default::default() });
     reflections.screen_hits = true;
     reflections.set_spot_lights(Some(renderer.spot_lights_buffer()));
-    reflections.set_glass(Some(RtGlass::default()));
+    // (the glass's reflections traced with the floor's and the mirrors', at their resolution: the
+    // pond's water fills much of the screen)
+    reflections.set_glass(Some(RtGlass { reflections_in_trace: true, ..Default::default() }));
+    reflections.set_caustics(Some((&caustics_map.0, &caustics_map.1)));
     reflections.set_sky_lighting(Some(sky));
     effects.push(Box::new(Switch { effect: reflections, on: true }));
     // a faint, even haze filling the room (a box volume; none outside), lit by the sun through the
@@ -261,7 +275,7 @@ fn sky_lighting(zenith: [f32; 3], horizon: [f32; 3]) -> [f32; 60] {
 /// The glass dragon on the plinth: the Stanford dragon (`www/assets`, CC-BY-NC-4.0, credited on the
 /// page) about 2.6 m long, clear glass, in the grid by its cluster LOD's cut with its vertex normals,
 /// casting no shadow (light passes through glass), outside voxel GI.
-async fn add_dragon(scene: &mut Scene) -> Option<usize> {
+async fn add_dragon(scene: &mut Scene) -> Option<(usize, (GVec3, GVec3))> {
     let bytes = match fetch_bytes("assets/stanford_dragon_pbr.glb").await {
         Ok(b) => b,
         Err(e) => {
@@ -277,7 +291,9 @@ async fn add_dragon(scene: &mut Scene) -> Option<usize> {
     dragon.cast_shadow = false;
     dragon.object.set_position(0.0, pond::PLINTH_TOP, 0.0);
     dragon.object.rotation.y = 0.7;
-    Some(scene.add(SceneNode::Renderable(dragon)))
+    let (lo, hi) = dragon.geometry.bounds();
+    let placed = kansei_core::rt::transform_box(&(glam::Mat4::from_translation(GVec3::new(0.0, pond::PLINTH_TOP, 0.0)) * glam::Mat4::from_rotation_y(0.7)), lo, hi);
+    Some((scene.add(SceneNode::Renderable(dragon)), placed))
 }
 
 /// Fixed views (`cam=<name>`): (name, target, distance, azimuth, elevation); the camera stands at
@@ -400,6 +416,14 @@ impl RoomState {
             let height = self.renderer.height() as f32;
             dust.update(&self.renderer, &mut self.scene, eye, &capsules, dt, height, lens);
         }
+        // the water's glass (its ripples) and its copy in the grid
+        let mut water = None;
+        if let Some(pond) = &mut self.pond {
+            if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
+                pond.update_surface(&mut self.scene, self.renderer.queue(), surface, self.time);
+                water = pond.caustic_water(surface);
+            }
+        }
         let RoomState { scene, volume, .. } = self;
         let lights: Vec<&Light> = scene.lights().collect();
         if let Some(e) = volume.effect_mut::<Switch<RtShadowsEffect>>() {
@@ -417,6 +441,25 @@ impl RoomState {
         }
         if let Some(e) = volume.effect_mut::<Switch<MotionBlurEffect>>() {
             e.effect.set_frame_time(dt);
+        }
+        // the caustics' casters
+        if let Some(e) = volume.effect_mut::<Switch<RtCausticsEffect>>() {
+            let x = &mut e.effect;
+            x.update_lights(lights.iter().copied());
+            x.set_time(self.time);
+            let mut casters: Vec<(GVec3, GVec3)> = self.dragon_box.into_iter().collect();
+            if water.is_some() && x.water_photons {
+                casters.push(Pond::water_box());
+            }
+            x.set_casters(&casters);
+            x.set_water(water);
+            // fed every `caustics_every` frames, four times as seldom with the pond out of view
+            // (the mirrors may still show it)
+            let (lo, hi) = Pond::water_box();
+            let (lo, hi) = self.dragon_box.map_or((lo, hi), |(a, b)| (lo.min(a), hi.max(b)));
+            let seen = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), lo, hi);
+            let every = self.settings.caustics_every.round().clamp(1.0, 16.0) as u32;
+            x.interval = if seen { every } else { every * 4 };
         }
         drop(world_scope);
 
@@ -618,6 +661,9 @@ impl RoomState {
                 l.cast_shadow = !deferred;
             }
         }
+        if let Some(Light::Spot(l)) = self.scene.get_light_mut(self.layout.lights.display) {
+            l.intensity = if s.display_spot { s.display_cd } else { 0.0 };
+        }
         let shade = lamp_color.map(|c| c * layout::SHADE_RADIANCE * if s.lamps { s.lamp_cd / layout::LAMP_CD } else { 0.02 });
         for &index in &self.layout.lights.shades {
             if let Some(r) = self.scene.get_renderable_mut(index) {
@@ -698,9 +744,21 @@ impl RoomState {
             e.on = s.reflections;
             e.effect.hit_indirect = gi != "off";
             e.effect.screen_hits = s.refl_screen;
+            e.effect.intensity = s.refl_intensity.max(0.0);
             // the voxels' irradiance at the hits the camera doesn't see, brought to the hybrid
             // RT GI's level (`refl_indirect`) so a mirror's far floor matches the floor in view
             e.effect.hit_indirect_scale = if gi == "rt" { s.refl_indirect } else { 1.0 };
+            e.effect.set_glass(Some(RtGlass { reflections_in_trace: s.glass_refl_shared, checkerboard: s.glass_checker, ..Default::default() }));
+        }
+        if let Some(e) = self.volume.effect_mut::<Switch<RtCausticsEffect>>() {
+            e.on = s.caustics;
+            e.effect.photons = s.caustics_photons.round().clamp(8.0, 1024.0) as u32;
+            e.effect.blend = s.caustics_blend.clamp(0.01, 1.0);
+            e.effect.intensity = s.caustics_intensity.max(0.0);
+            e.effect.view = if s.caustics_view { RtCausticsView::Caustics } else { RtCausticsView::Lit };
+            e.effect.water_photons = s.caustics_water_photons;
+            e.effect.area_emitters = s.caustics_area;
+            e.effect.set_glass(s.glass_ior, GLASS_TINT);
         }
         for (k, &mirror) in self.layout.mirrors.iter().enumerate() {
             let roughness = if k == 0 { s.mirror_rough } else { s.mirror2_rough };
@@ -815,7 +873,7 @@ impl RoomState {
         let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
+            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.settings.json(),
             self.view.unwrap_or("follow"),
             self.player.character.is_some(),
@@ -823,6 +881,8 @@ impl RoomState {
             self.proxy.as_ref().map_or(Vec::new(), |p| p.triangles(&self.scene)),
             grid.map_or(0, |g| g.grid.triangles),
             grid.map_or(0, |g| g.rebuilds),
+            self.volume.effect::<Switch<RtCausticsEffect>>().map_or(0, |e| e.effect.photons_sent().0),
+            self.volume.effect::<Switch<RtCausticsEffect>>().map_or(0, |e| e.effect.photons_sent().1),
             self.renderer.width(),
             self.renderer.height(),
             self.stats.as_ref().map_or(0.0, |s| s.frame_ms),
@@ -860,8 +920,9 @@ where
 {
     let canvas = Canvas::find(canvas_id)?;
     let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
-    // the skylight and four lamps cast shadows (the maps feed the fog, the voxels and the fallback)
-    renderer.enable_spot_shadows(2048, 5);
+    // the skylight, four lamps and the display spot cast shadows (the maps feed the fog, the
+    // voxels and the fallback)
+    renderer.enable_spot_shadows(2048, 6);
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
     renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: BOUNDS_MIN, bounds_max: BOUNDS_MAX, radiance_scale: 1.0, budget_bytes: 0 });
     renderer.enable_rt_grid(grid_options());
@@ -875,12 +936,15 @@ where
     let mut layout = layout::build(&mut scene, &assets, with_pond.then(Pond::terrain_bounds), &settings.floor, settings.floor_rough, deferred);
     let (pond, surface) = match with_pond {
         true => {
-            let (p, s) = Pond::new(&renderer, &mut scene, &mut layout.collision, &assets, deferred);
+            let (p, s) = Pond::new(&renderer, &mut scene, &mut layout.collision, &assets);
             (Some(p), Some(s))
         }
         false => (None, None),
     };
-    let dragon = if kansei_wasm::flag("dragon", true) { add_dragon(&mut scene).await } else { None };
+    let (dragon, dragon_box) = match kansei_wasm::flag("dragon", true) {
+        true => add_dragon(&mut scene).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
+        false => (None, None),
+    };
     // the sky behind the windows and the skylight (its colours set by `apply`)
     let mut sky = Renderable::new(SphereGeometry::new(300.0, 32, 16), Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [1.0; 3], horizon: [1.0; 3], ground: [0.2; 3], curve: 0.5 }));
     sky.cast_shadow = false;
@@ -969,6 +1033,7 @@ where
         dust,
         proxy,
         dragon,
+        dragon_box,
         bodies,
         sky,
         sky_lighting,

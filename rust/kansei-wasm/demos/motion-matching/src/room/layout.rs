@@ -51,6 +51,8 @@ pub struct Lights {
     pub skylight: usize,
     pub lamps: Vec<usize>,
     pub shades: Vec<usize>,
+    /// The display spot over the glass dragon (the last spot light).
+    pub display: usize,
 }
 
 /// Default light levels: the sun's illuminance (lux), the skylight's and a lamp's intensity (cd),
@@ -62,6 +64,13 @@ pub const SHADE_RADIANCE: f32 = 900.0;
 pub const SUN_DIR: [f32; 3] = [0.86, -0.4, 0.32];
 pub const SUN_COLOR: [f32; 3] = [1.0, 0.74, 0.5];
 pub const LAMP_COLOR: [f32; 3] = [1.0, 0.68, 0.4];
+/// The display spot over the dragon: hung under the beam that crosses the room's centre, its
+/// intensity (cd), its narrow cone (inner and outer half-angles, degrees) over the plinth and a
+/// ring of water, a small emitter (sharp shadows and caustics), a neutral warm white.
+pub const DISPLAY_AT: [f32; 3] = [0.0, HEIGHT - 0.62, 0.0];
+pub const DISPLAY_CD: f32 = 60000.0;
+const DISPLAY_CONE: [f32; 2] = [12.0, 18.0];
+pub const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
 
 /// A PBR surface in the room, for the page to change (deferred lighting, roughness, floors).
 pub struct Surface {
@@ -527,7 +536,15 @@ pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f
     lamps.push(l);
     shades.push(s);
 
-    Layout { collision: b.collision, surfaces: b.surfaces, lights: Lights { sun, skylight, lamps, shades }, mirrors }
+    // the display spot over the dragon, and its can under the beam
+    let mut spot = SpotLight::new(Vec3::new(DISPLAY_AT[0], DISPLAY_AT[1], DISPLAY_AT[2]), Vec3::new(0.0, -1.0, 0.0), Vec3::new(DISPLAY_COLOR[0], DISPLAY_COLOR[1], DISPLAY_COLOR[2]), DISPLAY_CD, 20.0, DISPLAY_CONE[0].to_radians(), DISPLAY_CONE[1].to_radians());
+    spot.cast_shadow = true;
+    spot.source_radius = 0.03;
+    spot.volumetric_scale = 1.0;
+    let display = b.scene.add(SceneNode::Light(Light::Spot(spot)));
+    let can = surface(STEEL, 0.5, [0.5, 0.0], false, b.deferred);
+    b.solid("DisplaySpot", [0.16, 0.24, 0.16], [DISPLAY_AT[0], DISPLAY_AT[1] + 0.13, DISPLAY_AT[2]], 0.0, "metal", can, STEEL, false);
+    Layout { collision: b.collision, surfaces: b.surfaces, lights: Lights { sun, skylight, lamps, shades, display }, mirrors }
 }
 
 /// The furniture meant for parkour as the character's traversal sees it: from feet in front of each

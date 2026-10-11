@@ -3374,12 +3374,20 @@ impl Renderer {
             );
         }
 
-        // Copy opaque color → background texture (for refractive objects to sample)
+        // Copy opaque color → background texture (for refractive objects to sample), and its depth
+        // (single-sampled: the depth texture is the one drawn into)
         encoder.copy_texture_to_texture(
             gbuffer.color_texture.as_image_copy(),
             gbuffer.background_texture.as_image_copy(),
             wgpu::Extent3d { width: gbuffer.width, height: gbuffer.height, depth_or_array_layers: 1 },
         );
+        if gbuffer.sample_count == 1 {
+            encoder.copy_texture_to_texture(
+                gbuffer.depth_texture.as_image_copy(),
+                gbuffer.background_depth_texture.as_image_copy(),
+                wgpu::Extent3d { width: gbuffer.width, height: gbuffer.height, depth_or_array_layers: 1 },
+            );
+        }
 
         // Pass 2: Indirect/refractive objects (Load existing MRT + depth), when there are any (an
         // empty pass would still load and store every target)

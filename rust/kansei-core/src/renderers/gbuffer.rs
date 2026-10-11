@@ -8,6 +8,9 @@ pub struct GBuffer {
     /// Snapshot of color after opaque rendering, before refractive/indirect objects.
     pub background_texture: wgpu::Texture,
     pub background_view: wgpu::TextureView,
+    /// The depth with it (single-sampled GBuffers): where the background shows what.
+    pub background_depth_texture: wgpu::Texture,
+    pub background_depth_view: wgpu::TextureView,
     pub emissive_texture: wgpu::Texture,
     pub emissive_view: wgpu::TextureView,
     pub normal_texture: wgpu::Texture,
@@ -72,7 +75,8 @@ impl GBuffer {
         let (emissive_texture, emissive_view) = mk("GBuffer/Emissive", Self::COLOR_FORMAT, storage_usage, 1);
         let (normal_texture, normal_view) = mk("GBuffer/Normal", Self::COLOR_FORMAT, tex_usage, 1);
         let (albedo_texture, albedo_view) = mk("GBuffer/Albedo", Self::ALBEDO_FORMAT, tex_usage, 1);
-        let (depth_texture, depth_view) = mk("GBuffer/Depth", Self::DEPTH_FORMAT, tex_usage, 1);
+        let (depth_texture, depth_view) = mk("GBuffer/Depth", Self::DEPTH_FORMAT, tex_usage | wgpu::TextureUsages::COPY_SRC, 1);
+        let (background_depth_texture, background_depth_view) = mk("GBuffer/BackgroundDepth", Self::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 1);
         // (COPY_SRC: read back by the tests)
         let (velocity_texture, velocity_view) = mk("GBuffer/Velocity", Self::VELOCITY_FORMAT, tex_usage | wgpu::TextureUsages::COPY_SRC, 1);
         let (output_texture, output_view) = mk("GBuffer/Output", Self::COLOR_FORMAT, storage_usage, 1);
@@ -96,7 +100,7 @@ impl GBuffer {
 
         Self {
             width, height, sample_count,
-            color_texture, color_view, background_texture, background_view,
+            color_texture, color_view, background_texture, background_view, background_depth_texture, background_depth_view,
             emissive_texture, emissive_view,
             normal_texture, normal_view, albedo_texture, albedo_view,
             depth_texture, depth_view, velocity_texture, velocity_view, output_texture, output_view,

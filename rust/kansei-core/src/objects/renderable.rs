@@ -40,6 +40,11 @@ pub struct Renderable {
     /// Where its instance records put its mesh, for the grid (the material's vertex stage does it
     /// on screen): needed by instanced renderables, unless their `ClusterLod::transform` says.
     pub rt_placement: Option<crate::rt::RtPlacement>,
+    /// A mesh for the grid that the GPU writes (`rt::RtGpuMesh`: a compute pass fills its
+    /// `RtMesh` words), gathered in place of the geometry's CPU vertices: a fluid's surface
+    /// (`simulations::fluid::FluidHeightfield`). Bump `Geometry::revision` after writing it, so the
+    /// grid gathers it again.
+    pub rt_mesh: Option<crate::rt::RtGpuMesh>,
     /// How the path tracer (`pathtracer::BVHBuilder::scene_materials`) sees this renderable;
     /// `None`: `PathTracerMaterial::default()`.
     pub path_tracer_material: Option<crate::pathtracer::PathTracerMaterial>,
@@ -82,6 +87,7 @@ impl Renderable {
             gi: None,
             rt: None,
             rt_placement: None,
+            rt_mesh: None,
             path_tracer_material: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }

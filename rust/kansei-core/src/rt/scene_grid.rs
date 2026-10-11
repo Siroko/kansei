@@ -62,7 +62,8 @@ struct SceneMesh {
 /// its mesh, placed by `Renderable::rt_placement`), and each single mesh whose world box meets the
 /// grid's (one box test per renderable on the CPU). It rebuilds when the box moves, when the
 /// static renderables in it change (transform, visibility, surface, `Geometry::revision`: a mesh
-/// whose CPU vertices were moved, such as a skinned proxy posed on the CPU), when a cut it
+/// whose CPU vertices were moved, such as a skinned proxy posed on the CPU, or whose
+/// `Renderable::rt_mesh` the GPU rewrote), when a cut it
 /// gathered grew,
 /// on `invalidate`, and every frame while a `dynamic` one is in it.
 pub struct SceneRtGrid {
@@ -191,6 +192,14 @@ impl SceneRtGrid {
                 chosen.push((idx, true));
                 continue;
             }
+            if let Some(m) = &r.rt_mesh {
+                // written on the GPU: its own buffer and bounds
+                let (a, b) = transform_box(&r.world_matrix.to_glam(), m.min, m.max);
+                if a.cmple(hi + eps).all() && b.cmpge(lo - eps).all() {
+                    chosen.push((idx, false));
+                }
+                continue;
+            }
             if r.geometry.vertices.is_empty() || r.geometry.indices.is_empty() {
                 if self.warned.insert(idx) {
                     log::warn!("rt grid: renderable {idx} ({}) has no CPU geometry: left out", r.geometry.label);
@@ -237,6 +246,8 @@ impl SceneRtGrid {
                 let cut = gpu.cut(slot as u32).unwrap();
                 let entries = GatherCount::Word { args: cut.args(), word: crate::clusters::CLAIMED_WORD as u32, at_most: cut.capacity() };
                 (GatherMesh::Clusters { buffer: gpu.mesh_buffer(), draws: cut.draws() }, entries)
+            } else if let Some(m) = &r.rt_mesh {
+                (GatherMesh::Mesh { buffer: &m.buffer, triangles: m.triangles }, count)
             } else {
                 let m = &self.meshes[&idx];
                 (GatherMesh::Mesh { buffer: &m.buffer, triangles: m.triangles }, count)
