@@ -87,12 +87,19 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     textureStore(historyOut, px, vec4f(result.rgb, select(0.0, 1.0, fresh || history.a > 0.5)));
     let eye = rp.invView[3].xyz;
     let cosT = max(dot(normalize(eye - s.world), s.n), 0.0);
-    let fresnel = s.f0 + (max(1.0 - s.roughness, s.f0) - s.f0) * pow(1.0 - cosT, 5.0);
+    var fresnel = s.f0 + (max(1.0 - s.roughness, s.f0) - s.f0) * pow(1.0 - cosT, 5.0);
+    // glass (RT_REFLECT_GLASS_SHARED): its exact Fresnel, over the light through it, which the glass
+    // pass already weighed by 1 - F
+    var under = 1.0 - fresnel;
+    if (s.glass) {
+        fresnel = rtFresnelDielectric(cosT, 1.0, s.ior);
+        under = 1.0;
+    }
     let reflection = result.rgb * rp.intensity;
     switch (rp.view) {
         case 1u: { textureStore(outTex, px, vec4f(fresnel * reflection, 1.0)); }
         case 2u: { textureStore(outTex, px, vec4f(reflection, 1.0)); }
         case 3u: { textureStore(outTex, px, vec4f(heat((current.a - 1.0) / 400.0) * rp.heatScale, 1.0)); }
-        default: { textureStore(outTex, px, vec4f(color.rgb * (1.0 - fresnel) + fresnel * reflection, color.a)); }
+        default: { textureStore(outTex, px, vec4f(color.rgb * under + fresnel * reflection, color.a)); }
     }
 }

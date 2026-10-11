@@ -29,6 +29,8 @@ const KANSEI_RT_ANY_HIT : u32 = 1u;
 const KANSEI_RT_SOLID : u32 = 2u;
 // glass triangles (KANSEI_RT_GLASS) are hit; without it rays pass straight through them
 const KANSEI_RT_GLASS_HITS : u32 = 4u;
+// coarse copies of surfaces drawn finely (KANSEI_RT_APPROXIMATE) are passed through
+const KANSEI_RT_NO_APPROXIMATE : u32 = 8u;
 const KANSEI_RT_BARY_EPSILON : f32 = 1e-6;
 
 fn kansei_rt_bounds_min() -> vec3f {
@@ -117,11 +119,14 @@ fn kansei_rt_intersect(o: vec3f, d: vec3f, v0: vec3f, e1: vec3f, e2: vec3f, tMin
 }
 
 // Test triangle `id`, closer than the hit so far; alpha-tested ones where kansei_rt_covered says,
-// glass only with KANSEI_RT_GLASS_HITS.
+// glass only with KANSEI_RT_GLASS_HITS, coarse copies not with KANSEI_RT_NO_APPROXIMATE.
 fn kansei_rt_test(hit: ptr<function, KanseiRtHit>, o: vec3f, d: vec3f, tMin: f32, id: u32, flags: u32) -> bool {
     let a = kansei_rt_triangles[id * 4u];
     let surface = bitcast<u32>(a.w);
     if ((surface & KANSEI_RT_GLASS) != 0u && (flags & KANSEI_RT_GLASS_HITS) == 0u) {
+        return false;
+    }
+    if ((surface & KANSEI_RT_APPROXIMATE) != 0u && (flags & KANSEI_RT_NO_APPROXIMATE) != 0u) {
         return false;
     }
     let r = kansei_rt_intersect(o, d, a.xyz, kansei_rt_triangles[id * 4u + 1u].xyz, kansei_rt_triangles[id * 4u + 2u].xyz, tMin, (*hit).t);

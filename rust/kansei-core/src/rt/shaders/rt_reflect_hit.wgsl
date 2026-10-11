@@ -43,10 +43,12 @@ fn rtLit(o: vec3f, to: vec3f) -> f32 {
     return rtVisible(o, (to - o) / dist, dist - 1e-3);
 }
 
-// The light leaving a hit the camera doesn't see (a Lambertian surface of the triangle's albedo):
+// The light leaving a hit the camera doesn't see (a Lambertian surface of `albedo`, the
+// includer's kansei_rt_hit_albedo: the triangle's, or its texture's where it has one; plus the
+// includer's kansei_rt_hit_caustics):
 // the lights' direct light, shadowed by rays through the grid, plus the irradiance the voxels hold
 // round it (srcIrradiance, voxel GI's own hemisphere of cones).
-fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, triangle: u32) -> vec3f {
+fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
     let o = p + ng * (0.05 * kansei_rt_grid.cell);
     var e = vec3f(0.0);
     for (var i = 0u; i < rtLights.numDir; i++) {
@@ -80,9 +82,12 @@ fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, triangle: u32) -> vec3f {
         e += s.illuminance * ndl * rtLit(o, light.position);
     }
     if ((rp.flags & RT_REFLECT_NO_INDIRECT) == 0u) {
-        e += srcIrradiance(o, n);
+        e += srcIrradiance(o, n) * rp.indirectScale;
     }
-    return kansei_rt_albedo(triangle) / 3.14159265 * e;
+    // the light glass and water focus there (and take away), from the includer: none, or a caustics
+    // map (RtCausticsEffect)
+    e += kansei_rt_hit_caustics(p, n);
+    return albedo / 3.14159265 * max(e, vec3f(0.0));
 }
 
 fn rtHash(p: vec2u, frame: u32) -> vec2f {
@@ -114,8 +119,40 @@ fn rtIsGlass(id: u32) -> bool {
     return (bitcast<u32>(kansei_rt_triangles[id * 4u].w) & KANSEI_RT_GLASS) != 0u;
 }
 
-// The lit image at p, when the camera sees p from the side `n` faces (rgb, and 1; else 0).
+// The lit image at pixel q where it shows the surface at p (within `tolerance`, facing `n`): rgb
+// and 1, or 0.
+fn rtScreenAt(q: vec2u, p: vec3f, n: vec3f, tolerance: f32) -> vec4f {
+    let depth = textureLoad(depthTex, q, 0);
+    if (depth >= 1.0) {
+        return vec4f(0.0);
+    }
+    // (the glass pass's own image has no glass drawn yet: RT_SCREEN_HAS_GLASS, which the pass sets)
+    if (!RT_SCREEN_HAS_GLASS && rtIsGlassAlbedo(textureLoad(albedoTex, q, 0).a)) {
+        return vec4f(0.0);
+    }
+    let seen = rtWorldPos((vec2f(q) + 0.5) / rp.fullSize, depth);
+    if (distance(seen, p) > tolerance) {
+        return vec4f(0.0);
+    }
+    // the same surface, not another within the tolerance (a foot's edge over the floor beside
+    // it, whose dark pixels would smear along the floor): its normal too
+    let seenN = textureLoad(normalTex, q, 0).xyz * 2.0 - 1.0;
+    if (dot(seenN, seenN) < 1e-4 || dot(normalize(seenN), n) < 0.8) {
+        return vec4f(0.0);
+    }
+    return vec4f(textureLoad(screenTex, q, 0).rgb, 1.0);
+}
+
+// The lit image at p, when the camera sees p from the side `n` faces (rgb, and 1; else 0). Where
+// something thin in front hides p (a leg over the floor), the pixels beside it on the same surface
+// stand in: a hidden strip lit by the traced fallback instead (another estimate of the indirect
+// light) shows in a mirror as a streak behind each leg.
 fn rtScreenRadiance(p: vec3f, n: vec3f) -> vec4f {
+    return rtScreenRadianceAt(p, n, true);
+}
+
+// The same, beside thin occluders only with `search`.
+fn rtScreenRadianceAt(p: vec3f, n: vec3f, search: bool) -> vec4f {
     let eye = rp.invView[3].xyz;
     if (dot(n, eye - p) <= 0.0) {
         return vec4f(0.0);
@@ -129,32 +166,66 @@ fn rtScreenRadiance(p: vec3f, n: vec3f) -> vec4f {
         return vec4f(0.0);
     }
     let px = vec2u(uv * rp.fullSize);
-    let depth = textureLoad(depthTex, px, 0);
-    if (depth >= 1.0) {
-        return vec4f(0.0);
-    }
-    // (the glass pass's own image has no glass drawn yet: RT_SCREEN_HAS_GLASS, which the pass sets)
-    if (!RT_SCREEN_HAS_GLASS && rtIsGlassAlbedo(textureLoad(albedoTex, px, 0).a)) {
-        return vec4f(0.0);
-    }
-    let seen = rtWorldPos((vec2f(px) + 0.5) / rp.fullSize, depth);
     let tolerance = max(1.5 * kansei_rt_grid.cell, 0.01 * distance(eye, p));
-    if (distance(seen, p) > tolerance) {
+    let direct = rtScreenAt(px, p, n, tolerance);
+    if (direct.a > 0.5 || !search) {
+        return direct;
+    }
+    // hidden by something nearer? then the same surface a few pixels either side
+    let depth = textureLoad(depthTex, px, 0);
+    // (by a few centimetres: a toe just in front of the floor counts)
+    if (depth >= 1.0 || distance(eye, rtWorldPos((vec2f(px) + 0.5) / rp.fullSize, depth)) > distance(eye, p) - 0.03) {
         return vec4f(0.0);
     }
-    return vec4f(textureLoad(screenTex, px, 0).rgb, 1.0);
+    let last = vec2i(rp.fullSize) - 1;
+    for (var step = 1; step <= 8; step++) {
+        let d = step * step * 2;
+        for (var side = 0; side < 4; side++) {
+            let o = select(vec2i(select(-d, d, side == 1), 0), vec2i(0, select(-d, d, side == 3)), side >= 2);
+            let q = vec2u(clamp(vec2i(px) + o, vec2i(0), last));
+            // its own point need only lie on p's plane, near p
+            let dq = textureLoad(depthTex, q, 0);
+            if (dq >= 1.0) {
+                continue;
+            }
+            let seen = rtWorldPos((vec2f(q) + 0.5) / rp.fullSize, dq);
+            if (abs(dot(seen - p, n)) > tolerance || distance(seen, p) > 1.0) {
+                continue;
+            }
+            let s = rtScreenAt(q, seen, n, tolerance);
+            if (s.a > 0.5) {
+                return s;
+            }
+        }
+    }
+    return vec4f(0.0);
 }
+
+// Light the hits the camera doesn't see from the voxels' surface cache alone (srcHitRadiance), not
+// the lights: for a ray whose light counts for little (a weak Fresnel reflection, set by the glass
+// pass around its reflection ray).
+var<private> rtCheapHits : bool = false;
 
 // A hit at p on `triangle` (geometric normal ng facing the ray's origin, barycentrics bary).
 fn rtHitRadiance(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f) -> vec3f {
     if ((rp.flags & RT_REFLECT_SCREEN) != 0u) {
-        let s = rtScreenRadiance(p, ng);
+        let s = rtScreenRadianceAt(p, ng, false);
         if (s.a > 0.5) {
             return s.rgb;
         }
+        // a surface that lights itself, seen only through the refractive pass (water): the
+        // includer's background image (none in TS); then the screen beside thin occluders
+        let b = kansei_rt_hit_background(p, ng, triangle, bary);
+        if (b.a > 0.5) {
+            return b.rgb;
+        }
+        let beside = rtScreenRadianceAt(p, ng, true);
+        if (beside.a > 0.5) {
+            return beside.rgb;
+        }
     }
-    if ((rp.flags & RT_REFLECT_DIRECT) != 0u) {
-        return rtLitHit(p, ng, kansei_rt_shading_normal(triangle, bary, ng), triangle);
+    if ((rp.flags & RT_REFLECT_DIRECT) != 0u && !rtCheapHits) {
+        return rtLitHit(p, ng, kansei_rt_shading_normal(triangle, bary, ng), kansei_rt_hit_albedo(triangle, bary));
     }
     return srcHitRadiance(p, ng);
 }
@@ -192,11 +263,15 @@ fn rtSceneRay(origin: vec3f, d: vec3f, n: vec3f, tanHalf: f32, traceFlags: u32) 
         }
         let p = o + d * hit.t;
         if (glass && rtIsGlass(hit.triangle)) {
-            let s = rtScreenRadiance(p, hit.normal);
-            if (s.a > 0.5) {
-                out.radiance = s.rgb;
-                out.found = true;
-                return out;
+            // (not the coarse copy of the surface the ray left, RtSurface::with_approximate)
+            let copy = (bitcast<u32>(kansei_rt_triangles[hit.triangle * 4u].w) & KANSEI_RT_APPROXIMATE) != 0u && distance(p, origin) < 0.3;
+            if (!copy) {
+                let s = rtScreenRadiance(p, hit.normal);
+                if (s.a > 0.5) {
+                    out.radiance = s.rgb;
+                    out.found = true;
+                    return out;
+                }
             }
             o = p + d * (0.05 * kansei_rt_grid.cell);
             continue;

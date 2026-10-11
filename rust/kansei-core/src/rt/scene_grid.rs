@@ -40,10 +40,11 @@ pub struct SceneRtGridStats {
     pub cpu_ms: f64,
 }
 
-/// A renderable's mesh for the gather: its vertex and index counts when made, its bounds, its
-/// buffer and triangles.
+/// A renderable's mesh for the gather: its vertex and index counts and geometry revision when
+/// made, its bounds, its buffer and triangles.
 struct SceneMesh {
     counts: (u32, u32),
+    revision: u32,
     min: Vec3,
     max: Vec3,
     buffer: wgpu::Buffer,
@@ -60,7 +61,10 @@ struct SceneMesh {
 /// on the GPU each clustered renderable's draw list, each instanced one's culled records (times
 /// its mesh, placed by `Renderable::rt_placement`), and each single mesh whose world box meets the
 /// grid's (one box test per renderable on the CPU). It rebuilds when the box moves, when the
-/// static renderables in it change (transform, visibility, surface), when a cut it gathered grew,
+/// static renderables in it change (transform, visibility, surface, `Geometry::revision`: a mesh
+/// whose CPU vertices were moved, such as a skinned proxy posed on the CPU, or whose
+/// `Renderable::rt_mesh` the GPU rewrote), when a cut it
+/// gathered grew,
 /// on `invalidate`, and every frame while a `dynamic` one is in it.
 pub struct SceneRtGrid {
     options: SceneRtGridOptions,
@@ -188,6 +192,14 @@ impl SceneRtGrid {
                 chosen.push((idx, true));
                 continue;
             }
+            if let Some(m) = &r.rt_mesh {
+                // written on the GPU: its own buffer and bounds
+                let (a, b) = transform_box(&r.world_matrix.to_glam(), m.min, m.max);
+                if a.cmple(hi + eps).all() && b.cmpge(lo - eps).all() {
+                    chosen.push((idx, false));
+                }
+                continue;
+            }
             if r.geometry.vertices.is_empty() || r.geometry.indices.is_empty() {
                 if self.warned.insert(idx) {
                     log::warn!("rt grid: renderable {idx} ({}) has no CPU geometry: left out", r.geometry.label);
@@ -195,9 +207,11 @@ impl SceneRtGrid {
                 continue;
             }
             let counts = (r.geometry.vertex_count(), r.geometry.index_count());
-            if self.meshes.get(&idx).is_none_or(|m| m.counts != counts) {
+            // read again when its counts or its vertices (`Geometry::revision`) changed
+            let revision = r.geometry.revision;
+            if self.meshes.get(&idx).is_none_or(|m| m.counts != counts || m.revision != revision) {
                 let mesh = RtMesh::from_geometry(&r.geometry);
-                self.meshes.insert(idx, SceneMesh { counts, min: mesh.min, max: mesh.max, buffer: mesh.create_buffer(device), triangles: mesh.triangle_count() });
+                self.meshes.insert(idx, SceneMesh { counts, revision, min: mesh.min, max: mesh.max, buffer: mesh.create_buffer(device), triangles: mesh.triangle_count() });
             }
             let m = &self.meshes[&idx];
             if r.geometry.instance_buffers.is_empty() {
@@ -232,6 +246,8 @@ impl SceneRtGrid {
                 let cut = gpu.cut(slot as u32).unwrap();
                 let entries = GatherCount::Word { args: cut.args(), word: crate::clusters::CLAIMED_WORD as u32, at_most: cut.capacity() };
                 (GatherMesh::Clusters { buffer: gpu.mesh_buffer(), draws: cut.draws() }, entries)
+            } else if let Some(m) = &r.rt_mesh {
+                (GatherMesh::Mesh { buffer: &m.buffer, triangles: m.triangles }, count)
             } else {
                 let m = &self.meshes[&idx];
                 (GatherMesh::Mesh { buffer: &m.buffer, triangles: m.triangles }, count)

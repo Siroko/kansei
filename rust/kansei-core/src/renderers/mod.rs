@@ -8,4 +8,4 @@ pub use renderer::{Renderer, RendererConfig, RequiredLimits};
 pub use gbuffer::GBuffer;
 pub use compute_batch::ComputeBatch;
 pub use readback::BufferReadback;
-pub use shared_layouts::{SharedLayouts, BindGroupSlot};
+pub use shared_layouts::{SharedLayouts, BindGroupSlot, MaterialProgram, MaterialPrograms};

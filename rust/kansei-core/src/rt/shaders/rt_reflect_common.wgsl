@@ -24,7 +24,7 @@ struct RtReflectParams {
     viewProj     : mat4x4f,   // world -> this frame's clip space (the hits looked up on screen)
     glassInterfaces : u32,    // the most surfaces a ray through the glass crosses or reflects off
     glassSamples : u32,       // paths a frosted glass pixel a frame (averaged, then over frames)
-    _pad2        : u32,
+    indirectScale : f32,      // scale of the voxels' irradiance at the hits the camera doesn't see
     _pad3        : u32,
 }
 
@@ -44,6 +44,11 @@ const RT_REFLECT_ANISO : u32 = 64u;
 const RT_REFLECT_NO_INDIRECT : u32 = 128u;
 // glass is drawn (rt_glass.wgsl): the rays hit the grid's glass triangles too
 const RT_REFLECT_GLASS : u32 = 256u;
+// the glass's reflections are traced here with the other surfaces' (RtGlass::reflections_in_trace):
+// the glass pass draws the light through it alone, and the resolve adds the reflection
+const RT_REFLECT_GLASS_SHARED : u32 = 512u;
+// the glass pass traces half its pixels a frame, a checkerboard (RtGlass::checkerboard)
+const RT_REFLECT_GLASS_CHECKER : u32 = 1024u;
 
 fn rtViewPos(uv: vec2f, depth: f32) -> vec3f {
     let p = rp.invProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
@@ -81,33 +86,60 @@ fn rtIsGlassAlbedo(a: f32) -> bool {
 
 // A reflective surface at a pixel: valid where the depth holds a surface whose material wrote a
 // normal and an F0 (GBUFFER_OUT_WGSL's kansei_gbuffer_out_specular stores 1 - F0 in the normal's
-// alpha and 1 - roughness / 2 in the albedo's; kansei_gbuffer_out leaves both at 1), not glass.
+// alpha and 1 - roughness / 2 in the albedo's; kansei_gbuffer_out leaves both at 1); glass only
+// with RT_REFLECT_GLASS_SHARED (its F0 from its index of refraction, its normal facing the eye).
 struct RtSurfacePixel {
     world     : vec3f,
     n         : vec3f,
     f0        : f32,
     roughness : f32,
     valid     : bool,
+    glass     : bool,
+    ior       : f32,
 }
 
 fn rtSurface(px: vec2u) -> RtSurfacePixel {
     var s : RtSurfacePixel;
     let depth = textureLoad(depthTex, px, 0);
     let raw = textureLoad(normalTex, px, 0);
-    s.f0 = clamp(1.0 - raw.w, 0.0, 1.0);
-    s.valid = depth < 1.0 && dot(raw.xyz, raw.xyz) > 1e-4 && s.f0 > 1e-3;
+    let a = textureLoad(albedoTex, px, 0).a;
+    s.valid = depth < 1.0 && dot(raw.xyz, raw.xyz) > 1e-4;
     if (!s.valid) {
         return s;
     }
-    let a = textureLoad(albedoTex, px, 0).a;
+    s.world = rtWorldPos((vec2f(px) + 0.5) / rp.fullSize, depth);
+    s.n = normalize(raw.xyz * 2.0 - 1.0);
     if (rtIsGlassAlbedo(a)) {
-        s.valid = false;
+        s.valid = (rp.flags & RT_REFLECT_GLASS_SHARED) != 0u;
+        s.glass = true;
+        s.ior = 1.0 / clamp(raw.w, 0.05, 1.0);
+        let r0 = (s.ior - 1.0) / (s.ior + 1.0);
+        s.f0 = r0 * r0;
+        let roughness = clamp((0.45 - a) / 0.4, 0.0, 1.0);
+        // (8-bit: a clear glass's alpha reads a hair off 0.45)
+        s.roughness = select(roughness, 0.0, roughness < 0.01);
+        if (dot(s.n, rp.invView[3].xyz - s.world) < 0.0) {
+            s.n = -s.n;
+        }
         return s;
     }
-    s.n = normalize(raw.xyz * 2.0 - 1.0);
+    s.f0 = clamp(1.0 - raw.w, 0.0, 1.0);
+    s.valid = s.f0 > 1e-3;
     s.roughness = clamp(2.0 * (1.0 - a), 0.0, 1.0);
-    s.world = rtWorldPos((vec2f(px) + 0.5) / rp.fullSize, depth);
     return s;
+}
+
+// The reflectance of a smooth dielectric surface for unpolarized light, from a medium of index
+// etaI into one of etaT at the incidence cosine cosI (1 past the critical angle).
+fn rtFresnelDielectric(cosI: f32, etaI: f32, etaT: f32) -> f32 {
+    let sinT = etaI / etaT * sqrt(max(1.0 - cosI * cosI, 0.0));
+    if (sinT >= 1.0) {
+        return 1.0;
+    }
+    let cosT = sqrt(max(1.0 - sinT * sinT, 0.0));
+    let rs = (etaI * cosI - etaT * cosT) / (etaI * cosI + etaT * cosT);
+    let rpar = (etaT * cosI - etaI * cosT) / (etaT * cosI + etaI * cosT);
+    return 0.5 * (rs * rs + rpar * rpar);
 }
 
 // The half-angle's tangent of a rough surface's reflection lobe (GGX's alpha, roughness squared).

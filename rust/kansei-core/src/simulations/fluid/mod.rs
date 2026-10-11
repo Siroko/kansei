@@ -19,6 +19,7 @@ mod activity;
 mod emitter;
 mod fill;
 mod stepper;
+mod heightfield;
 
 pub use params::{FluidSimulationOptions, FluidSolver, PbfOptions, DEFAULT_OPTIONS};
 pub use simulation::{FluidSimulation, FluidSubstepPass};
@@ -28,6 +29,7 @@ pub use colliders::{FluidCapsule, FluidColliders, FluidCollidersOptions};
 pub use emitter::FluidNozzle;
 pub use fill::{fill_box, lattice_density};
 pub use stepper::{FluidStepper, WorldScale};
+pub use heightfield::{FluidHeightfield, FluidHeightfieldOptions, WATER_RIPPLES_WGSL};
 pub use density_field::{FluidDensityField, DensityFieldOptions};
 pub use surface_renderer::FluidSurfaceRenderer;
 pub use particle_renderer::FluidParticleRenderer;
