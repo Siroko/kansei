@@ -198,6 +198,26 @@
         bind(water, 'fluid_speed', { label: 'time scale', min: 0.1, max: 3, step: 0.05 });
         bind(water, 'fluid_substeps', { label: 'substeps', min: 1, max: 12, step: 1 });
         bind(water, 'fluid_gravity', { label: 'gravity (m/s²)', min: 0, max: 30, step: 0.1 });
+        // the surface's resolution and the fluid's box (Pond::rebuild_surface: field, marching
+        // cubes and the grid's mesh made again, live; sent when a slider is let go)
+        const res = water.addFolder({ title: 'surface resolution & box', expanded: true });
+        const rebuild = (key, opts = {}) => res.addBinding(p, key, opts).on('change', (ev) => { if (ev.last !== false) set(key, ev.value); });
+        rebuild('fluid_res', { label: 'field voxels (longest side)', min: 64, max: 384, step: 16 });
+        rebuild('fluid_mc_max', { label: 'marching cubes max triangles', min: 100000, max: 2000000, step: 50000 });
+        rebuild('fluid_rt_spacing', { label: 'RT grid mesh spacing (m)', min: 0.1, max: 0.5, step: 0.01 });
+        bind(res, 'fluid_drop', { label: 'droplet radius (m)', min: 0.01, max: 0.1, step: 0.001 });
+        bind(res, 'fluid_splat', { label: 'splat radius, smoothing (m)', min: 0.05, max: 0.3, step: 0.005 });
+        bind(res, 'fluid_bounds_show', { label: 'show bounds' });
+        for (const k of ['min_x', 'min_y', 'min_z', 'max_x', 'max_y', 'max_z']) rebuild('fluid_' + k, { label: k.replace('_', ' ') + ' (m)', step: 0.05 });
+        // what it is built at, read back (room.info().fluid)
+        const built = { surface: '' };
+        res.addBinding(built, 'surface', { label: 'built', readonly: true, multiline: true, rows: 4, interval: 1000 });
+        setInterval(() => {
+            if (pane.hidden || water.expanded === false) return;
+            const f = window.room.info().fluid;
+            if (!f) return;
+            built.surface = `${f.dims.join('×')} voxels\n${f.cell_cm.map((c) => c.toFixed(1)).join('×')} cm each\nRT ${f.rt_mesh.join('×')}, ${f.rt_spacing_cm.toFixed(0)} cm\ndrop ${f.drop_cm.toFixed(1)}, splat ${f.splat_cm.toFixed(1)} cm`;
+        }, 1000);
         bind(water, 'fluid_damping', { label: 'damping', min: 0.9, max: 1, step: 0.001 });
         const sph = water.addFolder({ title: 'SPH', expanded: false });
         bind(sph, 'fluid_viscosity', { label: 'viscosity', min: 0, max: 2, step: 0.01 });

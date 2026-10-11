@@ -219,6 +219,22 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   the plinth's top and the bed with both. The map costs 0.5 ms (fed every other frame,
   `caustics_every`; four times as seldom with the pond out of view), the lines up to 0.7 in the
   glass pass where the bed fills the screen.
+- **The water's surface and box** (the panel's Fluid → surface resolution & box; `room.info().fluid`
+  reads back what it is built at). The surface is interpolated marching cubes over a surface field
+  of `fluid_res` voxels along the box's longest side (256: 193 x 32 x 256 voxels of 5.7 cm over
+  the 11 x 1.8 x 14.6 m box), at most `fluid_mc_max` triangles (500000), a lone particle a droplet
+  of `fluid_drop` (4.1 cm) and each splatted over `fluid_splat` (13.6 cm, the smoothing); the
+  ray tracing grid's copy is a height-field mesh `fluid_rt_spacing` apart (30 cm, 37 x 49
+  vertices). The box (`fluid_min_x` ... `fluid_max_z`, world metres, the pond's own unless the URL
+  names it; `fluid_bounds_show` draws it) is the simulation's bounds and the surface's. A change
+  makes the field, the marching cubes, the height field and the grid's copy again, live (a slider
+  sends when let go); a new box also refits the simulation's neighbour grid and fills the pond
+  again with the water within it (squeezed in instead, the water outside blew up). The droplet
+  and splat radii are live. Cost with the water running (`dragon`, `fluid_rest=0`): 128 voxels
+  24.8 ms, 192 25.3, 256 27.1, 320 28.7, 384 32.7; the grid's mesh at 15 cm +0.6 ms (its triangles
+  in the reflections' and the glass's traces), 50 cm the same as 30; the triangles' cap costs
+  nothing until the surface needs them. At rest (the default) the surface isn't extracted, so
+  its resolution costs nothing per frame.
 - **Glass and water quality** (the panel's preset, `quality=`). `game` (the default): the
   checkerboard, the glass's reflections at half resolution, the water's caustic lines, the glass's
   caustics 3x and sharper, photons from the lights' centres. `high`: every glass pixel and its own reflection, photons

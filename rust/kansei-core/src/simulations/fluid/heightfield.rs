@@ -194,6 +194,11 @@ impl FluidHeightfield {
     }
 
     /// The mesh for the ray tracing grid (`Renderable::rt_mesh`).
+    /// The grid's mesh: its vertices along x and z (`rt_spacing` apart).
+    pub fn mesh_dims(&self) -> [u32; 2] {
+        self.mesh_dims
+    }
+
     pub fn rt_mesh(&self) -> &RtGpuMesh {
         &self.mesh
     }

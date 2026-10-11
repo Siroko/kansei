@@ -783,6 +783,7 @@ impl RoomState {
         };
         if let (Some(pond), true) = (&mut self.pond, changed(fluid)) {
             if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
+                pond.rebuild_surface(&self.renderer, &mut self.scene, surface, &s);
                 pond.apply(&mut self.scene, surface, &s);
             }
         }
@@ -879,11 +880,15 @@ impl RoomState {
         let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
+            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.settings.json(),
             self.view.unwrap_or("follow"),
             self.player.character.is_some(),
             self.pond.as_ref().map_or(0, Pond::particles),
+            match (&self.pond, self.volume.effect::<FluidSurfaceEffect>()) {
+                (Some(pond), Some(surface)) => pond.surface_json(surface),
+                _ => "null".into(),
+            },
             self.proxy.as_ref().map_or(Vec::new(), |p| p.triangles(&self.scene)),
             grid.map_or(0, |g| g.grid.triangles),
             grid.map_or(0, |g| g.rebuilds),
@@ -932,7 +937,7 @@ where
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
     renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: BOUNDS_MIN, bounds_max: BOUNDS_MAX, radiance_scale: 1.0, budget_bytes: 0 });
     renderer.enable_rt_grid(grid_options());
-    let settings = Settings::from_url();
+    let mut settings = Settings::from_url();
     let deferred = settings.shadows == "rt";
 
     set_text("hud", "Loading the room …");
@@ -943,6 +948,13 @@ where
     let (pond, surface) = match with_pond {
         true => {
             let (p, s) = Pond::new(&renderer, &mut scene, &mut layout.collision, &assets);
+            // the fluid's box: the pond's own, unless the URL names it
+            let (min, max) = p.bounds();
+            for (name, value) in ["fluid_min_x", "fluid_min_y", "fluid_min_z", "fluid_max_x", "fluid_max_y", "fluid_max_z"].iter().zip(min.iter().chain(&max)) {
+                if kansei_wasm::param(name).is_none() {
+                    settings.set(name, &format!("{:.3}", value));
+                }
+            }
             (Some(p), Some(s))
         }
         false => (None, None),

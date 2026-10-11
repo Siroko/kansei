@@ -20,8 +20,9 @@
 use glam::{Mat4, Vec3 as GVec3};
 
 use kansei_core::collision::{CollisionWorld, Shape, TriangleMesh};
-use kansei_core::geometries::{CylinderGeometry, Geometry, Vertex};
+use kansei_core::geometries::{BoxGeometry, CylinderGeometry, Geometry, Vertex};
 use kansei_core::gi::GiSurface;
+use kansei_core::materials::Material;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{FluidGlassSurface, FluidSurfaceEffect, FluidSurfaceOptions};
 use kansei_core::renderers::Renderer;
@@ -68,6 +69,60 @@ const WATER_TINT: [f32; 3] = [0.12, 0.45, 0.5];
 /// its updates while the water moves.
 const GRID_SPACING: f32 = 0.3;
 const GRID_EVERY: u32 = 4;
+/// The surface field's voxels along the box's longest side, the marching cubes' triangles at
+/// most, a lone particle's droplet radius and the particles' splat radius (simulation units: 4.1
+/// and 13.6 cm): the surface's defaults (`settings::Settings::fluid_res`, `fluid_mc_max`,
+/// `fluid_drop`, `fluid_splat`).
+pub const RESOLUTION: u32 = 256;
+pub const MAX_TRIANGLES: u32 = 500_000;
+const DROP_RADIUS: f32 = 0.45;
+const SPLAT_RADIUS: f32 = 1.5;
+/// The fluid's box (world metres) over the bed: from a little under it to over the plinth.
+const BOX_Y: [f32; 2] = [-DEPTH - 0.1, 1.3];
+/// The bounds' wireframe: its edges' thickness (m) and glow (cd/m²).
+const EDGE: f32 = 0.025;
+const EDGE_RADIANCE: [f32; 3] = [600.0, 380.0, 60.0];
+
+/// What the water's surface is built at: rebuilt (`Pond::rebuild_surface`) when one changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SurfaceBuild {
+    resolution: u32,
+    max_triangles: u32,
+    rt_spacing: f32,
+    /// the fluid's box, world metres
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+/// The surface field's kernel over a lattice of particles at rest (see `DensityFieldOptions`).
+fn kernel_scale() -> f32 {
+    1.0 / (SPACING.powi(-3) * 0.638 * 1.5f32.powi(3))
+}
+
+/// The surface field over `sim`'s bounds, `resolution` voxels along the longest side.
+fn density_field(renderer: &Renderer, sim: &FluidSimulation, resolution: u32, drop: f32) -> FluidDensityField {
+    FluidDensityField::new(renderer, sim.positions_buffer().unwrap(), sim.world_bounds_min, sim.world_bounds_max, DensityFieldOptions { resolution, kernel_scale: kernel_scale(), particle_radius: Some(drop) })
+}
+
+/// The twelve edges of the box `min`-`max`: each a centre and a size.
+fn box_edges(min: GVec3, max: GVec3) -> [(GVec3, GVec3); 12] {
+    let (c, d) = ((min + max) * 0.5, max - min);
+    let mut edges = [(GVec3::ZERO, GVec3::ZERO); 12];
+    let mut k = 0;
+    for axis in 0..3 {
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        for (sa, sb) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+            let mut at = c;
+            at[a] += d[a] * sa;
+            at[b] += d[b] * sb;
+            let mut size = GVec3::splat(EDGE);
+            size[axis] = d[axis] + EDGE;
+            edges[k] = (at, size);
+            k += 1;
+        }
+    }
+    edges
+}
 
 /// The bed's stones (`settings::Settings::fluid_bed`) and their roughness scale, the first shown at
 /// first.
@@ -163,6 +218,12 @@ pub struct Pond {
     show: bool,
     splash_push: f32,
     poke: bool,
+    /// What the surface is built at, and frames left to extract it whatever the water's state
+    /// (after a rebuild, the new mesh is empty until it is extracted).
+    build: SurfaceBuild,
+    extract_frames: u32,
+    /// The fluid's box drawn as a wireframe (`fluid_bounds_show`): its edges' renderables.
+    edges: Vec<usize>,
 }
 
 impl Pond {
@@ -255,8 +316,8 @@ impl Pond {
             &particles,
             count,
         );
-        sim.world_bounds_min = [lo[0], (-DEPTH - 0.1) * SIM_SCALE, lo[1]];
-        sim.world_bounds_max = [hi[0], 1.3 * SIM_SCALE, hi[1]];
+        sim.world_bounds_min = [lo[0], BOX_Y[0] * SIM_SCALE, lo[1]];
+        sim.world_bounds_max = [hi[0], BOX_Y[1] * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
         let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.002 });
         let colliders = FluidColliders::new(&sim, COLLIDERS, FluidCollidersOptions { restitution: 0.3, drag: 0.6 });
@@ -266,14 +327,8 @@ impl Pond {
         plinth.set(&[FluidCapsule::new([0.0, -(DEPTH + 0.5) * SIM_SCALE - r, 0.0], [0.0, (PLINTH_TOP + 0.3) * SIM_SCALE, 0.0], r, [0.0; 3], [0.0; 3])]);
 
         // its surface: the lake's droplets surface field, interpolated marching cubes
-        let density = FluidDensityField::new(
-            renderer,
-            sim.positions_buffer().unwrap(),
-            sim.world_bounds_min,
-            sim.world_bounds_max,
-            DensityFieldOptions { resolution: 256, kernel_scale: 1.0 / (SPACING.powi(-3) * 0.638 * 1.5f32.powi(3)), particle_radius: Some(0.45) },
-        );
-        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: 500_000, iso_level: 1.0 });
+        let density = density_field(renderer, &sim, RESOLUTION, DROP_RADIUS);
+        let mut marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: MAX_TRIANGLES, iso_level: 1.0 });
         marching_cubes.set_use_classic(true);
         let marching_cubes_bg = marching_cubes.create_bind_group(renderer, &density.density_view);
         let mut surface = FluidSurfaceEffect::new(
@@ -300,7 +355,7 @@ impl Pond {
                 sky_reflection: 0.6,
             },
         );
-        surface.splat_radius = Some(1.5);
+        surface.splat_radius = Some(SPLAT_RADIUS);
         // other materials write the GBuffer's normals too (for the GI): the fluid is where its
         // material marks the emissive alpha
         surface.mask = kansei_core::postprocessing::effects::FluidMask::EmissiveAlpha;
@@ -326,6 +381,18 @@ impl Pond {
         surface.composite = false;
         let stepper = FluidStepper::new(STEP, MAX_STEPS, SCALE).with_rest(&surface.sim, FluidSleepOptions { cull_after: 1.5, settle_speed: SETTLE_SPEED, settle_after: 1.0 });
 
+        // the box's wireframe, hidden until asked for
+        let build = SurfaceBuild { resolution: RESOLUTION, max_triangles: MAX_TRIANGLES, rt_spacing: GRID_SPACING, min: sim_min.map(|v| v * s), max: sim_max.map(|v| v * s) };
+        let mut edges = Vec::new();
+        for (at, size) in box_edges(GVec3::from(build.min), GVec3::from(build.max)) {
+            let mut r = Renderable::new(BoxGeometry::new(1.0, 1.0, 1.0), Material::emissive("Pond/Bounds", EDGE_RADIANCE));
+            r.object.set_position(at.x, at.y, at.z);
+            r.object.scale = kansei_core::math::Vec3::new(size.x, size.y, size.z);
+            r.cast_shadow = false;
+            r.visible = false;
+            edges.push(scene.add(SceneNode::Renderable(r)));
+        }
+
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
         let pond = Self {
             container,
@@ -348,6 +415,9 @@ impl Pond {
             show: true,
             splash_push: SPLASH_PUSH,
             poke: false,
+            build,
+            extract_frames: 0,
+            edges,
         };
         (pond, surface)
     }
@@ -416,6 +486,14 @@ impl Pond {
         self.colliders.upload_uniform();
         self.splash_push = s.fluid_splash.max(0.0);
         surface.marching_cubes.set_use_classic(s.fluid_mesh != "voxels");
+        // the surface's droplets and splats (the rest of it, `rebuild_surface`)
+        surface.density_field.set_particle_radius(s.fluid_drop.clamp(0.005, 0.5) * SIM_SCALE);
+        surface.splat_radius = Some(s.fluid_splat.clamp(0.02, 1.0) * SIM_SCALE);
+        for &index in &self.edges {
+            if let Some(r) = scene.get_renderable_mut(index) {
+                r.visible = s.fluid_bounds_show;
+            }
+        }
         let o = &mut surface.options;
         o.ior = s.fluid_ior;
         // (the screen-space look's tint, as it was at its default)
@@ -427,10 +505,109 @@ impl Pond {
         self.poke = true;
     }
 
-    /// Fill the pond again, still: `fraction` of the full fill (its lowest particles).
+    /// The fluid's box (world metres) as built.
+    pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
+        (self.build.min, self.build.max)
+    }
+
+    /// The surface as built, for the page (`room.info()`'s `fluid`): the field's voxels a side and
+    /// their size (cm), the marching cubes' cap, the grid's mesh spacing (cm), the droplet and
+    /// splat radii (cm), the box (m).
+    pub fn surface_json(&self, surface: &FluidSurfaceEffect) -> String {
+        let dims = surface.density_field.tex_dims();
+        let (min, max) = (self.build.min, self.build.max);
+        let cell: Vec<String> = (0..3).map(|k| format!("{:.2}", (max[k] - min[k]) / dims[k] as f32 * 100.0)).collect();
+        format!(
+            "{{\"dims\":[{},{},{}],\"cell_cm\":[{}],\"max_triangles\":{},\"rt_spacing_cm\":{:.1},\"rt_mesh\":{:?},\"drop_cm\":{:.2},\"splat_cm\":{:.2},\"min\":[{}],\"max\":[{}]}}",
+            dims[0],
+            dims[1],
+            dims[2],
+            cell.join(","),
+            surface.marching_cubes.max_triangles(),
+            self.build.rt_spacing * 100.0,
+            surface.heightfield.as_ref().map_or([0, 0], |h| h.mesh_dims()),
+            surface.density_field.particle_radius().unwrap_or(0.0) / SIM_SCALE * 100.0,
+            surface.splat_radius.unwrap_or(0.0) / SIM_SCALE * 100.0,
+            min.map(|v| format!("{v:.3}")).join(","),
+            max.map(|v| format!("{v:.3}")).join(","),
+        )
+    }
+
+    /// Bring the surface's build to the settings (`fluid_res`, `fluid_mc_max`, `fluid_rt_spacing`,
+    /// the box `fluid_min_*`/`fluid_max_*`): what changed is made again (the field, the marching
+    /// cubes and their renderables' meshes, the height field and the grid's copy), live; a new box
+    /// moves the simulation's bounds too (its neighbour grid refitted) and fills the pond again
+    /// with the water within it (pushed in, the water outside piled up against the box and blew
+    /// up). False when nothing changed.
+    pub fn rebuild_surface(&mut self, renderer: &Renderer, scene: &mut Scene, surface: &mut FluidSurfaceEffect, s: &super::settings::Settings) -> bool {
+        let min = [s.fluid_min_x, s.fluid_min_y, s.fluid_min_z];
+        let max = [s.fluid_max_x, s.fluid_max_y, s.fluid_max_z];
+        // (an empty or inverted box keeps the old one)
+        let (min, max) = if (0..3).all(|k| max[k] - min[k] > 0.2) { (min, max) } else { (self.build.min, self.build.max) };
+        let want = SurfaceBuild {
+            resolution: s.fluid_res.round().clamp(16.0, 512.0) as u32,
+            max_triangles: s.fluid_mc_max.round().clamp(10_000.0, 4_000_000.0) as u32,
+            rt_spacing: s.fluid_rt_spacing.clamp(0.05, 1.0),
+            min,
+            max,
+        };
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-3);
+        let old = self.build;
+        let moved = !near(old.min, want.min) || !near(old.max, want.max);
+        if old.resolution == want.resolution && old.max_triangles == want.max_triangles && (old.rt_spacing - want.rt_spacing).abs() < 1e-4 && !moved {
+            return false;
+        }
+        let sim = &mut surface.sim;
+        if moved {
+            sim.world_bounds_min = want.min.map(|v| v * SIM_SCALE);
+            sim.world_bounds_max = want.max.map(|v| v * SIM_SCALE);
+            sim.rebuild_grid();
+            for (&index, (at, size)) in self.edges.iter().zip(box_edges(GVec3::from(want.min), GVec3::from(want.max))) {
+                if let Some(r) = scene.get_renderable_mut(index) {
+                    r.object.set_position(at.x, at.y, at.z);
+                    r.object.scale = kansei_core::math::Vec3::new(size.x, size.y, size.z);
+                }
+            }
+        }
+        if moved {
+            self.reset(surface, s.fluid_fill);
+        }
+        let drop = surface.density_field.particle_radius().unwrap_or(DROP_RADIUS);
+        let field = density_field(renderer, &surface.sim, want.resolution, drop);
+        if want.max_triangles != old.max_triangles {
+            let classic = surface.marching_cubes.use_classic();
+            surface.marching_cubes = FluidMarchingCubes::new(renderer, MarchingCubesOptions { max_triangles: want.max_triangles, iso_level: 1.0 });
+            surface.marching_cubes.set_use_classic(classic);
+            // the renderables draw the new mesh
+            let mc = &surface.marching_cubes;
+            for (index, label) in [(self.surface, "FluidSurface/Mesh"), (self.glass_surface, "FluidSurface/GlassMesh")] {
+                if let Some(r) = scene.get_renderable_mut(index) {
+                    r.geometry = Geometry::from_gpu_buffers(label, mc.vertex_buffer().clone(), mc.index_buffer().clone(), Some(mc.indirect_args_buffer().clone()));
+                }
+            }
+        }
+        surface.marching_cubes_bg = surface.marching_cubes.create_bind_group(renderer, &field.density_view);
+        let heightfield = FluidHeightfield::new(renderer.device(), renderer.queue(), &field, surface.sim.world_bounds_min, surface.sim.world_bounds_max, FluidHeightfieldOptions { iso: 1.0, world_scale: 1.0 / SIM_SCALE, rt_spacing: want.rt_spacing });
+        if let Some(r) = scene.get_renderable_mut(self.grid_water) {
+            r.rt_mesh = Some(heightfield.rt_mesh().clone());
+            r.geometry.revision = r.geometry.revision.wrapping_add(1);
+        }
+        surface.heightfield = Some(heightfield);
+        surface.density_field = field;
+        self.build = want;
+        self.extract_frames = 2;
+        self.poke = true;
+        true
+    }
+
+    /// Fill the pond again, still: `fraction` of the full fill (its lowest particles), those
+    /// within the fluid's box.
     pub fn reset(&mut self, surface: &mut FluidSurfaceEffect, fraction: f32) {
         let n = ((self.fill.len() / 4) as f32 * fraction.clamp(0.05, 1.0)) as usize;
-        surface.sim.reset_particles(&self.fill[..n * 4]);
+        let (lo, hi) = (surface.sim.world_bounds_min, surface.sim.world_bounds_max);
+        let inside = |p: &[f32]| (0..3).all(|k| p[k] > lo[k] + 0.1 && p[k] < hi[k] - 0.1);
+        let fill: Vec<f32> = self.fill[..n * 4].chunks_exact(4).filter(|p| inside(p)).flatten().copied().collect();
+        surface.sim.reset_particles(&fill);
         self.count = surface.sim.particle_count();
         self.previous.clear();
         self.splash = None;
@@ -509,13 +686,20 @@ impl Pond {
         self.colliders.set(&capsules);
         let (min, max) = surface.sim.bounds(0.0);
         let in_view = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), min / SIM_SCALE, max / SIM_SCALE);
+        // (a rebuilt surface is extracted once whatever the water does)
+        let rebuilt = self.extract_frames > 0 && in_view;
+        if rebuilt {
+            self.extract_frames -= 1;
+        }
         if !self.simulate || !self.show {
             // frozen: its last surface, no steps; hidden: nothing at all
             surface.set_activity(if in_view && self.show { FluidActivity::Asleep } else { FluidActivity::Culled });
+            surface.extract |= rebuilt && self.show;
             return;
         }
         let state = self.stepper.update_rest(&surface.sim, dt, in_view, disturbed);
         surface.set_activity(state);
+        surface.extract |= rebuilt;
         let steps = self.stepper.advance(dt);
         for _ in 0..steps {
             surface.sim.update_batched_with(self.stepper.step_dt(), 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.plinth, &self.container]);

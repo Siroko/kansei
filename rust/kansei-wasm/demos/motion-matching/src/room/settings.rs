@@ -175,6 +175,24 @@ settings! {
     fluid_render: String = "rt".into();
     fluid_bed: String = "marble".into();
     fluid_ripples: f32 = 1.0;
+    // the water's surface (`Pond::rebuild_surface`, made again on a change): the surface field's
+    // voxels along the box's longest side, the marching cubes' triangles at most, a lone
+    // particle's droplet radius and the particles' splat radius (m, live), the ray tracing grid's
+    // mesh spacing (m)
+    fluid_res: f32 = 256.0;
+    fluid_mc_max: f32 = 500000.0;
+    fluid_drop: f32 = 0.0409;
+    fluid_splat: f32 = 0.1364;
+    fluid_rt_spacing: f32 = 0.3;
+    // the fluid's box (world m: the simulation's bounds and the surface's), the pond's own unless
+    // the URL names them (set at start), and drawn as a wireframe
+    fluid_bounds_show: bool = false;
+    fluid_min_x: f32 = 0.0;
+    fluid_min_y: f32 = 0.0;
+    fluid_min_z: f32 = 0.0;
+    fluid_max_x: f32 = 0.0;
+    fluid_max_y: f32 = 0.0;
+    fluid_max_z: f32 = 0.0;
     // the caustics of the glass and the water (`RtCausticsEffect`): photons a light (a side), the
     // weight of a frame, the light's scale; the display spot over the dragon
     caustics: bool = true;
