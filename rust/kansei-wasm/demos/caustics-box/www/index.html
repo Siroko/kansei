@@ -111,7 +111,10 @@
         top.addButton({ title: 'Camera home (H)' }).on('click', () => caustics_home());
 
         const studio = pane.addFolder({ title: 'Studio & light' });
-        bind(studio, 'floor', { options: { white: 'white', grey: 'grey' } });
+        bind(studio, 'floor', { options: { white: 'white', grey: 'grey', 'lab checkerboard': 'checker' } });
+        bind(studio, 'checker_size', { label: 'checker square (m)', options: { '5 cm': 0.05, '10 cm': 0.1, '25 cm': 0.25, '50 cm': 0.5, '1 m': 1 } });
+        bind(studio, 'checker_lines', { label: 'checker metre lines' });
+        bind(studio, 'checker_axes', { label: 'checker axes' });
         bind(studio, 'floor_rough', { label: 'floor roughness (<0.6 reflects)', min: 0.05, max: 1, step: 0.01 });
         bind(studio, 'bg_white', { label: 'white background' });
         bind(studio, 'bg', { label: 'background (1: seamless)', min: 0, max: 3, step: 0.01 });

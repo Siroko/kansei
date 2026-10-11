@@ -41,6 +41,13 @@ them from the gi-box example's folder beside its own.
 
 ## What it shows
 
+- **The floor** (`floor=white|grey|checker`): white, an 18% grey, or a lab's checkerboard
+  (`checker_size` squares of 5 cm to 1 m, light and mid grey, `checker_lines` thin metre lines,
+  `checker_axes` the axes, x = 0 blue and z = 0 red), procedural in the floor's shader and box
+  filtered over each pixel's footprint, so it greys out toward the horizon without moiré; the
+  tank's bed carries it too. The reflections' and the glass's hits read the same pattern from a
+  texture (`studio::checker_texture`, `RtSurface::with_albedo_layer`), the floor's uvs a period
+  apart; the caustics' composite and the RT shadows read it from the GBuffer's albedo.
 - **The studio** (`studio.rs`): a 800 m floor and a backdrop as bright as that floor lit far off,
   so the horizon disappears; auto exposure (`auto_ev`) puts the lit white floor at display white
   under the Khronos neutral tone map. Its surfaces are deferred: `RtShadowsEffect` adds the key
@@ -52,7 +59,8 @@ them from the gi-box example's folder beside its own.
   faster, so it moves as water does). Its surface is marching cubes over a surface field, drawn as
   glass (`FluidSurfaceEffect::surface_renderable_glass`), its height field (`FluidHeightfield`) in
   the ray tracing grid as a coarse mesh, which the caustics' photons refract at. The tank (walls
-  and bed) is lit by its own material (`standard_lit`, the sun through the cascades): the glass
+  and bed) is lit by its own material (the studio shader's forward mode, the sun through the
+  cascades, as `standard_lit`): the glass
   pass reads what lies under the water from the GBuffer's background, which a deferred surface has
   no direct light in. The water rests when it is still (`fluid_rest`).
 - **The mouse** (`push.rs`, `push.wgsl`): a `FluidSubstepPass` that makes the particles in a column

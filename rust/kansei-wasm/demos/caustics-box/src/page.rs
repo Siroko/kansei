@@ -455,11 +455,17 @@ impl State {
         self.studio.apply(&self.renderer, &mut self.scene, &s, ambient);
         // the tank's walls' ambient
         if let Some(w) = &self.water {
-            w.set_ambient(&self.renderer, &mut self.scene, ambient);
+            w.set_look(&self.renderer, &mut self.scene, &s, ambient);
         }
-        if changed(|s| format!("{}", s.sky_radiance)) {
+        // the checkerboard's texture for the reflections' and the glass's hits
+        if std::mem::take(&mut self.studio.checker_changed) {
+            if let Some(e) = self.volume.effect_mut::<RtReflectionsEffect>() {
+                e.set_albedo_texture(self.studio.checker_view.as_ref());
+            }
+        }
+        if changed(|s| format!("{} {} {}", s.sky_radiance, s.floor, s.checker_lines)) {
             let up = s.sky_radiance;
-            queue.write_buffer(&self.sky_lighting, 0, bytemuck::cast_slice(&sky_lighting(up, up * studio::floor_albedo(&s.floor))));
+            queue.write_buffer(&self.sky_lighting, 0, bytemuck::cast_slice(&sky_lighting(up, up * studio::floor_surface(&s, 0.0).mean())));
         }
 
         // the glass

@@ -16,7 +16,6 @@
 use glam::{Mat4, Vec3 as GVec3};
 
 use kansei_core::geometries::{BoxGeometry, Geometry, SphereGeometry, Vertex};
-use kansei_core::gi::GiSurface;
 use kansei_core::materials::{Material, StandardLitOptions};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{FluidGlassSurface, FluidMask, FluidSurfaceEffect, FluidSurfaceOptions};
@@ -156,14 +155,11 @@ fn bed(size: [f32; 3]) -> (GVec3, GVec3) {
     (GVec3::new(0.0, BED * 0.5, 0.0), GVec3::new(size[0], BED, size[1]))
 }
 
-/// The tank's white, lit by the scene's lights and shadows itself, with `ambient` (cd/m²) from
-/// the white sky.
-fn tank_material(label: &str, ambient: f32) -> Material {
-    Material::standard_lit(label, &tank_options(ambient))
-}
-
-fn tank_options(ambient: f32) -> StandardLitOptions {
-    StandardLitOptions { base_color: [studio::WHITE; 3], roughness: WALL_ROUGHNESS, sky_up: [ambient; 3], sky_down: [ambient * studio::WHITE; 3], outputs_velocity: true, ..Default::default() }
+/// The tank's walls (or with `checker`, its bed): white, or the floor's checkerboard on the bed,
+/// lit by the scene's lights and shadows themselves (`studio::Surface::forward`), with `ambient`
+/// (cd/m²) from the white sky.
+fn tank_surface(ambient: f32, checker: Option<studio::Checker>) -> studio::Surface {
+    studio::Surface { albedo: studio::WHITE, roughness: WALL_ROUGHNESS, ambient, forward: true, checker }
 }
 
 /// The water's tint after a metre at `strength` (0 clear, 1 `WATER_TINT`).
@@ -308,8 +304,8 @@ impl Water {
         let mut wall_indices = Vec::new();
         for (k, (at, size)) in walls(build.size).into_iter().chain([bed(build.size)]).enumerate() {
             let label = if k < 4 { "Tank/Wall" } else { "Tank/Bed" };
-            let mut r = Renderable::new(BoxGeometry::new(1.0, 1.0, 1.0), tank_material(label, 0.0)).with_gi(GiSurface::new([studio::WHITE; 3]));
-            r.rt = Some(RtSurface::new([studio::WHITE; 3]).with_self_lit());
+            let checker = if k < 4 { None } else { studio::Checker::from(s) };
+            let mut r = studio::renderable(label, BoxGeometry::new(1.0, 1.0, 1.0), &tank_surface(0.0, checker), true);
             r.object.set_position(at.x, at.y, at.z);
             r.object.scale = kansei_core::math::Vec3::new(size.x, size.y, size.z);
             wall_indices.push(scene.add(SceneNode::Renderable(r)));
@@ -383,11 +379,13 @@ impl Water {
         }
     }
 
-    /// The flat light the tank's white adds itself (cd/m²; none while the RT GI lights it).
-    pub fn set_ambient(&self, renderer: &Renderer, scene: &mut Scene, ambient: f32) {
-        for &index in &self.walls {
+    /// The tank's look: the flat light its white adds itself (cd/m²; none while the RT GI lights
+    /// it), the floor's checkerboard on its bed.
+    pub fn set_look(&self, renderer: &Renderer, scene: &mut Scene, s: &Settings, ambient: f32) {
+        for (k, &index) in self.walls.iter().enumerate() {
+            let (label, checker) = if k < 4 { ("Tank/Wall", None) } else { ("Tank/Bed", studio::Checker::from(s)) };
             if let Some(r) = scene.get_renderable_mut(index) {
-                r.material.set_standard_lit(renderer, &tank_options(ambient));
+                studio::set_surface(renderer, r, label, &tank_surface(ambient, checker), true);
             }
         }
     }

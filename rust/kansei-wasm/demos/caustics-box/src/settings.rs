@@ -114,6 +114,11 @@ settings! {
     // the background as bright as the lit floor far off (1: seamless) or always white
     floor: String = "white".into();
     floor_rough: f32 = 0.9;
+    // `floor=checker`: a lab's checkerboard, its squares (m: 0.05, 0.1, 0.25, 0.5 or 1), its
+    // metre lines, its axes (x = 0 blue, z = 0 red)
+    checker_size: f32 = 0.5;
+    checker_lines: bool = true;
+    checker_axes: bool = true;
     bg_white: bool = true;
     bg: f32 = 1.0;
     // the far floor faded into the backdrop (no horizon line)
