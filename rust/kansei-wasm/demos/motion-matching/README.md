@@ -151,9 +151,19 @@ under the HUD's "no motion pack" message, and the room renders as it does with o
   direct light alone and which pixels it lights.
 - **The GI.** The hybrid by default (`RtDiffuseGiEffect`: a ray for each 2 x 2 pixels through the
   grid, the hits lit by the lights, shadowed by the maps, `gi_shadows=rays` for rays, and a voxel
-  cone, SVGF 3 x 3), over voxel GI's volume of the room. G (or `gi=`) switches to voxel cones,
-  screen space or none. The room's materials add no sky ambient of their own, so the effects take
-  none out (`ambient: 0`).
+  cone, SVGF 3 x 3), over voxel GI's volume of the room. G (or `gi=`) cycles the others: voxel
+  cones (`voxel`), voxel cones with screen-space GI in front for the near field (`voxel+ssgi`,
+  `VoxelGIOptions::near_field`), irradiance probes traced in the volume's distance field
+  (`probes`, `SceneVoxelGi::enable_probes`; `probe_spacing` in voxels, 6 by default, and
+  `probes_per_frame`, 0 for all, in the panel), the probes with the screen-space near field
+  (`probes+ssgi`), screen space alone (`ssgi`, dark here: it bounces only what is on screen) and
+  none. All read the same exposure. The volume sees the window sky past it
+  (`use_sky_lighting`), for the cones and the probes' rays that leave through the windows. The
+  probe lattice puts probes in the volume's half-metre margin outside the one-sided walls and
+  above the ceiling, where they see the sky; at the default backface limit (0.25) the lookups
+  reached them through the one-voxel shell and lit a band along the top of the walls. Those
+  probes see the shell's back faces, so the room drops them at 0.1. The room's materials add no
+  sky ambient of their own, so the effects take none out (`ambient: 0`).
 - **Reflections and glass.** The marble, the lacquered wood, a mirror on the north wall and a
   brushed one (roughness 0.1) on the east wall reflect through `RtReflectionsEffect`, and the glass
   Stanford dragon (index of refraction 1.5) through its glass pass. Only glossy pixels (roughness
@@ -255,6 +265,7 @@ measured with the GPU otherwise idle (other sessions sharing it doubled every pa
 | `hall`, GI hits shadowed by rays (`gi_shadows=rays`) | 20.1 ms | 19.8 ms |
 | `hall`, shadow maps (`shadows=maps`) | 16.9 ms | 16.2 ms |
 | `hall`, voxel GI / screen-space GI / no GI | 14.7 / 14.3 / 11.7 ms | 14.0 / 13.3 / 11.0 ms |
+| `hall`, interleaved in one page with the GPU shared (every pass about 1.5x): rt / voxel / voxel+ssgi / probes / probes+ssgi / ssgi / off | 26.5-27.1 / 24.0-25.4 / 25.8-26.1 / 22.4-23.7 / 24.1-25.1 / 24.3-25.1 / 21.0-23.0 ms | |
 | `hall`, the water running (`fluid_rest=0`) | 21.2 ms | 20.7 ms |
 | `hall`, every ray at full resolution | 31.0 ms | 30.5 ms |
 | `hall` at 720p | 10.8 ms | 10.2 ms |

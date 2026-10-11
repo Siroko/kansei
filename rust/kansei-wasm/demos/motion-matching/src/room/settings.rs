@@ -102,6 +102,8 @@ settings! {
     gi: String = "rt".into();
     rtgi_res: String = "half".into();
     gi_shadows: String = "maps".into();
+    probe_spacing: f32 = 6.0;
+    probes_per_frame: f32 = 0.0;
     gi_near: f32 = 0.0;
     shadows: String = "rt".into();
     shadow_res: String = "half".into();

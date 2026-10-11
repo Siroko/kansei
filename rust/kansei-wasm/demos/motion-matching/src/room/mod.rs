@@ -43,7 +43,7 @@ use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
 use kansei_core::controls::CameraControls;
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::SphereGeometry;
-use kansei_core::gi::{SceneVoxelGiOptions, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality};
+use kansei_core::gi::{SceneVoxelGiOptions, SdfProbeOptions, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality};
 use kansei_core::lights::Light;
 use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::{GradientSkyOptions, Material, StandardLitOptions};
@@ -91,6 +91,8 @@ const GLASS_TINT: [f32; 3] = [0.95, 0.98, 0.97];
 
 struct RoomState {
     canvas: Canvas,
+    /// The probes' options while a probe mode is on.
+    probes_applied: Option<(f32, f32)>,
     renderer: Renderer,
     scene: Scene,
     camera: Camera,
@@ -200,10 +202,16 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     hybrid.set_cascaded_shadow_map(renderer.cascaded_shadow_map());
     hybrid.set_sky_lighting(Some(sky));
     effects.push(Box::new(hybrid));
+    // voxel GI twice: the cones (or the probes) alone, and with screen-space GI in front for the
+    // near field (`voxel+ssgi`, `probes+ssgi`; it is fixed when the effect is made)
+    let near = ScreenSpaceGIOptions { radius_m: 6.0, ambient_occlusion: 0.0, ..Default::default() };
     let mut voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), material_ambient: 0.0, ..Default::default() });
     voxel.set_sky_lighting(Some(sky));
     effects.push(Box::new(voxel));
-    let mut ssgi = ScreenSpaceGIEffect::new(ScreenSpaceGIOptions { radius_m: 6.0, ambient_occlusion: 0.0, ..Default::default() });
+    let mut near_voxel = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), material_ambient: 0.0, near_field: Some(near.clone()), ..Default::default() });
+    near_voxel.set_sky_lighting(Some(sky));
+    effects.push(Box::new(Switch { effect: near_voxel, on: false }));
+    let mut ssgi = ScreenSpaceGIEffect::new(near);
     ssgi.set_sky_lighting(Some(sky));
     effects.push(Box::new(ssgi));
     // the mirrors, the floor and the dragon's glass
@@ -338,7 +346,10 @@ impl RoomState {
                 "g" => {
                     let next = match self.settings.gi.as_str() {
                         "rt" => "voxel",
-                        "voxel" => "ssgi",
+                        "voxel" => "voxel+ssgi",
+                        "voxel+ssgi" => "probes",
+                        "probes" => "probes+ssgi",
+                        "probes+ssgi" => "ssgi",
                         "ssgi" => "off",
                         _ => "rt",
                     };
@@ -649,8 +660,35 @@ impl RoomState {
             e.shadows = if s.gi_shadows == "maps" { RtGiShadows::Maps } else { RtGiShadows::Rays };
             e.near_distance = s.gi_near.max(0.0);
         }
+        // the probes (traced in voxel GI's distance field) only while a probe mode shows them
+        let probes = gi.starts_with("probes");
+        let near = gi.ends_with("+ssgi");
+        if let Some(scene_gi) = self.renderer.voxel_gi_mut() {
+            let wanted = probes.then_some((s.probe_spacing.clamp(2.0, 24.0), s.probes_per_frame.max(0.0)));
+            if wanted != self.probes_applied {
+                match wanted {
+                    // the lattice puts probes in the volume's margin outside the one-sided walls and above
+                    // the ceiling, where they see the sky, and the lookups' normal bias reaches
+                    // them through the 1-voxel shell: a band of sky light along the top of the
+                    // walls at the default 0.25. Those probes see the shell's back faces, so a
+                    // stricter limit drops them (0.1: no band, nothing inside lost)
+                    Some((spacing, per_frame)) => scene_gi.enable_probes(SdfProbeOptions { spacing_voxels: spacing, probes_per_frame: per_frame as u32, backface_limit: 0.1, ..Default::default() }),
+                    None => {
+                        scene_gi.disable_probes();
+                        scene_gi.disable_sdf();
+                    }
+                }
+                self.probes_applied = wanted;
+            }
+        }
+        let field = self.renderer.voxel_gi().and_then(|g| g.probes()).filter(|_| probes);
         if let Some(e) = self.volume.effect_mut::<VoxelGIEffect>() {
-            e.enabled = gi == "voxel";
+            e.enabled = !near && (gi == "voxel" || probes);
+            e.set_probes(field.filter(|_| !near));
+        }
+        if let Some(e) = self.volume.effect_mut::<Switch<VoxelGIEffect>>() {
+            e.on = near && (gi == "voxel+ssgi" || probes);
+            e.effect.set_probes(field.filter(|_| near));
         }
         if let Some(e) = self.volume.effect_mut::<ScreenSpaceGIEffect>() {
             e.enabled = gi == "ssgi";
@@ -842,6 +880,11 @@ where
     sky.cast_shadow = false;
     let sky = scene.add(SceneNode::Renderable(sky));
     let sky_lighting = renderer.device().create_buffer(&wgpu::BufferDescriptor { label: Some("Room/SkyLighting"), size: 240, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    // the sky the voxel volume's light (its bounce cones, the probes) sees past it: through the
+    // windows and the skylight
+    if let Some(gi) = renderer.voxel_gi_mut() {
+        gi.use_sky_lighting(&sky_lighting);
+    }
 
     // the character (or, without a pack, a capsule standing in for it), facing the pond
     let page_note = "\n\nThe room renders without one: a capsule stands in for the character.";
@@ -877,6 +920,7 @@ where
     player.follow = true;
     let mut state = RoomState {
         canvas: canvas.clone(),
+        probes_applied: None,
         renderer,
         scene,
         camera,
