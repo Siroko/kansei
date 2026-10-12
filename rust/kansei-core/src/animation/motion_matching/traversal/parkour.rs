@@ -152,6 +152,18 @@ pub(super) fn clip_joint(db: &Database, clip: usize, frame: f32, joint: usize) -
     model[joint].translation
 }
 
+/// `clip_joint`'s rotation: the joint's model rotation at `frame` (relative to the clip root's
+/// heading).
+pub(super) fn clip_joint_rotation(db: &Database, clip: usize, frame: f32, joint: usize) -> Quat {
+    let info = &db.clips[clip];
+    let a = (frame.max(0.0) as usize).min(info.frames - 1);
+    let mut pose = crate::animation::Pose { local: Vec::new() };
+    let mut model = Vec::new();
+    db.pose(info.start + a, info.start + a, 0.0, &mut pose);
+    pose.to_model(&db.skeleton, &mut model);
+    model[joint].rotation
+}
+
 /// Read the bar clips from the pack's actions: the first still hang and the first swing, its
 /// period from the hips' swing under the hands (zero crossings of their offset along the facing)
 /// and its angle.
@@ -218,6 +230,12 @@ pub(super) struct Hang {
     follow: Option<(Vec3, Vec3, f32)>,
     /// The pack's shimmy clip playing (captured hands and feet stepping, instead of the gait).
     shimmy: Option<usize>,
+    /// Each hand's pin as shown (followed by a spring): place and velocity; and where the clip
+    /// had the hand last frame (its own motion tells a hand planted from one stepping).
+    pins: [Option<(Vec3, Vec3)>; 2],
+    clip_hands: [Option<Vec3>; 2],
+    /// A hand stepping through a shimmy clip: where it lands (on the edge).
+    landing: [Option<Vec3>; 2],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -283,6 +301,11 @@ pub(super) struct Runtime {
     pub limbs: Vec<LimbTarget>,
     /// Each hand's and foot's push out of the level (`apply_limbs`): its weight and the push.
     pub limb_out: [(f32, Vec3); 4],
+    /// Each shimmy clip's lead: the farthest a hand gets to either side of the hips (m).
+    pub shimmy_leads: Vec<(usize, f32)>,
+    /// Each shimmy clip's hand contacts: per frame, whether each hand is down (still on the
+    /// clip's ground), and each hand's sideways position in the clip root's frame.
+    pub shimmy_contacts: Vec<(usize, Vec<HandContacts>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -307,6 +330,12 @@ const IDLE_HIPS_OUT: f32 = 0.42;
 
 /// A wrist's clearance from what it grips (m).
 const HAND_RADIUS: f32 = 0.035;
+
+/// A shimmy clip frame's hand contacts: each hand down or not, and its sideways place (m).
+type HandContacts = [(bool, f32); 2];
+
+/// How far in from an edge's end that turns no corner a hand grips (m).
+const GRIP_END: f32 = 0.08;
 
 fn smooth(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
@@ -835,7 +864,7 @@ impl CharacterController {
         };
         self.matcher.start_action(db, Action { clip: pose.climb.clip, start, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Climb as u32, rate: 1.0, lock_feet: false });
         let braced = self.hangable(edge, pose);
-        let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start, idle: None, follow: None, shimmy: None };
+        let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start, idle: None, follow: None, shimmy: None, pins: [None; 2], clip_hands: [None; 2], landing: [None; 2] };
         let rest = self.rest_limbs(pose, edge, s, world);
         for (k, l) in hang.limbs.iter_mut().enumerate() {
             l.planted = rest[k];
@@ -913,6 +942,14 @@ impl CharacterController {
         // clip's own speed (so the hands and feet step as captured)
         let moving_left = (e.direction() * wanted.signum()).dot(left) > 0.0;
         let captured = if settled && wanted.abs() > 0.05 { self.shimmy_clip(db, h.braced, moving_left) } else { None };
+        // never past an end that turns no corner: the hang stops a hand's lead short of it, so
+        // both hands keep the edge under them
+        let blocked = captured.is_some_and(|(clip, _)| {
+            let lead = self.shimmy_lead(db, clip) + 0.05;
+            let ed = &self.features.edges[h.edge];
+            (wanted > 0.0 && ed.next.is_none() && h.s >= ed.length() - lead) || (wanted < 0.0 && ed.prev.is_none() && h.s <= lead)
+        });
+        let captured = captured.filter(|_| !blocked);
         let pace = (stick.length() / 2.0).min(1.0);
         match captured {
             Some((clip, _)) if h.shimmy != Some(clip) => {
@@ -921,19 +958,33 @@ impl CharacterController {
                 h.shimmy = Some(clip);
                 h.idle = None;
                 h.follow = None;
+                h.clip_hands = [None; 2];
             }
             None if h.shimmy.is_some() => {
-                // stopped: back to the hang (its idle), the limbs pinned where the hang has them
+                // stopped: back to the hang (its idle), the hands kept where they grip, the feet
+                // where the hang has them
                 h.shimmy = None;
+                h.clip_hands = [None; 2];
                 let rest = self.rest_limbs(&pose, h.edge, h.s, world);
                 for (k, l) in h.limbs.iter_mut().enumerate() {
-                    *l = Step { planted: rest[k], from: rest[k], ..Step::default() };
+                    let at = if k < 2 { h.pins[k].map_or(rest[k], |(p, _)| p) } else { rest[k] };
+                    *l = Step { planted: at, from: at, ..Step::default() };
+                }
+                // (held there: no step under way carries on), the body between them
+                h.landing = [None; 2];
+                if let (Some((a, _)), Some((b, _))) = (h.pins[0], h.pins[1]) {
+                    let ed = &self.features.edges[h.edge];
+                    h.s = (0.5 * (ed.project(a) + ed.project(b))).clamp(0.3, (ed.length() - 0.3).max(0.3));
+                }
+                for pin in h.pins.iter_mut().flatten() {
+                    pin.1 = Vec3::ZERO;
                 }
             }
             _ => {}
         }
         let wanted = match captured {
             Some((_, speed)) => wanted.signum() * speed * pace,
+            None if blocked => 0.0,
             None => wanted,
         };
         let stride = self.parkour.shimmy_stride;
@@ -968,8 +1019,10 @@ impl CharacterController {
         let order = if left_ahead { [0usize, 3, 1, 2] } else { [1usize, 2, 0, 3] };
         // a planted limb the body has left out of its reach steps back under it at once
         let joints = self.hands.map(|hands| limb_joints(db, hands));
+        // (a clip drives the hang: its hands step with it, or are held through the idle, below)
+        let held = h.shimmy.is_none() && h.idle.is_some() && wanted.abs() <= 0.05;
         for k in 0..4 {
-            if h.shimmy.is_some() {
+            if h.shimmy.is_some() || held {
                 break;
             }
             let reaches = joints.is_none_or(|j| self.limb_reaches(db, j[k], h.limbs[k].planted, 0.97));
@@ -993,7 +1046,7 @@ impl CharacterController {
             let window = (slot as f32 * 0.25, slot as f32 * 0.25 + 0.25);
             let inside = |p: f32| p >= window.0 && p < window.1;
             let l = &mut h.limbs[k];
-            if l.forced.is_some() || h.shimmy.is_some() {
+            if l.forced.is_some() || h.shimmy.is_some() || held {
                 continue;
             }
             // landing ahead of its rest by what the root moves while it stays planted, halved
@@ -1020,6 +1073,7 @@ impl CharacterController {
                 let (root, yaw) = self.idle_place(db, clip, 1.0, h.edge, h.s);
                 self.switch_clip(db, Action { clip, start: 1.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::HangIdle as u32, rate: 1.0, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, yaw_rotation(yaw))));
                 h.idle = Some(clip);
+                h.clip_hands = [None; 2];
                 // (the root's place jumps with the clip: follow it from there)
                 h.follow = None;
                 h.from = None;
@@ -1058,6 +1112,12 @@ impl CharacterController {
                 (root, yaw)
             }
         };
+        // the hips kept out of the level (a path rounding a corner cuts it)
+        let root = {
+            let (clip, frame) = self.matcher.playing();
+            let hips = root + yaw_rotation(yaw) * clip_joint(db, clip, frame, db.roles.hips);
+            root + world.push_sphere_out(hips, 0.15, self.layers) - hips
+        };
         let mut character = self.matcher.character();
         character.translation = root;
         character.rotation = yaw_rotation(yaw);
@@ -1081,18 +1141,104 @@ impl CharacterController {
             a.rate = rate;
         }
         self.matcher.update(db, input, dt);
-        // pinned: the hands always, the feet when braced (eased in as the catch settles)
+        // pinned: the hands always, the feet when braced (eased in as the catch settles). Playing
+        // a clip (the idle, a shimmy), the hands grip the real edge, turned to its face: held
+        // still through the idle; through a shimmy each plants where the clip's hand comes down
+        // and lifts when it moves off, kept over the edge (short of an end) while it moves
         let w = if h.settle > 0.0 { smooth(h.time / h.settle) } else { 1.0 };
         let joints = self.hands.map(|hands| limb_joints(db, hands));
         self.park.limbs.clear();
         if let Some(joints) = joints {
+            let clip_mode = h.idle.is_some() || h.shimmy.is_some();
+            let rest_grips = self.rest_limbs(&pose, h.edge, h.s, world);
             #[allow(clippy::needless_range_loop)]
-            for k in 0..4 {
-                // (a shimmy clip's limbs step as captured)
-                if (k >= 2 && !h.braced) || h.shimmy.is_some() {
-                    continue;
+            for k in 0..2 {
+                let target = match h.shimmy {
+                    // the idle: held where they grip; a hand far from its grip about the body (a
+                    // shimmy stopped mid-step) steps there, one at a time
+                    None if held => {
+                        h.limbs[k].stepping = false;
+                        h.landing[k] = None;
+                        let home = rest_grips[k];
+                        let other_busy = h.limbs[1 - k].forced.is_some();
+                        let l = &mut h.limbs[k];
+                        if l.forced.is_none() && !other_busy && l.planted.distance(home) > 0.15 {
+                            l.forced = Some(0.0);
+                            l.from = l.planted;
+                        }
+                        match l.forced.as_mut() {
+                            Some(t) => {
+                                *t = (*t + dt / 0.3).min(1.0);
+                                let u = *t;
+                                let at = l.from.lerp(home, smooth(u)) + Vec3::Y * (u * std::f32::consts::PI).sin() * 0.06;
+                                if u >= 1.0 {
+                                    l.forced = None;
+                                    l.planted = home;
+                                }
+                                at
+                            }
+                            None => l.planted,
+                        }
+                    }
+                    Some(clip) => {
+                        // the clip's contacts: down, planted; up, stepping from where it was
+                        // planted to where the clip puts it down (on the edge), on the clip's
+                        // own timing, with a small lift
+                        let contacts = self.shimmy_contacts(db, clip);
+                        let n = contacts.len();
+                        let frame = (self.matcher.playing().1.round() as usize).min(n.saturating_sub(1));
+                        let down = contacts.get(frame).is_none_or(|c| c[k].0);
+                        if down {
+                            if let Some(l) = h.landing[k].take() {
+                                h.limbs[k].planted = l;
+                            }
+                            h.limbs[k].stepping = false;
+                            h.limbs[k].planted
+                        } else {
+                            // the step: from the last frame down to the next (round the loop)
+                            let back = (1..n).find(|d| contacts[(frame + n - d) % n][k].0).unwrap_or(1);
+                            let ahead = (1..n).find(|d| contacts[(frame + d) % n][k].0).unwrap_or(1);
+                            let land = (frame + ahead) % n;
+                            let u = back as f32 / (back + ahead) as f32;
+                            if !h.limbs[k].stepping {
+                                h.limbs[k].stepping = true;
+                                h.limbs[k].from = h.limbs[k].planted;
+                            }
+                            // where it lands: as far along as the clip moves the hand sideways
+                            // from here to there (the hang moves along at the clip's speed: the
+                            // clip's space maps onto the edge); across the loop's end, by the
+                            // clip's whole travel
+                            let (side, _) = edge_frame(self.features.edge_normal(h.edge, h.s, 0.35));
+                            let clip_hand = self.matcher.joint_world(db, joints[k]);
+                            let wraps = land < frame;
+                            let travel = if wraps { contacts[n - 1][k].1 - contacts[0][k].1 } else { 0.0 };
+                            let reach = contacts[land][k].1 + travel - contacts[frame][k].1;
+                            let landing = self.grip(&pose, h.edge, k, clip_hand + side * reach, world);
+                            h.landing[k] = Some(landing);
+                            let t = smooth(u);
+                            h.limbs[k].from.lerp(landing, t) + Vec3::Y * (u * std::f32::consts::PI).sin() * 0.06
+                        }
+                    }
+                    None => h.limbs[k].planted,
+                };
+                // (followed by a spring through a clip, so a plant or a lift eases)
+                let pin = match h.pins[k].as_mut() {
+                    Some((p, v)) if clip_mode => {
+                        crate::animation::springs::spring_damper_exact(p, v, target, 0.04, dt);
+                        *p
+                    }
+                    _ => {
+                        h.pins[k] = Some((target, Vec3::ZERO));
+                        target
+                    }
+                };
+                let rotation = if clip_mode { self.grip_rotation(db, &pose, h.edge, h.s, k) } else { None };
+                self.park.limbs.push(LimbTarget { joint: joints[k], target: pin, weight: w, rotation });
+            }
+            if h.braced && !clip_mode {
+                for (&joint, limb) in joints[2..].iter().zip(&h.limbs[2..]) {
+                    self.park.limbs.push(LimbTarget { joint, target: limb.planted, weight: w, rotation: None });
                 }
-                self.park.limbs.push(LimbTarget { joint: joints[k], target: h.limbs[k].planted, weight: w, rotation: None });
             }
         }
         self.park.hang = Some(h);
@@ -1638,6 +1784,82 @@ impl CharacterController {
         if !targets.is_empty() {
             self.matcher.reach(db, &targets);
         }
+    }
+
+    /// Where hand `k` grips the edge nearest `p`: on the edges about `edge` (it and its
+    /// neighbours round its corners), short of an end that turns no corner, at the hang pose's
+    /// grip (its wrist's height and depth from the edge), out of the level.
+    fn grip(&self, pose: &HangPose, edge: usize, k: usize, p: Vec3, world: &CollisionWorld) -> Vec3 {
+        let f = &self.features;
+        let e0 = &f.edges[edge];
+        let mut best: Option<(f32, Vec3)> = None;
+        for e in [Some(edge), e0.prev, e0.next].into_iter().flatten() {
+            let ed = &f.edges[e];
+            let len = ed.length();
+            let lo = if ed.prev.is_none() { GRIP_END } else { 0.0 };
+            let hi = (len - if ed.next.is_none() { GRIP_END } else { 0.0 }).max(lo);
+            let q = ed.point(ed.project(p).clamp(lo, hi));
+            let local = pose.hands[k];
+            let at = from_edge_frame(q, ed.normal, Vec3::new(0.0, local.y, local.z));
+            let d = at.distance(p);
+            if best.is_none_or(|(b, _)| d < b) {
+                best = Some((d, at));
+            }
+        }
+        world.push_sphere_out(best.map_or(p, |(_, at)| at), HAND_RADIUS, self.layers)
+    }
+
+    /// The world rotation of hand `k` gripping the edge at `s`: the hang pose's hand, turned
+    /// with the face.
+    fn grip_rotation(&self, db: &Database, pose: &HangPose, edge: usize, s: f32, k: usize) -> Option<Quat> {
+        let hands = self.hands?;
+        let into = -self.features.edge_normal(edge, s, 0.35);
+        Some(yaw_rotation(into.x.atan2(into.z) + pose.yaw) * clip_joint_rotation(db, pose.climb.clip, pose.frame, hands[k]))
+    }
+
+    /// The farthest a hand of shimmy clip `clip` gets to either side of its hips (m), cached.
+    fn shimmy_lead(&mut self, db: &Database, clip: usize) -> f32 {
+        if let Some(&(_, lead)) = self.park.shimmy_leads.iter().find(|(c, _)| *c == clip) {
+            return lead;
+        }
+        let Some(hands) = self.hands else { return 0.3 };
+        let frames = db.clips[clip].frames;
+        let lead = (0..frames)
+            .map(|f| {
+                let hips = clip_joint(db, clip, f as f32, db.roles.hips);
+                hands.iter().map(|&h| (clip_joint(db, clip, f as f32, h).x - hips.x).abs()).fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max);
+        self.park.shimmy_leads.push((clip, lead));
+        lead
+    }
+
+    /// Shimmy clip `clip`'s hand contacts (cached): per frame, each hand down or not (moving on
+    /// the clip's ground at under a third of its fastest), and its sideways place in the clip's
+    /// space (to the character's left from where the clip starts, m).
+    fn shimmy_contacts(&mut self, db: &Database, clip: usize) -> Vec<HandContacts> {
+        if let Some((_, c)) = self.park.shimmy_contacts.iter().find(|(c, _)| *c == clip) {
+            return c.clone();
+        }
+        let Some(hands) = self.hands else { return Vec::new() };
+        let n = db.clips[clip].frames;
+        let world = |f: usize, h: usize| {
+            let (root, yaw) = db.root_at(clip, f as f32);
+            root + yaw_rotation(yaw) * clip_joint(db, clip, f as f32, h)
+        };
+        let mut out = vec![[(true, 0.0f32); 2]; n];
+        for (k, &h) in hands.iter().enumerate() {
+            let pos: Vec<Vec3> = (0..n).map(|f| world(f, h)).collect();
+            let speed: Vec<f32> = (0..n).map(|f| pos[(f + 1).min(n - 1)].distance(pos[f.saturating_sub(1)]) * db.sample_rate / ((f + 1).min(n - 1) - f.saturating_sub(1)).max(1) as f32).collect();
+            let top = speed.iter().cloned().fold(0.0f32, f32::max).max(1e-3);
+            for f in 0..n {
+                // (sideways in the clip's space: the hand's own reach plus the body's travel)
+                let x = (pos[f] - db.root_at(clip, 0.0).0).dot(yaw_rotation(db.root_at(clip, 0.0).1) * Vec3::X);
+                out[f][k] = (speed[f] < top / 3.0, x);
+            }
+        }
+        self.park.shimmy_contacts.push((clip, out.clone()));
+        out
     }
 
     /// The pack's shimmy clip for a hang braced or not, moving to the character's left or right

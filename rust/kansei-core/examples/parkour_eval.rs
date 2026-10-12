@@ -138,6 +138,22 @@ fn scenarios() -> Vec<Scenario> {
             expect: &["traversing", "hanging", "traversing", "grounded"],
         },
         Scenario {
+            name: "climb to hang, hang still",
+            start: Vec3::new(14.4, 0.0, 10.8),
+            yaw: std::f32::consts::PI,
+            duration: 9.0,
+            cues: vec![cue(0.0, -z * 2.0), space(0.3, -z * 2.0), cue(1.0, Vec3::ZERO)],
+            expect: &["traversing", "hanging"],
+        },
+        Scenario {
+            name: "climb to hang, shimmy left into the ledge's end, keep pushing",
+            start: Vec3::new(14.4, 0.0, 10.8),
+            yaw: std::f32::consts::PI,
+            duration: 10.0,
+            cues: vec![cue(0.0, -z * 2.0), space(0.3, -z * 2.0), cue(1.0, Vec3::ZERO), cue(3.0, -x * 2.0), cue(9.0, Vec3::ZERO)],
+            expect: &["traversing", "hanging"],
+        },
+        Scenario {
             name: "hang, drop, land",
             start: Vec3::new(14.0, 0.0, 10.8),
             yaw: std::f32::consts::PI,
@@ -238,6 +254,12 @@ struct Report {
     root_at: f32,
     root_state: String,
     end: Vec3,
+    /// Hanging: the wrists' distance to the nearest edge (sum over hand-frames, frames, max), and
+    /// the fastest a hand moves while hanging still (the stick let go, a second into the hang).
+    hand_edge_sum: f32,
+    hand_frames: usize,
+    hand_edge_max: f32,
+    idle_hand_speed: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,6 +285,8 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
     let mut frame = 0usize;
     let mut sum_err = 0.0f32;
     let mut misses = 0;
+    let mut hang_time = 0.0f32;
+    let mut hands_prev: Option<[Vec3; 2]> = None;
     while time < s.duration {
         // a hitch: a 100 ms frame every 1.3 s
         let step = if hitch && frame % 78 == 77 { 0.1 } else { dt };
@@ -313,6 +337,29 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
             for t in c.limb_targets() {
                 println!("    target {} {:.3?} w {:.2} -> at {:.3?}", db.skeleton.names[t.joint], t.target, t.weight, c.matcher.joint_world(db, t.joint));
             }
+        }
+        // hands on the edge while hanging, and still while the hang is
+        if let (CharacterState::Hanging, Some(h)) = (c.state(), c.hands) {
+            hang_time += step;
+            let hands = h.map(|j| c.matcher.joint_world(db, j));
+            for p in hands {
+                let d = features.edges.iter().map(|e| e.point(e.project(p).clamp(0.0, e.length())).distance(p)).fold(f32::MAX, f32::min);
+                r.hand_edge_sum += d;
+                r.hand_frames += 1;
+                r.hand_edge_max = r.hand_edge_max.max(d);
+            }
+            if let Some(prev) = hands_prev {
+                if stick.length() < 0.1 && hang_time > 1.0 && step < 0.05 {
+                    for k in 0..2 {
+                        let v = hands[k].distance(prev[k]) / step;
+                        r.idle_hand_speed = r.idle_hand_speed.max(v);
+                    }
+                }
+            }
+            hands_prev = Some(hands);
+        } else {
+            hang_time = 0.0;
+            hands_prev = None;
         }
         let mut frame_err = 0.0f32;
         for t in c.limb_targets().iter().filter(|t| t.weight > 0.99) {
@@ -509,6 +556,9 @@ fn main() -> Result<(), String> {
                 "{:<52} {:>8} {:>4} {:>6.1}cm {:>6.1}cm {:>6.1}cm/s {:>6} {:>5.2}/{:<5.2} {:>5.2}/{:<5.2}  {} | root pop {:.2}s {} | pose pop {:.2}s {} | end ({:.2},{:.2},{:.2})",
                 s.name, label, if ok { "yes" } else { "NO" }, 100.0 * r.limb_error_max, 100.0 * r.limb_error_mean, r.slide_cm_s, r.inside, r.root_max, r.root_typical, r.pop_max, r.pop_typical, r.states.join(">"), r.root_at, r.root_state, r.pop_at, r.pop_state, r.end.x, r.end.y, r.end.z
             );
+            if r.hand_frames > 0 {
+                println!("{:<52} {:>8}      hands on the edge: mean {:.1} cm, max {:.1} cm; hanging still, the fastest hand {:.1} cm/s", "", "", 100.0 * r.hand_edge_sum / r.hand_frames as f32, 100.0 * r.hand_edge_max, 100.0 * r.idle_hand_speed);
+            }
             if let (Some(dir), Some(csv)) = (&csv_dir, csv) {
                 let name: String = s.name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
