@@ -534,9 +534,19 @@ GASP's air catches and its sprint and roll landings join the same pack (export t
              "catch": ["Traversal/Catch/Cliff/M_Neutral_*", "Traversal/Catch/Mantle/M_Neutral_*"] }
 ```
 
-(`shimmy` and `wallrun` are baked but not played yet: the generated
-shimmies paddle their legs and the generated wall runs read as leaping beside the wall, so the
-GASP-based ones stay; see the PR.) Packs with the new action kinds don't load in older builds or
+Captured hang clips from Mixamo (downloaded by hand, put on the mannequin by
+`kansei-anim-bake/mixamo`; Mixamo's terms forbid AI/ML use, so never into Kimodo) go into the same
+private pack:
+- `hangidle` takes its braced idle (`Hang_Idle_Braced_Against_Wall`) and free one (`Hang_Idle_Ledge`);
+- `shimmy` takes its braced and free shimmies. With shimmy clips in the pack, the shimmy plays the
+  one for the hang (braced or not, by `Braced` in its name) and the way it goes (`Left`/`Right`),
+  at the stick's pace, the hang moving along the edge at the clip's own speed.
+
+Their other clips (catches, hops, drops, climb-ups, wall runs, swings) are baked but not wired yet.
+
+(`wallrun` is baked but not played yet: the generated wall runs read as leaping beside the wall,
+so the GASP-based one stays; Kimodo's shimmies, which paddle their legs, are left out of `shimmy`;
+see the PR.) Packs with the new action kinds don't load in older builds or
 the TS port.
 
 **Testing it.** `render=forward` (the panel's render, top) draws the room with its direct lights
