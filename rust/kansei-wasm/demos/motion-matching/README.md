@@ -477,7 +477,9 @@ level tags for it (`traversal::features`: a glb node's `kansei_traversal`, read 
 - **Hanging from a ledge.** Climbing a tagged `ledge` stops hanging from it, and a fall or a jump
   that brings the body to an edge catches it. The hang is the climb clip's own hanging frame
   (`parkour::hang_poses`), held and breathing a frame either way, the hands pinned on the top and
-  the feet on the face below by IK (`MotionMatcher::reach`). A/D (the stick to either side)
+  the feet on the face below by IK (`MotionMatcher::reach`); with a `hangidle` clip in the pack
+  (generated, braced on the face or free, by its name's `Braced`) the hang settles into that loop
+  once still, placed by its hips. A/D (the stick to either side)
   shimmy along the edge and round its outer corners, hands and feet stepping in turn, each pinned
   where it lands; Space climbs up (the climb clip on from its hang, warped onto the edge); X lets
   go. The climbs' and mantles' ledges are refined from the hands (`parkour::refine_grips`) so the
@@ -494,7 +496,8 @@ level tags for it (`traversal::features`: a glb node's `kansei_traversal`, read 
   generated, see [Generated animation](#generated-animation-kimodo)) the pose is the hang clip
   still or the swing clip phase-locked to the pendulum (its frame from the swing's phase, the body
   turned about the bar by what the pendulum swings beyond the clip); without them, the climb's
-  hanging frame swung as a whole. Space lets go at the swing's speed, X straight down.
+  hanging frame swung as a whole. Space lets go at the swing's speed (hanging still, with a
+  `pullup` clip in the pack, it pulls up instead and hangs again after), X straight down.
 
 Every change of move keeps what shows continuous: the root's velocity (`MotionMatcher::
 blend_root`), its place and turn (`blend_position`, `blend_rotation`) ease out over a few frames
@@ -515,7 +518,7 @@ into a private pack with the GASP clips, e.g. the GASP bake config plus:
              "shimmy": ["Parkour/Gen_Shimmy_*"], "wallrun": ["Parkour/Gen_Wall_Run_*"] }
 ```
 
-(`pullup`, `hangidle`, `shimmy` and `wallrun` are baked but not played yet: the generated
+(`shimmy` and `wallrun` are baked but not played yet: the generated
 shimmies paddle their legs and the generated wall runs read as leaping beside the wall, so the
 GASP-based ones stay; see the PR.) Packs with the new action kinds don't load in older builds or
 the TS port.

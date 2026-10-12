@@ -170,6 +170,14 @@ fn scenarios() -> Vec<Scenario> {
             expect: &["wallrun", "falling", "grounded"],
         },
         Scenario {
+            name: "jump to a bar, hang still, pull up, let go",
+            start: Vec3::new(7.6, 0.0, 11.0),
+            yaw: std::f32::consts::PI,
+            duration: 9.0,
+            cues: vec![cue(0.0, -z * 4.0), space(0.45, -z * 4.0), cue(1.2, Vec3::ZERO), space(4.0, Vec3::ZERO), drop(7.5)],
+            expect: &["jumping", "falling", "swinging", "falling", "grounded"],
+        },
+        Scenario {
             name: "jump to a bar, swing, let go",
             start: Vec3::new(7.6, 0.0, 11.0),
             yaw: std::f32::consts::PI,
@@ -303,11 +311,13 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
                 planted_prev[k] = None;
             }
         }
-        // hands and feet (their joints) inside the level
+        // hands, feet and the body's core (their joints) inside the level
         let mut ends = db.roles.feet.to_vec();
         if let Some(h) = c.hands {
             ends.extend(h);
         }
+        // and the body's core (hips, spine, head)
+        ends.extend(body.iter().copied());
         for &j in &ends {
             let p = c.matcher.joint_world(db, j);
             if world.overlap_sphere(p, 0.001, u32::MAX) && p.y > 0.03 {

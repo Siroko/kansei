@@ -212,6 +212,10 @@ pub(super) struct Hang {
     latch: Option<(Vec3, f32)>,
     /// The clip frame the catch started at.
     start_frame: f32,
+    /// The pack's hang idle playing (instead of the climb's held frame).
+    idle: Option<usize>,
+    /// The root followed: its place, velocity and heading.
+    follow: Option<(Vec3, Vec3, f32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +249,8 @@ pub(super) struct Swing {
     from: Option<(Vec3, Quat)>,
     /// Swinging (the swing clip playing) rather than hanging still.
     swinging: bool,
+    /// Pulling up (the pull-up clip playing, the swing held still).
+    pulling: bool,
 }
 
 /// The parkour state a `CharacterController` keeps.
@@ -293,6 +299,9 @@ pub(super) const BAR_AIM: f32 = 1000.0;
 
 /// An ankle's clearance from what the foot stands or pushes on (m).
 const FOOT_RADIUS: f32 = 0.06;
+
+/// How far out from the face under an edge the hips hang (m).
+const IDLE_HIPS_OUT: f32 = 0.42;
 
 /// A wrist's clearance from what it grips (m).
 const HAND_RADIUS: f32 = 0.035;
@@ -503,6 +512,10 @@ impl CharacterController {
                 Some(Ok(ActionKind::Jump))
             }
             CharacterState::Swinging => {
+                // hanging still: pull up (when the pack has the clip); else let go
+                if self.start_pull_up(db) {
+                    return Some(Ok(ActionKind::PullUp));
+                }
                 self.release_bar(db, true);
                 Some(Ok(ActionKind::Jump))
             }
@@ -519,7 +532,7 @@ impl CharacterController {
                 let normal = self.features.edges[h.edge].normal;
                 self.park.cooldown = Some((Catchable::Edge(h.edge), self.parkour.cooldown));
                 self.park.limbs.clear();
-                self.fall_with(db, normal * 0.6);
+                self.fall_rerooted(db, normal * 0.6);
                 self.air_top = self.matcher.character().translation.y;
                 self.state = CharacterState::Falling(0.0);
                 true
@@ -737,7 +750,7 @@ impl CharacterController {
         let start = if catching { (pose.frame - 4.0).max(pose.climb.anchor) } else { pose.frame };
         self.matcher.start_action(db, Action { clip: pose.climb.clip, start, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Climb as u32, rate: 1.0, lock_feet: false });
         let braced = self.hangable(edge, pose);
-        let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start };
+        let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start, idle: None, follow: None };
         let rest = self.rest_limbs(pose, edge, s, world);
         for (k, l) in hang.limbs.iter_mut().enumerate() {
             l.planted = rest[k];
@@ -871,12 +884,28 @@ impl CharacterController {
                 let out = self.features.edges[h.edge].normal * lift * if k < 2 { 0.6 } else { 1.0 };
                 l.planted = l.from.lerp(target, t) + Vec3::Y * lift + out;
             } else if l.stepping && (!inside(h.phase) || rate == 0.0) {
+                // planted where the step's last frame put it (its window may end between frames:
+                // no jump to the target)
                 l.stepping = false;
-                l.planted = target;
+            }
+        }
+        // settled, onto the pack's hang idle if it has one (a breathing loop), from the climb's
+        // held frame
+        if h.idle.is_none() && h.time >= h.settle + 0.15 {
+            if let Some(clip) = self.hang_idle(db, h.braced) {
+                let (root, yaw) = self.idle_place(db, clip, 1.0, h.edge, h.s);
+                self.switch_clip(db, Action { clip, start: 1.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::HangIdle as u32, rate: 1.0, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, yaw_rotation(yaw))));
+                h.idle = Some(clip);
+                // (the root's place jumps with the clip: follow it from there)
+                h.follow = None;
+                h.from = None;
             }
         }
         // the root: on the edge (eased from where a catch began), its breathing
-        let (root, yaw) = self.hang_place(&pose, h.edge, h.s);
+        let (root, yaw) = match h.idle {
+            Some(clip) => self.idle_place(db, clip, self.matcher.playing().1, h.edge, h.s),
+            None => self.hang_place(&pose, h.edge, h.s),
+        };
         let (root, yaw) = match h.from {
             Some((p, y)) if h.time < h.settle => {
                 let t = smooth(h.time / h.settle.max(1e-3));
@@ -890,14 +919,32 @@ impl CharacterController {
         // swaying a little with the steps
         let sway = if rate > 0.0 { (h.phase * std::f32::consts::TAU * 2.0).sin() * 0.015 } else { 0.0 };
         let root = root + Vec3::Y * sway;
+        // followed with a critically damped spring, so a corner's turn of the path (the edge's
+        // kink) bends the body's path smoothly
+        let (root, yaw) = match h.follow.as_mut() {
+            Some((p, v, y)) => {
+                crate::animation::springs::spring_damper_exact(p, v, root, 0.06, dt);
+                *y += crate::animation::motion_matching::wrap_angle(yaw - *y) * (1.0 - (-dt / 0.06).exp());
+                (*p, *y)
+            }
+            None => {
+                h.follow = Some((root, Vec3::ZERO, yaw));
+                (root, yaw)
+            }
+        };
         let mut character = self.matcher.character();
         character.translation = root;
         character.rotation = yaw_rotation(yaw);
         self.matcher.place(character);
         // the clip: on to the hanging frame (catching), held there, then a frame either way of it,
         // slowly (breathing); the playback rate follows that frame
-        let (_, frame) = self.matcher.playing();
-        let wanted_frame = if h.time < h.settle {
+        let (clip, frame) = self.matcher.playing();
+        let wanted_frame = if let Some(idle) = h.idle.filter(|&i| i == clip) {
+            // the idle to and fro over its length (no loop cut)
+            let span = (db.clips[idle].frames as f32 - 3.0).max(1.0);
+            let t = ((h.time - h.settle) * db.sample_rate / span).rem_euclid(2.0);
+            1.0 + span * (1.0 - (t - 1.0).abs())
+        } else if h.time < h.settle {
             h.start_frame + (pose.frame - h.start_frame) * (h.time / h.settle.max(1e-3)).min(1.0)
         } else {
             let t = h.time - h.settle;
@@ -937,8 +984,13 @@ impl CharacterController {
         let into = -e.normal;
         let c = pose.climb;
         // room on top where the clip ends
-        let character = self.matcher.character();
         let clip_heading = c.forward.x.atan2(c.forward.z);
+        // from the idle: back onto the climb's hanging frame first, where the hang puts it
+        if h.idle.is_some() {
+            let (root, yaw) = self.hang_place(&pose, h.edge, h.s);
+            self.switch_clip(db, Action { clip: c.clip, start: pose.frame, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Climb as u32, rate: 1.0, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, yaw_rotation(yaw))));
+        }
+        let character = self.matcher.character();
         let (_, frame) = self.matcher.playing();
         let mut warp = RootWarp::identity(db.root_at(c.clip, frame), (character.translation, yaw_of(character.rotation)));
         warp.to = Placement::between((Vec3::new(c.ledge.x, 0.0, c.ledge.z), clip_heading), (Vec3::new(point.x, 0.0, point.z), into.x.atan2(into.z)));
@@ -1199,7 +1251,7 @@ impl CharacterController {
         let start = (pose.frame - 3.0).max(pose.climb.anchor);
         self.matcher.start_action(db, Action { clip: pose.climb.clip, start, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Jump as u32, rate: 1.0, lock_feet: false });
         let character = self.matcher.character();
-        self.park.swing = Some(Swing { bar, s, theta: 0.0, omega, yaw, time: 0.0, from: Some((character.translation, character.rotation)), swinging: false });
+        self.park.swing = Some(Swing { bar, s, theta: 0.0, omega, yaw, time: 0.0, from: Some((character.translation, character.rotation)), swinging: false, pulling: false });
         if let (Some(clips), Some(hands)) = (self.bar_clips_cached(db), self.hands) {
             self.matcher.start_action(db, Action { clip: clips.hang, start: 1.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::BarHang as u32, rate: 1.0, lock_feet: false });
             // placed on the bar at once; the hips eased there from where they show (the clip's
@@ -1259,10 +1311,13 @@ impl CharacterController {
         let stick = Vec3::new(input.velocity.x, 0.0, input.velocity.z).dot(into) / 2.0;
         // the pendulum, substepped
         let steps = ((dt / (1.0 / 240.0)).ceil() as usize).clamp(1, 32);
+        // (pulling up stills the swing quickly; the stick let go, the body stills it slowly)
+        let damping = if w.pulling { 8.0 } else if stick.abs() < 0.1 { s.swing_damping * 3.0 } else { s.swing_damping };
         let h = dt / steps as f32;
         for _ in 0..steps {
             let pump = if w.omega.abs() > 0.05 { s.swing_pump * stick.clamp(-1.0, 1.0) * w.omega.signum() * (stick * w.omega).signum().max(0.0) } else { s.swing_pump * stick.clamp(-1.0, 1.0) * 0.5 };
-            let accel = -(self.gravity / s.swing_length) * w.theta.sin() - s.swing_damping * w.omega + pump;
+            let pump = if w.pulling { 0.0 } else { pump };
+            let accel = -(self.gravity / s.swing_length) * w.theta.sin() - damping * w.omega + pump;
             w.omega += accel * h;
             w.theta += w.omega * h;
             if w.theta.abs() > s.swing_max {
@@ -1313,11 +1368,40 @@ impl CharacterController {
         self.park.swing = Some(w);
     }
 
+    /// Hanging still from a bar with a pull-up clip in the pack: start it (the swing held).
+    fn start_pull_up(&mut self, db: &Database) -> bool {
+        let Some(clip) = self.actions.iter().find(|c| c.kind == ActionKind::PullUp).map(|c| c.clip) else { return false };
+        let omega0 = (self.gravity / self.parkour.swing_length).sqrt();
+        let Some(w) = self.park.swing.as_mut() else { return false };
+        if w.pulling || (w.theta * w.theta + (w.omega / omega0).powi(2)).sqrt() > 0.35 {
+            return false;
+        }
+        w.pulling = true;
+        let Some(hands) = self.hands else { return false };
+        let w = self.park.swing.clone().unwrap();
+        let (root, rotation) = self.bar_place(db, clip, 1.0, hands, &w);
+        self.switch_clip(db, Action { clip, start: 1.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::PullUp as u32, rate: 1.0, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, rotation)));
+        true
+    }
+
     /// With bar clips: the clip that fits the swing (still or swinging, switched with some
     /// hysteresis), its frame from the pendulum's phase, the root placed so the clip's hands are
     /// on the bar, and turned about the bar by what the pendulum swings beyond the clip.
     fn swing_clip_place(&mut self, db: &Database, clips: &BarClips, hands: [usize; 2], w: &mut Swing, dt: f32) -> (Vec3, Quat) {
         let omega0 = (self.gravity / self.parkour.swing_length).sqrt();
+        if w.pulling {
+            // the pull-up as captured, the body under the bar, then back to hanging still
+            let (clip, frame) = self.matcher.playing();
+            if frame >= (db.clips[clip].frames - 2) as f32 {
+                w.pulling = false;
+                w.swinging = false;
+                let (root, rotation) = self.bar_place(db, clips.hang, 1.0, hands, w);
+                self.switch_clip(db, Action { clip: clips.hang, start: 1.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::BarHang as u32, rate: 1.0, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, rotation)));
+            } else {
+                let _ = dt;
+                return self.bar_place(db, clip, frame, hands, w);
+            }
+        }
         let amplitude = (w.theta * w.theta + (w.omega / omega0).powi(2)).sqrt();
         let phase = w.theta.atan2(w.omega / omega0);
         let swing = clips.swing.filter(|_| if w.swinging { amplitude > 0.08 } else { amplitude > 0.14 });
@@ -1352,12 +1436,18 @@ impl CharacterController {
             a.rate = rate;
         }
         let _ = clip_angle;
+        self.bar_place(db, clip, frame, hands, w)
+    }
+
+    /// The root's place and rotation showing bar clip `clip` at `frame` from the swing's bar: its
+    /// hands on the bar, turned about it by what the pendulum swings beyond the angle the clip's
+    /// own body hangs at this frame.
+    fn bar_place(&self, db: &Database, clip: usize, frame: f32, hands: [usize; 2], w: &Swing) -> (Vec3, Quat) {
         let b = self.features.bars[w.bar];
         let pivot = b.a + b.direction() * w.s;
         let heading = yaw_rotation(w.yaw);
         let mid = hands_mid(db, clip, frame, hands);
         let root = pivot - heading * mid;
-        // the angle the clip's own body hangs at, this frame: the pendulum turns it the rest
         let hips = clip_joint(db, clip, frame, db.roles.hips);
         let clip_angle = (hips.z - mid.z).atan2(mid.y - hips.y);
         let into = heading * FORWARD;
@@ -1378,7 +1468,7 @@ impl CharacterController {
         let flat = Vec3::new(velocity.x, 0.0, velocity.z);
         self.park.air_yaw = Some(if flat.length() > 0.3 { flat.x.atan2(flat.z) } else { w.yaw });
         self.park.limbs.clear();
-        self.fall_with(db, velocity);
+        self.fall_rerooted(db, velocity);
         self.air_top = self.matcher.character().translation.y;
         self.state = CharacterState::Falling(0.0);
     }
@@ -1400,6 +1490,66 @@ impl CharacterController {
             character.rotation = rotation;
             self.matcher.place(character);
         }
+    }
+
+    /// Play `action` now, the root placed at `place` (if given), what shows kept where it is: the
+    /// hips and the heading eased from where they show, the hips taking the new clip's place over
+    /// the root (`reroot`: the clips may put the root differently under the body).
+    fn switch_clip(&mut self, db: &Database, action: Action, place: Option<crate::animation::Transform>) {
+        let (hips_before, rotation_before) = (self.matcher.joint_world(db, db.roles.hips), self.matcher.shown().rotation);
+        self.matcher.start_action(db, action);
+        if let Some(t) = place {
+            self.matcher.place(t);
+        }
+        self.matcher.reroot(db);
+        self.matcher.soften(0.15, 0.4);
+        self.matcher.refresh(db);
+        self.matcher.blend_position(hips_before - self.matcher.joint_world(db, db.roles.hips));
+        self.matcher.blend_rotation(rotation_before);
+        // (the frame shows it already: its limbs where this frame pinned them)
+        let targets = self.park.limbs.clone();
+        if !targets.is_empty() {
+            self.matcher.reach(db, &targets);
+        }
+    }
+
+    /// The pack's hang idle (`ActionKind::HangIdle`): one braced (its name says `Braced`) for a
+    /// face the feet can push on, else any.
+    fn hang_idle(&self, db: &Database, braced: bool) -> Option<usize> {
+        let idles = || self.actions.iter().filter(|c| c.kind == ActionKind::HangIdle);
+        idles().find(|c| db.clips[c.clip].name.contains("Braced") == braced).or_else(|| idles().next()).map(|c| c.clip)
+    }
+
+    /// The root's place and heading to show hang idle clip `clip` at `frame` from `edge` at `s`:
+    /// the clip's hips (it faces +Z, the face ahead) out from the face under the edge, as far
+    /// below it as they hang below the clip's hands; the hands pinned onto the edge by IK. (The
+    /// generated idles' hands drift on their bar; their hips must not come into the wall.)
+    fn idle_place(&self, db: &Database, clip: usize, frame: f32, edge: usize, s: f32) -> (Vec3, f32) {
+        let hands = self.hands.unwrap_or([0, 0]);
+        let f = &self.features;
+        let normal = f.edge_normal(edge, s, 0.35);
+        let into = -normal;
+        let yaw = into.x.atan2(into.z);
+        let mid = hands_mid(db, clip, frame, hands);
+        let hips = clip_joint(db, clip, frame, db.roles.hips);
+        let target = f.edges[edge].point(s) + normal * IDLE_HIPS_OUT + Vec3::Y * (HAND_RADIUS - (mid.y - hips.y));
+        (target - yaw_rotation(yaw) * hips, yaw)
+    }
+
+    /// Fall from a hang or a bar with this momentum: the fall loop (whose root rides the body)
+    /// switched to with what shows kept where it is.
+    fn fall_rerooted(&mut self, db: &Database, velocity: Vec3) {
+        let (hips_before, rotation_before) = (self.matcher.joint_world(db, db.roles.hips), self.matcher.shown().rotation);
+        self.fall_with(db, velocity);
+        self.matcher.reroot(db);
+        self.matcher.soften(0.15, 0.4);
+        self.matcher.refresh(db);
+        // the root moved so the hips stay (the fall's root rides the body), not just shown there
+        let mut character = self.matcher.character();
+        character.translation += hips_before - self.matcher.joint_world(db, db.roles.hips);
+        self.matcher.place(character);
+        self.matcher.blend_position(Vec3::ZERO);
+        self.matcher.blend_rotation(rotation_before);
     }
 
     /// Whether limb end `joint` (a hand or a foot) can reach `target` from where its root joint
@@ -1483,11 +1633,17 @@ impl CharacterController {
         // would have to stretch past their length (a catch's eased body, a hand round a corner)
         let hanging = matches!(self.state, CharacterState::Hanging | CharacterState::Swinging);
         if hanging {
+            // the pull let go of slowly (0.15 s half-life), then what the arms still need on top
+            // of it, worked out where the shoulders will be once it has let go
+            let held = self.matcher.reach_offset();
+            let decayed = held * (-dt / 0.15).exp();
+            let moved = decayed - held;
             let mut pull = Vec3::ZERO;
             for t in targets.iter().filter(|t| t.weight > 0.5 && self.hands.is_some_and(|h| h.contains(&t.joint))) {
                 let (Some(elbow), Some(shoulder)) = (db.skeleton.parents[t.joint], db.skeleton.parents[t.joint].and_then(|e| db.skeleton.parents[e])) else { continue };
                 let (h, e, sh) = (self.matcher.joint_world(db, t.joint), self.matcher.joint_world(db, elbow), self.matcher.joint_world(db, shoulder));
                 let reach = (h.distance(e) + e.distance(sh)) * 0.985;
+                let sh = sh + moved;
                 let d = t.target.distance(sh);
                 if d > reach {
                     let need = (t.target - sh).normalize_or_zero() * (d - reach);
@@ -1499,12 +1655,13 @@ impl CharacterController {
                     );
                 }
             }
-            // what the arms still need, on top of the pull already showing; let go of slowly
-            // (half a second's half-life) when they don't need it
-            let held = self.matcher.reach_offset();
-            // (no faster than the body can be seen to be pulled: a catch's last few centimetres
-            // close over a few frames)
-            let next = if pull.length_squared() > 1e-8 { held + pull.clamp_length_max(if self.state == CharacterState::Swinging { 2.0 } else { 6.0 } * dt) } else { held * (-dt / 0.15).exp() };
+            // growing past what it held no faster than the body can be seen to be pulled (a
+            // catch's last few centimetres close over a few frames); within it, at once
+            let mut next = decayed + pull;
+            let rate = if self.state == CharacterState::Swinging { 2.0 } else { 6.0 } * dt;
+            if next.length() > held.length() + rate {
+                next = next.clamp_length_max(held.length() + rate);
+            }
             self.matcher.set_reach_offset(next);
         } else if self.matcher.reach_offset() != Vec3::ZERO {
             let held = self.matcher.reach_offset();

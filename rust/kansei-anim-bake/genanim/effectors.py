@@ -208,6 +208,8 @@ def build(skeleton, spec, frames, fps):
 
         def braced(flex):
             turns = arms_up(0.35)
+            # the body leaning in from the hips, the hips out from the face under the hands
+            turns["Hips"] = [((1.0, 0.0, 0.0), spec.get("lean", 0.36))]
             for side in ("Left", "Right"):
                 turns[f"{side}Leg"] = [((1.0, 0.0, 0.0), -flex)]
                 turns[f"{side}Shin"] = [((1.0, 0.0, 0.0), flex * 1.2)]
