@@ -231,6 +231,9 @@ pub struct MotionMatcher {
     blend_pending: Option<Vec3>,
     /// The hips on the output skeleton.
     hips_out: usize,
+    /// A longer inertialization half-life for a while (`soften`): its half-life and the seconds
+    /// left.
+    soft: Option<(f32, f32)>,
 }
 
 impl MotionMatcher {
@@ -268,6 +271,7 @@ impl MotionMatcher {
             last_root: None,
             blend_pending: None,
             hips_out: db.roles.hips,
+            soft: None,
         };
         matcher.pose.to_model(&db.skeleton, &mut matcher.model);
         matcher
@@ -333,6 +337,12 @@ impl MotionMatcher {
         self.output(db);
     }
 
+    /// Blend transitions over `halflife` (longer than the settings') for the next `seconds`: a
+    /// catch whose pose is far from the fall's.
+    pub fn soften(&mut self, halflife: f32, seconds: f32) {
+        self.soft = Some((halflife, seconds));
+    }
+
     /// Show the character turned to `from` (a world rotation: what showed before a catch turned
     /// it), easing onto its own rotation with the root blend's half-life.
     pub fn blend_rotation(&mut self, from: Quat) {
@@ -356,6 +366,10 @@ impl MotionMatcher {
     /// anew).
     pub fn blend_position(&mut self, offset: Vec3) {
         self.root_offset.0 += offset;
+        // the root's move to its new place is not a velocity
+        if let Some((p, _)) = self.last_root.as_mut() {
+            *p = self.character.translation;
+        }
     }
 
     pub fn character(&self) -> Transform {
@@ -441,6 +455,11 @@ impl MotionMatcher {
 
     /// Move the character (and its simulation) without blending, facing `yaw`.
     pub fn teleport(&mut self, position: Vec3, yaw: f32) {
+        // (no blend across a teleport)
+        self.root_offset = (Vec3::ZERO, Vec3::ZERO);
+        self.rotation_offset = (Quat::IDENTITY, Vec3::ZERO);
+        self.last_root = None;
+        self.blend_pending = None;
         self.character = Transform::from_translation_rotation(position, yaw_rotation(yaw));
         self.simulation = Simulation { position, velocity: Vec3::ZERO, acceleration: Vec3::ZERO, rotation: self.character.rotation, angular_velocity: Vec3::ZERO };
         self.desired_yaw = yaw;
@@ -469,7 +488,14 @@ impl MotionMatcher {
             self.search_if_due(db, input, dt);
             self.play(db, dt);
         }
-        self.inertializer.update(&mut self.matched, self.settings.inertialization_halflife, dt);
+        let halflife = match &mut self.soft {
+            Some((h, left)) if *left > 0.0 => {
+                *left -= dt;
+                h.max(self.settings.inertialization_halflife)
+            }
+            _ => self.settings.inertialization_halflife,
+        };
+        self.inertializer.update(&mut self.matched, halflife, dt);
         if self.action.is_some() {
             // the simulation waits where the action takes the character
             let s = &mut self.simulation;
@@ -511,10 +537,6 @@ impl MotionMatcher {
         decay_spring_damper_exact(x, w, self.settings.root_blend_halflife, dt);
         let (q, w) = &mut self.rotation_offset;
         decay_spring_damper_exact_quat(q, w, self.settings.root_blend_halflife * 1.5, dt);
-        // a teleport, not a move: no blend across it
-        if v.length() > 40.0 {
-            self.root_offset = (Vec3::ZERO, Vec3::ZERO);
-        }
         self.last_root = Some((p, v));
     }
 
@@ -617,6 +639,9 @@ impl MotionMatcher {
         db.velocities(to, destination_linear, destination_angular);
         db.pose(to, to, 0.0, destination);
         self.inertializer.transition(&self.sampled, source_linear, source_angular, destination, destination_linear, destination_angular);
+        // what plays now (a second switch before the next update starts from it, not the first's
+        // source again)
+        self.sampled.local.clone_from(&destination.local);
         self.clip = db.clip_of(to);
         self.frame = (to - db.clips[self.clip].start) as f32;
     }

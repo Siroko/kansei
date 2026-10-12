@@ -672,6 +672,18 @@ impl CharacterController {
             l.planted = rest[k];
             l.from = rest[k];
         }
+        if catching {
+            // on the edge at once, the hips and the heading eased from where they show (the
+            // catch's clip frames still play on to the hang)
+            let (hips_before, rotation_before) = (self.matcher.joint_world(db, db.roles.hips), self.matcher.shown().rotation);
+            let (root, yaw) = self.hang_place(pose, edge, s);
+            hang.from = None;
+            self.matcher.place(crate::animation::Transform::from_translation_rotation(root, yaw_rotation(yaw)));
+            self.matcher.soften(0.15, 0.4);
+            self.matcher.refresh(db);
+            self.matcher.blend_position(hips_before - self.matcher.joint_world(db, db.roles.hips));
+            self.matcher.blend_rotation(rotation_before);
+        }
         self.park.hang = Some(hang);
         self.park.jump_target = None;
         self.state = CharacterState::Hanging;
@@ -983,6 +995,11 @@ impl CharacterController {
             let planted = contacts[k] && w.time > 0.12;
             w.weights[k] += ((planted as u32 as f32) - w.weights[k]) * (1.0 - (-dt / 0.02).exp());
             if planted {
+                // pinned where it touched the wall, let go (and pinned again) once the leg would
+                // have to stretch past the animation by more than a hand's width
+                if w.pins[k].is_some_and(|p| p.distance(on_wall) > 0.12) {
+                    w.pins[k] = None;
+                }
                 let pin = *w.pins[k].get_or_insert(on_wall);
                 let flat = Quat::from_rotation_arc(up.normalize(), f.normal) * self.matcher.joint_world_rotation(db, joint);
                 self.park.limbs.push(LimbTarget { joint, target: pin, weight: w.weights[k] * entry, rotation: Some(flat) });
@@ -991,6 +1008,16 @@ impl CharacterController {
                 let target = if d < ankle { on_wall } else { animated };
                 let weight = if d < ankle { 1.0 } else { w.weights[k] };
                 self.park.limbs.push(LimbTarget { joint, target, weight: weight * entry, rotation: None });
+            }
+        }
+        // the arm on the wall's side swings into it, leaning: kept out of it
+        if let Some(hands) = self.hands {
+            for h in hands {
+                let p = self.matcher.joint_world(db, h);
+                let (d, _) = f.local(p);
+                if d < HAND_RADIUS {
+                    self.park.limbs.push(LimbTarget { joint: h, target: p + f.normal * (HAND_RADIUS - d), weight: entry, rotation: None });
+                }
             }
         }
         self.park.wall = Some(w);
@@ -1010,6 +1037,14 @@ impl CharacterController {
         let flat = Vec3::new(velocity.x, 0.0, velocity.z);
         self.park.air_yaw = Some(flat.x.atan2(flat.z));
         self.park.limbs.clear();
+        // the root (on the wall, at the feet) out to where the falling capsule clears the wall;
+        // what shows stays put
+        let mut character = self.matcher.character();
+        let (out, _) = f.local(character.translation);
+        let shift = f.normal * (self.radius + 0.05 - out).max(0.0);
+        character.translation += shift;
+        self.matcher.place(character);
+        self.matcher.blend_position(-shift);
         self.fall_with(db, velocity);
         self.air_top = self.matcher.character().translation.y;
         self.state = CharacterState::Falling(0.0);
@@ -1093,6 +1128,7 @@ impl CharacterController {
             character.translation = root;
             character.rotation = rotation;
             self.matcher.place(character);
+            self.matcher.soften(0.18, 0.5);
             self.matcher.refresh(db);
             self.matcher.blend_position(hips_before - hips_after);
             self.matcher.blend_rotation(rotation_before);

@@ -70,6 +70,28 @@ pivots, starts, stops and strafes come out where motion matching needs them. Thr
 - `limp`: one style, "a woman limping on her injured left leg", over a whole pack's locomotion
   and some parkour, at slower paces (walk 1.2, run 3.0 m/s: open the example with `walk=1.2&run=3`).
 
+### Touching what the level holds: end-effector constraints
+
+Kimodo doesn't see objects, so a clip's `effectors` (`effectors.py`) pin its hands to a bar or a
+ledge, its feet to a wall and its hips where hanging or leaning puts them, on the frames that
+should touch. Each constraint is a small pose built on the model's own SOMA skeleton (its rest
+pose with the arms raised or the body leaning) and placed so the hand or foot lands on the
+target: geometry, never a captured pose. Kinds: `bar_hang` and `bar_swing` (hands on a bar,
+`until` holds only the first seconds, for a pull-up), `shimmy` (hands stepping along a ledge),
+`wall_run` (feet stepping on a wall, the hips leaning away). `prompts/parkour.json` is the set the
+room's bars use (`prompts/parkour_spike.json` the first try); `spike_check.py` measures how close
+the result comes (hands to the bar or ledge, feet to the wall, from the NPZ's joints):
+
+```bat
+generate.cmd parkour
+docker run --rm ... kansei-genanim-kimodo:58e7818 python /genanim/spike_check.py /out/parkour
+```
+
+The constraints are soft: hands land 6-10 cm from a ledge and 15-30 cm from a swinging bar, and
+slide (0.1-0.5 m/s); feet come within 4-7 cm of a wall. The engine pins the contacts itself
+(`MotionMatcher::reach`), so the clips serve for the body's motion. Hangs and swings read well;
+the shimmies' legs still paddle and the wall runs read as leaping beside the wall.
+
 ## 2. Convert
 
 ```sh

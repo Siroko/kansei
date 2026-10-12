@@ -92,6 +92,10 @@ struct Scenario {
     expect: &'static [&'static str],
 }
 
+fn label_is_60(dt: f32, hitch: bool) -> bool {
+    (dt - 1.0 / 60.0).abs() < 1e-6 && !hitch
+}
+
 fn state_name(s: CharacterState) -> &'static str {
     match s {
         CharacterState::Grounded => "grounded",
@@ -257,8 +261,10 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
             let (z, y, x) = ch.rotation.to_euler(glam::EulerRot::ZYX);
             println!("    {time:.2}s {state} root {:.2?} euler x {:.2} y {:.2} z {:.2} sim {:.2?} clip {} frame {:.1}", ch.translation, x, y, z, c.matcher.simulation().position, db.clips[c.matcher.playing().0].name, c.matcher.playing().1);
         }
-        if std::env::var("PARKOUR_DEBUG").is_ok() && time > 0.98 && time < 1.2 {
+        if std::env::var("PARKOUR_DEBUG").is_ok() && time > 0.98 && time < 1.2 && label_is_60(dt, hitch) {
             let head = db.skeleton.find("head").unwrap_or(0);
+            let r = c.matcher.shown().rotation;
+            eprintln!("  rot {:.3?} char {:.3?}", r, c.matcher.character().rotation);
             eprintln!("  {time:.3} {state} head {:.3?} hips {:.3?} shown {:.3?} char {:.3?} clip {} {:.1}", c.matcher.joint_world(db, head), c.matcher.joint_world(db, db.roles.hips), c.matcher.shown().translation, c.matcher.character().translation, db.clips[c.matcher.playing().0].name, c.matcher.playing().1);
         }
         // limbs on their targets
@@ -340,7 +346,8 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
         }
         if let Some(out) = csv.as_mut() {
             let ch = c.matcher.character().translation;
-            out.push_str(&format!("{time:.4},{state},{:.4},{:.4},{:.4},{frame_err:.4},{accel:.2},{:.3}\n", ch.x, ch.y, ch.z, yaw_of(c.matcher.character().rotation)));
+            let hips = c.matcher.joint_world(db, db.roles.hips);
+            out.push_str(&format!("{time:.4},{state},{:.4},{:.4},{:.4},{frame_err:.4},{accel:.2},{:.3},{:.3},{:.3},{:.3}\n", ch.x, ch.y, ch.z, yaw_of(c.matcher.character().rotation), hips.x, hips.y, hips.z));
         }
     }
     r.limb_error_mean = if r.limb_frames > 0 { sum_err / r.limb_frames as f32 } else { 0.0 };
@@ -435,7 +442,7 @@ fn main() -> Result<(), String> {
     let mut failures = 0;
     for s in scenarios().iter().filter(|s| only.as_ref().is_none_or(|o| s.name.contains(o.as_str()))) {
         for (dt, hitch, label) in rates {
-            let mut csv = csv_dir.as_ref().map(|_| String::from("time,state,x,y,z,limb_error,accel,yaw\n"));
+            let mut csv = csv_dir.as_ref().map(|_| String::from("time,state,x,y,z,limb_error,accel,yaw,hips_x,hips_y,hips_z\n"));
             let r = run(db, &pack.actions, &world, &features, s, dt, hitch, gait, csv.as_mut(), trace && label == "60");
             // the expected states in order (others may come between)
             let mut want = s.expect.iter().peekable();
