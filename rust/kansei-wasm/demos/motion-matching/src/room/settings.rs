@@ -141,6 +141,15 @@ settings! {
     lamps: bool = true;
     lamp_cd: f32 = 700.0;
     lamp_temp: f32 = 2700.0;
+    // ambient occlusion over the lit image (`ao`): on, its reach (m), strength (an exponent on
+    // the unoccluded share), tightness round contacts (an exponent on the near samples' weight),
+    // samples a pixel, the occlusion alone; the showroom's on, the room's off
+    ao: bool = false;
+    ao_radius: f32 = 0.6;
+    ao_intensity: f32 = 2.5;
+    ao_falloff: f32 = 1.0;
+    ao_samples: f32 = 12.0;
+    ao_view: bool = false;
     // the air
     fog: f32 = 0.002;
     fog_aniso: f32 = 0.55;
@@ -221,6 +230,9 @@ settings! {
     mirror_rough: f32 = 0.0;
     mirror2_rough: f32 = 0.1;
     glass_ior: f32 = 1.5;
+    // the glb's glass's absorption times this (set at start: art direction over the authored
+    // glass; the showroom's vase, re-exported darker, reads as glass rather than a mirror at 0.5)
+    glass_density: f32 = 1.0;
     glass_rough: f32 = 0.0;
     // the glass pass (the dragon, the water) traces half its pixels a frame; the glass's
     // reflections traced with the other surfaces' (half resolution, accumulated)
@@ -307,6 +319,8 @@ impl Settings {
             display_cd: 120_000.0,
             fog: 0.0006,
             dust: false,
+            ao: true,
+            glass_density: 0.5,
             ev: 9.0,
             white_temp: 6200.0,
             contrast: 1.03,

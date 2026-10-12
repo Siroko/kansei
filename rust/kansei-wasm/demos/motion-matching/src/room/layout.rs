@@ -171,9 +171,10 @@ struct RoomMaterial {
     roughness: f32,
     /// Transmissive (KHR_materials_transmission): drawn as ray-traced glass.
     glass: bool,
-    /// The light a metre of it leaves: its volume's attenuation (KHR_materials_volume) brought
-    /// to a metre, else its base colour.
-    glass_tint: [f32; 3],
+    /// The light a centimetre of it leaves: its volume's attenuation (KHR_materials_volume)
+    /// brought to a centimetre, else its base colour as a metre's (a metre of thin coloured glass
+    /// leaves less light than an f32 holds).
+    glass_tint_cm: [f32; 3],
 }
 
 /// A group of meshes drawn as one renderable.
@@ -252,7 +253,7 @@ fn world_bounds(world: Mat4, (lo, hi): (GVec3, GVec3)) -> (GVec3, GVec3) {
 }
 
 /// The materials, their maps uploaded once each.
-fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, deferred: bool, layers: &mut Vec<(wgpu::TextureView, [f32; 3])>) -> Vec<RoomMaterial> {
+fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, deferred: bool, all_reflective: bool, layers: &mut Vec<(wgpu::TextureView, [f32; 3])>) -> Vec<RoomMaterial> {
     let support = renderer.compression_support();
     let mut uploaded: HashMap<usize, (wgpu::Texture, wgpu::TextureView)> = HashMap::new();
     let mut texture = |t: Option<&kansei_core::loaders::GLTFTextureRef>, flat: [u8; 4], label: &str| -> Shared {
@@ -286,7 +287,7 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
             let strength = m.emissive_strength().unwrap_or(1.0);
             let emission = emissive.map(|c| c * strength * EMISSION_SCALE);
             let roughness = if textured_orm { info.roughness } else { 1.0 };
-            let reflective = x.get("kansei_reflective").and_then(Value::as_f64).unwrap_or(0.0) > 0.5;
+            let reflective = all_reflective || x.get("kansei_reflective").and_then(Value::as_f64).unwrap_or(0.0) > 0.5;
             let params = PbrParams {
                 tint: [tint[0], tint[1], tint[2], 0.0],
                 surface: [1.0, roughness, 0.0, reflective as u32 as f32],
@@ -311,9 +312,9 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 emission,
                 roughness,
                 glass: m.transmission().is_some_and(|t| t.transmission_factor() > 0.5),
-                glass_tint: match m.volume() {
-                    Some(v) if v.attenuation_distance().is_finite() && v.attenuation_distance() > 0.0 => v.attenuation_color().map(|c| c.clamp(1e-6, 1.0).powf(1.0 / v.attenuation_distance())),
-                    _ => tint,
+                glass_tint_cm: match m.volume() {
+                    Some(v) if v.attenuation_distance().is_finite() && v.attenuation_distance() > 0.0 => v.attenuation_color().map(|c| c.clamp(1e-6, 1.0).powf(0.01 / v.attenuation_distance())),
+                    _ => tint.map(|c| c.clamp(1e-6, 1.0).powf(0.01)),
                 },
             }
         })
@@ -325,6 +326,9 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
 pub struct Source<'a> {
     pub url: &'a str,
     pub required: bool,
+    /// Every material reflective (`kansei_reflective`), traced where glossy: the showroom's
+    /// pieces, whose chrome and lacquer come from their own maps.
+    pub reflective: bool,
 }
 
 /// A glb fetched, its buffers and its materials.
@@ -336,7 +340,11 @@ struct Doc {
 
 /// Fetch the glbs (`assets/room/room.glb`, or the showroom's architecture and furniture) and build
 /// them into `scene` as one room: `deferred` leaves the direct light to `RtShadowsEffect`.
-pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, sources: &[Source<'_>]) -> Result<Layout, String> {
+///
+/// `glass_scale`: the glass's tint drawn as the light `1 / glass_scale` metres of it leave
+/// (`RtGlass::absorption_scale`); `layout.glass_tint` is that. `glass_density` scales the glass's
+/// absorption as authored (1: as the glb says).
+pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, sources: &[Source<'_>], glass_scale: f32, glass_density: f32) -> Result<Layout, String> {
     let mut albedo_layers = Vec::new();
     let mut docs = Vec::new();
     for source in sources {
@@ -352,7 +360,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
         let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))?;
         let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone()).map_err(|e| format!("{name} buffers: {e}"))?;
         let result = GLTFLoader::load_glb(&bytes)?;
-        let mats = materials(renderer, &gltf.document, &result, deferred, &mut albedo_layers);
+        let mats = materials(renderer, &gltf.document, &result, deferred, source.reflective, &mut albedo_layers);
         docs.push(Doc { gltf, buffers, mats });
     }
 
@@ -363,7 +371,8 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
     // again), else its mesh
     let mut grid: HashMap<(usize, usize, bool), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
     let mut mirrors: Vec<(String, Geometry, f32)> = Vec::new();
-    let mut glass: Vec<(String, Geometry, [f32; 3])> = Vec::new();
+    // (name, mesh, the drawn tint, a centimetre's)
+    let mut glass: Vec<(String, Geometry, [f32; 3], [f32; 3])> = Vec::new();
     let mut glass_boxes = Vec::new();
     let mut glass_tint = None;
     let mut views = Vec::new();
@@ -506,9 +515,12 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
                 if role == "mirror" {
                     mirrors.push((name, geometry, number(&x, "kansei_roughness").unwrap_or(0.0)));
                 } else {
-                    let tint = mesh.primitives().next().and_then(|p| p.material().index()).map_or([0.95; 3], |m| mats[m].glass_tint);
+                    let tint_cm = mesh.primitives().next().and_then(|p| p.material().index()).map_or([0.95f32.powf(0.01); 3], |m| mats[m].glass_tint_cm);
+                    // the drawn tint: the light 1 / glass_scale metres leave
+                    let tint_cm = tint_cm.map(|c| c.powf(glass_density.max(0.0)));
+                    let tint = tint_cm.map(|c| c.powf(100.0 / glass_scale.max(1e-3)));
                     glass_tint.get_or_insert(tint);
-                    glass.push((name, geometry, tint));
+                    glass.push((name, geometry, tint, tint_cm));
                     glass_boxes.push(bounds);
                 }
                 continue;
@@ -635,9 +647,16 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
         r.rt = Some(RtSurface::new(MIRROR_GI));
         mirrors_out.push((scene.add(SceneNode::Renderable(r)), roughness));
     }
-    for (name, geometry, tint) in glass {
-        let mut r = Renderable::new(geometry, Material::standard_lit(&name, &StandardLitOptions::glass(tint, 1.5, 0.0)));
-        r.rt = Some(RtSurface::glass(tint));
+    for (name, geometry, drawn, tint_cm) in glass {
+        let forward = fill().iter().any(|&c| c > 0.0);
+        let material = if forward {
+            // no glass pass: blended, its tint a centimetre's
+            pbr::forward_glass(&name, tint_cm, fill())
+        } else {
+            Material::standard_lit(&name, &StandardLitOptions::glass(drawn, 1.5, 0.0))
+        };
+        let mut r = Renderable::new(geometry, material);
+        r.rt = Some(RtSurface::glass(drawn));
         r.cast_shadow = false;
         scene.add(SceneNode::Renderable(r));
     }

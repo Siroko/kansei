@@ -253,6 +253,9 @@ pub struct RtCausticsEffect {
     /// Photons leave a spot light's emitter (`set_rect_emitter`, its disk) as it is; off, from its
     /// centre (sharper caustics, less physical).
     pub area_emitters: bool,
+    /// The glass's tint (`set_glass`) is the light left after `1 / glass_absorption_scale`
+    /// metres (1: a metre), as `RtGlass::absorption_scale`.
+    pub glass_absorption_scale: f32,
     /// The light the glass brings (its photons through it) times this, and their splats this
     /// much narrower (1 and 1: physical; the shadow the glass leaves stays as it is): a game's
     /// caustics, bright, crisp lines and spots where a physical glass's light spreads faint.
@@ -305,6 +308,7 @@ impl RtCausticsEffect {
             water_photons: false,
             area_emitters: false,
             focus_gain: 1.0,
+            glass_absorption_scale: 1.0,
             focus_sharpen: 1.0,
             options,
             map_dims,
@@ -641,7 +645,7 @@ impl PostProcessingEffect for RtCausticsEffect {
             splat_texels: self.options.splat_texels.max(1.0),
             water_absorb: absorb(water.map_or([1.0; 3], |w| w.tint)),
             photons,
-            glass_absorb: absorb(self.glass.1),
+            glass_absorb: absorb(self.glass.1).map(|a| a * self.glass_absorption_scale.max(1e-3)),
             flags: self.water_photons as u32,
             focus_gain: self.focus_gain.max(0.0),
             focus_sharpen: self.focus_sharpen.clamp(0.1, 1.0),

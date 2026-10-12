@@ -418,9 +418,32 @@ green caustics. Five track spots (3500 K) light five pieces; daylight comes thro
 and the windows. Everything else is the room's: every mode works (`gi=rt|voxel|voxel+ssgi|probes|
 probes+ssgi|ssgi|off`, `shadows=rt|maps`, `quality=game|high`, `render=forward`), the panel, the
 perf overlay, the character and its parkour (the bench takes a hurdle, the plinths are steps).
-`cam=` names a view: `hall`, `aisle`, `outside` and one a piece (`karuselli`, `togo`, `panton`,
-`vase`, `mg5`, `paimio`, `a406`, `wave`). The looks: `showroom` (the default), `overcast`, `spots
-only`, `golden hour`.
+`cam=` names a view: `hall`, `aisle`, `outside`, one a piece (`karuselli`, `togo`, `panton`,
+`vase`, `mg5`, `paimio`, `a406`, `wave`) and the chrome close up (`wave_close`, `mg5_close`,
+`karuselli_close`). The looks: `showroom` (the default), `overcast`, `spots only`, `golden hour`.
+With the links `link-packs.sh` makes, the page with no parameters walks the mannequin on the best
+private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion).
+
+- **Ambient occlusion** (`src/room/ao.rs`, from the caustics-box demo; the panel's Ambient
+  occlusion, `ao`, `ao_intensity`, `ao_radius`, `ao_falloff`, `ao_samples`, `ao_view`): a game's
+  contact darkening multiplied into the lit image after the lighting, the reflections and the
+  glass, in every mode (the GI's own occlusion only darkens its bounce, and most of the light here
+  is direct). On in the showroom, off in the room. About 1.0-1.3 ms at 1080p.
+- **Chrome and lacquer**: every material of the pieces' glb is reflective (traced where its
+  roughness is under 0.45), so the tubes reflect the room. `render=forward` traces nothing: there
+  the room's fill stands for what a surface reflects (F0 times the fill, brighter above than
+  below).
+- **The vase**: ray-traced glass tinted by its `KHR_materials_volume`, kept per centimetre (a
+  metre of thin coloured glass leaves less light than an f32 holds) and drawn with
+  `RtGlass::absorption_scale` 50 (the GBuffer's 8-bit tint is the light 2 cm leave), and the same
+  scale for its caustics (`RtCausticsEffect::glass_absorption_scale`). `glass_density` (0.5 here,
+  set at start) scales the authored absorption: the white plinth's reflections drown a dark
+  green. In `render=forward`, with no glass pass, it is blended over the room (`pbr::forward_glass`).
+- **Placement**: each piece is centred on its plinth by its bounds as Blender instances it (nested
+  empties, instance offsets), its bottom on the plinth's top; its `_SHADOW` and `_COL`, made where
+  missing, sit under a plain holder (`PIECE_<label>`) beside the instance (`PIECE_<label>_INST`),
+  since the glTF exporter misplaces an instance's children. The build prints each piece's centre,
+  height against its README and facing, and stops on a height off by more than 5%.
 
 **The furniture is private.** The pieces depict branded designs and are derived from the owner's
 photos, so they are not in this repository: the page loads the architecture from

@@ -156,6 +156,15 @@ bind(rt, 'caustics_sharpen', { label: 'glass caustics splat width (1 physical)',
 bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
 bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });
 
+// contact darkening over the lit image (room/ao.rs), in every render mode
+const ao = pane.addFolder({ title: 'Ambient occlusion', expanded: false });
+bind(ao, 'ao', { label: 'enabled' });
+bind(ao, 'ao_intensity', { label: 'strength', min: 0, max: 6, step: 0.05 });
+bind(ao, 'ao_radius', { label: 'radius (m)', min: 0.05, max: 3, step: 0.01 });
+bind(ao, 'ao_falloff', { label: 'contact tightness', min: 0, max: 6, step: 0.05 });
+bind(ao, 'ao_samples', { label: 'samples', min: 1, max: 32, step: 1 });
+bind(ao, 'ao_view', { label: 'show AO only' });
+
 const air = pane.addFolder({ title: 'Fog and dust', expanded: false });
 bind(air, 'fog', { label: 'fog density', min: 0, max: 0.03, step: 0.0005 }, 'look');
 bind(air, 'fog_aniso', { label: 'fog anisotropy', min: 0, max: 0.95, step: 0.01 });

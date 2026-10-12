@@ -25,7 +25,7 @@ struct RtReflectParams {
     glassInterfaces : u32,    // the most surfaces a ray through the glass crosses or reflects off
     glassSamples : u32,       // paths a frosted glass pixel a frame (averaged, then over frames)
     indirectScale : f32,      // scale of the voxels' irradiance at the hits the camera doesn't see
-    _pad3        : u32,
+    glassAbsorptionScale : f32, // the glass's tint is the light left after 1 / this metres (RtGlass::absorption_scale)
 }
 
 const RT_REFLECT_ALPHA : u32 = 1u;

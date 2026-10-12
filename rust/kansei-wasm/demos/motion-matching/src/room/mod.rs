@@ -26,6 +26,7 @@
 //! see `settings`. The character is the lake page's (`character`, `player`), drawn by
 //! `look::RoomLit` and standing in the grid as capsules on its bones (`look::Proxy`).
 
+mod ao;
 mod assets;
 mod dust;
 mod layout;
@@ -101,11 +102,11 @@ impl Venue {
     /// `pieces=0` leaves it out, for captures that may be published).
     fn sources(self) -> Vec<layout::Source<'static>> {
         match self {
-            Venue::Room => vec![layout::Source { url: "assets/room/room.glb", required: true }],
+            Venue::Room => vec![layout::Source { url: "assets/room/room.glb", required: true, reflective: false }],
             Venue::Showroom => {
-                let mut sources = vec![layout::Source { url: "assets/showroom/showroom.glb", required: true }];
+                let mut sources = vec![layout::Source { url: "assets/showroom/showroom.glb", required: true, reflective: false }];
                 if kansei_wasm::flag("pieces", true) {
-                    sources.push(layout::Source { url: "assets/showroom/private/pieces.glb", required: false });
+                    sources.push(layout::Source { url: "assets/showroom/private/pieces.glb", required: false, reflective: true });
                 }
                 sources
             }
@@ -124,6 +125,15 @@ impl Venue {
         match self {
             Venue::Room => Settings::default(),
             Venue::Showroom => Settings::showroom(),
+        }
+    }
+
+    /// `RtGlass::absorption_scale`: the room's glass (the dragon, the water) is tinted by the
+    /// metre, the showroom's thin green vase by the 2 cm.
+    fn glass_scale(self) -> f32 {
+        match self {
+            Venue::Room => 1.0,
+            Venue::Showroom => 50.0,
         }
     }
 
@@ -246,7 +256,7 @@ const FORWARD_FILL: [f32; 3] = [220.0, 225.0, 240.0];
 /// The effect chain: the aquarium's surface first (on the lit scene), the ray-traced direct light, the
 /// three GI effects (one enabled), the reflections and the glass, the fog, TAA, motion blur, the
 /// depth of field, bloom and the tone map. `apply` sets them all to the settings.
-fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout, forward: bool) -> Vec<Box<dyn PostProcessingEffect>> {
+fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout, forward: bool, glass_scale: f32) -> Vec<Box<dyn PostProcessingEffect>> {
     let [rect_z, rect_x] = layout.lights.skylight_rect;
     // (the sky lighting lights only the rays that leave through the windows and the skylight: the
     // room's materials add no sky ambient of their own for the GI to take out, so `ambient` 0)
@@ -297,7 +307,7 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     reflections.set_spot_lights(Some(renderer.spot_lights_buffer()));
     // (the glass's reflections traced with the floor's and the mirrors', at their resolution: the
     // water can fill much of the screen)
-    reflections.set_glass(Some(RtGlass { reflections_in_trace: true, ..Default::default() }));
+    reflections.set_glass(Some(RtGlass { reflections_in_trace: true, absorption_scale: glass_scale, ..Default::default() }));
     reflections.set_caustics(Some((&caustics_map.0, &caustics_map.1)));
     reflections.set_sky_lighting(Some(sky));
     effects.push(Box::new(Switch { effect: reflections, on: true }));
@@ -319,8 +329,10 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     effects
 }
 
-/// TAA, motion blur, depth of field, bloom and the tone map.
+/// The ambient occlusion over the lit image, TAA, motion blur, depth of field, bloom and the tone
+/// map.
 fn post_effects(renderer: &Renderer, effects: &mut Vec<Box<dyn PostProcessingEffect>>) {
+    effects.push(Box::new(ao::AoEffect::new()));
     effects.push(Box::new(Switch { effect: TemporalAAEffect::new(TemporalAAOptions::default()), on: true }));
     effects.push(Box::new(Switch { effect: MotionBlurEffect::new(MotionBlurOptions::default()), on: false }));
     effects.push(Box::new(Switch { effect: CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions::default()), on: false }));
@@ -795,7 +807,7 @@ impl RoomState {
             // the voxels' irradiance at the hits the camera doesn't see, brought to the hybrid
             // RT GI's level (`refl_indirect`) so a mirror's far floor matches the floor in view
             e.effect.hit_indirect_scale = if gi == "rt" { s.refl_indirect } else { 1.0 };
-            e.effect.set_glass(Some(RtGlass { reflections_in_trace: s.glass_refl_shared, checkerboard: s.glass_checker, ..Default::default() }));
+            e.effect.set_glass(Some(RtGlass { reflections_in_trace: s.glass_refl_shared, checkerboard: s.glass_checker, absorption_scale: self.venue.glass_scale(), ..Default::default() }));
         }
         if let Some(e) = self.volume.effect_mut::<Switch<RtCausticsEffect>>() {
             // (off, the reflections' and the water's lookups of it too)
@@ -809,8 +821,9 @@ impl RoomState {
             e.effect.focus_gain = s.caustics_glass_gain.max(0.0);
             e.effect.focus_sharpen = s.caustics_sharpen.clamp(0.1, 1.0);
             // (the dragon's glass, else the glb's: the showroom's green vase)
-            let tint = if self.dragon.is_some() { GLASS_TINT } else { self.layout.glass_tint.unwrap_or(GLASS_TINT) };
+            let (tint, scale) = if self.dragon.is_some() { (GLASS_TINT, 1.0) } else { (self.layout.glass_tint.unwrap_or(GLASS_TINT), self.venue.glass_scale()) };
             e.effect.set_glass(s.glass_ior, tint);
+            e.effect.glass_absorption_scale = scale;
         }
         for (k, &(mirror, _)) in self.layout.mirrors.iter().enumerate() {
             let roughness = if k == 0 { s.mirror_rough } else { s.mirror2_rough };
@@ -871,6 +884,16 @@ impl RoomState {
             o.grain = s.grain;
             o.chromatic_aberration = s.chromatic;
             total = t.total_exposure();
+        }
+        if let Some(e) = self.volume.effect_mut::<ao::AoEffect>() {
+            e.enabled = s.ao;
+            e.radius = s.ao_radius.clamp(0.02, 4.0);
+            e.intensity = s.ao_intensity.clamp(0.0, 6.0);
+            e.falloff = s.ao_falloff.clamp(0.0, 8.0);
+            e.samples = s.ao_samples.round().clamp(1.0, 32.0) as u32;
+            e.debug = s.ao_view;
+            // (the occlusion alone shown about mid grey at the exposure)
+            e.white = 0.5 / total.max(1e-9);
         }
         if let Some(e) = self.volume.effect_mut::<Switch<TemporalAAEffect>>() {
             e.on = s.taa;
@@ -1027,7 +1050,7 @@ where
     // the room (`www/assets/room/room.glb`, from Blender), then voxel GI and the grid over its box
     set_text("hud", &format!("Loading the {} …", venue.name()));
     let mut scene = Scene::new();
-    let layout = layout::load(&renderer, &mut scene, deferred, &venue.sources()).await.map_err(|e| {
+    let layout = layout::load(&renderer, &mut scene, deferred, &venue.sources(), venue.glass_scale(), settings.glass_density).await.map_err(|e| {
         set_text("hud", &format!("The {} didn't load: {e}", venue.name()));
         JsValue::from_str(&e)
     })?;
@@ -1095,7 +1118,7 @@ where
     let body_layers = layout.albedo_layers.len() as u8;
     let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, body_layers));
 
-    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward));
+    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward, venue.glass_scale()));
     // the albedo the reflections' hits read: the surfaces' colour maps and the bodies' (each
     // textured body a layer after the surfaces', in order: `Proxy::new`)
     let body_maps: Vec<kansei_core::buffers::Texture> = character.iter().flat_map(|c| c.bodies.iter().filter_map(|b| b.base_color.as_ref())).map(|(img, _)| {

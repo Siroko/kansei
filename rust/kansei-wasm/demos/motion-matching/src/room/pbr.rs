@@ -204,7 +204,11 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferO
         // direct light from rt::RtShadowsEffect (its roughness and F0 in the GBuffer)
         return kansei_gbuffer_out_rt_lit(fill, pbr.emissive.rgb, s.n, diffuse, s.roughness, f0, reflective);
     }
-    let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill;
+    // (`render=forward` traces no reflections: the fill stands for the room the surface reflects,
+    // brighter above than below, so chrome reads as chrome, not grey)
+    let r = reflect(-v, s.n);
+    let env = pbr.ambient.rgb * mix(0.25, 1.8, clamp(r.y * 0.5 + 0.5, 0.0, 1.0)) * s.occlusion;
+    let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill + env * f0;
     if (reflective) {
         return kansei_gbuffer_out_specular(lit, pbr.emissive.rgb, s.n, diffuse, f0, s.roughness);
     }
@@ -266,5 +270,58 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
     material.set_bindable(2, maps.normal);
     material.set_bindable(3, maps.orm);
     material.set_bindable(4, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    material
+}
+
+/// `render=forward`'s glass (no glass pass to refract it): blended over what is behind, its own
+/// tint `tint` (the light a centimetre of it leaves, so a thin wall's colour) and the fill as the
+/// room it reflects (Fresnel: clear face on, mirror-like at grazing angles). Colour target only:
+/// the GBuffer's normals and albedo stay the background's.
+const FORWARD_GLASS_WGSL: &str = r#"
+struct ForwardGlass { tint: vec4f, fill: vec4f };
+@group(0) @binding(0) var<uniform> glass: ForwardGlass;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4f;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4f;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4f;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4f;
+
+struct VIn { @location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f };
+struct VOut { @builtin(position) clip: vec4f, @location(0) world: vec3f, @location(1) normal: vec3f };
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let world = world_matrix * v.position;
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.normal = (normal_matrix * vec4f(v.normal, 0.0)).xyz;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+    let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+    let eye = -(transpose(view3) * view_matrix[3].xyz);
+    let v = normalize(eye - in.world);
+    var n = normalize(in.normal);
+    if (!front) { n = -n; }
+    let ndv = clamp(dot(n, v), 0.0, 1.0);
+    let fresnel = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+    let r = reflect(-v, n);
+    let env = glass.fill.rgb * mix(0.25, 1.8, clamp(r.y * 0.5 + 0.5, 0.0, 1.0));
+    // the body: the tint over the fill, thicker (darker, greener) where the wall is seen edge on
+    let body = glass.tint.rgb * glass.fill.rgb * mix(0.9, 0.45, 1.0 - ndv);
+    let alpha = clamp(glass.tint.a + 0.55 * fresnel + 0.3 * (1.0 - ndv), 0.0, 0.9);
+    return vec4f((body * (1.0 - fresnel) + env * fresnel) / max(alpha, 1e-3) * alpha, alpha);
+}
+"#;
+
+/// A forward glass material (`FORWARD_GLASS_WGSL`): `tint` the light a centimetre leaves,
+/// `fill` the room's flat light (cd/m²).
+pub fn forward_glass(label: &str, tint: [f32; 3], fill: [f32; 3]) -> Material {
+    let options = MaterialOptions { mrt_output_count: Some(1), transparent: true, cull_mode: CullMode::None, ..Default::default() };
+    let mut material = Material::new(label, FORWARD_GLASS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], options);
+    let params: [f32; 8] = [tint[0], tint[1], tint[2], 0.25, fill[0], fill[1], fill[2], 0.0];
+    material.set_uniform_bindable(0, &format!("{label}/ForwardGlass"), &params);
     material
 }
