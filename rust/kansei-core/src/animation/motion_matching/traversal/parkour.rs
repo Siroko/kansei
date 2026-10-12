@@ -328,14 +328,14 @@ fn limb_joints(db: &Database, hands: [usize; 2]) -> [usize; 4] {
     [hands[0], hands[1], db.roles.feet[0], db.roles.feet[1]]
 }
 
-/// Read the hang from each climb clip: the frame after the hands reach the ledge where the root
-/// moves least, its hands on the ledge (within 6 cm), the feet on the face under it. The best
-/// (stillest) first.
+/// Read the hang from each climb clip (and each air catch that hangs a moment): the frame after
+/// the hands reach the ledge where the root moves least, its hands on the ledge (within 6 cm), the
+/// feet on the face under it. The best (stillest) first.
 pub fn hang_poses(db: &Database, actions: &[ActionClip], hands: [usize; 2]) -> Vec<HangPose> {
     let mut poses: Vec<(f32, HangPose)> = Vec::new();
     let mut pose = crate::animation::Pose { local: Vec::new() };
     let mut model = Vec::new();
-    for c in actions.iter().filter(|c| c.kind == ActionKind::Climb) {
+    for c in actions.iter().filter(|c| matches!(c.kind, ActionKind::Climb | ActionKind::Catch)) {
         let info = &db.clips[c.clip];
         let clip_yaw = c.forward.x.atan2(c.forward.z);
         let into = c.forward;
@@ -359,7 +359,9 @@ pub fn hang_poses(db: &Database, actions: &[ActionClip], hands: [usize; 2]) -> V
             let hand = hands.map(|h| to_local(world(h)));
             // (the ledge is where the hands grip, a few centimetres short of them)
             let off = hand.iter().map(|h| h.y.abs() + (h.z - 0.05).abs()).fold(0.0f32, f32::max);
-            if off > 0.06 || to_local(root).y > -1.0 {
+            // (an air catch's wrists grip a little lower, arms straight under the body's weight)
+            let slack = if c.kind == ActionKind::Catch { 0.14 } else { 0.06 };
+            if off > slack || to_local(root).y > -1.0 {
                 continue;
             }
             let cost = speed + 4.0 * off;
@@ -472,8 +474,16 @@ impl CharacterController {
         let poses = self.hang_poses_cached(db);
         match clip {
             Some(c) => poses.iter().find(|p| p.climb.clip == c).copied(),
-            None => poses.first().copied(),
+            // (a climb's: the catches' are for catching an edge in the air)
+            None => poses.iter().find(|p| p.climb.kind == ActionKind::Climb).or(poses.first()).copied(),
         }
+    }
+
+    /// The hang to catch an edge in the air with: an air catch's (the captured catch, hang and
+    /// climb up) if the pack has one, else a climb's.
+    fn catch_pose(&mut self, db: &Database) -> Option<HangPose> {
+        let poses = self.hang_poses_cached(db);
+        poses.iter().find(|p| p.climb.kind == ActionKind::Catch).copied().or_else(|| self.hang_pose_for(db, None))
     }
 
     /// The hang pose in use.
@@ -717,7 +727,7 @@ impl CharacterController {
         if self.features.edges.is_empty() || velocity.y > 1.0 {
             return false;
         }
-        let Some(pose) = self.hang_pose_for(db, None) else { return false };
+        let Some(pose) = self.catch_pose(db) else { return false };
         let c = self.matcher.character().translation;
         let hands = c + Vec3::Y * (-pose.root.y);
         let Some((edge, s, _)) = self.features.nearest_edge(hands, 1.2) else { return false };
@@ -742,12 +752,85 @@ impl CharacterController {
         true
     }
 
+    /// Falling against the face of a top that is within a reach of the feet (0.1-0.9 m above
+    /// them, close ahead, room to stand on it, not a ledge tagged to hang from, not on a jump
+    /// aimed elsewhere): catch it and mantle up onto it with an air catch
+    /// that does (`ActionKind::Catch` clips meeting their top less than a metre over the root),
+    /// the one whose depth at the catch and speed fit best, from just before its hands meet the
+    /// edge, warped onto it.
+    pub(super) fn try_air_mantle(&mut self, db: &Database, world: &CollisionWorld, velocity: Vec3) -> bool {
+        if velocity.y > 0.5 {
+            return false;
+        }
+        let across = Vec3::new(velocity.x, 0.0, velocity.z);
+        let heading = if self.intent.length() > 0.1 { self.intent } else { across };
+        if heading.length() < 0.3 {
+            return false;
+        }
+        let c = self.matcher.character().translation;
+        let Some(o) = super::detect_obstacle(world, c, heading, 0.9, &self.detection) else { return false };
+        if !(0.1..=0.9).contains(&o.height) || o.distance > 0.7 {
+            return false;
+        }
+        let into = -o.normal;
+        if !super::stands_at(world, o.ledge + into * 0.45, &self.rules, self.layers) {
+            return false;
+        }
+        // (a jump aimed somewhere keeps to it; a ledge tagged to hang from is caught to hang)
+        if self.park.jump_target.is_some() || self.features.nearest_edge(o.ledge, 0.3).is_some() {
+            return false;
+        }
+        let speed = across.length();
+        let depth_at = |k: &ActionClip, f: f32| k.height - db.root_at(k.clip, f).0.y;
+        let yaw = yaw_of(self.matcher.character().rotation);
+        let warp_for = |k: &ActionClip| {
+            let start = (k.anchor - 1.0).max(0.0);
+            let clip_heading = k.forward.x.atan2(k.forward.z);
+            let mut warp = RootWarp::identity(db.root_at(k.clip, start), (c, yaw));
+            warp.to = Placement::between((Vec3::new(k.ledge.x, 0.0, k.ledge.z), clip_heading), (Vec3::new(o.ledge.x, 0.0, o.ledge.z), into.x.atan2(into.z)));
+            warp.window = Ramp::new(start, k.on_top.max(start + 3.0), 0.0, 1.0);
+            // the clip's top onto the real one
+            warp.ground = o.ledge.y - k.height;
+            (start, warp)
+        };
+        // the run-out must stay on the top caught (else a shorter one)
+        let fits = |k: &ActionClip| {
+            let (_, warp) = warp_for(k);
+            (1..=4).all(|n| {
+                let f = k.on_top + (k.exit - k.on_top) * n as f32 / 4.0;
+                let p = warp.root(f, db.root_at(k.clip, f)).0;
+                world.ground_height(Vec3::new(p.x, o.ledge.y, p.z), 0.3, 0.3, self.layers).is_some_and(|g| (g - o.ledge.y).abs() < 0.15)
+            })
+        };
+        let cost = |k: &ActionClip| (depth_at(k, k.anchor) - o.height).abs() + 0.1 * (k.speed_at(db, k.anchor + 3.0) - speed).abs() + if fits(k) { 0.0 } else { 10.0 };
+        let best = self
+            .actions
+            .iter()
+            .filter(|k| k.kind == ActionKind::Catch && depth_at(k, k.anchor) < 1.0)
+            .min_by(|a, b| cost(a).total_cmp(&cost(b)))
+            .copied();
+        let Some(k) = best else { return false };
+        let (start, warp) = warp_for(&k);
+        self.matcher.start_action(db, Action { clip: k.clip, start, exit: Some(k.exit), path: RootPath::Warp(warp), collides: false, tag: ActionKind::Catch as u32, rate: 1.0, lock_feet: false });
+        self.matcher.soften(0.12, 0.3);
+        self.park.jump_target = None;
+        self.park.air_yaw = None;
+        self.last_obstacle = Some(o);
+        self.state = CharacterState::Traversing(ActionKind::Catch);
+        true
+    }
+
     /// Hang from `edge` at `s`: catching it (easing onto the hanging place), or straight on from
     /// a climb at its hanging frame.
     fn start_hang(&mut self, db: &Database, world: &CollisionWorld, pose: &HangPose, edge: usize, s: f32, catching: bool) {
         self.park.hang_pose = Some(*pose);
         let character = self.matcher.character();
-        let start = if catching { (pose.frame - 4.0).max(pose.climb.anchor) } else { pose.frame };
+        // (an air catch from just before its hands meet the edge: the catch as captured)
+        let start = match (catching, pose.climb.kind) {
+            (true, ActionKind::Catch) => (pose.climb.anchor - 0.1 * db.sample_rate).max(0.0),
+            (true, _) => (pose.frame - 4.0).max(pose.climb.anchor),
+            _ => pose.frame,
+        };
         self.matcher.start_action(db, Action { clip: pose.climb.clip, start, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Climb as u32, rate: 1.0, lock_feet: false });
         let braced = self.hangable(edge, pose);
         let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start, idle: None, follow: None };

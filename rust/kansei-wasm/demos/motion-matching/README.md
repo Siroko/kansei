@@ -484,7 +484,14 @@ level tags for it (`traversal::features`: a glb node's `kansei_traversal`, read 
   where it lands; Space climbs up (the climb clip on from its hang, warped onto the edge); X lets
   go. The climbs' and mantles' ledges are refined from the hands (`parkour::refine_grips`) so the
   wrists grip the face rather than sink into the top, and hands that still sink into what they
-  vault or climb are pushed out of it.
+  vault or climb are pushed out of it. With air catches in the pack (`catch` actions: GASP's
+  `Traversal/Catch/*` clips, which fall onto a 3 m top and catch it), a fall onto an edge plays
+  the captured catch from just before the hands meet it into its hang (`Catch_Cliff`), and Space
+  climbs up with that clip's own climb.
+- **Air mantle.** Falling against the face of a top within a reach of the feet (0.1-0.9 m above
+  them, room to stand on it, not a ledge to hang from, not on a jump aimed elsewhere) catches it
+  and mantles up (`Catch_Mantle_*`: the one whose depth at the catch and pace fit, and whose
+  run-out stays on that top).
 - **Wall runs.** Running along a `wallrun` face (or jumping into it along it) and pressing Space
   runs along the wall: the run loop at the wall-run speed, the body leaning away from the wall
   about its feet, the planted feet pinned flat on it, the wall-side hand kept out of it; light
@@ -516,6 +523,15 @@ into a private pack with the GASP clips, e.g. the GASP bake config plus:
 "actions": { "...": [], "barhang": ["Parkour/Gen_Bar_Hang_*"], "barswing": ["Parkour/Gen_Bar_Swing_*"],
              "pullup": ["Parkour/Gen_Bar_PullUp_*"], "hangidle": ["Parkour/Gen_Hang_Idle_*"],
              "shimmy": ["Parkour/Gen_Shimmy_*"], "wallrun": ["Parkour/Gen_Wall_Run_*"] }
+```
+
+GASP's air catches and its sprint and roll landings join the same pack (export them with
+`Traversal/Catch/*/M_Neutral_*` and `Jump/M_Neutral_*` in the export config):
+
+```json
+"export": ["export", "export-extras", "../genanim/export-parkour-b"],
+"actions": { "...": [], "land": ["...", "Jump/M_Neutral_Jump_F_Land_Sprint_*", "Jump/M_Neutral_Jump_F_Land_Roll_*"],
+             "catch": ["Traversal/Catch/Cliff/M_Neutral_*", "Traversal/Catch/Mantle/M_Neutral_*"] }
 ```
 
 (`shimmy` and `wallrun` are baked but not played yet: the generated

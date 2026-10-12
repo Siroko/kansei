@@ -154,6 +154,22 @@ fn scenarios() -> Vec<Scenario> {
             expect: &["jumping", "falling", "hanging"],
         },
         Scenario {
+            name: "falling against a platform's face: catch its top, mantle up",
+            start: Vec3::new(10.6, 1.0, 10.3),
+            yaw: 0.0,
+            duration: 3.0,
+            cues: vec![cue(0.0, z * 3.0), cue(1.0, Vec3::ZERO)],
+            expect: &["falling", "traversing", "grounded"],
+        },
+        Scenario {
+            name: "jump from the last platform, catch the tower, climb up",
+            start: Vec3::new(13.6, 1.2, 12.2),
+            yaw: std::f32::consts::PI,
+            duration: 7.0,
+            cues: vec![cue(0.0, -z * 4.0), space(0.35, -z * 4.0), cue(1.2, Vec3::ZERO), space(3.5, Vec3::ZERO)],
+            expect: &["jumping", "falling", "hanging", "traversing", "grounded"],
+        },
+        Scenario {
             name: "wall run along the wall's south face, jump off",
             start: Vec3::new(6.5, 0.0, 3.9),
             yaw: std::f32::consts::FRAC_PI_2,
@@ -470,7 +486,13 @@ fn main() -> Result<(), String> {
     let rates: [(f32, bool, &str); 4] = [(1.0 / 30.0, false, "30"), (1.0 / 60.0, false, "60"), (1.0 / 120.0, false, "120"), (1.0 / 60.0, true, "60+hitch")];
     println!("{:<52} {:>8} {:>4} {:>8} {:>8} {:>10} {:>6} {:>11} {:>11}  states", "scenario", "fps", "ok", "limb max", "limb avg", "slide", "inside", "root pop", "pose pop");
     let mut failures = 0;
+    // (an air mantle needs the pack's air catches)
+    let catches = pack.actions.iter().any(|a| a.kind == kansei_core::animation::motion_matching::traversal::ActionKind::Catch);
     for s in scenarios().iter().filter(|s| only.as_ref().is_none_or(|o| s.name.contains(o.as_str()))) {
+        if s.name.contains("mantle up") && !catches {
+            println!("{:<52} skipped: the pack has no air catches (`catch` actions)", s.name);
+            continue;
+        }
         for (dt, hitch, label) in rates {
             let mut csv = csv_dir.as_ref().map(|_| String::from("time,state,x,y,z,limb_error,accel,yaw,hips_x,hips_y,hips_z\n"));
             let r = run(db, &pack.actions, &world, &features, s, dt, hitch, gait, csv.as_mut(), trace && label == trace_label.as_str());

@@ -57,10 +57,13 @@ pub enum ActionKind {
     PullUp = 10,
     HangIdle = 11,
     Shimmy = 12,
+    /// An air traversal: falling onto a top, the hands catching its edge, then up onto it (with a
+    /// moment hanging from it, if the body ends up a metre or more below the edge).
+    Catch = 13,
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 13] = [
+    pub const ALL: [ActionKind; 14] = [
         ActionKind::Hurdle,
         ActionKind::Vault,
         ActionKind::Mantle,
@@ -74,6 +77,7 @@ impl ActionKind {
         ActionKind::PullUp,
         ActionKind::HangIdle,
         ActionKind::Shimmy,
+        ActionKind::Catch,
     ];
 
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -95,6 +99,7 @@ impl ActionKind {
             ActionKind::PullUp => "pullup",
             ActionKind::HangIdle => "hangidle",
             ActionKind::Shimmy => "shimmy",
+            ActionKind::Catch => "catch",
         }
     }
 
@@ -221,6 +226,7 @@ impl ActionClip {
                     ..empty
                 });
             }
+            ActionKind::Catch => return catch_analysis(&t, empty, rate),
             _ => {}
         }
         let peak = if kind.crosses() { y.iter().cloned().fold(f32::MIN, f32::max) } else { y[n - 1] };
@@ -596,6 +602,54 @@ pub fn plan_traversal(db: &Database, table: &[ActionClip], kind: ActionKind, obs
 /// Squared distance between two frames' pose features (feet and hips, not the trajectory).
 fn pose_distance(a: &[f32], b: &[f32]) -> f32 {
     a[..15].iter().zip(&b[..15]).map(|(a, b)| (a - b) * (a - b)).sum()
+}
+
+/// `ActionClip::analyze` for an air traversal (`ActionKind::Catch`): the top is where the clip
+/// ends (its root's final height, in clip space: `height`); the hands planting on it near that
+/// height give the ledge and `anchor`; `on_top` is the first frame the root is up there, `exit`
+/// when the hips are back to standing height after it.
+fn catch_analysis(t: &Tracks, empty: ActionClip, rate: f32) -> Option<ActionClip> {
+    let n = t.root.len();
+    let last = (n - 1) as f32;
+    let top = t.root[n - 1].0.y;
+    let low = t.root.iter().map(|(p, _)| p.y).fold(f32::MAX, f32::min);
+    if top - low < 0.1 {
+        return None;
+    }
+    let mut planted: Option<(usize, Vec3)> = None;
+    for f in 0..n - 1 {
+        for h in 0..2 {
+            let (p, q) = (t.hands[f][h], t.hands[f + 1][h]);
+            if p.y > top - 0.15 && p.y < top + 0.25 && p.distance(q) * rate < 0.6 && t.root[f].0.y < top - 0.05 {
+                planted = planted.or(Some((f, p)));
+            }
+        }
+        if planted.is_some() {
+            break;
+        }
+    }
+    let (anchor, hand) = planted?;
+    let on_top = (anchor..n).find(|&f| t.root[f].0.y >= top - 0.02)?;
+    let forward = yaw_rotation(t.root[on_top].1) * FORWARD;
+    let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or(FORWARD);
+    let at = t.root[anchor].0;
+    let along = hand.dot(forward) - 0.05;
+    let ledge = Vec3::new(at.x, top, at.z) + forward * (along - at.dot(forward));
+    let standing = t.hips_height[n - 1] * 0.9;
+    let up = (on_top..n).find(|&f| t.hips_height[f] >= standing).unwrap_or(n - 1);
+    Some(ActionClip {
+        height: top,
+        ledge,
+        forward,
+        rise: 0.0,
+        anchor: anchor as f32,
+        on_top: on_top as f32,
+        off_top: last,
+        down: last,
+        exit: (up as f32 + 0.1 * rate).min(last),
+        last_entry: anchor as f32,
+        ..empty
+    })
 }
 
 /// The jump clip and frame to start it at for a character at this speed, playing database frame
@@ -979,7 +1033,7 @@ impl CharacterController {
                     _ => None,
                 });
                 if let Some(v) = velocity {
-                    if time > 0.08 && (self.try_catch_bar(db, v) || self.try_catch_edge(db, world, v) || self.try_wall_run(db, false)) {
+                    if time > 0.08 && (self.try_catch_bar(db, v) || self.try_catch_edge(db, world, v) || self.try_air_mantle(db, world, v) || self.try_wall_run(db, false)) {
                         return;
                     }
                 }
