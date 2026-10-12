@@ -4,7 +4,7 @@ use super::database::{wrap_angle, yaw_of, yaw_rotation, Database, FEATURES, FORW
 use super::search::{Match, SearchFilter};
 use crate::animation::ik::{two_joint_ik, FootLock, FootPose};
 use crate::animation::inertialization::Inertializer;
-use crate::animation::springs::{damper_exact, negexp, spring_character_update, spring_damper_exact_quat};
+use crate::animation::springs::{damper_exact, decay_spring_damper_exact, decay_spring_damper_exact_quat, negexp, spring_character_update, spring_damper_exact_quat};
 use crate::animation::retarget::Retarget;
 use crate::animation::warping::RootWarp;
 use crate::animation::{quat_abs, quat_from_scaled_angle_axis, quat_to_scaled_angle_axis, Pose, Skeleton, Transform};
@@ -45,6 +45,8 @@ pub struct MotionMatchingSettings {
     pub foot_lock: bool,
     pub foot_unlock_radius: f32,
     pub foot_lock_halflife: f32,
+    /// Half-life of the root blend (`MotionMatcher::blend_root`, seconds).
+    pub root_blend_halflife: f32,
 }
 
 impl Default for MotionMatchingSettings {
@@ -66,6 +68,7 @@ impl Default for MotionMatchingSettings {
             foot_lock: true,
             foot_unlock_radius: 0.3,
             foot_lock_halflife: 0.1,
+            root_blend_halflife: 0.08,
         }
     }
 }
@@ -141,6 +144,9 @@ pub enum RootPath {
     Warp(RootWarp),
     /// Momentum and gravity (jumping, falling); the clip only animates the pose.
     Ballistic { velocity: Vec3, gravity: f32 },
+    /// The caller places the character every frame (`MotionMatcher::place`: hanging from a ledge,
+    /// running along a wall, swinging from a bar); the clip only animates the pose.
+    External,
 }
 
 /// A clip played on command instead of found by the search: a traversal, a fall, a landing.
@@ -158,6 +164,26 @@ pub struct Action {
     pub collides: bool,
     /// For the caller: what the action is (e.g. a traversal kind).
     pub tag: u32,
+    /// Playback speed (1: as captured; 0 holds the pose; negative plays backward, stopping at the
+    /// clip's first frame).
+    pub rate: f32,
+    /// Pin planted feet while it plays (a landing), as motion matching does.
+    pub lock_feet: bool,
+}
+
+/// A limb's end pinned in the world after an update (`MotionMatcher::reach`): hands on a ledge or
+/// a bar, feet on a wall.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LimbTarget {
+    /// The end joint on the database's skeleton (a hand, a foot): its parent and grandparent bend
+    /// (forearm and upper arm, shin and thigh).
+    pub joint: usize,
+    /// Where the joint goes (world).
+    pub target: Vec3,
+    /// 0: as animated, 1: on the target.
+    pub weight: f32,
+    /// A world rotation to turn the end joint to, by the same weight (a sole flat on a wall).
+    pub rotation: Option<Quat>,
 }
 
 /// A character driven by motion matching: every few frames it searches the database for the
@@ -194,6 +220,17 @@ pub struct MotionMatcher {
     /// Height of the ground the character stands on while matching.
     ground: f32,
     scratch: (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Vec<Vec3>, Pose),
+    /// What the root shows on top of where it is: an offset that eases a jump in the root's
+    /// velocity (a take-off, a landing, a catch) out over a few frames, and its velocity; the
+    /// root's last position and velocity, and a blend asked for at the next update.
+    root_offset: (Vec3, Vec3),
+    /// The same for the rotation (about the hips): what shows turned from the character, easing
+    /// back.
+    rotation_offset: (Quat, Vec3),
+    last_root: Option<(Vec3, Vec3)>,
+    blend_pending: Option<Vec3>,
+    /// The hips on the output skeleton.
+    hips_out: usize,
 }
 
 impl MotionMatcher {
@@ -226,6 +263,11 @@ impl MotionMatcher {
             action: None,
             ground: position.y,
             scratch: (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Pose { local: Vec::new() }),
+            root_offset: (Vec3::ZERO, Vec3::ZERO),
+            rotation_offset: (Quat::IDENTITY, Vec3::ZERO),
+            last_root: None,
+            blend_pending: None,
+            hips_out: db.roles.hips,
         };
         matcher.pose.to_model(&db.skeleton, &mut matcher.model);
         matcher
@@ -240,6 +282,7 @@ impl MotionMatcher {
             let legs = [leg(&skeleton, foot(db.roles.feet[0])), leg(&skeleton, foot(db.roles.feet[1]))];
             Display { skeleton, retarget, legs }
         });
+        self.hips_out = self.output_joint(db, db.roles.hips);
         self.feet.iter_mut().for_each(FootLock::reset);
         self.output(db);
     }
@@ -260,6 +303,61 @@ impl MotionMatcher {
     }
 
     /// The character root in the world (position and heading): the mesh's placement.
+    /// The character as shown: `character` with the root blend's offset (see `blend_root`).
+    pub fn shown(&self) -> Transform {
+        let rotation = (self.rotation_offset.0 * self.character.rotation).normalize();
+        // turned about the hips: they stay where the character puts them
+        let hips = self.model.get(self.hips_out).map_or(Vec3::ZERO, |t| t.translation);
+        let pivot = self.character.rotation * hips - rotation * hips;
+        Transform::from_translation_rotation(self.character.translation + self.root_offset.0 + pivot, rotation)
+    }
+
+    /// After `start_action` onto a clip whose root sits elsewhere under the body than the clip
+    /// before (the root on the floor under a hanging body, not riding it), let the hips take the
+    /// new clip's place over the root at once: the caller places the root so they don't move, and
+    /// `blend_position` hides what is left.
+    pub fn reroot(&mut self, db: &Database) {
+        self.inertializer.clear_translation(db.roles.hips);
+    }
+
+    /// Pose the character on what plays now (after `start_action` or `place` outside `update`), so
+    /// what shows this frame already has it: the clip's frame at the playhead, the transition's
+    /// offsets as they are.
+    pub fn refresh(&mut self, db: &Database) {
+        let info = &db.clips[self.clip];
+        let a = (self.frame.floor().max(0.0) as usize).min(info.frames - 1);
+        let b = (a + 1).min(info.frames - 1);
+        db.pose(info.start + a, info.start + b, self.frame - a as f32, &mut self.sampled);
+        self.matched.local.clone_from(&self.sampled.local);
+        self.inertializer.update(&mut self.matched, self.settings.inertialization_halflife, 0.0);
+        self.output(db);
+    }
+
+    /// Show the character turned to `from` (a world rotation: what showed before a catch turned
+    /// it), easing onto its own rotation with the root blend's half-life.
+    pub fn blend_rotation(&mut self, from: Quat) {
+        let shown = self.rotation_offset.0 * self.character.rotation;
+        let _ = shown;
+        self.rotation_offset.0 = (from * self.character.rotation.conjugate()).normalize();
+    }
+
+    /// Ease the jump in the root's velocity the next update makes (the path changes: a take-off,
+    /// a landing, a catch) out over `MotionMatchingSettings::root_blend_halflife`: what shows
+    /// carries on at the old velocity and settles onto the new path. `start_action` and
+    /// `stop_action` ask for it themselves.
+    pub fn blend_root(&mut self) {
+        if let Some((_, v)) = self.last_root {
+            self.blend_pending = Some(v);
+        }
+    }
+
+    /// Show the character `offset` away from where it is, easing back (with the root blend): a
+    /// jump in where the root is that the pose doesn't make up for (a catch placing the root
+    /// anew).
+    pub fn blend_position(&mut self, offset: Vec3) {
+        self.root_offset.0 += offset;
+    }
+
     pub fn character(&self) -> Transform {
         self.character
     }
@@ -310,11 +408,13 @@ impl MotionMatcher {
         self.frame = action.start;
         self.feet.iter_mut().for_each(FootLock::reset);
         self.action = Some(action);
+        self.blend_root();
     }
 
     /// End the action: motion matching searches again at the next update.
     pub fn stop_action(&mut self) {
         if self.action.take().is_some() {
+            self.blend_root();
             self.searched_input = None;
             self.simulation.position = self.character.translation;
             self.simulation.rotation = self.character.rotation;
@@ -387,10 +487,35 @@ impl MotionMatcher {
             *y = if (*y - self.ground).abs() > 0.5 { self.ground } else { *y + (self.ground - *y) * (1.0 - negexp(dt / 0.05)) };
             self.simulation.position.y = self.ground;
         }
+        self.blend_root_update(dt);
         self.output(db);
-        if self.settings.foot_lock && self.action.is_none() {
+        let lock = self.action.as_ref().is_none_or(|a| a.lock_feet);
+        if self.settings.foot_lock && lock {
             self.lock_feet(db, dt);
         }
+    }
+
+    /// The root's velocity this update; a blend asked for starts from the jump in it; the offset
+    /// decays.
+    fn blend_root_update(&mut self, dt: f32) {
+        let p = self.character.translation;
+        let v = self.last_root.map_or(Vec3::ZERO, |(q, _)| (p - q) / dt);
+        if let Some(old) = self.blend_pending.take() {
+            // the offset takes the velocity the root lost, so what shows keeps it; across the
+            // ground only (up and down, the clips' own legs take a take-off and a landing, and
+            // feet would sink)
+            let lost = old - v;
+            self.root_offset.1 += Vec3::new(lost.x, 0.0, lost.z);
+        }
+        let (x, w) = &mut self.root_offset;
+        decay_spring_damper_exact(x, w, self.settings.root_blend_halflife, dt);
+        let (q, w) = &mut self.rotation_offset;
+        decay_spring_damper_exact_quat(q, w, self.settings.root_blend_halflife * 1.5, dt);
+        // a teleport, not a move: no blend across it
+        if v.length() > 40.0 {
+            self.root_offset = (Vec3::ZERO, Vec3::ZERO);
+        }
+        self.last_root = Some((p, v));
     }
 
     /// The output pose from the matched one: retargeted onto the display skeleton if any.
@@ -459,7 +584,9 @@ impl MotionMatcher {
         self.last_search.searched = false;
         self.last_search.switched = false;
         let info = &db.clips[self.clip];
-        let at_end = !info.looping && self.frame >= (info.frames - 1) as f32 - 1e-3;
+        // (an action's clip left playing after it ended, a fall cut short by the ground: never
+        // stay on it, the search never picks it)
+        let at_end = (!info.looping && self.frame >= (info.frames - 1) as f32 - 1e-3) || info.tags & super::database::ACTION_TAG != 0;
         let changed = match self.searched_input {
             None => true,
             Some((velocity, yaw)) => velocity.distance(input.velocity) > self.settings.force_search_velocity || wrap_angle(yaw - self.desired_yaw).abs() > self.settings.force_search_turn,
@@ -515,7 +642,8 @@ impl MotionMatcher {
         let Some((clip, exit, collides)) = self.action.as_ref().map(|a| (a.clip, a.exit, a.collides)) else { return };
         let info = &db.clips[clip];
         let before = self.character;
-        let mut next = self.frame + dt * db.sample_rate;
+        let rate = self.action.as_ref().map_or(1.0, |a| a.rate);
+        let mut next = (self.frame + dt * db.sample_rate * rate).max(0.0);
         let exit = exit.map(|e| e.min((info.frames - 1) as f32));
         if info.looping && exit.is_none() {
             next = next.rem_euclid(info.playable() as f32);
@@ -538,6 +666,7 @@ impl MotionMatcher {
                 velocity.y -= *gravity * dt;
                 self.character.translation = allowed;
             }
+            RootPath::External => {}
         }
         let a = self.frame.floor() as usize;
         let b = (a + 1).min(info.frames - 1);
@@ -580,6 +709,57 @@ impl MotionMatcher {
         }
     }
 
+    /// The output skeleton's joint named as database joint `joint`.
+    fn output_joint(&self, db: &Database, joint: usize) -> usize {
+        match &self.display {
+            Some(d) => d.skeleton.find(&db.skeleton.names[joint]).unwrap_or(0),
+            None => joint,
+        }
+    }
+
+    /// The hips' joint on the output skeleton (an index into `model`).
+    pub fn hips_joint(&self, db: &Database) -> usize {
+        self.output_joint(db, db.roles.hips)
+    }
+
+    /// Database joint `joint` in the world, as shown (after foot locking and `reach`).
+    pub fn joint_world(&self, db: &Database, joint: usize) -> Vec3 {
+        self.shown().transform_point(self.model[self.output_joint(db, joint)].translation)
+    }
+
+    /// Database joint `joint`'s world rotation, as shown.
+    pub fn joint_world_rotation(&self, db: &Database, joint: usize) -> Quat {
+        self.character.rotation * self.model[self.output_joint(db, joint)].rotation
+    }
+
+    /// Bend limbs so their ends reach `targets` (two-joint IK on each end's parent and
+    /// grandparent), on the pose shown: call it after each `update`, which rebuilds the pose.
+    pub fn reach(&mut self, db: &Database, targets: &[LimbTarget]) {
+        let mut moved = false;
+        for t in targets.iter().filter(|t| t.weight > 1e-4) {
+            let end = self.output_joint(db, t.joint);
+            let skeleton = self.display.as_ref().map_or(&db.skeleton, |d| &d.skeleton);
+            let Some(middle) = skeleton.parents[end] else { continue };
+            let Some(upper) = skeleton.parents[middle] else { continue };
+            let w = t.weight.min(1.0);
+            let animated = self.model[end].translation;
+            let local = animated.lerp(self.shown().inverse().transform_point(t.target), w);
+            two_joint_ik(skeleton, &mut self.pose, &mut self.model, upper, middle, end, local);
+            if let Some(rotation) = t.rotation {
+                // the end's model rotation toward the wanted one, as a local rotation under its
+                // parent's (now bent) model rotation
+                let wanted = self.model[end].rotation.slerp(self.character.rotation.conjugate() * rotation, w);
+                self.pose.local[end].rotation = (self.model[middle].rotation.conjugate() * wanted).normalize();
+                self.model[end].rotation = wanted;
+            }
+            moved = true;
+        }
+        if moved {
+            let skeleton = self.display.as_ref().map_or(&db.skeleton, |d| &d.skeleton);
+            self.pose.to_model(skeleton, &mut self.model);
+        }
+    }
+
     /// Pin planted feet where they touched down (two-joint IK on each leg): the ankle while the
     /// heel is down, the ball once it lifts.
     fn lock_feet(&mut self, db: &Database, dt: f32) {
@@ -595,10 +775,11 @@ impl MotionMatcher {
             }
             // the model is relative to the character, which stands on the ground
             let (ankle, ball) = (self.model[foot].translation, self.model[leg.ball].translation);
-            let animated = FootPose { ankle: self.character.transform_point(ankle), ball: self.character.transform_point(ball), ankle_lift: ankle.y - leg.rest[0], ball_lift: ball.y - leg.rest[1] };
+            let shown = self.shown();
+            let animated = FootPose { ankle: shown.transform_point(ankle), ball: shown.transform_point(ball), ankle_lift: ankle.y - leg.rest[0], ball_lift: ball.y - leg.rest[1] };
             let target = self.feet[side].update_foot(&animated, contacts[side], s.foot_unlock_radius, s.foot_lock_halflife, dt);
             if target.distance(animated.ankle) > 1e-5 {
-                let local = self.character.inverse().transform_point(target);
+                let local = shown.inverse().transform_point(target);
                 two_joint_ik(skeleton, &mut self.pose, &mut self.model, upper, middle, foot, local);
                 moved = true;
             }

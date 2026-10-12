@@ -47,10 +47,34 @@ pub enum ActionKind {
     Land = 5,
     /// Jumping: the run-up and take-off, then the pose in the air.
     Jump = 6,
+    /// Pose sources for the parkour moves (`parkour`), played with the controller placing the
+    /// character: running along a wall (on its left or right, by the clip's name), hanging from a
+    /// bar still, swinging from it, pulling up on it, hanging from a ledge, shimmying along it (left
+    /// or right).
+    WallRun = 7,
+    BarHang = 8,
+    BarSwing = 9,
+    PullUp = 10,
+    HangIdle = 11,
+    Shimmy = 12,
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 7] = [ActionKind::Hurdle, ActionKind::Vault, ActionKind::Mantle, ActionKind::Climb, ActionKind::Fall, ActionKind::Land, ActionKind::Jump];
+    pub const ALL: [ActionKind; 13] = [
+        ActionKind::Hurdle,
+        ActionKind::Vault,
+        ActionKind::Mantle,
+        ActionKind::Climb,
+        ActionKind::Fall,
+        ActionKind::Land,
+        ActionKind::Jump,
+        ActionKind::WallRun,
+        ActionKind::BarHang,
+        ActionKind::BarSwing,
+        ActionKind::PullUp,
+        ActionKind::HangIdle,
+        ActionKind::Shimmy,
+    ];
 
     pub fn from_u8(v: u8) -> Option<Self> {
         Self::ALL.get(v as usize).copied()
@@ -65,6 +89,12 @@ impl ActionKind {
             ActionKind::Fall => "fall",
             ActionKind::Land => "land",
             ActionKind::Jump => "jump",
+            ActionKind::WallRun => "wallrun",
+            ActionKind::BarHang => "barhang",
+            ActionKind::BarSwing => "barswing",
+            ActionKind::PullUp => "pullup",
+            ActionKind::HangIdle => "hangidle",
+            ActionKind::Shimmy => "shimmy",
         }
     }
 
@@ -160,7 +190,8 @@ impl ActionClip {
             last_entry: 0.0,
         };
         match kind {
-            ActionKind::Fall => return Some(empty),
+            // pose sources: nothing to read but the clip itself
+            ActionKind::Fall | ActionKind::WallRun | ActionKind::BarHang | ActionKind::BarSwing | ActionKind::PullUp | ActionKind::HangIdle | ActionKind::Shimmy => return Some(empty),
             ActionKind::Land => {
                 // the impact: the root reaches its final height after being well above it
                 let end = y[n - 1];
@@ -558,7 +589,7 @@ pub fn plan_traversal(db: &Database, table: &[ActionClip], kind: ActionKind, obs
         .into_iter()
         .map(|(_, c, start, past)| (c, start, warp_onto(db, c, start, obstacle, past, feet, heading, rules)))
         .find(|(c, _, warp)| c.kind.crosses() || stands(warp.root(c.exit, db.root_at(c.clip, c.exit)).0))
-        .map(|(c, start, warp)| Action { clip: c.clip, start, exit: Some(c.exit), path: RootPath::Warp(warp), collides: false, tag: kind as u32 })
+        .map(|(c, start, warp)| Action { clip: c.clip, start, exit: Some(c.exit), path: RootPath::Warp(warp), collides: false, tag: kind as u32, rate: 1.0, lock_feet: false })
         .ok_or(Refusal::NoRoom)
 }
 
@@ -632,6 +663,11 @@ pub enum CharacterState {
     /// Seconds in the air (after a take-off or off an edge).
     Falling(f32),
     Landing,
+    /// Hanging from an edge (shimmying along it), running along a wall, swinging from a bar
+    /// (`parkour`).
+    Hanging,
+    WallRunning,
+    Swinging,
 }
 
 /// A motion-matched character in a collision world: kept out of colliders, on its ground,
@@ -672,6 +708,12 @@ pub struct CharacterController {
     /// The jump running up to its take-off, and the highest point of this time in the air.
     jump: Option<ActionClip>,
     air_top: f32,
+    /// The parkour geometry (`features::ParkourFeatures::from_pieces`), the moves' tuning, and
+    /// the hand joints the hangs and bars pin (`find_hands`).
+    pub features: features::ParkourFeatures,
+    pub parkour: parkour::ParkourSettings,
+    pub hands: Option<[usize; 2]>,
+    park: parkour::Runtime,
 }
 
 impl CharacterController {
@@ -699,6 +741,10 @@ impl CharacterController {
             buffered: None,
             jump: None,
             air_top: 0.0,
+            features: features::ParkourFeatures::default(),
+            parkour: parkour::ParkourSettings::default(),
+            hands: None,
+            park: parkour::Runtime::default(),
         }
     }
 
@@ -724,6 +770,11 @@ impl CharacterController {
     /// busy (landing, traversing), it runs once the character is back on its feet, if that is
     /// within `request_buffer`.
     pub fn request_traverse_or_jump(&mut self, db: &Database, world: &CollisionWorld, patience: f32) -> Result<ActionKind, Refusal> {
+        // hanging, on a wall, on a bar: climb up, jump off, let go; or a wall alongside to run
+        if let Some(result) = self.parkour_request(db, world) {
+            self.last_result = Some(result);
+            return result;
+        }
         let result = self.request_traverse(db, world, patience);
         self.buffered = (result == Err(Refusal::Busy)).then_some((self.request_buffer, patience));
         let nothing_to_traverse = match result {
@@ -735,7 +786,7 @@ impl CharacterController {
             return result;
         }
         self.pending = 0.0;
-        let jumped = self.jump(db);
+        let jumped = self.jump_in(db, Some(world));
         self.last_result = Some(jumped);
         jumped
     }
@@ -745,6 +796,12 @@ impl CharacterController {
     /// `jump_height` (else the clip's own apex), the clip and then the fall loop animating it
     /// until it lands.
     pub fn jump(&mut self, db: &Database) -> Result<ActionKind, Refusal> {
+        self.jump_in(db, None)
+    }
+
+    /// `jump`, aimed (with `world`) at the next platform or a top across a gap ahead: the run-up
+    /// turns toward it and the take-off's speed lands on it (`parkour`).
+    pub fn jump_in(&mut self, db: &Database, world: Option<&CollisionWorld>) -> Result<ActionKind, Refusal> {
         if self.state != CharacterState::Grounded {
             return Err(Refusal::Busy);
         }
@@ -753,8 +810,21 @@ impl CharacterController {
         let (clip, start) = plan_jump(db, &self.actions, speed, self.matcher.current_frame(db), &self.rules, self.max_jump_delay).ok_or(Refusal::NoClip)?;
         let clip = *clip;
         let character = self.matcher.character();
-        let warp = RootWarp::identity(db.root_at(clip.clip, start), (character.translation, yaw_of(character.rotation)));
-        self.matcher.start_action(db, Action { clip: clip.clip, start, exit: None, path: RootPath::Warp(warp), collides: true, tag: ActionKind::Jump as u32 });
+        let mut warp = RootWarp::identity(db.root_at(clip.clip, start), (character.translation, yaw_of(character.rotation)));
+        // aimed: at the next platform, or a top across a gap ahead; the run-up turns toward it
+        let ahead = if self.intent.length() > 0.1 { self.intent } else if speed > 0.5 { velocity } else { character.rotation * FORWARD };
+        self.park.jump_target = world.and_then(|w| self.jump_target_from(w, character.translation, ahead));
+        if let Some(target) = self.park.jump_target {
+            let to = Vec3::new(target.x - character.translation.x, 0.0, target.z - character.translation.z);
+            let turn = super::database::wrap_angle(to.x.atan2(to.z) - yaw_of(character.rotation));
+            let pivot = warp.root(start, db.root_at(clip.clip, start)).0;
+            warp.to = Placement { yaw: warp.from.yaw + turn, offset: warp.from.offset };
+            // turning about the character, not the clip's origin
+            let moved = yaw_rotation(warp.to.yaw) * Vec3::new(db.root_at(clip.clip, start).0.x, 0.0, db.root_at(clip.clip, start).0.z);
+            warp.to.offset = glam::Vec2::new(pivot.x - moved.x, pivot.z - moved.z);
+            warp.window = Ramp::new(start, clip.rise.max(start + 1.0), 0.0, 1.0);
+        }
+        self.matcher.start_action(db, Action { clip: clip.clip, start, exit: None, path: RootPath::Warp(warp), collides: true, tag: ActionKind::Jump as u32, rate: 1.0, lock_feet: false });
         self.jump = Some(clip);
         self.state = CharacterState::Jumping;
         Ok(ActionKind::Jump)
@@ -763,7 +833,9 @@ impl CharacterController {
     /// Advance by `dt` under `input`.
     pub fn update(&mut self, db: &Database, world: &CollisionWorld, input: &MotionInput, dt: f32) {
         self.intent = Vec3::new(input.velocity.x, 0.0, input.velocity.z);
+        self.tick_cooldown(dt);
         self.advance(db, world, input, dt);
+        self.apply_limbs(db);
         if let Some((left, patience)) = self.buffered {
             self.buffered = None;
             if self.state == CharacterState::Grounded {
@@ -812,13 +884,17 @@ impl CharacterController {
             }
             CharacterState::Traversing(kind) => {
                 self.matcher.update(db, input, dt);
+                if kind == ActionKind::Climb && self.climb_reached_hang(db, world) {
+                    return;
+                }
+                self.keep_hands_out(db, world, dt);
                 if self.matcher.action().is_none() {
                     // over an obstacle, land on the floor behind; else stand where it ended
                     let c = self.matcher.character().translation;
                     let ground = world.ground_height(c, 0.3, 4.0, layers);
                     if kind == ActionKind::Vault && ground.is_some_and(|g| (g - c.y).abs() < 0.3) {
                         self.matcher.set_ground(ground.unwrap());
-                        self.land(db, self.last_obstacle.map_or(0.0, |o| o.height));
+                        self.land(db, world, self.last_obstacle.map_or(0.0, |o| o.height));
                     } else if ground.is_some_and(|g| g > c.y - 0.4) {
                         self.matcher.set_ground(ground.unwrap());
                         self.state = CharacterState::Grounded;
@@ -841,9 +917,27 @@ impl CharacterController {
                     let v = self.matcher.simulation().velocity;
                     let up = (2.0 * self.gravity * self.jump_height.unwrap_or(clip.height)).sqrt();
                     let gravity = self.gravity;
+                    let velocity = match self.park.jump_target {
+                        Some(target) => {
+                            // the clip's own speed up as it leaves the ground
+                            let rise = (db.root_at(clip.clip, clip.rise + 1.0).0.y - db.root_at(clip.clip, clip.rise).0.y) * db.sample_rate;
+                            let from = self.matcher.character().translation;
+                            // a bar: the hips' path through the hanging place (the hips as high
+                            // over the root as they are now)
+                            let target = if target.y > parkour::BAR_AIM * 0.5 {
+                                let hips = self.matcher.joint_world(db, db.roles.hips).y - from.y;
+                                target - Vec3::Y * (parkour::BAR_AIM + hips)
+                            } else {
+                                target
+                            };
+                            self.aimed_velocity(from, target, rise)
+                        }
+                        None => Vec3::new(v.x, up, v.z),
+                    };
                     if let Some(action) = self.matcher.action_mut() {
-                        action.path = RootPath::Ballistic { velocity: Vec3::new(v.x, up, v.z), gravity };
+                        action.path = RootPath::Ballistic { velocity, gravity };
                     }
+                    self.matcher.blend_root();
                     self.jump = None;
                     self.air_top = self.matcher.character().translation.y;
                     self.state = CharacterState::Falling(0.0);
@@ -854,11 +948,22 @@ impl CharacterController {
                 // a jump's clip played out: on with the fall loop, at the same momentum
                 let air = self.matcher.action().and_then(|a| match a.path {
                     RootPath::Ballistic { velocity, .. } => Some((a.clip, velocity)),
-                    RootPath::Warp(_) => None,
+                    RootPath::Warp(_) | RootPath::External => None,
                 });
                 if let (Some((clip, velocity)), Some(fall)) = (air, self.first(ActionKind::Fall).copied()) {
                     if clip != fall.clip && self.matcher.playing().1 >= (db.clips[clip].frames - 1) as f32 {
                         self.fall_with(db, velocity);
+                    }
+                }
+                self.air_turn(db, dt);
+                // an edge, a bar or a wall in reach: catch it, run along it
+                let velocity = self.matcher.action().and_then(|a| match a.path {
+                    RootPath::Ballistic { velocity, .. } => Some(velocity),
+                    _ => None,
+                });
+                if let Some(v) = velocity {
+                    if time > 0.08 && (self.try_catch_bar(db, v) || self.try_catch_edge(db, world, v) || self.try_wall_run(db, false)) {
+                        return;
                     }
                 }
                 let c = self.matcher.character().translation;
@@ -869,10 +974,16 @@ impl CharacterController {
                 if let Some(g) = ground.filter(|g| !rising && c.y <= *g) {
                     let mut t = self.matcher.character();
                     t.translation.y = g;
+                    t.rotation = yaw_rotation(yaw_of(t.rotation));
                     self.matcher.place(t);
                     self.matcher.set_ground(g);
-                    if time > 0.35 {
-                        self.land(db, self.air_top - g);
+                    self.park.air_yaw = None;
+                    self.park.jump_target = None;
+                    // a landing clip for a fall of any length coming down fast (off a wall), not
+                    // just a long one
+                    let falling_fast = air.is_some_and(|(_, v)| v.y < -2.5);
+                    if time > 0.35 || falling_fast {
+                        self.land(db, world, self.air_top - g);
                     } else {
                         self.matcher.stop_action();
                         self.state = CharacterState::Grounded;
@@ -887,6 +998,9 @@ impl CharacterController {
                     self.state = CharacterState::Grounded;
                 }
             }
+            CharacterState::Hanging => self.advance_hang(db, world, input, dt),
+            CharacterState::WallRunning => self.advance_wall_run(db, input, dt),
+            CharacterState::Swinging => self.advance_swing(db, input, dt),
         }
     }
 
@@ -905,27 +1019,44 @@ impl CharacterController {
             Some(fall) => (fall.clip, 0.0),
             None => self.matcher.playing(),
         };
-        self.matcher.start_action(db, Action { clip, start, exit: None, path, collides: true, tag: ActionKind::Fall as u32 });
+        self.matcher.start_action(db, Action { clip, start, exit: None, path, collides: true, tag: ActionKind::Fall as u32, rate: 1.0, lock_feet: false });
     }
 
     /// Land from a fall of `drop` metres: among the harder landings (those captured falling
     /// farther) past `heavy_fall`, else among the lighter ones, the one whose run-out pace is
     /// nearest.
-    fn land(&mut self, db: &Database, drop: f32) {
-        let speed = self.matcher.simulation().velocity.length();
+    fn land(&mut self, db: &Database, world: &CollisionWorld, drop: f32) {
+        // the pace the player asks for, not the flight's: a jump onto a platform with the stick
+        // let go lands into a stand
+        let speed = self.intent.length().min(self.matcher.simulation().velocity.length());
         let character = self.matcher.character();
         let lands = || self.actions.iter().filter(|c| c.kind == ActionKind::Land);
         let (low, high) = lands().fold((f32::MAX, f32::MIN), |(l, h), c| (l.min(c.height), h.max(c.height)));
         let heavy = drop > self.heavy_fall;
         let pace = |c: &ActionClip| (c.speed_at(db, (c.anchor + 5.0).min(c.exit)) - speed).abs();
-        let best = lands().filter(|c| high - low < 0.1 || (c.height > (low + high) * 0.5) == heavy).min_by(|a, b| pace(a).total_cmp(&pace(b)));
-        match best.copied() {
+        let mut candidates: Vec<&ActionClip> = lands().filter(|c| high - low < 0.1 || (c.height > (low + high) * 0.5) == heavy).collect();
+        candidates.sort_by(|a, b| pace(a).total_cmp(&pace(b)));
+        // from the impact on, on the ground (whatever height the fall or vault ended at)
+        let on_ground = Vec3::new(character.translation.x, self.matcher.ground(), character.translation.z);
+        let warp_for = |land: &ActionClip| RootWarp::identity(db.root_at(land.clip, land.anchor), (on_ground, yaw_of(character.rotation)));
+        // the run-out must stay on the ground landed on (a platform's top), else a shorter one
+        let fits = |land: &ActionClip| {
+            let warp = warp_for(land);
+            let samples = 4;
+            (1..=samples).all(|k| {
+                let f = land.anchor + (land.exit - land.anchor) * k as f32 / samples as f32;
+                let p = warp.root(f, db.root_at(land.clip, f)).0;
+                world.ground_height(Vec3::new(p.x, on_ground.y, p.z), 0.3, 0.3, self.layers).is_some_and(|g| (g - on_ground.y).abs() < 0.15)
+            })
+        };
+        let best = candidates.iter().find(|c| fits(c)).or(candidates.iter().min_by(|a, b| {
+            let reach = |c: &ActionClip| db.root_at(c.clip, c.anchor).0.distance(db.root_at(c.clip, c.exit).0);
+            reach(a).total_cmp(&reach(b))
+        }));
+        match best.copied().copied() {
             Some(land) => {
-                let clip_root = db.root_at(land.clip, land.anchor);
-                // from the impact on, on the ground (whatever height the fall or vault ended at)
-                let on_ground = Vec3::new(character.translation.x, self.matcher.ground(), character.translation.z);
-                let warp = RootWarp::identity(clip_root, (on_ground, yaw_of(character.rotation)));
-                self.matcher.start_action(db, Action { clip: land.clip, start: land.anchor, exit: Some(land.exit), path: RootPath::Warp(warp), collides: true, tag: ActionKind::Land as u32 });
+                let warp = warp_for(&land);
+                self.matcher.start_action(db, Action { clip: land.clip, start: land.anchor, exit: Some(land.exit), path: RootPath::Warp(warp), collides: true, tag: ActionKind::Land as u32, rate: 1.0, lock_feet: true });
                 self.state = CharacterState::Landing;
             }
             None => {
@@ -972,11 +1103,15 @@ impl CharacterController {
         self.traversable = true;
         let stands = |feet: Vec3| stands_at(world, feet, &self.rules, self.layers);
         let action = plan_traversal(db, &self.actions, kind, &obstacle, character.translation, yaw_of(character.rotation), speed, self.matcher.current_frame(db), &self.rules, stands)?;
+        self.park.hang_after = kind == ActionKind::Climb && self.ledge_is_hangable(db, obstacle.ledge);
         self.matcher.start_action(db, action);
         self.state = CharacterState::Traversing(kind);
         Ok(kind)
     }
 }
+
+pub mod features;
+pub mod parkour;
 
 #[cfg(test)]
 mod tests;

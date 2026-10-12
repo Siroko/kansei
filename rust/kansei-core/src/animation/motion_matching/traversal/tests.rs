@@ -712,3 +712,106 @@ fn against_a_face_the_ledge_is_in_front_of_the_feet() {
     let o = detect_obstacle(&w, Vec3::new(0.5, 0.0, -1.5), Vec3::new(-1.0, 0.0, 1.0), 3.0, &s).unwrap();
     assert!(o.ledge.abs_diff_eq(Vec3::new(-0.88, 1.0, 0.0), 0.05), "{}", o.ledge);
 }
+
+// ---- parkour ----
+
+use super::features::{ParkourFeatures, ParkourPiece, ParkourTag};
+
+/// Two platforms 1.2 m high with a 1.6 m gap, tagged as a chain.
+fn platforms() -> (CollisionWorld, ParkourFeatures) {
+    let mut w = floor();
+    let mut pieces = Vec::new();
+    for (k, z) in [0.0f32, 3.2].into_iter().enumerate() {
+        let obb = Obb::new(Vec3::new(0.0, 0.6, z), Vec3::new(0.8, 0.6, 0.8), Quat::IDENTITY);
+        w.add_box(obb);
+        let index = k.to_string();
+        pieces.push(ParkourPiece::from_extras("P", obb, [("kansei_traversal", "platform"), ("kansei_chain", "c"), ("kansei_chain_index", index.as_str())]).unwrap());
+    }
+    let f = ParkourFeatures::from_pieces(&pieces, &w);
+    (w, f)
+}
+
+#[test]
+fn an_aimed_jump_lands_on_the_next_platform_of_its_chain() {
+    let (db, table) = jump_database(false);
+    let (w, features) = platforms();
+    let mut c = controller(&db, table, Vec3::new(0.0, 1.2, 0.2));
+    c.features = features;
+    let target = c.jump_target_from(&w, Vec3::new(0.0, 1.2, 0.2), Vec3::Z).expect("the next platform");
+    assert!((target.y - 1.2).abs() < 1e-4 && target.z > 2.4 && target.z < 4.0, "on its top: {target}");
+    // the arc from a take-off at the edge comes down on it
+    let from = Vec3::new(0.0, 1.2, 0.7);
+    let v = c.aimed_velocity(from, target, 3.0);
+    let (mut p, mut v2) = (from, v);
+    let dt = 1.0 / 240.0;
+    while !(v2.y < 0.0 && p.y <= target.y) {
+        p += v2 * dt;
+        v2.y -= c.gravity * dt;
+    }
+    assert!(p.distance(target) < 0.08, "lands at {p}, aimed at {target}");
+    assert!(v.y >= 3.0 - 1e-4, "up at least as fast as the clip leaves the ground");
+}
+
+#[test]
+fn a_ledge_is_hung_from_and_shimmied_along_with_the_hands_on_it() {
+    // a climb clip whose hands hold the ledge (z = 0, 1.5 m up) from frame 22 to 34, the root
+    // hanging under it
+    let climb = {
+        let z = |f: usize| -1.0 + (f as f32).min(20.0) * 0.04;
+        let y = |f: usize| if f < 22 { 0.0 } else if f < 34 { 0.3 } else { 0.3 + 1.2 * ((f as f32 - 34.0) / 10.0).min(1.0) };
+        clip("climb", 60, move |f| Vec3::new(0.0, y(f), z(f) + if f > 34 { 0.3 * ((f as f32 - 34.0) / 10.0).min(1.0) } else { 0.0 }), |_| 1.0, |f| (22..=40).contains(&f).then_some([Vec3::new(0.2, 1.5, 0.05), Vec3::new(-0.2, 1.5, 0.05)]), 0.0)
+    };
+    let (db, mut table) = database_with(vec![(climb, ActionKind::Climb), (fall(), ActionKind::Fall), (land(), ActionKind::Land)]);
+    table.iter_mut().for_each(|a| a.ledge.y = a.height);
+    let mut w = floor();
+    let ledge = Obb::new(Vec3::new(0.0, 1.0, 1.0), Vec3::new(2.0, 1.0, 1.0), Quat::IDENTITY);
+    w.add_box(ledge);
+    let mut c = controller(&db, table, Vec3::new(0.0, 0.0, -1.0));
+    c.find_hands(&db);
+    assert!(c.hands.is_some(), "hand_l and hand_r");
+    c.features = ParkourFeatures::from_pieces(&[ParkourPiece::new("L", ParkourTag::Ledge, ledge)], &w);
+    // hanging from the -z edge
+    let pose = super::parkour::hang_poses(&db, &c.actions, c.hands.unwrap()).into_iter().next().expect("a hang in the climb");
+    let edge = c.features.edges.iter().position(|e| e.normal.z < -0.9).unwrap();
+    c.start_hang_for_tests(&db, &w, &pose, edge, 2.0);
+    for _ in 0..30 {
+        c.update(&db, &w, &MotionInput { velocity: Vec3::ZERO, facing: None }, 1.0 / 60.0);
+    }
+    assert_eq!(c.state(), CharacterState::Hanging);
+    let hands = c.hands.unwrap();
+    for h in hands {
+        let p = c.matcher.joint_world(&db, h);
+        assert!((p.y - 2.0).abs() < 0.08 && (p.z - 0.0).abs() < 0.12, "hand on the edge: {p}");
+    }
+    // shimmying along it: it moves, and planted hands stay put while planted
+    let start = c.matcher.character().translation;
+    for _ in 0..90 {
+        c.update(&db, &w, &MotionInput { velocity: Vec3::new(2.0, 0.0, 0.0), facing: None }, 1.0 / 60.0);
+    }
+    let moved = c.matcher.character().translation - start;
+    assert!(moved.x.abs() > 0.5 && moved.z.abs() < 0.05, "along the edge: {moved}");
+    // the hands' targets stay on the edge (this skeleton has no arms for the IK to bend: the
+    // targets, not the joints)
+    let edge_targets: Vec<Vec3> = c.limb_targets().iter().filter(|t| hands.contains(&t.joint)).map(|t| t.target).collect();
+    assert_eq!(edge_targets.len(), 2);
+    assert!(edge_targets.iter().all(|t| (t.y - 2.0).abs() < 0.06 && t.z.abs() < 0.12), "hands' targets on the edge: {edge_targets:?}");
+}
+
+#[test]
+fn the_root_blend_carries_the_old_velocity_and_settles() {
+    let (db, table) = jump_database(false);
+    let w = floor();
+    let mut c = controller(&db, table, Vec3::ZERO);
+    run(&mut c, &db, &w, Vec3::new(0.0, 0.0, 1.5), 1.0);
+    // a sudden stop of the root: what shows carries on, then settles back
+    let before = c.matcher.shown().translation;
+    c.matcher.blend_root();
+    c.matcher.teleport(c.matcher.character().translation, 0.0);
+    c.update(&db, &w, &MotionInput { velocity: Vec3::ZERO, facing: None }, 1.0 / 60.0);
+    let shown = c.matcher.shown().translation - c.matcher.character().translation;
+    assert!(shown.length() < 0.1, "a small offset, not a jump: {shown} (was at {before})");
+    for _ in 0..60 {
+        c.update(&db, &w, &MotionInput { velocity: Vec3::ZERO, facing: None }, 1.0 / 60.0);
+    }
+    assert!((c.matcher.shown().translation - c.matcher.character().translation).length() < 0.01, "settled");
+}

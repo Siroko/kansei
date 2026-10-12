@@ -137,7 +137,8 @@ pub struct RoomLit {
 
 impl RoomLit {
     fn uniform(&self, color: [f32; 4]) -> [f32; 8] {
-        [color[0], color[1], color[2], 1.0, AMBIENT[0], AMBIENT[1], AMBIENT[2], self.deferred as u32 as f32]
+        let fill = super::layout::fill();
+        [color[0], color[1], color[2], 1.0, AMBIENT[0] + fill[0], AMBIENT[1] + fill[1], AMBIENT[2] + fill[2], self.deferred as u32 as f32]
     }
 }
 
@@ -346,8 +347,8 @@ impl Proxy {
         }
         self.placed = ends;
         self.shown = shown;
-        let at = character.controller.matcher.character();
-        let place = Mat4::from_translation(at.translation) * Mat4::from_rotation_y(kansei_core::animation::motion_matching::yaw_of(at.rotation));
+        let at = character.controller.matcher.shown();
+        let place = Mat4::from_rotation_translation(at.rotation, at.translation);
         for (k, proxy) in self.bodies.iter().enumerate() {
             if let Some((view, _)) = &proxy.view {
                 if let Some(r) = scene.get_renderable_mut(*view) {
