@@ -36,6 +36,8 @@ pub struct ParkourSettings {
     pub max_jump_speed: f32,
     pub jump_clearance: f32,
     pub jump_cone: f32,
+    /// Seconds an aimed jump's speed across takes to come up from the run-up's.
+    pub take_off_ramp: f32,
     /// Catching an edge: how far the root may be from its hanging place when it does (m), and the
     /// shortest height of the face under the edge for a hang (m).
     pub catch_reach: f32,
@@ -72,6 +74,7 @@ impl Default for ParkourSettings {
             max_jump_speed: 7.5,
             jump_clearance: 0.45,
             jump_cone: 0.5,
+            take_off_ramp: 0.15,
             catch_reach: 0.55,
             min_hang_height: 1.9,
             shimmy_speed: 0.8,
@@ -252,6 +255,8 @@ pub(super) struct Runtime {
     pub swing: Option<Swing>,
     /// Where an aimed jump lands.
     pub jump_target: Option<Vec3>,
+    /// A take-off's speed across ramping up: where to, and the seconds left.
+    pub thrust: Option<(Vec3, f32)>,
     /// A climb of a tagged ledge that stops hanging from it.
     pub hang_after: bool,
     /// What was let go of, and for how much longer it can't be caught.
@@ -633,6 +638,46 @@ impl CharacterController {
         let d = Vec3::new(target.x - from.x, 0.0, target.z - from.z);
         let speed = (d.length() / t.max(0.1)).min(self.parkour.max_jump_speed);
         d.normalize_or_zero() * speed + Vec3::Y * up
+    }
+
+    /// The take-off of an aimed jump whose full velocity is `full`, its speed across ramped up
+    /// from the run-up's (`run`, the root's velocity as it leaves the ground) over
+    /// `ParkourSettings::take_off_ramp` seconds rather than at once: the speed across it ends at
+    /// is raised to land where `full` lands. Returns the velocity to leave the ground with.
+    pub(super) fn ramped_take_off(&mut self, from: Vec3, target: Vec3, full: Vec3, run: Vec3) -> Vec3 {
+        let ramp = self.parkour.take_off_ramp;
+        let across = Vec3::new(full.x, 0.0, full.z);
+        let speed = across.length();
+        let distance = Vec3::new(target.x - from.x, 0.0, target.z - from.z).length();
+        if speed < 0.2 || ramp <= 0.0 {
+            self.park.thrust = None;
+            return full;
+        }
+        let dir = across / speed;
+        let flight = distance / speed;
+        if flight <= ramp {
+            self.park.thrust = None;
+            return full;
+        }
+        let start = run.dot(dir).clamp(0.0, speed);
+        // covers `distance` in `flight`: the ramp's half-speed shortfall made up after it
+        let end = ((distance - start * ramp * 0.5) / (flight - ramp * 0.5)).min(self.parkour.max_jump_speed);
+        self.park.thrust = Some((dir * end, ramp));
+        dir * start + Vec3::Y * full.y
+    }
+
+    /// While a take-off's speed across ramps up: on toward it.
+    pub(super) fn apply_thrust(&mut self, dt: f32) {
+        let Some((target, left)) = self.park.thrust else { return };
+        if let Some(a) = self.matcher.action_mut() {
+            if let RootPath::Ballistic { velocity, .. } = &mut a.path {
+                let across = Vec3::new(velocity.x, 0.0, velocity.z);
+                let next = across + (target - across) * (dt / left.max(dt)).min(1.0);
+                velocity.x = next.x;
+                velocity.z = next.z;
+            }
+        }
+        self.park.thrust = (left - dt > 1e-4).then_some((target, left - dt));
     }
 
     // ---- hanging ----

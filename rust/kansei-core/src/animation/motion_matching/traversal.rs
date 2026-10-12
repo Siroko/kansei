@@ -929,7 +929,9 @@ impl CharacterController {
                             } else {
                                 target
                             };
-                            self.aimed_velocity(from, target, rise)
+                            // across, ramped up from the run-up's own speed rather than at once
+                            let full = self.aimed_velocity(from, target, rise);
+                            self.ramped_take_off(from, target, full, v)
                         }
                         None => Vec3::new(v.x, up, v.z),
                     };
@@ -944,6 +946,7 @@ impl CharacterController {
             }
             CharacterState::Falling(time) => {
                 self.matcher.update_constrained(db, input, dt, &mut constrain);
+                self.apply_thrust(dt);
                 // a jump's clip played out: on with the fall loop, at the same momentum
                 let air = self.matcher.action().and_then(|a| match a.path {
                     RootPath::Ballistic { velocity, .. } => Some((a.clip, velocity)),
