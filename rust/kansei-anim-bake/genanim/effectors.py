@@ -15,6 +15,8 @@ Kimodo's space (`paths.py`): Y up, the character facing +Z, its left +X, the fir
   Either holds only the first `until` seconds when given (a pull-up from the hang).
 - `shimmy`: hanging from a ledge at `height` (its face at z = 0), the hands stepping `step` m to
   the character's left (`direction` 1) or right (-1) every `step_time` seconds.
+- `ledge_hang`: hanging still from a ledge at `height` (its face at z = 0), hands on its edge,
+  the feet braced on the face (`wall`, the feet's z), the hips under the hands.
 - `wall_run`: running along +Z at `speed`, a wall on the right (`side` -1) or left (1) at
   `distance` m, the body leaning `lean` radians away from it; from `start` s for `time` s the feet
   step on the wall every `step_time` s, the root rising by `rise` m and back.
@@ -198,6 +200,25 @@ def build(skeleton, spec, frames, fps):
             keys.append(f)
             poses.append(poser.fk(local, [x, 1.0 + y, speed * t]))
         out.append(constraint(skeleton, keys, poses, "Hips"))
+    elif kind == "ledge_hang":
+        # hanging still from a ledge, the feet braced on the face under it (z = 0 the face, the
+        # body out toward -z): hands on the top's edge, the hips under them, the feet on the wall
+        height, grip, wall = spec.get("height", 2.3), spec.get("grip", 0.5), spec.get("wall", -0.08)
+        hands = {"LeftHand": (grip / 2, height, 0.04), "RightHand": (-grip / 2, height, 0.04)}
+
+        def braced(flex):
+            turns = arms_up(0.35)
+            for side in ("Left", "Right"):
+                turns[f"{side}Leg"] = [((1.0, 0.0, 0.0), -flex)]
+                turns[f"{side}Shin"] = [((1.0, 0.0, 0.0), flex * 1.2)]
+            return placed(poser, turns, hands)
+
+        # the hip flex that puts the feet on the wall
+        best = min((abs(braced(f)[1][poser.index("LeftFoot")][2].item() - wall), f) for f in [k * 0.05 for k in range(4, 30)])[1]
+        pose = braced(best)
+        keys = list(range(0, frames, every))
+        for joint in ("LeftHand", "RightHand", "LeftFoot", "RightFoot", "Hips"):
+            out.append(constraint(skeleton, keys, [pose] * len(keys), joint))
     else:
         raise ValueError(f"unknown effectors kind {kind}")
     return out

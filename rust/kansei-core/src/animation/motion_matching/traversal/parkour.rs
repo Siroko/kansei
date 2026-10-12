@@ -265,8 +265,8 @@ pub(super) struct Runtime {
     pub fall_hips: f32,
     /// The limb targets set this frame (for `reach`, and for measuring).
     pub limbs: Vec<LimbTarget>,
-    /// Each hand's push out of the world while traversing: its weight and the push.
-    pub hand_out: [(f32, Vec3); 2],
+    /// Each hand's and foot's push out of the level (`apply_limbs`): its weight and the push.
+    pub limb_out: [(f32, Vec3); 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -282,6 +282,9 @@ const HANG_DROP: f32 = 0.92;
 /// Added to a jump target's height to mark it as where the hips should pass (a bar to catch),
 /// not where the feet land.
 pub(super) const BAR_AIM: f32 = 1000.0;
+
+/// An ankle's clearance from what the foot stands or pushes on (m).
+const FOOT_RADIUS: f32 = 0.06;
 
 /// A wrist's clearance from what it grips (m).
 const HAND_RADIUS: f32 = 0.035;
@@ -544,6 +547,21 @@ impl CharacterController {
             (1.0..=5.5).contains(&dist) && (-2.5..=1.2).contains(&dh) && d.normalize_or_zero().dot(dir) >= s.jump_cone.cos()
         };
         let mut candidates: Vec<(f32, Vec3)> = Vec::new();
+        // a ledge ahead to catch (above what a jump lands on): the arc brings the hips under its
+        // edge, a hand's reach below it
+        for e in &f.edges {
+            if e.a.y - e.floor < self.parkour.min_hang_height || e.normal.dot(dir) > -0.5 {
+                continue;
+            }
+            let s = e.project(from + dir * 1.5).clamp(0.4, (e.length() - 0.4).max(0.4));
+            let point = e.point(s);
+            // (high: the hands reach up from the jump's arms-down pose a moment later)
+            let hips = point + e.normal * 0.3 - Vec3::Y * 0.6;
+            let d = Vec3::new(hips.x - from.x, 0.0, hips.z - from.z);
+            if (0.6..=3.5).contains(&d.length()) && hips.y - from.y > 0.3 && hips.y - from.y < 2.4 && d.normalize_or_zero().dot(dir) >= self.parkour.jump_cone.cos() {
+                candidates.push((d.length() - 15.0, Vec3::new(hips.x, hips.y + BAR_AIM, hips.z)));
+            }
+        }
         // a bar ahead to catch: the arc brings the hips to where hanging from it puts them (the
         // hips as high over the root as the fall loop holds them)
         for b in &f.bars {
@@ -652,6 +670,11 @@ impl CharacterController {
         // place not below the floor
         let out = (c - e.point(s)).dot(e.normal);
         if out < -0.05 || c.distance(root) > self.parkour.catch_reach + velocity.length() * 0.05 || root.y < e.floor + 0.05 {
+            return false;
+        }
+        // and the hands can take the edge from where the arms are
+        let rest = self.rest_limbs(&pose, edge, s, world);
+        if !self.arms_reach(db, [rest[0], rest[1]], -0.25) {
             return false;
         }
         self.start_hang(db, world, &pose, edge, s, true);
@@ -1077,7 +1100,9 @@ impl CharacterController {
                     let (p, s) = b.nearest(hips_now);
                     let length = (clip_joint(db, clips.hang, 1.0, db.roles.hips) - hands_mid(db, clips.hang, 1.0, h)).length();
                     let r = hips_now - p;
-                    let fits = r.length() > length - 0.3 && r.length() < length + 0.15 && -r.y > 0.45;
+                    let side = Vec3::Y.cross(yaw_rotation(yaw_of(self.matcher.character().rotation)) * FORWARD);
+                    let grip = (side.dot(b.direction()) * 0.25).abs();
+                    let fits = r.length() > length - 0.3 && r.length() < length + 0.15 && -r.y > 0.45 && self.arms_reach(db, [p - b.direction() * grip + Vec3::Y * 0.03, p + b.direction() * grip + Vec3::Y * 0.03], -0.15);
                     (if fits { (r.length() - length).abs() } else { f32::MAX }, s)
                 }
                 None => {
@@ -1287,26 +1312,6 @@ impl CharacterController {
         self.state = CharacterState::Falling(0.0);
     }
 
-    /// While traversing: hands that sink into what they vault or climb are pushed out of it (eased
-    /// in and out, following the animation otherwise).
-    pub(super) fn keep_hands_out(&mut self, db: &Database, world: &CollisionWorld, dt: f32) {
-        let Some(hands) = self.hands else { return };
-        self.park.limbs.clear();
-        for (k, &h) in hands.iter().enumerate() {
-            let p = self.matcher.joint_world(db, h);
-            let out = world.push_sphere_out(p, HAND_RADIUS, self.layers);
-            let pushed = out.distance(p) > 1e-4;
-            let w = &mut self.park.hand_out[k];
-            w.0 += ((pushed as u32 as f32) - w.0) * (1.0 - (-dt / 0.03).exp());
-            if pushed {
-                w.1 = out - p;
-            }
-            if w.0 > 1e-3 {
-                self.park.limbs.push(LimbTarget { joint: h, target: p + w.1, weight: w.0, rotation: None });
-            }
-        }
-    }
-
     // ---- in the air ----
 
     /// While falling: come upright and turn toward the heading asked for; tick the cooldown.
@@ -1326,6 +1331,18 @@ impl CharacterController {
         }
     }
 
+    /// Whether both hands could reach these points from where the shoulders are (the arms'
+    /// length less `slack`), either hand to either point.
+    fn arms_reach(&self, db: &Database, points: [Vec3; 2], slack: f32) -> bool {
+        let Some(hands) = self.hands else { return true };
+        let reach = |hand: usize, p: Vec3| {
+            let (Some(elbow), Some(shoulder)) = (db.skeleton.parents[hand], db.skeleton.parents[hand].and_then(|e| db.skeleton.parents[e])) else { return true };
+            let (h, e, sh) = (self.matcher.joint_world(db, hand), self.matcher.joint_world(db, elbow), self.matcher.joint_world(db, shoulder));
+            p.distance(sh) <= (h.distance(e) + e.distance(sh)) * 0.985 - slack
+        };
+        (reach(hands[0], points[0]) && reach(hands[1], points[1])) || (reach(hands[0], points[1]) && reach(hands[1], points[0]))
+    }
+
     /// The hips relative to the root, as shown.
     fn hips_local(&self, db: &Database) -> Vec3 {
         let model = self.matcher.model();
@@ -1339,17 +1356,85 @@ impl CharacterController {
         }
     }
 
-    /// Pin the limbs this frame's move asked for.
-    pub(super) fn apply_limbs(&mut self, db: &Database) {
-        let pinning = matches!(self.state, CharacterState::Hanging | CharacterState::WallRunning | CharacterState::Swinging | CharacterState::Traversing(_));
-        if !pinning {
+    /// Pin the limbs this frame's move asked for, and keep every hand and foot out of the level
+    /// whatever the character does off the ground (a vault's hand sinking into the box, a foot
+    /// into the wall it leaves, a landing foot into a ledge's face): a limb that would end inside
+    /// something is pushed out to a clearance, at once, and eased back onto the animation once
+    /// clear.
+    pub(super) fn apply_limbs(&mut self, db: &Database, world: &CollisionWorld, dt: f32) {
+        if self.state == CharacterState::Grounded {
             self.park.limbs.clear();
-            self.park.hand_out = Default::default();
-        } else if !self.park.limbs.is_empty() {
-            let targets = std::mem::take(&mut self.park.limbs);
-            self.matcher.reach(db, &targets);
-            self.park.limbs = targets;
+            self.park.limb_out = Default::default();
+            return;
         }
+        if !matches!(self.state, CharacterState::Hanging | CharacterState::WallRunning | CharacterState::Swinging) {
+            self.park.limbs.clear();
+        }
+        let mut targets = std::mem::take(&mut self.park.limbs);
+        let ends = self.hands.map_or([None, None, Some(db.roles.feet[0]), Some(db.roles.feet[1])], |h| [Some(h[0]), Some(h[1]), Some(db.roles.feet[0]), Some(db.roles.feet[1])]);
+        for (k, joint) in ends.into_iter().enumerate() {
+            let Some(joint) = joint else { continue };
+            let radius = if k < 2 { HAND_RADIUS } else { FOOT_RADIUS };
+            let animated = self.matcher.joint_world(db, joint);
+            let at = targets.iter().position(|t| t.joint == joint);
+            let p = at.map_or(animated, |i| animated.lerp(targets[i].target, targets[i].weight.min(1.0)));
+            let out = world.push_sphere_out(p, radius, self.layers);
+            let push = out - p;
+            let state = &mut self.park.limb_out[k];
+            if push.length_squared() > 1e-8 {
+                // what an eased release left still applies, plus this frame's push
+                *state = (1.0, push);
+            } else {
+                state.0 *= (-dt / 0.06).exp();
+            }
+            if state.0 > 1e-3 {
+                let target = p + state.1 * state.0;
+                // (still clear of the level)
+                let target = world.push_sphere_out(target, radius, self.layers);
+                match at {
+                    Some(i) => {
+                        targets[i].target = target;
+                        targets[i].weight = 1.0;
+                    }
+                    None => targets.push(LimbTarget { joint, target, weight: 1.0, rotation: None }),
+                }
+            }
+        }
+        // hanging or swinging, the body hangs from its hands: pulled up to them where the arms
+        // would have to stretch past their length (a catch's eased body, a hand round a corner)
+        let hanging = matches!(self.state, CharacterState::Hanging | CharacterState::Swinging);
+        if hanging {
+            let mut pull = Vec3::ZERO;
+            for t in targets.iter().filter(|t| t.weight > 0.5 && self.hands.is_some_and(|h| h.contains(&t.joint))) {
+                let (Some(elbow), Some(shoulder)) = (db.skeleton.parents[t.joint], db.skeleton.parents[t.joint].and_then(|e| db.skeleton.parents[e])) else { continue };
+                let (h, e, sh) = (self.matcher.joint_world(db, t.joint), self.matcher.joint_world(db, elbow), self.matcher.joint_world(db, shoulder));
+                let reach = (h.distance(e) + e.distance(sh)) * 0.985;
+                let d = t.target.distance(sh);
+                if d > reach {
+                    let need = (t.target - sh).normalize_or_zero() * (d - reach);
+                    // the larger of the hands' needs, along each axis
+                    pull = Vec3::new(
+                        if need.x.abs() > pull.x.abs() { need.x } else { pull.x },
+                        if need.y.abs() > pull.y.abs() { need.y } else { pull.y },
+                        if need.z.abs() > pull.z.abs() { need.z } else { pull.z },
+                    );
+                }
+            }
+            // what the arms still need, on top of the pull already showing; let go of slowly
+            // (half a second's half-life) when they don't need it
+            let held = self.matcher.reach_offset();
+            // (no faster than the body can be seen to be pulled: a catch's last few centimetres
+            // close over a few frames)
+            let next = if pull.length_squared() > 1e-8 { held + pull.clamp_length_max(2.0 * dt) } else { held * (-dt / 0.15).exp() };
+            self.matcher.set_reach_offset(next);
+        } else if self.matcher.reach_offset() != Vec3::ZERO {
+            let held = self.matcher.reach_offset();
+            self.matcher.set_reach_offset(if held.length() < 1e-4 { Vec3::ZERO } else { held * (-dt / 0.1).exp() });
+        }
+        if !targets.is_empty() {
+            self.matcher.reach(db, &targets);
+        }
+        self.park.limbs = targets;
     }
 }
 

@@ -143,6 +143,18 @@
     "step_time": 0.2,
     "rise": 0.9
    }
+  },
+  {
+   "name": "Parkour/Hang_Idle_Braced",
+   "prompt": "A person hangs from a ledge by both hands with their feet braced against the wall below, breathing and shifting their weight slightly.",
+   "duration": 6.0,
+   "effectors": {
+    "kind": "ledge_hang",
+    "height": 2.3,
+    "grip": 0.5,
+    "wall": -0.08,
+    "every": 6
+   }
   }
  ]
 }

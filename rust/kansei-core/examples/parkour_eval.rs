@@ -222,6 +222,7 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
     let mut csv = csv;
     let mut frame = 0usize;
     let mut sum_err = 0.0f32;
+    let mut misses = 0;
     while time < s.duration {
         // a hitch: a 100 ms frame every 1.3 s
         let step = if hitch && frame % 78 == 77 { 0.1 } else { dt };
@@ -276,7 +277,8 @@ fn run(db: &Database, actions: &[kansei_core::animation::motion_matching::traver
         let mut frame_err = 0.0f32;
         for t in c.limb_targets().iter().filter(|t| t.weight > 0.99) {
             let e = c.matcher.joint_world(db, t.joint).distance(t.target);
-            if trace && e > 0.05 && frame % 20 == 0 {
+            if trace && e > 0.04 && misses < 14 {
+                misses += 1;
                 println!("    {time:.2}s {} off its target by {:.1} cm (at {:.2?}, target {:.2?})", db.skeleton.names[t.joint], 100.0 * e, c.matcher.joint_world(db, t.joint), t.target);
             }
             frame_err = frame_err.max(e);

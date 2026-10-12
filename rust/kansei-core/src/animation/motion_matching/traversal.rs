@@ -835,7 +835,7 @@ impl CharacterController {
         self.intent = Vec3::new(input.velocity.x, 0.0, input.velocity.z);
         self.tick_cooldown(dt);
         self.advance(db, world, input, dt);
-        self.apply_limbs(db);
+        self.apply_limbs(db, world, dt);
         if let Some((left, patience)) = self.buffered {
             self.buffered = None;
             if self.state == CharacterState::Grounded {
@@ -887,7 +887,6 @@ impl CharacterController {
                 if kind == ActionKind::Climb && self.climb_reached_hang(db, world) {
                     return;
                 }
-                self.keep_hands_out(db, world, dt);
                 if self.matcher.action().is_none() {
                     // over an obstacle, land on the floor behind; else stand where it ended
                     let c = self.matcher.character().translation;

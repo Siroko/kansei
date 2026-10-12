@@ -234,6 +234,8 @@ pub struct MotionMatcher {
     /// A longer inertialization half-life for a while (`soften`): its half-life and the seconds
     /// left.
     soft: Option<(f32, f32)>,
+    /// `set_reach_offset`'s.
+    reach_offset: Vec3,
 }
 
 impl MotionMatcher {
@@ -272,6 +274,7 @@ impl MotionMatcher {
             blend_pending: None,
             hips_out: db.roles.hips,
             soft: None,
+            reach_offset: Vec3::ZERO,
         };
         matcher.pose.to_model(&db.skeleton, &mut matcher.model);
         matcher
@@ -313,7 +316,7 @@ impl MotionMatcher {
         // turned about the hips: they stay where the character puts them
         let hips = self.model.get(self.hips_out).map_or(Vec3::ZERO, |t| t.translation);
         let pivot = self.character.rotation * hips - rotation * hips;
-        Transform::from_translation_rotation(self.character.translation + self.root_offset.0 + pivot, rotation)
+        Transform::from_translation_rotation(self.character.translation + self.root_offset.0 + self.reach_offset + pivot, rotation)
     }
 
     /// After `start_action` onto a clip whose root sits elsewhere under the body than the clip
@@ -341,6 +344,16 @@ impl MotionMatcher {
     /// catch whose pose is far from the fall's.
     pub fn soften(&mut self, halflife: f32, seconds: f32) {
         self.soft = Some((halflife, seconds));
+    }
+
+    /// Show the body `offset` from where it is, as well (until set again): a body pulled up to
+    /// hands that would otherwise not reach what they hold. The caller keeps it smooth.
+    pub fn set_reach_offset(&mut self, offset: Vec3) {
+        self.reach_offset = offset;
+    }
+
+    pub fn reach_offset(&self) -> Vec3 {
+        self.reach_offset
     }
 
     /// Show the character turned to `from` (a world rotation: what showed before a catch turned
