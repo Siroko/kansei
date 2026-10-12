@@ -439,13 +439,15 @@ fn main() -> Result<(), String> {
     }
     let csv_dir = arg("csv");
     let trace = arg("trace").is_some();
+    // (`trace=120` traces the 120 fps run; `trace=1` the 60 fps one)
+    let trace_label = arg("trace").filter(|t| t != "1").unwrap_or_else(|| "60".to_string());
     let rates: [(f32, bool, &str); 4] = [(1.0 / 30.0, false, "30"), (1.0 / 60.0, false, "60"), (1.0 / 120.0, false, "120"), (1.0 / 60.0, true, "60+hitch")];
     println!("{:<52} {:>8} {:>4} {:>8} {:>8} {:>10} {:>6} {:>11} {:>11}  states", "scenario", "fps", "ok", "limb max", "limb avg", "slide", "inside", "root pop", "pose pop");
     let mut failures = 0;
     for s in scenarios().iter().filter(|s| only.as_ref().is_none_or(|o| s.name.contains(o.as_str()))) {
         for (dt, hitch, label) in rates {
             let mut csv = csv_dir.as_ref().map(|_| String::from("time,state,x,y,z,limb_error,accel,yaw,hips_x,hips_y,hips_z\n"));
-            let r = run(db, &pack.actions, &world, &features, s, dt, hitch, gait, csv.as_mut(), trace && label == "60");
+            let r = run(db, &pack.actions, &world, &features, s, dt, hitch, gait, csv.as_mut(), trace && label == trace_label.as_str());
             // the expected states in order (others may come between)
             let mut want = s.expect.iter().peekable();
             for st in &r.states {

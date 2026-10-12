@@ -184,6 +184,9 @@ struct Step {
     planted: Vec3,
     from: Vec3,
     stepping: bool,
+    /// A step out of turn, its progress (0..1): the body moved too far from where the limb was
+    /// planted for it to reach (round a corner).
+    forced: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -784,10 +787,33 @@ impl CharacterController {
         let (side, _) = edge_frame(self.features.edges[h.edge].normal);
         let left_ahead = side.dot(self.features.edges[h.edge].direction() * h.direction) > 0.0;
         let order = if left_ahead { [0usize, 3, 1, 2] } else { [1usize, 2, 0, 3] };
+        // a planted limb the body has left out of its reach steps back under it at once
+        let joints = self.hands.map(|hands| limb_joints(db, hands));
+        for k in 0..4 {
+            let reaches = joints.is_none_or(|j| self.limb_reaches(db, j[k], h.limbs[k].planted, 0.97));
+            let l = &mut h.limbs[k];
+            if l.forced.is_none() && !l.stepping && !reaches {
+                l.forced = Some(0.0);
+                l.from = l.planted;
+            }
+            if let Some(t) = l.forced.as_mut() {
+                *t = (*t + dt / 0.22).min(1.0);
+                let u = smooth(*t);
+                let lift = (u * std::f32::consts::PI).sin() * if k < 2 { 0.05 } else { 0.08 };
+                l.planted = l.from.lerp(rest[k], u) + Vec3::Y * lift + self.features.edges[h.edge].normal * lift * 0.6;
+                if *t >= 1.0 {
+                    l.forced = None;
+                    l.planted = rest[k];
+                }
+            }
+        }
         for (slot, &k) in order.iter().enumerate() {
             let window = (slot as f32 * 0.25, slot as f32 * 0.25 + 0.25);
             let inside = |p: f32| p >= window.0 && p < window.1;
             let l = &mut h.limbs[k];
+            if l.forced.is_some() {
+                continue;
+            }
             // landing ahead of its rest by what the root moves while it stays planted, halved
             let target = rest[k] + self.features.edges[h.edge].direction() * h.direction * stride * 0.375 * (wanted.abs() > 0.05) as u32 as f32;
             if rate > 0.0 && inside(h.phase) {
@@ -1331,6 +1357,14 @@ impl CharacterController {
         }
     }
 
+    /// Whether limb end `joint` (a hand or a foot) can reach `target` from where its root joint
+    /// (shoulder, hip) is: within `fraction` of the limb's length.
+    fn limb_reaches(&self, db: &Database, joint: usize, target: Vec3, fraction: f32) -> bool {
+        let (Some(middle), Some(upper)) = (db.skeleton.parents[joint], db.skeleton.parents[joint].and_then(|m| db.skeleton.parents[m])) else { return true };
+        let (e, m, u) = (self.matcher.joint_world(db, joint), self.matcher.joint_world(db, middle), self.matcher.joint_world(db, upper));
+        target.distance(u) <= (e.distance(m) + m.distance(u)) * fraction
+    }
+
     /// Whether both hands could reach these points from where the shoulders are (the arms'
     /// length less `slack`), either hand to either point.
     fn arms_reach(&self, db: &Database, points: [Vec3; 2], slack: f32) -> bool {
@@ -1425,11 +1459,24 @@ impl CharacterController {
             let held = self.matcher.reach_offset();
             // (no faster than the body can be seen to be pulled: a catch's last few centimetres
             // close over a few frames)
-            let next = if pull.length_squared() > 1e-8 { held + pull.clamp_length_max(2.0 * dt) } else { held * (-dt / 0.15).exp() };
+            let next = if pull.length_squared() > 1e-8 { held + pull.clamp_length_max(if self.state == CharacterState::Swinging { 2.0 } else { 6.0 } * dt) } else { held * (-dt / 0.15).exp() };
             self.matcher.set_reach_offset(next);
         } else if self.matcher.reach_offset() != Vec3::ZERO {
             let held = self.matcher.reach_offset();
             self.matcher.set_reach_offset(if held.length() < 1e-4 { Vec3::ZERO } else { held * (-dt / 0.1).exp() });
+        }
+        // feet braced on a face or running on a wall: a target past the leg's length comes in
+        // toward the hip (the foot lifts off the wall a little rather than the leg failing to
+        // reach)
+        if hanging || self.state == CharacterState::WallRunning {
+            for t in targets.iter_mut().filter(|t| db.roles.feet.contains(&t.joint)) {
+                let (Some(knee), Some(hip)) = (db.skeleton.parents[t.joint], db.skeleton.parents[t.joint].and_then(|k| db.skeleton.parents[k])) else { continue };
+                let (f, k, h) = (self.matcher.joint_world(db, t.joint), self.matcher.joint_world(db, knee), self.matcher.joint_world(db, hip));
+                let reach = (f.distance(k) + k.distance(h)) * 0.97;
+                if t.target.distance(h) > reach {
+                    t.target = h + (t.target - h).normalize_or_zero() * reach;
+                }
+            }
         }
         if !targets.is_empty() {
             self.matcher.reach(db, &targets);
