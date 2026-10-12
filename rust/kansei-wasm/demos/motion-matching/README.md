@@ -410,16 +410,21 @@ with the tank's panes traced as glass, its own view 54 ms.
 
 `www/showroom.html` (`start_showroom`) is a 20 x 14 m white gallery, 5 m high: a polished concrete
 floor, plaster walls (the north one a warm grey backdrop), three tall windows to the west, a long
-skylight over the aisle. On the floor, in two rows either side of it, stand the furniture pieces
-modelled in Blender from the owner's photos (the GAME version of each: the Karuselli, Togo and
-Panton to the north, the MG5, Paimio (shown 1.2 times its size, the owner's call), 406 and Wave
-cantilever to the south), and on white pedestals on a low plinth a green Aalto vase of ray-traced
-glass under a narrow display spot, throwing green caustics, and an Aalto steel tray. Five track spots (3500 K) light five pieces; daylight comes through the skylight
+skylight over the aisle. The furniture pieces modelled in Blender from the owner's photos (the
+GAME version of each) are arranged as a showroom's vignettes, each on a rug: a lounge (the Togo,
+two Karusellis and two Paimios, shown 1.2 times their size, the owner's call, round a coffee table,
+a plant), a dining group (six MG5s round an oak table), the Wave chairs as the set of four they
+come in, and the Panton and the 406 as accents; on white pedestals on a low plinth, a green Aalto
+vase of ray-traced glass under a narrow display spot, throwing green caustics, and an Aalto steel
+tray. Copies of a piece are instances of its one GAME collection, merged into the same draws (19
+pieces: 164 draws a frame against 160 for the 9 alone; 192k triangles against 127k; 12.8k in the
+ray tracing grid against 9.3k, the copies' 500-triangle proxies). Five track spots (3500 K) light five pieces; daylight comes through the skylight
 and the windows. Everything else is the room's: every mode works (`gi=rt|voxel|voxel+ssgi|probes|
 probes+ssgi|ssgi|off`, `shadows=rt|maps`, `quality=game|high`, `render=forward`), the panel, the
 perf overlay, the character and its parkour.
-`cam=` names a view: `hall`, `aisle`, `outside`, one a piece (`karuselli`, `togo`, `panton`,
-`vase`, `tray`, `mg5`, `paimio`, `a406`, `wave`) and the chrome close up (`wave_close`, `mg5_close`,
+`cam=` names a view: `hall`, `aisle`, `outside`, a group (`lounge`, `dining`, `waves`, `accent`),
+one a piece (its first copy: `karuselli`, `togo`, `panton`, `vase`, `tray`, `mg5`, `paimio`,
+`a406`, `wave`) and the chrome close up (`wave_close`, `mg5_close`,
 `karuselli_close`). The looks: `showroom` (the default), `overcast`, `spots only`, `golden hour`.
 With the links `link-packs.sh` makes, the page with no parameters walks the mannequin on the best
 private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion).
