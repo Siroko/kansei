@@ -410,16 +410,16 @@ with the tank's panes traced as glass, its own view 54 ms.
 
 `www/showroom.html` (`start_showroom`) is a 20 x 14 m white gallery, 5 m high: a polished concrete
 floor, plaster walls (the north one a warm grey backdrop), three tall windows to the west, a long
-skylight over the aisle, two rows of low white plinths and an oak bench. On the plinths stand the
-furniture pieces modelled in Blender from the owner's photos (the GAME version of each: the
-Karuselli, Togo and Panton to the north, the MG5, Paimio, 406 and Wave cantilever to the south),
-and a green Aalto vase of ray-traced glass on a pedestal under a narrow display spot, throwing
-green caustics. Five track spots (3500 K) light five pieces; daylight comes through the skylight
+skylight over the aisle. On the floor, in two rows either side of it, stand the furniture pieces
+modelled in Blender from the owner's photos (the GAME version of each: the Karuselli, Togo and
+Panton to the north, the MG5, Paimio (shown 1.2 times its size, the owner's call), 406 and Wave
+cantilever to the south), and on white pedestals on a low plinth a green Aalto vase of ray-traced
+glass under a narrow display spot, throwing green caustics, and an Aalto steel tray. Five track spots (3500 K) light five pieces; daylight comes through the skylight
 and the windows. Everything else is the room's: every mode works (`gi=rt|voxel|voxel+ssgi|probes|
 probes+ssgi|ssgi|off`, `shadows=rt|maps`, `quality=game|high`, `render=forward`), the panel, the
-perf overlay, the character and its parkour (the bench takes a hurdle, the plinths are steps).
+perf overlay, the character and its parkour.
 `cam=` names a view: `hall`, `aisle`, `outside`, one a piece (`karuselli`, `togo`, `panton`,
-`vase`, `mg5`, `paimio`, `a406`, `wave`) and the chrome close up (`wave_close`, `mg5_close`,
+`vase`, `tray`, `mg5`, `paimio`, `a406`, `wave`) and the chrome close up (`wave_close`, `mg5_close`,
 `karuselli_close`). The looks: `showroom` (the default), `overcast`, `spots only`, `golden hour`.
 With the links `link-packs.sh` makes, the page with no parameters walks the mannequin on the best
 private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion).
@@ -439,10 +439,11 @@ private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion)
   metre of thin coloured glass leaves less light than an f32 holds) and drawn with
   `RtGlass::absorption_scale` 50 (the GBuffer's 8-bit tint is the light 2 cm leave), and the same
   scale for its caustics (`RtCausticsEffect::glass_absorption_scale`). `glass_density` (0.5 here,
-  set at start) scales the authored absorption: the white plinth's reflections drown a dark
+  set at start) scales the authored absorption: the white pedestal's reflections drown a dark
   green. In `render=forward`, with no glass pass, it is blended over the room (`pbr::forward_glass`).
-- **Placement**: each piece is centred on its plinth by its bounds as Blender instances it (nested
-  empties, instance offsets), its bottom on the plinth's top; its `_SHADOW` and `_COL`, made where
+- **Placement**: each piece is centred on its spot by its bounds as Blender instances it (nested
+  empties, instance offsets), its bottom on the floor or its pedestal; a piece may be shown at
+  another scale (`SCALES` in the build); its `_SHADOW` and `_COL`, made where
   missing, sit under a plain holder (`PIECE_<label>`) beside the instance (`PIECE_<label>_INST`),
   since the glTF exporter misplaces an instance's children. The build prints each piece's centre,
   height against its README and facing, and stops on a height off by more than 5%.
@@ -451,7 +452,7 @@ private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion)
 photos, so they are not in this repository: the page loads the architecture from
 `www/assets/showroom/showroom.glb` (CC0, committed) and the pieces from
 `www/assets/showroom/private/pieces.glb`, a gitignored link to the owner's exports
-(`link-packs.sh` makes it). Without it the plinths stand empty; `pieces=0` leaves the pieces out
+(`link-packs.sh` makes it). Without it the hall stands empty but for the pedestals; `pieces=0` leaves the pieces out
 even when linked, for captures that may be published. Don't commit the pieces, a render of them or
 anything made from them unless the owner says so.
 
