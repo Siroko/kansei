@@ -431,8 +431,10 @@ private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion)
   is direct). On in the showroom, off in the room. About 1.0-1.3 ms at 1080p.
 - **Chrome and lacquer**: every material of the pieces' glb is reflective (traced where its
   roughness is under 0.45), so the tubes reflect the room. `render=forward` traces nothing: there
-  the room's fill stands for what a surface reflects (F0 times the fill, brighter above than
-  below).
+  the room's PBR material reads a probe of the room (`src/room/probe.rs`: six 90° views from the
+  middle of the room at 1.4 m into a GBuffer at start, lit as forward lights them, the character
+  left out, 256² a face with box-filtered mips), along the reflected ray, its mip by the
+  roughness, Fresnel-weighted. Forward stays about 4.5-6.5 ms a frame at 1080p.
 - **The vase**: ray-traced glass tinted by its `KHR_materials_volume`, kept per centimetre (a
   metre of thin coloured glass leaves less light than an f32 holds) and drawn with
   `RtGlass::absorption_scale` 50 (the GBuffer's 8-bit tint is the light 2 cm leave), and the same

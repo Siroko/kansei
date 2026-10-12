@@ -32,6 +32,7 @@ mod dust;
 mod layout;
 mod look;
 mod pbr;
+mod probe;
 mod aquarium;
 mod settings;
 
@@ -1046,6 +1047,9 @@ where
     // forward (`render=forward`): no voxel GI or ray tracing grid at all, a flat fill for the GI
     let forward = settings.render == "forward";
     layout::set_fill(if forward { FORWARD_FILL } else { [0.0; 3] });
+    // forward's reflections: the room's probe, bound now, captured once the room stands
+    let probe = forward.then(|| probe::Probe::new(&renderer));
+    pbr::set_probe(probe.as_ref().map(probe::Probe::parts));
 
     // the room (`www/assets/room/room.glb`, from Blender), then voxel GI and the grid over its box
     set_text("hud", &format!("Loading the {} …", venue.name()));
@@ -1118,6 +1122,13 @@ where
     let body_layers = layout.albedo_layers.len() as u8;
     let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, body_layers));
 
+    if let Some(probe) = &probe {
+        // from the middle of the room at eye height, the character left out
+        let (lo, hi) = (layout.min, layout.max);
+        let at = GVec3::new((lo.x + hi.x) * 0.5, lo.y + 1.4, (lo.z + hi.z) * 0.5);
+        probe.capture(&mut renderer, &mut scene, at, &bodies);
+        log::info!("{}: forward probe captured at {at:?}", venue.name());
+    }
     let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward, venue.glass_scale()));
     // the albedo the reflections' hits read: the surfaces' colour maps and the bodies' (each
     // textured body a layer after the surfaces', in order: `Proxy::new`)

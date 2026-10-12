@@ -204,11 +204,16 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferO
         // direct light from rt::RtShadowsEffect (its roughness and F0 in the GBuffer)
         return kansei_gbuffer_out_rt_lit(fill, pbr.emissive.rgb, s.n, diffuse, s.roughness, f0, reflective);
     }
-    // (`render=forward` traces no reflections: the fill stands for the room the surface reflects,
-    // brighter above than below, so chrome reads as chrome, not grey)
-    let r = reflect(-v, s.n);
-    let env = pbr.ambient.rgb * mix(0.25, 1.8, clamp(r.y * 0.5 + 0.5, 0.0, 1.0)) * s.occlusion;
-    let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill + env * f0;
+    // (`render=forward` traces no reflections: the room's probe (`probe::PROBE_WGSL`) along the
+    // reflected ray, its mip by the roughness, Fresnel-weighted; only where the forward fill is on)
+    var env = vec3f(0.0);
+    if (any(pbr.ambient.rgb > vec3f(0.0))) {
+        let r = reflect(-v, s.n);
+        let ndv = clamp(dot(s.n, v), 0.0, 1.0);
+        let fresnel = f0 + (max(1.0 - s.roughness, f0) - f0) * pow(1.0 - ndv, 5.0);
+        env = probe_radiance(r, s.roughness) * fresnel * s.occlusion;
+    }
+    let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill + env;
     if (reflective) {
         return kansei_gbuffer_out_specular(lit, pbr.emissive.rgb, s.n, diffuse, f0, s.roughness);
     }
@@ -237,9 +242,19 @@ impl PbrMaps {
     }
 }
 
+thread_local! {
+    /// The room's probe (texture and its array view) the materials made from now on bind.
+    static PROBE: std::cell::RefCell<Option<(wgpu::Texture, wgpu::TextureView)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Bind `probe` (its texture and array view) in the materials made from now on.
+pub fn set_probe(probe: Option<(wgpu::Texture, wgpu::TextureView)>) {
+    PROBE.with(|p| *p.borrow_mut() = probe);
+}
+
 /// The shader: the light and GBuffer chunks, then the material.
 fn shader() -> String {
-    format!("{}\n{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{PBR_WGSL}", lit_wgsl())
+    format!("{}\n{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{}\n{PBR_WGSL}", lit_wgsl(), super::probe::PROBE_WGSL)
 }
 
 /// A PBR material of `maps` drawn as `params` says (`double_sided` for leaves and cards; a
@@ -262,6 +277,8 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
             Binding::texture_2d(2, ShaderStages::FRAGMENT),
             Binding::texture_2d(3, ShaderStages::FRAGMENT),
             Binding::sampler(4, ShaderStages::FRAGMENT),
+            Binding::texture_2d_array(5, ShaderStages::FRAGMENT),
+            Binding::sampler(6, ShaderStages::FRAGMENT),
         ],
         options,
     );
@@ -270,6 +287,10 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
     material.set_bindable(2, maps.normal);
     material.set_bindable(3, maps.orm);
     material.set_bindable(4, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    // the room's probe (`set_probe`; black where none: only forward reads it)
+    let probe = PROBE.with(|p| p.borrow().clone()).map(|(t, v)| Texture::from_view("Room/Probe", t, v)).unwrap_or_else(|| { let black: &[u8] = &[0, 0, 0, 255]; Texture::from_rgba_layers("Room/NoProbe", 1, 1, &[black; 6]) });
+    material.set_bindable(5, probe);
+    material.set_bindable(6, super::probe::Probe::sampler());
     material
 }
 
