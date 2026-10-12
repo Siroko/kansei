@@ -1,20 +1,26 @@
 #!/bin/sh
-# Link the private motion-matching packs for www/kimodo.html into www/pack/ (gitignored; the packs
-# stay out of git):
+# Link the private data the pages load into gitignored places (none of it goes into git):
 #   www/pack/gen  -> <data>/genanim/pack  (gen-dance, gen-all, gen-limp, gasp-plus-gen)
 #   www/pack/gasp -> <data>/gasp/pack     (gasp-locomotion, hero: the GASP reference)
-# Usage: link-packs.sh [data]   (default: ~/Documents/dev/kansei-private-data)
+#   www/pack/mannequin.kmm      -> <assets>/mannequin/export/mannequin.kmm  (the showroom's body)
+#   www/assets/showroom/private -> <assets>/showroom/export/web             (the showroom's furniture)
+# Usage: link-packs.sh [data] [assets]
+#   (defaults: ~/Documents/dev/kansei-private-data, ~/Documents/dev/kansei-assets)
 set -e
 data="${1:-$HOME/Documents/dev/kansei-private-data}"
+assets="${2:-$HOME/Documents/dev/kansei-assets}"
 here="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$here/www/pack"
-for pair in gen:genanim/pack gasp:gasp/pack; do
-    name="${pair%%:*}"
-    dir="$data/${pair#*:}"
-    if [ -d "$dir" ]; then
-        ln -sfn "$dir" "$here/www/pack/$name"
-        echo "www/pack/$name -> $dir"
+link() {
+    if [ -e "$1" ]; then
+        ln -sfn "$1" "$2"
+        echo "${2#$here/} -> $1"
     else
-        echo "no $dir: www/pack/$name left out" >&2
+        echo "no $1: ${2#$here/} left out" >&2
     fi
+}
+for pair in gen:genanim/pack gasp:gasp/pack; do
+    link "$data/${pair#*:}" "$here/www/pack/${pair%%:*}"
 done
+link "$assets/mannequin/export/mannequin.kmm" "$here/www/pack/mannequin.kmm"
+link "$assets/showroom/export/web" "$here/www/assets/showroom/private"

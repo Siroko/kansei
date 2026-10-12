@@ -275,17 +275,20 @@ const MOVE: f32 = 0.03;
 pub const PROXY_TRIANGLES: usize = 1500;
 const PROXY_ERROR: f32 = 0.02;
 
-/// The albedo the rays see on a body's copy without a base colour texture (the pack's mannequin).
+/// The albedo the rays see on a body's copy without a base colour texture (the pack's own mesh).
 fn proxy_albedo(name: &str) -> [f32; 3] {
     if name == "hero" { [0.12, 0.1, 0.09] } else { [0.45, 0.45, 0.45] }
 }
 
 impl Proxy {
-    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool, hero_layer: u8) -> Self {
+    /// `first_layer`: the albedo array's layer of the first textured body's base colour, the
+    /// next textured body's the one after.
+    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool, first_layer: u8) -> Self {
         let view = kansei_wasm::flag("proxy_view", false);
         // `proxy_tris=` another count
         let target: usize = kansei_wasm::param_or("proxy_tris", PROXY_TRIANGLES);
         let mut bodies = Vec::new();
+        let mut layer = first_layer;
         for body in &character.bodies {
             let mesh = &body.mesh;
             // a textured body keeps its uv seams; a plain one is welded (its normals smoothed)
@@ -294,12 +297,16 @@ impl Proxy {
             } else {
                 super::assets::simplify_welded(&[(mesh.vertices.as_slice(), mesh.indices.as_slice())], target, PROXY_ERROR, target).map(|(kept, indices)| (kept.iter().map(|&(_, v)| v).collect(), indices))
             };
+            let body_layer = layer;
+            if body.base_color.is_some() {
+                layer += 1;
+            }
             let Some((source, indices)) = simplified else { continue };
             let vertices = source.iter().map(|&v| mesh.vertices[v]).collect();
             log::info!("room: {} in the grid as {} of {} triangles", body.name, indices.len() / 3, mesh.indices.len() / 3);
             // textured (its uvs; flat-shaded then), or one colour with smooth normals
             let surface = match &body.base_color {
-                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(hero_layer),
+                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(body_layer),
                 None => RtSurface::new(proxy_albedo(body.name)).with_smooth_normals(),
             };
             let mut r = grid_only(Geometry::new(&format!("{}/Grid", body.name), vertices, indices), surface);

@@ -22,6 +22,10 @@ climb, fog and dust (see
 [The room](#the-room)). The character and its controls are shared by the pages (`src/character.rs`,
 `src/player.rs`); the room is `src/room/`.
 
+`www/showroom.html` is a fourth, the room's renderer in a white gallery of furniture pieces, the
+character shown as a mannequin (see [The showroom](#the-showroom)). The two share `www/room.js`
+(the panel) and `src/room/` (`Venue`).
+
 ## A pack
 
 Bake one from glTF clips and a skinned mesh with [`kansei-anim-bake`](../../../kansei-anim-bake/README.md).
@@ -51,14 +55,17 @@ The clips should cover:
 Tag them `idle`, `walk` and `run` for the gait filter (see the bake config). The walk and run
 paces default to 2 and 5 m/s; set `walk=` and `run=` in the URL to match your data.
 
-## A second body
+## More bodies
 
-A character pack (`www/pack/hero.kmm`, or `?hero=<url>`) is optional. It holds a mesh rigged to the
-same skeleton as the motion pack, with its own proportions and textures. `kansei-anim-bake` makes
-one from a glTF mesh and its textures (`character` config).
+Character packs are optional: the hero (`www/pack/hero.kmm`, or `?hero=<url>`) and the mannequin
+(`www/pack/mannequin.kmm`, or `?mannequin=<url>`; [The mannequin](#the-mannequin)), `none` for
+neither. Each holds a mesh rigged to the same skeleton as the motion pack, with its own
+proportions and textures. `kansei-anim-bake` makes one from a glTF mesh and its textures
+(`character` config).
 
-- Loaded, it is shown by default. C switches between it and the motion pack's own mesh, and
-  `?char=hero` or `?char=mannequin` picks one.
+- The hero is shown first (the showroom: the mannequin). C cycles through the bodies and the
+  motion pack's own mesh; `?char=hero`, `?char=mannequin` or `?char=pack` picks one
+  (`char=mannequin` without a mannequin pack is the motion pack's mesh, as it was).
 - A motion pack may then ship without a mesh of its own (no `MESH` section): the character pack's
   body is the only one.
 - The pose is retargeted onto its skeleton (`animation::retarget`: rotations as they are,
@@ -399,12 +406,79 @@ the tank (3.2 cm): at 256 the marching cubes' draw alone was 3-9 ms. Before the 
 proxies stood in for the furniture in the grid it traced 43k triangles and `hall` was 21.6 ms;
 with the tank's panes traced as glass, its own view 54 ms.
 
+## The showroom
+
+`www/showroom.html` (`start_showroom`) is a 20 x 14 m white gallery, 5 m high: a polished concrete
+floor, plaster walls (the north one a warm grey backdrop), three tall windows to the west, a long
+skylight over the aisle, two rows of low white plinths and an oak bench. On the plinths stand the
+furniture pieces modelled in Blender from the owner's photos (the GAME version of each: the
+Karuselli, Togo and Panton to the north, the MG5, Paimio, 406 and Wave cantilever to the south),
+and a green Aalto vase of ray-traced glass on a pedestal under a narrow display spot, throwing
+green caustics. Five track spots (3500 K) light five pieces; daylight comes through the skylight
+and the windows. Everything else is the room's: every mode works (`gi=rt|voxel|voxel+ssgi|probes|
+probes+ssgi|ssgi|off`, `shadows=rt|maps`, `quality=game|high`, `render=forward`), the panel, the
+perf overlay, the character and its parkour (the bench takes a hurdle, the plinths are steps).
+`cam=` names a view: `hall`, `aisle`, `outside` and one a piece (`karuselli`, `togo`, `panton`,
+`vase`, `mg5`, `paimio`, `a406`, `wave`). The looks: `showroom` (the default), `overcast`, `spots
+only`, `golden hour`.
+
+**The furniture is private.** The pieces depict branded designs and are derived from the owner's
+photos, so they are not in this repository: the page loads the architecture from
+`www/assets/showroom/showroom.glb` (CC0, committed) and the pieces from
+`www/assets/showroom/private/pieces.glb`, a gitignored link to the owner's exports
+(`link-packs.sh` makes it). Without it the plinths stand empty; `pieces=0` leaves the pieces out
+even when linked, for captures that may be published. Don't commit the pieces, a render of them or
+anything made from them unless the owner says so.
+
+The scene is authored in Blender outside the repository (`kansei-assets/showroom/`: its
+`showroom_build.py` builds `showroom.blend`, `export_glb.py` writes the two glbs), on the room's
+contract ([The room's source](#the-rooms-source)) plus:
+
+- each piece is its asset's GAME collection, linked from the asset's `.blend` (or its
+  `export/*_game.glb` imported while that has none) as a collection instance; adding one is a
+  line in `PIECES` and a rebuild, and a piece whose asset has no `export/*_game.glb` yet is left
+  out. Pieces without `_SHADOW` or `_COL` get them made (a ~500-triangle decimated copy, a box);
+  a `_SHADOW` on the instance stands for all its meshes (`layout.rs`);
+- a transmissive material (`KHR_materials_transmission`) is ray-traced glass whatever its
+  object's `kansei`, tinted by its volume's attenuation (`KHR_materials_volume`) brought to a
+  metre: the vase's green;
+- the skylight's `inner`/`outer` (degrees) set its cone (the room keeps 62 and 86);
+- the page reads several glbs as one room (`layout::Source`), the missing optional ones left out.
+
+```sh
+B=/Applications/Blender.app/Contents/MacOS/Blender
+$B -b --factory-startup --python ~/Documents/dev/kansei-assets/showroom/showroom_build.py
+python3 tools/room_glb.py ~/Documents/dev/kansei-assets/showroom/export/showroom.glb --out www/assets/showroom/showroom.glb
+python3 tools/room_glb.py ~/Documents/dev/kansei-assets/showroom/export/pieces.glb --out ~/Documents/dev/kansei-assets/showroom/export/web/pieces.glb
+sh link-packs.sh
+```
+
+GPU per frame at 1080p (`dpr=1`, `cam=hall`, no pack, M4 Pro, headless Chrome without vsync, the
+GPU shared with other sessions), without the pieces / with them (the grid's 1650 / 7168
+triangles): `gi=rt` 14.1 / 16.9 ms, `voxel` 12.7 / 14.2, `voxel+ssgi` 14.6 / 16.4, `probes`
+9.9 / 11.4, `probes+ssgi` 12.0 / 13.6, `ssgi` 11.1 / 13.1, `off` 9.4 / 11.0, `shadows=maps`
+10.7 / 13.7, `quality=high` 12.8 / 20.0, `render=forward` 4.3 / 4.5. The mannequin walking (the
+grid rebuilt every frame for its copy) added about 10 ms in `gi=rt`.
+
+### The mannequin
+
+A neutral artist's mannequin, modelled for the showroom (CC0): an egg head with no face, a
+seamless torso, rigid tapered limbs between graphite ball joints, three-segment fingers, 26k
+triangles, a 1024² colour and AO atlas baked in Cycles. `kansei-assets/mannequin/`
+`mannequin_build.py` builds it from the joints of the packs' skeleton (read from the hero
+character's glb) and `mannequin_export.py` bakes it and writes the glb with that skeleton's own
+nodes and inverse bind matrices, so the packs' rotations play on it unchanged; the torso is
+weighted along the spine (and the clavicles at the shoulders), every other part rigidly to its
+bone. `bake-config.json` there makes `export/mannequin.kmm` with `kansei-anim-bake`; `link-packs.sh`
+links it as `www/pack/mannequin.kmm`. The mesh is original, but the pack carries the rig's joint
+frames, so it stays local with the packs.
+
 ## Build and run
 
 ```sh
 cd rust/kansei-wasm/demos/motion-matching
 wasm-pack build --target web --release
-python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html)
+python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html, www/showroom.html)
 ```
 
 The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on the CPU.

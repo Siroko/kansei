@@ -1,0 +1,290 @@
+// The room and showroom pages of the motion-matching module (`start_room`, `start_showroom`:
+// <body data-venue="room|showroom">) and their panel; the character's exports are the same as
+// www/index.html's.
+import init, { start_room, start_showroom, room_info, room_set, room_settings, room_views, room_check, room_parkour, room_aquarium_reset, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
+const venue = document.body.dataset.venue || 'room';
+const showroom = venue === 'showroom';
+await init();
+await (showroom ? start_showroom : start_room)('kansei');
+// for scripted captures: room.info() (with stats, each pass's GPU time), room.set('gi', 'voxel')
+window.room = {
+    info: () => JSON.parse(room_info() || '{}'),
+    settings: () => JSON.parse(room_settings() || '{}'),
+    set: (key, value) => room_set(key, String(value)),
+    check: () => JSON.parse(room_check()),
+    parkour: () => JSON.parse(room_parkour()),
+};
+window.driveRestart = drive_restart;
+window.motionTimings = () => JSON.parse(motion_timings() || '{}');
+const credit = document.getElementById('credit');
+if (credit && new URLSearchParams(location.search).get('dragon') === '0') credit.hidden = true;
+
+// ---- the panel: every setting, live (P hides it). The URL's parameters are the starting
+// values; a preset sets several at once, and editing one of its controls makes it "custom".
+const params = new URLSearchParams(location.search);
+const p = JSON.parse(room_settings());
+const set = (key, value) => room_set(key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
+
+// the glass and the water: 'game' (the default) trades exactness for speed where it barely
+// shows; 'high' is the physical path (settings::Settings::apply_quality)
+const QUALITIES = {
+    'game': { glass_checker: true, glass_refl_shared: true, caustics_water_photons: true, caustics_area: false, caustics_photons: 128, caustics_every: 2, caustics_glass_gain: 3, caustics_sharpen: 0.5 },
+    'high': { glass_checker: false, glass_refl_shared: false, caustics_water_photons: true, caustics_area: true, caustics_photons: 256, caustics_every: 1, caustics_glass_gain: 1, caustics_sharpen: 1 },
+};
+const LOOKS = {
+    'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 9.0 },
+    'midday': { sun: true, sun_lux: 40000, sun_elev: 58, sun_azim: 10, sun_temp: 5600, sky: true, sky_cd: 60000, sky_temp: 6800, sky_radiance: 7000, lamps: false, fog: 0.002, ev: 8.0 },
+    'overcast': { sun: false, sky: true, sky_cd: 52000, sky_temp: 7200, sky_radiance: 4500, lamps: true, lamp_cd: 600, lamp_temp: 2900, fog: 0.005, ev: 6.0 },
+    'night lamps': { sun: false, sky: true, sky_cd: 1500, sky_temp: 9000, sky_radiance: 25, lamps: true, lamp_cd: 1400, lamp_temp: 2500, fog: 0.006, ev: 1.6 },
+    'gallery': { sun: false, sky: true, sky_cd: 70000, sky_temp: 6000, sky_radiance: 5000, lamps: false, fog: 0.0015, ev: 6.5 },
+};
+// the showroom's (settings::Settings::showroom): daylight through the skylight and the windows,
+// warm-white track spots on the pieces, its own evening
+const SHOWROOM_LOOKS = {
+    'showroom': { sun: true, sun_lux: 26000, sun_elev: 28, sun_azim: -15, sun_temp: 4800, sky: true, sky_cd: 60000, sky_temp: 6500, sky_radiance: 5000, lamps: true, lamp_cd: 40000, lamp_temp: 3500, fog: 0.0006, ev: 9.0 },
+    'overcast': { sun: false, sky: true, sky_cd: 70000, sky_temp: 7000, sky_radiance: 5000, lamps: true, lamp_cd: 30000, lamp_temp: 3500, fog: 0.001, ev: 8.4 },
+    'spots only': { sun: false, sky: true, sky_cd: 2500, sky_temp: 8000, sky_radiance: 60, lamps: true, lamp_cd: 24000, lamp_temp: 3200, fog: 0.002, ev: 5.4 },
+    'golden hour': { sun: true, sun_lux: 9000, sun_elev: 14, sun_azim: -20, sun_temp: 3400, sky: true, sky_cd: 22000, sky_temp: 7500, sky_radiance: 1800, lamps: true, lamp_cd: 14000, lamp_temp: 3000, fog: 0.0015, ev: 8.6 },
+};
+if (showroom) { for (const k of Object.keys(LOOKS)) delete LOOKS[k]; Object.assign(LOOKS, SHOWROOM_LOOKS); }
+const POSTS = {
+    'neutral': { tonemap: 'agx', exposure_comp: 0, white_temp: 6500, tint: 0, contrast: 1.0, saturation: 1.0, lift: 1.0, gain: 1.0, highlights: 1.0, bloom: true, bloom_intensity: 0.04, bloom_threshold: 1.0, vignette: 0.15, grain: 0.0, chromatic: 0.0 },
+    'warm cinematic': { tonemap: 'agx', exposure_comp: 0, white_temp: 5600, tint: 0.02, contrast: 1.05, saturation: 1.05, lift: 0.98, gain: 1.02, highlights: 1.0, bloom: true, bloom_intensity: 0.06, bloom_threshold: 1.0, vignette: 0.28, grain: 0.06, chromatic: 0.08 },
+    'cool moody': { tonemap: 'agx_punchy', exposure_comp: -0.3, white_temp: 7600, tint: -0.03, contrast: 1.12, saturation: 0.9, lift: 0.92, gain: 1.0, highlights: 0.95, bloom: true, bloom_intensity: 0.05, bloom_threshold: 1.2, vignette: 0.4, grain: 0.08, chromatic: 0.1 },
+    'filmic contrast': { tonemap: 'aces', exposure_comp: 0, white_temp: 6300, tint: 0, contrast: 1.2, saturation: 1.08, lift: 0.95, gain: 1.03, highlights: 1.0, bloom: true, bloom_intensity: 0.07, bloom_threshold: 0.9, vignette: 0.32, grain: 0.05, chromatic: 0.06 },
+    'bleach bypass': { tonemap: 'unreal', exposure_comp: 0.1, white_temp: 6800, tint: 0, contrast: 1.3, saturation: 0.55, lift: 0.95, gain: 1.05, highlights: 1.05, bloom: true, bloom_intensity: 0.04, bloom_threshold: 1.0, vignette: 0.35, grain: 0.1, chromatic: 0.05 },
+    'vintage': { tonemap: 'agx', exposure_comp: 0.1, white_temp: 5200, tint: 0.05, contrast: 0.92, saturation: 0.85, lift: 1.08, gain: 0.98, highlights: 0.92, bloom: true, bloom_intensity: 0.1, bloom_threshold: 0.8, vignette: 0.45, grain: 0.18, chromatic: 0.18 },
+};
+const DOFS = {
+    'off': { dof: false },
+    'subtle': { dof: true, dof_focus: 'character', f_stop: 5.6, focal_mm: 0, blades: 6, blade_rot: 0, max_coc: 0.015 },
+    'portrait': { dof: true, dof_focus: 'character', f_stop: 1.8, focal_mm: 85, blades: 9, blade_rot: 0, max_coc: 0.03 },
+    'cinematic': { dof: true, dof_focus: 'character', f_stop: 2.0, focal_mm: 50, blades: 0, blade_rot: 0, max_coc: 0.035 },
+    'tilt-shift': { dof: true, dof_focus: 'centre', f_stop: 1.4, focal_mm: 100, blades: 6, blade_rot: 15, max_coc: 0.04 },
+};
+
+const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js');
+const pane = new Pane({ title: `${showroom ? 'Showroom' : 'Room'} (P to hide)`, expanded: window.innerWidth > 720 });
+// for clean captures: ?panel=0 starts with the panel hidden, ?hud=0 without the text
+pane.hidden = params.get('panel') === '0';
+if (params.get('hud') === '0') for (const id of ['hud', 'hud-room']) document.getElementById(id).style.display = 'none';
+window.addEventListener('keydown', (e) => { if (e.key.toLowerCase() === 'p' && !e.repeat) pane.hidden = !pane.hidden; });
+const presets = { look: params.get('look') || (showroom ? 'showroom' : 'golden hour'), post: params.get('post') || (showroom ? 'neutral' : 'warm cinematic'), dof: params.get('dof_preset') || 'subtle', quality: params.get('quality') || 'game' };
+const applyPreset = (table, name) => {
+    const values = table[name];
+    if (!values) return;
+    for (const [k, v] of Object.entries(values)) { p[k] = v; set(k, v); }
+    pane.refresh();
+};
+// a control of a preset's folder: editing it makes that preset custom. A slider's range
+// grows to take the URL's value (Tweakpane would clamp it and send the clamped one).
+const bind = (folder, key, opts = {}, preset = null) => {
+    if (typeof p[key] === 'number') {
+        if (opts.max !== undefined && p[key] > opts.max) opts = { ...opts, max: p[key] };
+        if (opts.min !== undefined && p[key] < opts.min) opts = { ...opts, min: p[key] };
+    }
+    return folder.addBinding(p, key, opts).on('change', (ev) => {
+        set(key, ev.value);
+        if (preset && ev.last !== false && presets[preset] !== 'custom') { presets[preset] = 'custom'; pane.refresh(); }
+    });
+};
+const options = (names) => Object.fromEntries(names.map((n) => [n, n]));
+
+const top = pane.addFolder({ title: 'Presets' });
+top.addBinding(presets, 'look', { options: { ...options(Object.keys(LOOKS)), custom: 'custom' } }).on('change', (ev) => applyPreset(LOOKS, ev.value));
+top.addBinding(presets, 'quality', { label: 'glass & water', options: { ...options(Object.keys(QUALITIES)), custom: 'custom' } }).on('change', (ev) => applyPreset(QUALITIES, ev.value));
+// how the room is drawn: set at start, so a change reloads the page with it in the URL
+// (forward: no ray tracing, no GI; for iterating on the character's moves)
+top.addBinding(p, 'render', { label: 'render', options: { 'hybrid (ray traced, GI)': 'hybrid', 'forward (post only, fast)': 'forward' } }).on('change', (ev) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('render', ev.value);
+    window.location.href = url.toString();
+});
+top.addBinding(p, 'cam', { label: 'camera', options: options(JSON.parse(room_views())) }).on('change', (ev) => set('cam', ev.value));
+
+const scene = pane.addFolder({ title: 'Scene', expanded: false });
+bind(scene, 'floor_rough', { label: 'floor roughness', min: 0.2, max: 2.0, step: 0.05 });
+bind(scene, 'mirror_rough', { label: 'mirror roughness', min: 0, max: 0.5, step: 0.01 });
+bind(scene, 'mirror2_rough', { label: 'brushed mirror', min: 0, max: 0.5, step: 0.01 });
+bind(scene, 'glass_ior', { label: 'dragon IOR', min: 1.0, max: 2.4, step: 0.01 });
+bind(scene, 'glass_rough', { label: 'dragon frost', min: 0, max: 0.6, step: 0.01 });
+
+const lights = pane.addFolder({ title: 'Lights', expanded: false });
+bind(lights, 'sun', {}, 'look');
+bind(lights, 'sun_lux', { label: 'sun (lux)', min: 0, max: 100000, step: 100 }, 'look');
+bind(lights, 'sun_elev', { label: 'sun elevation', min: 3, max: 85, step: 0.5 }, 'look');
+bind(lights, 'sun_azim', { label: 'sun azimuth', min: -60, max: 60, step: 0.5 }, 'look');
+bind(lights, 'sun_temp', { label: 'sun (K)', min: 1800, max: 9000, step: 50 }, 'look');
+bind(lights, 'sun_soft', { label: 'sun softness (deg)', min: 0.1, max: 6, step: 0.1 });
+bind(lights, 'sky', { label: 'skylight' }, 'look');
+bind(lights, 'sky_cd', { label: 'skylight (cd)', min: 0, max: 150000, step: 500 }, 'look');
+bind(lights, 'sky_temp', { label: 'skylight (K)', min: 3000, max: 12000, step: 50 }, 'look');
+bind(lights, 'sky_radiance', { label: 'sky (cd/m²)', min: 0, max: 15000, step: 25 }, 'look');
+bind(lights, 'lamps', {}, 'look');
+bind(lights, 'lamp_cd', { label: showroom ? 'spots (cd)' : 'lamp (cd)', min: 0, max: showroom ? 80000 : 5000, step: 10 }, 'look');
+bind(lights, 'lamp_temp', { label: 'lamp (K)', min: 1800, max: 6500, step: 50 }, 'look');
+bind(lights, 'display_spot', { label: showroom ? 'vase spot' : 'dragon spot' });
+bind(lights, 'display_cd', { label: showroom ? 'vase spot (cd)' : 'dragon spot (cd)', min: 0, max: 4000000, step: 10000 });
+
+const rt = pane.addFolder({ title: 'Shadows, GI, reflections', expanded: false });
+bind(rt, 'shadows', { options: { 'ray traced': 'rt', 'shadow maps': 'maps' } });
+bind(rt, 'shadow_res', { label: 'shadow rays', options: { 'half (1 per 2x2)': 'half', 'full': 'full' } });
+bind(rt, 'shadow_steps', { label: 'shadow filter', min: 0, max: 3, step: 1 });
+bind(rt, 'contact', { label: 'contact shadows' });
+bind(rt, 'contact_length', { label: 'contact length (m)', min: 0.02, max: 1.0, step: 0.01 });
+bind(rt, 'gi', { label: 'GI', options: { 'hybrid RT': 'rt', 'voxel cones': 'voxel', 'voxel + screen space': 'voxel+ssgi', 'probes': 'probes', 'probes + screen space': 'probes+ssgi', 'screen space': 'ssgi', 'off': 'off' } });
+bind(rt, 'probe_spacing', { label: 'probe spacing (voxels)', min: 2, max: 16, step: 1 });
+bind(rt, 'probes_per_frame', { label: 'probes a frame (0: all)', min: 0, max: 2048, step: 32 });
+bind(rt, 'rtgi_res', { label: 'GI rays', options: { 'half (1 per 2x2)': 'half', 'full': 'full' } });
+bind(rt, 'gi_shadows', { label: 'GI hits shadowed by', options: { rays: 'rays', 'shadow maps': 'maps' } });
+bind(rt, 'gi_near', { label: 'GI grid reach (m, 0: all)', min: 0, max: 40, step: 0.5 });
+bind(rt, 'reflections', { label: 'RT reflections' });
+bind(rt, 'refl_indirect', { label: 'reflected GI (hybrid)', min: 0, max: 2, step: 0.05 });
+bind(rt, 'glass_checker', { label: 'glass & water: half the pixels a frame' }, 'quality');
+bind(rt, 'glass_refl_shared', { label: 'glass reflections at half res' }, 'quality');
+// the glass dragon's and the water's caustics: photons from each light through the RT grid
+bind(rt, 'caustics');
+bind(rt, 'caustics_photons', { label: 'caustic photons (a side, per light)', min: 16, max: 512, step: 8 }, 'quality');
+bind(rt, 'caustics_blend', { label: 'caustics blend (a frame)', min: 0.02, max: 1, step: 0.01 });
+bind(rt, 'caustics_every', { label: 'caustics: update every N frames', min: 1, max: 8, step: 1 }, 'quality');
+bind(rt, 'caustics_intensity', { label: 'caustics intensity', min: 0, max: 4, step: 0.05 });
+bind(rt, 'caustics_view', { label: 'show caustics only' });
+bind(rt, 'caustics_water_photons', { label: 'water caustics by photons' }, 'quality');
+bind(rt, 'caustics_area', { label: 'caustics from the emitters\' area' }, 'quality');
+bind(rt, 'caustics_glass_gain', { label: 'glass caustics gain (1 physical)', min: 0, max: 8, step: 0.1 }, 'quality');
+bind(rt, 'caustics_sharpen', { label: 'glass caustics splat width (1 physical)', min: 0.1, max: 1, step: 0.05 }, 'quality');
+bind(rt, 'rt_view', { label: 'debug view', options: { lit: 'lit', 'shadow visibility': 'visibility', 'direct light': 'direct', 'lit-pixel mask': 'mask' } });
+bind(rt, 'debug_light', { label: 'debug light', min: 0, max: 7, step: 1 });
+
+const air = pane.addFolder({ title: 'Fog and dust', expanded: false });
+bind(air, 'fog', { label: 'fog density', min: 0, max: 0.03, step: 0.0005 }, 'look');
+bind(air, 'fog_aniso', { label: 'fog anisotropy', min: 0, max: 0.95, step: 0.01 });
+bind(air, 'dust');
+bind(air, 'dust_amount', { label: 'dust amount', min: 0, max: 1, step: 0.01 });
+bind(air, 'dust_size', { label: 'mote size (m)', min: 0.001, max: 0.03, step: 0.0005 });
+bind(air, 'dust_bright', { label: 'brightness', min: 0, max: 6, step: 0.05 });
+bind(air, 'dust_opacity', { label: 'opacity', min: 0, max: 1, step: 0.01 });
+bind(air, 'dust_mix', { label: 'fibres & flecks', min: 0, max: 1, step: 0.01 });
+bind(air, 'dust_speed', { label: 'drift (m/s)', min: 0, max: 0.5, step: 0.005 });
+
+// the aquarium's water: all live but the fill (Refill aquarium); its surface is marching cubes over a
+// splatted field (the engine has no ray-marched surface or foam)
+const water = pane.addFolder({ title: 'Fluid (the aquarium)', expanded: false });
+// (the showroom has none)
+water.hidden = window.room.info().aquarium === 0;
+bind(water, 'fluid', { label: 'simulate' });
+bind(water, 'fluid_show', { label: 'show water' });
+bind(water, 'fluid_rest', { label: 'sleep when still' });
+bind(water, 'fluid_solver', { label: 'solver', options: { SPH: 'sph', 'position based (PBF)': 'pbf' } });
+bind(water, 'fluid_fill', { label: 'fill (resets)', min: 0.2, max: 1, step: 0.05 });
+water.addButton({ title: 'Refill aquarium' }).on('click', () => room_aquarium_reset());
+bind(water, 'fluid_speed', { label: 'time scale', min: 0.1, max: 3, step: 0.05 });
+bind(water, 'fluid_substeps', { label: 'substeps', min: 1, max: 12, step: 1 });
+bind(water, 'fluid_gravity', { label: 'gravity (m/s²)', min: 0, max: 30, step: 0.1 });
+// the surface's resolution and the fluid's box (Pond::rebuild_surface: field, marching
+// cubes and the grid's mesh made again, live; sent when a slider is let go)
+const res = water.addFolder({ title: 'surface resolution & box', expanded: true });
+const rebuild = (key, opts = {}) => res.addBinding(p, key, opts).on('change', (ev) => { if (ev.last !== false) set(key, ev.value); });
+rebuild('fluid_res', { label: 'field voxels (longest side)', min: 64, max: 384, step: 16 });
+rebuild('fluid_mc_max', { label: 'marching cubes max triangles', min: 100000, max: 2000000, step: 50000 });
+rebuild('fluid_rt_spacing', { label: 'RT grid mesh spacing (m)', min: 0.1, max: 0.5, step: 0.01 });
+bind(res, 'fluid_drop', { label: 'droplet radius (m)', min: 0.01, max: 0.1, step: 0.001 });
+bind(res, 'fluid_splat', { label: 'splat radius, smoothing (m)', min: 0.05, max: 0.3, step: 0.005 });
+bind(res, 'fluid_bounds_show', { label: 'show bounds' });
+for (const k of ['min_x', 'min_y', 'min_z', 'max_x', 'max_y', 'max_z']) rebuild('fluid_' + k, { label: k.replace('_', ' ') + ' (m)', step: 0.05 });
+// what it is built at, read back (room.info().fluid)
+const built = { surface: '' };
+res.addBinding(built, 'surface', { label: 'built', readonly: true, multiline: true, rows: 4, interval: 1000 });
+setInterval(() => {
+    if (pane.hidden || water.expanded === false) return;
+    const f = window.room.info().fluid;
+    if (!f) return;
+    built.surface = `${f.dims.join('×')} voxels\n${f.cell_cm.map((c) => c.toFixed(1)).join('×')} cm each\nRT ${f.rt_mesh.join('×')}, ${f.rt_spacing_cm.toFixed(0)} cm\ndrop ${f.drop_cm.toFixed(1)}, splat ${f.splat_cm.toFixed(1)} cm`;
+}, 1000);
+bind(water, 'fluid_damping', { label: 'damping', min: 0.9, max: 1, step: 0.001 });
+const sph = water.addFolder({ title: 'SPH', expanded: false });
+bind(sph, 'fluid_viscosity', { label: 'viscosity', min: 0, max: 2, step: 0.01 });
+bind(sph, 'fluid_pressure', { label: 'pressure', min: 1, max: 150, step: 0.5 });
+bind(sph, 'fluid_near', { label: 'near pressure', min: 0, max: 80, step: 0.5 });
+bind(sph, 'fluid_cohesion', { label: 'cohesion', min: 0, max: 1, step: 0.01 });
+const pbf = water.addFolder({ title: 'PBF', expanded: false });
+bind(pbf, 'fluid_pbf_iter', { label: 'iterations', min: 1, max: 10, step: 1 });
+bind(pbf, 'fluid_xsph', { label: 'XSPH viscosity', min: 0, max: 1, step: 0.01 });
+const wade = water.addFolder({ title: 'The character', expanded: false });
+bind(wade, 'fluid_push', { label: 'drag (legs)', min: 0, max: 1, step: 0.01 });
+bind(wade, 'fluid_bounce', { label: 'bounce (legs)', min: 0, max: 1, step: 0.01 });
+bind(wade, 'fluid_splash', { label: 'landing splash', min: 0, max: 4, step: 0.05 });
+const look = water.addFolder({ title: 'Surface', expanded: false });
+bind(look, 'fluid_render', { label: 'drawn as', options: { 'ray-traced glass': 'rt', 'screen space': 'screen' } });
+bind(look, 'fluid_ripples', { label: 'ripples', min: 0, max: 3, step: 0.05 });
+bind(look, 'fluid_mesh', { label: 'mesh', options: { 'smooth (marching cubes)': 'smooth', voxels: 'voxels' } });
+bind(look, 'fluid_ior', { label: 'IOR', min: 1, max: 2, step: 0.01 });
+bind(look, 'fluid_tint', { label: 'tint', min: 0, max: 2, step: 0.01 });
+bind(look, 'fluid_thickness', { label: 'absorption depth (screen)', min: 0.1, max: 6, step: 0.05 });
+bind(look, 'fluid_rough', { label: 'roughness', min: 0, max: 1, step: 0.01 });
+bind(look, 'fluid_reflect', { label: 'sky reflection (screen)', min: 0, max: 1, step: 0.01 });
+bind(look, 'fluid_chromatic', { label: 'dispersion (screen)', min: 0, max: 0.2, step: 0.005 });
+
+const dof = pane.addFolder({ title: 'Depth of field', expanded: false });
+dof.addBinding(presets, 'dof', { label: 'preset', options: { ...options(Object.keys(DOFS)), custom: 'custom' } }).on('change', (ev) => applyPreset(DOFS, ev.value));
+bind(dof, 'dof', { label: 'enabled' }, 'dof');
+bind(dof, 'dof_focus', { label: 'focus', options: { 'the character': 'character', 'screen centre': 'centre', 'manual': 'manual' } }, 'dof');
+bind(dof, 'dof_distance', { label: 'distance (m)', min: 0.3, max: 40, step: 0.05 }, 'dof');
+bind(dof, 'f_stop', { label: 'f-stop', min: 0.95, max: 22, step: 0.05 }, 'dof');
+bind(dof, 'focal_mm', { label: 'focal (mm, 0: fov)', min: 0, max: 200, step: 1 }, 'dof');
+bind(dof, 'blades', { min: 0, max: 12, step: 1 }, 'dof');
+bind(dof, 'blade_rot', { label: 'blade rotation', min: 0, max: 60, step: 1 }, 'dof');
+bind(dof, 'max_coc', { label: 'max blur', min: 0.002, max: 0.06, step: 0.001 }, 'dof');
+
+const post = pane.addFolder({ title: 'Post-processing', expanded: false });
+post.addBinding(presets, 'post', { label: 'preset', options: { ...options(Object.keys(POSTS)), custom: 'custom' } }).on('change', (ev) => applyPreset(POSTS, ev.value));
+bind(post, 'tonemap', { label: 'tone map', options: { AgX: 'agx', 'AgX punchy': 'agx_punchy', ACES: 'aces', 'Khronos neutral': 'neutral', 'UE filmic': 'unreal', none: 'none' } }, 'post');
+bind(post, 'ev', { label: 'EV100', min: -2, max: 14, step: 0.1 }, 'look');
+bind(post, 'exposure_comp', { label: 'compensation', min: -3, max: 3, step: 0.05 }, 'post');
+bind(post, 'local_exposure', { label: 'local exposure' }, 'post');
+bind(post, 'white_temp', { label: 'white balance (K)', min: 2500, max: 11000, step: 50 }, 'post');
+bind(post, 'tint', { min: -0.5, max: 0.5, step: 0.01 }, 'post');
+bind(post, 'contrast', { min: 0.5, max: 1.8, step: 0.01 }, 'post');
+bind(post, 'saturation', { min: 0, max: 2, step: 0.01 }, 'post');
+bind(post, 'lift', { label: 'shadows', min: 0.5, max: 1.5, step: 0.01 }, 'post');
+bind(post, 'gain', { label: 'midtones', min: 0.5, max: 1.5, step: 0.01 }, 'post');
+bind(post, 'highlights', { min: 0.5, max: 1.5, step: 0.01 }, 'post');
+bind(post, 'bloom', {}, 'post');
+bind(post, 'bloom_intensity', { label: 'bloom intensity', min: 0, max: 0.5, step: 0.005 }, 'post');
+bind(post, 'bloom_threshold', { label: 'bloom threshold', min: 0, max: 4, step: 0.05 }, 'post');
+bind(post, 'bloom_radius', { label: 'bloom radius', min: 0.2, max: 3, step: 0.05 }, 'post');
+bind(post, 'vignette', { min: 0, max: 1, step: 0.01 }, 'post');
+bind(post, 'grain', { min: 0, max: 0.5, step: 0.005 }, 'post');
+bind(post, 'chromatic', { label: 'chromatic aberration', min: 0, max: 1, step: 0.01 }, 'post');
+bind(post, 'taa', { label: 'TAA' });
+bind(post, 'motion_blur', { label: 'motion blur' });
+bind(post, 'motion_amount', { label: 'blur amount', min: 0, max: 1.5, step: 0.01 });
+
+// the resolution, kept in the URL so a reload keeps it
+const view = pane.addFolder({ title: 'Resolution', expanded: false });
+const keepInUrl = (key) => (ev) => {
+    const url = new URL(location.href);
+    url.searchParams.set(key, String(ev.value));
+    history.replaceState(null, '', url);
+};
+bind(view, 'resolution', { label: 'canvas', options: { native: 'native', '2160p': '2160', '1440p': '1440', '1080p': '1080', '900p': '900', '720p': '720', '540p': '540' } }).on('change', keepInUrl('resolution'));
+bind(view, 'dpr', { label: 'pixel ratio (0: screen)', min: 0, max: 3, step: 0.25 }).on('change', keepInUrl('dpr'));
+bind(view, 'render_scale', { label: 'scene scale (TAA upscales)', min: 0.25, max: 1, step: 0.05 }).on('change', keepInUrl('render_scale'));
+
+const debug = pane.addFolder({ title: 'Stats', expanded: false });
+bind(debug, 'stats', { label: 'GPU / CPU times' });
+bind(debug, 'perf', { label: 'performance overlay (`)' });
+// (the ` key toggles it too: the checkbox follows)
+window.addEventListener('keydown', (e) => {
+    if (e.key === '`') setTimeout(() => { if (window.kanseiPerf && p.perf !== window.kanseiPerf.visible) { p.perf = window.kanseiPerf.visible; pane.refresh(); } });
+});
+debug.addButton({ title: 'check the parkour pieces' }).on('click', () => console.table(window.room.check()));
+
+// the presets the URL names start the page (its own parameters over them)
+const explicit = new Set(params.keys());
+for (const [table, name] of [[LOOKS, presets.look], [POSTS, presets.post], [DOFS, presets.dof], [QUALITIES, presets.quality]]) {
+    for (const [k, v] of Object.entries(table[name] || {})) {
+        if (!explicit.has(k)) { p[k] = v; set(k, v); }
+    }
+}
+pane.refresh();

@@ -88,6 +88,53 @@ struct Stats {
     gpu_span_ms: f64,
 }
 
+/// A page on the room's renderer: the loft (`room.html`) or the showroom (`showroom.html`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Venue {
+    Room,
+    Showroom,
+}
+
+impl Venue {
+    /// The glbs it is built from: the showroom's architecture, then its furniture if there (kept
+    /// out of the repository: `www/assets/showroom/private/`, a link to the owner's exports;
+    /// `pieces=0` leaves it out, for captures that may be published).
+    fn sources(self) -> Vec<layout::Source<'static>> {
+        match self {
+            Venue::Room => vec![layout::Source { url: "assets/room/room.glb", required: true }],
+            Venue::Showroom => {
+                let mut sources = vec![layout::Source { url: "assets/showroom/showroom.glb", required: true }];
+                if kansei_wasm::flag("pieces", true) {
+                    sources.push(layout::Source { url: "assets/showroom/private/pieces.glb", required: false });
+                }
+                sources
+            }
+        }
+    }
+
+    /// The body shown first (`char=` another).
+    fn body(self) -> &'static str {
+        match self {
+            Venue::Room => "hero",
+            Venue::Showroom => "mannequin",
+        }
+    }
+
+    fn settings(self) -> Settings {
+        match self {
+            Venue::Room => Settings::default(),
+            Venue::Showroom => Settings::showroom(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Venue::Room => "room",
+            Venue::Showroom => "showroom",
+        }
+    }
+}
+
 /// The glass dragon's tint (the light left after a metre inside).
 const GLASS_TINT: [f32; 3] = [0.95, 0.98, 0.97];
 
@@ -106,8 +153,10 @@ struct RoomState {
     dust: Option<Dust>,
     proxy: Option<Proxy>,
     dragon: Option<usize>,
-    /// The box the dragon fills (the caustics aim their photons at it and the water).
-    dragon_box: Option<(GVec3, GVec3)>,
+    /// The boxes the glass fills, the dragon's and the glb's (the caustics aim their photons at
+    /// them and the water).
+    glass_boxes: Vec<(GVec3, GVec3)>,
+    venue: Venue,
     /// The character's bodies or the stand-in (for the deferred switch).
     bodies: Vec<usize>,
     sky: usize,
@@ -446,7 +495,7 @@ impl RoomState {
             x.update_lights(lights.iter().copied());
             x.set_time(self.time);
             let water_box = self.aquarium.as_ref().map(Aquarium::water_box);
-            let mut casters: Vec<(GVec3, GVec3)> = self.dragon_box.into_iter().collect();
+            let mut casters: Vec<(GVec3, GVec3)> = self.glass_boxes.clone();
             if let (Some(b), true) = (water_box, water.is_some() && x.water_photons) {
                 casters.push(b);
             }
@@ -454,7 +503,7 @@ impl RoomState {
             x.set_water(water);
             // fed every `caustics_every` frames, four times as seldom with the tank and the dragon
             // out of view (the mirrors may still show them)
-            let boxes: Vec<(GVec3, GVec3)> = water_box.into_iter().chain(self.dragon_box).collect();
+            let boxes: Vec<(GVec3, GVec3)> = water_box.into_iter().chain(self.glass_boxes.iter().copied()).collect();
             let (lo, hi) = boxes.iter().fold((GVec3::splat(f32::MAX), GVec3::splat(f32::MIN)), |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)));
             let seen = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), lo, hi);
             let every = self.settings.caustics_every.round().clamp(1.0, 16.0) as u32;
@@ -565,7 +614,8 @@ impl RoomState {
             format!("\naquarium {} particles, {}{speed}", p.particles(), p.state_name())
         });
         format!(
-            "room   {} · GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            "{}   {} · GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            self.venue.name(),
             if s.render == "forward" { "forward (no ray tracing, no GI: render=hybrid for the full room)" } else { "hybrid" },
             s.gi,
             if s.shadows == "rt" { "ray traced" } else { "shadow maps" },
@@ -758,7 +808,9 @@ impl RoomState {
             e.effect.area_emitters = s.caustics_area;
             e.effect.focus_gain = s.caustics_glass_gain.max(0.0);
             e.effect.focus_sharpen = s.caustics_sharpen.clamp(0.1, 1.0);
-            e.effect.set_glass(s.glass_ior, GLASS_TINT);
+            // (the dragon's glass, else the glb's: the showroom's green vase)
+            let tint = if self.dragon.is_some() { GLASS_TINT } else { self.layout.glass_tint.unwrap_or(GLASS_TINT) };
+            e.effect.set_glass(s.glass_ior, tint);
         }
         for (k, &(mirror, _)) in self.layout.mirrors.iter().enumerate() {
             let roughness = if k == 0 { s.mirror_rough } else { s.mirror2_rough };
@@ -935,23 +987,48 @@ where
     L: Fn(String) -> F,
     F: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
+    start_venue(canvas_id, load, Venue::Room).await
+}
+
+/// The showroom page (`www/showroom.html`) on canvas `canvas_id`: the room's renderer in a white
+/// gallery of furniture (`assets/showroom/showroom.glb`, the pieces from the private
+/// `assets/showroom/private/pieces.glb`), the mannequin shown first.
+#[wasm_bindgen]
+pub async fn start_showroom(canvas_id: &str) -> Result<(), JsValue> {
+    start_showroom_with_loader(canvas_id, |url: String| async move { fetch_bytes(&url).await }).await
+}
+
+/// `start_showroom`, with the packs' bytes from `load` (see `start_with_loader`).
+pub async fn start_showroom_with_loader<L, F>(canvas_id: &str, load: L) -> Result<(), JsValue>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    start_venue(canvas_id, load, Venue::Showroom).await
+}
+
+async fn start_venue<L, F>(canvas_id: &str, load: L, venue: Venue) -> Result<(), JsValue>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
     let canvas = Canvas::find(canvas_id)?;
     let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
-    // the skylight, four lamps and the display spot cast shadows (the maps feed the fog, the
-    // voxels and the fallback)
-    renderer.enable_spot_shadows(2048, 6);
+    // the skylight, the lamps (four in the room, five in the showroom) and the display spot cast
+    // shadows (the maps feed the fog, the voxels and the fallback)
+    renderer.enable_spot_shadows(2048, if venue == Venue::Showroom { 7 } else { 6 });
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
-    let mut settings = Settings::from_url();
+    let mut settings = Settings::from_url(venue.settings());
     let deferred = settings.shadows == "rt";
     // forward (`render=forward`): no voxel GI or ray tracing grid at all, a flat fill for the GI
     let forward = settings.render == "forward";
     layout::set_fill(if forward { FORWARD_FILL } else { [0.0; 3] });
 
     // the room (`www/assets/room/room.glb`, from Blender), then voxel GI and the grid over its box
-    set_text("hud", "Loading the room …");
+    set_text("hud", &format!("Loading the {} …", venue.name()));
     let mut scene = Scene::new();
-    let layout = layout::load(&renderer, &mut scene, deferred).await.map_err(|e| {
-        set_text("hud", &format!("The room didn't load: {e}"));
+    let layout = layout::load(&renderer, &mut scene, deferred, &venue.sources()).await.map_err(|e| {
+        set_text("hud", &format!("The {} didn't load: {e}", venue.name()));
         JsValue::from_str(&e)
     })?;
     let bounds = room_bounds(&layout);
@@ -981,10 +1058,11 @@ where
         }
         _ => (None, None),
     };
-    let (dragon, dragon_box) = match kansei_wasm::flag("dragon", true) {
-        true => add_dragon(&mut scene, layout.dragon).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
-        false => (None, None),
+    let (dragon, dragon_box) = match (kansei_wasm::flag("dragon", true), layout.dragon) {
+        (true, Some(at)) => add_dragon(&mut scene, at).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
+        _ => (None, None),
     };
+    let glass_boxes: Vec<(GVec3, GVec3)> = dragon_box.into_iter().chain(layout.glass.iter().copied()).collect();
     // the sky behind the windows and the skylight (its colours set by `apply`)
     let mut sky = Renderable::new(SphereGeometry::new(300.0, 32, 16), Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [1.0; 3], horizon: [1.0; 3], ground: [0.2; 3], curve: 0.5 }));
     sky.cast_shadow = false;
@@ -1000,7 +1078,7 @@ where
 
     // the character (or, without a pack, a capsule standing in for it), at the spawn marker
     let page_note = "\n\nThe room renders without one: a capsule stands in for the character.";
-    let mut character = load_character(&renderer, &mut scene, &layout.collision, &RoomLit { deferred }, &load, page_note).await;
+    let mut character = load_character(&renderer, &mut scene, &layout.collision, &RoomLit { deferred }, &load, page_note, venue.body()).await;
     let mut bodies = Vec::new();
     if let Some(c) = &mut character {
         // the parkour the room's tagged pieces give: hangs and shimmies on its ledges, wall runs,
@@ -1014,17 +1092,18 @@ where
     } else {
         bodies.push(look::stand_in(&mut scene, layout.spawn.0, deferred));
     }
-    let hero_layer = layout.albedo_layers.len() as u8;
-    let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, hero_layer));
+    let body_layers = layout.albedo_layers.len() as u8;
+    let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, body_layers));
 
     let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward));
-    // the albedo the reflections' hits read: the surfaces' colour maps and the hero's
-    let hero = character.as_ref().and_then(|c| c.bodies.iter().find_map(|b| b.base_color.as_ref())).map(|(img, _)| {
-        let mut t = kansei_core::buffers::Texture::from_image("Room/HeroAlbedo", img, true);
+    // the albedo the reflections' hits read: the surfaces' colour maps and the bodies' (each
+    // textured body a layer after the surfaces', in order: `Proxy::new`)
+    let body_maps: Vec<kansei_core::buffers::Texture> = character.iter().flat_map(|c| c.bodies.iter().filter_map(|b| b.base_color.as_ref())).map(|(img, _)| {
+        let mut t = kansei_core::buffers::Texture::from_image("Room/BodyAlbedo", img, true);
         t.initialize_with_data(renderer.device(), renderer.queue());
         t
-    });
-    let sources: Vec<&wgpu::TextureView> = layout.albedo_layers.iter().map(|(v, _)| v).chain(hero.iter().filter_map(|t| t.view())).collect();
+    }).collect();
+    let sources: Vec<&wgpu::TextureView> = layout.albedo_layers.iter().map(|(v, _)| v).chain(body_maps.iter().filter_map(|t| t.view())).collect();
     let (albedo_texture, albedo) = assets::albedo_array(&renderer, &sources);
     if let Some(e) = volume.effect_mut::<Switch<RtReflectionsEffect>>() {
         e.effect.set_albedo_texture(Some(&albedo));
@@ -1077,7 +1156,8 @@ where
         dust,
         proxy,
         dragon,
-        dragon_box,
+        glass_boxes,
+        venue,
         bodies,
         sky,
         sky_lighting,
@@ -1094,7 +1174,7 @@ where
         state.renderer.set_profiling(true);
         state.profile_since = kansei_wasm::now();
     }
-    log::info!("Kansei — Motion Matching room (WASM) ready: character {}, gi {}, shadows {}", state.player.character.is_some(), state.settings.gi, state.settings.shadows);
+    log::info!("Kansei — Motion Matching {} (WASM) ready: character {}, gi {}, shadows {}", venue.name(), state.player.character.is_some(), state.settings.gi, state.settings.shadows);
     let state = Rc::new(RefCell::new(state));
     set_page(state.clone());
     ROOM.with(|s| *s.borrow_mut() = Some(state.clone()));

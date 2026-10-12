@@ -55,9 +55,9 @@ macro_rules! settings {
         }
 
         impl Settings {
-            /// The defaults, with any setting the URL names.
-            pub fn from_url() -> Self {
-                let mut s = Self::default();
+            /// `base` (the defaults, or a venue's), with any setting the URL names.
+            pub fn from_url(base: Self) -> Self {
+                let mut s = base;
                 // the old name of `fluid_rest`
                 if let Some(v) = param("rest") {
                     s.set("fluid_rest", &v);
@@ -290,6 +290,31 @@ impl Settings {
         self.fluid_render = "screen".into();
         self.fog = 0.0;
         self.dust = false;
+    }
+
+    /// The showroom's light (`showroom.html`'s "showroom" look): a cool daylight skylight and
+    /// window sun, warm-white track spots on the pieces, a narrow display spot on the glass vase,
+    /// the air clearer (no dust: the skylight lit it as snow).
+    pub fn showroom() -> Self {
+        Self {
+            sun_lux: 26000.0,
+            sun_temp: 4800.0,
+            sky_cd: 60000.0,
+            sky_temp: 6500.0,
+            sky_radiance: 5000.0,
+            lamp_cd: 40000.0,
+            lamp_temp: 3500.0,
+            display_cd: 120_000.0,
+            fog: 0.0006,
+            dust: false,
+            ev: 9.0,
+            white_temp: 6200.0,
+            contrast: 1.03,
+            vignette: 0.18,
+            grain: 0.03,
+            chromatic: 0.03,
+            ..Self::default()
+        }
     }
 
     pub fn apply_quality(&mut self, quality: &str) {
