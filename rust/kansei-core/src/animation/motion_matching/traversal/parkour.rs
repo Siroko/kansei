@@ -216,6 +216,8 @@ pub(super) struct Hang {
     idle: Option<usize>,
     /// The root followed: its place, velocity and heading.
     follow: Option<(Vec3, Vec3, f32)>,
+    /// The pack's shimmy clip playing (captured hands and feet stepping, instead of the gait).
+    shimmy: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -833,7 +835,7 @@ impl CharacterController {
         };
         self.matcher.start_action(db, Action { clip: pose.climb.clip, start, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Climb as u32, rate: 1.0, lock_feet: false });
         let braced = self.hangable(edge, pose);
-        let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start, idle: None, follow: None };
+        let mut hang = Hang { edge, s, time: 0.0, phase: 0.0, direction: 1.0, limbs: [Step::default(); 4], from: catching.then_some((character.translation, yaw_of(character.rotation))), settle: if catching { (pose.frame - start) / db.sample_rate } else { 0.0 }, braced, latch: None, start_frame: start, idle: None, follow: None, shimmy: None };
         let rest = self.rest_limbs(pose, edge, s, world);
         for (k, l) in hang.limbs.iter_mut().enumerate() {
             l.planted = rest[k];
@@ -906,10 +908,46 @@ impl CharacterController {
             _ => None,
         };
         let wanted = h.latch.map_or(0.0, |(_, sign)| sign * (stick.length() / 2.0).min(1.0) * self.parkour.shimmy_speed);
+        // with shimmy clips in the pack (braced or free, to the character's left or right): the
+        // clip plays, at the pace the stick asks of it, and the hang moves along the edge at the
+        // clip's own speed (so the hands and feet step as captured)
+        let moving_left = (e.direction() * wanted.signum()).dot(left) > 0.0;
+        let captured = if settled && wanted.abs() > 0.05 { self.shimmy_clip(db, h.braced, moving_left) } else { None };
+        let pace = (stick.length() / 2.0).min(1.0);
+        match captured {
+            Some((clip, _)) if h.shimmy != Some(clip) => {
+                let (root, yaw) = self.idle_place(db, clip, 0.0, h.edge, h.s);
+                self.switch_clip(db, Action { clip, start: 0.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::Shimmy as u32, rate: pace, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, yaw_rotation(yaw))));
+                h.shimmy = Some(clip);
+                h.idle = None;
+                h.follow = None;
+            }
+            None if h.shimmy.is_some() => {
+                // stopped: back to the hang (its idle), the limbs pinned where the hang has them
+                h.shimmy = None;
+                let rest = self.rest_limbs(&pose, h.edge, h.s, world);
+                for (k, l) in h.limbs.iter_mut().enumerate() {
+                    *l = Step { planted: rest[k], from: rest[k], ..Step::default() };
+                }
+            }
+            _ => {}
+        }
+        let wanted = match captured {
+            Some((_, speed)) => wanted.signum() * speed * pace,
+            None => wanted,
+        };
         let stride = self.parkour.shimmy_stride;
         // the gait runs on while moving, and finishes a step under way once stopped
         let mid_step = h.limbs.iter().any(|l| l.stepping);
-        let rate = if wanted.abs() > 0.05 { wanted.abs() / stride } else if mid_step { self.parkour.shimmy_speed / stride } else { 0.0 };
+        let rate = if h.shimmy.is_some() {
+            0.0
+        } else if wanted.abs() > 0.05 {
+            wanted.abs() / stride
+        } else if mid_step {
+            self.parkour.shimmy_speed / stride
+        } else {
+            0.0
+        };
         if wanted.abs() > 0.05 && !mid_step {
             h.direction = wanted.signum();
         }
@@ -931,6 +969,9 @@ impl CharacterController {
         // a planted limb the body has left out of its reach steps back under it at once
         let joints = self.hands.map(|hands| limb_joints(db, hands));
         for k in 0..4 {
+            if h.shimmy.is_some() {
+                break;
+            }
             let reaches = joints.is_none_or(|j| self.limb_reaches(db, j[k], h.limbs[k].planted, 0.97));
             let l = &mut h.limbs[k];
             if l.forced.is_none() && !l.stepping && !reaches {
@@ -952,7 +993,7 @@ impl CharacterController {
             let window = (slot as f32 * 0.25, slot as f32 * 0.25 + 0.25);
             let inside = |p: f32| p >= window.0 && p < window.1;
             let l = &mut h.limbs[k];
-            if l.forced.is_some() {
+            if l.forced.is_some() || h.shimmy.is_some() {
                 continue;
             }
             // landing ahead of its rest by what the root moves while it stays planted, halved
@@ -974,7 +1015,7 @@ impl CharacterController {
         }
         // settled, onto the pack's hang idle if it has one (a breathing loop), from the climb's
         // held frame
-        if h.idle.is_none() && h.time >= h.settle + 0.15 {
+        if h.idle.is_none() && h.shimmy.is_none() && h.time >= h.settle + 0.15 {
             if let Some(clip) = self.hang_idle(db, h.braced) {
                 let (root, yaw) = self.idle_place(db, clip, 1.0, h.edge, h.s);
                 self.switch_clip(db, Action { clip, start: 1.0, exit: None, path: RootPath::External, collides: false, tag: ActionKind::HangIdle as u32, rate: 1.0, lock_feet: false }, Some(crate::animation::Transform::from_translation_rotation(root, yaw_rotation(yaw))));
@@ -985,9 +1026,11 @@ impl CharacterController {
             }
         }
         // the root: on the edge (eased from where a catch began), its breathing
-        let (root, yaw) = match h.idle {
-            Some(clip) => self.idle_place(db, clip, self.matcher.playing().1, h.edge, h.s),
-            None => self.hang_place(&pose, h.edge, h.s),
+        let (root, yaw) = match (h.shimmy, h.idle) {
+            // (the clip's root runs along under its hips: placed by its first frame's)
+            (Some(clip), _) => self.idle_place(db, clip, 0.0, h.edge, h.s),
+            (None, Some(clip)) => self.idle_place(db, clip, self.matcher.playing().1, h.edge, h.s),
+            (None, None) => self.hang_place(&pose, h.edge, h.s),
         };
         let (root, yaw) = match h.from {
             Some((p, y)) if h.time < h.settle => {
@@ -1033,7 +1076,7 @@ impl CharacterController {
             let t = h.time - h.settle;
             pose.frame + (t * 1.3).sin() * 0.8 * smooth(t / 1.0)
         };
-        let rate = ((wanted_frame - frame) / (dt * db.sample_rate)).clamp(-1.5, 1.5);
+        let rate = if h.shimmy.is_some() { pace } else { ((wanted_frame - frame) / (dt * db.sample_rate)).clamp(-1.5, 1.5) };
         if let Some(a) = self.matcher.action_mut() {
             a.rate = rate;
         }
@@ -1045,7 +1088,8 @@ impl CharacterController {
         if let Some(joints) = joints {
             #[allow(clippy::needless_range_loop)]
             for k in 0..4 {
-                if k >= 2 && !h.braced {
+                // (a shimmy clip's limbs step as captured)
+                if (k >= 2 && !h.braced) || h.shimmy.is_some() {
                     continue;
                 }
                 self.park.limbs.push(LimbTarget { joint: joints[k], target: h.limbs[k].planted, weight: w, rotation: None });
@@ -1594,6 +1638,23 @@ impl CharacterController {
         if !targets.is_empty() {
             self.matcher.reach(db, &targets);
         }
+    }
+
+    /// The pack's shimmy clip for a hang braced or not, moving to the character's left or right
+    /// (by its name: `Braced` or not, `Left`/`Right`), and its speed along the edge (m/s).
+    fn shimmy_clip(&self, db: &Database, braced: bool, left: bool) -> Option<(usize, f32)> {
+        let side = if left { "Left" } else { "Right" };
+        self.actions
+            .iter()
+            .filter(|c| c.kind == ActionKind::Shimmy)
+            .map(|c| (c.clip, &db.clips[c.clip]))
+            .filter(|(_, info)| info.name.contains(side) && info.name.contains("Braced") == braced)
+            .map(|(k, info)| {
+                let end = (info.frames - 1) as f32;
+                let (moved, _) = db.root_motion(k, 0.0, end);
+                (k, Vec3::new(moved.x, 0.0, moved.z).length() / (end / db.sample_rate).max(1e-3))
+            })
+            .find(|&(_, speed)| speed > 0.05)
     }
 
     /// The pack's hang idle (`ActionKind::HangIdle`): one braced (its name says `Braced`) for a
