@@ -921,11 +921,26 @@ impl CharacterController {
                             // the clip's own speed up as it leaves the ground
                             let rise = (db.root_at(clip.clip, clip.rise + 1.0).0.y - db.root_at(clip.clip, clip.rise).0.y) * db.sample_rate;
                             let from = self.matcher.character().translation;
-                            // a bar: the hips' path through the hanging place (the hips as high
-                            // over the root as they are now)
+                            // a bar or a ledge: the hips' path through the hanging place, the
+                            // hips where the jump's clip has them over the root on arrival (its
+                            // take-off crouches them; past its end, the fall loop's)
                             let target = if target.y > parkour::BAR_AIM * 0.5 {
-                                let hips = self.matcher.joint_world(db, db.roles.hips).y - from.y;
-                                target - Vec3::Y * (parkour::BAR_AIM + hips)
+                                let hang = target - Vec3::Y * parkour::BAR_AIM;
+                                let rotation = yaw_rotation(yaw_of(self.matcher.character().rotation));
+                                let mut root = hang - Vec3::Y * self.park.fall_hips;
+                                for _ in 0..2 {
+                                    let v = self.aimed_velocity(from, root, rise);
+                                    let across = Vec3::new(v.x, 0.0, v.z).length().max(0.5);
+                                    let flight = Vec3::new(root.x - from.x, 0.0, root.z - from.z).length() / across;
+                                    let frame = clip.rise + flight * db.sample_rate;
+                                    let hips = if frame < (db.clips[clip.clip].frames - 1) as f32 {
+                                        rotation * parkour::clip_joint(db, clip.clip, frame, db.roles.hips)
+                                    } else {
+                                        Vec3::Y * self.park.fall_hips
+                                    };
+                                    root = hang - hips;
+                                }
+                                root
                             } else {
                                 target
                             };

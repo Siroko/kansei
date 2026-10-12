@@ -142,7 +142,7 @@ fn hands_mid(db: &Database, clip: usize, frame: f32, hands: [usize; 2]) -> Vec3 
 }
 
 /// Database joint `joint` relative to the clip root (root-local) at `frame` of `clip`.
-fn clip_joint(db: &Database, clip: usize, frame: f32, joint: usize) -> Vec3 {
+pub(super) fn clip_joint(db: &Database, clip: usize, frame: f32, joint: usize) -> Vec3 {
     let info = &db.clips[clip];
     let a = (frame.max(0.0) as usize).min(info.frames - 1);
     let mut pose = crate::animation::Pose { local: Vec::new() };
@@ -593,7 +593,7 @@ impl CharacterController {
             let hang = point - Vec3::Y * HANG_DROP - dir * 0.05;
             let root = hang - Vec3::Y * self.park.fall_hips;
             let d = Vec3::new(root.x - from.x, 0.0, root.z - from.z);
-            if (0.4..=3.0).contains(&d.length()) && root.y - from.y < 1.2 && d.normalize_or_zero().dot(dir) >= s.jump_cone.cos() {
+            if (0.4..=4.2).contains(&d.length()) && root.y - from.y < 1.2 && d.normalize_or_zero().dot(dir) >= s.jump_cone.cos() {
                 // (marked as a hips target: the take-off aims the hips there)
                 candidates.push((d.length() - 20.0, Vec3::new(hang.x, hang.y + BAR_AIM, hang.z)));
             }

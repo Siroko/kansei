@@ -170,6 +170,22 @@ fn scenarios() -> Vec<Scenario> {
             expect: &["wallrun", "falling", "grounded"],
         },
         Scenario {
+            name: "a standing jump to a bar",
+            start: Vec3::new(7.6, 0.0, 10.4),
+            yaw: std::f32::consts::PI,
+            duration: 3.0,
+            cues: vec![cue(0.0, -z * 0.6), space(0.15, -z * 0.6), cue(1.2, Vec3::ZERO)],
+            expect: &["jumping", "falling", "swinging"],
+        },
+        Scenario {
+            name: "from a platform to a bar",
+            start: Vec3::new(7.6, 1.2, 12.3),
+            yaw: std::f32::consts::PI,
+            duration: 3.0,
+            cues: vec![cue(0.0, -z * 4.0), space(0.5, -z * 4.0), cue(1.5, Vec3::ZERO)],
+            expect: &["jumping", "falling", "swinging"],
+        },
+        Scenario {
             name: "jump to a bar, hang still, pull up, let go",
             start: Vec3::new(7.6, 0.0, 11.0),
             yaw: std::f32::consts::PI,
