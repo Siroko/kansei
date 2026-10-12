@@ -39,7 +39,7 @@ fn course() -> (CollisionWorld, ParkourFeatures) {
     add("Course_Tower", ParkourTag::Ledge, Vec3::new(14.4, 1.4, 8.0), Vec3::new(1.0, 1.4, 1.0), &[]);
     add("Course_Wall", ParkourTag::WallRun, Vec3::new(10.0, 1.6, 3.0), Vec3::new(2.5, 1.6, 0.12), &[("kansei_run_axis", "x"), ("kansei_run_faces", "both")]);
     for (k, z) in [8.4f32, 6.6, 4.8].into_iter().enumerate() {
-        add(&format!("Course_Bar_{}", k + 1), ParkourTag::Bar, Vec3::new(7.6, 1.17, z), Vec3::new(1.14, 1.17, 0.04), &[("kansei_bar_height", "2.3"), ("kansei_bar_axis", "x")]);
+        add(&format!("Course_Bar_{}", k + 1), ParkourTag::Bar, Vec3::new(9.6, 1.17, z), Vec3::new(1.14, 1.17, 0.04), &[("kansei_bar_height", "2.3"), ("kansei_bar_axis", "x")]);
     }
     for p in &pieces {
         match p.tag {
@@ -187,7 +187,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "a standing jump to a bar",
-            start: Vec3::new(7.6, 0.0, 10.4),
+            start: Vec3::new(9.6, 0.0, 10.4),
             yaw: std::f32::consts::PI,
             duration: 3.0,
             cues: vec![cue(0.0, -z * 0.6), space(0.15, -z * 0.6), cue(1.2, Vec3::ZERO)],
@@ -195,7 +195,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "from a platform to a bar",
-            start: Vec3::new(7.6, 1.2, 12.3),
+            start: Vec3::new(10.2, 1.4, 12.3),
             yaw: std::f32::consts::PI,
             duration: 3.0,
             cues: vec![cue(0.0, -z * 4.0), space(0.5, -z * 4.0), cue(1.5, Vec3::ZERO)],
@@ -203,7 +203,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "jump to a bar, hang still, pull up, let go",
-            start: Vec3::new(7.6, 0.0, 11.0),
+            start: Vec3::new(9.6, 0.0, 10.6),
             yaw: std::f32::consts::PI,
             duration: 9.0,
             cues: vec![cue(0.0, -z * 4.0), space(0.45, -z * 4.0), cue(1.2, Vec3::ZERO), space(4.0, Vec3::ZERO), drop(7.5)],
@@ -211,7 +211,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "jump to a bar, swing, let go",
-            start: Vec3::new(7.6, 0.0, 11.0),
+            start: Vec3::new(9.6, 0.0, 10.6),
             yaw: std::f32::consts::PI,
             duration: 7.0,
             cues: vec![cue(0.0, -z * 4.0), space(0.45, -z * 4.0), cue(1.2, -z * 2.0), cue(3.4, Vec3::ZERO), space(4.25, Vec3::ZERO)],
