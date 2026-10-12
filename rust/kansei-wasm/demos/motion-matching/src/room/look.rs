@@ -280,7 +280,7 @@ fn proxy_albedo(name: &str) -> [f32; 3] {
 }
 
 impl Proxy {
-    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool) -> Self {
+    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool, hero_layer: u8) -> Self {
         let view = kansei_wasm::flag("proxy_view", false);
         // `proxy_tris=` another count
         let target: usize = kansei_wasm::param_or("proxy_tris", PROXY_TRIANGLES);
@@ -298,7 +298,7 @@ impl Proxy {
             log::info!("room: {} in the grid as {} of {} triangles", body.name, indices.len() / 3, mesh.indices.len() / 3);
             // textured (its uvs; flat-shaded then), or one colour with smooth normals
             let surface = match &body.base_color {
-                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(super::assets::HERO_LAYER),
+                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(hero_layer),
                 None => RtSurface::new(proxy_albedo(body.name)).with_smooth_normals(),
             };
             let mut r = grid_only(Geometry::new(&format!("{}/Grid", body.name), vertices, indices), surface);

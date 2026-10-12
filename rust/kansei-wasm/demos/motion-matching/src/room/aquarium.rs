@@ -1,27 +1,24 @@
-//! The pond in the middle of the room: the lake demo's water (`kansei_wasm_lake::lake`, the
-//! engine's SPH fluid at the same scale and tuning) in a smaller outline round a stone plinth, the
-//! glass dragon's island. The bed is the container's floor and a mesh in the collision world, so
-//! the character wades in, its legs pushing the water through `FluidColliders`. The plinth stands
-//! on the bed as one more collider, a still upright capsule the water flows round (as part of the
-//! container's floor, a step that steep kept the water churning: it never settled).
+//! The aquarium: the lake demo's water (`kansei_wasm_lake::lake`, the engine's SPH fluid at the
+//! same scale and tuning) in a glass tank by the west windows, the low sun through it. The tank is
+//! the room glb's `AQUA_Water` box (`kansei: aquarium`): the container is that box (a rectangle
+//! for walls, its bottom for a floor), filled to `fill` of its height. The glass panes round it are
+//! the room's (`kansei: glass`); the character's legs still push the water through
+//! `FluidColliders` were it to reach in.
 //!
-//! The bed is drawn into the GBuffer (wet below the waterline) and lit by the room's spot lights,
-//! for the GI and the reflections. The water's surface (the marching-cubes mesh) is drawn as glass
+//! The water's surface (the marching-cubes mesh) is drawn as glass
 //! (`FluidSurfaceEffect::surface_renderable_glass`): `RtReflectionsEffect`'s glass pass refracts
-//! through it to the bed, the plinth and the legs in the grid (Beer-Lambert in the water) and
-//! reflects the room off it, with small wind ripples on its normal. The water is in the grid too,
-//! as glass (`FluidHeightfield`'s coarse mesh of the surface, 30 cm apart: the grid's cost is
-//! triangles a cell), so the mirrors and the glass dragon show it, and the caustics' photons
-//! refract at it (`RtCausticsEffect`, the fine height field and the same ripples). `fluid_render
-//! = screen` draws it the old way, refracting the image on screen (`FluidSurfaceEffect`'s
+//! through the tank's panes and the water to what is behind them in the grid (Beer-Lambert in the
+//! water) and reflects the room off it, with small ripples on its normal. The water is in the grid
+//! too, as glass (`FluidHeightfield`'s coarse mesh of the surface), so the mirrors and the dragon
+//! show it, and the caustics' photons refract at it (`RtCausticsEffect`, the fine height field and
+//! the same ripples): the sun through the tank throws them across the floor. `fluid_render =
+//! screen` draws it the old way, refracting the image on screen (`FluidSurfaceEffect`'s
 //! composite). Like the lake, the water rests when it can: culled out of view, asleep once settled
-//! with no legs near it.
+//! with nothing near it.
 
 use glam::{Mat4, Vec3 as GVec3};
 
-use kansei_core::collision::{CollisionWorld, Shape, TriangleMesh};
-use kansei_core::geometries::{BoxGeometry, CylinderGeometry, Geometry, Vertex};
-use kansei_core::gi::GiSurface;
+use kansei_core::geometries::{BoxGeometry, Geometry, Vertex};
 use kansei_core::materials::Material;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{FluidGlassSurface, FluidSurfaceEffect, FluidSurfaceOptions};
@@ -39,18 +36,28 @@ const SCALE: WorldScale = WorldScale { length: 11.0, time: 3.316_625 };
 const SIM_SCALE: f32 = SCALE.length;
 const STEP: f32 = 1.0 / 60.0;
 const MAX_STEPS: u32 = 2;
-/// The outline's half-size along x and z (round the room's centre).
-const HALF: [f32; 2] = [4.2, 6.0];
-/// The still water's height, a little under the floor's; the bed's depth and shelf; the shore
-/// strip the container's walls stand on, and the low bank down to the floor (as the lake's).
-const WATER: f32 = -0.1;
-const DEPTH: f32 = 0.4;
-const SHELF: f32 = 0.6;
-const SHORE: f32 = 1.2;
-/// The plinth: its radius, its top's height, and the stone's colour.
-pub const PLINTH_RADIUS: f32 = 1.35;
-pub const PLINTH_TOP: f32 = 0.5;
-const STONE: [f32; 3] = [0.75, 0.75, 0.74];
+/// The tank as the room's glb places it (`layout`: `AQUA_Water`): the water's box (world metres)
+/// and how full it is.
+#[derive(Clone, Copy, Debug)]
+pub struct Tank {
+    pub min: GVec3,
+    pub max: GVec3,
+    pub fill: f32,
+}
+
+impl Default for Tank {
+    fn default() -> Self {
+        Self { min: GVec3::new(-13.0, 0.85, -2.6), max: GVec3::new(-12.0, 1.85, 1.4), fill: 0.85 }
+    }
+}
+
+impl Tank {
+    /// The still water's height.
+    pub fn level(&self) -> f32 {
+        self.min.y + (self.max.y - self.min.y) * self.fill.clamp(0.05, 1.0)
+    }
+}
+
 /// A landing's splash, as the lake's.
 const SPLASH_RADIUS: f32 = 0.3;
 const SPLASH_TIME: f32 = 0.12;
@@ -63,27 +70,26 @@ pub const SETTLE_SPEED: f32 = 0.15;
 /// Lattice spacing of the particles at rest density (simulation units).
 const SPACING: f32 = 0.537;
 /// The water's light left after a metre through it, at `fluid_tint` 1 (none at 0): deeper than
-/// clear water's, so the 40 cm pond reads turquoise as a deeper pool would.
+/// clear water's: the tank reads aqua against the room.
 const WATER_TINT: [f32; 3] = [0.12, 0.45, 0.5];
 /// Metres between the vertices of the water's mesh in the ray tracing grid, and the frames between
 /// its updates while the water moves.
 const GRID_SPACING: f32 = 0.3;
 const GRID_EVERY: u32 = 4;
-/// The surface field's voxels along the box's longest side, the marching cubes' triangles at
-/// most, a lone particle's droplet radius and the particles' splat radius (simulation units: 4.1
+/// The surface field's voxels along the box's longest side (the tank's 4 m: 3.2 cm), the
+/// marching cubes' triangles at most, a lone particle's droplet radius and the particles' splat radius (simulation units: 4.1
 /// and 13.6 cm): the surface's defaults (`settings::Settings::fluid_res`, `fluid_mc_max`,
 /// `fluid_drop`, `fluid_splat`).
-pub const RESOLUTION: u32 = 256;
+pub const RESOLUTION: u32 = 128;
 pub const MAX_TRIANGLES: u32 = 500_000;
 const DROP_RADIUS: f32 = 0.45;
 const SPLAT_RADIUS: f32 = 1.5;
-/// The fluid's box (world metres) over the bed: from a little under it to over the plinth.
-const BOX_Y: [f32; 2] = [-DEPTH - 0.1, 1.3];
+
 /// The bounds' wireframe: its edges' thickness (m) and glow (cd/m²).
 const EDGE: f32 = 0.025;
 const EDGE_RADIANCE: [f32; 3] = [600.0, 380.0, 60.0];
 
-/// What the water's surface is built at: rebuilt (`Pond::rebuild_surface`) when one changes.
+/// What the water's surface is built at: rebuilt (`Aquarium::rebuild_surface`) when one changes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SurfaceBuild {
     resolution: u32,
@@ -124,80 +130,25 @@ fn box_edges(min: GVec3, max: GVec3) -> [(GVec3, GVec3); 12] {
     edges
 }
 
-/// The bed's stones (`settings::Settings::fluid_bed`) and their roughness scale, the first shown at
-/// first.
-const BEDS: [(&str, f32); 3] = [("marble", 0.7), ("gravel", 1.0), ("blackmarble", 0.6)];
-
 /// The water's tint after a metre at `strength` (`fluid_tint`: 0 clear, 1 `WATER_TINT`).
 fn water_tint(strength: f32) -> [f32; 3] {
     let k = strength.clamp(0.0, 1.5);
     WATER_TINT.map(|t| (1.0 - k * (1.0 - t)).clamp(0.02, 1.0))
 }
 
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+/// The tank's walls: its box's rectangle (x, z), counter-clockwise.
+fn outline(tank: &Tank) -> Vec<[f32; 2]> {
+    let (a, b) = (tank.min, tank.max);
+    vec![[a.x, a.z], [b.x, a.z], [b.x, b.z], [a.x, b.z]]
 }
 
-/// The waterline: a long pool under the skylight, its corners rounded.
-fn outline() -> Vec<[f32; 2]> {
-    (0..256)
-        .map(|k| {
-            let a = k as f32 / 256.0 * std::f32::consts::TAU;
-            // a superellipse (|x / a|^4 + |z / b|^4 = 1): a rectangle with rounded corners
-            let (c, s) = (a.cos(), a.sin());
-            [HALF[0] * c.signum() * c.abs().sqrt(), HALF[1] * s.signum() * s.abs().sqrt()]
-        })
-        .collect()
-}
-
-/// The ground's height at signed distance `d` from the waterline (negative in the pond).
-fn height(_x: f32, _z: f32, d: f32) -> f32 {
-    // a pool's: its floor flat, its sides a short slope, its coping flush with the room's floor
-    if d < 0.0 {
-        -DEPTH * smoothstep(0.0, SHELF, -d)
-    } else {
-        0.0
-    }
-}
-
-/// How far the black stone coping reaches past the waterline (m): the terrain's edge.
-const COPING: f32 = 1.6;
-
-/// A grid of vertices over `[min, max]` (x, z), `cells` across, at `height(x, z)`, with normals
-/// from the heights around; triangles wound counter-clockwise seen from above.
-fn heightfield(min: [f32; 2], max: [f32; 2], cells: [usize; 2], height: &dyn Fn(f32, f32) -> f32) -> (Vec<GVec3>, Vec<[f32; 3]>, Vec<u32>) {
-    let step = [(max[0] - min[0]) / cells[0] as f32, (max[1] - min[1]) / cells[1] as f32];
-    let (mut positions, mut normals) = (Vec::new(), Vec::new());
-    for j in 0..=cells[1] {
-        for i in 0..=cells[0] {
-            let (x, z) = (min[0] + i as f32 * step[0], min[1] + j as f32 * step[1]);
-            positions.push(GVec3::new(x, height(x, z), z));
-            let e = 0.1;
-            let n = GVec3::new(height(x - e, z) - height(x + e, z), 2.0 * e, height(x, z - e) - height(x, z + e)).normalize();
-            normals.push(n.to_array());
-        }
-    }
-    let row = cells[0] as u32 + 1;
-    let mut indices = Vec::new();
-    for j in 0..cells[1] as u32 {
-        for i in 0..cells[0] as u32 {
-            let (a, b, c, d) = (j * row + i, j * row + i + 1, (j + 1) * row + i + 1, (j + 1) * row + i);
-            indices.extend_from_slice(&[a, d, c, a, c, b]);
-        }
-    }
-    (positions, normals, indices)
-}
-
-pub struct Pond {
+pub struct Aquarium {
     container: FluidContainer,
     colliders: FluidColliders,
-    /// The plinth: still, neither bouncing the water nor dragging it (so it settles against it).
-    plinth: FluidColliders,
     stepper: FluidStepper,
     previous: Vec<[GVec3; 2]>,
     splash: Option<(GVec3, f32, f32)>,
-    /// The waterline's bounds (x, z): legs within `WAKE_DISTANCE` of them push the water.
+    /// The tank's bounds (x, z): legs within `WAKE_DISTANCE` of them push the water.
     near: ([f32; 2], [f32; 2]),
     count: u32,
     /// The full fill, lowest particles first (a partial fill is its first part: lower water).
@@ -211,8 +162,7 @@ pub struct Pond {
     rt: bool,
     glass: FluidGlassSurface,
     frames: u32,
-    /// The beds (stone, renderable): the one `fluid_bed` names shown.
-    beds: Vec<(&'static str, usize)>,
+    tank: Tank,
     /// Stepped at all (off: frozen, its last surface drawn); a landing's push; wake next update.
     simulate: bool,
     show: bool,
@@ -226,75 +176,24 @@ pub struct Pond {
     edges: Vec<usize>,
 }
 
-impl Pond {
-    /// The rectangle (x, z min and max) the pond's terrain covers: the floor stays out of it.
-    pub fn terrain_bounds() -> ([f32; 2], [f32; 2]) {
-        let shape = PlanarContainerShape::from_outline(&outline(), 0.1, COPING, height);
-        shape.bounds()
-    }
+impl Aquarium {
+    /// Build the aquarium into `scene`: the water in `tank`, and its surface effect for the
+    /// post-processing chain (its renderable added).
+    pub fn new(renderer: &Renderer, scene: &mut Scene, tank: Tank) -> (Self, FluidSurfaceEffect) {
+        let outline = outline(&tank);
+        let level = tank.level();
 
-    /// Build the pond into `scene` and `world`: its bed, the plinth, and the water's surface
-    /// effect for the post-processing chain (its renderable added).
-    pub fn new(renderer: &Renderer, scene: &mut Scene, world: &mut CollisionWorld, assets: &super::assets::Assets) -> (Self, FluidSurfaceEffect) {
-        let outline = outline();
-        let mut terrain = PlanarContainerShape::from_outline(&outline, 0.1, COPING, height);
-        terrain.smooth_floor(4);
-        let (min, max) = terrain.bounds();
-        let ground = |x: f32, z: f32| terrain.floor(x, z);
-
-        // the bed: a fine mesh to draw (and trace), a coarser one to walk on
-        let cells = |step: f32| [((max[0] - min[0]) / step).ceil() as usize, ((max[1] - min[1]) / step).ceil() as usize];
-        let (positions, normals, indices) = heightfield(min, max, cells(0.15), &ground);
-        let vertices: Vec<Vertex> = positions.iter().zip(&normals).map(|(p, n)| Vertex { position: [p.x, p.y, p.z, 1.0], normal: *n, uv: [p.x, p.z] }).collect();
-        // the bed's stones (`fluid_bed`, one shown): pale marble (where the caustics show), gravel,
-        // polished black marble (a reflecting pool); lit by the lights themselves (the water's
-        // glass pass takes them from the background image)
-        let mut beds = Vec::new();
-        for (name, polish) in BEDS {
-            let mut bed = super::layout::surface([1.0, 1.0, 1.0], 2.0, [polish, 0.0], polish < 0.9, false);
-            bed.flags[0] = 1.0;
-            let albedo = super::layout::mean(name, [1.0; 3]);
-            let material = super::pbr::material("Pond/Bed", assets.surface(name, "Pond/Bed"), &bed, false);
-            let mut r = Renderable::new(Geometry::new("Pond/Bed", vertices.clone(), indices.clone()), material).with_gi(GiSurface::new(albedo));
-            r.rt = Some(RtSurface::new(albedo).with_self_lit());
-            r.cast_shadow = false;
-            r.visible = name == BEDS[0].0;
-            super::layout::texture_rt(&mut r, name, &bed, assets.surfaces.contains_key(name));
-            beds.push((name, scene.add(SceneNode::Renderable(r))));
-        }
-        let (positions, _, indices) = heightfield(min, max, cells(0.4), &ground);
-        world.add(Shape::Mesh(TriangleMesh::from_indexed(&positions, &indices, Mat4::IDENTITY)), 1);
-
-        // the plinth: a stone drum from below the bed to its top, and the same in the collision
-        // world (to wade round, or climb onto)
-        let drum = CylinderGeometry::new(PLINTH_RADIUS, PLINTH_RADIUS, PLINTH_TOP + DEPTH, 48, 1);
-        let place = Mat4::from_translation(GVec3::new(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0));
-        let corners: Vec<GVec3> = drum.vertices.iter().map(|v| GVec3::new(v.position[0], v.position[1], v.position[2])).collect();
-        world.add(Shape::Mesh(TriangleMesh::from_indexed(&corners, &drum.indices, place)), 1);
-        // lit by the lights itself, as the bed: below the waterline the glass pass reads it from the
-        // background image (`RtSurface::with_self_lit`)
-        let stone_params = super::layout::surface([1.0; 3], 1.5, [1.0, 0.0], true, false);
-        let stone = super::pbr::material("Plinth", assets.surface("marble", "Plinth"), &stone_params, false);
-        let mut r = Renderable::new(drum, stone).with_gi(GiSurface::new(STONE));
-        r.rt = Some(RtSurface::new(STONE).with_self_lit());
-        r.object.set_position(0.0, (PLINTH_TOP - DEPTH) * 0.5, 0.0);
-        super::layout::texture_rt(&mut r, "marble", &stone_params, assets.surfaces.contains_key("marble"));
-        scene.add(SceneNode::Renderable(r));
-
-        // the container in simulation space: walls a shore's width outside the waterline, the bed
-        // (and the plinth) its floor
-        let shape = PlanarContainerShape::from_outline(&outline, 0.1, SHORE, |x, z, _| terrain.floor(x, z)).scaled(SIM_SCALE);
+        // the container in simulation space: the tank's rectangle its walls, its bottom the floor
+        let bottom = tank.min.y;
+        let shape = PlanarContainerShape::from_outline(&outline, 0.05, 0.0, |_, _, _| bottom).scaled(SIM_SCALE);
         let (lo, hi) = shape.bounds();
-        // (none inside the plinth)
-        let keep = (PLINTH_RADIUS + 0.05) * SIM_SCALE;
-        let mut cells: Vec<&[f32]> = Vec::new();
-        let lattice = shape.lattice(SPACING, WATER * SIM_SCALE, |d| d < 0.0);
-        cells.extend(lattice.chunks_exact(4).filter(|p| p[0] * p[0] + p[2] * p[2] > keep * keep));
+        let lattice = shape.lattice(SPACING, level * SIM_SCALE, |d| d < 0.0);
+        let mut cells: Vec<&[f32]> = lattice.chunks_exact(4).collect();
         // lowest first, so a partial fill (`reset`) is shallower water
         cells.sort_by(|a, b| a[1].total_cmp(&b[1]));
         let particles: Vec<f32> = cells.into_iter().flatten().copied().collect();
         let count = (particles.len() / 4) as u32;
-        log::info!("pond: {count} particles");
+        log::info!("aquarium: {count} particles");
         // the lake's tuning (see `kansei_wasm_lake::lake`)
         let mut sim = FluidSimulation::with_capacity(
             renderer,
@@ -316,15 +215,11 @@ impl Pond {
             &particles,
             count,
         );
-        sim.world_bounds_min = [lo[0], BOX_Y[0] * SIM_SCALE, lo[1]];
-        sim.world_bounds_max = [hi[0], BOX_Y[1] * SIM_SCALE, hi[1]];
+        sim.world_bounds_min = [lo[0], (tank.min.y - 0.05) * SIM_SCALE, lo[1]];
+        sim.world_bounds_max = [hi[0], (tank.max.y + 0.3) * SIM_SCALE, hi[1]];
         sim.rebuild_grid();
         let container = FluidContainer::new(&sim, shape, FluidContainerOptions { margin: 0.1, restitution: 0.05, friction: 0.002 });
         let colliders = FluidColliders::new(&sim, COLLIDERS, FluidCollidersOptions { restitution: 0.3, drag: 0.6 });
-        // an upright capsule from under the bed to over the plinth's top
-        let mut plinth = FluidColliders::new(&sim, 1, FluidCollidersOptions { restitution: 0.0, drag: 0.0 });
-        let r = PLINTH_RADIUS * SIM_SCALE;
-        plinth.set(&[FluidCapsule::new([0.0, -(DEPTH + 0.5) * SIM_SCALE - r, 0.0], [0.0, (PLINTH_TOP + 0.3) * SIM_SCALE, 0.0], r, [0.0; 3], [0.0; 3])]);
 
         // its surface: the lake's droplets surface field, interpolated marching cubes
         let density = density_field(renderer, &sim, RESOLUTION, DROP_RADIUS);
@@ -344,8 +239,7 @@ impl Pond {
                 roughness: 0.08,
                 thickness: 1.2,
                 color: [0.3, 0.5, 0.55, 1.0],
-                // the panel overhead: its light straight down, about the illuminance it gives the
-                // pond (lux)
+                // (the screen-space look's light: straight down, about the illuminance at the tank)
                 light_direction: [0.0, -1.0, 0.0],
                 light_intensity: 1.0,
                 light_color: [170.0, 165.0, 155.0],
@@ -373,7 +267,7 @@ impl Pond {
         let (sim_min, sim_max) = (surface.sim.world_bounds_min, surface.sim.world_bounds_max);
         let heightfield = FluidHeightfield::new(renderer.device(), renderer.queue(), &surface.density_field, sim_min, sim_max, FluidHeightfieldOptions { iso: 1.0, world_scale: s, rt_spacing: GRID_SPACING });
         // (a triangle for the renderer to draw, out of view; the grid takes `rt_mesh`)
-        let placeholder = Geometry::new("Pond/WaterGrid", vec![Vertex { position: [0.0, 0.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], uv: [0.0; 2] }; 3], vec![0, 1, 2]);
+        let placeholder = Geometry::new("Aquarium/WaterGrid", vec![Vertex { position: [0.0, 0.0, 0.0, 1.0], normal: [0.0, 1.0, 0.0], uv: [0.0; 2] }; 3], vec![0, 1, 2]);
         let mut r = super::look::grid_only(placeholder, RtSurface::glass(glass.tint).with_approximate());
         r.rt_mesh = Some(heightfield.rt_mesh().clone());
         let grid_water = scene.add(SceneNode::Renderable(r));
@@ -385,7 +279,7 @@ impl Pond {
         let build = SurfaceBuild { resolution: RESOLUTION, max_triangles: MAX_TRIANGLES, rt_spacing: GRID_SPACING, min: sim_min.map(|v| v * s), max: sim_max.map(|v| v * s) };
         let mut edges = Vec::new();
         for (at, size) in box_edges(GVec3::from(build.min), GVec3::from(build.max)) {
-            let mut r = Renderable::new(BoxGeometry::new(1.0, 1.0, 1.0), Material::emissive("Pond/Bounds", EDGE_RADIANCE));
+            let mut r = Renderable::new(BoxGeometry::new(1.0, 1.0, 1.0), Material::emissive("Aquarium/Bounds", EDGE_RADIANCE));
             r.object.set_position(at.x, at.y, at.z);
             r.object.scale = kansei_core::math::Vec3::new(size.x, size.y, size.z);
             r.cast_shadow = false;
@@ -394,10 +288,9 @@ impl Pond {
         }
 
         let (bmin, bmax) = (outline.iter().fold([f32::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]), outline.iter().fold([f32::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]));
-        let pond = Self {
+        let aquarium = Self {
             container,
             colliders,
-            plinth,
             stepper,
             previous: Vec::new(),
             splash: None,
@@ -410,7 +303,7 @@ impl Pond {
             rt: true,
             glass,
             frames: 0,
-            beds,
+            tank,
             simulate: true,
             show: true,
             splash_push: SPLASH_PUSH,
@@ -419,7 +312,7 @@ impl Pond {
             extract_frames: 0,
             edges,
         };
-        (pond, surface)
+        (aquarium, surface)
     }
 
     pub fn particles(&self) -> u32 {
@@ -457,12 +350,6 @@ impl Pond {
             }
         }
         surface.composite = !self.rt;
-        let bed = if self.beds.iter().any(|(n, _)| *n == s.fluid_bed) { s.fluid_bed.as_str() } else { BEDS[0].0 };
-        for &(name, index) in &self.beds {
-            if let Some(r) = scene.get_renderable_mut(index) {
-                r.visible = name == bed;
-            }
-        }
         self.glass = FluidGlassSurface { tint: water_tint(s.fluid_tint), ior: s.fluid_ior.max(1.0), roughness: s.fluid_rough.clamp(0.0, 1.0), ripples: s.fluid_ripples.max(0.0), time: self.glass.time };
         if let Some(r) = scene.get_renderable_mut(self.grid_water) {
             r.rt = Some(RtSurface::glass(self.glass.tint).with_approximate());
@@ -536,7 +423,7 @@ impl Pond {
     /// Bring the surface's build to the settings (`fluid_res`, `fluid_mc_max`, `fluid_rt_spacing`,
     /// the box `fluid_min_*`/`fluid_max_*`): what changed is made again (the field, the marching
     /// cubes and their renderables' meshes, the height field and the grid's copy), live; a new box
-    /// moves the simulation's bounds too (its neighbour grid refitted) and fills the pond again
+    /// moves the simulation's bounds too (its neighbour grid refitted) and fills the tank again
     /// with the water within it (pushed in, the water outside piled up against the box and blew
     /// up). False when nothing changed.
     pub fn rebuild_surface(&mut self, renderer: &Renderer, scene: &mut Scene, surface: &mut FluidSurfaceEffect, s: &super::settings::Settings) -> bool {
@@ -600,7 +487,7 @@ impl Pond {
         true
     }
 
-    /// Fill the pond again, still: `fraction` of the full fill (its lowest particles), those
+    /// Fill the tank again, still: `fraction` of the full fill (its lowest particles), those
     /// within the fluid's box.
     pub fn reset(&mut self, surface: &mut FluidSurfaceEffect, fraction: f32) {
         let n = ((self.fill.len() / 4) as f32 * fraction.clamp(0.05, 1.0)) as usize;
@@ -619,11 +506,12 @@ impl Pond {
     pub fn caustic_water(&self, surface: &FluidSurfaceEffect) -> Option<RtCausticWater> {
         let heightfield = surface.heightfield.as_ref().filter(|_| self.rt && self.show)?;
         let (min, size) = heightfield.rect();
-        Some(RtCausticWater { heights: heightfield.height_view().clone(), min, size, dims: heightfield.height_dims(), source: self.grid_water as u32, ior: self.glass.ior, tint: self.glass.tint, ripples: self.glass.ripples, level: WATER })
+        Some(RtCausticWater { heights: heightfield.height_view().clone(), min, size, dims: heightfield.height_dims(), source: self.grid_water as u32, ior: self.glass.ior, tint: self.glass.tint, ripples: self.glass.ripples, level: self.tank.level() })
     }
 
-    pub fn water_box() -> (GVec3, GVec3) {
-        (GVec3::new(-HALF[0], -DEPTH - 0.05, -HALF[1]), GVec3::new(HALF[0], WATER + 0.15, HALF[1]))
+    /// The water's box (world metres): the caustics aim their photons at it.
+    pub fn water_box(&self) -> (GVec3, GVec3) {
+        (self.tank.min - 0.05, GVec3::new(self.tank.max.x, self.tank.level() + 0.15, self.tank.max.z) + 0.05)
     }
 
     /// The glass's uniform for this frame (the ripples' time `time`), and the grid's copy read
@@ -667,7 +555,7 @@ impl Pond {
         self.previous = legs.iter().map(|(a, b, _)| [*a, *b]).collect();
         if let Some((at, speed)) = landing {
             let inside = self.container.shape().distance(at.x * SIM_SCALE, at.z * SIM_SCALE) < 0.0;
-            if inside && at.y < WATER + 0.15 && speed > 1.0 {
+            if inside && at.y < self.tank.level() + 0.15 && speed > 1.0 {
                 self.splash = Some((at, speed.min(8.0), 0.0));
             }
         }
@@ -702,7 +590,7 @@ impl Pond {
         surface.extract |= rebuilt;
         let steps = self.stepper.advance(dt);
         for _ in 0..steps {
-            surface.sim.update_batched_with(self.stepper.step_dt(), 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.plinth, &self.container]);
+            surface.sim.update_batched_with(self.stepper.step_dt(), 0.0, [0.0; 2], [0.0; 2], &[&self.colliders as &dyn FluidSubstepPass, &self.container]);
         }
         self.stepper.stepped(&surface.sim, steps);
         self.count = surface.sim.particle_count();

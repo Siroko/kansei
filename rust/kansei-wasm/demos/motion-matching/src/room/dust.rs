@@ -24,10 +24,12 @@ use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::Renderer;
 use kansei_core::shadows::CASCADED_SHADOWS_WGSL;
 
-use super::layout::{HALF, HEIGHT};
-
-/// The box the motes live in: half its width and depth (m; the room's), and its height.
-const BOX_HALF: f32 = HALF;
+/// The box the motes live in: half its width and depth (m; the room's, `Dust::new`), its height.
+#[derive(Clone, Copy)]
+struct Room {
+    half: f32,
+    height: f32,
+}
 /// The character's capsules the motes feel.
 const CAPSULES: usize = 8;
 /// The atlas: 4 x 4 sprites of 64 texels.
@@ -361,6 +363,7 @@ pub struct Dust {
     renderable: usize,
     time: f32,
     previous: Vec<[glam::Vec3; 2]>,
+    room: Room,
     pub look: DustLook,
 }
 
@@ -425,14 +428,16 @@ fn atlas(renderer: &Renderer) -> Texture {
 
 impl Dust {
     /// `count` motes in the box round `center` (the camera's start).
-    pub fn new(renderer: &Renderer, scene: &mut Scene, count: u32, center: glam::Vec3) -> Self {
+    pub fn new(renderer: &Renderer, scene: &mut Scene, count: u32, center: glam::Vec3, half: f32, height: f32) -> Self {
+        let room = Room { half, height };
+        let (box_half, height) = (room.half, room.height);
         let device = renderer.device();
         let mut positions = Vec::with_capacity(count as usize * 4);
         for i in 0..count {
             positions.extend([
-                center.x + (hash(i * 4) * 2.0 - 1.0) * BOX_HALF,
-                0.05 + hash(i * 4 + 1) * (HEIGHT - 0.15),
-                center.z + (hash(i * 4 + 2) * 2.0 - 1.0) * BOX_HALF,
+                center.x + (hash(i * 4) * 2.0 - 1.0) * box_half,
+                0.05 + hash(i * 4 + 1) * (height - 0.15),
+                center.z + (hash(i * 4 + 2) * 2.0 - 1.0) * box_half,
                 hash(i * 4 + 3),
             ]);
         }
@@ -471,7 +476,7 @@ impl Dust {
         r.dynamic = true;
         let renderable = scene.add(SceneNode::Renderable(r));
         log::info!("room: {count} dust motes");
-        Self { count, pipeline, bind_group, params, renderable, time: 0.0, previous: Vec::new(), look: DustLook::default() }
+        Self { count, pipeline, bind_group, params, renderable, time: 0.0, previous: Vec::new(), room, look: DustLook::default() }
     }
 
     pub fn count(&self) -> u32 {
@@ -488,24 +493,24 @@ impl Dust {
         }
     }
 
-    /// Step the motes by `dt` round `eye`, pushed by `capsules` (world ends and radius), and
+    /// Step the motes by `dt` (the room's box: the camera's place is unused), pushed by `capsules` (world ends and radius), and
     /// upload what their material reads (`viewport_height` in pixels, `lens` for the bokeh).
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, renderer: &Renderer, scene: &mut Scene, eye: glam::Vec3, capsules: &[(glam::Vec3, glam::Vec3, f32)], dt: f32, viewport_height: f32, lens: DustLens) {
+    pub fn update(&mut self, renderer: &Renderer, scene: &mut Scene, _eye: glam::Vec3, capsules: &[(glam::Vec3, glam::Vec3, f32)], dt: f32, viewport_height: f32, lens: DustLens) {
         if !self.visible(scene) {
             return;
         }
         self.time += dt;
-        // the box: the room (round the camera, clamped to the room, were it smaller)
-        let reach = (HALF - BOX_HALF).max(0.0);
-        let center = glam::Vec3::new(eye.x.clamp(-reach, reach), HEIGHT * 0.5, eye.z.clamp(-reach, reach));
-        let half = [BOX_HALF, HEIGHT * 0.5, BOX_HALF];
+        // the box: the room
+        let Room { half: room_half, height } = self.room;
+        let center = glam::Vec3::new(0.0, height * 0.5, 0.0);
+        let half = [room_half, height * 0.5, room_half];
         let capsules = &capsules[..capsules.len().min(CAPSULES)];
         if self.previous.len() != capsules.len() {
             self.previous = capsules.iter().map(|(a, b, _)| [*a, *b]).collect();
         }
         let look = self.look;
-        let mut params = StepParams { center: [center.x, center.y, center.z, self.time], half: [half[0], half[1], half[2], dt], room: [HALF, HEIGHT, look.speed, capsules.len() as f32], capsules: [Capsule { a: [0.0; 4], b: [0.0; 4], velocity: [0.0; 4] }; CAPSULES] };
+        let mut params = StepParams { center: [center.x, center.y, center.z, self.time], half: [half[0], half[1], half[2], dt], room: [room_half, height, look.speed, capsules.len() as f32], capsules: [Capsule { a: [0.0; 4], b: [0.0; 4], velocity: [0.0; 4] }; CAPSULES] };
         for (k, ((a, b, r), [pa, pb])) in capsules.iter().zip(&self.previous).enumerate() {
             let v = ((*a - *pa) + (*b - *pb)) * 0.5 / dt.max(1e-3);
             let v = if v.length() > 15.0 { glam::Vec3::ZERO } else { v };
@@ -527,7 +532,7 @@ impl Dust {
         let draw = [
             center.x, center.y, center.z, look.size,
             half[0], half[1], half[2], viewport_height,
-            HALF, HEIGHT, look.brightness, look.opacity,
+            room_half, height, look.brightness, look.opacity,
             self.time, look.mix, look.amount, 0.0,
             focus, defocus, on, 0.0,
         ];

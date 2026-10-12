@@ -48,8 +48,9 @@
 
 //!
 //! `www/room.html` is a second page on this module (`start_room`, the [`room`] module): the same
-//! character in a 40 m room lit by ray-traced global illumination, with mirrors, a glass dragon on
-//! an island in a pond, furniture to vault and climb, fog and dust. The character and its
+//! character in a loft gallery authored in Blender (`www/assets/room/room.glb`), lit by ray-traced
+//! global illumination, with mirrors, a glass dragon, an aquarium of SPH water, furniture to vault
+//! and climb, a parkour course, fog and dust. The character and its
 //! controls are shared ([`character`], [`player`]).
 
 pub mod character;

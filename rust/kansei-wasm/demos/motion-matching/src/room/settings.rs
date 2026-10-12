@@ -99,7 +99,6 @@ macro_rules! settings {
 
 settings! {
     // the scene
-    floor: String = "marble".into();
     floor_rough: f32 = 1.0;
     cam: String = "follow".into();
     // global illumination, shadows, reflections
@@ -144,7 +143,7 @@ settings! {
     dust_opacity: f32 = 0.7;
     dust_mix: f32 = 0.3;
     dust_speed: f32 = 0.06;
-    // the pond's water (see `Pond::apply`; `fluid_fill` takes a reset)
+    // the aquarium's water (see `Aquarium::apply`; `fluid_fill` takes a reset)
     fluid: bool = true;
     fluid_show: bool = true;
     fluid_rest: bool = true;
@@ -173,18 +172,17 @@ settings! {
     // drawn as ray-traced glass ("rt": refracted and reflected through the grid, in it for the
     // mirrors) or the screen-space composite ("screen"); the small wind ripples on it
     fluid_render: String = "rt".into();
-    fluid_bed: String = "marble".into();
     fluid_ripples: f32 = 1.0;
     // the water's surface (`Pond::rebuild_surface`, made again on a change): the surface field's
     // voxels along the box's longest side, the marching cubes' triangles at most, a lone
     // particle's droplet radius and the particles' splat radius (m, live), the ray tracing grid's
     // mesh spacing (m)
-    fluid_res: f32 = 256.0;
+    fluid_res: f32 = 128.0;
     fluid_mc_max: f32 = 500000.0;
     fluid_drop: f32 = 0.0409;
     fluid_splat: f32 = 0.1364;
     fluid_rt_spacing: f32 = 0.3;
-    // the fluid's box (world m: the simulation's bounds and the surface's), the pond's own unless
+    // the fluid's box (world m: the simulation's bounds and the surface's), the tank's own unless
     // the URL names them (set at start), and drawn as a wireframe
     fluid_bounds_show: bool = false;
     fluid_min_x: f32 = 0.0;
@@ -198,12 +196,12 @@ settings! {
     caustics: bool = true;
     caustics_photons: f32 = 128.0;
     caustics_blend: f32 = 0.1;
-    // frames between the caustics' updates (four times that with the pond out of view)
+    // frames between the caustics' updates (four times that with the tank and the dragon out of view)
     caustics_every: f32 = 2.0;
     caustics_intensity: f32 = 1.0;
     caustics_view: bool = false;
     // the water's caustics from photons (else a net of caustic lines), the lights' emitters' size
-    caustics_water_photons: bool = false;
+    caustics_water_photons: bool = true;
     caustics_area: bool = false;
     // the light through the glass scaled, its splats narrowed (`RtCausticsEffect::focus_gain`,
     // `focus_sharpen`; 1 and 1 physical)
@@ -268,7 +266,7 @@ settings! {
 
 impl Settings {
     /// The quality preset (the panel's): `game` (the default) traces half the glass's pixels a frame
-    /// and its reflections with the other surfaces', the water's caustics as a net of lines, the
+    /// and its reflections with the other surfaces', the water's caustics by photons through it, the
     /// glass's 3x as bright and half as wide, the photons from the lights' centres, the map fed
     /// every other frame; `high` traces every glass pixel and its reflection, the caustics as
     /// physical (the water's by photons through it), from the lights' emitters, 4x the photons.
@@ -276,7 +274,8 @@ impl Settings {
         let high = quality == "high";
         self.glass_checker = !high;
         self.glass_refl_shared = !high;
-        self.caustics_water_photons = high;
+        // (both: the aquarium throws its caustics on the floor only by photons through it)
+        self.caustics_water_photons = true;
         self.caustics_area = high;
         self.caustics_photons = if high { 256.0 } else { 128.0 };
         self.caustics_every = if high { 1.0 } else { 2.0 };
