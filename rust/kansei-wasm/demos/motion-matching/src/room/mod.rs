@@ -146,6 +146,49 @@ impl Venue {
     }
 }
 
+/// Rendering stops while nothing moves (`idle=0` keeps it going): no input, the camera, the
+/// character and the water still, no setting changed, and `SETTLE` frames gone by since anything
+/// did, for the accumulating effects (TAA, the denoisers, the caustics) to converge on the last
+/// image, which the canvas keeps showing. The character's update still runs each frame, so input
+/// wakes it at once.
+struct Idle {
+    enabled: bool,
+    /// Frames nothing has moved for, and whether rendering has stopped.
+    still: u32,
+    stopped: bool,
+    last: Option<(GVec3, Vec3, Option<GVec3>)>,
+}
+
+/// Frames to let the image converge before stopping (about 2 s at 60 Hz).
+const SETTLE: u32 = 120;
+
+impl Idle {
+    /// This frame's activity: whether to render it.
+    fn render(&mut self, active: bool, eye: GVec3, target: Vec3, at: Option<GVec3>) -> bool {
+        let moved = self.last.as_ref().is_none_or(|(e, t, a)| {
+            // (a millimetre a frame: the follow camera eases after the idle clip's breathing, and
+            // its root sways a hair, neither of which is anyone moving)
+            e.distance(eye) > 2e-3 || (t.x - target.x).abs() + (t.y - target.y).abs() + (t.z - target.z).abs() > 2e-3 || match (a, at) {
+                (Some(a), Some(b)) => a.distance(b) > 2e-3,
+                (None, None) => false,
+                _ => true,
+            }
+        });
+        self.last = Some((eye, target, at));
+        if !self.enabled || active || moved {
+            self.still = 0;
+        } else {
+            self.still = self.still.saturating_add(1);
+        }
+        let stop = self.still > SETTLE;
+        if stop != self.stopped {
+            self.stopped = stop;
+            kansei_wasm::perf::set_idle(stop);
+        }
+        !stop
+    }
+}
+
 /// The glass dragon's tint (the light left after a metre inside).
 const GLASS_TINT: [f32; 3] = [0.95, 0.98, 0.97];
 
@@ -168,6 +211,7 @@ struct RoomState {
     /// them and the water).
     glass_boxes: Vec<(GVec3, GVec3)>,
     venue: Venue,
+    idle: Idle,
     /// The character's bodies or the stand-in (for the deferred switch).
     bodies: Vec<usize>,
     sky: usize,
@@ -535,6 +579,15 @@ impl RoomState {
             }
         }
 
+        // nothing moving: the last image stays on the canvas
+        let eye = *self.camera.position();
+        let active = out.input
+            || frame.resized.is_some()
+            || self.aquarium.as_ref().is_some_and(|a| a.state_name() == "running")
+            || (self.dust.is_some() && self.settings.dust);
+        if !self.idle.render(active, GVec3::new(eye.x, eye.y, eye.z), self.controls.look_target(), out.at) {
+            return;
+        }
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
         // the performance overlay's passes (while it shows)
         kansei_wasm::perf::profile(&mut self.renderer);
@@ -661,6 +714,8 @@ impl RoomState {
     fn apply(&mut self) {
         let s = self.settings.clone();
         let old = self.applied.clone();
+        // (a change shows: render again)
+        self.idle.still = 0;
         let changed = |f: fn(&Settings) -> String| old.as_ref().is_none_or(|o| f(o) != f(&s));
         let queue = self.renderer.queue().clone();
         let deferred = s.shadows == "rt";
@@ -1192,6 +1247,7 @@ where
         dragon,
         glass_boxes,
         venue,
+        idle: Idle { enabled: kansei_wasm::flag("idle", true), still: 0, stopped: false, last: None },
         bodies,
         sky,
         sky_lighting,

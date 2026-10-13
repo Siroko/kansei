@@ -429,6 +429,15 @@ one a piece (its first copy: `karuselli`, `togo`, `panton`, `vase`, `tray`, `mg5
 With the links `link-packs.sh` makes, the page with no parameters walks the mannequin on the best
 private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion).
 
+- **Idle**: both pages stop rendering while nothing moves (`idle=0` keeps them going): no input,
+  the camera, the character's root and the water still (a millimetre a frame: the idle clip's
+  breathing doesn't count), no dust drifting (the room's is on by default), no setting changed.
+  After about 2 s still (120 frames, for TAA, the denoisers and the caustics to converge) the
+  canvas keeps the last image; the character's update still runs each frame, so input wakes it at
+  once. The perf overlay shows "idle" and no GPU time (`kansei_wasm::perf::set_idle`). In the
+  showroom at 1080p: 0.1-0.3 ms of CPU and no GPU work a frame idle, against about 20 ms of GPU
+  and 177 draws rendering.
+
 - **Ambient occlusion** (`src/room/ao.rs`, from the caustics-box demo; the panel's Ambient
   occlusion, `ao`, `ao_intensity`, `ao_radius`, `ao_falloff`, `ao_samples`, `ao_view`): a game's
   contact darkening multiplied into the lit image after the lighting, the reflections and the
