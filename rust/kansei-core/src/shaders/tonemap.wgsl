@@ -28,6 +28,7 @@ const TONEMAP_EXPONENTIAL    : u32 = 6u;
 
 const FLAG_ENCODE_SRGB : u32 = 1u;
 const FLAG_DITHER      : u32 = 2u;
+const FLAG_DITHER_10BIT: u32 = 8u;
 
 const MIDDLE_GREY : f32 = 0.18;
 
@@ -415,10 +416,11 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         let l = luminance(encoded);
         encoded += p.grain * 0.12 * grainNoise(pix) * (4.0 * l * (1.0 - l));
     }
-    // triangular dither of one 8-bit step, so dusk gradients don't band on 8-bit swapchains
+    // triangular dither of one step of the surface (8-bit, or 10 for a float one on an HDR
+    // screen), so dusk gradients and soft highlights don't band
     if ((p.flags & FLAG_DITHER) != 0u) {
         let h = hash3(vec2i(gid.xy), p.frame ^ 0x9e3779b9u);
-        encoded += (h.x + h.y - 1.0) / 255.0;
+        encoded += (h.x + h.y - 1.0) / select(255.0, 1023.0, (p.flags & FLAG_DITHER_10BIT) != 0u);
     }
     encoded = saturate(encoded);
 

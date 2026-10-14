@@ -114,7 +114,7 @@ async function remote({ module, canvas, canvasId, moduleUrl, extensions, probe, 
     // worker's entry and the bindings share its state
     const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module', name: `kansei ${canvasId}` });
     const post = (message, transfer = []) => worker.postMessage(message, transfer);
-    const box = () => ({ width: canvas.clientWidth, height: canvas.clientHeight, ratio: devicePixelRatio });
+    const box = () => ({ width: canvas.clientWidth, height: canvas.clientHeight, ratio: devicePixelRatio, hdr: matchMedia('(dynamic-range: high)').matches });
 
     let started;
     const ready = new Promise((resolve, reject) => (started = { resolve, reject }));

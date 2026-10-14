@@ -14,6 +14,14 @@ use web_sys::{HtmlCanvasElement, OffscreenCanvas};
 
 use crate::worker;
 
+#[wasm_bindgen(module = "/js/canvas.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = screenIsHdr)]
+    fn screen_is_hdr(element: &JsValue) -> bool;
+    #[wasm_bindgen(js_name = extendFloatCanvases)]
+    fn extend_float_canvases();
+}
+
 /// The canvas's drawing buffer is its CSS size times `devicePixelRatio`, at most this much
 /// unless [`Canvas::with_max_pixel_ratio`] or `?dpr=` says otherwise.
 const DEFAULT_MAX_PIXEL_RATIO: f32 = 2.0;
@@ -175,11 +183,22 @@ impl Canvas {
 
     /// A renderer drawing to this canvas, at its size: `config`'s other fields (sample count,
     /// clear colour, limits, ...) as given. [`crate::run`] keeps its frames in flight in check.
+    ///
+    /// On an HDR screen (`(dynamic-range: high)`; `?hdr=1` or `?hdr=0` decides instead) and
+    /// unless `config` names a surface format, the canvas is `rgba16float` with extended tone
+    /// mapping: the compositor gets more than 8 bits (Windows in HDR mode bands an 8-bit canvas's
+    /// gradients), the values as an 8-bit canvas's, so the picture is the same.
+    /// `ToneMapOptions::for_surface(renderer.presentation_format())` encodes and dithers for it.
     #[cfg(target_arch = "wasm32")]
     pub async fn renderer(&self, config: RendererConfig) -> Renderer {
         let (width, height) = self.size();
         let device_pixel_ratio = self.inner.pixel_ratio.get() as f32;
-        let mut renderer = Renderer::new(RendererConfig { width, height, device_pixel_ratio, ..config });
+        let hdr = config.surface_format.is_none() && crate::param("hdr").map_or_else(|| screen_is_hdr(&self.inner.element), |v| v != "0");
+        if hdr {
+            extend_float_canvases();
+        }
+        let surface_format = if hdr { Some(wgpu::TextureFormat::Rgba16Float) } else { config.surface_format };
+        let mut renderer = Renderer::new(RendererConfig { width, height, device_pixel_ratio, surface_format, ..config });
         match &self.inner.target {
             Target::Element(canvas) => renderer.initialize_with_canvas(canvas.clone()).await,
             Target::Offscreen(canvas) => renderer.initialize_with_offscreen_canvas(canvas.clone()).await,
