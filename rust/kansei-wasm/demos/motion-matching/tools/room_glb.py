@@ -6,11 +6,11 @@ Blender exports it as a .glb with JPEG/PNG textures, and this script rewrites th
 page loads it:
 
 - each material's occlusion and metallic-roughness maps as one ORM image (occlusion, roughness,
-  metallic in R, G, B: a grayscale roughness map gets metallic 0, a missing occlusion 1), set as
-  both its occlusion and metallic-roughness texture;
+  metallic in R, G, B: a grayscale roughness map gets metallic 0, a missing occlusion 1; the
+  metallic factor multiplied in), set as both its occlusion and metallic-roughness texture;
 - every image encoded to KTX2 with rust/tools/ktx2 (`kansei-ktx2`): colour as ETC1S, normals and
   ORM as UASTC, at most `--max` texels a side (`--max-data` for normals and ORM; models' 1k maps
-  `--max-small`), referenced through KHR_texture_basisu;
+  `--max-small`) and a multiple of 4 (the GPU formats' blocks), referenced through KHR_texture_basisu;
 - everything else (nodes, extras, lights, cameras, meshes) as it was.
 
 Needs Pillow, `basisu` on PATH and the tool built (`cargo build --release -p kansei-ktx2-tool` in
@@ -106,8 +106,11 @@ def main():
         occ = source(m["occlusionTexture"]) if "occlusionTexture" in m else None
         mr = source(pbr["metallicRoughnessTexture"]) if "metallicRoughnessTexture" in pbr else None
         if occ is not None or mr is not None:
+            # (the metallic factor baked into its map: the page reads the map's metallic as it is,
+            # and a print whose map said 1 under a factor of 0 drew black)
+            metallic = pbr.pop("metallicFactor", 1.0) if mr is not None else 1.0
 
-            def orm(occ=occ, mr=mr):
+            def orm(occ=occ, mr=mr, metallic=metallic):
                 ref = load(mr if mr is not None else occ)
                 size = ref.size
                 o = load(occ).convert("RGB").split()[0].resize(size) if occ is not None else Image.new("L", size, 255)
@@ -117,10 +120,12 @@ def main():
                     r, b = load(mr).convert("L"), Image.new("L", size, 0)
                 else:
                     _, r, b = load(mr).convert("RGB").split()
+                if metallic != 1.0:
+                    b = b.point(lambda v: round(v * metallic))
                 return Image.merge("RGB", (o, r, b))
 
             name = gltf["images"][mr if mr is not None else occ].get("name", "orm")
-            img = add(("orm", occ, mr), "data", name, orm)
+            img = add(("orm", occ, mr, metallic), "data", name, orm)
             t = texture(img)
             pbr["metallicRoughnessTexture"] = {"index": t}
             m["occlusionTexture"] = {"index": t}
@@ -148,6 +153,11 @@ def main():
             side = min(cap, max(im.size))
             if max(im.size) > side:
                 im = im.resize((side * im.size[0] // max(im.size), side * im.size[1] // max(im.size)), Image.LANCZOS)
+            # (a multiple of 4 a side: the GPU's 4 x 4 blocks; a 1457-texel print transcoded to
+            # nothing, its normal map with it, and drew black)
+            aligned = tuple(max(4, (s + 2) // 4 * 4) for s in im.size)
+            if aligned != im.size:
+                im = im.resize(aligned, Image.LANCZOS)
             mode = "RGBA" if kind == "color" and im.mode in ("RGBA", "LA", "P") else "RGB"
             png = os.path.join(tmp, f"{k}.png")
             im.convert(mode).save(png)
