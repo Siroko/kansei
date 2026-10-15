@@ -51,6 +51,10 @@ const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
 const EMISSION_SCALE: f32 = 150.0;
 const MIRROR: [f32; 3] = [0.92, 0.92, 0.92];
 const MIRROR_GI: [f32; 3] = [0.03, 0.03, 0.03];
+/// A metal's albedo in the grid and the voxel GI, as a share of its colour's: they shade a hit as
+/// a diffuse surface, and a metal (no diffuse) mirrors what is round it, much of it more metal; at
+/// its full colour a polished shelf showed white in its own folds, flat as plastic.
+const METAL_GI: f32 = 0.15;
 
 /// The lights as built (scene indices): the sun, the skylight's area light (the first spot light:
 /// `RtShadowsEffect::set_rect_emitter(0, ..)`) and its rectangle, the lamps, the glowing shades,
@@ -122,7 +126,7 @@ pub struct Layout {
     pub tank: Option<Tank>,
     pub caustics: ([f32; 2], [f32; 2]),
     /// The colour maps the reflections' hits read (`assets::albedo_array`, a layer each) and the
-    /// tint each is drawn with.
+    /// tint each has in the grid and the voxel GI (a metal's darker: `METAL_GI`).
     pub albedo_layers: Vec<(wgpu::TextureView, [f32; 3])>,
     pub traversals: Vec<Traversal>,
     /// Triangles drawn, by role, for the log and the README.
@@ -164,6 +168,8 @@ struct RoomMaterial {
     /// Its colour map's layer in the albedo array.
     layer: Option<u8>,
     tint: [f32; 3],
+    /// The tint in the grid and the voxel GI (`METAL_GI` for a metal).
+    gi_tint: [f32; 3],
     double_sided: bool,
     cutout: bool,
     shade: bool,
@@ -288,6 +294,9 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
             let emission = emissive.map(|c| c * strength * EMISSION_SCALE);
             let roughness = if textured_orm { info.roughness } else { 1.0 };
             let reflective = all_reflective || x.get("kansei_reflective").and_then(Value::as_f64).unwrap_or(0.0) > 0.5;
+            // (a textured map's mean metallic as the packer measured it, `kansei_metallic`)
+            let metallic = x.get("kansei_metallic").and_then(Value::as_f64).map_or(if textured_orm { 0.0 } else { info.metallic }, |v| v as f32);
+            let gi_tint = tint.map(|c| c * (1.0 - metallic.clamp(0.0, 1.0) * (1.0 - METAL_GI)));
             let params = PbrParams {
                 tint: [tint[0], tint[1], tint[2], 0.0],
                 surface: [1.0, roughness, 0.0, reflective as u32 as f32],
@@ -297,7 +306,7 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 flags: [0.0, 1.0, 0.0, 0.0],
             };
             let layer = info.base_color_texture.as_ref().map(|_| {
-                layers.push((color.view().clone(), tint));
+                layers.push((color.view().clone(), gi_tint));
                 (layers.len() - 1) as u8
             });
             RoomMaterial {
@@ -306,6 +315,7 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 params,
                 layer,
                 tint,
+                gi_tint,
                 double_sided: m.double_sided() || cutout,
                 cutout,
                 shade: x.get("kansei_shade").and_then(Value::as_f64).unwrap_or(0.0) > 0.5,
@@ -603,7 +613,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
         let m = &docs[key.doc].mats[key.material];
         let label = format!("Room/{}", m.name);
         let geometry = Geometry::new(&label, group.vertices, group.indices);
-        let albedo = m.tint.map(|c| c * 0.6);
+        let albedo = m.gi_tint.map(|c| c * 0.6);
         if m.shade {
             let mut r = Renderable::new(geometry, Material::emissive("LampShade", m.emission)).with_gi(GiSurface::new([0.8; 3]).with_emission(m.emission.map(|c| c * 0.02)));
             r.cast_shadow = false;

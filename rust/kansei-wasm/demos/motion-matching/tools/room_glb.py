@@ -7,7 +7,8 @@ page loads it:
 
 - each material's occlusion and metallic-roughness maps as one ORM image (occlusion, roughness,
   metallic in R, G, B: a grayscale roughness map gets metallic 0, a missing occlusion 1; the
-  metallic factor multiplied in), set as both its occlusion and metallic-roughness texture;
+  metallic factor multiplied in; its mean in the material's extras as `kansei_metallic`), set as
+  both its occlusion and metallic-roughness texture;
 - every image encoded to KTX2 with rust/tools/ktx2 (`kansei-ktx2`): colour as ETC1S, normals and
   ORM as UASTC, at most `--max` texels a side (`--max-data` for normals and ORM; models' 1k maps
   `--max-small`) and a multiple of 4 (the GPU formats' blocks), referenced through KHR_texture_basisu;
@@ -109,6 +110,12 @@ def main():
             # (the metallic factor baked into its map: the page reads the map's metallic as it is,
             # and a print whose map said 1 under a factor of 0 drew black)
             metallic = pbr.pop("metallicFactor", 1.0) if mr is not None else 1.0
+            # (and its mean, for the page: `kansei_metallic` darkens a metal in the ray tracing grid
+            # and the voxel GI, which shade every hit as a diffuse surface)
+            if mr is not None and load(mr).mode not in ("L", "LA", "I", "I;16"):
+                b = load(mr).convert("RGB").split()[2]
+                mean = sum(i * c for i, c in enumerate(b.histogram())) / (255.0 * b.size[0] * b.size[1])
+                m.setdefault("extras", {})["kansei_metallic"] = round(mean * metallic, 3)
 
             def orm(occ=occ, mr=mr, metallic=metallic):
                 ref = load(mr if mr is not None else occ)
