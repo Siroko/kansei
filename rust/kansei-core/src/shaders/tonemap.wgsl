@@ -143,7 +143,20 @@ fn grade(c0: vec3f) -> vec3f {
     let wMid = 1.0 - wShadow - wHighlight;
     let sat = p.saturation * (wShadow * p.shadowSaturation + wMid + wHighlight * p.highlightSaturation);   // per channel
     c = max(mix(vec3f(luma), c, sat), vec3f(0.0));
-    return c * p.gain * (wShadow * p.shadowGain + wMid + wHighlight * p.highlightGain);
+    // the highlight gain scales the luminance above highlightsMin as the weight comes in (its
+    // integral), so the output still rises with the input: gained by the weight itself, a gain
+    // under 1 darkened brighter pixels across the ramp and drew contours on smooth gradients
+    let highlight = (1.0 - wShadow) * highlightRamp(luma) / max(luma, 1e-6);
+    return c * p.gain * (wShadow * p.shadowGain + (1.0 - wShadow) - highlight * (1.0 - p.highlightGain));
+}
+
+// The integral of smoothstep(highlightsMin, 1, l) over l: 0 below the range, the excess over it
+// above.
+fn highlightRamp(l: f32) -> f32 {
+    let a = p.highlightsMin;
+    let w = max(1.0 - a, 1e-4);
+    let t = saturate((l - a) / w);
+    return w * (t * t * t - 0.5 * t * t * t * t) + max(l - a - w, 0.0);
 }
 
 // ── Tone curves (display-linear out) ──
