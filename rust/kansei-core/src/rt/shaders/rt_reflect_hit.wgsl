@@ -119,6 +119,14 @@ fn rtIsGlass(id: u32) -> bool {
     return (bitcast<u32>(kansei_rt_triangles[id * 4u].w) & KANSEI_RT_GLASS) != 0u;
 }
 
+// How far off p's plane, along its normal, a point the camera sees may lie and still be p's
+// surface: a proxy's few centimetres, not the whole lateral tolerance (a grid cell and a half),
+// which took a parallel surface a bay away for it (a shelf's arms, 13 cm apart, each showing the
+// one above it in its reflection).
+fn rtScreenPlaneTolerance(p: vec3f, tolerance: f32) -> f32 {
+    return min(tolerance, max(0.05, 0.004 * distance(rp.invView[3].xyz, p)));
+}
+
 // The lit image at pixel q where it shows the surface at p (within `tolerance`, facing `n`): rgb
 // and 1, or 0.
 fn rtScreenAt(q: vec2u, p: vec3f, n: vec3f, tolerance: f32) -> vec4f {
@@ -127,17 +135,25 @@ fn rtScreenAt(q: vec2u, p: vec3f, n: vec3f, tolerance: f32) -> vec4f {
         return vec4f(0.0);
     }
     // (the glass pass's own image has no glass drawn yet: RT_SCREEN_HAS_GLASS, which the pass sets)
-    if (!RT_SCREEN_HAS_GLASS && rtIsGlassAlbedo(textureLoad(albedoTex, q, 0).a)) {
+    let glass = rtIsGlassAlbedo(textureLoad(albedoTex, q, 0).a);
+    if (!RT_SCREEN_HAS_GLASS && glass) {
         return vec4f(0.0);
     }
     let seen = rtWorldPos((vec2f(q) + 0.5) / rp.fullSize, depth);
-    if (distance(seen, p) > tolerance) {
+    if (distance(seen, p) > tolerance || abs(dot(seen - p, n)) > rtScreenPlaneTolerance(p, tolerance)) {
         return vec4f(0.0);
     }
     // the same surface, not another within the tolerance (a foot's edge over the floor beside
     // it, whose dark pixels would smear along the floor): its normal too
-    let seenN = textureLoad(normalTex, q, 0).xyz * 2.0 - 1.0;
+    let raw = textureLoad(normalTex, q, 0);
+    let seenN = raw.xyz * 2.0 - 1.0;
     if (dot(seenN, seenN) < 1e-4 || dot(normalize(seenN), n) < 0.8) {
+        return vec4f(0.0);
+    }
+    // nor a metal (its F0, stored as 1 - F0 in the normal's alpha, a quarter or more): the image
+    // holds it before its reflection is added, nearly black, and a shelf of polished sheets showed
+    // each arm black in the next one's reflection
+    if (!glass && raw.w < 0.75) {
         return vec4f(0.0);
     }
     return vec4f(textureLoad(screenTex, q, 0).rgb, 1.0);
@@ -189,7 +205,7 @@ fn rtScreenRadianceAt(p: vec3f, n: vec3f, search: bool) -> vec4f {
                 continue;
             }
             let seen = rtWorldPos((vec2f(q) + 0.5) / rp.fullSize, dq);
-            if (abs(dot(seen - p, n)) > tolerance || distance(seen, p) > 1.0) {
+            if (abs(dot(seen - p, n)) > rtScreenPlaneTolerance(p, tolerance) || distance(seen, p) > 1.0) {
                 continue;
             }
             let s = rtScreenAt(q, seen, n, tolerance);

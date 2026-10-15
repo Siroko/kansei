@@ -363,9 +363,10 @@ function refresh(force = false) {
             if (history[key].length > HISTORY) history[key].shift();
         }
     }
-    fields.fps.textContent = fps ? fps.toFixed(0) : '-';
+    fields.fps.textContent = idle ? 'idle' : fps ? fps.toFixed(0) : '-';
+    fields.fps.title = idle ? 'nothing moves: the page renders no frames until something does' : '';
     fields.cpu.textContent = cpu ? cpu.toFixed(2) : '-';
-    fields.gpu.textContent = Number.isFinite(gpu) ? gpu.toFixed(2) : '-';
+    fields.gpu.textContent = idle ? '0' : Number.isFinite(gpu) ? gpu.toFixed(2) : '-';
     fields.gpu.title = profile ? `passes ${profile.gpu_ms.toFixed(2)} ms, first to last ${profile.gpu_span_ms.toFixed(2)} ms` : 'the page forwards no profile (kansei_wasm::perf::profile)';
     fields.mem.textContent = mb(memory.bufferBytes + memory.textureBytes);
     fields.draws.textContent = count(acc.draws / n);
@@ -455,6 +456,12 @@ export function perfClusters(camera, all) {
     clusters.all = all;
 }
 
+// the page renders nothing while still (kansei_wasm::perf::set_idle): the overlay says so, no GPU time
+let idle = false;
+export function perfIdle(on) {
+    idle = !!on;
+}
+
 export function perfProfile(json) {
     try {
         profile = JSON.parse(json);
@@ -470,7 +477,7 @@ if (hasDom) {
         const n = Math.max(last.frames, 1);
         const per = (map) => Object.fromEntries([...map].sort((a, b) => b[1].triangles - a[1].triangles).map(([k, b]) => [k, { passes: b.passes / n, draws: b.draws / n, indirect: b.indirect / n, triangles: b.triangles / n }]));
         return {
-            fps: last.fps, cpu_ms: last.cpu, gpu_ms: last.gpu, draws: last.draws / n, indirect: last.indirect / n, triangles: last.triangles / n, dispatches: last.dispatches / n,
+            idle, fps: last.fps, cpu_ms: last.cpu, gpu_ms: idle ? 0 : last.gpu, draws: last.draws / n, indirect: last.indirect / n, triangles: last.triangles / n, dispatches: last.dispatches / n,
             cluster_triangles: { ...clusters },
             render_passes: last.renderPasses / n, compute_passes: last.computePasses / n, pipelines_made: last.pipelinesMade, since_ms: last.since,
             memory: { ...memory }, by_pass: per(last.byPass), by_material: per(last.byMaterial),

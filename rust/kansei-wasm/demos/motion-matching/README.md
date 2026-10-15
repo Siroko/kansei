@@ -22,6 +22,10 @@ climb, fog and dust (see
 [The room](#the-room)). The character and its controls are shared by the pages (`src/character.rs`,
 `src/player.rs`); the room is `src/room/`.
 
+`www/showroom.html` is a fourth, the room's renderer in a white gallery of furniture pieces, the
+character shown as a mannequin (see [The showroom](#the-showroom)). The two share `www/room.js`
+(the panel) and `src/room/` (`Venue`).
+
 ## A pack
 
 Bake one from glTF clips and a skinned mesh with [`kansei-anim-bake`](../../../kansei-anim-bake/README.md).
@@ -51,14 +55,17 @@ The clips should cover:
 Tag them `idle`, `walk` and `run` for the gait filter (see the bake config). The walk and run
 paces default to 2 and 5 m/s; set `walk=` and `run=` in the URL to match your data.
 
-## A second body
+## More bodies
 
-A character pack (`www/pack/hero.kmm`, or `?hero=<url>`) is optional. It holds a mesh rigged to the
-same skeleton as the motion pack, with its own proportions and textures. `kansei-anim-bake` makes
-one from a glTF mesh and its textures (`character` config).
+Character packs are optional: the hero (`www/pack/hero.kmm`, or `?hero=<url>`) and the mannequin
+(`www/pack/mannequin.kmm`, or `?mannequin=<url>`; [The mannequin](#the-mannequin)), `none` for
+neither. Each holds a mesh rigged to the same skeleton as the motion pack, with its own
+proportions and textures. `kansei-anim-bake` makes one from a glTF mesh and its textures
+(`character` config).
 
-- Loaded, it is shown by default. C switches between it and the motion pack's own mesh, and
-  `?char=hero` or `?char=mannequin` picks one.
+- The hero is shown first (the showroom: the mannequin). C cycles through the bodies and the
+  motion pack's own mesh; `?char=hero`, `?char=mannequin` or `?char=pack` picks one
+  (`char=mannequin` without a mannequin pack is the motion pack's mesh, as it was).
 - A motion pack may then ship without a mesh of its own (no `MESH` section): the character pack's
   body is the only one.
 - The pose is retargeted onto its skeleton (`animation::retarget`: rotations as they are,
@@ -347,14 +354,18 @@ What the page reads from the glb (`layout.rs`), by names and custom properties (
 - `<name>_CUT` (Blender's boolean cutters) and `kansei: preview` (Blender-only stand-ins): skipped;
 - `kansei`: `shell` (one-sided), `mirror` (`kansei_roughness`), `glass`, `aquarium` (the water's
   box, `fill`), `caustics` (the caustics map's floor rectangle), `dragon` (an empty: where, yaw,
-  `length`), `spawn` (an arrow: the character's start and heading);
+  `length`), `spawn` (an arrow: the character's start and heading), `backdrop` (drawn as the sky
+  is: its colour map times its material's `kansei_emission_scale` and the look's sky radiance,
+  unlit, alpha-tested, casting nothing, in neither the grid nor the voxel GI);
 - materials: base colour × factor, normal map × strength, the ORM image, roughness factor, alpha
   clip for cut-outs, emission; `kansei_reflective`, `kansei_macro`, `kansei_shade` (a lamp shade
-  that follows the lamp settings), `kansei_self_lit` on objects;
+  glowing at its own emission, dimmed with the lamp settings against the venue's), `kansei_self_lit`
+  on objects;
 - lights by `kansei_light`: `sun` (its direction sets `sun_elev`/`sun_azim` unless the URL does),
   `skylight` (an area light: its `width`/`length` are the RT shadows' and caustics' emitter, the
-  first spot light), `lamp` (spot lights), `display` (the dragon's spot, the last); their
-  intensities and colours are the page's settings;
+  first spot light), `lamp` (spot lights; `kansei_lamp_scale` their share of the page's lamp
+  intensity), `display` (the dragon's spot, the last); their intensities and colours are the
+  page's settings;
 - cameras `CAM_<name>`: the fixed views (`distance` the orbit's);
 - `kansei_traversal` on parkour pieces: `vault`, `hurdle`, `mantle`, `climb` (checked by
   `room_check()` from `kansei_from` m south of the piece at `kansei_from_y`), and the course's
@@ -399,12 +410,125 @@ the tank (3.2 cm): at 256 the marching cubes' draw alone was 3-9 ms. Before the 
 proxies stood in for the furniture in the grid it traced 43k triangles and `hall` was 21.6 ms;
 with the tank's panes traced as glass, its own view 54 ms.
 
+## The showroom
+
+`www/showroom.html` (`start_showroom`) is a 20 x 14 m white gallery, 5 m high: a polished concrete
+floor, plaster walls (the north one a warm grey backdrop), three tall windows to the west, a long
+skylight over the aisle. The furniture pieces modelled in Blender from the owner's photos (the
+GAME version of each) are arranged as a showroom's vignettes, each on a rug: a lounge (the Togo,
+two Karusellis and two Paimios, shown 1.2 times their size, the owner's call, round a coffee table,
+a plant), a dining group (six MG5s round an oak table), the Wave chairs as the set of four they
+come in, and the Panton and the 406 as accents; on white pedestals on a low plinth, a green Aalto
+vase of ray-traced glass under a narrow display spot, throwing green caustics, and an Aalto steel
+tray; a reading nook (two Limas, serpentine steel shelves); a living corner (a Mérida corner sofa,
+an arc lamp over it with its own spot, a chrome and opal table lamp whose shade glows); IKEA
+shelving units on a wall and as dividers, dressed with art books, magazines and design objects,
+and a smoked glass shelving unit dressed as in the owner's photo; framed artworks; and a park
+outside the west windows (`kansei: backdrop`). The caustics' photons leave only the glass over
+their map (the vase's), not the shelves' glasses and vases. Copies of a piece are instances of its one GAME collection, merged into the same draws (19
+pieces: 164 draws a frame against 160 for the 9 alone; 192k triangles against 127k; 12.8k in the
+ray tracing grid against 9.3k, the copies' 500-triangle proxies). Five track spots (3500 K) light five pieces; daylight comes through the skylight
+and the windows. Everything else is the room's: every mode works (`gi=rt|voxel|voxel+ssgi|probes|
+probes+ssgi|ssgi|off`, `shadows=rt|maps`, `quality=game|high`, `render=forward`), the panel, the
+perf overlay, the character and its parkour.
+`cam=` names a view: `hall`, `aisle`, `outside`, a group (`lounge`, `dining`, `waves`, `accent`),
+one a piece (its first copy: `karuselli`, `togo`, `panton`, `vase`, `tray`, `mg5`, `paimio`,
+`a406`, `wave`) and the chrome close up (`wave_close`, `mg5_close`,
+`karuselli_close`). The looks: `showroom` (the default), `overcast`, `spots only`, `golden hour`.
+With the links `link-packs.sh` makes, the page with no parameters walks the mannequin on the best
+private motion pack (the parkour pack with Mixamo hangs, else GASP's locomotion).
+
+- **Idle**: both pages stop rendering while nothing moves (`idle=0` keeps them going): no input,
+  the camera, the character's root and the water still (a millimetre a frame: the idle clip's
+  breathing doesn't count), no dust drifting (the room's is on by default), no setting changed.
+  After about 2 s still (120 frames, for TAA, the denoisers and the caustics to converge) the
+  canvas keeps the last image; the character's update still runs each frame, so input wakes it at
+  once. The perf overlay shows "idle" and no GPU time (`kansei_wasm::perf::set_idle`). In the
+  showroom at 1080p: 0.1-0.3 ms of CPU and no GPU work a frame idle, against about 20 ms of GPU
+  and 177 draws rendering.
+
+- **Ambient occlusion** (`src/room/ao.rs`, from the caustics-box demo; the panel's Ambient
+  occlusion, `ao`, `ao_intensity`, `ao_radius`, `ao_falloff`, `ao_samples`, `ao_view`): a game's
+  contact darkening multiplied into the lit image after the lighting, the reflections and the
+  glass, in every mode (the GI's own occlusion only darkens its bounce, and most of the light here
+  is direct). On in the showroom, off in the room. About 1.0-1.3 ms at 1080p.
+- **Chrome and lacquer**: every material of the pieces' glb is reflective (traced where its
+  roughness is under 0.45), so the tubes reflect the room. `render=forward` traces nothing: there
+  the room's PBR material reads a probe of the room (`src/room/probe.rs`: six 90° views from the
+  middle of the room at 1.4 m into a GBuffer at start, lit as forward lights them, the character
+  left out, 256² a face with box-filtered mips), along the reflected ray, its mip by the
+  roughness, Fresnel-weighted. Forward stays about 4.5-6.5 ms a frame at 1080p.
+- **The vase**: ray-traced glass tinted by its `KHR_materials_volume`, kept per centimetre (a
+  metre of thin coloured glass leaves less light than an f32 holds) and drawn with
+  `RtGlass::absorption_scale` 50 (the GBuffer's 8-bit tint is the light 2 cm leave), and the same
+  scale for its caustics (`RtCausticsEffect::glass_absorption_scale`). `glass_density` (0.5 here,
+  set at start) scales the authored absorption: the white pedestal's reflections drown a dark
+  green. In `render=forward`, with no glass pass, it is blended over the room (`pbr::forward_glass`).
+- **Placement**: each piece is one instance of its asset's game glb, its origin where it stands
+  (the floor under its middle, the wall behind an artwork); its `_SHADOW` and `_COL`, made at
+  export from where it stands where its asset has none, sit under a plain holder
+  (`PIECE_<name>`) beside the instance, since the glTF exporter misplaces an instance's children.
+
+**The furniture is private.** The pieces depict branded designs and are derived from the owner's
+photos, so they are not in this repository: the page loads the architecture from
+`www/assets/showroom/showroom.glb` (CC0, committed) and the pieces from
+`www/assets/showroom/private/pieces.glb`, a gitignored link to the owner's exports
+(`link-packs.sh` makes it). Without it the hall stands empty but for the pedestals; `pieces=0` leaves the pieces out
+even when linked, for captures that may be published. Don't commit the pieces, a render of them or
+anything made from them unless the owner says so.
+
+The scene is `showroom.blend`, outside the repository (`kansei-assets/showroom/`), edited by hand
+since its first build (its README's "Editing by hand"); `export.sh` there exports it as saved and
+packs it. On the room's contract ([The room's source](#the-rooms-source)) plus:
+
+- each piece is an instance of its asset's game glb, imported once into the file; pieces without
+  `_SHADOW` or `_COL` get them made at export (a ~500-triangle decimated copy, a box, or a box a
+  part for the sofa); a `_SHADOW` on the instance stands for all its meshes (`layout.rs`);
+- the park outside the west windows (`kansei-assets/park_parallax_backdrop`, CC0) is a third glb
+  in the same private folder, `backdrop.glb` (`backdrop=0` leaves it out), its atlas packed as
+  UASTC (ETC1S bands its sky);
+- a transmissive material (`KHR_materials_transmission`) is ray-traced glass whatever its
+  object's `kansei`, tinted by its volume's attenuation (`KHR_materials_volume`) brought to a
+  metre: the vase's green;
+- the skylight's `inner`/`outer` (degrees) set its cone (the room keeps 62 and 86);
+- the page reads several glbs as one room (`layout::Source`), the missing optional ones left out.
+
+```sh
+KANSEI=<this checkout> ~/Documents/dev/kansei-assets/showroom/export.sh
+sh link-packs.sh
+```
+
+With everything placed (2026-10-16: 34 pieces, 74 shelf objects, 5 artworks, the park; 521 draws,
+489k triangles, 27.6k in the grid, about 650 MB of textures), `cam=hall` at 1080p takes about
+25-26 ms of GPU against 13 ms for the empty hall (`pieces=0&backdrop=0`): the GI's trace 7.2 ms
+(2.6), the reflections' 3.2 (0.2), the glass 3.1 (0.3), the caustics 0.8-1.3 every other frame;
+the park costs nothing measurable; `render=forward` 6.8 ms. Earlier, with the first pieces only,
+GPU per frame at 1080p (`dpr=1`, `cam=hall`, no pack, M4 Pro, headless Chrome without vsync, the
+GPU shared with other sessions), without the pieces / with them (the grid's 1650 / 7168
+triangles): `gi=rt` 14.1 / 16.9 ms, `voxel` 12.7 / 14.2, `voxel+ssgi` 14.6 / 16.4, `probes`
+9.9 / 11.4, `probes+ssgi` 12.0 / 13.6, `ssgi` 11.1 / 13.1, `off` 9.4 / 11.0, `shadows=maps`
+10.7 / 13.7, `quality=high` 12.8 / 20.0, `render=forward` 4.3 / 4.5. The mannequin walking (the
+grid rebuilt every frame for its copy) added about 10 ms in `gi=rt`.
+
+### The mannequin
+
+A neutral artist's mannequin, modelled for the showroom (CC0): an egg head with no face, a
+seamless torso, rigid tapered limbs between graphite ball joints, three-segment fingers, 26k
+triangles, a 1024² colour and AO atlas baked in Cycles. `kansei-assets/mannequin/`
+`mannequin_build.py` builds it from the joints of the packs' skeleton (read from the hero
+character's glb) and `mannequin_export.py` bakes it and writes the glb with that skeleton's own
+nodes and inverse bind matrices, so the packs' rotations play on it unchanged; the torso is
+weighted along the spine (and the clavicles at the shoulders), every other part rigidly to its
+bone. `bake-config.json` there makes `export/mannequin.kmm` with `kansei-anim-bake`; `link-packs.sh`
+links it as `www/pack/mannequin.kmm`. The mesh is original, but the pack carries the rig's joint
+frames, so it stays local with the packs.
+
 ## Build and run
 
 ```sh
 cd rust/kansei-wasm/demos/motion-matching
 wasm-pack build --target web --release
-python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html)
+python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html, www/showroom.html)
 ```
 
 The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on the CPU.

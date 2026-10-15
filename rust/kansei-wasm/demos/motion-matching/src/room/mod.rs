@@ -26,11 +26,13 @@
 //! see `settings`. The character is the lake page's (`character`, `player`), drawn by
 //! `look::RoomLit` and standing in the grid as capsules on its bones (`look::Proxy`).
 
+mod ao;
 mod assets;
 mod dust;
 mod layout;
 mod look;
 mod pbr;
+mod probe;
 mod aquarium;
 mod settings;
 
@@ -88,6 +90,110 @@ struct Stats {
     gpu_span_ms: f64,
 }
 
+/// A page on the room's renderer: the loft (`room.html`) or the showroom (`showroom.html`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Venue {
+    Room,
+    Showroom,
+}
+
+impl Venue {
+    /// The glbs it is built from: the showroom's architecture, then its furniture if there (kept
+    /// out of the repository: `www/assets/showroom/private/`, a link to the owner's exports;
+    /// `pieces=0` leaves it out, for captures that may be published).
+    fn sources(self) -> Vec<layout::Source<'static>> {
+        match self {
+            Venue::Room => vec![layout::Source { url: "assets/room/room.glb", required: true, reflective: false }],
+            Venue::Showroom => {
+                let mut sources = vec![layout::Source { url: "assets/showroom/showroom.glb", required: true, reflective: false }];
+                if kansei_wasm::flag("pieces", true) {
+                    sources.push(layout::Source { url: "assets/showroom/private/pieces.glb", required: false, reflective: true });
+                }
+                // the park outside the west windows (CC0, from the same folder; `backdrop=0` leaves
+                // it out)
+                if kansei_wasm::flag("backdrop", true) {
+                    sources.push(layout::Source { url: "assets/showroom/private/backdrop.glb", required: false, reflective: false });
+                }
+                sources
+            }
+        }
+    }
+
+    /// The body shown first (`char=` another).
+    fn body(self) -> &'static str {
+        match self {
+            Venue::Room => "hero",
+            Venue::Showroom => "mannequin",
+        }
+    }
+
+    fn settings(self) -> Settings {
+        match self {
+            Venue::Room => Settings::default(),
+            Venue::Showroom => Settings::showroom(),
+        }
+    }
+
+    /// `RtGlass::absorption_scale`: the room's glass (the dragon, the water) is tinted by the
+    /// metre, the showroom's thin green vase by the 2 cm.
+    fn glass_scale(self) -> f32 {
+        match self {
+            Venue::Room => 1.0,
+            Venue::Showroom => 50.0,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Venue::Room => "room",
+            Venue::Showroom => "showroom",
+        }
+    }
+}
+
+/// Rendering stops while nothing moves (`idle=0` keeps it going): no input, the camera, the
+/// character and the water still, no setting changed, and `SETTLE` frames gone by since anything
+/// did, for the accumulating effects (TAA, the denoisers, the caustics) to converge on the last
+/// image, which the canvas keeps showing. The character's update still runs each frame, so input
+/// wakes it at once.
+struct Idle {
+    enabled: bool,
+    /// Frames nothing has moved for, and whether rendering has stopped.
+    still: u32,
+    stopped: bool,
+    last: Option<(GVec3, Vec3, Option<GVec3>)>,
+}
+
+/// Frames to let the image converge before stopping (about 2 s at 60 Hz).
+const SETTLE: u32 = 120;
+
+impl Idle {
+    /// This frame's activity: whether to render it.
+    fn render(&mut self, active: bool, eye: GVec3, target: Vec3, at: Option<GVec3>) -> bool {
+        let moved = self.last.as_ref().is_none_or(|(e, t, a)| {
+            // (a millimetre a frame: the follow camera eases after the idle clip's breathing, and
+            // its root sways a hair, neither of which is anyone moving)
+            e.distance(eye) > 2e-3 || (t.x - target.x).abs() + (t.y - target.y).abs() + (t.z - target.z).abs() > 2e-3 || match (a, at) {
+                (Some(a), Some(b)) => a.distance(b) > 2e-3,
+                (None, None) => false,
+                _ => true,
+            }
+        });
+        self.last = Some((eye, target, at));
+        if !self.enabled || active || moved {
+            self.still = 0;
+        } else {
+            self.still = self.still.saturating_add(1);
+        }
+        let stop = self.still > SETTLE;
+        if stop != self.stopped {
+            self.stopped = stop;
+            kansei_wasm::perf::set_idle(stop);
+        }
+        !stop
+    }
+}
+
 /// The glass dragon's tint (the light left after a metre inside).
 const GLASS_TINT: [f32; 3] = [0.95, 0.98, 0.97];
 
@@ -106,8 +212,11 @@ struct RoomState {
     dust: Option<Dust>,
     proxy: Option<Proxy>,
     dragon: Option<usize>,
-    /// The box the dragon fills (the caustics aim their photons at it and the water).
-    dragon_box: Option<(GVec3, GVec3)>,
+    /// The boxes the glass fills, the dragon's and the glb's (the caustics aim their photons at
+    /// them and the water).
+    glass_boxes: Vec<(GVec3, GVec3)>,
+    venue: Venue,
+    idle: Idle,
     /// The character's bodies or the stand-in (for the deferred switch).
     bodies: Vec<usize>,
     sky: usize,
@@ -197,7 +306,7 @@ const FORWARD_FILL: [f32; 3] = [220.0, 225.0, 240.0];
 /// The effect chain: the aquarium's surface first (on the lit scene), the ray-traced direct light, the
 /// three GI effects (one enabled), the reflections and the glass, the fog, TAA, motion blur, the
 /// depth of field, bloom and the tone map. `apply` sets them all to the settings.
-fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout, forward: bool) -> Vec<Box<dyn PostProcessingEffect>> {
+fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout, forward: bool, glass_scale: f32) -> Vec<Box<dyn PostProcessingEffect>> {
     let [rect_z, rect_x] = layout.lights.skylight_rect;
     // (the sky lighting lights only the rays that leave through the windows and the skylight: the
     // room's materials add no sky ambient of their own for the GI to take out, so `ambient` 0)
@@ -248,7 +357,7 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     reflections.set_spot_lights(Some(renderer.spot_lights_buffer()));
     // (the glass's reflections traced with the floor's and the mirrors', at their resolution: the
     // water can fill much of the screen)
-    reflections.set_glass(Some(RtGlass { reflections_in_trace: true, ..Default::default() }));
+    reflections.set_glass(Some(RtGlass { reflections_in_trace: true, absorption_scale: glass_scale, ..Default::default() }));
     reflections.set_caustics(Some((&caustics_map.0, &caustics_map.1)));
     reflections.set_sky_lighting(Some(sky));
     effects.push(Box::new(Switch { effect: reflections, on: true }));
@@ -270,8 +379,10 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     effects
 }
 
-/// TAA, motion blur, depth of field, bloom and the tone map.
+/// The ambient occlusion over the lit image, TAA, motion blur, depth of field, bloom and the tone
+/// map.
 fn post_effects(renderer: &Renderer, effects: &mut Vec<Box<dyn PostProcessingEffect>>) {
+    effects.push(Box::new(ao::AoEffect::new()));
     effects.push(Box::new(Switch { effect: TemporalAAEffect::new(TemporalAAOptions::default()), on: true }));
     effects.push(Box::new(Switch { effect: MotionBlurEffect::new(MotionBlurOptions::default()), on: false }));
     effects.push(Box::new(Switch { effect: CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions::default()), on: false }));
@@ -446,7 +557,7 @@ impl RoomState {
             x.update_lights(lights.iter().copied());
             x.set_time(self.time);
             let water_box = self.aquarium.as_ref().map(Aquarium::water_box);
-            let mut casters: Vec<(GVec3, GVec3)> = self.dragon_box.into_iter().collect();
+            let mut casters: Vec<(GVec3, GVec3)> = self.glass_boxes.clone();
             if let (Some(b), true) = (water_box, water.is_some() && x.water_photons) {
                 casters.push(b);
             }
@@ -454,7 +565,7 @@ impl RoomState {
             x.set_water(water);
             // fed every `caustics_every` frames, four times as seldom with the tank and the dragon
             // out of view (the mirrors may still show them)
-            let boxes: Vec<(GVec3, GVec3)> = water_box.into_iter().chain(self.dragon_box).collect();
+            let boxes: Vec<(GVec3, GVec3)> = water_box.into_iter().chain(self.glass_boxes.iter().copied()).collect();
             let (lo, hi) = boxes.iter().fold((GVec3::splat(f32::MAX), GVec3::splat(f32::MIN)), |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)));
             let seen = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), lo, hi);
             let every = self.settings.caustics_every.round().clamp(1.0, 16.0) as u32;
@@ -473,6 +584,15 @@ impl RoomState {
             }
         }
 
+        // nothing moving: the last image stays on the canvas
+        let eye = *self.camera.position();
+        let active = out.input
+            || frame.resized.is_some()
+            || self.aquarium.as_ref().is_some_and(|a| a.state_name() == "running")
+            || (self.dust.is_some() && self.settings.dust);
+        if !self.idle.render(active, GVec3::new(eye.x, eye.y, eye.z), self.controls.look_target(), out.at) {
+            return;
+        }
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
         // the performance overlay's passes (while it shows)
         kansei_wasm::perf::profile(&mut self.renderer);
@@ -565,7 +685,8 @@ impl RoomState {
             format!("\naquarium {} particles, {}{speed}", p.particles(), p.state_name())
         });
         format!(
-            "room   {} · GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            "{}   {} · GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            self.venue.name(),
             if s.render == "forward" { "forward (no ray tracing, no GI: render=hybrid for the full room)" } else { "hybrid" },
             s.gi,
             if s.shadows == "rt" { "ray traced" } else { "shadow maps" },
@@ -598,6 +719,8 @@ impl RoomState {
     fn apply(&mut self) {
         let s = self.settings.clone();
         let old = self.applied.clone();
+        // (a change shows: render again)
+        self.idle.still = 0;
         let changed = |f: fn(&Settings) -> String| old.as_ref().is_none_or(|o| f(o) != f(&s));
         let queue = self.renderer.queue().clone();
         let deferred = s.shadows == "rt";
@@ -644,10 +767,10 @@ impl RoomState {
             l.intensity = if s.sky { s.sky_cd } else { 0.0 };
         }
         let lamp_color = kelvin(s.lamp_temp);
-        for &lamp in &self.layout.lights.lamps {
+        for &(lamp, scale) in &self.layout.lights.lamps {
             if let Some(Light::Spot(l)) = self.scene.get_light_mut(lamp) {
                 l.color = Vec3::new(lamp_color[0], lamp_color[1], lamp_color[2]);
-                l.intensity = if s.lamps { s.lamp_cd } else { 0.0 };
+                l.intensity = if s.lamps { s.lamp_cd * scale } else { 0.0 };
                 // ray traced, the lamps need no shadow map (only the fog and the GI's hits read
                 // them, and the skylight's is the one that shows there): four fewer redraws of
                 // the room a frame
@@ -658,10 +781,11 @@ impl RoomState {
         if let Some(Light::Spot(l)) = self.scene.get_light_mut(self.layout.lights.display) {
             l.intensity = if s.display_spot { s.display_cd } else { 0.0 };
         }
-        let shade = lamp_color.map(|c| c * layout::SHADE_RADIANCE * if s.lamps { s.lamp_cd / layout::LAMP_CD } else { 0.02 });
-        for &index in &self.layout.lights.shades {
+        // (each shade at its own radiance, with the lamps' intensity against the venue's)
+        let dim = if s.lamps { s.lamp_cd / self.venue.settings().lamp_cd } else { 0.02 };
+        for &(index, radiance) in &self.layout.lights.shades {
             if let Some(r) = self.scene.get_renderable_mut(index) {
-                r.material.set_standard_lit(&self.renderer, &StandardLitOptions::emissive(shade));
+                r.material.set_standard_lit(&self.renderer, &StandardLitOptions::emissive(lamp_color.map(|c| c * radiance * dim)));
             }
         }
         // the sky behind the windows, and what the rays leaving through them find
@@ -673,6 +797,13 @@ impl RoomState {
                 r.material_dirty = true;
             }
             queue.write_buffer(&self.sky_lighting, 0, bytemuck::cast_slice(&sky_lighting(zenith, horizon)));
+            // the park outside follows the sky
+            for &(index, scale) in &self.layout.backdrops {
+                if let Some(buffer) = self.scene.get_renderable(index).and_then(|r| r.material.bindable_buffer(0)) {
+                    // (the radiance only: the cutoff after it stays as built)
+                    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&[s.sky_radiance * scale; 3]));
+                }
+            }
         }
 
         // shadows, GI, reflections
@@ -745,7 +876,7 @@ impl RoomState {
             // the voxels' irradiance at the hits the camera doesn't see, brought to the hybrid
             // RT GI's level (`refl_indirect`) so a mirror's far floor matches the floor in view
             e.effect.hit_indirect_scale = if gi == "rt" { s.refl_indirect } else { 1.0 };
-            e.effect.set_glass(Some(RtGlass { reflections_in_trace: s.glass_refl_shared, checkerboard: s.glass_checker, ..Default::default() }));
+            e.effect.set_glass(Some(RtGlass { reflections_in_trace: s.glass_refl_shared, checkerboard: s.glass_checker, absorption_scale: self.venue.glass_scale(), ..Default::default() }));
         }
         if let Some(e) = self.volume.effect_mut::<Switch<RtCausticsEffect>>() {
             // (off, the reflections' and the water's lookups of it too)
@@ -758,7 +889,10 @@ impl RoomState {
             e.effect.area_emitters = s.caustics_area;
             e.effect.focus_gain = s.caustics_glass_gain.max(0.0);
             e.effect.focus_sharpen = s.caustics_sharpen.clamp(0.1, 1.0);
-            e.effect.set_glass(s.glass_ior, GLASS_TINT);
+            // (the dragon's glass, else the glb's: the showroom's green vase)
+            let (tint, scale) = if self.dragon.is_some() { (GLASS_TINT, 1.0) } else { (self.layout.glass_tint.unwrap_or(GLASS_TINT), self.venue.glass_scale()) };
+            e.effect.set_glass(s.glass_ior, tint);
+            e.effect.glass_absorption_scale = scale;
         }
         for (k, &(mirror, _)) in self.layout.mirrors.iter().enumerate() {
             let roughness = if k == 0 { s.mirror_rough } else { s.mirror2_rough };
@@ -819,6 +953,16 @@ impl RoomState {
             o.grain = s.grain;
             o.chromatic_aberration = s.chromatic;
             total = t.total_exposure();
+        }
+        if let Some(e) = self.volume.effect_mut::<ao::AoEffect>() {
+            e.enabled = s.ao;
+            e.radius = s.ao_radius.clamp(0.02, 4.0);
+            e.intensity = s.ao_intensity.clamp(0.0, 6.0);
+            e.falloff = s.ao_falloff.clamp(0.0, 8.0);
+            e.samples = s.ao_samples.round().clamp(1.0, 32.0) as u32;
+            e.debug = s.ao_view;
+            // (the occlusion alone shown about mid grey at the exposure)
+            e.white = 0.5 / total.max(1e-9);
         }
         if let Some(e) = self.volume.effect_mut::<Switch<TemporalAAEffect>>() {
             e.on = s.taa;
@@ -935,23 +1079,51 @@ where
     L: Fn(String) -> F,
     F: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
+    start_venue(canvas_id, load, Venue::Room).await
+}
+
+/// The showroom page (`www/showroom.html`) on canvas `canvas_id`: the room's renderer in a white
+/// gallery of furniture (`assets/showroom/showroom.glb`, the pieces from the private
+/// `assets/showroom/private/pieces.glb`), the mannequin shown first.
+#[wasm_bindgen]
+pub async fn start_showroom(canvas_id: &str) -> Result<(), JsValue> {
+    start_showroom_with_loader(canvas_id, |url: String| async move { fetch_bytes(&url).await }).await
+}
+
+/// `start_showroom`, with the packs' bytes from `load` (see `start_with_loader`).
+pub async fn start_showroom_with_loader<L, F>(canvas_id: &str, load: L) -> Result<(), JsValue>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    start_venue(canvas_id, load, Venue::Showroom).await
+}
+
+async fn start_venue<L, F>(canvas_id: &str, load: L, venue: Venue) -> Result<(), JsValue>
+where
+    L: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
     let canvas = Canvas::find(canvas_id)?;
     let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
-    // the skylight, four lamps and the display spot cast shadows (the maps feed the fog, the
-    // voxels and the fallback)
-    renderer.enable_spot_shadows(2048, 6);
+    // the skylight, the lamps (four in the room, five in the showroom) and the display spot cast
+    // shadows (the maps feed the fog, the voxels and the fallback)
+    renderer.enable_spot_shadows(2048, if venue == Venue::Showroom { 7 } else { 6 });
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
-    let mut settings = Settings::from_url();
+    let mut settings = Settings::from_url(venue.settings());
     let deferred = settings.shadows == "rt";
     // forward (`render=forward`): no voxel GI or ray tracing grid at all, a flat fill for the GI
     let forward = settings.render == "forward";
     layout::set_fill(if forward { FORWARD_FILL } else { [0.0; 3] });
+    // forward's reflections: the room's probe, bound now, captured once the room stands
+    let probe = forward.then(|| probe::Probe::new(&renderer));
+    pbr::set_probe(probe.as_ref().map(probe::Probe::parts));
 
     // the room (`www/assets/room/room.glb`, from Blender), then voxel GI and the grid over its box
-    set_text("hud", "Loading the room …");
+    set_text("hud", &format!("Loading the {} …", venue.name()));
     let mut scene = Scene::new();
-    let layout = layout::load(&renderer, &mut scene, deferred).await.map_err(|e| {
-        set_text("hud", &format!("The room didn't load: {e}"));
+    let layout = layout::load(&renderer, &mut scene, deferred, &venue.sources(), venue.glass_scale(), settings.glass_density).await.map_err(|e| {
+        set_text("hud", &format!("The {} didn't load: {e}", venue.name()));
         JsValue::from_str(&e)
     })?;
     let bounds = room_bounds(&layout);
@@ -981,10 +1153,16 @@ where
         }
         _ => (None, None),
     };
-    let (dragon, dragon_box) = match kansei_wasm::flag("dragon", true) {
-        true => add_dragon(&mut scene, layout.dragon).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
-        false => (None, None),
+    let (dragon, dragon_box) = match (kansei_wasm::flag("dragon", true), layout.dragon) {
+        (true, Some(at)) => add_dragon(&mut scene, at).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
+        _ => (None, None),
     };
+    // (the caustics' casters: the glass over their map's rectangle, the rest's light lands where
+    // nothing reads it: the showroom's shelves of glasses and vases would cost the photons for
+    // nothing)
+    let ([x0, z0], [x1, z1]) = layout.caustics;
+    let over_map = |(lo, hi): &(GVec3, GVec3)| lo.x <= x1 && hi.x >= x0 && lo.z <= z1 && hi.z >= z0;
+    let glass_boxes: Vec<(GVec3, GVec3)> = dragon_box.into_iter().chain(layout.glass.iter().copied().filter(over_map)).collect();
     // the sky behind the windows and the skylight (its colours set by `apply`)
     let mut sky = Renderable::new(SphereGeometry::new(300.0, 32, 16), Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [1.0; 3], horizon: [1.0; 3], ground: [0.2; 3], curve: 0.5 }));
     sky.cast_shadow = false;
@@ -1000,7 +1178,7 @@ where
 
     // the character (or, without a pack, a capsule standing in for it), at the spawn marker
     let page_note = "\n\nThe room renders without one: a capsule stands in for the character.";
-    let mut character = load_character(&renderer, &mut scene, &layout.collision, &RoomLit { deferred }, &load, page_note).await;
+    let mut character = load_character(&renderer, &mut scene, &layout.collision, &RoomLit { deferred }, &load, page_note, venue.body()).await;
     let mut bodies = Vec::new();
     if let Some(c) = &mut character {
         // the parkour the room's tagged pieces give: hangs and shimmies on its ledges, wall runs,
@@ -1014,17 +1192,25 @@ where
     } else {
         bodies.push(look::stand_in(&mut scene, layout.spawn.0, deferred));
     }
-    let hero_layer = layout.albedo_layers.len() as u8;
-    let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, hero_layer));
+    let body_layers = layout.albedo_layers.len() as u8;
+    let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, body_layers));
 
-    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward));
-    // the albedo the reflections' hits read: the surfaces' colour maps and the hero's
-    let hero = character.as_ref().and_then(|c| c.bodies.iter().find_map(|b| b.base_color.as_ref())).map(|(img, _)| {
-        let mut t = kansei_core::buffers::Texture::from_image("Room/HeroAlbedo", img, true);
+    if let Some(probe) = &probe {
+        // from the middle of the room at eye height, the character left out
+        let (lo, hi) = (layout.min, layout.max);
+        let at = GVec3::new((lo.x + hi.x) * 0.5, lo.y + 1.4, (lo.z + hi.z) * 0.5);
+        probe.capture(&mut renderer, &mut scene, at, &bodies);
+        log::info!("{}: forward probe captured at {at:?}", venue.name());
+    }
+    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward, venue.glass_scale()));
+    // the albedo the reflections' hits read: the surfaces' colour maps and the bodies' (each
+    // textured body a layer after the surfaces', in order: `Proxy::new`)
+    let body_maps: Vec<kansei_core::buffers::Texture> = character.iter().flat_map(|c| c.bodies.iter().filter_map(|b| b.base_color.as_ref())).map(|(img, _)| {
+        let mut t = kansei_core::buffers::Texture::from_image("Room/BodyAlbedo", img, true);
         t.initialize_with_data(renderer.device(), renderer.queue());
         t
-    });
-    let sources: Vec<&wgpu::TextureView> = layout.albedo_layers.iter().map(|(v, _)| v).chain(hero.iter().filter_map(|t| t.view())).collect();
+    }).collect();
+    let sources: Vec<&wgpu::TextureView> = layout.albedo_layers.iter().map(|(v, _)| v).chain(body_maps.iter().filter_map(|t| t.view())).collect();
     let (albedo_texture, albedo) = assets::albedo_array(&renderer, &sources);
     if let Some(e) = volume.effect_mut::<Switch<RtReflectionsEffect>>() {
         e.effect.set_albedo_texture(Some(&albedo));
@@ -1077,7 +1263,9 @@ where
         dust,
         proxy,
         dragon,
-        dragon_box,
+        glass_boxes,
+        venue,
+        idle: Idle { enabled: kansei_wasm::flag("idle", true), still: 0, stopped: false, last: None },
         bodies,
         sky,
         sky_lighting,
@@ -1094,7 +1282,7 @@ where
         state.renderer.set_profiling(true);
         state.profile_since = kansei_wasm::now();
     }
-    log::info!("Kansei — Motion Matching room (WASM) ready: character {}, gi {}, shadows {}", state.player.character.is_some(), state.settings.gi, state.settings.shadows);
+    log::info!("Kansei — Motion Matching {} (WASM) ready: character {}, gi {}, shadows {}", venue.name(), state.player.character.is_some(), state.settings.gi, state.settings.shadows);
     let state = Rc::new(RefCell::new(state));
     set_page(state.clone());
     ROOM.with(|s| *s.borrow_mut() = Some(state.clone()));

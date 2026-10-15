@@ -74,8 +74,8 @@ pub struct Body {
     pub base_color: Option<(image::RgbaImage, [f32; 3])>,
 }
 
-/// A character pack as a body: its textured mesh, hidden until shown.
-fn hero_body(scene: &mut Scene, pack: CharacterPack, db: &Database, look: &dyn BodyLook) -> Result<Body, String> {
+/// A character pack as a body named `name`: its textured mesh, hidden until shown.
+fn pack_body(scene: &mut Scene, name: &'static str, pack: CharacterPack, db: &Database, look: &dyn BodyLook) -> Result<Body, String> {
     let retarget = Retarget::new(&db.skeleton, &pack.skeleton, &Retarget::UNREAL_KEEP);
     let texture = |name: &str, srgb: bool, fallback: [u8; 4]| -> Result<Texture, String> {
         let image = match pack.image(name) {
@@ -94,12 +94,13 @@ fn hero_body(scene: &mut Scene, pack: CharacterPack, db: &Database, look: &dyn B
     let mesh = first.mesh;
     let mut palette = BonePalette::new(mesh.skin_joints.len());
     palette.update(&mesh, &pack.skeleton.rest_model());
-    let material = look.textured("Hero", first.color, &mesh, &palette, textures);
+    let label = format!("{}{}", name[..1].to_uppercase(), &name[1..]);
+    let material = look.textured(&label, first.color, &mesh, &palette, textures);
     let mut r = Renderable::new(mesh.geometry(), material);
     r.dynamic = true;
     r.visible = false;
     let index = scene.add(SceneNode::Renderable(r));
-    log::info!("character pack: {} joints, {} vertices, {} triangles", pack.skeleton.len(), mesh.vertices.len(), mesh.indices.len() / 3);
+    log::info!("character pack {name}: {} joints, {} vertices, {} triangles", pack.skeleton.len(), mesh.vertices.len(), mesh.indices.len() / 3);
     let linear = |c: u8| {
         let c = c as f32 / 255.0;
         if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
@@ -110,7 +111,7 @@ fn hero_body(scene: &mut Scene, pack: CharacterPack, db: &Database, look: &dyn B
         let mean = [0, 1, 2].map(|i| sum[i] / n * first.color[i]);
         (img, mean)
     });
-    Ok(Body { name: "hero", mesh, palette, index, display: Some((pack.skeleton, retarget)), base_color })
+    Ok(Body { name, mesh, palette, index, display: Some((pack.skeleton, retarget)), base_color })
 }
 
 /// The character: its database, matcher, bodies, and the debug markers.
@@ -130,7 +131,9 @@ pub struct Character {
 }
 
 impl Character {
-    pub fn new(renderer: &Renderer, scene: &mut Scene, pack: MotionPack, hero: Option<CharacterPack>, gait: bool, look: &dyn BodyLook) -> Result<Self, String> {
+    /// `packs`: the character packs to show it as besides the pack's own mesh, by name (`hero`,
+    /// `mannequin`), in C's order.
+    pub fn new(renderer: &Renderer, scene: &mut Scene, pack: MotionPack, packs: Vec<(&'static str, CharacterPack)>, gait: bool, look: &dyn BodyLook) -> Result<Self, String> {
         let tags: Vec<String> = pack.meta("tags").unwrap_or("").split(',').map(str::to_string).collect();
         let MotionPack { database: db, meshes, actions, .. } = pack;
         // the pack's own mesh, when it has one (a pack may ship without, for a character pack's body)
@@ -142,12 +145,12 @@ impl Character {
             let mut r = Renderable::new(mesh.geometry(), look.plain("Character", first.color, &mesh, &palette));
             r.dynamic = true;
             let index = scene.add(SceneNode::Renderable(r));
-            bodies.push(Body { name: "the pack's mesh", mesh, palette, index, display: None, base_color: None });
+            bodies.push(Body { name: "pack", mesh, palette, index, display: None, base_color: None });
         }
-        if let Some(pack) = hero {
-            match hero_body(scene, pack, &db, look) {
+        for (name, pack) in packs {
+            match pack_body(scene, name, pack, &db, look) {
                 Ok(b) => bodies.push(b),
-                Err(e) => log::warn!("character pack left out: {e}"),
+                Err(e) => log::warn!("character pack {name} left out: {e}"),
             }
         }
         if bodies.is_empty() {

@@ -23,7 +23,7 @@ log = "0.4"
 optimesh = "1.1"
 # the room's glb: its nodes' names and extras, lights and cameras (kansei-core's loader reads the
 # meshes and textures)
-gltf = { version = "1", features = ["extras", "names", "KHR_lights_punctual", "KHR_materials_emissive_strength", "extensions", "utils", "allow_empty_texture"] }
+gltf = { version = "1", features = ["extras", "names", "KHR_lights_punctual", "KHR_materials_emissive_strength", "KHR_materials_transmission", "KHR_materials_volume", "extensions", "utils", "allow_empty_texture"] }
 serde_json = "1"
 
 [workspace]

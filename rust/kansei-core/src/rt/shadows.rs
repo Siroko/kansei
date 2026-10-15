@@ -219,7 +219,8 @@ impl RtShadowsEffect {
                 Light::Spot(l) => {
                     let c = l.effective_color();
                     let d = glam::Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or_zero();
-                    let (inner, outer) = l.cone();
+                    // (`cone` is outer then inner)
+                    let (outer, inner) = l.cone();
                     let mut g = LightGpu {
                         position: [l.position.x, l.position.y, l.position.z],
                         kind: 1,

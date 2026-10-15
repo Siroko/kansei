@@ -32,15 +32,16 @@ function post(message) {
 }
 
 // The page's canvas element as listeners see it: an event target with the canvas's CSS size
-// (clientWidth, clientHeight) and the page's device pixel ratio. Adding a listener asks the page
-// to forward that event type.
+// (clientWidth, clientHeight), the page's device pixel ratio and whether its screen is HDR.
+// Adding a listener asks the page to forward that event type.
 class CanvasStandIn extends EventTarget {
-    constructor(id, width, height, ratio) {
+    constructor(id, width, height, ratio, hdr) {
         super();
         this.id = id;
         this.clientWidth = width;
         this.clientHeight = height;
         this.devicePixelRatio = ratio;
+        this.dynamicRangeHigh = hdr;
         this.style = {};
     }
 
@@ -72,7 +73,7 @@ function dispatch(target, data) {
 async function boot(message) {
     page = { search: message.search, base: message.base };
     pageTicks = message.ticks;
-    const element = new CanvasStandIn(message.canvasId, message.width, message.height, message.ratio);
+    const element = new CanvasStandIn(message.canvasId, message.width, message.height, message.ratio, message.hdr);
     canvases.set(message.canvasId, { canvas: message.canvas, element });
     if (message.probe) probe = frameProbe();
     const wasm = await import(message.module);
@@ -109,6 +110,7 @@ function onMessage({ data }) {
             element.clientWidth = data.width;
             element.clientHeight = data.height;
             element.devicePixelRatio = data.ratio;
+            element.dynamicRangeHigh = data.hdr;
             element.dispatchEvent(new Event('kansei-resize'));
             break;
         }

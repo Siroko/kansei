@@ -319,7 +319,7 @@ class CinematicDepthOfFieldEffect extends PostProcessingEffect {
             postfilter: bgl('CinematicDoF/PostfilterBGL', [
                 tex(0), tex(1), storage(2), storage(3), uniform(4), buffer(5, true), buffer(6, true), buffer(7, true),
             ]),
-            composite: bgl('CinematicDoF/CompositeBGL', [tex(0), depth(1), tex(2), tex(3), storage(4), uniform(5)]),
+            composite: bgl('CinematicDoF/CompositeBGL', [tex(0), depth(1), tex(2), tex(3), storage(4), uniform(5), tex(6)]),
         };
         const modules = new Map<string, GPUShaderModule>();
         const pipeline = (label: string, code: string, entryPoint: string, layout: GPUBindGroupLayout) => {
@@ -537,7 +537,7 @@ class CinematicDepthOfFieldEffect extends PostProcessingEffect {
             entries: resources.map((resource, binding) => ({ binding, resource })),
         });
         this._prefilter = group(layouts.prefilter, [input.createView(), depth.createView(), t.near.raw, params, t.far.raw, t.tiles]);
-        this._composite = group(layouts.composite, [input.createView(), depth.createView(), t.bgFiltered, t.fgFiltered, output.createView(), params]);
+        this._composite = group(layouts.composite, [input.createView(), depth.createView(), t.bgFiltered, t.fgFiltered, output.createView(), params, t.tilesDilated]);
         this._currentInput = input;
         this._currentDepth = depth;
         this._currentOutput = output;

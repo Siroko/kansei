@@ -204,7 +204,16 @@ fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> KanseiGBufferO
         // direct light from rt::RtShadowsEffect (its roughness and F0 in the GBuffer)
         return kansei_gbuffer_out_rt_lit(fill, pbr.emissive.rgb, s.n, diffuse, s.roughness, f0, reflective);
     }
-    let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill;
+    // (`render=forward` traces no reflections: the room's probe (`probe::PROBE_WGSL`) along the
+    // reflected ray, its mip by the roughness, Fresnel-weighted; only where the forward fill is on)
+    var env = vec3f(0.0);
+    if (any(pbr.ambient.rgb > vec3f(0.0))) {
+        let r = reflect(-v, s.n);
+        let ndv = clamp(dot(s.n, v), 0.0, 1.0);
+        let fresnel = f0 + (max(1.0 - s.roughness, f0) - f0) * pow(1.0 - ndv, 5.0);
+        env = probe_radiance(r, s.roughness) * fresnel * s.occlusion;
+    }
+    let lit = pbr_direct(in.world, s.n, v, s.albedo, s.roughness, s.metallic, in.clip.xy) * mix(1.0, s.occlusion, 0.5) + fill + env;
     if (reflective) {
         return kansei_gbuffer_out_specular(lit, pbr.emissive.rgb, s.n, diffuse, f0, s.roughness);
     }
@@ -233,9 +242,19 @@ impl PbrMaps {
     }
 }
 
+thread_local! {
+    /// The room's probe (texture and its array view) the materials made from now on bind.
+    static PROBE: std::cell::RefCell<Option<(wgpu::Texture, wgpu::TextureView)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Bind `probe` (its texture and array view) in the materials made from now on.
+pub fn set_probe(probe: Option<(wgpu::Texture, wgpu::TextureView)>) {
+    PROBE.with(|p| *p.borrow_mut() = probe);
+}
+
 /// The shader: the light and GBuffer chunks, then the material.
 fn shader() -> String {
-    format!("{}\n{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{PBR_WGSL}", lit_wgsl())
+    format!("{}\n{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{}\n{PBR_WGSL}", lit_wgsl(), super::probe::PROBE_WGSL)
 }
 
 /// A PBR material of `maps` drawn as `params` says (`double_sided` for leaves and cards; a
@@ -258,6 +277,8 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
             Binding::texture_2d(2, ShaderStages::FRAGMENT),
             Binding::texture_2d(3, ShaderStages::FRAGMENT),
             Binding::sampler(4, ShaderStages::FRAGMENT),
+            Binding::texture_2d_array(5, ShaderStages::FRAGMENT),
+            Binding::sampler(6, ShaderStages::FRAGMENT),
         ],
         options,
     );
@@ -266,5 +287,120 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
     material.set_bindable(2, maps.normal);
     material.set_bindable(3, maps.orm);
     material.set_bindable(4, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    // the room's probe (`set_probe`; black where none: only forward reads it)
+    let probe = PROBE.with(|p| p.borrow().clone()).map(|(t, v)| Texture::from_view("Room/Probe", t, v)).unwrap_or_else(|| { let black: &[u8] = &[0, 0, 0, 255]; Texture::from_rgba_layers("Room/NoProbe", 1, 1, &[black; 6]) });
+    material.set_bindable(5, probe);
+    material.set_bindable(6, super::probe::Probe::sampler());
+    material
+}
+
+/// A backdrop (`layout`'s `kansei: backdrop`: the showroom's park outside its windows) drawn as the
+/// sky is: its colour map's texels times a radiance (cd/m²), unlit, cut out below an alpha cutoff,
+/// with no albedo (the GI adds nothing to it) and its normal toward the eye.
+const BACKDROP_WGSL: &str = r#"
+struct Backdrop { radiance: vec4f, cutoff: vec4f };
+@group(0) @binding(0) var<uniform> backdrop: Backdrop;
+@group(0) @binding(1) var color_map: texture_2d<f32>;
+@group(0) @binding(2) var maps: sampler;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4f;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4f;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4f;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4f;
+
+struct VIn { @location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f };
+struct VOut { @builtin(position) @invariant clip: vec4f, @location(0) world: vec3f, @location(1) uv: vec2f };
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let world = world_matrix * v.position;
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.uv = v.uv;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
+    let c = textureSample(color_map, maps, in.uv);
+    if (c.a < backdrop.cutoff.x) { discard; }
+    let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+    let eye = -(transpose(view3) * view_matrix[3].xyz);
+    let d = normalize(in.world - eye);
+    return kansei_gbuffer_out(c.rgb * backdrop.radiance.rgb, vec3f(0.0), -d, vec3f(0.0));
+}
+"#;
+
+/// `BACKDROP_WGSL`'s uniform: the radiance a texel of 1 stands for (cd/m²) and the alpha cutoff.
+pub fn backdrop_params(radiance: f32, cutoff: f32) -> [f32; 8] {
+    [radiance, radiance, radiance, 0.0, cutoff, 0.0, 0.0, 0.0]
+}
+
+/// A backdrop material (`BACKDROP_WGSL`) of `color` at `radiance` (cd/m² for a texel of 1), cut out
+/// below `cutoff`.
+pub fn backdrop(label: &str, color: Texture, cutoff: f32, radiance: f32) -> Material {
+    let options = MaterialOptions { mrt_output_count: Some(4), cull_mode: CullMode::None, ..Default::default() };
+    let mut material = Material::new(
+        label,
+        &format!("{GBUFFER_OUT_WGSL}\n{BACKDROP_WGSL}"),
+        vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::texture_2d(1, ShaderStages::FRAGMENT), Binding::sampler(2, ShaderStages::FRAGMENT)],
+        options,
+    );
+    material.set_uniform_bindable(0, &format!("{label}/Backdrop"), &backdrop_params(radiance, cutoff));
+    material.set_bindable(1, color);
+    material.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    material
+}
+
+/// `render=forward`'s glass (no glass pass to refract it): blended over what is behind, its own
+/// tint `tint` (the light a centimetre of it leaves, so a thin wall's colour) and the fill as the
+/// room it reflects (Fresnel: clear face on, mirror-like at grazing angles). Colour target only:
+/// the GBuffer's normals and albedo stay the background's.
+const FORWARD_GLASS_WGSL: &str = r#"
+struct ForwardGlass { tint: vec4f, fill: vec4f };
+@group(0) @binding(0) var<uniform> glass: ForwardGlass;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4f;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4f;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4f;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4f;
+
+struct VIn { @location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f };
+struct VOut { @builtin(position) clip: vec4f, @location(0) world: vec3f, @location(1) normal: vec3f };
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let world = world_matrix * v.position;
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.normal = (normal_matrix * vec4f(v.normal, 0.0)).xyz;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+    let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+    let eye = -(transpose(view3) * view_matrix[3].xyz);
+    let v = normalize(eye - in.world);
+    var n = normalize(in.normal);
+    if (!front) { n = -n; }
+    let ndv = clamp(dot(n, v), 0.0, 1.0);
+    let fresnel = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+    let r = reflect(-v, n);
+    let env = glass.fill.rgb * mix(0.25, 1.8, clamp(r.y * 0.5 + 0.5, 0.0, 1.0));
+    // the body: the tint over the fill, thicker (darker, greener) where the wall is seen edge on
+    let body = glass.tint.rgb * glass.fill.rgb * mix(0.9, 0.45, 1.0 - ndv);
+    let alpha = clamp(glass.tint.a + 0.55 * fresnel + 0.3 * (1.0 - ndv), 0.0, 0.9);
+    return vec4f((body * (1.0 - fresnel) + env * fresnel) / max(alpha, 1e-3) * alpha, alpha);
+}
+"#;
+
+/// A forward glass material (`FORWARD_GLASS_WGSL`): `tint` the light a centimetre leaves,
+/// `fill` the room's flat light (cd/m²).
+pub fn forward_glass(label: &str, tint: [f32; 3], fill: [f32; 3]) -> Material {
+    let options = MaterialOptions { mrt_output_count: Some(1), transparent: true, cull_mode: CullMode::None, ..Default::default() };
+    let mut material = Material::new(label, FORWARD_GLASS_WGSL, vec![Binding::uniform(0, ShaderStages::FRAGMENT)], options);
+    let params: [f32; 8] = [tint[0], tint[1], tint[2], 0.25, fill[0], fill[1], fill[2], 0.0];
+    material.set_uniform_bindable(0, &format!("{label}/ForwardGlass"), &params);
     material
 }

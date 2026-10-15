@@ -28,6 +28,7 @@ const TONEMAP_EXPONENTIAL    : u32 = 6u;
 
 const FLAG_ENCODE_SRGB : u32 = 1u;
 const FLAG_DITHER      : u32 = 2u;
+const FLAG_DITHER_10BIT: u32 = 8u;
 
 const MIDDLE_GREY : f32 = 0.18;
 
@@ -142,7 +143,20 @@ fn grade(c0: vec3f) -> vec3f {
     let wMid = 1.0 - wShadow - wHighlight;
     let sat = p.saturation * (wShadow * p.shadowSaturation + wMid + wHighlight * p.highlightSaturation);   // per channel
     c = max(mix(vec3f(luma), c, sat), vec3f(0.0));
-    return c * p.gain * (wShadow * p.shadowGain + wMid + wHighlight * p.highlightGain);
+    // the highlight gain scales the luminance above highlightsMin as the weight comes in (its
+    // integral), so the output still rises with the input: gained by the weight itself, a gain
+    // under 1 darkened brighter pixels across the ramp and drew contours on smooth gradients
+    let highlight = (1.0 - wShadow) * highlightRamp(luma) / max(luma, 1e-6);
+    return c * p.gain * (wShadow * p.shadowGain + (1.0 - wShadow) - highlight * (1.0 - p.highlightGain));
+}
+
+// The integral of smoothstep(highlightsMin, 1, l) over l: 0 below the range, the excess over it
+// above.
+fn highlightRamp(l: f32) -> f32 {
+    let a = p.highlightsMin;
+    let w = max(1.0 - a, 1e-4);
+    let t = saturate((l - a) / w);
+    return w * (t * t * t - 0.5 * t * t * t * t) + max(l - a - w, 0.0);
 }
 
 // ── Tone curves (display-linear out) ──
@@ -415,10 +429,11 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         let l = luminance(encoded);
         encoded += p.grain * 0.12 * grainNoise(pix) * (4.0 * l * (1.0 - l));
     }
-    // triangular dither of one 8-bit step, so dusk gradients don't band on 8-bit swapchains
+    // triangular dither of one step of the surface (8-bit, or 10 for a float one on an HDR
+    // screen), so dusk gradients and soft highlights don't band
     if ((p.flags & FLAG_DITHER) != 0u) {
         let h = hash3(vec2i(gid.xy), p.frame ^ 0x9e3779b9u);
-        encoded += (h.x + h.y - 1.0) / 255.0;
+        encoded += (h.x + h.y - 1.0) / select(255.0, 1023.0, (p.flags & FLAG_DITHER_10BIT) != 0u);
     }
     encoded = saturate(encoded);
 

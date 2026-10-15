@@ -55,9 +55,9 @@ macro_rules! settings {
         }
 
         impl Settings {
-            /// The defaults, with any setting the URL names.
-            pub fn from_url() -> Self {
-                let mut s = Self::default();
+            /// `base` (the defaults, or a venue's), with any setting the URL names.
+            pub fn from_url(base: Self) -> Self {
+                let mut s = base;
                 // the old name of `fluid_rest`
                 if let Some(v) = param("rest") {
                     s.set("fluid_rest", &v);
@@ -141,6 +141,15 @@ settings! {
     lamps: bool = true;
     lamp_cd: f32 = 700.0;
     lamp_temp: f32 = 2700.0;
+    // ambient occlusion over the lit image (`ao`): on, its reach (m), strength (an exponent on
+    // the unoccluded share), tightness round contacts (an exponent on the near samples' weight),
+    // samples a pixel, the occlusion alone; the showroom's on, the room's off
+    ao: bool = false;
+    ao_radius: f32 = 0.6;
+    ao_intensity: f32 = 2.5;
+    ao_falloff: f32 = 1.0;
+    ao_samples: f32 = 12.0;
+    ao_view: bool = false;
     // the air
     fog: f32 = 0.002;
     fog_aniso: f32 = 0.55;
@@ -221,6 +230,9 @@ settings! {
     mirror_rough: f32 = 0.0;
     mirror2_rough: f32 = 0.1;
     glass_ior: f32 = 1.5;
+    // the glb's glass's absorption times this (set at start: art direction over the authored
+    // glass; the showroom's vase, re-exported darker, reads as glass rather than a mirror at 0.5)
+    glass_density: f32 = 1.0;
     glass_rough: f32 = 0.0;
     // the glass pass (the dragon, the water) traces half its pixels a frame; the glass's
     // reflections traced with the other surfaces' (half resolution, accumulated)
@@ -290,6 +302,33 @@ impl Settings {
         self.fluid_render = "screen".into();
         self.fog = 0.0;
         self.dust = false;
+    }
+
+    /// The showroom's light (`showroom.html`'s "showroom" look): a cool daylight skylight and
+    /// window sun, warm-white track spots on the pieces, a narrow display spot on the glass vase,
+    /// the air clearer (no dust: the skylight lit it as snow).
+    pub fn showroom() -> Self {
+        Self {
+            sun_lux: 26000.0,
+            sun_temp: 4800.0,
+            sky_cd: 60000.0,
+            sky_temp: 6500.0,
+            sky_radiance: 5000.0,
+            lamp_cd: 40000.0,
+            lamp_temp: 3500.0,
+            display_cd: 120_000.0,
+            fog: 0.0006,
+            dust: false,
+            ao: true,
+            glass_density: 0.5,
+            ev: 9.0,
+            white_temp: 6200.0,
+            contrast: 1.03,
+            vignette: 0.18,
+            grain: 0.03,
+            chromatic: 0.03,
+            ..Self::default()
+        }
     }
 
     pub fn apply_quality(&mut self, quality: &str) {

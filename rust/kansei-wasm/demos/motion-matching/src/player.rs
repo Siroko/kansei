@@ -36,6 +36,8 @@ pub struct PlayerFrame {
     pub at: Option<GVec3>,
     /// Running (Shift, B, the right trigger, or the route).
     pub run: bool,
+    /// Any input this frame: a move held, a key or button pressed (a page idles without).
+    pub input: bool,
 }
 
 pub struct Player {
@@ -154,6 +156,7 @@ impl Player {
             }
             out.e_held |= pad.held(Gamepad::X);
         }
+        out.input = stick != [0.0, 0.0] || run || !toggles.is_empty() || out.e_held || self.drive.is_some() || self.player.is_some();
         let mut traverse = false;
         let mut drop = false;
         for key in toggles {

@@ -298,11 +298,16 @@ pub struct RtGlass {
     /// the traced ones beside them on the same surface: half the glass pass where glass fills much
     /// of the screen, a little softer (TAA brings back the rest).
     pub checkerboard: bool,
+    /// The glass's tint (`kansei_gbuffer_out_glass`, 8 bits in the GBuffer's albedo) is the light
+    /// left after `1 / absorption_scale` metres: 1 (a metre) suits thick or nearly clear glass and
+    /// water; thin coloured glass (a vase's 5 mm walls) needs centimetres, past the darkest tint 8
+    /// bits hold a metre (about 5.5 per metre absorbed).
+    pub absorption_scale: f32,
 }
 
 impl Default for RtGlass {
     fn default() -> Self {
-        Self { interfaces: 8, samples: 4, reflections_in_trace: false, checkerboard: false }
+        Self { interfaces: 8, samples: 4, reflections_in_trace: false, checkerboard: false, absorption_scale: 1.0 }
     }
 }
 
@@ -347,7 +352,7 @@ pub(crate) struct RtReflectParamsGpu {
     glass_interfaces: u32,
     glass_samples: u32,
     indirect_scale: f32,
-    _pad2: u32,
+    glass_absorption_scale: f32,
 }
 
 enum Source {
@@ -858,7 +863,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
             glass_interfaces: self.glass.map_or(0, |g| g.interfaces.max(1)),
             glass_samples: self.glass.map_or(1, |g| g.samples.max(1)),
             indirect_scale: self.hit_indirect_scale.max(0.0),
-            _pad2: 0,
+            glass_absorption_scale: self.glass.map_or(1.0, |g| g.absorption_scale.max(1e-3)),
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let current = (self.frame % 2) as usize;

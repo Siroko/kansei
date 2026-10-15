@@ -49,6 +49,16 @@ fn layerTolerance(coc: f32) -> f32 {
     return 0.5 + 0.2 * abs(coc);
 }
 
+// Whether a texel of CoC `other` may stand in for a pixel of CoC `coc` when a blurred layer is
+// resampled (pixels): only where one of them is near focus does a difference in CoC mark an edge
+// to keep. Two blurred surfaces meet in a blurred edge, which the gather already drew; told
+// apart, each pixel would snap to its own surface's texels and outline the silhouette.
+fn layerMatch(coc: f32, other: f32) -> f32 {
+    let k = 3.0;
+    let c = clamp(coc, -k, k);
+    return exp(-abs(clamp(other, -k, k) - c) / layerTolerance(c));
+}
+
 // The depth under full-resolution pixel `px`. The depth buffer is at the scene's render size,
 // below this pass's when a temporal upscaler before it reconstructs the display size.
 fn loadDepth(tex: texture_depth_2d, px: vec2i) -> f32 {
