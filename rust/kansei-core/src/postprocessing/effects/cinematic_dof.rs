@@ -372,7 +372,7 @@ impl CinematicDepthOfFieldEffect {
             "CinematicDoF/PostfilterBGL",
             &[tex(0), tex(1), storage(2), storage(3), uniform(4), buffer_entry(5, compute, true), buffer_entry(6, compute, true), buffer_entry(7, compute, true)],
         );
-        let composite_bgl = bgl("CinematicDoF/CompositeBGL", &[tex(0), depth(1), tex(2), tex(3), storage(4), uniform(5)]);
+        let composite_bgl = bgl("CinematicDoF/CompositeBGL", &[tex(0), depth(1), tex(2), tex(3), storage(4), uniform(5), tex(6)]);
         let pipeline = |label: &str, code: &str, entry: &str, bgl: &BindGroupLayout| {
             let module = device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(code.into()) });
             let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
@@ -568,7 +568,7 @@ impl PostProcessingEffect for CinematicDepthOfFieldEffect {
         );
         let composite = group(
             &gpu.composite_bgl,
-            vec![(0, view(input)), (1, view(depth)), (2, view(&t.bg_filtered)), (3, view(&t.fg_filtered)), (4, view(output)), (5, params_res())],
+            vec![(0, view(input)), (1, view(depth)), (2, view(&t.bg_filtered)), (3, view(&t.fg_filtered)), (4, view(output)), (5, params_res()), (6, view(&t.tiles_dilated))],
         );
 
         let (hw, hh) = (width.div_ceil(2), height.div_ceil(2));
