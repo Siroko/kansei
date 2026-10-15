@@ -12,6 +12,8 @@ page loads it:
 - every image encoded to KTX2 with rust/tools/ktx2 (`kansei-ktx2`): colour as ETC1S, normals and
   ORM as UASTC, at most `--max` texels a side (`--max-data` for normals and ORM; models' 1k maps
   `--max-small`) and a multiple of 4 (the GPU formats' blocks), referenced through KHR_texture_basisu;
+  a backdrop's colour (a material with `kansei: backdrop`, the showroom's park) as UASTC, where
+  ETC1S bands a sky's gradient, up to `--max-backdrop`;
 - everything else (nodes, extras, lights, cameras, meshes) as it was.
 
 Needs Pillow, `basisu` on PATH and the tool built (`cargo build --release -p kansei-ktx2-tool` in
@@ -65,6 +67,7 @@ def main():
     parser.add_argument("--max", type=int, default=2048)
     parser.add_argument("--max-data", type=int, default=1024)
     parser.add_argument("--max-small", type=int, default=512, help="normal and ORM maps of the models (images named *_1k)")
+    parser.add_argument("--max-backdrop", type=int, default=4096, help="a backdrop's colour (UASTC)")
     parser.add_argument("--cache", default=os.path.join(tempfile.gettempdir(), "kansei-room-ktx2"), help="encoded images, by content (a re-export encodes only what changed)")
     args = parser.parse_args()
     if not os.path.exists(TOOL):
@@ -98,7 +101,8 @@ def main():
         pbr = m.setdefault("pbrMetallicRoughness", {})
         if "baseColorTexture" in pbr:
             i = source(pbr["baseColorTexture"])
-            img = add(("color", i), "color", gltf["images"][i].get("name", f"image{i}"), lambda i=i: load(i))
+            kind = "hero" if (m.get("extras") or {}).get("kansei") == "backdrop" else "color"
+            img = add((kind, i), kind, gltf["images"][i].get("name", f"image{i}"), lambda i=i: load(i))
             pbr["baseColorTexture"] = {"index": texture(img)}
         if "normalTexture" in m:
             i = source(m["normalTexture"])
@@ -156,7 +160,7 @@ def main():
         for k, (kind, name, make) in enumerate(out_images):
             im = make()
             small = name.endswith("_1k")
-            cap = args.max if kind == "color" else (args.max_small if small else args.max_data)
+            cap = args.max if kind == "color" else args.max_backdrop if kind == "hero" else (args.max_small if small else args.max_data)
             side = min(cap, max(im.size))
             if max(im.size) > side:
                 im = im.resize((side * im.size[0] // max(im.size), side * im.size[1] // max(im.size)), Image.LANCZOS)
@@ -165,7 +169,7 @@ def main():
             aligned = tuple(max(4, (s + 2) // 4 * 4) for s in im.size)
             if aligned != im.size:
                 im = im.resize(aligned, Image.LANCZOS)
-            mode = "RGBA" if kind == "color" and im.mode in ("RGBA", "LA", "P") else "RGB"
+            mode = "RGBA" if kind in ("color", "hero") and im.mode in ("RGBA", "LA", "P") else "RGB"
             png = os.path.join(tmp, f"{k}.png")
             im.convert(mode).save(png)
             digest = hashlib.sha1(kind.encode() + open(png, "rb").read()).hexdigest()

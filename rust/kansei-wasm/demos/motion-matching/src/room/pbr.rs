@@ -294,6 +294,64 @@ pub fn material(label: &str, maps: PbrMaps, params: &PbrParams, double_sided: bo
     material
 }
 
+/// A backdrop (`layout`'s `kansei: backdrop`: the showroom's park outside its windows) drawn as the
+/// sky is: its colour map's texels times a radiance (cd/m²), unlit, cut out below an alpha cutoff,
+/// with no albedo (the GI adds nothing to it) and its normal toward the eye.
+const BACKDROP_WGSL: &str = r#"
+struct Backdrop { radiance: vec4f, cutoff: vec4f };
+@group(0) @binding(0) var<uniform> backdrop: Backdrop;
+@group(0) @binding(1) var color_map: texture_2d<f32>;
+@group(0) @binding(2) var maps: sampler;
+@group(1) @binding(0) var<uniform> view_matrix: mat4x4f;
+@group(1) @binding(1) var<uniform> projection_matrix: mat4x4f;
+@group(2) @binding(0) var<uniform> normal_matrix: mat4x4f;
+@group(2) @binding(1) var<uniform> world_matrix: mat4x4f;
+
+struct VIn { @location(0) position: vec4f, @location(1) normal: vec3f, @location(2) uv: vec2f };
+struct VOut { @builtin(position) @invariant clip: vec4f, @location(0) world: vec3f, @location(1) uv: vec2f };
+
+@vertex
+fn vertex_main(v: VIn) -> VOut {
+    let world = world_matrix * v.position;
+    var out: VOut;
+    out.clip = projection_matrix * view_matrix * world;
+    out.world = world.xyz;
+    out.uv = v.uv;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: VOut) -> KanseiGBufferOut {
+    let c = textureSample(color_map, maps, in.uv);
+    if (c.a < backdrop.cutoff.x) { discard; }
+    let view3 = mat3x3f(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
+    let eye = -(transpose(view3) * view_matrix[3].xyz);
+    let d = normalize(in.world - eye);
+    return kansei_gbuffer_out(c.rgb * backdrop.radiance.rgb, vec3f(0.0), -d, vec3f(0.0));
+}
+"#;
+
+/// `BACKDROP_WGSL`'s uniform: the radiance a texel of 1 stands for (cd/m²) and the alpha cutoff.
+pub fn backdrop_params(radiance: f32, cutoff: f32) -> [f32; 8] {
+    [radiance, radiance, radiance, 0.0, cutoff, 0.0, 0.0, 0.0]
+}
+
+/// A backdrop material (`BACKDROP_WGSL`) of `color` at `radiance` (cd/m² for a texel of 1), cut out
+/// below `cutoff`.
+pub fn backdrop(label: &str, color: Texture, cutoff: f32, radiance: f32) -> Material {
+    let options = MaterialOptions { mrt_output_count: Some(4), cull_mode: CullMode::None, ..Default::default() };
+    let mut material = Material::new(
+        label,
+        &format!("{GBUFFER_OUT_WGSL}\n{BACKDROP_WGSL}"),
+        vec![Binding::uniform(0, ShaderStages::FRAGMENT), Binding::texture_2d(1, ShaderStages::FRAGMENT), Binding::sampler(2, ShaderStages::FRAGMENT)],
+        options,
+    );
+    material.set_uniform_bindable(0, &format!("{label}/Backdrop"), &backdrop_params(radiance, cutoff));
+    material.set_bindable(1, color);
+    material.set_bindable(2, Sampler::new(wgpu::FilterMode::Linear, wgpu::FilterMode::Linear).with_anisotropy(8));
+    material
+}
+
 /// `render=forward`'s glass (no glass pass to refract it): blended over what is behind, its own
 /// tint `tint` (the light a centimetre of it leaves, so a thin wall's colour) and the fill as the
 /// room it reflects (Fresnel: clear face on, mirror-like at grazing angles). Colour target only:

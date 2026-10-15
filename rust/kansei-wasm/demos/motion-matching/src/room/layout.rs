@@ -7,8 +7,13 @@
 //! room is a draw per material; `<name>_COL` boxes are the collision world, `<name>_SHADOW` meshes
 //! what their parent casts into the shadow maps, `_CUT` meshes Blender's boolean cutters (skipped);
 //! `kansei` names a role (`shell`, `mirror`, `glass`, `aquarium`, `caustics`, `dragon`, `spawn`,
-//! `preview`); lights carry `kansei_light` (`sun`, `skylight`, `lamp`,
-//! `display`); cameras named `CAM_<view>` are the page's fixed views.
+//! `preview`, `backdrop`); lights carry `kansei_light` (`sun`, `skylight`, `lamp`,
+//! `display`; a lamp's `kansei_lamp_scale` its share of the page's lamp intensity); cameras named
+//! `CAM_<view>` are the page's fixed views.
+//!
+//! A backdrop (`kansei: backdrop`, the showroom's park outside its windows) is drawn as the sky is:
+//! its colour map times `kansei_emission_scale` and the page's sky radiance, unlit, alpha-tested,
+//! casting nothing and in neither the grid nor the voxel GI.
 //!
 //! One-sided: the shell (`kansei: shell`: walls, floor, ceiling) is drawn with back faces discarded
 //! on screen, so from outside (the orbit camera past a wall or above the ceiling) the camera looks
@@ -49,6 +54,9 @@ const LAMP_COLOR: [f32; 3] = [1.0, 0.68, 0.4];
 const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
 /// cd/m² for a unit of Blender's emission strength (its shades' 6 are `SHADE_RADIANCE`).
 const EMISSION_SCALE: f32 = 150.0;
+/// The sky radiance a backdrop is first drawn at (cd/m², the page's horizon), until the page sets
+/// its own (`backdrop_radiance`).
+const BACKDROP_SKY: f32 = 5000.0;
 const MIRROR: [f32; 3] = [0.92, 0.92, 0.92];
 const MIRROR_GI: [f32; 3] = [0.03, 0.03, 0.03];
 /// A metal's albedo in the grid and the voxel GI, as a share of its colour's: they shade a hit as
@@ -57,8 +65,9 @@ const MIRROR_GI: [f32; 3] = [0.03, 0.03, 0.03];
 const METAL_GI: f32 = 0.15;
 
 /// The lights as built (scene indices): the sun, the skylight's area light (the first spot light:
-/// `RtShadowsEffect::set_rect_emitter(0, ..)`) and its rectangle, the lamps, the glowing shades,
-/// the display spot over the dragon (the last spot light).
+/// `RtShadowsEffect::set_rect_emitter(0, ..)`) and its rectangle, the lamps (each with its share of
+/// the page's lamp intensity), the glowing shades (each with its radiance, cd/m²), the display spot
+/// over the dragon (the last spot light).
 pub struct Lights {
     pub sun: usize,
     pub sun_direction: GVec3,
@@ -66,8 +75,8 @@ pub struct Lights {
     /// The skylight's emitter: its extent along z and along x (m), as `set_rect_emitter` takes it
     /// for a light pointing down.
     pub skylight_rect: [f32; 2],
-    pub lamps: Vec<usize>,
-    pub shades: Vec<usize>,
+    pub lamps: Vec<(usize, f32)>,
+    pub shades: Vec<(usize, f32)>,
     pub display: usize,
 }
 
@@ -129,6 +138,9 @@ pub struct Layout {
     /// tint each has in the grid and the voxel GI (a metal's darker: `METAL_GI`).
     pub albedo_layers: Vec<(wgpu::TextureView, [f32; 3])>,
     pub traversals: Vec<Traversal>,
+    /// The backdrops' renderables and their emission scale (`kansei_emission_scale`): drawn at that
+    /// times the sky's radiance (`backdrop_radiance`).
+    pub backdrops: Vec<(usize, f32)>,
     /// Triangles drawn, by role, for the log and the README.
     pub triangles: Vec<(String, usize)>,
 }
@@ -167,7 +179,6 @@ struct RoomMaterial {
     params: PbrParams,
     /// Its colour map's layer in the albedo array.
     layer: Option<u8>,
-    tint: [f32; 3],
     /// The tint in the grid and the voxel GI (`METAL_GI` for a metal).
     gi_tint: [f32; 3],
     double_sided: bool,
@@ -181,6 +192,8 @@ struct RoomMaterial {
     /// brought to a centimetre, else its base colour as a metre's (a metre of thin coloured glass
     /// leaves less light than an f32 holds).
     glass_tint_cm: [f32; 3],
+    /// A backdrop's (`kansei: backdrop`): its emission scale.
+    backdrop: Option<f32>,
 }
 
 /// A group of meshes drawn as one renderable.
@@ -305,7 +318,9 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 emissive: [emission[0], emission[1], emission[2], number(&x, "kansei_macro").unwrap_or(0.0)],
                 flags: [0.0, 1.0, 0.0, 0.0],
             };
-            let layer = info.base_color_texture.as_ref().map(|_| {
+            let backdrop = (text(&x, "kansei") == "backdrop").then(|| number(&x, "kansei_emission_scale").unwrap_or(1.0));
+            // (a backdrop is never hit: no layer)
+            let layer = info.base_color_texture.as_ref().filter(|_| backdrop.is_none()).map(|_| {
                 layers.push((color.view().clone(), gi_tint));
                 (layers.len() - 1) as u8
             });
@@ -314,7 +329,6 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 maps: SharedMaps { color, normal, orm },
                 params,
                 layer,
-                tint,
                 gi_tint,
                 double_sided: m.double_sided() || cutout,
                 cutout,
@@ -326,6 +340,7 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                     Some(v) if v.attenuation_distance().is_finite() && v.attenuation_distance() > 0.0 => v.attenuation_color().map(|c| c.clamp(1e-6, 1.0).powf(0.01 / v.attenuation_distance())),
                     _ => tint.map(|c| c.clamp(1e-6, 1.0).powf(0.01)),
                 },
+                backdrop,
             }
         })
         .collect()
@@ -395,6 +410,8 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
     let (mut shell_lo, mut shell_hi) = (GVec3::splat(f32::MAX), GVec3::splat(f32::MIN));
     let (mut sun, mut skylight, mut lamps, mut display) = (None, None, Vec::new(), None);
     let mut triangles: HashMap<String, usize> = HashMap::new();
+    // the backdrops' meshes, by glb and material
+    let mut backdrop_parts: HashMap<(usize, usize), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
 
     for (d, Doc { gltf, buffers, mats }) in docs.iter().enumerate() {
         let doc = &gltf.document;
@@ -461,7 +478,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
                     "sun" => sun = Some(forward),
                     // (its cone: `inner`/`outer` degrees, else the room's 62 and 86)
                     "skylight" => skylight = Some((at, dir, [number(&x, "length").unwrap_or(12.0), number(&x, "width").unwrap_or(6.0)], [number(&x, "inner").unwrap_or(62.0), number(&x, "outer").unwrap_or(86.0)])),
-                    "lamp" => lamps.push((at, dir, cone.unwrap_or((55f32.to_radians(), 84f32.to_radians())))),
+                    "lamp" => lamps.push((at, dir, cone.unwrap_or((55f32.to_radians(), 84f32.to_radians())), number(&x, "kansei_lamp_scale").unwrap_or(1.0))),
                     "display" => display = Some((at, dir, cone.unwrap_or((7f32.to_radians(), 11f32.to_radians())))),
                     other => log::warn!("room: {name}: unknown kansei_light {other}"),
                 }
@@ -481,6 +498,13 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
                 _ => {}
             }
             let Some(mesh) = node.mesh() else { continue };
+            if role == "backdrop" {
+                for p in mesh.primitives() {
+                    let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
+                    primitive(&p, buffers, *world, backdrop_parts.entry((d, material)).or_default());
+                }
+                continue;
+            }
             if name.ends_with("_COL") {
                 // a bar's tube (`<bar>_COL`) is not in the collision world: the body swinging up to it
                 // must not be pushed off (its posts are)
@@ -617,7 +641,9 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
         if m.shade {
             let mut r = Renderable::new(geometry, Material::emissive("LampShade", m.emission)).with_gi(GiSurface::new([0.8; 3]).with_emission(m.emission.map(|c| c * 0.02)));
             r.cast_shadow = false;
-            shades.push(scene.add(SceneNode::Renderable(r)));
+            // (its radiance as authored: the room's shades' strength 6 is SHADE_RADIANCE)
+            let radiance = m.emission.iter().fold(0.0f32, |a, &c| a.max(c));
+            shades.push((scene.add(SceneNode::Renderable(r)), if radiance > 0.0 { radiance } else { SHADE_RADIANCE }));
             continue;
         }
         let mut params = m.params;
@@ -647,6 +673,21 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
         r.cast_shadow = !floor && casts;
         let index = scene.add(SceneNode::Renderable(r));
         surfaces.push(Surface { index, params, floor, roughness: m.roughness });
+    }
+    // the backdrops: unlit, alpha-tested, casting nothing, in neither the grid nor the voxel GI
+    let mut backdrops = Vec::new();
+    let mut keys: Vec<(usize, usize)> = backdrop_parts.keys().copied().collect();
+    keys.sort();
+    for key in keys {
+        let (v, i) = backdrop_parts.remove(&key).unwrap();
+        let m = &docs[key.0].mats[key.1];
+        let label = format!("Room/{}", m.name);
+        let scale = m.backdrop.unwrap_or(1.0);
+        *triangles.entry("backdrop".into()).or_default() += i.len() / 3;
+        let material = pbr::backdrop(&label, m.maps.color.texture(&label), if m.cutout { m.params.pattern[3] } else { 0.0 }, scale * BACKDROP_SKY);
+        let mut r = Renderable::new(Geometry::new(&label, v, i), material);
+        r.cast_shadow = false;
+        backdrops.push((scene.add(SceneNode::Renderable(r)), scale));
     }
     let mut mirrors_out = Vec::new();
     mirrors.sort_by(|a, b| a.0.cmp(&b.0));
@@ -692,12 +733,12 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
     let skylight = scene.add(SceneNode::Light(Light::Spot(sky)));
     let lamps = lamps
         .into_iter()
-        .map(|(at, dir, (inner, outer))| {
-            let mut light = SpotLight::new(at, dir, Vec3::new(LAMP_COLOR[0], LAMP_COLOR[1], LAMP_COLOR[2]), LAMP_CD, 10.0, inner, outer);
+        .map(|(at, dir, (inner, outer), scale)| {
+            let mut light = SpotLight::new(at, dir, Vec3::new(LAMP_COLOR[0], LAMP_COLOR[1], LAMP_COLOR[2]), LAMP_CD * scale, 10.0, inner, outer);
             light.cast_shadow = true;
             light.source_radius = 0.12;
             light.volumetric_scale = 1.0;
-            scene.add(SceneNode::Light(Light::Spot(light)))
+            (scene.add(SceneNode::Light(Light::Spot(light))), scale)
         })
         .collect();
     let (at, dir, (inner, outer)) = display.unwrap_or((Vec3::new(0.0, hi.y - 0.6, -10.5), Vec3::new(0.0, -0.54, 0.84), (7f32.to_radians(), 11f32.to_radians())));
@@ -726,7 +767,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
     let mut triangles: Vec<(String, usize)> = triangles.into_iter().collect();
     triangles.sort();
     let materials: usize = docs.iter().map(|d| d.mats.len()).sum();
-    log::info!("room: {} draws from {} materials, triangles {:?}, {} views, {} colliders", surfaces.len() + shades.len() + mirrors_out.len(), materials, triangles, views.len(), colliders);
+    log::info!("room: {} draws from {} materials, triangles {:?}, {} views, {} colliders", surfaces.len() + shades.len() + mirrors_out.len() + backdrops.len(), materials, triangles, views.len(), colliders);
     Ok(Layout {
         collision,
         surfaces,
@@ -743,6 +784,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, source
         caustics,
         albedo_layers,
         traversals,
+        backdrops,
         triangles,
     })
 }

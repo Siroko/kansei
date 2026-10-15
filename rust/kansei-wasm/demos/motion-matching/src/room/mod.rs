@@ -109,6 +109,11 @@ impl Venue {
                 if kansei_wasm::flag("pieces", true) {
                     sources.push(layout::Source { url: "assets/showroom/private/pieces.glb", required: false, reflective: true });
                 }
+                // the park outside the west windows (CC0, from the same folder; `backdrop=0` leaves
+                // it out)
+                if kansei_wasm::flag("backdrop", true) {
+                    sources.push(layout::Source { url: "assets/showroom/private/backdrop.glb", required: false, reflective: false });
+                }
                 sources
             }
         }
@@ -762,10 +767,10 @@ impl RoomState {
             l.intensity = if s.sky { s.sky_cd } else { 0.0 };
         }
         let lamp_color = kelvin(s.lamp_temp);
-        for &lamp in &self.layout.lights.lamps {
+        for &(lamp, scale) in &self.layout.lights.lamps {
             if let Some(Light::Spot(l)) = self.scene.get_light_mut(lamp) {
                 l.color = Vec3::new(lamp_color[0], lamp_color[1], lamp_color[2]);
-                l.intensity = if s.lamps { s.lamp_cd } else { 0.0 };
+                l.intensity = if s.lamps { s.lamp_cd * scale } else { 0.0 };
                 // ray traced, the lamps need no shadow map (only the fog and the GI's hits read
                 // them, and the skylight's is the one that shows there): four fewer redraws of
                 // the room a frame
@@ -776,10 +781,11 @@ impl RoomState {
         if let Some(Light::Spot(l)) = self.scene.get_light_mut(self.layout.lights.display) {
             l.intensity = if s.display_spot { s.display_cd } else { 0.0 };
         }
-        let shade = lamp_color.map(|c| c * layout::SHADE_RADIANCE * if s.lamps { s.lamp_cd / layout::LAMP_CD } else { 0.02 });
-        for &index in &self.layout.lights.shades {
+        // (each shade at its own radiance, with the lamps' intensity against the venue's)
+        let dim = if s.lamps { s.lamp_cd / self.venue.settings().lamp_cd } else { 0.02 };
+        for &(index, radiance) in &self.layout.lights.shades {
             if let Some(r) = self.scene.get_renderable_mut(index) {
-                r.material.set_standard_lit(&self.renderer, &StandardLitOptions::emissive(shade));
+                r.material.set_standard_lit(&self.renderer, &StandardLitOptions::emissive(lamp_color.map(|c| c * radiance * dim)));
             }
         }
         // the sky behind the windows, and what the rays leaving through them find
@@ -791,6 +797,13 @@ impl RoomState {
                 r.material_dirty = true;
             }
             queue.write_buffer(&self.sky_lighting, 0, bytemuck::cast_slice(&sky_lighting(zenith, horizon)));
+            // the park outside follows the sky
+            for &(index, scale) in &self.layout.backdrops {
+                if let Some(buffer) = self.scene.get_renderable(index).and_then(|r| r.material.bindable_buffer(0)) {
+                    // (the radiance only: the cutoff after it stays as built)
+                    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&[s.sky_radiance * scale; 3]));
+                }
+            }
         }
 
         // shadows, GI, reflections
@@ -1144,7 +1157,12 @@ where
         (true, Some(at)) => add_dragon(&mut scene, at).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
         _ => (None, None),
     };
-    let glass_boxes: Vec<(GVec3, GVec3)> = dragon_box.into_iter().chain(layout.glass.iter().copied()).collect();
+    // (the caustics' casters: the glass over their map's rectangle, the rest's light lands where
+    // nothing reads it: the showroom's shelves of glasses and vases would cost the photons for
+    // nothing)
+    let ([x0, z0], [x1, z1]) = layout.caustics;
+    let over_map = |(lo, hi): &(GVec3, GVec3)| lo.x <= x1 && hi.x >= x0 && lo.z <= z1 && hi.z >= z0;
+    let glass_boxes: Vec<(GVec3, GVec3)> = dragon_box.into_iter().chain(layout.glass.iter().copied().filter(over_map)).collect();
     // the sky behind the windows and the skylight (its colours set by `apply`)
     let mut sky = Renderable::new(SphereGeometry::new(300.0, 32, 16), Material::gradient_sky("Sky", &GradientSkyOptions { zenith: [1.0; 3], horizon: [1.0; 3], ground: [0.2; 3], curve: 0.5 }));
     sky.cast_shadow = false;
