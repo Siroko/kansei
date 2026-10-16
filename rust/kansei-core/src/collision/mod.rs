@@ -518,6 +518,29 @@ impl CollisionWorld {
         position
     }
 
+    /// Where a sphere at `center` must move to stop overlapping the world (in any direction: a
+    /// hand pushed out of a ledge it sank into): a few iterations of the deepest push.
+    pub fn push_sphere_out(&self, center: Vec3, radius: f32, layers: u32) -> Vec3 {
+        let mut position = center;
+        for _ in 0..3 {
+            let mut push = Vec3::ZERO;
+            for c in self.colliders.iter().filter(|c| c.layers & layers != 0) {
+                let p = match &c.shape {
+                    Shape::Box(b) => b.sphere_penetration(position, radius),
+                    Shape::Mesh(m) => m.sphere_penetration(position, radius),
+                };
+                if p.length_squared() > push.length_squared() {
+                    push = p;
+                }
+            }
+            if push.length_squared() < 1e-10 {
+                break;
+            }
+            position += push;
+        }
+        position
+    }
+
     /// The height of the first surface below `position`, looking from `above` metres over it down
     /// to `below` metres under it.
     pub fn ground_height(&self, position: Vec3, above: f32, below: f32, layers: u32) -> Option<f32> {

@@ -62,6 +62,7 @@ use kansei_core::rt::{
     RtCausticsEffect, RtCausticsOptions, RtCausticsView, RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiResolution, RtGiShadows, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions,
     RtShadowsEffect, RtShadowsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
 };
+use kansei_core::animation::motion_matching::traversal::features::ParkourFeatures;
 use kansei_core::shadows::CascadedShadowOptions;
 use kansei_wasm::{param, param_or, set_text, Canvas, Frame};
 
@@ -190,16 +191,24 @@ impl<E: PostProcessingEffect + 'static> PostProcessingEffect for Switch<E> {
     }
 }
 
+/// `render=forward`'s flat fill in place of the GI (cd/m² per unit albedo).
+const FORWARD_FILL: [f32; 3] = [220.0, 225.0, 240.0];
+
 /// The effect chain: the aquarium's surface first (on the lit scene), the ray-traced direct light, the
 /// three GI effects (one enabled), the reflections and the glass, the fog, TAA, motion blur, the
 /// depth of field, bloom and the tone map. `apply` sets them all to the settings.
-fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout) -> Vec<Box<dyn PostProcessingEffect>> {
+fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout, forward: bool) -> Vec<Box<dyn PostProcessingEffect>> {
     let [rect_z, rect_x] = layout.lights.skylight_rect;
     // (the sky lighting lights only the rays that leave through the windows and the skylight: the
     // room's materials add no sky ambient of their own for the GI to take out, so `ambient` 0)
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     if let Some(surface) = surface {
         effects.push(Box::new(surface));
+    }
+    if forward {
+        // the post-processing only
+        post_effects(renderer, &mut effects);
+        return effects;
     }
     let scene_gi = renderer.voxel_gi().expect("the room enables voxel GI");
     let grid = renderer.rt_grid().expect("the room builds the grid");
@@ -257,12 +266,17 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
     fog.set_cascaded_shadow_map(renderer.cascaded_shadow_map());
     effects.push(Box::new(Switch { effect: fog, on: true }));
+    post_effects(renderer, &mut effects);
+    effects
+}
+
+/// TAA, motion blur, depth of field, bloom and the tone map.
+fn post_effects(renderer: &Renderer, effects: &mut Vec<Box<dyn PostProcessingEffect>>) {
     effects.push(Box::new(Switch { effect: TemporalAAEffect::new(TemporalAAOptions::default()), on: true }));
     effects.push(Box::new(Switch { effect: MotionBlurEffect::new(MotionBlurOptions::default()), on: false }));
     effects.push(Box::new(Switch { effect: CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions::default()), on: false }));
     effects.push(Box::new(Switch { effect: BloomEffect::new(BloomOptions::default()), on: true }));
     effects.push(Box::new(ToneMapEffect::new(ToneMapOptions::for_surface(renderer.presentation_format()))));
-    effects
 }
 
 /// The sky the windows and the skylight show, as `SkyLighting` (`atmosphere::SKY_LIGHTING_WGSL`)
@@ -551,10 +565,11 @@ impl RoomState {
             format!("\naquarium {} particles, {}{speed}", p.particles(), p.state_name())
         });
         format!(
-            "room   GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            "room   {} · GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            if s.render == "forward" { "forward (no ray tracing, no GI: render=hybrid for the full room)" } else { "hybrid" },
             s.gi,
             if s.shadows == "rt" { "ray traced" } else { "shadow maps" },
-            if s.fog > 0.0 { "on" } else { "off" },
+            if s.fog > 0.0 && s.render != "forward" { "on" } else { "off" },
             self.dust.as_ref().filter(|_| s.dust).map_or("off".to_string(), |d| format!("{} motes", (d.count() as f32 * s.dust_amount.clamp(0.0, 1.0)) as u32)),
             self.view_name().unwrap_or("following"),
             aquarium,
@@ -636,7 +651,8 @@ impl RoomState {
                 // ray traced, the lamps need no shadow map (only the fog and the GI's hits read
                 // them, and the skylight's is the one that shows there): four fewer redraws of
                 // the room a frame
-                l.cast_shadow = !deferred;
+                // (forward, for speed, only the sun and the skylight cast shadows)
+                l.cast_shadow = !deferred && s.render != "forward";
             }
         }
         if let Some(Light::Spot(l)) = self.scene.get_light_mut(self.layout.lights.display) {
@@ -927,6 +943,9 @@ where
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
     let mut settings = Settings::from_url();
     let deferred = settings.shadows == "rt";
+    // forward (`render=forward`): no voxel GI or ray tracing grid at all, a flat fill for the GI
+    let forward = settings.render == "forward";
+    layout::set_fill(if forward { FORWARD_FILL } else { [0.0; 3] });
 
     // the room (`www/assets/room/room.glb`, from Blender), then voxel GI and the grid over its box
     set_text("hud", "Loading the room …");
@@ -936,8 +955,10 @@ where
         JsValue::from_str(&e)
     })?;
     let bounds = room_bounds(&layout);
-    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: bounds.0, bounds_max: bounds.1, radiance_scale: 1.0, budget_bytes: 0 });
-    renderer.enable_rt_grid(grid_options(settings.grid_lod_cm, bounds));
+    if !forward {
+        renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: bounds.0, bounds_max: bounds.1, radiance_scale: 1.0, budget_bytes: 0 });
+        renderer.enable_rt_grid(grid_options(settings.grid_lod_cm, bounds));
+    }
     // the sun where the room's Blender sun points, unless the URL says
     let d = layout.lights.sun_direction;
     if param("sun_elev").is_none() {
@@ -982,6 +1003,10 @@ where
     let mut character = load_character(&renderer, &mut scene, &layout.collision, &RoomLit { deferred }, &load, page_note).await;
     let mut bodies = Vec::new();
     if let Some(c) = &mut character {
+        // the parkour the room's tagged pieces give: hangs and shimmies on its ledges, wall runs,
+        // bars, jumps aimed along its platforms
+        c.controller.features = ParkourFeatures::from_pieces(&layout::parkour_pieces(&layout.traversals), &layout.collision);
+        log::info!("room: parkour {} edges, {} bars, {} wall faces, {} platforms", c.controller.features.edges.len(), c.controller.features.bars.len(), c.controller.features.faces.len(), c.controller.features.platforms.len());
         if param("at").is_none() {
             c.controller.matcher.teleport(layout.spawn.0, layout.spawn.1);
         }
@@ -990,9 +1015,9 @@ where
         bodies.push(look::stand_in(&mut scene, layout.spawn.0, deferred));
     }
     let hero_layer = layout.albedo_layers.len() as u8;
-    let proxy = character.as_ref().filter(|_| kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, hero_layer));
+    let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, hero_layer));
 
-    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout));
+    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward));
     // the albedo the reflections' hits read: the surfaces' colour maps and the hero's
     let hero = character.as_ref().and_then(|c| c.bodies.iter().find_map(|b| b.base_color.as_ref())).map(|(img, _)| {
         let mut t = kansei_core::buffers::Texture::from_image("Room/HeroAlbedo", img, true);
@@ -1022,7 +1047,7 @@ where
     }
     let dust_count: u32 = param_or("dust_count", 65536);
     let (lo, hi) = (layout.min, layout.max);
-    let dust = (dust_count > 0).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::ZERO, (hi.x - lo.x).min(hi.z - lo.z) * 0.5, hi.y - lo.y));
+    let dust = (dust_count > 0 && (!forward || settings.dust)).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::ZERO, (hi.x - lo.x).min(hi.z - lo.z) * 0.5, hi.y - lo.y));
 
     let mut camera = Camera::new(45.0, 0.1, 700.0, canvas.aspect());
     camera.update_projection_matrix();

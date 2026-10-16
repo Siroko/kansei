@@ -119,6 +119,13 @@
         const top = pane.addFolder({ title: 'Presets' });
         top.addBinding(presets, 'look', { options: { ...options(Object.keys(LOOKS)), custom: 'custom' } }).on('change', (ev) => applyPreset(LOOKS, ev.value));
         top.addBinding(presets, 'quality', { label: 'glass & water', options: { ...options(Object.keys(QUALITIES)), custom: 'custom' } }).on('change', (ev) => applyPreset(QUALITIES, ev.value));
+        // how the room is drawn: set at start, so a change reloads the page with it in the URL
+        // (forward: no ray tracing, no GI; for iterating on the character's moves)
+        top.addBinding(p, 'render', { label: 'render', options: { 'hybrid (ray traced, GI)': 'hybrid', 'forward (post only, fast)': 'forward' } }).on('change', (ev) => {
+            const url = new URL(window.location.href);
+            url.searchParams.set('render', ev.value);
+            window.location.href = url.toString();
+        });
         top.addBinding(p, 'cam', { label: 'camera', options: options(JSON.parse(room_views())) }).on('change', (ev) => set('cam', ev.value));
 
         const scene = pane.addFolder({ title: 'Scene', expanded: false });

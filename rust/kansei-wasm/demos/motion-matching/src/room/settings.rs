@@ -66,6 +66,10 @@ macro_rules! settings {
                 if let Some(v) = param("quality") {
                     s.apply_quality(&v);
                 }
+                // `render=forward`: no ray tracing and no GI, for iterating on the animation
+                if param("render").as_deref() == Some("forward") {
+                    s.apply_forward();
+                }
                 $(
                     if let Some(v) = param(stringify!($name)) {
                         s.set(stringify!($name), &v);
@@ -98,6 +102,10 @@ macro_rules! settings {
 }
 
 settings! {
+    // how the room is drawn: "hybrid" (ray-traced light, GI, reflections; the default) or
+    // "forward" (direct lights and shadow maps with the post-processing only, for iterating on the
+    // character; set at start: the page reloads to change it)
+    render: String = "hybrid".into();
     // the scene
     floor_rough: f32 = 1.0;
     cam: String = "follow".into();
@@ -270,6 +278,20 @@ impl Settings {
     /// glass's 3x as bright and half as wide, the photons from the lights' centres, the map fed
     /// every other frame; `high` traces every glass pixel and its reflection, the caustics as
     /// physical (the water's by photons through it), from the lights' emitters, 4x the photons.
+    /// `render=forward`: the direct lights through their shadow maps and the post-processing
+    /// (TAA, bloom, tone mapping), no ray tracing, no GI, no fog or dust, a flat fill in place of
+    /// the GI; the water drawn in screen space. The URL can still turn any of them back on.
+    pub fn apply_forward(&mut self) {
+        self.render = "forward".into();
+        self.shadows = "maps".into();
+        self.gi = "off".into();
+        self.reflections = false;
+        self.caustics = false;
+        self.fluid_render = "screen".into();
+        self.fog = 0.0;
+        self.dust = false;
+    }
+
     pub fn apply_quality(&mut self, quality: &str) {
         let high = quality == "high";
         self.glass_checker = !high;
