@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use glam::{Mat3, Mat4, Vec3 as GVec3};
 
+use kansei_core::animation::motion_matching::traversal::features::ParkourPiece;
 use kansei_core::collision::{CollisionWorld, Obb};
 use kansei_core::geometries::{Geometry, Vertex};
 use kansei_core::gi::GiSurface;
@@ -124,13 +125,28 @@ pub struct Layout {
     pub triangles: Vec<(String, usize)>,
 }
 
+thread_local! {
+    /// The flat fill surfaces get with no GI (`render=forward`), cd/m² per unit albedo.
+    static FILL: std::cell::Cell<[f32; 3]> = const { std::cell::Cell::new([0.0; 3]) };
+}
+
+/// Give the surfaces made from now on a flat fill in place of the GI (`render=forward`).
+pub fn set_fill(fill: [f32; 3]) {
+    FILL.with(|f| f.set(fill));
+}
+
+/// The fill `set_fill` gave.
+pub fn fill() -> [f32; 3] {
+    FILL.with(|f| f.get())
+}
+
 /// How a surface is drawn: a texture `size` metres across in the world (box mapped), its
 /// roughness scaled and biased, reflective (traced) or not, deferred (`RtShadowsEffect`) or not.
 pub fn surface(tint: [f32; 3], size: f32, roughness: [f32; 2], reflective: bool, deferred: bool) -> PbrParams {
     PbrParams {
         tint: [tint[0], tint[1], tint[2], 1.0],
         surface: [size, roughness[0], roughness[1], reflective as u32 as f32],
-        ambient: [0.0, 0.0, 0.0, deferred as u32 as f32],
+        ambient: { let f = fill(); [f[0], f[1], f[2], deferred as u32 as f32] },
         emissive: [0.0, 0.0, 0.0, 1.0],
         ..Default::default()
     }
@@ -264,7 +280,7 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 tint: [tint[0], tint[1], tint[2], 0.0],
                 surface: [1.0, roughness, 0.0, reflective as u32 as f32],
                 pattern: [0.0, 1.0, m.normal_texture().map_or(1.0, |n| n.scale()), if cutout { m.alpha_cutoff().unwrap_or(0.5) } else { 0.0 }],
-                ambient: [0.0, 0.0, 0.0, deferred as u32 as f32],
+                ambient: { let f = fill(); [f[0], f[1], f[2], deferred as u32 as f32] },
                 emissive: [emission[0], emission[1], emission[2], number(&x, "kansei_macro").unwrap_or(0.0)],
                 flags: [0.0, 1.0, 0.0, 0.0],
             };
@@ -347,7 +363,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
             }
         }
     }
-    for (node, world, _) in &placed {
+    for (node, world, parent) in &placed {
         let name = node.name().unwrap_or("").to_string();
         let x = extras(node.extras());
         let role = text(&x, "kansei").to_string();
@@ -396,6 +412,12 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
         }
         let Some(mesh) = node.mesh() else { continue };
         if name.ends_with("_COL") {
+            // a bar's tube (`<bar>_COL`) is not in the collision world: the body swinging up to it
+            // must not be pushed off (its posts are)
+            let tube = parent.and_then(|p| doc.nodes().nth(p)).is_some_and(|p| text(&extras(p.extras()), "kansei_traversal") == "bar" && name == format!("{}_COL", p.name().unwrap_or("")));
+            if tube {
+                continue;
+            }
             let (lo, hi) = local_bounds(&mesh, &buffers);
             let (scale, rotation, _) = world.to_scale_rotation_translation();
             let centre = world.transform_point3((lo + hi) * 0.5);
@@ -627,6 +649,19 @@ fn today(kind: &str) -> Option<&str> {
 /// default rules). Each piece's name and whether it got the kind meant (for the course's new
 /// kinds, what today's traversal makes of them: `today`), or what it got: `room_check()` on the
 /// page.
+/// The tagged pieces as the controller's parkour reads them (`ParkourPiece::from_extras`): each
+/// piece's box and its `kansei_*` extras.
+pub fn parkour_pieces(pieces: &[Traversal]) -> Vec<ParkourPiece> {
+    pieces
+        .iter()
+        .filter_map(|t| {
+            let x: Value = serde_json::from_str(&t.extras).unwrap_or(Value::Null);
+            let entries: Vec<(String, String)> = x.as_object().map_or(Vec::new(), |o| o.iter().map(|(k, v)| (k.clone(), v.as_str().map_or(v.to_string(), str::to_string))).collect());
+            ParkourPiece::from_extras(&t.name, Obb::from_min_max(t.min, t.max), entries.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        })
+        .collect()
+}
+
 pub fn check_traversals(world: &CollisionWorld, pieces: &[Traversal]) -> Vec<(String, Result<(), String>)> {
     use kansei_core::animation::motion_matching::traversal::{detect_obstacle, traversal_kind, DetectionSettings, TraversalRules};
     let (settings, rules) = (DetectionSettings::default(), TraversalRules::default());

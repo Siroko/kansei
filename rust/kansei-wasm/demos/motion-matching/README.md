@@ -256,14 +256,16 @@ and the room renders as it does with one.
   again). Colliders are the glb's `_COL` boxes.
 - **Parkour.** The north-east blocks (a crate, a rail, a block, a two-block stack, a 2.2 m
   platform behind a step, two ledges with a gap), the island, a bench and the dragon's drum:
-  Space vaults, hurdles, mantles and climbs them as on the course. The south-east is a course
-  for moves the controller doesn't do yet, tagged in the glb (`kansei_traversal`): four platforms
-  with 1.0-1.4 m gaps to jump (`platform`, a chain in order), a 2.8 m tower whose top edges are
-  ledges to hang from and shimmy round (`ledge`), a 5 m wall to run along (`wallrun`) and three
-  bars to swing from (`bar`). `room_check()` (`room.check()`) probes each piece as the traversal
-  does and says whether it gets the traversal meant (the course's platforms: mantle, the tower:
-  climb; walls and bars not checked); all pass. `room_parkour()` (`room.parkour()`) lists every
-  tagged piece with its bounds and properties, for the controller's moves to come.
+  Space vaults, hurdles, mantles and climbs them as on the course. The south-east is the
+  [parkour course](#parkour), tagged in the glb (`kansei_traversal`): four platforms with
+  1.0-1.4 m gaps to jump (`platform`, a chain in order), a 2.8 m tower whose top edges are ledges
+  to hang from and shimmy round (`ledge`), a 5 m wall to run along (`wallrun`) and three bars to
+  swing from (`bar`). The page reads them into the controller's parkour
+  (`layout::parkour_pieces`, `ParkourFeatures::from_pieces`; the console logs how many edges,
+  bars, wall faces and platforms it found). `room_check()` (`room.check()`) probes each piece as
+  the traversal does and says whether it gets the traversal meant (the course's platforms:
+  mantle, the tower: climb; walls and bars not checked); all pass. `room_parkour()`
+  (`room.parkour()`) lists every tagged piece with its bounds and properties.
 - **One-sided walls.** The walls, the floor and the ceiling face in and discard their back faces,
   so from outside (O, or `cam=outside`) the camera looks through them into the room. The grid hits
   a triangle from either side, so the rays from inside meet the walls as they should. Thick boxes
@@ -414,7 +416,8 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 |---|---|---|
 | move (relative to the camera) | WASD, arrows | left stick (tilt sets the pace) |
 | run | Shift | B, right trigger |
-| jump, or traverse what is ahead | Space | A |
+| jump, or traverse what is ahead; by a wall, run along it; hanging, climb up; on a wall, jump off; on a bar, let go | Space | A |
+| let go (of a ledge or a bar), drop off a wall | X | right bumper |
 | strafe (face the camera's way) | Q | left bumper |
 | fire the water cannon (by it; hold to pour) | E, or click the prompt | X |
 | drain the lake (by the cannon) | R | Y |
@@ -458,6 +461,107 @@ URL parameters:
 - The lake's exports (the P panel's, `cannon_prompt()`, `cannon_fire(down)`, `lake_fill()`,
   `lake_regions()`) come from the lake crate and are in this module too: see the
   [lake's README](../lake/README.md).
+
+## Parkour
+
+On top of the traversals, the controller (`motion_matching::traversal::parkour`) does the moves a
+level tags for it (`traversal::features`: a glb node's `kansei_traversal`, read by
+`ParkourPiece::from_extras`; the room's course has them all):
+
+- **Platform to platform.** Space toward a `platform` (the next of its `kansei_chain` first) or any
+  top across a gap jumps at it: the run-up turns toward it and the take-off's speed is solved so
+  the arc lands a little in from its near edge, upward at the jump clip's own take-off speed (so
+  the body's rise carries on). The landing is picked by the pace the player asks for and must fit
+  on what it lands on (a run-out that would walk off a platform's far edge gives way to a
+  shorter one).
+- **Hanging from a ledge.** Climbing a tagged `ledge` stops hanging from it, and a fall or a jump
+  that brings the body to an edge catches it. The hang is the climb clip's own hanging frame
+  (`parkour::hang_poses`), held and breathing a frame either way, the hands pinned on the top and
+  the feet on the face below by IK (`MotionMatcher::reach`); with a `hangidle` clip in the pack
+  (generated, braced on the face or free, by its name's `Braced`) the hang settles into that loop
+  once still, placed by its hips. A/D (the stick to either side)
+  shimmy along the edge and round its outer corners, hands and feet stepping in turn, each pinned
+  where it lands; Space climbs up (the climb clip on from its hang, warped onto the edge); X lets
+  go. The climbs' and mantles' ledges are refined from the hands (`parkour::refine_grips`) so the
+  wrists grip the face rather than sink into the top, and hands that still sink into what they
+  vault or climb are pushed out of it. With air catches in the pack (`catch` actions: GASP's
+  `Traversal/Catch/*` clips, which fall onto a 3 m top and catch it), a fall onto an edge plays
+  the captured catch from just before the hands meet it into its hang (`Catch_Cliff`), and Space
+  climbs up with that clip's own climb.
+- **Air mantle.** Falling against the face of a top within a reach of the feet (0.1-0.9 m above
+  them, room to stand on it, not a ledge to hang from, not on a jump aimed elsewhere) catches it
+  and mantles up (`Catch_Mantle_*`: the one whose depth at the catch and pace fit, and whose
+  run-out stays on that top).
+- **Wall runs.** Running along a `wallrun` face (or jumping into it along it) and pressing Space
+  runs along the wall: the run loop at the wall-run speed, the body leaning away from the wall
+  about its feet, the planted feet pinned flat on it, the wall-side hand kept out of it; light
+  gravity at first, then more, up to 1.3 s; the lean comes off before the run ends. Space jumps
+  off, away from the wall (into another wall run, or a catch); X drops off.
+- **Bars.** A jump at a `bar` aims the hips through the place hanging from it puts them, and the
+  hands catch it as the body passes: the body swings about the bar as a damped pendulum, pumped
+  by W/S, the hands pinned to it. With bar clips in the pack (`barhang`, `barswing` actions:
+  generated, see [Generated animation](#generated-animation-kimodo)) the pose is the hang clip
+  still or the swing clip phase-locked to the pendulum (its frame from the swing's phase, the body
+  turned about the bar by what the pendulum swings beyond the clip); without them, the climb's
+  hanging frame swung as a whole. Space lets go at the swing's speed (hanging still, with a
+  `pullup` clip in the pack, it pulls up instead and hangs again after), X straight down.
+
+Every change of move keeps what shows continuous: the root's velocity (`MotionMatcher::
+blend_root`), its place and turn (`blend_position`, `blend_rotation`) ease out over a few frames
+instead of jumping, a catch onto a clip whose root sits elsewhere under the body re-roots it
+(`reroot`), and the pose is refreshed the frame the move starts (`refresh`).
+
+**The packs.** The moves work with the GASP pack as it is (`gasp-locomotion.kmm`): jumps, the
+hang, shimmy, corners and climbs come from its jump and climb clips; the wall run from its run
+loop; the bars from the climb's hang. The bar clips come from Kimodo
+(`kansei-anim-bake/genanim/prompts/parkour.json`, retargeted onto the mannequin, route B) and go
+into a private pack with the GASP clips, e.g. the GASP bake config plus:
+
+```json
+"export": ["export", "../genanim/export-parkour-b"],
+"include": ["...", "Jump/M_Neutral_Jump_F_Start_Across_*", "Jump/M_Neutral_Jump_F_Start_Sprint_*", "Parkour/Gen_*"],
+"actions": { "...": [], "barhang": ["Parkour/Gen_Bar_Hang_*"], "barswing": ["Parkour/Gen_Bar_Swing_*"],
+             "pullup": ["Parkour/Gen_Bar_PullUp_*"], "hangidle": ["Parkour/Gen_Hang_Idle_*"],
+             "shimmy": ["Parkour/Gen_Shimmy_*"], "wallrun": ["Parkour/Gen_Wall_Run_*"] }
+```
+
+GASP's air catches and its sprint and roll landings join the same pack (export them with
+`Traversal/Catch/*/M_Neutral_*` and `Jump/M_Neutral_*` in the export config):
+
+```json
+"export": ["export", "export-extras", "../genanim/export-parkour-b"],
+"actions": { "...": [], "land": ["...", "Jump/M_Neutral_Jump_F_Land_Sprint_*", "Jump/M_Neutral_Jump_F_Land_Roll_*"],
+             "catch": ["Traversal/Catch/Cliff/M_Neutral_*", "Traversal/Catch/Mantle/M_Neutral_*"] }
+```
+
+Captured hang clips from Mixamo (downloaded by hand, put on the mannequin by
+`kansei-anim-bake/mixamo`; Mixamo's terms forbid AI/ML use, so never into Kimodo) go into the same
+private pack:
+- `hangidle` takes its braced idle (`Hang_Idle_Braced_Against_Wall`) and free one (`Hang_Idle_Ledge`);
+- `shimmy` takes its braced and free shimmies. With shimmy clips in the pack, the shimmy plays the
+  one for the hang (braced or not, by `Braced` in its name) and the way it goes (`Left`/`Right`),
+  at the stick's pace, the hang moving along the edge at the clip's own speed.
+
+Their other clips (catches, hops, drops, climb-ups, wall runs, swings) are baked but not wired yet.
+
+(`wallrun` is baked but not played yet: the generated wall runs read as leaping beside the wall,
+so the GASP-based one stays; Kimodo's shimmies, which paddle their legs, are left out of `shimmy`;
+see the PR.) Packs with the new action kinds don't load in older builds or
+the TS port.
+
+**Testing it.** `render=forward` (the panel's render, top) draws the room with its direct lights
+and shadow maps and the post-processing only, no ray tracing and no GI (a flat fill in their
+place): the frame rate a character's animation is tuned at. `parkour_eval` measures the moves on a
+pack against the course (the room's, built in code), at 30, 60 and 120 fps and with 100 ms frame
+hitches: limbs off their targets, planted-foot slide, hands and feet inside the level, and pops
+(the largest jump in the hips', spine's and head's velocity over 1/30 s windows, against the
+run's 99th percentile; `clips=1` prints the captured clips' own, the floor: their take-offs reach
+1-3 m/s and their landings 4-9):
+
+```sh
+cargo run -p kansei-core --release --example parkour_eval -- <pack.kmm> [only=<name part>] [trace=1] [csv=<dir>] [clips=1]
+cargo run -p kansei-core --release --example pack_actions -- <pack.kmm> [track=<clip>] [clip=<clip>]
+```
 
 ## Foot slide
 
