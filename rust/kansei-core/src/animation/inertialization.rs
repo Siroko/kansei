@@ -50,6 +50,16 @@ impl Inertializer {
         }
     }
 
+    /// Forget one joint's translation offset: the clips on either side of a switch put it
+    /// differently over the root (a clip whose root rides the body in the air, one whose root
+    /// stays on the floor), and the caller moves the root to make up for it.
+    pub fn clear_translation(&mut self, joint: usize) {
+        if let (Some(p), Some(v)) = (self.position.get_mut(joint), self.velocity.get_mut(joint)) {
+            *p = Vec3::ZERO;
+            *v = Vec3::ZERO;
+        }
+    }
+
     /// Forget the offsets (after a teleport).
     pub fn reset(&mut self) {
         *self = Self::new(self.position.len());

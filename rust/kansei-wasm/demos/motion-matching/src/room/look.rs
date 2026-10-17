@@ -137,7 +137,8 @@ pub struct RoomLit {
 
 impl RoomLit {
     fn uniform(&self, color: [f32; 4]) -> [f32; 8] {
-        [color[0], color[1], color[2], 1.0, AMBIENT[0], AMBIENT[1], AMBIENT[2], self.deferred as u32 as f32]
+        let fill = super::layout::fill();
+        [color[0], color[1], color[2], 1.0, AMBIENT[0] + fill[0], AMBIENT[1] + fill[1], AMBIENT[2] + fill[2], self.deferred as u32 as f32]
     }
 }
 
@@ -280,7 +281,7 @@ fn proxy_albedo(name: &str) -> [f32; 3] {
 }
 
 impl Proxy {
-    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool) -> Self {
+    pub fn new(renderer: &kansei_core::renderers::Renderer, scene: &mut Scene, character: &Character, deferred: bool, hero_layer: u8) -> Self {
         let view = kansei_wasm::flag("proxy_view", false);
         // `proxy_tris=` another count
         let target: usize = kansei_wasm::param_or("proxy_tris", PROXY_TRIANGLES);
@@ -298,7 +299,7 @@ impl Proxy {
             log::info!("room: {} in the grid as {} of {} triangles", body.name, indices.len() / 3, mesh.indices.len() / 3);
             // textured (its uvs; flat-shaded then), or one colour with smooth normals
             let surface = match &body.base_color {
-                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(super::assets::HERO_LAYER),
+                Some((_, mean)) => RtSurface::new(*mean).with_albedo_layer(hero_layer),
                 None => RtSurface::new(proxy_albedo(body.name)).with_smooth_normals(),
             };
             let mut r = grid_only(Geometry::new(&format!("{}/Grid", body.name), vertices, indices), surface);
@@ -346,8 +347,8 @@ impl Proxy {
         }
         self.placed = ends;
         self.shown = shown;
-        let at = character.controller.matcher.character();
-        let place = Mat4::from_translation(at.translation) * Mat4::from_rotation_y(kansei_core::animation::motion_matching::yaw_of(at.rotation));
+        let at = character.controller.matcher.shown();
+        let place = Mat4::from_rotation_translation(at.rotation, at.translation);
         for (k, proxy) in self.bodies.iter().enumerate() {
             if let Some((view, _)) = &proxy.view {
                 if let Some(r) = scene.get_renderable_mut(*view) {
