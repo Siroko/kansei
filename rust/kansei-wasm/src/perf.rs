@@ -29,6 +29,8 @@ extern "C" {
     fn js_profile(json: &str);
     #[wasm_bindgen(js_name = perfClusters)]
     fn js_clusters(camera: u32, all: u32);
+    #[wasm_bindgen(js_name = perfIdle)]
+    fn js_idle(idle: bool);
 }
 
 /// How often [`profile`] takes the renderer's profile while the overlay shows (ms).
@@ -49,6 +51,12 @@ pub fn visible() -> bool {
 /// Show or hide the overlay.
 pub fn set_visible(visible: bool) {
     js_set_visible(visible);
+}
+
+/// Tell the overlay the page renders nothing while nothing moves (`true`), or renders again: it
+/// shows "idle" and no GPU time meanwhile (the frames it counts are the loop's, rendered or not).
+pub fn set_idle(idle: bool) {
+    js_idle(idle);
 }
 
 /// [`crate::run`]: a frame starts (its time when the overlay shows).

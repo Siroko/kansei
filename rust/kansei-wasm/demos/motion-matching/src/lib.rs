@@ -7,10 +7,12 @@
 //! ships with Kansei: the page loads `pack/locomotion.kmm` next to `index.html` (or `pack=<url>`)
 //! and says how to make one when it is missing. See this example's README.
 //!
-//! A character pack (`pack/hero.kmm`, or `hero=<url>`), when there is one, is a second body for
-//! the same animation: a mesh rigged to the same skeleton with its own proportions and textures,
-//! the pose retargeted onto it (`animation::retarget`). It is shown by default; C switches
-//! between it and the motion pack's own mesh (`char=hero` or `char=mannequin` to choose).
+//! Character packs (`pack/hero.kmm`, `pack/mannequin.kmm` and `pack/tripo.kmm`, or `hero=<url>`,
+//! `mannequin=<url>`, `tripo=<url>`),
+//! when there are some, are more bodies for the same animation: meshes rigged to the same
+//! skeleton with their own proportions and textures, the pose retargeted onto them
+//! (`animation::retarget`). The hero is shown by default; C cycles through the bodies and the
+//! motion pack's own mesh (`char=hero`, `char=mannequin`, `char=tripo` or `char=pack` to choose).
 //!
 //! A course of boxes stands around the start: low rails to hurdle, boxes to vault, blocks to mantle
 //! onto, walls to climb, long narrow beams and stacked blocks, some turned. Space in front of one
@@ -136,12 +138,14 @@ impl State {
     }
 }
 
-/// The motion pack (`pack=<url>`, else `pack/locomotion.kmm`) and the character pack (`hero=<url>`,
-/// else `pack/hero.kmm`; `hero=none`: none) loaded by `load`, as a character drawn by `look`
-/// (`char=hero|mannequin` picks the body shown, `at=<x>,<z>,<degrees>` where it starts, on
-/// whatever `collision` has there). Without a pack, the HUD says how to make one (`page`: where
-/// to put it).
-pub(crate) async fn load_character<L, F>(renderer: &Renderer, scene: &mut Scene, collision: &CollisionWorld, look: &dyn BodyLook, load: &L, page: &str) -> Option<Character>
+/// The motion pack (`pack=<url>`, else `pack/locomotion.kmm`) and the character packs, each
+/// optional: the hero (`hero=<url>`, else `pack/hero.kmm`), the mannequin (`mannequin=<url>`,
+/// else `pack/mannequin.kmm`) and the owner's Tripo character (`tripo=<url>`, else
+/// `pack/tripo.kmm`, private), `none` for one left out; loaded by `load`, as a character drawn by
+/// `look`. `char=pack|hero|mannequin|tripo` picks the body shown (else `prefer`, if loaded, else the
+/// last), `at=<x>,<z>,<degrees>` where it starts, on whatever `collision` has there. Without a
+/// pack, the HUD says how to make one (`page`: where to put it).
+pub(crate) async fn load_character<L, F>(renderer: &Renderer, scene: &mut Scene, collision: &CollisionWorld, look: &dyn BodyLook, load: &L, page: &str, prefer: &str) -> Option<Character>
 where
     L: Fn(String) -> F,
     F: std::future::Future<Output = Result<Vec<u8>, String>>,
@@ -151,29 +155,32 @@ where
     set_text("hud", &format!("Loading motion pack {url} …"));
     let gait = flag("gait", true);
     let motion = load(url.clone()).await.and_then(|bytes| MotionPack::from_bytes(&bytes));
-    // a second body, optional
-    let hero_url = param("hero").unwrap_or_else(|| "pack/hero.kmm".to_string());
-    let hero = match &motion {
-        Ok(_) if hero_url == "none" => {
-            log::info!("no character pack: none asked for (hero=none)");
-            None
-        }
-        Ok(_) => match load(hero_url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                log::info!("no character pack: {e}");
-                None
+    // more bodies, optional
+    let mut packs = Vec::new();
+    if motion.is_ok() {
+        for name in ["hero", "mannequin", "tripo"] {
+            let url = param(name).unwrap_or_else(|| format!("pack/{name}.kmm"));
+            if url == "none" {
+                log::info!("no {name} pack: none asked for ({name}=none)");
+                continue;
             }
-        },
-        Err(_) => None,
-    };
+            match load(url).await.and_then(|bytes| CharacterPack::from_bytes(&bytes)) {
+                Ok(p) => packs.push((name, p)),
+                Err(e) => log::info!("no {name} pack: {e}"),
+            }
+        }
+    }
     match motion {
-        Ok(pack) => match Character::new(renderer, scene, pack, hero, gait, look) {
+        Ok(pack) => match Character::new(renderer, scene, pack, packs, gait, look) {
             Ok(mut c) => {
+                let named = |name: &str| c.bodies.iter().position(|b| b.name == name);
                 let wanted = match param("char").as_deref() {
-                    Some("mannequin") => 0,
-                    _ => c.bodies.len() - 1,
-                };
+                    // (the motion pack's own mesh was `char=mannequin` before the mannequin pack)
+                    Some("mannequin") => named("mannequin").or(named("pack")),
+                    Some(name) => named(name),
+                    None => named(prefer),
+                }
+                .unwrap_or(c.bodies.len() - 1);
                 c.show(scene, wanted);
                 if let Some(at) = param("at") {
                     let v: Vec<f32> = at.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -223,7 +230,7 @@ where
     let mut scene = Scene::new();
     // the course, the lake and its props (`course=0`, `lake=0`, `rest=0`, `mill=0`, `taa=0`)
     let mut world = World::new(&renderer, &mut scene, &WorldOptions::from_url());
-    let character = load_character(&renderer, &mut scene, &world.collision, &SunLit, &load, "").await;
+    let character = load_character(&renderer, &mut scene, &world.collision, &SunLit, &load, "", "hero").await;
 
     let volume = world.post_processing(&renderer, &mut scene);
     let mut camera = Camera::new(45.0, 0.1, 1200.0, canvas.aspect());

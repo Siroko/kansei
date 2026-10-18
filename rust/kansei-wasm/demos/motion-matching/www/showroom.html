@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Motion Matching Showroom</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+        #hud, #hud-room {
+            position: fixed; left: 14px; margin: 0; max-width: 70vw;
+            color: #f2f2f2; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+            text-shadow: 0 1px 2px #000, 0 0 6px #000; white-space: pre-wrap; pointer-events: none;
+        }
+        #hud { top: 12px; }
+        #hud-room { bottom: 28px; }
+        #stats {
+            position: fixed; right: 8px; bottom: 8px; margin: 0; padding: 6px 8px;
+            font: 11px/1.35 ui-monospace, Menlo, monospace; color: #e8e8e8;
+            background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none; white-space: pre;
+        }
+        #stats:empty { display: none; }
+        #credit { position: fixed; left: 14px; bottom: 6px; font: 10px sans-serif; color: #999; }
+        #credit a { color: #bbb; }
+        .tp-dfwv { width: 300px !important; }
+    </style>
+</head>
+<body data-venue="showroom">
+    <canvas id="kansei" tabindex="0"></canvas>
+    <pre id="hud"></pre>
+    <pre id="hud-room"></pre>
+    <pre id="stats"></pre>
+    <div id="credit">
+        Surfaces: <a href="https://ambientcg.com">ambientCG</a> (CC0). The furniture is modelled from the owner's photos and loads only where it is linked in (see the README).
+    </div>
+    <script type="module" src="room.js"></script>
+</body>
+</html>

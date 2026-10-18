@@ -37,7 +37,7 @@ const RT_APPROXIMATE_SKIN : f32 = 0.3;
 // The glass a pixel shows, as kansei_gbuffer_out_glass wrote it.
 struct Glass {
     ior    : f32,
-    // Beer-Lambert's absorption a metre (-log of the tint)
+    // Beer-Lambert's absorption a metre (-log of the tint, times RtGlass::absorption_scale)
     absorb : vec3f,
     // the tan of its surfaces' lobe (rtLobeTan of its roughness; 0: clear)
     lobe   : f32,
@@ -167,7 +167,7 @@ fn glassPixel(px: vec2u, inside: bool) -> GlassPixel {
     }
     let raw = textureLoad(normalTex, px, 0);
     gp.g.ior = 1.0 / clamp(raw.w, 0.05, 1.0);
-    gp.g.absorb = -log(clamp(albedo.rgb, vec3f(1e-4), vec3f(1.0)));
+    gp.g.absorb = -log(clamp(albedo.rgb, vec3f(1e-4), vec3f(1.0))) * rp.glassAbsorptionScale;
     let roughness = clamp((0.45 - albedo.a) / 0.4, 0.0, 1.0);
     // (8-bit: a clear glass's alpha reads a hair off 0.45)
     gp.g.lobe = select(rtLobeTan(roughness), 0.0, roughness < 0.01);

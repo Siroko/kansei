@@ -44,6 +44,11 @@ pub struct RendererConfig {
     pub present_mode: wgpu::PresentMode,
     /// Device limits to request (WebGPU's defaults unless raised).
     pub required_limits: RequiredLimits,
+    /// The surface format to use when the surface offers it: `Rgba16Float` for an HDR screen,
+    /// whose compositor then gets more than 8 bits (kansei-wasm's `Canvas::renderer` asks for it
+    /// there). `None`, or not offered: an sRGB format, else the surface's first (the browser's
+    /// preferred `bgra8unorm`/`rgba8unorm`).
+    pub surface_format: Option<wgpu::TextureFormat>,
 }
 
 impl Default for RendererConfig {
@@ -56,6 +61,7 @@ impl Default for RendererConfig {
             clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0),
             present_mode: wgpu::PresentMode::Fifo,
             required_limits: RequiredLimits::Default,
+            surface_format: None,
         }
     }
 }
@@ -333,10 +339,10 @@ impl Renderer {
     pub async fn initialize(&mut self, surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) {
         let (device, queue) = self.request_device(adapter).await;
         let surface_caps = surface.get_capabilities(adapter);
-        let format = surface_caps.formats.iter()
-            .find(|f| f.is_srgb())
-            .copied()
+        let format = self.config.surface_format.filter(|f| surface_caps.formats.contains(f))
+            .or_else(|| surface_caps.formats.iter().find(|f| f.is_srgb()).copied())
             .unwrap_or(surface_caps.formats[0]);
+        log::info!("Surface format: {format:?}");
 
         // Pick best available present mode: prefer requested, fallback to Mailbox, then Fifo
         let present_mode = if surface_caps.present_modes.contains(&self.config.present_mode) {

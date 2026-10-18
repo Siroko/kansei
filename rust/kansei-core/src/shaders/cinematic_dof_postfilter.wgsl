@@ -26,8 +26,8 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
             let c = vec2u(clamp(vec2i(gid.xy) + vec2i(dx, dy), vec2i(0), lim));
             let tent = f32((2 - abs(dx)) * (2 - abs(dy))) / 16.0;
             let b = textureLoad(bgIn, c, 0);
-            // sharp texels keep themselves; blurred ones average with their like
-            let w = tent * exp(-abs(b.a - center.a) / layerTolerance(center.a)) * select(1.0, 0.0, abs(center.a) < 0.5 && (dx != 0 || dy != 0));
+            // sharp texels keep themselves; blurred ones average with their like, or with any blurred
+            let w = tent * layerMatch(center.a * 2.0, b.a * 2.0) * select(1.0, 0.0, abs(center.a) < 0.5 && (dx != 0 || dy != 0));
             bg += b.rgb * w;
             bgW += w;
             fg += textureLoad(fgIn, c, 0) * tent;

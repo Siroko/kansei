@@ -7,8 +7,13 @@
 //! room is a draw per material; `<name>_COL` boxes are the collision world, `<name>_SHADOW` meshes
 //! what their parent casts into the shadow maps, `_CUT` meshes Blender's boolean cutters (skipped);
 //! `kansei` names a role (`shell`, `mirror`, `glass`, `aquarium`, `caustics`, `dragon`, `spawn`,
-//! `preview`); lights carry `kansei_light` (`sun`, `skylight`, `lamp`,
-//! `display`); cameras named `CAM_<view>` are the page's fixed views.
+//! `preview`, `backdrop`); lights carry `kansei_light` (`sun`, `skylight`, `lamp`,
+//! `display`; a lamp's `kansei_lamp_scale` its share of the page's lamp intensity); cameras named
+//! `CAM_<view>` are the page's fixed views.
+//!
+//! A backdrop (`kansei: backdrop`, the showroom's park outside its windows) is drawn as the sky is:
+//! its colour map times `kansei_emission_scale` and the page's sky radiance, unlit, alpha-tested,
+//! casting nothing and in neither the grid nor the voxel GI.
 //!
 //! One-sided: the shell (`kansei: shell`: walls, floor, ceiling) is drawn with back faces discarded
 //! on screen, so from outside (the orbit camera past a wall or above the ceiling) the camera looks
@@ -49,12 +54,20 @@ const LAMP_COLOR: [f32; 3] = [1.0, 0.68, 0.4];
 const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
 /// cd/m² for a unit of Blender's emission strength (its shades' 6 are `SHADE_RADIANCE`).
 const EMISSION_SCALE: f32 = 150.0;
+/// The sky radiance a backdrop is first drawn at (cd/m², the page's horizon), until the page sets
+/// its own (`backdrop_radiance`).
+const BACKDROP_SKY: f32 = 5000.0;
 const MIRROR: [f32; 3] = [0.92, 0.92, 0.92];
 const MIRROR_GI: [f32; 3] = [0.03, 0.03, 0.03];
+/// A metal's albedo in the grid and the voxel GI, as a share of its colour's: they shade a hit as
+/// a diffuse surface, and a metal (no diffuse) mirrors what is round it, much of it more metal; at
+/// its full colour a polished shelf showed white in its own folds, flat as plastic.
+const METAL_GI: f32 = 0.15;
 
 /// The lights as built (scene indices): the sun, the skylight's area light (the first spot light:
-/// `RtShadowsEffect::set_rect_emitter(0, ..)`) and its rectangle, the lamps, the glowing shades,
-/// the display spot over the dragon (the last spot light).
+/// `RtShadowsEffect::set_rect_emitter(0, ..)`) and its rectangle, the lamps (each with its share of
+/// the page's lamp intensity), the glowing shades (each with its radiance, cd/m²), the display spot
+/// over the dragon (the last spot light).
 pub struct Lights {
     pub sun: usize,
     pub sun_direction: GVec3,
@@ -62,8 +75,8 @@ pub struct Lights {
     /// The skylight's emitter: its extent along z and along x (m), as `set_rect_emitter` takes it
     /// for a light pointing down.
     pub skylight_rect: [f32; 2],
-    pub lamps: Vec<usize>,
-    pub shades: Vec<usize>,
+    pub lamps: Vec<(usize, f32)>,
+    pub shades: Vec<(usize, f32)>,
     pub display: usize,
 }
 
@@ -108,8 +121,12 @@ pub struct Layout {
     pub views: Vec<View>,
     /// Where the character starts and its heading.
     pub spawn: (GVec3, f32),
-    /// The dragon's place on the plinth, its yaw and its length.
-    pub dragon: (GVec3, f32, f32),
+    /// The dragon's place on the plinth, its yaw and its length (`kansei: dragon`; none without).
+    pub dragon: Option<(GVec3, f32, f32)>,
+    /// The boxes of the glass the glb places (`kansei: glass`, or a transmissive material), for
+    /// the caustics' photons, and the first one's tint (the light a metre of it leaves).
+    pub glass: Vec<(GVec3, GVec3)>,
+    pub glass_tint: Option<[f32; 3]>,
     /// The room's inside (the shell's bounds).
     pub min: GVec3,
     pub max: GVec3,
@@ -118,9 +135,12 @@ pub struct Layout {
     pub tank: Option<Tank>,
     pub caustics: ([f32; 2], [f32; 2]),
     /// The colour maps the reflections' hits read (`assets::albedo_array`, a layer each) and the
-    /// tint each is drawn with.
+    /// tint each has in the grid and the voxel GI (a metal's darker: `METAL_GI`).
     pub albedo_layers: Vec<(wgpu::TextureView, [f32; 3])>,
     pub traversals: Vec<Traversal>,
+    /// The backdrops' renderables and their emission scale (`kansei_emission_scale`): drawn at that
+    /// times the sky's radiance (`backdrop_radiance`).
+    pub backdrops: Vec<(usize, f32)>,
     /// Triangles drawn, by role, for the log and the README.
     pub triangles: Vec<(String, usize)>,
 }
@@ -159,17 +179,28 @@ struct RoomMaterial {
     params: PbrParams,
     /// Its colour map's layer in the albedo array.
     layer: Option<u8>,
-    tint: [f32; 3],
+    /// The tint in the grid and the voxel GI (`METAL_GI` for a metal).
+    gi_tint: [f32; 3],
     double_sided: bool,
     cutout: bool,
     shade: bool,
     emission: [f32; 3],
     roughness: f32,
+    /// Transmissive (KHR_materials_transmission): drawn as ray-traced glass.
+    glass: bool,
+    /// The light a centimetre of it leaves: its volume's attenuation (KHR_materials_volume)
+    /// brought to a centimetre, else its base colour as a metre's (a metre of thin coloured glass
+    /// leaves less light than an f32 holds).
+    glass_tint_cm: [f32; 3],
+    /// A backdrop's (`kansei: backdrop`): its emission scale.
+    backdrop: Option<f32>,
 }
 
 /// A group of meshes drawn as one renderable.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
+    /// The glb (of the sources `load` reads) and its material.
+    doc: usize,
     material: usize,
     shell: bool,
     self_lit: bool,
@@ -241,7 +272,7 @@ fn world_bounds(world: Mat4, (lo, hi): (GVec3, GVec3)) -> (GVec3, GVec3) {
 }
 
 /// The materials, their maps uploaded once each.
-fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, deferred: bool, layers: &mut Vec<(wgpu::TextureView, [f32; 3])>) -> Vec<RoomMaterial> {
+fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, deferred: bool, all_reflective: bool, layers: &mut Vec<(wgpu::TextureView, [f32; 3])>) -> Vec<RoomMaterial> {
     let support = renderer.compression_support();
     let mut uploaded: HashMap<usize, (wgpu::Texture, wgpu::TextureView)> = HashMap::new();
     let mut texture = |t: Option<&kansei_core::loaders::GLTFTextureRef>, flat: [u8; 4], label: &str| -> Shared {
@@ -275,7 +306,10 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
             let strength = m.emissive_strength().unwrap_or(1.0);
             let emission = emissive.map(|c| c * strength * EMISSION_SCALE);
             let roughness = if textured_orm { info.roughness } else { 1.0 };
-            let reflective = x.get("kansei_reflective").and_then(Value::as_f64).unwrap_or(0.0) > 0.5;
+            let reflective = all_reflective || x.get("kansei_reflective").and_then(Value::as_f64).unwrap_or(0.0) > 0.5;
+            // (a textured map's mean metallic as the packer measured it, `kansei_metallic`)
+            let metallic = x.get("kansei_metallic").and_then(Value::as_f64).map_or(if textured_orm { 0.0 } else { info.metallic }, |v| v as f32);
+            let gi_tint = tint.map(|c| c * (1.0 - metallic.clamp(0.0, 1.0) * (1.0 - METAL_GI)));
             let params = PbrParams {
                 tint: [tint[0], tint[1], tint[2], 0.0],
                 surface: [1.0, roughness, 0.0, reflective as u32 as f32],
@@ -284,8 +318,10 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 emissive: [emission[0], emission[1], emission[2], number(&x, "kansei_macro").unwrap_or(0.0)],
                 flags: [0.0, 1.0, 0.0, 0.0],
             };
-            let layer = info.base_color_texture.as_ref().map(|_| {
-                layers.push((color.view().clone(), tint));
+            let backdrop = (text(&x, "kansei") == "backdrop").then(|| number(&x, "kansei_emission_scale").unwrap_or(1.0));
+            // (a backdrop is never hit: no layer)
+            let layer = info.base_color_texture.as_ref().filter(|_| backdrop.is_none()).map(|_| {
+                layers.push((color.view().clone(), gi_tint));
                 (layers.len() - 1) as u8
             });
             RoomMaterial {
@@ -293,209 +329,301 @@ fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, def
                 maps: SharedMaps { color, normal, orm },
                 params,
                 layer,
-                tint,
+                gi_tint,
                 double_sided: m.double_sided() || cutout,
                 cutout,
                 shade: x.get("kansei_shade").and_then(Value::as_f64).unwrap_or(0.0) > 0.5,
                 emission,
                 roughness,
+                glass: m.transmission().is_some_and(|t| t.transmission_factor() > 0.5),
+                glass_tint_cm: match m.volume() {
+                    Some(v) if v.attenuation_distance().is_finite() && v.attenuation_distance() > 0.0 => v.attenuation_color().map(|c| c.clamp(1e-6, 1.0).powf(0.01 / v.attenuation_distance())),
+                    _ => tint.map(|c| c.clamp(1e-6, 1.0).powf(0.01)),
+                },
+                backdrop,
             }
         })
         .collect()
 }
 
-/// Fetch `assets/room/room.glb` and build the room into `scene`: `deferred` leaves the direct
-/// light to `RtShadowsEffect`.
-pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Result<Layout, String> {
-    let bytes = crate::fetch_bytes("assets/room/room.glb").await?;
-    let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("room.glb: {e}"))?;
-    let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone()).map_err(|e| format!("room.glb buffers: {e}"))?;
-    let result = GLTFLoader::load_glb(&bytes)?;
-    let doc = &gltf.document;
-    let mut albedo_layers = Vec::new();
-    let mats = materials(renderer, doc, &result, deferred, &mut albedo_layers);
+/// A glb `load` reads: its URL, and whether the page needs it (else, missing, it is left out:
+/// the showroom's furniture, kept out of the repository).
+pub struct Source<'a> {
+    pub url: &'a str,
+    pub required: bool,
+    /// Every material reflective (`kansei_reflective`), traced where glossy: the showroom's
+    /// pieces, whose chrome and lacquer come from their own maps.
+    pub reflective: bool,
+}
 
-    // every node, placed in the world
-    let mut placed: Vec<(gltf::Node, Mat4, Option<usize>)> = Vec::new();
-    fn walk<'a>(node: gltf::Node<'a>, parent: Mat4, parent_index: Option<usize>, out: &mut Vec<(gltf::Node<'a>, Mat4, Option<usize>)>) {
-        let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-        let me = node.index();
-        for child in node.children() {
-            walk(child, world, Some(me), out);
-        }
-        out.push((node, world, parent_index));
-    }
-    let root = doc.default_scene().or_else(|| doc.scenes().next()).ok_or("room.glb: no scene")?;
-    for node in root.nodes() {
-        walk(node, Mat4::IDENTITY, None, &mut placed);
+/// A glb fetched, its buffers and its materials.
+struct Doc {
+    gltf: gltf::Gltf,
+    buffers: Vec<gltf::buffer::Data>,
+    mats: Vec<RoomMaterial>,
+}
+
+/// Fetch the glbs (`assets/room/room.glb`, or the showroom's architecture and furniture) and build
+/// them into `scene` as one room: `deferred` leaves the direct light to `RtShadowsEffect`.
+///
+/// `glass_scale`: the glass's tint drawn as the light `1 / glass_scale` metres of it leave
+/// (`RtGlass::absorption_scale`); `layout.glass_tint` is that. `glass_density` scales the glass's
+/// absorption as authored (1: as the glb says).
+pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool, sources: &[Source<'_>], glass_scale: f32, glass_density: f32) -> Result<Layout, String> {
+    let mut albedo_layers = Vec::new();
+    let mut docs = Vec::new();
+    for source in sources {
+        let name = source.url.rsplit('/').next().unwrap_or(source.url);
+        let bytes = match crate::fetch_bytes(source.url).await {
+            Ok(b) => b,
+            Err(e) if !source.required => {
+                log::info!("room: {name} left out ({e})");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))?;
+        let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone()).map_err(|e| format!("{name} buffers: {e}"))?;
+        let result = GLTFLoader::load_glb(&bytes)?;
+        let mats = materials(renderer, &gltf.document, &result, deferred, source.reflective, &mut albedo_layers);
+        docs.push(Doc { gltf, buffers, mats });
     }
 
     let mut collision = CollisionWorld::new();
     let mut groups: HashMap<Key, Group> = HashMap::new();
-    let mut shadows: HashMap<usize, (Vec<Vertex>, Vec<u32>)> = HashMap::new();
-    // the same `_SHADOW` meshes by parent and material, and what the ray tracing grid traces of
-    // each material: a member's `_SHADOW` mesh where it has one (the grid's cost is triangles a
-    // cell: the furniture's full meshes cost the rays half again), else its mesh
-    let mut proxy_parts: HashMap<(usize, usize), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
-    let mut grid: HashMap<(usize, bool), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+    // what the ray tracing grid traces of each material: a member's `_SHADOW` mesh where it has
+    // one (the grid's cost is triangles a cell: the furniture's full meshes cost the rays half
+    // again), else its mesh
+    let mut grid: HashMap<(usize, usize, bool), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
     let mut mirrors: Vec<(String, Geometry, f32)> = Vec::new();
-    let mut glass: Vec<(String, Geometry, [f32; 3])> = Vec::new();
+    // (name, mesh, the drawn tint, a centimetre's)
+    let mut glass: Vec<(String, Geometry, [f32; 3], [f32; 3])> = Vec::new();
+    let mut glass_boxes = Vec::new();
+    let mut glass_tint = None;
     let mut views = Vec::new();
     let mut traversals = Vec::new();
     let mut spawn = (GVec3::new(0.0, 0.0, 11.0), std::f32::consts::PI);
-    let mut dragon = (GVec3::new(0.0, 0.5, 0.0), 0.7, 2.6);
+    let mut dragon = None;
     let mut tank = None;
     let mut colliders = 0;
     let mut caustics = None;
     let (mut shell_lo, mut shell_hi) = (GVec3::splat(f32::MAX), GVec3::splat(f32::MIN));
     let (mut sun, mut skylight, mut lamps, mut display) = (None, None, Vec::new(), None);
     let mut triangles: HashMap<String, usize> = HashMap::new();
+    // the backdrops' meshes, by glb and material
+    let mut backdrop_parts: HashMap<(usize, usize), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
 
-    // the `_SHADOW` meshes first, keyed by their parent
-    for (node, world, parent) in &placed {
-        let name = node.name().unwrap_or("");
-        if let (Some(mesh), Some(parent), true) = (node.mesh(), parent, name.ends_with("_SHADOW")) {
-            let out = shadows.entry(*parent).or_default();
-            for p in mesh.primitives() {
-                primitive(&p, &buffers, *world, out);
-                let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
-                primitive(&p, &buffers, *world, proxy_parts.entry((*parent, material)).or_default());
+    for (d, Doc { gltf, buffers, mats }) in docs.iter().enumerate() {
+        let doc = &gltf.document;
+        let buffers = buffers.as_slice();
+        // every node, placed in the world
+        let mut placed: Vec<(gltf::Node, Mat4, Option<usize>)> = Vec::new();
+        fn walk<'a>(node: gltf::Node<'a>, parent: Mat4, parent_index: Option<usize>, out: &mut Vec<(gltf::Node<'a>, Mat4, Option<usize>)>) {
+            let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+            let me = node.index();
+            for child in node.children() {
+                walk(child, world, Some(me), out);
+            }
+            out.push((node, world, parent_index));
+        }
+        let root = doc.default_scene().or_else(|| doc.scenes().next()).ok_or("glb: no scene")?;
+        for node in root.nodes() {
+            walk(node, Mat4::IDENTITY, None, &mut placed);
+        }
+        let parents: HashMap<usize, usize> = placed.iter().filter_map(|(n, _, p)| p.map(|p| (n.index(), p))).collect();
+
+        // the `_SHADOW` meshes first, keyed by their parent, and by parent and material
+        let mut shadows: HashMap<usize, (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+        let mut proxy_parts: HashMap<(usize, usize), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+        for (node, world, parent) in &placed {
+            let name = node.name().unwrap_or("");
+            if let (Some(mesh), Some(parent), true) = (node.mesh(), parent, name.ends_with("_SHADOW")) {
+                let out = shadows.entry(*parent).or_default();
+                for p in mesh.primitives() {
+                    primitive(&p, buffers, *world, out);
+                    let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
+                    primitive(&p, buffers, *world, proxy_parts.entry((*parent, material)).or_default());
+                }
             }
         }
-    }
-    for (node, world, parent) in &placed {
-        let name = node.name().unwrap_or("").to_string();
-        let x = extras(node.extras());
-        let role = text(&x, "kansei").to_string();
-        let (_, rotation, translation) = world.to_scale_rotation_translation();
-        if name.ends_with("_CUT") || name.ends_with("_SHADOW") || role == "preview" {
-            continue;
-        }
-        if node.camera().is_some() {
-            let forward = rotation * -GVec3::Z;
-            let distance = number(&x, "distance").unwrap_or(8.0).max(0.5);
-            let target = translation + forward * distance;
-            let d = translation - target;
-            views.push(View { name: name.trim_start_matches("CAM_").to_string(), target, distance, azimuth: d.x.atan2(d.z), elevation: (d.y / distance).clamp(-1.0, 1.0).asin() });
-            continue;
-        }
-        let light_role = text(&x, "kansei_light");
-        if !light_role.is_empty() {
-            let forward = (rotation * -GVec3::Z).normalize();
-            let at = Vec3::new(translation.x, translation.y, translation.z);
-            let dir = Vec3::new(forward.x, forward.y, forward.z);
-            let cone = node.light().and_then(|l| match l.kind() {
-                gltf::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => Some((inner_cone_angle, outer_cone_angle)),
-                _ => None,
-            });
-            match light_role {
-                "sun" => sun = Some(forward),
-                "skylight" => skylight = Some((at, dir, [number(&x, "length").unwrap_or(12.0), number(&x, "width").unwrap_or(6.0)])),
-                "lamp" => lamps.push((at, dir, cone.unwrap_or((55f32.to_radians(), 84f32.to_radians())))),
-                "display" => display = Some((at, dir, cone.unwrap_or((7f32.to_radians(), 11f32.to_radians())))),
-                other => log::warn!("room: {name}: unknown kansei_light {other}"),
-            }
-            continue;
-        }
-        match role.as_str() {
-            "spawn" => {
-                let facing = rotation * GVec3::Y;
-                spawn = (translation, facing.x.atan2(facing.z));
+        // a `_SHADOW` held by an ancestor (a piece's instance, its meshes under it) stands for all
+        // its meshes: the first one met casts it and puts it in the grid, the others nothing
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (node, world, parent) in &placed {
+            let name = node.name().unwrap_or("").to_string();
+            let x = extras(node.extras());
+            let role = text(&x, "kansei").to_string();
+            let (_, rotation, translation) = world.to_scale_rotation_translation();
+            if name.ends_with("_CUT") || name.ends_with("_SHADOW") || role == "preview" {
                 continue;
             }
-            "dragon" => {
-                let facing = rotation * GVec3::Z;
-                dragon = (translation, facing.x.atan2(facing.z), number(&x, "length").unwrap_or(2.6));
+            if node.camera().is_some() {
+                let forward = rotation * -GVec3::Z;
+                let distance = number(&x, "distance").unwrap_or(8.0).max(0.5);
+                let target = translation + forward * distance;
+                let d = translation - target;
+                views.push(View { name: name.trim_start_matches("CAM_").to_string(), target, distance, azimuth: d.x.atan2(d.z), elevation: (d.y / distance).clamp(-1.0, 1.0).asin() });
                 continue;
             }
-            _ => {}
-        }
-        let Some(mesh) = node.mesh() else { continue };
-        if name.ends_with("_COL") {
-            // a bar's tube (`<bar>_COL`) is not in the collision world: the body swinging up to it
-            // must not be pushed off (its posts are)
-            let tube = parent.and_then(|p| doc.nodes().nth(p)).is_some_and(|p| text(&extras(p.extras()), "kansei_traversal") == "bar" && name == format!("{}_COL", p.name().unwrap_or("")));
-            if tube {
+            let light_role = text(&x, "kansei_light");
+            if !light_role.is_empty() {
+                let forward = (rotation * -GVec3::Z).normalize();
+                let at = Vec3::new(translation.x, translation.y, translation.z);
+                let dir = Vec3::new(forward.x, forward.y, forward.z);
+                let cone = node.light().and_then(|l| match l.kind() {
+                    gltf::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => Some((inner_cone_angle, outer_cone_angle)),
+                    _ => None,
+                });
+                match light_role {
+                    "sun" => sun = Some(forward),
+                    // (its cone: `inner`/`outer` degrees, else the room's 62 and 86)
+                    "skylight" => skylight = Some((at, dir, [number(&x, "length").unwrap_or(12.0), number(&x, "width").unwrap_or(6.0)], [number(&x, "inner").unwrap_or(62.0), number(&x, "outer").unwrap_or(86.0)])),
+                    "lamp" => lamps.push((at, dir, cone.unwrap_or((55f32.to_radians(), 84f32.to_radians())), number(&x, "kansei_lamp_scale").unwrap_or(1.0))),
+                    "display" => display = Some((at, dir, cone.unwrap_or((7f32.to_radians(), 11f32.to_radians())))),
+                    other => log::warn!("room: {name}: unknown kansei_light {other}"),
+                }
                 continue;
             }
-            let (lo, hi) = local_bounds(&mesh, &buffers);
-            let (scale, rotation, _) = world.to_scale_rotation_translation();
-            let centre = world.transform_point3((lo + hi) * 0.5);
-            collision.add_box(Obb::new(centre, (hi - lo) * 0.5 * scale, rotation));
-            colliders += 1;
-            continue;
-        }
-        let bounds = world_bounds(*world, local_bounds(&mesh, &buffers));
-        match role.as_str() {
-            "aquarium" => {
-                tank = Some(Tank { min: bounds.0, max: bounds.1, fill: number(&x, "fill").unwrap_or(0.85) });
+            match role.as_str() {
+                "spawn" => {
+                    let facing = rotation * GVec3::Y;
+                    spawn = (translation, facing.x.atan2(facing.z));
+                    continue;
+                }
+                "dragon" => {
+                    let facing = rotation * GVec3::Z;
+                    dragon = Some((translation, facing.x.atan2(facing.z), number(&x, "length").unwrap_or(2.6)));
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(mesh) = node.mesh() else { continue };
+            if role == "backdrop" {
+                for p in mesh.primitives() {
+                    let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
+                    primitive(&p, buffers, *world, backdrop_parts.entry((d, material)).or_default());
+                }
                 continue;
             }
-            "caustics" => {
-                caustics = Some(([bounds.0.x, bounds.0.z], [bounds.1.x, bounds.1.z]));
+            if name.ends_with("_COL") {
+                // a bar's tube (`<bar>_COL`) is not in the collision world: the body swinging up to it
+                // must not be pushed off (its posts are)
+                let tube = parent.and_then(|p| doc.nodes().nth(p)).is_some_and(|p| text(&extras(p.extras()), "kansei_traversal") == "bar" && name == format!("{}_COL", p.name().unwrap_or("")));
+                if tube {
+                    continue;
+                }
+                let (lo, hi) = local_bounds(&mesh, buffers);
+                let (scale, rotation, _) = world.to_scale_rotation_translation();
+                let centre = world.transform_point3((lo + hi) * 0.5);
+                collision.add_box(Obb::new(centre, (hi - lo) * 0.5 * scale, rotation));
+                colliders += 1;
                 continue;
             }
-            "shell" => {
-                shell_lo = shell_lo.min(bounds.0);
-                shell_hi = shell_hi.max(bounds.1);
+            let bounds = world_bounds(*world, local_bounds(&mesh, buffers));
+            match role.as_str() {
+                "aquarium" => {
+                    tank = Some(Tank { min: bounds.0, max: bounds.1, fill: number(&x, "fill").unwrap_or(0.85) });
+                    continue;
+                }
+                "caustics" => {
+                    caustics = Some(([bounds.0.x, bounds.0.z], [bounds.1.x, bounds.1.z]));
+                    continue;
+                }
+                "shell" => {
+                    shell_lo = shell_lo.min(bounds.0);
+                    shell_hi = shell_hi.max(bounds.1);
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        if let Some(kind) = x.get("kansei_traversal").and_then(Value::as_str) {
-            traversals.push(Traversal { name: name.clone(), min: bounds.0, max: bounds.1, from: number(&x, "kansei_from").unwrap_or(1.1), from_y: number(&x, "kansei_from_y").unwrap_or(0.0), want: kind.to_string(), extras: x.to_string() });
-        }
-        if role == "mirror" || role == "glass" {
-            let mut part = (Vec::new(), Vec::new());
-            for p in mesh.primitives() {
-                primitive(&p, &buffers, *world, &mut part);
+            if let Some(kind) = x.get("kansei_traversal").and_then(Value::as_str) {
+                traversals.push(Traversal { name: name.clone(), min: bounds.0, max: bounds.1, from: number(&x, "kansei_from").unwrap_or(1.1), from_y: number(&x, "kansei_from_y").unwrap_or(0.0), want: kind.to_string(), extras: x.to_string() });
             }
-            let geometry = Geometry::new(&name, part.0, part.1);
-            if role == "mirror" {
-                mirrors.push((name, geometry, number(&x, "kansei_roughness").unwrap_or(0.0)));
+            // (a transmissive material is glass too: the showroom's vase)
+            let glassy = mesh.primitives().next().and_then(|p| p.material().index()).is_some_and(|m| mats[m].glass);
+            if role == "mirror" || role == "glass" || glassy {
+                let mut part = (Vec::new(), Vec::new());
+                for p in mesh.primitives() {
+                    primitive(&p, buffers, *world, &mut part);
+                }
+                let geometry = Geometry::new(&name, part.0, part.1);
+                if role == "mirror" {
+                    mirrors.push((name, geometry, number(&x, "kansei_roughness").unwrap_or(0.0)));
+                } else {
+                    let tint_cm = mesh.primitives().next().and_then(|p| p.material().index()).map_or([0.95f32.powf(0.01); 3], |m| mats[m].glass_tint_cm);
+                    // the drawn tint: the light 1 / glass_scale metres leave
+                    let tint_cm = tint_cm.map(|c| c.powf(glass_density.max(0.0)));
+                    let tint = tint_cm.map(|c| c.powf(100.0 / glass_scale.max(1e-3)));
+                    glass_tint.get_or_insert(tint);
+                    glass.push((name, geometry, tint, tint_cm));
+                    glass_boxes.push(bounds);
+                }
+                continue;
+            }
+            // its own `_SHADOW`, or an ancestor's (`Some(None)`: claimed by a sibling already)
+            let holder = if shadows.contains_key(&node.index()) {
+                Some(node.index())
             } else {
-                let tint = mesh.primitives().next().and_then(|p| p.material().index()).map_or([0.95; 3], |m| mats[m].tint);
-                glass.push((name, geometry, tint));
-            }
-            continue;
-        }
-        let proxy = shadows.get(&node.index());
-        for p in mesh.primitives() {
-            let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
-            let key = Key { material, shell: role == "shell", self_lit: x.get("kansei_self_lit").and_then(Value::as_f64).unwrap_or(0.0) > 0.5 };
-            let group = groups.entry(key).or_default();
-            let mut part = (Vec::new(), Vec::new());
-            primitive(&p, &buffers, *world, &mut part);
-            let base = group.vertices.len() as u32;
-            group.vertices.extend_from_slice(&part.0);
-            group.indices.extend(part.1.iter().map(|i| i + base));
-            match proxy {
-                // (a node's proxy is cast once, by its first primitive's group)
-                Some(s) if p.index() == 0 => {
-                    let base = group.shadow.0.len() as u32;
-                    group.shadow.0.extend_from_slice(&s.0);
-                    group.shadow.1.extend(s.1.iter().map(|i| i + base));
-                    group.proxies = true;
-                }
-                Some(_) => {}
-                None => {
-                    let base = group.shadow.0.len() as u32;
-                    group.shadow.0.extend_from_slice(&part.0);
-                    group.shadow.1.extend(part.1.iter().map(|i| i + base));
+                std::iter::successors(parents.get(&node.index()).copied(), |a| parents.get(a).copied()).find(|a| shadows.contains_key(a))
+            };
+            let inherited = holder.filter(|&h| h != node.index());
+            let proxy: Option<Option<&(Vec<Vertex>, Vec<u32>)>> = match (holder, inherited) {
+                (Some(h), None) => Some(shadows.get(&h)),
+                (Some(h), Some(_)) => Some(claimed.insert(h).then(|| &shadows[&h])),
+                _ => None,
+            };
+            if let (Some(Some(_)), Some(h)) = (proxy, inherited) {
+                // the ancestor's proxy into the grid, by its own materials
+                for ((owner, material), (v, i)) in proxy_parts.iter().filter(|((o, _), _)| *o == h) {
+                    let _ = owner;
+                    let traced = grid.entry((d, *material, false)).or_default();
+                    let base = traced.0.len() as u32;
+                    traced.0.extend_from_slice(v);
+                    traced.1.extend(i.iter().map(|k| k + base));
                 }
             }
-            let traced = grid.entry((material, key.self_lit)).or_default();
-            let source = if proxy.is_some() { proxy_parts.get(&(node.index(), material)) } else { Some(&part) };
-            if let Some((v, i)) = source {
-                let base = traced.0.len() as u32;
-                traced.0.extend_from_slice(v);
-                traced.1.extend(i.iter().map(|k| k + base));
+            for p in mesh.primitives() {
+                let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
+                let key = Key { doc: d, material, shell: role == "shell", self_lit: x.get("kansei_self_lit").and_then(Value::as_f64).unwrap_or(0.0) > 0.5 };
+                let group = groups.entry(key).or_default();
+                let mut part = (Vec::new(), Vec::new());
+                primitive(&p, buffers, *world, &mut part);
+                let base = group.vertices.len() as u32;
+                group.vertices.extend_from_slice(&part.0);
+                group.indices.extend(part.1.iter().map(|i| i + base));
+                match proxy {
+                    // (a node's proxy is cast once, by its first primitive's group)
+                    Some(Some(s)) if p.index() == 0 => {
+                        let base = group.shadow.0.len() as u32;
+                        group.shadow.0.extend_from_slice(&s.0);
+                        group.shadow.1.extend(s.1.iter().map(|i| i + base));
+                        group.proxies = true;
+                    }
+                    Some(_) => group.proxies = true,
+                    None => {
+                        let base = group.shadow.0.len() as u32;
+                        group.shadow.0.extend_from_slice(&part.0);
+                        group.shadow.1.extend(part.1.iter().map(|i| i + base));
+                    }
+                }
+                let source = match (proxy, inherited) {
+                    (None, _) => Some(&part),
+                    (Some(_), None) => proxy_parts.get(&(node.index(), material)),
+                    // (the ancestor's went in whole above)
+                    (Some(_), Some(_)) => None,
+                };
+                if let Some((v, i)) = source {
+                    let traced = grid.entry((d, material, key.self_lit)).or_default();
+                    let base = traced.0.len() as u32;
+                    traced.0.extend_from_slice(v);
+                    traced.1.extend(i.iter().map(|k| k + base));
+                }
+                let what = if role.is_empty() { "furniture".to_string() } else { role.clone() };
+                *triangles.entry(what).or_default() += part.1.len() / 3;
             }
-            let what = if role.is_empty() { "furniture".to_string() } else { role.clone() };
-            *triangles.entry(what).or_default() += part.1.len() / 3;
         }
     }
     if shell_lo.x > shell_hi.x {
-        return Err("room.glb: no shell (kansei: shell)".into());
+        return Err("glb: no shell (kansei: shell)".into());
     }
 
     // the renderables, a draw per material and way of drawing
@@ -503,17 +631,19 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
     let mut shades = Vec::new();
     let mut grid_triangles = 0;
     let mut keys: Vec<Key> = groups.keys().copied().collect();
-    keys.sort_by_key(|k| (k.material, k.shell, k.self_lit));
+    keys.sort_by_key(|k| (k.doc, k.material, k.shell, k.self_lit));
     for key in keys {
         let group = groups.remove(&key).unwrap();
-        let m = &mats[key.material];
+        let m = &docs[key.doc].mats[key.material];
         let label = format!("Room/{}", m.name);
         let geometry = Geometry::new(&label, group.vertices, group.indices);
-        let albedo = m.tint.map(|c| c * 0.6);
+        let albedo = m.gi_tint.map(|c| c * 0.6);
         if m.shade {
             let mut r = Renderable::new(geometry, Material::emissive("LampShade", m.emission)).with_gi(GiSurface::new([0.8; 3]).with_emission(m.emission.map(|c| c * 0.02)));
             r.cast_shadow = false;
-            shades.push(scene.add(SceneNode::Renderable(r)));
+            // (its radiance as authored: the room's shades' strength 6 is SHADE_RADIANCE)
+            let radiance = m.emission.iter().fold(0.0f32, |a, &c| a.max(c));
+            shades.push((scene.add(SceneNode::Renderable(r)), if radiance > 0.0 { radiance } else { SHADE_RADIANCE }));
             continue;
         }
         let mut params = m.params;
@@ -521,7 +651,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
         let material = pbr::material(&label, m.maps.maps(&label), &params, m.double_sided);
         let r = Renderable::new(geometry, material).with_gi(GiSurface::new(albedo));
         // in the grid (not cut-out leaves): its members as `grid` gathered them
-        if let Some((v, i)) = grid.remove(&(key.material, key.self_lit)).filter(|_| !m.cutout) {
+        if let Some((v, i)) = grid.remove(&(key.doc, key.material, key.self_lit)).filter(|_| !m.cutout) {
             let mut rt = RtSurface::new(albedo);
             if let Some(layer) = m.layer {
                 rt = rt.with_albedo_layer(layer);
@@ -533,14 +663,31 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
             scene.add(SceneNode::Renderable(super::look::grid_only(Geometry::new(&format!("{label}/Grid"), v, i), rt)));
         }
         let mut r = r;
-        if group.proxies {
+        // (the floor casts nothing the room can see; a group whose members' proxies all went into
+        // other groups, nothing either)
+        let floor = m.name == "Floor";
+        let casts = !group.proxies || !group.shadow.1.is_empty();
+        if group.proxies && casts {
             r.shadow_geometry = Some(Geometry::new(&format!("{label}/Shadow"), group.shadow.0, group.shadow.1));
         }
-        // (the floor casts nothing the room can see)
-        let floor = m.name == "Floor";
-        r.cast_shadow = !floor;
+        r.cast_shadow = !floor && casts;
         let index = scene.add(SceneNode::Renderable(r));
         surfaces.push(Surface { index, params, floor, roughness: m.roughness });
+    }
+    // the backdrops: unlit, alpha-tested, casting nothing, in neither the grid nor the voxel GI
+    let mut backdrops = Vec::new();
+    let mut keys: Vec<(usize, usize)> = backdrop_parts.keys().copied().collect();
+    keys.sort();
+    for key in keys {
+        let (v, i) = backdrop_parts.remove(&key).unwrap();
+        let m = &docs[key.0].mats[key.1];
+        let label = format!("Room/{}", m.name);
+        let scale = m.backdrop.unwrap_or(1.0);
+        *triangles.entry("backdrop".into()).or_default() += i.len() / 3;
+        let material = pbr::backdrop(&label, m.maps.color.texture(&label), if m.cutout { m.params.pattern[3] } else { 0.0 }, scale * BACKDROP_SKY);
+        let mut r = Renderable::new(Geometry::new(&label, v, i), material);
+        r.cast_shadow = false;
+        backdrops.push((scene.add(SceneNode::Renderable(r)), scale));
     }
     let mut mirrors_out = Vec::new();
     mirrors.sort_by(|a, b| a.0.cmp(&b.0));
@@ -551,9 +698,16 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
         r.rt = Some(RtSurface::new(MIRROR_GI));
         mirrors_out.push((scene.add(SceneNode::Renderable(r)), roughness));
     }
-    for (name, geometry, tint) in glass {
-        let mut r = Renderable::new(geometry, Material::standard_lit(&name, &StandardLitOptions::glass(tint, 1.5, 0.0)));
-        r.rt = Some(RtSurface::glass(tint));
+    for (name, geometry, drawn, tint_cm) in glass {
+        let forward = fill().iter().any(|&c| c > 0.0);
+        let material = if forward {
+            // no glass pass: blended, its tint a centimetre's
+            pbr::forward_glass(&name, tint_cm, fill())
+        } else {
+            Material::standard_lit(&name, &StandardLitOptions::glass(drawn, 1.5, 0.0))
+        };
+        let mut r = Renderable::new(geometry, material);
+        r.rt = Some(RtSurface::glass(drawn));
         r.cast_shadow = false;
         scene.add(SceneNode::Renderable(r));
     }
@@ -571,20 +725,20 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
     let mut light = DirectionalLight::new(Vec3::new(d.x, d.y, d.z), Vec3::new(SUN_COLOR[0], SUN_COLOR[1], SUN_COLOR[2]), SUN_LUX);
     light.cast_shadow = true;
     let sun = scene.add(SceneNode::Light(Light::Directional(light)));
-    let (at, dir, skylight_rect) = skylight.unwrap_or((Vec3::new(0.0, hi.y + 0.7, 0.0), Vec3::new(0.0, -1.0, 0.0), [12.0, 6.0]));
-    let mut sky = SpotLight::new(at, dir, Vec3::new(0.78, 0.86, 1.0), SKYLIGHT_CD, 48.0, 62f32.to_radians(), 86f32.to_radians());
+    let (at, dir, skylight_rect, [inner, outer]) = skylight.unwrap_or((Vec3::new(0.0, hi.y + 0.7, 0.0), Vec3::new(0.0, -1.0, 0.0), [12.0, 6.0], [62.0, 86.0]));
+    let mut sky = SpotLight::new(at, dir, Vec3::new(0.78, 0.86, 1.0), SKYLIGHT_CD, 48.0, inner.to_radians(), outer.to_radians());
     sky.cast_shadow = true;
     sky.source_radius = 1.5;
     sky.volumetric_scale = 1.0;
     let skylight = scene.add(SceneNode::Light(Light::Spot(sky)));
     let lamps = lamps
         .into_iter()
-        .map(|(at, dir, (inner, outer))| {
-            let mut light = SpotLight::new(at, dir, Vec3::new(LAMP_COLOR[0], LAMP_COLOR[1], LAMP_COLOR[2]), LAMP_CD, 10.0, inner, outer);
+        .map(|(at, dir, (inner, outer), scale)| {
+            let mut light = SpotLight::new(at, dir, Vec3::new(LAMP_COLOR[0], LAMP_COLOR[1], LAMP_COLOR[2]), LAMP_CD * scale, 10.0, inner, outer);
             light.cast_shadow = true;
             light.source_radius = 0.12;
             light.volumetric_scale = 1.0;
-            scene.add(SceneNode::Light(Light::Spot(light)))
+            (scene.add(SceneNode::Light(Light::Spot(light))), scale)
         })
         .collect();
     let (at, dir, (inner, outer)) = display.unwrap_or((Vec3::new(0.0, hi.y - 0.6, -10.5), Vec3::new(0.0, -0.54, 0.84), (7f32.to_radians(), 11f32.to_radians())));
@@ -597,7 +751,7 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
     // the caustics' map: as authored, else round the tank and where the sun through it lands on
     // the floor, and round the dragon
     let caustics = caustics.unwrap_or_else(|| {
-        let mut points = vec![dragon.0 - GVec3::splat(2.0), dragon.0 + GVec3::splat(2.0)];
+        let mut points: Vec<GVec3> = dragon.iter().flat_map(|d: &(GVec3, f32, f32)| [d.0 - GVec3::splat(2.0), d.0 + GVec3::splat(2.0)]).collect();
         if let Some(t) = tank {
             for corner in [t.min, t.max, GVec3::new(t.min.x, t.max.y, t.max.z), GVec3::new(t.max.x, t.max.y, t.min.z)] {
                 points.push(corner - GVec3::splat(0.8));
@@ -612,7 +766,8 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
     triangles.insert("grid".into(), grid_triangles);
     let mut triangles: Vec<(String, usize)> = triangles.into_iter().collect();
     triangles.sort();
-    log::info!("room: {} draws from {} materials, triangles {:?}, {} views, {} colliders", surfaces.len() + shades.len() + mirrors_out.len(), mats.len(), triangles, views.len(), colliders);
+    let materials: usize = docs.iter().map(|d| d.mats.len()).sum();
+    log::info!("room: {} draws from {} materials, triangles {:?}, {} views, {} colliders", surfaces.len() + shades.len() + mirrors_out.len() + backdrops.len(), materials, triangles, views.len(), colliders);
     Ok(Layout {
         collision,
         surfaces,
@@ -621,12 +776,15 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
         views,
         spawn,
         dragon,
+        glass: glass_boxes,
+        glass_tint,
         min: lo,
         max: hi,
         tank,
         caustics,
         albedo_layers,
         traversals,
+        backdrops,
         triangles,
     })
 }

@@ -212,8 +212,11 @@ pub struct ToneMapOptions {
     /// Write sRGB-encoded values. Needed when the surface format is not sRGB (browsers give
     /// `Bgra8Unorm`), since the blit copies the chain's last texture as is; see [`Self::for_surface`].
     pub encode_srgb: bool,
-    /// Triangular dither of one 8-bit step against banding.
+    /// Triangular dither of one step of the surface's precision against banding.
     pub dither: bool,
+    /// The surface's bits a channel the dither's step is one of: 8, or 10 for a float surface
+    /// (an HDR screen's compositor and panel, which still band 8-bit steps' worth of noise less).
+    pub dither_bits: u32,
     /// Unreal's local exposure; off when `None`.
     pub local_exposure: Option<LocalExposure>,
     /// The aspect (width / height) of the frame the picture is the centre crop of, when it is
@@ -237,6 +240,7 @@ impl Default for ToneMapOptions {
             grain_size: 1.6,
             encode_srgb: true,
             dither: true,
+            dither_bits: 8,
             local_exposure: None,
             frame_aspect: None,
         }
@@ -244,10 +248,13 @@ impl Default for ToneMapOptions {
 }
 
 impl ToneMapOptions {
-    /// Defaults with `encode_srgb` set for a surface of this format
-    /// (`renderer.presentation_format()`): encode unless the surface is sRGB already.
+    /// Defaults with `encode_srgb` and the dither set for a surface of this format
+    /// (`renderer.presentation_format()`): encode unless the surface is sRGB already (a float
+    /// surface takes sRGB-encoded values too); dither by 8-bit steps, or 10-bit ones on a float
+    /// surface.
     pub fn for_surface(format: wgpu::TextureFormat) -> Self {
-        Self { encode_srgb: !format.is_srgb(), ..Default::default() }
+        let float = matches!(format, wgpu::TextureFormat::Rgba16Float);
+        Self { encode_srgb: !format.is_srgb(), dither_bits: if float { 10 } else { 8 }, ..Default::default() }
     }
 }
 
@@ -425,6 +432,7 @@ struct ToneMapParamsGpu {
 const FLAG_ENCODE_SRGB: u32 = 1;
 const FLAG_DITHER: u32 = 2;
 const FLAG_LOCAL_EXPOSURE: u32 = 4;
+const FLAG_DITHER_10BIT: u32 = 8;
 /// Half-resolution texels per side of a bilateral grid cell (local_exposure.wgsl's LOCAL_CELL).
 const LOCAL_CELL: u32 = 64;
 /// Bins of the grid.
@@ -520,7 +528,7 @@ impl ToneMapEffect {
             height,
             frame: self.frame,
             tonemapper: o.tonemapper.gpu_id(),
-            flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 } | if o.local_exposure.is_some() { FLAG_LOCAL_EXPOSURE } else { 0 },
+            flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 } | if o.local_exposure.is_some() { FLAG_LOCAL_EXPOSURE } else { 0 } | if o.dither_bits >= 10 { FLAG_DITHER_10BIT } else { 0 },
             frame_aspect: o.frame_aspect.unwrap_or(0.0).max(0.0),
             film: [f.slope, f.toe, f.shoulder, f.black_clip],
             film2: [f.white_clip, f.blue_correction.clamp(0.0, 1.0), f.expand_gamut.max(0.0), 1.0],

@@ -27,6 +27,10 @@ dist-ssr
 *.kmm
 # the TS motion-matching page's linked packs folder
 examples/pack
+# the Rust motion-matching demo's links to private data (link-packs.sh): the packs, and the
+# showroom's furniture (modelled from the owner's photos)
+rust/kansei-wasm/demos/motion-matching/www/pack
+rust/kansei-wasm/demos/motion-matching/www/assets/showroom/private
 
 # Rust build output (cargo target dirs and wasm-pack pkg dirs; the site does not use them)
 target/
