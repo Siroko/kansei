@@ -7,11 +7,12 @@
 //! ships with Kansei: the page loads `pack/locomotion.kmm` next to `index.html` (or `pack=<url>`)
 //! and says how to make one when it is missing. See this example's README.
 //!
-//! Character packs (`pack/hero.kmm` and `pack/mannequin.kmm`, or `hero=<url>`, `mannequin=<url>`),
+//! Character packs (`pack/hero.kmm`, `pack/mannequin.kmm` and `pack/tripo.kmm`, or `hero=<url>`,
+//! `mannequin=<url>`, `tripo=<url>`),
 //! when there are some, are more bodies for the same animation: meshes rigged to the same
 //! skeleton with their own proportions and textures, the pose retargeted onto them
 //! (`animation::retarget`). The hero is shown by default; C cycles through the bodies and the
-//! motion pack's own mesh (`char=hero`, `char=mannequin` or `char=pack` to choose).
+//! motion pack's own mesh (`char=hero`, `char=mannequin`, `char=tripo` or `char=pack` to choose).
 //!
 //! A course of boxes stands around the start: low rails to hurdle, boxes to vault, blocks to mantle
 //! onto, walls to climb, long narrow beams and stacked blocks, some turned. Space in front of one
@@ -138,9 +139,10 @@ impl State {
 }
 
 /// The motion pack (`pack=<url>`, else `pack/locomotion.kmm`) and the character packs, each
-/// optional: the hero (`hero=<url>`, else `pack/hero.kmm`) and the mannequin (`mannequin=<url>`,
-/// else `pack/mannequin.kmm`), `none` for neither; loaded by `load`, as a character drawn by
-/// `look`. `char=pack|hero|mannequin` picks the body shown (else `prefer`, if loaded, else the
+/// optional: the hero (`hero=<url>`, else `pack/hero.kmm`), the mannequin (`mannequin=<url>`,
+/// else `pack/mannequin.kmm`) and the owner's Tripo character (`tripo=<url>`, else
+/// `pack/tripo.kmm`, private), `none` for one left out; loaded by `load`, as a character drawn by
+/// `look`. `char=pack|hero|mannequin|tripo` picks the body shown (else `prefer`, if loaded, else the
 /// last), `at=<x>,<z>,<degrees>` where it starts, on whatever `collision` has there. Without a
 /// pack, the HUD says how to make one (`page`: where to put it).
 pub(crate) async fn load_character<L, F>(renderer: &Renderer, scene: &mut Scene, collision: &CollisionWorld, look: &dyn BodyLook, load: &L, page: &str, prefer: &str) -> Option<Character>
@@ -156,7 +158,7 @@ where
     // more bodies, optional
     let mut packs = Vec::new();
     if motion.is_ok() {
-        for name in ["hero", "mannequin"] {
+        for name in ["hero", "mannequin", "tripo"] {
             let url = param(name).unwrap_or_else(|| format!("pack/{name}.kmm"));
             if url == "none" {
                 log::info!("no {name} pack: none asked for ({name}=none)");

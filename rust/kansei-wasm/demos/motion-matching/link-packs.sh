@@ -6,6 +6,7 @@
 #                                  (parkour, Mixamo hangs), else gasp-parkour.kmm, else gasp-locomotion.kmm
 #   www/pack/hero.kmm           -> <data>/gasp/pack/hero.kmm                (the room's body)
 #   www/pack/mannequin.kmm      -> <assets>/mannequin/export/mannequin.kmm  (the showroom's body)
+#   www/pack/tripo.kmm          -> <assets>/tripo_character/export/tripo.kmm (the owner's own, private)
 #   www/assets/showroom/private -> <assets>/showroom/export/web             (the showroom's furniture)
 # Usage: link-packs.sh [data] [assets]
 #   (defaults: ~/Documents/dev/kansei-private-data, ~/Documents/dev/kansei-assets)
@@ -34,4 +35,5 @@ for pack in gasp-parkour-mixamo gasp-parkour gasp-locomotion; do
 done
 link "$data/gasp/pack/hero.kmm" "$here/www/pack/hero.kmm"
 link "$assets/mannequin/export/mannequin.kmm" "$here/www/pack/mannequin.kmm"
+link "$assets/tripo_character/export/tripo.kmm" "$here/www/pack/tripo.kmm"
 link "$assets/showroom/export/web" "$here/www/assets/showroom/private"

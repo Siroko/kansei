@@ -1309,6 +1309,35 @@ pub fn room_views() -> String {
     format!("[\"follow\",{}]", names.join(","))
 }
 
+/// The character's bodies' names, as JSON (`pack`, `hero`, `mannequin`, `tripo`: those loaded),
+/// the one shown first.
+#[wasm_bindgen]
+pub fn room_bodies() -> String {
+    let names: Vec<String> = with_room(|s| {
+        s.player.character.as_ref().map_or(Vec::new(), |c| {
+            let mut n: Vec<String> = c.bodies.iter().map(|b| format!("\"{}\"", b.name)).collect();
+            n.rotate_left(c.showing);
+            n
+        })
+    })
+    .unwrap_or_default();
+    format!("[{}]", names.join(","))
+}
+
+/// Show the body named `name` (C cycles through them); false for one not loaded.
+#[wasm_bindgen]
+pub fn room_body(name: &str) -> bool {
+    with_room(|s| {
+        let RoomState { player, scene, idle, .. } = s;
+        let Some(c) = &mut player.character else { return false };
+        let Some(k) = c.bodies.iter().position(|b| b.name == name) else { return false };
+        c.show(scene, k);
+        idle.still = 0;
+        true
+    })
+    .unwrap_or(false)
+}
+
 /// Change a setting (`settings`' names, as the URL's) live; false for an unknown one.
 #[wasm_bindgen]
 pub fn room_set(key: &str, value: &str) -> bool {

@@ -58,13 +58,15 @@ paces default to 2 and 5 m/s; set `walk=` and `run=` in the URL to match your da
 ## More bodies
 
 Character packs are optional: the hero (`www/pack/hero.kmm`, or `?hero=<url>`) and the mannequin
-(`www/pack/mannequin.kmm`, or `?mannequin=<url>`; [The mannequin](#the-mannequin)), `none` for
-neither. Each holds a mesh rigged to the same skeleton as the motion pack, with its own
+(`www/pack/mannequin.kmm`, or `?mannequin=<url>`; [The mannequin](#the-mannequin)), and the
+owner's own character (`www/pack/tripo.kmm`, or `?tripo=<url>`; [The owner's
+character](#the-owners-character)), `none` for one left out. Each holds a mesh rigged to the same skeleton as the motion pack, with its own
 proportions and textures. `kansei-anim-bake` makes one from a glTF mesh and its textures
 (`character` config).
 
 - The hero is shown first (the showroom: the mannequin). C cycles through the bodies and the
-  motion pack's own mesh; `?char=hero`, `?char=mannequin` or `?char=pack` picks one
+  motion pack's own mesh (the room and showroom panels' `character` too); `?char=hero`,
+  `?char=mannequin`, `?char=tripo` or `?char=pack` picks one
   (`char=mannequin` without a mannequin pack is the motion pack's mesh, as it was).
 - A motion pack may then ship without a mesh of its own (no `MESH` section): the character pack's
   body is the only one.
@@ -522,6 +524,17 @@ weighted along the spine (and the clavicles at the shoulders), every other part 
 bone. `bake-config.json` there makes `export/mannequin.kmm` with `kansei-anim-bake`; `link-packs.sh`
 links it as `www/pack/mannequin.kmm`. The mesh is original, but the pack carries the rig's joint
 frames, so it stays local with the packs.
+
+### The owner's character
+
+A character the owner generated with Tripo, private: it never goes into git, a published capture
+or the site (`link-packs.sh` links it as `www/pack/tripo.kmm` where it exists; without it the
+pages are as before). `kansei-assets/tripo_character/tripo_rig.py` puts it on the packs'
+skeleton: the source's own rig weights every vertex to `root`, so only its joints' positions are
+read; the packs' skeleton takes their bone lengths in its own T-pose, a solid voxel stand-in of
+the mesh (its open shells closed) is weighted by Blender's bone heat in the source's A-pose and
+carried to each vertex, the shells above the neck rigid to the head, and the mesh is skinned
+into the T-pose. `?char=tripo` shows it; the mannequin stays the showroom's first.
 
 ## Build and run
 

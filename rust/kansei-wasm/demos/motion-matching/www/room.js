@@ -1,7 +1,7 @@
 // The room and showroom pages of the motion-matching module (`start_room`, `start_showroom`:
 // <body data-venue="room|showroom">) and their panel; the character's exports are the same as
 // www/index.html's.
-import init, { start_room, start_showroom, room_info, room_set, room_settings, room_views, room_check, room_parkour, room_aquarium_reset, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
+import init, { start_room, start_showroom, room_info, room_set, room_settings, room_views, room_check, room_parkour, room_bodies, room_body, room_aquarium_reset, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
 const venue = document.body.dataset.venue || 'room';
 const showroom = venue === 'showroom';
 await init();
@@ -101,6 +101,12 @@ top.addBinding(p, 'render', { label: 'render', options: { 'hybrid (ray traced, G
     window.location.href = url.toString();
 });
 top.addBinding(p, 'cam', { label: 'camera', options: options(JSON.parse(room_views())) }).on('change', (ev) => set('cam', ev.value));
+// the bodies loaded (the first shown; C cycles them too)
+const bodies = JSON.parse(room_bodies() || '[]');
+if (bodies.length > 1) {
+    const body = { char: bodies[0] };
+    top.addBinding(body, 'char', { label: 'character', options: options(bodies) }).on('change', (ev) => room_body(ev.value));
+}
 
 const scene = pane.addFolder({ title: 'Scene', expanded: false });
 bind(scene, 'floor_rough', { label: 'floor roughness', min: 0.2, max: 2.0, step: 0.05 });
