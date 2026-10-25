@@ -186,6 +186,11 @@ pub(crate) fn now_ms() -> f64 {
 }
 
 /// Turn profiling on or off (on this thread; the renderer's).
+/// Whether frames are being profiled (`Renderer::set_profiling`).
+pub fn is_enabled() -> bool {
+    PROFILER.with(|p| p.borrow().as_ref().is_some_and(|p| p.enabled))
+}
+
 pub(crate) fn set_enabled(device: &wgpu::Device, queue: &wgpu::Queue, enabled: bool) {
     PROFILER.with(|p| {
         let mut p = p.borrow_mut();

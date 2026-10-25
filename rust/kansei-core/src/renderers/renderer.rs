@@ -598,6 +598,23 @@ impl Renderer {
     /// Cluster LOD's error budget (`Renderable::clusters`), in pixels at the render size: each
     /// cluster drawn is the coarsest whose simplification error the camera sees under it. 1 by
     /// default; 0 draws the full mesh.
+    /// The triangles `r`'s cluster LOD cuts (`Renderable::clusters`) drew in the camera's view
+    /// and in all its views together (the camera's, the shadow maps', the grid's...), as the cull's
+    /// counts last read back (a few frames late); `None` before a reading or without clusters.
+    pub fn cluster_triangles(&self, r: &crate::objects::Renderable) -> Option<(u32, u32)> {
+        let id = r.clusters.as_ref()?.gpu.as_ref()?.id;
+        let counts = self.cluster_culling.as_ref()?.counts();
+        let mine: Vec<(u32, u32)> = counts.iter().filter(|((c, _), _)| *c == id).map(|((_, view), (_, triangles))| (*view, *triangles)).collect();
+        (!mine.is_empty()).then(|| (mine.iter().filter(|(v, _)| *v as usize == MAIN_VIEW).map(|(_, t)| t).sum(), mine.iter().map(|(_, t)| t).sum()))
+    }
+
+    /// Every cluster LOD cut's triangles as `cluster_triangles` gives them: (the camera's view,
+    /// all views).
+    pub fn cluster_triangles_total(&self) -> (u32, u32) {
+        let Some(culling) = self.cluster_culling.as_ref() else { return (0, 0) };
+        culling.counts().iter().fold((0, 0), |(main, all), ((_, view), (_, t))| (main + if *view as usize == MAIN_VIEW { *t } else { 0 }, all + t))
+    }
+
     pub fn set_cluster_error_threshold(&mut self, pixels: f32) {
         self.cluster_threshold = pixels.max(0.0);
     }
@@ -2564,6 +2581,11 @@ impl Renderer {
     /// default; costs a thread-local check per pass and section while off.
     pub fn set_profiling(&mut self, enabled: bool) {
         crate::profiling::set_enabled(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap(), enabled);
+    }
+
+    /// Whether frames are profiled (`set_profiling`).
+    pub fn profiling(&self) -> bool {
+        crate::profiling::is_enabled()
     }
 
     /// End a profiled frame of work recorded without a surface (offscreen tools and tests: the
