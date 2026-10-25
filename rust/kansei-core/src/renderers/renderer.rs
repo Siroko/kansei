@@ -66,6 +66,7 @@ impl Default for RendererConfig {
 /// was nothing to record.
 struct SceneBundles {
     opaque: Option<wgpu::RenderBundle>,
+    transmissive: Option<wgpu::RenderBundle>,
     transparent: Option<wgpu::RenderBundle>,
     late: Option<wgpu::RenderBundle>,
     /// The renderables recorded (`bundle_key`), and those culled in two phases; the bundles are
@@ -79,6 +80,9 @@ enum DrawSet {
     /// The opaque renderables: with occlusion culling, the first phase, whose depth the pyramid is
     /// built from.
     Opaque,
+    /// The transmissive renderables (`MaterialOptions::transmissive`), drawn after the GBuffer's
+    /// background copy (both phases' instances).
+    Transmissive,
     /// The transparent renderables (both phases' instances); they do not occlude.
     Transparent,
     /// Occlusion's second phase: the instances it found visible of the opaque renderables culled
@@ -89,9 +93,10 @@ enum DrawSet {
 impl DrawSet {
     fn includes(self, r: &crate::objects::Renderable) -> bool {
         match self {
-            DrawSet::Opaque => !r.is_transparent(),
+            DrawSet::Opaque => !r.is_transparent() && !r.is_transmissive(),
+            DrawSet::Transmissive => r.is_transmissive(),
             DrawSet::Transparent => r.is_transparent(),
-            DrawSet::Late => !r.is_transparent() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase_in(MAIN_VIEW)),
+            DrawSet::Late => !r.is_transparent() && !r.is_transmissive() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase_in(MAIN_VIEW)),
         }
     }
 
@@ -1010,7 +1015,7 @@ impl Renderer {
     ) -> SceneBundles {
         let bundle = |set| self.build_render_bundle(scene, camera, color_formats, depth_format, sample_count, set);
         let late = if key.1.is_empty() { None } else { bundle(DrawSet::Late) };
-        SceneBundles { opaque: bundle(DrawSet::Opaque), transparent: bundle(DrawSet::Transparent), late, key }
+        SceneBundles { opaque: bundle(DrawSet::Opaque), transmissive: bundle(DrawSet::Transmissive), transparent: bundle(DrawSet::Transparent), late, key }
     }
 
     /// Pre-record the draws of the visible static renderables (`is_bundled`) of `set` into a
@@ -1179,6 +1184,7 @@ impl Renderer {
         for &set in sets {
             let bundle = match set {
                 DrawSet::Opaque => &bundles.opaque,
+                DrawSet::Transmissive => &bundles.transmissive,
                 DrawSet::Transparent => &bundles.transparent,
                 DrawSet::Late => &bundles.late,
             };
@@ -3030,7 +3036,7 @@ impl Renderer {
             // Static renderables from the bundles, dynamic ones drawn live
             self.draw_scene_renderables(
                 &mut pass, self.render_bundle.as_ref().unwrap(), scene, camera,
-                &[format], depth_format, sample_count, &[DrawSet::Opaque, DrawSet::Transparent],
+                &[format], depth_format, sample_count, &[DrawSet::Opaque, DrawSet::Transmissive, DrawSet::Transparent],
             );
 
             // Draw GPU-driven indirect renderables in the same pass
@@ -3331,6 +3337,9 @@ impl Renderer {
         let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
         let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
+        // the transmissive renderables split the pass: they draw after the background copy
+        let transmissive = scene.ordered_indices().filter_map(|i| scene.get_renderable(i)).any(|r| r.visible && r.geometry.initialized && r.is_transmissive());
+
         // Pass 1: Opaque objects (render bundle)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3361,8 +3370,9 @@ impl Renderer {
                 timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferOpaquePass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             // Static renderables from the bundles, dynamic ones drawn live; with occlusion culling,
-            // only the opaque ones (the first phase)
-            let sets: &[DrawSet] = if self.two_phase.is_empty() { &[DrawSet::Opaque, DrawSet::Transparent] } else { &[DrawSet::Opaque] };
+            // only the opaque ones (the first phase); with transmissive ones, the transparent ones
+            // after them (pass 2)
+            let sets: &[DrawSet] = if self.two_phase.is_empty() && !transmissive { &[DrawSet::Opaque, DrawSet::Transparent] } else { &[DrawSet::Opaque] };
             self.draw_scene_renderables(
                 &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
                 &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, sets,
@@ -3392,7 +3402,7 @@ impl Renderer {
             });
             self.draw_scene_renderables(
                 &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
-                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, &[DrawSet::Late, DrawSet::Transparent],
+                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, if transmissive { &[DrawSet::Late] } else { &[DrawSet::Late, DrawSet::Transparent] },
             );
         }
 
@@ -3403,10 +3413,11 @@ impl Renderer {
             wgpu::Extent3d { width: gbuffer.width, height: gbuffer.height, depth_or_array_layers: 1 },
         );
 
-        // Pass 2: Indirect/refractive objects (Load existing MRT + depth), when there are any (an
-        // empty pass would still load and store every target)
+        // Pass 2: Indirect/refractive objects (Load existing MRT + depth), the transmissive ones
+        // and then the transparent ones, when there are any (an empty pass would still load and
+        // store every target)
         let indirect = scene.ordered_indices().filter_map(|i| scene.get_renderable(i)).any(|r| r.visible && r.geometry.initialized && r.geometry.is_indirect());
-        if indirect {
+        if indirect || transmissive {
             let load = wgpu::LoadOp::Load;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/GBufferIndirectPass"),
@@ -3435,6 +3446,12 @@ impl Renderer {
                 }),
                 timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferIndirectPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
+            if transmissive {
+                self.draw_scene_renderables(
+                    &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
+                    &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, &[DrawSet::Transmissive, DrawSet::Transparent],
+                );
+            }
             self.draw_indirect_renderables(
                 &mut pass, scene, camera,
                 &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count,
