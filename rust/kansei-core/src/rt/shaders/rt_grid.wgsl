@@ -72,6 +72,23 @@ fn kansei_rt_albedo(id: u32) -> vec3f {
     return unpack4x8unorm(bitcast<u32>(kansei_rt_triangles[id * 4u + 1u].w)).rgb;
 }
 
+// Triangle `id`'s reflectance at normal incidence (RtSurface::specular: 0 for a matte one), kept in
+// the albedo's alpha as 1 - F0, as the GBuffer keeps it.
+fn kansei_rt_specular(id: u32) -> f32 {
+    return 1.0 - unpack4x8unorm(bitcast<u32>(kansei_rt_triangles[id * 4u + 1u].w)).a;
+}
+
+// The light triangle `id` emits (cd/m²; RtSurface::record_emission), RGBE as rt_emission.wgsl
+// packs it.
+fn kansei_rt_emission(id: u32) -> vec3f {
+    let w = bitcast<u32>(kansei_rt_triangles[id * 4u + 3u].w);
+    let e = w >> 24u;
+    if (e == 0u) {
+        return vec3f(0.0);
+    }
+    return (vec3f(f32(w & 255u), f32((w >> 8u) & 255u), f32((w >> 16u) & 255u)) + 0.5) * exp2(f32(e) - 136.0);
+}
+
 // The id of the source triangle `id` came from (the gather's `source`).
 fn kansei_rt_source(id: u32) -> u32 {
     return bitcast<u32>(kansei_rt_triangles[id * 4u + 2u].w) >> 20u;

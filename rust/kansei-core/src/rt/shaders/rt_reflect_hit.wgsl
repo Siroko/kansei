@@ -43,10 +43,11 @@ fn rtLit(o: vec3f, to: vec3f) -> f32 {
     return rtVisible(o, (to - o) / dist, dist - 1e-3);
 }
 
-// The light leaving a hit the camera doesn't see (a Lambertian surface of the triangle's albedo):
+// The light leaving a hit the camera doesn't see (a Lambertian surface of its albedo there,
+// kansei_rt_hit_albedo: the triangle's, or what the effect's albedo hook makes of it):
 // the lights' direct light, shadowed by rays through the grid, plus the irradiance the voxels hold
 // round it (srcIrradiance, voxel GI's own hemisphere of cones).
-fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, triangle: u32) -> vec3f {
+fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, triangle: u32, bary: vec2f) -> vec3f {
     let o = p + ng * (0.05 * kansei_rt_grid.cell);
     var e = vec3f(0.0);
     for (var i = 0u; i < rtLights.numDir; i++) {
@@ -82,7 +83,7 @@ fn rtLitHit(p: vec3f, ng: vec3f, n: vec3f, triangle: u32) -> vec3f {
     if ((rp.flags & RT_REFLECT_NO_INDIRECT) == 0u) {
         e += srcIrradiance(o, n);
     }
-    return kansei_rt_albedo(triangle) / 3.14159265 * e;
+    return kansei_rt_hit_albedo(triangle, p, bary) / 3.14159265 * e;
 }
 
 fn rtHash(p: vec2u, frame: u32) -> vec2f {
@@ -145,18 +146,34 @@ fn rtScreenRadiance(p: vec3f, n: vec3f) -> vec4f {
     return vec4f(textureLoad(screenTex, px, 0).rgb, 1.0);
 }
 
-// A hit at p on `triangle` (geometric normal ng facing the ray's origin, barycentrics bary).
-fn rtHitRadiance(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f) -> vec3f {
+// What a polished hit (RtSurface::specular, its F0) reflects toward a ray along d: Schlick's
+// Fresnel of its F0 times the sky round the mirrored ray (low-pass, as a rough reflection), and the
+// share of its diffuse light that is left (1 - F).
+fn rtHitSpecular(triangle: u32, n: vec3f, d: vec3f) -> vec4f {
+    let f0 = kansei_rt_specular(triangle);
+    if (f0 <= 0.0) {
+        return vec4f(0.0, 0.0, 0.0, 1.0);
+    }
+    let f = f0 + (1.0 - f0) * pow(1.0 - clamp(-dot(d, n), 0.0, 1.0), 5.0);
+    return vec4f(f * rp.skyScale * skyRadiance(sky, reflect(d, n)), 1.0 - f);
+}
+
+// A hit at p on `triangle` (geometric normal ng facing the ray's origin, barycentrics bary) of a
+// ray along d: the lit image where the camera sees it, else its light, its reflection of the sky
+// (RtSurface::specular) and its own emission.
+fn rtHitRadiance(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f, d: vec3f) -> vec3f {
     if ((rp.flags & RT_REFLECT_SCREEN) != 0u) {
         let s = rtScreenRadiance(p, ng);
         if (s.a > 0.5) {
             return s.rgb;
         }
     }
+    let n = kansei_rt_shading_normal(triangle, bary, ng);
+    let specular = rtHitSpecular(triangle, n, d);
     if ((rp.flags & RT_REFLECT_DIRECT) != 0u) {
-        return rtLitHit(p, ng, kansei_rt_shading_normal(triangle, bary, ng), triangle);
+        return rtLitHit(p, ng, n, triangle, bary) * specular.a + specular.rgb + kansei_rt_emission(triangle);
     }
-    return srcHitRadiance(p, ng);
+    return srcHitRadiance(p, ng) * specular.a + specular.rgb + kansei_rt_emission(triangle);
 }
 
 // Past the grid (or outside it): the voxels from where the ray left it, then the sky.
@@ -201,7 +218,7 @@ fn rtSceneRay(origin: vec3f, d: vec3f, n: vec3f, tanHalf: f32, traceFlags: u32) 
             o = p + d * (0.05 * kansei_rt_grid.cell);
             continue;
         }
-        out.radiance = rtHitRadiance(p, hit.normal, hit.triangle, hit.bary);
+        out.radiance = rtHitRadiance(p, hit.normal, hit.triangle, hit.bary, d);
         out.found = true;
         return out;
     }
