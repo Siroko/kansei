@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Glass particles</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        import init, * as wasm from '../pkg/kansei_wasm_glass_particles.js';
+        const params = new URLSearchParams(location.search);
+        await init();
+        // the demo runs here or (?worker=1) in a worker on an OffscreenCanvas; its exports are
+        // called through `kansei`, each returning a promise (kansei_wasm's `launch`)
+        const kansei = await wasm.launch(wasm, { module: new URL('../pkg/kansei_wasm_glass_particles.js', import.meta.url).href });
+        const info = async () => JSON.parse(await kansei.info());
+        // for scripted captures: await window.kansei.set('fStop', 1.2), set_camera(...), and so on
+        window.kansei = Object.assign(Object.create(kansei), { camera: async () => JSON.parse(await kansei.camera()), events: async () => JSON.parse(await kansei.take_events()) });
+
+        const state = await info();
+        const s = state.settings;
+        const p = {
+            ...s,
+            gridBase: rgb(s.gridBase), gridMinor: rgb(s.gridMinor), gridMajor: rgb(s.gridMajor), gridCross: rgb(s.gridCross),
+            sound: false, volume: -8, perf: state.perf, sim: '', lighting: params.get('lighting') || 'studio',
+        };
+        function rgb(c) { return { r: c[0], g: c[1], b: c[2] }; }
+
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Glass particles', expanded: !/Mobi|Android/.test(navigator.userAgent) });
+        pane.hidden = params.get('ui') === '0';
+        const set = (key) => (e) => kansei.set(key, typeof e.value === 'boolean' ? (e.value ? 1 : 0) : e.value);
+        // the panel shows values a preset set; the presets' own dropdowns don't act on that refresh
+        let refreshing = false;
+        const refresh = () => { refreshing = true; pane.refresh(); refreshing = false; };
+
+        // the quality (built below the passes' folders): EPIC the page's defaults, each level under
+        // it cheaper; it sets the passes' on/offs and presets, the render scale and the particles
+        p.quality = 'EPIC';
+        const qualityBinding = pane.addBinding(p, 'quality', { options: { LOW: 'LOW', MID: 'MID', HIGH: 'HIGH', EPIC: 'EPIC' } });
+
+        pane.addBinding(p, 'palette', { options: Object.fromEntries(state.palettes.map((n) => [n, n])) }).on('change', (e) => kansei.set_palette(e.value));
+        // a preset sets the spot light, the environment, the exposure and the mist (each editable below)
+        pane.addBinding(p, 'lighting', { options: Object.fromEntries(state.lightings.map((n) => [n, n])) }).on('change', async (e) => {
+            await kansei.set_lighting(e.value);
+            const st = (await info()).settings;
+            for (const key of ['light', 'cone', 'skyUp', 'skyDown', 'ev100', 'fogDensity']) p[key] = st[key];
+            refresh();
+        });
+
+        // the emitters: where they sit and point, what they emit from, how fast and how many
+        const shapes = { point: 0, ball: 1, disc: 2 };
+        const emitters = state.emitters.map((em, i) => {
+            const f = pane.addFolder({ title: `Emitter ${'AB'[i]}`, expanded: i === 0 });
+            const e = { ...em, position: { x: em.x, y: em.y, z: em.z }, rotation: { x: em.rx, y: em.ry, z: em.rz } };
+            const setE = (key) => (ev) => kansei.set_emitter(i, key, typeof ev.value === 'boolean' ? (ev.value ? 1 : 0) : ev.value);
+            f.addBinding(e, 'enabled', { label: 'on' }).on('change', setE('enabled'));
+            f.addBinding(e, 'position', { x: { min: -3.5, max: 3.5, step: 0.01 }, y: { min: 0, max: 4.5, step: 0.01 }, z: { min: -3.5, max: 3.5, step: 0.01 } })
+                .on('change', (ev) => { kansei.set_emitter(i, 'x', ev.value.x); kansei.set_emitter(i, 'y', ev.value.y); kansei.set_emitter(i, 'z', ev.value.z); });
+            f.addBinding(e, 'rotation', { label: 'rotation (°)', x: { min: -180, max: 180, step: 1 }, y: { min: -180, max: 180, step: 1 }, z: { min: -180, max: 180, step: 1 } })
+                .on('change', (ev) => { kansei.set_emitter(i, 'rx', ev.value.x); kansei.set_emitter(i, 'ry', ev.value.y); kansei.set_emitter(i, 'rz', ev.value.z); });
+            f.addBinding(e, 'shape', { options: shapes }).on('change', setE('shape'));
+            f.addBinding(e, 'radius', { min: 0, max: 1, step: 0.01 }).on('change', setE('radius'));
+            f.addBinding(e, 'rate', { label: 'rate (/s)', min: 0, max: 8000, step: 10 }).on('change', setE('rate'));
+            f.addBinding(e, 'speed', { label: 'speed (m/s)', min: 0, max: 8, step: 0.05 }).on('change', setE('speed'));
+            f.addBinding(e, 'spread', { label: 'spread (°)', min: 0, max: 90, step: 0.5 }).on('change', setE('spread'));
+            f.addBinding(e, 'lifetime', { label: 'lifetime (s)', min: 0.5, max: 20, step: 0.1 }).on('change', setE('lifetime'));
+            f.addBinding(e, 'size', { label: 'size (m)', min: 0.005, max: 0.08, step: 0.001 }).on('change', setE('size'));
+            f.addBinding(e, 'glowShare', { label: 'glowing share', min: 0, max: 1, step: 0.01 }).on('change', setE('glowShare'));
+            f.addBinding(e, 'speedJitter', { label: 'speed jitter', min: 0, max: 1, step: 0.01 }).on('change', setE('speedJitter'));
+            f.addBinding(e, 'lifeJitter', { label: 'life jitter', min: 0, max: 1, step: 0.01 }).on('change', setE('lifeJitter'));
+            return e;
+        });
+
+        const flow = pane.addFolder({ title: 'Curl flow', expanded: false });
+        flow.addBinding(p, 'curlSpeed', { label: 'speed (m/s)', min: 0, max: 4, step: 0.01 }).on('change', set('curlSpeed'));
+        flow.addBinding(p, 'curlFrequency', { label: 'frequency (1/m)', min: 0.05, max: 3, step: 0.01 }).on('change', set('curlFrequency'));
+        flow.addBinding(p, 'curlEvolve', { label: 'drift (m/s)', min: 0, max: 2, step: 0.01 }).on('change', set('curlEvolve'));
+        flow.addBinding(p, 'drag', { label: 'take-up (1/s)', min: 0, max: 6, step: 0.01 }).on('change', set('drag'));
+        flow.addBinding(p, 'gravity', { label: 'gravity (m/s²)', min: -9.8, max: 2, step: 0.01 }).on('change', set('gravity'));
+        flow.addBinding(p, 'mouseForce', { label: 'pointer push (1/s)', min: 0, max: 30, step: 0.1 }).on('change', set('mouseForce'));
+        flow.addBinding(p, 'mouseRadius', { label: 'pointer reach (m)', min: 0.05, max: 2, step: 0.01 }).on('change', set('mouseRadius'));
+        flow.addBinding(p, 'paused').on('change', set('paused'));
+
+        const rep = pane.addFolder({ title: 'Repellers', expanded: false });
+        rep.addBinding(p, 'repelRange', { label: 'reach (m)', min: 0.01, max: 1.5, step: 0.01 }).on('change', set('repelRange'));
+        rep.addBinding(p, 'repelStrength', { label: 'push (m/s²)', min: 0, max: 60, step: 0.1 }).on('change', set('repelStrength'));
+        rep.addBinding(p, 'bounce', { min: 0, max: 1, step: 0.01 }).on('change', set('bounce'));
+        rep.addBinding(p, 'glassShadows', { label: 'cast shadows' }).on('change', set('glassShadows'));
+
+        const look = pane.addFolder({ title: 'Particles', expanded: false });
+        look.addBinding(p, 'glow', { label: 'glow (cd/m²)', min: 0, max: 300, step: 0.5 }).on('change', set('glow'));
+        look.addBinding(p, 'stretch', { label: 'stretch at 1 m/s', min: 0, max: 20, step: 0.1 }).on('change', set('stretch'));
+        look.addBinding(p, 'roughness', { min: 0.02, max: 1, step: 0.01 }).on('change', set('roughness'));
+        look.addBinding(p, 'metallic', { min: 0, max: 1, step: 0.01 }).on('change', set('metallic'));
+
+        const grid = pane.addFolder({ title: 'Floor grid', expanded: false });
+        const color = (key, which) => grid.addBinding(p, key, { label: which, color: { type: 'float' } }).on('change', (e) => kansei.set_grid_color(which, e.value.r, e.value.g, e.value.b));
+        color('gridBase', 'base');
+        color('gridMinor', 'minor');
+        color('gridMajor', 'major');
+        color('gridCross', 'cross');
+        grid.addBinding(p, 'gridSpacing', { label: 'spacing (m)', min: 0.02, max: 1, step: 0.005 }).on('change', set('gridSpacing'));
+        grid.addBinding(p, 'gridMajorEvery', { label: 'major every', min: 2, max: 20, step: 1 }).on('change', set('gridMajorEvery'));
+        grid.addBinding(p, 'gridMinorWidth', { label: 'minor width (m)', min: 0, max: 0.02, step: 0.0005 }).on('change', set('gridMinorWidth'));
+        grid.addBinding(p, 'gridMajorWidth', { label: 'major width (m)', min: 0, max: 0.05, step: 0.0005 }).on('change', set('gridMajorWidth'));
+        grid.addBinding(p, 'gridCrossWidth', { label: 'cross width (m)', min: 0, max: 0.05, step: 0.0005 }).on('change', set('gridCrossWidth'));
+        grid.addBinding(p, 'gridCrossArm', { label: 'cross arm', min: 0, max: 0.4, step: 0.005 }).on('change', set('gridCrossArm'));
+
+        const light = pane.addFolder({ title: 'Light', expanded: false });
+        light.addBinding(p, 'light', { label: 'spot (cd)', min: 0, max: 8000, step: 10 }).on('change', set('light'));
+        light.addBinding(p, 'cone', { label: 'cone (°)', min: 5, max: 80, step: 0.5 }).on('change', set('cone'));
+        light.addBinding(p, 'skyUp', { label: 'environment up (cd/m²)', min: 0, max: 80, step: 0.05 }).on('change', set('skyUp'));
+        light.addBinding(p, 'skyDown', { label: 'environment down', min: 0, max: 40, step: 0.05 }).on('change', set('skyDown'));
+
+        // ── the post-processing passes, in the chain's order: each one's folder has an on/off that
+        // takes it out of the chain (PostProcessingVolume::set_enabled), a preset that sets its
+        // values (each still editable after), and its values ──
+        const post = pane.addFolder({ title: 'Post-processing', expanded: false });
+        const passes = {};
+        // set a value of the demo's and show it
+        const put = (key, value) => { p[key] = value; kansei.set(key, typeof value === 'boolean' ? (value ? 1 : 0) : value); };
+        function pass(title, onKey, presets, bindings) {
+            const f = post.addFolder({ title, expanded: false });
+            f.addBinding(p, onKey, { label: 'on' }).on('change', set(onKey));
+            const names = Object.keys(presets);
+            const shown = { preset: 'default' in presets ? 'default' : names[0] };
+            const apply = (name) => { shown.preset = name; for (const [key, value] of Object.entries(presets[name])) put(key, value); };
+            passes[title] = { onKey, apply };
+            f.addBinding(shown, 'preset', { options: Object.fromEntries(names.map((n) => [n, n])) }).on('change', (e) => {
+                if (refreshing) return;
+                apply(e.value);
+                refresh();
+            });
+            bindings(f);
+            return f;
+        }
+        pass('SSAO', 'ssao', {
+            subtle: { ao: 0.35, aoRadius: 0.15, aoBias: 0.01, aoSamples: 8 },
+            default: { ao: 0.6, aoRadius: 0.25, aoBias: 0.01, aoSamples: 16 },
+            strong: { ao: 1.0, aoRadius: 0.45, aoBias: 0.015, aoSamples: 32 },
+        }, (f) => {
+            f.addBinding(p, 'ao', { label: 'strength', min: 0, max: 1, step: 0.01 }).on('change', set('ao'));
+            f.addBinding(p, 'aoRadius', { label: 'radius (m)', min: 0.02, max: 1.5, step: 0.01 }).on('change', set('aoRadius'));
+            f.addBinding(p, 'aoBias', { label: 'bias (m)', min: 0, max: 0.1, step: 0.001 }).on('change', set('aoBias'));
+            f.addBinding(p, 'aoSamples', { label: 'samples', min: 1, max: 32, step: 1 }).on('change', set('aoSamples'));
+        });
+        // off: the repellers as polished grey solids; ray traced (every surface a path crosses) or
+        // in screen space (a ball proxy, a fraction of the cost)
+        pass('Glass', 'glassPass', {
+            clear: { glassIor: 1.5, glassRoughness: 0, ssDispersion: 0.02 },
+            frosted: { glassIor: 1.5, glassRoughness: 0.35, ssDispersion: 0.0 },
+            crystal: { glassIor: 1.9, glassRoughness: 0, ssDispersion: 0.05, glassInterfaces: 10 },
+            'fast (screen space)': { glassMode: 1, ssThickness: 0.8, ssBehind: 2.0 },
+        }, (f) => {
+            f.addBinding(p, 'glassMode', { label: 'mode', options: { 'ray traced': 0, 'screen space': 1 } }).on('change', set('glassMode'));
+            f.addBinding(p, 'glassIor', { label: 'index of refraction', min: 1, max: 2.4, step: 0.01 }).on('change', set('glassIor'));
+            f.addBinding(p, 'glassRoughness', { label: 'frost', min: 0, max: 1, step: 0.01 }).on('change', set('glassRoughness'));
+            f.addBinding(p, 'glassInterfaces', { label: 'surfaces (RT)', min: 1, max: 16, step: 1 }).on('change', set('glassInterfaces'));
+            f.addBinding(p, 'ssThickness', { label: 'ball (m, SS)', min: 0.05, max: 3, step: 0.01 }).on('change', set('ssThickness'));
+            f.addBinding(p, 'ssBehind', { label: 'behind (m, SS)', min: 0, max: 10, step: 0.05 }).on('change', set('ssBehind'));
+            f.addBinding(p, 'ssDispersion', { label: 'dispersion (SS)', min: 0, max: 0.2, step: 0.005 }).on('change', set('ssDispersion'));
+        });
+        pass('Floor reflections', 'reflections', {
+            low: { reflQuarter: true, reflDistance: 6, reflBlend: 0.35 },
+            default: { reflQuarter: false, reflDistance: 12, reflBlend: 0.25 },
+            high: { reflQuarter: false, reflDistance: 24, reflBlend: 0.15 },
+        }, (f) => {
+            f.addBinding(p, 'reflIntensity', { label: 'intensity', min: 0, max: 2, step: 0.01 }).on('change', set('reflIntensity'));
+            f.addBinding(p, 'reflDistance', { label: 'reach (m)', min: 1, max: 40, step: 0.5 }).on('change', set('reflDistance'));
+            f.addBinding(p, 'reflQuarter', { label: 'trace 1 in 4x4' }).on('change', set('reflQuarter'));
+            f.addBinding(p, 'reflBlend', { label: 'new frame weight', min: 0.02, max: 1, step: 0.01 }).on('change', set('reflBlend'));
+        });
+        // the far floor (and anything far) fades into the backdrop behind it by its distance from
+        // the scene's centre, all of it by the dome
+        pass('Distance fade', 'fade', {
+            near: { fadeStart: 5, fadeEnd: 20 },
+            default: { fadeStart: 7, fadeEnd: 30 },
+            far: { fadeStart: 12, fadeEnd: 44 },
+        }, (f) => {
+            f.addBinding(p, 'fadeStart', { label: 'start (m)', min: 0, max: 45, step: 0.5 }).on('change', set('fadeStart'));
+            f.addBinding(p, 'fadeEnd', { label: 'end (m)', min: 1, max: 45, step: 0.5 }).on('change', set('fadeEnd'));
+        });
+        pass('Volumetric fog', 'fog', {
+            low: { fogSteps: 0 },
+            medium: { fogSteps: 16 },
+            default: { fogSteps: 32 },
+            ultra: { fogSteps: 64 },
+        }, (f) => {
+            f.addBinding(p, 'fogDensity', { label: 'density (1/m)', min: 0, max: 1, step: 0.005 }).on('change', set('fogDensity'));
+            f.addBinding(p, 'fogAnisotropy', { label: 'forward scatter', min: -0.9, max: 0.9, step: 0.01 }).on('change', set('fogAnisotropy'));
+            f.addBinding(p, 'fogFalloff', { label: 'height falloff (1/m)', min: 0, max: 1, step: 0.005 }).on('change', set('fogFalloff'));
+            f.addBinding(p, 'fogAmbient', { label: 'ambient', min: 0, max: 3, step: 0.01 }).on('change', set('fogAmbient'));
+            f.addBinding(p, 'fogSteps', { label: 'beam samples (0 froxels)', min: 0, max: 128, step: 1 }).on('change', set('fogSteps'));
+        });
+        pass('TAA', 'taa', {
+            sharp: { taaFeedbackMax: 0.88, taaFeedbackMin: 0.7, taaGamma: 0.75 },
+            default: { taaFeedbackMax: 0.95, taaFeedbackMin: 0.85, taaGamma: 1.0 },
+            smooth: { taaFeedbackMax: 0.97, taaFeedbackMin: 0.9, taaGamma: 1.25 },
+        }, (f) => {
+            f.addBinding(p, 'taaFeedbackMax', { label: 'history still', min: 0, max: 0.99, step: 0.005 }).on('change', set('taaFeedbackMax'));
+            f.addBinding(p, 'taaFeedbackMin', { label: 'history moving', min: 0, max: 0.99, step: 0.005 }).on('change', set('taaFeedbackMin'));
+            f.addBinding(p, 'taaGamma', { label: 'clip box (σ)', min: 0.25, max: 4, step: 0.05 }).on('change', set('taaGamma'));
+            f.addBinding(p, 'renderScale', { label: 'render scale', min: 0.25, max: 1, step: 0.05 }).on('change', set('renderScale'));
+        });
+        let focus;
+        pass('Depth of field', 'dof', {
+            subtle: { fStop: 5.6, dofSamples: 32, dofMaxCoc: 0.015 },
+            default: { fStop: 1.8, dofSamples: 48, dofMaxCoc: 0.025 },
+            strong: { fStop: 0.9, dofSamples: 72, dofMaxCoc: 0.04 },
+        }, (f) => {
+            f.addBinding(p, 'autofocus', { label: 'focus on target' }).on('change', (e) => { kansei.set('autofocus', e.value ? 1 : 0); focus.disabled = e.value; });
+            focus = f.addBinding(p, 'focus', { label: 'focus (m)', min: 0.3, max: 20, step: 0.01, disabled: p.autofocus }).on('change', (e) => { if (!p.autofocus) kansei.set('focus', e.value); });
+            f.addBinding(p, 'fStop', { label: 'f-stop', min: 0.7, max: 16, step: 0.05 }).on('change', set('fStop'));
+            f.addBinding(p, 'dofBlades', { label: 'blades (0 round)', min: 0, max: 12, step: 1 }).on('change', set('dofBlades'));
+            f.addBinding(p, 'dofSamples', { label: 'samples', min: 8, max: 128, step: 1 }).on('change', set('dofSamples'));
+            f.addBinding(p, 'dofMaxCoc', { label: 'largest blur', min: 0.002, max: 0.08, step: 0.001 }).on('change', set('dofMaxCoc'));
+        });
+        pass('Bloom', 'bloomOn', {
+            subtle: { bloom: 0.12, bloomThreshold: 2.0, bloomRadius: 0.8 },
+            default: { bloom: 0.25, bloomThreshold: 1.0, bloomRadius: 1.0 },
+            strong: { bloom: 0.6, bloomThreshold: 0.5, bloomRadius: 1.3 },
+        }, (f) => {
+            f.addBinding(p, 'bloom', { label: 'intensity', min: 0, max: 3, step: 0.01 }).on('change', set('bloom'));
+            f.addBinding(p, 'bloomThreshold', { label: 'threshold', min: 0.05, max: 8, step: 0.05 }).on('change', set('bloomThreshold'));
+            f.addBinding(p, 'bloomKnee', { label: 'knee', min: 0.01, max: 2, step: 0.01 }).on('change', set('bloomKnee'));
+            f.addBinding(p, 'bloomRadius', { label: 'radius', min: 0.1, max: 3, step: 0.05 }).on('change', set('bloomRadius'));
+            f.addBinding(p, 'bloomEmissive', { label: 'emissive only' }).on('change', set('bloomEmissive'));
+        });
+        pass('Tone map', 'tone', {
+            neutral: { toneMapper: 3, vignette: 0.1, grain: 0, chromatic: 0 },
+            default: { toneMapper: 0, vignette: 0.35, grain: 0, chromatic: 0 },
+            punchy: { toneMapper: 2, vignette: 0.5, grain: 0.12, chromatic: 0.25 },
+        }, (f) => {
+            f.addBinding(p, 'ev100', { label: 'exposure (EV100)', min: 0, max: 10, step: 0.05 }).on('change', set('ev100'));
+            f.addBinding(p, 'exposureComp', { label: 'compensation (stops)', min: -4, max: 4, step: 0.05 }).on('change', set('exposureComp'));
+            f.addBinding(p, 'toneMapper', { label: 'curve', options: { 'ACES fitted': 0, AgX: 1, 'AgX punchy': 2, 'Khronos neutral': 3, '1 - exp(-x)': 4 } }).on('change', set('toneMapper'));
+            f.addBinding(p, 'vignette', { min: 0, max: 2, step: 0.01 }).on('change', set('vignette'));
+            f.addBinding(p, 'grain', { min: 0, max: 1, step: 0.01 }).on('change', set('grain'));
+            f.addBinding(p, 'chromatic', { label: 'fringing', min: 0, max: 2, step: 0.01 }).on('change', set('chromatic'));
+        });
+
+        // ── the quality levels: each pass on (its preset) or off, then the values under its presets,
+        // the render scale (TAA upscales) and the emitters' rates (the share of EPIC's 2200 a second
+        // each, so about that share of the particles flies) ──
+        const QUALITY = {
+            LOW: {
+                passes: { SSAO: false, Glass: 'fast (screen space)', 'Floor reflections': false, 'Distance fade': 'default', 'Volumetric fog': 'low', TAA: 'default', 'Depth of field': false, Bloom: 'default', 'Tone map': 'default' },
+                values: { renderScale: 0.5, glassInterfaces: 8 },
+                rate: 0.5,
+            },
+            MID: {
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': false, 'Distance fade': 'default', 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { glassMode: 0, renderScale: 0.7, aoSamples: 8, dofSamples: 24, glassInterfaces: 4 },
+                rate: 0.75,
+            },
+            HIGH: {
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'low', 'Distance fade': 'default', 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { glassMode: 0, renderScale: 0.85, aoSamples: 12, dofSamples: 32, glassInterfaces: 6 },
+                rate: 1,
+            },
+            EPIC: {
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'default', 'Distance fade': 'default', 'Volumetric fog': 'default', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { glassMode: 0, renderScale: 1, glassInterfaces: 8 },
+                rate: 1,
+            },
+        };
+        function quality(level) {
+            const q = QUALITY[level];
+            p.quality = level;
+            for (const [title, preset] of Object.entries(q.passes)) {
+                const { onKey, apply } = passes[title];
+                put(onKey, preset !== false);
+                if (preset !== false) apply(preset);
+            }
+            for (const [key, value] of Object.entries(q.values)) put(key, value);
+            emitters.forEach((e, i) => { e.rate = 2200 * q.rate; kansei.set_emitter(i, 'rate', e.rate); });
+            refresh();
+        }
+        qualityBinding.on('change', (e) => { if (!refreshing) quality(e.value); });
+        window.kansei.quality = quality;
+        const startQuality = (params.get('quality') || '').toUpperCase();
+        if (startQuality in QUALITY && startQuality !== 'EPIC') quality(startQuality);
+
+        // ── sound: Tone.js, started by the box's tick (a user gesture) ──
+        // The sim counts its respawns, its brushes with the glass and its hits on the floor on the GPU; they
+        // come back in bulk a few frames late (take_events) and play on a sixteenth-note grid in
+        // A minor pentatonic: each emitter an arpeggio while it emits (louder the more it does),
+        // each kind of repeller a glass bell, the floor a soft low knock; at most one note a kind a
+        // step, so a shower of hits stays a phrase.
+        const sound = pane.addFolder({ title: 'Sound', expanded: false });
+        let audio = null;
+        const pending = { spawn: [0, 0], hits: [0, 0, 0, 0], speed: 0 };
+        async function startAudio() {
+            if (audio) return audio;
+            if (!window.Tone) {
+                await new Promise((resolve, reject) => {
+                    const el = document.createElement('script');
+                    el.src = 'https://cdn.jsdelivr.net/npm/tone@15.0.4/build/Tone.js';
+                    el.onload = resolve;
+                    el.onerror = reject;
+                    document.head.appendChild(el);
+                });
+            }
+            const Tone = window.Tone;
+            await Tone.start();
+            const out = new Tone.Volume(p.volume).toDestination();
+            const limiter = new Tone.Limiter(-3).connect(out);
+            const reverb = new Tone.Reverb({ decay: 7, wet: 0.45 }).connect(limiter);
+            const delay = new Tone.FeedbackDelay({ delayTime: '8n.', feedback: 0.28, wet: 0.22 }).connect(reverb);
+            const pluck = new Tone.PolySynth(Tone.FMSynth, {
+                harmonicity: 2, modulationIndex: 3,
+                envelope: { attack: 0.004, decay: 0.25, sustain: 0, release: 0.6 },
+                modulationEnvelope: { attack: 0.002, decay: 0.15, sustain: 0, release: 0.2 },
+            }).connect(delay);
+            pluck.volume.value = -14;
+            pluck.maxPolyphony = 8;
+            const bell = new Tone.PolySynth(Tone.FMSynth, {
+                harmonicity: 3.01, modulationIndex: 11,
+                envelope: { attack: 0.001, decay: 1.4, sustain: 0, release: 2.2 },
+                modulationEnvelope: { attack: 0.001, decay: 0.4, sustain: 0, release: 0.6 },
+            }).connect(reverb);
+            bell.volume.value = -16;
+            bell.maxPolyphony = 10;
+            const knock = new Tone.MembraneSynth({ pitchDecay: 0.03, octaves: 3, envelope: { attack: 0.001, decay: 0.35, sustain: 0, release: 0.4 } }).connect(reverb);
+            knock.volume.value = -18;
+            const scale = ['A', 'C', 'D', 'E', 'G'];
+            const note = (degree, octave) => scale[((degree % 5) + 5) % 5] + (octave + Math.floor(degree / 5));
+            const bells = [[note(3, 5), note(5, 5)], [note(1, 5), note(4, 5)], [note(2, 6), note(5, 6)]];
+            let step = 0;
+            const arp = [0, 2, 4, 3, 1, 3, 2, 4];
+            Tone.Transport.bpm.value = 84;
+            Tone.Transport.scheduleRepeat((time) => {
+                step++;
+                // the emitters: every eighth note while they emit, A an octave under B
+                if (step % 2 === 0) {
+                    pending.spawn.forEach((n, e) => {
+                        if (n > 0) {
+                            const velocity = Math.min(0.15 + Math.log10(1 + n) * 0.12, 0.6);
+                            pluck.triggerAttackRelease(note(arp[(step / 2 + e * 3) % arp.length], 3 + e), '16n', time + e * 0.004, velocity);
+                        }
+                        pending.spawn[e] = 0;
+                    });
+                }
+                // the hits: a bell a kind of glass, the floor a knock, louder the more and the harder
+                const hard = Math.min(pending.speed / 3, 1);
+                pending.hits.forEach((n, k) => {
+                    if (n === 0) return;
+                    const velocity = Math.min(0.08 + Math.log10(1 + n) * 0.12 + hard * 0.2, 0.7);
+                    if (k < 3) {
+                        const choices = bells[k];
+                        bell.triggerAttackRelease(choices[(step + n) % choices.length], '8n', time + 0.01 * k, velocity);
+                    } else if (step % 2 === 0) {
+                        knock.triggerAttackRelease(note(0, 1), '16n', time, velocity * 0.8);
+                    }
+                    pending.hits[k] = 0;
+                });
+            }, '16n');
+            Tone.Transport.start();
+            audio = { Tone, out };
+            return audio;
+        }
+        sound.addBinding(p, 'sound', { label: 'on' }).on('change', async (e) => {
+            if (e.value) {
+                const a = await startAudio();
+                a.out.mute = false;
+            } else if (audio) {
+                audio.out.mute = true;
+            }
+        });
+        sound.addBinding(p, 'volume', { label: 'volume (dB)', min: -40, max: 6, step: 0.5 }).on('change', (e) => { if (audio) audio.out.volume.value = e.value; });
+        // the events, in bulk, a few times a second (also when muted, so they don't pile up)
+        setInterval(async () => {
+            const ev = JSON.parse(await kansei.take_events());
+            if (!p.sound) return;
+            ev.spawn.forEach((n, k) => { pending.spawn[k] += n; });
+            ev.hits.forEach((n, k) => { pending.hits[k] += n; });
+            pending.speed = ev.speed;
+        }, 100);
+
+        // the stats: the sim's own counters (those the sounds read, a second), beside kansei-wasm's
+        // performance overlay (fps, CPU and GPU time, memory, draws, each pass's GPU time)
+        const stats = pane.addFolder({ title: 'Stats' });
+        stats.addBinding(p, 'sim', { readonly: true, multiline: true, rows: 5, label: 'sim' });
+        stats.addBinding(p, 'perf', { label: 'perf overlay' }).on('change', (e) => kansei.set_perf(e.value));
+        setInterval(async () => {
+            const i = await info();
+            p.sim = `${Math.round(i.alive).toLocaleString()} of ${i.particles.toLocaleString()} alive\n`
+                + `${Math.round(i.emitted_per_s).toLocaleString()} emitted / s\n`
+                + `${Math.round(i.brushes_per_s).toLocaleString()} glass brushes / s\n`
+                + `${Math.round(i.floor_hits_per_s).toLocaleString()} floor hits / s\n`
+                + `${i.frame_ms} ms a frame`;
+            p.perf = i.perf;
+            if (p.autofocus) p.focus = i.settings.focus;
+            refresh();
+        }, 500);
+    </script>
+</body>
+</html>

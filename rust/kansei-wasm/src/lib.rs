@@ -28,6 +28,9 @@
 //!   [`set_text`], [`checkbox`] and [`thousands`] serve a HUD.
 //! - [`Keys`] and [`Gamepad`] are the input of pages that play: keys held and pressed, sticks
 //!   and buttons.
+//! - [`perf`] is a performance overlay (r3f-perf's kind) every example has: `?perf=1` or the
+//!   backquote key shows frames per second, CPU and GPU time with graphs, draw calls, triangles,
+//!   pipelines and GPU memory; [`perf::profile`] adds the renderer's passes.
 //! - [`launch`] runs the example's `start` on the page or, with `?worker=1`, in a dedicated
 //!   worker on the canvas transferred as an `OffscreenCanvas`: all of the above works there
 //!   unchanged (see below).
@@ -63,6 +66,7 @@ mod frame_gate;
 mod frame_loop;
 mod input;
 mod page;
+pub mod perf;
 mod worker;
 
 pub use canvas::Canvas;

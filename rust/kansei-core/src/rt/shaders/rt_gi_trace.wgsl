@@ -138,12 +138,13 @@ fn directLight(p: vec3f, ng: vec3f, n: vec3f, px: vec2u, dim: u32, cost: ptr<fun
 // The light leaving a hit (a Lambertian surface of the triangle's albedo) toward the ray: the
 // voxels' radiance there, or its exact direct light plus the indirect light round it from one
 // voxel cone in a cosine-distributed direction (a sample of the irradiance over pi, which the
-// denoiser averages; one wide cone along the normal loses a third of it through thin walls).
+// denoiser averages; one wide cone along the normal loses a third of it through thin walls), and
+// the light it emits.
 // Shaded with the triangle's interpolated vertex normals where it carries them
 // (RtSurface::with_smooth_normals), offset along its geometric normal ng.
 fn shadeHit(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f, px: vec2u, cost: ptr<function, u32>) -> vec3f {
     if ((gp.flags & RT_GI_HIT_DIRECT) == 0u) {
-        return srcHitRadiance(p, ng);
+        return srcHitRadiance(p, ng) + kansei_rt_emission(triangle);
     }
     let n = kansei_rt_shading_normal(triangle, bary, ng);
     let albedo = kansei_rt_albedo(triangle);
@@ -156,7 +157,7 @@ fn shadeHit(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f, px: vec2u, cost: pt
         let c = srcSurfaceCone(p, d, n, gp.hitConeTan, 1.5 * size, gp.maxDistance, gp.hitConeSteps);
         indirect = c.rgb + c.a * skyLight(d);
     }
-    return albedo / RT_GI_PI * e + albedo * indirect;
+    return albedo / RT_GI_PI * e + albedo * indirect + kansei_rt_emission(triangle);
 }
 
 // Past the grid's box (or with the grid off): a voxel cone from where the ray left it, the sky
@@ -199,7 +200,7 @@ fn tracePath(origin: vec3f, n0: vec3f, px: vec2u, cost: ptr<function, u32>, foun
         let ng = h.normal;
         let nh = kansei_rt_shading_normal(h.triangle, h.bary, ng);
         let albedo = kansei_rt_albedo(h.triangle);
-        radiance += throughput * albedo / RT_GI_PI * directLight(p, ng, nh, px, 8u + 4u * b, cost);
+        radiance += throughput * (albedo / RT_GI_PI * directLight(p, ng, nh, px, 8u + 4u * b, cost) + kansei_rt_emission(h.triangle));
         // cosine sampling: the BRDF times the cosine over the pdf is the albedo
         throughput *= albedo;
         if (b >= 1u) {

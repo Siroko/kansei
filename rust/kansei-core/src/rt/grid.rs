@@ -60,7 +60,9 @@ pub(crate) struct RtSourceGpu {
     source: u32,
     slot: u32,
     kind: u32,
-    _pad: [u32; 2],
+    /// `RtSurface::record_albedo` and `record_emission`, plus one (0: none).
+    albedo_record_word: u32,
+    emission_record_word: u32,
 }
 
 /// What `RtGrid::new` sets up.
@@ -249,18 +251,46 @@ pub struct RtSurface {
     /// Glass (`RtSurface::glass`): rays pass straight through it (diffuse GI, shadow rays, any
     /// trace without `KANSEI_RT_GLASS_HITS`); `RtReflectionsEffect`'s glass refracts at it.
     pub glass: bool,
+    /// An instanced surface's albedo per instance, in place of `albedo`: the word of each instance
+    /// record (0 the first) holding it as `pack4x8unorm` (alpha unused), for instances the GPU
+    /// colours (particles).
+    pub record_albedo: Option<u32>,
+    /// The light an instanced surface emits per instance (cd/m²): the word of each instance
+    /// record holding it packed RGBE (`RT_EMISSION_WGSL`'s `kansei_rt_pack_emission`). The hits
+    /// the rays shade themselves (those the camera doesn't see) add it; `None`: no emission.
+    pub record_emission: Option<u32>,
+    /// Its reflectance at normal incidence (F0: 0.04 for a polished dielectric, 0 matte, the
+    /// default): the hits the rays light themselves add its Fresnel reflection of the sky, the
+    /// rest of their light scaled by what it leaves (`RtReflectionsEffect`'s and its glass's). A
+    /// polished floor seen in a mirror or through glass reflects the sky at grazing angles, as it
+    /// does on screen.
+    pub specular: f32,
 }
 
 impl RtSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false }
+        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false, record_albedo: None, record_emission: None, specular: 0.0 }
     }
 
     /// The surface of a glass object (the triangles `RtReflectionsEffect` refracts through, with
     /// smooth normals) whose material is `StandardLitOptions::glass`: `tint` its albedo, for the
     /// rays that pass through it.
     pub fn glass(tint: [f32; 3]) -> Self {
-        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true }
+        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true, record_albedo: None, record_emission: None, specular: 0.0 }
+    }
+
+    /// See `specular`.
+    pub fn with_specular(mut self, f0: f32) -> Self {
+        self.specular = f0.clamp(0.0, 1.0);
+        self
+    }
+
+    /// See `record_albedo` and `record_emission` (word offsets in the instance record; `None`
+    /// leaves that one as it is).
+    pub fn with_record_surface(mut self, albedo_word: Option<u32>, emission_word: Option<u32>) -> Self {
+        self.record_albedo = albedo_word.or(self.record_albedo);
+        self.record_emission = emission_word.or(self.record_emission);
+        self
     }
 
     /// See `smooth_normals`.
@@ -281,7 +311,7 @@ impl RtSurface {
 
     pub(crate) fn albedo_word(&self) -> u32 {
         let byte = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
-        byte(self.albedo[0]) | byte(self.albedo[1]) << 8 | byte(self.albedo[2]) << 16 | 255 << 24
+        byte(self.albedo[0]) | byte(self.albedo[1]) << 8 | byte(self.albedo[2]) << 16 | byte(1.0 - self.specular) << 24
     }
 }
 
@@ -781,7 +811,8 @@ impl RtGrid {
                 source: (s.id & 0xfff) << 20,
                 slot: k as u32,
                 kind,
-                _pad: [0; 2],
+                albedo_record_word: s.surface.record_albedo.map_or(0, |w| w + 1),
+                emission_record_word: s.surface.record_emission.map_or(0, |w| w + 1),
             };
             bytes[k * SOURCE_STRIDE as usize..][..std::mem::size_of::<RtSourceGpu>()].copy_from_slice(bytemuck::bytes_of(&gpu));
         }

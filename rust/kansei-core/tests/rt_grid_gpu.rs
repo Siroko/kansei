@@ -3,11 +3,13 @@
 //! soup of small triangles, a sphere half out of the box, a ground too wide for the cells that
 //! goes to the big list, an alpha-tested quad), and rays find the closest hit (and any hit) the
 //! brute-force reference finds, with the big list overflowing, without macro-cell skipping, and
-//! after the buffers grew from a readback. Skipped (passes) when no adapter is available.
+//! after the buffers grew from a readback; instanced triangles take their albedo and emission from
+//! their instance records when their surface says so. Skipped (passes) when no adapter is
+//! available.
 
 use glam::{DMat4, DVec3, Mat4, Quat, Vec3};
 use kansei_core::geometries::{BoxGeometry, Geometry, IcosphereGeometry, Vertex};
-use kansei_core::rt::{RtGrid, RtGridOptions, RtInstance, RtMesh, RtScene, RtSurface, RT_GRID_WGSL};
+use kansei_core::rt::{pack_emission, unpack_emission, RtGrid, RtGridOptions, RtInstance, RtMesh, RtPlacement, RtScene, RtSource, RtSurface, RT_GRID_WGSL};
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
@@ -613,6 +615,72 @@ fn build_times() {
                 "{scene_name}, {what}: gather {:.3} + count {:.3} + scan {:.3} + fill {:.3} ms (GPU, {} frames); {} triangles, {} references, {} big",
                 ms("Rt/Gather"), ms("Rt/GridCount"), ms("Rt/GridScan"), ms("Rt/GridFill"), profile.gpu_frames, s.triangles, s.references, s.big_triangles
             );
+        }
+    }
+}
+
+#[test]
+fn instances_carry_their_records_albedo_and_emission() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    use wgpu::util::DeviceExt;
+    // three quads a metre apart, each record (x, albedo, emission, unused): the first two with
+    // their own colour and glow, the third unlit
+    let colours = [[0.9f32, 0.2, 0.1], [0.1, 0.8, 0.3], [0.5, 0.5, 0.5]];
+    let glows = [[60.0f32, 22.0, 4.0], [0.0, 3.0, 9.0], [0.0; 3]];
+    let mut words: Vec<u32> = Vec::new();
+    for k in 0..3 {
+        let [r, g, b] = colours[k].map(|c| (c * 255.0).round() as u32);
+        words.extend([(k as f32 - 1.0).to_bits(), r | g << 8 | b << 16, pack_emission(glows[k]), 0]);
+    }
+    let records = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&words), usage: wgpu::BufferUsages::STORAGE });
+    let mesh = RtMesh::from_geometry(&quad());
+    let mesh_buffer = mesh.create_buffer(&device);
+    let placement = RtPlacement::Wgsl("fn kansei_rt_place(record: u32, p: vec3f) -> vec3f { return p + vec3f(kansei_rt_record_f32(record, 0u), 0.0, 0.0); }\n".into());
+    let mut grid = RtGrid::new(&device, options());
+    for (surface, per_record) in [(RtSurface::new([0.2, 0.2, 0.2]).with_record_surface(Some(1), Some(2)), true), (RtSurface::new([0.2, 0.2, 0.2]), false)] {
+        let source = RtSource {
+            mesh: &mesh_buffer,
+            triangles: mesh.triangle_count(),
+            records: Some((&records, 16)),
+            first_record: 0,
+            record_count: 3,
+            world: Mat4::IDENTITY,
+            placement: &placement,
+            surface,
+            id: 1,
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        grid.begin(&device, &queue, &mut encoder);
+        grid.gather(&device, &queue, &mut encoder, &[source]);
+        grid.finish(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        grid.read_back(&device, &queue);
+        grid.wait_readback(&device);
+        assert_eq!(grid.stats().triangles, 6);
+        let tris = read_words(&device, &queue, grid.triangles_buffer());
+        for t in 0..6 {
+            let tri = &tris[t * 16..t * 16 + 16];
+            let record = (tri[11] & 0xfffff) as usize;
+            let albedo = [tri[7] & 255, (tri[7] >> 8) & 255, (tri[7] >> 16) & 255].map(|c| c as f32 / 255.0);
+            assert_eq!(tri[7] >> 24, 255, "opaque albedo");
+            // the quad sits where its record put it
+            let x = f32::from_bits(tri[0]);
+            assert!((x - (record as f32 - 1.0)).abs() <= 0.5 + 1e-5, "triangle {t} at x {x}, record {record}");
+            if per_record {
+                for c in 0..3 {
+                    assert!((albedo[c] - colours[record][c]).abs() < 0.01, "record {record}: {albedo:?}");
+                }
+                let glow = unpack_emission(tri[15]);
+                for c in 0..3 {
+                    assert!((glow[c] - glows[record][c]).abs() <= 0.01 * 60.0, "record {record}: {glow:?}");
+                }
+            } else {
+                assert!(albedo.iter().all(|&c| (c - 0.2).abs() < 0.01), "the surface's own albedo: {albedo:?}");
+                assert_eq!(tri[15], 0, "no emission");
+            }
         }
     }
 }

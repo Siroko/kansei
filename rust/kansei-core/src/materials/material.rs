@@ -25,6 +25,11 @@ impl CullMode {
 /// Configuration for a render material.
 pub struct MaterialOptions {
     pub transparent: bool,
+    /// Drawn after the opaque renderables, once the GBuffer's colour has been copied to its
+    /// `background` (the TS `transmissive`): an effect or material can then refract what is
+    /// behind it from that copy (`postprocessing::effects::ScreenSpaceGlassEffect`). It still
+    /// writes depth and occludes; transparent renderables draw after it.
+    pub transmissive: bool,
     pub depth_write: Option<bool>,
     pub depth_compare: wgpu::CompareFunction,
     pub cull_mode: CullMode,
@@ -56,6 +61,7 @@ impl Default for MaterialOptions {
     fn default() -> Self {
         Self {
             transparent: false,
+            transmissive: false,
             depth_write: None,
             depth_compare: wgpu::CompareFunction::Less,
             cull_mode: CullMode::Back,

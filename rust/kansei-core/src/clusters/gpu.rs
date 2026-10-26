@@ -255,6 +255,12 @@ impl ClusterCulling {
         self.feedback.begin_frame(device);
     }
 
+    /// The clusters and triangles each cut (a `ClusterGpu`'s id, its view) claimed at its latest
+    /// readback, a few frames old.
+    pub(crate) fn counts(&self) -> &std::collections::HashMap<(u64, u32), (u32, u32)> {
+        &self.feedback.last
+    }
+
     /// After the frame's cuts `(clusters, view)` are submitted: read back how many clusters each
     /// claimed (drawn or not), unless a readback is still in flight.
     pub(crate) fn read_back(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cuts: &[(&ClusterGpu, u32)]) {
@@ -372,7 +378,7 @@ impl ClusterLod {
 /// A renderable's cluster mesh on the GPU, and its cuts: one per view that draws it.
 pub(crate) struct ClusterGpu {
     /// Names its cuts' readbacks (`Feedback`), whatever the scene does with the renderable.
-    id: u64,
+    pub(crate) id: u64,
     mesh: wgpu::Buffer,
     vertex_count: u32,
     cluster_count: u32,
@@ -614,6 +620,8 @@ struct Feedback {
     pending: Option<(Vec<(u64, u32)>, std::sync::Arc<std::sync::atomic::AtomicU8>)>,
     /// the last readback's counts (clusters, triangles), until the next frame's
     needed: std::collections::HashMap<(u64, u32), (u32, u32)>,
+    /// the latest counts of every cut read back, kept (`ClusterCulling::counts`)
+    last: std::collections::HashMap<(u64, u32), (u32, u32)>,
 }
 
 const MAPPING: u8 = 0;
@@ -644,6 +652,7 @@ impl Feedback {
             let bytes = staging.slice(..).get_mapped_range();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
             self.needed.extend(cuts.into_iter().zip(words.chunks(2).map(|w| (w[0], w[1]))));
+            self.last.extend(self.needed.iter().map(|(k, v)| (*k, *v)));
         }
         staging.unmap();
     }

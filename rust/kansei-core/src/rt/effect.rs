@@ -78,16 +78,20 @@ fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
 const ALPHA_BINDINGS_WGSL: &str = "@group(1) @binding(3) var kansei_rt_alpha_texture : texture_2d<f32>;\n@group(1) @binding(4) var kansei_rt_alpha_sampler : sampler;\n";
 const DEFAULT_COVERED_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {\n    return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;\n}\n";
 
+/// The default `kansei_rt_hit_albedo`: the triangle's albedo.
+pub(crate) const DEFAULT_HIT_ALBEDO_WGSL: &str = "fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f {\n    return kansei_rt_albedo(triangle);\n}\n";
+
 const COMMON_WGSL: &str = include_str!("shaders/rt_reflect_common.wgsl");
 
-/// The trace's WGSL over a clipmap or a volume, with `covered` (`kansei_rt_covered`).
-pub(crate) fn trace_wgsl(clipmap: bool, covered: &str) -> String {
-    traced_wgsl(clipmap, covered, include_str!("shaders/rt_reflect_trace.wgsl"))
+/// The trace's WGSL over a clipmap or a volume, with `surface` (`kansei_rt_covered`, then
+/// `kansei_rt_hit_albedo`).
+pub(crate) fn trace_wgsl(clipmap: bool, surface: &str) -> String {
+    traced_wgsl(clipmap, surface, include_str!("shaders/rt_reflect_trace.wgsl"))
 }
 
 /// The glass pass's WGSL, prefixed as the trace.
-pub(crate) fn glass_wgsl(clipmap: bool, covered: &str) -> String {
-    traced_wgsl(clipmap, covered, include_str!("shaders/rt_glass.wgsl"))
+pub(crate) fn glass_wgsl(clipmap: bool, surface: &str) -> String {
+    traced_wgsl(clipmap, surface, include_str!("shaders/rt_glass.wgsl"))
 }
 
 fn traced_wgsl(clipmap: bool, covered: &str, main: &str) -> String {
@@ -161,6 +165,12 @@ pub struct RtReflectionsOptions {
     /// Alpha-test the grid's alpha-tested triangles (`RtSurface::with_alpha_layer`); off, they are
     /// solid.
     pub alpha_test: bool,
+    /// WGSL defining `fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f`, the
+    /// albedo of a hit the rays light themselves (one the camera doesn't see) at world point `p`:
+    /// for a surface whose albedo varies across its triangles (a procedural or textured floor
+    /// seen in a mirror or through glass). It may tell the surfaces apart by `kansei_rt_source`
+    /// and read `rp` (the camera). None: `kansei_rt_albedo(triangle)`.
+    pub albedo_wgsl: Option<String>,
     /// WGSL defining `fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool`, which may sample
     /// `kansei_rt_alpha_texture` with `kansei_rt_alpha_sampler` (`set_alpha_texture`). None: the
     /// texture's alpha is at least a half (a white texture until one is set: every hit).
@@ -169,7 +179,7 @@ pub struct RtReflectionsOptions {
 
 impl Default for RtReflectionsOptions {
     fn default() -> Self {
-        Self { resolution: RtTraceResolution::Half, intensity: 1.0, max_distance: 400.0, cone_tan: 0.04, cone_steps: 96, temporal_blend: 0.25, sky_scale: 1.0, alpha_test: true, covered_wgsl: None }
+        Self { resolution: RtTraceResolution::Half, intensity: 1.0, max_distance: 400.0, cone_tan: 0.04, cone_steps: 96, temporal_blend: 0.25, sky_scale: 1.0, alpha_test: true, albedo_wgsl: None, covered_wgsl: None }
     }
 }
 
@@ -293,6 +303,10 @@ struct Gpu {
 /// TAA.
 pub struct RtReflectionsEffect {
     pub enabled: bool,
+    /// Trace the reflections (on by default). Off, only the glass pass runs (`set_glass`), writing
+    /// the effect's output itself, and the reflections' trace and resolve are skipped: a toggle
+    /// for their cost that keeps the glass. Call `reset_history` when turning them back on.
+    pub reflections: bool,
     pub view: RtReflectionsView,
     pub intensity: f32,
     pub max_distance: f32,
@@ -324,6 +338,7 @@ pub struct RtReflectionsEffect {
     lights_dirty: bool,
     resolution: RtTraceResolution,
     covered_wgsl: Option<String>,
+    albedo_wgsl: Option<String>,
     grid: RtGridHandle,
     source: Source,
     sky_lighting: Option<wgpu::Buffer>,
@@ -358,6 +373,7 @@ impl RtReflectionsEffect {
     fn from_source(source: Source, grid: RtGridHandle, o: RtReflectionsOptions) -> Self {
         Self {
             enabled: true,
+            reflections: true,
             view: RtReflectionsView::Lit,
             intensity: o.intensity,
             max_distance: o.max_distance,
@@ -377,6 +393,7 @@ impl RtReflectionsEffect {
             lights_dirty: false,
             resolution: o.resolution,
             covered_wgsl: o.covered_wgsl,
+            albedo_wgsl: o.albedo_wgsl,
             grid,
             source,
             sky_lighting: None,
@@ -520,7 +537,11 @@ impl RtReflectionsEffect {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, push_constant_ranges: &[] });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None })
         };
-        let covered = self.covered_wgsl.clone().unwrap_or_else(|| DEFAULT_COVERED_WGSL.into());
+        let covered = format!(
+            "{}{}",
+            self.covered_wgsl.as_deref().unwrap_or(DEFAULT_COVERED_WGSL),
+            self.albedo_wgsl.as_deref().unwrap_or(DEFAULT_HIT_ALBEDO_WGSL)
+        );
         let trace = pipeline("RtReflections/Trace", trace_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
         let glass = pipeline("RtReflections/Glass", glass_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
         let resolve = pipeline("RtReflections/Resolve", resolve_wgsl(), &[&resolve_bgl]);
@@ -572,7 +593,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
     fn initialize(&mut self, _device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {}
 
     fn is_active(&self) -> bool {
-        self.enabled
+        self.enabled && (self.reflections || self.glass.is_some())
     }
 
     fn render(
@@ -710,7 +731,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout: &gpu.trace_bgl, entries: &e })
         };
         let trace_group = group("RtReflections/Trace", &t.trace, lit);
-        let glass_group = glass_on.then(|| group("RtReflections/Glass", &t.glassed, input));
+        // without the reflections the glass pass writes the output itself
+        let glass_group = glass_on.then(|| group("RtReflections/Glass", if self.reflections { &t.glassed } else { output }, input));
         // the grid's group, made anew when the grid's buffers or the alpha texture change
         let (buffers, generation) = self.grid.buffers();
         if gpu.grid_group.as_ref().is_none_or(|(g, alpha, _)| *g != generation || *alpha != self.alpha_texture) {
@@ -756,6 +778,9 @@ impl PostProcessingEffect for RtReflectionsEffect {
             pass.set_bind_group(0, glass_group, &[]);
             pass.set_bind_group(1, &gpu.grid_group.as_ref().unwrap().2, &[]);
             pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        if !self.reflections {
+            return;
         }
         {
             let stamp = crate::profiling::gpu_pass("Rt/Trace");
