@@ -5,7 +5,8 @@
 //! display signal. A physically ordered chain:
 //!
 //! 1. the sky and aerial perspective ([`effects::AtmosphereEffect`]), then the far height fog
-//!    ([`effects::HeightFogEffect`]);
+//!    ([`effects::HeightFogEffect`]), or a distance fade into a backdrop
+//!    ([`effects::DistanceFogEffect`]);
 //! 2. volumetric fog (composited over the lit scene by depth);
 //! 3. anti-aliasing, while samples are still linear ([`effects::TemporalAAEffect`], which also
 //!    upscales to the display size under `Renderer::set_render_scale`; what follows runs at it);
