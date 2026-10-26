@@ -35,6 +35,14 @@
         const pane = new Pane({ title: 'Glass particles', expanded: !/Mobi|Android/.test(navigator.userAgent) });
         pane.hidden = params.get('ui') === '0';
         const set = (key) => (e) => kansei.set(key, typeof e.value === 'boolean' ? (e.value ? 1 : 0) : e.value);
+        // the panel shows values a preset set; the presets' own dropdowns don't act on that refresh
+        let refreshing = false;
+        const refresh = () => { refreshing = true; pane.refresh(); refreshing = false; };
+
+        // the quality (built below the passes' folders): EPIC the page's defaults, each level under
+        // it cheaper; it sets the passes' on/offs and presets, the render scale and the particles
+        p.quality = 'EPIC';
+        const qualityBinding = pane.addBinding(p, 'quality', { options: { LOW: 'LOW', MID: 'MID', HIGH: 'HIGH', EPIC: 'EPIC' } });
 
         pane.addBinding(p, 'palette', { options: Object.fromEntries(state.palettes.map((n) => [n, n])) }).on('change', (e) => kansei.set_palette(e.value));
         // a preset sets the spot light, the environment, the exposure and the mist (each editable below)
@@ -42,12 +50,12 @@
             await kansei.set_lighting(e.value);
             const st = (await info()).settings;
             for (const key of ['light', 'cone', 'skyUp', 'skyDown', 'ev100', 'fogDensity']) p[key] = st[key];
-            pane.refresh();
+            refresh();
         });
 
         // the emitters: where they sit and point, what they emit from, how fast and how many
         const shapes = { point: 0, ball: 1, disc: 2 };
-        state.emitters.forEach((em, i) => {
+        const emitters = state.emitters.map((em, i) => {
             const f = pane.addFolder({ title: `Emitter ${'AB'[i]}`, expanded: i === 0 });
             const e = { ...em, position: { x: em.x, y: em.y, z: em.z }, rotation: { x: em.rx, y: em.ry, z: em.rz } };
             const setE = (key) => (ev) => kansei.set_emitter(i, key, typeof ev.value === 'boolean' ? (ev.value ? 1 : 0) : ev.value);
@@ -66,6 +74,7 @@
             f.addBinding(e, 'glowShare', { label: 'glowing share', min: 0, max: 1, step: 0.01 }).on('change', setE('glowShare'));
             f.addBinding(e, 'speedJitter', { label: 'speed jitter', min: 0, max: 1, step: 0.01 }).on('change', setE('speedJitter'));
             f.addBinding(e, 'lifeJitter', { label: 'life jitter', min: 0, max: 1, step: 0.01 }).on('change', setE('lifeJitter'));
+            return e;
         });
 
         const flow = pane.addFolder({ title: 'Curl flow', expanded: false });
@@ -113,18 +122,20 @@
         // takes it out of the chain (PostProcessingVolume::set_enabled), a preset that sets its
         // values (each still editable after), and its values ──
         const post = pane.addFolder({ title: 'Post-processing', expanded: false });
-        const presetOf = {};
+        const passes = {};
+        // set a value of the demo's and show it
+        const put = (key, value) => { p[key] = value; kansei.set(key, typeof value === 'boolean' ? (value ? 1 : 0) : value); };
         function pass(title, onKey, presets, bindings) {
             const f = post.addFolder({ title, expanded: false });
             f.addBinding(p, onKey, { label: 'on' }).on('change', set(onKey));
             const names = Object.keys(presets);
-            presetOf[title] = { preset: 'default' in presets ? 'default' : names[0] };
-            f.addBinding(presetOf[title], 'preset', { options: Object.fromEntries(names.map((n) => [n, n])) }).on('change', (e) => {
-                for (const [key, value] of Object.entries(presets[e.value])) {
-                    p[key] = value;
-                    kansei.set(key, typeof value === 'boolean' ? (value ? 1 : 0) : value);
-                }
-                pane.refresh();
+            const shown = { preset: 'default' in presets ? 'default' : names[0] };
+            const apply = (name) => { shown.preset = name; for (const [key, value] of Object.entries(presets[name])) put(key, value); };
+            passes[title] = { onKey, apply };
+            f.addBinding(shown, 'preset', { options: Object.fromEntries(names.map((n) => [n, n])) }).on('change', (e) => {
+                if (refreshing) return;
+                apply(e.value);
+                refresh();
             });
             bindings(f);
             return f;
@@ -223,6 +234,48 @@
             f.addBinding(p, 'grain', { min: 0, max: 1, step: 0.01 }).on('change', set('grain'));
             f.addBinding(p, 'chromatic', { label: 'fringing', min: 0, max: 2, step: 0.01 }).on('change', set('chromatic'));
         });
+
+        // ── the quality levels: each pass on (its preset) or off, then the values under its presets,
+        // the render scale (TAA upscales) and the emitters' rates (the share of EPIC's 2200 a second
+        // each, so about that share of the particles flies) ──
+        const QUALITY = {
+            LOW: {
+                passes: { SSAO: false, Glass: 'fast (screen space)', 'Floor reflections': false, 'Volumetric fog': 'low', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { renderScale: 0.5, dofSamples: 16, glassInterfaces: 8 },
+                rate: 0.5,
+            },
+            MID: {
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': false, 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { glassMode: 0, renderScale: 0.7, aoSamples: 8, dofSamples: 24, glassInterfaces: 4 },
+                rate: 0.75,
+            },
+            HIGH: {
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'low', 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { glassMode: 0, renderScale: 0.85, aoSamples: 12, dofSamples: 32, glassInterfaces: 6 },
+                rate: 1,
+            },
+            EPIC: {
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'default', 'Volumetric fog': 'default', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                values: { glassMode: 0, renderScale: 1, glassInterfaces: 8 },
+                rate: 1,
+            },
+        };
+        function quality(level) {
+            const q = QUALITY[level];
+            p.quality = level;
+            for (const [title, preset] of Object.entries(q.passes)) {
+                const { onKey, apply } = passes[title];
+                put(onKey, preset !== false);
+                if (preset !== false) apply(preset);
+            }
+            for (const [key, value] of Object.entries(q.values)) put(key, value);
+            emitters.forEach((e, i) => { e.rate = 2200 * q.rate; kansei.set_emitter(i, 'rate', e.rate); });
+            refresh();
+        }
+        qualityBinding.on('change', (e) => { if (!refreshing) quality(e.value); });
+        window.kansei.quality = quality;
+        const startQuality = (params.get('quality') || '').toUpperCase();
+        if (startQuality in QUALITY && startQuality !== 'EPIC') quality(startQuality);
 
         // ── sound: Tone.js, started by the box's tick (a user gesture) ──
         // The sim counts its respawns, its brushes with the glass and its hits on the floor on the GPU; they
@@ -334,7 +387,7 @@
                 + `${i.frame_ms} ms a frame`;
             p.perf = i.perf;
             if (p.autofocus) p.focus = i.settings.focus;
-            pane.refresh();
+            refresh();
         }, 500);
     </script>
 </body>

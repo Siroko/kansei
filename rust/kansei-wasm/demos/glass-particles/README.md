@@ -43,6 +43,7 @@ grid, the lighting presets, the palettes, the page's panel and its sounds.
 | `n=<particles>` | particle count, split between the emitters (default 32 768, 4096..262 144) |
 | `palette=<name>` | `ember` (default), `glacier`, `neon`, `bauhaus`, `moss` or `mono` |
 | `lighting=<name>` | `studio` (default), `spotlight` (the spot alone in a dark mist) or `overcast` |
+| `quality=<level>` | `low`, `mid`, `high` or `epic` (default): the panel's quality on load |
 | `ev=<EV100>` | exposure, over the preset's |
 | `glassmode=1` | the glass in screen space (`ScreenSpaceGlassEffect`) instead of ray traced |
 | `glass=0` | the repellers drawn grey instead of glass: no ray tracing grid, voxels or reflections |
@@ -54,8 +55,10 @@ grid, the lighting presets, the palettes, the page's panel and its sounds.
 | `dpr=<ratio>` | drawing-buffer pixels per CSS pixel (default: the screen's, at most 1.5) |
 
 Controls: drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan;
-moving the pointer over the particles pushes them. The Tweakpane panel has the palette and the
-lighting preset; each emitter's transform (position, rotation), shape, radius, rate, speed,
+moving the pointer over the particles pushes them. The Tweakpane panel has the quality (LOW, MID,
+HIGH, EPIC: EPIC the defaults, each level under it cheaper, setting every pass's on/off and preset,
+the samples under them, the render scale and the emitters' rates; all still editable), the palette
+and the lighting preset; each emitter's transform (position, rotation), shape, radius, rate, speed,
 spread, lifetime, size, glowing share and jitters; the curl flow and the pointer's push; the
 repellers (reach and push of their fields, bounce, whether they cast shadows); the particles'
 look; the floor grid (colours, spacing, line widths); the light and the environment; and a
