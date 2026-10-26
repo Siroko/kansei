@@ -3,7 +3,9 @@
 //! - `drive=1`: a fixed route stands in for the stick: starts, walks, turns, stops, a run, a turn
 //!   and a stop at a run, pivots, strafes and walking backwards, round and round. Every pack gets
 //!   the same input, so two recordings line up (`drive_restart()` starts it over, from where the
-//!   character started, and the clips of `play=` from the first).
+//!   character started, and the clips of `play=` from the first). `circle=<radius>` runs round a
+//!   circle of that radius instead (metres; negative turns right), as the foot-slide course does
+//!   (`motion_matching::foot_slide`).
 //! - `play=<pattern>`: plays the pack's clips whose names start with the pattern (`*` matches any
 //!   run of characters: `play=Parkour/*_00`; several patterns separated by commas) one after another,
 //!   as they are (root motion included), each from the start point, with the clip's name on the
@@ -44,10 +46,17 @@ pub struct Drive {
     pub start: f64,
     /// Where the character started, and its heading: the route turns with it.
     pub home: (Vec3, f32),
+    /// `circle=<radius>`: instead of the route, run round and round, the heading turning at this
+    /// many radians a second (positive to the left).
+    pub circle: Option<f32>,
 }
 
 impl Drive {
     pub fn step(&self, now: f64) -> Step {
+        if let Some(rate) = self.circle {
+            let yaw = self.home.1 + rate * (now - self.start) as f32;
+            return Step { direction: Some(Vec3::new(yaw.sin(), 0.0, yaw.cos())), run: true, facing: None };
+        }
         let total: f32 = ROUTE.iter().map(|r| r.0).sum();
         let mut t = ((now - self.start) as f32).rem_euclid(total);
         for &(seconds, direction, run, facing) in &ROUTE {

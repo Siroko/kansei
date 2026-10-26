@@ -1,5 +1,6 @@
 import { quat, vec3 } from "gl-matrix";
 import { FootLock, twoJointIK } from "../IK";
+import type { FootPose } from "../IK";
 import { Inertializer } from "../Inertialization";
 import { Pose } from "../Pose";
 import { Retarget } from "../Retarget";
@@ -44,7 +45,11 @@ interface MotionMatchingSettings {
     maxAdjustmentRatio: number;
     clampDistance: number;
     clampAngle: number;
-    /** Foot locking: pin planted feet with two-joint IK. */
+    /**
+     * Foot locking: pin planted feet with two-joint IK. A pin lets go when the contact ends or
+     * the animated foot strays `footUnlockRadius` metres from it; the foot then fades back onto
+     * the animation with `footLockHalflife`, and is pinned again there while the contact lasts.
+     */
     footLock: boolean;
     footUnlockRadius: number;
     footLockHalflife: number;
@@ -66,7 +71,7 @@ function defaultMotionMatchingSettings(): MotionMatchingSettings {
         clampDistance: 0.15,
         clampAngle: Math.PI / 2,
         footLock: true,
-        footUnlockRadius: 0.2,
+        footUnlockRadius: 0.3,
         footLockHalflife: 0.1,
     };
 }
@@ -133,8 +138,15 @@ interface Display {
     legs: [Leg, Leg];
 }
 
-/** (upper, middle, foot) joints of a leg. */
-type Leg = [number, number, number];
+/**
+ * A leg for foot locking: its (upper, middle, foot) joints, the foot's ball (its first child, or
+ * the foot itself), and the heights of the foot and the ball at rest.
+ */
+interface Leg {
+    joints: [number, number, number];
+    ball: number;
+    rest: [number, number];
+}
 
 const flat = (v: vec3): vec3 => vec3.fromValues(v[0], 0, v[2]);
 
@@ -162,10 +174,13 @@ function blockedDirection(from: vec3, wanted: vec3, allowed: vec3): vec3 {
     return normalizeOr(across, normalizeOr(removed, vec3.create()));
 }
 
-/** The (upper, middle, foot) joints of the leg ending at `foot`. */
+/** The leg ending at `foot`. */
 function leg(skeleton: Skeleton, foot: number): Leg {
     const middle = skeleton.parents[foot] ?? foot;
-    return [skeleton.parents[middle] ?? middle, middle, foot];
+    const child = skeleton.parents.indexOf(foot);
+    const ball = child < 0 ? foot : child;
+    const rest = skeleton.restModel();
+    return { joints: [skeleton.parents[middle] ?? middle, middle, foot], ball, rest: [rest[foot].translation[1], rest[ball].translation[1]] };
 }
 
 /**
@@ -572,7 +587,7 @@ class MotionMatcher {
         if (Math.abs(yawGap) > s.clampAngle) this.root.rotation = yawRotation(simYaw + Math.sign(yawGap) * s.clampAngle);
     }
 
-    /** Pin planted feet where they touched down (two-joint IK on each leg). */
+    /** Pin planted feet where they touched down (two-joint IK on each leg): the ankle while the heel is down, the ball once it lifts. */
     private lockFeet(db: Database, dt: number): void {
         const contacts = db.contacts(this.currentFrame(db));
         const s = this.settings;
@@ -581,11 +596,14 @@ class MotionMatcher {
         const legs = this.display?.legs ?? this.legs;
         let inverse: Transform | undefined;
         for (let side = 0; side < 2; side++) {
-            const [upper, middle, foot] = legs[side];
+            const leg = legs[side];
+            const [upper, middle, foot] = leg.joints;
             if (upper === middle || middle === foot) continue;
-            const animated = this.root.transformPoint(this.outputModel[foot].translation);
-            const target = this.feet[side].update(animated, contacts[side], s.footUnlockRadius, s.footLockHalflife, dt);
-            if (vec3.distance(target, animated) > 1e-5) {
+            // the model is relative to the character, which stands on the ground
+            const ankle = this.outputModel[foot].translation, ball = this.outputModel[leg.ball].translation;
+            const animated: FootPose = { ankle: this.root.transformPoint(ankle), ball: this.root.transformPoint(ball), ankleLift: ankle[1] - leg.rest[0], ballLift: ball[1] - leg.rest[1] };
+            const target = this.feet[side].updateFoot(animated, contacts[side], s.footUnlockRadius, s.footLockHalflife, dt);
+            if (vec3.distance(target, animated.ankle) > 1e-5) {
                 inverse ??= this.root.inverse();
                 twoJointIK(skeleton, this.output, this.outputModel, upper, middle, foot, inverse.transformPoint(target));
                 moved = true;

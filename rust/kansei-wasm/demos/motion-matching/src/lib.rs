@@ -42,6 +42,7 @@
 //! profile every 3 s), `debug=1` (allows `lake_regions()`, a GPU readback),
 //! `at=<x>,<z>,<heading in degrees>` (where the character starts; `at=14,-1,90` at the lake),
 //! `drive=1` (a fixed route instead of the player, for side-by-side captures; `demo`),
+//! `circle=<radius>` (round a circle of that radius at a run instead, negative turning right),
 //! `play=<pattern>` (the pack's clips whose names start with it, `*` any run, one after another),
 //! `view=<degrees>` (the camera turned round the character from behind it).
 
@@ -656,8 +657,10 @@ where
             (at.translation, yaw_of(at.rotation))
         });
         if let Some(home) = home {
-            if flag("drive", false) {
-                s.drive = Some(demo::Drive { start: kansei_wasm::now(), home });
+            // circle=<radius>: round a circle at the run pace (negative radius: turning right)
+            let circle = param("circle").and_then(|r| r.parse::<f32>().ok()).filter(|r| r.abs() > 0.1).map(|r| s.speeds.1[0] / r);
+            if flag("drive", false) || circle.is_some() {
+                s.drive = Some(demo::Drive { start: kansei_wasm::now(), home, circle });
             }
             if let Some(prefix) = param("play") {
                 let player = s.character.as_ref().map(|c| demo::ClipPlayer::new(&c.db, &prefix, home));
@@ -745,7 +748,7 @@ pub fn set_drive(on: bool) {
     with_state(|s| {
         s.drive = on.then(|| {
             let at = s.character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
-            demo::Drive { start: kansei_wasm::now(), home: (at.translation, yaw_of(at.rotation)) }
+            demo::Drive { start: kansei_wasm::now(), home: (at.translation, yaw_of(at.rotation)), circle: None }
         });
         if !on {
             s.strafe = false;

@@ -6,6 +6,7 @@ import {
 } from "../../src/animation/Springs";
 import { Inertializer, poseVelocities } from "../../src/animation/Inertialization";
 import { FootLock, twoJointIK } from "../../src/animation/IK";
+import type { FootPose } from "../../src/animation/IK";
 import { Retarget, TranslationMode } from "../../src/animation/Retarget";
 import { Placement, Ramp, Root, RootWarp } from "../../src/animation/Warping";
 import { Pose } from "../../src/animation/Pose";
@@ -182,13 +183,43 @@ test("ik: a planted foot stays until released, then blends back", () => {
     // the animated foot slides 10 cm while planted: the output stays
     const still = lock.update(v(0.4, 0, 0), true, 0.2, 0.1, dt);
     assertClose(still, planted, 0);
-    // past the radius it lets go, starting from where it was, then catches up
+    // past the radius it lets go, starting from where it was, and is pinned again where the
+    // animation has it, the output fading over
     const released = lock.update(v(0.6, 0, 0), true, 0.2, 0.1, dt);
-    assert(!lock.isLocked());
+    assert(lock.isLocked());
     assert(vec3.distance(released, planted) < 0.05, `${released}`);
     let out = released;
-    for (let i = 0; i < 60; i++) out = lock.update(v(0.6, 0.1, 0), false, 0.2, 0.1, dt);
-    assert(vec3.distance(out, v(0.6, 0.1, 0)) < 1e-3, `${out}`);
+    for (let i = 0; i < 60; i++) out = lock.update(v(0.65, 0, 0), true, 0.2, 0.1, dt);
+    assert(vec3.distance(out, v(0.6, 0, 0)) < 1e-3, `${out}`);
+    // lifted, it follows the animation
+    for (let i = 0; i < 60; i++) out = lock.update(v(0.9, 0.1, 0), false, 0.2, 0.1, dt);
+    assert(vec3.distance(out, v(0.9, 0.1, 0)) < 1e-3, `${out}`);
+});
+
+test("ik: a rolling foot stays on its ball once the heel lifts", () => {
+    const lock = new FootLock();
+    const dt = 1 / 60;
+    const foot = (ankle: vec3, ball: vec3, ankleLift: number): FootPose => ({ ankle, ball, ankleLift, ballLift: 0 });
+    const toe = (f: FootPose) => vec3.subtract(vec3.create(), f.ball, f.ankle);
+    // flat on the ground, the ball 0.15 m ahead of the ankle: the ankle is pinned
+    const flat = foot(v(0, 0.1, 0), v(0, 0.03, 0.15), 0);
+    assertClose(lock.updateFoot(flat, true, 0.2, 0.1, dt), flat.ankle, 0);
+    // the heel rises 4 cm while the animated foot slides 2 cm: the pin moves to the ball
+    // where the output has it, the ankle staying put
+    const slide = (z: number) => v(0, 0, z);
+    const plus = (a: vec3, b: vec3) => vec3.add(vec3.create(), a, b);
+    const rolled = foot(plus(v(0, 0.14, 0.02), slide(0.02)), plus(flat.ball, slide(0.02)), 0.04);
+    let target = lock.updateFoot(rolled, true, 0.2, 0.1, dt);
+    assert(vec3.distance(target, flat.ankle) < 1e-5, `${target}`);
+    const ball = plus(target, toe(rolled));
+    // it rolls further and slides on: the ball stays, the ankle above it where the roll puts it
+    const further = foot(plus(v(0, 0.17, 0.05), slide(0.06)), plus(flat.ball, slide(0.06)), 0.07);
+    target = lock.updateFoot(further, true, 0.2, 0.1, dt);
+    assert(lock.isLocked());
+    assert(vec3.distance(plus(target, toe(further)), ball) < 1e-5, `${target}`);
+    // heel down again: back on the ankle, without a jump
+    const again = lock.updateFoot({ ...further, ankleLift: 0 }, true, 0.2, 0.1, dt);
+    assert(vec3.distance(again, target) < 1e-5, `${again} vs ${target}`);
 });
 
 // ── retarget.rs ──

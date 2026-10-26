@@ -120,6 +120,12 @@ impl Renderable {
     pub fn is_transparent(&self) -> bool {
         self.material.options.transparent
     }
+
+    /// Drawn after the GBuffer's background copy (`MaterialOptions::transmissive`), unless
+    /// transparent (drawn last either way).
+    pub fn is_transmissive(&self) -> bool {
+        self.material.options.transmissive && !self.material.options.transparent
+    }
 }
 
 impl std::ops::Deref for Renderable {

@@ -30,8 +30,10 @@ struct RtSource {
     slot        : u32,
     // 0: a mesh (`gather`), 1: a cut (`gather_clusters`)
     kind        : u32,
-    pad0        : u32,
-    pad1        : u32,
+    // the record words holding each instance's albedo (pack4x8unorm) and emission (RGBE),
+    // plus one; 0: the source's `albedo` and no emission
+    albedoWord  : u32,
+    emissionWord: u32,
 }
 
 const KANSEI_RT_NO_WORD : u32 = 0xffffffffu;
@@ -120,14 +122,25 @@ fn extra(record: u32, a: vec3f, b: vec3f, c: vec3f, na: vec3f, nb: vec3f, nc: ve
     return vec3u(placeNormal(record, a, na), placeNormal(record, b, nb), placeNormal(record, c, nc));
 }
 
+// Word `word` (plus one, 0: none) of `record`, else `fallback`.
+fn recordWord(record: u32, word: u32, fallback: u32) -> u32 {
+    if (word == 0u || src.strideWords == 0u) {
+        return fallback;
+    }
+    return records[record * src.strideWords + word - 1u];
+}
+
 fn write(id: u32, p: Placed, uv: vec3u, record: u32) {
     if (id >= grid.triangleCapacity) {
         return;
     }
+    // a record's albedo is opaque (no F0); the source's keeps its own alpha (1 - its F0)
+    let albedo = select(src.albedo, recordWord(record, src.albedoWord, src.albedo) | 0xff000000u, src.albedoWord != 0u && src.strideWords != 0u);
+    let emission = recordWord(record, src.emissionWord, 0u);
     triangles[id * 4u] = vec4f(p.v0, bitcast<f32>(src.surface));
-    triangles[id * 4u + 1u] = vec4f(p.v1 - p.v0, bitcast<f32>(src.albedo));
+    triangles[id * 4u + 1u] = vec4f(p.v1 - p.v0, bitcast<f32>(albedo));
     triangles[id * 4u + 2u] = vec4f(p.v2 - p.v0, bitcast<f32>(src.source | min(record, 0xfffffu)));
-    triangles[id * 4u + 3u] = vec4f(bitcast<f32>(uv.x), bitcast<f32>(uv.y), bitcast<f32>(uv.z), 0.0);
+    triangles[id * 4u + 3u] = vec4f(bitcast<f32>(uv.x), bitcast<f32>(uv.y), bitcast<f32>(uv.z), bitcast<f32>(emission));
 }
 
 var<workgroup> kept : atomic<u32>;

@@ -4,20 +4,24 @@
 //! `KMMP`, a u32 version, then sections: a 4-byte tag, a u64 length and the payload. Readers skip
 //! tags they don't know. Sections: `SKEL` skeleton, `ROLE` joint roles, rate and feature weights,
 //! `CLIP` clips, `ROTS` quantized rotations, `TRAN`/`SCAL` translation and scale tracks, `ROOT`
-//! character root per frame, `CONT` foot contacts, `FEAT` feature normalization and rows, `MESH`
+//! character root per frame, `CONT` foot contacts (`CRUL`: how they were found), `FEAT` feature normalization and rows, `MESH`
 //! (repeated) skinned meshes with a colour, `IMAG` (repeated) named images (encoded bytes, e.g.
 //! WebP), `ACTS` action clips (traversals, falls, landings: what `traversal::ActionClip::analyze`
 //! found), `META` key/value strings (source, licence).
 
 use glam::{Mat4, Quat, Vec3};
 
-use super::database::{ClipInfo, Database, FeatureWeights, JointRoles, Vec3Tracks, FEATURES, STRIDE};
+use super::database::{ClipInfo, ContactThresholds, Database, FeatureWeights, JointRoles, Vec3Tracks, FEATURES, STRIDE};
 use super::traversal::{ActionClip, ActionKind};
 use crate::animation::{Skeleton, SkinnedMesh, Transform, MAX_INFLUENCES};
 use crate::geometries::Vertex;
 
 pub const MAGIC: &[u8; 4] = b"KMMP";
 pub const VERSION: u32 = 1;
+/// How the contacts in `CONT` were found (`ContactThresholds`): packs without a `CRUL` section
+/// (rule 0) found them on the ankles alone, too strictly to see a running foot planted, and get
+/// them found again on load.
+pub const CONTACT_RULE: u32 = 1;
 
 /// A skinned mesh of a pack and the colour to draw it with.
 #[derive(Debug, Clone)]
@@ -96,6 +100,7 @@ impl MotionPack {
             w.u32(db.contacts.len() as u32);
             w.bytes(&db.contacts);
         });
+        section(&mut out, b"CRUL", |w| w.u32(CONTACT_RULE));
         section(&mut out, b"FEAT", |w| {
             for x in db.feature_offset.iter().chain(&db.feature_scale) {
                 w.f32(*x);
@@ -145,6 +150,7 @@ impl MotionPack {
         let (mut translations, mut scales) = (None, None);
         let mut roots = Vec::new();
         let mut contacts = Vec::new();
+        let mut contact_rule = 0;
         let mut features = None;
         let mut meshes = Vec::new();
         let mut actions = Vec::new();
@@ -191,6 +197,7 @@ impl MotionPack {
                     let n = r.u32()? as usize;
                     contacts = r.take(n)?.to_vec();
                 }
+                b"CRUL" => contact_rule = r.u32()?,
                 b"FEAT" => {
                     let mut offset = [0.0; FEATURES];
                     let mut scale = [0.0; FEATURES];
@@ -245,6 +252,10 @@ impl MotionPack {
         }
         let mut database = Database { skeleton, roles, sample_rate, weights, clips, rotations, translations, scales, roots, contacts, feature_offset, feature_scale, features, bounds_small: Vec::new(), bounds_large: Vec::new() };
         database.build_bounds();
+        if contact_rule != CONTACT_RULE {
+            // baked when contacts read the ankles alone, at a quarter of today's speed
+            database.detect_contacts(&ContactThresholds::default());
+        }
         Ok(Self { database, meshes, actions, meta })
     }
 }

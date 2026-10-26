@@ -69,8 +69,10 @@ function featureGroups(w: FeatureWeights): [number, number, number][] {
 }
 
 /**
- * When a foot is planted: its joint below `height` metres above the ground and slower than
- * `speed` metres per second, for at least `minFrames` frames in a row.
+ * When a foot is planted: its ankle or its ball (the foot joint's first child) below `height`
+ * metres above where it is at rest and slower than `speed` metres per second, for at least
+ * `minFrames` frames in a row. A running foot lands on its ball and rolls off it: its ankle is
+ * never still long enough on its own.
  */
 interface ContactThresholds {
     height: number;
@@ -79,7 +81,7 @@ interface ContactThresholds {
 }
 
 function defaultContactThresholds(): ContactThresholds {
-    return { height: 0.15, speed: 0.25, minFrames: 3 };
+    return { height: 0.15, speed: 1.0, minFrames: 3 };
 }
 
 /**
@@ -313,7 +315,7 @@ class Database {
         public readonly scales: Vec3Tracks,
         roots: { translations: Float32Array, rotations: Float32Array },
         /** Per frame: bit 0 left foot planted, bit 1 right. */
-        public readonly contactBits: Uint8Array,
+        public contactBits: Uint8Array,
         /** Per feature, subtracted then divided to normalize. */
         public featureOffset: Float32Array,
         public featureScale: Float32Array,
@@ -360,6 +362,36 @@ class Database {
     public contacts(frame: number): [boolean, boolean] {
         const c = this.contactBits[frame];
         return [(c & 1) !== 0, (c & 2) !== 0];
+    }
+
+    /**
+     * Find the feet's contacts again from the poses, with `thresholds` (packs baked before
+     * contacts read the balls of the feet as well as the ankles get them that way).
+     */
+    public detectContacts(thresholds: ContactThresholds): void {
+        const joints = contactJoints(this.skeleton, this.roles);
+        const restModel = this.skeleton.restModel();
+        const rest = joints.map((j) => restModel[j].translation[1]);
+        // each contact joint's chain of ancestors, root first
+        const chains = joints.map((j) => {
+            const chain = [j];
+            for (let p = this.skeleton.parents[j]; p !== null; p = this.skeleton.parents[p]) chain.push(p);
+            return chain.reverse();
+        });
+        const contacts = new Uint8Array(this.frameCount);
+        for (const clip of this.clips) {
+            const { frames: n, start } = clip;
+            const points: vec3[][] = [];
+            const ground: number[] = [];
+            for (let f = start; f < start + n; f++) {
+                const root = this.root(f);
+                points.push(chains.map((chain) => chain.reduce((t, j) => t.mul(this.transform(f, j)), root).translation));
+                ground.push(root.translation[1]);
+            }
+            const cycle = this.root(start + n - 1).mul(this.root(start).inverse());
+            contacts.set(plant(points, ground, rest, clip.looping, cycle, this.sampleRate, thresholds), start);
+        }
+        this.contactBits = contacts;
     }
 
     /** The character root at `frame`, in its clip's space. */
@@ -595,6 +627,61 @@ class Database {
     }
 }
 
+/** The joints foot contacts are read from: left ankle, left ball, right ankle, right ball (a foot with no child is its own ball). */
+function contactJoints(skeleton: Skeleton, roles: JointRoles): number[] {
+    const ball = (foot: number) => {
+        const child = skeleton.parents.indexOf(foot);
+        return child < 0 ? foot : child;
+    };
+    return [roles.feet[0], ball(roles.feet[0]), roles.feet[1], ball(roles.feet[1])];
+}
+
+/**
+ * The velocity of `positions` (per frame of a clip of `n` frames) at frame `f`, by central
+ * differences: one-sided at a clip's ends, around the seam of a loop (the frame before its first
+ * is its second-to-last a cycle back, the frame after its last is its second a cycle on; `cycle`
+ * is the root's move over one).
+ */
+function clipVelocity(f: number, n: number, looping: boolean, cycle: Transform, rate: number, positions: (k: number) => vec3): vec3 {
+    let before: vec3, after: vec3, span: number;
+    if (looping && f === 0) [before, after, span] = [cycle.inverse().transformPoint(positions(n - 2)), positions(1), 2];
+    else if (looping && f === n - 1) [before, after, span] = [positions(n - 2), cycle.transformPoint(positions(1)), 2];
+    else if (!looping && f === 0) [before, after, span] = [positions(0), positions(1), 1];
+    else if (!looping && f === n - 1) [before, after, span] = [positions(n - 2), positions(n - 1), 1];
+    else [before, after, span] = [positions(f - 1), positions(f + 1), 2];
+    return vec3.scale(vec3.create(), vec3.subtract(vec3.create(), after, before), rate / span);
+}
+
+/**
+ * A clip's foot contacts (per frame, bit 0 left planted, bit 1 right) from its `contactJoints`
+ * positions and its root's height per frame (`ContactThresholds`).
+ */
+function plant(points: vec3[][], ground: number[], rest: number[], looping: boolean, cycle: Transform, rate: number, thresholds: ContactThresholds): Uint8Array {
+    const n = points.length;
+    const planted = Array.from({ length: n }, () => [false, false]);
+    for (let side = 0; side < 2; side++) {
+        for (let f = 0; f < n; f++) {
+            planted[f][side] = [2 * side, 2 * side + 1].some((k) => {
+                const v = clipVelocity(f, n, looping, cycle, rate, (i) => points[i][k]);
+                return points[f][k][1] - ground[f] < rest[k] + thresholds.height && vec3.length(v) < thresholds.speed;
+            });
+        }
+        // contacts: in runs of at least minFrames
+        let f = 0;
+        while (f < n) {
+            if (planted[f][side]) {
+                let run = 0;
+                while (f + run < n && planted[f + run][side]) run++;
+                if (run < thresholds.minFrames) for (let k = f; k < f + run; k++) planted[k][side] = false;
+                f += run;
+            } else {
+                f++;
+            }
+        }
+    }
+    return Uint8Array.from(planted, (p) => (p[0] ? 1 : 0) | (p[1] ? 2 : 0));
+}
+
 /** Collects clips on one skeleton and builds their `Database`. Rust: `motion_matching::DatabaseBuilder`. */
 class DatabaseBuilder {
     public weights: FeatureWeights = defaultFeatureWeights();
@@ -634,7 +721,8 @@ class DatabaseBuilder {
         const contacts = new Uint8Array(total);
         const raw = new Float32Array(total * FEATURES);
         const restModel = skeleton.restModel();
-        const restFeet = [restModel[roles.feet[0]].translation[1], restModel[roles.feet[1]].translation[1]];
+        const pointJoints = contactJoints(skeleton, roles);
+        const restPoints = pointJoints.map((j) => restModel[j].translation[1]);
         let at = 0;
 
         for (const { clip, looping, tags } of this.clips) {
@@ -648,6 +736,7 @@ class DatabaseBuilder {
             const model: Transform[] = [];
             const root: Transform[] = [];
             const feet: [vec3, vec3][] = [];
+            const points: vec3[][] = [];
             const hips: vec3[] = [];
             for (let f = 0; f < n; f++) {
                 clip.framePose(f, pose);
@@ -663,46 +752,15 @@ class DatabaseBuilder {
                     scales.set(t.scale, 3 * k);
                 });
                 feet.push([vec3.clone(model[roles.feet[0]].translation), vec3.clone(model[roles.feet[1]].translation)]);
+                points.push(pointJoints.map((j) => vec3.clone(model[j].translation)));
                 hips.push(vec3.clone(model[roles.hips].translation));
             }
 
-            // velocities by central differences: one-sided at a clip's ends, around the seam of a
-            // loop (the frame before its first is its second-to-last a cycle back, the frame after
-            // its last is its second a cycle on)
             const period = looping ? n - 1 : n;
+            // velocities by central differences (see `clipVelocity`)
             const cycle = root[n - 1].mul(root[0].inverse());
-            const cycleInverse = cycle.inverse();
-            const velocity = (f: number, positions: (k: number) => vec3): vec3 => {
-                let before: vec3, after: vec3, span: number;
-                if (looping && f === 0) [before, after, span] = [cycleInverse.transformPoint(positions(n - 2)), positions(1), 2];
-                else if (looping && f === n - 1) [before, after, span] = [positions(n - 2), cycle.transformPoint(positions(1)), 2];
-                else if (!looping && f === 0) [before, after, span] = [positions(0), positions(1), 1];
-                else if (!looping && f === n - 1) [before, after, span] = [positions(n - 2), positions(n - 1), 1];
-                else [before, after, span] = [positions(f - 1), positions(f + 1), 2];
-                return vec3.scale(vec3.create(), vec3.subtract(vec3.create(), after, before), rate / span);
-            };
-
-            // contacts: low and slow, in runs of at least minFrames
-            const planted = Array.from({ length: n }, () => [false, false]);
-            for (let side = 0; side < 2; side++) {
-                for (let f = 0; f < n; f++) {
-                    const v = velocity(f, (k) => feet[k][side]);
-                    const height = feet[f][side][1] - root[f].translation[1];
-                    planted[f][side] = height < restFeet[side] + this.contacts.height && vec3.length(v) < this.contacts.speed;
-                }
-                let f = 0;
-                while (f < n) {
-                    if (planted[f][side]) {
-                        let run = 0;
-                        while (f + run < n && planted[f + run][side]) run++;
-                        if (run < this.contacts.minFrames) for (let k = f; k < f + run; k++) planted[k][side] = false;
-                        f += run;
-                    } else {
-                        f++;
-                    }
-                }
-            }
-            planted.forEach((p, f) => contacts[start + f] = (p[0] ? 1 : 0) | (p[1] ? 2 : 0));
+            const velocity = (f: number, positions: (k: number) => vec3): vec3 => clipVelocity(f, n, looping, cycle, rate, positions);
+            contacts.set(plant(points, root.map((r) => r.translation[1]), restPoints, looping, cycle, rate, this.contacts), start);
 
             // the root at any frame ahead: loops continue cycle after cycle, other clips go on
             // at their last frame's velocity and turn rate

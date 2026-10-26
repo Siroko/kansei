@@ -2,7 +2,7 @@ use glam::{Quat, Vec3};
 
 use super::database::{wrap_angle, yaw_of, yaw_rotation, Database, FEATURES, FORWARD, STRIDE, TRAJECTORY_TIMES};
 use super::search::{Match, SearchFilter};
-use crate::animation::ik::{two_joint_ik, FootLock};
+use crate::animation::ik::{two_joint_ik, FootLock, FootPose};
 use crate::animation::inertialization::Inertializer;
 use crate::animation::springs::{damper_exact, negexp, spring_character_update, spring_damper_exact_quat};
 use crate::animation::retarget::Retarget;
@@ -38,7 +38,10 @@ pub struct MotionMatchingSettings {
     pub max_adjustment_ratio: f32,
     pub clamp_distance: f32,
     pub clamp_angle: f32,
-    /// Foot locking: pin planted feet with two-joint IK.
+    /// Foot locking: pin planted feet with two-joint IK. A pin lets go when the contact ends or
+    /// the animated foot strays `foot_unlock_radius` metres from it; the foot then fades back
+    /// onto the animation with `foot_lock_halflife`, and is pinned again there while the contact
+    /// lasts.
     pub foot_lock: bool,
     pub foot_unlock_radius: f32,
     pub foot_lock_halflife: f32,
@@ -61,7 +64,7 @@ impl Default for MotionMatchingSettings {
             clamp_distance: 0.15,
             clamp_angle: std::f32::consts::FRAC_PI_2,
             foot_lock: true,
-            foot_unlock_radius: 0.2,
+            foot_unlock_radius: 0.3,
             foot_lock_halflife: 0.1,
         }
     }
@@ -101,7 +104,7 @@ pub struct SearchInfo {
 struct Display {
     skeleton: Skeleton,
     retarget: Retarget,
-    legs: [[usize; 3]; 2],
+    legs: [Leg; 2],
 }
 
 /// The horizontal direction a move from `from` toward `wanted` was blocked in, when it ended at
@@ -114,10 +117,21 @@ fn blocked_direction(from: Vec3, wanted: Vec3, allowed: Vec3) -> Vec3 {
     (removed - along * removed.dot(along)).normalize_or(removed.normalize_or_zero())
 }
 
-/// The (upper, middle, foot) joints of the leg ending at `foot`.
-fn leg(skeleton: &Skeleton, foot: usize) -> [usize; 3] {
+/// A leg for foot locking: its (upper, middle, foot) joints, the foot's ball (its first child,
+/// or the foot itself), and the heights of the foot and the ball at rest.
+#[derive(Debug, Clone, Copy)]
+struct Leg {
+    joints: [usize; 3],
+    ball: usize,
+    rest: [f32; 2],
+}
+
+/// The leg ending at `foot`.
+fn leg(skeleton: &Skeleton, foot: usize) -> Leg {
     let middle = skeleton.parents[foot].unwrap_or(foot);
-    [skeleton.parents[middle].unwrap_or(middle), middle, foot]
+    let ball = skeleton.parents.iter().position(|p| *p == Some(foot)).unwrap_or(foot);
+    let rest = skeleton.rest_model();
+    Leg { joints: [skeleton.parents[middle].unwrap_or(middle), middle, foot], ball, rest: [rest[foot].translation.y, rest[ball].translation.y] }
 }
 
 /// How the character moves while an action plays.
@@ -171,8 +185,7 @@ pub struct MotionMatcher {
     search_timer: f32,
     searched_input: Option<(Vec3, f32)>,
     feet: [FootLock; 2],
-    /// (upper, middle, foot) joints of each leg.
-    legs: [[usize; 3]; 2],
+    legs: [Leg; 2],
     last_search: SearchInfo,
     /// The root motion's speed (m/s) and turn rate (rad/s) this frame.
     root_speed: (f32, f32),
@@ -567,21 +580,24 @@ impl MotionMatcher {
         }
     }
 
-    /// Pin planted feet where they touched down (two-joint IK on each leg).
+    /// Pin planted feet where they touched down (two-joint IK on each leg): the ankle while the
+    /// heel is down, the ball once it lifts.
     fn lock_feet(&mut self, db: &Database, dt: f32) {
         let contacts = db.contacts(self.current_frame(db));
         let s = &self.settings;
         let mut moved = false;
         let skeleton = self.display.as_ref().map_or(&db.skeleton, |d| &d.skeleton);
         let legs = self.display.as_ref().map_or(self.legs, |d| d.legs);
-        for side in 0..2 {
-            let [upper, middle, foot] = legs[side];
+        for (side, leg) in legs.iter().enumerate() {
+            let [upper, middle, foot] = leg.joints;
             if upper == middle || middle == foot {
                 continue;
             }
-            let animated = self.character.transform_point(self.model[foot].translation);
-            let target = self.feet[side].update(animated, contacts[side], s.foot_unlock_radius, s.foot_lock_halflife, dt);
-            if target.distance(animated) > 1e-5 {
+            // the model is relative to the character, which stands on the ground
+            let (ankle, ball) = (self.model[foot].translation, self.model[leg.ball].translation);
+            let animated = FootPose { ankle: self.character.transform_point(ankle), ball: self.character.transform_point(ball), ankle_lift: ankle.y - leg.rest[0], ball_lift: ball.y - leg.rest[1] };
+            let target = self.feet[side].update_foot(&animated, contacts[side], s.foot_unlock_radius, s.foot_lock_halflife, dt);
+            if target.distance(animated.ankle) > 1e-5 {
                 let local = self.character.inverse().transform_point(target);
                 two_joint_ik(skeleton, &mut self.pose, &mut self.model, upper, middle, foot, local);
                 moved = true;

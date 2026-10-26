@@ -72,7 +72,8 @@ impl Default for RunOptions {
 /// Call `frame` on every animation frame from now on (the page's `requestAnimationFrame`, or in
 /// a worker the worker's), with the frame's timing and any canvas resize. The closure owns (or shares) the example's state. At most
 /// [`DEFAULT_MAX_FRAMES_IN_FLIGHT`] frames go to the GPU at once (see
-/// [`RunOptions::max_frames_in_flight`]; `?inflight=0` turns the cap off).
+/// [`RunOptions::max_frames_in_flight`]; `?inflight=0` turns the cap off). The performance
+/// overlay ([`crate::perf`]) times its frames.
 pub fn run(canvas: &Canvas, frame: impl FnMut(&Frame) + 'static) {
     run_with(canvas, RunOptions::default(), frame);
 }
@@ -109,6 +110,7 @@ pub fn run_with(canvas: &Canvas, options: RunOptions, mut frame: impl FnMut(&Fra
         }
         let now = crate::now();
         let resized = canvas.poll_resize();
+        let timed = crate::perf::frame_begin();
         frame(&Frame {
             time: now - start,
             dt: if index == 0 { 0.0 } else { (now - last) as f32 },
@@ -117,6 +119,7 @@ pub fn run_with(canvas: &Canvas, options: RunOptions, mut frame: impl FnMut(&Fra
             size: canvas.size(),
             resized,
         });
+        crate::perf::frame_end(timed);
         if let Some(gate) = gate.as_mut() {
             gate.frame_submitted();
         }

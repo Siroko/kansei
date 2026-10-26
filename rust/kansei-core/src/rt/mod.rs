@@ -56,6 +56,34 @@ pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
 /// triangle (`RtSurface::with_alpha_layer`) is there at `uv` (`RT_OPAQUE_WGSL`: everywhere).
 pub const RT_GRID_WGSL: &str = concat!(include_str!("shaders/rt_types.wgsl"), include_str!("shaders/rt_grid.wgsl"));
 
+/// Light packed in one word for `RtSurface::record_emission` (RGBE): `kansei_rt_pack_emission(radiance)`
+/// for the pass that writes the instance records, `kansei_rt_unpack_emission(word)` for a material
+/// that reads them back; [`pack_emission`] is its CPU twin. A hit's is `RT_GRID_WGSL`'s
+/// `kansei_rt_emission`.
+pub const RT_EMISSION_WGSL: &str = include_str!("shaders/rt_emission.wgsl");
+
+/// `RT_EMISSION_WGSL`'s `kansei_rt_pack_emission` on the CPU: `radiance` (cd/m², linear rgb) as
+/// RGBE, r | g << 8 | b << 16 | e << 24, worth (m + 0.5) x 2^(e - 136); 0 is black.
+pub fn pack_emission(radiance: [f32; 3]) -> u32 {
+    let c = radiance.map(|x| x.max(0.0));
+    let peak = c[0].max(c[1]).max(c[2]);
+    if peak < 1e-30 {
+        return 0;
+    }
+    let x = (peak.log2().floor() as i32 + 1).clamp(-127, 127);
+    let m = c.map(|v| ((v * 2f32.powi(8 - x)) as u32).min(255));
+    m[0] | m[1] << 8 | m[2] << 16 | ((x + 128) as u32) << 24
+}
+
+/// `RT_EMISSION_WGSL`'s `kansei_rt_unpack_emission` on the CPU.
+pub fn unpack_emission(word: u32) -> [f32; 3] {
+    let e = word >> 24;
+    if e == 0 {
+        return [0.0; 3];
+    }
+    [word & 255, (word >> 8) & 255, (word >> 16) & 255].map(|m| (m as f32 + 0.5) * 2f32.powi(e as i32 - 136))
+}
+
 /// A `kansei_rt_covered` for `RT_GRID_WGSL` that keeps every hit (no alpha test).
 pub const RT_OPAQUE_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { return true; }\n";
 
@@ -121,12 +149,19 @@ mod tests {
     fn shaders_validate_reflections() {
         let custom = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { if (uv.x > 1.5) { return true; } return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5; }";
         for clipmap in [true, false] {
-            for covered in [super::effect::trace_wgsl(clipmap, "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { return true; }"), super::effect::trace_wgsl(clipmap, custom)] {
+            let albedo = super::effect::DEFAULT_HIT_ALBEDO_WGSL;
+            // the albedo hook as a surface would write it: the source tells the floor apart
+            let hook = "fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f { if (kansei_rt_source(triangle) == 3u) { return vec3f(fract(p.x)); } return kansei_rt_albedo(triangle) * (1.0 + 0.0 * bary.x) + 0.0 * rp.invView[3].xyz; }\n";
+            for covered in [
+                super::effect::trace_wgsl(clipmap, &format!("fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {{ return true; }}\n{albedo}")),
+                super::effect::trace_wgsl(clipmap, &format!("{custom}\n{albedo}")),
+                super::effect::trace_wgsl(clipmap, &format!("{custom}\n{hook}")),
+            ] {
                 let trace = validate(&format!("reflection trace (clipmap {clipmap})"), &covered);
                 assert_eq!(struct_span(&trace, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
                 assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
             }
-            let glass = validate(&format!("glass (clipmap {clipmap})"), &super::effect::glass_wgsl(clipmap, custom));
+            let glass = validate(&format!("glass (clipmap {clipmap})"), &super::effect::glass_wgsl(clipmap, &format!("{custom}\n{albedo}")));
             assert_eq!(struct_span(&glass, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
         }
         let resolve = validate("reflection resolve", &super::effect::resolve_wgsl());
@@ -152,12 +187,32 @@ mod tests {
     }
 
     #[test]
+    fn emission_packs_within_a_percent_of_its_peak() {
+        validate(
+            "emission",
+            &format!("{RT_EMISSION_WGSL}\n@group(0) @binding(0) var<storage, read_write> out: array<vec4f>;\n@compute @workgroup_size(1) fn main() {{ out[0] = vec4f(kansei_rt_unpack_emission(kansei_rt_pack_emission(out[0].rgb)), 0.0); }}"),
+        );
+        assert_eq!(pack_emission([0.0; 3]), 0);
+        assert_eq!(unpack_emission(0), [0.0; 3]);
+        for radiance in [[1.0, 0.5, 0.25], [60.0, 22.0, 4.0], [0.003, 0.0, 0.002], [12000.0, 9000.0, 20000.0], [255.0, 256.0, 0.5]] {
+            let back = unpack_emission(pack_emission(radiance));
+            let peak = radiance.iter().cloned().fold(0.0, f32::max);
+            for k in 0..3 {
+                assert!((back[k] - radiance[k]).abs() <= 0.01 * peak, "{radiance:?} -> {back:?}");
+            }
+        }
+    }
+
+    #[test]
     fn surface_words_carry_their_flags() {
         assert_eq!(RtSurface::new([1.0; 3]).surface_word(), 0);
         assert_eq!(RtSurface::new([1.0; 3]).with_smooth_normals().surface_word(), 4);
         assert_eq!(RtSurface::new([1.0; 3]).with_alpha_layer(2).with_smooth_normals().surface_word(), 1 | 2 << 8 | 4);
         // glass (KANSEI_RT_GLASS) is smooth too
         assert_eq!(RtSurface::glass([0.9; 3]).surface_word(), 4 | 8);
+        // the albedo's alpha is 1 - F0: opaque for a matte surface
+        assert_eq!(RtSurface::new([1.0, 0.0, 0.0]).albedo_word(), 255 | 255 << 24);
+        assert_eq!(RtSurface::new([0.0; 3]).with_specular(0.04).albedo_word() >> 24, 245);
     }
 
     #[test]
