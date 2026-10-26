@@ -23,18 +23,25 @@
       <sub>An SPH pile lit by voxel cone tracing, with ray-traced mirror and glass spheres and depth of field</sub>
     </td>
     <td width="50%" valign="top">
+      <a href="https://kansei.graphics/examples/glass-particles/?quality=mid"><img src="docs/media/readme/glass-particles.jpg" alt="Glass particles" width="100%"></a><br>
+      <a href="https://kansei.graphics/examples/glass-particles/?quality=mid"><b>Glass particles</b></a><br>
+      <sub>Particles poured through curl noise and ray-traced glass that pushes them off, in a lit mist with bloom</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
       <a href="https://kansei.graphics/examples/depth-of-field/"><img src="docs/media/readme/depth-of-field.jpg" alt="Depth of field" width="100%"></a><br>
       <a href="https://kansei.graphics/examples/depth-of-field/"><b>Depth of field</b></a><br>
       <sub>Physical lens depth of field with bokeh on a scrolling field of glowing columns</sub>
     </td>
-  </tr>
-  <tr>
     <td width="50%" valign="top">
       <a href="https://kansei.graphics/examples/fluid/"><img src="docs/media/readme/fluid.jpg" alt="Fluid" width="100%"></a><br>
       <a href="https://kansei.graphics/examples/fluid/"><b>Fluid</b></a><br>
       <sub>A 3D particle fluid splashing in a box, meshed with marching cubes and refracting the room</sub>
     </td>
-    <td width="50%" valign="top">
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <a href="https://kansei.graphics/examples/outdoor-gi/?cam=departure&amp;gi=rt&amp;view=lit&amp;elevation=2.5&amp;bearing=262"><img src="docs/media/readme/outdoor-gi.jpg" alt="Outdoor GI" width="100%"></a><br>
       <a href="https://kansei.graphics/examples/outdoor-gi/?cam=departure&amp;gi=rt&amp;view=lit&amp;elevation=2.5&amp;bearing=262"><b>Outdoor GI</b></a><br>
       <sub>The Raggare intro's forest under a low sun, lit by hybrid ray-traced GI over a voxel clipmap</sub>
