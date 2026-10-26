@@ -78,15 +78,11 @@
         flow.addBinding(p, 'mouseRadius', { label: 'pointer reach (m)', min: 0.05, max: 2, step: 0.01 }).on('change', set('mouseRadius'));
         flow.addBinding(p, 'paused').on('change', set('paused'));
 
-        const rep = pane.addFolder({ title: 'Glass repellers', expanded: false });
+        const rep = pane.addFolder({ title: 'Repellers', expanded: false });
         rep.addBinding(p, 'repelRange', { label: 'reach (m)', min: 0.01, max: 1.5, step: 0.01 }).on('change', set('repelRange'));
         rep.addBinding(p, 'repelStrength', { label: 'push (m/s²)', min: 0, max: 60, step: 0.1 }).on('change', set('repelStrength'));
         rep.addBinding(p, 'bounce', { min: 0, max: 1, step: 0.01 }).on('change', set('bounce'));
-        // ray traced (every surface it crosses), or in screen space (a fraction of the cost)
-        rep.addBinding(p, 'glassMode', { label: 'glass', options: { 'ray traced': 0, 'screen space': 1 } }).on('change', set('glassMode'));
-        rep.addBinding(p, 'glassIor', { label: 'index of refraction', min: 1, max: 2.4, step: 0.01 }).on('change', set('glassIor'));
-        rep.addBinding(p, 'glassRoughness', { label: 'frost', min: 0, max: 1, step: 0.01 }).on('change', set('glassRoughness'));
-        rep.addBinding(p, 'glassShadows', { label: 'casts shadows' }).on('change', set('glassShadows'));
+        rep.addBinding(p, 'glassShadows', { label: 'cast shadows' }).on('change', set('glassShadows'));
 
         const look = pane.addFolder({ title: 'Particles', expanded: false });
         look.addBinding(p, 'glow', { label: 'glow (cd/m²)', min: 0, max: 300, step: 0.5 }).on('change', set('glow'));
@@ -100,7 +96,6 @@
         color('gridMinor', 'minor');
         color('gridMajor', 'major');
         color('gridCross', 'cross');
-        grid.addBinding(p, 'reflections', { label: 'reflections (ray traced)' }).on('change', set('reflections'));
         grid.addBinding(p, 'gridSpacing', { label: 'spacing (m)', min: 0.02, max: 1, step: 0.005 }).on('change', set('gridSpacing'));
         grid.addBinding(p, 'gridMajorEvery', { label: 'major every', min: 2, max: 20, step: 1 }).on('change', set('gridMajorEvery'));
         grid.addBinding(p, 'gridMinorWidth', { label: 'minor width (m)', min: 0, max: 0.02, step: 0.0005 }).on('change', set('gridMinorWidth'));
@@ -108,23 +103,126 @@
         grid.addBinding(p, 'gridCrossWidth', { label: 'cross width (m)', min: 0, max: 0.05, step: 0.0005 }).on('change', set('gridCrossWidth'));
         grid.addBinding(p, 'gridCrossArm', { label: 'cross arm', min: 0, max: 0.4, step: 0.005 }).on('change', set('gridCrossArm'));
 
-        const light = pane.addFolder({ title: 'Light and mist', expanded: false });
+        const light = pane.addFolder({ title: 'Light', expanded: false });
         light.addBinding(p, 'light', { label: 'spot (cd)', min: 0, max: 8000, step: 10 }).on('change', set('light'));
         light.addBinding(p, 'cone', { label: 'cone (°)', min: 5, max: 80, step: 0.5 }).on('change', set('cone'));
         light.addBinding(p, 'skyUp', { label: 'environment up (cd/m²)', min: 0, max: 80, step: 0.05 }).on('change', set('skyUp'));
         light.addBinding(p, 'skyDown', { label: 'environment down', min: 0, max: 40, step: 0.05 }).on('change', set('skyDown'));
-        light.addBinding(p, 'fogDensity', { label: 'mist (1/m)', min: 0, max: 1, step: 0.005 }).on('change', set('fogDensity'));
-        light.addBinding(p, 'fogAnisotropy', { label: 'forward scatter', min: -0.9, max: 0.9, step: 0.01 }).on('change', set('fogAnisotropy'));
-        light.addBinding(p, 'ao', { label: 'ambient occlusion', min: 0, max: 1, step: 0.01 }).on('change', set('ao'));
-        light.addBinding(p, 'ev100', { label: 'exposure (EV100)', min: 0, max: 10, step: 0.05 }).on('change', set('ev100'));
 
-        const lens = pane.addFolder({ title: 'Lens', expanded: false });
-        lens.addBinding(p, 'dof', { label: 'depth of field' }).on('change', set('dof'));
-        lens.addBinding(p, 'autofocus', { label: 'focus on target' }).on('change', (e) => { kansei.set('autofocus', e.value ? 1 : 0); focus.disabled = e.value; });
-        const focus = lens.addBinding(p, 'focus', { label: 'focus (m)', min: 0.3, max: 20, step: 0.01, disabled: p.autofocus }).on('change', (e) => { if (!p.autofocus) kansei.set('focus', e.value); });
-        lens.addBinding(p, 'fStop', { label: 'f-stop', min: 0.7, max: 16, step: 0.05 }).on('change', set('fStop'));
-        lens.addBinding(p, 'bloom', { min: 0, max: 3, step: 0.01 }).on('change', set('bloom'));
-        lens.addBinding(p, 'bloomThreshold', { label: 'bloom threshold', min: 0.05, max: 8, step: 0.05 }).on('change', set('bloomThreshold'));
+        // ── the post-processing passes, in the chain's order: each one's folder has an on/off that
+        // takes it out of the chain (PostProcessingVolume::set_enabled), a preset that sets its
+        // values (each still editable after), and its values ──
+        const post = pane.addFolder({ title: 'Post-processing', expanded: false });
+        const presetOf = {};
+        function pass(title, onKey, presets, bindings) {
+            const f = post.addFolder({ title, expanded: false });
+            f.addBinding(p, onKey, { label: 'on' }).on('change', set(onKey));
+            const names = Object.keys(presets);
+            presetOf[title] = { preset: 'default' in presets ? 'default' : names[0] };
+            f.addBinding(presetOf[title], 'preset', { options: Object.fromEntries(names.map((n) => [n, n])) }).on('change', (e) => {
+                for (const [key, value] of Object.entries(presets[e.value])) {
+                    p[key] = value;
+                    kansei.set(key, typeof value === 'boolean' ? (value ? 1 : 0) : value);
+                }
+                pane.refresh();
+            });
+            bindings(f);
+            return f;
+        }
+        pass('SSAO', 'ssao', {
+            subtle: { ao: 0.35, aoRadius: 0.15, aoBias: 0.01, aoSamples: 8 },
+            default: { ao: 0.6, aoRadius: 0.25, aoBias: 0.01, aoSamples: 16 },
+            strong: { ao: 1.0, aoRadius: 0.45, aoBias: 0.015, aoSamples: 32 },
+        }, (f) => {
+            f.addBinding(p, 'ao', { label: 'strength', min: 0, max: 1, step: 0.01 }).on('change', set('ao'));
+            f.addBinding(p, 'aoRadius', { label: 'radius (m)', min: 0.02, max: 1.5, step: 0.01 }).on('change', set('aoRadius'));
+            f.addBinding(p, 'aoBias', { label: 'bias (m)', min: 0, max: 0.1, step: 0.001 }).on('change', set('aoBias'));
+            f.addBinding(p, 'aoSamples', { label: 'samples', min: 1, max: 32, step: 1 }).on('change', set('aoSamples'));
+        });
+        // off: the repellers as polished grey solids; ray traced (every surface a path crosses) or
+        // in screen space (a ball proxy, a fraction of the cost)
+        pass('Glass', 'glassPass', {
+            clear: { glassIor: 1.5, glassRoughness: 0, ssDispersion: 0.02 },
+            frosted: { glassIor: 1.5, glassRoughness: 0.35, ssDispersion: 0.0 },
+            crystal: { glassIor: 1.9, glassRoughness: 0, ssDispersion: 0.05, glassInterfaces: 10 },
+            'fast (screen space)': { glassMode: 1, ssThickness: 0.8, ssBehind: 2.0 },
+        }, (f) => {
+            f.addBinding(p, 'glassMode', { label: 'mode', options: { 'ray traced': 0, 'screen space': 1 } }).on('change', set('glassMode'));
+            f.addBinding(p, 'glassIor', { label: 'index of refraction', min: 1, max: 2.4, step: 0.01 }).on('change', set('glassIor'));
+            f.addBinding(p, 'glassRoughness', { label: 'frost', min: 0, max: 1, step: 0.01 }).on('change', set('glassRoughness'));
+            f.addBinding(p, 'glassInterfaces', { label: 'surfaces (RT)', min: 1, max: 16, step: 1 }).on('change', set('glassInterfaces'));
+            f.addBinding(p, 'ssThickness', { label: 'ball (m, SS)', min: 0.05, max: 3, step: 0.01 }).on('change', set('ssThickness'));
+            f.addBinding(p, 'ssBehind', { label: 'behind (m, SS)', min: 0, max: 10, step: 0.05 }).on('change', set('ssBehind'));
+            f.addBinding(p, 'ssDispersion', { label: 'dispersion (SS)', min: 0, max: 0.2, step: 0.005 }).on('change', set('ssDispersion'));
+        });
+        pass('Floor reflections', 'reflections', {
+            low: { reflQuarter: true, reflDistance: 6, reflBlend: 0.35 },
+            default: { reflQuarter: false, reflDistance: 12, reflBlend: 0.25 },
+            high: { reflQuarter: false, reflDistance: 24, reflBlend: 0.15 },
+        }, (f) => {
+            f.addBinding(p, 'reflIntensity', { label: 'intensity', min: 0, max: 2, step: 0.01 }).on('change', set('reflIntensity'));
+            f.addBinding(p, 'reflDistance', { label: 'reach (m)', min: 1, max: 40, step: 0.5 }).on('change', set('reflDistance'));
+            f.addBinding(p, 'reflQuarter', { label: 'trace 1 in 4x4' }).on('change', set('reflQuarter'));
+            f.addBinding(p, 'reflBlend', { label: 'new frame weight', min: 0.02, max: 1, step: 0.01 }).on('change', set('reflBlend'));
+        });
+        pass('Volumetric fog', 'fog', {
+            low: { fogSteps: 0 },
+            medium: { fogSteps: 16 },
+            default: { fogSteps: 32 },
+            ultra: { fogSteps: 64 },
+        }, (f) => {
+            f.addBinding(p, 'fogDensity', { label: 'density (1/m)', min: 0, max: 1, step: 0.005 }).on('change', set('fogDensity'));
+            f.addBinding(p, 'fogAnisotropy', { label: 'forward scatter', min: -0.9, max: 0.9, step: 0.01 }).on('change', set('fogAnisotropy'));
+            f.addBinding(p, 'fogFalloff', { label: 'height falloff (1/m)', min: 0, max: 1, step: 0.005 }).on('change', set('fogFalloff'));
+            f.addBinding(p, 'fogAmbient', { label: 'ambient', min: 0, max: 3, step: 0.01 }).on('change', set('fogAmbient'));
+            f.addBinding(p, 'fogSteps', { label: 'beam samples (0 froxels)', min: 0, max: 128, step: 1 }).on('change', set('fogSteps'));
+        });
+        pass('TAA', 'taa', {
+            sharp: { taaFeedbackMax: 0.88, taaFeedbackMin: 0.7, taaGamma: 0.75 },
+            default: { taaFeedbackMax: 0.95, taaFeedbackMin: 0.85, taaGamma: 1.0 },
+            smooth: { taaFeedbackMax: 0.97, taaFeedbackMin: 0.9, taaGamma: 1.25 },
+        }, (f) => {
+            f.addBinding(p, 'taaFeedbackMax', { label: 'history still', min: 0, max: 0.99, step: 0.005 }).on('change', set('taaFeedbackMax'));
+            f.addBinding(p, 'taaFeedbackMin', { label: 'history moving', min: 0, max: 0.99, step: 0.005 }).on('change', set('taaFeedbackMin'));
+            f.addBinding(p, 'taaGamma', { label: 'clip box (σ)', min: 0.25, max: 4, step: 0.05 }).on('change', set('taaGamma'));
+            f.addBinding(p, 'renderScale', { label: 'render scale', min: 0.25, max: 1, step: 0.05 }).on('change', set('renderScale'));
+        });
+        let focus;
+        pass('Depth of field', 'dof', {
+            subtle: { fStop: 5.6, dofSamples: 32, dofMaxCoc: 0.015 },
+            default: { fStop: 1.8, dofSamples: 48, dofMaxCoc: 0.025 },
+            strong: { fStop: 0.9, dofSamples: 72, dofMaxCoc: 0.04 },
+        }, (f) => {
+            f.addBinding(p, 'autofocus', { label: 'focus on target' }).on('change', (e) => { kansei.set('autofocus', e.value ? 1 : 0); focus.disabled = e.value; });
+            focus = f.addBinding(p, 'focus', { label: 'focus (m)', min: 0.3, max: 20, step: 0.01, disabled: p.autofocus }).on('change', (e) => { if (!p.autofocus) kansei.set('focus', e.value); });
+            f.addBinding(p, 'fStop', { label: 'f-stop', min: 0.7, max: 16, step: 0.05 }).on('change', set('fStop'));
+            f.addBinding(p, 'dofBlades', { label: 'blades (0 round)', min: 0, max: 12, step: 1 }).on('change', set('dofBlades'));
+            f.addBinding(p, 'dofSamples', { label: 'samples', min: 8, max: 128, step: 1 }).on('change', set('dofSamples'));
+            f.addBinding(p, 'dofMaxCoc', { label: 'largest blur', min: 0.002, max: 0.08, step: 0.001 }).on('change', set('dofMaxCoc'));
+        });
+        pass('Bloom', 'bloomOn', {
+            subtle: { bloom: 0.12, bloomThreshold: 2.0, bloomRadius: 0.8 },
+            default: { bloom: 0.25, bloomThreshold: 1.0, bloomRadius: 1.0 },
+            strong: { bloom: 0.6, bloomThreshold: 0.5, bloomRadius: 1.3 },
+        }, (f) => {
+            f.addBinding(p, 'bloom', { label: 'intensity', min: 0, max: 3, step: 0.01 }).on('change', set('bloom'));
+            f.addBinding(p, 'bloomThreshold', { label: 'threshold', min: 0.05, max: 8, step: 0.05 }).on('change', set('bloomThreshold'));
+            f.addBinding(p, 'bloomKnee', { label: 'knee', min: 0.01, max: 2, step: 0.01 }).on('change', set('bloomKnee'));
+            f.addBinding(p, 'bloomRadius', { label: 'radius', min: 0.1, max: 3, step: 0.05 }).on('change', set('bloomRadius'));
+            f.addBinding(p, 'bloomEmissive', { label: 'emissive only' }).on('change', set('bloomEmissive'));
+        });
+        pass('Tone map', 'tone', {
+            neutral: { toneMapper: 3, vignette: 0.1, grain: 0, chromatic: 0 },
+            default: { toneMapper: 0, vignette: 0.35, grain: 0, chromatic: 0 },
+            punchy: { toneMapper: 2, vignette: 0.5, grain: 0.12, chromatic: 0.25 },
+        }, (f) => {
+            f.addBinding(p, 'ev100', { label: 'exposure (EV100)', min: 0, max: 10, step: 0.05 }).on('change', set('ev100'));
+            f.addBinding(p, 'exposureComp', { label: 'compensation (stops)', min: -4, max: 4, step: 0.05 }).on('change', set('exposureComp'));
+            f.addBinding(p, 'toneMapper', { label: 'curve', options: { 'ACES fitted': 0, AgX: 1, 'AgX punchy': 2, 'Khronos neutral': 3, '1 - exp(-x)': 4 } }).on('change', set('toneMapper'));
+            f.addBinding(p, 'vignette', { min: 0, max: 2, step: 0.01 }).on('change', set('vignette'));
+            f.addBinding(p, 'grain', { min: 0, max: 1, step: 0.01 }).on('change', set('grain'));
+            f.addBinding(p, 'chromatic', { label: 'fringing', min: 0, max: 2, step: 0.01 }).on('change', set('chromatic'));
+        });
 
         // ── sound: Tone.js, started by the box's tick (a user gesture) ──
         // The sim counts its respawns, its brushes with the glass and its hits on the floor on the GPU; they
@@ -227,7 +325,6 @@
         const stats = pane.addFolder({ title: 'Stats' });
         stats.addBinding(p, 'sim', { readonly: true, multiline: true, rows: 5, label: 'sim' });
         stats.addBinding(p, 'perf', { label: 'perf overlay' }).on('change', (e) => kansei.set_perf(e.value));
-        stats.addBinding(p, 'renderScale', { label: 'render scale', min: 0.25, max: 1, step: 0.05 }).on('change', set('renderScale'));
         setInterval(async () => {
             const i = await info();
             p.sim = `${Math.round(i.alive).toLocaleString()} of ${i.particles.toLocaleString()} alive\n`

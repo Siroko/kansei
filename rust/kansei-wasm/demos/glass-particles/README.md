@@ -56,15 +56,19 @@ grid, the lighting presets, the palettes, the page's panel and its sounds.
 Controls: drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two fingers to pan;
 moving the pointer over the particles pushes them. The Tweakpane panel has the palette and the
 lighting preset; each emitter's transform (position, rotation), shape, radius, rate, speed,
-spread, lifetime, size, glowing share and jitters; the curl flow and the pointer's push; the glass
-(ray traced or screen space, reach and push of its fields, bounce, index of refraction, frost, its
-shadows); the particles' look; the floor grid (its ray-traced reflections on or off, colours,
-spacing, line widths); the light, the environment, the mist, AO and exposure; the lens (depth of
-field on or off, focus, f-stop, bloom); the sound (off until ticked: audio starts on that gesture)
-and its volume; and the stats: particles alive, emitted, glass brushes and floor hits a second,
-the frame interval, the overlay and the render scale. `window.kansei` exposes every export (`info`,
-`set`, `set_emitter`, `set_palette`, `set_lighting`, `set_grid_color`, `set_camera`, `set_perf`,
-`take_events`), each returning a promise.
+spread, lifetime, size, glowing share and jitters; the curl flow and the pointer's push; the
+repellers (reach and push of their fields, bounce, whether they cast shadows); the particles'
+look; the floor grid (colours, spacing, line widths); the light and the environment; and a
+Post-processing folder with one folder a pass, in the chain's order: SSAO, the glass (ray traced
+or screen space; off, the repellers are polished grey solids), the floor's reflections, the
+volumetric fog, TAA (and the render scale), depth of field, bloom and the tone mapper. Each has an
+on/off that takes the pass out of the chain (`PostProcessingVolume::set_enabled`, so the perf
+overlay shows what it saves), a preset (subtle / default / strong, or quality levels for the
+costly ones) that sets its values, and those values, still editable after. Then the sound (off
+until ticked: audio starts on that gesture) and its volume, and the stats: particles alive,
+emitted, glass brushes and floor hits a second, the frame interval and the overlay. `window.kansei`
+exposes every export (`info`, `set`, `set_emitter`, `set_palette`, `set_lighting`,
+`set_grid_color`, `set_camera`, `set_perf`, `take_events`), each returning a promise.
 
 The sounds: the sim counts its respawns, the particles brushing each kind of glass (coming within
 half its reach) and hitting the floor on the GPU, read back in bulk a few frames late

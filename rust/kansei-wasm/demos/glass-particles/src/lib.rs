@@ -53,11 +53,11 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
     exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
-    ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions,
+    ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_core::rt::{pack_emission, RtGlass, RtGridOptions, RtPlacement, RtReflectionsEffect, RtReflectionsOptions, RtSurface, SceneRtGridOptions, RT_EMISSION_WGSL};
+use kansei_core::rt::{pack_emission, RtGlass, RtGridOptions, RtPlacement, RtReflectionsEffect, RtReflectionsOptions, RtSurface, RtTraceResolution, SceneRtGridOptions, RT_EMISSION_WGSL};
 use kansei_wasm::{flag, now, param, param_or, Canvas};
 
 const SIM_WGSL: &str = include_str!("shaders/particles_sim.wgsl");
@@ -103,7 +103,7 @@ fn rt_effect(renderer: &Renderer, scene: &Scene, floor: usize, settings: &Settin
     let mut rt = RtReflectionsEffect::with_volume(gi.volume(), grid.handle(), options);
     rt.set_spot_lights(Some(renderer.spot_lights_buffer()));
     // (the screen-space glass draws it itself)
-    rt.set_glass((settings.glass_mode == 0).then(RtGlass::default));
+    rt.set_glass((settings.glass_pass && settings.glass_mode == 0).then_some(RtGlass { interfaces: settings.glass_interfaces, ..Default::default() }));
     rt.set_sky_lighting(Some(sky));
     rt.reflections = settings.reflections;
     rt.update_lights(scene.lights());
@@ -137,6 +137,20 @@ const LAMP_RADIUS: f32 = 0.2;
 const NOZZLE_LENGTH: f32 = 0.18;
 /// The glass's tint (the light left after a metre inside) and index of refraction.
 const GLASS_TINT: [f32; 3] = [0.92, 0.96, 0.98];
+/// The repellers with the glass's pass off: polished grey solids.
+const SOLID_REPELLER: StandardLitOptions = StandardLitOptions {
+    base_color: [0.55, 0.57, 0.6],
+    roughness: 0.18,
+    metallic: 0.0,
+    emissive: [0.0; 3],
+    sky_up: [0.0; 3],
+    sky_down: [0.0; 3],
+    instancing: None,
+    outputs_velocity: false,
+    traced: kansei_core::materials::StandardTraced::None,
+};
+/// The tone mapper's curves, by `Settings::tone_mapper`.
+const TONE_MAPPERS: [ToneMapper; 5] = [ToneMapper::AcesFitted, ToneMapper::AgX, ToneMapper::AgXPunchy, ToneMapper::KhronosNeutral, ToneMapper::Exponential];
 /// The floor's polish (GGX roughness) and reflectance (F0), as the reflections trace it and the
 /// rays that meet it shade it.
 const FLOOR_ROUGHNESS: f32 = 0.22;
@@ -496,7 +510,56 @@ struct Settings {
     sky_down: f32,
     /// The floor's ray-traced reflections (the glass is traced either way).
     reflections: bool,
+    /// The post-processing passes, each on or off (`PostProcessingVolume::set_enabled`) with its
+    /// own settings. SSAO: its strength, radius (m), depth bias (m) and samples.
+    ssao: bool,
     ao: f32,
+    ao_radius: f32,
+    ao_bias: f32,
+    ao_samples: u32,
+    /// The glass's pass (off: the repellers drawn as polished grey solids); the screen-space
+    /// glass's ball (m), its depth behind (m) and dispersion; the ray traced glass's surfaces.
+    glass_pass: bool,
+    ss_thickness: f32,
+    ss_behind: f32,
+    ss_dispersion: f32,
+    glass_interfaces: u32,
+    /// The floor's reflections: their scale, reach (m), a pixel of each 4 x 4 (else 2 x 2) a
+    /// frame, and the weight of each new frame.
+    refl_intensity: f32,
+    refl_distance: f32,
+    refl_quarter: bool,
+    refl_blend: f32,
+    /// The mist: on, its falloff with height (1/m), its ambient (a share of the environment's)
+    /// and the beam's samples a pixel (0: in the froxels).
+    fog: bool,
+    fog_falloff: f32,
+    fog_ambient: f32,
+    fog_steps: u32,
+    /// TAA: the history's weight still and moving, and its clip box (standard deviations).
+    taa: bool,
+    taa_feedback_max: f32,
+    taa_feedback_min: f32,
+    taa_gamma: f32,
+    /// Depth of field: its samples a pixel, the aperture's blades (0 round) and the largest
+    /// blur (a share of the image's width).
+    dof_samples: u32,
+    dof_blades: u32,
+    dof_max_coc: f32,
+    /// Bloom: on, its knee, its spread and whether it reads the emissive target only.
+    bloom_on: bool,
+    bloom_knee: f32,
+    bloom_radius: f32,
+    bloom_emissive: bool,
+    /// The tone mapper: on (off: the light as it is, clamped), its curve (0 ACES fitted, 1 AgX,
+    /// 2 AgX punchy, 3 Khronos neutral, 4 1 - exp(-x)), the exposure's compensation (stops),
+    /// vignetting, grain and fringing.
+    tone: bool,
+    tone_mapper: u32,
+    exposure_comp: f32,
+    vignette: f32,
+    grain: f32,
+    chromatic: f32,
     /// The floor's grid: its colours (linear albedo), the minor lines' spacing (m), minor cells
     /// per major cell, the lines' and the crosses' widths (m), the crosses' arms (share of a
     /// major cell).
@@ -559,7 +622,41 @@ impl Settings {
             sky_up: 0.15,
             sky_down: 0.05,
             reflections: true,
+            ssao: true,
             ao: 0.6,
+            ao_radius: 0.25,
+            ao_bias: 0.01,
+            ao_samples: 16,
+            glass_pass: true,
+            ss_thickness: 0.8,
+            ss_behind: 2.0,
+            ss_dispersion: 0.02,
+            glass_interfaces: 8,
+            refl_intensity: 1.0,
+            refl_distance: 12.0,
+            refl_quarter: false,
+            refl_blend: 0.25,
+            fog: true,
+            fog_falloff: 0.08,
+            fog_ambient: 1.0,
+            fog_steps: 32,
+            taa: true,
+            taa_feedback_max: 0.95,
+            taa_feedback_min: 0.85,
+            taa_gamma: 1.0,
+            dof_samples: 48,
+            dof_blades: 7,
+            dof_max_coc: 0.025,
+            bloom_on: true,
+            bloom_knee: 0.5,
+            bloom_radius: 1.0,
+            bloom_emissive: true,
+            tone: true,
+            tone_mapper: 0,
+            exposure_comp: 0.0,
+            vignette: 0.35,
+            grain: 0.0,
+            chromatic: 0.0,
             grid_base: [0.035, 0.036, 0.038],
             grid_minor: [0.08, 0.082, 0.085],
             grid_major: [0.17, 0.174, 0.18],
@@ -622,6 +719,13 @@ impl Settings {
             "bloom" => bloom, "bloomThreshold" => bloom_threshold, "glassIor" => glass_ior, "glassRoughness" => glass_roughness, "glassShadows" => glass_shadows, "glassMode" => glass_mode,
             "skyUp" => sky_up, "skyDown" => sky_down, "reflections" => reflections, "ao" => ao, "gridSpacing" => grid_spacing, "gridMajorEvery" => grid_major_every, "gridMinorWidth" => grid_minor_width, "gridMajorWidth" => grid_major_width,
             "gridCrossWidth" => grid_cross_width, "gridCrossArm" => grid_cross_arm, "paused" => paused,
+            "ssao" => ssao, "aoRadius" => ao_radius, "aoBias" => ao_bias, "aoSamples" => ao_samples, "glassPass" => glass_pass, "ssThickness" => ss_thickness,
+            "ssBehind" => ss_behind, "ssDispersion" => ss_dispersion, "glassInterfaces" => glass_interfaces, "reflIntensity" => refl_intensity,
+            "reflDistance" => refl_distance, "reflQuarter" => refl_quarter, "reflBlend" => refl_blend, "fog" => fog, "fogFalloff" => fog_falloff,
+            "fogAmbient" => fog_ambient, "fogSteps" => fog_steps, "taa" => taa, "taaFeedbackMax" => taa_feedback_max, "taaFeedbackMin" => taa_feedback_min,
+            "taaGamma" => taa_gamma, "dofSamples" => dof_samples, "dofBlades" => dof_blades, "dofMaxCoc" => dof_max_coc, "bloomOn" => bloom_on,
+            "bloomKnee" => bloom_knee, "bloomRadius" => bloom_radius, "bloomEmissive" => bloom_emissive, "tone" => tone, "toneMapper" => tone_mapper,
+            "exposureComp" => exposure_comp, "vignette" => vignette, "grain" => grain, "chromatic" => chromatic,
         )
         .replacen('{', &format!("{{\"gridBase\":{:?},\"gridMinor\":{:?},\"gridMajor\":{:?},\"gridCross\":{:?},", self.grid_base, self.grid_minor, self.grid_major, self.grid_cross), 1)
     }
@@ -669,6 +773,40 @@ impl Settings {
             "gridCrossWidth" => self.grid_cross_width = v.max(0.0),
             "gridCrossArm" => self.grid_cross_arm = v.clamp(0.0, 0.5),
             "paused" => self.paused = v != 0.0,
+            "ssao" => self.ssao = v != 0.0,
+            "aoRadius" => self.ao_radius = v.max(0.01),
+            "aoBias" => self.ao_bias = v.max(0.0),
+            "aoSamples" => self.ao_samples = (v.round() as u32).clamp(1, 32),
+            "glassPass" => self.glass_pass = v != 0.0,
+            "ssThickness" => self.ss_thickness = v.max(0.01),
+            "ssBehind" => self.ss_behind = v.max(0.0),
+            "ssDispersion" => self.ss_dispersion = v.max(0.0),
+            "glassInterfaces" => self.glass_interfaces = (v.round() as u32).clamp(1, 16),
+            "reflIntensity" => self.refl_intensity = v.max(0.0),
+            "reflDistance" => self.refl_distance = v.max(0.5),
+            "reflQuarter" => self.refl_quarter = v != 0.0,
+            "reflBlend" => self.refl_blend = v.clamp(0.02, 1.0),
+            "fog" => self.fog = v != 0.0,
+            "fogFalloff" => self.fog_falloff = v.max(0.0),
+            "fogAmbient" => self.fog_ambient = v.max(0.0),
+            "fogSteps" => self.fog_steps = (v.round() as u32).min(128),
+            "taa" => self.taa = v != 0.0,
+            "taaFeedbackMax" => self.taa_feedback_max = v.clamp(0.0, 0.99),
+            "taaFeedbackMin" => self.taa_feedback_min = v.clamp(0.0, 0.99),
+            "taaGamma" => self.taa_gamma = v.clamp(0.25, 4.0),
+            "dofSamples" => self.dof_samples = (v.round() as u32).clamp(8, 128),
+            "dofBlades" => self.dof_blades = (v.round() as u32).min(12),
+            "dofMaxCoc" => self.dof_max_coc = v.clamp(0.002, 0.08),
+            "bloomOn" => self.bloom_on = v != 0.0,
+            "bloomKnee" => self.bloom_knee = v.max(0.01),
+            "bloomRadius" => self.bloom_radius = v.max(0.1),
+            "bloomEmissive" => self.bloom_emissive = v != 0.0,
+            "tone" => self.tone = v != 0.0,
+            "toneMapper" => self.tone_mapper = (v.max(0.0) as u32).min(4),
+            "exposureComp" => self.exposure_comp = v.clamp(-6.0, 6.0),
+            "vignette" => self.vignette = v.clamp(0.0, 2.0),
+            "grain" => self.grain = v.clamp(0.0, 1.0),
+            "chromatic" => self.chromatic = v.clamp(0.0, 2.0),
             _ => return false,
         }
         true
@@ -908,8 +1046,6 @@ struct State {
     lamp: wgpu::Buffer,
     /// The floor grid the ray traced hits see (baked into the reflections' shader).
     traced_grid: FloorGpu,
-    /// The depth of field while it is off, out of the chain.
-    parked_dof: Option<Box<dyn PostProcessingEffect>>,
     /// The glass mode the scene and the chain were last brought to (`Settings::glass_mode`).
     applied_glass_mode: Option<u32>,
     time: f32,
@@ -1093,40 +1229,39 @@ impl State {
                 r.visible = e.enabled;
             }
         }
-        let screen_glass = self.glass && s.glass_mode == 1;
+        // the glass: ray traced, in screen space, or (its pass off) polished grey solids
+        let glass_on = self.glass && s.glass_pass;
+        let screen_glass = glass_on && s.glass_mode == 1;
+        let traced_glass = glass_on && s.glass_mode == 0;
         for &node in &self.glass_nodes {
             if let Some(r) = self.scene.get_renderable_mut(node) {
                 if self.glass {
-                    r.material.set_standard_lit(&self.renderer, &glass_material(&s));
+                    r.material.set_standard_lit(&self.renderer, &if glass_on { glass_material(&s) } else { SOLID_REPELLER });
+                    r.rt = Some(if glass_on { RtSurface::glass(GLASS_TINT) } else { RtSurface::new(SOLID_REPELLER.base_color).with_smooth_normals() });
                 }
-                r.cast_shadow = s.glass_shadows;
+                r.cast_shadow = s.glass_shadows || !glass_on;
                 // in screen space the glass draws after the background copy it refracts
                 r.material.options.transmissive = screen_glass;
             }
         }
-        if self.glass && self.applied_glass_mode != Some(s.glass_mode) {
-            self.applied_glass_mode = Some(s.glass_mode);
+        let glass_state = (glass_on as u32) << 8 | s.glass_mode << 4 | s.glass_interfaces;
+        if self.glass && self.applied_glass_mode != Some(glass_state) {
+            self.applied_glass_mode = Some(glass_state);
             // the bundles hold the glass in the set it was drawn in
             self.renderer.invalidate_bundle();
-            let slot = self.volume.effects.iter().position(|e| e.as_any().is::<ScreenSpaceGlassEffect>());
-            match (screen_glass, slot) {
-                (true, None) => {
-                    let mut glass = ScreenSpaceGlassEffect::new(ScreenSpaceGlassOptions { thickness: 0.8, behind: 2.0, dispersion: 0.02, ..Default::default() });
-                    glass.set_sky_lighting(Some(&self.sky));
-                    // after the reflections, before the mist
-                    let at = self.volume.effects.iter().position(|e| e.as_any().is::<VolumetricFogEffect>() || e.as_any().is::<TemporalAAEffect>()).unwrap_or(0);
-                    self.volume.effects.insert(at, Box::new(glass));
-                }
-                (false, Some(k)) => drop(self.volume.effects.remove(k)),
-                _ => {}
-            }
             if let Some(rt) = self.volume.effect_mut::<RtReflectionsEffect>() {
-                rt.set_glass((!screen_glass).then(RtGlass::default));
+                rt.set_glass(traced_glass.then_some(RtGlass { interfaces: s.glass_interfaces, ..Default::default() }));
                 rt.reset_history();
             }
         }
+        self.volume.set_enabled::<ScreenSpaceGlassEffect>(screen_glass);
+        if let Some(ss) = self.volume.effect_mut::<ScreenSpaceGlassEffect>() {
+            ss.options.thickness = s.ss_thickness;
+            ss.options.behind = s.ss_behind;
+            ss.options.dispersion = s.ss_dispersion;
+        }
         // the particles and the lamp go into the ray tracing grid only while a ray can meet them
-        let traced = self.glass && (!screen_glass || s.reflections);
+        let traced = traced_glass || (self.glass && s.reflections);
         for node in [self.particle_node, self.lamp_node] {
             if let Some(r) = self.scene.get_renderable_mut(node) {
                 r.rt = traced.then(|| RtSurface::new([0.5; 3]).with_record_surface(Some(ALBEDO_WORD), Some(EMISSION_WORD)));
@@ -1158,55 +1293,74 @@ impl State {
         let rgb = |c: [f32; 4]| [c[0], c[1], c[2]];
         let sky = gradient_sky_lighting(rgb(sky_rgb(s.sky_up)), rgb(sky_rgb(s.sky_down)));
         self.renderer.queue().write_buffer(&self.sky, 0, bytemuck::cast_slice(&sky));
+        // the passes: each on or off in the chain, with its settings; a temporal one coming back
+        // starts its history afresh
+        self.volume.set_enabled::<SSAOEffect>(s.ssao);
         if let Some(ao) = self.volume.effect_mut::<SSAOEffect>() {
-            ao.options.strength = s.ao;
+            ao.options = SSAOOptions { radius: s.ao_radius, bias: s.ao_bias, kernel_size: s.ao_samples, strength: s.ao };
         }
         let exposure = exposure_from_ev100(s.ev100);
+        self.volume.set_enabled::<ToneMapEffect>(s.tone);
         if let Some(tone) = self.volume.effect_mut::<ToneMapEffect>() {
-            tone.options.exposure = exposure;
+            let o = &mut tone.options;
+            o.exposure = exposure;
+            o.exposure_compensation = s.exposure_comp;
+            o.tonemapper = TONE_MAPPERS[s.tone_mapper.min(TONE_MAPPERS.len() as u32 - 1) as usize];
+            o.vignette = s.vignette;
+            o.grain = s.grain;
+            o.chromatic_aberration = s.chromatic;
         }
         let total = self.volume.effect::<ToneMapEffect>().map_or(exposure, |t| t.total_exposure());
+        let taa_back = s.taa && !self.volume.is_enabled::<TemporalAAEffect>();
+        self.volume.set_enabled::<TemporalAAEffect>(s.taa);
         if let Some(taa) = self.volume.effect_mut::<TemporalAAEffect>() {
-            taa.options.exposure = total;
+            taa.options = TemporalAAOptions { feedback_max: s.taa_feedback_max, feedback_min: s.taa_feedback_min.min(s.taa_feedback_max), exposure: total, variance_gamma: s.taa_gamma };
+            if taa_back {
+                taa.reset_history();
+            }
         }
+        self.volume.set_enabled::<BloomEffect>(s.bloom_on);
         if let Some(bloom) = self.volume.effect_mut::<BloomEffect>() {
             bloom.exposure = total;
-            bloom.options.intensity = s.bloom;
-            bloom.options.threshold = s.bloom_threshold;
+            bloom.options = BloomOptions { threshold: s.bloom_threshold, knee: s.bloom_knee, intensity: s.bloom, radius: s.bloom_radius, use_emissive: s.bloom_emissive };
         }
+        let fog_back = s.fog && !self.volume.is_enabled::<VolumetricFogEffect>();
+        self.volume.set_enabled::<VolumetricFogEffect>(s.fog);
         if let Some(fog) = self.volume.effect_mut::<VolumetricFogEffect>() {
             fog.base_density = s.fog_density;
             fog.anisotropy = s.fog_anisotropy;
-            // a uniform sky of the environment's mean radiance
-            let [r, g, b, _] = sky_rgb(0.5 * (s.sky_up + s.sky_down));
+            fog.height_falloff = s.fog_falloff;
+            // a uniform sky of the environment's mean radiance, scaled
+            let [r, g, b, _] = sky_rgb(0.5 * (s.sky_up + s.sky_down) * s.fog_ambient);
             fog.ambient = Vec3::new(r, g, b);
+            fog.spot_scattering = if s.fog_steps == 0 { SpotScattering::Froxels } else { SpotScattering::Raymarched { steps: s.fog_steps } };
+            if fog_back {
+                fog.reset_history();
+            }
+            fog.update_lights(self.scene.lights());
         }
         self.renderer.set_render_scale(s.render_scale);
-        // the depth of field in the chain (before the bloom) or parked out of it
-        let slot = self.volume.effects.iter().position(|e| e.as_any().is::<CinematicDepthOfFieldEffect>());
-        match (s.dof, slot, self.parked_dof.take()) {
-            (false, Some(k), _) => self.parked_dof = Some(self.volume.effects.remove(k)),
-            (true, None, Some(dof)) => {
-                let at = self.volume.effects.iter().position(|e| e.as_any().is::<BloomEffect>()).unwrap_or(self.volume.effects.len());
-                self.volume.effects.insert(at, dof);
-            }
-            (_, _, parked) => self.parked_dof = parked,
-        }
+        self.volume.set_enabled::<CinematicDepthOfFieldEffect>(s.dof);
         if let Some(dof) = self.volume.effect_mut::<CinematicDepthOfFieldEffect>() {
             dof.lens.f_stop = s.f_stop;
+            dof.lens.blade_count = s.dof_blades;
+            dof.sample_count = s.dof_samples;
+            dof.max_coc_fraction = s.dof_max_coc;
         }
         if let Some(ss) = self.volume.effect_mut::<ScreenSpaceGlassEffect>() {
             ss.set_sky_lighting(Some(&self.sky));
         }
         if let Some(rt) = self.volume.effect_mut::<RtReflectionsEffect>() {
             rt.update_lights(self.scene.lights());
-            if rt.reflections != s.reflections {
+            rt.intensity = s.refl_intensity;
+            rt.max_distance = s.refl_distance;
+            rt.temporal_blend = s.refl_blend;
+            let resolution = if s.refl_quarter { RtTraceResolution::Quarter } else { RtTraceResolution::Half };
+            if rt.reflections != s.reflections || rt.resolution() != resolution {
                 rt.reflections = s.reflections;
+                rt.set_resolution(resolution);
                 rt.reset_history();
             }
-        }
-        if let Some(fog) = self.volume.effect_mut::<VolumetricFogEffect>() {
-            fog.update_lights(self.scene.lights());
         }
     }
 
@@ -1294,6 +1448,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     }
     settings.ev100 = param_or("ev", settings.ev100);
     settings.dof = flag("dof", true);
+    settings.fog = flag("fog", true);
     settings.glass_mode = param_or("glassmode", 0u32).min(1);
     settings.render_scale = param_or("scale", 1.0f32).clamp(0.25, 1.0);
 
@@ -1400,7 +1555,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let spot = scene.add(SceneNode::Light(Light::Spot(spot_light(&settings))));
 
-    // the chain: glass and reflections, the mist, TAA, depth of field, bloom, the tone mapper
+    // the chain: SSAO, the ray traced glass and reflections, the screen-space glass, the mist,
+    // TAA, depth of field, bloom, the tone mapper; each pass on or off (`set_enabled`) by `apply`
     let tone = {
         let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
         options.exposure = exposure_from_ev100(settings.ev100);
@@ -1417,7 +1573,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     if let Some(rt) = rt_effect(&renderer, &scene, floor, &settings, &sky).filter(|_| glass) {
         effects.push(Box::new(rt));
     }
-    if flag("fog", true) {
+    effects.push(Box::new(ScreenSpaceGlassEffect::new(ScreenSpaceGlassOptions::default())));
+    {
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
             grid: FroxelGridOptions { near: 0.1, far: 24.0, temporal: true, ..Default::default() },
             base_density: settings.fog_density,
@@ -1471,7 +1628,6 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         colliders: collider_list,
         glass_nodes,
         glass,
-        parked_dof: None,
         applied_glass_mode: None,
         traced_grid: FloorGpu { sky_up: [0.0; 4], sky_down: [0.0; 4], ..floor_grid(&settings) },
         sky,
