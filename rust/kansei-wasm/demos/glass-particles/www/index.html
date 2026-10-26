@@ -95,7 +95,7 @@
 
         const look = pane.addFolder({ title: 'Particles', expanded: false });
         look.addBinding(p, 'glow', { label: 'glow (cd/m²)', min: 0, max: 300, step: 0.5 }).on('change', set('glow'));
-        look.addBinding(p, 'stretch', { label: 'stretch at 1 m/s', min: 0, max: 4, step: 0.01 }).on('change', set('stretch'));
+        look.addBinding(p, 'stretch', { label: 'stretch at 1 m/s', min: 0, max: 20, step: 0.1 }).on('change', set('stretch'));
         look.addBinding(p, 'roughness', { min: 0.02, max: 1, step: 0.01 }).on('change', set('roughness'));
         look.addBinding(p, 'metallic', { min: 0, max: 1, step: 0.01 }).on('change', set('metallic'));
 
@@ -176,6 +176,16 @@
             f.addBinding(p, 'reflQuarter', { label: 'trace 1 in 4x4' }).on('change', set('reflQuarter'));
             f.addBinding(p, 'reflBlend', { label: 'new frame weight', min: 0.02, max: 1, step: 0.01 }).on('change', set('reflBlend'));
         });
+        // the far floor (and anything far) fades into the backdrop behind it by its distance from
+        // the scene's centre, all of it by the dome
+        pass('Distance fade', 'fade', {
+            near: { fadeStart: 5, fadeEnd: 20 },
+            default: { fadeStart: 7, fadeEnd: 30 },
+            far: { fadeStart: 12, fadeEnd: 44 },
+        }, (f) => {
+            f.addBinding(p, 'fadeStart', { label: 'start (m)', min: 0, max: 45, step: 0.5 }).on('change', set('fadeStart'));
+            f.addBinding(p, 'fadeEnd', { label: 'end (m)', min: 1, max: 45, step: 0.5 }).on('change', set('fadeEnd'));
+        });
         pass('Volumetric fog', 'fog', {
             low: { fogSteps: 0 },
             medium: { fogSteps: 16 },
@@ -240,22 +250,22 @@
         // each, so about that share of the particles flies) ──
         const QUALITY = {
             LOW: {
-                passes: { SSAO: false, Glass: 'fast (screen space)', 'Floor reflections': false, 'Volumetric fog': 'low', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
-                values: { renderScale: 0.5, dofSamples: 16, glassInterfaces: 8 },
+                passes: { SSAO: false, Glass: 'fast (screen space)', 'Floor reflections': false, 'Distance fade': 'default', 'Volumetric fog': 'low', TAA: 'default', 'Depth of field': false, Bloom: 'default', 'Tone map': 'default' },
+                values: { renderScale: 0.5, glassInterfaces: 8 },
                 rate: 0.5,
             },
             MID: {
-                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': false, 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': false, 'Distance fade': 'default', 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
                 values: { glassMode: 0, renderScale: 0.7, aoSamples: 8, dofSamples: 24, glassInterfaces: 4 },
                 rate: 0.75,
             },
             HIGH: {
-                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'low', 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'low', 'Distance fade': 'default', 'Volumetric fog': 'medium', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
                 values: { glassMode: 0, renderScale: 0.85, aoSamples: 12, dofSamples: 32, glassInterfaces: 6 },
                 rate: 1,
             },
             EPIC: {
-                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'default', 'Volumetric fog': 'default', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
+                passes: { SSAO: 'default', Glass: 'clear', 'Floor reflections': 'default', 'Distance fade': 'default', 'Volumetric fog': 'default', TAA: 'default', 'Depth of field': 'default', Bloom: 'default', 'Tone map': 'default' },
                 values: { glassMode: 0, renderScale: 1, glassInterfaces: 8 },
                 rate: 1,
             },

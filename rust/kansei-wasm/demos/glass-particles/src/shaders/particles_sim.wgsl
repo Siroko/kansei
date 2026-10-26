@@ -2,10 +2,11 @@
 // for the frame lasts; a live one is carried by curl noise (the curl of a noise potential, so the
 // flow has vorticity and no sources or sinks), pushed off the repellers along their distance
 // fields' gradients and kept out of them, then written as an instance the boxes draw: placed,
-// turned to face where it moves and stretched with its speed, its albedo and glow packed as the
-// ray tracing grid reads them (RT_EMISSION_WGSL's kansei_rt_pack_emission, prepended). The pointer
-// pushes the particles near the ray from the eye through it along its motion, and the respawns
-// and the hits on the repellers are counted for the page's sounds.
+// turned to face where it moves and stretched with its speed (short of the glass and the floor),
+// its albedo and glow packed as the ray tracing grid reads them (RT_EMISSION_WGSL's
+// kansei_rt_pack_emission, prepended). The pointer pushes the particles near the ray from the eye
+// through it along its motion, and the respawns and the hits on the repellers are counted for the
+// page's sounds.
 
 struct Emitter {
     // its rotation: its local axes in world space (it points along y)
@@ -359,9 +360,18 @@ fn instanceOf(i: u32, q: Particle, e: Emitter) -> Instance {
     let age = q.p.w;
     let life = q.v.w;
     let fade = smoothstep(0.0, 0.2, age) * (1.0 - smoothstep(life - 0.5, life, age));
-    out.placement = vec4f(q.p.xyz, e.jitter.x * fade);
+    let size = e.jitter.x * fade;
+    out.placement = vec4f(q.p.xyz, size);
     out.rotation = arcFromZ(dir);
-    out.motion = vec4f(v, 1.0 + sim.stretch * min(speed, 3.0));
+    // stretched with its speed, but never past the glass or the floor: half its length at most
+    // the room round it (the distance fields are exact, so the whole box stays clear)
+    var room = q.p.y - sim.boundsMin.y;
+    for (var k = 0u; k < sim.colliderCount; k++) {
+        let c = sim.colliders[k];
+        room = min(room, colliderDistance(c, toLocal(c, q.p.xyz)));
+    }
+    let stretch = min(1.0 + sim.stretch * min(speed, 3.0), max(2.0 * room / max(size, 1e-4), 1.0));
+    out.motion = vec4f(v, stretch);
     // the colour is the particle's for good: its index picks it
     let h = hash01(i * 3u + 101u);
     let glows = hash01(i * 3u + 102u) < e.jitter.w;

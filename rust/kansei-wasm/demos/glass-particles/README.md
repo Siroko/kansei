@@ -1,7 +1,7 @@
 # Glass particles
 
 Two emitters pour particles, each a small box turned to the way it moves (stretched with its
-speed), through a scatter of glass spheres, boxes and pyramids over a polished floor with a
+speed, but never into the glass or the floor), through a scatter of glass spheres, boxes and pyramids over a polished floor with a
 technical grid, under a spot light from above. Curl noise carries them, so the flow swirls; the
 glass pushes them off by its distance fields; the pointer pushes them along its motion. A share
 of them glow, and only those bloom. The glass refracts and reflects the particles, the floor's
@@ -22,14 +22,16 @@ albedo and glow from its instance record, packed by `rt::RT_EMISSION_WGSL` and
 `rt::pack_emission`), `Renderable::rt_placement` (`RtPlacement::Wgsl`); `RtReflectionsEffect`
 (`set_glass`, `reflections`, `set_spot_lights`, `set_sky_lighting` with
 `gi::gradient_sky_lighting`, `RtReflectionsOptions::albedo_wgsl` for the floor's grid where the
-rays meet it); `ScreenSpaceGlassEffect`, `SSAOEffect`, `VolumetricFogEffect`
+rays meet it); `ScreenSpaceGlassEffect`, `SSAOEffect`, `DistanceFogEffect`
+(`DistanceFogColor::GradientSky`, `from_point`), `VolumetricFogEffect`
 (`SpotScattering::Raymarched`), `TemporalAAEffect`, `CinematicDepthOfFieldEffect`, `BloomEffect`
 with `BloomOptions::use_emissive`, `ToneMapEffect` in a `PostProcessingVolume`;
 `CameraControls::with_mouse_pan`, `MouseVectors`.
 
 Demo-local: the particle simulation (`src/shaders/particles_sim.wgsl`: the respawns against each
 emitter's budget a frame, curl noise from analytic gradient noise, the repellers' distance fields
-and their pushes, the pointer's push, the live particles compacted into the instance records, and
+and their pushes, each box's stretch held to half the room those fields and the floor leave it,
+the pointer's push, the live particles compacted into the instance records, and
 the events the sounds and the stats count; `particles_clear.wgsl` clears the records past the live
 ones, so every pass draws as many as are alive, a bound read back a few frames late), the boxes'
 material (`particles_draw.wgsl`), the floor's grid (`floor.wgsl`, `floor_grid.wgsl`, also baked
@@ -47,7 +49,7 @@ grid, the lighting presets, the palettes, the page's panel and its sounds.
 | `ev=<EV100>` | exposure, over the preset's |
 | `glassmode=1` | the glass in screen space (`ScreenSpaceGlassEffect`) instead of ray traced |
 | `glass=0` | the repellers drawn grey instead of glass: no ray tracing grid, voxels or reflections |
-| `fog=0`, `dof=0` | no mist, no depth of field |
+| `fog=0`, `dof=0`, `fade=0` | no mist, no depth of field, no distance fade |
 | `scale=<0.25..1>` | render scale: the scene's passes at that share of the canvas, the TAA upscaling |
 | `perf=0` | no performance overlay (shown by default; the backquote key toggles it) |
 | `ui=0` | hide the panel |
@@ -64,6 +66,8 @@ repellers (reach and push of their fields, bounce, whether they cast shadows); t
 look; the floor grid (colours, spacing, line widths); the light and the environment; and a
 Post-processing folder with one folder a pass, in the chain's order: SSAO, the glass (ray traced
 or screen space; off, the repellers are polished grey solids), the floor's reflections, the
+distance fade (`DistanceFogEffect`: the floor fades into the backdrop behind it between a start and
+an end distance from the scene's centre, all of it by the dome, so it never ends on a line), the
 volumetric fog, TAA (and the render scale), depth of field, bloom and the tone mapper. Each has an
 on/off that takes the pass out of the chain (`PostProcessingVolume::set_enabled`, so the perf
 overlay shows what it saves), a preset (subtle / default / strong, or quality levels for the

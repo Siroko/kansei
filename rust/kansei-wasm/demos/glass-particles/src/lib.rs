@@ -52,7 +52,7 @@ use kansei_core::materials::{Binding, BindingResource, Compute, GradientSkyOptio
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
-    exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
+    exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DistanceFogColor, DistanceFogEffect, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
     ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
@@ -574,6 +574,11 @@ struct Settings {
     grid_cross_width: f32,
     grid_cross_arm: f32,
     paused: bool,
+    /// The fade of the far floor into the backdrop (`DistanceFogEffect`), from and to (m from the
+    /// scene's centre, so the set stays clear wherever the camera is).
+    fade: bool,
+    fade_start: f32,
+    fade_end: f32,
 }
 
 impl Default for Settings {
@@ -596,7 +601,7 @@ impl Settings {
             repel_range: 0.35,
             repel_strength: 9.0,
             bounce: 0.35,
-            stretch: 0.9,
+            stretch: 10.0,
             glow: 40.0,
             palette: 0,
             mouse_force: 6.0,
@@ -668,6 +673,9 @@ impl Settings {
             grid_cross_width: 0.016,
             grid_cross_arm: 0.07,
             paused: false,
+            fade: true,
+            fade_start: 7.0,
+            fade_end: 30.0,
         }
     }
 }
@@ -719,6 +727,7 @@ impl Settings {
             "bloom" => bloom, "bloomThreshold" => bloom_threshold, "glassIor" => glass_ior, "glassRoughness" => glass_roughness, "glassShadows" => glass_shadows, "glassMode" => glass_mode,
             "skyUp" => sky_up, "skyDown" => sky_down, "reflections" => reflections, "ao" => ao, "gridSpacing" => grid_spacing, "gridMajorEvery" => grid_major_every, "gridMinorWidth" => grid_minor_width, "gridMajorWidth" => grid_major_width,
             "gridCrossWidth" => grid_cross_width, "gridCrossArm" => grid_cross_arm, "paused" => paused,
+            "fade" => fade, "fadeStart" => fade_start, "fadeEnd" => fade_end,
             "ssao" => ssao, "aoRadius" => ao_radius, "aoBias" => ao_bias, "aoSamples" => ao_samples, "glassPass" => glass_pass, "ssThickness" => ss_thickness,
             "ssBehind" => ss_behind, "ssDispersion" => ss_dispersion, "glassInterfaces" => glass_interfaces, "reflIntensity" => refl_intensity,
             "reflDistance" => refl_distance, "reflQuarter" => refl_quarter, "reflBlend" => refl_blend, "fog" => fog, "fogFalloff" => fog_falloff,
@@ -773,6 +782,9 @@ impl Settings {
             "gridCrossWidth" => self.grid_cross_width = v.max(0.0),
             "gridCrossArm" => self.grid_cross_arm = v.clamp(0.0, 0.5),
             "paused" => self.paused = v != 0.0,
+            "fade" => self.fade = v != 0.0,
+            "fadeStart" => self.fade_start = v.max(0.0),
+            "fadeEnd" => self.fade_end = v.max(0.0),
             "ssao" => self.ssao = v != 0.0,
             "aoRadius" => self.ao_radius = v.max(0.01),
             "aoBias" => self.ao_bias = v.max(0.0),
@@ -1117,10 +1129,20 @@ fn floor_grid(s: &Settings) -> FloorGpu {
 /// horizon (the mean, so it runs linearly in the height as `gi::gradient_sky_lighting` does) and
 /// below.
 fn backdrop(s: &Settings) -> [f32; 12] {
-    let (up, down) = (sky_rgb(s.sky_up), sky_rgb(s.sky_down));
-    let mid = [0, 1, 2].map(|k| 0.5 * (up[k] + down[k]));
-    [up[0], up[1], up[2], 1.0, mid[0], mid[1], mid[2], 0.0, down[0], down[1], down[2], 0.0]
+    let sky = backdrop_sky(s);
+    let ([zr, zg, zb], [hr, hg, hb], [gr, gg, gb]) = (sky.zenith, sky.horizon, sky.ground);
+    [zr, zg, zb, sky.curve, hr, hg, hb, 0.0, gr, gg, gb, 0.0]
 }
+
+fn backdrop_sky(s: &Settings) -> GradientSkyOptions {
+    let (up, down) = (sky_rgb(s.sky_up), sky_rgb(s.sky_down));
+    let rgb = |c: [f32; 4]| [c[0], c[1], c[2]];
+    let mid = [0, 1, 2].map(|k| 0.5 * (up[k] + down[k]));
+    GradientSkyOptions { zenith: rgb(up), horizon: mid, ground: rgb(down), curve: 1.0 }
+}
+
+/// The backdrop's radius (m), round the origin.
+const DOME_RADIUS: f32 = 45.0;
 
 /// The environment's colour: a cool white.
 fn sky_rgb(radiance: f32) -> [f32; 4] {
@@ -1324,6 +1346,13 @@ impl State {
             bloom.exposure = total;
             bloom.options = BloomOptions { threshold: s.bloom_threshold, knee: s.bloom_knee, intensity: s.bloom, radius: s.bloom_radius, use_emissive: s.bloom_emissive };
         }
+        self.volume.set_enabled::<DistanceFogEffect>(s.fade);
+        if let Some(fade) = self.volume.effect_mut::<DistanceFogEffect>() {
+            fade.start = s.fade_start;
+            fade.end = s.fade_end;
+            fade.color = DistanceFogColor::GradientSky { sky: backdrop_sky(&s), centre: Vec3::ZERO, radius: DOME_RADIUS };
+            fade.from_point = Some(Vec3::ZERO);
+        }
         let fog_back = s.fog && !self.volume.is_enabled::<VolumetricFogEffect>();
         self.volume.set_enabled::<VolumetricFogEffect>(s.fog);
         if let Some(fog) = self.volume.effect_mut::<VolumetricFogEffect>() {
@@ -1449,6 +1478,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     settings.ev100 = param_or("ev", settings.ev100);
     settings.dof = flag("dof", true);
     settings.fog = flag("fog", true);
+    settings.fade = flag("fade", true);
     settings.glass_mode = param_or("glassmode", 0u32).min(1);
     settings.render_scale = param_or("scale", 1.0f32).clamp(0.25, 1.0);
 
@@ -1485,7 +1515,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let floor = scene.add(SceneNode::Renderable(floor));
 
     // the environment round it all: the sky the glass and the floor reflect, drawn
-    let mut dome = Renderable::new(SphereGeometry::new(45.0, 48, 24), Material::gradient_sky("Backdrop", &GradientSkyOptions { curve: 1.0, ..Default::default() }));
+    let mut dome = Renderable::new(SphereGeometry::new(DOME_RADIUS, 48, 24), Material::gradient_sky("Backdrop", &GradientSkyOptions { curve: 1.0, ..Default::default() }));
     dome.cast_shadow = false;
     let backdrop = scene.add(SceneNode::Renderable(dome));
 
@@ -1574,6 +1604,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         effects.push(Box::new(rt));
     }
     effects.push(Box::new(ScreenSpaceGlassEffect::new(ScreenSpaceGlassOptions::default())));
+    // the far floor fades into the backdrop behind it, so it never ends on a line
+    effects.push(Box::new(DistanceFogEffect::new(settings.fade_start, settings.fade_end, DistanceFogColor::Constant([0.0; 3]))));
     {
         let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
             grid: FroxelGridOptions { near: 0.1, far: 24.0, temporal: true, ..Default::default() },
