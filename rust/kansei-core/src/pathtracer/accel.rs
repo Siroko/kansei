@@ -223,11 +223,12 @@ pub(crate) fn shader_module(device: &wgpu::Device, backend: RtBackend, label: &s
 mod tests {
     use super::*;
 
-    /// Validated with naga for `backend`: ray queries for the hardware one.
+    /// Validated with naga for `backend`: ray queries for the hardware one (and f16-in-f32, which
+    /// naga 30 counts pack2x16float as and every WebGPU device has).
     fn validate(backend: RtBackend, name: &str, code: &str) -> naga::Module {
         let name = format!("{name} ({backend:?})");
         let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
-        let mut capabilities = naga::valid::Capabilities::empty();
+        let mut capabilities = naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
         if backend == RtBackend::Hardware {
             capabilities |= naga::valid::Capabilities::RAY_QUERY;
         }
@@ -253,7 +254,7 @@ mod tests {
         for backend in [RtBackend::Software, RtBackend::Hardware] {
             for count_rays in [false, true] {
                 let trace = validate(backend, &format!("trace (count rays {count_rays})"), &super::super::path_tracer::trace_wgsl(backend, count_rays));
-                assert_eq!(struct_span(&trace, "TraceParams"), 192);
+                assert_eq!(struct_span(&trace, "TraceParams") as u64, super::super::path_tracer::TRACE_PARAMS_SIZE);
                 assert_eq!(struct_span(&trace, "Instance"), std::mem::size_of::<PackedInstance>());
             }
             validate(backend, "probe trace", &super::super::probes::trace_wgsl(backend));

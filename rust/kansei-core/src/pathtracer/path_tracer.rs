@@ -10,8 +10,63 @@ use super::blue_noise::generate_blue_noise;
 use super::bvh_builder::GPUBVHData;
 use super::material::PathTracerMaterial;
 
-/// Size of the TraceParams uniform in bytes (48 floats * 4 bytes).
-const TRACE_PARAMS_SIZE: u64 = 192;
+/// Size of the TraceParams uniform in bytes (52 floats * 4 bytes).
+pub(crate) const TRACE_PARAMS_SIZE: u64 = 208;
+
+// TraceParams flags (trace.wgsl's PT_*)
+const PT_GUIDES: u32 = 1;
+const PT_PREV_INSTANCES: u32 = 2;
+
+/// The guide buffers a trace writes for a denoiser (`PathTracer::set_guides`), all
+/// `rgba32uint`, laid out as trace.wgsl's bindings 20-22 describe: the first hit's diffuse and
+/// specular light each over its albedo (`signal`), those albedos (`albedo`), the light no filter
+/// should touch (sky, emitters seen directly, in both), and the surface: linear depth, normal,
+/// motion and last frame's depth (`surface`).
+pub struct PathTracerGuides<'a> {
+    pub signal: &'a wgpu::TextureView,
+    pub albedo: &'a wgpu::TextureView,
+    pub surface: &'a wgpu::TextureView,
+    pub width: u32,
+    pub height: u32,
+}
+
+struct GuideTextures {
+    signal: wgpu::TextureView,
+    albedo: wgpu::TextureView,
+    surface: wgpu::TextureView,
+}
+
+impl GuideTextures {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let view = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Uint,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        Self { signal: view("PathTracer/GuideSignal"), albedo: view("PathTracer/GuideAlbedo"), surface: view("PathTracer/GuideSurface") }
+    }
+}
+
+/// The `index`-th element (from 1) of the Halton sequence in `base`, in [0, 1).
+fn halton(mut index: u32, base: u32) -> f32 {
+    let mut f = 1.0;
+    let mut r = 0.0;
+    while index > 0 {
+        f /= base as f32;
+        r += f * (index % base) as f32;
+        index /= base;
+    }
+    r
+}
 
 /// Owns the path trace compute pipeline and dispatches trace passes.
 ///
@@ -32,6 +87,8 @@ const TRACE_PARAMS_SIZE: u64 = 192;
 ///   8  instances   storage buffer  (read) — array of Instance
 ///   9  prev_frame  texture_2d (read) — previous frame for temporal accumulation
 ///  10  the ray counter, while counting rays (`set_count_rays`)
+///   20-22 guide buffers (rgba32uint, write) — `PathTracerGuides`, written with `set_guides`
+///   23 prev_instances storage buffer (read) — last frame's instances, for the guides' motion
 pub struct PathTracer {
     /// the trace pipelines made so far, by backend and whether they count rays
     pipelines: Vec<TracePipeline>,
@@ -46,6 +103,21 @@ pub struct PathTracer {
     lights_buf: Option<wgpu::Buffer>,
     blue_noise_buf: Option<wgpu::Buffer>,
     frame_index: u32,
+    /// the sampler's frame: advances every trace, never reset (`frame_index` counts the
+    /// accumulated frames)
+    seed: u32,
+    jitter: bool,
+    /// the last trace's sub-pixel offset, pixels
+    last_jitter: [f32; 2],
+    /// full-size guide buffers while `set_guides(true)`, else 1x1 placeholders to bind
+    guides: Option<GuideTextures>,
+    guides_enabled: bool,
+    placeholder_guides: GuideTextures,
+    /// last frame's instances (the guides' object motion), and whether it holds them
+    prev_instances: Option<wgpu::Buffer>,
+    prev_instances_valid: bool,
+    /// last frame's view-projection, for the guides' motion
+    prev_view_proj: Option<[f32; 16]>,
     width: u32,
     height: u32,
     device: wgpu::Device,
@@ -127,6 +199,12 @@ impl TracePipeline {
                 },
                 count: None,
             },
+            // 20-22: guide buffers (rgba32uint, write)
+            guide_entry(20),
+            guide_entry(21),
+            guide_entry(22),
+            // 23: prev_instances (array<Instance>)
+            storage(23),
         ];
         // 5-8: the scene
         entries.extend(accel::traversal_layout_entries(backend, 5));
@@ -194,6 +272,15 @@ impl PathTracer {
             lights_buf: None,
             blue_noise_buf: Some(blue_noise_buf),
             frame_index: 0,
+            seed: 0,
+            jitter: true,
+            last_jitter: [0.0; 2],
+            guides: None,
+            guides_enabled: false,
+            placeholder_guides: GuideTextures::new(&device, 1, 1),
+            prev_instances: None,
+            prev_instances_valid: false,
+            prev_view_proj: None,
             width: 0,
             height: 0,
             device,
@@ -236,6 +323,39 @@ impl PathTracer {
         encoder.clear_buffer(counter, 0, None);
         self.queue.submit(Some(encoder.finish()));
         count[0]
+    }
+
+    /// Offset the primary rays within their pixels, a Halton (2, 3) point a frame (default on):
+    /// accumulated or denoised frames anti-alias. Off, every ray goes through its pixel's centre.
+    pub fn set_jitter(&mut self, enabled: bool) {
+        self.jitter = enabled;
+    }
+
+    /// Write the guide buffers a denoiser reads (`guides`; `PathTracerDenoise` turns this on).
+    pub fn set_guides(&mut self, enabled: bool) {
+        if enabled != self.guides_enabled {
+            self.guides_enabled = enabled;
+            self.guides = (enabled && self.width > 0).then(|| GuideTextures::new(&self.device, self.width, self.height));
+            self.prev_instances_valid = false;
+            self.prev_view_proj = None;
+        }
+    }
+
+    /// The guide buffers the last trace wrote, while `set_guides` is on (after the first `resize`).
+    pub fn guides(&self) -> Option<PathTracerGuides<'_>> {
+        self.guides.as_ref().map(|g| PathTracerGuides { signal: &g.signal, albedo: &g.albedo, surface: &g.surface, width: self.width, height: self.height })
+    }
+
+    /// The last trace's sub-pixel offset of its (first) samples from the pixel centres, in pixels
+    /// (+x right, +y down).
+    pub fn jitter(&self) -> [f32; 2] {
+        self.last_jitter
+    }
+
+    /// The sampler's frame: it advances every trace and `reset_accumulation` leaves it, so each
+    /// frame draws new samples.
+    pub fn seed(&self) -> u32 {
+        self.seed
     }
 
     // ── Resize / recreate output texture ───────────────────────────
@@ -281,6 +401,10 @@ impl PathTracer {
         let prev_view = prev.create_view(&wgpu::TextureViewDescriptor::default());
         self.prev_texture = Some(prev);
         self.prev_view = Some(prev_view);
+        if self.guides_enabled {
+            self.guides = Some(GuideTextures::new(&self.device, width, height));
+            self.prev_view_proj = None;
+        }
     }
 
     // ── Material upload ────────────────────────────────────────────
@@ -432,8 +556,29 @@ impl PathTracer {
         }
         let lights_buf = self.lights_buf.as_ref().unwrap();
 
+        // last frame's instances, for the guides' object motion (a copy of the instances after
+        // each trace; the same buffer, unread, until there is one)
+        if self.guides_enabled {
+            let size = bvh_data.instances_buf.size();
+            if self.prev_instances.as_ref().is_none_or(|b| b.size() != size) {
+                self.prev_instances = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("PathTracer/PrevInstances"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.prev_instances_valid = false;
+            }
+        }
+        let prev_instances = match (self.guides_enabled, self.prev_instances.as_ref()) {
+            (true, Some(buf)) => buf,
+            _ => &bvh_data.instances_buf,
+        };
+        let guides = self.guides.as_ref().unwrap_or(&self.placeholder_guides);
+
         // ── Upload TraceParams ─────────────────────────────────────
         let params = self.pack_params(camera, light_count);
+        self.last_jitter = [params[32], params[33]];
         self.queue
             .write_buffer(params_buf, 0, bytemuck::cast_slice(&params));
 
@@ -463,6 +608,10 @@ impl PathTracer {
                 binding: 9,
                 resource: wgpu::BindingResource::TextureView(prev_view),
             },
+            wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::TextureView(&guides.signal) },
+            wgpu::BindGroupEntry { binding: 21, resource: wgpu::BindingResource::TextureView(&guides.albedo) },
+            wgpu::BindGroupEntry { binding: 22, resource: wgpu::BindingResource::TextureView(&guides.surface) },
+            wgpu::BindGroupEntry { binding: 23, resource: prev_instances.as_entire_binding() },
         ];
         entries.extend(bvh_data.bind_group_entries(tlas_buf, 5));
         if let (true, Some(counter)) = (count_rays, self.ray_counter.as_ref()) {
@@ -503,8 +652,17 @@ impl PathTracer {
             );
         }
 
+        if self.guides_enabled {
+            if let Some(prev) = self.prev_instances.as_ref() {
+                encoder.copy_buffer_to_buffer(&bvh_data.instances_buf, 0, prev, 0, prev.size());
+                self.prev_instances_valid = true;
+            }
+            self.prev_view_proj = Some(*camera.projection_matrix.mul(&camera.view_matrix).as_slice());
+        }
+
         // Advance frame index (for temporal jitter / accumulation)
         self.frame_index += 1;
+        self.seed = self.seed.wrapping_add(1);
     }
 
     // ── Output accessor ────────────────────────────────────────────
@@ -526,14 +684,14 @@ impl PathTracer {
 
     // ── TraceParams packing ────────────────────────────────────────
 
-    /// Pack camera + render parameters into a 192-byte (48 x f32) array
+    /// Pack camera + render parameters into a 208-byte (52 x f32) array
     /// matching the WGSL `TraceParams` struct layout.
-    fn pack_params(&self, camera: &Camera, light_count: u32) -> [f32; 48] {
+    fn pack_params(&self, camera: &Camera, light_count: u32) -> [f32; 52] {
         // inv_view_proj = (P * V)^-1
         let vp = camera.projection_matrix.mul(&camera.view_matrix);
         let inv_vp = vp.inverse();
 
-        let mut params = [0.0f32; 48];
+        let mut params = [0.0f32; 52];
 
         // bytes 0-63: mat4x4f inv_view_proj (16 floats, column-major)
         params[0..16].copy_from_slice(inv_vp.as_slice());
@@ -568,17 +726,48 @@ impl PathTracer {
         // bytes 104-107: u32 max_bounces
         params[26] = f32::from_bits(self.max_bounces);
 
-        // bytes 108-111: _pad0
+        // bytes 108-111: u32 seed
+        params[27] = f32::from_bits(self.seed);
 
         // bytes 112-123: vec3f ambient_color (default dark gray sky)
         params[28] = 0.05;
         params[29] = 0.07;
         params[30] = 0.1;
 
-        // bytes 124-127: _pad1
-        // bytes 128-191: padding vec4f * 4 (zeroed)
+        // bytes 124-127: u32 flags
+        let mut flags = 0;
+        if self.guides_enabled {
+            flags |= PT_GUIDES;
+            if self.prev_instances_valid {
+                flags |= PT_PREV_INSTANCES;
+            }
+        }
+        params[31] = f32::from_bits(flags);
+
+        // bytes 128-135: vec2f jitter, in pixels within [-0.5, 0.5)
+        if self.jitter {
+            let i = self.seed % 65536 + 1;
+            params[32] = halton(i, 2) - 0.5;
+            params[33] = halton(i, 3) - 0.5;
+        }
+
+        // bytes 144-207: mat4x4f prev_view_proj (this frame's on the first)
+        params[36..52].copy_from_slice(self.prev_view_proj.as_ref().unwrap_or(vp.as_slice()));
 
         params
+    }
+}
+
+fn guide_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
     }
 }
 
@@ -602,6 +791,54 @@ fn pack_lights<'a>(lights: impl Iterator<Item = &'a Light>) -> Vec<f32> {
         data.extend_from_slice(&record);
     }
     data
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+    use crate::pathtracer::denoise::{AtrousParamsGpu, SvgfParamsGpu, SVGF_WGSL};
+
+    fn validate(name: &str, code: &str) -> naga::Module {
+        let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
+        // (unpack2x16float counts as f16-in-f32 in naga 30, a capability every WebGPU device has)
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
+        module
+    }
+
+    fn struct_span(module: &naga::Module, name: &str) -> u64 {
+        module
+            .types
+            .iter()
+            .find_map(|(_, ty)| match (&ty.name, &ty.inner) {
+                (Some(n), naga::TypeInner::Struct { span, .. }) if n == name => Some(*span as u64),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no struct {name}"))
+    }
+
+    /// The trace and the denoiser validate, and their uniforms are the size the CPU packs.
+    #[test]
+    fn shaders_validate_and_the_params_match() {
+        // (the hardware backend's: accel.rs's shaders_validate_pathtracer)
+        let trace = validate("trace", &trace_wgsl(RtBackend::Software, false));
+        assert_eq!(struct_span(&trace, "TraceParams"), TRACE_PARAMS_SIZE);
+        let svgf = validate("svgf", SVGF_WGSL);
+        assert_eq!(struct_span(&svgf, "SvgfParams"), std::mem::size_of::<SvgfParamsGpu>() as u64);
+        assert_eq!(struct_span(&svgf, "AtrousParams"), std::mem::size_of::<AtrousParamsGpu>() as u64);
+        assert_eq!(struct_span(&svgf, "Texel"), 24);
+    }
+
+    /// Jitter offsets cover the pixel evenly: Halton (2, 3)'s first points.
+    #[test]
+    fn halton_points() {
+        assert_eq!(halton(1, 2), 0.5);
+        assert_eq!(halton(2, 2), 0.25);
+        assert_eq!(halton(3, 2), 0.75);
+        assert!((halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]
