@@ -6,7 +6,10 @@ through the open front. One sample a pixel a frame goes through `PathTracerDenoi
 the tracer's own guide buffers, then a temporal anti-aliasing resolve), so the image stays clean
 while the camera or objects move. With the denoiser off, samples accumulate while nothing
 changes and moving the camera, an object or the light starts the accumulation again. Moved
-objects only rebuild the top-level BVH.
+objects only rebuild the top-level BVH. On the web the BVH is walked in compute; run
+natively (where the device has hardware ray queries) the same scene goes into acceleration
+structures instead (`BVHBuilder::set_backend`, picked as the RT grid's backend,
+`KANSEI_RT_BACKEND`), which the log names.
 
 Engine API: `kansei_wasm::{Canvas, run, fetch_bytes}`, `GLTFLoader::load_glb`,
 `Renderable::path_tracer_material` with `PathTracerMaterial` and `PathTracerMaterial::glass`,

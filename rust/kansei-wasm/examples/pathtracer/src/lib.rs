@@ -175,10 +175,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let mut tlas = TLASBuilder::new(&renderer);
     let gpu_data = bvh.build_full(&renderer, &scene, &mut tlas);
     log::info!(
-        "BVH built: {} triangles, {} BVH4 nodes, {} instances",
+        "BVH built: {} triangles, {} BVH4 nodes, {} instances; traced by {:?}",
         gpu_data.triangle_count,
         gpu_data.node_count,
         gpu_data.instance_count,
+        gpu_data.backend(),
     );
 
     // Create PathTracer
@@ -253,7 +254,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 ref mut denoise,
                 ref keys,
                 ref mut bvh,
-                ref bvh_data,
+                ref mut bvh_data,
                 ref mut tlas,
                 ref mut volume,
                 box_b_idx,

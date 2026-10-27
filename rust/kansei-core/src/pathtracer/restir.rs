@@ -3,6 +3,7 @@ use crate::renderers::Renderer;
 use bytemuck::{Pod, Zeroable};
 
 use super::bvh_builder::GPUBVHData;
+use crate::rt::RtBackend;
 
 /// Uniform parameters for the ReSTIR DI shader.
 ///
@@ -34,66 +35,22 @@ const PARAMS_SIZE: u64 = std::mem::size_of::<ReSTIRParams>() as u64;
 /// Reservoir stride: 3 vec4f per pixel (48 bytes).
 const RESERVOIR_VEC4_PER_PIXEL: u32 = 3;
 
-/// ReSTIR Direct Illumination.
-///
-/// Two-pass compute pipeline:
-///   1. **Generate** — streams all lights through RIS to build initial
-///      reservoirs, then merges with the previous frame's reservoir
-///      (temporal reuse).
-///   2. **Spatial** — merges with 5 random neighbor reservoirs that pass
-///      depth/normal similarity checks, then performs a shadow test and
-///      evaluates the final direct lighting contribution.
-///
-/// The reservoir data is double-buffered (ping-pong) for temporal reuse.
-pub struct ReSTIR {
+/// The ReSTIR passes for one backend of the scene.
+struct ReSTIRPipelines {
+    backend: RtBackend,
     generate_pipeline: wgpu::ComputePipeline,
     spatial_pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
-    reservoir_a: Option<wgpu::Buffer>,
-    reservoir_b: Option<wgpu::Buffer>,
-    output_tex: Option<wgpu::Texture>,
-    output_view: Option<wgpu::TextureView>,
-    params_buf: wgpu::Buffer,
-    ping: bool,
-    width: u32,
-    height: u32,
-    /// Maximum temporal history length (default 20). Higher values give
-    /// smoother results but slower convergence when lighting changes.
-    pub history_cap: u32,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
 }
 
-impl ReSTIR {
-    /// Create the ReSTIR DI pipelines and parameter buffer.
-    pub fn new(renderer: &Renderer) -> Self {
-        let device = renderer.device().clone();
-        let queue = renderer.queue().clone();
+/// The ReSTIR shader for the scene's `backend`.
+pub(crate) fn restir_wgsl(backend: RtBackend) -> String {
+    super::accel::assemble(format!("{}\n{}", super::accel::traversal_wgsl(backend, 4, None), include_str!("shaders/restir-di.wgsl")))
+}
 
-        // ── Build concatenated shader source ─────────────────────────
-        let intersection_src = include_str!("shaders/intersection.wgsl");
-        let traversal_src = include_str!("shaders/traversal.wgsl");
-        let restir_src = include_str!("shaders/restir-di.wgsl");
-
-        // BVH storage bindings injected between traversal and restir.
-        // Bindings 4-8 for triangles, bvh4_nodes, tlas_bvh4_nodes, instances.
-        let bvh_bindings = "\
-// ── BVH storage bindings (injected by ReSTIR) ────────────────────────
-@group(0) @binding(4) var<storage, read> triangles       : array<f32>;
-@group(0) @binding(5) var<storage, read> bvh4_nodes      : array<vec4f>;
-@group(0) @binding(6) var<storage, read> tlas_bvh4_nodes : array<vec4f>;
-@group(0) @binding(7) var<storage, read> instances       : array<Instance>;
-";
-
-        let shader_code = format!(
-            "{}\n{}\n{}\n{}",
-            intersection_src, traversal_src, bvh_bindings, restir_src,
-        );
-
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ReSTIR/Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-        });
+impl ReSTIRPipelines {
+    fn new(device: &wgpu::Device, backend: RtBackend) -> Self {
+        let shader_module = super::accel::shader_module(device, backend, "ReSTIR/Shader", &restir_wgsl(backend));
 
         // ── Bind group layout ────────────────────────────────────────
         //
@@ -101,171 +58,121 @@ impl ReSTIR {
         //  1: normal_tex          texture_2d<f32>
         //  2: params              uniform
         //  3: scene_lights        storage (read)
-        //  4: triangles           storage (read)
-        //  5: bvh4_nodes          storage (read)
-        //  6: tlas_bvh4_nodes     storage (read)
-        //  7: instances           storage (read)
-        //  8: materials           storage (read)  -- declared in preamble, used by shader
+        //  4-7: the scene        (`GPUBVHData::layout_entries`: triangles, BLAS nodes,
+        //                         TLAS nodes or the acceleration structure, instances)
+        //  8: materials           storage (read)  -- unused by the shader
         //  9: materials           storage (read)  -- from restir-di.wgsl binding 9
         // 10: reservoir_prev      storage (read)
         // 11: reservoir_cur       storage (read_write)
         // 12: direct_light_out    storage texture (write) -- spatial pass only
         //
-        // Note: The restir-di.wgsl declares its own bindings 0-3 and 9-12.
-        // Bindings 4-8 are injected via the preamble above.
-        // The BGL must cover bindings 0-12. Binding 8 (materials from preamble)
-        // and binding 9 (materials from restir-di.wgsl) would conflict.
-        // We resolve this by removing the duplicate materials binding from
-        // the preamble (binding 8) since the shader's own binding 9 handles it.
+        // Note: The restir-di.wgsl declares its own bindings 0-3 and 9-12;
+        // `accel::traversal_wgsl` declares 4-7.
 
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ReSTIR/BGL"),
-            entries: &[
-                // 0: depth_tex
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+        let mut entries = vec![
+            // 0: depth_tex
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                // 1: normal_tex
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 1: normal_tex
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                // 2: params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(PARAMS_SIZE),
-                    },
-                    count: None,
+                count: None,
+            },
+            // 2: params
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(PARAMS_SIZE),
                 },
-                // 3: scene_lights
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 3: scene_lights
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 4: triangles
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 8: materials (from preamble)
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 5: bvh4_nodes
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 9: materials (from restir-di.wgsl)
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 6: tlas_bvh4_nodes
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 10: reservoir_prev
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 7: instances
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 11: reservoir_cur
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
-                // 8: materials (from preamble)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 12: direct_light_out (storage texture, write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 12,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
-                // 9: materials (from restir-di.wgsl)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 10: reservoir_prev
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 11: reservoir_cur
-                wgpu::BindGroupLayoutEntry {
-                    binding: 11,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 12: direct_light_out (storage texture, write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 12,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
+                count: None,
+            },
+        ];
+        // 4-7: the scene
+        entries.extend(super::accel::traversal_layout_entries(backend, 4));
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("ReSTIR/BGL"), entries: &entries });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ReSTIR/PipelineLayout"),
@@ -293,6 +200,45 @@ impl ReSTIR {
                 cache: None,
             });
 
+        Self { backend, generate_pipeline, spatial_pipeline, bgl }
+    }
+}
+
+/// ReSTIR Direct Illumination.
+///
+/// Two-pass compute pipeline:
+///   1. **Generate** — streams all lights through RIS to build initial
+///      reservoirs, then merges with the previous frame's reservoir
+///      (temporal reuse).
+///   2. **Spatial** — merges with 5 random neighbor reservoirs that pass
+///      depth/normal similarity checks, then performs a shadow test and
+///      evaluates the final direct lighting contribution.
+///
+/// The reservoir data is double-buffered (ping-pong) for temporal reuse.
+pub struct ReSTIR {
+    /// the passes for each backend traced so far
+    pipelines: Vec<ReSTIRPipelines>,
+    reservoir_a: Option<wgpu::Buffer>,
+    reservoir_b: Option<wgpu::Buffer>,
+    output_tex: Option<wgpu::Texture>,
+    output_view: Option<wgpu::TextureView>,
+    params_buf: wgpu::Buffer,
+    ping: bool,
+    width: u32,
+    height: u32,
+    /// Maximum temporal history length (default 20). Higher values give
+    /// smoother results but slower convergence when lighting changes.
+    pub history_cap: u32,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+impl ReSTIR {
+    /// Create the ReSTIR DI pipelines and parameter buffer.
+    pub fn new(renderer: &Renderer) -> Self {
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
+
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR/Params"),
             size: PARAMS_SIZE,
@@ -301,9 +247,7 @@ impl ReSTIR {
         });
 
         Self {
-            generate_pipeline,
-            spatial_pipeline,
-            bgl,
+            pipelines: Vec::new(),
             reservoir_a: None,
             reservoir_b: None,
             output_tex: None,
@@ -380,7 +324,8 @@ impl ReSTIR {
     /// * `camera`       - Camera with current view/projection matrices
     /// * `prev_vp`      - Previous frame's view-projection (column-major f32x16)
     /// * `bvh_data`     - GPU BVH data from `BVHBuilder`
-    /// * `tlas_buf`     - TLAS BVH4 node buffer from `TLASBuilder`
+    /// * `tlas_buf`     - TLAS BVH4 node buffer from `TLASBuilder` (unused on the
+    ///                    hardware backend)
     /// * `frame_index`  - Current frame number
     #[allow(clippy::too_many_arguments)]
     pub fn run(
@@ -430,63 +375,54 @@ impl ReSTIR {
             (res_a, res_b)
         };
 
+        let backend = bvh_data.backend();
+        if !self.pipelines.iter().any(|p| p.backend == backend) {
+            self.pipelines.push(ReSTIRPipelines::new(&self.device, backend));
+        }
+        let pipelines = self.pipelines.iter().find(|p| p.backend == backend).unwrap();
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(normal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self.params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: lights_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: materials_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: materials_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: prev_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: cur_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+        ];
+        entries.extend(bvh_data.bind_group_entries(tlas_buf, 4));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ReSTIR/BG"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: lights_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: bvh_data.triangles_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: bvh_data.bvh4_nodes_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: tlas_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: bvh_data.instances_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: materials_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: materials_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: prev_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: cur_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: wgpu::BindingResource::TextureView(output_view),
-                },
-            ],
+            layout: &pipelines.bgl,
+            entries: &entries,
         });
 
         let wg_x = (self.width + 7) / 8;
@@ -498,7 +434,7 @@ impl ReSTIR {
                 label: Some("ReSTIR/Generate"),
                 timestamp_writes: crate::profiling::gpu_pass("ReSTIR/Generate").as_ref().map(crate::profiling::PassStamp::compute),
             });
-            pass.set_pipeline(&self.generate_pipeline);
+            pass.set_pipeline(&pipelines.generate_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
@@ -509,7 +445,7 @@ impl ReSTIR {
                 label: Some("ReSTIR/Spatial"),
                 timestamp_writes: crate::profiling::gpu_pass("ReSTIR/Spatial").as_ref().map(crate::profiling::PassStamp::compute),
             });
-            pass.set_pipeline(&self.spatial_pipeline);
+            pass.set_pipeline(&pipelines.spatial_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }

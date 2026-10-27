@@ -317,7 +317,7 @@ fn time(adapter: &wgpu::Adapter, args: &Args) {
     }
     let profile = s.renderer.take_profile();
     let info = s.renderer.adapter_info();
-    println!("{} ({:?}), {}x{}, scene {}, {} spp, kernel {}, {} frames", info.name, info.backend, args.width, args.height, args.scene, args.spp, args.kernel.name(), profile.gpu_frames);
+    println!("{} ({:?}), traced by {:?}, {}x{}, scene {}, {} spp, kernel {}, {} frames", info.name, info.backend, s.bvh_data.backend(), args.width, args.height, args.scene, args.spp, args.kernel.name(), profile.gpu_frames);
     let mut denoiser = 0.0;
     for p in &profile.gpu {
         println!("  {:<28} busy {:>7.3} ms  exclusive {:>7.3} ms  x{}", p.label, p.busy_ms, p.exclusive_ms, p.count);

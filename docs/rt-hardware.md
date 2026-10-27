@@ -1,4 +1,4 @@
-# Hardware ray tracing for the RT grid
+# Hardware ray tracing for the RT grid and the path tracer
 
 The ray tracing grid (`kansei_core::rt`, `Renderer::enable_rt_grid`) traces its rays in compute
 shaders: `RT_GRID_WGSL`'s `kansei_rt_trace` walks a uniform grid of the scene's triangles round
@@ -134,9 +134,55 @@ that added the backend):
   Vulkan did: Kansei's traces don't take the shape of the miscompiled one. It stays opt-in until
   the driver bug is understood.
 
-The path tracer (`pathtracer`) has its own BVH and doesn't use the grid; moving it to hardware
-ray queries is later work, as is an instanced TLAS over per-mesh BLASes that traces the whole
-scene rather than the box round the camera.
+## The path tracer
+
+The path tracer (`kansei_core::pathtracer`: `PathTracer`, `PathTracerEffect`, `ProbeGrid`,
+`ReSTIR`) traces its own scene, the whole of it, not the grid's box: `BVHBuilder` builds a BVH4 a
+mesh on the CPU and a TLAS of BVH4 nodes over the instances on the GPU, walked in compute
+(`traversal.wgsl`). On native it can go to hardware the same way: `BVHBuilder::set_backend` takes
+an `RtBackend`, resolved by the same rules (`Auto`, `KANSEI_RT_BACKEND`; `RtBackend::resolve`), and
+`upload_to_gpu` then also builds a BLAS a mesh (its primitive i the mesh's triangle i, in the
+builder's order) and a TLAS instance a scene instance (`pathtracer/accel.rs`), traced by
+`traversal_query.wgsl`'s `trace_bvh_internal` with ray queries. `GPUBVHData::backend()` says which
+it got; the tracer, the probes and ReSTIR pick their pipeline from it the first time they trace
+it, and every hit (`HitInfo`: distance, barycentrics, triangle, instance, material, normal) is the
+BVH's. The BLASes are built once; `BVHBuilder::refresh_transforms` rebuilds the TLAS when
+instances move. Metal waits for the BLASes' submit before the TLAS build, as the grid does.
+
+To trace the scene from a pass of your own, take `GPUBVHData::traversal_wgsl(first)`,
+`layout_entries(first)` and `bind_group_entries(tlas_nodes, first)`, and make the module with
+`GPUBVHData::shader_module`. On the hardware backend that module skips wgpu's ray query
+initialization tracking (`ShaderRuntimeChecks::ray_query_initialization_tracking`): the traversal
+keeps the rules itself (a ray with a NaN or an infinity, or an empty interval, misses before the
+query starts), and the tracking cost the trace about ten times over on NVIDIA's driver (1080p,
+1 spp, the Cornell box, RTX 5090: 9.3 ms a frame with it and 0.95 ms without on Vulkan, 9.6 and
+0.7 ms on DX12; the M4 Pro lost 2%). The RT grid's modules still keep it: they may gain the same
+way.
+
+`PathTracer::set_count_rays` counts the rays a trace casts (each closest-hit and any-hit query)
+for a rays-per-second figure; `cargo run --release -p kansei-native --example pathtracer_backends`
+times both backends on the web demo's Cornell box with the glass dragon (`cornell`: the
+decimated 19k-triangle `.glb`; `full`: the 871k scan), 1080p, 1 spp, 8 bounces, alternating
+blocks of frames, and a minimal kernel of a primary and a shadow ray a pixel (`PtProbe`, the
+traversal without the tracer's shading).
+
+Measured (1920x1080, 1 spp, 8 bounces; frame = median wall time with the CPU waiting for each
+frame; rays = every closest-hit and any-hit query, 5.55 M a frame on either backend; GPUs
+otherwise idle):
+
+| software → hardware | M4 Pro, Metal | RTX 5090, Vulkan | RTX 5090, DX12 (opt-in) |
+|---|---|---|---|
+| **cornell** (19k-triangle dragon), frame | 71.8 → **21.3 ms** | 13.4 → **1.01 ms** | 6.3 → **0.69 ms** |
+| trace pass, rays per second | 81 M → 272 M | 405 M → 6.5 G | 889 M → 11.1 G |
+| **full** (871k-triangle dragon), frame | 71.6 → **22.0 ms** | 15.3 → **1.05 ms** | 6.9 → **0.73 ms** |
+| trace pass, rays per second | 78 M → 263 M | 342 M → 6.1 G | 771 M → 10.5 G |
+| traversal alone (`PtProbe`, full), rays per second | 589 M → 1.6 G | 6.9 G → 44.8 G | 8.5 G → 34.7 G |
+
+- The whole frame gains 3.3x on the M4 Pro and 9-15x on the 5090. The scan's 45 times the
+  triangles cost the hardware up to 6% more, the BVH in compute up to 14%.
+- In software, DX12 runs the trace twice as fast as Vulkan on the 5090 (DXC's code against
+  naga's SPIR-V through the driver); in hardware DX12 is ahead too. DX12 stays opt-in for the
+  grid's sake (the miscompile above); the path tracer's parity tests pass there.
 
 ## Tests
 
@@ -150,3 +196,12 @@ scene rather than the box round the camera.
   queries.
 - The renderer's RT tests (`rt_reflections_gpu`, `rt_diffuse_gi_gpu`, `rt_grid_scene_gpu`) run on
   whatever `Auto` picks; `KANSEI_RT_BACKEND=software` runs them on the grid.
+- `cargo test -p kansei-core --lib pathtracer::` validates the path tracer's trace, probe and
+  ReSTIR modules for both backends with naga.
+- `cargo test -p kansei-core --test pathtracer_hw_gpu` (where the adapter has ray queries, on
+  `WGPU_BACKEND`'s backend: DX12 too) traces the Cornell box with the glass dragon through both
+  backends: 39,200 rays compared hit for hit (distance, triangle, instance, material, normal,
+  position, area, and an any-hit within a random distance), again after moving two instances
+  (`refresh_transforms`), the images of 64 samples a pixel (the same samples down the same paths:
+  well inside the noise between two sample sets), and rays with a NaN or an infinity.
+  `pathtracer_gpu` runs on whatever `Auto` picks.

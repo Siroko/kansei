@@ -18,9 +18,18 @@ use kansei_core::renderers::{GBuffer, Renderer, RendererConfig};
 const W: u32 = 64;
 const H: u32 = 64;
 
+/// The fast adapter on `WGPU_BACKEND`'s backend (the discrete GPU beside an integrated one, so the
+/// scene goes to hardware ray queries where it has them), named on stderr.
+fn adapter() -> Option<wgpu::Adapter> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
+    let info = adapter.get_info();
+    eprintln!("{} ({:?})", info.name, info.backend);
+    Some(adapter)
+}
+
 fn renderer() -> Option<Renderer> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    let adapter = adapter()?;
     let mut renderer = Renderer::new(RendererConfig::default());
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -331,8 +340,7 @@ fn traced_floor(renderer: &mut Renderer, sun: bool, frames: u32) -> [f32; 3] {
 
 #[test]
 fn the_effect_writes_the_floor_lit_by_the_scenes_lights() {
-    let instance = wgpu::Instance::default();
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+    let Some(adapter) = adapter() else { return };
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     let sky_only = traced_floor(&mut renderer, false, 8);
@@ -488,7 +496,7 @@ fn guides_hold_the_surface_and_its_motion() {
     r.object.set_position(0.3, -0.1, 0.0);
     r.object.update_model_matrix();
     r.object.update_world_matrix(None);
-    f.bvh.refresh_transforms(&f.renderer, &f.scene, &f.data, &mut f.tlas);
+    f.bvh.refresh_transforms(&f.renderer, &f.scene, &mut f.data, &mut f.tlas);
     f.trace(None);
     let m = half(f.surface()[c][2], false);
     assert!((m - shift).abs() < 0.002, "object motion {m}, expected {shift}");
