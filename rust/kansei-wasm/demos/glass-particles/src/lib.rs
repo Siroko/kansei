@@ -52,7 +52,7 @@ use kansei_core::materials::{Binding, BindingResource, Compute, GradientSkyOptio
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
-    exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DistanceFogColor, DistanceFogEffect, SSAOAmbient, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
+    exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, ContactAoEffect, ContactAoOptions, DistanceFogColor, DistanceFogEffect, SSAOAmbient, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
     ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
@@ -518,6 +518,15 @@ struct Settings {
     ao_radius: f32,
     ao_bias: f32,
     ao_samples: u32,
+    /// The contact darkening after the glass (`ContactAoEffect`): its reach (m), strength (the
+    /// exponent on the open share), falloff, samples, and the occlusion alone in place of the
+    /// image.
+    contact_ao: bool,
+    cao_radius: f32,
+    cao_strength: f32,
+    cao_falloff: f32,
+    cao_samples: u32,
+    cao_view: bool,
     /// The glass's pass (off: the repellers drawn as polished grey solids); the screen-space
     /// glass's ball (m), its depth behind (m) and dispersion; the ray traced glass's surfaces.
     glass_pass: bool,
@@ -633,6 +642,12 @@ impl Settings {
             ao_radius: 0.25,
             ao_bias: 0.003,
             ao_samples: 16,
+            contact_ao: false,
+            cao_radius: 0.3,
+            cao_strength: 2.5,
+            cao_falloff: 1.0,
+            cao_samples: 12,
+            cao_view: false,
             glass_pass: true,
             ss_thickness: 0.8,
             ss_behind: 2.0,
@@ -729,7 +744,8 @@ impl Settings {
             "skyUp" => sky_up, "skyDown" => sky_down, "reflections" => reflections, "ao" => ao, "gridSpacing" => grid_spacing, "gridMajorEvery" => grid_major_every, "gridMinorWidth" => grid_minor_width, "gridMajorWidth" => grid_major_width,
             "gridCrossWidth" => grid_cross_width, "gridCrossArm" => grid_cross_arm, "paused" => paused,
             "fade" => fade, "fadeStart" => fade_start, "fadeEnd" => fade_end,
-            "ssao" => ssao, "aoRadius" => ao_radius, "aoBias" => ao_bias, "aoSamples" => ao_samples, "glassPass" => glass_pass, "ssThickness" => ss_thickness,
+            "ssao" => ssao, "aoRadius" => ao_radius, "aoBias" => ao_bias, "aoSamples" => ao_samples, "contactAo" => contact_ao, "caoRadius" => cao_radius,
+            "caoStrength" => cao_strength, "caoFalloff" => cao_falloff, "caoSamples" => cao_samples, "caoView" => cao_view, "glassPass" => glass_pass, "ssThickness" => ss_thickness,
             "ssBehind" => ss_behind, "ssDispersion" => ss_dispersion, "glassInterfaces" => glass_interfaces, "reflIntensity" => refl_intensity,
             "reflDistance" => refl_distance, "reflQuarter" => refl_quarter, "reflBlend" => refl_blend, "fog" => fog, "fogFalloff" => fog_falloff,
             "fogAmbient" => fog_ambient, "fogSteps" => fog_steps, "taa" => taa, "taaFeedbackMax" => taa_feedback_max, "taaFeedbackMin" => taa_feedback_min,
@@ -790,6 +806,12 @@ impl Settings {
             "aoRadius" => self.ao_radius = v.max(0.01),
             "aoBias" => self.ao_bias = v.max(0.0),
             "aoSamples" => self.ao_samples = (v.round() as u32).clamp(1, 32),
+            "contactAo" => self.contact_ao = v != 0.0,
+            "caoRadius" => self.cao_radius = v.max(0.005),
+            "caoStrength" => self.cao_strength = v.max(0.0),
+            "caoFalloff" => self.cao_falloff = v.max(0.0),
+            "caoSamples" => self.cao_samples = (v.round() as u32).clamp(1, 32),
+            "caoView" => self.cao_view = v != 0.0,
             "glassPass" => self.glass_pass = v != 0.0,
             "ssThickness" => self.ss_thickness = v.max(0.01),
             "ssBehind" => self.ss_behind = v.max(0.0),
@@ -1158,6 +1180,11 @@ fn ssao_options(s: &Settings) -> SSAOOptions {
     SSAOOptions { radius: s.ao_radius, bias: s.ao_bias, kernel_size: s.ao_samples, strength: s.ao, ambient }
 }
 
+/// The contact darkening's settings.
+fn contact_ao_options(s: &Settings) -> ContactAoOptions {
+    ContactAoOptions { radius: s.cao_radius, strength: s.cao_strength, falloff: s.cao_falloff, samples: s.cao_samples, ..Default::default() }
+}
+
 fn look(settings: &Settings, dt: f32) -> LookGpu {
     LookGpu { roughness: settings.roughness, metallic: settings.metallic, dt, _pad: 0.0, sky_up: sky_rgb(settings.sky_up), sky_down: sky_rgb(settings.sky_down) }
 }
@@ -1342,6 +1369,15 @@ impl State {
             o.chromatic_aberration = s.chromatic;
         }
         let total = self.volume.effect::<ToneMapEffect>().map_or(exposure, |t| t.total_exposure());
+        // the contact darkening; its occlusion alone shown about mid grey at the exposure, with
+        // the passes that would cloud it (the fade, the mist, depth of field, bloom) left out
+        let cao_view = s.contact_ao && s.cao_view;
+        self.volume.set_enabled::<ContactAoEffect>(s.contact_ao);
+        if let Some(cao) = self.volume.effect_mut::<ContactAoEffect>() {
+            cao.options = contact_ao_options(&s);
+            cao.show_occlusion = cao_view;
+            cao.debug_white = 0.5 / total.max(1e-9);
+        }
         let taa_back = s.taa && !self.volume.is_enabled::<TemporalAAEffect>();
         self.volume.set_enabled::<TemporalAAEffect>(s.taa);
         if let Some(taa) = self.volume.effect_mut::<TemporalAAEffect>() {
@@ -1350,20 +1386,21 @@ impl State {
                 taa.reset_history();
             }
         }
-        self.volume.set_enabled::<BloomEffect>(s.bloom_on);
+        self.volume.set_enabled::<BloomEffect>(s.bloom_on && !cao_view);
         if let Some(bloom) = self.volume.effect_mut::<BloomEffect>() {
             bloom.exposure = total;
             bloom.options = BloomOptions { threshold: s.bloom_threshold, knee: s.bloom_knee, intensity: s.bloom, radius: s.bloom_radius, use_emissive: s.bloom_emissive };
         }
-        self.volume.set_enabled::<DistanceFogEffect>(s.fade);
+        self.volume.set_enabled::<DistanceFogEffect>(s.fade && !cao_view);
         if let Some(fade) = self.volume.effect_mut::<DistanceFogEffect>() {
             fade.start = s.fade_start;
             fade.end = s.fade_end;
             fade.color = DistanceFogColor::GradientSky { sky: backdrop_sky(&s), centre: Vec3::ZERO, radius: DOME_RADIUS };
             fade.from_point = Some(Vec3::ZERO);
         }
-        let fog_back = s.fog && !self.volume.is_enabled::<VolumetricFogEffect>();
-        self.volume.set_enabled::<VolumetricFogEffect>(s.fog);
+        let fog_on = s.fog && !cao_view;
+        let fog_back = fog_on && !self.volume.is_enabled::<VolumetricFogEffect>();
+        self.volume.set_enabled::<VolumetricFogEffect>(fog_on);
         if let Some(fog) = self.volume.effect_mut::<VolumetricFogEffect>() {
             fog.base_density = s.fog_density;
             fog.anisotropy = s.fog_anisotropy;
@@ -1378,7 +1415,7 @@ impl State {
             fog.update_lights(self.scene.lights());
         }
         self.renderer.set_render_scale(s.render_scale);
-        self.volume.set_enabled::<CinematicDepthOfFieldEffect>(s.dof);
+        self.volume.set_enabled::<CinematicDepthOfFieldEffect>(s.dof && !cao_view);
         if let Some(dof) = self.volume.effect_mut::<CinematicDepthOfFieldEffect>() {
             dof.lens.f_stop = s.f_stop;
             dof.lens.blade_count = s.dof_blades;
@@ -1488,6 +1525,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     settings.dof = flag("dof", true);
     settings.fog = flag("fog", true);
     settings.fade = flag("fade", true);
+    settings.contact_ao = flag("contactao", false);
+    settings.cao_view = flag("aoview", false);
     settings.glass_mode = param_or("glassmode", 0u32).min(1);
     settings.render_scale = param_or("scale", 1.0f32).clamp(0.25, 1.0);
 
@@ -1594,8 +1633,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     let spot = scene.add(SceneNode::Light(Light::Spot(spot_light(&settings))));
 
-    // the chain: SSAO, the ray traced glass and reflections, the screen-space glass, the mist,
-    // TAA, depth of field, bloom, the tone mapper; each pass on or off (`set_enabled`) by `apply`
+    // the chain: SSAO, the ray traced glass and reflections, the screen-space glass, the contact
+    // darkening, the distance fade, the mist, TAA, depth of field, bloom, the tone mapper; each
+    // pass on or off (`set_enabled`) by `apply`
     let tone = {
         let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
         options.exposure = exposure_from_ev100(settings.ev100);
@@ -1613,6 +1653,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         effects.push(Box::new(rt));
     }
     effects.push(Box::new(ScreenSpaceGlassEffect::new(ScreenSpaceGlassOptions::default())));
+    effects.push(Box::new(ContactAoEffect::new(contact_ao_options(&settings))));
     // the far floor fades into the backdrop behind it, so it never ends on a line
     effects.push(Box::new(DistanceFogEffect::new(settings.fade_start, settings.fade_end, DistanceFogColor::Constant([0.0; 3]))));
     {

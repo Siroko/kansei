@@ -6,7 +6,8 @@ technical grid, under a spot light from above. Curl noise carries them, so the f
 glass pushes them off by its distance fields; the pointer pushes them along its motion. A share
 of them glow, and only those bloom. The glass refracts and reflects the particles, the floor's
 grid, the lamp and the environment; the particles and the glass shadow the floor and streak the
-beam in the mist; depth of field, TAA and SSAO finish the frame. Three lighting presets, six
+beam in the mist; depth of field, TAA and SSAO finish the frame (or a stylised contact
+darkening, `ContactAoEffect`, on the panel). Three lighting presets, six
 palettes, and Tone.js sounds the emitters and the particles brushing the glass.
 
 Engine API: `kansei_wasm::{Canvas, run, launch, param, param_or, flag, now}` and its performance
@@ -22,7 +23,8 @@ albedo and glow from its instance record, packed by `rt::RT_EMISSION_WGSL` and
 `rt::pack_emission`), `Renderable::rt_placement` (`RtPlacement::Wgsl`); `RtReflectionsEffect`
 (`set_glass`, `reflections`, `set_spot_lights`, `set_sky_lighting` with
 `gi::gradient_sky_lighting`, `RtReflectionsOptions::albedo_wgsl` for the floor's grid where the
-rays meet it); `ScreenSpaceGlassEffect`, `SSAOEffect`, `DistanceFogEffect`
+rays meet it); `ScreenSpaceGlassEffect`, `SSAOEffect`, `ContactAoEffect` (`show_occlusion`,
+`debug_white`), `DistanceFogEffect`
 (`DistanceFogColor::GradientSky`, `from_point`), `VolumetricFogEffect`
 (`SpotScattering::Raymarched`), `TemporalAAEffect`, `CinematicDepthOfFieldEffect`, `BloomEffect`
 with `BloomOptions::use_emissive`, `ToneMapEffect` in a `PostProcessingVolume`;
@@ -50,6 +52,7 @@ grid, the lighting presets, the palettes, the page's panel and its sounds.
 | `glassmode=1` | the glass in screen space (`ScreenSpaceGlassEffect`) instead of ray traced |
 | `glass=0` | the repellers drawn grey instead of glass: no ray tracing grid, voxels or reflections |
 | `fog=0`, `dof=0`, `fade=0` | no mist, no depth of field, no distance fade |
+| `contactao=1`, `aoview=1` | the contact darkening on (off by default); its occlusion alone |
 | `scale=<0.25..1>` | render scale: the scene's passes at that share of the canvas, the TAA upscaling |
 | `perf=0` | no performance overlay (shown by default; the backquote key toggles it) |
 | `ui=0` | hide the panel |
@@ -66,6 +69,8 @@ repellers (reach and push of their fields, bounce, whether they cast shadows); t
 look; the floor grid (colours, spacing, line widths); the light and the environment; and a
 Post-processing folder with one folder a pass, in the chain's order: SSAO, the glass (ray traced
 or screen space; off, the repellers are polished grey solids), the floor's reflections, the
+contact AO (`ContactAoEffect`, off by default: its reach, strength, falloff and samples, and "AO
+only", which shows its occlusion with the fade, the mist, depth of field and bloom left out), the
 distance fade (`DistanceFogEffect`: the floor fades into the backdrop behind it between a start and
 an end distance from the scene's centre, all of it by the dome, so it never ends on a line), the
 volumetric fog, TAA (and the render scale), depth of field, bloom and the tone mapper. Each has an
