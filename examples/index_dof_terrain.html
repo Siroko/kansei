@@ -73,10 +73,12 @@
     // Light sits top-right of the scene: high Y, positive X, slightly back.
     // Light data is baked as WGSL constants. The whole field is one instanced draw: each instance is a column
     // (x, start z, height), and the vertex shader scrolls it along Z by the shared offset, wrapping it to the back.
+    // the columns' ambient light: the share of their albedo they show away from the light (SSAO darkens it)
+    const AMBIENT = 0.12;
     const lambertShader = /* wgsl */`
       // World-space light position (top-right of the scene).
       const LIGHT_POS : vec3f = vec3f(80.0, 150.0, -60.0);
-      const AMBIENT   : f32   = 0.12;
+      const AMBIENT   : f32   = ${AMBIENT.toFixed(4)};
       const BASE_COLOR: vec3f = vec3f(1.0, 1.0, 1.0);
       const LIGHT_COLOR: vec3f = vec3f(1.0, 0.62, 0.3);
       const MAX_Z     : f32   = ${(GRID_HALF + GRID_SPACING).toFixed(4)};
@@ -136,7 +138,7 @@
           vec4f(BASE_COLOR * lighting + glow, 1.0),
           vec4f(glow, 1.0),
           vec4f(frag.worldNormal * 0.5 + 0.5, 1.0),
-          vec4f(BASE_COLOR, 0.0)
+          vec4f(BASE_COLOR, 1.0)
         );
       }
     `;
@@ -217,9 +219,9 @@
     // ── Post-processing volume ────────────────────────────────────────────────
     const ssaoEffect = new SSAOEffect({
       radius: 0.8,
-      bias: 0.02,
-      kernelSize: 64,
-      strength: 0.5
+      kernelSize: 32,
+      strength: 0.5,
+      ambient: { kind: 'hemisphere', up: [AMBIENT, AMBIENT, AMBIENT], down: [AMBIENT, AMBIENT, AMBIENT] },
     });
     // The cinematic DoF's circle of confusion follows from a physical lens (thin-lens equation). A 150-unit terrain
     // seen through a lens that frames it would be nearly all in focus, so the lens is a long one, set apart from the

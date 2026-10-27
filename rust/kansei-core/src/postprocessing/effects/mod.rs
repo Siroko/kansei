@@ -25,7 +25,7 @@ pub use fluid_surface::{FluidMask, FluidSurfaceEffect, FluidSurfaceOptions};
 pub use height_fog::{HeightFogEffect, HeightFogLayer};
 pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
 pub use screen_space_glass::{ScreenSpaceGlassEffect, ScreenSpaceGlassOptions};
-pub use ssao::{SSAOEffect, SSAOOptions};
+pub use ssao::{SSAOAmbient, SSAOEffect, SSAOOptions};
 pub use ssgi::{GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions};
 pub use taa::{TemporalAAEffect, TemporalAAOptions};
 pub use tonemap::{

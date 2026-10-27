@@ -64,6 +64,7 @@ export { PostProcessingEffect } from "./postprocessing/PostProcessingEffect";
 export { PostProcessingVolume, halton, jitterPhases } from "./postprocessing/PostProcessingVolume";
 export type { PostProcessingVolumeOptions } from "./postprocessing/PostProcessingVolume";
 export { SSAOEffect } from "./postprocessing/effects/SSAOEffect";
+export type { SSAOAmbient, SSAOOptions } from "./postprocessing/effects/SSAOEffect";
 export { DepthOfFieldEffect } from "./postprocessing/effects/DepthOfFieldEffect";
 export { CinematicDepthOfFieldEffect, CameraLens, DofDebugView } from "./postprocessing/effects/CinematicDepthOfFieldEffect";
 export type { CinematicDepthOfFieldOptions, CameraLensOptions, HighlightOptions } from "./postprocessing/effects/CinematicDepthOfFieldEffect";

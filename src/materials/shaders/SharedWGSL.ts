@@ -33,6 +33,11 @@ import ssgiTrace from '../../../rust/kansei-core/src/shaders/ssgi_trace.wgsl?raw
 import ssgiTemporal from '../../../rust/kansei-core/src/shaders/ssgi_temporal.wgsl?raw';
 import ssgiComposite from '../../../rust/kansei-core/src/shaders/ssgi_composite.wgsl?raw';
 import skyLighting from '../../../rust/kansei-core/src/atmosphere/shaders/sky_lighting.wgsl?raw';
+import ssaoCommon from '../../../rust/kansei-core/src/shaders/ssao_common.wgsl?raw';
+import ssao from '../../../rust/kansei-core/src/shaders/ssao.wgsl?raw';
+import ssaoBlur from '../../../rust/kansei-core/src/shaders/ssao_blur.wgsl?raw';
+import ssaoBlurX from '../../../rust/kansei-core/src/shaders/ssao_blur_x.wgsl?raw';
+import ssaoComposite from '../../../rust/kansei-core/src/shaders/ssao_composite.wgsl?raw';
 
 /**
  * The directional shadow map and point-light cube shadow (group 3 bindings 0-3):
@@ -94,6 +99,16 @@ export const MOTION_BLUR_GATHER_WGSL: string = `${motionBlurCommon}\n${motionBlu
 export const SSGI_TRACE_WGSL: string = `${ssgiCommon}${ssgiNormal}${ssgiTrace}`;
 export const SSGI_TEMPORAL_WGSL: string = `${ssgiCommon}${ssgiTemporal}`;
 export const SSGI_COMPOSITE_WGSL: string = `${ssgiCommon}${ssgiNormal}${skyLighting}${ssgiComposite}`;
+
+/**
+ * `SSAOEffect`'s three passes, each with `SSAOParams` (336 bytes), the depth and the normal at
+ * group 0 bindings 0-2: the occlusion, the blur across, and the blur down with the composite
+ * (with the `SkyLighting` uniform at binding 7). Rust: `postprocessing/effects/ssao.rs`'s
+ * `ao_source`, `blur_source` and `composite_source`.
+ */
+export const SSAO_WGSL: string = `${ssaoCommon}${ssao}`;
+export const SSAO_BLUR_WGSL: string = `${ssaoCommon}${ssaoBlur}${ssaoBlurX}`;
+export const SSAO_COMPOSITE_WGSL: string = `${ssaoCommon}${skyLighting}${ssaoBlur}${ssaoComposite}`;
 
 /**
  * The GBuffer's four colour targets for a fragment shader (`KanseiGBufferOut`): return
