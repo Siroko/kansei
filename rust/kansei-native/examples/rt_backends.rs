@@ -376,6 +376,8 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
             .collect();
         println!("| {label} | {} |", cells.join(" | "));
     }
+    // (no teardown: on Vulkan this run's device didn't finish dropping, whichever backend)
+    std::mem::forget(renderer);
 }
 
 fn median(v: &[f64]) -> f64 {
@@ -397,4 +399,5 @@ fn main() {
         let (args, adapter) = (args.clone(), adapter.clone());
         std::thread::spawn(move || run(kind, &args, &adapter)).join().expect("scene");
     }
+    std::process::exit(0);
 }
