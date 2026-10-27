@@ -65,7 +65,7 @@
         const denoise = {
             mode: query.get('denoise') ?? 'svgf',
             view: query.get('view') ?? 'final',
-            kernel: query.get('kernel') ?? '5x5',
+            kernel: query.get('kernel') ?? '3x3',
             iterations: Number(query.get('iterations') ?? 5),
             alpha: 0.2,
             phiColor: 4,

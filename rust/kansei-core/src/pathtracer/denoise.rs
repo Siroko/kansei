@@ -30,10 +30,11 @@ pub enum PathTracerDenoiseMode {
 /// The a-trous wavelet's kernel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PathTracerDenoiseKernel {
-    /// 3 x 3 taps (1-2-1).
+    /// 3 x 3 taps (1-2-1): under half the 5 x 5's taps, and as good or better on the path
+    /// tracer's scenes (measured against references at 1 and 4 spp).
+    #[default]
     Three,
     /// 5 x 5 taps (the B3 spline, SVGF's).
-    #[default]
     Five,
 }
 
@@ -362,7 +363,7 @@ impl PathTracerDenoise {
         Self {
             mode: PathTracerDenoiseMode::Svgf,
             view: PathTracerDenoiseView::Final,
-            kernel: PathTracerDenoiseKernel::Five,
+            kernel: PathTracerDenoiseKernel::Three,
             iterations: 5,
             feedback_iteration: 0,
             alpha_color: 0.2,

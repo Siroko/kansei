@@ -259,7 +259,7 @@ fn settings(renderer: &Renderer) -> Vec<(&'static str, PathTracerDenoise)> {
     vec![
         ("temporal", make(&|d| d.mode = PathTracerDenoiseMode::Temporal)),
         ("svgf", make(&|_| {})),
-        ("svgf-3x3", make(&|d| d.kernel = PathTracerDenoiseKernel::Three)),
+        ("svgf-5x5", make(&|d| d.kernel = PathTracerDenoiseKernel::Five)),
         ("svgf-no-taa", make(&|d| d.taa = false)),
         ("svgf-alpha0.1", make(&|d| d.alpha_color = 0.1)),
         ("svgf-clamp2", make(&|d| d.clamp_sigma = 2.0)),
