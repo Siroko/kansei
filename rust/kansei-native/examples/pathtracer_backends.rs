@@ -11,7 +11,8 @@
 //! the frame's wall time (the CPU waiting for each frame's GPU work), the trace pass's GPU time
 //! (the profiler's `PathTracer/Trace`), the rays a frame casts (each closest-hit and any-hit query,
 //! counted in separate frames by `PathTracer::set_count_rays`), and rays per second over the trace
-//! pass's time.
+//! pass's time. And the traversal alone, apart from the tracer's shading: a kernel that traces a
+//! primary ray a pixel and, from what it hits, a shadow ray towards the sun (`PtProbe`).
 //!
 //! ```text
 //! cargo run --release -p kansei-native --example pathtracer_backends -- [cornell|full|all] [--backend both|software|hardware] [--size WxH] [--spp N] [--bounces N] [--rounds N] [--frames N]
@@ -114,6 +115,90 @@ struct Totals {
     trace_ms: f64,
     traces: usize,
     rays: Vec<u32>,
+    probe_ms: f64,
+    probes: usize,
+    probe_rays: u32,
+}
+
+/// The traversal alone: a primary ray a pixel and a shadow ray from its hit towards the sun,
+/// through `data`'s backend, writing 0 (sky), 1 (lit) or 2 (shadowed) a pixel.
+struct Probe {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    params: wgpu::Buffer,
+    out: wgpu::Buffer,
+}
+
+impl Probe {
+    fn new(renderer: &Renderer, data: &kansei_core::pathtracer::GPUBVHData, camera: &Camera, sun: Vec3, (w, h): (u32, u32)) -> Self {
+        let device = renderer.device();
+        let code = kansei_core::rt::hoist_wgsl_enables(&format!(
+            "{}\n\
+             struct ProbeParams {{ inv_view_proj : mat4x4f, eye : vec4f, sun : vec4f, size : vec4u }}\n\
+             @group(0) @binding(4) var<uniform> pp : ProbeParams;\n\
+             @group(0) @binding(5) var<storage, read_write> probe_out : array<u32>;\n\
+             @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) gid : vec3u) {{\n\
+                 if (gid.x >= pp.size.x || gid.y >= pp.size.y) {{ return; }}\n\
+                 let uv = (vec2f(gid.xy) + 0.5) / vec2f(pp.size.xy);\n\
+                 let far = pp.inv_view_proj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);\n\
+                 var ray : Ray;\n\
+                 ray.origin = pp.eye.xyz;\n\
+                 ray.dir = normalize(far.xyz / far.w - pp.eye.xyz);\n\
+                 let hit = trace_bvh(ray);\n\
+                 var v = 0u;\n\
+                 if (hit.hit) {{\n\
+                     var shadow : Ray;\n\
+                     shadow.origin = hit.world_pos + hit.world_norm * 1e-3;\n\
+                     shadow.dir = pp.sun.xyz;\n\
+                     v = select(1u, 2u, trace_bvh_shadow(shadow, 1e30));\n\
+                 }}\n\
+                 probe_out[gid.y * pp.size.x + gid.x] = v;\n\
+             }}",
+            data.traversal_wgsl(0)
+        ));
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("PtProbe"), source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let buffer = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let mut entries = data.layout_entries(0);
+        entries.extend([buffer(4, wgpu::BufferBindingType::Uniform), buffer(5, wgpu::BufferBindingType::Storage { read_only: false })]);
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("PtProbe"), entries: &entries });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("PtProbe"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("PtProbe"), layout: Some(&pipeline_layout), module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let inv = camera.projection_matrix.mul(&camera.view_matrix).inverse();
+        let eye = camera.position();
+        let to_sun = (-sun.to_glam()).normalize();
+        let mut words = [0u32; 28];
+        words[..16].copy_from_slice(bytemuck::cast_slice(inv.as_slice()));
+        words[16..19].copy_from_slice(bytemuck::cast_slice(&[eye.x, eye.y, eye.z]));
+        words[20..23].copy_from_slice(bytemuck::cast_slice(&[to_sun.x, to_sun.y, to_sun.z]));
+        words[24] = w;
+        words[25] = h;
+        let params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("PtProbe"), size: 112, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        renderer.queue().write_buffer(&params, 0, bytemuck::cast_slice(&words));
+        let out = device.create_buffer(&wgpu::BufferDescriptor { label: Some("PtProbe"), size: (w * h * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        Self { pipeline, layout, params, out }
+    }
+
+    fn run(&self, renderer: &Renderer, data: &kansei_core::pathtracer::GPUBVHData, tlas: &TLASBuilder, (w, h): (u32, u32)) {
+        let mut entries = data.bind_group_entries(tlas.tlas_nodes_buf.as_ref().unwrap(), 0);
+        entries.push(wgpu::BindGroupEntry { binding: 4, resource: self.params.as_entire_binding() });
+        entries.push(wgpu::BindGroupEntry { binding: 5, resource: self.out.as_entire_binding() });
+        let group = renderer.device().create_bind_group(&wgpu::BindGroupDescriptor { label: Some("PtProbe"), layout: &self.layout, entries: &entries });
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        {
+            let stamp = kansei_core::profiling::gpu_pass("PtProbe");
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("PtProbe"), timestamp_writes: stamp.as_ref().map(kansei_core::profiling::PassStamp::compute) });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+
+    /// The rays the last run cast: a pixel's primary ray, and a shadow ray where it hit.
+    fn rays(&self, renderer: &Renderer, (w, h): (u32, u32)) -> u32 {
+        let v: Vec<u32> = renderer.read_back_buffer_sync(&self.out, (w * h * 4) as u64);
+        w * h + v.iter().filter(|&&v| v != 0).count() as u32
+    }
 }
 
 fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
@@ -149,6 +234,8 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
     tracer.set_max_bounces(args.bounces);
     tracer.set_materials(&materials);
     let lights = tracer.set_lights_from_scene(&scene);
+    let sun = scene.lights().find_map(|l| if let Light::Directional(d) = l { Some(d.direction) } else { None }).unwrap();
+    let probes: Vec<Probe> = scenes.iter().map(|(data, _)| Probe::new(&renderer, data, &camera, sun, (w, h))).collect();
 
     renderer.set_profiling(true);
     let mut totals: Vec<Totals> = args.backends.iter().map(|_| Totals::default()).collect();
@@ -168,11 +255,27 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
                     totals[b].wall.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
             }
-            let profile = renderer.take_profile();
-            for p in profile.gpu.iter().filter(|p| p.label == "PathTracer/Trace") {
-                totals[b].trace_ms += p.busy_ms;
-                totals[b].traces += 1;
+            // the traversal alone
+            for _ in 0..args.frames {
+                probes[b].run(&renderer, data, tlas, (w, h));
+                renderer.end_profiled_frame();
+                let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
             }
+            let profile = renderer.take_profile();
+            for p in &profile.gpu {
+                match p.label {
+                    "PathTracer/Trace" => {
+                        totals[b].trace_ms += p.busy_ms;
+                        totals[b].traces += 1;
+                    }
+                    "PtProbe" => {
+                        totals[b].probe_ms += p.busy_ms;
+                        totals[b].probes += 1;
+                    }
+                    _ => {}
+                }
+            }
+            totals[b].probe_rays = probes[b].rays(&renderer, (w, h));
             let t = &totals[b];
             eprintln!("  block {round} {:?}: wall {:.2} ms", args.backends[b], median(&t.wall[t.wall.len() - args.frames..]));
         }
@@ -204,6 +307,9 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
     println!("| rays a frame | {} |", totals.iter().map(|t| format!("{:.2} M", rays(t) / 1e6)).collect::<Vec<_>>().join(" | "));
     println!("| rays per second (trace pass) | {} |", totals.iter().map(|t| format!("{:.0} M", rays(t) / trace(t) / 1e3)).collect::<Vec<_>>().join(" | "));
     println!("| rays per second (frame) | {} |", totals.iter().map(|t| format!("{:.0} M", rays(t) / median(&t.wall) / 1e3)).collect::<Vec<_>>().join(" | "));
+    let probe = |t: &Totals| t.probe_ms / t.probes.max(1) as f64;
+    println!("| traversal alone (PtProbe: {:.2} M rays) | {} |", totals[0].probe_rays as f64 / 1e6, totals.iter().map(|t| format!("{:.3} ms", probe(t))).collect::<Vec<_>>().join(" | "));
+    println!("| rays per second (traversal alone) | {} |", totals.iter().map(|t| format!("{:.0} M", t.probe_rays as f64 / probe(t) / 1e3)).collect::<Vec<_>>().join(" | "));
     // (no teardown: on Vulkan a device didn't always finish dropping; see rt_backends)
     std::mem::forget(scenes);
     std::mem::forget(tracer);
