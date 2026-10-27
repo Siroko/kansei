@@ -120,15 +120,14 @@ fn next_random() -> f32 {
 // ── Orthonormal basis ───────────────────────────────────────────────────────
 // Robust ONB from normal (Duff et al. 2017, Frisvad 2012 revised).
 // Branchless, no cross products, numerically stable for all directions.
+// Written through pointers: naga 24's HLSL cannot return an array (FXC and DXC reject it).
 
-fn build_onb(n: vec3f) -> array<vec3f, 2> {
+fn build_onb(n: vec3f, tangent: ptr<function, vec3f>, bitangent: ptr<function, vec3f>) {
     let s = select(-1.0, 1.0, n.z >= 0.0);
     let a = -1.0 / (s + n.z);
     let b = n.x * n.y * a;
-    return array<vec3f, 2>(
-        vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x),
-        vec3f(b, s + n.y * n.y * a, -n.y),
-    );
+    *tangent = vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+    *bitangent = vec3f(b, s + n.y * n.y * a, -n.y);
 }
 
 // ── Sampling functions ──────────────────────────────────────────────────────
@@ -138,9 +137,9 @@ fn cosine_sample_hemisphere(n: vec3f, r1: f32, r2: f32) -> vec3f {
     let cos_theta = sqrt(1.0 - r2);
     let sin_theta = sqrt(r2);
 
-    let tb = build_onb(n);
-    let tangent = tb[0];
-    let bitangent = tb[1];
+    var tangent: vec3f;
+    var bitangent: vec3f;
+    build_onb(n, &tangent, &bitangent);
 
     return normalize(
         tangent * cos(phi) * sin_theta +
@@ -155,9 +154,9 @@ fn sample_ggx(n: vec3f, roughness: f32, r1: f32, r2: f32) -> vec3f {
     let cos_theta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
     let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
 
-    let tb = build_onb(n);
-    let tangent = tb[0];
-    let bitangent = tb[1];
+    var tangent: vec3f;
+    var bitangent: vec3f;
+    build_onb(n, &tangent, &bitangent);
 
     let h = normalize(
         tangent * cos(phi) * sin_theta +

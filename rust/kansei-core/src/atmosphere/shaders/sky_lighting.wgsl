@@ -18,12 +18,18 @@ struct SkyLighting {
     distantSkyLight : vec4f,             // the sky's mean radiance from 6 km up (Unreal's distant sky light)
 }
 
-fn skyShBasis(d: vec3f) -> array<f32, 9> {
-    return array<f32, 9>(
-        0.282095,
-        0.488603 * d.y, 0.488603 * d.z, 0.488603 * d.x,
-        1.092548 * d.x * d.y, 1.092548 * d.y * d.z, 0.315392 * (3.0 * d.z * d.z - 1.0),
-        1.092548 * d.x * d.z, 0.546274 * (d.x * d.x - d.y * d.y));
+// The basis is written through a pointer: naga 24's HLSL declares a function returning an array
+// as returning a scalar, which FXC and DXC reject.
+fn skyShBasis(d: vec3f, y: ptr<function, array<f32, 9>>) {
+    (*y)[0] = 0.282095;
+    (*y)[1] = 0.488603 * d.y;
+    (*y)[2] = 0.488603 * d.z;
+    (*y)[3] = 0.488603 * d.x;
+    (*y)[4] = 1.092548 * d.x * d.y;
+    (*y)[5] = 1.092548 * d.y * d.z;
+    (*y)[6] = 0.315392 * (3.0 * d.z * d.z - 1.0);
+    (*y)[7] = 1.092548 * d.x * d.z;
+    (*y)[8] = 0.546274 * (d.x * d.x - d.y * d.y);
 }
 
 // Sum of sh[i] * basis[i] * band[l(i)]: the SH convolved with a zonal kernel given per band.

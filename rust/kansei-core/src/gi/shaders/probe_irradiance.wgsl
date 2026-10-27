@@ -13,7 +13,8 @@
 
 // A probe's irradiance toward `n`.
 fn kanseiProbeShIrradiance(slot: u32, n: vec3f) -> vec3f {
-    let y = probeShBasis(n);
+    var y: array<f32, 9>;
+    probeShBasis(n, &y);
     var e = vec3f(0.0);
     for (var i = 0u; i < PROBE_SH_WORDS; i++) {
         e += kansei_probe_sh[slot * PROBE_SH_WORDS + i].rgb * y[i];

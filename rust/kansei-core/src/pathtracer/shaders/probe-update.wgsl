@@ -27,19 +27,18 @@ struct ProbeUpdateParams {
 const SH_STRIDE = 9u;
 const PI = 3.14159265;
 
-fn compute_sh_basis(d: vec3f) -> array<f32, 9> {
+// Written through a pointer: naga 24's HLSL cannot return an array (FXC and DXC reject it).
+fn compute_sh_basis(d: vec3f, sh: ptr<function, array<f32, 9>>) {
     let x = d.x; let y = d.y; let z = d.z;
-    var sh: array<f32, 9>;
-    sh[0] = 0.282095;                      // Y00  = 1/(2*sqrt(pi))
-    sh[1] = 0.488603 * y;                  // Y1-1 = sqrt(3/(4pi)) * y
-    sh[2] = 0.488603 * z;                  // Y10  = sqrt(3/(4pi)) * z
-    sh[3] = 0.488603 * x;                  // Y11  = sqrt(3/(4pi)) * x
-    sh[4] = 1.092548 * x * y;              // Y2-2 = sqrt(15/(4pi)) * xy
-    sh[5] = 1.092548 * y * z;              // Y2-1 = sqrt(15/(4pi)) * yz
-    sh[6] = 0.315392 * (3.0 * z * z - 1.0); // Y20  = sqrt(5/(16pi)) * (3z^2-1)
-    sh[7] = 1.092548 * x * z;              // Y21  = sqrt(15/(4pi)) * xz
-    sh[8] = 0.546274 * (x * x - y * y);    // Y22  = sqrt(15/(16pi)) * (x^2-y^2)
-    return sh;
+    (*sh)[0] = 0.282095;                      // Y00  = 1/(2*sqrt(pi))
+    (*sh)[1] = 0.488603 * y;                  // Y1-1 = sqrt(3/(4pi)) * y
+    (*sh)[2] = 0.488603 * z;                  // Y10  = sqrt(3/(4pi)) * z
+    (*sh)[3] = 0.488603 * x;                  // Y11  = sqrt(3/(4pi)) * x
+    (*sh)[4] = 1.092548 * x * y;              // Y2-2 = sqrt(15/(4pi)) * xy
+    (*sh)[5] = 1.092548 * y * z;              // Y2-1 = sqrt(15/(4pi)) * yz
+    (*sh)[6] = 0.315392 * (3.0 * z * z - 1.0); // Y20  = sqrt(5/(16pi)) * (3z^2-1)
+    (*sh)[7] = 1.092548 * x * z;              // Y21  = sqrt(15/(4pi)) * xz
+    (*sh)[8] = 0.546274 * (x * x - y * y);    // Y22  = sqrt(15/(16pi)) * (x^2-y^2)
 }
 
 @compute @workgroup_size(64)
@@ -65,7 +64,8 @@ fn probe_update_main(@builtin(global_invocation_id) gid: vec3u) {
         let ray_dir = dir_pad.xyz;
 
         // Project radiance onto SH basis
-        let sh = compute_sh_basis(ray_dir);
+        var sh: array<f32, 9>;
+        compute_sh_basis(ray_dir, &sh);
 
         // Monte Carlo integration: weight = 4*PI / N (uniform sphere sampling)
         for (var c = 0u; c < 9u; c++) {

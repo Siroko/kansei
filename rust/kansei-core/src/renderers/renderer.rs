@@ -117,6 +117,7 @@ pub struct Renderer {
     pub config: RendererConfig,
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
+    adapter_info: Option<wgpu::AdapterInfo>,
     surface: Option<wgpu::Surface<'static>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
     presentation_format: wgpu::TextureFormat,
@@ -211,6 +212,7 @@ impl Renderer {
             config,
             device: None,
             queue: None,
+            adapter_info: None,
             surface: None,
             surface_config: None,
             presentation_format: wgpu::TextureFormat::Bgra8Unorm,
@@ -309,22 +311,25 @@ impl Renderer {
     ///
     /// Native: `renderer.initialize_with_target(window.clone()).await`
     /// WASM: `renderer.initialize_with_canvas(canvas).await`
+    ///
+    /// Natively it honours wgpu's environment variables: `WGPU_BACKEND` (for example `dx12`,
+    /// `vulkan`, `metal`, `gl`), `WGPU_DX12_COMPILER` (`fxc`, `dxc`, `staticdxc`, `auto`),
+    /// `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`; unset, every backend, `auto` (DXC when
+    /// `dxcompiler.dll` is on the PATH, else FXC) and the default adapter.
+    /// [`Renderer::adapter_info`] says which adapter it chose.
     pub async fn initialize_with_target(&mut self, target: impl Into<wgpu::SurfaceTarget<'static>>) {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            #[cfg(target_arch = "wasm32")]
+        #[cfg(target_arch = "wasm32")]
+        let descriptor = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
-            #[cfg(not(target_arch = "wasm32"))]
-            backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        let instance = wgpu::Instance::new(descriptor);
         let surface = instance
             .create_surface(target)
             .expect("Failed to create surface");
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            })
+        let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, Some(&surface))
             .await
             .expect("No suitable GPU adapter found");
         self.initialize(surface, &adapter).await;
@@ -336,6 +341,7 @@ impl Renderer {
     /// creation automatically.
     #[doc(hidden)]
     pub async fn initialize(&mut self, surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) {
+        self.adapter_info = Some(adapter.get_info());
         let (device, queue) = self.request_device(adapter).await;
         let surface_caps = surface.get_capabilities(adapter);
         let format = surface_caps.formats.iter()
@@ -378,12 +384,15 @@ impl Renderer {
     /// tests. `render` and `render_with_postprocessing` need a surface.
     #[doc(hidden)]
     pub async fn initialize_headless(&mut self, adapter: &wgpu::Adapter) {
+        self.adapter_info = Some(adapter.get_info());
         let (device, queue) = self.request_device(adapter).await;
         self.presentation_format = wgpu::TextureFormat::Rgba8UnormSrgb;
         self.initialize_resources(device, queue);
     }
 
     async fn request_device(&self, adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
+        let info = adapter.get_info();
+        log::info!("adapter: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
         // Optional features: requested only where the adapter offers them, so devices without
         // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs); the
         // texture compression features let KTX2 textures stay block-compressed on the GPU.
@@ -820,6 +829,12 @@ impl Renderer {
 
     pub fn presentation_format(&self) -> wgpu::TextureFormat {
         self.presentation_format
+    }
+
+    /// The adapter the renderer runs on: its name, backend (Vulkan, DX12, Metal, BrowserWebGpu…),
+    /// device type and driver.
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        self.adapter_info.as_ref().expect("Renderer not initialized")
     }
 
     pub fn surface(&self) -> Option<&wgpu::Surface<'static>> {
