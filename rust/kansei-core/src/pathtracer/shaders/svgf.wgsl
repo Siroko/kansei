@@ -13,7 +13,8 @@
 //   neighbourhood (edge-stopped), and the light averaged over it, instead.
 // - `atrous`: one iteration of the edge-avoiding a-trous wavelet (the 5x5 B3 kernel or the 3x3
 //   1-2-1, taps `step` apart) with SVGF's depth (the distance to the centre's tangent plane),
-//   normal and luminance stops, the luminance's scaled by the variance prefiltered 3x3; the
+//   normal and luminance stops, the luminance's scaled by the variance prefiltered over the
+//   centre and its four neighbours; the
 //   variance filtered by the squared weights. The specular light's neighbours count by the lobe's
 //   roughness: a mirror or clear glass shows what it reflects or refracts sharp, and only the
 //   temporal passes average it. The iteration `feedback` names writes next frame's history.
@@ -388,19 +389,17 @@ fn atrous(@builtin(global_invocation_id) gid : vec3u) {
     let d = unpack_light(centre.diffuse);
     let s = unpack_light(centre.specular);
     let last = vec2i(sp.size) - 1;
-    // the variance prefiltered by a 3x3 Gaussian, for the luminance stops
-    var vd = 0.0;
-    var vs = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            // 1/4 at the centre, 1/8 beside, 1/16 at the corners
-            let k = 0.25 / f32(1 << u32(abs(x) + abs(y)));
-            let q = atrousIn[texel_index(clamp(t + vec2i(x, y), vec2i(0), last))];
-            let sdq = unpack2x16float(q.diffuse.y).y;
-            let ssq = unpack2x16float(q.specular.y).y;
-            vd += k * sdq * sdq;
-            vs += k * ssq * ssq;
-        }
+    // the variance prefiltered (the centre and its four neighbours: SVGF's 3x3 Gaussian at
+    // half the loads), for the luminance stops
+    var vd = 0.5 * d.a * d.a;
+    var vs = 0.5 * s.a * s.a;
+    for (var k = 0; k < 4; k++) {
+        let o = select(vec2i(0, 2 * (k & 1) - 1), vec2i(2 * (k & 1) - 1, 0), k < 2);
+        let q = atrousIn[texel_index(clamp(t + o, vec2i(0), last))];
+        let sdq = unpack2x16float(q.diffuse.y).y;
+        let ssq = unpack2x16float(q.specular.y).y;
+        vd += 0.125 * sdq * sdq;
+        vs += 0.125 * ssq * ssq;
     }
     let inv_ld = 1.0 / (sp.phi_color * sqrt(max(vd, 0.0)) + 1e-6);
     let inv_ls = 1.0 / (sp.phi_color * sqrt(max(vs, 0.0)) + 1e-6);

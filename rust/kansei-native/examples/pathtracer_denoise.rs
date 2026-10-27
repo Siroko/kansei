@@ -8,13 +8,13 @@
 //!   many; at the end of each, the tracer's own frame (`noisy`) and each denoiser setting's
 //!   output are written as `<out>/<scene>/spp<N>/<moving|still>/<setting>.f32`. Every setting
 //!   denoises the same traced frames.
-//! - `time`: the denoiser's passes, timed by the profiler over `--frames` frames of the orbit,
-//!   with the trace's, at `--size`.
+//! - `time`: the denoiser's passes (with `--kernel 3x3|5x5`), timed by the profiler over
+//!   `--frames` frames of the orbit, with the trace's, at `--size`.
 //!
 //! Images are raw: width and height (u32), then RGBA f32 rows, linear HDR.
 //!
 //! ```text
-//! cargo run --release -p kansei-native --example pathtracer_denoise -- reference|eval|time [--scene cornell|dragon] [--size WxH] [--spp N] [--samples N] [--frames N] [--out DIR]
+//! cargo run --release -p kansei-native --example pathtracer_denoise -- reference|eval|time [--scene cornell|dragon] [--size WxH] [--spp N] [--samples N] [--frames N] [--kernel 3x3|5x5] [--out DIR]
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -37,11 +37,12 @@ struct Args {
     spp: u32,
     samples: u32,
     frames: u32,
+    kernel: PathTracerDenoiseKernel,
     out: PathBuf,
 }
 
 fn args() -> Args {
-    let mut a = Args { mode: String::new(), scene: "cornell".into(), width: 1920, height: 1080, spp: 1, samples: 4096, frames: 60, out: PathBuf::from("pathtracer-denoise") };
+    let mut a = Args { mode: String::new(), scene: "cornell".into(), width: 1920, height: 1080, spp: 1, samples: 4096, frames: 60, kernel: PathTracerDenoiseKernel::default(), out: PathBuf::from("pathtracer-denoise") };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().expect("a value");
@@ -56,6 +57,7 @@ fn args() -> Args {
             "--samples" => a.samples = value().parse().unwrap(),
             "--frames" => a.frames = value().parse().unwrap(),
             "--out" => a.out = value().into(),
+            "--kernel" => a.kernel = PathTracerDenoiseKernel::from_name(&value()).expect("3x3 or 5x5"),
             m => a.mode = m.into(),
         }
     }
@@ -298,6 +300,7 @@ fn time(adapter: &wgpu::Adapter, args: &Args) {
     let mut s = setup(adapter, args);
     s.tracer.set_guides(true);
     let mut denoise = PathTracerDenoise::new(&s.renderer);
+    denoise.kernel = args.kernel;
     s.renderer.set_profiling(true);
     let warmup = 20;
     for k in 0..warmup + args.frames {
@@ -314,7 +317,7 @@ fn time(adapter: &wgpu::Adapter, args: &Args) {
     }
     let profile = s.renderer.take_profile();
     let info = s.renderer.adapter_info();
-    println!("{} ({:?}), {}x{}, scene {}, {} spp, {} frames", info.name, info.backend, args.width, args.height, args.scene, args.spp, profile.gpu_frames);
+    println!("{} ({:?}), {}x{}, scene {}, {} spp, kernel {}, {} frames", info.name, info.backend, args.width, args.height, args.scene, args.spp, args.kernel.name(), profile.gpu_frames);
     let mut denoiser = 0.0;
     for p in &profile.gpu {
         println!("  {:<28} busy {:>7.3} ms  exclusive {:>7.3} ms  x{}", p.label, p.busy_ms, p.exclusive_ms, p.count);
