@@ -599,6 +599,69 @@ fn hardware_rays_find_what_the_reference_finds() {
     check_rays(&device, &queue, &small, &tris, &rays, "hardware, grown");
 }
 
+/// The hardware BLAS is sized from what the last build gathered: a gather that outgrows it says so
+/// (`overflowed`, which `SceneRtGrid` rebuilds on), and the next build holds it all.
+#[test]
+fn the_hardware_blas_follows_what_the_gather_needs() {
+    let Some((device, queue)) = ray_query_device() else {
+        eprintln!("no adapter with hardware ray queries: skipped");
+        return;
+    };
+    let mut rng = Rng(0x7f4a_7c15_9e37_79b9);
+    let (small, large) = (soup(&mut rng, 200, 1.5), soup(&mut rng, 3000, 1.5));
+    let buffers = [&small, &large].map(|g| RtMesh::from_geometry(g).create_buffer(&device));
+    let placement = RtPlacement::None;
+    let source = |k: usize, triangles: u32| RtSource {
+        mesh: &buffers[k],
+        triangles,
+        records: None,
+        first_record: 0,
+        record_count: 1,
+        world: Mat4::IDENTITY,
+        placement: &placement,
+        surface: RtSurface::new([0.5; 3]),
+        id: k as u32,
+    };
+    let mut grid = RtGrid::new(&device, RtGridOptions { backend: RtBackend::Hardware, ..options() });
+    // (no reserve_triangles, as the renderer's grid: the readback sizes the BLAS)
+    let mut rebuild = |grid: &mut RtGrid, sources: &[RtSource]| {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        grid.begin(&device, &queue, &mut encoder);
+        grid.gather(&device, &queue, &mut encoder, sources);
+        grid.finish(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        grid.read_back(&device, &queue);
+        grid.wait_readback(&device);
+        grid.prepare_trace(&device, &queue);
+    };
+    // before any readback, the whole capacity; then what was gathered, with room to grow
+    rebuild(&mut grid, &[source(0, 200)]);
+    assert_eq!(grid.stats().accel_triangles, grid.stats().triangle_capacity);
+    rebuild(&mut grid, &[source(0, 200)]);
+    let sized = grid.stats().accel_triangles;
+    assert!((200..400).contains(&sized), "{:?}", grid.stats());
+    assert!(!grid.overflowed());
+    // a gather past it: the triangles past the BLAS are left out, and it says so
+    let both = [source(0, 200), source(1, 3000)];
+    rebuild(&mut grid, &both);
+    assert!(grid.overflowed(), "{:?}", grid.stats());
+    rebuild(&mut grid, &both);
+    assert!(!grid.overflowed() && grid.stats().accel_triangles >= 3200, "{:?}", grid.stats());
+    // and every triangle of both is found
+    let tris: Vec<Tri> = [&small, &large]
+        .iter()
+        .flat_map(|g| g.indices.chunks(3).map(|k| {
+            let v = |i: u32| DVec3::from(<[f32; 3]>::try_from(&g.vertices[i as usize].position[..3]).unwrap().map(|x| x as f64));
+            let uv = |i: u32| g.vertices[i as usize].uv.map(|x| x as f64);
+            Tri { v: [v(k[0]), v(k[1]), v(k[2])], uv: [uv(k[0]), uv(k[1]), uv(k[2])], layer: None }
+        }))
+        .collect();
+    let (lo, hi) = grid.bounds();
+    let rays = rays(&mut rng, &tris, lo.as_dvec3(), hi.as_dvec3());
+    let (compared, hitting) = check_rays(&device, &queue, &grid, &tris, &rays, "hardware, grown to the gather");
+    assert!(hitting * 4 > compared, "{hitting} of {compared} rays hit");
+}
+
 /// The software grid's and the hardware backend's hits ray for ray, on the reference's scene with
 /// a glass sphere added, for each trace flag: rtbench's comparison (the scout's), inside Kansei.
 #[test]
