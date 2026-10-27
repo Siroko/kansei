@@ -1,7 +1,9 @@
 //! Minimal path tracer validation example.
 //!
 //! Creates a simple scene with boxes, builds a BVH, traces 1 SPP per frame,
-//! and blits the path tracer output to the window surface. The image may be
+//! and blits the path tracer output to the window surface. The scene is traced
+//! by hardware ray queries where the device has them (`KANSEI_RT_BACKEND`
+//! overrides, as for the RT grid), the window's title says which. The image may be
 //! black or noisy — the goal is to verify the full pipeline compiles and runs
 //! without GPU validation errors.
 
@@ -331,11 +333,15 @@ impl ApplicationHandler for App {
         let mut tlas = TLASBuilder::new(&renderer);
         let gpu_data = bvh.build_full(&renderer, &self.scene, &mut tlas);
         log::info!(
-            "BVH built: {} triangles, {} BVH4 nodes, {} instances",
+            "BVH built: {} triangles, {} BVH4 nodes, {} instances; traced by {:?}",
             gpu_data.triangle_count,
             gpu_data.node_count,
             gpu_data.instance_count,
+            gpu_data.backend(),
         );
+        // the traversal in the title: hardware ray queries or the BVH4s in compute (KANSEI_RT_BACKEND)
+        let info = renderer.device().adapter_info();
+        window.set_title(&format!("Kansei \u{2014} Path Tracer Test ({}, {:?}; traced by {:?})", info.name, info.backend, gpu_data.backend()));
 
         // ── Create PathTracer ────────────────────────────────────────────
         let mut pt = PathTracer::new(&renderer);

@@ -3,7 +3,10 @@
 A Cornell box (white floor, ceiling and back wall, red and green side walls) with two diffuse
 boxes and a glass Stanford dragon, path traced on the GPU against a BVH. A low sun shines in
 through the open front. Samples accumulate while nothing changes; moving the camera, an object
-or the light starts the accumulation again. Moved objects only rebuild the top-level BVH.
+or the light starts the accumulation again. Moved objects only rebuild the top-level BVH. On the
+web the BVH is walked in compute; run natively (where the device has hardware ray queries) the
+same scene goes into acceleration structures instead (`BVHBuilder::set_backend`, picked as the RT
+grid's backend, `KANSEI_RT_BACKEND`), which the log names.
 
 Engine API: `kansei_wasm::{Canvas, run, fetch_bytes}`, `GLTFLoader::load_glb`,
 `Renderable::path_tracer_material` with `PathTracerMaterial` and `PathTracerMaterial::glass`,
