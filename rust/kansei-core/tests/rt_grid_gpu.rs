@@ -627,11 +627,32 @@ fn hardware_hits_match_the_grid() {
         r[3] &= 0x7fff_ffff;
         r
     };
+    // rays whose verdict doesn't hang on rounding (the reference's, solid and glass both counted:
+    // not grazing an edge, nor lying in a face's plane as the rays along cell faces may); either
+    // backend may go either way on the rest
+    let (lo, hi) = (lo.as_dvec3(), hi.as_dvec3());
+    // (and, where the alpha test counts, clear of the checker's lines)
+    let robust_for = |solid: bool| -> Vec<bool> {
+        rays.iter()
+            .map(|r| {
+                let (o, d) = (DVec3::new(r.o[0] as f64, r.o[1] as f64, r.o[2] as f64), DVec3::new(r.d[0] as f64, r.d[1] as f64, r.d[2] as f64));
+                robust_hit(&tris, o, d, exit_distance(o, d, lo, hi), solid).is_some() && (solid || robust_hit(&tris, o, d, exit_distance(o, d, lo, hi), true).is_some())
+            })
+            .collect()
+    };
+    let (robust_solid, robust_alpha) = (robust_for(true), robust_for(false));
     for (what, flags) in [("closest", 0), ("any", 1), ("solid", 2), ("glass hits", 4), ("solid glass hits", 6), ("any, glass hits", 5)] {
         let sw = trace(&device, &queue, &software, &rays, flags);
         let hw = trace(&device, &queue, &hardware, &rays, flags);
-        let (mut hits, mut wrong, mut other_triangle) = (0, Vec::new(), 0);
+        let robust = if flags & 2 != 0 { &robust_solid } else { &robust_alpha };
+        let compared = robust.iter().filter(|r| **r).count();
+        assert!(compared * 10 >= rays.len() * 9, "{what}: only {compared} of {} rays robust", rays.len());
+        let (mut hits, mut wrong, mut other_triangle, mut grazing) = (0, Vec::new(), 0, 0);
         for (k, (a, b)) in sw.iter().zip(&hw).enumerate() {
+            if !robust[k] {
+                grazing += (a[1] != b[1] || (flags & 1 == 0 && a[1] == 1.0 && (a[0] - b[0]).abs() > 1e-4 * (1.0 + a[0]))) as usize;
+                continue;
+            }
             hits += (a[1] == 1.0) as usize;
             let same = if flags & 1 != 0 {
                 // any hit: whether, not which
@@ -647,13 +668,14 @@ fn hardware_hits_match_the_grid() {
                 other_triangle += 1;
             }
         }
-        let share = wrong.len() as f64 / rays.len() as f64;
-        eprintln!("{what}: {} rays, {hits} hit; {} mismatched ({:.3}%), {other_triangle} on a neighbouring triangle", rays.len(), wrong.len(), 100.0 * share);
+        let share = wrong.len() as f64 / compared as f64;
+        eprintln!("{what}: {compared} rays, {hits} hit; {} mismatched ({:.3}%), {other_triangle} on a neighbouring triangle; {grazing} of the {} non-robust rays differ", wrong.len(), 100.0 * share, rays.len() - compared);
         for w in wrong.iter().take(3) {
             eprintln!("  {w}");
         }
-        // rays grazing an edge may go either way in either traversal
-        assert!(share <= 0.002, "{what}: {} of {} rays differ:\n{}", wrong.len(), rays.len(), wrong.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+        // (the reference's robustness margin is 1e-5 of a barycentric; the GPUs' f32 may still
+        // split a hair's breadth)
+        assert!(share <= 0.0005, "{what}: {} of {compared} rays differ:\n{}", wrong.len(), wrong.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
         assert!(other_triangle * 100 <= hits, "{what}: {other_triangle} hits on another triangle");
     }
 }
