@@ -256,21 +256,11 @@ fn settings(renderer: &Renderer) -> Vec<(&'static str, PathTracerDenoise)> {
     };
     vec![
         ("temporal", make(&|d| d.mode = PathTracerDenoiseMode::Temporal)),
-        ("temporal-alpha0.05", make(&|d| {
-            d.mode = PathTracerDenoiseMode::Temporal;
-            d.alpha_color = 0.05;
-            d.alpha_moments = 0.05;
-        })),
         ("svgf", make(&|_| {})),
         ("svgf-3x3", make(&|d| d.kernel = PathTracerDenoiseKernel::Three)),
+        ("svgf-no-taa", make(&|d| d.taa = false)),
         ("svgf-alpha0.1", make(&|d| d.alpha_color = 0.1)),
-        ("svgf-alpha0.05", make(&|d| {
-            d.alpha_color = 0.05;
-            d.alpha_moments = 0.05;
-        })),
         ("svgf-clamp2", make(&|d| d.clamp_sigma = 2.0)),
-        ("svgf-clamp1", make(&|d| d.clamp_sigma = 1.0)),
-        ("svgf-phi8", make(&|d| d.phi_color = 8.0)),
     ]
 }
 
