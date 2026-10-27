@@ -176,6 +176,19 @@
             f.addBinding(p, 'reflQuarter', { label: 'trace 1 in 4x4' }).on('change', set('reflQuarter'));
             f.addBinding(p, 'reflBlend', { label: 'new frame weight', min: 0.02, max: 1, step: 0.01 }).on('change', set('reflBlend'));
         });
+        // a stylised contact darkening of all the light the surfaces reflect, after the glass
+        // (ContactAoEffect); "AO only" shows its occlusion alone, the passes that would cloud it off
+        pass('Contact AO', 'contactAo', {
+            subtle: { caoRadius: 0.15, caoStrength: 1.5, caoFalloff: 1.5, caoSamples: 8 },
+            default: { caoRadius: 0.3, caoStrength: 2.5, caoFalloff: 1.0, caoSamples: 12 },
+            strong: { caoRadius: 0.6, caoStrength: 4.0, caoFalloff: 0.75, caoSamples: 16 },
+        }, (f) => {
+            f.addBinding(p, 'caoView', { label: 'AO only' }).on('change', set('caoView'));
+            f.addBinding(p, 'caoRadius', { label: 'radius (m)', min: 0.01, max: 2, step: 0.005 }).on('change', set('caoRadius'));
+            f.addBinding(p, 'caoStrength', { label: 'strength', min: 0, max: 8, step: 0.05 }).on('change', set('caoStrength'));
+            f.addBinding(p, 'caoFalloff', { label: 'falloff', min: 0, max: 8, step: 0.05 }).on('change', set('caoFalloff'));
+            f.addBinding(p, 'caoSamples', { label: 'samples', min: 1, max: 32, step: 1 }).on('change', set('caoSamples'));
+        });
         // the far floor (and anything far) fades into the backdrop behind it by its distance from
         // the scene's centre, all of it by the dome
         pass('Distance fade', 'fade', {
