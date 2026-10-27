@@ -640,7 +640,8 @@ fn hardware_hits_match_the_grid() {
                 a[1] == b[1] && (a[1] == 0.0 || (a[0] - b[0]).abs() <= 1e-4 * (1.0 + a[0]))
             };
             if !same {
-                wrong.push(format!("ray {k}: software found {} t {}, hardware found {} t {}", a[1], a[0], b[1], b[0]));
+                let r = &rays[k];
+                wrong.push(format!("ray {k} (o {:?} d {:?}): software found {} t {}, hardware found {} t {}", &r.o[..3], &r.d[..3], a[1], a[0], b[1], b[0]));
             } else if a[1] == 1.0 && flags & 1 == 0 && record(&sw_records, a[7].to_bits()) != record(&hw_records, b[7].to_bits()) {
                 // the same distance on another triangle: a shared edge or a coplanar pair
                 other_triangle += 1;
@@ -648,6 +649,9 @@ fn hardware_hits_match_the_grid() {
         }
         let share = wrong.len() as f64 / rays.len() as f64;
         eprintln!("{what}: {} rays, {hits} hit; {} mismatched ({:.3}%), {other_triangle} on a neighbouring triangle", rays.len(), wrong.len(), 100.0 * share);
+        for w in wrong.iter().take(3) {
+            eprintln!("  {w}");
+        }
         // rays grazing an edge may go either way in either traversal
         assert!(share <= 0.002, "{what}: {} of {} rays differ:\n{}", wrong.len(), rays.len(), wrong.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
         assert!(other_triangle * 100 <= hits, "{what}: {other_triangle} hits on another triangle");
