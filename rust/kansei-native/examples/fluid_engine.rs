@@ -81,12 +81,12 @@ struct FOut { @location(0) color: vec4<f32>, }
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
         ]});
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Blit"), layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         Self { pipeline, sampler, bgl }
@@ -214,22 +214,22 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @l
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("CornellBox/Layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("CornellBox"), layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader, entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 36, step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
                     ],
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -244,26 +244,26 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @l
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
-            multiview: None, cache: None,
+            multiview_mask: None, cache: None,
         });
         let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("CornellBox/Depth"), layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader, entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 36, step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
                         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
                     ],
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -278,12 +278,12 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, @l
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: Default::default(), multiview: None, cache: None,
+            multisample: Default::default(), multiview_mask: None, cache: None,
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -332,13 +332,13 @@ const Q: array<vec2<f32>,6> = array(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState { count: PARTICLE_MSAA_SAMPLES, ..Default::default() },
-            multiview: None, cache: None,
+            multiview_mask: None, cache: None,
         });
         let bgl = pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
@@ -533,7 +533,7 @@ impl ApplicationHandler for App {
 
         // egui
         self.egui_state = Some(egui_winit::State::new(self.egui_ctx.clone(), egui::ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), None, None));
-        self.egui_renderer = Some(egui_wgpu::Renderer::new(self.renderer.as_ref().unwrap().device(), format, None, 1, false));
+        self.egui_renderer = Some(egui_wgpu::Renderer::new(self.renderer.as_ref().unwrap().device(), format, egui_wgpu::RendererOptions { msaa_samples: 1, depth_stencil_format: None, dithering: false, ..Default::default() }));
 
         self.camera.aspect = size.width as f32 / size.height as f32;
         self.camera.update_projection_matrix();
@@ -640,7 +640,7 @@ impl ApplicationHandler for App {
                 }
 
                 let surface = renderer.surface().unwrap();
-                let output = surface.get_current_texture().expect("Surface texture");
+                let output = kansei_core::renderers::surface_texture(surface).expect("Surface texture");
                 let canvas_view = output.texture.create_view(&Default::default());
                 let mut encoder = device.create_command_encoder(&Default::default());
 
@@ -652,6 +652,7 @@ impl ApplicationHandler for App {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: self.particle_msaa_view.as_ref().unwrap_or(&canvas_view),
+                            depth_slice: None,
                             resolve_target: self.particle_msaa_view.as_ref().map(|_| &canvas_view),
                             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
                         })],
@@ -693,7 +694,7 @@ impl ApplicationHandler for App {
                     }
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: self.color_view.as_ref().unwrap(), resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: self.color_view.as_ref().unwrap(), depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store } })],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: self.depth_view.as_ref().unwrap(), depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                         ..Default::default()
                     });
@@ -718,15 +719,15 @@ impl ApplicationHandler for App {
                         );
                     }
                     { let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &canvas_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], ..Default::default()
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &canvas_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], ..Default::default()
                     });
                     if let Some(ref blit) = self.blit { pass.set_pipeline(&blit.pipeline); pass.set_bind_group(0, self.blit_bg.as_ref().unwrap(), &[]); pass.draw(0..3, 0..1); } }
                 }
 
                 // egui
                 let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(self.window.as_ref().unwrap());
-                let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                    egui::SidePanel::right("controls").min_width(220.0).show(ctx, |ui| {
+                let full_output = self.egui_ctx.run_ui(raw_input, |root| {
+                    egui::Panel::right("controls").min_size(220.0).show(root, |ui| {
                         ui.heading("Fluid Engine");
                         ui.label(format!("{:.1} FPS  ({:.2} ms)", self.current_fps, self.current_frame_ms));
                         ui.label(format!("Particles: {}", 50000));
@@ -766,8 +767,8 @@ impl ApplicationHandler for App {
 
                 // Take egui renderer out of self to avoid borrow conflicts
                 let mut er = self.egui_renderer.take().unwrap();
-                for (id, delta) in &full_output.textures_delta.set {
-                    er.update_texture(device, queue, *id, delta);
+                for (id, deltas) in &full_output.textures_delta.set {
+                    for delta in deltas { er.update_texture(device, queue, *id, delta); }
                 }
                 // Egui: upload buffers in one encoder, render in another
                 let mut upload_enc = device.create_command_encoder(&Default::default());
@@ -778,7 +779,7 @@ impl ApplicationHandler for App {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &canvas_view, resolve_target: None,
+                        view: &canvas_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                     })],
                     ..Default::default()
@@ -790,7 +791,7 @@ impl ApplicationHandler for App {
                 for id in &full_output.textures_delta.free { er.free_texture(id); }
                 self.egui_renderer = Some(er);
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
-                output.present();
+                queue.present(output);
 
                 // Wall clock FPS (actual frame duration including present)
                 self.frame_time_accum += frame_dt;

@@ -177,7 +177,7 @@ impl MotionBlurEffect {
         let gather_bgl = bgl("MotionBlur/GatherBGL", &[tex(0), tex(1), tex(2), storage(3), uniform(4)]);
         let pipeline = |label: &str, code: &str, bgl: &BindGroupLayout| {
             let module = device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(code.into()) });
-            let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),

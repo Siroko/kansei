@@ -175,13 +175,13 @@ impl App {
         vslice.map_async(wgpu::MapMode::Read, move |r| {
             tx2.send(r).unwrap();
         });
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
         rx.recv().unwrap().unwrap();
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         let pos: &[f32] = bytemuck::cast_slice(&data);
-        let vdata = vslice.get_mapped_range();
+        let vdata = vslice.get_mapped_range().unwrap();
         let vel: &[f32] = bytemuck::cast_slice(&vdata);
         let mut mean_speed = 0.0f64;
         let mut max_speed = 0.0f64;

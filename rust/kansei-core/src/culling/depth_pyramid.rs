@@ -121,7 +121,7 @@ impl DepthPyramid {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("DepthPyramid"), source: wgpu::ShaderSource::Wgsl(reduction.shader().into()) });
         let pipeline = |bgl: &wgpu::BindGroupLayout, entry_point: &str| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("DepthPyramid"), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("DepthPyramid"), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(&format!("DepthPyramid/{entry_point}")),
                 layout: Some(&layout),

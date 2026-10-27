@@ -9,8 +9,8 @@ use wgpu::util::DeviceExt;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn read<T: bytemuck::Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<T> {
@@ -19,8 +19,8 @@ fn read<T: bytemuck::Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &w
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let data = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     data
 }
 

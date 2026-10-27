@@ -206,8 +206,8 @@ impl PathTracer {
         // ── Pipeline ───────────────────────────────────────────────
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PathTracer/PipelineLayout"),
-            bind_group_layouts: &[&trace_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&trace_bgl)],
+            immediate_size: 0,
         });
 
         let trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

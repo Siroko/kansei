@@ -45,9 +45,9 @@ fn readback<T: bytemuck::Pod>(device: &wgpu::Device, queue: &wgpu::Queue, src: &
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
-    let out: Vec<T> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+    let out: Vec<T> = bytemuck::cast_slice(&slice.get_mapped_range().unwrap()).to_vec();
     staging.unmap();
     out
 }
@@ -181,7 +181,7 @@ impl App {
             if acc > step_dt as f64 {
                 acc = step_dt as f64;
             }
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             sim_ms += t0.elapsed().as_secs_f64() * 1000.0;
             total_steps += steps;
 
@@ -207,7 +207,7 @@ impl App {
             attractor.retag(&mut enc, pos_buf, vel_buf, &RetagParams { changed_mask, per_slot_count: per_slot, cooldown_frames: 45, capture_scale: capture, capture_below, emit_height, emit_spread, emit_rate });
             attractor.dispatch(&mut enc, pos_buf, vel_buf);
             queue.submit(std::iter::once(enc.finish()));
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             attr_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
             if checkpoint > 0 && (frame + 1) % checkpoint == 0 {

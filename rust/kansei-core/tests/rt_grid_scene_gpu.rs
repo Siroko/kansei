@@ -22,7 +22,7 @@ const H: u32 = 64;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)

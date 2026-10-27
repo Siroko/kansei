@@ -87,7 +87,7 @@ impl JumpFloodSdf {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGI/JumpFlood"), source: wgpu::ShaderSource::Wgsl(JUMP_FLOOD_WGSL.into()) });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/JumpFlood"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/JumpFlood"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipelines = ["seed", "flood", "distance"].map(|entry_point| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("VoxelGI/JumpFlood"),

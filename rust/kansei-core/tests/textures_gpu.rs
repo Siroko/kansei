@@ -9,14 +9,12 @@ use kansei_core::renderers::RequiredLimits;
 
 fn adapter() -> Option<wgpu::Adapter> {
     let instance = wgpu::Instance::default();
-    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()
 }
 
 fn request_device(adapter: &wgpu::Adapter, limits: &RequiredLimits) -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor { required_limits: limits.resolve(&adapter.limits()), ..Default::default() },
-        None,
-    ))
+        &wgpu::DeviceDescriptor { required_limits: limits.resolve(&adapter.limits()), ..Default::default() }))
     .unwrap()
 }
 
@@ -65,7 +63,7 @@ fn rgba_layers_upload_into_their_own_array_layers() {
             .into(),
         ),
     });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[] });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: Some(&pipeline_layout),
@@ -84,8 +82,8 @@ fn rgba_layers_upload_into_their_own_array_layers() {
     encoder.copy_buffer_to_buffer(&out, 0, &readback, 0, 48);
     queue.submit(std::iter::once(encoder.finish()));
     readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::Maintain::Wait);
-    let values: Vec<f32> = bytemuck::cast_slice(&readback.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let values: Vec<f32> = bytemuck::cast_slice(&readback.slice(..).get_mapped_range().unwrap()).to_vec();
     for (layer, colour) in colours.iter().enumerate() {
         let got = &values[layer * 4..layer * 4 + 4];
         let want: Vec<f32> = colour.iter().map(|&c| c as f32 / 255.0).collect();
@@ -105,14 +103,14 @@ fn adapter_limits_bind_more_textures_than_the_default() {
     assert_eq!(device.limits().max_sampled_textures_per_shader_stage, supported);
     // one more texture than WebGPU's default allows, in a single fragment stage
     let bindings: Vec<Binding> = (0..=defaults).map(|i| Binding::texture_2d(i, wgpu::ShaderStages::FRAGMENT)).collect();
-    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let _layout = BindGroupBuilder::create_layout(&device, "ManyTextures", &bindings);
-    let error = pollster::block_on(device.pop_error_scope());
+    let error = pollster::block_on(scope.pop());
     assert!(error.is_none(), "{error:?}");
     // and the default limits refuse it
     let (default_device, _queue) = request_device(&adapter, &RequiredLimits::Default);
-    default_device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let scope = default_device.push_error_scope(wgpu::ErrorFilter::Validation);
     let _layout = BindGroupBuilder::create_layout(&default_device, "ManyTextures", &bindings);
-    assert!(pollster::block_on(default_device.pop_error_scope()).is_some());
+    assert!(pollster::block_on(scope.pop()).is_some());
     eprintln!("{} sampled textures bound (adapter supports {supported})", defaults + 1);
 }

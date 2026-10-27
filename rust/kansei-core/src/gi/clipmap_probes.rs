@@ -135,7 +135,7 @@ impl ClipmapProbes {
         entries.extend(clipmap_layout_entries(compute));
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VoxelClipmap/ProbesBGL"), entries: &entries });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelClipmap/Probes"), source: wgpu::ShaderSource::Wgsl(CLIPMAP_PROBE_UPDATE_WGSL.into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelClipmap/Probes"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelClipmap/Probes"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("VoxelClipmap/Probes"),
             layout: Some(&pl),
@@ -350,8 +350,8 @@ mod tests {
 
     fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-        pollster::block_on(adapter.request_device(&Default::default(), None)).ok()
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        pollster::block_on(adapter.request_device(&Default::default())).ok()
     }
 
     /// The lookups read the probes as their SH say: under a uniform sky of radiance L (every
@@ -421,8 +421,8 @@ mod tests {
             encoder.copy_buffer_to_buffer(&out, 0, &read, 0, 6 * 16);
             queue.submit(Some(encoder.finish()));
             read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let values = bytemuck::cast_slice::<u8, [f32; 4]>(&read.slice(..).get_mapped_range()).to_vec();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let values = bytemuck::cast_slice::<u8, [f32; 4]>(&read.slice(..).get_mapped_range().unwrap()).to_vec();
             values
         };
         let close = |a: [f32; 4], b: [f32; 4]| (0..4).all(|c| (a[c] - b[c]).abs() <= 1e-3 * b[c].abs().max(1.0));

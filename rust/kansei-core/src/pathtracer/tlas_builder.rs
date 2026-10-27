@@ -180,8 +180,8 @@ impl TLASBuilder {
         let morton_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("TLASBuilder/MortonPipelineLayout"),
-                bind_group_layouts: &[&morton_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&morton_bgl)],
+                immediate_size: 0,
             });
 
         let morton_pipeline =
@@ -266,8 +266,8 @@ impl TLASBuilder {
         let build_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("TLASBuilder/BuildPipelineLayout"),
-                bind_group_layouts: &[&build_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&build_bgl)],
+                immediate_size: 0,
             });
 
         let leaf_pipeline =

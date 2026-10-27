@@ -13,6 +13,6 @@ pollster = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 winit = "0.30"
-egui = "0.31"
-egui-wgpu = "0.31"
-egui-winit = "0.31"
+egui = "0.37"
+egui-wgpu = "0.37"
+egui-winit = "0.37"

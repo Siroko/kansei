@@ -233,7 +233,7 @@ pub(crate) fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
         let (buffer, state, arrived, period) = (readback.buffer.clone(), readback.state.clone(), p.arrived.clone(), gpu.period_ns);
         readback.buffer.slice(..count as u64 * 8).map_async(wgpu::MapMode::Read, move |result| {
             if result.is_ok() {
-                let stamps: Vec<u64> = bytemuck::cast_slice(&buffer.slice(..count as u64 * 8).get_mapped_range()).to_vec();
+                let stamps: Vec<u64> = bytemuck::cast_slice(&buffer.slice(..count as u64 * 8).get_mapped_range().unwrap()).to_vec();
                 buffer.unmap();
                 let to_ns = |t: u64| (t as f64 * period) as u64;
                 let passes = labels.iter().enumerate().map(|(k, &label)| (label, to_ns(stamps[2 * k]), to_ns(stamps[2 * k + 1]))).collect();
@@ -247,7 +247,7 @@ pub(crate) fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
 /// The frames profiled since the last call, averaged (and forgotten).
 pub(crate) fn take(device: &wgpu::Device) -> FrameProfile {
     #[cfg(not(target_arch = "wasm32"))]
-    device.poll(wgpu::Maintain::Poll);
+    let _ = device.poll(wgpu::PollType::Poll);
     #[cfg(target_arch = "wasm32")]
     let _ = device;
     PROFILER.with(|p| {

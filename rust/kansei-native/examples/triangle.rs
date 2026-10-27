@@ -21,19 +21,19 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() { return; }
         let win = Arc::new(el.create_window(Window::default_attributes().with_title("Triangle Test")).unwrap());
-        let instance = wgpu::Instance::new(&Default::default());
+        let instance = wgpu::Instance::default();
         let surface = instance.create_surface(win.clone()).unwrap();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface), ..Default::default()
         })).unwrap();
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let caps = surface.get_capabilities(&adapter);
         self.format = caps.formats[0];
         let size = win.inner_size();
         surface.configure(&device, &wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format: self.format,
             width: size.width, height: size.height, present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0], view_formats: vec![], desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0], view_formats: vec![], desired_maximum_frame_latency: 2, color_space: wgpu::SurfaceColorSpace::Auto,
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -53,7 +53,7 @@ impl ApplicationHandler for App {
                 targets: &[Some(wgpu::ColorTargetState { format: self.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 compilation_options: Default::default() }),
             primitive: Default::default(), depth_stencil: None,
-            multisample: Default::default(), multiview: None, cache: None,
+            multisample: Default::default(), multiview_mask: None, cache: None,
         }));
         self.surface = Some(surface);
         self.device = Some(device);
@@ -65,13 +65,13 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => {
-                let output = self.surface.as_ref().unwrap().get_current_texture().unwrap();
+                let output = kansei_core::renderers::surface_texture(self.surface.as_ref().unwrap()).unwrap();
                 let view = output.texture.create_view(&Default::default());
                 let mut enc = self.device.as_ref().unwrap().create_command_encoder(&Default::default());
                 {
                     let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view, resolve_target: None,
+                            view: &view, depth_slice: None, resolve_target: None,
                             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.1, a: 1.0 }), store: wgpu::StoreOp::Store },
                         })],
                         ..Default::default()
@@ -80,7 +80,7 @@ impl ApplicationHandler for App {
                     pass.draw(0..3, 0..1);
                 }
                 self.queue.as_ref().unwrap().submit(std::iter::once(enc.finish()));
-                output.present();
+                self.queue.as_ref().unwrap().present(output);
                 self.window.as_ref().unwrap().request_redraw();
             }
             _ => {}

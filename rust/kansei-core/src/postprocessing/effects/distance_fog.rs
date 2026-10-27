@@ -139,7 +139,7 @@ impl DistanceFogEffect {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("DistanceFog"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("DistanceFog"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("DistanceFog"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("DistanceFog"),
             layout: Some(&layout),
@@ -278,8 +278,8 @@ mod tests {
     #[test]
     fn the_shader_fades_as_the_cpu_does() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (9u32, 9u32);
         let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
         let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
@@ -303,7 +303,7 @@ mod tests {
         for (distance, want) in [(2.0f32, 0.0f32), (20.0, 0.5), (40.0, 1.0)] {
             let clip = camera.projection_matrix.to_glam() * glam::Vec4::new(0.0, 0.0, -distance, 1.0);
             let mut e = device.create_command_encoder(&Default::default());
-            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(clip.z / clip.w), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(clip.z / clip.w), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             fog.render(&device, &queue, &mut e, &gbuffer, &input, &depth, &output, &camera, w, h);
             let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
             e.copy_texture_to_buffer(
@@ -313,8 +313,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             // the centre pixel looks along -z: the dome's horizon
             let px = &bytemuck::cast_slice::<u8, u16>(&data[(4 * row) as usize..])[16..19];
             let got = [half(px[0]), half(px[1]), half(px[2])];

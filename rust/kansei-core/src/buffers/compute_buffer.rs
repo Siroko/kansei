@@ -154,7 +154,7 @@ impl ComputeBuffer {
                 usage: self.usage | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: true,
             });
-            buffer.slice(..).get_mapped_range_mut().copy_from_slice(&self.data);
+            buffer.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(&self.data);
             buffer.unmap();
             buffer
         });
@@ -207,8 +207,8 @@ mod tests {
     #[test]
     fn clones_share_one_gpu_buffer() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
-        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)) else { return };
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) else { return };
         let geometry_side = ComputeBuffer::from_slice("Instances", BufferType::Storage, BufferUsage::VERTEX | BufferUsage::STORAGE, &[[1.0f32; 4]; 8]).with_vertex_vec4(3);
         let mut culling_side = geometry_side.clone();
         assert!(geometry_side.gpu_buffer().is_none());

@@ -310,12 +310,12 @@ impl Renderer {
     /// Native: `renderer.initialize_with_target(window.clone()).await`
     /// WASM: `renderer.initialize_with_canvas(canvas).await`
     pub async fn initialize_with_target(&mut self, target: impl Into<wgpu::SurfaceTarget<'static>>) {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(target_arch = "wasm32")]
             backends: wgpu::Backends::BROWSER_WEBGPU,
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
             .create_surface(target)
@@ -364,6 +364,7 @@ impl Renderer {
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
 
@@ -394,7 +395,8 @@ impl Renderer {
                 required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
                 required_limits: self.config.required_limits.resolve(&adapter.limits()),
                 memory_hints: wgpu::MemoryHints::default(),
-            }, None)
+                ..Default::default()
+            })
             .await
             .expect("Failed to create device");
         log::info!("texture compression: {:?}", crate::loaders::ktx2::CompressionSupport::of_device(&device));
@@ -1327,8 +1329,8 @@ impl Renderer {
 
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Shadow/PipelineLayout"),
-            bind_group_layouts: &[&shadow_light_vp_bgl, &shared.camera_bgl, &shared.mesh_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&shadow_light_vp_bgl), Some(&shared.camera_bgl), Some(&shared.mesh_bgl)],
+            immediate_size: 0,
         });
 
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1342,7 +1344,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shadow_shader,
                 entry_point: Some("shadow_vs"),
-                buffers: &[crate::geometries::Vertex::LAYOUT],
+                buffers: &[Some(crate::geometries::Vertex::LAYOUT)],
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -1353,13 +1355,13 @@ impl Renderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         }));
 
@@ -2087,6 +2089,7 @@ impl Renderer {
         let mut attachments: [Option<wgpu::RenderPassColorAttachment>; GBuffer::VELOCITY_TARGET + 1] = Default::default();
         attachments[GBuffer::VELOCITY_TARGET] = Some(wgpu::RenderPassColorAttachment {
             view: &gbuffer.velocity_view,
+            depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color { r: no_velocity, g: no_velocity, b: 0.0, a: 0.0 }),
@@ -2695,6 +2698,7 @@ impl Renderer {
                     label: Some("CubemapShadow"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &color_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2992,7 +2996,7 @@ impl Renderer {
 
         // Phase 2+3: Create render pass and execute bundle
         let surface = self.surface.as_ref().unwrap();
-        let output = surface.get_current_texture().expect("Failed to get surface texture");
+        let output = surface_texture(surface).expect("Failed to get surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
 
         let device = self.device.as_ref().unwrap();
@@ -3014,6 +3018,7 @@ impl Renderer {
                 label: Some("Renderer/MainPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_view,
+                    depth_slice: None,
                     resolve_target: resolve,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -3049,7 +3054,7 @@ impl Renderer {
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
-        output.present();
+        self.queue.as_ref().unwrap().present(output);
         camera.end_frame();
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
@@ -3062,10 +3067,10 @@ impl Renderer {
         let (width, height) = (self.config.width, self.config.height);
         volume.ensure_gbuffer(width, height);
         let surface = self.surface.as_ref().unwrap();
-        let output = surface.get_current_texture().expect("Surface texture");
+        let output = surface_texture(surface).expect("Surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
         volume.render_from(Some(input), camera, &canvas_view, width, height);
-        output.present();
+        self.queue.as_ref().unwrap().present(output);
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
 
@@ -3100,7 +3105,7 @@ impl Renderer {
         // Get surface texture for blit
         let t = crate::profiling::cpu_scope("frame/surface");
         let surface = self.surface.as_ref().unwrap();
-        let output = surface.get_current_texture().expect("Surface texture");
+        let output = surface_texture(surface).expect("Surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
         drop(t);
 
@@ -3108,7 +3113,7 @@ impl Renderer {
         volume.render(camera, &canvas_view, width, height);
 
         let t = crate::profiling::cpu_scope("frame/present");
-        output.present();
+        self.queue.as_ref().unwrap().present(output);
         drop(t);
         camera.end_frame();
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
@@ -3346,19 +3351,19 @@ impl Renderer {
                 label: Some("Renderer/GBufferOpaquePass"),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.color_view, resolve_target: None,
+                        view: &gbuffer.color_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.emissive_view, resolve_target: None,
+                        view: &gbuffer.emissive_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.normal_view, resolve_target: None,
+                        view: &gbuffer.normal_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.albedo_view, resolve_target: None,
+                        view: &gbuffer.albedo_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                 ],
@@ -3384,7 +3389,7 @@ impl Renderer {
         if !self.two_phase.is_empty() {
             self.run_late_culling(&mut encoder, scene, gbuffer);
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
-            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: load });
+            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/GBufferLatePass"),
                 color_attachments: &[
@@ -3423,19 +3428,19 @@ impl Renderer {
                 label: Some("Renderer/GBufferIndirectPass"),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.color_view, resolve_target: None,
+                        view: &gbuffer.color_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.emissive_view, resolve_target: None,
+                        view: &gbuffer.emissive_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.normal_view, resolve_target: None,
+                        view: &gbuffer.normal_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.albedo_view, resolve_target: None,
+                        view: &gbuffer.albedo_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                 ],
@@ -3491,21 +3496,25 @@ impl Renderer {
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.color_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.color_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.emissive_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.emissive_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Discard },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.normal_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.normal_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Discard },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.albedo_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.albedo_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Discard },
                     }),
@@ -3524,21 +3533,25 @@ impl Renderer {
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.color_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.emissive_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.normal_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.albedo_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
@@ -3586,10 +3599,10 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -3617,7 +3630,7 @@ impl Renderer {
             }],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
         self.depth_copy_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("DepthCopy"),
@@ -3627,13 +3640,13 @@ impl Renderer {
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         }));
         self.depth_copy_bgl = Some(bgl);
@@ -3831,7 +3844,7 @@ fn draw_reflection(
     let late = phase == ReflectionPhase::Late;
     let targets = reflection.color_attachments();
     let load = |cleared| if late { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(cleared) };
-    let attachment = |view, cleared| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: load(cleared), store: wgpu::StoreOp::Store } });
+    let attachment = |view, cleared| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: load(cleared), store: wgpu::StoreOp::Store } });
     let black = wgpu::Color::TRANSPARENT;
     let label = if late { "Renderer/PlanarReflectionLatePass" } else { "Renderer/PlanarReflectionPass" };
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3947,6 +3960,14 @@ fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
     bind_and_draw(enc, r, r.instance_culling.as_ref().and_then(|c| c.view(view)));
 }
 
+/// The surface's next texture, suboptimal or not; `None` when it is outdated, lost, occluded or timed out.
+pub fn surface_texture(surface: &wgpu::Surface) -> Option<wgpu::SurfaceTexture> {
+    match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+        _ => None,
+    }
+}
+
 /// Draw the second phase of a renderable culled in two phases in cull view `view` this frame
 /// (nothing otherwise).
 fn draw_late_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
@@ -3956,14 +3977,14 @@ fn draw_late_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a c
 }
 
 fn bind_and_draw<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, culled: Option<crate::culling::CulledDraw<'a>>) {
-    enc.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+    enc.set_vertex_buffer(0, Some(r.geometry.active_vertex_buffer().unwrap().slice(..)));
     for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
         let buffer = match culled {
             Some(draw) if i == 0 => Some((draw.instances, draw.instances_offset)),
             _ => cb.gpu_buffer().map(|b| (b, 0)),
         };
         if let Some((buffer, offset)) = buffer {
-            enc.set_vertex_buffer(i as u32 + 1, buffer.slice(offset..));
+            enc.set_vertex_buffer(i as u32 + 1, Some(buffer.slice(offset..)));
         }
     }
     enc.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);

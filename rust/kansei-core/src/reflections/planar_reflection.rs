@@ -363,7 +363,7 @@ impl PlanarReflection {
         });
         let pipeline = |label: &str, code: &str, bgl: &wgpu::BindGroupLayout| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),

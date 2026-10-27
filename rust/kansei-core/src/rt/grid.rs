@@ -446,7 +446,7 @@ impl RtGrid {
         let gather_prepare_bgl = layout("RtGrid/GatherPrepare", &[entry(5, rw)]);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("RtGrid/Build"), source: wgpu::ShaderSource::Wgsl(BUILD_WGSL.into()) });
         let pipeline = |entry_point: &str, bgl: &wgpu::BindGroupLayout| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("RtGrid/Build"), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("RtGrid/Build"), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(&format!("RtGrid/{entry_point}")),
                 layout: Some(&layout),
@@ -458,8 +458,8 @@ impl RtGrid {
         };
         let gather_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("RtGrid/Gather"),
-            bind_group_layouts: &[&gather_grid_bgl, &gather_source_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&gather_grid_bgl), Some(&gather_source_bgl)],
+            immediate_size: 0,
         });
         let gather_prepare = {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -468,8 +468,8 @@ impl RtGrid {
             });
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("RtGrid/GatherPrepare"),
-                bind_group_layouts: &[&gather_prepare_bgl, &gather_source_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&gather_prepare_bgl), Some(&gather_source_bgl)],
+                immediate_size: 0,
             });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("RtGrid/GatherPrepare"),
@@ -936,7 +936,7 @@ impl RtGrid {
     fn collect_readback(&mut self, device: &wgpu::Device) {
         #[cfg(not(target_arch = "wasm32"))]
         if self.readback.pending.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
@@ -945,7 +945,7 @@ impl RtGrid {
             return;
         }
         {
-            let bytes = self.readback.staging.slice(..).get_mapped_range();
+            let bytes = self.readback.staging.slice(..).get_mapped_range().unwrap();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
             self.stats.triangles = words[0];
             self.stats.references = words[1];
@@ -958,7 +958,7 @@ impl RtGrid {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait_readback(&mut self, device: &wgpu::Device) {
         if self.readback.pending.is_some() {
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
         }
         self.collect_readback(device);
     }

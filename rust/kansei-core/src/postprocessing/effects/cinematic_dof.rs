@@ -375,7 +375,7 @@ impl CinematicDepthOfFieldEffect {
         let composite_bgl = bgl("CinematicDoF/CompositeBGL", &[tex(0), depth(1), tex(2), tex(3), storage(4), uniform(5)]);
         let pipeline = |label: &str, code: &str, entry: &str, bgl: &BindGroupLayout| {
             let module = device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(code.into()) });
-            let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),

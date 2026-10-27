@@ -122,7 +122,7 @@ impl PostProcessingEffect for ScreenSpaceGlassEffect {
                 uniform(8),
             ],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("SsGlass/Layout"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("SsGlass/Layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("SsGlass/Pipeline"),
             layout: Some(&layout),

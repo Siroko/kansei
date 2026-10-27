@@ -8,8 +8,8 @@ use kansei_core::culling::{DepthPyramid, DepthReduction};
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 /// A full-screen triangle writing a hash of the pixel as its depth.
@@ -41,8 +41,8 @@ fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Text
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     (0..h as usize)
         .map(|y| bytemuck::cast_slice::<u8, f32>(&bytes[y * row as usize..][..(w * 4 * channels) as usize]).to_vec())
         .collect()
@@ -63,13 +63,13 @@ fn every_texel_reduces_exactly_the_pixels_it_covers() {
         primitive: Default::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Always,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 

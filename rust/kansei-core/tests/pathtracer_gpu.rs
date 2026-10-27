@@ -19,7 +19,7 @@ const H: u32 = 64;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig::default());
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -65,6 +65,7 @@ fn flat_gbuffer(renderer: &Renderer) -> (wgpu::TextureView, wgpu::TextureView) {
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     renderer.queue().submit(Some(encoder.finish()));
     let normal = rgba_texture(renderer, &vec![[0.5, 0.5, 1.0, 1.0]; (W * H) as usize]);
@@ -330,7 +331,7 @@ fn traced_floor(renderer: &mut Renderer, sun: bool, frames: u32) -> [f32; 3] {
 #[test]
 fn the_effect_writes_the_floor_lit_by_the_scenes_lights() {
     let instance = wgpu::Instance::default();
-    let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     let sky_only = traced_floor(&mut renderer, false, 8);

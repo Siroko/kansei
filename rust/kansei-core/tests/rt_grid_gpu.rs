@@ -13,8 +13,8 @@ use kansei_core::rt::{pack_emission, unpack_emission, RtGrid, RtGridOptions, RtI
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    Some(pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap())
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    Some(pollster::block_on(adapter.request_device(&Default::default())).unwrap())
 }
 
 /// A small deterministic generator (xorshift).
@@ -233,8 +233,8 @@ fn read_words(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer)
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     words
 }
 
@@ -282,7 +282,7 @@ fn trace(device: &wgpu::Device, queue: &wgpu::Queue, grid: &RtGrid, rays: &[Ray]
         wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
     ]);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
     let ray_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(rays), usage: wgpu::BufferUsages::STORAGE });
     let hits = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (rays.len() * 32) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
@@ -550,7 +550,7 @@ fn a_box_that_follows_the_eye_moves_in_steps() {
 fn build_times() {
     use kansei_core::renderers::{Renderer, RendererConfig};
     let instance = wgpu::Instance::default();
-    let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
         eprintln!("no GPU adapter: skipped");
         return;
     };
@@ -606,7 +606,7 @@ fn build_times() {
                 grid.finish(&mut encoder);
                 queue.submit(Some(encoder.finish()));
                 renderer.end_profiled_frame();
-                device.poll(wgpu::Maintain::Wait);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
             }
             let profile = renderer.take_profile();
             let ms = |label: &str| profile.gpu.iter().find(|p| p.label == label).map_or(0.0, |p| p.busy_ms);

@@ -23,9 +23,9 @@ pub(super) fn struct_size(module: &naga::Module, name: &str) -> usize {
 
 /// A device, or None without an adapter.
 pub(super) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-    pollster::block_on(adapter.request_device(&Default::default(), None)).ok()
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    pollster::block_on(adapter.request_device(&Default::default())).ok()
 }
 
 pub(super) fn read_words(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<u32> {
@@ -34,8 +34,8 @@ pub(super) fn read_words(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wg
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     words
 }
 
@@ -470,8 +470,8 @@ fn fragment_main(in: VOut) -> FOut {
 const SIZE: u32 = 192;
 
 fn headless() -> Option<Renderer> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: SIZE, height: SIZE, clear_color: crate::math::Vec4::new(0.0, 0.0, 0.0, 0.0), ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -536,8 +536,8 @@ fn draw(renderer: &mut Renderer, scene: &mut Scene, camera: &mut Camera) -> Vec<
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     (0..SIZE * SIZE)
         .map(|i| {
             let at = ((i / SIZE) * row + (i % SIZE) * 8) as usize;
@@ -1106,8 +1106,8 @@ fn read_depth(renderer: &Renderer, texture: &wgpu::Texture, layer: u32) -> Vec<f
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     (0..w * h).map(|i| f32::from_le_bytes(bytes[((i / w) * row + (i % w) * 4) as usize..][..4].try_into().unwrap())).collect()
 }
 
@@ -1177,8 +1177,8 @@ fn sky_volume(clusters: bool, threshold: f32, scale: f32) -> Option<Vec<u8>> {
     );
     queue.submit(Some(encoder.finish()));
     read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let data = read.slice(..).get_mapped_range().to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = read.slice(..).get_mapped_range().unwrap().to_vec();
     Some(data)
 }
 
@@ -1246,8 +1246,8 @@ fn read_half(renderer: &Renderer, texture: &wgpu::Texture, channels: u32) -> Vec
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     (0..w * h)
         .map(|i| {
             let at = ((i / w) * row + (i % w) * 2 * channels) as usize;
@@ -1404,7 +1404,7 @@ fn cull_frame(device: &wgpu::Device, queue: &wgpu::Queue, culling: &mut ClusterC
     queue.submit(Some(encoder.finish()));
     culling.read_back(device, queue, &[(&*gpu, 0)]);
     // (the frame's readback lands before the next: in a renderer, a few frames later)
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let args = read_words(device, queue, gpu.args(0));
     (args[W_LISTED], args[W_CLAIMED], gpu.capacity(0))
 }

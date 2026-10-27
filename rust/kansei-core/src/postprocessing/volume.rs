@@ -164,8 +164,8 @@ impl PostProcessingVolume {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Blit PipelineLayout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -193,7 +193,7 @@ impl PostProcessingVolume {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -361,6 +361,7 @@ impl PostProcessingVolume {
                 label: Some("Blit RenderPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: surface_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -370,6 +371,7 @@ impl PostProcessingVolume {
                 depth_stencil_attachment: None,
                 timestamp_writes: crate::profiling::gpu_pass("Blit RenderPass").as_ref().map(crate::profiling::PassStamp::render),
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             rpass.set_pipeline(pipeline);

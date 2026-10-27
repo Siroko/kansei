@@ -21,7 +21,7 @@ const H: u32 = 120;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -98,8 +98,8 @@ fn read_rgba16(renderer: &Renderer, texture: &wgpu::Texture) -> Vec<[f32; 4]> {
     );
     renderer.queue().submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    renderer.device().poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((W * H) as usize);
     for y in 0..H {
         for x in 0..W {

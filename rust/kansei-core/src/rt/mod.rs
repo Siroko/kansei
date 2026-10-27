@@ -95,8 +95,9 @@ mod tests {
 
     fn validate(name: &str, code: &str) -> naga::Module {
         let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
-        // the strictest capabilities, closest to core WebGPU
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        // the strictest capabilities, closest to core WebGPU (whose unpack2x16float naga 30 counts as
+        // f16-in-f32, a capability wgpu grants every WebGPU device)
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
         module

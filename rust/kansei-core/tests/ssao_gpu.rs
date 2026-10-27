@@ -19,8 +19,8 @@ const AMBIENT: f32 = 0.8;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -121,9 +121,9 @@ fn run(device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, scene: &dyn 
             compilation_options: Default::default(),
         }),
         primitive: Default::default(),
-        depth_stencil: Some(wgpu::DepthStencilState { format: GBuffer::DEPTH_FORMAT, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+        depth_stencil: Some(wgpu::DepthStencilState { format: GBuffer::DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -138,13 +138,14 @@ fn run(device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, scene: &dyn 
     });
     let mut encoder = device.create_command_encoder(&Default::default());
     {
-        let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
+        let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[attachment(&gbuffer.emissive_view), attachment(&gbuffer.normal_view), attachment(&gbuffer.albedo_view)],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &gbuffer.depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bg, &[]);
@@ -175,8 +176,8 @@ fn run(device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, scene: &dyn 
     );
     queue.submit([encoder.finish()]);
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let data = staging.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = staging.slice(..).get_mapped_range().unwrap();
     let half = |o: usize| f16_to_f32(u16::from_le_bytes([data[o], data[o + 1]]));
     let output = (0..H * W)
         .map(|i| {

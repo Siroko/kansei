@@ -325,8 +325,8 @@ impl FftCompute {
 
         let scroll_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("JoyDiv/ElevScroll/Layout"),
-            bind_group_layouts: &[&scroll_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&scroll_bgl)],
+            immediate_size: 0,
         });
 
         let scroll_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -401,8 +401,8 @@ impl FftCompute {
 
         let displace_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("JoyDiv/FftDisplace/Layout"),
-            bind_group_layouts: &[&displace_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&displace_bgl)],
+            immediate_size: 0,
         });
 
         let displace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -513,8 +513,8 @@ impl FftCompute {
 
         let wave_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("JoyDiv/WaveDisplace/Layout"),
-            bind_group_layouts: &[&wave_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&wave_bgl)],
+            immediate_size: 0,
         });
 
         let wave_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -568,8 +568,8 @@ impl FftCompute {
 
         let fill_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("JoyDiv/WaveFill/Layout"),
-            bind_group_layouts: &[&wave_bgl], // same layout as wave
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&wave_bgl)], // same layout as wave
+            immediate_size: 0,
         });
 
         let fill_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

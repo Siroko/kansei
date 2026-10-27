@@ -118,7 +118,7 @@ impl TemporalAAEffect {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("TAA/Shader"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("TAA/Layout"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("TAA/Layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("TAA/Resolve"),
             layout: Some(&layout),

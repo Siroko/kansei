@@ -72,8 +72,8 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("SimulationRenderer/Layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("SimulationRenderer/Pipeline"),
@@ -81,7 +81,7 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<MarchingCubesVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
@@ -101,7 +101,7 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
                             shader_location: 2,
                         },
                     ],
-                }],
+                })],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -121,8 +121,8 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -130,7 +130,7 @@ fn fs(v: VSOut) -> @location(0) vec4<f32> {
                 count: sample_count.max(1),
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

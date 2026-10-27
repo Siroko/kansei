@@ -89,8 +89,8 @@ impl BlitResources {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Blit/PipelineLayout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -118,7 +118,7 @@ impl BlitResources {
             },
             depth_stencil: None,
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -162,6 +162,7 @@ impl BlitResources {
             label: Some("Blit/Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -415,9 +416,7 @@ impl ApplicationHandler for App {
 
                 // Get surface texture
                 let surface = renderer.surface().unwrap();
-                let output = surface
-                    .get_current_texture()
-                    .expect("Failed to get surface texture");
+                let output = kansei_core::renderers::surface_texture(surface).expect("Failed to get surface texture");
                 let canvas_view = output.texture.create_view(&Default::default());
 
                 let mut encoder =
@@ -434,7 +433,7 @@ impl ApplicationHandler for App {
                 }
 
                 queue.submit(std::iter::once(encoder.finish()));
-                output.present();
+                queue.present(output);
 
                 if let Some(ref w) = self.window {
                     w.request_redraw();

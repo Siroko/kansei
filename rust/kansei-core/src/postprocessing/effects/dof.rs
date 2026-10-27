@@ -300,8 +300,8 @@ fn make_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),

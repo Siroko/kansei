@@ -711,7 +711,7 @@ impl FrameTimer {
                 if result.is_ok() {
                     let ms = match period {
                         Some(period) => {
-                            let t: [u64; 4] = bytemuck::pod_read_unaligned(&readback.slice(..).get_mapped_range()[..32]);
+                            let t: [u64; 4] = bytemuck::pod_read_unaligned(&readback.slice(..).get_mapped_range().unwrap()[..32]);
                             // from the start pass's first stamp to the end pass's last written one
                             let start = t[0];
                             let end = if t[3] > t[2] { t[3] } else { t[2] };
@@ -729,7 +729,7 @@ impl FrameTimer {
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::Maintain::Poll);
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 
     /// The frames measured since the last call, ms.
@@ -1292,9 +1292,9 @@ mod tests {
     #[test]
     fn the_frame_timer_measures_each_frame() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
         let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }, None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() })).unwrap();
         // many timers alive on one device, as a browser tab's reloads leave them for its garbage
         // collector: each holds one query set (on Metal a counter sample buffer, of which a
         // device has few)
@@ -1327,11 +1327,11 @@ mod tests {
             }
             queue.submit(Some(encoder.finish()));
             timer.end();
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             measured.extend(timer.take());
         }
         timer.flush();
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         measured.extend(timer.take());
         assert!(measured.len() >= 3, "most frames measured: {measured:?}");
         assert!(measured.iter().all(|&ms| ms > 0.0 && ms < 1000.0), "{measured:?}");

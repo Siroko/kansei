@@ -218,7 +218,7 @@ impl ScreenSpaceGIEffect {
         let composite_bgl = bgl("SSGI/CompositeBGL", &[uniform(0), texture(1, false), depth(2), texture(3, false), texture(4, false), texture(5, false), uniform(6), storage(7)]);
         let pipeline = |label: &str, code: &str, layout: &wgpu::BindGroupLayout| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[layout], push_constant_ranges: &[] });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(layout)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pl),
@@ -442,8 +442,8 @@ mod tests {
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-        pollster::block_on(adapter.request_device(&Default::default(), None)).ok()
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        pollster::block_on(adapter.request_device(&Default::default())).ok()
     }
 
     const W: u32 = 384;
@@ -512,9 +512,9 @@ mod tests {
                 compilation_options: Default::default(),
             }),
             primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState { format: GBuffer::DEPTH_FORMAT, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+            depth_stencil: Some(wgpu::DepthStencilState { format: GBuffer::DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -528,13 +528,14 @@ mod tests {
         });
         let mut encoder = device.create_command_encoder(&Default::default());
         {
-            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
+            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[attachment(&gbuffer.normal_view), attachment(&gbuffer.albedo_view)],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &gbuffer.depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -567,8 +568,8 @@ mod tests {
         );
         queue.submit([e.finish()]);
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = buf.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = buf.slice(..).get_mapped_range().unwrap();
         let half = |o: usize| {
             let h = u16::from_le_bytes([data[o], data[o + 1]]);
             let e = ((h >> 10) & 0x1f) as i32;

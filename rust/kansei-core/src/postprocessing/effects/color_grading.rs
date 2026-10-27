@@ -74,7 +74,7 @@ impl PostProcessingEffect for ColorGradingEffect {
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
 
         self.pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

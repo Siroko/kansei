@@ -163,7 +163,7 @@ impl MarchingCubesSimulation {
             label: Some("FluidMarchingCubes/Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -210,8 +210,8 @@ impl MarchingCubesSimulation {
         });
         let reset_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FluidMarchingCubes/ResetLayout"),
-            bind_group_layouts: &[&reset_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&reset_bgl)],
+            immediate_size: 0,
         });
         let reset_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("FluidMarchingCubes/ResetPipeline"),
@@ -308,8 +308,8 @@ impl MarchingCubesSimulation {
         });
         let extract_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FluidMarchingCubes/ExtractLayout"),
-            bind_group_layouts: &[&extract_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&extract_bgl)],
+            immediate_size: 0,
         });
         let extract_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("FluidMarchingCubes/ExtractPipeline"),
@@ -370,8 +370,8 @@ impl MarchingCubesSimulation {
         });
         let finalize_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FluidMarchingCubes/FinalizeLayout"),
-            bind_group_layouts: &[&finalize_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&finalize_bgl)],
+            immediate_size: 0,
         });
         let finalize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("FluidMarchingCubes/FinalizePipeline"),

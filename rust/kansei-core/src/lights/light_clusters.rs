@@ -59,7 +59,7 @@ impl LightClusters {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("LightClusters"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("LightClusters"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("LightClusters"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("LightClusters/Build"),
             layout: Some(&layout),
@@ -159,12 +159,12 @@ mod tests {
     /// behind the camera nowhere, and one aiming away is not listed where it doesn't reach.
     #[test]
     fn gpu_builds_cluster_lists() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let spot = |pos: Vec3, dir: Vec3, range: f32, outer: f32| {
             Light::Spot(SpotLight::new(pos, dir, Vec3::new(1.0, 1.0, 1.0), 100.0, range, outer * 0.5, outer))
         };
@@ -190,8 +190,8 @@ mod tests {
         encoder.copy_buffer_to_buffer(&clusters.lights, 0, &staging, 0, staging.size());
         queue.submit(Some(encoder.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let words: Vec<u32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let words: Vec<u32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
         let list = |c: u32| -> Vec<u32> {
             let base = (c * CLUSTER_SLOTS) as usize;
             words[base + 1..base + 1 + words[base] as usize].to_vec()

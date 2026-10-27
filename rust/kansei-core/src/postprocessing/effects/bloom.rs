@@ -267,7 +267,7 @@ impl PostProcessingEffect for BloomEffect {
 
         // --- Pipelines ---
         let ds_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&downsample_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&downsample_bgl)], immediate_size: 0,
         });
         self.downsample_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom/DownsamplePipeline"), layout: Some(&ds_layout), module: &ds_shader,
@@ -275,7 +275,7 @@ impl PostProcessingEffect for BloomEffect {
         }));
 
         let us_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&upsample_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&upsample_bgl)], immediate_size: 0,
         });
         self.upsample_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom/UpsamplePipeline"), layout: Some(&us_layout), module: &us_shader,
@@ -283,7 +283,7 @@ impl PostProcessingEffect for BloomEffect {
         }));
 
         let comp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&composite_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&composite_bgl)], immediate_size: 0,
         });
         self.composite_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom/CompositePipeline"), layout: Some(&comp_layout), module: &comp_shader,
@@ -295,7 +295,7 @@ impl PostProcessingEffect for BloomEffect {
             label: Some("Bloom/LinearSampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
