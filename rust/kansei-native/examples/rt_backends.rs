@@ -333,6 +333,9 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
                 if measured {
                     totals[b].wall.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
+                if std::env::var("RTB_FRAMES").is_ok() {
+                    eprintln!("    frame {k}: {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
+                }
             }
             let profile = renderer.take_profile();
             if std::env::var("RTB_REPORT").is_ok() {

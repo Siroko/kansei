@@ -128,7 +128,8 @@ Both engines have these features unless an item says otherwise.
 - Screen-space GI
 - Ray tracing on a GPU-built grid of the scene's triangles around the camera: hybrid diffuse GI
   (rays plus voxel GI for further bounces, SVGF denoising, a reference path-tracing mode),
-  reflections, and mirror and glass materials (Fresnel, refraction, frosted glass)
+  reflections, and mirror and glass materials (Fresnel, refraction, frosted glass); on native, hardware ray
+  queries over the same triangles (Vulkan, Metal on M3 and later)
 - A BVH path tracer (the path-traced Cornell box example)
 
 **Post-processing**
@@ -537,6 +538,7 @@ shader in the browser too.
   each TS page's header comment: what it shows, its URL parameters and the engine API it uses
 - [AGENTS.md](AGENTS.md): build, verification and the engine's sharp edges, for contributors
 - [docs/ktx2.md](docs/ktx2.md): textures in KTX2
+- [docs/rt-hardware.md](docs/rt-hardware.md): hardware ray tracing for the RT grid on native
 - [docs/architecture/simulation-renderer-contract.md](docs/architecture/simulation-renderer-contract.md)
 - [docs/plans](docs/plans): design notes, such as the [ray-tracing grid](docs/plans/2026-10-05-rt-grid-design.md)
 - [rust/kansei-anim-bake/README.md](rust/kansei-anim-bake/README.md): motion-matching packs
