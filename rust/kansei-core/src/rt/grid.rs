@@ -122,6 +122,14 @@ pub enum RtBackend {
 }
 
 impl RtBackend {
+    /// The backend this one traces with on `device`: `Software` or `Hardware`, by the rules
+    /// above (`Auto`, `KANSEI_RT_BACKEND`, and software where the device has no ray queries).
+    /// `RtGrid::new` resolves its options' backend so, and the path tracer's scene too
+    /// (`pathtracer::BVHBuilder::set_backend`).
+    pub fn resolve(self, device: &wgpu::Device) -> RtBackend {
+        super::query::resolve(self, device)
+    }
+
     /// Its `kansei_rt_trace` library (`Auto` has none: ask the grid, `RtGrid::backend`).
     pub fn wgsl(self) -> &'static str {
         match self {

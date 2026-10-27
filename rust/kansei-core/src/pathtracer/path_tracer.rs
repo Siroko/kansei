@@ -3,6 +3,9 @@ use crate::lights::Light;
 use crate::objects::Scene;
 use crate::renderers::Renderer;
 
+use crate::rt::RtBackend;
+
+use super::accel;
 use super::blue_noise::generate_blue_noise;
 use super::bvh_builder::GPUBVHData;
 use super::material::PathTracerMaterial;
@@ -12,10 +15,10 @@ const TRACE_PARAMS_SIZE: u64 = 192;
 
 /// Owns the path trace compute pipeline and dispatches trace passes.
 ///
-/// The trace shader is formed by concatenating `intersection.wgsl`,
-/// `traversal.wgsl`, a binding preamble for the BVH storage buffers,
-/// and `trace.wgsl`. The resulting pipeline uses a single bind group
-/// (group 0) with 9 bindings:
+/// The trace shader is formed by concatenating `intersection.wgsl`, `instances.wgsl`, the
+/// scene's traversal for its backend (`traversal.wgsl`'s BVH4s, or `traversal_query.wgsl`'s
+/// hardware ray queries; `GPUBVHData::backend`) with its bindings, and `trace.wgsl`. The pipeline
+/// uses a single bind group (group 0), made for each backend the first time it traces one:
 ///
 ///   0  TraceParams uniform
 ///   1  output_tex  storage texture (rgba16float, write)
@@ -23,13 +26,17 @@ const TRACE_PARAMS_SIZE: u64 = 192;
 ///   3  scene_lights storage buffer (read)
 ///   4  blue_noise  storage buffer  (read)
 ///   5  triangles   storage buffer  (read) — array<f32>
-///   6  bvh4_nodes  storage buffer  (read) — array<vec4<f32>>
-///   7  tlas_bvh4_nodes storage buffer (read) — array<vec4<f32>>
+///   6  bvh4_nodes  storage buffer  (read) — array<vec4<f32>> (software)
+///   7  tlas_bvh4_nodes storage buffer (read) — array<vec4<f32>> (software), or the scene's
+///      acceleration structure (hardware)
 ///   8  instances   storage buffer  (read) — array of Instance
 ///   9  prev_frame  texture_2d (read) — previous frame for temporal accumulation
+///  10  the ray counter, while counting rays (`set_count_rays`)
 pub struct PathTracer {
-    trace_pipeline: Option<wgpu::ComputePipeline>,
-    trace_bgl: Option<wgpu::BindGroupLayout>,
+    /// the trace pipelines made so far, by backend and whether they count rays
+    pipelines: Vec<TracePipeline>,
+    count_rays: bool,
+    ray_counter: Option<wgpu::Buffer>,
     params_buf: Option<wgpu::Buffer>,
     output_texture: Option<wgpu::Texture>,
     output_view: Option<wgpu::TextureView>,
@@ -48,169 +55,97 @@ pub struct PathTracer {
     use_blue_noise: bool,
 }
 
-impl PathTracer {
-    /// Create a new `PathTracer` from an initialized renderer.
-    ///
-    /// This immediately builds the compute pipeline and uploads the
-    /// blue noise LUT. Call [`resize`] before the first [`trace`].
-    pub fn new(renderer: &Renderer) -> Self {
-        let device = renderer.device().clone();
-        let queue = renderer.queue().clone();
+struct TracePipeline {
+    backend: RtBackend,
+    count_rays: bool,
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
 
-        // ── Build concatenated shader source ────────────────────────
-        //
-        // The traversal shader references `triangles`, `bvh4_nodes`,
-        // `tlas_bvh4_nodes`, and `instances` without declaring their
-        // bindings (they are marked "external"). We inject a small
-        // preamble between traversal.wgsl and trace.wgsl that declares
-        // bindings 5-8 matching the TypeScript engine.
-        let intersection_src = include_str!("shaders/intersection.wgsl");
-        let traversal_src = include_str!("shaders/traversal.wgsl");
-        let trace_src = include_str!("shaders/trace.wgsl");
+/// The ray counter's binding.
+const COUNTER_BINDING: u32 = 10;
 
-        let bvh_bindings = "\
-// ── BVH storage bindings (injected by PathTracer) ───────────────────
-@group(0) @binding(5) var<storage, read> triangles       : array<f32>;
-@group(0) @binding(6) var<storage, read> bvh4_nodes      : array<vec4f>;
-@group(0) @binding(7) var<storage, read> tlas_bvh4_nodes : array<vec4f>;
-@group(0) @binding(8) var<storage, read> instances       : array<Instance>;
-";
+/// The trace shader for `backend`, counting rays or not.
+pub(crate) fn trace_wgsl(backend: RtBackend, count_rays: bool) -> String {
+    accel::assemble(format!(
+        "{}\n{}",
+        accel::traversal_wgsl(backend, 5, count_rays.then_some(COUNTER_BINDING)),
+        include_str!("shaders/trace.wgsl")
+    ))
+}
 
-        let shader_code = format!(
-            "{}\n{}\n{}\n{}",
-            intersection_src, traversal_src, bvh_bindings, trace_src,
-        );
-
+impl TracePipeline {
+    fn new(device: &wgpu::Device, backend: RtBackend, count_rays: bool) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("PathTracer/trace"),
-            source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+            source: wgpu::ShaderSource::Wgsl(trace_wgsl(backend, count_rays).into()),
         });
 
         // ── Bind group layout ──────────────────────────────────────
-        let trace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("PathTracer/BGL"),
-            entries: &[
-                // 0: TraceParams uniform
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(TRACE_PARAMS_SIZE),
-                    },
-                    count: None,
+        let storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let mut entries = vec![
+            // 0: TraceParams uniform
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(TRACE_PARAMS_SIZE),
                 },
-                // 1: output texture (rgba16float, write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 1: output texture (rgba16float, write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
-                // 2: materials
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 2: materials, 3: scene_lights, 4: blue_noise
+            storage(2),
+            storage(3),
+            storage(4),
+            // 9: prev_frame (previous frame for temporal accumulation)
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                // 3: scene_lights
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 4: blue_noise
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 5: triangles (array<f32>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 6: bvh4_nodes (array<vec4f>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 7: tlas_bvh4_nodes (array<vec4f>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 8: instances (array<Instance>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 9: prev_frame (previous frame for temporal accumulation)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
+                count: None,
+            },
+        ];
+        // 5-8: the scene
+        entries.extend(accel::traversal_layout_entries(backend, 5));
+        if count_rays {
+            entries.push(accel::counter_layout_entry(COUNTER_BINDING));
+        }
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("PathTracer/BGL"), entries: &entries });
 
         // ── Pipeline ───────────────────────────────────────────────
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PathTracer/PipelineLayout"),
-            bind_group_layouts: &[Some(&trace_bgl)],
+            bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
 
-        let trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("PathTracer/Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
@@ -218,6 +153,18 @@ impl PathTracer {
             compilation_options: Default::default(),
             cache: None,
         });
+        Self { backend, count_rays, layout, pipeline }
+    }
+}
+
+impl PathTracer {
+    /// Create a new `PathTracer` from an initialized renderer.
+    ///
+    /// This uploads the blue noise LUT; the trace pipeline is made at the first `trace`, for the
+    /// scene's backend. Call [`resize`] before the first [`trace`].
+    pub fn new(renderer: &Renderer) -> Self {
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
 
         // ── TraceParams uniform buffer ─────────────────────────────
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -238,8 +185,9 @@ impl PathTracer {
         queue.write_buffer(&blue_noise_buf, 0, bytemuck::cast_slice(&noise_data));
 
         Self {
-            trace_pipeline: Some(trace_pipeline),
-            trace_bgl: Some(trace_bgl),
+            pipelines: Vec::new(),
+            count_rays: false,
+            ray_counter: None,
             params_buf: Some(params_buf),
             output_texture: None,
             output_view: None,
@@ -274,6 +222,23 @@ impl PathTracer {
     /// Enable/disable blue noise sampling (falls back to PCG RNG).
     pub fn set_use_blue_noise(&mut self, enabled: bool) {
         self.use_blue_noise = enabled;
+    }
+
+    /// Count the rays the traces cast (each closest-hit and any-hit query, an atomic add in the
+    /// shader: slower, for measuring rays per second); `take_ray_count` reads them.
+    pub fn set_count_rays(&mut self, enabled: bool) {
+        self.count_rays = enabled;
+    }
+
+    /// The rays the traces cast since counting started or the last take (a 32-bit count: take it
+    /// every frame or so at 1080p), waiting for the GPU; then counting again from 0.
+    pub fn take_ray_count(&mut self, renderer: &Renderer) -> u32 {
+        let Some(counter) = self.ray_counter.as_ref() else { return 0 };
+        let count: Vec<u32> = renderer.read_back_buffer_sync(counter, 4);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("PathTracer/RayCounter") });
+        encoder.clear_buffer(counter, 0, None);
+        self.queue.submit(Some(encoder.finish()));
+        count[0]
     }
 
     // ── Resize / recreate output texture ───────────────────────────
@@ -412,7 +377,8 @@ impl PathTracer {
     ///   - `resize()` called with non-zero dimensions
     ///   - `set_materials()` called with at least one material
     ///   - `bvh_data` from `BVHBuilder::upload_to_gpu()`
-    ///   - `tlas_buf` from `TLASBuilder` (the TLAS BVH4 node buffer)
+    ///   - `tlas_buf` from `TLASBuilder` (the TLAS BVH4 node buffer; unused when
+    ///     `bvh_data.backend()` is hardware)
     ///   - `camera` with up-to-date view/projection matrices
     ///   - `light_count` number of lights uploaded via `set_lights_raw`
     pub fn trace(
@@ -423,10 +389,28 @@ impl PathTracer {
         camera: &Camera,
         light_count: u32,
     ) {
+        // The pipeline for the scene's backend
+        let backend = bvh_data.backend();
+        let count_rays = self.count_rays;
+        let index = match self.pipelines.iter().position(|p| p.backend == backend && p.count_rays == count_rays) {
+            Some(index) => index,
+            None => {
+                self.pipelines.push(TracePipeline::new(&self.device, backend, count_rays));
+                self.pipelines.len() - 1
+            }
+        };
+        if count_rays && self.ray_counter.is_none() {
+            self.ray_counter = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("PathTracer/RayCounter"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
         // Guard: all resources must be present
-        let (Some(pipeline), Some(bgl), Some(params_buf), Some(output_view), Some(prev_view)) = (
-            self.trace_pipeline.as_ref(),
-            self.trace_bgl.as_ref(),
+        let TracePipeline { layout: bgl, pipeline, .. } = &self.pipelines[index];
+        let (Some(params_buf), Some(output_view), Some(prev_view)) = (
             self.params_buf.as_ref(),
             self.output_view.as_ref(),
             self.prev_view.as_ref(),
@@ -457,51 +441,40 @@ impl PathTracer {
             .write_buffer(params_buf, 0, bytemuck::cast_slice(&params));
 
         // ── Create bind group ──────────────────────────────────────
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: materials_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: lights_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: blue_noise_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(prev_view),
+            },
+        ];
+        entries.extend(bvh_data.bind_group_entries(tlas_buf, 5));
+        if let (true, Some(counter)) = (count_rays, self.ray_counter.as_ref()) {
+            entries.push(wgpu::BindGroupEntry { binding: COUNTER_BINDING, resource: counter.as_entire_binding() });
+        }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PathTracer/BG"),
             layout: bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(output_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: materials_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: lights_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: blue_noise_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: bvh_data.triangles_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: bvh_data.bvh4_nodes_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: tlas_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: bvh_data.instances_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(prev_view),
-                },
-            ],
+            entries: &entries,
         });
 
         // ── Dispatch ───────────────────────────────────────────────

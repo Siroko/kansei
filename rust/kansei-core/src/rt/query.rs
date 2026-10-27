@@ -281,7 +281,7 @@ pub(crate) fn resolve(backend: RtBackend, device: &wgpu::Device) -> RtBackend {
         RtBackend::Software => RtBackend::Software,
         RtBackend::Hardware if has_queries => RtBackend::Hardware,
         RtBackend::Hardware => {
-            log::warn!("rt grid: hardware ray queries asked for, but the device has none (EXPERIMENTAL_RAY_QUERY): tracing in software");
+            log::warn!("rt: hardware ray queries asked for, but the device has none (EXPERIMENTAL_RAY_QUERY): tracing in software");
             RtBackend::Software
         }
         RtBackend::Auto => {

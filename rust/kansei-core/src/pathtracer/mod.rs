@@ -1,3 +1,4 @@
+mod accel;
 mod blue_noise;
 mod buffers;
 mod bvh_builder;

@@ -230,7 +230,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 ref mut controls,
                 ref mut path_tracer,
                 ref mut bvh,
-                ref bvh_data,
+                ref mut bvh_data,
                 ref mut tlas,
                 ref mut volume,
                 box_b_idx,
