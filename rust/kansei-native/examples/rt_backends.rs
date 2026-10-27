@@ -18,7 +18,7 @@
 //! builds have no pass for the profiler to time; `Rt/BlasInput` is the BLAS's vertices).
 //!
 //! ```text
-//! cargo run --release -p kansei-native --example rt_backends -- [room|drive|particles|all] [--backend both|software|hardware] [--dense N] [--size WxH] [--rounds N] [--frames N]
+//! cargo run --release -p kansei-native --example rt_backends -- [room|room-static|room-rebuilt|drive|particles|all] [--backend both|software|hardware] [--dense N] [--size WxH] [--rounds N] [--frames N]
 //! ```
 
 use std::time::Instant;
@@ -74,6 +74,8 @@ fn args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "room" => a.scenes = vec![Kind::Room, Kind::RoomRebuilt],
+            "room-static" => a.scenes = vec![Kind::Room],
+            "room-rebuilt" => a.scenes = vec![Kind::RoomRebuilt],
             "drive" => a.scenes = vec![Kind::Drive],
             "particles" => a.scenes = vec![Kind::Particles],
             "all" => {}
