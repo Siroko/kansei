@@ -99,24 +99,24 @@ fn probe_index_to_coord(idx: u32) -> vec3u {
 // ── Probe grid sampling (previous frame's SH for multi-bounce) ──────────────
 const SH_STRIDE = 9u;
 
-fn compute_sh_basis_probe(d: vec3f) -> array<f32, 9> {
+// Written through a pointer: naga 24's HLSL cannot return an array (FXC and DXC reject it).
+fn compute_sh_basis_probe(d: vec3f, sh: ptr<function, array<f32, 9>>) {
     let x = d.x; let y = d.y; let z = d.z;
-    var sh: array<f32, 9>;
-    sh[0] = 0.282095;
-    sh[1] = 0.488603 * y;
-    sh[2] = 0.488603 * z;
-    sh[3] = 0.488603 * x;
-    sh[4] = 1.092548 * x * y;
-    sh[5] = 1.092548 * y * z;
-    sh[6] = 0.315392 * (3.0 * z * z - 1.0);
-    sh[7] = 1.092548 * x * z;
-    sh[8] = 0.546274 * (x * x - y * y);
-    return sh;
+    (*sh)[0] = 0.282095;
+    (*sh)[1] = 0.488603 * y;
+    (*sh)[2] = 0.488603 * z;
+    (*sh)[3] = 0.488603 * x;
+    (*sh)[4] = 1.092548 * x * y;
+    (*sh)[5] = 1.092548 * y * z;
+    (*sh)[6] = 0.315392 * (3.0 * z * z - 1.0);
+    (*sh)[7] = 1.092548 * x * z;
+    (*sh)[8] = 0.546274 * (x * x - y * y);
 }
 
 fn evaluate_probe_sh_prev(probe_idx: u32, dir: vec3f) -> vec3f {
     let base = probe_idx * SH_STRIDE;
-    let sh = compute_sh_basis_probe(dir);
+    var sh: array<f32, 9>;
+    compute_sh_basis_probe(dir, &sh);
     var result = vec3f(0.0);
     for (var c = 0u; c < 9u; c++) {
         result += probe_sh_prev[base + c].xyz * sh[c];
