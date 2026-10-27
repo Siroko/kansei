@@ -102,7 +102,36 @@ rebuilt every frame, outdoor-gi's grid round a camera driving through a field of
 glass-particles' room of glass beads rebuilt every frame. Frame times are wall time with the CPU
 waiting for each frame's GPU work; pass times are the profiler's.
 
-MEASUREMENTS
+Software → hardware, 2026-10-27 (NVIDIA driver 617.42; the full tables are in the pull request
+that added the backend):
+
+| 1920 x 1080 | Apple M4 Pro, Metal | RTX 5090, Vulkan |
+|---|---|---|
+| **room** (a 19k-triangle mesh), frame | 7.96 → 6.20 ms | 2.18 → 1.05 ms |
+| GI trace (`RtGi/Trace`) | 3.00 → 1.37 ms | 0.63 → 0.16 ms |
+| reflections (`Rt/Trace`) | 0.55 → 0.26 ms | 0.40 → 0.06 ms |
+| glass (`Rt/Glass`) | 0.94 → 1.00 ms | 0.44 → 0.12 ms |
+| **room, rebuilt every frame**, frame | 8.21 → 7.78 ms | 2.53 → 1.57 ms |
+| **room with a 1.3 M-triangle mesh**, frame | 66.4 → 6.2 ms | 56.2 → 1.25 ms |
+| GI trace | 36.8 → 1.38 ms | 21.3 → 0.16 ms |
+| **the same, rebuilt every frame**, frame | 68.7 → 67.3 ms | 58.6 → 4.7 ms |
+| **drive** (the box stepping along), frame | 6.15 → 5.19 ms | 2.08 → 1.90 ms |
+| GI trace | 1.49 → 0.85 ms | 0.19 → 0.06 ms |
+| **particles** (400 glass beads, rebuilt every frame), frame | 65.9 → 46.0 ms | 19.0 → 9.1 ms |
+| glass | 60.8 → 35.9 ms | 12.5 → 2.9 ms |
+
+- In the room the traces run about twice as fast on the M4 Pro and four to six times on the
+  5090. Dense meshes, which crowd the grid's cells, gain the most: the GI trace of the
+  1.3 M-triangle room, 27 and 130 times.
+- A hardware rebuild costs more than the grid's on Metal: a fast BLAS build of the room's 39k
+  slots and the CPU's wait add about 1.6 ms to a frame, 61 ms for 1.7 M triangles. On the 5090
+  the same builds take about 0.5 and 3.5 ms. Static scenes build once.
+- Metal's glass pass gains nothing in the room, unexplained so far (on the 5090 it runs 3.8
+  times as fast); its rays meet the glass ball in the BLAS's non-opaque geometry, whose
+  candidates come back to the shader.
+- DX12 (`RtBackend::Hardware`, DXC from the Windows SDK) passed the parity tests on the 5090 as
+  Vulkan did: Kansei's traces don't take the shape of the miscompiled one. It stays opt-in until
+  the driver bug is understood.
 
 The path tracer (`pathtracer`) has its own BVH and doesn't use the grid; moving it to hardware
 ray queries is later work, as is an instanced TLAS over per-mesh BLASes that traces the whole
