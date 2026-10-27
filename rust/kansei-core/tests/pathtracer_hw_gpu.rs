@@ -102,7 +102,7 @@ fn build(renderer: &Renderer, scene: &Scene, backend: RtBackend) -> (GPUBVHData,
 /// material), (position, u), (v, the triangle's world area, 0, 0).
 fn trace(renderer: &Renderer, data: &GPUBVHData, tlas: &TLASBuilder, queries: &[[f32; 4]]) -> Vec<[f32; 4]> {
     let device = renderer.device();
-    let code = kansei_core::rt::hoist_wgsl_enables(&format!(
+    let code = format!(
         "{}\n\
          @group(0) @binding(4) var<storage, read> queries : array<vec4f>;\n\
          @group(0) @binding(5) var<storage, read_write> results : array<vec4f>;\n\
@@ -122,8 +122,8 @@ fn trace(renderer: &Renderer, data: &GPUBVHData, tlas: &TLASBuilder, queries: &[
              results[4u * i + 3u] = vec4f(h.v, area, 0.0, 0.0);\n\
          }}",
         data.traversal_wgsl(0)
-    ));
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("PtParity"), source: wgpu::ShaderSource::Wgsl(code.into()) });
+    );
+    let module = data.shader_module(device, "PtParity", &code);
     let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -384,4 +384,38 @@ fn hardware_image_matches_the_bvh() {
     assert!((m_hw - m_sw).abs() < 0.01 * m_sw, "mean luminance: software {m_sw}, hardware {m_hw}");
     // the same samples down the same paths: well within the noise between two sample sets
     assert!(d_hw < 0.25 * d_noise, "hardware differs by {d_hw} a pixel, other samples by {d_noise}");
+}
+
+/// Rays the hardware's query must not be given (its module skips wgpu's check of them): a NaN or
+/// an infinity in the origin or direction, or no interval to search. Each misses on both backends.
+#[test]
+fn rays_with_a_nan_or_an_infinity_miss() {
+    let Some(renderer) = renderer() else { return };
+    let (scene, _, _) = cornell();
+    let (nan, inf) = (f32::NAN, f32::INFINITY);
+    // (origin + any-hit distance, direction), each aimed at the back wall from the eye but for its fault
+    let q: Vec<[f32; 4]> = [
+        ([nan, 3.0, 8.0, 100.0], [0.0, 0.0, -1.0]),
+        ([0.0, 3.0, 8.0, 100.0], [0.0, nan, -1.0]),
+        ([inf, 3.0, 8.0, 100.0], [0.0, 0.0, -1.0]),
+        ([0.0, 3.0, 8.0, 100.0], [0.0, 0.0, -inf]),
+        ([0.0, 3.0, 8.0, nan], [0.0, 0.0, -1.0]),
+        ([0.0, 3.0, 8.0, 0.0], [0.0, 0.0, -1.0]),
+        ([0.0, 3.0, 8.0, -5.0], [0.0, 0.0, -1.0]),
+    ]
+    .iter()
+    .flat_map(|&(o, d)| [o, [d[0], d[1], d[2], 0.0]])
+    .collect();
+    for backend in [RtBackend::Software, RtBackend::Hardware] {
+        let (data, tlas, _) = build(&renderer, &scene, backend);
+        let r = trace(&renderer, &data, &tlas, &q);
+        for i in 0..q.len() / 2 {
+            assert_eq!(r[4 * i][3], 0.0, "{backend:?}: ray {i} {:?} -> {:?} found an any hit", q[2 * i], q[2 * i + 1]);
+            // the closest hit has no distance limit: only the rays with a faulty origin or
+            // direction (the first four) miss it
+            if i < 4 {
+                assert!(r[4 * i][0] < 0.0, "{backend:?}: ray {i} {:?} -> {:?} hit at {}", q[2 * i], q[2 * i + 1], r[4 * i][0]);
+            }
+        }
+    }
 }

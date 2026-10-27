@@ -76,10 +76,7 @@ pub(crate) fn trace_wgsl(backend: RtBackend, count_rays: bool) -> String {
 
 impl TracePipeline {
     fn new(device: &wgpu::Device, backend: RtBackend, count_rays: bool) -> Self {
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("PathTracer/trace"),
-            source: wgpu::ShaderSource::Wgsl(trace_wgsl(backend, count_rays).into()),
-        });
+        let shader_module = accel::shader_module(device, backend, "PathTracer/trace", &trace_wgsl(backend, count_rays));
 
         // ── Bind group layout ──────────────────────────────────────
         let storage = |binding| wgpu::BindGroupLayoutEntry {

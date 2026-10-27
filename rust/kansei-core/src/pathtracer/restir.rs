@@ -50,10 +50,7 @@ pub(crate) fn restir_wgsl(backend: RtBackend) -> String {
 
 impl ReSTIRPipelines {
     fn new(device: &wgpu::Device, backend: RtBackend) -> Self {
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ReSTIR/Shader"),
-            source: wgpu::ShaderSource::Wgsl(restir_wgsl(backend).into()),
-        });
+        let shader_module = super::accel::shader_module(device, backend, "ReSTIR/Shader", &restir_wgsl(backend));
 
         // ── Bind group layout ────────────────────────────────────────
         //

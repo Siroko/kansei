@@ -132,7 +132,7 @@ struct Probe {
 impl Probe {
     fn new(renderer: &Renderer, data: &kansei_core::pathtracer::GPUBVHData, camera: &Camera, sun: Vec3, (w, h): (u32, u32)) -> Self {
         let device = renderer.device();
-        let code = kansei_core::rt::hoist_wgsl_enables(&format!(
+        let code = format!(
             "{}\n\
              struct ProbeParams {{ inv_view_proj : mat4x4f, eye : vec4f, sun : vec4f, size : vec4u }}\n\
              @group(0) @binding(4) var<uniform> pp : ProbeParams;\n\
@@ -155,8 +155,8 @@ impl Probe {
                  probe_out[gid.y * pp.size.x + gid.x] = v;\n\
              }}",
             data.traversal_wgsl(0)
-        ));
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("PtProbe"), source: wgpu::ShaderSource::Wgsl(code.into()) });
+        );
+        let module = data.shader_module(device, "PtProbe", &code);
         let buffer = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let mut entries = data.layout_entries(0);
         entries.extend([buffer(4, wgpu::BufferBindingType::Uniform), buffer(5, wgpu::BufferBindingType::Storage { read_only: false })]);
@@ -255,6 +255,13 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
                     totals[b].wall.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
             }
+            // (a profile averages its passes over the window's frames: a pass's own time is its
+            // busy time over its count)
+            let profile = renderer.take_profile();
+            for p in profile.gpu.iter().filter(|p| p.label == "PathTracer/Trace") {
+                totals[b].trace_ms += p.busy_ms / p.count;
+                totals[b].traces += 1;
+            }
             // the traversal alone
             for _ in 0..args.frames {
                 probes[b].run(&renderer, data, tlas, (w, h));
@@ -262,18 +269,9 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
                 let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
             }
             let profile = renderer.take_profile();
-            for p in &profile.gpu {
-                match p.label {
-                    "PathTracer/Trace" => {
-                        totals[b].trace_ms += p.busy_ms;
-                        totals[b].traces += 1;
-                    }
-                    "PtProbe" => {
-                        totals[b].probe_ms += p.busy_ms;
-                        totals[b].probes += 1;
-                    }
-                    _ => {}
-                }
+            for p in profile.gpu.iter().filter(|p| p.label == "PtProbe") {
+                totals[b].probe_ms += p.busy_ms / p.count;
+                totals[b].probes += 1;
             }
             totals[b].probe_rays = probes[b].rays(&renderer, (w, h));
             let t = &totals[b];

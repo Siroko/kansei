@@ -78,10 +78,7 @@ pub(crate) fn trace_wgsl(backend: RtBackend) -> String {
 ///  7: ray_results (storage, read_write)
 ///  8: probe_sh_prev (storage, read)
 fn trace_pipeline(device: &wgpu::Device, backend: RtBackend) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
-    let trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("ProbeGrid/TraceShader"),
-        source: wgpu::ShaderSource::Wgsl(trace_wgsl(backend).into()),
-    });
+    let trace_shader = super::accel::shader_module(device, backend, "ProbeGrid/TraceShader", &trace_wgsl(backend));
     let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,

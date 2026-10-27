@@ -8,6 +8,11 @@
 // Requires: intersection.wgsl (Ray, HitInfo), instances.wgsl (Instance and its transforms)
 // Requires: external bindings for triangles, instances and `scene_tlas` (acceleration_structure).
 // The module's `enable` goes first (`rt::hoist_wgsl_enables`).
+//
+// The query keeps wgpu's ray query rules itself (initialized before it proceeds, proceeded to the
+// end before its committed hit is read, no NaN or infinity in the ray it is given), so its module
+// is made without wgpu's tracking of them (`ray_query_initialization_tracking`; accel.rs's
+// `shader_module`), which cost ten times the trace on NVIDIA's Vulkan driver.
 
 enable wgpu_ray_query;
 
@@ -19,6 +24,9 @@ fn trace_bvh_internal(ray: Ray, any_hit: bool, max_dist: f32) -> HitInfo {
     var hit: HitInfo;
     hit.t = max_dist;
     hit.hit = false;
+    // a ray with a NaN or an infinity, or nothing between its ends, misses (as it would the BVH)
+    let big = vec3f(3.0e38);
+    if (!(all(abs(ray.origin) < big) && all(abs(ray.dir) < big) && max_dist > RQ_T_MIN)) { return hit; }
 
     // every triangle is opaque and two-sided, as ray_triangle's are
     var flags = RAY_FLAG_FORCE_OPAQUE;

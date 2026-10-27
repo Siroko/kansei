@@ -174,11 +174,19 @@ impl GPUBVHData {
     /// WGSL tracing the scene from a compute pass, through its backend: `Ray`, `HitInfo`,
     /// `trace_bvh(ray)` (the closest hit), `trace_bvh_shadow(ray, max_dist)` (any hit),
     /// `trace_bvh_internal(ray, any_hit, max_dist)` and `get_world_tri_area(tri, instance)`, its
-    /// four bindings in group 0 from `first` (`layout_entries`, `bind_group_entries`). On the
-    /// hardware backend the module opens with an `enable`: assemble it through
-    /// `rt::hoist_wgsl_enables`.
+    /// four bindings in group 0 from `first` (`layout_entries`, `bind_group_entries`). Make the
+    /// module with `shader_module` (on the hardware backend it opens with an `enable`, and skips
+    /// a costly runtime check).
     pub fn traversal_wgsl(&self, first: u32) -> String {
         super::accel::traversal_wgsl(self.backend(), first, None)
+    }
+
+    /// The compute module of `code`, a module whose only ray queries are `traversal_wgsl`'s,
+    /// assembled (its `enable` first): on the hardware backend made without wgpu's ray query
+    /// initialization tracking, which the traversal does without (it keeps the rules itself) and
+    /// which cost NVIDIA's Vulkan driver ten times the path tracer's trace.
+    pub fn shader_module(&self, device: &wgpu::Device, label: &str, code: &str) -> wgpu::ShaderModule {
+        super::accel::shader_module(device, self.backend(), label, &crate::rt::hoist_wgsl_enables(code))
     }
 
     /// The layout entries of `traversal_wgsl(first)`'s bindings.

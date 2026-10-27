@@ -201,6 +201,24 @@ pub(crate) fn assemble(code: String) -> String {
     crate::rt::hoist_wgsl_enables(&code)
 }
 
+/// The compute module of `code` (assembled, with `traversal_wgsl(backend, ..)` its only ray
+/// queries). On the hardware backend it is made without wgpu's ray query initialization
+/// tracking, which cost ten times the path tracer's trace on NVIDIA's Vulkan driver (1080p, 1 spp:
+/// 9.3 against 0.95 ms on an RTX 5090); `traversal_query.wgsl` keeps the rules it checks.
+pub(crate) fn shader_module(device: &wgpu::Device, backend: RtBackend, label: &str, code: &str) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) };
+    match backend {
+        // SAFETY: the module's one ray query (traversal_query.wgsl's `trace_bvh_internal`) is
+        // initialized before it proceeds, proceeds until it returns false before its committed
+        // intersection is read, reads no candidate, and is given no ray with a NaN or an infinity
+        // in its origin or direction or a t_max not above its t_min (those return a miss first).
+        RtBackend::Hardware => unsafe {
+            device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks { ray_query_initialization_tracking: false, ..wgpu::ShaderRuntimeChecks::checked() })
+        },
+        _ => device.create_shader_module(desc),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
