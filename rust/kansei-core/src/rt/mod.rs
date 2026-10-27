@@ -1,7 +1,9 @@
 //! Ray tracing a near-field grid of triangles, in compute shaders (WebGPU has no hardware ray
 //! tracing): a uniform grid of world triangles in a box round the camera (or a fixed box, a
 //! room), rebuilt on the GPU, for sharp and glossy reflections and short rays the voxels are too
-//! coarse for. See `docs/plans/2026-10-05-rt-grid-design.md`.
+//! coarse for. See `docs/plans/2026-10-05-rt-grid-design.md`. On native, where the device has
+//! hardware ray queries, the same triangles can go into an acceleration structure instead
+//! ([`RtBackend`], `docs/rt-hardware.md`): the same `kansei_rt_trace` and hits, traced in hardware.
 //!
 //! The technique combines Hector Arellano's two posts: triangles treated as particles, small
 //! enough to fit the grid's cells, with the few big ones kept apart (miaumiau.cat/?p=1457), and a
@@ -23,7 +25,8 @@
 //! - [`RtScene`] places meshes ([`RtMesh`]) on the CPU for a grid with no renderer;
 //!   [`split_large_triangles`] splits a mesh's big triangles at load.
 //! - [`RT_GRID_WGSL`]'s `kansei_rt_trace` traces it from any compute pass, with the buffers
-//!   `RtGrid::bindings_wgsl` declares.
+//!   `RtGrid::bindings_wgsl` declares; [`RT_QUERY_WGSL`]'s with hardware ray queries, where
+//!   `RtGrid::backend` is `RtBackend::Hardware` (`RtBackend::wgsl` and `bindings_wgsl` pick).
 //! - [`RtReflectionsEffect`] traces sharp and glossy reflections through it on the surfaces whose
 //!   material writes an F0 (`materials::GBUFFER_OUT_WGSL`'s `kansei_gbuffer_out_specular`), the
 //!   hits lit by the voxel GI (the light leaving the surface there), the voxel cone past it.
@@ -36,12 +39,13 @@ mod diffuse;
 mod effect;
 mod grid;
 mod mesh;
+mod query;
 mod scene;
 mod scene_grid;
 
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
-pub use grid::{RtGrid, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
+pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
@@ -54,7 +58,35 @@ pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
 /// buffers with `RtGrid::bindings_wgsl(group, first)` (bind `RtGrid::bind_group_entries`), and
 /// define `fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool`, whether an alpha-tested
 /// triangle (`RtSurface::with_alpha_layer`) is there at `uv` (`RT_OPAQUE_WGSL`: everywhere).
-pub const RT_GRID_WGSL: &str = concat!(include_str!("shaders/rt_types.wgsl"), include_str!("shaders/rt_grid.wgsl"));
+pub const RT_GRID_WGSL: &str = concat!(include_str!("shaders/rt_types.wgsl"), include_str!("shaders/rt_hit.wgsl"), include_str!("shaders/rt_grid.wgsl"));
+
+/// `RT_GRID_WGSL` with hardware ray queries (`RtBackend::Hardware`, native only): the same
+/// functions and `KanseiRtHit`, over the grid's acceleration structure. Declare its bindings with
+/// `RtBackend::Hardware.bindings_wgsl(group, first)` (bind `RtGrid::bind_group_entries`). It
+/// starts `enable wgpu_ray_query;`, which must open the module: pass the assembled module through
+/// [`hoist_wgsl_enables`].
+pub const RT_QUERY_WGSL: &str = concat!(include_str!("shaders/rt_types.wgsl"), include_str!("shaders/rt_hit.wgsl"), include_str!("shaders/rt_query.wgsl"));
+
+/// A WGSL module with its `enable` directives (`RT_QUERY_WGSL`'s, spliced mid-module) moved to
+/// its start, once each, as WGSL requires; the rest as it was.
+pub fn hoist_wgsl_enables(code: &str) -> String {
+    let mut enables: Vec<&str> = Vec::new();
+    let mut rest = String::with_capacity(code.len());
+    for line in code.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with("enable ") && t.ends_with(';') {
+            if !enables.contains(&t) {
+                enables.push(t);
+            }
+        } else {
+            rest.push_str(line);
+        }
+    }
+    if enables.is_empty() {
+        return code.to_string();
+    }
+    format!("{}\n{rest}", enables.join("\n"))
+}
 
 /// Light packed in one word for `RtSurface::record_emission` (RGBE): `kansei_rt_pack_emission(radiance)`
 /// for the pass that writes the instance records, `kansei_rt_unpack_emission(word)` for a material
@@ -91,13 +123,25 @@ pub const RT_OPAQUE_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) ->
 mod tests {
     use super::grid::{gather_wgsl, RtGridGpu, RtSourceGpu, BUILD_WGSL};
     use super::*;
+
+    const BACKENDS: [RtBackend; 2] = [RtBackend::Software, RtBackend::Hardware];
     use crate::clusters::InstanceTransform;
 
     fn validate(name: &str, code: &str) -> naga::Module {
+        validate_for(RtBackend::Software, name, code)
+    }
+
+    /// Validated for `backend`: the strictest capabilities, closest to core WebGPU (whose
+    /// unpack2x16float naga 30 counts as f16-in-f32, a capability wgpu grants every WebGPU
+    /// device), plus ray queries for the hardware backend (native only).
+    fn validate_for(backend: RtBackend, name: &str, code: &str) -> naga::Module {
+        let name = format!("{name} ({backend:?})");
         let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
-        // the strictest capabilities, closest to core WebGPU (whose unpack2x16float naga 30 counts as
-        // f16-in-f32, a capability wgpu grants every WebGPU device)
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+        let mut capabilities = naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+        if backend == RtBackend::Hardware {
+            capabilities |= naga::valid::Capabilities::RAY_QUERY;
+        }
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
         module
@@ -129,21 +173,56 @@ mod tests {
             assert_eq!(struct_span(&gather, "RtSource"), std::mem::size_of::<RtSourceGpu>());
             assert_eq!(struct_span(&gather, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
         }
-        // the library as a caller uses it
-        let trace = validate(
-            "trace library",
-            &format!(
-                "{RT_GRID_WGSL}\n{}\n{RT_OPAQUE_WGSL}\n@group(0) @binding(0) var<storage, read_write> out: array<vec4f>;\n\
-                 @compute @workgroup_size(1) fn main() {{\n\
-                     let h = kansei_rt_trace(vec3f(0.0), vec3f(0.0, 0.0, 1.0), 0.0, 100.0, KANSEI_RT_ANY_HIT);\n\
-                     out[0] = vec4f(h.normal * h.t, kansei_rt_exit(vec3f(0.0), vec3f(1.0, 0.0, 0.0)));\n\
-                     out[1] = vec4f(kansei_rt_albedo(h.triangle), f32(kansei_rt_source(h.triangle) + kansei_rt_record(h.triangle)));\n\
-                     out[2] = vec4f(kansei_rt_uv(h.triangle, h.bary), select(0.0, 1.0, kansei_rt_contains(vec3f(1.0))), 0.0);\n\
-                 }}",
-                RtGrid::bindings_wgsl(1, 4)
-            ),
-        );
-        assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+        // the library as a caller uses it, through either backend
+        for backend in BACKENDS {
+            let trace = validate_for(
+                backend,
+                "trace library",
+                &hoist_wgsl_enables(&format!(
+                    "{}\n{}\n{RT_OPAQUE_WGSL}\n@group(0) @binding(0) var<storage, read_write> out: array<vec4f>;\n\
+                     @compute @workgroup_size(1) fn main() {{\n\
+                         let h = kansei_rt_trace(vec3f(0.0), vec3f(0.0, 0.0, 1.0), 0.0, 100.0, KANSEI_RT_ANY_HIT);\n\
+                         out[0] = vec4f(h.normal * h.t, kansei_rt_exit(vec3f(0.0), vec3f(1.0, 0.0, 0.0)));\n\
+                         out[1] = vec4f(kansei_rt_albedo(h.triangle), f32(kansei_rt_source(h.triangle) + kansei_rt_record(h.triangle)));\n\
+                         out[2] = vec4f(kansei_rt_uv(h.triangle, h.bary), select(0.0, 1.0, kansei_rt_contains(vec3f(1.0))), 0.0);\n\
+                     }}",
+                    backend.wgsl(),
+                    backend.bindings_wgsl(1, 4)
+                )),
+            );
+            assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+        }
+        // the hardware backend's BLAS input
+        let build = validate("query build", super::query::BUILD_WGSL);
+        assert_eq!(struct_span(&build, "KanseiRtQueryParams"), std::mem::size_of::<super::query::QueryParamsGpu>());
+    }
+
+    #[test]
+    fn enables_open_the_module() {
+        let code = hoist_wgsl_enables(&format!("struct A {{ x: f32 }}\n{RT_QUERY_WGSL}\nenable wgpu_ray_query;\nfn f() {{}}\n"));
+        assert!(code.starts_with("enable wgpu_ray_query;\n"), "{}", &code[..80]);
+        assert_eq!(code.matches("enable ").count(), 1, "once");
+        assert!(code.contains("struct A { x: f32 }\n") && code.ends_with("fn f() {}\n"));
+        // a module without enables is left as it was
+        assert_eq!(hoist_wgsl_enables(RT_GRID_WGSL), RT_GRID_WGSL);
+        assert!(!RT_GRID_WGSL.contains("enable "), "the software library stays core WebGPU");
+    }
+
+    /// Buffers and acceleration structures a stage binds, which Metal draws from one table of 31
+    /// (wgpu 30 keeps 2: `max_buffers_and_acceleration_structures_per_shader_stage` is 29).
+    fn metal_buffer_slots(groups: &[Vec<wgpu::BindGroupLayoutEntry>]) -> usize {
+        groups.iter().flatten().filter(|e| matches!(e.ty, wgpu::BindingType::Buffer { .. } | wgpu::BindingType::AccelerationStructure { .. })).count()
+    }
+
+    #[test]
+    fn rt_passes_fit_metals_buffer_slots() {
+        for backend in BACKENDS {
+            for clipmap in [true, false] {
+                let gi = metal_buffer_slots(&super::diffuse::trace_layout_entries(clipmap, backend));
+                let reflections = metal_buffer_slots(&super::effect::trace_layout_entries(clipmap, backend));
+                assert!(gi <= 29 && reflections <= 29, "{backend:?}, clipmap {clipmap}: GI trace {gi}, reflections {reflections} of 29");
+            }
+        }
     }
 
     #[test]
@@ -153,17 +232,19 @@ mod tests {
             let albedo = super::effect::DEFAULT_HIT_ALBEDO_WGSL;
             // the albedo hook as a surface would write it: the source tells the floor apart
             let hook = "fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f { if (kansei_rt_source(triangle) == 3u) { return vec3f(fract(p.x)); } return kansei_rt_albedo(triangle) * (1.0 + 0.0 * bary.x) + 0.0 * rp.invView[3].xyz; }\n";
-            for covered in [
-                super::effect::trace_wgsl(clipmap, &format!("fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {{ return true; }}\n{albedo}")),
-                super::effect::trace_wgsl(clipmap, &format!("{custom}\n{albedo}")),
-                super::effect::trace_wgsl(clipmap, &format!("{custom}\n{hook}")),
-            ] {
-                let trace = validate(&format!("reflection trace (clipmap {clipmap})"), &covered);
-                assert_eq!(struct_span(&trace, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
-                assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+            for backend in BACKENDS {
+                for covered in [
+                    super::effect::trace_wgsl(clipmap, backend, &format!("fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {{ return true; }}\n{albedo}")),
+                    super::effect::trace_wgsl(clipmap, backend, &format!("{custom}\n{albedo}")),
+                    super::effect::trace_wgsl(clipmap, backend, &format!("{custom}\n{hook}")),
+                ] {
+                    let trace = validate_for(backend, &format!("reflection trace (clipmap {clipmap})"), &covered);
+                    assert_eq!(struct_span(&trace, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
+                    assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+                }
+                let glass = validate_for(backend, &format!("glass (clipmap {clipmap})"), &super::effect::glass_wgsl(clipmap, backend, &format!("{custom}\n{albedo}")));
+                assert_eq!(struct_span(&glass, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
             }
-            let glass = validate(&format!("glass (clipmap {clipmap})"), &super::effect::glass_wgsl(clipmap, &format!("{custom}\n{albedo}")));
-            assert_eq!(struct_span(&glass, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
         }
         let resolve = validate("reflection resolve", &super::effect::resolve_wgsl());
         assert_eq!(struct_span(&resolve, "RtReflectParams"), std::mem::size_of::<super::effect::RtReflectParamsGpu>());
@@ -177,8 +258,10 @@ mod tests {
     #[test]
     fn shaders_validate_diffuse_gi() {
         for clipmap in [true, false] {
-            let trace = validate(&format!("gi trace (clipmap {clipmap})"), &super::diffuse::trace_wgsl(clipmap, RT_OPAQUE_WGSL));
-            assert_eq!(struct_span(&trace, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
+            for backend in BACKENDS {
+                let trace = validate_for(backend, &format!("gi trace (clipmap {clipmap})"), &super::diffuse::trace_wgsl(clipmap, backend, RT_OPAQUE_WGSL));
+                assert_eq!(struct_span(&trace, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
+            }
         }
         let svgf = validate("gi svgf", &super::diffuse::svgf_wgsl());
         assert_eq!(struct_span(&svgf, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());

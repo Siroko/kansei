@@ -148,6 +148,7 @@ fn the_floor_beside_a_red_wall_is_lit_red_and_the_hybrid_converges() {
     });
     let output_view = output.create_view(&Default::default());
     let handle = renderer.rt_grid().unwrap().handle();
+    eprintln!("rt grid backend: {:?}", handle.backend());
     let effect = |options: RtDiffuseGiOptions, renderer: &Renderer, scene: &Scene| {
         let mut e = RtDiffuseGiEffect::with_volume(renderer.voxel_gi().unwrap().volume(), handle.clone(), RtDiffuseGiOptions { max_distance: 10.0, ..options });
         e.update_lights(scene.lights());

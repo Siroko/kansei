@@ -7,6 +7,7 @@
  */
 import { assemble } from '../materials/shaders/ShaderUtils';
 import rtTypes from '../../rust/kansei-core/src/rt/shaders/rt_types.wgsl?raw';
+import rtHit from '../../rust/kansei-core/src/rt/shaders/rt_hit.wgsl?raw';
 import rtGrid from '../../rust/kansei-core/src/rt/shaders/rt_grid.wgsl?raw';
 import rtBuild from '../../rust/kansei-core/src/rt/shaders/rt_build.wgsl?raw';
 import rtGather from '../../rust/kansei-core/src/rt/shaders/rt_gather.wgsl?raw';
@@ -34,7 +35,7 @@ import { COMPUTE_SHADOWS_WGSL } from '../shadows/ComputeShadows';
  * `fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool`, whether an alpha-tested triangle
  * (`RtSurface.alphaLayer`) is there at `uv` (`RT_OPAQUE_WGSL`: everywhere). Rust: `rt::RT_GRID_WGSL`.
  */
-export const RT_GRID_WGSL: string = assemble([rtTypes, rtGrid]);
+export const RT_GRID_WGSL: string = assemble([rtTypes, rtHit, rtGrid]);
 
 /** A `kansei_rt_covered` for `RT_GRID_WGSL` that keeps every hit (no alpha test). */
 export const RT_OPAQUE_WGSL = 'fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { return true; }\n';

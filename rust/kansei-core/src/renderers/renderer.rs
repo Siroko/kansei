@@ -428,14 +428,31 @@ impl Renderer {
         log::info!("adapter: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
         // Optional features: requested only where the adapter offers them, so devices without
         // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs); the
-        // texture compression features let KTX2 textures stay block-compressed on the GPU.
-        let optional_features =
-            adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | crate::loaders::ktx2::CompressionSupport::FEATURES);
+        // texture compression features let KTX2 textures stay block-compressed on the GPU;
+        // EXPERIMENTAL_RAY_QUERY (native: Vulkan, Metal, DX12 with DXC) lets the ray tracing grid
+        // trace in hardware (`rt::RtBackend`).
+        let optional_features = adapter.features()
+            & (wgpu::Features::TIMESTAMP_QUERY | crate::loaders::ktx2::CompressionSupport::FEATURES | wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        let mut required_limits = self.config.required_limits.resolve(&adapter.limits());
+        let experimental_features = if optional_features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            // the acceleration structures' limits are 0 unless raised
+            let a = adapter.limits();
+            required_limits.max_blas_primitive_count = a.max_blas_primitive_count;
+            required_limits.max_blas_geometry_count = a.max_blas_geometry_count;
+            required_limits.max_tlas_instance_count = a.max_tlas_instance_count;
+            required_limits.max_acceleration_structures_per_shader_stage = a.max_acceleration_structures_per_shader_stage;
+            // SAFETY: wgpu's ray queries are experimental (their API may change, and may have
+            // bugs); only the grid's hardware backend uses them, on the backends rt::RtBackend trusts
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Kansei Device"),
                 required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
-                required_limits: self.config.required_limits.resolve(&adapter.limits()),
+                required_limits,
+                experimental_features,
                 memory_hints: wgpu::MemoryHints::default(),
                 ..Default::default()
             })
@@ -3156,6 +3173,11 @@ impl Renderer {
         let output = surface_texture(surface).expect("Surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
         drop(t);
+
+        // the ray tracing grid ready for the effects' traces (the hardware backend's TLAS)
+        if let Some(rt) = &self.rt_grid {
+            rt.grid().prepare_trace(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+        }
 
         // Run post-processing chain + blit
         volume.render(camera, &canvas_view, width, height);

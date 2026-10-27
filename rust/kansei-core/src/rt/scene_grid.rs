@@ -50,9 +50,13 @@ struct SceneMesh {
     triangles: u32,
 }
 
+/// Frames a moving grid rests before the hardware backend rebuilds its BLAS once to trace fast.
+const SETTLE_FRAMES: u32 = 30;
+
 /// The renderer's ray tracing grid (`Renderer::enable_rt_grid`): an `RtGrid` round the camera
 /// holding the triangles of the renderables with `Renderable::rt`, read with `rt::RT_GRID_WGSL`
-/// from any compute pass after the frame's culling (`grid().bind_group_entries`).
+/// (or, with the hardware backend, `grid().backend().wgsl()`) from any compute pass after the
+/// frame's culling (`grid().bind_group_entries`).
 ///
 /// Its box is one more cull view: `InstanceCulling` compacts the instances meeting it (by
 /// `rt_lod_range`, the camera's bands by default), and a cluster view cuts cluster LOD
@@ -61,7 +65,9 @@ struct SceneMesh {
 /// its mesh, placed by `Renderable::rt_placement`), and each single mesh whose world box meets the
 /// grid's (one box test per renderable on the CPU). It rebuilds when the box moves, when the
 /// static renderables in it change (transform, visibility, surface), when a cut it gathered grew,
-/// on `invalidate`, and every frame while a `dynamic` one is in it.
+/// on `invalidate`, and every frame while a `dynamic` one is in it. The hardware backend
+/// (`RtGridOptions::backend`) builds its BLAS fast while the box moves or a dynamic renderable
+/// rebuilds it, and once more to trace fast when it has rested `SETTLE_FRAMES` frames.
 pub struct SceneRtGrid {
     options: SceneRtGridOptions,
     grid: RtGrid,
@@ -72,11 +78,13 @@ pub struct SceneRtGrid {
     stats: SceneRtGridStats,
     /// renderables left out (no CPU geometry, or instances with no placement), warned once
     warned: HashSet<usize>,
+    /// frames since a hardware BLAS was built fast, while it stands (None: built to trace fast)
+    fast_built: Option<u32>,
 }
 
 impl SceneRtGrid {
     pub(crate) fn new(device: &wgpu::Device, options: SceneRtGridOptions) -> Self {
-        Self { grid: RtGrid::new(device, options.grid), options, meshes: HashMap::new(), key: None, force: true, rebuild: false, stats: SceneRtGridStats::default(), warned: HashSet::new() }
+        Self { grid: RtGrid::new(device, options.grid), options, meshes: HashMap::new(), key: None, force: true, rebuild: false, stats: SceneRtGridStats::default(), warned: HashSet::new(), fast_built: None }
     }
 
     pub fn options(&self) -> &SceneRtGridOptions {
@@ -122,9 +130,20 @@ impl SceneRtGrid {
         let moved = self.grid.follow(eye);
         let changed = self.key.as_ref() != Some(&key);
         self.key = Some(key);
-        let s = self.grid.stats();
-        let overflowed = s.triangles > s.triangle_capacity || s.references > s.reference_capacity;
-        self.rebuild = moved || changed || any_dynamic || overflowed || self.options.rebuild_every_frame || std::mem::take(&mut self.force);
+        let overflowed = self.grid.overflowed();
+        let moving = moved || any_dynamic || self.options.rebuild_every_frame;
+        self.rebuild = moving || changed || overflowed || std::mem::take(&mut self.force);
+        if self.grid.backend() == super::RtBackend::Hardware {
+            // a BLAS built fast while moving, rebuilt once to trace fast when it has rested
+            let settle = self.fast_built.is_some_and(|f| f >= SETTLE_FRAMES);
+            self.rebuild |= settle;
+            self.grid.set_prefer_fast_build(moving);
+            self.fast_built = match (self.rebuild, moving) {
+                (true, true) => Some(0),
+                (true, false) => None,
+                (false, _) => self.fast_built.map(|f| f + 1),
+            };
+        }
         self.stats.rebuilt = self.rebuild;
     }
 

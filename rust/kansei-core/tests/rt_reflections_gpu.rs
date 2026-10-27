@@ -170,6 +170,7 @@ fn a_mirror_floor_reflects_the_box_where_its_rays_hit_it() {
     });
     let output_view = output.create_view(&Default::default());
     let handle = renderer.rt_grid().unwrap().handle();
+    eprintln!("rt grid backend: {:?}", handle.backend());
     let mut effect = RtReflectionsEffect::with_volume(renderer.voxel_gi().unwrap().volume(), handle, RtReflectionsOptions { max_distance: 10.0, ..Default::default() });
     let mut run = |renderer: &mut Renderer, effect: &mut RtReflectionsEffect, frames: usize| {
         for _ in 0..frames {
