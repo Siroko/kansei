@@ -141,13 +141,13 @@
             return f;
         }
         pass('SSAO', 'ssao', {
-            subtle: { ao: 0.35, aoRadius: 0.15, aoBias: 0.01, aoSamples: 8 },
-            default: { ao: 0.6, aoRadius: 0.25, aoBias: 0.01, aoSamples: 16 },
-            strong: { ao: 1.0, aoRadius: 0.45, aoBias: 0.015, aoSamples: 32 },
+            subtle: { ao: 0.35, aoRadius: 0.15, aoBias: 0.003, aoSamples: 8 },
+            default: { ao: 0.6, aoRadius: 0.25, aoBias: 0.003, aoSamples: 16 },
+            strong: { ao: 1.0, aoRadius: 0.45, aoBias: 0.003, aoSamples: 32 },
         }, (f) => {
             f.addBinding(p, 'ao', { label: 'strength', min: 0, max: 1, step: 0.01 }).on('change', set('ao'));
             f.addBinding(p, 'aoRadius', { label: 'radius (m)', min: 0.02, max: 1.5, step: 0.01 }).on('change', set('aoRadius'));
-            f.addBinding(p, 'aoBias', { label: 'bias (m)', min: 0, max: 0.1, step: 0.001 }).on('change', set('aoBias'));
+            f.addBinding(p, 'aoBias', { label: 'bias (m per m)', min: 0, max: 0.02, step: 0.0005 }).on('change', set('aoBias'));
             f.addBinding(p, 'aoSamples', { label: 'samples', min: 1, max: 32, step: 1 }).on('change', set('aoSamples'));
         });
         // off: the repellers as polished grey solids; ray traced (every surface a path crosses) or

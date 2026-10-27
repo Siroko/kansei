@@ -52,7 +52,7 @@ use kansei_core::materials::{Binding, BindingResource, Compute, GradientSkyOptio
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
-    exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DistanceFogColor, DistanceFogEffect, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
+    exposure_from_ev100, BloomEffect, BloomOptions, CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DistanceFogColor, DistanceFogEffect, SSAOAmbient, SSAOEffect, SSAOOptions, ScreenSpaceGlassEffect, ScreenSpaceGlassOptions, SpotScattering, TemporalAAEffect, TemporalAAOptions,
     ToneMapEffect, ToneMapOptions, ToneMapper, VolumetricFogEffect, VolumetricFogOptions,
 };
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
@@ -511,7 +511,8 @@ struct Settings {
     /// The floor's ray-traced reflections (the glass is traced either way).
     reflections: bool,
     /// The post-processing passes, each on or off (`PostProcessingVolume::set_enabled`) with its
-    /// own settings. SSAO: its strength, radius (m), depth bias (m) and samples.
+    /// own settings. SSAO: its strength, radius (m), depth bias (m a metre of distance) and
+    /// samples.
     ssao: bool,
     ao: f32,
     ao_radius: f32,
@@ -630,7 +631,7 @@ impl Settings {
             ssao: true,
             ao: 0.6,
             ao_radius: 0.25,
-            ao_bias: 0.01,
+            ao_bias: 0.003,
             ao_samples: 16,
             glass_pass: true,
             ss_thickness: 0.8,
@@ -1149,6 +1150,14 @@ fn sky_rgb(radiance: f32) -> [f32; 4] {
     [radiance * 0.96, radiance, radiance * 1.06, 0.0]
 }
 
+/// SSAO's settings: it occludes the environment's hemisphere, the ambient the particles and the
+/// floor add.
+fn ssao_options(s: &Settings) -> SSAOOptions {
+    let rgb = |c: [f32; 4]| [c[0], c[1], c[2]];
+    let ambient = SSAOAmbient::Hemisphere { up: rgb(sky_rgb(s.sky_up)), down: rgb(sky_rgb(s.sky_down)) };
+    SSAOOptions { radius: s.ao_radius, bias: s.ao_bias, kernel_size: s.ao_samples, strength: s.ao, ambient }
+}
+
 fn look(settings: &Settings, dt: f32) -> LookGpu {
     LookGpu { roughness: settings.roughness, metallic: settings.metallic, dt, _pad: 0.0, sky_up: sky_rgb(settings.sky_up), sky_down: sky_rgb(settings.sky_down) }
 }
@@ -1319,7 +1328,7 @@ impl State {
         // starts its history afresh
         self.volume.set_enabled::<SSAOEffect>(s.ssao);
         if let Some(ao) = self.volume.effect_mut::<SSAOEffect>() {
-            ao.options = SSAOOptions { radius: s.ao_radius, bias: s.ao_bias, kernel_size: s.ao_samples, strength: s.ao };
+            ao.options = ssao_options(&s);
         }
         let exposure = exposure_from_ev100(s.ev100);
         self.volume.set_enabled::<ToneMapEffect>(s.tone);
@@ -1599,7 +1608,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         contents: bytemuck::cast_slice(&gradient_sky_lighting([0.0; 3], [0.0; 3])),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
-    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(SSAOEffect::new(SSAOOptions { radius: 0.25, bias: 0.01, kernel_size: 16, strength: settings.ao }))];
+    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(SSAOEffect::new(ssao_options(&settings)))];
     if let Some(rt) = rt_effect(&renderer, &scene, floor, &settings, &sky).filter(|_| glass) {
         effects.push(Box::new(rt));
     }

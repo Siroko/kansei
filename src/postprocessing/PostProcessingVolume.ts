@@ -42,7 +42,7 @@ export function halton(index: number, base: number): number {
  * -----
  * ```typescript
  * const volume = new PostProcessingVolume(renderer, [
- *     new SSAOEffect({ radius: 0.5 }),
+ *     new SSAOEffect({ radius: 0.5, ambient: { kind: 'unlit' } }),
  *     new GodRaysEffect({ lightScreenPos: new Vector2(0.5, 0.3) }),
  *     new DepthOfFieldEffect({ focusDistance: 5.0 }),
  * ]);

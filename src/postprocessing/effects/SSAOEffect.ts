@@ -1,298 +1,259 @@
+import { mat4 } from 'gl-matrix';
 import { Camera } from '../../cameras/Camera';
-import { Matrix4 } from '../../math/Matrix4';
 import { GBuffer } from '../GBuffer';
 import { PostProcessingEffect } from '../PostProcessingEffect';
+import { SSAO_BLUR_WGSL, SSAO_COMPOSITE_WGSL, SSAO_WGSL } from '../../materials/shaders/SharedWGSL';
+import { SKY_LIGHTING_BYTES } from '../../atmosphere/SkyAtmosphere';
 import { gpuPass } from '../../profiling/Profiler';
 
+/** Bytes of the WGSL `SSAOParams` (`ssao_common.wgsl`; Rust `SSAOParams`): four mat4, two vec4, then 12 scalars. */
+export const SSAO_PARAMS_BYTES = 336;
+
+/** The most hemisphere samples a pixel takes (the kernel's size). */
+const MAX_KERNEL = 32;
+
+/**
+ * The sampling radius on screen at most, as a share of the image's height: past it the radius
+ * shrinks (a close-up's samples would otherwise spread over the whole screen).
+ */
+const MAX_RADIUS_SCREEN = 0.1;
+
+/**
+ * The ambient light the materials add to the colour, which `SSAOEffect` takes the occluded
+ * share of: the occlusion darkens it alone, never the direct light or the emission (Rust
+ * `SSAOAmbient`).
+ * - `hemisphere`: the albedo times a hemisphere of sky blended by the normal's height,
+ *   `mix(down, up, n.y * 0.5 + 0.5)`, as `Material.standardLit` adds it from its `skyUp` and
+ *   `skyDown`; `up` equal to `down` for a constant ambient (albedo x ambient).
+ * - `sky`: the albedo times the irradiance of the sky's SH around the normal, over pi, for
+ *   materials lit by `SKY_LIGHTING_WGSL`'s `skyIrradiance` (a `SkyLighting` uniform).
+ * - `unlit`: the whole colour less the GBuffer's emissive part, for unlit materials, whose colour
+ *   is all ambient (a texture shown as it is, with no lights).
+ */
+export type SSAOAmbient =
+    | { kind: 'hemisphere'; up: [number, number, number]; down: [number, number, number] }
+    | { kind: 'sky'; skyLighting: GPUBuffer }
+    | { kind: 'unlit' };
+
 export interface SSAOOptions {
-    /** World-space sampling radius around each fragment. Default 0.5 */
+    /**
+     * Metres around each point searched for occluders: a few times the size of the creases that
+     * should darken (centimetres on a tabletop, half a metre in a room). Default 0.5
+     */
     radius?: number;
-    /** Depth-comparison bias to prevent self-occlusion. Default 0.025 */
+    /**
+     * How much nearer than a sample a surface must be to occlude it, per metre of the point's
+     * distance from the camera. Default 0.003
+     */
     bias?: number;
-    /** Number of hemisphere samples (1–32). Default 16 */
+    /** Hemisphere samples a pixel (1-32). Default 16 */
     kernelSize?: number;
-    /** Occlusion multiplier applied to the colour result. Default 1.0 */
+    /** How much of the occluded ambient is taken out (1: all of it). Default 1 */
     strength?: number;
+    /** The ambient light it occludes. */
+    ambient: SSAOAmbient;
 }
 
 /**
- * Screen-Space Ambient Occlusion (SSAO)
- * ======================================
- * Reconstructs view-space positions and normals entirely from the depth buffer
- * (no separate normals render pass required).  A hemisphere of random samples is
- * projected back to screen space and compared against the stored depth to
- * determine how much each fragment is occluded by surrounding geometry.
+ * The hemisphere kernel: `MAX_KERNEL` points in the +z half of the unit ball, more of them near
+ * the centre (scaled by lerp(0.1, 1, (i / n)²)) and none within 8.6 degrees of the base, from
+ * Rust's fixed seed (xorshift32).
+ */
+export function ssaoKernel(): Float32Array {
+    let seed = 0x9e3779b9 >>> 0;
+    const random = () => {
+        seed = (seed ^ (seed << 13)) >>> 0;
+        seed = (seed ^ (seed >>> 17)) >>> 0;
+        seed = (seed ^ (seed << 5)) >>> 0;
+        return Math.fround((seed >>> 8) / (1 << 24));
+    };
+    const data = new Float32Array(MAX_KERNEL * 4);
+    for (let i = 0; i < MAX_KERNEL; i++) {
+        const phi = Math.fround(random() * Math.fround(Math.PI * 2));
+        const cosTheta = Math.fround(0.15 + Math.fround(0.85 * random()));
+        const sinTheta = Math.fround(Math.sqrt(Math.fround(1 - Math.fround(cosTheta * cosTheta))));
+        const t = Math.fround(i / MAX_KERNEL);
+        const scale = Math.fround(0.1 + Math.fround(Math.fround(t * t) * 0.9));
+        data.set([Math.cos(phi) * sinTheta * scale, Math.sin(phi) * sinTheta * scale, cosTheta * scale, 0], i * 4);
+    }
+    return data;
+}
+
+interface Targets {
+    width: number;
+    height: number;
+    /** The occlusion, then blurred across. */
+    ao: [GPUTexture, GPUTexture];
+}
+
+interface Gpu {
+    params: GPUBuffer;
+    kernel: GPUBuffer;
+    noSky: GPUBuffer;
+    ao: GPUComputePipeline;
+    aoBGL: GPUBindGroupLayout;
+    blur: GPUComputePipeline;
+    blurBGL: GPUBindGroupLayout;
+    composite: GPUComputePipeline;
+    compositeBGL: GPUBindGroupLayout;
+    targets: Targets | null;
+}
+
+/**
+ * Screen-space ambient occlusion (Rust `SSAOEffect`, the same WGSL): a hemisphere of samples
+ * around each point's normal (the GBuffer's, or one rebuilt from depth where the material wrote
+ * none), turned per pixel and projected back to the screen against the depth there, blurred by
+ * depth, then taken out of the ambient light alone (`SSAOAmbient`): flat open surfaces keep their
+ * light, creases and contacts lose some of their ambient, and the direct light and emission stay
+ * as they are.
  *
- * The effect outputs the scene colour modulated by the AO factor.
+ * Put it first in the chain. The GI effects occlude the light they add themselves: with one that
+ * replaces the materials' ambient, leave this off, or give it only the ambient that effect leaves.
  */
 class SSAOEffect extends PostProcessingEffect {
-    private _device: GPUDevice | null = null;
-    private _pipeline: GPUComputePipeline | null = null;
-    private _paramsBuffer: GPUBuffer | null = null;
-    private _kernelBuffer: GPUBuffer | null = null;
-    private _bindGroup: GPUBindGroup | null = null;
-    private _currentInput: GPUTexture | null = null;
-    private _currentDepth: GPUTexture | null = null;
-    private _currentOutput: GPUTexture | null = null;
+    public radius: number;
+    public bias: number;
+    public kernelSize: number;
+    public strength: number;
+    public ambient: SSAOAmbient;
+    /** Debug view: output the occlusion (white open, black occluded) in place of the image. */
+    public showOcclusion = false;
+    private device: GPUDevice | null = null;
+    private gpu: Gpu | null = null;
+    private readonly paramsData = new ArrayBuffer(SSAO_PARAMS_BYTES);
 
-    private readonly _radius: number;
-    private readonly _bias: number;
-    private readonly _kernelSize: number;
-    private readonly _strength: number;
-    private readonly _kernelData: Float32Array;
-
-    // Reusable scratch matrix for inverse-projection computation.
-    private _invProj: Matrix4 = new Matrix4();
-
-    constructor(options: SSAOOptions = {}) {
+    constructor(options: SSAOOptions) {
         super();
-        this._radius     = options.radius     ?? 0.5;
-        this._bias       = options.bias       ?? 0.025;
-        this._kernelSize = Math.min(Math.max(options.kernelSize ?? 16, 1), 32);
-        this._strength   = options.strength   ?? 1.0;
-        this._kernelData = this._generateKernel(32); // always generate 32; shader caps at kernelSize
+        this.radius = options.radius ?? 0.5;
+        this.bias = options.bias ?? 0.003;
+        this.kernelSize = options.kernelSize ?? 16;
+        this.strength = options.strength ?? 1;
+        this.ambient = options.ambient;
     }
 
-    // ── Hemisphere sample kernel ─────────────────────────────────────────────
-
-    private _generateKernel(size: number): Float32Array {
-        const data = new Float32Array(size * 4);
-        for (let i = 0; i < size; i++) {
-            const phi      = Math.random() * Math.PI * 2;
-            const cosTheta = Math.random();
-            const sinTheta = Math.sqrt(1 - cosTheta * cosTheta);
-
-            // Lerp(0.1, 1.0, (i/size)^2) — more samples near the origin.
-            const t     = i / size;
-            const scale = 0.1 + t * t * 0.9;
-
-            data[i * 4 + 0] = Math.cos(phi) * sinTheta * scale;
-            data[i * 4 + 1] = Math.sin(phi) * sinTheta * scale;
-            data[i * 4 + 2] = cosTheta * scale;
-            data[i * 4 + 3] = 0.0;
-        }
-        return data;
-    }
-
-    // ── WGSL compute shader ──────────────────────────────────────────────────
-
-    private static readonly _SHADER = /* wgsl */`
-        struct SSAOParams {
-            projMatrix    : mat4x4f,
-            invProjMatrix : mat4x4f,
-            screenWidth   : f32,
-            screenHeight  : f32,
-            radius        : f32,
-            bias          : f32,
-            kernelSize    : u32,
-            strength      : f32,
-            _pad0         : f32,
-            _pad1         : f32,
-        }
-
-        @group(0) @binding(0) var depthTex   : texture_depth_2d;
-        @group(0) @binding(1) var colorTex   : texture_2d<f32>;
-        @group(0) @binding(2) var outputTex  : texture_storage_2d<rgba16float, write>;
-        @group(0) @binding(3) var<uniform>  params : SSAOParams;
-        @group(0) @binding(4) var<uniform>  kernel : array<vec4f, 32>;
-
-        // Reconstruct a view-space position from a UV coordinate and a raw depth value.
-        fn viewPosFromDepth(uv: vec2f, depth: f32) -> vec3f {
-            let ndc     = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, depth, 1.0);
-            let viewPos = params.invProjMatrix * ndc;
-            return viewPos.xyz / viewPos.w;
-        }
-
-        // Estimate the view-space normal at a pixel by finite differences on the depth buffer.
-        fn viewNormalFromDepth(coord: vec2u) -> vec3f {
-            let w = u32(params.screenWidth);
-            let h = u32(params.screenHeight);
-
-            let rCoord = vec2u(min(coord.x + 1u, w - 1u), coord.y);
-            let lCoord = vec2u(select(0u, coord.x - 1u, coord.x > 0u), coord.y);
-            let uCoord = vec2u(coord.x, select(0u, coord.y - 1u, coord.y > 0u));
-            let dCoord = vec2u(coord.x, min(coord.y + 1u, h - 1u));
-
-            let pR = viewPosFromDepth(vec2f(f32(rCoord.x) / params.screenWidth, f32(rCoord.y) / params.screenHeight), textureLoad(depthTex, rCoord, 0));
-            let pL = viewPosFromDepth(vec2f(f32(lCoord.x) / params.screenWidth, f32(lCoord.y) / params.screenHeight), textureLoad(depthTex, lCoord, 0));
-            let pU = viewPosFromDepth(vec2f(f32(uCoord.x) / params.screenWidth, f32(uCoord.y) / params.screenHeight), textureLoad(depthTex, uCoord, 0));
-            let pD = viewPosFromDepth(vec2f(f32(dCoord.x) / params.screenWidth, f32(dCoord.y) / params.screenHeight), textureLoad(depthTex, dCoord, 0));
-
-            return normalize(cross(pR - pL, pD - pU));
-        }
-
-        @compute @workgroup_size(8, 8)
-        fn main(@builtin(global_invocation_id) gid : vec3u) {
-            let coord = gid.xy;
-            let w     = u32(params.screenWidth);
-            let h     = u32(params.screenHeight);
-            if (coord.x >= w || coord.y >= h) { return; }
-
-            let uv    = vec2f(f32(coord.x) / params.screenWidth, f32(coord.y) / params.screenHeight);
-            let depth = textureLoad(depthTex, coord, 0);
-
-            // Background/sky — no occlusion; pass colour through unchanged.
-            if (depth >= 1.0) {
-                textureStore(outputTex, coord, textureLoad(colorTex, coord, 0));
-                return;
-            }
-
-            let viewPos    = viewPosFromDepth(uv, depth);
-            let viewNormal = viewNormalFromDepth(coord);
-
-            // Build a tangent-space basis aligned with the surface normal.
-            let up        = select(vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(viewNormal.y) > 0.99);
-            let tangent   = normalize(up - viewNormal * dot(up, viewNormal));
-            let bitangent = cross(viewNormal, tangent);
-            let tbn       = mat3x3f(tangent, bitangent, viewNormal);
-
-            var occlusion : f32 = 0.0;
-
-            for (var i = 0u; i < params.kernelSize; i++) {
-                // Orient hemisphere sample along the surface normal.
-                let sampleViewPos = viewPos + (tbn * kernel[i].xyz) * params.radius;
-
-                // Project into clip / NDC / screen space.
-                let clip      = params.projMatrix * vec4f(sampleViewPos, 1.0);
-                let ndc       = clip.xyz / clip.w;
-                let sampleUV  = vec2f(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
-
-                if (sampleUV.x < 0.0 || sampleUV.x > 1.0 ||
-                    sampleUV.y < 0.0 || sampleUV.y > 1.0) {
-                    continue;
-                }
-
-                let sampleCoord = vec2u(
-                    u32(sampleUV.x * params.screenWidth),
-                    u32(sampleUV.y * params.screenHeight)
-                );
-                let sampleDepth   = textureLoad(depthTex, sampleCoord, 0);
-                let sampleViewRef = viewPosFromDepth(sampleUV, sampleDepth);
-
-                // Range check avoids bleeding occlusion over large depth discontinuities.
-                let rangeCheck = smoothstep(0.0, 1.0, params.radius / abs(viewPos.z - sampleViewRef.z));
-                occlusion += select(0.0, 1.0, sampleViewRef.z >= sampleViewPos.z + params.bias) * rangeCheck;
-            }
-
-            let ao    = 1.0 - (occlusion / f32(params.kernelSize)) * params.strength;
-            let color = textureLoad(colorTex, coord, 0);
-            textureStore(outputTex, coord, vec4f(color.rgb * ao, color.a));
-        }
-    `;
-
-    // ── PostProcessingEffect interface ───────────────────────────────────────
-
-    initialize(device: GPUDevice, gbuffer: GBuffer, _camera: Camera): void {
-        this._device = device;
-        // Params uniform buffer: 2×mat4 + 8 floats = 128 + 32 = 160 bytes → padded to 256.
-        this._paramsBuffer = device.createBuffer({
-            label: 'SSAO/Params',
-            size: 256,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        // Kernel uniform buffer: 32 × vec4f = 512 bytes.
-        this._kernelBuffer = device.createBuffer({
-            label: 'SSAO/Kernel',
-            size: 512,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        device.queue.writeBuffer(this._kernelBuffer, 0, this._kernelData.buffer as ArrayBuffer);
-
-        const module = device.createShaderModule({ code: SSAOEffect._SHADER });
-        const bgl = device.createBindGroupLayout({
-            label: 'SSAO/BGL',
-            entries: [
-                { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
-                { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-                { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-                { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-                { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            ],
-        });
-
-        this._pipeline = device.createComputePipeline({
-            label: 'SSAO/Pipeline',
-            layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
-            compute: { module, entryPoint: 'main' },
-        });
-
-        this._buildBindGroup(gbuffer.colorTexture, gbuffer.depthTexture, gbuffer.outputTexture);
+    public initialize(device: GPUDevice, _gbuffer: GBuffer, _camera: Camera): void {
+        this.device = device;
+        if (!this.gpu) this.gpu = SSAOEffect.initGpu(device);
         this.initialized = true;
     }
 
-    private _buildBindGroup(
-        input: GPUTexture,
-        depth: GPUTexture,
-        output: GPUTexture
-    ): void {
-        const bgl = this._pipeline!.getBindGroupLayout(0);
-        this._bindGroup = this._device!.createBindGroup({
-            label: 'SSAO/BindGroup',
-            layout: bgl,
-            entries: [
-                { binding: 0, resource: depth.createView() },
-                { binding: 1, resource: input.createView() },
-                { binding: 2, resource: output.createView() },
-                { binding: 3, resource: { buffer: this._paramsBuffer! } },
-                { binding: 4, resource: { buffer: this._kernelBuffer! } },
-            ],
+    private static initGpu(device: GPUDevice): Gpu {
+        const visibility = GPUShaderStage.COMPUTE;
+        const uniform = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility, buffer: { type: 'uniform' } });
+        const texture = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility, texture: { sampleType: 'unfilterable-float' } });
+        const depth = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility, texture: { sampleType: 'depth' } });
+        const storage = (binding: number, format: GPUTextureFormat): GPUBindGroupLayoutEntry =>
+            ({ binding, visibility, storageTexture: { access: 'write-only', format } });
+        const bgl = (label: string, entries: GPUBindGroupLayoutEntry[]) => device.createBindGroupLayout({ label, entries });
+        // bindings 0-2 of every pass: the params, the GBuffer's depth and normal
+        const aoBGL = bgl('SSAO/BGL', [uniform(0), depth(1), texture(2), uniform(3), storage(4, 'rg32float')]);
+        const blurBGL = bgl('SSAO/BlurBGL', [uniform(0), depth(1), texture(2), texture(3), storage(4, 'rg32float')]);
+        const compositeBGL = bgl('SSAO/CompositeBGL', [
+            uniform(0), depth(1), texture(2), texture(3), texture(4), texture(5), texture(6), uniform(7), storage(8, 'rgba16float'),
+        ]);
+        const pipeline = (label: string, code: string, layout: GPUBindGroupLayout) => device.createComputePipeline({
+            label,
+            layout: device.createPipelineLayout({ label, bindGroupLayouts: [layout] }),
+            compute: { module: device.createShaderModule({ label, code }), entryPoint: 'main' },
         });
-        this._currentInput  = input;
-        this._currentDepth  = depth;
-        this._currentOutput = output;
+        const kernel = device.createBuffer({ label: 'SSAO/Kernel', size: MAX_KERNEL * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(kernel, 0, ssaoKernel());
+        return {
+            params: device.createBuffer({ label: 'SSAO/Params', size: SSAO_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+            kernel,
+            noSky: device.createBuffer({ label: 'SSAO/NoSky', size: SKY_LIGHTING_BYTES, usage: GPUBufferUsage.UNIFORM }),
+            ao: pipeline('SSAO', SSAO_WGSL, aoBGL),
+            aoBGL,
+            blur: pipeline('SSAO/Blur', SSAO_BLUR_WGSL, blurBGL),
+            blurBGL,
+            composite: pipeline('SSAO/Composite', SSAO_COMPOSITE_WGSL, compositeBGL),
+            compositeBGL,
+            targets: null,
+        };
     }
 
-    render(
+    private ensureTargets(device: GPUDevice, width: number, height: number): Targets {
+        const gpu = this.gpu!;
+        if (gpu.targets && gpu.targets.width === width && gpu.targets.height === height) return gpu.targets;
+        if (gpu.targets) for (const t of gpu.targets.ao) t.destroy();
+        const target = (label: string) => device.createTexture({
+            label,
+            size: [width, height],
+            format: 'rg32float',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+        });
+        gpu.targets = { width, height, ao: [target('SSAO/Occlusion'), target('SSAO/OcclusionBlurred')] };
+        return gpu.targets;
+    }
+
+    public render(
         commandEncoder: GPUCommandEncoder,
         input: GPUTexture,
         depth: GPUTexture,
         output: GPUTexture,
         camera: Camera,
         width: number,
-        height: number
+        height: number,
+        _emissive?: GPUTexture,
+        gbuffer?: GBuffer,
     ): void {
-        if (!this._pipeline) return;
+        if (!gbuffer) throw new Error('SSAOEffect reads the GBuffer\'s normals, albedo and emission (render it through a PostProcessingVolume)');
+        const device = this.device!;
+        if (!this.gpu) this.gpu = SSAOEffect.initGpu(device);
+        const gpu = this.gpu;
+        const t = this.ensureTargets(device, width, height);
+        const proj = camera.projectionMatrix.internalMat4;
+        const view = camera.viewMatrix.internalMat4;
+        const a = this.ambient;
+        const f32 = new Float32Array(this.paramsData);
+        const u32 = new Uint32Array(this.paramsData);
+        f32.set(proj, 0);
+        f32.set(mat4.invert(mat4.create(), proj), 16);
+        f32.set(view, 32);
+        f32.set(mat4.invert(mat4.create(), view), 48);
+        f32.set(a.kind === 'hemisphere' ? [...a.up, 0, ...a.down, 0] : [0, 0, 0, 0, 0, 0, 0, 0], 64);
+        f32.set([width, height, Math.max(this.radius, 1e-4), Math.max(this.bias, 0)], 72);
+        u32[76] = Math.min(Math.max(Math.round(this.kernelSize), 1), MAX_KERNEL);
+        f32[77] = Math.max(this.strength, 0);
+        f32[78] = height * MAX_RADIUS_SCREEN;
+        u32[79] = a.kind === 'hemisphere' ? 0 : a.kind === 'sky' ? 1 : 2;
+        u32[80] = this.showOcclusion ? 1 : 0;
+        device.queue.writeBuffer(gpu.params, 0, this.paramsData);
 
-        // Rebuild bind group when textures change (ping-pong).
-        if (input !== this._currentInput || depth !== this._currentDepth || output !== this._currentOutput) {
-            this._buildBindGroup(input, depth, output);
-        }
-
-        // Update params uniform.
-        this._invProj.invert(camera.projectionMatrix);
-        const params = new Float32Array(64); // 256-byte buffer as f32 view
-        params.set(camera.projectionMatrix.internalMat4, 0);  // offset 0  (16 floats)
-        params.set(this._invProj.internalMat4,            16); // offset 64 (16 floats)
-        params[32] = width;
-        params[33] = height;
-        params[34] = this._radius;
-        params[35] = this._bias;
-        // kernelSize as uint — write raw bytes at byte offset 144 (float index 36)
-        new Uint32Array(params.buffer, 36 * 4, 1)[0] = this._kernelSize;
-        params[37] = this._strength;
-
-        this._device!.queue.writeBuffer(this._paramsBuffer!, 0, params.buffer as ArrayBuffer);
-
-        const wg = (t: number) => Math.ceil(t / 8);
+        const params = { buffer: gpu.params };
+        const depthView = depth.createView();
+        const normalView = gbuffer.normalTexture.createView();
+        const [ao, blurred] = [t.ao[0].createView(), t.ao[1].createView()];
+        const group = (label: string, layout: GPUBindGroupLayout, resources: GPUBindingResource[]) =>
+            device.createBindGroup({ label, layout, entries: resources.map((resource, binding) => ({ binding, resource })) });
+        const groups: [GPUComputePipeline, GPUBindGroup][] = [
+            [gpu.ao, group('SSAO/BindGroup', gpu.aoBGL, [params, depthView, normalView, { buffer: gpu.kernel }, ao])],
+            [gpu.blur, group('SSAO/BlurBindGroup', gpu.blurBGL, [params, depthView, normalView, ao, blurred])],
+            [gpu.composite, group('SSAO/CompositeBindGroup', gpu.compositeBGL, [
+                params, depthView, normalView, blurred, input.createView(), gbuffer.albedoTexture.createView(),
+                gbuffer.emissiveTexture.createView(), { buffer: a.kind === 'sky' ? a.skyLighting : gpu.noSky }, output.createView(),
+            ])],
+        ];
         const pass = commandEncoder.beginComputePass({ label: 'SSAO', timestampWrites: gpuPass('SSAO') });
-        pass.setPipeline(this._pipeline!);
-        pass.setBindGroup(0, this._bindGroup!);
-        pass.dispatchWorkgroups(wg(width), wg(height));
+        for (const [pipeline, bindGroup] of groups) {
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+        }
         pass.end();
     }
 
-    resize(_w: number, _h: number, _gbuffer: GBuffer): void {
-        // Params are recalculated every frame — nothing size-dependent to recreate.
-    }
+    public resize(_width: number, _height: number, _gbuffer: GBuffer): void {}
 
-    destroy(): void {
-        this._paramsBuffer?.destroy();
-        this._kernelBuffer?.destroy();
-        this._paramsBuffer = null;
-        this._kernelBuffer = null;
-        this._pipeline = null;
-        this._bindGroup = null;
+    public destroy(): void {
+        const gpu = this.gpu;
+        if (!gpu) return;
+        gpu.params.destroy();
+        gpu.kernel.destroy();
+        gpu.noSky.destroy();
+        if (gpu.targets) for (const t of gpu.targets.ao) t.destroy();
+        this.gpu = null;
+        this.initialized = false;
     }
 }
 

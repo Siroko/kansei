@@ -18,11 +18,14 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{
     CameraLens, CinematicDepthOfFieldEffect, CinematicDepthOfFieldOptions, DepthOfFieldEffect, DepthOfFieldOptions, DofDebugView, HighlightOptions,
-    SSAOEffect, SSAOOptions, ToneMapEffect, ToneMapOptions, ToneMapper,
+    SSAOAmbient, SSAOEffect, SSAOOptions, ToneMapEffect, ToneMapOptions, ToneMapper,
 };
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{param, param_or, Canvas};
+
+/// The columns' ambient light: the share of their albedo they show away from the light.
+const AMBIENT: f32 = 0.12;
 
 /// Unreal's default filmback width, mm.
 const SENSOR_MM: f32 = 23.76;
@@ -52,7 +55,6 @@ const GRID_SPAN: f32 = GRID_SIZE as f32 * GRID_SPACING;
 /// shared offset, wrapping it to the back. Prefixed with GBUFFER_OUT_WGSL and the grid constants.
 const COLUMNS_WGSL: &str = r#"
 const LIGHT_POS: vec3<f32> = vec3<f32>(80.0, 150.0, -60.0);
-const AMBIENT: f32 = 0.12;
 const BASE_COLOR: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
 const LIGHT_COLOR: vec3<f32> = vec3<f32>(1.0, 0.62, 0.3);
 
@@ -352,7 +354,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         },
     );
-    let constants = format!("const MAX_Z: f32 = {:.4};\nconst GRID_SPAN: f32 = {:.4};\n", GRID_HALF + GRID_SPACING, GRID_SPAN);
+    let constants = format!("const MAX_Z: f32 = {:.4};\nconst GRID_SPAN: f32 = {:.4};\nconst AMBIENT: f32 = {AMBIENT:.4};\n", GRID_HALF + GRID_SPACING, GRID_SPAN);
     let mut material = Material::new(
         "Columns",
         &format!("{GBUFFER_OUT_WGSL}\n{constants}{COLUMNS_WGSL}"),
@@ -372,7 +374,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // A 150-unit terrain seen through a lens that frames it would be nearly all in focus, so the
     // lens is a long one, set apart from the view's field of view: the shallow focus of a miniature.
     let focus = param_or("focus", 101.5f32);
-    let ssao = SSAOEffect::new(SSAOOptions { radius: 0.8, bias: 0.02, kernel_size: 32, strength: 0.5 });
+    // SSAO darkens the columns' ambient (the albedo times AMBIENT), not the light on them
+    let ssao = SSAOEffect::new(SSAOOptions { radius: 0.8, kernel_size: 32, strength: 0.5, ..SSAOOptions::new(SSAOAmbient::Hemisphere { up: [AMBIENT; 3], down: [AMBIENT; 3] }) });
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(ssao)];
     match mode {
         DofMode::Cinematic => {
