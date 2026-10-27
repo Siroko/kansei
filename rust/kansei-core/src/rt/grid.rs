@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
+use super::query::{RtQuery, TlasState};
 use crate::clusters::InstanceTransform;
 
 pub(crate) const BUILD_WGSL: &str = concat!(include_str!("shaders/rt_types.wgsl"), include_str!("shaders/rt_build.wgsl"));
@@ -98,6 +99,61 @@ pub struct RtGridOptions {
     pub triangle_capacity: u32,
     /// References (a triangle listed in a cell) the buffers start with room for; grows likewise.
     pub reference_capacity: u32,
+    /// What `kansei_rt_trace` finds hits with: the cells (software) or hardware ray queries,
+    /// picked once at `RtGrid::new` (`Auto`: hardware where the device has it and it is trusted).
+    pub backend: RtBackend,
+}
+
+/// What traces an `RtGrid`'s rays: its cells walked in a compute shader (`RT_GRID_WGSL`, the web's
+/// only one), or hardware ray queries over an acceleration structure of the same triangles
+/// (`RT_QUERY_WGSL`, native: wgpu's `EXPERIMENTAL_RAY_QUERY`, which the renderer's device asks
+/// for where the adapter has it). Both return the same `KanseiRtHit` for the same triangle ids.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RtBackend {
+    /// Hardware on Vulkan, and on Metal on Apple GPUs with ray tracing hardware (M3, A17 on);
+    /// software elsewhere: on the web, on M1 and M2, and on DX12, where NVIDIA's driver 617.42
+    /// miscompiles a ray query. `KANSEI_RT_BACKEND=software|hardware|auto` overrides it on native.
+    #[default]
+    Auto,
+    /// The cells, whatever the device has (comparisons, and the hardware path's fallback).
+    Software,
+    /// Hardware ray queries wherever the device has them, DX12 included; software where it hasn't.
+    Hardware,
+}
+
+impl RtBackend {
+    /// Its `kansei_rt_trace` library (`Auto` has none: ask the grid, `RtGrid::backend`).
+    pub fn wgsl(self) -> &'static str {
+        match self {
+            Self::Hardware => super::RT_QUERY_WGSL,
+            _ => super::RT_GRID_WGSL,
+        }
+    }
+
+    /// WGSL declaring its bindings in group `group` from binding `first` (three: the grid's
+    /// uniform, its triangles, and its cells or its acceleration structure).
+    pub fn bindings_wgsl(self, group: u32, first: u32) -> String {
+        match self {
+            Self::Hardware => format!(
+                "@group({group}) @binding({}) var<uniform> kansei_rt_grid : KanseiRtGrid;\n\
+                 @group({group}) @binding({}) var<storage, read> kansei_rt_triangles : array<vec4f>;\n\
+                 @group({group}) @binding({}) var kansei_rt_tlas : acceleration_structure;\n",
+                first,
+                first + 1,
+                first + 2
+            ),
+            _ => RtGrid::bindings_wgsl(group, first),
+        }
+    }
+
+    /// The layout entries for `bindings_wgsl(_, first)`.
+    pub fn layout_entries(self, first: u32, visibility: wgpu::ShaderStages) -> [wgpu::BindGroupLayoutEntry; 3] {
+        let mut entries = RtGrid::layout_entries(first, visibility);
+        if self == Self::Hardware {
+            entries[2].ty = wgpu::BindingType::AccelerationStructure { vertex_return: false };
+        }
+        entries
+    }
 }
 
 impl Default for RtGridOptions {
@@ -114,6 +170,7 @@ impl Default for RtGridOptions {
             macro_skip: true,
             triangle_capacity: 1 << 16,
             reference_capacity: 1 << 20,
+            backend: RtBackend::Auto,
         }
     }
 }
@@ -147,7 +204,7 @@ impl RtGridOptions {
 pub struct RtGridStats {
     /// Triangles gathered (meeting the box), whether they fitted or not.
     pub triangles: u32,
-    /// References the cells needed.
+    /// References the cells needed (0 with the hardware backend, which has none).
     pub references: u32,
     /// Triangles too wide for the cells (those up to `big_triangle_capacity` in the big list).
     pub big_triangles: u32,
@@ -166,18 +223,58 @@ pub struct RtGridHandle {
 
 #[derive(Clone)]
 struct GridBuffers {
-    uniform: wgpu::Buffer,
-    triangles: wgpu::Buffer,
-    cells: wgpu::Buffer,
+    bindings: RtGridBindings,
     generation: u64,
+    /// the hardware backend's TLAS, built before the first trace after a rebuild
+    tlas: Option<Arc<std::sync::Mutex<TlasState>>>,
+}
+
+/// What a pass binds to trace an `RtGrid` (`RtGridHandle::bindings`).
+#[derive(Clone)]
+pub struct RtGridBindings {
+    pub backend: RtBackend,
+    pub uniform: wgpu::Buffer,
+    pub triangles: wgpu::Buffer,
+    /// The cells (software), or the acceleration structure (hardware).
+    pub cells: wgpu::Buffer,
+    pub tlas: Option<wgpu::Tlas>,
+}
+
+impl RtGridBindings {
+    /// The entries for `self.backend.bindings_wgsl(_, first)`, in order.
+    pub fn entries(&self, first: u32) -> [wgpu::BindGroupEntry<'_>; 3] {
+        let third = match &self.tlas {
+            Some(tlas) => wgpu::BindingResource::AccelerationStructure(tlas),
+            None => self.cells.as_entire_binding(),
+        };
+        [
+            wgpu::BindGroupEntry { binding: first, resource: self.uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: first + 1, resource: self.triangles.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: first + 2, resource: third },
+        ]
+    }
 }
 
 impl RtGridHandle {
-    /// The buffers of `RtGrid::bindings_wgsl`, in order, and the grid's generation (changed when
-    /// they are made anew).
-    pub fn buffers(&self) -> ([wgpu::Buffer; 3], u64) {
+    /// What `RtGrid::bindings_wgsl` (or the hardware backend's) binds, and the grid's generation
+    /// (changed when they are made anew).
+    pub fn bindings(&self) -> (RtGridBindings, u64) {
         let b = self.shared.lock().unwrap();
-        ([b.uniform.clone(), b.triangles.clone(), b.cells.clone()], b.generation)
+        (b.bindings.clone(), b.generation)
+    }
+
+    /// Ready the grid for tracing after a rebuild (`RtGrid::prepare_trace`): the effects call it
+    /// before their passes.
+    pub fn prepare_trace(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let tlas = self.shared.lock().unwrap().tlas.clone();
+        if let Some(t) = tlas {
+            t.lock().unwrap().build(device, queue);
+        }
+    }
+
+    /// The grid's backend (never `Auto`): the WGSL and layout a pass traces it with.
+    pub fn backend(&self) -> RtBackend {
+        self.shared.lock().unwrap().bindings.backend
     }
 }
 
@@ -423,12 +520,23 @@ pub struct RtGrid {
     handle: RtGridHandle,
     /// between `begin` and `finish`: whether this build gathered yet
     gathered: Option<bool>,
+    /// what traces it (never `Auto`), and the hardware backend's acceleration structures
+    backend: RtBackend,
+    query: Option<RtQuery>,
+    /// its TLAS, to bind
+    tlas: Option<wgpu::Tlas>,
+    /// the hardware BLAS: rebuilt for speed of building (every frame) or of tracing, and whether
+    /// the last gather held non-opaque sources (its second geometry)
+    fast_build: bool,
+    split: bool,
 }
 
 impl RtGrid {
     pub fn new(device: &wgpu::Device, options: RtGridOptions) -> Self {
         assert!(options.dims.iter().all(|&d| d > 0 && d.is_multiple_of(MACRO)), "grid dims must be multiples of {MACRO}");
         assert!(options.cell_count() <= RT_MAX_CELLS, "at most {RT_MAX_CELLS} cells");
+        let backend = super::query::resolve(options.backend, device);
+        log::info!("rt grid: {backend:?} backend (asked for {:?})", options.backend);
         let compute = wgpu::ShaderStages::COMPUTE;
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty, count: None };
         let buffer = |ty, dynamic| wgpu::BindingType::Buffer { ty, has_dynamic_offset: dynamic, min_binding_size: None };
@@ -527,15 +635,45 @@ impl RtGrid {
             },
             stats: RtGridStats::default(),
             generation: 0,
-            handle: RtGridHandle { shared: Arc::new(std::sync::Mutex::new(GridBuffers { uniform: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()), triangles: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()), cells: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()), generation: 0 })) },
+            handle: RtGridHandle {
+                shared: Arc::new(std::sync::Mutex::new(GridBuffers {
+                    bindings: RtGridBindings {
+                        backend,
+                        uniform: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()),
+                        triangles: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()),
+                        cells: storage("RtGrid/Placeholder", 16, wgpu::BufferUsages::empty()),
+                        tlas: None,
+                    },
+                    generation: 0,
+                    tlas: None,
+                })),
+            },
             gathered: None,
+            query: (backend == RtBackend::Hardware).then(|| RtQuery::new(device)),
+            tlas: None,
+            backend,
+            fast_build: false,
+            split: false,
         };
+        grid.tlas = grid.query.as_ref().map(|q| q.tlas().lock().unwrap().tlas().clone());
         grid.resize(device, options.triangle_capacity.max(64), options.reference_capacity.max(1024));
         grid
     }
 
     pub fn options(&self) -> &RtGridOptions {
         &self.options
+    }
+
+    /// What traces it (never `Auto`): the WGSL (`RtBackend::wgsl`, `bindings_wgsl`) and layout
+    /// (`layout_entries`) a pass traces it with.
+    pub fn backend(&self) -> RtBackend {
+        self.backend
+    }
+
+    /// The hardware backend's next BLAS builds fast rather than tracing fast: for a grid rebuilt
+    /// every frame (`SceneRtGrid` sets it while its box moves or a dynamic renderable is in it).
+    pub fn set_prefer_fast_build(&mut self, on: bool) {
+        self.fast_build = on;
     }
 
     /// The box's corner.
@@ -562,7 +700,7 @@ impl RtGrid {
     /// Bytes on the GPU: the triangles, the cell words, the counters (with the wide triangles'
     /// list) and the sources' parameters.
     pub fn memory_bytes(&self) -> u64 {
-        self.triangles.size() + self.cells.size() + self.counters.size() + self.sources.size()
+        self.triangles.size() + self.cells.size() + self.counters.size() + self.sources.size() + self.query.as_ref().map_or(0, RtQuery::memory_bytes)
     }
 
     /// Place the box round `eye` (in steps of `snap_cells` cells, `below` of its height under the
@@ -602,7 +740,8 @@ impl RtGrid {
         let limit = Self::binding_limit(device);
         let (_, _, refs_base) = self.cells_layout();
         let triangles = (triangles as u64).min(limit / RT_TRIANGLE_BYTES) as u32;
-        let references = (references as u64).min(limit / 4 - refs_base as u64) as u32;
+        // (the hardware backend lists no references: it keeps the 16-byte placeholder)
+        let references = if self.backend == RtBackend::Hardware { 0 } else { (references as u64).min(limit / 4 - refs_base as u64) as u32 };
         if triangles != self.triangle_capacity {
             self.triangle_capacity = triangles;
             self.triangles = device.create_buffer(&wgpu::BufferDescriptor {
@@ -619,7 +758,7 @@ impl RtGrid {
                 mapped_at_creation: false,
             });
         }
-        if references != self.reference_capacity {
+        if references != self.reference_capacity && references > 0 {
             self.reference_capacity = references;
             self.cells = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("RtGrid/Cells"),
@@ -630,7 +769,17 @@ impl RtGrid {
         }
         self.bind_groups = None;
         self.generation += 1;
-        *self.handle.shared.lock().unwrap() = GridBuffers { uniform: self.uniform.clone(), triangles: self.triangles.clone(), cells: self.cells.clone(), generation: self.generation };
+        *self.handle.shared.lock().unwrap() = GridBuffers {
+            bindings: RtGridBindings {
+                backend: self.backend,
+                uniform: self.uniform.clone(),
+                triangles: self.triangles.clone(),
+                cells: self.cells.clone(),
+                tlas: self.query.as_ref().map(|q| q.tlas().lock().unwrap().tlas().clone()),
+            },
+            generation: self.generation,
+            tlas: self.query.as_ref().map(RtQuery::tlas),
+        };
     }
 
     /// A handle to the buffers passes trace the grid through, which follows the grid's.
@@ -646,7 +795,17 @@ impl RtGrid {
             self.ensure_bind_groups(device);
             if self.gathered.is_some() {
                 self.write_uniform(queue);
+                self.prepare_query(device, queue);
             }
+        }
+    }
+
+    /// Ready the hardware backend's BLAS for this build.
+    fn prepare_query(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let Some(q) = self.query.as_mut() {
+            // the filler under the box, a metre clear of it
+            let below = (self.origin - Vec3::Y).to_array();
+            q.prepare(device, queue, &self.triangles, &self.counters, self.triangle_capacity, self.split, self.fast_build, below);
         }
     }
 
@@ -690,8 +849,11 @@ impl RtGrid {
         self.write_uniform(queue);
         let (_, big_base, _) = self.cells_layout();
         encoder.clear_buffer(&self.counters, 0, Some(16));
-        // the cells' counts, the macro cells and the big list's count
-        encoder.clear_buffer(&self.cells, 0, Some((big_base as u64 + 1) * 4));
+        if self.query.is_none() {
+            // the cells' counts, the macro cells and the big list's count
+            encoder.clear_buffer(&self.cells, 0, Some((big_base as u64 + 1) * 4));
+        }
+        self.prepare_query(device, queue);
         self.gathered = Some(false);
     }
 
@@ -770,6 +932,9 @@ impl RtGrid {
         if sources.is_empty() {
             return;
         }
+        // alpha-tested or glass triangles: the hardware BLAS's second, non-opaque geometry
+        self.split = sources.iter().any(|s| s.surface.alpha_layer.is_some() || s.surface.glass);
+        self.prepare_query(device, queue);
         let needed = sources.len() as u64 * SOURCE_STRIDE;
         if self.sources.size() < needed {
             self.sources = device.create_buffer(&wgpu::BufferDescriptor {
@@ -873,6 +1038,11 @@ impl RtGrid {
         assert!(self.gathered.is_some(), "RtGrid::finish without begin");
         self.gathered = None;
         self.stats.builds += 1;
+        if let Some(q) = self.query.as_mut() {
+            // the BLAS; its TLAS after the submit (`read_back`)
+            q.record_blas(encoder);
+            return;
+        }
         let (build, prepare, _) = self.bind_groups.as_ref().expect("begin first");
         {
             let mut p = timed_pass(encoder, "Rt/GridCount");
@@ -911,15 +1081,25 @@ impl RtGrid {
     }
 
     /// After the submit of a build: read back what it needed (the gathered triangles, the
-    /// references, the big triangles), unless a readback is still in flight. `begin` takes it.
+    /// references, the big triangles), unless a readback is still in flight (`begin` takes it).
+    /// With the hardware backend, the TLAS is then to be built over the new BLAS before the next
+    /// trace (`prepare_trace`).
     pub fn read_back(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let Some(q) = self.query.as_mut() {
+            q.submitted(device, queue);
+        }
         if self.readback.pending.is_some() {
             return;
         }
         let (_, big_base, _) = self.cells_layout();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("RtGrid/Readback") });
-        encoder.copy_buffer_to_buffer(&self.counters, 0, &self.readback.staging, 0, 8);
-        encoder.copy_buffer_to_buffer(&self.cells, big_base as u64 * 4, &self.readback.staging, 8, 4);
+        if self.query.is_some() {
+            // no cells: the counters' wide triangles (none) for the big ones
+            encoder.copy_buffer_to_buffer(&self.counters, 0, &self.readback.staging, 0, 12);
+        } else {
+            encoder.copy_buffer_to_buffer(&self.counters, 0, &self.readback.staging, 0, 8);
+            encoder.copy_buffer_to_buffer(&self.cells, big_base as u64 * 4, &self.readback.staging, 8, 4);
+        }
         queue.submit(Some(encoder.finish()));
         let state = Arc::new(AtomicU8::new(MAPPING));
         let done = state.clone();
@@ -963,8 +1143,8 @@ impl RtGrid {
         self.collect_readback(device);
     }
 
-    /// WGSL declaring the grid's buffers in group `group` from binding `first` (three bindings),
-    /// for `RT_GRID_WGSL`.
+    /// WGSL declaring the software grid's buffers in group `group` from binding `first` (three
+    /// bindings), for `RT_GRID_WGSL` (`RtBackend::bindings_wgsl` for either backend's).
     pub fn bindings_wgsl(group: u32, first: u32) -> String {
         format!(
             "@group({group}) @binding({}) var<uniform> kansei_rt_grid : KanseiRtGrid;\n\
@@ -976,19 +1156,31 @@ impl RtGrid {
         )
     }
 
-    /// The layout entries for `bindings_wgsl(_, first)`.
+    /// The layout entries for `bindings_wgsl(_, first)` (`RtBackend::layout_entries` for either
+    /// backend's).
     pub fn layout_entries(first: u32, visibility: wgpu::ShaderStages) -> [wgpu::BindGroupLayoutEntry; 3] {
         let buffer = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let ro = wgpu::BufferBindingType::Storage { read_only: true };
         [buffer(first, wgpu::BufferBindingType::Uniform), buffer(first + 1, ro), buffer(first + 2, ro)]
     }
 
-    /// The buffers for `bindings_wgsl(_, first)`, in order.
+    /// Ready the grid for tracing after a rebuild's submit and `read_back`, before the passes that
+    /// trace it: the hardware backend builds its TLAS over the new BLAS (on Metal once the BLAS's
+    /// submit has finished, which the CPU waits for: gfx-rs/wgpu#9215). Nothing in software.
+    pub fn prepare_trace(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.handle.prepare_trace(device, queue);
+    }
+
+    /// The resources for `self.backend().bindings_wgsl(_, first)`, in order.
     pub fn bind_group_entries(&self, first: u32) -> [wgpu::BindGroupEntry<'_>; 3] {
+        let third = match &self.tlas {
+            Some(tlas) => wgpu::BindingResource::AccelerationStructure(tlas),
+            None => self.cells.as_entire_binding(),
+        };
         [
             wgpu::BindGroupEntry { binding: first, resource: self.uniform.as_entire_binding() },
             wgpu::BindGroupEntry { binding: first + 1, resource: self.triangles.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: first + 2, resource: self.cells.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: first + 2, resource: third },
         ]
     }
 

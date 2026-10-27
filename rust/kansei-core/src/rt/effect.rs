@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use super::grid::{RtGrid, RtGridHandle};
+use super::grid::{RtBackend, RtGridHandle};
 use crate::cameras::Camera;
 use crate::gi::{VoxelClipmap, VoxelVolume};
 use crate::lights::Light;
@@ -83,31 +83,56 @@ pub(crate) const DEFAULT_HIT_ALBEDO_WGSL: &str = "fn kansei_rt_hit_albedo(triang
 
 const COMMON_WGSL: &str = include_str!("shaders/rt_reflect_common.wgsl");
 
-/// The trace's WGSL over a clipmap or a volume, with `surface` (`kansei_rt_covered`, then
-/// `kansei_rt_hit_albedo`).
-pub(crate) fn trace_wgsl(clipmap: bool, surface: &str) -> String {
-    traced_wgsl(clipmap, surface, include_str!("shaders/rt_reflect_trace.wgsl"))
+/// The trace's WGSL over a clipmap or a volume, through a grid traced by `backend`, with `surface`
+/// (`kansei_rt_covered`, then `kansei_rt_hit_albedo`).
+pub(crate) fn trace_wgsl(clipmap: bool, backend: RtBackend, surface: &str) -> String {
+    traced_wgsl(clipmap, backend, surface, include_str!("shaders/rt_reflect_trace.wgsl"))
 }
 
 /// The glass pass's WGSL, prefixed as the trace.
-pub(crate) fn glass_wgsl(clipmap: bool, surface: &str) -> String {
-    traced_wgsl(clipmap, surface, include_str!("shaders/rt_glass.wgsl"))
+pub(crate) fn glass_wgsl(clipmap: bool, backend: RtBackend, surface: &str) -> String {
+    traced_wgsl(clipmap, backend, surface, include_str!("shaders/rt_glass.wgsl"))
 }
 
-fn traced_wgsl(clipmap: bool, covered: &str, main: &str) -> String {
+fn traced_wgsl(clipmap: bool, backend: RtBackend, covered: &str, main: &str) -> String {
     let source = if clipmap {
         format!("{}{CLIPMAP_SOURCE_WGSL}", crate::gi::CLIPMAP_WGSL)
     } else {
         format!("{}{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL, include_str!("../gi/shaders/voxel_irradiance.wgsl"))
     };
-    format!(
+    super::hoist_wgsl_enables(&format!(
         "{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}\n{main}",
         crate::atmosphere::SKY_LIGHTING_WGSL,
         include_str!("../shaders/spot_light_types.wgsl"),
-        super::RT_GRID_WGSL,
-        RtGrid::bindings_wgsl(1, 0),
+        backend.wgsl(),
+        backend.bindings_wgsl(1, 0),
         include_str!("shaders/rt_reflect_hit.wgsl"),
-    )
+    ))
+}
+
+/// The trace's and the glass pass's bind group layouts (groups 0 and 1) over a clipmap or a
+/// volume, through a grid traced by `backend`.
+pub(crate) fn trace_layout_entries(clipmap: bool, backend: RtBackend) -> [Vec<wgpu::BindGroupLayoutEntry>; 2] {
+    let compute = wgpu::ShaderStages::COMPUTE;
+    let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty, count: None };
+    let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+    let storage = |read_only| wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None };
+    let texture = |filterable, view_dimension| wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable }, view_dimension, multisampled: false };
+    let d2 = wgpu::TextureViewDimension::D2;
+    let depth = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: false };
+    let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
+    let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
+    let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, storage(true)), entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering), entry(15, storage(true))];
+    if clipmap {
+        trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
+    } else {
+        trace_entries.extend([entry(6, uniform), entry(7, texture(true, wgpu::TextureViewDimension::D3)), entry(8, filtering)]);
+        // the anisotropic mips (the volume itself where it has none)
+        trace_entries.extend((40..46).map(|b| entry(b, texture(true, wgpu::TextureViewDimension::D3))));
+    }
+    let mut grid_entries = backend.layout_entries(0, compute).to_vec();
+    grid_entries.extend([entry(3, texture(true, d2)), entry(4, filtering), entry(5, storage(false))]);
+    [trace_entries, grid_entries]
 }
 
 pub(crate) fn resolve_wgsl() -> String {
@@ -500,22 +525,10 @@ impl RtReflectionsEffect {
         let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
         let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
-        let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }), entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering), entry(15, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None })];
         let clipmap = matches!(self.source, Source::Clipmap { .. });
-        if clipmap {
-            trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
-        } else {
-            trace_entries.extend([entry(6, uniform), entry(7, texture(true, wgpu::TextureViewDimension::D3)), entry(8, filtering)]);
-            // the anisotropic mips (the volume itself where it has none)
-            trace_entries.extend((40..46).map(|b| entry(b, texture(true, wgpu::TextureViewDimension::D3))));
-        }
+        let backend = self.grid.backend();
+        let [trace_entries, grid_entries] = trace_layout_entries(clipmap, backend);
         let trace_bgl = layout("RtReflections/Trace", &trace_entries);
-        let mut grid_entries = RtGrid::layout_entries(0, compute).to_vec();
-        grid_entries.extend([
-            entry(3, texture(true, d2)),
-            entry(4, filtering),
-            entry(5, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }),
-        ]);
         let grid_bgl = layout("RtReflections/Grid", &grid_entries);
         let resolve_bgl = layout(
             "RtReflections/Resolve",
@@ -542,8 +555,8 @@ impl RtReflectionsEffect {
             self.covered_wgsl.as_deref().unwrap_or(DEFAULT_COVERED_WGSL),
             self.albedo_wgsl.as_deref().unwrap_or(DEFAULT_HIT_ALBEDO_WGSL)
         );
-        let trace = pipeline("RtReflections/Trace", trace_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
-        let glass = pipeline("RtReflections/Glass", glass_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
+        let trace = pipeline("RtReflections/Trace", trace_wgsl(clipmap, backend, &covered), &[&trace_bgl, &grid_bgl]);
+        let glass = pipeline("RtReflections/Glass", glass_wgsl(clipmap, backend, &covered), &[&trace_bgl, &grid_bgl]);
         let resolve = pipeline("RtReflections/Resolve", resolve_wgsl(), &[&resolve_bgl]);
         use wgpu::util::DeviceExt;
         let white = device
@@ -612,6 +625,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
         if self.gpu.is_none() {
             self.init_gpu(device, queue);
         }
+        // the hardware backend's TLAS over a rebuilt BLAS
+        self.grid.prepare_trace(device, queue);
         self.poll_stats(device);
         let downscale = self.resolution.downscale();
         let (tw, th) = (width.div_ceil(downscale), height.div_ceil(downscale));
@@ -734,16 +749,17 @@ impl PostProcessingEffect for RtReflectionsEffect {
         // without the reflections the glass pass writes the output itself
         let glass_group = glass_on.then(|| group("RtReflections/Glass", if self.reflections { &t.glassed } else { output }, input));
         // the grid's group, made anew when the grid's buffers or the alpha texture change
-        let (buffers, generation) = self.grid.buffers();
+        let (bindings, generation) = self.grid.bindings();
         if gpu.grid_group.as_ref().is_none_or(|(g, alpha, _)| *g != generation || *alpha != self.alpha_texture) {
             let alpha = self.alpha_texture.as_ref().unwrap_or(&gpu.white);
+            let [e0, e1, e2] = bindings.entries(0);
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("RtReflections/Grid"),
                 layout: &gpu.grid_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buf(&buffers[0]) },
-                    wgpu::BindGroupEntry { binding: 1, resource: buf(&buffers[1]) },
-                    wgpu::BindGroupEntry { binding: 2, resource: buf(&buffers[2]) },
+                    e0,
+                    e1,
+                    e2,
                     wgpu::BindGroupEntry { binding: 3, resource: tex(alpha) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&gpu.alpha_sampler) },
                     wgpu::BindGroupEntry { binding: 5, resource: buf(&gpu.stats) },
