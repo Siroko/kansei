@@ -206,6 +206,27 @@ pub struct Renderer {
     rt_grid: Option<crate::rt::SceneRtGrid>,
 }
 
+/// wgpu's environment variables with DX12 on DXC unless `WGPU_DX12_COMPILER` says otherwise.
+/// wgpu's own default (`auto`) falls back to FXC without a word when it finds no DXC, and FXC
+/// works 20 minutes on the path tracer's trace shader before failing (X4505); DXC takes 23 s.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_instance_descriptor() -> wgpu::InstanceDescriptor {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let compiler = &mut descriptor.backend_options.dx12.shader_compiler;
+    match wgpu::Dx12Compiler::from_env() {
+        None if cfg!(all(windows, target_env = "msvc", not(target_arch = "aarch64"))) => {
+            *compiler = wgpu::Dx12Compiler::StaticDxc;
+        }
+        None => *compiler = wgpu::Dx12Compiler::default_dynamic_dxc(),
+        Some(wgpu::Dx12Compiler::Fxc) if cfg!(windows) => log::warn!(
+            "WGPU_DX12_COMPILER=fxc: DX12 compiles with FXC, which can take many minutes on large \
+             shaders and fails on the path tracer's (X4505)"
+        ),
+        Some(_) => {}
+    }
+    descriptor
+}
+
 impl Renderer {
     pub fn new(config: RendererConfig) -> Self {
         Self {
@@ -314,9 +335,10 @@ impl Renderer {
     ///
     /// Natively it honours wgpu's environment variables: `WGPU_BACKEND` (for example `dx12`,
     /// `vulkan`, `metal`, `gl`), `WGPU_DX12_COMPILER` (`fxc`, `dxc`, `staticdxc`, `auto`),
-    /// `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`; unset, every backend, `auto` (DXC when
-    /// `dxcompiler.dll` is on the PATH, else FXC) and the default adapter.
-    /// [`Renderer::adapter_info`] says which adapter it chose.
+    /// `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`; unset, every backend, the default adapter and
+    /// DX12 on DXC: the one built into kansei-core on Windows MSVC x64, elsewhere `dxcompiler.dll`
+    /// beside the executable or on the PATH, without which DX12 is left out (logged as an error)
+    /// rather than falling back to FXC. [`Renderer::adapter_info`] says which adapter it chose.
     pub async fn initialize_with_target(&mut self, target: impl Into<wgpu::SurfaceTarget<'static>>) {
         #[cfg(target_arch = "wasm32")]
         let descriptor = wgpu::InstanceDescriptor {
@@ -324,8 +346,19 @@ impl Renderer {
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         };
         #[cfg(not(target_arch = "wasm32"))]
-        let descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        let descriptor = native_instance_descriptor();
+        #[cfg(windows)]
+        let dynamic_dxc = descriptor.backends.contains(wgpu::Backends::DX12)
+            && matches!(descriptor.backend_options.dx12.shader_compiler, wgpu::Dx12Compiler::DynamicDxc { .. });
         let instance = wgpu::Instance::new(descriptor);
+        // wgpu drops a backend that fails to start with only a debug log
+        #[cfg(windows)]
+        if dynamic_dxc && instance.enumerate_adapters(wgpu::Backends::DX12).await.is_empty() {
+            log::error!(
+                "DX12 is unavailable: no adapter, most likely because dxcompiler.dll did not load \
+                 (put it beside the executable, or set WGPU_DX12_COMPILER=fxc to accept FXC)"
+            );
+        }
         let surface = instance
             .create_surface(target)
             .expect("Failed to create surface");

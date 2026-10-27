@@ -6,7 +6,8 @@
 //!
 //! `--post` renders through a post-processing volume (bloom, then a colour grade). It prints the
 //! adapter it runs on; pick another with wgpu's variables, for example `WGPU_BACKEND=dx12` (or
-//! `vulkan`) and `WGPU_DX12_COMPILER=dxc`.
+//! `vulkan`). DX12 compiles shaders with the DXC built into kansei-core (`WGPU_DX12_COMPILER`
+//! picks another).
 
 use std::sync::Arc;
 use std::time::Instant;
