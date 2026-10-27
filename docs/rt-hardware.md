@@ -22,8 +22,9 @@ tracing.
 
 On native, `KANSEI_RT_BACKEND=software|hardware|auto` overrides `Auto` without a rebuild. The
 renderer asks for `EXPERIMENTAL_RAY_QUERY` (and the acceleration structure limits) wherever the
-adapter offers it; DX12 offers it only with DXC (`WGPU_DX12_COMPILER=dynamicdxc` with
-`dxcompiler.dll` on the path, or wgpu's `static-dxc` feature).
+adapter offers it; DX12 offers it only with DXC, which kansei-core builds in on Windows (MSVC
+x64) and the renderer's own instance uses by default (an adapter you request yourself needs
+`Dx12Compiler::StaticDxc` or `WGPU_DX12_COMPILER`).
 
 DX12 stays opt-in because NVIDIA's driver 617.42 miscompiles a ray query there: a sample traced
 its coherent primary rays with another branch's flags and range (28-97% of them wrong), while
@@ -129,7 +130,7 @@ that added the backend):
 - Metal's glass pass gains nothing in the room, unexplained so far (on the 5090 it runs 3.8
   times as fast); its rays meet the glass ball in the BLAS's non-opaque geometry, whose
   candidates come back to the shader.
-- DX12 (`RtBackend::Hardware`, DXC from the Windows SDK) passed the parity tests on the 5090 as
+- DX12 (`RtBackend::Hardware`, on DXC) passed the parity tests on the 5090 as
   Vulkan did: Kansei's traces don't take the shape of the miscompiled one. It stays opt-in until
   the driver bug is understood.
 
