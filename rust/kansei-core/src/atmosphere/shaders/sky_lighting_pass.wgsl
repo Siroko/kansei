@@ -44,7 +44,8 @@ fn main(@builtin(local_invocation_index) li : u32) {
         let d = vec3f(sinT * cos(phi), cosT, sinT * sin(phi));
         // below the horizon, the lit ground (added after the sum) where the lighting sees it
         let lum = select(capturedSky(d, skyWithClouds(d), distantSkyLight.rgb) * cellSolidAngle, vec3f(0.0), cosT < 0.0 && lightingSeesGround());
-        var y = skyShBasis(d);
+        var y: array<f32, 9>;
+        skyShBasis(d, &y);
         for (var i = 0u; i < 9u; i++) { sh[i] += lum * y[i]; }
         up += lum * max(cosT, 0.0);
         if (cosT > 0.0) { clearUp += skyViewLuminance(d) * (cellSolidAngle * cosT); }
